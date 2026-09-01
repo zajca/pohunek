@@ -1,6 +1,6 @@
 //! Per-session process watcher and active-agent reconciliation.
 
-// Rust guideline compliant 2026-08-28
+// Rust guideline compliant 2026-09-01
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -13,9 +13,9 @@ use crate::detect::{identify_agent, DetectorConfig};
 use crate::procwatch::{ExitWatch, Pid, ProcessFact};
 
 use super::{
-    agent_kind_label, clear_active_agent, is_terminal, report_is_current, timestamp_now,
-    ActiveAgentReport, CancellationToken, Notify, ObservedAgent, Ordering, SessionEntry, SessionId,
-    SessionRegistry,
+    agent_kind_label, clear_active_agent, is_terminal, report_is_current, send_detector_config,
+    timestamp_now, ActiveAgentReport, CancellationToken, Notify, ObservedAgent, Ordering,
+    SessionEntry, SessionId, SessionRegistry,
 };
 
 const PROCWATCH_SOURCE: &str = "pohunek:procwatch";
@@ -153,7 +153,10 @@ impl SessionRegistry {
             self.emit(event::SESSION_UPDATED, &info);
         }
         match self.inner.inspector.cwd(focus_pid) {
-            Ok(cwd) => self.apply_cwd_change(id, cwd, CwdSource::Procwatch).await,
+            Ok(cwd) => {
+                self.apply_cwd_change(id, cwd, CwdSource::Procwatch, None)
+                    .await;
+            }
             Err(err) => {
                 debug!(
                     session_id = %id.0,
@@ -492,6 +495,9 @@ impl SessionRegistry {
             let Some(active) = entry.active_agent.clone() else {
                 return ForegroundDecision::Preserve;
             };
+            if unbound_claim_is_current(&active, now, self.inner.config.active_agent_claim_ttl) {
+                return ForegroundDecision::Preserve;
+            }
             let _ = clear_active_agent(entry, self.procwatch_tombstone_for(&active, now));
             return ForegroundDecision::Updated;
         }
@@ -509,9 +515,8 @@ impl SessionRegistry {
                         observed_process_matches(entry, pid, active.start_identity, active_base)
                     })
                 });
-        let unbound_is_current = active.pid.is_none()
-            && now.saturating_duration_since(active.reported_at)
-                < self.inner.config.active_agent_claim_ttl;
+        let unbound_is_current =
+            unbound_claim_is_current(&active, now, self.inner.config.active_agent_claim_ttl);
         if active_is_live || unbound_is_current {
             ForegroundDecision::Preserve
         } else {
@@ -526,6 +531,14 @@ impl SessionRegistry {
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1)
     }
+}
+
+fn unbound_claim_is_current(
+    active: &ActiveAgentReport,
+    now: Instant,
+    ttl: std::time::Duration,
+) -> bool {
+    active.pid.is_none() && now.saturating_duration_since(active.reported_at) < ttl
 }
 
 fn apply_observed_refresh(
@@ -667,9 +680,7 @@ fn apply_observed_transition(
         entry.info.activity = None;
         entry.info.state_source = protocol::StateSource::Process;
     }
-    let _ = entry
-        .detector_config
-        .send(DetectorConfig::for_agent(&observed.agent_base));
+    send_detector_config(entry, DetectorConfig::for_agent(&observed.agent_base));
     entry.info.updated_at = timestamp_now();
     entry.info.clone()
 }

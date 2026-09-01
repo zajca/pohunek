@@ -1,7 +1,8 @@
 //! `pohunek` — the CLI control plane.
 //!
 //! Commands: `doctor`, `daemon start`, `health`/`status`, `session`, `attach`,
-//! `integration`, and `host` (discover/list/inspect). The grammar is host-aware
+//! `completions`, `integration`, and `host` (discover/list/inspect). The grammar
+//! is host-aware
 //! (a `--host` flag and `<host>/<session-id>` targets); the *effective host*
 //! selects the transport, so local and remote (over `NetBird`) execute through one
 //! surface. Local behavior is unchanged from the local-only phase.
@@ -10,6 +11,7 @@
 
 mod client;
 mod commands;
+mod completion;
 mod error;
 mod hermes_integration;
 mod paths;
@@ -19,7 +21,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Command, CommandFactory, Parser, Subcommand};
-use protocol::{method, Request};
+use protocol::{method, Request, SessionReadFormat, SessionReadSource};
 
 use crate::error::CliError;
 use crate::paths::Paths;
@@ -51,6 +53,16 @@ enum Commands {
     Attach {
         /// Session target: `session-id` or `<host>/<session-id>`.
         target: Target,
+    },
+
+    /// Generate shell completion for Bash, Zsh, or Fish.
+    Completions {
+        /// Shell whose completion script should be generated.
+        #[arg(value_enum)]
+        shell: completion::CompletionShell,
+        /// Include bounded runtime host and session-target completion.
+        #[arg(long)]
+        dynamic: bool,
     },
 
     /// Check environment health (binaries, socket/state dir writability).
@@ -109,11 +121,12 @@ enum Commands {
         action: MigrationAction,
     },
 
-    /// Set up the sway/rofi launcher integration on this machine.
+    /// Set up shell completion and the sway/rofi launcher on this machine.
     ///
-    /// With no subcommand, runs the full setup (scripts + config + sway
-    /// drop-in). Subcommands apply one part at a time. All operations are
-    /// local filesystem writes; `--host` is ignored.
+    /// With no subcommand, runs the launcher setup (scripts + config + sway
+    /// drop-in). Subcommands apply one part at a time and can also install
+    /// completion for a selected shell. All operations are local filesystem
+    /// writes; `--host` is ignored.
     Setup {
         #[command(subcommand)]
         action: Option<SetupAction>,
@@ -597,11 +610,11 @@ enum IntegrationAction {
         #[arg(long)]
         json: bool,
     },
-    /// Inspect the locally managed Hermes operator plugin.
+    /// Inspect local Hermes or daemon-backed Codex/Claude integration status.
     Status {
-        /// Hermes is the only agent with a local integration lifecycle.
+        /// Restrict status; Hermes requires an explicit local target.
         #[arg(long, value_enum)]
-        agent: commands::integration::HookAgentArg,
+        agent: Option<commands::integration::HookAgentArg>,
         #[command(flatten)]
         hermes: HermesStatusCliOptions,
         /// Emit machine-readable JSON instead of human text.
@@ -722,19 +735,23 @@ struct HermesRequiredTarget {
 /// Read-only Hermes status options.
 #[derive(Debug, Args)]
 struct HermesStatusCliOptions {
-    #[command(flatten)]
-    target: HermesRequiredTarget,
+    /// Select the default or one named Hermes profile.
+    #[arg(long = "hermes-profile", conflicts_with = "home")]
+    profile: Option<String>,
+    /// Select one absolute, owner-private Hermes home.
+    #[arg(long = "hermes-home")]
+    home: Option<PathBuf>,
     /// Use one absolute Hermes executable instead of a bounded absolute PATH lookup.
-    #[arg(long)]
-    hermes_bin: Option<PathBuf>,
+    #[arg(long = "hermes-bin")]
+    binary: Option<PathBuf>,
 }
 
 impl From<HermesStatusCliOptions> for commands::integration::HermesOptions {
     fn from(value: HermesStatusCliOptions) -> Self {
         Self {
-            profile: value.target.hermes_profile,
-            home: value.target.hermes_home,
-            hermes_bin: value.hermes_bin,
+            profile: value.profile,
+            home: value.home,
+            hermes_bin: value.binary,
             pohunek_bin: None,
             access_mode: None,
             allowed_hosts: vec![],
@@ -887,6 +904,19 @@ enum MigrationAction {
 
 #[derive(Debug, Subcommand)]
 enum SetupAction {
+    /// Install shell completion in the conventional per-user directory.
+    Completions {
+        /// Shell whose completion script should be installed.
+        #[arg(value_enum)]
+        shell: completion::CompletionShell,
+        /// Include bounded runtime host and session-target completion.
+        #[arg(long)]
+        dynamic: bool,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Materialize the launcher scripts into the data dir's `bin/`.
     Scripts {
         /// Emit machine-readable JSON instead of human text.
@@ -1065,6 +1095,12 @@ enum SessionAction {
         /// Read text from stdin instead of argv. Alias: `--input-stdin`.
         #[arg(long = "stdin", alias = "input-stdin")]
         input_stdin: bool,
+        /// Agent activities that complete the input wait (repeatable).
+        #[arg(long = "until", value_parser = commands::session::parse_activity_filter)]
+        wait_until: Vec<protocol::AgentActivity>,
+        /// Bounded input-wait duration in milliseconds.
+        #[arg(long = "timeout", value_parser = commands::session::parse_input_timeout_ms)]
+        timeout_ms: Option<u32>,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -1073,6 +1109,31 @@ enum SessionAction {
     /// Read the current rendered terminal screen.
     Screen {
         target: Target,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Preview the active detection manifest regions.
+    Detection {
+        target: Target,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Read a bounded terminal capture.
+    Read {
+        /// Session target: `session-id` or `local/session-id`.
+        target: Target,
+        /// Capture source. Defaults to the current visible screen.
+        #[arg(long, value_parser = commands::session::parse_read_source)]
+        source: Option<SessionReadSource>,
+        /// Maximum returned lines.
+        #[arg(long, value_parser = commands::session::parse_read_lines)]
+        lines: Option<u32>,
+        /// Capture encoding.
+        #[arg(long, value_parser = commands::session::parse_read_format)]
+        format: Option<SessionReadFormat>,
+        /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
     },
@@ -1208,7 +1269,9 @@ impl Commands {
             }
             Commands::Subscribe { json } => *json,
             Commands::Prompt { action } => action.wants_json(),
-            Commands::Attach { .. } | Commands::Daemon { .. } => false,
+            Commands::Attach { .. } | Commands::Completions { .. } | Commands::Daemon { .. } => {
+                false
+            }
         }
     }
 
@@ -1216,6 +1279,7 @@ impl Commands {
         match self {
             Commands::Notifications { action } => action.uses_all_hosts(),
             Commands::Attach { .. }
+            | Commands::Completions { .. }
             | Commands::Doctor { .. }
             | Commands::Daemon { .. }
             | Commands::Health { .. }
@@ -1251,7 +1315,8 @@ impl ProjectAction {
 impl SetupAction {
     fn wants_json(&self) -> bool {
         match self {
-            SetupAction::Scripts { json }
+            SetupAction::Completions { json, .. }
+            | SetupAction::Scripts { json }
             | SetupAction::Config { json, .. }
             | SetupAction::Sway { json, .. } => *json,
         }
@@ -1337,6 +1402,8 @@ impl SessionAction {
             | SessionAction::Rm { json, .. }
             | SessionAction::Input { json, .. }
             | SessionAction::Screen { json, .. }
+            | SessionAction::Detection { json, .. }
+            | SessionAction::Read { json, .. }
             | SessionAction::Output { json, .. }
             | SessionAction::Wait { json, .. }
             | SessionAction::Resume { json, .. }
@@ -1388,6 +1455,8 @@ impl PromptAction {
 }
 
 pub async fn run_cli() -> ExitCode {
+    completion::complete_env();
+
     // Parse manually (not `Cli::parse`) so a clap usage error can be rendered as a
     // structured `--json` document instead of clap's human text + hard process
     // exit. We keep the raw argv to recover the `--json` intent: parsing fails
@@ -1430,6 +1499,10 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let host = effective_host(&global_host, Some(&target));
             // Box the large attach future to keep this dispatch arm small.
             Box::pin(commands::attach::run_attach(&host, &paths, &target)).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Completions { shell, dynamic } => {
+            completion::run(shell, dynamic)?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Doctor { json } => {
@@ -1542,6 +1615,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     target,
                     text,
                     input_stdin,
+                    wait_until,
+                    timeout_ms,
                     json,
                 } => {
                     let host = effective_host(&global_host, Some(&target));
@@ -1551,12 +1626,48 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                         text.expect("clap requires positional text or --stdin")
                     };
                     let target = commands::session::resolve_target(&host, &paths, &target).await?;
-                    commands::session::run_input(&host, &paths, &target, &text, json).await?;
+                    commands::session::run_input(
+                        &host,
+                        &paths,
+                        &target,
+                        &text,
+                        &wait_until,
+                        timeout_ms,
+                        json,
+                    )
+                    .await?;
                 }
                 SessionAction::Screen { target, json } => {
                     let host = effective_host(&global_host, Some(&target));
                     let target = commands::session::resolve_target(&host, &paths, &target).await?;
                     commands::session::run_screen(&host, &paths, &target, json).await?;
+                }
+                SessionAction::Detection { target, json } => {
+                    let host = effective_host(&global_host, Some(&target));
+                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    commands::session::run_detection(&host, &paths, &target, json).await?;
+                }
+                SessionAction::Read {
+                    target,
+                    source,
+                    lines,
+                    format,
+                    json,
+                } => {
+                    let host = effective_host(&global_host, Some(&target));
+                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    commands::session::run_read(
+                        &host,
+                        &paths,
+                        &target,
+                        commands::session::ReadArgs {
+                            source,
+                            lines,
+                            format,
+                        },
+                        json,
+                    )
+                    .await?;
                 }
                 SessionAction::Output {
                     target,
@@ -1725,12 +1836,22 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     hermes,
                     json,
                 } => {
-                    return run_integration_hermes_action(
-                        commands::integration::HermesAction::Status,
-                        agent,
-                        &hermes.into(),
-                        json,
-                    );
+                    let hermes = commands::integration::HermesOptions::from(hermes);
+                    if agent == Some(commands::integration::HookAgentArg::Hermes) {
+                        return run_integration_hermes_action(
+                            commands::integration::HermesAction::Status,
+                            commands::integration::HookAgentArg::Hermes,
+                            &hermes,
+                            json,
+                        );
+                    }
+                    if hermes.is_explicit() {
+                        return Err(commands::integration::hermes_options_require_hermes());
+                    }
+                    let paths = Paths::resolve()?;
+                    let host = effective_host(&global_host, None);
+                    commands::integration::run_status(&host, &paths, agent, json).await?;
+                    return Ok(ExitCode::SUCCESS);
                 }
                 IntegrationAction::Doctor {
                     agent,
@@ -1791,6 +1912,13 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let paths = Paths::resolve()?;
             match action {
                 None => commands::setup::run_all(&paths, json)?,
+                Some(SetupAction::Completions {
+                    shell,
+                    dynamic,
+                    json,
+                }) => {
+                    completion::install(&paths, shell, dynamic, json)?;
+                }
                 Some(SetupAction::Scripts { json }) => {
                     commands::setup::run_scripts(&paths, json)?;
                 }
@@ -2227,7 +2355,7 @@ mod tests {
     }
 
     #[test]
-    fn integration_rejects_conflicting_hermes_targets_and_missing_lifecycle_agent() {
+    fn integration_preserves_status_target_conflicts_and_other_required_targets() {
         let conflict = Cli::try_parse_from([
             "pohunek",
             "integration",
@@ -2242,14 +2370,29 @@ mod tests {
         .expect_err("targets conflict");
         assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
 
-        let missing = Cli::try_parse_from(["pohunek", "integration", "status"])
-            .expect_err("lifecycle requires an agent");
-        assert_eq!(
-            missing.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
+        Cli::try_parse_from(["pohunek", "integration", "status"])
+            .expect("bare daemon-backed status remains reachable");
+        for agent in ["codex", "claude"] {
+            Cli::try_parse_from(["pohunek", "integration", "status", "--agent", agent])
+                .expect("explicit daemon-backed status remains reachable");
+        }
+        Cli::try_parse_from([
+            "pohunek",
+            "integration",
+            "status",
+            "--agent",
+            "hermes",
+            "--hermes-profile",
+            "default",
+            "--hermes-bin",
+            "/opt/hermes/bin/hermes",
+        ])
+        .expect("explicit local Hermes status preserves target flags");
 
-        for action in ["status", "doctor", "update", "uninstall"] {
+        Cli::try_parse_from(["pohunek", "integration", "status", "--agent", "hermes"])
+            .expect("Hermes target validation runs before local filesystem access");
+
+        for action in ["doctor", "update", "uninstall"] {
             let missing_target =
                 Cli::try_parse_from(["pohunek", "integration", action, "--agent", "hermes"])
                     .expect_err("Hermes-only action requires an explicit target");
@@ -2267,7 +2410,7 @@ mod tests {
     #[test]
     fn integration_rejects_non_hermes_lifecycle_before_dispatch() {
         let error = run_integration_hermes_action(
-            commands::integration::HermesAction::Status,
+            commands::integration::HermesAction::Doctor,
             commands::integration::HookAgentArg::Codex,
             &commands::integration::HermesOptions {
                 profile: None,
@@ -2577,6 +2720,7 @@ mod tests {
                         text,
                         input_stdin,
                         json,
+                        ..
                     },
             } => {
                 assert_eq!(target.session_id, "s-42");
@@ -2609,6 +2753,7 @@ mod tests {
                         text,
                         input_stdin,
                         json,
+                        ..
                     },
             } => {
                 assert_eq!(target.host.as_deref(), Some("host-a"));
@@ -2720,6 +2865,63 @@ mod tests {
         ])
         .expect_err("timeout above shared maximum");
         assert_eq!(invalid.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn session_input_parses_optional_wait_flags() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "session",
+            "input",
+            "s-42",
+            "hello",
+            "--until",
+            "idle",
+            "--until",
+            "blocked",
+            "--timeout",
+            "1000",
+        ])
+        .expect("parse input wait");
+
+        match cli.command {
+            Commands::Session {
+                action:
+                    SessionAction::Input {
+                        wait_until,
+                        timeout_ms,
+                        ..
+                    },
+            } => {
+                assert_eq!(
+                    wait_until,
+                    vec![
+                        protocol::AgentActivity::Idle,
+                        protocol::AgentActivity::Blocked
+                    ]
+                );
+                assert_eq!(timeout_ms, Some(1000));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_input_timeout_errors_name_the_input_flag() {
+        let error = Cli::try_parse_from([
+            "pohunek",
+            "session",
+            "input",
+            "s-42",
+            "hello",
+            "--timeout",
+            "0",
+        ])
+        .expect_err("zero input timeout must fail");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("--timeout must be between 1 and 8000"));
+        assert!(!rendered.contains("--timeout-ms"));
     }
 
     #[test]
@@ -2836,6 +3038,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parses_static_completion_command() {
+        let cli = Cli::try_parse_from(["pohunek", "completions", "zsh"]).expect("parse");
+
+        match cli.command {
+            Commands::Completions { shell, dynamic } => {
+                assert_eq!(shell, completion::CompletionShell::Zsh);
+                assert!(!dynamic);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_dynamic_setup_completion_command() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "setup",
+            "completions",
+            "fish",
+            "--dynamic",
+            "--json",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Setup {
+                action:
+                    Some(SetupAction::Completions {
+                        shell,
+                        dynamic,
+                        json,
+                    }),
+                ..
+            } => {
+                assert_eq!(shell, completion::CompletionShell::Fish);
+                assert!(dynamic);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
     // --- setup ----------------------------------------------------------------
 
     #[test]
@@ -2935,6 +3180,31 @@ mod tests {
     fn effective_host_uses_global_when_no_target() {
         assert_eq!(effective_host(LOCAL_HOST, None), "local");
         assert_eq!(effective_host("host-b", None), "host-b");
+    }
+
+    #[test]
+    fn integration_status_preserves_global_host_for_dispatch() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "--host",
+            "host-b",
+            "integration",
+            "status",
+            "--agent",
+            "codex",
+        ])
+        .expect("parse remote integration status");
+
+        assert_eq!(effective_host(&cli.host, None), "host-b");
+        assert!(matches!(
+            cli.command,
+            Commands::Integration {
+                action: IntegrationAction::Status {
+                    agent: Some(commands::integration::HookAgentArg::Codex),
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]

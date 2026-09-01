@@ -301,6 +301,12 @@ jobs:
             cp scripts/smoke-hermes-plugin-release "${staging}/packaging/"
             chmod 0755 "${staging}/packaging/smoke-hermes-plugin-release"
           fi
+          if [ "${{ matrix.component }}" = "cli" ] || [ "${{ matrix.component }}" = "daemon" ]; then
+            mkdir -p "${staging}/completions"
+            "${bindir}/pohunek" completions bash > "${staging}/completions/pohunek.bash"
+            "${bindir}/pohunek" completions zsh > "${staging}/completions/_pohunek"
+            "${bindir}/pohunek" completions fish > "${staging}/completions/pohunek.fish"
+          fi
           mkdir -p "${staging}/docs"
           cp -R target/pohunek-docs/offline "${staging}/docs/offline"
           cp target/pohunek-docs/manifest.json "${staging}/docs/manifest.json"

@@ -1,6 +1,6 @@
 //! Startup adoption of durable session workers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,8 +11,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    event, event_payload, identity_claim_expiry_is_valid, runtime_error, timestamp_now, watch,
-    ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig, Notify, ObservedAgent,
+    event, event_payload, identity_claim_expiry_is_valid, mpsc, runtime_error, timestamp_now,
+    watch, ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig,
+    DetectorConfigUpdate, DetectorInputs, DetectorScope, Mutex, Notify, ObservedAgent,
     ProtocolError, ResumeSnapshot, RuntimeHandle, RuntimeState, RuntimeWatchIdentity, SessionEntry,
     SessionId, SessionRecord, SessionRef, SessionRefKind, SessionRegistry, SessionRuntime,
     SessionState, StateSource, Worker, WorkerError, WORKER_CONNECT_RETRY,
@@ -21,7 +22,7 @@ use crate::procwatch::ProcessInspector;
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-08-28
+// Rust guideline compliant 2026-09-01
 
 #[derive(Debug, Clone)]
 struct DiscoveredWorker {
@@ -740,15 +741,23 @@ impl SessionRegistry {
         let procwatch_rescan = Arc::new(Notify::new());
         let (detector_resize, detector_resize_rx) =
             watch::channel((record.info.rows, record.info.cols));
-        let (detector_config, detector_config_rx) = watch::channel(default_detector_config.clone());
+        let (detector_config, detector_config_rx) = watch::channel(DetectorConfigUpdate {
+            generation: 0,
+            config: default_detector_config.clone(),
+        });
+        let (detector_preview, detector_preview_rx) = mpsc::channel(1);
         let info = record.info.clone();
         let entry = SessionEntry {
             info: info.clone(),
+            activity_revision: 0,
+            activity_evidence: VecDeque::new(),
+            input_gate: Arc::new(Mutex::new(())),
             runtime: RuntimeHandle::Worker(worker.clone()),
             desired_state: DesiredState::Running,
             detector_cancel: detector_cancel.clone(),
             detector_resize,
             detector_config,
+            detector_preview,
             default_detector_config,
             procwatch_cancel: procwatch_cancel.clone(),
             runtime_watch_cancel: runtime_watch_cancel.clone(),
@@ -767,17 +776,21 @@ impl SessionRegistry {
             return;
         }
         self.inner.sessions.lock().await.insert(id.clone(), entry);
-        self.spawn_detector(
-            id.clone(),
-            detector_output,
-            (info.rows, info.cols),
-            detector_cancel,
-            detector_resize_rx,
-            detector_config_rx,
-        );
-        self.spawn_procwatch(id.clone(), child.pid, procwatch_cancel, procwatch_rescan);
         let expected = RuntimeWatchIdentity::from_info(&info)
             .expect("reconciled live runtime has a complete watcher identity");
+        self.spawn_detector(DetectorInputs {
+            scope: DetectorScope {
+                id: id.clone(),
+                runtime: expected.clone(),
+            },
+            output: detector_output,
+            initial_size: (info.rows, info.cols),
+            cancel: detector_cancel,
+            resize: detector_resize_rx,
+            config: detector_config_rx,
+            preview: detector_preview_rx,
+        });
+        self.spawn_procwatch(id.clone(), child.pid, procwatch_cancel, procwatch_rescan);
         self.spawn_worker_exit_watcher(id, worker, expected, runtime_watch_cancel);
         if let Some(previous_runtime_id) = native_recovery {
             self.emit_native_recovered(&info, previous_runtime_id);
@@ -786,6 +799,10 @@ impl SessionRegistry {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "unavailable-record reconstruction keeps one atomic registry transition together"
+    )]
     async fn insert_unavailable_record(
         &self,
         mut record: SessionRecord,
@@ -847,15 +864,23 @@ impl SessionRegistry {
         );
         let default_detector_config = DetectorConfig::for_agent(&record.info.agent_base);
         let (detector_resize, _) = watch::channel((record.info.rows, record.info.cols));
-        let (detector_config, _) = watch::channel(default_detector_config.clone());
+        let (detector_config, _) = watch::channel(DetectorConfigUpdate {
+            generation: 0,
+            config: default_detector_config.clone(),
+        });
+        let (detector_preview, _) = mpsc::channel::<super::DetectionPreviewRequest>(1);
         let info = record.info.clone();
         let entry = SessionEntry {
             info: info.clone(),
+            activity_revision: 0,
+            activity_evidence: VecDeque::new(),
+            input_gate: Arc::new(Mutex::new(())),
             runtime: RuntimeHandle::Unavailable(state),
             desired_state: record.desired_state,
             detector_cancel: CancellationToken::new(),
             detector_resize,
             detector_config,
+            detector_preview,
             default_detector_config,
             procwatch_cancel: CancellationToken::new(),
             runtime_watch_cancel: CancellationToken::new(),

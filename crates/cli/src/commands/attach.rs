@@ -2350,11 +2350,7 @@ mod tests {
     }
 
     async fn connect_stdin_test_client() -> (Client, UnixStream, Paths, StdinTestSocket) {
-        let id = NEXT_BANNER_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "pohunek-cli-stdin-{}-{id}.sock",
-            std::process::id()
-        ));
+        let path = test_socket_path("pohunek-cli-stdin");
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).expect("bind stdin test daemon");
         let paths = banner_test_paths(path.clone());
@@ -2591,11 +2587,7 @@ mod tests {
     }
 
     fn spawn_banner_test_daemon(connection_count: usize) -> BannerTestDaemon {
-        let id = NEXT_BANNER_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
-        let socket = std::env::temp_dir().join(format!(
-            "pohunek-cli-banner-{}-{id}.sock",
-            std::process::id()
-        ));
+        let socket = test_socket_path("pohunek-cli-banner");
         let _ = std::fs::remove_file(&socket);
         let listener = UnixListener::bind(&socket).expect("bind banner test daemon");
         let (controls_tx, controls) = mpsc::unbounded_channel();
@@ -2624,6 +2616,13 @@ mod tests {
             task,
             socket,
         }
+    }
+
+    fn test_socket_path(prefix: &str) -> PathBuf {
+        let id = NEXT_BANNER_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!("{prefix}-{}-{id}.sock", std::process::id()))
+            .with_extension("sock")
     }
 
     async fn handle_banner_test_connection(

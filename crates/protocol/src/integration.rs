@@ -45,6 +45,13 @@ pub const ENV_WORKER_PROTOCOL_VERSION: &str = "POHUNEK_WORKER_PROTOCOL_VERSION";
 /// source of truth.
 pub const ENV_PROTOCOL_VERSION: &str = "POHUNEK_PROTOCOL_VERSION";
 
+/// Expected integration asset version reported by `integration.status`.
+///
+/// Every managed daemon hook asset carries this version marker. It is exposed
+/// through `protocol` because CLI and SDK consumers need the same expected value
+/// without linking the daemon implementation.
+pub const EXPECTED_INTEGRATION_VERSION: u32 = 4;
+
 /// Parameters for `integration.install`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -66,6 +73,86 @@ pub struct IntegrationInstallResult {
     pub installed: Vec<IntegrationInstallReport>,
 }
 
+/// Request parameters for `integration.status`.
+///
+/// Unknown fields are rejected so misspelled filters cannot broaden a report.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationStatusParams.ts"))]
+pub struct IntegrationStatusParams {
+    /// Restrict the read-only report to one agent. When omitted, report every
+    /// supported hook agent regardless of whether its config dir exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub agent: Option<AgentKind>,
+}
+
+/// Result returned by `integration.status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationStatusResult.ts"))]
+pub struct IntegrationStatusResult {
+    /// One read-only report per requested (or supported) hook agent.
+    pub agents: Vec<IntegrationAgentStatus>,
+}
+
+/// Read-only installation state for one managed hook integration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationAgentStatus.ts"))]
+pub struct IntegrationAgentStatus {
+    /// Agent the report describes.
+    pub agent: AgentKind,
+    /// Whether the agent's configuration directory exists.
+    pub available: bool,
+    /// Expected managed asset paths, including files that are absent.
+    pub expected_asset_paths: Vec<String>,
+    /// Managed assets present on disk. Paths never contain secret values.
+    pub present_asset_paths: Vec<String>,
+    /// Registration files inspected for this agent.
+    pub registration_paths: Vec<String>,
+    /// Common version marker found across readable managed assets.
+    pub installed_version: Option<u32>,
+    /// Version currently embedded in this build.
+    pub expected_version: u32,
+    /// Aggregate install health derived from the files above.
+    pub state: IntegrationInstallState,
+    /// Safe next action derived from the complete set of findings.
+    pub recovery: IntegrationRecovery,
+    /// Non-fatal, non-secret reasons the complete install contract is unhealthy.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// Safe recovery action for one managed hook integration report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationRecovery.ts"))]
+pub enum IntegrationRecovery {
+    /// The complete managed integration contract is current.
+    None,
+    /// Re-running the installer can repair every reported finding.
+    Reinstall,
+    /// Provider configuration must be repaired before reinstalling safely.
+    RepairConfiguration,
+}
+
+/// Derived installation health for one managed hook integration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationInstallState.ts"))]
+pub enum IntegrationInstallState {
+    /// No Pohunek-managed asset or registration was detected.
+    NotInstalled,
+    /// Every managed asset, registration, and trust record matches the installer.
+    Current,
+    /// A detected or unreadable install is incomplete, modified, or malformed.
+    Outdated,
+}
+
 /// Per-agent record of what the installer wrote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -78,4 +165,56 @@ pub struct IntegrationInstallReport {
     /// Config files the installer created or merged into (settings.json /
     /// hooks.json / config.toml), in the order they were touched.
     pub config_paths: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IntegrationInstallState, IntegrationRecovery, IntegrationStatusParams};
+
+    #[test]
+    fn integration_status_params_default_to_all_agents() {
+        assert_eq!(IntegrationStatusParams::default().agent, None);
+    }
+
+    #[test]
+    fn integration_status_params_reject_unknown_fields() {
+        let error = serde_json::from_value::<IntegrationStatusParams>(serde_json::json!({
+            "agent": "codex",
+            "unexpected": true,
+        }))
+        .expect_err("unknown integration status fields must fail");
+
+        assert!(error.to_string().contains("unknown field `unexpected`"));
+    }
+
+    #[test]
+    fn integration_install_states_use_exact_snake_case_wire_values() {
+        for (state, expected) in [
+            (IntegrationInstallState::NotInstalled, "\"not_installed\""),
+            (IntegrationInstallState::Current, "\"current\""),
+            (IntegrationInstallState::Outdated, "\"outdated\""),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&state).expect("serialize integration state"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn integration_recovery_uses_exact_snake_case_wire_values() {
+        for (recovery, expected) in [
+            (IntegrationRecovery::None, "\"none\""),
+            (IntegrationRecovery::Reinstall, "\"reinstall\""),
+            (
+                IntegrationRecovery::RepairConfiguration,
+                "\"repair_configuration\"",
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&recovery).expect("serialize integration recovery"),
+                expected
+            );
+        }
+    }
 }

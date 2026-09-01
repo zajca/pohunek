@@ -11,13 +11,16 @@
 //! clobbers unrelated user hooks: only exact command strings written by this
 //! installer are stripped before managed hooks are (re-)added.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use protocol::{
-    AgentKind, ErrorClass, IntegrationInstallReport, IntegrationInstallResult, ProtocolError,
+    AgentKind, ErrorClass, IntegrationAgentStatus, IntegrationInstallReport,
+    IntegrationInstallResult, IntegrationInstallState, IntegrationRecovery,
+    IntegrationStatusParams, IntegrationStatusResult, ProtocolError, EXPECTED_INTEGRATION_VERSION,
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -37,6 +40,8 @@ pub use protocol::{
 const STATE_HOOK_INSTALL_NAME: &str = "pohunek-agent-state.sh";
 /// Installed notification hook script file name (shared by both agents).
 const NOTIFY_HOOK_INSTALL_NAME: &str = "pohunek-agent-notify.sh";
+/// Marker prefix used to identify the installed managed asset version.
+const INTEGRATION_VERSION_PREFIX: &str = "# POHUNEK_INTEGRATION_VERSION=";
 /// The Claude hook script, embedded at compile time.
 const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/pohunek-agent-state.sh");
 /// The Claude notification hook script, embedded at compile time.
@@ -45,6 +50,21 @@ const CLAUDE_NOTIFY_HOOK_ASSET: &str = include_str!("assets/claude/pohunek-agent
 const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/pohunek-agent-state.sh");
 /// The Codex notification hook script, embedded at compile time.
 const CODEX_NOTIFY_HOOK_ASSET: &str = include_str!("assets/codex/pohunek-agent-notify.sh");
+/// Managed hook assets are currently below 8 KiB; 64 KiB leaves ample growth
+/// while bounding status memory and I/O for installer-owned executable files.
+const MANAGED_ASSET_INSPECTION_LIMIT_BYTES: usize = 64 * 1024;
+/// Provider configuration can legitimately contain unrelated user settings, so
+/// status allows 2 MiB before requiring manual inspection rather than parsing
+/// an attacker-controlled or accidentally expanded file in full.
+const PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+/// One byte beyond a limit distinguishes an exact-boundary file from overflow.
+const INSPECTION_LIMIT_PROBE_BYTES: usize = 1;
+/// Unix permission and special-mode bits relevant to executable trust checks.
+#[cfg(unix)]
+const UNIX_MODE_MASK: u32 = 0o7777;
+/// Group/other write bits violate the owner-private executable path boundary.
+#[cfg(unix)]
+const GROUP_OR_OTHER_WRITE_MASK: u32 = 0o022;
 /// Per-hook timeout (seconds) recorded in the agent's hook config.
 const HOOK_TIMEOUT_SECS: u64 = 10;
 /// Action argument passed to the hook script for the `SessionStart` event.
@@ -71,6 +91,12 @@ const CODEX_SESSION_START_TRUST_EVENT: &str = "session_start";
 const CODEX_PERMISSION_REQUEST_TRUST_EVENT: &str = "permission_request";
 /// Codex trust identity name for `Stop`.
 const CODEX_STOP_TRUST_EVENT: &str = "stop";
+/// Codex trust keys owned by this installer across all managed lifecycle hooks.
+const CODEX_MANAGED_TRUST_EVENTS: &[&str] = &[
+    CODEX_SESSION_START_TRUST_EVENT,
+    CODEX_PERMISSION_REQUEST_TRUST_EVENT,
+    CODEX_STOP_TRUST_EVENT,
+];
 /// Action argument passed to notification hook scripts for approval prompts.
 const PERMISSION_REQUEST_ACTION: &str = "permission_request";
 /// Action argument passed to notification hook scripts for notifications.
@@ -87,6 +113,19 @@ const CLAUDE_NOTIFICATION_MATCHERS: &[&str] = &[
     "elicitation_complete",
     "elicitation_response",
 ];
+
+/// Exact Unix mode written for Pohunek-managed hook executables.
+///
+/// Group or other write access would let another local principal alter code
+/// executed by the owner. Other modes are drift from the installer contract.
+#[cfg(unix)]
+const MANAGED_HOOK_MODE: u32 = 0o755;
+/// Newly created Claude hook directories are private to the daemon owner.
+#[cfg(unix)]
+const MANAGED_HOOK_DIR_MODE: u32 = 0o700;
+/// Newly created provider registration files are readable only by the owner.
+#[cfg(unix)]
+const NEW_REGISTRATION_MODE: u32 = 0o600;
 
 /// Env var overriding Claude's config dir (else `~/.claude`).
 const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
@@ -151,6 +190,1232 @@ pub fn install(agent: Option<AgentKind>) -> Result<IntegrationInstallResult, Pro
     Ok(IntegrationInstallResult { installed })
 }
 
+/// Inspect managed Codex and Claude hook files without writing anything.
+///
+/// Unsupported agents are rejected so callers cannot mistake an empty report
+/// for "nothing is installed". Missing config directories are reported as
+/// unavailable rather than treated as errors.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError`] for unsupported agents or when the agent config
+/// directory cannot be resolved.
+pub fn status(params: IntegrationStatusParams) -> Result<IntegrationStatusResult, ProtocolError> {
+    let agents = match params.agent {
+        Some(AgentKind::Claude) => vec![reported_agent_status(StatusAgent::Claude)],
+        Some(AgentKind::Codex) => vec![reported_agent_status(StatusAgent::Codex)],
+        Some(AgentKind::Shell) => return Err(status_unsupported(&AgentKind::Shell)),
+        Some(AgentKind::Hermes) => return Err(status_unsupported(&AgentKind::Hermes)),
+        Some(AgentKind::Unknown(value)) => {
+            return Err(ProtocolError::agent_kind_unsupported(&value));
+        }
+        None => vec![
+            reported_agent_status(StatusAgent::Claude),
+            reported_agent_status(StatusAgent::Codex),
+        ],
+    };
+    Ok(IntegrationStatusResult { agents })
+}
+
+/// Degrade one supported agent's config-resolution failure into a warning.
+fn reported_agent_status(agent: StatusAgent) -> IntegrationAgentStatus {
+    match agent_status(agent) {
+        Ok(report) => report,
+        Err(error) => IntegrationAgentStatus {
+            agent: agent.kind(),
+            available: false,
+            expected_asset_paths: Vec::new(),
+            present_asset_paths: Vec::new(),
+            registration_paths: Vec::new(),
+            installed_version: None,
+            expected_version: EXPECTED_INTEGRATION_VERSION,
+            state: IntegrationInstallState::Outdated,
+            recovery: IntegrationRecovery::RepairConfiguration,
+            warnings: vec![format!(
+                "agent config directory could not be resolved ({})",
+                error.code
+            )],
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusAgent {
+    Claude,
+    Codex,
+}
+
+impl StatusAgent {
+    fn kind(self) -> AgentKind {
+        match self {
+            Self::Claude => AgentKind::Claude,
+            Self::Codex => AgentKind::Codex,
+        }
+    }
+}
+
+fn status_unsupported(agent: &AgentKind) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "agent_not_installable",
+        format!("{} has no daemon-managed hook integration", agent.as_wire()),
+        None,
+    )
+}
+
+/// Build one supported agent's read-only status report.
+fn agent_status(agent: StatusAgent) -> Result<IntegrationAgentStatus, ProtocolError> {
+    match agent {
+        StatusAgent::Claude => Ok(status_at(
+            StatusAgent::Claude,
+            &claude_config_dir()?,
+            CLAUDE_HOOK_ASSET,
+            CLAUDE_NOTIFY_HOOK_ASSET,
+        )),
+        StatusAgent::Codex => Ok(status_at(
+            StatusAgent::Codex,
+            &codex_config_dir()?,
+            CODEX_HOOK_ASSET,
+            CODEX_NOTIFY_HOOK_ASSET,
+        )),
+    }
+}
+
+fn status_at(
+    agent: StatusAgent,
+    config_dir: &Path,
+    state_asset: &'static str,
+    notify_asset: &'static str,
+) -> IntegrationAgentStatus {
+    let state_path = managed_hook_path(config_dir, agent, STATE_HOOK_INSTALL_NAME);
+    let notify_path = managed_hook_path(config_dir, agent, NOTIFY_HOOK_INSTALL_NAME);
+    let registration_paths = registration_paths(config_dir, agent);
+    let expected_asset_paths = vec![path_text(&state_path), path_text(&notify_path)];
+    let registration_path_strings = registration_paths
+        .iter()
+        .map(|path| path_text(path))
+        .collect();
+
+    if let Some((state, warning)) = config_dir_issue(config_dir) {
+        return IntegrationAgentStatus {
+            agent: agent.kind(),
+            available: false,
+            expected_asset_paths,
+            present_asset_paths: Vec::new(),
+            registration_paths: registration_path_strings,
+            installed_version: None,
+            expected_version: EXPECTED_INTEGRATION_VERSION,
+            state,
+            recovery: IntegrationRecovery::RepairConfiguration,
+            warnings: vec![warning.to_owned()],
+        };
+    }
+
+    let mut warnings = Vec::new();
+    let mut recovery = IntegrationRecovery::None;
+    let parent_chain_current = managed_asset_parent_chain_current(
+        agent,
+        config_dir,
+        state_path
+            .parent()
+            .expect("managed asset path always has a parent"),
+        &mut warnings,
+        &mut recovery,
+    );
+    let assets = [
+        inspect_asset(
+            agent,
+            ManagedAssetKind::StateHook,
+            state_path,
+            state_asset,
+            parent_chain_current,
+            &mut warnings,
+            &mut recovery,
+        ),
+        inspect_asset(
+            agent,
+            ManagedAssetKind::NotificationHook,
+            notify_path,
+            notify_asset,
+            parent_chain_current,
+            &mut warnings,
+            &mut recovery,
+        ),
+    ];
+    let (registration_footprint, registrations_current) = match agent {
+        StatusAgent::Claude => inspect_claude_registration(
+            config_dir,
+            &assets[0].path,
+            &assets[1].path,
+            &mut warnings,
+            &mut recovery,
+        ),
+        StatusAgent::Codex => inspect_codex_registration(
+            config_dir,
+            &assets[0].path,
+            &assets[1].path,
+            &mut warnings,
+            &mut recovery,
+        ),
+    };
+    let present_asset_paths = assets
+        .iter()
+        .filter(|asset| asset.present)
+        .map(|asset| path_text(&asset.path))
+        .collect();
+    let installed_version = installed_version(&assets, &mut warnings);
+    let footprint = registration_footprint || assets.iter().any(|asset| asset.footprint);
+    let state = if !footprint {
+        IntegrationInstallState::NotInstalled
+    } else if registrations_current && assets.iter().all(|asset| asset.current) {
+        IntegrationInstallState::Current
+    } else {
+        IntegrationInstallState::Outdated
+    };
+
+    IntegrationAgentStatus {
+        agent: agent.kind(),
+        available: true,
+        expected_asset_paths,
+        present_asset_paths,
+        registration_paths: registration_path_strings,
+        installed_version,
+        expected_version: EXPECTED_INTEGRATION_VERSION,
+        state,
+        recovery,
+        warnings,
+    }
+}
+
+fn config_dir_issue(config_dir: &Path) -> Option<(IntegrationInstallState, &'static str)> {
+    match fs::metadata(config_dir) {
+        Ok(metadata) if metadata.is_dir() => None,
+        Ok(_metadata) => Some((
+            IntegrationInstallState::Outdated,
+            "agent config path is not a directory",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some((
+            IntegrationInstallState::NotInstalled,
+            "agent config directory does not exist",
+        )),
+        Err(_error) => Some((
+            IntegrationInstallState::Outdated,
+            "agent config directory could not be inspected",
+        )),
+    }
+}
+
+fn require_recovery(current: &mut IntegrationRecovery, required: IntegrationRecovery) {
+    if required == IntegrationRecovery::RepairConfiguration || *current == IntegrationRecovery::None
+    {
+        *current = required;
+    }
+}
+
+/// Resolve the platform-specific managed hook path for an agent.
+fn managed_hook_path(config_dir: &Path, agent: StatusAgent, file_name: &str) -> PathBuf {
+    match agent {
+        StatusAgent::Claude => config_dir.join("hooks").join(file_name),
+        StatusAgent::Codex => config_dir.join(file_name),
+    }
+}
+
+/// Parse the first exact integration-version marker in a hook asset.
+fn parse_integration_version(content: &str) -> Option<u32> {
+    content.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(INTEGRATION_VERSION_PREFIX)
+            .and_then(|version| version.parse::<u32>().ok())
+    })
+}
+
+#[derive(Debug)]
+struct AssetStatus {
+    path: PathBuf,
+    content: Option<String>,
+    present: bool,
+    footprint: bool,
+    current: bool,
+}
+
+/// Independently classifies each read-only managed hook asset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedAssetKind {
+    StateHook,
+    NotificationHook,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnixMetadataSnapshot {
+    is_expected_type: bool,
+    owner_uid: u32,
+    mode: u32,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataTrustIssue {
+    UnexpectedType,
+    ForeignOwner { actual: u32, expected: u32 },
+    GroupOrOtherWritable { mode: u32 },
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentStatus {
+    Current,
+    Missing,
+    Unsafe,
+}
+
+#[cfg(unix)]
+fn evaluate_owner_private_metadata(
+    metadata: UnixMetadataSnapshot,
+    effective_uid: u32,
+) -> Result<(), MetadataTrustIssue> {
+    if !metadata.is_expected_type {
+        return Err(MetadataTrustIssue::UnexpectedType);
+    }
+    if metadata.owner_uid != effective_uid {
+        return Err(MetadataTrustIssue::ForeignOwner {
+            actual: metadata.owner_uid,
+            expected: effective_uid,
+        });
+    }
+    if metadata.mode & GROUP_OR_OTHER_WRITE_MASK != 0 {
+        return Err(MetadataTrustIssue::GroupOrOtherWritable {
+            mode: metadata.mode,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn metadata_snapshot(metadata: &fs::Metadata, is_expected_type: bool) -> UnixMetadataSnapshot {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    UnixMetadataSnapshot {
+        is_expected_type,
+        owner_uid: metadata.uid(),
+        mode: metadata.permissions().mode() & UNIX_MODE_MASK,
+    }
+}
+
+#[cfg(unix)]
+fn managed_asset_parent_chain_current(
+    agent: StatusAgent,
+    config_dir: &Path,
+    asset_parent: &Path,
+    warnings: &mut Vec<String>,
+    recovery: &mut IntegrationRecovery,
+) -> bool {
+    let relative_parent = match asset_parent.strip_prefix(config_dir) {
+        Ok(relative_parent) => relative_parent,
+        Err(_error) => {
+            warnings.push("managed asset parent escapes the agent config root".to_owned());
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            return false;
+        }
+    };
+    let effective_uid = nix::unistd::Uid::effective().as_raw();
+    let mut parent = config_dir.to_path_buf();
+    if inspect_managed_parent(agent, &parent, effective_uid, warnings) != ParentStatus::Current {
+        require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+        return false;
+    }
+    for component in relative_parent.components() {
+        parent.push(component);
+        match inspect_managed_parent(agent, &parent, effective_uid, warnings) {
+            ParentStatus::Current => {}
+            ParentStatus::Missing => return true,
+            ParentStatus::Unsafe => {
+                require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[cfg(not(unix))]
+fn managed_asset_parent_chain_current(
+    _agent: StatusAgent,
+    _config_dir: &Path,
+    _asset_parent: &Path,
+    _warnings: &mut Vec<String>,
+    _recovery: &mut IntegrationRecovery,
+) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn inspect_managed_parent(
+    agent: StatusAgent,
+    path: &Path,
+    effective_uid: u32,
+    warnings: &mut Vec<String>,
+) -> ParentStatus {
+    let file = match open_inspection_directory(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return ParentStatus::Missing,
+        Err(_error) => {
+            warnings.push(format!(
+                "managed asset parent {} could not be opened safely",
+                path.display()
+            ));
+            return ParentStatus::Unsafe;
+        }
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_error) => {
+            warnings.push(format!(
+                "managed asset parent {} metadata could not be read",
+                path.display()
+            ));
+            return ParentStatus::Unsafe;
+        }
+    };
+    match evaluate_owner_private_metadata(
+        metadata_snapshot(&metadata, metadata.file_type().is_dir()),
+        effective_uid,
+    ) {
+        Ok(()) => ParentStatus::Current,
+        Err(MetadataTrustIssue::UnexpectedType) => {
+            warnings.push(format!(
+                "managed asset parent {} is not a real directory",
+                path.display()
+            ));
+            ParentStatus::Unsafe
+        }
+        Err(MetadataTrustIssue::ForeignOwner { actual, expected }) => {
+            warnings.push(format!(
+                "managed asset parent {} is owned by uid {actual}, not daemon uid {expected}; repair the agent configuration before running `pohunek integration install --agent {}`",
+                path.display(),
+                agent.kind().as_wire()
+            ));
+            ParentStatus::Unsafe
+        }
+        Err(MetadataTrustIssue::GroupOrOtherWritable { mode }) => {
+            warnings.push(format!(
+                "managed asset parent {} is unsafe (mode {mode:04o}; group or other users can replace managed hooks); repair the directory permissions before running `pohunek integration install --agent {}`",
+                path.display(),
+                agent.kind().as_wire()
+            ));
+            ParentStatus::Unsafe
+        }
+    }
+}
+
+impl ManagedAssetKind {
+    fn description(self) -> &'static str {
+        match self {
+            Self::StateHook => "state hook",
+            Self::NotificationHook => "notification hook",
+        }
+    }
+}
+
+fn inspect_asset(
+    agent: StatusAgent,
+    kind: ManagedAssetKind,
+    path: PathBuf,
+    expected: &'static str,
+    parent_chain_current: bool,
+    warnings: &mut Vec<String>,
+    recovery: &mut IntegrationRecovery,
+) -> AssetStatus {
+    let description = kind.description();
+    let mut file = match open_inspection_file(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            warnings.push(format!("managed {description} is missing"));
+            require_recovery(recovery, IntegrationRecovery::Reinstall);
+            return AssetStatus {
+                path,
+                content: None,
+                present: false,
+                footprint: false,
+                current: false,
+            };
+        }
+        Err(_error) => {
+            warnings.push(format!("managed {description} could not be opened safely"));
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            return AssetStatus {
+                path,
+                content: None,
+                present: false,
+                footprint: true,
+                current: false,
+            };
+        }
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_error) => {
+            warnings.push(format!("managed {description} metadata could not be read"));
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            return AssetStatus {
+                path,
+                content: None,
+                present: true,
+                footprint: true,
+                current: false,
+            };
+        }
+    };
+    let metadata_current = asset_metadata_current(agent, kind, &metadata, warnings, recovery);
+    let content = match read_bounded_utf8_from_file(&mut file, MANAGED_ASSET_INSPECTION_LIMIT_BYTES)
+    {
+        Ok(BoundedRead::Content(content)) => content,
+        Ok(BoundedRead::Oversized) => {
+            warnings.push(format!(
+                "managed {description} exceeds the {MANAGED_ASSET_INSPECTION_LIMIT_BYTES}-byte inspection limit; reinstall the integration to replace it"
+            ));
+            require_recovery(recovery, IntegrationRecovery::Reinstall);
+            return AssetStatus {
+                path,
+                content: None,
+                present: true,
+                footprint: true,
+                current: false,
+            };
+        }
+        Err(_error) => {
+            warnings.push(format!("managed {description} could not be read"));
+            require_recovery(recovery, IntegrationRecovery::Reinstall);
+            return AssetStatus {
+                path,
+                content: None,
+                present: true,
+                footprint: true,
+                current: false,
+            };
+        }
+    };
+    let version = parse_integration_version(&content);
+    let content_current = content == expected;
+    if !content_current {
+        require_recovery(recovery, IntegrationRecovery::Reinstall);
+        match version {
+            Some(version) if version != EXPECTED_INTEGRATION_VERSION => warnings.push(format!(
+                "managed {description} version {version} does not match expected {EXPECTED_INTEGRATION_VERSION}"
+            )),
+            Some(_version) => warnings.push(format!(
+                "managed {description} content differs from the embedded asset"
+            )),
+            None => warnings.push(format!(
+                "managed {description} version marker is missing or invalid"
+            )),
+        }
+    }
+    AssetStatus {
+        path,
+        content: Some(content),
+        present: true,
+        footprint: true,
+        current: content_current && metadata_current && parent_chain_current,
+    }
+}
+
+#[cfg(unix)]
+fn asset_metadata_current(
+    agent: StatusAgent,
+    kind: ManagedAssetKind,
+    metadata: &fs::Metadata,
+    warnings: &mut Vec<String>,
+    recovery: &mut IntegrationRecovery,
+) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let effective_uid = nix::unistd::Uid::effective().as_raw();
+    match evaluate_owner_private_metadata(
+        metadata_snapshot(metadata, metadata.file_type().is_file()),
+        effective_uid,
+    ) {
+        Ok(()) | Err(MetadataTrustIssue::GroupOrOtherWritable { .. }) => {}
+        Err(MetadataTrustIssue::UnexpectedType) => {
+            warnings.push(format!(
+                "managed {} is not a regular file",
+                kind.description()
+            ));
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            return false;
+        }
+        Err(MetadataTrustIssue::ForeignOwner { actual, expected }) => {
+            warnings.push(format!(
+                "managed {} is owned by uid {actual}, not daemon uid {expected}; repair ownership before running `pohunek integration install --agent {}`",
+                kind.description(),
+                agent.kind().as_wire()
+            ));
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            return false;
+        }
+    }
+
+    let mode = metadata.permissions().mode() & UNIX_MODE_MASK;
+    if mode == MANAGED_HOOK_MODE {
+        return true;
+    }
+
+    let description = kind.description();
+    let agent = agent.kind();
+    if mode & 0o022 != 0 {
+        warnings.push(format!(
+            "managed {description} permissions are unsafe (mode {mode:04o}; group or other users can write it); run `pohunek integration install --agent {}` to restore mode {MANAGED_HOOK_MODE:04o}",
+            agent.as_wire()
+        ));
+        require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+    } else {
+        warnings.push(format!(
+            "managed {description} permissions drifted (mode {mode:04o}; expected {MANAGED_HOOK_MODE:04o}); run `pohunek integration install --agent {}` to restore them",
+            agent.as_wire()
+        ));
+        require_recovery(recovery, IntegrationRecovery::Reinstall);
+    }
+    false
+}
+
+#[cfg(not(unix))]
+fn asset_metadata_current(
+    _agent: StatusAgent,
+    _kind: ManagedAssetKind,
+    _metadata: &fs::Metadata,
+    _warnings: &mut Vec<String>,
+    _recovery: &mut IntegrationRecovery,
+) -> bool {
+    true
+}
+
+fn installed_version(assets: &[AssetStatus], warnings: &mut Vec<String>) -> Option<u32> {
+    let mut versions = Vec::new();
+    for content in assets.iter().filter_map(|asset| asset.content.as_deref()) {
+        versions.push(parse_integration_version(content)?);
+    }
+    versions.sort_unstable();
+    versions.dedup();
+    if versions.len() > 1 {
+        warnings.push("managed asset version markers are inconsistent".to_owned());
+        None
+    } else {
+        versions.first().copied()
+    }
+}
+
+enum BoundedRead {
+    Content(String),
+    Oversized,
+}
+
+#[cfg(test)]
+fn read_bounded_utf8(path: &Path, max_bytes: usize) -> io::Result<BoundedRead> {
+    let mut file = open_regular_inspection_file(path)?;
+    read_bounded_utf8_from_file(&mut file, max_bytes)
+}
+
+fn read_bounded_utf8_from_file(file: &mut fs::File, max_bytes: usize) -> io::Result<BoundedRead> {
+    let read_limit = max_bytes.saturating_add(INSPECTION_LIMIT_PROBE_BYTES);
+    let read_limit = u64::try_from(read_limit).map_err(|_error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "inspection limit does not fit in u64",
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.take(read_limit).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Ok(BoundedRead::Oversized);
+    }
+    String::from_utf8(bytes)
+        .map(BoundedRead::Content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn open_inspection_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+    };
+    options.open(path)
+}
+
+#[cfg(test)]
+fn open_regular_inspection_file(path: &Path) -> io::Result<fs::File> {
+    let file = open_inspection_file(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inspection target is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_inspection_directory(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    options.open(path)
+}
+
+fn registration_paths(config_dir: &Path, agent: StatusAgent) -> Vec<PathBuf> {
+    match agent {
+        StatusAgent::Claude => vec![config_dir.join("settings.json")],
+        StatusAgent::Codex => vec![
+            config_dir.join("hooks.json"),
+            config_dir.join("config.toml"),
+        ],
+    }
+}
+
+fn path_text(path: &Path) -> String {
+    path.display().to_string()
+}
+
+#[derive(Debug)]
+struct HookSpec {
+    label: String,
+    event: &'static str,
+    command: String,
+    matcher: Option<&'static str>,
+    trust_event: Option<&'static str>,
+}
+
+#[derive(Debug)]
+struct HookFileStatus {
+    footprint: bool,
+    current: bool,
+    positions: Vec<Option<(usize, usize)>>,
+}
+
+fn noncurrent_hook_file(footprint: bool, spec_count: usize) -> HookFileStatus {
+    HookFileStatus {
+        footprint,
+        current: false,
+        positions: vec![None; spec_count],
+    }
+}
+
+enum ReadState {
+    Missing,
+    Unreadable,
+    Oversized,
+    Content(String),
+}
+
+fn inspect_claude_registration(
+    config_dir: &Path,
+    state_path: &Path,
+    notify_path: &Path,
+    warnings: &mut Vec<String>,
+    recovery: &mut IntegrationRecovery,
+) -> (bool, bool) {
+    let settings_path = config_dir.join("settings.json");
+    let mut specs = vec![
+        HookSpec {
+            label: "Claude SessionStart".to_owned(),
+            event: SESSION_START_EVENT,
+            command: hook_command(state_path, HOOK_ACTION),
+            matcher: Some("*"),
+            trust_event: None,
+        },
+        HookSpec {
+            label: "Claude SessionEnd".to_owned(),
+            event: SESSION_END_EVENT,
+            command: hook_command(state_path, HOOK_RELEASE_ACTION),
+            matcher: Some("*"),
+            trust_event: None,
+        },
+    ];
+    specs.extend(CLAUDE_NOTIFICATION_MATCHERS.iter().map(|matcher| HookSpec {
+        label: format!("Claude Notification ({matcher})"),
+        event: CLAUDE_NOTIFICATION_EVENT,
+        command: hook_command_with_args(notify_path, &[NOTIFICATION_ACTION, matcher]),
+        matcher: Some(matcher),
+        trust_event: None,
+    }));
+    specs.extend([
+        HookSpec {
+            label: "Claude Stop".to_owned(),
+            event: CLAUDE_STOP_EVENT,
+            command: hook_command(notify_path, STOP_ACTION),
+            matcher: Some("*"),
+            trust_event: None,
+        },
+        HookSpec {
+            label: "Claude StopFailure".to_owned(),
+            event: CLAUDE_STOP_FAILURE_EVENT,
+            command: hook_command(notify_path, STOP_FAILURE_ACTION),
+            matcher: Some("*"),
+            trust_event: None,
+        },
+    ]);
+    let status = inspect_hook_file(
+        StatusAgent::Claude,
+        &settings_path,
+        "Claude settings.json",
+        &specs,
+        warnings,
+        recovery,
+    );
+    (status.footprint, status.current)
+}
+
+fn inspect_codex_registration(
+    config_dir: &Path,
+    state_path: &Path,
+    notify_path: &Path,
+    warnings: &mut Vec<String>,
+    recovery: &mut IntegrationRecovery,
+) -> (bool, bool) {
+    let hooks_path = config_dir.join("hooks.json");
+    let specs = vec![
+        HookSpec {
+            label: "Codex SessionStart".to_owned(),
+            event: SESSION_START_EVENT,
+            command: hook_command(state_path, HOOK_ACTION),
+            matcher: None,
+            trust_event: Some(CODEX_SESSION_START_TRUST_EVENT),
+        },
+        HookSpec {
+            label: "Codex PermissionRequest".to_owned(),
+            event: CODEX_PERMISSION_REQUEST_EVENT,
+            command: hook_command(notify_path, PERMISSION_REQUEST_ACTION),
+            matcher: None,
+            trust_event: Some(CODEX_PERMISSION_REQUEST_TRUST_EVENT),
+        },
+        HookSpec {
+            label: "Codex Stop".to_owned(),
+            event: CODEX_STOP_EVENT,
+            command: hook_command(notify_path, STOP_ACTION),
+            matcher: None,
+            trust_event: Some(CODEX_STOP_TRUST_EVENT),
+        },
+    ];
+    let hooks = inspect_hook_file(
+        StatusAgent::Codex,
+        &hooks_path,
+        "Codex hooks.json",
+        &specs,
+        warnings,
+        recovery,
+    );
+    let config = inspect_codex_config(
+        &config_dir.join("config.toml"),
+        &hooks_path,
+        &specs,
+        &hooks.positions,
+        warnings,
+        recovery,
+    );
+    (hooks.footprint || config.0, hooks.current && config.1)
+}
+
+fn inspect_hook_file(
+    agent: StatusAgent,
+    path: &Path,
+    label: &str,
+    specs: &[HookSpec],
+    warnings: &mut Vec<String>,
+    recovery: &mut IntegrationRecovery,
+) -> HookFileStatus {
+    let content = match read_status_file(path, label, warnings, recovery) {
+        ReadState::Missing => return noncurrent_hook_file(false, specs.len()),
+        ReadState::Unreadable | ReadState::Oversized => {
+            return noncurrent_hook_file(true, specs.len());
+        }
+        ReadState::Content(content) => content,
+    };
+    let document: Value = match serde_json::from_str(&content) {
+        Ok(document) => document,
+        Err(_error) => {
+            warnings.push(format!("{label} is malformed"));
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            return noncurrent_hook_file(true, specs.len());
+        }
+    };
+    let Some(root) = document.as_object() else {
+        warnings.push(format!("{label} top level is not an object"));
+        require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+        return noncurrent_hook_file(true, specs.len());
+    };
+    let hooks = match root.get("hooks") {
+        Some(Value::Object(hooks)) => hooks,
+        None => {
+            warnings.push(format!("{label} has no hooks object"));
+            require_recovery(recovery, IntegrationRecovery::Reinstall);
+            return noncurrent_hook_file(false, specs.len());
+        }
+        Some(_invalid) => {
+            warnings.push(format!("{label} has an invalid hooks structure"));
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            return noncurrent_hook_file(true, specs.len());
+        }
+    };
+    if let Some(event) = specs
+        .iter()
+        .map(|spec| spec.event)
+        .find(|event| hooks.get(*event).is_some_and(|entries| !entries.is_array()))
+    {
+        warnings.push(format!("{label} has invalid {event} hook entries"));
+        require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+        return noncurrent_hook_file(true, specs.len());
+    }
+
+    let mut footprint = false;
+    let mut current = true;
+    let mut positions = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let references = hook_command_positions(hooks, spec.event, &spec.command);
+        let reference_count = hook_command_count(hooks, &spec.command);
+        footprint |= reference_count > 0;
+        let exact = references
+            .iter()
+            .copied()
+            .filter(|&(group_index, handler_index)| {
+                hook_registration_matches(hooks, spec.event, group_index, handler_index, spec)
+            })
+            .collect::<Vec<_>>();
+        let spec_current = reference_count == 1 && references.len() == 1 && exact.len() == 1;
+        if !spec_current {
+            require_recovery(recovery, IntegrationRecovery::Reinstall);
+            let agent = agent.kind();
+            if reference_count > references.len() {
+                warnings.push(format!(
+                    "managed {} registration also appears under an unexpected event; run `pohunek integration install --agent {}` to remove the duplicate",
+                    spec.label,
+                    agent.as_wire()
+                ));
+            } else {
+                warnings.push(format!(
+                    "managed {} registration is missing or modified; run `pohunek integration install --agent {}` to restore it",
+                    spec.label,
+                    agent.as_wire()
+                ));
+            }
+        }
+        current &= spec_current;
+        positions.push(spec_current.then(|| exact[0]));
+    }
+    HookFileStatus {
+        footprint,
+        current,
+        positions,
+    }
+}
+
+fn hook_command_positions(
+    hooks: &Map<String, Value>,
+    event: &str,
+    command: &str,
+) -> Vec<(usize, usize)> {
+    hooks
+        .get(event)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .flat_map(|(group_index, group)| {
+            group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter_map(move |(handler_index, handler)| {
+                    (handler.get("command").and_then(Value::as_str) == Some(command))
+                        .then_some((group_index, handler_index))
+                })
+        })
+        .collect()
+}
+
+fn hook_command_count(hooks: &Map<String, Value>, command: &str) -> usize {
+    hooks
+        .values()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter(|handler| handler.get("command").and_then(Value::as_str) == Some(command))
+        .count()
+}
+
+fn hook_registration_matches(
+    hooks: &Map<String, Value>,
+    event: &str,
+    group_index: usize,
+    handler_index: usize,
+    spec: &HookSpec,
+) -> bool {
+    let Some(group) = hooks
+        .get(event)
+        .and_then(Value::as_array)
+        .and_then(|groups| groups.get(group_index))
+    else {
+        return false;
+    };
+    let matcher_matches = match spec.matcher {
+        Some(matcher) => group.get("matcher").and_then(Value::as_str) == Some(matcher),
+        None => group.get("matcher").is_none(),
+    };
+    let expected = json!({
+        "type": "command",
+        "command": spec.command,
+        "timeout": HOOK_TIMEOUT_SECS,
+    });
+    let Some(handlers) = group.get("hooks").and_then(Value::as_array) else {
+        return false;
+    };
+    let handler_matches = handlers.get(handler_index) == Some(&expected);
+    // Codex trusts the complete normalized group, so siblings change identity.
+    let canonical_codex_group = spec.trust_event.is_none() || handlers.as_slice() == [expected];
+    matcher_matches && handler_matches && canonical_codex_group
+}
+
+fn inspect_codex_config(
+    path: &Path,
+    hooks_path: &Path,
+    specs: &[HookSpec],
+    positions: &[Option<(usize, usize)>],
+    warnings: &mut Vec<String>,
+    recovery: &mut IntegrationRecovery,
+) -> (bool, bool) {
+    let content = match read_status_file(path, "Codex config.toml", warnings, recovery) {
+        ReadState::Missing => return (false, false),
+        ReadState::Unreadable | ReadState::Oversized => return (true, false),
+        ReadState::Content(content) => content,
+    };
+    let document: DocumentMut = match content.parse() {
+        Ok(document) => document,
+        Err(_error) => {
+            warnings.push("Codex config.toml is malformed".to_owned());
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            return (true, false);
+        }
+    };
+    let trust_prefix = format!("{}:", hooks_path.display());
+    if !codex_config_structure_valid(&document, &trust_prefix) {
+        warnings.push(
+            "Codex config.toml has invalid features, hooks, or hooks.state structure".to_owned(),
+        );
+        require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+        return (true, false);
+    }
+    let expected_keys = specs
+        .iter()
+        .zip(positions)
+        .filter_map(|(spec, position)| {
+            let trust_event = spec.trust_event?;
+            let (group_index, handler_index) = (*position)?;
+            Some(codex_hook_trust_key(
+                hooks_path,
+                trust_event,
+                group_index,
+                handler_index,
+            ))
+        })
+        .collect::<BTreeSet<_>>();
+    let hooks_enabled = document
+        .as_table()
+        .get("features")
+        .and_then(Item::as_table)
+        .and_then(|features| features.get("hooks"))
+        .and_then(Item::as_bool)
+        == Some(true);
+    if !hooks_enabled {
+        warnings.push("Codex hooks feature is not enabled".to_owned());
+        require_recovery(recovery, IntegrationRecovery::Reinstall);
+    }
+
+    let trust_state = document
+        .as_table()
+        .get("hooks")
+        .and_then(Item::as_table)
+        .and_then(|hooks| hooks.get("state"))
+        .and_then(Item::as_table);
+    let actual_keys = trust_state
+        .into_iter()
+        .flat_map(|state| state.iter())
+        .filter(|(key, _item)| is_managed_trust_key(key, &trust_prefix))
+        .map(|(key, _item)| key.to_owned())
+        .collect::<BTreeSet<_>>();
+    let footprint = !actual_keys.is_empty();
+    let mut trust_current = true;
+    for (spec, position) in specs.iter().zip(positions) {
+        let Some(trust_event) = spec.trust_event else {
+            continue;
+        };
+        let valid = position.is_some_and(|(group_index, handler_index)| {
+            let trust_key =
+                codex_hook_trust_key(hooks_path, trust_event, group_index, handler_index);
+            let expected = codex_command_hook_trusted_hash(
+                trust_event,
+                &spec.command,
+                HOOK_TIMEOUT_SECS,
+                None,
+            )
+            .ok();
+            trust_state
+                .and_then(|state| state.get(&trust_key))
+                .and_then(Item::as_table)
+                .and_then(|entry| entry.get("trusted_hash"))
+                .and_then(Item::as_str)
+                .zip(expected.as_deref())
+                .is_some_and(|(actual, expected)| actual == expected)
+        });
+        if !valid {
+            warnings.push(format!(
+                "managed {} trust record is missing or modified",
+                spec.label
+            ));
+            require_recovery(recovery, IntegrationRecovery::Reinstall);
+        }
+        trust_current &= valid;
+    }
+    if actual_keys != expected_keys {
+        warnings.push("managed Codex trust state contains stale or unexpected keys".to_owned());
+        require_recovery(recovery, IntegrationRecovery::Reinstall);
+        trust_current = false;
+    }
+    (footprint, hooks_enabled && trust_current)
+}
+
+fn codex_config_structure_valid(document: &DocumentMut, trust_prefix: &str) -> bool {
+    let root = document.as_table();
+    if root.get("features").is_some_and(|item| !item.is_table()) {
+        return false;
+    }
+    let Some(hooks) = root.get("hooks") else {
+        return true;
+    };
+    let Some(hooks) = hooks.as_table() else {
+        return false;
+    };
+    let Some(state) = hooks.get("state") else {
+        return true;
+    };
+    let Some(state) = state.as_table() else {
+        return false;
+    };
+    state
+        .iter()
+        .all(|(key, item)| !is_managed_trust_key(key, trust_prefix) || item.is_table())
+}
+
+fn is_managed_trust_key(key: &str, trust_prefix: &str) -> bool {
+    key.strip_prefix(trust_prefix).is_some_and(|suffix| {
+        CODEX_MANAGED_TRUST_EVENTS.iter().any(|event| {
+            suffix
+                .strip_prefix(event)
+                .is_some_and(|rest| rest.starts_with(':'))
+        })
+    })
+}
+
+fn read_status_file(
+    path: &Path,
+    label: &str,
+    warnings: &mut Vec<String>,
+    recovery: &mut IntegrationRecovery,
+) -> ReadState {
+    let mut file = match open_inspection_file(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            warnings.push(format!("{label} is missing"));
+            require_recovery(recovery, IntegrationRecovery::Reinstall);
+            return ReadState::Missing;
+        }
+        Err(_error) => {
+            warnings.push(format!("{label} could not be opened safely"));
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            return ReadState::Unreadable;
+        }
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_error) => {
+            warnings.push(format!("{label} metadata could not be read"));
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            return ReadState::Unreadable;
+        }
+    };
+    if !registration_metadata_current(label, &metadata, warnings) {
+        require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+        return ReadState::Unreadable;
+    }
+    match read_bounded_utf8_from_file(&mut file, PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES) {
+        Ok(BoundedRead::Content(content)) => ReadState::Content(content),
+        Ok(BoundedRead::Oversized) => {
+            warnings.push(format!(
+                "{label} exceeds the {PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES}-byte inspection limit; reduce or replace the file before rerunning status"
+            ));
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            ReadState::Oversized
+        }
+        Err(_error) => {
+            warnings.push(format!("{label} could not be read"));
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            ReadState::Unreadable
+        }
+    }
+}
+
+#[cfg(unix)]
+fn registration_metadata_current(
+    label: &str,
+    metadata: &fs::Metadata,
+    warnings: &mut Vec<String>,
+) -> bool {
+    let effective_uid = nix::unistd::Uid::effective().as_raw();
+    match evaluate_owner_private_metadata(
+        metadata_snapshot(metadata, metadata.file_type().is_file()),
+        effective_uid,
+    ) {
+        Ok(()) => true,
+        Err(MetadataTrustIssue::UnexpectedType) => {
+            warnings.push(format!("{label} is not a regular file"));
+            false
+        }
+        Err(MetadataTrustIssue::ForeignOwner { actual, expected }) => {
+            warnings.push(format!(
+                "{label} is owned by uid {actual}, not daemon uid {expected}"
+            ));
+            false
+        }
+        Err(MetadataTrustIssue::GroupOrOtherWritable { mode }) => {
+            warnings.push(format!(
+                "{label} permissions are unsafe (mode {mode:04o}; group or other users can modify provider registration)"
+            ));
+            false
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn registration_metadata_current(
+    label: &str,
+    metadata: &fs::Metadata,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if metadata.file_type().is_file() {
+        true
+    } else {
+        warnings.push(format!("{label} is not a regular file"));
+        false
+    }
+}
+
 /// Install for every supported agent whose config dir exists.
 fn install_all_present() -> Result<Vec<IntegrationInstallReport>, ProtocolError> {
     let mut installed = Vec::new();
@@ -211,21 +1476,26 @@ pub fn codex_config_dir() -> Result<PathBuf, ProtocolError> {
 /// Fails fast if `claude_dir` is absent, if `settings.json` is malformed, or on
 /// any I/O error.
 pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> {
+    validate_config_dir(claude_dir.to_path_buf(), "Claude config directory")?;
     if !claude_dir.is_dir() {
         return Err(config_dir_missing(&AgentKind::Claude, claude_dir));
     }
 
+    let config_root = TrustedDir::open(claude_dir, "Claude config directory")?;
     let hooks_dir = claude_dir.join("hooks");
-    create_dir_all(&hooks_dir)?;
+    let trusted_hooks = config_root.open_child("hooks", "Claude hooks directory")?;
     let hook_path = hooks_dir.join(STATE_HOOK_INSTALL_NAME);
-    write_file(&hook_path, CLAUDE_HOOK_ASSET)?;
-    make_executable(&hook_path)?;
     let notify_hook_path = hooks_dir.join(NOTIFY_HOOK_INSTALL_NAME);
-    write_file(&notify_hook_path, CLAUDE_NOTIFY_HOOK_ASSET)?;
-    make_executable(&notify_hook_path)?;
 
     let settings_path = claude_dir.join("settings.json");
-    let mut settings = read_json_object_or_empty(&settings_path)?;
+    let settings_file = config_root.read_optional("settings.json", "Claude settings.json")?;
+    let settings_mode = settings_file
+        .as_ref()
+        .map_or(NEW_REGISTRATION_MODE, |file| file.mode);
+    let mut settings = parse_json_object_or_empty(
+        settings_file.as_ref().map(|file| file.content.as_str()),
+        &settings_path,
+    )?;
     let hooks = ensure_hooks_object(&mut settings, &settings_path)?;
     let state_hook_commands = [
         hook_command(&hook_path, HOOK_ACTION),
@@ -260,7 +1530,25 @@ pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> 
         &hook_command(&notify_hook_path, STOP_FAILURE_ACTION),
         Some("*"),
     )?;
-    write_json_pretty(&settings_path, &settings)?;
+    let settings_body = json_pretty(&settings_path, &settings)?;
+
+    let trusted_hooks = match trusted_hooks {
+        Some(hooks) => hooks,
+        None => {
+            config_root.create_child("hooks", "Claude hooks directory", MANAGED_HOOK_DIR_MODE)?
+        }
+    };
+    trusted_hooks.replace(
+        STATE_HOOK_INSTALL_NAME,
+        CLAUDE_HOOK_ASSET,
+        MANAGED_HOOK_MODE,
+    )?;
+    trusted_hooks.replace(
+        NOTIFY_HOOK_INSTALL_NAME,
+        CLAUDE_NOTIFY_HOOK_ASSET,
+        MANAGED_HOOK_MODE,
+    )?;
+    config_root.replace("settings.json", &settings_body, settings_mode)?;
 
     Ok(InstallPaths {
         hook_path,
@@ -279,19 +1567,24 @@ pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> 
 /// Fails fast if `codex_dir` is absent, if `hooks.json` is malformed, or on any
 /// I/O error.
 pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
+    validate_config_dir(codex_dir.to_path_buf(), "Codex config directory")?;
     if !codex_dir.is_dir() {
         return Err(config_dir_missing(&AgentKind::Codex, codex_dir));
     }
 
+    let config_root = TrustedDir::open(codex_dir, "Codex config directory")?;
     let hook_path = codex_dir.join(STATE_HOOK_INSTALL_NAME);
-    write_file(&hook_path, CODEX_HOOK_ASSET)?;
-    make_executable(&hook_path)?;
     let notify_hook_path = codex_dir.join(NOTIFY_HOOK_INSTALL_NAME);
-    write_file(&notify_hook_path, CODEX_NOTIFY_HOOK_ASSET)?;
-    make_executable(&notify_hook_path)?;
 
     let hooks_path = codex_dir.join("hooks.json");
-    let mut hooks_file = read_json_object_or_empty(&hooks_path)?;
+    let hooks_source = config_root.read_optional("hooks.json", "Codex hooks.json")?;
+    let hooks_mode = hooks_source
+        .as_ref()
+        .map_or(NEW_REGISTRATION_MODE, |file| file.mode);
+    let mut hooks_file = parse_json_object_or_empty(
+        hooks_source.as_ref().map(|file| file.content.as_str()),
+        &hooks_path,
+    )?;
     let hooks = ensure_hooks_object(&mut hooks_file, &hooks_path)?;
     remove_owned_command_hooks(hooks, &[hook_command(&hook_path, HOOK_ACTION)]);
     remove_owned_command_hooks(hooks, &codex_notify_hook_commands(&notify_hook_path));
@@ -336,14 +1629,14 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
             handler_index,
         ));
     }
-    write_json_pretty(&hooks_path, &hooks_file)?;
-
     let config_path = codex_dir.join("config.toml");
-    let existing = match fs::read_to_string(&config_path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(io_error("read", &config_path, &err)),
-    };
+    let config_source = config_root.read_optional("config.toml", "Codex config.toml")?;
+    let config_mode = config_source
+        .as_ref()
+        .map_or(NEW_REGISTRATION_MODE, |file| file.mode);
+    let existing = config_source
+        .as_ref()
+        .map_or("", |file| file.content.as_str());
     let mut trust_states = Vec::with_capacity(trust_entries.len());
     for (trust_event, command, group_index, handler_index) in trust_entries {
         let trust_key = codex_hook_trust_key(&hooks_path, trust_event, group_index, handler_index);
@@ -351,9 +1644,18 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
             codex_command_hook_trusted_hash(trust_event, &command, HOOK_TIMEOUT_SECS, None)?;
         trust_states.push((trust_key, trusted_hash));
     }
-    let updated = update_codex_config_toml(&existing, &trust_states, &config_path)?;
+    let updated = update_codex_config_toml(existing, &trust_states, &config_path, &hooks_path)?;
+    let hooks_body = json_pretty(&hooks_path, &hooks_file)?;
+
+    config_root.replace(STATE_HOOK_INSTALL_NAME, CODEX_HOOK_ASSET, MANAGED_HOOK_MODE)?;
+    config_root.replace(
+        NOTIFY_HOOK_INSTALL_NAME,
+        CODEX_NOTIFY_HOOK_ASSET,
+        MANAGED_HOOK_MODE,
+    )?;
+    config_root.replace("hooks.json", &hooks_body, hooks_mode)?;
     if updated != existing {
-        write_file(&config_path, &updated)?;
+        config_root.replace("config.toml", &updated, config_mode)?;
     }
 
     Ok(InstallPaths {
@@ -636,13 +1938,11 @@ fn remove_owned_command_hooks(hooks: &mut Map<String, Value>, owned_commands: &[
     }
 }
 
-/// Whether a hook entry is one of this installer's exact command hooks.
+/// Whether a hook entry carries one of this installer's exact command identities.
 fn is_owned_command(hook: &Value, owned_commands: &[String]) -> bool {
-    hook.get("type").and_then(Value::as_str) == Some("command")
-        && hook
-            .get("command")
-            .and_then(Value::as_str)
-            .is_some_and(|command| owned_commands.iter().any(|owned| owned == command))
+    hook.get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| owned_commands.iter().any(|owned| owned == command))
 }
 
 /// Update Codex `config.toml` through a TOML parser, preserving unrelated data.
@@ -655,6 +1955,7 @@ fn update_codex_config_toml(
     content: &str,
     trust_states: &[(String, String)],
     path: &Path,
+    hooks_path: &Path,
 ) -> Result<String, ProtocolError> {
     let mut doc = content.parse::<DocumentMut>().map_err(|err| {
         settings_invalid(path, &format!("invalid TOML in Codex config.toml: {err}"))
@@ -663,6 +1964,24 @@ fn update_codex_config_toml(
     ensure_table(doc.as_table_mut(), "features", path)?.insert("hooks", value(true));
     let hooks = ensure_table(doc.as_table_mut(), "hooks", path)?;
     let state = ensure_table(hooks, "state", path)?;
+    let trust_prefix = format!("{}:", hooks_path.display());
+    if state
+        .iter()
+        .any(|(key, item)| is_managed_trust_key(key, &trust_prefix) && !item.is_table())
+    {
+        return Err(settings_invalid(
+            path,
+            "cannot replace a scalar managed Codex trust entry",
+        ));
+    }
+    let stale_keys = state
+        .iter()
+        .filter(|(key, _item)| is_managed_trust_key(key, &trust_prefix))
+        .map(|(key, _item)| key.to_owned())
+        .collect::<Vec<_>>();
+    for stale_key in stale_keys {
+        state.remove(&stale_key);
+    }
     for (trust_key, trusted_hash) in trust_states {
         ensure_table(state, trust_key, path)?.insert("trusted_hash", value(trusted_hash.as_str()));
     }
@@ -706,7 +2025,7 @@ fn toml_basic_string(value: &str) -> String {
 
 fn config_dir(env_var: &str, home_relative: &str) -> Result<PathBuf, ProtocolError> {
     if let Some(value) = std::env::var_os(env_var).filter(|value| !value.is_empty()) {
-        return Ok(expand_tilde(PathBuf::from(value)));
+        return validate_config_dir(expand_tilde(PathBuf::from(value)), env_var);
     }
     let home = std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
@@ -718,7 +2037,19 @@ fn config_dir(env_var: &str, home_relative: &str) -> Result<PathBuf, ProtocolErr
                 None,
             )
         })?;
-    Ok(PathBuf::from(home).join(home_relative))
+    validate_config_dir(PathBuf::from(home).join(home_relative), "HOME")
+}
+
+fn validate_config_dir(path: PathBuf, source: &str) -> Result<PathBuf, ProtocolError> {
+    if !path.is_absolute() || path.to_str().is_none() {
+        return Err(ProtocolError::new(
+            ErrorClass::Configuration,
+            "agent_config_dir_invalid",
+            format!("{source} must resolve to an absolute UTF-8 path for agent hook registration"),
+            Some("set the provider config directory to an absolute path".to_owned()),
+        ));
+    }
+    Ok(path)
 }
 
 /// Expand a leading `~`/`~/` against `$HOME`.
@@ -738,42 +2069,478 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
     path
 }
 
-fn read_json_object_or_empty(path: &Path) -> Result<Value, ProtocolError> {
-    match fs::read_to_string(path) {
-        Ok(content) => serde_json::from_str::<Value>(&content)
-            .map_err(|err| settings_invalid(path, &format!("invalid JSON: {err}"))),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(json!({})),
-        Err(err) => Err(io_error("read", path, &err)),
+#[cfg(unix)]
+#[derive(Debug)]
+struct TrustedDir {
+    path: PathBuf,
+    file: fs::File,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct LoadedFile {
+    content: String,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl TrustedDir {
+    fn open(path: &Path, label: &str) -> Result<Self, ProtocolError> {
+        let fd = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| path_open_untrusted(path, label, error))?;
+        let file = fs::File::from(fd);
+        validate_trusted_metadata(
+            path,
+            label,
+            &file
+                .metadata()
+                .map_err(|error| io_error("read trusted directory metadata", path, &error))?,
+            true,
+        )?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+        })
+    }
+
+    fn open_child(&self, name: &str, label: &str) -> Result<Option<Self>, ProtocolError> {
+        let path = self.path.join(name);
+        let fd = match rustix::fs::openat(
+            &self.file,
+            name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(path_open_untrusted(&path, label, error)),
+        };
+        let file = fs::File::from(fd);
+        validate_trusted_metadata(
+            &path,
+            label,
+            &file
+                .metadata()
+                .map_err(|error| io_error("read trusted directory metadata", &path, &error))?,
+            true,
+        )?;
+        Ok(Some(Self { path, file }))
+    }
+
+    fn create_child(&self, name: &str, label: &str, mode: u32) -> Result<Self, ProtocolError> {
+        let path = self.path.join(name);
+        let created =
+            match rustix::fs::mkdirat(&self.file, name, rustix::fs::Mode::from_bits_truncate(mode))
+            {
+                Ok(()) => true,
+                Err(rustix::io::Errno::EXIST) => false,
+                Err(error) => {
+                    return Err(io_error(
+                        "create trusted directory",
+                        &path,
+                        &io::Error::from(error),
+                    ));
+                }
+            };
+        if !created {
+            return self.open_child(name, label)?.ok_or_else(|| {
+                path_untrusted(&path, &format!("{label} disappeared after creation"))
+            });
+        }
+
+        #[cfg(target_os = "linux")]
+        let handle = match self.open_created_child_handle(name, label) {
+            Ok(handle) => handle,
+            Err(error) => {
+                // `unlinkat(..., REMOVEDIR)` never follows a replacement
+                // symlink. A disappeared or non-directory replacement is left
+                // untouched while the ordinary just-created case is cleaned.
+                let _ = rustix::fs::unlinkat(&self.file, name, rustix::fs::AtFlags::REMOVEDIR);
+                return Err(error);
+            }
+        };
+        #[cfg(target_os = "linux")]
+        let result = Self::finish_created_child(&path, label, &handle, mode);
+        #[cfg(not(target_os = "linux"))]
+        let result = (|| {
+            let child = self.open_child(name, label)?.ok_or_else(|| {
+                path_untrusted(&path, &format!("{label} disappeared after creation"))
+            })?;
+            rustix::fs::fchmod(&child.file, rustix::fs::Mode::from_bits_truncate(mode)).map_err(
+                |error| {
+                    io_error(
+                        "enforce trusted directory mode",
+                        &path,
+                        &io::Error::from(error),
+                    )
+                },
+            )?;
+            Ok(child)
+        })();
+        if result.is_err() {
+            #[cfg(target_os = "linux")]
+            self.cleanup_created_child(name, &handle);
+            #[cfg(not(target_os = "linux"))]
+            let _ = rustix::fs::unlinkat(&self.file, name, rustix::fs::AtFlags::REMOVEDIR);
+        }
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    fn finish_created_child(
+        path: &Path,
+        label: &str,
+        handle: &fs::File,
+        mode: u32,
+    ) -> Result<Self, ProtocolError> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // `mkdirat` applies the process umask. An `O_PATH` descriptor opens the
+        // created inode without requiring owner permissions and keeps mode
+        // enforcement independent of later pathname replacement.
+        chmod_path_handle(handle, mode)
+            .map_err(|error| io_error("set trusted directory mode", path, &error))?;
+        let fd = rustix::fs::openat(
+            handle,
+            ".",
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| {
+            io_error(
+                "open trusted directory after mode enforcement",
+                path,
+                &io::Error::from(error),
+            )
+        })?;
+        let file = fs::File::from(fd);
+        validate_trusted_metadata(
+            path,
+            label,
+            &file
+                .metadata()
+                .map_err(|error| io_error("read trusted directory metadata", path, &error))?,
+            true,
+        )?;
+        let child = Self {
+            path: path.to_path_buf(),
+            file,
+        };
+        rustix::fs::fchmod(&child.file, rustix::fs::Mode::from_bits_truncate(mode)).map_err(
+            |error| {
+                io_error(
+                    "enforce trusted directory mode",
+                    path,
+                    &io::Error::from(error),
+                )
+            },
+        )?;
+        let actual_mode = child
+            .file
+            .metadata()
+            .map_err(|error| io_error("verify trusted directory mode", path, &error))?
+            .permissions()
+            .mode()
+            & UNIX_MODE_MASK;
+        if actual_mode != mode {
+            return Err(io_error(
+                "verify trusted directory mode",
+                path,
+                &io::Error::other(format!(
+                    "requested mode {mode:04o}, filesystem reported {actual_mode:04o}"
+                )),
+            ));
+        }
+        Ok(child)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_created_child_handle(
+        &self,
+        name: &str,
+        label: &str,
+    ) -> Result<fs::File, ProtocolError> {
+        let path = self.path.join(name);
+        let fd = rustix::fs::openat(
+            &self.file,
+            name,
+            rustix::fs::OFlags::PATH
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| path_open_untrusted(&path, label, error))?;
+        let file = fs::File::from(fd);
+        validate_trusted_metadata(
+            &path,
+            label,
+            &file
+                .metadata()
+                .map_err(|error| io_error("read trusted directory metadata", &path, &error))?,
+            true,
+        )?;
+        Ok(file)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cleanup_created_child(&self, name: &str, created: &fs::File) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        // Stage the current entry under a unique name before comparing inode
+        // identity. This prevents cleanup from deleting a replacement raced into
+        // the original name after the created directory was opened.
+        let cleanup_name = format!(".{name}.{}.cleanup", ulid::Ulid::new());
+        if rustix::fs::renameat_with(
+            &self.file,
+            name,
+            &self.file,
+            cleanup_name.as_str(),
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .is_err()
+        {
+            return;
+        }
+        let staged = rustix::fs::openat(
+            &self.file,
+            cleanup_name.as_str(),
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .ok()
+        .map(fs::File::from);
+        let same_inode = staged
+            .as_ref()
+            .and_then(|file| file.metadata().ok())
+            .zip(created.metadata().ok())
+            .is_some_and(|(staged, created)| {
+                staged.dev() == created.dev() && staged.ino() == created.ino()
+            });
+        let restore = if same_inode {
+            rustix::fs::unlinkat(
+                &self.file,
+                cleanup_name.as_str(),
+                rustix::fs::AtFlags::REMOVEDIR,
+            )
+            .is_err()
+        } else {
+            true
+        };
+        if restore {
+            // A raced writer can make the created directory non-empty after it
+            // was staged. Restore the original name when it is still free so a
+            // failed cleanup never hides live contents under a cleanup name.
+            let _ = rustix::fs::renameat_with(
+                &self.file,
+                cleanup_name.as_str(),
+                &self.file,
+                name,
+                rustix::fs::RenameFlags::NOREPLACE,
+            );
+        }
+    }
+
+    fn read_optional(&self, name: &str, label: &str) -> Result<Option<LoadedFile>, ProtocolError> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = self.path.join(name);
+        let fd = match rustix::fs::openat(
+            &self.file,
+            name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(path_open_untrusted(&path, label, error)),
+        };
+        let mut file = fs::File::from(fd);
+        let metadata = file
+            .metadata()
+            .map_err(|error| io_error("read trusted file metadata", &path, &error))?;
+        validate_trusted_metadata(&path, label, &metadata, false)?;
+        let mode = metadata.permissions().mode() & UNIX_MODE_MASK;
+        let mut content = String::new();
+        file.read_to_string(&mut content)
+            .map_err(|error| io_error("read trusted file", &path, &error))?;
+        Ok(Some(LoadedFile { content, mode }))
+    }
+
+    fn replace(&self, name: &str, body: &str, mode: u32) -> Result<(), ProtocolError> {
+        let path = self.path.join(name);
+        let temp_name = format!(".{name}.{}.tmp", ulid::Ulid::new());
+        let temp_path = self.path.join(&temp_name);
+        let result = (|| {
+            let fd = rustix::fs::openat(
+                &self.file,
+                temp_name.as_str(),
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .map_err(|error| {
+                io_error(
+                    "create temporary trusted file",
+                    &temp_path,
+                    &io::Error::from(error),
+                )
+            })?;
+            let mut file = fs::File::from(fd);
+            file.write_all(body.as_bytes())
+                .map_err(|error| io_error("write temporary trusted file", &temp_path, &error))?;
+            rustix::fs::fchmod(&file, rustix::fs::Mode::from_bits_truncate(mode)).map_err(
+                |error| {
+                    io_error(
+                        "set temporary trusted file mode",
+                        &temp_path,
+                        &io::Error::from(error),
+                    )
+                },
+            )?;
+            file.sync_all()
+                .map_err(|error| io_error("sync temporary trusted file", &temp_path, &error))?;
+            drop(file);
+            rustix::fs::renameat(&self.file, temp_name.as_str(), &self.file, name).map_err(
+                |error| io_error("replace trusted file", &path, &io::Error::from(error)),
+            )?;
+            self.file
+                .sync_all()
+                .map_err(|error| io_error("sync trusted directory", &self.path, &error))
+        })();
+        if result.is_err() {
+            let _ =
+                rustix::fs::unlinkat(&self.file, temp_name.as_str(), rustix::fs::AtFlags::empty());
+        }
+        result
     }
 }
 
-fn write_json_pretty(path: &Path, value: &Value) -> Result<(), ProtocolError> {
-    let body = serde_json::to_string_pretty(value)
-        .map_err(|err| settings_invalid(path, &format!("could not serialize settings: {err}")))?;
-    write_file(path, &body)
-}
+#[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "fchmodat2 is required to chmod an O_PATH descriptor; SAFETY documented below"
+)]
+fn chmod_path_handle(file: &fs::File, mode: u32) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::PermissionsExt as _;
 
-fn write_file(path: &Path, body: &str) -> Result<(), ProtocolError> {
-    fs::write(path, body).map_err(|err| io_error("write", path, &err))
-}
+    const EMPTY_C_PATH: &[u8] = b"\0";
 
-fn create_dir_all(path: &Path) -> Result<(), ProtocolError> {
-    fs::create_dir_all(path).map_err(|err| io_error("create directory", path, &err))
-}
-
-fn make_executable(path: &Path) -> Result<(), ProtocolError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut perms = fs::metadata(path)
-            .map_err(|err| io_error("stat", path, &err))?
-            .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).map_err(|err| io_error("chmod", path, &err))?;
+    // SAFETY: `file` owns a live descriptor, `EMPTY_C_PATH` is a valid
+    // NUL-terminated empty path, and the remaining arguments are the documented
+    // `fchmodat2(2)` mode and `AT_EMPTY_PATH` flag. The syscall does not retain
+    // any pointer or descriptor after returning.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_fchmodat2,
+            file.as_raw_fd(),
+            EMPTY_C_PATH.as_ptr().cast::<libc::c_char>(),
+            mode,
+            libc::AT_EMPTY_PATH,
+        )
     };
-    let _ = path;
-    Ok(())
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::ENOSYS) {
+        return Err(error);
+    }
+
+    // Linux before fchmodat2 can still address the same held descriptor through
+    // procfs. The descriptor remains open, so its number cannot be reused while
+    // this stable kernel-generated link is followed.
+    let proc_path = PathBuf::from("/proc/self/fd").join(file.as_raw_fd().to_string());
+    fs::set_permissions(proc_path, fs::Permissions::from_mode(mode))
+}
+
+#[cfg(unix)]
+fn validate_trusted_metadata(
+    path: &Path,
+    label: &str,
+    metadata: &fs::Metadata,
+    expected_directory: bool,
+) -> Result<(), ProtocolError> {
+    let expected_type = if expected_directory {
+        metadata.file_type().is_dir()
+    } else {
+        metadata.file_type().is_file()
+    };
+    let effective_uid = nix::unistd::Uid::effective().as_raw();
+    match evaluate_owner_private_metadata(metadata_snapshot(metadata, expected_type), effective_uid)
+    {
+        Ok(()) => Ok(()),
+        Err(MetadataTrustIssue::UnexpectedType) => Err(path_untrusted(
+            path,
+            &format!("{label} has an unexpected filesystem type"),
+        )),
+        Err(MetadataTrustIssue::ForeignOwner { actual, expected }) => Err(path_untrusted(
+            path,
+            &format!("{label} is owned by uid {actual}, not daemon uid {expected}"),
+        )),
+        Err(MetadataTrustIssue::GroupOrOtherWritable { mode }) => Err(path_untrusted(
+            path,
+            &format!("{label} is group/world writable (mode {mode:04o})"),
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn path_open_untrusted(path: &Path, label: &str, error: rustix::io::Errno) -> ProtocolError {
+    path_untrusted(
+        path,
+        &format!(
+            "{label} could not be opened safely: {}",
+            io::Error::from(error)
+        ),
+    )
+}
+
+fn path_untrusted(path: &Path, detail: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Configuration,
+        "integration_path_untrusted",
+        format!("untrusted integration path {}: {detail}", path.display()),
+        Some("repair path ownership, type, and permissions before reinstalling".to_owned()),
+    )
+}
+
+fn parse_json_object_or_empty(content: Option<&str>, path: &Path) -> Result<Value, ProtocolError> {
+    content.map_or_else(
+        || Ok(json!({})),
+        |content| {
+            serde_json::from_str::<Value>(content)
+                .map_err(|error| settings_invalid(path, &format!("invalid JSON: {error}")))
+        },
+    )
+}
+
+fn json_pretty(path: &Path, value: &Value) -> Result<String, ProtocolError> {
+    serde_json::to_string_pretty(value)
+        .map_err(|error| settings_invalid(path, &format!("could not serialize settings: {error}")))
 }
 
 fn config_dir_missing(agent: &AgentKind, dir: &Path) -> ProtocolError {
@@ -817,23 +2584,29 @@ fn io_error(action: &str, path: &Path, source: &io::Error) -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::fs;
     use std::io::{ErrorKind, Read, Write};
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use protocol::method;
+    use protocol::AgentKind;
     use serde_json::{json, Value};
 
     use super::{
         codex_command_hook_trusted_hash, codex_hook_trust_key, hook_command, install_claude,
-        install_codex, shell_single_quote, toml_basic_string, CLAUDE_HOOK_ASSET, CODEX_HOOK_ASSET,
+        install_codex, shell_single_quote, toml_basic_string, CLAUDE_HOOK_ASSET,
+        CLAUDE_NOTIFY_HOOK_ASSET, CODEX_HOOK_ASSET, CODEX_NOTIFY_HOOK_ASSET,
         CODEX_SESSION_START_TRUST_EVENT, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID,
-        ENV_SOCKET_PATH, HOOK_TIMEOUT_SECS,
+        ENV_SOCKET_PATH, EXPECTED_INTEGRATION_VERSION, HOOK_TIMEOUT_SECS,
+        INTEGRATION_VERSION_PREFIX, NOTIFY_HOOK_INSTALL_NAME, SESSION_START_EVENT,
+        STATE_HOOK_INSTALL_NAME,
     };
 
     /// Large enough to expose unbounded hook stdin reads through pipe backpressure.
@@ -862,14 +2635,21 @@ mod tests {
     const STATE_RELEASE_ACTION: &str = "release";
     /// Claude lifecycle event used for active-agent release.
     const CLAUDE_SESSION_END_EVENT: &str = "SessionEnd";
+    /// Marks the isolated child process that may safely change process umask.
+    #[cfg(unix)]
+    const CLAUDE_HOOKS_UMASK_CHILD_ENV: &str = "POHUNEK_TEST_CLAUDE_HOOKS_UMASK_CHILD";
+
+    /// Per-process sequence that keeps parallel temp paths collision-free.
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     fn temp_dir(tag: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "pohunek-integration-{tag}-{}-{nanos}",
+            "pohunek-integration-{tag}-{}-{nanos}-{sequence}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
@@ -1793,6 +3573,1497 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_missing_config_without_mutation() {
+        let root = temp_dir("status-missing");
+        fs::create_dir_all(&root).expect("create temp root");
+        let claude = root.join(".claude");
+        let codex = root.join(".codex");
+
+        let result = with_config_dirs(&claude, &codex, || {
+            super::status(protocol::IntegrationStatusParams { agent: None })
+        })
+        .expect("status missing");
+
+        assert_eq!(result.agents.len(), 2);
+        for report in &result.agents {
+            assert!(!report.available);
+            assert_eq!(report.present_asset_paths, Vec::<String>::new());
+            assert_eq!(report.expected_asset_paths.len(), 2);
+            assert_eq!(report.installed_version, None);
+            assert_eq!(report.expected_version, EXPECTED_INTEGRATION_VERSION);
+            assert_eq!(
+                report.state,
+                protocol::IntegrationInstallState::NotInstalled
+            );
+            assert_eq!(
+                report.recovery,
+                protocol::IntegrationRecovery::RepairConfiguration
+            );
+            assert_eq!(report.warnings.len(), 1);
+        }
+        assert!(!claude.exists());
+        assert!(!codex.exists());
+    }
+
+    #[test]
+    fn every_managed_asset_marker_matches_the_expected_version() {
+        for (name, asset) in [
+            ("Claude state", CLAUDE_HOOK_ASSET),
+            ("Claude notification", CLAUDE_NOTIFY_HOOK_ASSET),
+            ("Codex state", CODEX_HOOK_ASSET),
+            ("Codex notification", CODEX_NOTIFY_HOOK_ASSET),
+        ] {
+            assert_eq!(
+                super::parse_integration_version(asset),
+                Some(EXPECTED_INTEGRATION_VERSION),
+                "{name} marker must match the public expected version"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_status_read_accepts_limit_and_rejects_next_byte() {
+        let root = temp_dir("status-bounded-read");
+        fs::create_dir_all(&root).expect("create bounded read root");
+        let path = root.join("settings.json");
+        fs::write(
+            &path,
+            vec![b' '; super::PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES],
+        )
+        .expect("write exact-limit file");
+
+        match super::read_bounded_utf8(&path, super::PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES)
+            .expect("read exact-limit file")
+        {
+            super::BoundedRead::Content(content) => {
+                assert_eq!(content.len(), super::PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES);
+            }
+            super::BoundedRead::Oversized => panic!("exact-limit file must be accepted"),
+        }
+
+        fs::write(
+            &path,
+            vec![b' '; super::PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES + 1],
+        )
+        .expect("write over-limit file");
+        assert!(matches!(
+            super::read_bounded_utf8(&path, super::PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES)
+                .expect("classify over-limit file"),
+            super::BoundedRead::Oversized
+        ));
+    }
+
+    #[test]
+    fn status_reports_complete_installs_current_without_mutation() {
+        let root = temp_dir("status-current");
+        let claude = root.join("claude");
+        let codex = root.join("codex");
+        fs::create_dir_all(&claude).expect("create Claude dir");
+        fs::create_dir_all(&codex).expect("create Codex dir");
+        install_claude(&claude).expect("install Claude fixture");
+        install_codex(&codex).expect("install Codex fixture");
+        let before = tree_snapshot(&root);
+
+        let result = with_config_dirs(&claude, &codex, || {
+            super::status(protocol::IntegrationStatusParams { agent: None })
+        })
+        .expect("status current");
+
+        assert_eq!(tree_snapshot(&root), before, "status must not mutate files");
+        assert_eq!(result.agents.len(), 2);
+        for report in result.agents {
+            assert_eq!(report.state, protocol::IntegrationInstallState::Current);
+            assert_eq!(report.recovery, protocol::IntegrationRecovery::None);
+            assert_eq!(report.installed_version, Some(EXPECTED_INTEGRATION_VERSION));
+            assert_eq!(report.expected_asset_paths.len(), 2);
+            assert_eq!(report.present_asset_paths.len(), 2);
+            assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_files_require_owner_safe_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for (name, agent, relative_path) in [
+            ("Claude settings.json", AgentKind::Claude, "settings.json"),
+            ("Codex hooks.json", AgentKind::Codex, "hooks.json"),
+            ("Codex config.toml", AgentKind::Codex, "config.toml"),
+        ] {
+            let config_dir = temp_dir(&format!("status-registration-mode-{name}"));
+            match agent {
+                AgentKind::Claude => {
+                    install_claude(&config_dir).expect("install Claude fixture");
+                }
+                AgentKind::Codex => {
+                    install_codex(&config_dir).expect("install Codex fixture");
+                }
+                AgentKind::Shell | AgentKind::Hermes | AgentKind::Unknown(_) => {
+                    unreachable!("test uses managed agents")
+                }
+            }
+            fs::set_permissions(
+                config_dir.join(relative_path),
+                fs::Permissions::from_mode(0o664),
+            )
+            .expect("make registration group writable");
+
+            let report = explicit_status(&config_dir, agent);
+
+            assert_eq!(
+                report.state,
+                protocol::IntegrationInstallState::Outdated,
+                "{name}"
+            );
+            assert_eq!(
+                report.recovery,
+                protocol::IntegrationRecovery::RepairConfiguration,
+                "{name}"
+            );
+            assert!(
+                report.warnings.iter().any(|warning| {
+                    warning.contains(name)
+                        && warning.contains("permissions are unsafe")
+                        && warning.contains("mode 0664")
+                }),
+                "{name}: {:?}",
+                report.warnings
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_files_are_opened_without_following_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        for (name, agent, relative_path) in [
+            ("Claude settings.json", AgentKind::Claude, "settings.json"),
+            ("Codex hooks.json", AgentKind::Codex, "hooks.json"),
+            ("Codex config.toml", AgentKind::Codex, "config.toml"),
+        ] {
+            let config_dir = temp_dir(&format!("status-registration-symlink-{name}"));
+            match agent {
+                AgentKind::Claude => {
+                    install_claude(&config_dir).expect("install Claude fixture");
+                }
+                AgentKind::Codex => {
+                    install_codex(&config_dir).expect("install Codex fixture");
+                }
+                AgentKind::Shell | AgentKind::Hermes | AgentKind::Unknown(_) => {
+                    unreachable!("test uses managed agents")
+                }
+            }
+            let registration_path = config_dir.join(relative_path);
+            let target_path = config_dir.join(format!("{relative_path}.target"));
+            fs::rename(&registration_path, &target_path).expect("move registration target");
+            symlink(&target_path, &registration_path).expect("link registration file");
+
+            let report = explicit_status(&config_dir, agent);
+
+            assert_eq!(
+                report.state,
+                protocol::IntegrationInstallState::Outdated,
+                "{name}"
+            );
+            assert_eq!(
+                report.recovery,
+                protocol::IntegrationRecovery::RepairConfiguration,
+                "{name}"
+            );
+            assert!(
+                report.warnings.iter().any(|warning| {
+                    warning.contains(name) && warning.contains("could not be opened safely")
+                }),
+                "{name}: {:?}",
+                report.warnings
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_rejects_untrusted_parents_before_any_mutation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let claude = temp_dir("install-untrusted-claude-hooks-parent");
+        install_claude(&claude).expect("install trusted Claude fixture");
+        fs::set_permissions(claude.join("hooks"), fs::Permissions::from_mode(0o775))
+            .expect("make Claude hooks parent unsafe");
+        let claude_before = tree_snapshot(&claude);
+
+        let claude_error = install_claude(&claude).expect_err("reject unsafe Claude hooks parent");
+
+        assert_eq!(claude_error.code, "integration_path_untrusted");
+        assert_eq!(tree_snapshot(&claude), claude_before);
+
+        let codex = temp_dir("install-untrusted-codex-config-parent");
+        install_codex(&codex).expect("install trusted Codex fixture");
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o775))
+            .expect("make Codex config parent unsafe");
+        let codex_before = tree_snapshot(&codex);
+
+        let codex_error = install_codex(&codex).expect_err("reject unsafe Codex config parent");
+
+        assert_eq!(codex_error.code, "integration_path_untrusted");
+        assert_eq!(tree_snapshot(&codex), codex_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_dir_replace_is_anchored_against_parent_name_swap() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp_dir("trusted-dir-name-swap");
+        let trusted = super::TrustedDir::open(&root, "test root").expect("open trusted dirfd");
+        let moved = root.with_extension("opened");
+        fs::rename(&root, &moved).expect("move opened directory");
+        fs::create_dir(&root).expect("create replacement directory at original name");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("make replacement directory private");
+
+        trusted
+            .replace("sentinel", "trusted\n", 0o600)
+            .expect("replace through opened dirfd");
+
+        assert_eq!(
+            fs::read_to_string(moved.join("sentinel")).expect("read dirfd target"),
+            "trusted\n"
+        );
+        assert!(!root.join("sentinel").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn created_dir_mode_and_cleanup_are_anchored_against_name_swap() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let root = temp_dir("created-dir-name-swap");
+        let trusted = super::TrustedDir::open(&root, "test root").expect("open trusted dirfd");
+        let child = root.join("hooks");
+        fs::create_dir(&child).expect("create child directory");
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o000))
+            .expect("mask child owner permissions");
+        let handle = trusted
+            .open_created_child_handle("hooks", "test child")
+            .expect("open owner-masked child with O_PATH");
+        let moved = root.join("opened");
+        fs::rename(&child, &moved).expect("move opened child");
+        let victim = root.join("victim");
+        fs::create_dir(&victim).expect("create symlink target");
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o750))
+            .expect("set symlink target mode");
+        symlink(&victim, &child).expect("replace child name with symlink");
+
+        let _opened = super::TrustedDir::finish_created_child(
+            &child,
+            "test child",
+            &handle,
+            super::MANAGED_HOOK_DIR_MODE,
+        )
+        .expect("finish opened child descriptor");
+
+        let moved_mode = fs::symlink_metadata(&moved)
+            .expect("moved child metadata")
+            .permissions()
+            .mode()
+            & super::UNIX_MODE_MASK;
+        let victim_mode = fs::symlink_metadata(&victim)
+            .expect("symlink target metadata")
+            .permissions()
+            .mode()
+            & super::UNIX_MODE_MASK;
+        assert_eq!(moved_mode, super::MANAGED_HOOK_DIR_MODE);
+        assert_eq!(victim_mode, 0o750, "chmod must not follow the raced name");
+
+        trusted.cleanup_created_child("hooks", &handle);
+        assert!(
+            fs::symlink_metadata(&child)
+                .expect("replacement symlink remains")
+                .file_type()
+                .is_symlink(),
+            "cleanup must restore a raced replacement"
+        );
+        assert!(moved.is_dir(), "cleanup must not delete the moved inode");
+
+        fs::remove_file(&child).expect("remove replacement symlink");
+        fs::rename(&moved, &child).expect("restore created inode name");
+        trusted.cleanup_created_child("hooks", &handle);
+        assert!(!child.exists(), "cleanup removes the created inode");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_restores_nonempty_created_directory() {
+        let root = temp_dir("created-dir-nonempty-cleanup");
+        let trusted = super::TrustedDir::open(&root, "test root").expect("open trusted dirfd");
+        let child = root.join("hooks");
+        fs::create_dir(&child).expect("create child directory");
+        let handle = trusted
+            .open_created_child_handle("hooks", "test child")
+            .expect("open created child handle");
+        fs::write(child.join("raced-entry"), "live\n")
+            .expect("simulate a concurrent directory writer");
+
+        trusted.cleanup_created_child("hooks", &handle);
+
+        assert_eq!(
+            fs::read_to_string(child.join("raced-entry")).expect("read restored raced entry"),
+            "live\n"
+        );
+        assert!(
+            fs::read_dir(&root)
+                .expect("read test root")
+                .all(|entry| !entry
+                    .expect("read test root entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".cleanup")),
+            "failed cleanup must not strand a staged directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_claude_creates_private_hooks_under_owner_masking_umask() {
+        use nix::sys::stat::{umask, Mode};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if std::env::var_os(CLAUDE_HOOKS_UMASK_CHILD_ENV).is_none() {
+            let output = Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg(
+                    "integration::tests::install_claude_creates_private_hooks_under_owner_masking_umask",
+                )
+                .arg("--test-threads=1")
+                .arg("--nocapture")
+                .env(CLAUDE_HOOKS_UMASK_CHILD_ENV, "1")
+                .output()
+                .expect("spawn isolated umask test child");
+            assert!(
+                output.status.success(),
+                "isolated umask child failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let new_config = temp_dir("claude-hooks-new-under-umask");
+        let existing_config = temp_dir("claude-hooks-existing-under-umask");
+        let existing_hooks = existing_config.join("hooks");
+        fs::create_dir(&existing_hooks).expect("create existing hooks directory");
+        fs::set_permissions(&existing_hooks, fs::Permissions::from_mode(0o750))
+            .expect("set existing hooks mode");
+
+        let previous_umask = umask(Mode::from_bits_truncate(0o700));
+        install_claude(&new_config).expect("install Claude with new hooks directory");
+        let new_mode = fs::symlink_metadata(new_config.join("hooks"))
+            .expect("new hooks metadata")
+            .permissions()
+            .mode()
+            & super::UNIX_MODE_MASK;
+        let new_settings_mode = fs::symlink_metadata(new_config.join("settings.json"))
+            .expect("new settings metadata")
+            .permissions()
+            .mode()
+            & super::UNIX_MODE_MASK;
+        let new_hook_mode =
+            fs::symlink_metadata(new_config.join("hooks").join(STATE_HOOK_INSTALL_NAME))
+                .expect("new managed hook metadata")
+                .permissions()
+                .mode()
+                & super::UNIX_MODE_MASK;
+        install_claude(&existing_config).expect("install Claude into existing hooks directory");
+        let existing_mode = fs::symlink_metadata(&existing_hooks)
+            .expect("existing hooks metadata")
+            .permissions()
+            .mode()
+            & super::UNIX_MODE_MASK;
+        umask(previous_umask);
+
+        assert_eq!(new_mode, super::MANAGED_HOOK_DIR_MODE);
+        assert_eq!(new_settings_mode, super::NEW_REGISTRATION_MODE);
+        assert_eq!(new_hook_mode, super::MANAGED_HOOK_MODE);
+        assert_eq!(
+            existing_mode, 0o750,
+            "installer must preserve an existing user directory"
+        );
+    }
+
+    #[test]
+    fn missing_claude_hooks_directory_is_reinstallable_not_installed() {
+        let claude = temp_dir("status-missing-claude-hooks-parent");
+
+        let report = explicit_status(&claude, AgentKind::Claude);
+
+        assert_eq!(
+            report.state,
+            protocol::IntegrationInstallState::NotInstalled
+        );
+        assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
+        assert!(report
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("managed asset parent")));
+    }
+
+    #[test]
+    fn relative_provider_config_roots_are_rejected_before_cwd_can_diverge() {
+        let home = temp_dir("relative-provider-root-home");
+        let relative = Path::new("relative-agent-config");
+
+        let claude_error = with_status_env(Some(relative), None, Some(&home), || {
+            super::claude_config_dir().expect_err("reject relative Claude config root")
+        });
+        let codex_error = with_status_env(None, Some(relative), Some(&home), || {
+            super::codex_config_dir().expect_err("reject relative Codex config root")
+        });
+
+        assert_eq!(claude_error.code, "agent_config_dir_invalid");
+        assert_eq!(codex_error.code, "agent_config_dir_invalid");
+        assert!(claude_error.msg.contains("absolute UTF-8 path"));
+        assert!(codex_error.msg.contains("absolute UTF-8 path"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_provider_config_root_is_rejected_before_registration() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let mut bytes = b"/tmp/pohunek-non-utf8-".to_vec();
+        bytes.push(0xff);
+        let path = PathBuf::from(OsString::from_vec(bytes));
+        let error = with_status_env(Some(&path), None, None, || {
+            super::claude_config_dir().expect_err("reject non-UTF-8 Claude config root")
+        });
+
+        assert_eq!(error.code, "agent_config_dir_invalid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_private_metadata_rejects_foreign_uid_without_chown() {
+        let effective_uid = nix::unistd::Uid::effective().as_raw();
+        let foreign_uid = effective_uid.wrapping_add(1);
+        let metadata = super::UnixMetadataSnapshot {
+            is_expected_type: true,
+            owner_uid: foreign_uid,
+            mode: super::MANAGED_HOOK_MODE,
+        };
+
+        assert_eq!(
+            super::evaluate_owner_private_metadata(metadata, effective_uid),
+            Err(super::MetadataTrustIssue::ForeignOwner {
+                actual: foreign_uid,
+                expected: effective_uid,
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_trust_anchor_does_not_reject_safe_config_below_system_temp() {
+        let codex = temp_dir("status-safe-config-trust-anchor");
+        install_codex(&codex).expect("install Codex fixture");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Current);
+        assert_eq!(report.recovery, protocol::IntegrationRecovery::None);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_managed_asset_parents_require_manual_repair() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for (name, agent, mode) in [
+            ("codex config root", AgentKind::Codex, 0o775),
+            ("claude hooks directory", AgentKind::Claude, 0o757),
+        ] {
+            let config_dir = temp_dir(&format!("status-writable-parent-{name}"));
+            let parent = match agent {
+                AgentKind::Codex => {
+                    install_codex(&config_dir).expect("install Codex fixture");
+                    config_dir.clone()
+                }
+                AgentKind::Claude => {
+                    install_claude(&config_dir).expect("install Claude fixture");
+                    config_dir.join("hooks")
+                }
+                AgentKind::Shell | AgentKind::Hermes | AgentKind::Unknown(_) => {
+                    unreachable!("test uses managed agents")
+                }
+            };
+            fs::set_permissions(&parent, fs::Permissions::from_mode(mode))
+                .expect("make managed asset parent writable");
+
+            let report = explicit_status(&config_dir, agent);
+
+            assert_eq!(
+                report.state,
+                protocol::IntegrationInstallState::Outdated,
+                "{name}"
+            );
+            assert_eq!(
+                report.recovery,
+                protocol::IntegrationRecovery::RepairConfiguration,
+                "{name}"
+            );
+            assert!(
+                report.warnings.iter().any(|warning| {
+                    warning.contains("managed asset parent")
+                        && warning.contains(&format!("mode {mode:04o}"))
+                }),
+                "{name}: {:?}",
+                report.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn status_detects_each_modified_or_missing_managed_asset() {
+        for (name, relative_path, mutation) in [
+            (
+                "state modified",
+                "pohunek-agent-state.sh",
+                Some("# modified\n"),
+            ),
+            (
+                "notification modified",
+                "pohunek-agent-notify.sh",
+                Some("# modified\n"),
+            ),
+            ("state missing", "pohunek-agent-state.sh", None),
+            ("notification missing", "pohunek-agent-notify.sh", None),
+        ] {
+            let codex = temp_dir(&format!("status-asset-{name}"));
+            install_codex(&codex).expect("install Codex fixture");
+            let path = codex.join(relative_path);
+            match mutation {
+                Some(content) => fs::write(&path, content).expect("modify managed asset"),
+                None => fs::remove_file(&path).expect("remove managed asset"),
+            }
+
+            let report = explicit_status(&codex, AgentKind::Codex);
+
+            assert_eq!(
+                report.state,
+                protocol::IntegrationInstallState::Outdated,
+                "{name}"
+            );
+            assert_eq!(
+                report.recovery,
+                protocol::IntegrationRecovery::Reinstall,
+                "{name}"
+            );
+            assert!(
+                report.warnings.iter().any(|warning| warning.contains(
+                    if relative_path.contains("notify") {
+                        "notification hook"
+                    } else {
+                        "state hook"
+                    }
+                )),
+                "{name}: {:?}",
+                report.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn installed_version_is_unknown_when_one_readable_asset_has_no_valid_marker() {
+        let codex = temp_dir("status-invalid-version-marker");
+        install_codex(&codex).expect("install Codex fixture");
+        let notify_path = codex.join(NOTIFY_HOOK_INSTALL_NAME);
+        let invalid_asset = CODEX_NOTIFY_HOOK_ASSET.replacen(
+            &format!("{INTEGRATION_VERSION_PREFIX}{EXPECTED_INTEGRATION_VERSION}"),
+            "# POHUNEK_INTEGRATION_VERSION=invalid",
+            1,
+        );
+        fs::write(notify_path, invalid_asset).expect("write invalid marker fixture");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.installed_version, None);
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
+    }
+
+    #[test]
+    fn status_classifies_oversized_asset_as_reinstallable_outdated() {
+        let codex = temp_dir("status-oversized-asset");
+        install_codex(&codex).expect("install Codex fixture");
+        fs::write(
+            codex.join(STATE_HOOK_INSTALL_NAME),
+            vec![b'#'; super::MANAGED_ASSET_INSPECTION_LIMIT_BYTES + 1],
+        )
+        .expect("write oversized asset");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("exceeds the 65536-byte inspection limit")));
+    }
+
+    #[test]
+    fn status_classifies_oversized_provider_config_as_manual_repair() {
+        let codex = temp_dir("status-oversized-config");
+        install_codex(&codex).expect("install Codex fixture");
+        fs::write(
+            codex.join("config.toml"),
+            vec![b' '; super::PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES + 1],
+        )
+        .expect("write oversized config");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("exceeds the 2097152-byte inspection limit")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_rejects_provider_config_fifo_without_blocking() {
+        let codex = temp_dir("status-config-fifo");
+        install_codex(&codex).expect("install Codex fixture");
+        let config_path = codex.join("config.toml");
+        fs::remove_file(&config_path).expect("remove regular Codex config");
+        let output = Command::new("mkfifo")
+            .arg(&config_path)
+            .output()
+            .expect("run mkfifo");
+        assert!(
+            output.status.success(),
+            "mkfifo failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let report = super::status_at(
+                super::StatusAgent::Codex,
+                &codex,
+                CODEX_HOOK_ASSET,
+                CODEX_NOTIFY_HOOK_ASSET,
+            );
+            sender.send(report).expect("send FIFO status report");
+        });
+        let report = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("provider FIFO inspection must not block");
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Codex config.toml is not a regular file")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_asset_symlink_requires_repair_and_reinstall_preserves_target() {
+        use std::os::unix::fs::symlink;
+
+        let codex = temp_dir("status-asset-symlink");
+        install_codex(&codex).expect("install Codex fixture");
+        let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
+        let sentinel_path = codex.join("sentinel-target");
+        let sentinel = b"sentinel-private-payload";
+        fs::write(&sentinel_path, sentinel).expect("write sentinel target");
+        fs::remove_file(&hook_path).expect("remove managed hook");
+        symlink(&sentinel_path, &hook_path).expect("link managed hook to sentinel");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        install_codex(&codex).expect("safely replace managed symlink");
+        assert_eq!(
+            fs::read(&sentinel_path).expect("read sentinel target"),
+            sentinel,
+            "managed asset replacement must not follow the symlink"
+        );
+        assert!(
+            fs::symlink_metadata(&hook_path)
+                .expect("replacement metadata")
+                .file_type()
+                .is_file(),
+            "managed asset must become a regular file"
+        );
+        assert_eq!(
+            fs::read_to_string(&hook_path).expect("read replacement hook"),
+            CODEX_HOOK_ASSET
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_asset_parent_symlink_requires_manual_repair() {
+        use std::os::unix::fs::symlink;
+
+        let claude = temp_dir("status-asset-parent-symlink");
+        install_claude(&claude).expect("install Claude fixture");
+        let hooks_path = claude.join("hooks");
+        let real_hooks_path = claude.join("hooks-real");
+        fs::rename(&hooks_path, &real_hooks_path).expect("move real hooks directory");
+        symlink(&real_hooks_path, &hooks_path).expect("link managed asset parent");
+
+        let report = explicit_status(&claude, AgentKind::Claude);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("managed asset parent")
+                && warning.contains("could not be opened safely")));
+    }
+
+    #[test]
+    fn managed_asset_metadata_error_requires_manual_repair() {
+        let claude = temp_dir("status-asset-metadata-error");
+        fs::write(claude.join("hooks"), "not a directory\n")
+            .expect("replace managed asset parent with a file");
+
+        let report = explicit_status(&claude, AgentKind::Claude);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("managed asset parent")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_rejects_unsafe_managed_hook_permissions_with_repair_hint() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let codex = temp_dir("status-unsafe-hook-permissions");
+        install_codex(&codex).expect("install Codex fixture");
+        let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
+        let mut permissions = fs::metadata(&hook_path)
+            .expect("managed hook metadata")
+            .permissions();
+        permissions.set_mode(0o777);
+        fs::set_permissions(&hook_path, permissions).expect("make managed hook unsafe");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        let warning = report
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("permissions are unsafe"))
+            .expect("unsafe permissions warning");
+        assert!(warning.contains("mode 0777"), "{warning}");
+        assert!(
+            warning.contains("pohunek integration install --agent codex"),
+            "{warning}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_detects_special_managed_hook_mode_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let codex = temp_dir("status-special-hook-mode");
+        install_codex(&codex).expect("install Codex fixture");
+        let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
+        fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o4755))
+            .expect("set managed hook setuid bit");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("mode 4755")));
+    }
+
+    #[test]
+    fn status_detects_broken_claude_registration() {
+        let claude = temp_dir("status-claude-registration");
+        install_claude(&claude).expect("install Claude fixture");
+        let settings_path = claude.join("settings.json");
+        let mut settings = read_json(&settings_path);
+        settings["hooks"][SESSION_START_EVENT][0]["hooks"][0]["timeout"] = json!(1);
+        fs::write(
+            &settings_path,
+            serde_json::to_vec_pretty(&settings).expect("serialize modified settings"),
+        )
+        .expect("write modified settings");
+
+        let report = explicit_status(&claude, AgentKind::Claude);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Claude SessionStart registration")));
+    }
+
+    #[test]
+    fn status_rejects_managed_registration_under_an_extra_event() {
+        let codex = temp_dir("status-extra-registration-event");
+        install_codex(&codex).expect("install Codex fixture");
+        let hooks_path = codex.join("hooks.json");
+        let mut hooks = read_json(&hooks_path);
+        let duplicate = hooks["hooks"][SESSION_START_EVENT][0]["hooks"][0].clone();
+        hooks["hooks"]["PreToolUse"] = json!([{ "hooks": [duplicate] }]);
+        fs::write(
+            &hooks_path,
+            serde_json::to_vec_pretty(&hooks).expect("serialize hooks with duplicate"),
+        )
+        .expect("write hooks with duplicate");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        let warning = report
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("unexpected event"))
+            .expect("unexpected event warning");
+        assert!(warning.contains("Codex SessionStart"), "{warning}");
+        assert!(
+            warning.contains("pohunek integration install --agent codex"),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn codex_managed_hook_group_with_sibling_handler_is_not_current() {
+        let codex = temp_dir("status-codex-sibling-handler");
+        install_codex(&codex).expect("install Codex fixture");
+        let hooks_path = codex.join("hooks.json");
+        let mut hooks = read_json(&hooks_path);
+        hooks["hooks"][SESSION_START_EVENT][0]["hooks"]
+            .as_array_mut()
+            .expect("managed Codex handler group")
+            .push(json!({
+                "type": "command",
+                "command": "echo user-sibling",
+                "timeout": HOOK_TIMEOUT_SECS,
+            }));
+        fs::write(
+            &hooks_path,
+            serde_json::to_vec_pretty(&hooks).expect("serialize sibling handler fixture"),
+        )
+        .expect("write sibling handler fixture");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Codex SessionStart registration")));
+
+        install_codex(&codex).expect("normalize managed Codex group");
+        let repaired = explicit_status(&codex, AgentKind::Codex);
+        assert_eq!(repaired.state, protocol::IntegrationInstallState::Current);
+        let repaired_hooks = read_json(&hooks_path);
+        assert_eq!(
+            super::hook_command_count(
+                repaired_hooks["hooks"]
+                    .as_object()
+                    .expect("repaired hooks object"),
+                "echo user-sibling",
+            ),
+            1,
+            "reinstall must preserve the sibling user handler"
+        );
+    }
+
+    #[test]
+    fn stale_codex_managed_trust_keys_are_reinstalled_to_the_exact_set() {
+        let codex = temp_dir("status-codex-stale-trust-key");
+        install_codex(&codex).expect("install Codex fixture");
+        let hooks_path = codex.join("hooks.json");
+        let config_path = codex.join("config.toml");
+        let stale_key =
+            super::codex_hook_trust_key(&hooks_path, CODEX_SESSION_START_TRUST_EVENT, 99, 99);
+        let mut config = fs::read_to_string(&config_path).expect("read Codex config");
+        write!(
+            config,
+            "\n[hooks.state.{}]\ntrusted_hash = \"sha256:stale\"\n",
+            toml_basic_string(&stale_key)
+        )
+        .expect("append stale trust table");
+        fs::write(&config_path, config).expect("append stale trust entry");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("stale or unexpected keys")));
+
+        install_codex(&codex).expect("remove stale managed trust table");
+        let repaired = explicit_status(&codex, AgentKind::Codex);
+        let repaired_config = fs::read_to_string(&config_path).expect("read repaired config");
+        assert_eq!(repaired.state, protocol::IntegrationInstallState::Current);
+        assert!(!repaired_config.contains(&stale_key));
+    }
+
+    #[test]
+    fn invalid_hook_event_structure_requires_manual_repair_before_install() {
+        let codex = temp_dir("status-invalid-hook-event");
+        install_codex(&codex).expect("install Codex fixture");
+        let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
+        let sentinel = "# managed asset sentinel\n";
+        fs::write(&hook_path, sentinel).expect("write managed asset sentinel");
+        let hooks_path = codex.join("hooks.json");
+        let mut hooks = read_json(&hooks_path);
+        hooks["hooks"][SESSION_START_EVENT] = json!({ "invalid": true });
+        fs::write(
+            &hooks_path,
+            serde_json::to_vec_pretty(&hooks).expect("serialize invalid hooks structure"),
+        )
+        .expect("write invalid hooks structure");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        let error = install_codex(&codex).expect_err("invalid event structure must fail install");
+        assert_eq!(error.code, "integration_settings_invalid");
+        assert_eq!(
+            fs::read_to_string(&hook_path).expect("read managed asset sentinel"),
+            sentinel,
+            "config validation must precede managed asset replacement"
+        );
+    }
+
+    #[test]
+    fn non_object_registration_root_requires_manual_repair_for_each_provider() {
+        for agent in [AgentKind::Claude, AgentKind::Codex] {
+            let config_dir = temp_dir(&format!("status-non-object-root-{}", agent.as_wire()));
+            let registration_path = match &agent {
+                AgentKind::Claude => {
+                    install_claude(&config_dir).expect("install Claude fixture");
+                    config_dir.join("settings.json")
+                }
+                AgentKind::Codex => {
+                    install_codex(&config_dir).expect("install Codex fixture");
+                    config_dir.join("hooks.json")
+                }
+                _ => panic!("test uses only managed hook agents"),
+            };
+            fs::write(&registration_path, "[]\n").expect("write non-object registration root");
+
+            let report = explicit_status(&config_dir, agent.clone());
+
+            assert_eq!(
+                report.recovery,
+                protocol::IntegrationRecovery::RepairConfiguration,
+                "{}",
+                agent.as_wire()
+            );
+            let error = match &agent {
+                AgentKind::Claude => install_claude(&config_dir),
+                AgentKind::Codex => install_codex(&config_dir),
+                _ => unreachable!("test uses only managed hook agents"),
+            }
+            .expect_err("non-object registration root must fail install");
+            assert_eq!(error.code, "integration_settings_invalid");
+        }
+    }
+
+    #[test]
+    fn missing_hooks_object_is_reinstallable_for_each_provider() {
+        for agent in [AgentKind::Claude, AgentKind::Codex] {
+            let config_dir = temp_dir(&format!("status-missing-hooks-{}", agent.as_wire()));
+            let registration_path = match &agent {
+                AgentKind::Claude => {
+                    install_claude(&config_dir).expect("install Claude fixture");
+                    config_dir.join("settings.json")
+                }
+                AgentKind::Codex => {
+                    install_codex(&config_dir).expect("install Codex fixture");
+                    config_dir.join("hooks.json")
+                }
+                _ => panic!("test uses only managed hook agents"),
+            };
+            fs::write(registration_path, "{}\n").expect("remove hooks object");
+
+            let report = explicit_status(&config_dir, agent.clone());
+
+            assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+            assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
+            match &agent {
+                AgentKind::Claude => install_claude(&config_dir),
+                AgentKind::Codex => install_codex(&config_dir),
+                _ => unreachable!("test uses only managed hook agents"),
+            }
+            .expect("reinstall missing hooks object");
+            assert_eq!(
+                explicit_status(&config_dir, agent).state,
+                protocol::IntegrationInstallState::Current
+            );
+        }
+    }
+
+    #[test]
+    fn reinstall_replaces_owned_command_with_missing_type_for_each_provider() {
+        for agent in [AgentKind::Claude, AgentKind::Codex] {
+            let config_dir = temp_dir(&format!("status-owned-command-{}", agent.as_wire()));
+            let registration_path = match &agent {
+                AgentKind::Claude => {
+                    install_claude(&config_dir).expect("install Claude fixture");
+                    config_dir.join("settings.json")
+                }
+                AgentKind::Codex => {
+                    install_codex(&config_dir).expect("install Codex fixture");
+                    config_dir.join("hooks.json")
+                }
+                _ => panic!("test uses only managed hook agents"),
+            };
+            let mut registration = read_json(&registration_path);
+            registration["hooks"][SESSION_START_EVENT][0]["hooks"][0]
+                .as_object_mut()
+                .expect("managed handler object")
+                .remove("type");
+            fs::write(
+                &registration_path,
+                serde_json::to_vec_pretty(&registration).expect("serialize drifted registration"),
+            )
+            .expect("write drifted registration");
+
+            let report = explicit_status(&config_dir, agent.clone());
+
+            assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
+            match &agent {
+                AgentKind::Claude => install_claude(&config_dir),
+                AgentKind::Codex => install_codex(&config_dir),
+                _ => unreachable!("test uses only managed hook agents"),
+            }
+            .expect("reinstall exact owned command identity");
+            let repaired = explicit_status(&config_dir, agent);
+            assert_eq!(repaired.state, protocol::IntegrationInstallState::Current);
+            assert!(repaired.warnings.is_empty(), "{:?}", repaired.warnings);
+        }
+    }
+
+    #[test]
+    fn invalid_codex_config_structure_requires_manual_repair_before_install() {
+        let codex = temp_dir("status-invalid-config-structure");
+        install_codex(&codex).expect("install Codex fixture");
+        let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
+        let sentinel = "# managed asset sentinel\n";
+        fs::write(&hook_path, sentinel).expect("write managed asset sentinel");
+        fs::write(codex.join("config.toml"), "features = true\n")
+            .expect("write invalid Codex config structure");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        let error = install_codex(&codex).expect_err("invalid config structure must fail install");
+        assert_eq!(error.code, "integration_settings_invalid");
+        assert_eq!(
+            fs::read_to_string(&hook_path).expect("read managed asset sentinel"),
+            sentinel,
+            "config validation must precede managed asset replacement"
+        );
+    }
+
+    #[test]
+    fn scalar_managed_trust_key_requires_manual_repair_before_install() {
+        let codex = temp_dir("status-scalar-trust-key");
+        install_codex(&codex).expect("install Codex fixture");
+        let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
+        let sentinel = "# managed asset sentinel\n";
+        fs::write(&hook_path, sentinel).expect("write managed asset sentinel");
+        let trust_key = codex_hook_trust_key(
+            &codex.join("hooks.json"),
+            CODEX_SESSION_START_TRUST_EVENT,
+            0,
+            0,
+        );
+        fs::write(
+            codex.join("config.toml"),
+            format!(
+                "[features]\nhooks = true\n\n[hooks.state]\n{} = \"invalid\"\n",
+                toml_basic_string(&trust_key)
+            ),
+        )
+        .expect("write scalar managed trust key");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        let error = install_codex(&codex).expect_err("scalar trust key must fail install");
+        assert_eq!(error.code, "integration_settings_invalid");
+        assert_eq!(
+            fs::read_to_string(&hook_path).expect("read managed asset sentinel"),
+            sentinel,
+            "config validation must precede managed asset replacement"
+        );
+    }
+
+    #[test]
+    fn scalar_future_trust_key_with_hook_drift_requires_manual_repair() {
+        let codex = temp_dir("status-scalar-future-trust-key");
+        install_codex(&codex).expect("install Codex fixture");
+        let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
+        let sentinel = "# managed asset sentinel\n";
+        fs::write(&hook_path, sentinel).expect("write managed asset sentinel");
+        let hooks_path = codex.join("hooks.json");
+        let mut hooks = read_json(&hooks_path);
+        hooks["hooks"][SESSION_START_EVENT][0]["hooks"]
+            .as_array_mut()
+            .expect("managed Codex handler group")
+            .push(json!({
+                "type": "command",
+                "command": "echo user-sibling",
+            }));
+        fs::write(
+            &hooks_path,
+            serde_json::to_vec_pretty(&hooks).expect("serialize drifted Codex hooks"),
+        )
+        .expect("write drifted Codex hooks");
+
+        let config_path = codex.join("config.toml");
+        // Reinstall preserves the sibling as group zero and recreates the
+        // managed handler at this future position.
+        let trust_key = codex_hook_trust_key(&hooks_path, CODEX_SESSION_START_TRUST_EVENT, 1, 0);
+        let mut config = fs::read_to_string(&config_path)
+            .expect("read Codex config")
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse Codex config");
+        config["hooks"]["state"]
+            .as_table_mut()
+            .expect("Codex trust state table")
+            .insert(&trust_key, toml_edit::value("sha256:invalid"));
+        fs::write(&config_path, config.to_string()).expect("write scalar future trust key");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        let error = install_codex(&codex).expect_err("scalar future trust key must fail install");
+        assert_eq!(error.code, "integration_settings_invalid");
+        assert_eq!(
+            fs::read_to_string(&hook_path).expect("read managed asset sentinel"),
+            sentinel,
+            "config validation must precede managed asset replacement"
+        );
+    }
+
+    #[test]
+    fn status_detects_broken_codex_registration_trust_and_read_errors() {
+        for failure in ["registration", "trust", "read", "malformed-config"] {
+            let codex = temp_dir(&format!("status-codex-{failure}"));
+            install_codex(&codex).expect("install Codex fixture");
+            match failure {
+                "registration" => {
+                    let hooks_path = codex.join("hooks.json");
+                    let mut hooks = read_json(&hooks_path);
+                    hooks["hooks"][SESSION_START_EVENT][0]["hooks"][0]["timeout"] = json!(1);
+                    fs::write(
+                        hooks_path,
+                        serde_json::to_vec_pretty(&hooks).expect("serialize modified hooks"),
+                    )
+                    .expect("write modified hooks");
+                }
+                "trust" => {
+                    let config_path = codex.join("config.toml");
+                    let config = fs::read_to_string(&config_path).expect("read Codex config");
+                    fs::write(
+                        config_path,
+                        config.replacen("sha256:", "sha256:modified-", 1),
+                    )
+                    .expect("modify trust hash");
+                }
+                "read" => {
+                    let hooks_path = codex.join("hooks.json");
+                    fs::remove_file(&hooks_path).expect("remove hooks file");
+                    fs::create_dir(&hooks_path).expect("replace hooks file with directory");
+                }
+                "malformed-config" => {
+                    fs::write(codex.join("config.toml"), "[invalid")
+                        .expect("write malformed config");
+                }
+                other => panic!("unknown fixture failure: {other}"),
+            }
+
+            let report = explicit_status(&codex, AgentKind::Codex);
+
+            assert_eq!(
+                report.state,
+                protocol::IntegrationInstallState::Outdated,
+                "{failure}"
+            );
+            assert!(!report.warnings.is_empty(), "{failure}");
+            let expected_recovery = if matches!(failure, "read" | "malformed-config") {
+                protocol::IntegrationRecovery::RepairConfiguration
+            } else {
+                protocol::IntegrationRecovery::Reinstall
+            };
+            assert_eq!(report.recovery, expected_recovery, "{failure}");
+        }
+    }
+
+    #[test]
+    fn aggregate_status_degrades_one_resolution_failure_without_aborting() {
+        let codex = temp_dir("status-aggregate-resolve");
+        install_codex(&codex).expect("install Codex fixture");
+
+        let result = with_status_env(None, Some(&codex), None, || {
+            super::status(protocol::IntegrationStatusParams { agent: None })
+        })
+        .expect("aggregate status");
+
+        assert_eq!(result.agents.len(), 2);
+        assert_eq!(result.agents[0].agent, AgentKind::Claude);
+        assert_eq!(
+            result.agents[0].state,
+            protocol::IntegrationInstallState::Outdated
+        );
+        assert!(result.agents[0].warnings[0].contains("missing_env"));
+        assert_eq!(
+            result.agents[0].recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        assert_eq!(result.agents[1].agent, AgentKind::Codex);
+        assert_eq!(
+            result.agents[1].state,
+            protocol::IntegrationInstallState::Current
+        );
+    }
+
+    #[test]
+    fn explicit_status_degrades_resolution_failure_to_warning() {
+        let report = with_status_env(None, None, None, || {
+            super::status(protocol::IntegrationStatusParams {
+                agent: Some(AgentKind::Claude),
+            })
+        })
+        .expect("explicit status")
+        .agents
+        .pop()
+        .expect("Claude report");
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        assert!(report.warnings[0].contains("missing_env"));
+    }
+
+    #[test]
+    fn explicit_unsupported_status_agents_return_typed_errors() {
+        for agent in [AgentKind::Shell, AgentKind::Hermes] {
+            let error = super::status(protocol::IntegrationStatusParams { agent: Some(agent) })
+                .expect_err("unsupported agent must fail");
+            assert_eq!(error.code, "agent_not_installable");
+        }
+    }
+
+    #[test]
+    fn status_env_restores_home_and_provider_specific_overrides_under_shared_lock() {
+        let _lock = crate::test_support::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_claude = std::env::var_os(super::CLAUDE_CONFIG_DIR_ENV);
+        let original_codex = std::env::var_os(super::CODEX_HOME_ENV);
+        let original_home = std::env::var_os("HOME");
+        let root = temp_dir("status-env-isolation");
+        let claude = root.join("claude");
+        let codex = root.join("codex");
+        let home = root.join("home");
+
+        let () = {
+            let _guard = ConfigDirGuard {
+                claude_dir: original_claude.clone(),
+                codex_dir: original_codex.clone(),
+                home: original_home.clone(),
+            };
+            set_optional_env(super::CLAUDE_CONFIG_DIR_ENV, Some(&claude));
+            set_optional_env(super::CODEX_HOME_ENV, Some(&codex));
+            set_optional_env("HOME", Some(&home));
+            assert_eq!(
+                std::env::var_os(super::CLAUDE_CONFIG_DIR_ENV),
+                Some(claude.into())
+            );
+            assert_eq!(std::env::var_os(super::CODEX_HOME_ENV), Some(codex.into()));
+            assert_eq!(std::env::var_os("HOME"), Some(home.into()));
+        };
+
+        assert_eq!(
+            std::env::var_os(super::CLAUDE_CONFIG_DIR_ENV),
+            original_claude
+        );
+        assert_eq!(std::env::var_os(super::CODEX_HOME_ENV), original_codex);
+        assert_eq!(std::env::var_os("HOME"), original_home);
+    }
+
+    /// Restores the pre-test environment when the scoped assertion finishes.
+    struct ConfigDirGuard {
+        claude_dir: Option<std::ffi::OsString>,
+        codex_dir: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.claude_dir.take() {
+                std::env::set_var(super::CLAUDE_CONFIG_DIR_ENV, value);
+            } else {
+                std::env::remove_var(super::CLAUDE_CONFIG_DIR_ENV);
+            }
+            if let Some(value) = self.codex_dir.take() {
+                std::env::set_var(super::CODEX_HOME_ENV, value);
+            } else {
+                std::env::remove_var(super::CODEX_HOME_ENV);
+            }
+            if let Some(value) = self.home.take() {
+                std::env::set_var("HOME", value);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
+
+    fn with_config_dirs<T>(
+        claude_dir: &Path,
+        codex_dir: &Path,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        let home = std::env::var_os("HOME");
+        with_status_env(
+            Some(claude_dir),
+            Some(codex_dir),
+            home.as_deref().map(Path::new),
+            operation,
+        )
+    }
+
+    fn with_status_env<T>(
+        claude_dir: Option<&Path>,
+        codex_dir: Option<&Path>,
+        home: Option<&Path>,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        let _lock = crate::test_support::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = ConfigDirGuard {
+            claude_dir: std::env::var_os(super::CLAUDE_CONFIG_DIR_ENV),
+            codex_dir: std::env::var_os(super::CODEX_HOME_ENV),
+            home: std::env::var_os("HOME"),
+        };
+        set_optional_env(super::CLAUDE_CONFIG_DIR_ENV, claude_dir);
+        set_optional_env(super::CODEX_HOME_ENV, codex_dir);
+        set_optional_env("HOME", home);
+        operation()
+    }
+
+    fn set_optional_env(key: &str, value: Option<&Path>) {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    fn explicit_status(config_dir: &Path, agent: AgentKind) -> protocol::IntegrationAgentStatus {
+        with_config_dirs(config_dir, config_dir, || {
+            super::status(protocol::IntegrationStatusParams { agent: Some(agent) })
+        })
+        .expect("explicit status")
+        .agents
+        .into_iter()
+        .next()
+        .expect("one agent report")
+    }
+
+    fn tree_snapshot(root: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
+        fn visit(root: &Path, path: &Path, entries: &mut Vec<(PathBuf, u32, Vec<u8>)>) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut children = fs::read_dir(path)
+                .expect("read snapshot directory")
+                .map(|entry| entry.expect("read snapshot entry").path())
+                .collect::<Vec<_>>();
+            children.sort();
+            for child in children {
+                let metadata = fs::symlink_metadata(&child).expect("snapshot metadata");
+                let relative = child.strip_prefix(root).expect("relative snapshot path");
+                let content = if metadata.is_file() {
+                    fs::read(&child).expect("snapshot file")
+                } else {
+                    Vec::new()
+                };
+                entries.push((
+                    relative.to_path_buf(),
+                    metadata.permissions().mode(),
+                    content,
+                ));
+                if metadata.is_dir() {
+                    visit(root, &child, entries);
+                }
+            }
+        }
+
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    #[test]
     fn install_claude_preserves_unrelated_hooks_and_is_idempotent() {
         let claude_dir = temp_dir("claude-merge");
         // Pre-existing, unrelated user settings and hooks.
@@ -1955,8 +5226,13 @@ mod tests {
         )
         .unwrap();
 
+        let report = explicit_status(&codex_dir, AgentKind::Codex);
         let err = install_codex(&codex_dir).expect_err("inline features table is refused");
 
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
         assert_eq!(err.code, "integration_settings_invalid");
         assert!(
             err.msg.contains("features") && err.msg.contains("not a TOML table"),

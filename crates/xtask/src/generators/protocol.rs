@@ -49,6 +49,10 @@ static METHODS: &[MethodDescriptor] = &[
         description: "Install the per-agent SessionStart hook that captures the native id.",
     },
     MethodDescriptor {
+        wire_name: protocol::method::INTEGRATION_STATUS,
+        description: "Inspect managed Codex and Claude hook installations without mutation.",
+    },
+    MethodDescriptor {
         wire_name: "notification.create",
         description: "Create or dedupe a durable host-local notification record.",
     },

@@ -343,6 +343,7 @@ where
         serde_json::to_value(SessionInputParams {
             session_id: id.clone(),
             text: text.to_owned(),
+            wait: None,
         })
         .expect("serialize input params"),
     );

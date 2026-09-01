@@ -432,9 +432,9 @@ fn binary_legacy_install_preserves_daemon_rpc_for_each_selector() {
 }
 
 #[test]
-fn binary_parser_rejects_missing_and_conflicting_hermes_targets() {
+fn binary_parser_preserves_daemon_status_and_hermes_target_contracts() {
     let fixture = Fixture::new("parser");
-    for action in ["status", "doctor", "update", "uninstall"] {
+    for action in ["doctor", "update", "uninstall"] {
         let missing = run(
             &fixture,
             &["integration", action, "--agent", "hermes", "--json"],
@@ -443,6 +443,17 @@ fn binary_parser_rejects_missing_and_conflicting_hermes_targets() {
         let envelope: Value = serde_json::from_slice(&missing.stdout).expect("usage JSON");
         assert_eq!(envelope["err"]["code"], "cli_usage");
     }
+
+    let missing_status_target = run(
+        &fixture,
+        &["integration", "status", "--agent", "hermes", "--json"],
+    );
+    assert_eq!(missing_status_target.status.code(), Some(1));
+    assert_eq!(
+        parse_error(&missing_status_target)["code"],
+        "integration_hermes_usage"
+    );
+
     let both = run(
         &fixture,
         &[
@@ -460,4 +471,14 @@ fn binary_parser_rejects_missing_and_conflicting_hermes_targets() {
     assert_eq!(both.status.code(), Some(2));
     let envelope: Value = serde_json::from_slice(&both.stdout).expect("conflict JSON");
     assert_eq!(envelope["err"]["code"], "cli_usage");
+
+    for selector in [None, Some("codex"), Some("claude")] {
+        let mut arguments = vec!["integration", "status", "--json"];
+        if let Some(agent) = selector {
+            arguments.extend(["--agent", agent]);
+        }
+        let output = run(&fixture, &arguments);
+        assert_eq!(output.status.code(), Some(1), "{selector:?}");
+        assert_ne!(parse_error(&output)["code"], "cli_usage", "{selector:?}");
+    }
 }

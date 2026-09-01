@@ -17,19 +17,23 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use protocol::{
     event, method, AgentActivity, AgentKind, AssistantMaterializeParams,
-    AssistantMaterializeResult, AttachHeader, ErrorClass, Event, NotificationCreateParams,
-    NotificationCreateResult, NotificationDeleteParams, NotificationDeleteResult, NotificationKind,
-    NotificationKindPolicy, NotificationListParams, NotificationListResult, NotificationPolicy,
-    NotificationPolicyParams, NotificationPolicyResult, NotificationRetentionParams,
-    NotificationRetentionResult, NotificationSeverity, NotificationSource, NotificationStatus,
-    NotificationUpdateParams, NotificationUpdateResult, ReportSequence, Request as ProtocolRequest,
+    AssistantMaterializeResult, AttachHeader, ErrorClass, Event, IntegrationInstallState,
+    IntegrationStatusResult, NotificationCreateParams, NotificationCreateResult,
+    NotificationDeleteParams, NotificationDeleteResult, NotificationKind, NotificationKindPolicy,
+    NotificationListParams, NotificationListResult, NotificationPolicy, NotificationPolicyParams,
+    NotificationPolicyResult, NotificationRetentionParams, NotificationRetentionResult,
+    NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
+    NotificationUpdateResult, ProcessStartIdentity, ReportSequence, Request as ProtocolRequest,
     Response, SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
     SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter,
     SessionListParams, SessionNewParams, SessionRemoveResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionResizeParams, SessionResizeResult, SessionState,
-    SessionStopResult, StateSource, TerminalDimensions, PROTOCOL_VERSION,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, StateSource,
+    TerminalDimensions, PROTOCOL_VERSION,
 };
 use serde_json::Value;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{oneshot, Mutex, MutexGuard};
@@ -133,10 +137,15 @@ impl Drop for PathGuard {
 struct XdgGuard {
     _guard: MutexGuard<'static, ()>,
     saved: Vec<(&'static str, Option<String>)>,
+    root: PathBuf,
 }
 
 impl XdgGuard {
     async fn set_all(tag: &str) -> Self {
+        Self::set_all_after(tag, || {}).await
+    }
+
+    async fn set_all_after(tag: &str, before_isolation: impl FnOnce()) -> Self {
         let guard = XDG_LOCK.lock().await;
         let vars = [
             "XDG_RUNTIME_DIR",
@@ -145,11 +154,14 @@ impl XdgGuard {
             "XDG_CONFIG_HOME",
             "XDG_CACHE_HOME",
             "HOME",
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
         ];
         let saved = vars
             .iter()
             .map(|&key| (key, std::env::var(key).ok()))
             .collect::<Vec<_>>();
+        before_isolation();
         let root = temp_dir(tag);
         std::env::set_var("XDG_RUNTIME_DIR", root.join("runtime"));
         std::env::set_var("XDG_STATE_HOME", root.join("state"));
@@ -157,10 +169,17 @@ impl XdgGuard {
         std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
         std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
         std::env::set_var("HOME", root.join("home"));
+        std::env::set_var("CLAUDE_CONFIG_DIR", root.join("home/.claude"));
+        std::env::set_var("CODEX_HOME", root.join("home/.codex"));
         Self {
             _guard: guard,
             saved,
+            root,
         }
+    }
+
+    fn home(&self) -> PathBuf {
+        self.root.join("home")
     }
 }
 
@@ -232,6 +251,125 @@ async fn spawn_server(
             .await;
     });
     (tx, handle)
+}
+
+#[tokio::test]
+async fn integration_status_accepts_null_at_daemon_boundary() {
+    let ambient = temp_dir("integration-status-ambient-provider-overrides");
+    let ambient_claude = ambient.join("claude");
+    let ambient_codex = ambient.join("codex");
+    std::fs::create_dir_all(&ambient_claude).expect("create ambient Claude override");
+    std::fs::create_dir_all(&ambient_codex).expect("create ambient Codex override");
+    std::fs::write(ambient_claude.join("sentinel"), "ambient Claude\n")
+        .expect("write ambient Claude sentinel");
+    std::fs::write(ambient_codex.join("sentinel"), "ambient Codex\n")
+        .expect("write ambient Codex sentinel");
+    let ambient_before = tree_snapshot(&ambient);
+    let claude_override = ambient_claude.clone();
+    let codex_override = ambient_codex.clone();
+    let xdg = XdgGuard::set_all_after("integration-status-rpc", move || {
+        std::env::set_var("CLAUDE_CONFIG_DIR", claude_override);
+        std::env::set_var("CODEX_HOME", codex_override);
+    })
+    .await;
+    let claude = xdg.home().join(".claude");
+    let codex = xdg.home().join(".codex");
+    assert_eq!(
+        std::env::var_os("CLAUDE_CONFIG_DIR"),
+        Some(claude.clone().into())
+    );
+    assert_eq!(std::env::var_os("CODEX_HOME"), Some(codex.clone().into()));
+    std::fs::create_dir_all(&claude).expect("create isolated Claude config");
+    std::fs::create_dir_all(&codex).expect("create isolated Codex config");
+    pohunek_daemon::integration::install_claude(&claude).expect("install Claude fixture");
+    pohunek_daemon::integration::install_codex(&codex).expect("install Codex fixture");
+    let before = tree_snapshot(&xdg.home());
+    let socket = temp_socket("integration-status-rpc");
+    let (shutdown, server) = spawn_server(&socket, "test").await;
+    let mut framed = connect(&socket).await;
+    let request = Request::make(
+        "integration-status",
+        method::INTEGRATION_STATUS,
+        serde_json::Value::Null,
+    );
+    let payload = ok_payload(exchange(&mut framed, &request).await);
+
+    let result: IntegrationStatusResult =
+        serde_json::from_value(payload).expect("deserialize status result");
+    assert_eq!(result.agents.len(), 2);
+    assert!(result.agents.iter().all(|agent| agent.available));
+    assert!(result
+        .agents
+        .iter()
+        .all(|agent| agent.state == IntegrationInstallState::Current));
+    assert!(result.agents.iter().all(|agent| agent.warnings.is_empty()));
+    assert_eq!(
+        tree_snapshot(&xdg.home()),
+        before,
+        "integration.status must not mutate provider configuration"
+    );
+    assert_eq!(
+        tree_snapshot(&ambient),
+        ambient_before,
+        "isolated status must not inspect or mutate ambient provider overrides"
+    );
+
+    framed.get_mut().shutdown().await.expect("close client");
+    shutdown.send(()).expect("send integration status shutdown");
+    server.await.expect("integration status server task");
+}
+
+#[tokio::test]
+async fn integration_status_rejects_unknown_params_at_daemon_boundary() {
+    let socket = temp_socket("integration-status-unknown-params");
+    let (shutdown, server) = spawn_server(&socket, "test").await;
+    let mut framed = connect(&socket).await;
+    let request = Request::make(
+        "integration-status-unknown-params",
+        method::INTEGRATION_STATUS,
+        serde_json::json!({ "agent": "codex", "unexpected": true }),
+    );
+
+    let response = exchange(&mut framed, &request).await;
+
+    assert_eq!(response.id(), "integration-status-unknown-params");
+    assert_eq!(err_payload(response).code, "bad_request");
+    framed.get_mut().shutdown().await.expect("close client");
+    shutdown.send(()).expect("send integration status shutdown");
+    server.await.expect("integration status server task");
+}
+
+fn tree_snapshot(root: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
+    fn visit(root: &Path, path: &Path, entries: &mut Vec<(PathBuf, u32, Vec<u8>)>) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut children = std::fs::read_dir(path)
+            .expect("read snapshot directory")
+            .map(|entry| entry.expect("read snapshot entry").path())
+            .collect::<Vec<_>>();
+        children.sort();
+        for child in children {
+            let metadata = std::fs::symlink_metadata(&child).expect("snapshot metadata");
+            let relative = child.strip_prefix(root).expect("relative snapshot path");
+            let content = if metadata.is_file() {
+                std::fs::read(&child).expect("snapshot file")
+            } else {
+                Vec::new()
+            };
+            entries.push((
+                relative.to_path_buf(),
+                metadata.permissions().mode(),
+                content,
+            ));
+            if metadata.is_dir() {
+                visit(root, &child, entries);
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries);
+    entries
 }
 
 /// Build a `SessionRegistry` wired to a real `SubprocessWorkerLauncher` (the
@@ -609,6 +747,7 @@ async fn input_session(
         serde_json::to_value(SessionInputParams {
             session_id: id.clone(),
             text: text.to_owned(),
+            wait: None,
         })
         .expect("serialize input params"),
     );
@@ -916,103 +1055,31 @@ async fn wait_for_notification_event(
     }
 }
 
-/// Python reporter the stub agents run on launch to simulate the `SessionStart`
-/// hook: it reads the daemon-injected handshake env and fires one
-/// `session.report_native_id` RPC. Kept as a separate file (not a heredoc) so
-/// the stub shell script stays trivial to template.
-const STUB_REPORTER_PY: &str = r#"import json
-import os
-import socket
-import time
-from datetime import datetime, timedelta, timezone
-
-session_id = os.environ.get("POHUNEK_SESSION_ID")
-socket_path = os.environ.get("POHUNEK_SOCKET_PATH")
-protocol_raw = os.environ.get("POHUNEK_PROTOCOL_VERSION")
-native = os.environ.get("POHUNEK_STUB_NATIVE_ID")
-agent = os.environ.get("POHUNEK_STUB_AGENT")
-runtime_id = os.environ.get("POHUNEK_RUNTIME_ID")
-
-if not (session_id and socket_path and protocol_raw and native and agent and runtime_id):
-    raise SystemExit(0)
-
-pid = os.getppid()
-try:
-    with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
-        stat = handle.read()
-    start_identity = int(stat[stat.rfind(")") + 2:].split()[19])
-except Exception:
-    raise SystemExit(0)
-
-sequence = int(time.time() * 1000)
-
-request = {
-    "v": {"minimum": int(protocol_raw), "maximum": int(protocol_raw)},
-    "id": "stub-report",
-    "method": "session.report_native_id",
-    "params": {
-        "session_id": session_id,
-        "runtime_id": runtime_id,
-        "agent": agent,
-        "pid": pid,
-        "pid_start_identity": str(start_identity),
-        "sequence": str(sequence),
-        "expires_at": (
-            datetime.now(timezone.utc) + timedelta(seconds=30)
-        ).isoformat().replace("+00:00", "Z"),
-        "native_session_id": native,
-    },
-}
-
-try:
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client.settimeout(1.0)
-    client.connect(socket_path)
-    client.sendall((json.dumps(request) + "\n").encode())
-    try:
-        client.recv(4096)
-    except Exception:
-        pass
-    client.close()
-except Exception:
-    pass
-"#;
-
-/// Build a stub agent script that logs its argv (one line per launch), fires the
-/// native-id report via [`STUB_REPORTER_PY`] using the injected handshake env,
-/// then idles. The argv log lets the test assert the resume argv after restart.
-fn stub_agent_script(argv_log: &Path, reporter_py: &Path, agent: &str, native_id: &str) -> String {
+/// Build a stub agent script that logs its argv and then idles.
+fn stub_agent_script(argv_log: &Path) -> String {
     format!(
         "#!/bin/sh\n\
 printf '%s\\n' \"$*\" >> '{argv}'\n\
-if [ \"${{POHUNEK_ENV:-}}\" = \"1\" ] && command -v python3 >/dev/null 2>&1; then\n\
-  POHUNEK_STUB_NATIVE_ID='{native}' POHUNEK_STUB_AGENT='{agent}' python3 '{reporter}' || true\n\
-fi\n\
 /bin/sleep 30\n",
         argv = argv_log.display(),
-        native = native_id,
-        agent = agent,
-        reporter = reporter_py.display(),
     )
 }
 
-/// Poll `inspect` until the session reports the expected captured native id.
-async fn wait_for_native_id(
-    framed: &mut Framed<UnixStream, LinesCodec>,
-    id: &SessionId,
-    native_id: &str,
-) -> SessionInfo {
-    for _ in 0..250 {
-        let info = inspect_session(framed, id).await;
-        if info.native_session_id.as_deref() == Some(native_id) {
-            return info;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!(
-        "native id {native_id} was not captured for session {}",
-        id.0
-    );
+fn process_start_identity(pid: u32) -> ProcessStartIdentity {
+    let stat =
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read child process identity");
+    let fields = stat
+        .rsplit_once(") ")
+        .expect("process stat contains command terminator")
+        .1
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>();
+    let start_identity = fields
+        .get(19)
+        .expect("process stat contains start identity")
+        .parse()
+        .expect("process start identity is numeric");
+    ProcessStartIdentity::new(start_identity)
 }
 
 async fn wait_for_persisted_resume_and_worktree(
@@ -2872,12 +2939,7 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
     let store_path = data_dir.join("metadata.jsonl");
     let worktree_root = data_dir.join("worktrees");
     let argv_log = temp_dir("wt-resume-argv").join("argv.log");
-    let reporter_py = temp_dir("wt-resume-reporter").join("reporter.py");
-    write_executable(&reporter_py, STUB_REPORTER_PY);
-    write_executable(
-        &bin_dir.join(bin_name),
-        &stub_agent_script(&argv_log, &reporter_py, bin_name, native_id),
-    );
+    write_executable(&bin_dir.join(bin_name), &stub_agent_script(&argv_log));
 
     let socket = temp_socket("wt-resume");
     let config = SessionRegistryConfig {
@@ -2889,7 +2951,7 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
 
     let _path = PathGuard::prepend(&bin_dir).await;
 
-    // --- Create phase: a worktree-bound stub agent reports its native id. ---
+    // --- Create phase: report a native id after the session commit. ---
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
     let created: SessionInfo = serde_json::from_value(ok_payload(
@@ -2900,7 +2962,38 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
     assert_eq!(created.branch.as_deref(), Some("feat/x"));
     assert_eq!(created.cwd, worktree_path);
 
-    let captured = wait_for_native_id(&mut control, &created.id, native_id).await;
+    let runtime_id = created
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.runtime_id.as_deref())
+        .expect("created worktree session exposes its runtime id");
+    let report_req = Request::make(
+        "wt-resume-report-native-id",
+        method::SESSION_REPORT_NATIVE_ID,
+        serde_json::to_value(
+            SessionReportNativeIdParams::new(
+                created.id.clone(),
+                runtime_id,
+                bin_name,
+                created.pid,
+                process_start_identity(created.pid),
+                ReportSequence::new(1),
+                (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+                    .format(&Rfc3339)
+                    .expect("format native identity expiry"),
+                native_id,
+                None,
+            )
+            .expect("valid worktree native identity claim"),
+        )
+        .expect("serialize worktree report-native-id params"),
+    );
+    let reported: SessionReportNativeIdResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &report_req).await))
+            .expect("worktree report-native-id result");
+    assert!(reported.recorded, "worktree native id must be recorded");
+
+    let captured = inspect_session(&mut control, &created.id).await;
     assert_eq!(captured.native_session_id.as_deref(), Some(native_id));
 
     // Both records coexist in one unified metadata file while recovery remains

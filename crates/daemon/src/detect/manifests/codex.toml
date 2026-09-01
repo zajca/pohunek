@@ -23,6 +23,21 @@ priority = 1050
 region = "osc_title"
 regex = ['^[\x{2800}-\x{28FF}] ']
 
+# The first-run workspace trust dialog is pinned at the top of the visible
+# screen. Require the exact question and both numbered choices so transcript
+# prose that merely discusses trusting a repository cannot trigger the rule.
+[[rules]]
+id = "workspace_trust_prompt"
+state = "blocked"
+priority = 1000
+region = "top_non_empty_lines(8)"
+visible_blocker = true
+all = [
+  { line_regex = ['(?i)^\s*(?:do you )?trust (?:the contents of this directory|this repository)\?\s*$'] },
+  { line_regex = ['(?i)^\s*(?:›|❯)?\s*1\.\s*yes\b'] },
+  { line_regex = ['(?i)^\s*2\.\s*no\b'] },
+]
+
 [[rules]]
 id = "live_strong_blocker"
 state = "blocked"

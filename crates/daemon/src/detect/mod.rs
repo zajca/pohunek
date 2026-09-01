@@ -8,7 +8,7 @@
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use protocol::{AgentActivity, AgentKind, StateSource};
+use protocol::{AgentActivity, AgentKind, DetectionRegionPreview, StateSource};
 
 use crate::procwatch::ProcessFact;
 
@@ -319,6 +319,25 @@ impl Detector {
         }
     }
 
+    /// Renders every region required by the active manifest.
+    #[must_use]
+    pub fn region_previews(&self) -> Vec<DetectionRegionPreview> {
+        let Some(manifest) = &self.manifest else {
+            return Vec::new();
+        };
+        let context = self.match_context(manifest, ContextFreshness::all());
+
+        manifest
+            .required_regions()
+            .into_iter()
+            .map(|region| DetectionRegionPreview {
+                kind: region.kind(),
+                region: region.to_string(),
+                text: context.region_text(&region).unwrap_or_default().to_owned(),
+            })
+            .collect()
+    }
+
     fn manifest_evidence(&self, freshness: ContextFreshness) -> Option<ActivityEvidence> {
         let manifest = self.manifest.as_ref()?;
         let matched = manifest.match_context(&self.match_context(manifest, freshness))?;
@@ -370,6 +389,14 @@ impl Detector {
                     ManifestRegion::BottomNonEmptyLines(count),
                     region_text(&self.screen.bottom_non_empty_lines(count)),
                 ),
+                ManifestRegion::TopNonEmptyLines(count) => context.with_region_text(
+                    ManifestRegion::TopNonEmptyLines(count),
+                    region_text(&self.screen.top_non_empty_lines(count)),
+                ),
+                ManifestRegion::LastNonEmptyAbovePromptBox => context.with_region_text(
+                    ManifestRegion::LastNonEmptyAbovePromptBox,
+                    self.screen.last_non_empty_above_prompt_box(),
+                ),
                 ManifestRegion::AfterLastPromptMarker => context.with_region_text(
                     ManifestRegion::AfterLastPromptMarker,
                     self.screen.after_last_prompt_marker(),
@@ -416,6 +443,8 @@ impl ContextFreshness {
             ManifestRegion::WholeRecent
             | ManifestRegion::BottomLines(_)
             | ManifestRegion::BottomNonEmptyLines(_)
+            | ManifestRegion::TopNonEmptyLines(_)
+            | ManifestRegion::LastNonEmptyAbovePromptBox
             | ManifestRegion::AfterLastPromptMarker
             | ManifestRegion::PromptBoxBody
             | ManifestRegion::AfterLastHorizontalRule => self.screen,
@@ -484,6 +513,8 @@ fn manifest_source(region: &ManifestRegion) -> StateSource {
         ManifestRegion::WholeRecent
         | ManifestRegion::BottomLines(_)
         | ManifestRegion::BottomNonEmptyLines(_)
+        | ManifestRegion::TopNonEmptyLines(_)
+        | ManifestRegion::LastNonEmptyAbovePromptBox
         | ManifestRegion::AfterLastPromptMarker
         | ManifestRegion::PromptBoxBody
         | ManifestRegion::AfterLastHorizontalRule => StateSource::Screen,
@@ -840,6 +871,141 @@ mod tests {
             ),
             vec![transition(AgentActivity::Blocked, StateSource::Screen)]
         );
+    }
+
+    #[test]
+    fn top_non_empty_lines_region_matches_joined_head_content() {
+        let started_at = instant();
+        let mut detector_config = config();
+        detector_config.manifest = Some(manifest(
+            r#"
+            [[rules]]
+            id = "top-trust-blocked"
+            state = "blocked"
+            priority = 1
+            region = "top_non_empty_lines(2)"
+            contains = "trust this repository"
+            "#,
+        ));
+        let mut detector = Detector::new(5, 80, started_at, detector_config);
+
+        assert_eq!(
+            detector.feed(
+                started_at,
+                "\x1b[2J\x1b[H\r\nDo you trust this repository?\r\n\r\nlater output".as_bytes()
+            ),
+            vec![transition(AgentActivity::Blocked, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn top_non_empty_lines_region_matches_cjk_wide_glyph_content() {
+        let started_at = instant();
+        let mut detector_config = config();
+        detector_config.manifest = Some(manifest(
+            r#"
+            [[rules]]
+            id = "top-trust-cjk-blocked"
+            state = "blocked"
+            priority = 1
+            region = "top_non_empty_lines(1)"
+            contains = "信任仓库"
+            "#,
+        ));
+        let mut detector = Detector::new(4, 20, started_at, detector_config);
+
+        assert_eq!(
+            detector.feed(
+                started_at,
+                "\x1b[2J\x1b[H\r\n信任仓库界\r\n\r\nlater output".as_bytes()
+            ),
+            vec![transition(AgentActivity::Blocked, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn last_non_empty_above_prompt_box_region_matches_status_line() {
+        let started_at = instant();
+        let mut detector_config = config();
+        detector_config.manifest = Some(manifest(
+            r#"
+            [[rules]]
+            id = "above-prompt-blocked"
+            state = "blocked"
+            priority = 1
+            region = "last_non_empty_above_prompt_box"
+            contains = "approval required"
+            "#,
+        ));
+        let mut detector = Detector::new(6, 80, started_at, detector_config);
+
+        assert_eq!(
+            detector.feed(
+                started_at,
+                "\x1b[2J\x1b[Holder status\r\napproval required\r\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\r\n\u{203a} type here\r\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}".as_bytes()
+            ),
+            vec![transition(AgentActivity::Blocked, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn last_non_empty_above_prompt_box_region_matches_cjk_wide_glyph_content() {
+        let started_at = instant();
+        let mut detector_config = config();
+        detector_config.manifest = Some(manifest(
+            r#"
+            [[rules]]
+            id = "above-prompt-cjk-blocked"
+            state = "blocked"
+            priority = 1
+            region = "last_non_empty_above_prompt_box"
+            contains = "审批需要"
+            "#,
+        ));
+        let mut detector = Detector::new(5, 20, started_at, detector_config);
+
+        assert_eq!(
+            detector.feed(
+                started_at,
+                "\x1b[2J\x1b[H审批需要确认界\r\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\r\n\u{203a} type here\r\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}".as_bytes()
+            ),
+            vec![transition(AgentActivity::Blocked, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn region_previews_render_new_regions_with_canonical_names() {
+        let started_at = instant();
+        let mut detector_config = config();
+        detector_config.manifest = Some(manifest(
+            r#"
+            [[rules]]
+            id = "top"
+            state = "blocked"
+            priority = 2
+            region = "top_non_empty_lines(2)"
+            contains = "trust"
+
+            [[rules]]
+            id = "prompt-adjacent"
+            state = "idle"
+            priority = 1
+            region = "last_non_empty_above_prompt_box"
+            contains = "complete"
+            "#,
+        ));
+        let mut detector = Detector::new(7, 40, started_at, detector_config);
+        detector.feed(
+            started_at,
+            "trust this directory\r\ncompleted for 2s\r\n─────\r\n› type here\r\n─────".as_bytes(),
+        );
+
+        let previews = detector.region_previews();
+        assert_eq!(previews.len(), 2);
+        assert_eq!(previews[0].region, "top_non_empty_lines(2)");
+        assert_eq!(previews[0].text, "trust this directory\ncompleted for 2s");
+        assert_eq!(previews[1].region, "last_non_empty_above_prompt_box");
+        assert_eq!(previews[1].text, "completed for 2s");
     }
 
     #[test]
@@ -1421,6 +1587,42 @@ mod tests {
     }
 
     #[test]
+    fn codex_manifest_maps_bounded_workspace_trust_prompt_to_blocked() {
+        let started_at = instant();
+        let mut detector_config = super::DetectorConfig::codex();
+        detector_config.detection = config().detection;
+        let mut detector = Detector::new(12, 100, started_at, detector_config);
+
+        assert_eq!(
+            detector.feed(
+                started_at,
+                b"\x1b[2J\x1b[HDo you trust the contents of this directory?\r\n\r\n1. Yes\r\n2. No\r\n\r\nold transcript output"
+            ),
+            vec![transition(AgentActivity::Blocked, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn codex_manifest_ignores_workspace_trust_phrase_in_transcript() {
+        let started_at = instant();
+        let mut detector_config = super::DetectorConfig::codex();
+        detector_config.detection = config().detection;
+        let mut detector = Detector::new(12, 100, started_at, detector_config);
+
+        let transitions = detector.feed(
+            started_at,
+            b"\x1b[2J\x1b[HUser: explain the phrase trust this repository\r\nAssistant: it describes a workspace trust setting",
+        );
+
+        assert!(
+            transitions
+                .iter()
+                .all(|transition| transition.activity != AgentActivity::Blocked),
+            "transcript prose must not look like the interactive trust dialog"
+        );
+    }
+
+    #[test]
     fn claude_manifest_maps_ink_selection_form_to_blocked() {
         let started_at = instant();
         let mut detector_config = super::DetectorConfig::claude();
@@ -1484,6 +1686,19 @@ mod tests {
             ),
             vec![transition(AgentActivity::Idle, StateSource::Screen)]
         );
+    }
+
+    #[test]
+    fn claude_manifest_maps_prompt_adjacent_completion_status_to_idle() {
+        let matched = super::claude_manifest()
+            .match_context(&MatchContext::default().with_region_text(
+                ManifestRegion::LastNonEmptyAbovePromptBox,
+                "✻ Cogitated for 26s",
+            ))
+            .expect("Claude completion fixture should match");
+
+        assert_eq!(matched.activity, AgentActivity::Idle);
+        assert_eq!(matched.region, ManifestRegion::LastNonEmptyAbovePromptBox);
     }
 
     #[test]
