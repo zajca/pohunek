@@ -123,6 +123,7 @@ export interface FixtureDaemonHandle {
   readonly endpoints: readonly FixtureDaemonEndpoint[];
   readonly unixSocketPath: string | undefined;
   readonly tcpAddress: { readonly host: string; readonly port: number } | undefined;
+  readonly activeInputWaiterCount: number;
   readonly scenario: FixtureScenario;
   close(): Promise<void>;
   stopAbruptly(): Promise<void>;
@@ -159,6 +160,20 @@ interface FixtureObservation {
   watermark: bigint;
 }
 
+interface FixtureActivityEvidence {
+  readonly activity: AgentActivity;
+  readonly source: StateSource;
+  readonly runtime: SessionRuntimeIdentity;
+  readonly revision: bigint;
+}
+
+type FixtureInputWaitEvent =
+  | { readonly kind: "activity"; readonly evidence: FixtureActivityEvidence }
+  | { readonly kind: "removed" }
+  | { readonly kind: "runtime_changed" }
+  | { readonly kind: "stopped" }
+  | { readonly kind: "shutdown" };
+
 const U64_MAX = 18_446_744_073_709_551_615n;
 const U64_DECIMAL_DIGITS = U64_MAX.toString().length;
 
@@ -191,6 +206,7 @@ const DEFAULT_NOTIFICATION_SOURCE = {
 
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const encoder = new TextEncoder();
+let nextActivityEpoch = 1;
 
 class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBackend {
   public readonly scenario: FixtureScenario;
@@ -210,7 +226,14 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
   private readonly projectWorktrees = new Map<string, ProjectWorktree[]>();
   private readonly sessionInitialAttachDimensions = new Map<string, TerminalDimensions[]>();
   private readonly sessionResizes = new Map<string, ScenarioResize[]>();
+  private readonly sessionInputs = new Map<string, Uint8Array[]>();
   private readonly observations = new Map<string, FixtureObservation>();
+  private readonly activityRevisions = new Map<string, bigint>();
+  private readonly activityWaiters = new Map<
+    string,
+    Set<(event: FixtureInputWaitEvent) => void>
+  >();
+  private readonly activityEpoch: string;
   private endpointsValue: FixtureDaemonEndpoint[] = [];
   private discoveredHosts: HostRecord[];
   private nextSessionId = 1;
@@ -222,6 +245,8 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     assertListenOptions(options.listen);
     this.listenOptions = options.listen;
     this.daemonVersion = options.daemonVersion ?? DEFAULT_DAEMON_VERSION;
+    this.activityEpoch = `d-testkit-${nextActivityEpoch}`;
+    nextActivityEpoch += 1;
     this.protocolVersion = options.protocolVersion ?? PROTOCOL_VERSION;
     this.hostCapabilities = cloneValue(options.host?.capabilities ?? defaultHostCapabilities(this.daemonVersion));
     this.discoveredHosts = cloneValue([...(options.host?.discoveredHosts ?? [])]);
@@ -262,6 +287,14 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     return { host: endpoint.host, port: endpoint.port };
   }
 
+  public get activeInputWaiterCount(): number {
+    let count = 0;
+    for (const waiters of this.activityWaiters.values()) {
+      count += waiters.size;
+    }
+    return count;
+  }
+
   public async start(): Promise<FixtureDaemonHandle> {
     if (this.listenOptions.unixSocketPath !== undefined) {
       await this.listenUnix(this.listenOptions.unixSocketPath);
@@ -300,6 +333,9 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
 
   public setAgentState(sessionId: string, activity: AgentActivity, source: StateSource): void {
     const session = this.requireSession(sessionId);
+    const observation = this.observation(sessionId);
+    const revision = (this.activityRevisions.get(sessionId) ?? 0n) + 1n;
+    this.activityRevisions.set(sessionId, revision);
     session.activity = activity;
     session.state_source = source;
     session.updated_at = timestamp();
@@ -309,12 +345,32 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       session_id: sessionId,
       activity,
       source,
+      runtime: {
+        runtime_id: observation.runtime_id,
+        runtime_generation: observation.runtime_generation.toString(),
+      },
+      activity_epoch: this.activityEpoch,
+      revision: revision.toString(),
     });
+    const evidence: FixtureActivityEvidence = {
+      activity,
+      source,
+      runtime: {
+        runtime_id: observation.runtime_id,
+        runtime_generation: observation.runtime_generation.toString(),
+      },
+      revision,
+    };
+    for (const waiter of [...(this.activityWaiters.get(sessionId) ?? [])]) {
+      waiter({ kind: "activity", evidence });
+    }
   }
 
   public removeSession(sessionId: string): void {
     const session = this.requireSession(sessionId);
+    this.notifyInputWaiters(sessionId, { kind: "removed" });
     this.sessions.delete(sessionId);
+    this.activityRevisions.delete(sessionId);
     this.pty.closeSession(sessionId);
     this.emitEvent({
       v: PROTOCOL_VERSION,
@@ -340,6 +396,42 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
 
   public resizes(sessionId: string): ReadonlyArray<ScenarioResize> {
     return (this.sessionResizes.get(sessionId) ?? []).map((resize) => ({ ...resize }));
+  }
+
+  public inputs(sessionId: string): ReadonlyArray<Uint8Array> {
+    return (this.sessionInputs.get(sessionId) ?? []).map(copyBytes);
+  }
+
+  public replaceRuntime(sessionId: string, runtimeId?: string): void {
+    const session = this.requireSession(sessionId);
+    const current = this.observation(sessionId);
+    const nextGeneration = incrementU64(current.runtime_generation, "fixture runtime generation");
+    const nextRuntimeId = runtimeId ?? `${current.runtime_id}-replacement`;
+    const nextWorkerId = `${current.worker_id}-replacement`;
+    if (!isBoundedRuntimeId(nextRuntimeId)) {
+      throw new Error("fixture replacement runtime id must be a bounded control-free identifier");
+    }
+    session.runtime = {
+      state: "live",
+      runtime_generation: nextGeneration.toString(),
+      worker_id: nextWorkerId,
+      runtime_id: nextRuntimeId,
+      started_at: timestamp(),
+      last_connected_at: timestamp(),
+    };
+    delete session.activity;
+    session.state_source = "process";
+    session.updated_at = timestamp();
+    this.observations.set(sessionId, {
+      runtime_id: nextRuntimeId,
+      runtime_generation: nextGeneration,
+      worker_id: nextWorkerId,
+      history_start_offset: 0n,
+      output: new Uint8Array(),
+      watermark: 0n,
+    });
+    this.notifyInputWaiters(sessionId, { kind: "runtime_changed" });
+    this.emitSessionEvent(EVENT_SESSION_UPDATED, session);
   }
 
   public initialAttachDimensions(sessionId: string): ReadonlyArray<TerminalDimensions> {
@@ -503,7 +595,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       });
   }
 
-  private handleControlLine(socket: Socket, context: SocketContext, line: string): void {
+  private async handleControlLine(socket: Socket, context: SocketContext, line: string): Promise<void> {
     const trimmed = line.trim();
     if (trimmed.length === 0) {
       this.writeResponse(socket, errResponse("", badRequest("empty request line")));
@@ -528,10 +620,10 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       return;
     }
 
-    this.writeResponse(socket, this.dispatchRequest(request));
+    this.writeResponse(socket, await this.dispatchRequest(request));
   }
 
-  private dispatchRequest(request: ControlRequest): ControlResponse {
+  private dispatchRequest(request: ControlRequest): ControlResponse | Promise<ControlResponse> {
     const unsupportedMutation = this.rejectUnsupportedAgentMutation(request);
     if (unsupportedMutation !== undefined) {
       return unsupportedMutation;
@@ -686,6 +778,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     session.state = "stopped";
     session.updated_at = timestamp();
     session.exit_code = 0;
+    this.notifyInputWaiters(session.id, { kind: "stopped" });
     this.pty.closeSession(session.id);
     this.emitSessionEvent(EVENT_SESSION_STOPPED, session);
     return okResponse(request.id, { stopped: true } satisfies SessionStopResult);
@@ -799,22 +892,121 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     if (session === undefined) return okResponse(request.id, { removed: false, stopped: false });
     if (session.external === true) return errResponse(request.id, badRequest("external sessions cannot be removed"));
     const stopped = session.state === "running" || session.state === "starting";
+    this.notifyInputWaiters(session.id, { kind: "removed" });
     this.sessions.delete(session.id);
     this.pty.closeSession(session.id);
     this.emitEvent({ v: PROTOCOL_VERSION, event: EVENT_SESSION_REMOVED, session: cloneValue(session) });
     return okResponse(request.id, { removed: true, stopped });
   }
 
-  private handleSessionInput(request: ControlRequest): ControlResponse {
+  private async handleSessionInput(request: ControlRequest): Promise<ControlResponse> {
     const params = readObjectParams<SessionInputParams>(request);
-    if (params === undefined || typeof params.session_id !== "string" || typeof params.text !== "string") {
+    if (
+      params === undefined
+      || !hasOnlyKeys(params, ["session_id", "text", "wait"])
+      || typeof params.session_id !== "string"
+      || typeof params.text !== "string"
+    ) {
       return errResponse(request.id, invalidParams(request.method));
     }
     const session = this.sessions.get(params.session_id);
     if (session === undefined) return errResponse(request.id, sessionNotFound(params.session_id));
+    if (session.external === true) return errResponse(request.id, sessionExternalReadOnly());
     if (session.state !== "running") return errResponse(request.id, sessionNotRunning(params.session_id));
-    this.pty.writeToSession(session.id, encoder.encode(params.text));
-    return okResponse(request.id, { accepted: true } satisfies SessionInputResult);
+    if (params.wait === undefined) {
+      this.deliverSessionInput(session.id, encoder.encode(params.text));
+      return okResponse(request.id, { accepted: true } satisfies SessionInputResult);
+    }
+    const until = isRecord(params.wait) ? params.wait.until : undefined;
+    if (
+      !isRecord(params.wait)
+      || !hasOnlyKeys(params.wait, ["until", "timeout_ms"])
+      || (until !== undefined && !Array.isArray(until))
+      || (Array.isArray(until) && until.some((activity) => !isAgentActivity(activity)))
+      || (params.wait.timeout_ms !== undefined && !isPositiveInteger(params.wait.timeout_ms))
+    ) {
+      if (isRecord(params.wait) && params.wait.timeout_ms === 0) {
+        return errResponse(request.id, sessionInputInvalidWait());
+      }
+      return errResponse(request.id, invalidParams(request.method));
+    }
+    const normalizedUntil = until ?? [];
+    const timeoutMs = params.wait.timeout_ms ?? MAX_SESSION_WAIT_MS;
+    if (timeoutMs > MAX_SESSION_WAIT_MS) {
+      return errResponse(request.id, sessionWaitLimitExceeded());
+    }
+    if (session.agent_base !== "shell") {
+      return errResponse(request.id, sessionInputWaitUnsupported());
+    }
+    if (session.activity === "blocked") {
+      return errResponse(request.id, sessionAgentBlocked());
+    }
+    const targets = new Set<AgentActivity>(
+      normalizedUntil.length === 0 ? ["idle", "blocked"] : normalizedUntil,
+    );
+    const observation = this.observation(session.id);
+    const deadline = Date.now() + timeoutMs;
+    const afterRevision = this.activityRevisions.get(session.id) ?? 0n;
+    this.deliverSessionInput(session.id, encoder.encode(params.text));
+    while (Date.now() < deadline) {
+      const event = await this.waitForActivity(session.id, deadline - Date.now());
+      if (event === undefined) {
+        break;
+      }
+      if (event.kind === "removed") {
+        return errResponse(request.id, sessionNotFound(session.id));
+      }
+      if (event.kind === "stopped") {
+        return errResponse(request.id, sessionNotRunning(session.id));
+      }
+      if (event.kind === "runtime_changed") {
+        return errResponse(request.id, sessionRuntimeChanged());
+      }
+      if (event.kind === "shutdown") {
+        return errResponse(request.id, daemonShuttingDown());
+      }
+      const evidence = event.evidence;
+      if (
+        evidence.revision > afterRevision
+        && targets.has(evidence.activity)
+        && sameRuntime(evidence.runtime, observation)
+      ) {
+        return okResponse(request.id, {
+          accepted: true,
+          activity: evidence.activity,
+          activity_source: evidence.source,
+          runtime: evidence.runtime,
+          activity_epoch: this.activityEpoch,
+          activity_revision: evidence.revision.toString(),
+        } satisfies SessionInputResult);
+      }
+    }
+    return errResponse(request.id, sessionInputTimeout());
+  }
+
+  private waitForActivity(
+    sessionId: string,
+    timeoutMs: number,
+  ): Promise<FixtureInputWaitEvent | undefined> {
+    return new Promise((resolve) => {
+      const waiters = this.activityWaiters.get(sessionId) ?? new Set();
+      this.activityWaiters.set(sessionId, waiters);
+      const finish = (event: FixtureInputWaitEvent | undefined): void => {
+        clearTimeout(timer);
+        waiters.delete(onEvent);
+        if (waiters.size === 0) {
+          this.activityWaiters.delete(sessionId);
+        }
+        resolve(event);
+      };
+      const onEvent = (event: FixtureInputWaitEvent): void => {
+        finish(event);
+      };
+      const timer = setTimeout(() => {
+        finish(undefined);
+      }, timeoutMs);
+      waiters.add(onEvent);
+    });
   }
 
   private handleSessionAttach(request: ControlRequest): ControlResponse {
@@ -1369,6 +1561,19 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     }
   }
 
+  private deliverSessionInput(sessionId: string, bytes: Uint8Array): void {
+    const inputs = this.sessionInputs.get(sessionId) ?? [];
+    inputs.push(copyBytes(bytes));
+    this.sessionInputs.set(sessionId, inputs);
+    this.pty.writeToSession(sessionId, bytes);
+  }
+
+  private notifyInputWaiters(sessionId: string, event: FixtureInputWaitEvent): void {
+    for (const waiter of [...(this.activityWaiters.get(sessionId) ?? [])]) {
+      waiter(event);
+    }
+  }
+
   private writeResponse(socket: Socket, response: ControlResponse): void {
     const line = JSON.stringify(response);
     if (line === undefined) {
@@ -1435,6 +1640,9 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     }
     this.closed = true;
 
+    for (const sessionId of [...this.activityWaiters.keys()]) {
+      this.notifyInputWaiters(sessionId, { kind: "shutdown" });
+    }
     this.subscribers.clear();
     this.pty.closeAll();
     for (const socket of this.sockets) {
@@ -2029,8 +2237,17 @@ function sessionRuntimeChanged(): ProtocolError {
   return protocolError(
     "runtime",
     "session_runtime_changed",
-    "session runtime changed while reading retained output",
-    "read the current screen and restart output reads from its runtime identity",
+    "session runtime changed during the bounded operation",
+    "inspect the session and restart from its current runtime identity",
+  );
+}
+
+function daemonShuttingDown(): ProtocolError {
+  return protocolError(
+    "daemon",
+    "daemon_shutting_down",
+    "daemon shutdown cancelled the bounded input wait",
+    "inspect the current session after the daemon is available again",
   );
 }
 
@@ -2039,6 +2256,40 @@ function sessionTerminalUnavailable(): ProtocolError {
     "runtime",
     "session_terminal_unavailable",
     "the managed terminal is temporarily unavailable",
+  );
+}
+
+function sessionInputInvalidWait(): ProtocolError {
+  return protocolError(
+    "runtime",
+    "session_input_invalid_wait",
+    "timeout_ms must be greater than zero",
+  );
+}
+
+function sessionInputTimeout(): ProtocolError {
+  return protocolError(
+    "runtime",
+    "session_input_timeout",
+    "the overall input deadline elapsed before delivery and requested activity were confirmed",
+    "delivery outcome may be unknown; inspect the current session before deciding whether to resend, and do not retry blindly",
+  );
+}
+
+function sessionInputWaitUnsupported(): ProtocolError {
+  return protocolError(
+    "runtime",
+    "session_input_wait_unsupported",
+    "bounded input confirmation is unavailable for agents that require delayed submit framing",
+    "use fire-and-forget input only when safe, or select a zero-delay agent profile",
+  );
+}
+
+function sessionWaitLimitExceeded(): ProtocolError {
+  return protocolError(
+    "runtime",
+    "session_wait_limit_exceeded",
+    "the requested wait exceeds the configured maximum",
   );
 }
 
@@ -2127,6 +2378,22 @@ function sessionNotFound(sessionId: string): ProtocolError {
 
 function sessionNotRunning(sessionId: string): ProtocolError {
   return protocolError("runtime", "session_not_running", `session is not running: ${sessionId}`);
+}
+
+function sessionAgentBlocked(): ProtocolError {
+  return protocolError(
+    "runtime",
+    "session_agent_blocked",
+    "the agent is blocked on operator input",
+  );
+}
+
+function sessionExternalReadOnly(): ProtocolError {
+  return protocolError(
+    "runtime",
+    "session_external_read_only",
+    "external sessions are read-only",
+  );
 }
 
 function agentKindUnsupported(agent: string): ProtocolError {

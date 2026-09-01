@@ -44,8 +44,8 @@ pub use assistant::{
 pub use capabilities::{AgentRuntime, HostCapabilities};
 #[doc(inline)]
 pub use decimal::{
-    DecimalWireError, OutputOffset, ProcessStartIdentity, ReportSequence, RuntimeGeneration,
-    TerminalWatermark,
+    ActivityRevision, DecimalWireError, OutputOffset, ProcessStartIdentity, ReportSequence,
+    RuntimeGeneration, TerminalWatermark,
 };
 #[doc(inline)]
 pub use discovery::{HostClass, HostDiscoverParams, HostRecord};
@@ -65,9 +65,9 @@ pub use integration::{
 pub use limits::{
     MAX_CONTROL_LINE_BYTES, MAX_IDENTITY_CLAIM_TTL_SECS, MAX_REQUEST_ID_BYTES,
     MAX_RUNTIME_ID_BYTES, MAX_SESSION_DIFF_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES,
-    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS,
-    MAX_SUCCESS_RESPONSE_ENVELOPE_BYTES, OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES,
-    SESSION_OUTPUT_METADATA_HEADROOM_BYTES,
+    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_READ_RESPONSE_BYTES,
+    MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS, MAX_SUCCESS_RESPONSE_ENVELOPE_BYTES,
+    OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, SESSION_OUTPUT_METADATA_HEADROOM_BYTES,
 };
 #[doc(inline)]
 pub use method::Method;
@@ -97,16 +97,18 @@ pub use session::{
     RuntimeState, SessionAttachParams, SessionAttachResult, SessionCapabilities,
     SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
     SessionDiffParams, SessionDiffResult, SessionEvent, SessionForkParams, SessionForkResult,
-    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter,
-    SessionListParams, SessionNativeRecoveredEvent, SessionNewParams, SessionNewResult,
-    SessionOutputGap, SessionOutputParams, SessionOutputResult, SessionReleaseAgentParams,
-    SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeResult,
-    SessionRuntime, SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
-    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
-    TerminalCursor, TerminalDimensions, TerminalDimensionsError,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
+    SessionListFilter, SessionListParams, SessionNativeRecoveredEvent, SessionNewParams,
+    SessionNewResult, SessionOutputGap, SessionOutputParams, SessionOutputResult,
+    SessionReadFormat, SessionReadParams, SessionReadResult, SessionReadSource,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams,
+    SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionResumeResult, SessionRuntime, SessionRuntimeIdentity,
+    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
+    SessionState, SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult,
+    SessionWarning, SessionWarningKind, TerminalCursor, TerminalDimensions,
+    TerminalDimensionsError,
 };
 #[doc(inline)]
 pub use version::{

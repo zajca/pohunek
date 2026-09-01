@@ -1,6 +1,6 @@
 //! Startup adoption of durable session workers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,16 +13,16 @@ use sha2::{Digest, Sha256};
 use super::{
     event, event_payload, identity_claim_expiry_is_valid, mpsc, runtime_error, timestamp_now,
     watch, ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig,
-    DetectorConfigUpdate, DetectorInputs, Notify, ObservedAgent, ProtocolError, ResumeSnapshot,
-    RuntimeHandle, RuntimeState, RuntimeWatchIdentity, SessionEntry, SessionId, SessionRecord,
-    SessionRef, SessionRefKind, SessionRegistry, SessionRuntime, SessionState, StateSource, Worker,
-    WorkerError, WORKER_CONNECT_RETRY,
+    DetectorConfigUpdate, DetectorInputs, DetectorScope, Mutex, Notify, ObservedAgent,
+    ProtocolError, ResumeSnapshot, RuntimeHandle, RuntimeState, RuntimeWatchIdentity, SessionEntry,
+    SessionId, SessionRecord, SessionRef, SessionRefKind, SessionRegistry, SessionRuntime,
+    SessionState, StateSource, Worker, WorkerError, WORKER_CONNECT_RETRY,
 };
 use crate::procwatch::ProcessInspector;
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-08-31
+// Rust guideline compliant 2026-09-01
 
 #[derive(Debug, Clone)]
 struct DiscoveredWorker {
@@ -749,6 +749,9 @@ impl SessionRegistry {
         let info = record.info.clone();
         let entry = SessionEntry {
             info: info.clone(),
+            activity_revision: 0,
+            activity_evidence: VecDeque::new(),
+            input_gate: Arc::new(Mutex::new(())),
             runtime: RuntimeHandle::Worker(worker.clone()),
             desired_state: DesiredState::Running,
             detector_cancel: detector_cancel.clone(),
@@ -772,20 +775,21 @@ impl SessionRegistry {
             return;
         }
         self.inner.sessions.lock().await.insert(id.clone(), entry);
-        self.spawn_detector(
-            id.clone(),
-            DetectorInputs {
-                output: detector_output,
-                initial_size: (info.rows, info.cols),
-                cancel: detector_cancel,
-                resize: detector_resize_rx,
-                config: detector_config_rx,
-                preview: detector_preview_rx,
-            },
-        );
-        self.spawn_procwatch(id.clone(), child.pid, procwatch_cancel, procwatch_rescan);
         let expected = RuntimeWatchIdentity::from_info(&info)
             .expect("reconciled live runtime has a complete watcher identity");
+        self.spawn_detector(DetectorInputs {
+            scope: DetectorScope {
+                id: id.clone(),
+                runtime: expected.clone(),
+            },
+            output: detector_output,
+            initial_size: (info.rows, info.cols),
+            cancel: detector_cancel,
+            resize: detector_resize_rx,
+            config: detector_config_rx,
+            preview: detector_preview_rx,
+        });
+        self.spawn_procwatch(id.clone(), child.pid, procwatch_cancel, procwatch_rescan);
         self.spawn_worker_exit_watcher(id, worker, expected, runtime_watch_cancel);
         if let Some(previous_runtime_id) = native_recovery {
             self.emit_native_recovered(&info, previous_runtime_id);
@@ -863,6 +867,9 @@ impl SessionRegistry {
         let info = record.info.clone();
         let entry = SessionEntry {
             info: info.clone(),
+            activity_revision: 0,
+            activity_evidence: VecDeque::new(),
+            input_gate: Arc::new(Mutex::new(())),
             runtime: RuntimeHandle::Unavailable(state),
             desired_state: record.desired_state,
             detector_cancel: CancellationToken::new(),

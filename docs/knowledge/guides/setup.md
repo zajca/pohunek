@@ -28,11 +28,19 @@ consistently. For first-install migration and runtime diagnosis, see
 [durable session workers](../runbooks/debug-session-runtime.md).
 
 Setup assets are installed through `pohunek setup`. The subcommands split the
-work into launcher scripts, config templates, and sway integration:
+work into launcher scripts, config templates, sway integration, and shell
+completion:
 
 - `pohunek setup scripts`
 - `pohunek setup config`
 - `pohunek setup sway`
+- `pohunek setup completions <bash|zsh|fish>`
+
+Completion installation is idempotent and does not edit shell startup files.
+The default script is static and performs no runtime lookup. Add `--dynamic`
+only when host and session-target candidates are wanted; those queries are
+deadline-bounded, do not start a daemon, and fail silently. Zsh installation
+prints the `fpath` line that must appear before `compinit`.
 
 Do not overwrite existing user config unless the user asks for that behavior and
 the command supports it. For launcher details, see [launcher](launcher.md). For

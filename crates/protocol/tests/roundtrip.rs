@@ -4,32 +4,34 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
 use protocol::{
-    event, method, negotiate, AgentActivity, AgentKind, AgentRuntime, AssistantMaterializeParams,
-    AssistantMaterializeResult, AttachHeader, ConceptDeprecation, ConceptIntent, ConceptMeta,
-    ConceptType, CwdSource, DaemonDoctorResult, DetectionRegionKind, DetectionRegionPreview,
-    DoctorCheck, DoctorReport, DoctorStatus, ErrorClass, Event, ForkCwdMode, HostCapabilities,
-    IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult,
-    NotificationCreateParams, NotificationCreateResult, NotificationCreatedEvent,
-    NotificationDeleteParams, NotificationDeleteResult, NotificationDeletedEvent, NotificationId,
-    NotificationKind, NotificationKindPolicy, NotificationListParams, NotificationListResult,
-    NotificationPolicy, NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
-    NotificationRetentionParams, NotificationRetentionPolicy, NotificationRetentionResult,
-    NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
-    NotificationUpdateResult, NotificationUpdatedEvent, ObservationParamsError, OutputOffset,
-    ProcessStartIdentity, ProjectSource, ProtocolError, ProtocolVersion, ProtocolVersionRange,
-    ProviderKind, ReportSequence, Request, Response, RuntimeGeneration, SessionAttachParams,
-    SessionAttachResult, SessionCapabilities, SessionDetachParams, SessionDetachResult,
-    SessionDetectionParams, SessionDetectionResult, SessionForkParams, SessionForkResult,
-    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter,
-    SessionListParams, SessionNewParams, SessionOutputGap, SessionOutputParams,
-    SessionOutputResult, SessionReleaseAgentParams, SessionReleaseAgentResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionRuntimeIdentity,
-    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
-    SessionState, SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult,
-    SessionWarning, SessionWarningKind, StateSource, TerminalCursor, TerminalDimensions,
-    TerminalWatermark, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES, MAX_RUNTIME_ID_BYTES,
-    MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
+    event, method, negotiate, ActivityRevision, AgentActivity, AgentKind, AgentRuntime,
+    AssistantMaterializeParams, AssistantMaterializeResult, AttachHeader, ConceptDeprecation,
+    ConceptIntent, ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult, DetectionRegionKind,
+    DetectionRegionPreview, DoctorCheck, DoctorReport, DoctorStatus, ErrorClass, Event,
+    ForkCwdMode, HostCapabilities, IntegrationInstallParams, IntegrationInstallReport,
+    IntegrationInstallResult, NotificationCreateParams, NotificationCreateResult,
+    NotificationCreatedEvent, NotificationDeleteParams, NotificationDeleteResult,
+    NotificationDeletedEvent, NotificationId, NotificationKind, NotificationKindPolicy,
+    NotificationListParams, NotificationListResult, NotificationPolicy, NotificationPolicyParams,
+    NotificationPolicyResult, NotificationRecord, NotificationRetentionParams,
+    NotificationRetentionPolicy, NotificationRetentionResult, NotificationSeverity,
+    NotificationSource, NotificationStatus, NotificationUpdateParams, NotificationUpdateResult,
+    NotificationUpdatedEvent, ObservationParamsError, OutputOffset, ProcessStartIdentity,
+    ProjectSource, ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind,
+    ReportSequence, Request, Response, RuntimeGeneration, SessionAttachParams, SessionAttachResult,
+    SessionCapabilities, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
+    SessionDetectionResult, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
+    SessionNewParams, SessionOutputGap, SessionOutputParams, SessionOutputResult,
+    SessionReadFormat, SessionReadParams, SessionReadResult, SessionReadSource,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionRuntimeIdentity, SessionScreenParams,
+    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
+    SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning,
+    SessionWarningKind, StateSource, TerminalCursor, TerminalDimensions, TerminalWatermark,
+    MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES, MAX_RUNTIME_ID_BYTES, MAX_SESSION_ID_BYTES,
+    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
     MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS,
     OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
     SESSION_OUTPUT_METADATA_HEADROOM_BYTES, SUPPORTED_PROTOCOL_VERSIONS,
@@ -457,6 +459,48 @@ fn notification_create_params_json_shape_roundtrips() {
 
     let back = line_roundtrip(&params);
     assert_eq!(back, params);
+
+    let waiting = SessionInputParams {
+        session_id: SessionId("s-42".to_owned()),
+        text: "write tests first".to_owned(),
+        wait: Some(SessionInputWait {
+            until: Some(vec![AgentActivity::Idle, AgentActivity::Blocked]),
+            timeout_ms: Some(MAX_SESSION_WAIT_MS),
+        }),
+    };
+    let value = serde_json::to_value(&waiting).expect("serialize waiting input params");
+    assert_eq!(
+        value,
+        json!({
+            "session_id": "s-42",
+            "text": "write tests first",
+            "wait": {
+                "until": ["idle", "blocked"],
+                "timeout_ms": 8000
+            }
+        })
+    );
+    assert_eq!(line_roundtrip(&waiting), waiting);
+
+    let absent_until: SessionInputParams = serde_json::from_value(json!({
+        "session_id": "s-42",
+        "text": "write tests first",
+        "wait": { "timeout_ms": 1000 }
+    }))
+    .expect("absent wait targets use the serde default");
+    assert_eq!(
+        absent_until.wait.expect("wait contract").until,
+        None,
+        "the SDK layer normalizes absent targets before sending"
+    );
+
+    let overflow = json!({
+        "session_id": "s-42",
+        "text": "write tests first",
+        "wait": { "until": ["idle"], "timeout_ms": 4_294_967_296_u64 }
+    });
+    serde_json::from_value::<SessionInputParams>(overflow)
+        .expect_err("input wait timeout must stay bounded to an unsigned 32-bit integer");
 }
 
 #[test]
@@ -1335,6 +1379,7 @@ fn session_input_params_json_shape_roundtrips() {
     let params = SessionInputParams {
         session_id: SessionId("s-42".to_owned()),
         text: "write tests first".to_owned(),
+        wait: None,
     };
 
     let value = serde_json::to_value(&params).expect("serialize input params");
@@ -1352,16 +1397,47 @@ fn session_input_params_json_shape_roundtrips() {
 
 #[test]
 fn session_input_result_json_shape_roundtrips() {
-    for result in [
-        SessionInputResult { accepted: true },
-        SessionInputResult { accepted: false },
-    ] {
-        let value = serde_json::to_value(&result).expect("serialize input result");
-        assert_eq!(value, json!({ "accepted": result.accepted }));
+    let omitted = SessionInputResult {
+        accepted: true,
+        activity: None,
+        activity_source: None,
+        runtime: None,
+        activity_epoch: None,
+        activity_revision: None,
+    };
+    let value = serde_json::to_value(&omitted).expect("serialize omitted input result");
+    assert_eq!(value, json!({ "accepted": true }));
+    let back = line_roundtrip(&omitted);
+    assert_eq!(back, omitted);
 
-        let back = line_roundtrip(&result);
-        assert_eq!(back, result);
-    }
+    let populated = SessionInputResult {
+        accepted: true,
+        activity: Some(AgentActivity::Idle),
+        activity_source: Some(StateSource::Screen),
+        runtime: Some(
+            SessionRuntimeIdentity::new("runtime-42", RuntimeGeneration::new(3))
+                .expect("valid runtime identity"),
+        ),
+        activity_epoch: Some("d-epoch-1".to_owned()),
+        activity_revision: Some(ActivityRevision::new(7)),
+    };
+    let value = serde_json::to_value(&populated).expect("serialize populated input result");
+    assert_eq!(
+        value,
+        json!({
+            "accepted": true,
+            "activity": "idle",
+            "activity_source": "screen",
+            "runtime": {
+                "runtime_id": "runtime-42",
+                "runtime_generation": "3"
+            },
+            "activity_epoch": "d-epoch-1",
+            "activity_revision": "7"
+        })
+    );
+    let back = line_roundtrip(&populated);
+    assert_eq!(back, populated);
 }
 
 #[test]
@@ -2133,7 +2209,13 @@ fn agent_state_event_carries_activity_in_flattened_payload() {
         json!({
             "session_id": "s-42",
             "activity": AgentActivity::Blocked,
-            "source": StateSource::OscTitle
+            "source": StateSource::OscTitle,
+            "runtime": {
+                "runtime_id": "runtime-42",
+                "runtime_generation": "3"
+            },
+            "activity_epoch": "d-epoch-1",
+            "revision": "7"
         }),
     )
     .expect("valid event");
@@ -2150,7 +2232,13 @@ fn agent_state_event_carries_activity_in_flattened_payload() {
             "event": "agent_state",
             "session_id": "s-42",
             "activity": "blocked",
-            "source": "osc_title"
+            "source": "osc_title",
+            "runtime": {
+                "runtime_id": "runtime-42",
+                "runtime_generation": "3"
+            },
+            "activity_epoch": "d-epoch-1",
+            "revision": "7"
         })
     );
     assert!(
@@ -2767,6 +2855,76 @@ fn session_output_params_reject_invalid_limits_and_cursor_shapes() {
 }
 
 #[test]
+fn session_read_contract_uses_decimal_revision_and_exact_wire_shape() {
+    let params = SessionReadParams::new(
+        SessionId("s-42".to_owned()),
+        Some(SessionReadSource::RecentUnwrapped),
+        Some(20),
+        Some(SessionReadFormat::Ansi),
+    )
+    .expect("valid read params");
+    let params_json = json!({
+        "session_id": "s-42",
+        "source": "recent_unwrapped",
+        "lines": 20,
+        "format": "ansi"
+    });
+    assert_eq!(
+        serde_json::to_value(&params).expect("serialize read params"),
+        params_json
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionReadParams>(params_json).expect("parse read params"),
+        params
+    );
+    serde_json::from_value::<SessionReadParams>(json!({
+        "session_id": "s-42",
+        "unknown": true
+    }))
+    .expect_err("unknown read field must fail");
+    for lines in [0, MAX_SESSION_READ_LINES + 1] {
+        serde_json::from_value::<SessionReadParams>(json!({
+            "session_id": "s-42",
+            "lines": lines
+        }))
+        .expect_err("out-of-range read lines must fail");
+    }
+
+    let result = SessionReadResult {
+        text: "one\ntwo".to_owned(),
+        source_used: SessionReadSource::Visible,
+        runtime: SessionRuntimeIdentity::new(
+            "runtime-1",
+            RuntimeGeneration::new(9_007_199_254_740_993),
+        )
+        .expect("valid runtime"),
+        revision: TerminalWatermark::new(9_007_199_254_740_994),
+        alternate_screen: false,
+        lines_requested: 20,
+        truncated: true,
+    };
+    let expected = json!({
+        "text": "one\ntwo",
+        "source_used": "visible",
+        "runtime_id": "runtime-1",
+        "runtime_generation": "9007199254740993",
+        "revision": "9007199254740994",
+        "alternate_screen": false,
+        "lines_requested": 20,
+        "truncated": true
+    });
+    assert_eq!(
+        serde_json::to_value(&result).expect("serialize read"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionReadResult>(expected).expect("parse read"),
+        result
+    );
+    assert_eq!(line_roundtrip(&result), result);
+}
+
+#[test]
 fn session_output_result_rejects_encoding_size_and_offset_invariants() {
     let valid_session = "s-42".to_owned();
     let valid_runtime = "runtime-1".to_owned();
@@ -3123,6 +3281,7 @@ fn m1_observation_errors_are_stable_and_payload_free() {
         ProtocolError::agent_runtime_unsupported(),
         ProtocolError::session_input_rejected(),
         ProtocolError::session_input_blocked(),
+        ProtocolError::session_agent_blocked(),
         ProtocolError::session_terminal_unavailable(),
         ProtocolError::session_has_no_managed_terminal(),
         ProtocolError::session_runtime_changed(),
@@ -3137,6 +3296,18 @@ fn m1_observation_errors_are_stable_and_payload_free() {
         assert!(!error.msg.contains("base64"));
         assert_eq!(line_roundtrip(&error), error);
     }
+
+    let timeout = ProtocolError::session_input_timeout();
+    assert_eq!(timeout.class, ErrorClass::Runtime);
+    let timeout_recovery = timeout.recover.as_deref().expect("timeout recovery hint");
+    assert!(timeout_recovery.contains("inspect the current session"));
+    assert!(timeout_recovery.contains("do not retry blindly"));
+    assert_eq!(line_roundtrip(&timeout), timeout);
+
+    let unsupported = ProtocolError::session_input_wait_unsupported();
+    assert_eq!(unsupported.class, ErrorClass::Runtime);
+    assert!(unsupported.recover.is_some());
+    assert_eq!(line_roundtrip(&unsupported), unsupported);
 
     let response = Response::err(
         PROTOCOL_VERSION,

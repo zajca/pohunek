@@ -99,6 +99,10 @@ pub(crate) enum CliError {
     #[error("operation cancelled by process signal")]
     Cancelled,
 
+    /// A waited input was interrupted after delivery may have begun.
+    #[error("input wait interrupted by process signal; delivery outcome is unknown")]
+    InputWaitInterrupted,
+
     /// A remote `session new` named no target. No filesystem path crosses the
     /// wire to another host, so a remote session must be referenced by `--project`
     /// (or, for first-introduction, `--repo` with a path valid on that host). Fails
@@ -229,6 +233,12 @@ impl CliError {
                 "cancelled",
                 "operation cancelled by process signal".to_owned(),
                 Some("retry the bounded operation when ready".to_owned()),
+            ),
+            CliError::InputWaitInterrupted => ProtocolError::new(
+                ErrorClass::Runtime,
+                "session_input_interrupted",
+                "input wait interrupted by process signal; delivery outcome is unknown".to_owned(),
+                None,
             ),
             CliError::RemoteTargetRequired => ProtocolError::new(
                 ErrorClass::Configuration,

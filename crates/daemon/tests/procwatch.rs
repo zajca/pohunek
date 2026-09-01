@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-08-31
+// Rust guideline compliant 2026-09-01
 
 #![cfg(target_os = "linux")]
 
@@ -254,6 +254,7 @@ async fn procwatch_updates_cwd_after_shell_cd() {
         .input(SessionInputParams {
             session_id: created.id.clone(),
             text: format!("cd {}", target_dir.display()),
+            wait: None,
         })
         .await
         .expect("send cd command");
@@ -265,6 +266,10 @@ async fn procwatch_updates_cwd_after_shell_cd() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the end-to-end external-session contract is clearer in one lifecycle test"
+)]
 async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
     if !pidfd_is_available() {
         return;
@@ -329,6 +334,7 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
         .input(SessionInputParams {
             session_id: observed.id.clone(),
             text: "hello".to_owned(),
+            wait: None,
         })
         .await
         .expect_err("external sessions cannot receive input");

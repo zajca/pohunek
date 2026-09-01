@@ -57,6 +57,8 @@ import type {
   SessionNewResult,
   SessionOutputParams,
   SessionOutputResult,
+  SessionReadParams,
+  SessionReadResult,
   SessionReleaseAgentParams,
   SessionReleaseAgentResult,
   SessionRemoveResult,
@@ -112,6 +114,7 @@ export interface Methods {
   "session.list": { params: SessionListParams; output: SessionInfo[] };
   "session.new": { params: SessionNewParams; output: SessionNewResult };
   "session.output": { params: SessionOutputParams; output: SessionOutputResult };
+  "session.read": { params: SessionReadParams; output: SessionReadResult };
   "session.release_agent": { params: SessionReleaseAgentParams; output: SessionReleaseAgentResult };
   "session.remove": { params: SessionId; output: SessionRemoveResult };
   "session.rename": { params: SessionRenameParams; output: SessionRenameResult };

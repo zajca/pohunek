@@ -16,6 +16,7 @@ Current CLI and command surface:
 
 - `crates/cli/src/lib.rs`
 - `crates/cli/src/main.rs`
+- `crates/cli/src/completion.rs`
 - `crates/cli/src/commands/mod.rs`
 - `crates/cli/src/commands/assistant/mod.rs`
 - `crates/cli/src/commands/assistant/bootstrap.rs`

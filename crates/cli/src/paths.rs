@@ -31,6 +31,19 @@ pub(crate) struct Paths {
 }
 
 impl Paths {
+    /// Resolve only the XDG data base directory.
+    ///
+    /// Shell completion installation uses shell-owned paths adjacent to, rather
+    /// than inside, pohunek's data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError::MissingEnv`] when neither `XDG_DATA_HOME` nor `HOME`
+    /// is available.
+    pub(crate) fn data_home_only() -> Result<PathBuf, CliError> {
+        pohunek_paths::data_home().map_err(path_error)
+    }
+
     /// Resolve only the pohunek cache directory.
     ///
     /// Standalone host discovery deliberately does not need a runtime directory

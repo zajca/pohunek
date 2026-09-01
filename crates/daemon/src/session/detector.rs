@@ -1,10 +1,10 @@
 //! Per-session activity detector task and activity recording.
 
 use super::{
-    broadcast, debug, event, event_payload, is_terminal, log_lag_warn, timestamp_now,
-    ActivityTransition, AgentActivity, AgentStateEvent, DetectionPreviewRequest, Detector,
-    DetectorConfig, DetectorConfigUpdate, DetectorInputs, Instant, LagWarnThrottle, SessionId,
-    SessionRegistry,
+    broadcast, debug, event, event_payload, is_terminal, log_lag_warn, record_activity_evidence,
+    timestamp_now, ActivityTransition, AgentActivity, DetectionPreviewRequest, Detector,
+    DetectorConfig, DetectorConfigUpdate, DetectorInputs, DetectorScope, Instant, LagWarnThrottle,
+    RuntimeWatchIdentity, SessionId, SessionRegistry,
 };
 
 fn detection_interval(config: &DetectorConfig) -> tokio::time::Interval {
@@ -49,8 +49,9 @@ fn reply_to_preview(
 }
 
 impl SessionRegistry {
-    pub(super) fn spawn_detector(&self, id: SessionId, inputs: DetectorInputs) {
+    pub(super) fn spawn_detector(&self, inputs: DetectorInputs) {
         let DetectorInputs {
+            scope,
             output: mut output_rx,
             initial_size: size,
             cancel,
@@ -60,6 +61,7 @@ impl SessionRegistry {
         } = inputs;
         let registry = self.clone();
         tokio::spawn(async move {
+            let DetectorScope { id, runtime } = scope;
             let initial_config = detector_config_rx.borrow().clone();
             let mut applied_config_generation = initial_config.generation;
             let mut tick = detection_interval(&initial_config.config);
@@ -98,7 +100,9 @@ impl SessionRegistry {
                     }
                     _ = tick.tick() => {
                         for transition in detector.tick(Instant::now()) {
-                            registry.record_activity(&id, transition).await;
+                            registry
+                                .record_detector_activity(&id, &runtime, transition)
+                                .await;
                         }
                         // Flush a folded lag batch whose window has elapsed, so a
                         // session that stopped lagging still reports its summary.
@@ -117,10 +121,14 @@ impl SessionRegistry {
                         match received {
                             Ok(chunk) => {
                                 for transition in detector.feed(Instant::now(), &chunk) {
-                                    registry.record_activity(&id, transition).await;
+                                    registry
+                                        .record_detector_activity(&id, &runtime, transition)
+                                        .await;
                                 }
                                 if let Some(path) = detector.take_cwd_hint() {
-                                    registry.record_cwd_hint(&id, path).await;
+                                    registry
+                                        .record_cwd_hint_scoped(&id, path, Some(&runtime))
+                                        .await;
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -185,13 +193,42 @@ impl SessionRegistry {
         })
     }
 
+    #[cfg(test)]
     pub(super) async fn record_activity(&self, id: &SessionId, transition: ActivityTransition) {
+        self.record_activity_scoped(id, None, transition).await;
+    }
+
+    pub(super) async fn record_detector_activity(
+        &self,
+        id: &SessionId,
+        expected: &RuntimeWatchIdentity,
+        transition: ActivityTransition,
+    ) {
+        self.record_activity_scoped(id, Some(expected), transition)
+            .await;
+    }
+
+    async fn record_activity_scoped(
+        &self,
+        id: &SessionId,
+        expected: Option<&RuntimeWatchIdentity>,
+        transition: ActivityTransition,
+    ) {
+        let activity_epoch = self.daemon_instance_id().to_owned();
         let updated = {
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(id) else {
                 debug!(session_id = %id.0, "detector activity arrived for unknown session");
                 return;
             };
+
+            if expected.is_some_and(|expected| !expected.matches(entry)) {
+                debug!(
+                    session_id = %id.0,
+                    "detector activity arrived for a superseded runtime"
+                );
+                return;
+            }
 
             if entry.stopping || is_terminal(entry.info.state) {
                 return;
@@ -208,21 +245,26 @@ impl SessionRegistry {
             entry.info.activity = Some(transition.activity);
             entry.info.state_source = transition.source;
             entry.info.updated_at = timestamp_now();
+            let evidence = record_activity_evidence(
+                entry,
+                transition.activity,
+                transition.source,
+                &activity_epoch,
+            );
             let rescan = (transition.activity == AgentActivity::Working)
                 .then(|| std::sync::Arc::clone(&entry.procwatch_rescan));
-            (transition, rescan)
+            (rescan, evidence)
         };
-        if let Some(rescan) = updated.1 {
+        if let Some(rescan) = updated.0 {
             rescan.notify_one();
         }
 
+        let Some(evidence) = updated.1 else {
+            return;
+        };
         let event = crate::events::event(
             event::AGENT_STATE,
-            event_payload(AgentStateEvent {
-                session_id: id.clone(),
-                activity: updated.0.activity,
-                source: updated.0.source,
-            }),
+            event_payload(evidence.event(id.clone())),
         );
         let _ = self.inner.events.send(event);
     }

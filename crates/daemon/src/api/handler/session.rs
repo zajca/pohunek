@@ -9,7 +9,7 @@ use protocol::{
     ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams,
     SessionDetectionParams, SessionDiffParams, SessionForkParams, SessionForkResult, SessionId,
     SessionInputParams, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
-    SessionReleaseAgentParams, SessionRenameParams, SessionReportAgentParams,
+    SessionReadParams, SessionReleaseAgentParams, SessionRenameParams, SessionReportAgentParams,
     SessionReportNativeIdParams, SessionResizeParams, SessionResumeResult, SessionScreenParams,
     SessionSetMetadataParams, SessionWaitParams,
 };
@@ -258,6 +258,17 @@ pub(super) async fn handle_session_detection(
             &result,
             ProtocolError::session_detection_response_too_large(),
         ),
+        Err(err) => error_value(request, err),
+    }
+}
+
+pub(super) async fn handle_session_read(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<SessionReadParams>(request) {
+        Ok(params) => params,
+        Err(err) => return error_value(request, err),
+    };
+    match sessions.session_read(&params).await {
+        Ok(result) => ok_value(request, &result),
         Err(err) => error_value(request, err),
     }
 }

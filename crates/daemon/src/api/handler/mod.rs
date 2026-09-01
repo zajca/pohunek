@@ -245,6 +245,7 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
             session::handle_session_detection(request, &state.sessions).await
         }
         method::SESSION_OUTPUT => session::handle_session_output(request, &state.sessions).await,
+        method::SESSION_READ => session::handle_session_read(request, &state.sessions).await,
         method::SESSION_WAIT => session::handle_session_wait(request, &state.sessions).await,
         method::SESSION_REPORT_NATIVE_ID => {
             session::handle_session_report_native_id(request, &state.sessions).await
