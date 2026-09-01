@@ -50,7 +50,7 @@ export function startBackendServer(
   return startRelay({
     bindHost: options.bindHost,
     port: options.port,
-    targets: (host: string) => options.hosts.targetForHost(host),
+    targets: (host: string) => options.hosts.resolveTargetForHost(host),
     allowLoopbackBind: options.allowLoopbackBind,
     httpHandler: (request: Request) => handleHttpRequest(request, options.hosts, staticAssetsRoot, logger),
   });

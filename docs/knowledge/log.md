@@ -33,6 +33,8 @@
   unavailable instead of deriving launch permission from the name-only
   `supported_agents` field or falling back to built-in base kinds.
 - Cross-linked agent profiles from the GUI Session Launch section.
+- Documented fail-closed daemon shutdown when an overlay listener supervisor
+  exits or panics unexpectedly after readiness.
 
 ## 0.18.3
 

@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 const HOST: &str = "build-box";
+const LEGACY_PROTOCOL_VERSION: u32 = 1;
 
 static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -131,7 +132,7 @@ async fn subscription_remote_ack_error_maps_to_remote_protocol_and_preserves_cod
         spawn_tcp_subscription_daemon(response_error_line_for(&request, source.clone()), vec![])
             .await;
 
-    let client = Client::connect_tcp_addr(HOST, daemon.addr)
+    let client = Client::connect_trusted_tcp_addr(HOST, daemon.addr)
         .await
         .expect("connect tcp subscription test daemon");
     let err = client
@@ -305,7 +306,7 @@ async fn subscription_rejects_an_event_with_a_different_selected_version() {
     let daemon = spawn_unix_subscription_daemon(
         response_ok_line_for(&request, json!({"subscribed": true})),
         vec![json!({
-            "v": 1,
+            "v": LEGACY_PROTOCOL_VERSION,
             "event": "agent_state",
             "session_id": "s-1",
             "activity": "working",
@@ -325,7 +326,9 @@ async fn subscription_rejects_an_event_with_a_different_selected_version() {
         .await
         .expect_err("wrong event version must fail")
     {
-        ClientError::Protocol(source) => assert_eq!(source.code, "version_mismatch"),
+        ClientError::Protocol(source) => {
+            assert_eq!(source, canonical_legacy_protocol_mismatch());
+        }
         other => panic!("expected canonical protocol mismatch, got {other:?}"),
     }
     daemon
@@ -340,7 +343,7 @@ async fn remote_subscription_wrong_version_event_preserves_host_context() {
     let daemon = spawn_tcp_subscription_daemon(
         response_ok_line_for(&request, json!({"subscribed": true})),
         vec![json!({
-            "v": 1,
+            "v": LEGACY_PROTOCOL_VERSION,
             "event": "agent_state",
             "session_id": "s-1",
             "activity": "working",
@@ -349,7 +352,7 @@ async fn remote_subscription_wrong_version_event_preserves_host_context() {
     )
     .await;
 
-    let client = Client::connect_tcp_addr(HOST, daemon.addr)
+    let client = Client::connect_trusted_tcp_addr(HOST, daemon.addr)
         .await
         .expect("connect remote subscription daemon");
     let mut subscription = client
@@ -363,9 +366,7 @@ async fn remote_subscription_wrong_version_event_preserves_host_context() {
     {
         ClientError::RemoteProtocol { host, source } => {
             assert_eq!(host, HOST);
-            assert_eq!(source.code, "version_mismatch");
-            assert!(source.msg.contains("2..=2"));
-            assert!(source.msg.contains("1..=1"));
+            assert_eq!(source, canonical_legacy_protocol_mismatch());
         }
         other => panic!("expected remote protocol mismatch, got {other:?}"),
     }
@@ -464,6 +465,14 @@ async fn handle_subscription_connection<S>(
 
 fn subscribe_request(id: &str) -> Request {
     Request::new(id, protocol::method::SUBSCRIBE, Value::Null).expect("valid test request")
+}
+
+fn canonical_legacy_protocol_mismatch() -> ProtocolError {
+    let legacy = protocol::ProtocolVersion::new(LEGACY_PROTOCOL_VERSION)
+        .expect("nonzero legacy protocol version");
+    let legacy_range =
+        protocol::ProtocolVersionRange::new(legacy, legacy).expect("valid exact legacy range");
+    ProtocolError::version_mismatch(protocol::SUPPORTED_PROTOCOL_VERSIONS, legacy_range)
 }
 
 fn response_ok_line_for(request: &Request, ok: Value) -> String {

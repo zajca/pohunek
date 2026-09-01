@@ -1,6 +1,6 @@
 //! Validates the pinned Hermes CLI and refreshes bounded PTY evidence.
 
-// Rust guideline compliant 2026-08-14
+// Rust guideline compliant 2026-08-28
 
 use std::ffi::OsString;
 use std::fs;
@@ -83,7 +83,7 @@ const PLUGIN_RUNTIME_CHECKS: usize = 1;
 /// Four CLI states plus one real production-plugin registration check.
 const PRODUCTION_PLUGIN_CHECKS: usize = 5;
 /// The current Pohunek CLI protocol required by the generated plugin policy.
-const EXPECTED_POHUNEK_PROTOCOL: u32 = 2;
+const EXPECTED_POHUNEK_PROTOCOL: u32 = 3;
 /// A normal executable search remains well below this abuse-resistant bound.
 const MAX_EXECUTABLE_PATH_ENTRIES: usize = 64;
 const PLUGIN_RUNTIME_MARKERS: [&str; 3] = [
@@ -4546,7 +4546,7 @@ PY
                         doctor: Option<serde_json::Value>| {
             serde_json::json!({
                 "cli_version": "controlled",
-                "protocol": {"minimum": 2, "maximum": 2},
+                "protocol": {"minimum": 3, "maximum": 3},
                 "ok": {
                     "action": action,
                     "target_kind": "profile",

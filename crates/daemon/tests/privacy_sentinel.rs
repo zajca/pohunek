@@ -19,6 +19,8 @@
 
 // Rust guideline compliant 2026-07-24
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -291,7 +293,11 @@ async fn spawn_worker_backed_server(
             tokio_util::sync::CancellationToken::default(),
         );
     }
-    let state = DaemonState::new(HealthInfo::new(version), registry);
+    let state = DaemonState::new(
+        HealthInfo::new(version),
+        registry,
+        support::overlay_registry(),
+    );
     let server = ControlServer::bind_with_state(socket, state)
         .await
         .expect("server binds");

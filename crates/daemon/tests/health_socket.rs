@@ -7,6 +7,8 @@
 //! response carries the daemon and protocol versions. It also covers
 //! stale-socket recovery and the `method_not_found` path.
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -17,19 +19,20 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use protocol::{
     event, method, AgentActivity, AgentKind, AssistantMaterializeParams,
-    AssistantMaterializeResult, AttachHeader, ErrorClass, Event, IntegrationInstallState,
-    IntegrationStatusResult, NotificationCreateParams, NotificationCreateResult,
-    NotificationDeleteParams, NotificationDeleteResult, NotificationKind, NotificationKindPolicy,
-    NotificationListParams, NotificationListResult, NotificationPolicy, NotificationPolicyParams,
-    NotificationPolicyResult, NotificationRetentionParams, NotificationRetentionResult,
-    NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
-    NotificationUpdateResult, ProcessStartIdentity, ReportSequence, Request as ProtocolRequest,
-    Response, SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
-    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter,
-    SessionListParams, SessionNewParams, SessionRemoveResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, StateSource,
-    TerminalDimensions, PROTOCOL_VERSION,
+    AssistantMaterializeResult, AttachHeader, ErrorClass, Event, HostDiscoverParams, HostRecord,
+    IntegrationInstallState, IntegrationStatusResult, NotificationCreateParams,
+    NotificationCreateResult, NotificationDeleteParams, NotificationDeleteResult, NotificationKind,
+    NotificationKindPolicy, NotificationListParams, NotificationListResult, NotificationPolicy,
+    NotificationPolicyParams, NotificationPolicyResult, NotificationRetentionParams,
+    NotificationRetentionResult, NotificationSeverity, NotificationSource, NotificationStatus,
+    NotificationUpdateParams, NotificationUpdateResult, ProcessStartIdentity, ReportSequence,
+    Request as ProtocolRequest, Response, SessionAttachParams, SessionAttachResult,
+    SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
+    SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionState, SessionStopResult, StateSource, TerminalDimensions,
+    PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
@@ -239,7 +242,7 @@ async fn spawn_server(
     version: &str,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let health = HealthInfo::new(version);
-    let server = ControlServer::bind(socket, health)
+    let server = ControlServer::bind(socket, health, support::overlay_registry())
         .await
         .expect("server binds");
     let (tx, rx) = oneshot::channel();
@@ -430,8 +433,12 @@ async fn spawn_server_with_config(
             tokio_util::sync::CancellationToken::default(),
         );
     }
-    let state =
-        DaemonState::new(HealthInfo::new(version), registry).with_notifications(notifications);
+    let state = DaemonState::new(
+        HealthInfo::new(version),
+        registry,
+        support::overlay_registry(),
+    )
+    .with_notifications(notifications);
     let server = ControlServer::bind_with_state(socket, state)
         .await
         .expect("server binds");
@@ -1126,6 +1133,26 @@ async fn health_returns_versions() {
     assert_eq!(ok["status"], Value::from("ok"));
     assert_eq!(ok["daemon_version"], Value::from("9.9.9-test"));
     assert_eq!(ok["protocol_version"], Value::from(PROTOCOL_VERSION.get()));
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn public_bind_serves_host_discover_with_supplied_registry() {
+    let socket = temp_socket("host-discover-public-bind");
+    let (shutdown, handle) = spawn_server(&socket, "9.9.9-test").await;
+
+    let mut client = connect(&socket).await;
+    let req = Request::make(
+        "host-discover",
+        method::HOST_DISCOVER,
+        serde_json::to_value(HostDiscoverParams { force: true }).expect("params serialize"),
+    );
+    let resp = exchange(&mut client, &req).await;
+    let records: Vec<HostRecord> =
+        serde_json::from_value(ok_payload(resp)).expect("host records deserialize");
+    assert!(records.is_empty());
 
     let _ = shutdown.send(());
     let _ = handle.await;

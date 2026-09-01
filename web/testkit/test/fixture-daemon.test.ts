@@ -830,7 +830,10 @@ describe("@pohunek/testkit fixture daemon", () => {
       const host = {
         name: "peer-a",
         fqdn: "peer-a.example.netbird.cloud",
-        netbird_ip: "100.64.0.2",
+        address: "100.64.0.2",
+        port: 18_722,
+        overlay: "netbird",
+        peer_id: "peer-a-id",
         classification: "reachable_daemon",
         daemon_version: "0.0.0-testkit",
       } as const satisfies HostRecord;

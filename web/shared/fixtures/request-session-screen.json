@@ -5,7 +5,7 @@
     "session_id": "s-fixture-1"
   },
   "v": {
-    "maximum": 2,
-    "minimum": 2
+    "maximum": 3,
+    "minimum": 3
   }
 }

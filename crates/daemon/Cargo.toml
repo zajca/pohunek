@@ -17,6 +17,7 @@ pohunek-hostcheck = { workspace = true }
 pohunek-logging = { workspace = true }
 pohunek-protocol = { workspace = true }
 pohunek-netbird = { workspace = true }
+overlay = { workspace = true }
 pohunek-paths = { workspace = true }
 pohunek-terminal = { workspace = true }
 pohunek-client = { workspace = true }

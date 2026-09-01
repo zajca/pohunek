@@ -9,12 +9,12 @@ export type {
 } from "./bind";
 export {
   DEFAULT_DISCOVER_INTERVAL_SECONDS,
-  DEFAULT_REMOTE_PORT,
   DEFAULT_STATIC_ASSETS_DIR,
   BackendConfigError,
   loadBackendConfig,
 } from "./config";
 export type { BackendConfig } from "./config";
+export { externalFqdnSelector, externalPeerSelector } from "./identity";
 export { BackendStartupError, startHostsPipeline } from "./hosts";
 export type {
   BackendHostEntry,

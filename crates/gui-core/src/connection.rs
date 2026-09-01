@@ -1,6 +1,5 @@
 //! Reconnecting host transport: event streams, wire parsing, and attach spawn.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use futures::{stream, StreamExt};
@@ -265,8 +264,11 @@ pub(crate) async fn connect_client(
         HostTransport::Remote { host, socket_path } => {
             Ok(Client::connect_with_options(host, socket_path, options).await?)
         }
-        HostTransport::Tcp { addr } => {
-            Ok(Client::connect_tcp_addr_with_options(config.id.as_str(), *addr, options).await?)
+        HostTransport::Tcp { addr, .. } => {
+            Ok(
+                Client::connect_trusted_tcp_addr_with_options(config.id.as_str(), *addr, options)
+                    .await?,
+            )
         }
     }
 }
@@ -356,30 +358,47 @@ pub async fn discover_hosts(
     let mut hosts = vec![local.clone()];
     for record in records {
         if matches!(record.class, HostClass::ReachableDaemon { .. }) {
-            let host = discovered_transport_host(&record)?;
-            let id = record
-                .name
-                .clone()
-                .or_else(|| record.fqdn.clone())
-                .unwrap_or_else(|| host.clone());
-            let socket_path = match &local.transport {
-                HostTransport::Local { socket_path }
-                | HostTransport::Remote { socket_path, .. } => socket_path.clone(),
-                HostTransport::Tcp { .. } => PathBuf::new(),
-            };
-            hosts.push(HostConfig::remote(id, host, socket_path));
+            hosts.push(discovered_host_config(&record)?);
         }
     }
     Ok(hosts)
 }
 
-pub(crate) fn discovered_transport_host(record: &HostRecord) -> Result<String, CoreError> {
-    record
-        .netbird_ip
+pub(crate) fn discovered_host_config(record: &HostRecord) -> Result<HostConfig, CoreError> {
+    discovered_transport_addr(record)?;
+    let identity = if let Some(peer_id) =
+        record.peer_id.as_deref().filter(|value| !value.is_empty())
+    {
+        pohunek_client::ExternalIdentity::peer_id(peer_id)
+            .map_err(pohunek_client::ClientError::from)?
+    } else if let Some(fqdn) = record.fqdn.as_deref().filter(|value| !value.is_empty()) {
+        pohunek_client::ExternalIdentity::fqdn(fqdn).map_err(pohunek_client::ClientError::from)?
+    } else {
+        return Err(CoreError::MissingDiscoveredStableIdentity);
+    };
+    let selector = format!("{}:{}", record.overlay, identity.selector());
+    let route = pohunek_client::remote_host_with_port(&selector, record.port)?;
+    Ok(HostConfig::remote(selector, route, ""))
+}
+
+pub(crate) fn discovered_transport_addr(
+    record: &HostRecord,
+) -> Result<std::net::SocketAddr, CoreError> {
+    if record.port == 0 {
+        return Err(CoreError::InvalidDiscoveredPort);
+    }
+    let address = record
+        .address
         .clone()
-        .or_else(|| record.fqdn.clone())
-        .or_else(|| record.name.clone())
-        .ok_or(CoreError::MissingDiscoveredHostName)
+        .ok_or(CoreError::MissingDiscoveredHostName)?;
+    address
+        .parse::<std::net::IpAddr>()
+        .map(|address| std::net::SocketAddr::new(address, record.port))
+        .map_err(|source| CoreError::InvalidDiscoveredAddress {
+            address,
+            port: record.port,
+            source,
+        })
 }
 
 fn required_typed<T>(value: &Value, field: &'static str) -> Result<T, CoreError>

@@ -2,7 +2,7 @@
 type: Guide
 id: guide/remote-hosts
 title: Remote hosts
-description: Use host discovery and host-qualified targets to inspect and operate Pohunek across NetBird peers.
+description: Use host discovery and host-qualified targets to inspect and operate Pohunek across configured overlay peers.
 source_kind: manual
 intents: [setup, project, debug, help]
 ---
@@ -14,16 +14,24 @@ target a host, and session targets can use `<host>/<session-id>`.
 
 Opt-in dynamic shell completion (`pohunek setup completions <shell> --dynamic`)
 uses the same model. Host candidates come from the owner-private discovery
-cache. For a session target, an explicit `host/id` prefix wins, then `--host`,
-then `local`; completion performs a bounded live `session.list` query and emits
-no diagnostics when discovery or a daemon is unavailable. Static completion is
-the default and performs no discovery or daemon I/O.
+cache. Every reachable remote has a provider-qualified
+`<overlay>:<address>` candidate; a short name is offered only when exactly one
+reachable route owns it. Completion never resolves a collision by choosing the
+first cache record. For a session target, an explicit `host/id` prefix wins,
+then `--host`, then `local`; completion performs a bounded live `session.list`
+query and emits no diagnostics when discovery or a daemon is unavailable.
+Static completion is the default and performs no discovery or daemon I/O.
 
 Use these commands for orientation:
 
-- `pohunek host discover --json` to enumerate NetBird peers and probe daemons.
+- `pohunek host discover --json` to enumerate configured overlay peers and probe
+  daemons. Each record carries its overlay, optional provider peer identity,
+  address, and that overlay's effective daemon port. Address-less peers remain
+  visible as candidates instead of being discarded. Discovery emits remote
+  peers only; GUI, web, and `--all-hosts` consumers add the explicit local target
+  through its Unix socket.
 - `pohunek host list --json` to list known live peers. These commands need the
-  local NetBird CLI/state, but do not connect to local `pohunekd`; a short
+  local overlay CLI/state, but do not connect to local `pohunekd`; a short
   owner-private cache avoids repeated probing, and `--refresh` bypasses it.
   Status loading and peer probes are bounded by a complete discovery deadline.
 - `pohunek host inspect <host> --json` to inspect one host's daemon
@@ -36,7 +44,7 @@ confirmation model; non-interactive remote starts require `--yes`.
 Durable notifications keep the same host-authoritative model. Each daemon owns
 only its local notification store, and cross-host notification views are
 client-side fan-out. `pohunek notifications list --all-hosts` queries the local
-daemon plus reachable daemon peers discovered directly from local NetBird state, then
+daemon plus reachable daemon peers discovered directly from local overlay state, then
 renders per-host successes and structured per-host errors. The matching watch
 command with `--all-hosts` opens one subscription per reachable host and streams
 notification create, update, and delete events as they arrive.
@@ -57,7 +65,28 @@ The assistant design keeps the same boundary. A remote assistant must use a
 knowledge bundle materialized on the remote host, version-matched to the remote
 binary, and readable by the selected remote agent profile.
 
-The Hermes operator uses the same direct NetBird path but never performs host
+The Hermes operator uses the same direct overlay path but never performs host
 discovery on a model's behalf. Its policy allows only explicitly listed hosts;
 a wildcard requires explicit install-time confirmation. See
 [Hermes operator](hermes-operator.md#access-policy-and-targets).
+
+Unqualified names that resolve in more than one overlay fail closed. Clients
+keep the overlay-qualified stable peer identity and discovered port for display,
+caching, reconnects, and external attach. Each new connection re-resolves that
+identity through current provider state; only control and raw attach opened by
+one SDK client reuse its exact selected socket endpoint. The explicit
+`<overlay>:<selector>@<port>` form carries the discovered port without trusting
+a cached IP. Generated selectors encode typed identities as unpadded base64url:
+`peer~<base64url>` for provider peer IDs and `fqdn~<base64url>` for the fallback.
+Providers must resolve the requested identity field explicitly, so an FQDN can
+never fall through to a colliding peer ID or short name. This keeps raw `/`, `+`,
+`=`, and `@` characters out of target and exact-port grammar.
+A socket-address literal cannot bypass current overlay membership. NetBird uses
+`publicKey` or legacy `pubKey` as `peer_id`; when absent, `peer_id` stays null
+and clients fall back to FQDN. The web relay forces a new local-daemon discovery
+before each remote tunnel upgrade and refuses an identity that no longer owns
+the cached address. A bare IPv6 literal such as
+`fd00::2` remains an unqualified selector; only an explicit configured-overlay
+prefix such as `netbird:fd00::2` qualifies it. A failure in one configured
+overlay does not hide healthy peers from another overlay; discovery reports an
+error only when every provider fails.

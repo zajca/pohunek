@@ -43,20 +43,25 @@ pub enum HostClass {
     Candidate,
 }
 
-/// One enumerated host with its classification.
+/// One enumerated host with its overlay identity and classification.
 ///
-/// Field order and names are part of the wire contract the rofi switcher parses
-/// (`name`, `netbird_ip`, and the flattened `classification`).
+/// Field order and names are part of the wire contract the rofi switcher parses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "HostRecord.ts"))]
 pub struct HostRecord {
     /// Short host name (first DNS label of the fqdn), when derivable.
     pub name: Option<String>,
-    /// The peer's fully qualified `NetBird` name.
+    /// The peer's provider-qualified DNS name.
     pub fqdn: Option<String>,
-    /// The peer's `NetBird` IP as a string.
-    pub netbird_ip: Option<String>,
+    /// The peer's dialable IP address without a port.
+    pub address: Option<String>,
+    /// Effective daemon port configured for this overlay route.
+    pub port: u16,
+    /// Which overlay transport discovered this peer (e.g. `"netbird"`).
+    pub overlay: String,
+    /// The overlay's stable provider peer identity (e.g. a `NetBird` public key).
+    pub peer_id: Option<String>,
     /// Classification (flattened so its fields sit alongside the record).
     #[serde(flatten)]
     pub class: HostClass,
@@ -84,7 +89,10 @@ mod tests {
         let record = HostRecord {
             name: Some("host-b".to_owned()),
             fqdn: Some("host-b.netbird.cloud".to_owned()),
-            netbird_ip: Some("100.92.30.40".to_owned()),
+            address: Some("100.92.30.40".to_owned()),
+            port: 18722,
+            overlay: "netbird".to_owned(),
+            peer_id: Some("100.92.30.40".to_owned()),
             class: HostClass::ReachableDaemon {
                 daemon_version: "0.1.0".to_owned(),
             },
@@ -93,7 +101,10 @@ mod tests {
         assert_eq!(value["classification"], "reachable_daemon");
         assert_eq!(value["daemon_version"], "0.1.0");
         assert_eq!(value["name"], "host-b");
-        assert_eq!(value["netbird_ip"], "100.92.30.40");
+        assert_eq!(value["address"], "100.92.30.40");
+        assert_eq!(value["port"], 18722);
+        assert_eq!(value["overlay"], "netbird");
+        assert_eq!(value["peer_id"], "100.92.30.40");
 
         let back: HostRecord = serde_json::from_value(value).expect("deserialize");
         assert_eq!(back, record);

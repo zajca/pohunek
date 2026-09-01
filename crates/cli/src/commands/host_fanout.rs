@@ -183,12 +183,32 @@ async fn fetch_records(paths: &Paths) -> Result<Vec<HostRecord>, CliError> {
     crate::commands::host::fetch_records(&paths.cache_dir, false).await
 }
 
-fn reachable_target(record: &HostRecord) -> Option<HostTarget> {
+pub(crate) fn reachable_target(record: &HostRecord) -> Option<HostTarget> {
     match &record.class {
-        HostClass::ReachableDaemon { .. } => record
-            .name
-            .as_deref()
-            .map(|name| HostTarget::new(name, name)),
+        HostClass::ReachableDaemon { .. } => {
+            record
+                .address
+                .as_deref()?
+                .parse::<std::net::IpAddr>()
+                .ok()?;
+            let identity = record
+                .peer_id
+                .as_deref()
+                .filter(|identity| !identity.is_empty())
+                .map(pohunek_client::ExternalIdentity::peer_id)
+                .or_else(|| {
+                    record
+                        .fqdn
+                        .as_deref()
+                        .filter(|fqdn| !fqdn.is_empty())
+                        .map(pohunek_client::ExternalIdentity::fqdn)
+                })?
+                .ok()?;
+            let host_id = format!("{}:{}", record.overlay, identity.selector());
+            let transport_target =
+                pohunek_client::remote_host_with_port(&host_id, record.port).ok()?;
+            Some(HostTarget::new(host_id, transport_target))
+        }
         HostClass::VersionMismatch { .. } | HostClass::Unreachable | HostClass::Candidate => None,
     }
 }
@@ -221,7 +241,10 @@ mod tests {
         HostRecord {
             name: Some(name.to_owned()),
             fqdn: Some(format!("{name}.example.net")),
-            netbird_ip: Some("100.92.30.40".to_owned()),
+            address: Some("100.92.30.40".to_owned()),
+            port: 18722,
+            overlay: "netbird".to_owned(),
+            peer_id: Some(name.to_owned()),
             class,
         }
     }
@@ -241,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn all_hosts_resolves_local_and_reachable_discovered_hosts_in_host_id_order() {
+    fn all_hosts_adds_one_local_and_routes_only_discovered_peers_as_remote() {
         let records = vec![
             record("host-c", HostClass::Unreachable),
             record(
@@ -264,10 +287,53 @@ mod tests {
             .iter()
             .map(|target| target.host_id.as_str())
             .collect();
-        assert_eq!(ids, ["host-a", "host-b", "local"]);
-        assert!(targets
+        assert_eq!(
+            ids,
+            ["local", "netbird:peer~aG9zdC1h", "netbird:peer~aG9zdC1i"]
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .filter(|target| target.host_id == LOCAL_HOST)
+                .count(),
+            1
+        );
+        let transport_targets: Vec<_> = targets
             .iter()
-            .all(|target| target.host_id == target.transport_target));
+            .map(|target| target.transport_target.as_str())
+            .collect();
+        assert_eq!(
+            transport_targets,
+            [
+                "local",
+                "netbird:peer~aG9zdC1h@18722",
+                "netbird:peer~aG9zdC1i@18722"
+            ]
+        );
+    }
+
+    #[test]
+    fn cached_ip_changes_never_change_or_supply_the_fan_out_route() {
+        let mut original = record(
+            "host-a",
+            HostClass::ReachableDaemon {
+                daemon_version: "0.1.0".to_owned(),
+            },
+        );
+        original.peer_id = Some("stable/key+=".to_owned());
+        let first = reachable_target(&original).expect("original target");
+
+        let mut moved = original.clone();
+        moved.address = Some("100.92.30.41".to_owned());
+        let moved = reachable_target(&moved).expect("moved target");
+        assert_eq!(moved, first);
+
+        let mut reassigned = original;
+        reassigned.peer_id = Some("different-key".to_owned());
+        let reassigned = reachable_target(&reassigned).expect("reassigned target");
+        assert_ne!(reassigned, first);
+        assert!(!first.transport_target.contains("100.92.30.40"));
+        assert!(first.transport_target.ends_with("@18722"));
     }
 
     #[tokio::test]

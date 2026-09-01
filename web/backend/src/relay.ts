@@ -8,7 +8,7 @@ export type DaemonTarget =
 
 export type DaemonTargetSource =
   | ReadonlyMap<string, DaemonTarget>
-  | ((host: string) => DaemonTarget | undefined);
+  | ((host: string) => DaemonTarget | undefined | Promise<DaemonTarget | undefined>);
 
 export interface StartRelayOptions {
   readonly bindHost: string;
@@ -104,6 +104,7 @@ const DAEMON_WRITE_QUEUE_CAP_BYTES = 8 * 1024 * 1024;
 const RESPONSE_NOT_FOUND = new Response("unknown relay target", { status: 404 });
 const RESPONSE_UPGRADE_REQUIRED = new Response("websocket upgrade required", { status: 426 });
 const RESPONSE_BAD_UPGRADE = new Response("websocket upgrade failed", { status: 400 });
+const RESPONSE_TARGET_UNAVAILABLE = new Response("relay target unavailable", { status: 503 });
 
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const encoder = new TextEncoder();
@@ -120,19 +121,23 @@ export function startRelay(options: StartRelayOptions): Promise<RelayHandle> {
     const server = bun.serve<RelayWebSocketData>({
       hostname: options.bindHost,
       port: options.port,
-      fetch(request, upgradeServer): Response | undefined | Promise<Response | undefined> {
+      async fetch(request, upgradeServer): Promise<Response | undefined> {
         const route = parseRelayRoute(request.url);
         if (route === undefined) {
-          return options.httpHandler?.(request) ?? RESPONSE_NOT_FOUND;
+          return await options.httpHandler?.(request) ?? RESPONSE_NOT_FOUND;
         }
-
-        const target = targetForHost(route.host);
-        if (target === undefined) {
-          return RESPONSE_NOT_FOUND;
-        }
-
         if (!isWebSocketUpgrade(request)) {
           return RESPONSE_UPGRADE_REQUIRED;
+        }
+
+        let target: DaemonTarget | undefined;
+        try {
+          target = await targetForHost(route.host);
+        } catch {
+          return RESPONSE_TARGET_UNAVAILABLE;
+        }
+        if (target === undefined) {
+          return RESPONSE_NOT_FOUND;
         }
 
         const upgraded = upgradeServer.upgrade(request, {
@@ -449,10 +454,12 @@ function formatUrlHost(host: string): string {
   return host.includes(":") ? `[${host}]` : host;
 }
 
-function targetResolver(source: DaemonTargetSource): (host: string) => DaemonTarget | undefined {
+function targetResolver(
+  source: DaemonTargetSource,
+): (host: string) => Promise<DaemonTarget | undefined> {
   return typeof source === "function"
-    ? source
-    : (host: string): DaemonTarget | undefined => source.get(host);
+    ? async (host: string): Promise<DaemonTarget | undefined> => await source(host)
+    : (host: string): Promise<DaemonTarget | undefined> => Promise.resolve(source.get(host));
 }
 
 function bunRuntime(): BunRuntime {

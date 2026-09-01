@@ -3,7 +3,7 @@
 //! This crate intentionally has no Iced dependency. The native view layer wraps
 //! these async helpers in Iced `Task` and `Subscription` values.
 
-// Rust guideline compliant 2026-07-21
+// Rust guideline compliant 2026-08-28
 #![forbid(unsafe_code)]
 
 pub mod assistant;
@@ -170,8 +170,11 @@ pub enum HostTransport {
     Local { socket_path: PathBuf },
     /// Remote daemon resolved by the SDK through `NetBird`.
     Remote { host: String, socket_path: PathBuf },
-    /// Remote daemon over a concrete TCP address.
-    Tcp { addr: SocketAddr },
+    /// Remote daemon over a trusted TCP route with a policy-resolved attach selector.
+    Tcp {
+        addr: SocketAddr,
+        attach_host: String,
+    },
 }
 
 /// Static connection config for one host.
@@ -196,9 +199,30 @@ impl HostConfig {
     /// Build a TCP host config.
     #[must_use]
     pub fn tcp(id: impl Into<String>, addr: SocketAddr) -> Self {
+        let id = id.into();
+        Self {
+            id: HostId::new(id.clone()),
+            transport: HostTransport::Tcp {
+                addr,
+                attach_host: id,
+            },
+        }
+    }
+
+    /// Build a trusted TCP config whose external attach command re-resolves a
+    /// provider-qualified selector through CLI overlay policy.
+    #[must_use]
+    pub fn tcp_with_attach_host(
+        id: impl Into<String>,
+        addr: SocketAddr,
+        attach_host: impl Into<String>,
+    ) -> Self {
         Self {
             id: HostId::new(id),
-            transport: HostTransport::Tcp { addr },
+            transport: HostTransport::Tcp {
+                addr,
+                attach_host: attach_host.into(),
+            },
         }
     }
 
@@ -220,11 +244,11 @@ impl HostConfig {
 
     /// Value substituted into `{host}` for attach commands.
     #[must_use]
-    pub fn attach_host(&self) -> &str {
+    pub fn attach_host(&self) -> String {
         match &self.transport {
-            HostTransport::Local { .. } => "",
-            HostTransport::Remote { host, .. } => host,
-            HostTransport::Tcp { .. } => self.id.as_str(),
+            HostTransport::Local { .. } => String::new(),
+            HostTransport::Remote { host, .. } => host.clone(),
+            HostTransport::Tcp { attach_host, .. } => attach_host.clone(),
         }
     }
 }
@@ -314,4 +338,17 @@ pub struct ObservationCapabilities {
     pub output_read: bool,
     /// Whether the host can wait for provider-neutral session predicates.
     pub session_wait: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tcp_attach_uses_the_policy_resolved_selector() {
+        let addr = "127.0.0.1:17421".parse().expect("test socket address");
+        let host = HostConfig::tcp_with_attach_host("memory:peer-a", addr, "memory:100.64.0.2");
+
+        assert_eq!(host.attach_host(), "memory:100.64.0.2");
+    }
 }

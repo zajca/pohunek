@@ -1,10 +1,9 @@
 //! `NetBird` adapter for pohunek remote hosts.
 //!
 //! This crate is the foundation shared by the daemon and the CLI for the
-//! "remote hosts over `NetBird`" feature (Phase 2). It is deliberately small,
-//! synchronous, and dependency-light so both downstream crates can depend on it
-//! without pulling in an async runtime: subprocess execution uses
-//! [`std::process::Command`], not tokio.
+//! "remote hosts over `NetBird`" feature (Phase 2). It is deliberately small
+//! and dependency-light. Provider operations use cancellable Tokio subprocesses;
+//! synchronous status helpers remain available for bounded blocking probes.
 //!
 //! Responsibilities:
 //! - Parse `netbird status --json`. `NetBird`'s JSON output drifts across
@@ -29,6 +28,7 @@ mod bind;
 mod host;
 mod port;
 mod status;
+mod transport;
 
 pub use bind::{validate_netbird_bind_addr, BindAddrError};
 pub use host::resolve_host;
@@ -37,6 +37,7 @@ pub use status::{
     parse_status, run_status, run_status_async, run_status_with_program, NetbirdError,
     NetbirdStatus, Peer,
 };
+pub use transport::{configured_registry, NetbirdTransport, NETBIRD_OVERLAY_ID};
 
 /// True when `ip` is an IPv4 address inside the `NetBird` CGNAT range
 /// `100.64.0.0/10` (RFC 6598).

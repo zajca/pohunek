@@ -31,6 +31,8 @@ use protocol::{
 use serde_json::json;
 use tracing::{debug, warn};
 
+use pohunek_client::OverlayRegistry;
+
 use crate::discovery::DiscoveryCache;
 use crate::notifications::{AttentionCoordinator, NotificationService};
 use crate::session::SessionRegistry;
@@ -60,10 +62,10 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
-    /// Construct shared daemon state.
+    /// Construct shared daemon state with a validated overlay registry.
     #[must_use]
-    pub fn new(health: HealthInfo, sessions: SessionRegistry) -> Self {
-        Self::new_with_discovery(health, sessions, DiscoveryCache::default())
+    pub fn new(health: HealthInfo, sessions: SessionRegistry, registry: OverlayRegistry) -> Self {
+        Self::new_with_discovery(health, sessions, DiscoveryCache::new(registry))
     }
 
     /// Construct shared daemon state with an existing discovery cache.
@@ -434,11 +436,15 @@ mod tests {
             .collect()
     }
 
+    fn daemon_state(health: HealthInfo, sessions: SessionRegistry) -> DaemonState {
+        DaemonState::new(health, sessions, crate::test_support::overlay_registry())
+    }
+
     #[tokio::test]
     async fn origin_guard_denies_every_targeted_session_mutation() {
         let sessions = SessionRegistry::new(SessionRegistryConfig::default());
         let daemon_id = sessions.daemon_instance_id().to_owned();
-        let state = DaemonState::new(HealthInfo::new("test"), sessions);
+        let state = daemon_state(HealthInfo::new("test"), sessions);
         let target = SessionId("s-origin".to_owned());
         let mutations = [
             (method::SESSION_STOP, serde_json::json!(target)),
@@ -479,7 +485,7 @@ mod tests {
     async fn origin_guard_allows_other_origins_and_read_only_methods() {
         let sessions = SessionRegistry::new(SessionRegistryConfig::default());
         let daemon_id = sessions.daemon_instance_id().to_owned();
-        let state = DaemonState::new(HealthInfo::new("test"), sessions);
+        let state = daemon_state(HealthInfo::new("test"), sessions);
         let target = SessionId("s-origin".to_owned());
         let cases = [
             (
@@ -554,7 +560,7 @@ mod tests {
             })
             .await
             .expect("create session");
-        let state = DaemonState::new(HealthInfo::new("test"), sessions.clone());
+        let state = daemon_state(HealthInfo::new("test"), sessions.clone());
         let params = SessionSetMetadataParams {
             session_id: created.id.clone(),
             metadata: BTreeMap::from([
@@ -612,7 +618,7 @@ mod tests {
             })
             .await
             .expect("create non-forkable session");
-        let state = DaemonState::new(HealthInfo::new("test"), sessions.clone());
+        let state = daemon_state(HealthInfo::new("test"), sessions.clone());
         let params = SessionForkParams {
             session_id: created.id.clone(),
             name: Some("must-not-exist".to_owned()),
@@ -661,7 +667,7 @@ mod tests {
             })
             .await
             .expect("create shell session");
-        let state = DaemonState::new(HealthInfo::new("test"), sessions.clone());
+        let state = daemon_state(HealthInfo::new("test"), sessions.clone());
         let request = request(
             "detection-preview",
             method::SESSION_DETECTION,
@@ -694,7 +700,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_detection_dispatch_rejects_unknown_session() {
-        let state = DaemonState::new(
+        let state = daemon_state(
             HealthInfo::new("test"),
             SessionRegistry::new(SessionRegistryConfig::default()),
         );
@@ -849,7 +855,7 @@ mod tests {
             .expect("notification service opens");
         enable_all_notification_kinds(&notifications);
         let (attention, _task) = AttentionCoordinator::spawn(notifications.clone());
-        let state = DaemonState::new(
+        let state = daemon_state(
             HealthInfo::new("test"),
             SessionRegistry::new(SessionRegistryConfig::default()),
         )
@@ -916,7 +922,7 @@ mod tests {
     #[tokio::test]
     async fn assistant_materialize_persists_snapshot_and_returns_bundle_metadata() {
         let _env = EnvGuard::set_all("assistant-materialize-rpc");
-        let state = DaemonState::new(
+        let state = daemon_state(
             HealthInfo::new("test"),
             SessionRegistry::new(SessionRegistryConfig::default()),
         );
@@ -948,7 +954,7 @@ mod tests {
     #[tokio::test]
     async fn assistant_materialize_uses_unique_snapshot_paths_per_request() {
         let _env = EnvGuard::set_all("assistant-materialize-unique-rpc");
-        let state = DaemonState::new(
+        let state = daemon_state(
             HealthInfo::new("test"),
             SessionRegistry::new(SessionRegistryConfig::default()),
         );
@@ -973,7 +979,7 @@ mod tests {
     #[tokio::test]
     async fn daemon_doctor_returns_report() {
         let _env = EnvGuard::set_all("daemon-doctor-rpc");
-        let state = DaemonState::new(
+        let state = daemon_state(
             HealthInfo::new("test"),
             SessionRegistry::new(SessionRegistryConfig::default()),
         );

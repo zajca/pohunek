@@ -48,6 +48,9 @@ pub enum NetbirdError {
     /// The requested host name did not match any `NetBird` peer.
     #[error("host '{0}' was not found among NetBird peers")]
     HostUnknown(String),
+    /// The selector matched more than one current peer.
+    #[error("host '{0}' is ambiguous among NetBird peers")]
+    HostAmbiguous(String),
 }
 
 /// This host's local peer state (shape B: `localPeerState`).
@@ -69,6 +72,10 @@ pub(crate) struct LocalPeerState {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Peer {
+    /// Stable provider identity. Current status uses publicKey; legacy status
+    /// may use pubKey.
+    #[serde(rename = "publicKey", alias = "pubKey")]
+    pub public_key: Option<String>,
     /// The peer's fully qualified `NetBird` name (e.g. `host-b.netbird.cloud`).
     pub fqdn: Option<String>,
     /// The peer's `NetBird` IP as a string (wire key `netbirdIp` in both shapes).
@@ -85,6 +92,12 @@ pub struct Peer {
 }
 
 impl Peer {
+    /// Return the non-empty stable provider identity.
+    #[must_use]
+    pub fn peer_id(&self) -> Option<&str> {
+        self.public_key.as_deref().filter(|value| !value.is_empty())
+    }
+
     /// True when this peer's connection status equals `"Connected"`
     /// (case-insensitive). Absent status is treated as not connected.
     #[must_use]
@@ -188,6 +201,16 @@ impl NetbirdStatus {
     #[must_use]
     pub fn peers(&self) -> &[Peer] {
         &self.peers.0
+    }
+
+    /// Return this host's provider-qualified name, when available.
+    #[must_use]
+    pub fn self_fqdn(&self) -> Option<&str> {
+        self.fqdn.as_deref().or_else(|| {
+            self.local_peer_state
+                .as_ref()
+                .and_then(|state| state.fqdn.as_deref())
+        })
     }
 
     /// The daemon/root status string, if present (for doctor messaging).
@@ -344,6 +367,7 @@ mod tests {
         // First peer: Connected P2P.
         assert!(peers[0].is_connected());
         assert_eq!(peers[0].connection_type.as_deref(), Some("P2P"));
+        assert_eq!(peers[0].peer_id(), Some("pubkey-b"));
         assert_eq!(
             peers[0].ip(),
             Some("100.92.30.40".parse::<IpAddr>().unwrap())
@@ -368,6 +392,7 @@ mod tests {
         assert!(peers[0].is_connected());
         // Shape B uses connType / connectionStatus.
         assert_eq!(peers[0].connection_type.as_deref(), Some("P2P"));
+        assert_eq!(peers[0].peer_id(), Some("pubkey-b-legacy"));
         assert_eq!(
             peers[0].ip(),
             Some("100.64.0.20".parse::<IpAddr>().unwrap())
@@ -477,22 +502,64 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn async_status_future_is_cancellation_safe() {
-        let path = std::env::temp_dir().join(format!(
-            "pohunek-netbird-slow-status-{}",
+        const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+        const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10);
+        const EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "pohunek-netbird-slow-status-{}-{nonce}",
             std::process::id()
         ));
-        fs::write(&path, "#!/bin/sh\nsleep 1\n").expect("write script");
-        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&path, permissions).expect("chmod script");
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(10),
-            run_status_async_with_program(path.to_str().expect("utf8 path")),
+        fs::create_dir(&root).expect("create test root");
+        let program = root.join("netbird-test");
+        let pid_path = root.join("pid");
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+                pid_path.display()
+            ),
         )
-        .await;
+        .expect("write script");
+        let mut permissions = fs::metadata(&program).expect("metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&program, permissions).expect("chmod script");
+
+        let mut status = Box::pin(run_status_async_with_program(
+            program.to_str().expect("utf8 path"),
+        ));
+        tokio::time::timeout(START_TIMEOUT, async {
+            tokio::select! {
+                result = &mut status => panic!("slow status exited before cancellation: {result:?}"),
+                () = async {
+                    while !pid_path.exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .expect("status subprocess started");
+        let pid = fs::read_to_string(&pid_path)
+            .expect("read child pid")
+            .parse::<u32>()
+            .expect("parse child pid");
+
+        let result = tokio::time::timeout(STATUS_TIMEOUT, status).await;
         assert!(result.is_err(), "slow status must exceed the test deadline");
-        let _ = fs::remove_file(path);
+        tokio::time::timeout(EXIT_TIMEOUT, async {
+            while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed-out status subprocess must be killed");
+        fs::remove_dir_all(root).expect("remove test root");
     }
 
     #[test]

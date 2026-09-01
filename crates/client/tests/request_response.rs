@@ -16,6 +16,8 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 const HOST: &str = "build-box";
+const LEGACY_PROTOCOL_VERSION: u32 = 1;
+const DISCOVERED_HOST_PORT: u16 = 18_722;
 static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -84,7 +86,8 @@ async fn request_response_connect_local_sends_json_request_line_and_returns_ok_p
 }
 
 #[tokio::test]
-async fn request_response_connect_tcp_addr_sends_json_request_line_and_returns_ok_payload() {
+async fn request_response_connect_trusted_tcp_addr_sends_json_request_line_and_returns_ok_payload()
+{
     let (result, request_line) = run_remote(Reply::Line(response_ok_line())).await;
 
     assert_eq!(result.expect("remote request succeeds"), ok_payload());
@@ -94,14 +97,16 @@ async fn request_response_connect_tcp_addr_sends_json_request_line_and_returns_o
 #[tokio::test]
 async fn request_response_rejects_a_response_outside_the_selected_protocol_range() {
     let legacy_response = json!({
-        "v": 1,
+        "v": LEGACY_PROTOCOL_VERSION,
         "id": "req-request-response",
         "ok": { "status": "ok" },
     });
     let (result, _) = run_local(Reply::Line(legacy_response.to_string())).await;
 
     match result.expect_err("wrong response version must fail") {
-        ClientError::Protocol(source) => assert_eq!(source.code, "version_mismatch"),
+        ClientError::Protocol(source) => {
+            assert_eq!(source, canonical_legacy_protocol_mismatch());
+        }
         other => panic!("expected canonical protocol mismatch, got {other:?}"),
     }
 }
@@ -109,7 +114,7 @@ async fn request_response_rejects_a_response_outside_the_selected_protocol_range
 #[tokio::test]
 async fn remote_wrong_version_success_preserves_host_and_canonical_mismatch() {
     let response = json!({
-        "v": 1,
+        "v": LEGACY_PROTOCOL_VERSION,
         "id": "req-request-response",
         "ok": { "status": "ok" },
     });
@@ -119,9 +124,7 @@ async fn remote_wrong_version_success_preserves_host_and_canonical_mismatch() {
     match &error {
         ClientError::RemoteProtocol { host, source } => {
             assert_eq!(host, HOST);
-            assert_eq!(source.code, "version_mismatch");
-            assert!(source.msg.contains("2..=2"));
-            assert!(source.msg.contains("1..=1"));
+            assert_eq!(source, &canonical_legacy_protocol_mismatch());
         }
         other => panic!("expected remote protocol mismatch, got {other:?}"),
     }
@@ -131,7 +134,7 @@ async fn remote_wrong_version_success_preserves_host_and_canonical_mismatch() {
 #[tokio::test]
 async fn remote_wrong_version_noncanonical_error_becomes_canonical_mismatch() {
     let response = json!({
-        "v": 1,
+        "v": LEGACY_PROTOCOL_VERSION,
         "id": "req-request-response",
         "err": {
             "class": "daemon",
@@ -144,9 +147,7 @@ async fn remote_wrong_version_noncanonical_error_becomes_canonical_mismatch() {
     match result.expect_err("wrong remote error version must fail") {
         ClientError::RemoteProtocol { host, source } => {
             assert_eq!(host, HOST);
-            assert_eq!(source.code, "version_mismatch");
-            assert!(source.msg.contains("2..=2"));
-            assert!(source.msg.contains("1..=1"));
+            assert_eq!(source, canonical_legacy_protocol_mismatch());
         }
         other => panic!("expected remote protocol mismatch, got {other:?}"),
     }
@@ -154,11 +155,8 @@ async fn remote_wrong_version_noncanonical_error_becomes_canonical_mismatch() {
 
 #[tokio::test]
 async fn canonical_negotiation_mismatch_is_not_masked_by_response_version_validation() {
-    let legacy = protocol::ProtocolVersion::new(1).expect("nonzero legacy version");
-    let legacy_range =
-        protocol::ProtocolVersionRange::new(legacy, legacy).expect("valid exact legacy range");
-    let source =
-        ProtocolError::version_mismatch(protocol::SUPPORTED_PROTOCOL_VERSIONS, legacy_range);
+    let legacy = legacy_protocol_version();
+    let source = canonical_legacy_protocol_mismatch();
     let response = Response::err(legacy, test_request().id(), source.clone())
         .expect("valid canonical mismatch response");
     let line = serde_json::to_string(&response).expect("serialize canonical mismatch");
@@ -355,7 +353,7 @@ async fn waiting_output_uses_a_dedicated_remote_tcp_connection() {
         (handshake, output_request)
     });
 
-    let mut client = Client::connect_tcp_addr(HOST, addr)
+    let mut client = Client::connect_trusted_tcp_addr(HOST, addr)
         .await
         .expect("connect tcp daemon");
     client.handshake().await.expect("negotiate protocol");
@@ -654,7 +652,10 @@ async fn request_response_typed_call_sends_method_params_and_decodes_output() {
         {
             "name": "host-a",
             "fqdn": "host-a.example.test",
-            "netbird_ip": "100.1.2.3",
+            "address": "100.1.2.3",
+            "port": DISCOVERED_HOST_PORT,
+            "overlay": "netbird",
+            "peer_id": "peer-host-a",
             "classification": "candidate"
         }
     ]));
@@ -669,6 +670,11 @@ async fn request_response_typed_call_sends_method_params_and_decodes_output() {
 
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].name.as_deref(), Some("host-a"));
+    assert_eq!(records[0].fqdn.as_deref(), Some("host-a.example.test"));
+    assert_eq!(records[0].address.as_deref(), Some("100.1.2.3"));
+    assert_eq!(records[0].port, DISCOVERED_HOST_PORT);
+    assert_eq!(records[0].overlay, "netbird");
+    assert_eq!(records[0].peer_id.as_deref(), Some("peer-host-a"));
     assert_eq!(records[0].class, protocol::HostClass::Candidate);
     let request_line = daemon
         .request_line
@@ -1235,7 +1241,7 @@ async fn run_local(reply: Reply) -> (Result<Value, ClientError>, String) {
 
 async fn run_remote(reply: Reply) -> (Result<Value, ClientError>, String) {
     let daemon = spawn_tcp_daemon(reply).await;
-    let mut client = Client::connect_tcp_addr(HOST, daemon.addr)
+    let mut client = Client::connect_trusted_tcp_addr(HOST, daemon.addr)
         .await
         .expect("connect tcp test daemon");
     let result = client.request(&test_request()).await;
@@ -1540,6 +1546,17 @@ async fn handle_reusable_connection<S>(
 
 fn test_request() -> Request {
     request_with_id("req-request-response")
+}
+
+fn legacy_protocol_version() -> protocol::ProtocolVersion {
+    protocol::ProtocolVersion::new(LEGACY_PROTOCOL_VERSION).expect("nonzero legacy version")
+}
+
+fn canonical_legacy_protocol_mismatch() -> ProtocolError {
+    let legacy = legacy_protocol_version();
+    let legacy_range =
+        protocol::ProtocolVersionRange::new(legacy, legacy).expect("valid exact legacy range");
+    ProtocolError::version_mismatch(protocol::SUPPORTED_PROTOCOL_VERSIONS, legacy_range)
 }
 
 fn request_with_id(id: &str) -> Request {

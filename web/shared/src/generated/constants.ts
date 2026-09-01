@@ -2,9 +2,9 @@
 
 import type { AttachHeader } from "./index";
 
-export const PROTOCOL_VERSION = 2 as const;
-export const MIN_PROTOCOL_VERSION = 2 as const;
-export const SUPPORTED_PROTOCOL_VERSIONS = { minimum: 2, maximum: 2 } as const;
+export const PROTOCOL_VERSION = 3 as const;
+export const MIN_PROTOCOL_VERSION = 3 as const;
+export const SUPPORTED_PROTOCOL_VERSIONS = { minimum: 3, maximum: 3 } as const;
 export const MAX_CONTROL_LINE_BYTES = 1048576 as const;
 export const MAX_RUNTIME_ID_BYTES = 128 as const;
 export const MAX_SESSION_INPUT_BYTES = 262144 as const;

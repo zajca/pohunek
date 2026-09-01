@@ -4,6 +4,7 @@ import {
   FIXTURE_LOCAL_HOST,
   FIXTURE_LOCAL_SESSION_ID,
   FIXTURE_OWNED_WORKTREE_PATH,
+  FIXTURE_PEER_HOST,
 } from "../../scripts/fixture-stack";
 
 test("manages a session lifecycle and keeps observed sessions read-only", async ({ page, stack }) => {
@@ -56,12 +57,12 @@ test("manages a session lifecycle and keeps observed sessions read-only", async 
 test("manages host-scoped projects and eligible owned worktrees", async ({ page, stack }) => {
   await page.goto(stack.backend.url);
   await page.getByRole("button", { name: "Projects" }).click();
-  await expect(page).toHaveURL(new RegExp(`/hosts/${FIXTURE_LOCAL_HOST}/projects$`));
-  await page.getByRole("combobox", { name: "Project host" }).selectOption("fixture-peer");
-  await expect(page).toHaveURL(/\/hosts\/fixture-peer\/projects$/u);
+  await expect(page).toHaveURL((url): boolean => url.pathname === projectPath(FIXTURE_LOCAL_HOST));
+  await page.getByRole("combobox", { name: "Project host" }).selectOption(FIXTURE_PEER_HOST);
+  await expect(page).toHaveURL((url): boolean => url.pathname === projectPath(FIXTURE_PEER_HOST));
   await expect(page.getByRole("button", { name: "Add project" })).toBeEnabled();
   await page.getByRole("combobox", { name: "Project host" }).selectOption(FIXTURE_LOCAL_HOST);
-  await expect(page).toHaveURL(new RegExp(`/hosts/${FIXTURE_LOCAL_HOST}/projects$`));
+  await expect(page).toHaveURL((url): boolean => url.pathname === projectPath(FIXTURE_LOCAL_HOST));
   await page.getByRole("button", { name: "Fixture project" }).click();
   await expect(page.getByTestId("projects-screen")).toContainText(FIXTURE_OWNED_WORKTREE_PATH);
   await page.getByRole("button", { name: "Remove worktree" }).click();
@@ -84,9 +85,13 @@ test("manages host-scoped projects and eligible owned worktrees", async ({ page,
   const remove = page.getByRole("dialog", { name: "Remove this project?" });
   await remove.getByRole("checkbox").check();
   await remove.getByRole("button", { name: "Remove project" }).click();
-  await expect(page).toHaveURL(new RegExp(`/hosts/${FIXTURE_LOCAL_HOST}/projects$`));
+  await expect(page).toHaveURL((url): boolean => url.pathname === projectPath(FIXTURE_LOCAL_HOST));
   await expect(page.getByRole("button", { name: "Browser project" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Renamed fixture project" })).toBeVisible();
   await page.getByRole("button", { name: "Back to workspace" }).click();
   await expect(page).toHaveURL(`${stack.backend.url}/`);
 });
+
+function projectPath(host: string): string {
+  return `/hosts/${encodeURIComponent(host)}/projects`;
+}

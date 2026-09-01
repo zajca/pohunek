@@ -78,7 +78,31 @@ pub(crate) async fn run_inspect(host: &str, paths: &Paths, json: bool) -> Result
 /// Render the discovered hosts as an aligned table.
 fn render_records_human(records: &[HostRecord]) -> String {
     let name_of = |r: &HostRecord| r.name.clone().unwrap_or_else(|| "-".to_owned());
-    let ip_of = |r: &HostRecord| r.netbird_ip.clone().unwrap_or_else(|| "-".to_owned());
+    let route_of = |record: &HostRecord| {
+        let identity = record
+            .peer_id
+            .as_deref()
+            .filter(|peer_id| !peer_id.is_empty())
+            .map(pohunek_client::ExternalIdentity::peer_id)
+            .or_else(|| {
+                record
+                    .fqdn
+                    .as_deref()
+                    .filter(|fqdn| !fqdn.is_empty())
+                    .map(pohunek_client::ExternalIdentity::fqdn)
+            })
+            .and_then(Result::ok);
+        identity
+            .and_then(|identity| {
+                pohunek_client::remote_host_with_port(
+                    &format!("{}:{}", record.overlay, identity.selector()),
+                    record.port,
+                )
+                .ok()
+            })
+            .unwrap_or_else(|| "-".to_owned())
+    };
+    let route_header = "ROUTE";
 
     let name_width = records
         .iter()
@@ -86,26 +110,26 @@ fn render_records_human(records: &[HostRecord]) -> String {
         .max()
         .unwrap_or(0)
         .max("NAME".len());
-    let ip_width = records
+    let route_width = records
         .iter()
-        .map(|r| ip_of(r).len())
+        .map(|record| route_of(record).len())
         .max()
         .unwrap_or(0)
-        .max("NETBIRD_IP".len());
+        .max(route_header.len());
 
     let mut output = String::new();
     let _ = writeln!(
         output,
-        "{:<name_width$}  {:<ip_width$}  STATUS         VERSION",
-        "NAME", "NETBIRD_IP",
+        "{:<name_width$}  {:<route_width$}  STATUS         VERSION",
+        "NAME", route_header,
     );
     for r in records {
         let (status, version) = class_columns(&r.class);
         let _ = writeln!(
             output,
-            "{:<name_width$}  {:<ip_width$}  {status:<13}  {version}",
+            "{:<name_width$}  {:<route_width$}  {status:<13}  {version}",
             name_of(r),
-            ip_of(r),
+            route_of(r),
         );
     }
     output
@@ -218,7 +242,10 @@ mod tests {
             HostRecord {
                 name: Some("host-b".to_owned()),
                 fqdn: Some("host-b.netbird.cloud".to_owned()),
-                netbird_ip: Some("100.92.30.40".to_owned()),
+                address: Some("100.92.30.40".to_owned()),
+                port: 18722,
+                overlay: "netbird".to_owned(),
+                peer_id: Some("100.92.30.40".to_owned()),
                 class: HostClass::ReachableDaemon {
                     daemon_version: "0.1.0".to_owned(),
                 },
@@ -226,18 +253,44 @@ mod tests {
             HostRecord {
                 name: Some("host-c".to_owned()),
                 fqdn: Some("host-c.netbird.cloud".to_owned()),
-                netbird_ip: Some("100.92.30.41".to_owned()),
+                address: Some("100.92.30.41".to_owned()),
+                port: 18722,
+                overlay: "netbird".to_owned(),
+                peer_id: None,
                 class: HostClass::Candidate,
             },
         ];
         let output = render_records_human(&records);
         let header = output.lines().next().expect("header");
-        for column in ["NAME", "NETBIRD_IP", "STATUS", "VERSION"] {
+        for column in ["NAME", "ROUTE", "STATUS", "VERSION"] {
             assert!(header.contains(column), "header missing {column}: {header}");
         }
         assert!(output.contains("host-b"));
         assert!(output.contains("reachable"));
         assert!(output.contains("0.1.0"));
         assert!(output.contains("candidate"));
+        let peer_route = pohunek_client::remote_host_with_port(
+            &format!(
+                "netbird:{}",
+                pohunek_client::ExternalIdentity::peer_id("100.92.30.40")
+                    .expect("peer identity")
+                    .selector()
+            ),
+            18722,
+        )
+        .expect("canonical peer route");
+        let fqdn_route = pohunek_client::remote_host_with_port(
+            &format!(
+                "netbird:{}",
+                pohunek_client::ExternalIdentity::fqdn("host-c.netbird.cloud")
+                    .expect("FQDN identity")
+                    .selector()
+            ),
+            18722,
+        )
+        .expect("canonical candidate route");
+        assert!(output.contains(&peer_route));
+        assert!(output.contains(&fqdn_route));
+        assert!(!output.contains("netbird://"));
     }
 }

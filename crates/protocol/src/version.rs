@@ -16,7 +16,7 @@ use crate::error::ProtocolError;
 /// Bump this when the wire contract changes in a way that is not purely
 /// additive. New optional fields and methods do not require a bump when their
 /// containing contract explicitly permits them.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(2);
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(3);
 
 /// Oldest public protocol version this build accepts.
 pub const MIN_PROTOCOL_VERSION: ProtocolVersion = PROTOCOL_VERSION;

@@ -1,14 +1,16 @@
-//! `NetBird` peer discovery and bounded daemon classification.
+//! Overlay peer discovery and bounded daemon classification.
 //!
-//! This module is the single protocol-aware discovery implementation used by
-//! the CLI and daemon. `NetBird` remains the synchronous, dependency-light source
-//! of peer state; this module owns the asynchronous health exchange instead.
+//! This module is the protocol-aware discovery implementation used by the CLI
+//! and daemon. Each configured overlay supplies its own peer snapshot; this
+//! module isolates per-overlay failures, aggregates their peers, and owns the
+//! asynchronous health exchange instead.
 
 use std::net::SocketAddr;
-use std::num::{NonZeroU16, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use futures::{stream, StreamExt as _};
+use overlay::{OverlayFailure, OverlayRegistry, RoutedPeer};
 use protocol::{
     method, HostClass, HostRecord, Request, Response, MAX_CONTROL_LINE_BYTES,
     SUPPORTED_PROTOCOL_VERSIONS,
@@ -49,36 +51,21 @@ pub const MAX_DISCOVERY_DEADLINE: Duration = Duration::from_secs(u64::MAX - 3);
 /// Discovery probing settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveryOptions {
-    port: NonZeroU16,
     probe_timeout: Duration,
     concurrency: NonZeroUsize,
     deadline: Duration,
 }
 
 impl DiscoveryOptions {
-    /// Build options for a non-zero remote daemon port.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::ClientError::InvalidDiscoveryOptions`] when `port` is
-    /// zero.
-    pub fn new(port: u16) -> Result<Self, crate::ClientError> {
-        if port == 0 {
-            return Err(invalid_option("remote daemon port must be non-zero"));
-        }
-        Ok(Self {
-            port: NonZeroU16::new(port).expect("non-zero port was checked"),
+    /// Build the default bounded discovery settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
             concurrency: NonZeroUsize::new(DEFAULT_PROBE_CONCURRENCY)
                 .expect("default concurrency is non-zero"),
             deadline: DEFAULT_DISCOVERY_DEADLINE,
-        })
-    }
-
-    /// Return the validated remote daemon port.
-    #[must_use]
-    pub fn port(&self) -> u16 {
-        self.port.get()
+        }
     }
 
     /// Return the bounded timeout for one peer health exchange.
@@ -148,13 +135,19 @@ impl DiscoveryOptions {
     }
 }
 
+impl Default for DiscoveryOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn invalid_option(detail: &str) -> crate::ClientError {
     crate::ClientError::InvalidDiscoveryOptions {
         detail: detail.to_owned(),
     }
 }
 
-/// Discover and classify this machine's `NetBird` peers.
+/// Discover and classify peers from the configured overlay registry.
 ///
 /// Only peers advertising an address in the `NetBird` CGNAT range are dialed.
 /// Peers with no safe address remain candidates. A transport, framing, or health
@@ -163,94 +156,146 @@ fn invalid_option(detail: &str) -> crate::ClientError {
 ///
 /// # Errors
 ///
-/// Returns [`crate::ClientError::Netbird`] when local `NetBird` state or its
-/// configured port cannot be loaded. Returns
-/// [`crate::ClientError::RemoteDiscoveryFailed`] when complete discovery
-/// exceeds its deadline.
-pub async fn discover_hosts() -> Result<Vec<HostRecord>, crate::ClientError> {
-    let options =
-        DiscoveryOptions::new(netbird::remote_port().map_err(crate::ClientError::Netbird)?)?;
-    discover_hosts_with_options(options).await
+/// Returns [`crate::ClientError::InvalidDiscoveryOptions`] when a configured
+/// port is invalid. Returns [`crate::ClientError::RemoteDiscoveryFailed`] when
+/// no configured overlay completes discovery before the deadline.
+pub async fn discover_hosts(
+    registry: &OverlayRegistry,
+) -> Result<Vec<HostRecord>, crate::ClientError> {
+    discover_hosts_with_options(registry, DiscoveryOptions::new()).await
 }
 
 /// Discover peers using caller-supplied bounded probe settings.
 ///
+/// An empty transport collection returns no peers; per-overlay failures are
+/// logged and isolated so another configured overlay can still contribute.
+///
 /// # Errors
 ///
-/// Returns [`crate::ClientError::Netbird`] when local `NetBird` state cannot
-/// be loaded. Returns [`crate::ClientError::RemoteDiscoveryFailed`] when
-/// complete discovery exceeds [`DiscoveryOptions::deadline`]. Returns an
-/// origin-environment error when exactly one origin marker is present or a
-/// marker value is invalid.
+/// Returns [`crate::ClientError::RemoteDiscoveryFailed`] when no configured
+/// overlay completes before [`DiscoveryOptions::deadline`]. Completed healthy
+/// overlay snapshots remain usable when another provider reaches that
+/// deadline. Returns an origin-environment error when exactly one origin marker
+/// is present or a marker value is invalid.
 pub async fn discover_hosts_with_options(
+    registry: &OverlayRegistry,
     options: DiscoveryOptions,
 ) -> Result<Vec<HostRecord>, crate::ClientError> {
     let origin = RequestOrigin::from_environment()?;
-    discover_with_status(
-        options,
-        async {
-            netbird::run_status_async()
-                .await
-                .map_err(crate::ClientError::Netbird)
-        },
-        origin,
-    )
-    .await
+    discover_with_registry(registry, options, origin).await
 }
 
-async fn discover_with_status<F>(
+async fn discover_with_registry(
+    registry: &OverlayRegistry,
     options: DiscoveryOptions,
-    status: F,
     origin: Option<RequestOrigin>,
-) -> Result<Vec<HostRecord>, crate::ClientError>
-where
-    F: std::future::Future<Output = Result<netbird::NetbirdStatus, crate::ClientError>>,
-{
-    tokio::time::timeout(options.deadline(), async {
-        let status = status.await?;
-        Ok(discover_status(&status, options, origin.as_ref()).await)
-    })
-    .await
-    .map_err(|_timeout| crate::ClientError::RemoteDiscoveryFailed {
-        detail: "discovery exceeded its configured deadline".to_owned(),
-    })?
+) -> Result<Vec<HostRecord>, crate::ClientError> {
+    let deadline = tokio::time::Instant::now() + options.deadline();
+    let mut results = Vec::with_capacity(registry.entries().len());
+    let mut completed = vec![false; registry.entries().len()];
+    let mut pending = stream::iter(registry.entries().iter().cloned().enumerate())
+        .map(|(index, configured)| async move {
+            let overlay = configured.id().clone();
+            let result = configured.discover_peers().await;
+            (index, overlay, result)
+        })
+        .buffer_unordered(registry.entries().len());
+    let providers_timed_out = loop {
+        match tokio::time::timeout_at(deadline, pending.next()).await {
+            Ok(Some(result)) => {
+                completed[result.0] = true;
+                results.push(result);
+            }
+            Ok(None) => break false,
+            Err(_timeout) => break true,
+        }
+    };
+    drop(pending);
+
+    if providers_timed_out {
+        for (index, configured) in registry.entries().iter().enumerate() {
+            if !completed[index] {
+                tracing::debug!(
+                    overlay = %configured.id(),
+                    "one configured overlay exceeded the discovery deadline"
+                );
+            }
+        }
+    }
+
+    results.sort_by_key(|(index, _, _)| *index);
+    let mut snapshots = Vec::new();
+    let mut failures = Vec::new();
+    let mut healthy_overlays = 0_usize;
+    for (_, overlay, result) in results {
+        match result {
+            Ok(peers) => {
+                healthy_overlays += 1;
+                snapshots.extend(peers);
+            }
+            Err(error) => {
+                tracing::debug!(
+                    overlay = %overlay,
+                    error = %error,
+                    "one configured overlay was unavailable during discovery"
+                );
+                failures.push(OverlayFailure { overlay, error });
+            }
+        }
+    }
+    if healthy_overlays == 0 {
+        if providers_timed_out {
+            return Err(crate::ClientError::RemoteDiscoveryFailed {
+                detail: "no overlay completed discovery before the configured deadline".to_owned(),
+            });
+        }
+        return Err(crate::ClientError::OverlayDiscoveryFailed { failures });
+    }
+    Ok(discover_peers(snapshots, options, origin.as_ref(), Some(deadline)).await)
 }
 
-/// Classify peers from an already loaded `NetBird` status snapshot.
+/// Classify aggregated overlay peer snapshots.
 #[must_use]
-async fn discover_status(
-    status: &netbird::NetbirdStatus,
+async fn discover_peers(
+    peers: Vec<RoutedPeer>,
     options: DiscoveryOptions,
     origin: Option<&RequestOrigin>,
+    deadline: Option<tokio::time::Instant>,
 ) -> Vec<HostRecord> {
-    stream::iter(status.peers().iter().cloned())
+    stream::iter(peers)
         .map(|peer| async move {
-            let name = peer.fqdn.as_deref().map(short_hostname).map(str::to_owned);
+            let name = peer
+                .display_name
+                .clone()
+                .or_else(|| peer.fqdn.as_deref().map(short_hostname).map(str::to_owned));
             let fqdn = peer.fqdn.clone();
-            let netbird_ip = peer.netbird_ip.clone();
-            let class = match probe_target(&peer, options.port()) {
-                Some(addr) => classify(addr, options.probe_timeout(), origin).await,
+            let address = peer.addr.map(|addr| addr.ip().to_string());
+            let port = peer.port;
+            let probe_timeout = deadline.map_or(options.probe_timeout(), |deadline| {
+                options
+                    .probe_timeout()
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            });
+            let class = match peer.addr {
+                Some(addr) => classify(addr, probe_timeout, origin).await,
                 None => HostClass::Candidate,
             };
             HostRecord {
                 name,
                 fqdn,
-                netbird_ip,
+                address,
+                port,
+                overlay: peer.overlay.to_string(),
+                peer_id: peer.peer_id,
                 class,
             }
         })
-        // Preserve NetBird's deterministic peer ordering while still starting
+        // Preserve each overlay's deterministic peer ordering while still starting
         // up to `concurrency` probes at once. CLI JSON consumers rely on a
         // stable ordering for reproducible output.
         .buffered(options.concurrency())
         .collect()
         .await
-}
-
-fn probe_target(peer: &netbird::Peer, port: u16) -> Option<SocketAddr> {
-    peer.ip()
-        .filter(|ip| netbird::is_netbird_ip(*ip))
-        .map(|ip| SocketAddr::new(ip, port))
 }
 
 async fn classify(
@@ -336,38 +381,149 @@ fn short_hostname(fqdn: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     use protocol::{ProtocolVersion, ProtocolVersionRange, PROTOCOL_VERSION};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
 
     use super::*;
+    use overlay::{
+        BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, OverlayError,
+        OverlayFuture, OverlayId, OverlayTransport, ResolvedPeer,
+    };
 
-    #[test]
-    fn candidate_gate_is_connected_idle_and_hostile_safe() {
-        let port = 7421;
-        for ip in ["100.92.30.40", "100.92.30.41"] {
-            let peer = netbird::Peer {
-                netbird_ip: Some(ip.to_owned()),
-                ..netbird::Peer::default()
-            };
-            assert!(probe_target(&peer, port).is_some());
+    #[derive(Debug)]
+    struct TestTransport {
+        id: OverlayId,
+        discovery: Result<Vec<DiscoveredPeer>, OverlayError>,
+    }
+
+    impl TestTransport {
+        fn healthy(id: &str, peers: Vec<DiscoveredPeer>) -> Self {
+            Self {
+                id: OverlayId::new(id).expect("test overlay id"),
+                discovery: Ok(peers),
+            }
         }
-        let no_ip = netbird::Peer::default();
-        assert_eq!(probe_target(&no_ip, port), None);
-        for hostile in ["127.0.0.1", "169.254.169.254", "10.0.0.1", "8.8.8.8"] {
-            let peer = netbird::Peer {
-                netbird_ip: Some(hostile.to_owned()),
-                ..netbird::Peer::default()
-            };
-            assert_eq!(probe_target(&peer, port), None, "must not dial {hostile}");
+
+        fn unavailable(id: &str) -> Self {
+            let id = OverlayId::new(id).expect("test overlay id");
+            Self {
+                discovery: Err(OverlayError::StateUnavailable {
+                    overlay: id.clone(),
+                    detail: "test state unavailable".to_owned(),
+                }),
+                id,
+            }
         }
     }
 
+    impl OverlayTransport for TestTransport {
+        fn id(&self) -> &OverlayId {
+            &self.id
+        }
+
+        fn validate_bind_addr(&self, _addr: IpAddr) -> Result<(), BindAddrError> {
+            Ok(())
+        }
+
+        fn listener_addr(&self) -> OverlayFuture<'_, IpAddr> {
+            Box::pin(async { Ok(IpAddr::V4(Ipv4Addr::LOCALHOST)) })
+        }
+
+        fn resolve_peer<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedPeer> {
+            let error = OverlayError::HostUnknown {
+                host: host.to_owned(),
+                overlay: self.id.clone(),
+            };
+            Box::pin(async move { Err(error) })
+        }
+
+        fn resolve_peer_identity<'a>(
+            &'a self,
+            identity: &'a ExternalIdentity,
+        ) -> OverlayFuture<'a, ResolvedPeer> {
+            let error = OverlayError::HostUnknown {
+                host: identity.value().to_owned(),
+                overlay: self.id.clone(),
+            };
+            Box::pin(async move { Err(error) })
+        }
+
+        fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>> {
+            let discovery = self.discovery.clone();
+            Box::pin(async move { discovery })
+        }
+    }
+
+    #[derive(Debug)]
+    struct PendingTransport {
+        id: OverlayId,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl OverlayTransport for PendingTransport {
+        fn id(&self) -> &OverlayId {
+            &self.id
+        }
+
+        fn validate_bind_addr(&self, _addr: IpAddr) -> Result<(), BindAddrError> {
+            Ok(())
+        }
+
+        fn listener_addr(&self) -> OverlayFuture<'_, IpAddr> {
+            Box::pin(std::future::pending())
+        }
+
+        fn resolve_peer<'a>(&'a self, _host: &'a str) -> OverlayFuture<'a, ResolvedPeer> {
+            Box::pin(std::future::pending())
+        }
+
+        fn resolve_peer_identity<'a>(
+            &'a self,
+            _identity: &'a ExternalIdentity,
+        ) -> OverlayFuture<'a, ResolvedPeer> {
+            Box::pin(std::future::pending())
+        }
+
+        fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>> {
+            Box::pin(DropSignal {
+                dropped: Arc::clone(&self.dropped),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct DropSignal {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl std::future::Future for DropSignal {
+        type Output = Result<Vec<DiscoveredPeer>, OverlayError>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn configured(transport: TestTransport, port: u16) -> ConfiguredTransport {
+        ConfiguredTransport::new(Arc::new(transport), port).expect("configured test transport")
+    }
+
     #[test]
-    fn options_reject_zero_port_concurrency_and_deadline() {
-        let zero_port = DiscoveryOptions::new(0).expect_err("zero port");
-        let options = DiscoveryOptions::new(7421).expect("options");
+    fn options_reject_zero_concurrency_and_deadline() {
+        let options = DiscoveryOptions::new();
         let zero_concurrency = options.with_concurrency(0).expect_err("zero concurrency");
         let zero_deadline = options
             .with_deadline(Duration::ZERO)
@@ -379,7 +535,6 @@ mod tests {
             .with_probe_timeout(Duration::ZERO)
             .expect_err("zero probe timeout");
         for error in [
-            zero_port,
             zero_concurrency,
             zero_deadline,
             overflow_deadline,
@@ -397,35 +552,6 @@ mod tests {
                 Some("fix the invalid discovery option before running discovery")
             );
         }
-    }
-
-    #[tokio::test]
-    async fn overall_deadline_bounds_status_loading() {
-        let options = DiscoveryOptions::new(7421)
-            .expect("options")
-            .with_deadline(Duration::from_millis(10))
-            .expect("deadline");
-        let result = discover_with_status(
-            options,
-            async {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                Ok(netbird::parse_status(r#"{"peers":[]}"#).expect("status"))
-            },
-            None,
-        )
-        .await;
-        let timeout = result.expect_err("status loading must time out");
-        assert!(matches!(
-            timeout,
-            crate::ClientError::RemoteDiscoveryFailed { .. }
-        ));
-        let structured = timeout.to_protocol_error();
-        assert_eq!(structured.class, protocol::ErrorClass::Discovery);
-        assert_eq!(structured.code, "remote_discovery_failed");
-        assert_eq!(
-            structured.recover.as_deref(),
-            Some("retry the remote request; if it persists, check the local NetBird state")
-        );
     }
 
     #[test]
@@ -608,26 +734,157 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_order_is_preserved_despite_concurrent_buffering() {
-        let status = netbird::parse_status(
-            r#"{"peers":[
-                {"fqdn":"first.example","netbirdIp":"100.64.0.1"},
-                {"fqdn":"second.example","netbirdIp":"100.64.0.2"}
-            ]}"#,
-        )
-        .expect("status");
-        let records = discover_status(
-            &status,
-            DiscoveryOptions::new(1)
-                .expect("options")
+    async fn peer_order_is_preserved_and_unsafe_addresses_remain_candidates() {
+        let peers = vec![
+            RoutedPeer {
+                overlay: OverlayId::new("netbird").expect("id"),
+                peer_id: Some("100.64.0.1".to_owned()),
+                display_name: None,
+                fqdn: Some("first.example".to_owned()),
+                addr: Some("100.64.0.1:1".parse().expect("safe socket address")),
+                port: 1,
+            },
+            RoutedPeer {
+                overlay: OverlayId::new("netbird").expect("id"),
+                peer_id: Some("127.0.0.1".to_owned()),
+                display_name: None,
+                fqdn: Some("second.example".to_owned()),
+                addr: None,
+                port: 1,
+            },
+        ];
+        let records = discover_peers(
+            peers,
+            DiscoveryOptions::new()
                 .with_probe_timeout(Duration::from_millis(1))
                 .expect("probe timeout")
                 .with_concurrency(2)
                 .expect("concurrency"),
             None,
+            None,
         )
         .await;
         assert_eq!(records[0].name.as_deref(), Some("first"));
         assert_eq!(records[1].name.as_deref(), Some("second"));
+        assert_eq!(records[0].overlay, "netbird");
+        assert_eq!(records[0].peer_id.as_deref(), Some("100.64.0.1"));
+        assert_eq!(records[1].peer_id.as_deref(), Some("127.0.0.1"));
+        assert_eq!(records[0].port, 1);
+        assert_eq!(records[1].class, HostClass::Candidate);
+    }
+
+    #[tokio::test]
+    async fn registry_discovery_isolates_failures_and_preserves_addressless_candidates() {
+        let candidate = DiscoveredPeer {
+            peer_id: None,
+            display_name: Some("addressless".to_owned()),
+            fqdn: Some("addressless.example".to_owned()),
+            address: None,
+        };
+        let registry = OverlayRegistry::new(vec![
+            configured(TestTransport::unavailable("broken"), 17001),
+            configured(TestTransport::healthy("memory", vec![candidate]), 17002),
+        ])
+        .expect("test registry");
+
+        let records = discover_with_registry(&registry, DiscoveryOptions::new(), None)
+            .await
+            .expect("healthy overlay remains available");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].overlay, "memory");
+        assert_eq!(records[0].port, 17002);
+        assert_eq!(records[0].address, None);
+        assert_eq!(records[0].peer_id, None);
+        assert_eq!(records[0].class, HostClass::Candidate);
+    }
+
+    #[tokio::test]
+    async fn registry_discovery_reports_typed_error_when_every_overlay_fails() {
+        let registry = OverlayRegistry::new(vec![
+            configured(TestTransport::unavailable("broken-a"), 17001),
+            configured(TestTransport::unavailable("broken-b"), 17002),
+        ])
+        .expect("test registry");
+
+        let error = discover_with_registry(&registry, DiscoveryOptions::new(), None)
+            .await
+            .expect_err("all failed overlays must be reported");
+        assert!(matches!(
+            error,
+            crate::ClientError::OverlayDiscoveryFailed { failures }
+                if failures.len() == 2
+                    && failures[0].overlay.as_str() == "broken-a"
+                    && failures[1].overlay.as_str() == "broken-b"
+        ));
+    }
+
+    #[tokio::test]
+    async fn discovery_deadline_cancels_provider_future() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let pending = ConfiguredTransport::new(
+            Arc::new(PendingTransport {
+                id: OverlayId::new("pending").expect("id"),
+                dropped: Arc::clone(&dropped),
+            }),
+            17001,
+        )
+        .expect("pending transport");
+        let registry = OverlayRegistry::new(vec![pending]).expect("pending registry");
+        let options = DiscoveryOptions::new()
+            .with_deadline(Duration::from_millis(10))
+            .expect("test deadline");
+
+        let error = discover_with_registry(&registry, options, None)
+            .await
+            .expect_err("pending provider must hit the complete deadline");
+
+        assert!(matches!(
+            error,
+            crate::ClientError::RemoteDiscoveryFailed { .. }
+        ));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "deadline must drop the provider-owned future"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_deadline_preserves_completed_overlay_results() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let pending = ConfiguredTransport::new(
+            Arc::new(PendingTransport {
+                id: OverlayId::new("pending").expect("id"),
+                dropped: Arc::clone(&dropped),
+            }),
+            17001,
+        )
+        .expect("pending transport");
+        let candidate = DiscoveredPeer {
+            peer_id: None,
+            display_name: Some("healthy-peer".to_owned()),
+            fqdn: Some("healthy-peer.example".to_owned()),
+            address: None,
+        };
+        let registry = OverlayRegistry::new(vec![
+            pending,
+            configured(TestTransport::healthy("healthy", vec![candidate]), 17002),
+        ])
+        .expect("mixed registry");
+        let options = DiscoveryOptions::new()
+            .with_deadline(Duration::from_millis(10))
+            .expect("test deadline");
+
+        let records = discover_with_registry(&registry, options, None)
+            .await
+            .expect("healthy overlay must survive another provider timing out");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name.as_deref(), Some("healthy-peer"));
+        assert_eq!(records[0].overlay, "healthy");
+        assert_eq!(records[0].class, HostClass::Candidate);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "deadline must cancel the pending provider future"
+        );
     }
 }

@@ -126,6 +126,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_canonical_peer_key_with_reserved_route_characters() {
+        let selector = pohunek_client::ExternalIdentity::peer_id("a/real+netbird@key==")
+            .expect("stable peer identity")
+            .selector();
+        let route = pohunek_client::remote_host_with_port(&format!("netbird:{selector}"), 18722)
+            .expect("canonical remote route");
+        let target: Target = format!("{route}/s-42").parse().expect("target parse");
+
+        assert_eq!(target.host.as_deref(), Some(route.as_str()));
+        assert_eq!(target.session_id, "s-42");
+        assert!(!selector.contains(['/', '+', '=', '@']));
+    }
+
+    #[test]
     fn rejects_empty() {
         assert_eq!("".parse::<Target>(), Err(TargetParseError::Empty));
         assert_eq!("   ".parse::<Target>(), Err(TargetParseError::Empty));

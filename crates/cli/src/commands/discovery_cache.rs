@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::CliError;
 
 /// Cache format revision; changing it invalidates incompatible derived data.
-const CACHE_SCHEMA: u32 = 1;
+const CACHE_SCHEMA: u32 = 2;
 /// Cache directory under the pohunek XDG cache root.
 const CACHE_SUBDIR: &str = "host-discovery";
 /// Completed cache filename.
@@ -42,16 +42,36 @@ struct Snapshot {
     schema: u32,
     fetched_unix_nanos: u128,
     protocol_version: u32,
-    remote_port: u16,
+    routes: Vec<RegistryRoute>,
     records: Vec<HostRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RegistryRoute {
+    overlay: String,
+    port: u16,
 }
 
 /// Return a fresh standalone discovery snapshot, refreshing the cache if needed.
 pub(crate) async fn records(cache_root: &Path, refresh: bool) -> Result<Vec<HostRecord>, CliError> {
-    records_with(cache_root, refresh, |options| async move {
-        Ok(pohunek_client::discover_hosts_with_options(options).await?)
+    let registry = pohunek_client::default_overlay_registry()?;
+    let routes = registry_routes(&registry);
+    records_with(cache_root, refresh, routes, move |options| {
+        let registry = registry.clone();
+        async move { Ok(pohunek_client::discover_hosts_with_options(&registry, options).await?) }
     })
     .await
+}
+
+fn registry_routes(registry: &pohunek_client::OverlayRegistry) -> Vec<RegistryRoute> {
+    registry
+        .entries()
+        .iter()
+        .map(|entry| RegistryRoute {
+            overlay: entry.id().to_string(),
+            port: entry.port(),
+        })
+        .collect()
 }
 
 /// Cache orchestration with an injected discovery operation.
@@ -61,19 +81,17 @@ pub(crate) async fn records(cache_root: &Path, refresh: bool) -> Result<Vec<Host
 async fn records_with<F, Fut>(
     cache_root: &Path,
     refresh: bool,
+    routes: Vec<RegistryRoute>,
     discover: F,
 ) -> Result<Vec<HostRecord>, CliError>
 where
     F: Fn(pohunek_client::DiscoveryOptions) -> Fut,
     Fut: Future<Output = Result<Vec<HostRecord>, CliError>>,
 {
-    let options = pohunek_client::DiscoveryOptions::new(
-        netbird::remote_port().map_err(pohunek_client::ClientError::Netbird)?,
-    )?;
-    let port = options.port();
+    let options = pohunek_client::DiscoveryOptions::new();
     let dir = cache_root.join(CACHE_SUBDIR);
     ensure_private_dir(&dir)?;
-    let before = load_fresh(&dir, port)?;
+    let before = load_fresh(&dir, &routes)?;
     if !refresh {
         if let Some(snapshot) = before.as_ref() {
             return Ok(snapshot.records.clone());
@@ -85,7 +103,7 @@ where
     // A competing caller may have completed a refresh while we waited. This
     // re-check coalesces explicit `--refresh` callers too, but a lone refresh
     // always reaches the network.
-    if let Some(snapshot) = load_fresh(&dir, port)? {
+    if let Some(snapshot) = load_fresh(&dir, &routes)? {
         if snapshot.fetched_unix_nanos > before_fetched {
             return Ok(snapshot.records);
         }
@@ -96,14 +114,14 @@ where
         schema: CACHE_SCHEMA,
         fetched_unix_nanos: unix_nanos()?,
         protocol_version: PROTOCOL_VERSION.get(),
-        remote_port: port,
+        routes,
         records: records.clone(),
     };
     store_atomic(&dir, &snapshot)?;
     Ok(records)
 }
 
-fn load_fresh(dir: &Path, port: u16) -> Result<Option<Snapshot>, CliError> {
+fn load_fresh(dir: &Path, routes: &[RegistryRoute]) -> Result<Option<Snapshot>, CliError> {
     let path = dir.join(CACHE_FILE);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -124,7 +142,7 @@ fn load_fresh(dir: &Path, port: u16) -> Result<Option<Snapshot>, CliError> {
     let now = unix_nanos()?;
     let fresh = snapshot.schema == CACHE_SCHEMA
         && snapshot.protocol_version == PROTOCOL_VERSION.get()
-        && snapshot.remote_port == port
+        && snapshot.routes == routes
         && snapshot.fetched_unix_nanos <= now
         && now.saturating_sub(snapshot.fetched_unix_nanos)
             < pohunek_client::DISCOVERY_CACHE_TTL.as_nanos();
@@ -253,6 +271,15 @@ mod tests {
 
     use super::*;
 
+    const TEST_PORT: u16 = 18722;
+
+    fn routes(port: u16) -> Vec<RegistryRoute> {
+        vec![RegistryRoute {
+            overlay: "netbird".to_owned(),
+            port,
+        }]
+    }
+
     fn temp_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "pohunek-discovery-cache-{tag}-{}",
@@ -265,7 +292,7 @@ mod tests {
             schema: CACHE_SCHEMA,
             fetched_unix_nanos,
             protocol_version: PROTOCOL_VERSION.get(),
-            remote_port: port,
+            routes: routes(port),
             records,
         }
     }
@@ -274,7 +301,10 @@ mod tests {
         HostRecord {
             name: Some(name.to_owned()),
             fqdn: Some(format!("{name}.example")),
-            netbird_ip: Some("100.64.0.1".to_owned()),
+            address: Some("100.64.0.1".to_owned()),
+            port: TEST_PORT,
+            overlay: "netbird".to_owned(),
+            peer_id: Some("100.64.0.1".to_owned()),
             class: protocol::HostClass::Unreachable,
         }
     }
@@ -286,8 +316,10 @@ mod tests {
         ensure_private_dir(&dir).expect("private directory");
         let snapshot = snapshot(18722, unix_nanos().expect("clock"), Vec::new());
         store_atomic(&dir, &snapshot).expect("store");
-        assert!(load_fresh(&dir, 18722).expect("load").is_some());
-        assert!(load_fresh(&dir, 18723).expect("load").is_none());
+        assert!(load_fresh(&dir, &routes(TEST_PORT))
+            .expect("load")
+            .is_some());
+        assert!(load_fresh(&dir, &routes(18723)).expect("load").is_none());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -299,7 +331,9 @@ mod tests {
         let path = dir.join(CACHE_FILE);
         fs::write(&path, b"not-json").expect("write");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
-        assert!(load_fresh(&dir, 18722).expect("load").is_none());
+        assert!(load_fresh(&dir, &routes(TEST_PORT))
+            .expect("load")
+            .is_none());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -323,16 +357,22 @@ mod tests {
         ];
         for item in cases {
             store_atomic(&dir, &item).expect("store");
-            assert!(load_fresh(&dir, 18722).expect("load").is_none());
+            assert!(load_fresh(&dir, &routes(TEST_PORT))
+                .expect("load")
+                .is_none());
         }
         let mut wrong_schema = snapshot(18722, now, Vec::new());
         wrong_schema.schema += 1;
         store_atomic(&dir, &wrong_schema).expect("store");
-        assert!(load_fresh(&dir, 18722).expect("load").is_none());
+        assert!(load_fresh(&dir, &routes(TEST_PORT))
+            .expect("load")
+            .is_none());
         let mut wrong_protocol = snapshot(18722, now, Vec::new());
         wrong_protocol.protocol_version += 1;
         store_atomic(&dir, &wrong_protocol).expect("store");
-        assert!(load_fresh(&dir, 18722).expect("load").is_none());
+        assert!(load_fresh(&dir, &routes(TEST_PORT))
+            .expect("load")
+            .is_none());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -344,7 +384,9 @@ mod tests {
         let target = root.join("target");
         fs::write(&target, b"{}").expect("target");
         std::os::unix::fs::symlink(&target, dir.join(CACHE_FILE)).expect("symlink");
-        assert!(load_fresh(&dir, 18722).expect("load").is_none());
+        assert!(load_fresh(&dir, &routes(TEST_PORT))
+            .expect("load")
+            .is_none());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -356,7 +398,9 @@ mod tests {
         let now = unix_nanos().expect("clock");
         store_atomic(&dir, &snapshot(18722, now, vec![record("old")])).expect("first store");
         store_atomic(&dir, &snapshot(18722, now + 1, vec![record("new")])).expect("second store");
-        let loaded = load_fresh(&dir, 18722).expect("load").expect("fresh");
+        let loaded = load_fresh(&dir, &routes(TEST_PORT))
+            .expect("load")
+            .expect("fresh");
         assert_eq!(loaded.records[0].name.as_deref(), Some("new"));
         let _ = fs::remove_dir_all(root);
     }
@@ -374,7 +418,7 @@ mod tests {
         let root = temp_dir("refresh");
         let dir = root.join(CACHE_SUBDIR);
         ensure_private_dir(&dir).expect("private directory");
-        let port = netbird::remote_port().expect("port");
+        let port = TEST_PORT;
         store_atomic(
             &dir,
             &snapshot(port, unix_nanos().expect("clock"), vec![record("cached")]),
@@ -382,7 +426,7 @@ mod tests {
         .expect("store");
         let calls = Arc::new(AtomicUsize::new(0));
         let hit_calls = Arc::clone(&calls);
-        let hit = records_with(&root, false, move |_| {
+        let hit = records_with(&root, false, routes(port), move |_| {
             let calls = Arc::clone(&hit_calls);
             async move {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -395,7 +439,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         let refresh_calls = Arc::clone(&calls);
-        let refreshed = records_with(&root, true, move |_| {
+        let refreshed = records_with(&root, true, routes(port), move |_| {
             let calls = Arc::clone(&refresh_calls);
             async move {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -406,7 +450,7 @@ mod tests {
         .expect("refresh");
         assert_eq!(refreshed[0].name.as_deref(), Some("refreshed"));
         let before = fs::read(dir.join(CACHE_FILE)).expect("before failed refresh");
-        let failed = records_with(&root, true, |_| async {
+        let failed = records_with(&root, true, routes(port), |_| async {
             Err(CliError::Spawn("discovery failed".to_owned()))
         })
         .await;
@@ -425,7 +469,7 @@ mod tests {
         let left_root = root.clone();
         let left_calls = Arc::clone(&calls);
         let left = async move {
-            records_with(&left_root, false, move |_| {
+            records_with(&left_root, false, routes(TEST_PORT), move |_| {
                 let calls = Arc::clone(&left_calls);
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -438,7 +482,7 @@ mod tests {
         let right_root = root.clone();
         let right_calls = Arc::clone(&calls);
         let right = async move {
-            records_with(&right_root, false, move |_| {
+            records_with(&right_root, false, routes(TEST_PORT), move |_| {
                 let calls = Arc::clone(&right_calls);
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);

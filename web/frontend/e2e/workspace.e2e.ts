@@ -38,7 +38,7 @@ test("keeps every host in one session rail and promotes live blocked work", asyn
     FIXTURE_LOCAL_SESSION_ID,
   );
 
-  await page.getByRole("searchbox", { name: "Search sessions" }).fill("fixture-peer");
+  await page.getByRole("searchbox", { name: "Search sessions" }).fill(FIXTURE_PEER_HOST);
   await expect(peerSession).toBeVisible();
   await expect(localSession).toBeHidden();
 });
@@ -256,7 +256,7 @@ async function reportNativeIdentity(
 ): Promise<void> {
   const address = stack.peer.tcpAddress;
   if (address === undefined) throw new Error("fixture peer did not expose a TCP address");
-  const client = await connectTcp("fixture-peer", address);
+  const client = await connectTcp(FIXTURE_PEER_HOST, address);
   try {
     const session = await client.call("session.inspect", sessionId);
     const result = await client.call("session.report_native_id", {

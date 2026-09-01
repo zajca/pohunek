@@ -2723,14 +2723,14 @@ mod tests {
     use serde_json::Value;
 
     use crate::connection::{
-        discovered_transport_host, parse_agent_state, parse_event_message, subscribe_request,
-        Backoff,
+        discovered_host_config, discovered_transport_addr, parse_agent_state, parse_event_message,
+        subscribe_request, Backoff,
     };
     use crate::link::action_prompt_provider;
     use crate::sdk::notification_seed_queries;
     use crate::{
         render_attach_command, AttachTemplateValues, ConnectionOptions, HostSnapshot,
-        DEFAULT_BACKOFF_MAX,
+        HostTransport, DEFAULT_BACKOFF_MAX,
     };
 
     use super::*;
@@ -4646,19 +4646,117 @@ mod tests {
     }
 
     #[test]
-    fn discovered_transport_prefers_netbird_ip_over_short_name() {
+    fn discovered_transport_validates_address_but_caches_stable_identity() {
         let record = HostRecord {
             name: Some("dev".to_owned()),
             fqdn: Some("dev.example.netbird.cloud".to_owned()),
-            netbird_ip: Some("100.92.30.40".to_owned()),
+            address: Some("100.92.30.40".to_owned()),
+            port: 18722,
+            overlay: "netbird".to_owned(),
+            peer_id: Some("peer-7".to_owned()),
             class: HostClass::ReachableDaemon {
                 daemon_version: "0.5.0".to_owned(),
             },
         };
 
         assert_eq!(
-            discovered_transport_host(&record).expect("transport host"),
-            "100.92.30.40"
+            discovered_transport_addr(&record).expect("transport address"),
+            "100.92.30.40:18722".parse().expect("socket address")
+        );
+        let host = discovered_host_config(&record).expect("discovered host config");
+        assert_eq!(host.id.as_str(), "netbird:peer~cGVlci03");
+        assert_eq!(host.attach_host(), "netbird:peer~cGVlci03@18722");
+        assert!(matches!(host.transport, HostTransport::Remote { .. }));
+    }
+
+    #[test]
+    fn discovered_transport_requires_stable_identity_and_non_zero_port() {
+        let mut record = HostRecord {
+            name: Some("dev".to_owned()),
+            fqdn: None,
+            address: Some("100.92.30.40".to_owned()),
+            port: 18722,
+            overlay: "netbird".to_owned(),
+            peer_id: None,
+            class: HostClass::ReachableDaemon {
+                daemon_version: "0.5.0".to_owned(),
+            },
+        };
+
+        assert!(matches!(
+            discovered_host_config(&record),
+            Err(CoreError::MissingDiscoveredStableIdentity)
+        ));
+
+        record.peer_id = Some(String::new());
+        record.fqdn = Some(String::new());
+        assert!(matches!(
+            discovered_host_config(&record),
+            Err(CoreError::MissingDiscoveredStableIdentity)
+        ));
+
+        record.peer_id = None;
+        record.fqdn = Some("dev.example.netbird.cloud".to_owned());
+        record.port = 0;
+        assert!(matches!(
+            discovered_host_config(&record),
+            Err(CoreError::InvalidDiscoveredPort)
+        ));
+    }
+
+    #[test]
+    fn discovered_reconnect_identity_ignores_ip_changes_and_reassigned_peers() {
+        let record = HostRecord {
+            name: Some("dev".to_owned()),
+            fqdn: Some("dev.example.netbird.cloud".to_owned()),
+            address: Some("100.92.30.40".to_owned()),
+            port: 18722,
+            overlay: "netbird".to_owned(),
+            peer_id: Some("stable-key".to_owned()),
+            class: HostClass::ReachableDaemon {
+                daemon_version: "0.5.0".to_owned(),
+            },
+        };
+        let first = discovered_host_config(&record).expect("first GUI route");
+
+        let mut moved = record.clone();
+        moved.address = Some("100.92.30.41".to_owned());
+        let moved = discovered_host_config(&moved).expect("moved GUI route");
+        assert_eq!(moved, first);
+
+        let mut reassigned = record;
+        reassigned.peer_id = Some("different-key".to_owned());
+        let reassigned = discovered_host_config(&reassigned).expect("reassigned GUI route");
+        assert_ne!(reassigned, first);
+        assert_eq!(first.attach_host(), "netbird:peer~c3RhYmxlLWtleQ@18722");
+        assert_eq!(
+            reassigned.attach_host(),
+            "netbird:peer~ZGlmZmVyZW50LWtleQ@18722"
+        );
+    }
+
+    #[test]
+    fn discovered_reconnect_identity_falls_back_to_fqdn() {
+        let record = HostRecord {
+            name: Some("dev".to_owned()),
+            fqdn: Some("dev.example.netbird.cloud".to_owned()),
+            address: Some("100.92.30.40".to_owned()),
+            port: 18722,
+            overlay: "netbird".to_owned(),
+            peer_id: None,
+            class: HostClass::ReachableDaemon {
+                daemon_version: "0.5.0".to_owned(),
+            },
+        };
+
+        let host = discovered_host_config(&record).expect("FQDN GUI route");
+        assert_eq!(
+            host.id.as_str(),
+            "netbird:fqdn~ZGV2LmV4YW1wbGUubmV0YmlyZC5jbG91ZA"
+        );
+        assert_eq!(
+            host.attach_host(),
+            "netbird:fqdn~ZGV2LmV4YW1wbGUubmV0YmlyZC5jbG91ZA@18722"
         );
     }
 

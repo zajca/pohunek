@@ -74,12 +74,14 @@ where they are doing it, and when they need you.
 - Every command takes `--host <name>`; session targets accept
   `<host>/<session-id>`. The CLI talks **directly** to each host's daemon —
   there is no coordinator, no SaaS, no state sync.
-- Remote transport is a TCP listener bound **only** to the host's
-  NetBird/WireGuard address, never `0.0.0.0`. Reachability and encryption come
-  from the mesh; local access is an owner-only Unix socket.
-- **Tokenless discovery**: `pohunek host discover` enumerates local NetBird
-  peers and probes which run a reachable daemon. It needs local NetBird but not
-  local `pohunekd`, and uses a short owner-private cache; `--refresh` re-probes.
+- Remote transport is one TCP listener per configured overlay, bound **only**
+  to that provider's validated member address and port, never `0.0.0.0`.
+  NetBird/WireGuard is the default provider; local access is an owner-only Unix
+  socket.
+- **Tokenless discovery**: `pohunek host discover` aggregates configured
+  overlay peers and probes which run a reachable daemon. It needs provider-local
+  state but not local `pohunekd`, and uses a short owner-private cache;
+  `--refresh` re-probes.
   Status loading and peer probing have explicit bounded deadlines.
   `host inspect` queries live capabilities straight from the selected daemon.
 - **Shell completion**: generate static Bash, Zsh, or Fish completion from the
@@ -348,7 +350,13 @@ waiting for owner approval.
 Every command accepts `--host <name>` (default `local`), and nearly all of
 them `--json` for machine-readable output (the exceptions are `attach`,
 `daemon start`, and `prompt render`). Session targets are `<session-id>` or
-`<host>/<session-id>`.
+`<host>/<session-id>`. A discovered route uses
+`<overlay>:<canonical-identity>@<port>`. Canonical identities are typed
+`peer~<base64url>` or `fqdn~<base64url>` selectors without padding, so provider
+keys containing `/`, `+`, `=`, or the route separator `@` remain safe inside
+session targets and URLs. The selector is decoded and re-resolved through
+current provider state before every new connection while the discovered daemon
+port is retained.
 
 | Command | What it does |
 |---|---|
@@ -414,12 +422,14 @@ pohunek setup completions fish --dynamic
 
 Static completion performs no I/O beyond script generation. Dynamic completion
 is opt-in: it reads the existing owner-private host-discovery cache and makes a
-live, deadline-bounded `session.list` call for session targets. A qualified
-`host/id` target overrides `--host`; otherwise an explicit `--host` selects the
-session source and the default is local. Missing daemons, unavailable NetBird,
-and timeouts produce no shell diagnostics or candidates. The setup command does
-not edit shell startup files; for Zsh it prints the `fpath` step required before
-`compinit`.
+live, deadline-bounded `session.list` call for session targets. Every remote
+candidate has a provider-qualified `<overlay>:<address>` form; a short host name
+is offered only when it identifies one reachable route. A qualified `host/id`
+target overrides `--host`; otherwise an explicit `--host` selects the session
+source and the default is local. Missing daemons, unavailable overlays, name
+collisions, and timeouts produce no shell diagnostics or unsafe fallback
+candidates. The setup command does not edit shell startup files; for Zsh it
+prints the `fpath` step required before `compinit`.
 
 ### Automation and bounded observation
 
@@ -726,7 +736,8 @@ workspace in `web/` for the TypeScript packages.
 | `crates/prompt` | Shared prompt rendering + `link.*` metadata schema (CLI, GUI, scripts). |
 | `crates/knowledge` | Knowledge-bundle primitives for the assistant and offline docs. |
 | `crates/terminal` | VT screen tracking and attach compositing. |
-| `crates/netbird` | NetBird status parsing, host resolution, bind validation. |
+| `crates/netbird` | NetBird status parsing, host resolution, bind validation, and overlay adapter. |
+| `crates/overlay` | Provider-neutral overlay contract, configured registry, and per-overlay routing. |
 | `crates/paths` / `crates/hostcheck` | XDG/socket contract; host environment probes. |
 | `crates/xtask` | Workspace automation: docs build/check, TS type generation. |
 | `web/` | `@pohunek/protocol`, `@pohunek/sdk`, `@pohunek/backend`, `@pohunek/client-core`, `@pohunek/frontend`, `@pohunek/testkit`. |

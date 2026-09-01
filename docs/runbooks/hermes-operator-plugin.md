@@ -19,16 +19,14 @@ remain under the operator's control.
 - Do not inspect, copy, repair, or delete Hermes `state.db`, credentials,
   `.env` files, keys, or certificates. The plugin does not need them.
 
-## Ordinary M3 rollout
+## Historical M3 rollout context
 
-M1's exact-version-to-range-negotiation transition was a one-time coordinated
-fleet boundary. If every public client and daemon already runs protocol v2, M2
-and M3 are ordinary rollouts: they do not bump the public protocol. For a host
-that still predates M1, first follow the coordinated M1 transition described in
-the [Hermes migration guide](../migrations/hermes-operator-plugin.md); do not mix
-old exact-version peers with a new range-negotiating peer. The
-[durable-worker migration](../migrations/durable-session-workers.md) covers the
-separate legacy daemon-owned-PTY boundary only.
+M1's exact-version-to-range-negotiation transition historically established
+protocol v2. M2 and M3 were ordinary rollouts that did not bump that then-current
+public protocol. Current releases use protocol v3 and require the coordinated
+v3 upgrade described in the [update runbook](../knowledge/runbooks/update-after-release.md).
+The [durable-worker migration](../migrations/durable-session-workers.md) covers
+the separate legacy daemon-owned-PTY boundary only.
 
 For each host after that one-time transition:
 

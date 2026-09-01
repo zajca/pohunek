@@ -4,7 +4,7 @@
 //! fixed local runner. It neither reads Hermes state databases nor contacts an
 //! allowed remote host.
 
-// Rust guideline compliant 2026-08-12
+// Rust guideline compliant 2026-08-28
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Read as _;
@@ -407,7 +407,7 @@ mod tests {
         create_private_directory(&config);
         let cli = write_executable(
             &root.join("pohunek"),
-            "printf '%s\\n' '{\"protocol\":{\"minimum\":2,\"maximum\":2},\"ok\":{}}'",
+            "printf '%s\\n' '{\"protocol\":{\"minimum\":3,\"maximum\":3},\"ok\":{}}'",
         );
         let policy = config.join("policy.json");
         write_policy(&policy, &cli, access_mode);
@@ -495,8 +495,8 @@ mod tests {
         let document = serde_json::json!({
             "schema_version": 1,
             "pohunek_cli": cli,
-            "protocol_min": 2,
-            "protocol_max": 2,
+            "protocol_min": 3,
+            "protocol_max": 3,
             "access_mode": access_mode,
             "allowed_hosts": ["local"],
             "tool_timeout_ms": 1_000,

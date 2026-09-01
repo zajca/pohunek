@@ -43,7 +43,7 @@ use tokio::sync::broadcast;
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 use tracing::{error, info, warn};
 
-use netbird::validate_netbird_bind_addr;
+use overlay::OverlayTransport;
 
 use crate::error::DaemonError;
 use crate::session::{RedeemedAttach, RedeemedRuntime, SessionRegistry};
@@ -79,7 +79,7 @@ pub struct ControlServer {
 }
 
 impl ControlServer {
-    /// Bind the control socket at `socket_path`.
+    /// Bind the control socket at `socket_path` with a validated overlay registry.
     ///
     /// The parent directory is created (mode `0700`) if missing. If a socket
     /// file already exists, it is probed: a live daemon there is a hard error
@@ -90,10 +90,14 @@ impl ControlServer {
     /// # Errors
     ///
     /// Returns [`DaemonError`] on directory, permission, probe, or bind failure.
-    pub async fn bind(socket_path: &Path, health: HealthInfo) -> Result<Self, DaemonError> {
+    pub async fn bind(
+        socket_path: &Path,
+        health: HealthInfo,
+        registry: pohunek_client::OverlayRegistry,
+    ) -> Result<Self, DaemonError> {
         Self::bind_with_state(
             socket_path,
-            DaemonState::new(health, SessionRegistry::default()),
+            DaemonState::new(health, SessionRegistry::default(), registry),
         )
         .await
     }
@@ -178,12 +182,11 @@ impl ControlServer {
     }
 }
 
-/// The bound remote (`NetBird` TCP) control server, ready to accept connections.
+/// The bound remote (overlay TCP) control server, ready to accept connections.
 ///
 /// Identical protocol and attach semantics to [`ControlServer`]; only the
-/// transport differs. Binding is gated by [`validate_netbird_bind_addr`] so the
-/// daemon never exposes the control port on a non-NetBird interface (it fails
-/// closed — see [`RemoteServer::bind`]).
+/// transport differs. Binding is gated by [`OverlayTransport::validate_bind_addr`]
+/// so the daemon never exposes the control port on a non-overlay interface.
 #[derive(Debug)]
 pub struct RemoteServer {
     listener: TcpListener,
@@ -194,19 +197,23 @@ pub struct RemoteServer {
 impl RemoteServer {
     /// Bind a TCP control listener at `addr`.
     ///
-    /// FAILS CLOSED: `addr.ip()` is validated as a `NetBird` address
-    /// ([`validate_netbird_bind_addr`]) **before** the socket is opened, so an
-    /// invalid or non-NetBird address never reaches the OS bind. This is the
+    /// FAILS CLOSED: `addr.ip()` is validated against the overlay's trusted
+    /// range ([`OverlayTransport::validate_bind_addr`]) **before** the socket is
+    /// opened, so an invalid or non-member address never reaches the OS bind. This is the
     /// authoritative gate that keeps the control port off public, RFC1918, and
     /// loopback interfaces.
     ///
     /// # Errors
     ///
-    /// Returns [`DaemonError::NetbirdBind`] when the address is not a valid
-    /// `NetBird` bind address, or [`DaemonError::Socket`] on an OS bind failure.
-    pub async fn bind(addr: SocketAddr, state: DaemonState) -> Result<Self, DaemonError> {
-        if let Err(err) = validate_netbird_bind_addr(addr.ip()) {
-            return Err(DaemonError::NetbirdBind {
+    /// Returns [`DaemonError::OverlayBind`] when the address is not a valid
+    /// member of the overlay's range, or [`DaemonError::Socket`] on bind failure.
+    pub async fn bind(
+        addr: SocketAddr,
+        state: DaemonState,
+        transport: &dyn OverlayTransport,
+    ) -> Result<Self, DaemonError> {
+        if let Err(err) = transport.validate_bind_addr(addr.ip()) {
+            return Err(DaemonError::OverlayBind {
                 addr: addr.ip(),
                 reason: err.to_string(),
             });

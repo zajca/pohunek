@@ -1,6 +1,7 @@
 import type { DaemonHealthResult, HostRecord } from "@pohunek/protocol";
 import { connectLocal } from "@pohunek/sdk";
 import type { DaemonTarget } from "./relay";
+import { externalFqdnSelector, externalPeerSelector } from "./identity";
 import { errorClass, stdoutLogger, type BackendLogger } from "./log";
 
 const LOCAL_HOST = "local";
@@ -17,7 +18,6 @@ export interface BackendHostEntry {
 
 export interface StartHostsPipelineOptions {
   readonly daemonSocketPath: string;
-  readonly remotePort: number;
   readonly discoverIntervalSeconds: number;
   readonly logger?: BackendLogger;
 }
@@ -43,7 +43,7 @@ export class BackendStartupError extends Error {
 
 export interface HostsPipelineHandle {
   snapshot(): readonly BackendHostEntry[];
-  targetForHost(host: string): DaemonTarget | undefined;
+  resolveTargetForHost(host: string): Promise<DaemonTarget | undefined>;
   refresh(): Promise<void>;
   close(): Promise<void>;
 }
@@ -92,7 +92,12 @@ class HostsPipeline implements HostsPipelineHandle {
     return this.hosts.map((entry) => ({ ...entry }));
   }
 
-  public targetForHost(host: string): DaemonTarget | undefined {
+  public async resolveTargetForHost(host: string): Promise<DaemonTarget | undefined> {
+    if (host === LOCAL_HOST) {
+      return this.targets.get(host);
+    }
+    await this.activeRefresh;
+    await this.refresh();
     return this.targets.get(host);
   }
 
@@ -175,11 +180,11 @@ class HostsPipeline implements HostsPipelineHandle {
           reachability: record.classification,
           daemon_version: record.daemon_version,
         });
-        if (record.netbird_ip !== null) {
+        if (record.address !== null) {
           nextTargets.set(host, {
             kind: "tcp",
-            host: record.netbird_ip,
-            port: this.options.remotePort,
+            host: record.address,
+            port: record.port,
           });
         }
         continue;
@@ -226,7 +231,12 @@ function localEntry(health: DaemonHealthResult): BackendHostEntry {
 }
 
 function hostIdentifier(record: HostRecord): string | undefined {
-  return record.name ?? record.fqdn ?? record.netbird_ip ?? undefined;
+  const identity = record.peer_id !== null && record.peer_id.length > 0
+    ? externalPeerSelector(record.peer_id)
+    : record.fqdn !== null && record.fqdn.length > 0
+      ? externalFqdnSelector(record.fqdn)
+      : undefined;
+  return identity === undefined ? undefined : `${record.overlay}:${identity}`;
 }
 
 function elapsedMilliseconds(startedAt: number): number {

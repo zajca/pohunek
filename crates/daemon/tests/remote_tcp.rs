@@ -11,6 +11,8 @@
 //! over TCP, `host.inspect` over TCP, cross-transport payload parity, and the
 //! fail-closed bind.
 
+mod support;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
@@ -121,7 +123,11 @@ async fn spawn_dual_servers(
         )),
         Arc::new(LinuxInspector::new()),
     );
-    let state = DaemonState::new(HealthInfo::new(version), registry);
+    let state = DaemonState::new(
+        HealthInfo::new(version),
+        registry,
+        support::overlay_registry(),
+    );
     let unix = ControlServer::bind_with_state(&socket, state.clone())
         .await
         .expect("unix server binds");
@@ -657,15 +663,17 @@ async fn bind_rejects_non_netbird_address() {
     let state = DaemonState::new(
         HealthInfo::new("0.0.0"),
         SessionRegistry::new(SessionRegistryConfig::default()),
+        support::overlay_registry(),
     );
     let addr: SocketAddr = "127.0.0.1:18722".parse().expect("parse loopback addr");
 
-    let result = RemoteServer::bind(addr, state).await;
+    let transport = netbird::NetbirdTransport::new();
+    let result = RemoteServer::bind(addr, state, &transport).await;
     match result {
-        Err(DaemonError::NetbirdBind { addr: rejected, .. }) => {
+        Err(DaemonError::OverlayBind { addr: rejected, .. }) => {
             assert_eq!(rejected.to_string(), "127.0.0.1");
         }
-        Err(other) => panic!("expected NetbirdBind error, got: {other}"),
-        Ok(_) => panic!("expected bind to fail closed on a non-NetBird address"),
+        Err(other) => panic!("expected OverlayBind error, got: {other}"),
+        Ok(_) => panic!("expected bind to fail closed on a non-overlay address"),
     }
 }

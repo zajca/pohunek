@@ -431,7 +431,10 @@ failure returns a typed creation error.
 - required event-log initialization.
 
 The optional NetBird listener may still degrade to local-only according to the
-existing policy. Reconciliation errors that make individual sessions
+existing policy. Temporary provider state and bind failures remain retryable,
+but an overlay listener supervisor that exits or panics unexpectedly after
+readiness cancels every daemon transport and produces a fatal exit after
+controlled cleanup. Reconciliation errors that make individual sessions
 unavailable do not prevent daemon readiness once they have been classified and
 surfaced.
 

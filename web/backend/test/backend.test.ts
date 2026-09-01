@@ -7,6 +7,7 @@ import {
   BackendStartupError,
   startBackend,
   startHostsPipeline,
+  startRelay,
   type BackendHandle,
   type BackendHostEntry,
   type BackendLogger,
@@ -21,7 +22,9 @@ import {
 const LOOPBACK_HOST = "127.0.0.1";
 const LOCAL_DAEMON_VERSION = "2.0.0-local-test";
 const PEER_DAEMON_VERSION = "2.0.0-peer-test";
-const PEER_HOST = "peer-one";
+const PEER_NAME = "peer-one";
+const PEER_PUBLIC_KEY = "peer/one+key==";
+const PEER_HOST = "netbird:peer~cGVlci9vbmUra2V5PT0";
 const TEST_COLS = 80;
 const TEST_ROWS = 24;
 const DISCOVER_INTERVAL_SECONDS = 0.02;
@@ -44,6 +47,26 @@ interface BackendFixture {
 }
 
 describe("@pohunek/backend", () => {
+  test("rejects non-WebSocket relay requests before resolving a target", async () => {
+    let resolutionCount = 0;
+    const relay = await startRelay({
+      bindHost: LOOPBACK_HOST,
+      port: 0,
+      allowLoopbackBind: true,
+      targets: (): undefined => {
+        resolutionCount += 1;
+        return undefined;
+      },
+    });
+    try {
+      const response = await fetch(`${relay.url}/daemon/remote/control`);
+      expect(response.status).toBe(426);
+      expect(resolutionCount).toBe(0);
+    } finally {
+      await relay.close();
+    }
+  });
+
   test("discovers and tunnels to local and peer daemons on one origin", async () => {
     const fixture = await startBackendFixture();
     try {
@@ -116,8 +139,52 @@ describe("@pohunek/backend", () => {
         { host: PEER_HOST, reachability: "unreachable" },
       ]);
 
-      const removedRoute = await fetch(`${fixture.backend.url}/daemon/${PEER_HOST}/control`);
-      expect(removedRoute.status).toBe(404);
+      let removedRouteConnected = false;
+      try {
+        const removedRoute = await Client.connectWs(fixture.backend.url, PEER_HOST);
+        removedRouteConnected = true;
+        await removedRoute.close();
+      } catch {
+        removedRouteConnected = false;
+      }
+      expect(removedRouteConnected).toBe(false);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  test("tunnel open refreshes identity ownership before dialing cached address", async () => {
+    const fixture = await startBackendFixture(60);
+    try {
+      const peerAddress = fixture.peer.tcpAddress;
+      if (peerAddress === undefined) {
+        throw new Error("peer fixture did not expose a TCP address");
+      }
+      fixture.local.scenario.setDiscoveredHosts([
+        {
+          ...reachablePeerRecord(peerAddress.port),
+          peer_id: "different-peer-key",
+        },
+      ]);
+
+      let cachedOwnerConnected = false;
+      try {
+        const cachedOwner = await Client.connectWs(fixture.backend.url, PEER_HOST);
+        cachedOwnerConnected = true;
+        await cachedOwner.close();
+      } catch {
+        cachedOwnerConnected = false;
+      }
+      expect(cachedOwnerConnected).toBe(false);
+
+      const reassignedHost = "netbird:peer~ZGlmZmVyZW50LXBlZXIta2V5";
+      const reassigned = await Client.connectWs(fixture.backend.url, reassignedHost);
+      try {
+        const health = await reassigned.call("daemon.health", null);
+        expect(health.daemon_version).toBe(PEER_DAEMON_VERSION);
+      } finally {
+        await reassigned.close();
+      }
     } finally {
       await fixture.close();
     }
@@ -150,7 +217,6 @@ describe("@pohunek/backend", () => {
       try {
         await startHostsPipeline({
           daemonSocketPath: socketPath,
-          remotePort: 18_722,
           discoverIntervalSeconds: 1,
           logger: silentLogger,
         });
@@ -169,7 +235,9 @@ describe("@pohunek/backend", () => {
   });
 });
 
-async function startBackendFixture(): Promise<BackendFixture> {
+async function startBackendFixture(
+  discoverIntervalSeconds: number = DISCOVER_INTERVAL_SECONDS,
+): Promise<BackendFixture> {
   const root = await mkdtemp(join(tmpdir(), "pohunek-backend-test-"));
   const assets = join(root, "assets");
   await mkdir(assets);
@@ -191,7 +259,7 @@ async function startBackendFixture(): Promise<BackendFixture> {
   const local = await startFixtureDaemon({
     listen: { unixSocketPath: socketPath },
     daemonVersion: LOCAL_DAEMON_VERSION,
-    host: { discoveredHosts: [reachablePeerRecord()] },
+    host: { discoveredHosts: [reachablePeerRecord(peerAddress.port)] },
   });
 
   let backend: BackendHandle;
@@ -202,8 +270,7 @@ async function startBackendFixture(): Promise<BackendFixture> {
         port: 0,
         allowLoopbackBind: true,
         daemonSocketPath: socketPath,
-        remotePort: peerAddress.port,
-        discoverIntervalSeconds: DISCOVER_INTERVAL_SECONDS,
+        discoverIntervalSeconds,
         staticAssetsDir: assets,
       },
       silentLogger,
@@ -229,11 +296,14 @@ async function startBackendFixture(): Promise<BackendFixture> {
   };
 }
 
-function reachablePeerRecord(): HostRecord {
+function reachablePeerRecord(port: number): HostRecord {
   return {
-    name: PEER_HOST,
-    fqdn: `${PEER_HOST}.test.invalid`,
-    netbird_ip: LOOPBACK_HOST,
+    name: PEER_NAME,
+    fqdn: `${PEER_NAME}.test.invalid`,
+    address: LOOPBACK_HOST,
+    port,
+    overlay: "netbird",
+    peer_id: PEER_PUBLIC_KEY,
     classification: "reachable_daemon",
     daemon_version: PEER_DAEMON_VERSION,
   };

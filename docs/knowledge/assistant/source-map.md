@@ -236,6 +236,9 @@ Protocol contracts and transport:
 - `crates/protocol/tests/roundtrip.rs`
 - `crates/netbird/src/lib.rs`
 - `crates/netbird/src/status.rs`
+- `crates/netbird/src/transport.rs`
+- `crates/overlay/src/lib.rs`
+- `crates/overlay/tests/registry_contract.rs`
 
 Assistant knowledge implementation work in progress:
 

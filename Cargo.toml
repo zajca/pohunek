@@ -16,6 +16,7 @@ members = [
     "crates/paths",
     "crates/xtask",
     "crates/netbird",
+    "crates/overlay",
     "crates/prompt",
     "crates/terminal",
     "crates/worker-protocol",
@@ -42,6 +43,8 @@ pohunek-hostcheck = { path = "crates/hostcheck" }
 pohunek-knowledge = { path = "crates/knowledge" }
 pohunek-logging = { path = "crates/logging" }
 pohunek-netbird = { path = "crates/netbird" }
+netbird = { package = "pohunek-netbird", path = "crates/netbird" }
+overlay = { package = "pohunek-overlay", path = "crates/overlay" }
 pohunek-paths = { path = "crates/paths" }
 pohunek-prompt = { path = "crates/prompt" }
 pohunek-protocol = { path = "crates/protocol" }

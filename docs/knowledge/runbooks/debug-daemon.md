@@ -22,8 +22,12 @@ Use this runbook when commands report that the daemon is unreachable or unhealth
    host daemon responds through the remote transport.
    If the remote daemon started before NetBird was ready, allow one retry
    interval for its NetBird-only listener to become available, then repeat the
-   inspection and check its logs for `serving control protocol over NetBird`.
-   A daemon restart is not required for this startup ordering.
+   inspection and check its logs for `serving control protocol over overlay`.
+   A daemon restart is not required for this startup ordering. If a listener
+   supervisor exits or panics unexpectedly, the daemon logs
+   `remote listener supervisor failed; shutting down daemon` with the overlay
+   identifier and exits after controlled cleanup instead of remaining ready
+   without that listener.
 6. If a session was expected, run `pohunek session list --json` on the relevant
    host and inspect the specific session with `pohunek session inspect <target>`.
 7. If the daemon restarted, do not infer session exit from the closed control or

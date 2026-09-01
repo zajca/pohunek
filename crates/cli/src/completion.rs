@@ -10,7 +10,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::future::Future;
 use std::io::{self, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::iter;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ use clap::{Command, CommandFactory, ValueEnum};
 use clap_complete::engine::ValueCompleter;
 use clap_complete::{ArgValueCompleter, CompleteEnv, CompletionCandidate};
 use pohunek_client::{Client, ClientOptions};
-use protocol::{HostClass, HostRecord, SessionInfo, SessionListParams};
+use protocol::{HostRecord, SessionInfo, SessionListParams};
 use serde::Serialize;
 
 use crate::error::CliError;
@@ -417,16 +417,7 @@ async fn query_sessions(host: &str) -> Option<Vec<SessionInfo>> {
             .await
             .ok()?
     } else {
-        let records = crate::commands::host::fetch_records(&paths.cache_dir, false)
-            .await
-            .ok()?;
-        let record = records.iter().find(|record| {
-            record.name.as_deref() == Some(host)
-                && matches!(record.class, HostClass::ReachableDaemon { .. })
-        })?;
-        let ip: IpAddr = record.netbird_ip.as_deref()?.parse().ok()?;
-        let port = netbird::remote_port().ok()?;
-        Client::connect_tcp_addr_with_options(host, SocketAddr::new(ip, port), options)
+        Client::connect_with_options(host, &paths.socket, options)
             .await
             .ok()?
     };
@@ -437,17 +428,29 @@ async fn query_sessions(host: &str) -> Option<Vec<SessionInfo>> {
 }
 
 fn host_names(records: &[HostRecord]) -> Vec<String> {
-    let mut hosts = vec![LOCAL_HOST.to_owned()];
-    hosts.extend(records.iter().filter_map(|record| {
-        matches!(record.class, HostClass::ReachableDaemon { .. })
-            .then(|| record.name.as_deref())
-            .flatten()
-            .filter(|name| valid_host(name))
-            .map(str::to_owned)
-    }));
+    let mut hosts = completion_hosts(records)
+        .into_iter()
+        .map(|host| host.target)
+        .chain(iter::once(LOCAL_HOST.to_owned()))
+        .collect::<Vec<_>>();
     hosts.sort();
     hosts.dedup();
     hosts
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletionHost {
+    target: String,
+}
+
+fn completion_hosts(records: &[HostRecord]) -> Vec<CompletionHost> {
+    records
+        .iter()
+        .filter_map(crate::commands::host_fanout::reachable_target)
+        .map(|target| CompletionHost {
+            target: target.transport_target,
+        })
+        .collect()
 }
 
 fn session_candidates(
@@ -533,13 +536,18 @@ where
 
 #[cfg(test)]
 mod tests {
+    use protocol::HostClass;
+
     use super::*;
 
     fn host_record(name: &str, class: HostClass) -> HostRecord {
         HostRecord {
             name: Some(name.to_owned()),
             fqdn: Some(format!("{name}.example.test")),
-            netbird_ip: Some("100.64.0.2".to_owned()),
+            address: Some("100.64.0.2".to_owned()),
+            port: 18_722,
+            overlay: "netbird".to_owned(),
+            peer_id: Some(format!("peer-{name}")),
             class,
         }
     }
@@ -657,7 +665,73 @@ mod tests {
                 },
             ),
         ];
-        assert_eq!(host_names(&records), vec!["host-b", "local"]);
+        assert_eq!(
+            host_names(&records),
+            vec![
+                "local",
+                "netbird:peer~cGVlci1iYWQvbmFtZQ@18722",
+                "netbird:peer~cGVlci1ob3N0LWI@18722"
+            ]
+        );
+    }
+
+    #[test]
+    fn completion_collisions_preserve_distinct_provider_qualified_identities() {
+        let reachable = HostClass::ReachableDaemon {
+            daemon_version: "1.0.0".to_owned(),
+        };
+        let mut first = host_record("build", reachable.clone());
+        first.overlay = "first".to_owned();
+        first.address = Some("100.64.0.2".to_owned());
+        first.port = 17_001;
+        let mut second = host_record("build", reachable);
+        second.overlay = "second".to_owned();
+        second.address = Some("100.64.0.3".to_owned());
+        second.port = 17_002;
+        let records = vec![first, second];
+
+        assert_eq!(
+            host_names(&records),
+            vec![
+                "first:peer~cGVlci1idWlsZA@17001",
+                "local",
+                "second:peer~cGVlci1idWlsZA@17002"
+            ]
+        );
+    }
+
+    #[test]
+    fn completion_target_uses_stable_identity_and_discovered_port() {
+        let record = host_record(
+            "host-b",
+            HostClass::ReachableDaemon {
+                daemon_version: "1.0.0".to_owned(),
+            },
+        );
+
+        let hosts = completion_hosts(&[record]);
+        assert_eq!(hosts[0].target, "netbird:peer~cGVlci1ob3N0LWI@18722");
+    }
+
+    #[test]
+    fn completion_target_rejects_non_dialable_records() {
+        let reachable = HostClass::ReachableDaemon {
+            daemon_version: "1.0.0".to_owned(),
+        };
+        let mut record = host_record("host-b", reachable.clone());
+        record.address = None;
+        assert!(completion_hosts(&[record.clone()]).is_empty());
+
+        record.address = Some("not-an-ip".to_owned());
+        assert!(completion_hosts(&[record.clone()]).is_empty());
+
+        record.address = Some("100.64.0.2".to_owned());
+        record.port = 0;
+        assert!(completion_hosts(&[record.clone()]).is_empty());
+
+        record.port = 18_722;
+        record.class = HostClass::Candidate;
+        assert!(completion_hosts(&[record]).is_empty());
     }
 
     #[test]

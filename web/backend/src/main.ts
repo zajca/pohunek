@@ -16,7 +16,6 @@ export async function startBackend(
 ): Promise<BackendHandle> {
   const hosts = await startHostsPipeline({
     daemonSocketPath: config.daemonSocketPath,
-    remotePort: config.remotePort,
     discoverIntervalSeconds: config.discoverIntervalSeconds,
     logger,
   });

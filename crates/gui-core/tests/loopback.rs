@@ -2051,7 +2051,11 @@ impl LoopbackDaemon {
             config.shell_command = shell_command;
         }
         let sessions = worker_backed_registry(config);
-        let mut state = DaemonState::new(HealthInfo::new(version), sessions);
+        let mut state = DaemonState::new(
+            HealthInfo::new(version),
+            sessions,
+            pohunek_client::default_overlay_registry().expect("configured registry"),
+        );
         if notifications_enabled {
             let notifications =
                 NotificationService::open(&temp_dir(&format!("{tag}-notifications")))
@@ -2583,8 +2587,8 @@ async fn stop_session(host: &HostConfig, id: &SessionId) {
 
 async fn client(host: &HostConfig) -> Client {
     match host.transport {
-        pohunek_gui_core::HostTransport::Tcp { addr } => {
-            Client::connect_tcp_addr(host.id.as_str(), addr)
+        pohunek_gui_core::HostTransport::Tcp { addr, .. } => {
+            Client::connect_trusted_tcp_addr(host.id.as_str(), addr)
                 .await
                 .expect("connect tcp")
         }
