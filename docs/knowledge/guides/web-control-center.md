@@ -119,18 +119,20 @@ Browser code imports `Client` from `@pohunek/sdk/browser` and calls
 Unix sockets directly. The backend only tunnels the public newline-delimited
 JSON control frames and raw attach bytes; it does not define a second protocol.
 
-## Accepted public relay replacement
+## Separate accepted team web surface
 
 The [optional team-relay design](../concepts/team-relay.md) is accepted but not
-implemented. The future Rust `pohunek-relayd` will be the single production
+implemented. The future Rust `pohunek-relayd` will be the single team-path
 authentication, authorization, routing, aggregation, and browser-API authority,
-and will serve the compiled SPA. Browser clients will use a typed relay API
+and will serve a team-mode SPA. Team browser clients will use a typed relay API
 rather than forwarding arbitrary daemon NDJSON through a transparent tunnel.
 
 The current `@pohunek/backend` runtime and the release/install instructions
-above remain accurate until
-[#86](https://github.com/zajca/pohunek/issues/86) delivers the complete
-replacement. Bun remains the web build, test, and development runtime, but the
-Bun backend will not remain a second deployed production authority. This
-accepted direction adds no usable relay command, endpoint, or configuration to
-the current release.
+above remain supported after
+[#86](https://github.com/zajca/pohunek/issues/86) delivers that separate team
+surface. `pohunek-relayd` has no local mode. Owner and team WebUIs may share
+Svelte presentation components, but use separate explicit origins, API
+adapters, credentials, and state; neither silently falls back to the other.
+The Bun backend never becomes a team authorization or relay-routing authority.
+This accepted direction adds no usable relay command, endpoint, or
+configuration to the current release.

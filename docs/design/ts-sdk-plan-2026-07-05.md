@@ -7,8 +7,8 @@
 > `pohunek-relayd` and its client API follow the
 > [team-relay RFC](team-relay-control-plane-rfc.md),
 > [#71](https://github.com/zajca/pohunek/issues/71), and
-> [#86](https://github.com/zajca/pohunek/issues/86). The Bun backend remains
-> supported until #86 supplies its complete production replacement.
+> [#86](https://github.com/zajca/pohunek/issues/86). The Bun backend remains the
+> supported owner-path WebUI; #86 adds a separate typed team-relay client.
 
 Implements **Track S.3** from [`ROADMAP.md`](../ROADMAP.md) and Slice A items
 3–4 of [`phases/04-browser-control-center.md`](../phases/04-browser-control-center.md):

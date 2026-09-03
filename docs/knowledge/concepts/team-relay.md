@@ -15,6 +15,13 @@ such as NetBird. The shipped Bun web backend is a transparent mesh-local
 browser transport, not the team relay described here. Do not suggest relay
 commands or configuration until their owning issues have shipped.
 
+The owner WebUI remains supported alongside the relay. Its Bun backend discovers
+the local daemon and direct-overlay peers and transparently bridges browser
+WebSockets into the existing owner protocol. `pohunek-relayd` has no local mode;
+its team WebUI uses a separate typed API, credential set, state adapter, and
+origin. Presentation components may be shared, but there is no cross-mode
+fallback or session aggregation.
+
 The accepted design adds one optional public Rust `pohunek-relayd` authority.
 Standalone and direct NetBird operation remain first-class and never depend on
 the relay. A host may use either owner mode, enroll with the relay, or use both

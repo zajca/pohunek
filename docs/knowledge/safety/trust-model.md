@@ -96,7 +96,10 @@ boundaries in [secrets](secrets.md) and [repo `.pohunek/`](repo-pohunek.md).
 The [optional team relay](../concepts/team-relay.md) is accepted architecture,
 not shipped functionality. Do not invent relay commands, configuration keys,
 protocol fields, or recovery steps. Current protocol-v3 local, overlay, and Bun
-browser paths remain one owner trust domain.
+browser paths remain one owner trust domain and remain supported after the
+relay ships. The relay has no local mode. Owner and team browser surfaces must
+not exchange credentials, state, or silently fall back between their explicit
+origins and API adapters.
 
 When relay support is implemented, preserve these independent authorization
 responsibilities:

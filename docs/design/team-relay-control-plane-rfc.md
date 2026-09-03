@@ -19,6 +19,13 @@ audit, quotas, and the browser-facing API. It does not own PTYs or host session
 state. Each `pohunekd` remains authoritative for the sessions and processes on
 its machine.
 
+The shipped owner WebUI remains a separate supported path. Its Bun backend runs
+inside the owner trust domain, discovers the local daemon and direct-overlay
+peers, and transparently maps browser WebSockets to daemon connections. The
+relay neither replaces that backend nor needs a local mode. Owner and team web
+surfaces may share presentation code, but their transports, credentials, state,
+and origins remain explicit and fail closed without cross-mode fallback.
+
 The relay publishes a WireGuard endpoint. `pohunekd` embeds a userspace
 WireGuard implementation and initiates both the tunnel and every application
 connection to the relay. The relay never dials a host. This requires neither a
@@ -77,6 +84,10 @@ The following decisions are final for the first complete team-relay release:
 17. The relay process and operator are trusted with transient plaintext and the
     full authority of every active `HostShare`. The design does not claim
     protection from a compromised relay.
+18. The existing owner WebUI and `web/backend` remain supported for local and
+    direct-overlay access. `pohunek-relayd` has no owner/local mode. Team and
+    owner browser modes use separate explicit API adapters and credentials,
+    even when they share Svelte presentation components.
 
 ## 3. Goals
 
@@ -99,6 +110,8 @@ The following decisions are final for the first complete team-relay release:
 ## 4. Non-goals
 
 - Replacing direct local or NetBird access.
+- Replacing the existing owner WebUI or moving its Unix/NetBird gateway into
+  `pohunek-relayd`.
 - Publishing local or direct-NetBird sessions through a relay.
 - Protecting a host from a compromised relay within active `HostShare` limits.
 - Protecting the daemon owner's Unix account from a malicious repository,
@@ -173,12 +186,15 @@ only after explicit enrollment and exposes only locally approved shares.
 | `pohunek-relayd` | OIDC and service-account auth, teams, roles, groups, host registry, share requests, user authorization, routing, state catalog, audit, quotas, public API | Host PTYs, host worktrees, host profile bodies, durable terminal content |
 | `pohunek` | Explicit local/NetBird owner mode and explicit relay client mode | Hidden fallback between trust domains |
 | `pohunek-gui` | Existing direct-owner client behavior; future typed relay client behavior | Authorization authority |
-| `web/frontend` | Browser presentation and relay client state | Authentication secrets, authorization authority, durable terminal data |
-| `web/backend` | No production authority after migration; removed as a runtime service | Relay routing, auth, aggregation, or host dialing |
+| `web/frontend` | Owner-mode browser presentation and reusable Svelte presentation components for the future team surface | Authorization authority, cross-mode fallback, durable terminal data |
+| `web/backend` | Supported owner-mode host discovery, SPA serving, and transparent one-WebSocket-to-one-daemon tunneling over local/direct-overlay paths | Relay routing, relay auth, team aggregation, or public-Internet exposure |
 
-`pohunek-relayd` serves the compiled SPA and the authenticated HTTP/WebSocket
-API. Bun remains the build, test, and development runtime for web packages, but
-there is no separately deployed Bun backend with overlapping authority.
+`pohunek-relayd` serves the team-mode SPA and its authenticated typed
+HTTP/WebSocket API. The separately deployed Bun backend remains the owner-mode
+WebUI gateway and continues to serve the owner SPA. It has no relay authority,
+and the Rust relay has no local/owner mode. The two surfaces may reuse Svelte
+components and framework-independent presentation helpers, but not transport,
+credential, authorization, or session-state adapters.
 
 ### 7.1 Trust-boundary data flow
 
@@ -206,7 +222,18 @@ principal -> WSS -> relay one-use attach authorization
           -> existing host control link -> pohunekd
 pohunekd -> separate TCP stream inside the same tunnel -> pohunek-relayd
 pohunek-relayd <-> principal WSS         (bounded opaque PTY bytes)
+
+Owner WebUI (independent of relay)
+owner browser -> private HTTP/WSS -> web/backend
+web/backend -> local Unix socket ------------------+-> pohunekd
+            -> direct overlay/NetBird TCP ---------+
 ```
+
+The owner WebUI keeps the shipped transparent daemon protocol and `/api/hosts`
+catalog. It does not accept relay credentials or expose relay-only team state.
+The team WebUI uses only the typed relay API and does not fall back to the owner
+gateway when the relay, login, team, share, or host is unavailable. Each origin
+declares exactly one mode; a deployment may expose both on different origins.
 
 The relay never opens a connection to a host address. PostgreSQL participates
 in relay authentication, authorization, audit, and catalog transactions, but
@@ -637,8 +664,10 @@ ingress, health, and shutdown.
 
 Shared host-link types live in `crates/protocol`. Relay-client API types live in
 a dedicated Rust crate and generate the TypeScript contract consumed by the CLI
-and web workspace. Browser clients never send arbitrary daemon NDJSON through a
-transparent tunnel.
+and team web workspace. Team browser clients never send arbitrary daemon NDJSON
+through a transparent tunnel. The existing owner browser client continues to
+use the transparent `web/backend` transport because browsers cannot dial the
+owner Unix socket or direct daemon TCP listener themselves.
 
 ### 15.2 PostgreSQL
 
@@ -909,7 +938,7 @@ description conflicts until the issue is reconciled.
 | 7 | [#83](https://github.com/zajca/pohunek/issues/83) | Relay-side session visibility, creator rights, ACLs, admin authority, and revocation. |
 | 8 | [#84](https://github.com/zajca/pohunek/issues/84) | Subscription-first atomic snapshot/watermark and gap-triggered resync without replay. |
 | 9 | [#71](https://github.com/zajca/pohunek/issues/71) | Relay host-link manager, router, state aggregator, attach proxy, and typed public API. |
-| 10 | [#86](https://github.com/zajca/pohunek/issues/86) | Team CLI, Svelte web control surface, and removal of the production Bun backend authority. |
+| 10 | [#86](https://github.com/zajca/pohunek/issues/86) | Team CLI and Svelte relay surface, with explicit separation from the retained owner WebUI. |
 | 11 | [#87](https://github.com/zajca/pohunek/issues/87) | Audit, quotas, deployment, backup/restore, observability, and incident hardening. |
 | Later | [#73](https://github.com/zajca/pohunek/issues/73) | Provider webhook delivery and encrypted token vault. |
 | Later | [#88](https://github.com/zajca/pohunek/issues/88) | Real profile-backed container/VM runtime isolation. |
@@ -963,7 +992,11 @@ The team relay track is complete only when all of the following are true:
 - no forbidden terminal or secret data reaches relay persistence or telemetry;
 - quotas and backpressure prevent one tenant or host from exhausting the relay;
 - CLI and web provide the same typed permissions and failure behavior;
-- the deployed runtime has exactly one auth/routing authority: the Rust relay;
+- the team path has exactly one auth/routing authority: the Rust relay;
+- the retained owner WebUI still reaches local and direct-overlay daemons when
+  no relay exists or the relay is unavailable;
+- owner and team browser modes use explicit origins and adapters, never exchange
+  credentials or session state, and never silently fall back between modes;
 - security and operational runbooks pass their automated checks; and
 - every required repository, web, protocol, docs, security, and release gate is
   green.
@@ -1010,19 +1043,28 @@ Rejected for the relay contract. Subscription-first atomic snapshotting avoids
 a persistent replay subsystem while still preventing lost startup mutations.
 Any detectable uncertainty causes a full bounded resynchronization.
 
-### 25.8 Continue the Bun backend as relay authority
+### 25.8 Use the Bun backend as team relay authority
 
 Rejected. Authentication, WireGuard, routing, aggregation, audit, and quotas
-must have one implementation authority. Bun remains for frontend build/test
-tooling; the production relay is Rust.
+must have one implementation authority: the Rust relay. This does not remove
+the Bun backend's distinct production role as the owner-private local/NetBird
+browser gateway.
 
-### 25.9 SQLite relay storage
+### 25.9 Give `pohunek-relayd` a local mode
+
+Rejected. A relay local mode would mix the public multi-tenant trust boundary
+with owner Unix-socket and direct-overlay access, requiring bypasses or parallel
+rules for OIDC, PostgreSQL, team authorization, host discovery, and session
+visibility. The existing Bun gateway already solves browser access inside the
+owner trust domain without expanding `pohunekd` or `pohunek-relayd`.
+
+### 25.10 SQLite relay storage
 
 Rejected. The public multi-team service needs transactional concurrency,
 operational backups, migrations, and future active-passive options. PostgreSQL
 is required from the first release.
 
-### 25.10 Persist terminal output for reconnect
+### 25.11 Persist terminal output for reconnect
 
 Rejected. Host workers already own bounded terminal state. The relay requests
 fresh bounded observations after reconnect and never becomes a terminal archive.

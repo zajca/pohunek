@@ -25,6 +25,9 @@ Hard constraints, decided on purpose — respect them in every change:
   clients keep talking to each host daemon without a relay dependency. Their
   trust boundary remains owner-only socket/file permissions plus the configured
   overlay, with NetBird as the production provider.
+- **The owner WebUI stays first-class.** The shipped Bun backend remains the
+  private local/NetBird browser gateway. It is not replaced by the relay and
+  must never become a second team-auth or relay-routing authority.
 - **The optional team relay is additive.** The accepted design introduces one
   trusted Rust `pohunek-relayd` authority for teams, end-user authorization,
   routing, audit, and quotas. Each host remains authoritative for its PTYs,
@@ -69,7 +72,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/gui-core` | Pure, headless state + SDK bridge for the GUI (no Iced dependency; fully unit-testable). |
 | `crates/gui`      | Native Iced shell that wraps `gui-core` in `Task`/`Subscription`. |
 | `crates/xtask`    | Workspace automation (docs, TypeScript generation, and pinned Hermes compatibility evidence). |
-| `web/`            | Bun workspace: generated protocol types, SDK runtime, control-center backend/client core/SPA, and testkit. |
+| `web/`            | Bun workspace: generated protocol types, SDK runtime, retained owner-mode WebUI backend/client core/SPA, reusable presentation code, and testkit. |
 
 Other top-level: `compat/` (pinned upstream compatibility locks and sanitized
 goldens), `docs/` (architecture, roadmap, phases, knowledge source), `scripts/`

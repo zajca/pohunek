@@ -47,11 +47,13 @@ full-resync state synchronization, and
 [#71](https://github.com/zajca/pohunek/issues/71) for relay routing and its typed
 public API.
 
-The current `@pohunek/backend` remains the shipped transparent browser
-transport until [#86](https://github.com/zajca/pohunek/issues/86) replaces its
-production runtime with the Rust relay and a typed relay client. Its current
-exported names, including `WsTransport.relay`, describe existing SDK API and do
-not imply that the accepted team relay has shipped.
+The current `@pohunek/backend` remains the supported owner-mode transparent
+browser transport after [#86](https://github.com/zajca/pohunek/issues/86) adds a
+separate typed team-relay client. The Rust relay has no local mode. The two web
+surfaces may reuse presentation components, but they use explicit origins,
+transports, credentials, and state with no cross-mode fallback. Existing names,
+including `WsTransport.relay`, describe shipped SDK API and do not imply that
+the accepted team relay has shipped.
 
 ## Compatibility Model
 
@@ -134,8 +136,8 @@ state. It is a pure one-WebSocket-to-one-daemon-connection tunnel:
   development; wildcard addresses such as `0.0.0.0` and `::` are never valid.
 
 This transparent WebSocket framing contract is pre-1.0 transport
-infrastructure. It remains the current shipped browser path until #86 replaces
-the production Bun backend; it is not the accepted public team-relay contract.
+infrastructure. It remains the shipped owner browser path alongside the future
+team surface; it is not the accepted public team-relay contract.
 
 ## Envelopes
 
@@ -1615,5 +1617,5 @@ transport-core server used by `WsTransport`:
 discovery, `/api/hosts`, and SPA composition do not change the WebSocket framing
 contract documented above: it remains a transparent 1:1 tunnel. It is
 the currently shipped mesh-local browser backend, not `pohunek-relayd`, and its
-production runtime is scheduled for replacement by #86 only after the complete
-typed relay client is available.
+production owner-mode runtime remains supported after #86 adds the separate
+typed team-relay client.

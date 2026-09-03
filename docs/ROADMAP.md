@@ -242,14 +242,15 @@ in-browser terminal provide the multi-host sessions workspace and live session
 lifecycle through one mesh-local backend origin. This is a shipped owner-path
 client, not the accepted public team relay.
 
-The old M2/M3 production-backend direction is superseded by the
-[team-relay RFC](design/team-relay-control-plane-rfc.md). The Rust relay and its
-team web/CLI surfaces are implemented by
+The old M2/M3 plan to grow this owner gateway into a public multi-user backend
+is superseded by the [team-relay RFC](design/team-relay-control-plane-rfc.md).
+The shipped M1 owner WebUI remains supported permanently alongside the relay.
+The Rust relay and its separate team web/CLI surfaces are implemented by
 [#71](https://github.com/zajca/pohunek/issues/71) and
 [#86](https://github.com/zajca/pohunek/issues/86); later provider delivery is
-tracked by [#73](https://github.com/zajca/pohunek/issues/73). Until #86 lands,
-the existing Bun backend remains documented and supported as the shipped
-mesh-local transparent browser transport.
+tracked by [#73](https://github.com/zajca/pohunek/issues/73). Presentation
+components may be shared, but owner and team transports, credentials, state,
+and origins remain explicit with no cross-mode fallback.
 
 ### Track R — Optional Team Relay *(accepted; not implemented)*
 
@@ -289,8 +290,8 @@ live blocker graph:
    #83, #84, and #85, completes relay host links, routing, aggregation, attach
    proxying, and the typed public API.
 7. [#86](https://github.com/zajca/pohunek/issues/86), after #71, supplies the
-   team CLI and Svelte web surfaces and removes the production Bun backend
-   authority. [#87](https://github.com/zajca/pohunek/issues/87), after #71,
+   team CLI and Svelte web surfaces while preserving the owner WebUI as a
+   separate private gateway. [#87](https://github.com/zajca/pohunek/issues/87), after #71,
    #72, and #85, completes audit, quotas, deployment, backup/restore,
    observability, and incident hardening.
 

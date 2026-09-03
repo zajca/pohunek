@@ -43,7 +43,7 @@ The following invariants span both domains:
 |---|---|---|
 | Standalone Unix-socket owner operation | Shipped in public protocol v3 | Existing daemon, CLI, SDK, and GUI |
 | Direct configured-overlay operation, including NetBird | Shipped in public protocol v3 | Existing daemon and clients; generic overlay work completed in [#69](https://github.com/zajca/pohunek/issues/69) |
-| Mesh-local transparent Bun browser backend | Shipped owner-path client transport | Existing `web/backend`; replacement is [#86](https://github.com/zajca/pohunek/issues/86) |
+| Local/direct-overlay transparent Bun browser backend | Shipped and retained owner-path client transport | Existing `web/backend`; team web mode is separate work in [#86](https://github.com/zajca/pohunek/issues/86) |
 | Stable host identity and exact principal-or-team ownership | Accepted, not implemented | [#81](https://github.com/zajca/pohunek/issues/81) |
 | Rust relay foundation, PostgreSQL, OIDC, principals, teams, roles, and service accounts | Accepted, not implemented | [#85](https://github.com/zajca/pohunek/issues/85) |
 | Host-initiated userspace WireGuard link | Accepted, not implemented | [#72](https://github.com/zajca/pohunek/issues/72) |
@@ -60,6 +60,8 @@ The following invariants span both domains:
   human-readable defaults and machine-readable `--json` output.
 - Keep standalone and direct-overlay owner operation independent of any central
   application service.
+- Keep the existing owner WebUI available for local-daemon and direct-overlay
+  access independently of the team relay.
 - Make each host authoritative for its own PTYs, agent processes, state, logs,
   and worktrees.
 - Support durable detach and reattach by giving every live session a dedicated
@@ -168,9 +170,13 @@ route, privileged helper, or `CAP_NET_ADMIN`. This transport belongs to
 
 The planned production relay is the single Rust `pohunek-relayd` authorization,
 routing, aggregation, audit, and quota authority, backed by PostgreSQL. The
-current Bun backend remains a mesh-local transparent owner-path client until
-[#86](https://github.com/zajca/pohunek/issues/86) replaces it as the production
-web backend. The relay does not own PTYs or durable terminal content.
+current Bun backend remains the production owner-path WebUI gateway for its
+local daemon and direct-overlay peers. It is not a relay authority and is not
+replaced by [#86](https://github.com/zajca/pohunek/issues/86). The Rust relay has
+no local mode: it serves a separate typed team surface. The two web surfaces may
+share presentation components, but they use explicit origins, transports,
+credentials, and state without fallback. The relay does not own PTYs or durable
+terminal content.
 
 ### Accepted relay model concepts
 

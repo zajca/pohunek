@@ -43,7 +43,8 @@ Current protocol-v3 operation is owner-only. Local clients connect to the Unix
 socket, direct remote clients use a configured overlay such as NetBird, and the
 shipped Bun browser backend transparently maps one WebSocket to one daemon
 connection. Each host daemon remains authoritative for its sessions and each
-worker remains authoritative for one live PTY.
+worker remains authoritative for one live PTY. This owner WebUI remains a
+supported local/direct-overlay path after the team relay ships.
 
 Pohunek also has an [accepted optional team-relay design](team-relay.md), but it
 is not implemented. The future relay is additive: standalone and direct
@@ -52,7 +53,8 @@ control, and attach connection to a public Rust relay. The relay owns teams,
 principals, roles, session ACLs, routing, and aggregation; the daemon recognizes
 only the enrolled relay and enforces locally approved `HostShare` and immutable
 session-origin limits. Local and direct-overlay sessions never enter relay
-state.
+state. The relay has no local mode; its team WebUI and the retained owner WebUI
+use separate explicit API adapters, credentials, state, and origins.
 
 Protocol v4 and the typed relay API will arrive only through their linked
 implementation issues. Assistants must not infer future commands or fields from

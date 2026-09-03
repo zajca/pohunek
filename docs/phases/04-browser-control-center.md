@@ -6,9 +6,9 @@
 > host-initiated userspace WireGuard path, and multi-team authorization are
 > specified by the [team-relay RFC](../design/team-relay-control-plane-rfc.md)
 > and [#56](https://github.com/zajca/pohunek/issues/56). The existing Bun
-> backend remains accurate until [#86](https://github.com/zajca/pohunek/issues/86)
-> supplies the complete relay client surface and replaces it as the production
-> web backend. Standalone and direct NetBird owner paths remain supported.
+> backend remains the supported owner-path WebUI after
+> [#86](https://github.com/zajca/pohunek/issues/86) adds a separate team relay
+> client surface. Standalone and direct NetBird owner paths remain supported.
 
 ## Objective
 
