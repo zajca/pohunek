@@ -6,13 +6,14 @@ convention, update this file in the same change.
 
 ## What pohunek is
 
-`pohunek` is a **single-user control plane for durable coding-agent sessions**
+`pohunek` is an **owner-first control plane for durable coding-agent sessions**
 across the operator's own machines. A Rust daemon (`pohunekd`) owns the logical
 session registry and public API on each host; one isolated
 `pohunek-sessiond` worker owns each live PTY and agent process. The Rust CLI
 (`pohunek`) drives the daemon locally over a Unix socket and remotely over a
 NetBird/WireGuard address. A native Iced GUI (`pohunek-gui`) is an optional
-client.
+client. The accepted future direction adds an optional trusted team relay
+without replacing these direct owner paths; it is not implemented yet.
 
 It is pre-1.0 and experimental: wire shapes, config files, and on-disk metadata
 may change freely. **Do not add backward-compatibility shims** unless asked.
@@ -20,19 +21,32 @@ may change freely. **Do not add backward-compatibility shims** unless asked.
 Authoritative design lives in `docs/architecture.md` (it wins over `idea.md`).
 Hard constraints, decided on purpose — respect them in every change:
 
-- **Single operator only.** No multi-user auth, no shared-tenant model. The
-  trust boundary is owner-only socket/file permissions plus the NetBird network.
-- **No central server.** The CLI talks directly to each host's daemon; each host
-  is authoritative for its own PTYs, state, logs, and worktrees.
+- **Direct owner operation stays first-class.** Standalone and direct-overlay
+  clients keep talking to each host daemon without a relay dependency. Their
+  trust boundary remains owner-only socket/file permissions plus the configured
+  overlay, with NetBird as the production provider.
+- **The owner WebUI stays first-class.** The shipped Bun backend remains the
+  private local/NetBird browser gateway. It is not replaced by the relay and
+  must never become a second team-auth or relay-routing authority.
+- **The optional team relay is additive.** The accepted design introduces one
+  trusted Rust `pohunek-relayd` authority for teams, end-user authorization,
+  routing, audit, and quotas. Each host remains authoritative for its PTYs,
+  processes, worktrees, session origin, and locally approved `HostShare`
+  ceilings. See the [accepted RFC](docs/design/team-relay-control-plane-rfc.md)
+  and [#85](https://github.com/zajca/pohunek/issues/85); neither the relay binary
+  nor team mode is shipped yet.
 - **PTY/TUI-first.** Agents run in real terminals (Codex, Claude Code, and the
   pinned local Hermes Agent runtime are first-class). Not a re-rendered control
   plane.
-- **Remote transport is direct over NetBird**, never SSH bridging.
+- **Remote owner transport is direct over NetBird**, never SSH bridging. Relay
+  transport is the separate host-initiated path defined by the accepted RFC.
 - **Providers (Linear/GitHub) are shell-out based** (`gh`, Linear GraphQL) and
   live only in client surfaces (CLI scripts, gui-core), never in the daemon.
-- **Protocol:** newline-delimited JSON over a Unix socket (local) and a TCP
-  listener on the NetBird interface (remote); attach uses a separate raw-byte
-  connection per PTY.
+- **Protocol today:** public protocol v3 is owner-only newline-delimited JSON
+  over a Unix socket (local) and TCP on configured overlays (remote); attach
+  uses a separate raw-byte connection per PTY. [#70](https://github.com/zajca/pohunek/issues/70)
+  owns the coordinated v4 host-link cutover; do not describe relay protocol as
+  shipped before that issue lands.
 
 ## Repository map
 
@@ -58,7 +72,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/gui-core` | Pure, headless state + SDK bridge for the GUI (no Iced dependency; fully unit-testable). |
 | `crates/gui`      | Native Iced shell that wraps `gui-core` in `Task`/`Subscription`. |
 | `crates/xtask`    | Workspace automation (docs, TypeScript generation, and pinned Hermes compatibility evidence). |
-| `web/`            | Bun workspace: generated protocol types, SDK runtime, control-center backend/client core/SPA, and testkit. |
+| `web/`            | Bun workspace: generated protocol types, SDK runtime, retained owner-mode WebUI backend/client core/SPA, reusable presentation code, and testkit. |
 
 Other top-level: `compat/` (pinned upstream compatibility locks and sanitized
 goldens), `docs/` (architecture, roadmap, phases, knowledge source), `scripts/`
@@ -224,6 +238,12 @@ feature — `--all-features` only covers the everything-on case.
   release/install coverage when those surfaces change. Run at least
   `cargo test -p pohunek-cli` and `cargo xtask docs check` before the full gates.
 - Comments and all repository text are in **English**.
+
+The first complete team-relay release intentionally runs direct-host profiles
+under the daemon owner's account. Real profile-backed container and VM
+isolation is a post-release track owned by
+[#88](https://github.com/zajca/pohunek/issues/88); do not call the relay track a
+PoC or imply that current direct-host execution is a hostile-workload sandbox.
 
 ## Workflow
 

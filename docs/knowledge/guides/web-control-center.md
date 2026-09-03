@@ -9,12 +9,15 @@ intents: [setup, update, debug, help]
 
 # Web Control Center
 
+## Current shipped control center
+
 The optional web control center is a client surface over the existing public
 protocol. One `@pohunek/backend` origin serves the Svelte SPA, reports hosts at
 `GET /api/hosts`, and exposes a transparent control or attach WebSocket per
 daemon. The backend is not authoritative: each daemon still owns its logical
 sessions, events, and notifications, while per-session workers own live PTYs.
-The CLI and native GUI keep working when the backend is down.
+The CLI and native GUI keep working when the backend is down. This is a
+mesh-local owner tool, not the accepted public team relay.
 
 The control center uses one persistent, session-first workspace shell. The
 session rail combines every host, groups normal work by project, and promotes
@@ -76,7 +79,7 @@ The TypeScript surfaces are:
 - `@pohunek/sdk/browser`: the browser-safe entry with only the WebSocket path;
   it contains no `node:net` dependency.
 - `@pohunek/backend`: local-daemon host discovery, `/api/hosts`, static SPA
-  serving, and unchanged 1:1 WebSocket relay framing.
+  serving, and unchanged transparent 1:1 WebSocket framing.
 - `@pohunek/client-core`: framework-free multi-host state and actions used by
   the SPA.
 - `@pohunek/frontend`: the Svelte control-center SPA.
@@ -115,3 +118,21 @@ Browser code imports `Client` from `@pohunek/sdk/browser` and calls
 `Client.connectWs(window.location.origin, host)`. It must not dial daemon TCP or
 Unix sockets directly. The backend only tunnels the public newline-delimited
 JSON control frames and raw attach bytes; it does not define a second protocol.
+
+## Separate accepted team web surface
+
+The [optional team-relay design](../concepts/team-relay.md) is accepted but not
+implemented. The future Rust `pohunek-relayd` will be the single team-path
+authentication, authorization, routing, aggregation, and browser-API authority,
+and will serve a team-mode SPA. Team browser clients will use a typed relay API
+rather than forwarding arbitrary daemon NDJSON through a transparent tunnel.
+
+The current `@pohunek/backend` runtime and the release/install instructions
+above remain supported after
+[#86](https://github.com/zajca/pohunek/issues/86) delivers that separate team
+surface. `pohunek-relayd` has no local mode. Owner and team WebUIs may share
+Svelte presentation components, but use separate explicit origins, API
+adapters, credentials, and state; neither silently falls back to the other.
+The Bun backend never becomes a team authorization or relay-routing authority.
+This accepted direction adds no usable relay command, endpoint, or
+configuration to the current release.

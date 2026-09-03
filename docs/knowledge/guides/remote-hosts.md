@@ -9,6 +9,10 @@ intents: [setup, project, debug, help]
 
 # Remote Hosts
 
+This guide documents the current protocol-v3 owner path over configured
+overlays. The [optional team relay](../concepts/team-relay.md) is accepted but
+not implemented, and it has no commands in current releases.
+
 Remote behavior is host-aware. The CLI uses `--host <host>` for commands that
 target a host, and session targets can use `<host>/<session-id>`.
 
@@ -83,10 +87,20 @@ never fall through to a colliding peer ID or short name. This keeps raw `/`, `+`
 `=`, and `@` characters out of target and exact-port grammar.
 A socket-address literal cannot bypass current overlay membership. NetBird uses
 `publicKey` or legacy `pubKey` as `peer_id`; when absent, `peer_id` stays null
-and clients fall back to FQDN. The web relay forces a new local-daemon discovery
-before each remote tunnel upgrade and refuses an identity that no longer owns
-the cached address. A bare IPv6 literal such as
+and clients fall back to FQDN. The current transparent Bun web backend forces a
+new local-daemon discovery before each remote tunnel upgrade and refuses an
+identity that no longer owns the cached address. A bare IPv6 literal such as
 `fd00::2` remains an unqualified selector; only an explicit configured-overlay
 prefix such as `netbird:fd00::2` qualifies it. A failure in one configured
 overlay does not hide healthy peers from another overlay; discovery reports an
 error only when every provider fails.
+
+The future public team relay does not replace this direct overlay model and does
+not require NetBird. An enrolled `pohunekd` will initiate its own userspace
+WireGuard link and all control and attach streams to one relay. Independently
+approved `HostShare` records can expose bounded project, profile, operation, and
+resource capacity to multiple teams. Local and direct-overlay sessions remain
+owner-only and never appear through the relay; only sessions created through a
+share are eligible. Until the implementation issues linked from the
+[team-relay concept](../concepts/team-relay.md) land, use only the owner commands
+documented above.

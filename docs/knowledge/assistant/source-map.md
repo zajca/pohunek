@@ -101,6 +101,17 @@ Web control center client:
 - `docs/design/track-b-web-control-center-plan-2026-07-22.md`
 - `docs/phases/04-browser-control-center.md`
 
+Accepted team-relay architecture (not yet implemented):
+
+- `docs/design/team-relay-control-plane-rfc.md`
+- `docs/architecture.md`
+- `docs/ROADMAP.md`
+- `docs/public-api.md`
+- `docs/knowledge/concepts/team-relay.md`
+- `docs/knowledge/safety/trust-model.md`
+- `docs/knowledge/guides/remote-hosts.md`
+- `docs/knowledge/guides/web-control-center.md`
+
 Release packaging:
 
 - `.github/workflows/ci.yml`

@@ -2,6 +2,9 @@
 
 ## Unreleased (2026-08-12)
 
+- Added the accepted optional team-relay concept and separated its future
+  protocol-v4, multi-team, `HostShare`, and trusted-relay boundaries from the
+  currently shipped owner-only protocol v3 and transparent Bun web backend.
 - Documented the simplified session-first native GUI: prioritized cross-host
   groups, modal session detail, direct lifecycle actions, and removal of the
   Agents monitor, provider browsers, review, and worktree-management surfaces.
