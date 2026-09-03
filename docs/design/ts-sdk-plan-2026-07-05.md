@@ -1,5 +1,15 @@
 # TypeScript SDK plan (2026-07-05) — Track S.3, `web/shared` + `web/sdk`
 
+> **Status and supersession (2026-09-03):** This completed plan produced the
+> current protocol-v3 TypeScript SDK and owner-only, mesh-local transparent Bun
+> WebSocket transport. References below to `@pohunek/relay` describe that
+> historical package role, not the accepted public team relay. The future Rust
+> `pohunek-relayd` and its client API follow the
+> [team-relay RFC](team-relay-control-plane-rfc.md),
+> [#71](https://github.com/zajca/pohunek/issues/71), and
+> [#86](https://github.com/zajca/pohunek/issues/86). The Bun backend remains
+> supported until #86 supplies its complete production replacement.
+
 Implements **Track S.3** from [`ROADMAP.md`](../ROADMAP.md) and Slice A items
 3–4 of [`phases/04-browser-control-center.md`](../phases/04-browser-control-center.md):
 a TypeScript SDK for the pohunek control protocol with `ts-rs`-generated types,

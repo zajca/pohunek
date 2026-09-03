@@ -90,3 +90,40 @@ The assistant must:
 The assistant may write host or repo configuration when that is the requested
 task, but it must stay inside the user's requested scope and respect the
 boundaries in [secrets](secrets.md) and [repo `.pohunek/`](repo-pohunek.md).
+
+## Accepted team-relay boundary
+
+The [optional team relay](../concepts/team-relay.md) is accepted architecture,
+not shipped functionality. Do not invent relay commands, configuration keys,
+protocol fields, or recovery steps. Current protocol-v3 local, overlay, and Bun
+browser paths remain one owner trust domain.
+
+When relay support is implemented, preserve these independent authorization
+responsibilities:
+
+- The relay authenticates and authorizes human principals, service accounts,
+  teams, groups, roles, and session ACLs.
+- `pohunekd` authenticates the enrolled relay and enforces the current local
+  `HostShare` ceiling, including projects, worktree roots, agent profiles,
+  operations, resource limits, and immutable session origin. End-user identity
+  is not a daemon authorization input.
+- Local and direct-overlay sessions are never relay-visible or
+  relay-controllable. A claimed session ID or relay-supplied metadata must not
+  bypass the origin check.
+- Every share request and ownership transfer grants nothing until the required
+  local host confirmation. Relay-side state cannot expand host authority.
+- Each relay operation is bound to one active share and its current revision;
+  permissions from different shares are never composed for one operation.
+
+The relay is explicitly trusted with transient terminal plaintext and all
+authority granted by active shares. A compromised relay can exercise that
+entire union, even though application RBAC gives an ordinary infrastructure
+administrator no implicit session access. Never describe the relay as
+end-to-end encrypted from its operator. Relay persistence and telemetry must
+exclude PTY bytes, input, prompts, terminal snapshots, file contents, and raw
+secrets.
+
+Direct-host agent profiles run under the daemon owner's Unix account and are not
+hostile-workload isolation. `HostShare` limits reduce relay authority but do not
+turn direct processes into a sandbox. Container and VM-backed execution remains
+separate future work.

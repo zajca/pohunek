@@ -8,6 +8,8 @@ Start here:
 
 - [Architecture](concepts/architecture.md) explains the assistant model and data
   flow.
+- [Optional team relay](concepts/team-relay.md) records the accepted future
+  multi-team relay design and clearly separates it from shipped protocol v3.
 - [Sessions](concepts/sessions.md), [projects](concepts/projects.md),
   [worktrees](concepts/worktrees.md), and
   [agent profiles](concepts/agent-profiles.md) describe the operating model.

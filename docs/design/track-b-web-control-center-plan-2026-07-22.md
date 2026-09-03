@@ -1,5 +1,14 @@
 # Track B — Web Control Center plan (2026-07-22)
 
+> **Status and supersession (2026-09-03):** M1 shipped as an owner-only,
+> mesh-local transparent Bun backend and remains documented here as current
+> behavior. This is not the accepted public team relay. The future trusted Rust
+> relay and its multi-team clients follow the
+> [team-relay RFC](team-relay-control-plane-rfc.md) and
+> [#56](https://github.com/zajca/pohunek/issues/56); production replacement of
+> the Bun backend belongs to [#86](https://github.com/zajca/pohunek/issues/86).
+> Standalone and direct NetBird owner paths remain first-class.
+
 Implements **Track B** from [`ROADMAP.md`](../ROADMAP.md), designed in
 [`phases/04-browser-control-center.md`](../phases/04-browser-control-center.md).
 That phase doc remains the source of truth for *why*; this plan reconciles its

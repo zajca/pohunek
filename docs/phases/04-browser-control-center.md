@@ -1,5 +1,15 @@
 # Phase 4: Browser Control Center
 
+> **Status and supersession (2026-09-03):** This document records the design
+> behind the shipped owner-only, mesh-local Bun browser backend. It is not the
+> design for the accepted public team relay. The future trusted Rust relay,
+> host-initiated userspace WireGuard path, and multi-team authorization are
+> specified by the [team-relay RFC](../design/team-relay-control-plane-rfc.md)
+> and [#56](https://github.com/zajca/pohunek/issues/56). The existing Bun
+> backend remains accurate until [#86](https://github.com/zajca/pohunek/issues/86)
+> supplies the complete relay client surface and replaces it as the production
+> web backend. Standalone and direct NetBird owner paths remain supported.
+
 ## Objective
 
 Keep `pohunek` a **chassis** (a headless engine with a stable control protocol)

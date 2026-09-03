@@ -10,8 +10,11 @@ This directory turns the product idea into implementation-oriented planning.
 
 ## Committed Direction (summary)
 
-`pohunek` is a **single-user, personal multi-host tool**: durable coding-agent
-sessions across your own machines on a NetBird (WireGuard) network.
+The shipped protocol v3 product is an **owner-operated personal multi-host
+tool**: durable coding-agent sessions across the owner's machines locally or on
+a NetBird (WireGuard) network. The accepted, not-yet-implemented
+[team relay RFC](design/team-relay-control-plane-rfc.md) adds an optional public
+multi-team control plane without replacing either owner path.
 
 - CLI-first; Rust daemon + Rust CLI.
 - Daemon owns PTYs; clients attach/detach. Agents run PTY/TUI-first.
@@ -26,8 +29,10 @@ sessions across your own machines on a NetBird (WireGuard) network.
 - Control protocol: newline-delimited JSON over a Unix socket (local) and a TCP
   listener bound to the NetBird interface (remote). Attach uses a **separate
   raw-byte connection** per PTY.
-- No multi-user authorization (single operator; socket perms + NetBird are the
-  boundary).
+- Protocol v3 has no multi-user authorization; socket permissions and NetBird
+  are its owner trust boundary. The planned relay owns principals, service
+  accounts, teams, roles, and session ACLs, while `pohunekd` enforces only the
+  enrolled relay and host-approved `HostShare` ceilings.
 - The next client-surface work starts with a Rust SDK, then a pure-native Rust
   desktop companion app as the primary GUI. The browser control center is later
   and optional.

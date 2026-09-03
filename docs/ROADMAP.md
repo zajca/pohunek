@@ -5,11 +5,11 @@ sequencing** source of truth; the per-phase design docs under
 [`docs/phases/`](phases/) and [`docs/design/`](design/) remain the source of truth
 for *what* and *why* inside each track.
 
-Status reflects the **code on `main`**, verified against the tree (releases
-v0.1.0 -> v0.4.3). Where a phase/plan doc's own status header lags the code, the
-code wins and the lag is noted.
+Status reflects the **code on `main`**. Where a phase/plan doc's own status
+header lags the code, the code wins and the lag is noted. Accepted future work
+is marked explicitly and must not be read as shipped functionality.
 
-Last reconciled: 2026-07-19.
+Last reconciled: 2026-09-03.
 
 ---
 
@@ -54,10 +54,14 @@ work.
 
 ## 3. Forward tracks
 
-The forward direction is **client surfaces** on top of the existing chassis.
-The chassis (daemon + control protocol) stays **provider-agnostic and
-presentation-agnostic** and gains no new network surface. Three separate tracks,
-in dependency order: **SDKs → native desktop app → browser control center**.
+The shipped forward work built client surfaces on top of the owner-first
+chassis: **SDKs → native desktop app → mesh-local browser control center**. The
+daemon remains provider-agnostic and presentation-agnostic.
+
+The accepted next product track is an **optional team relay**. It adds a
+host-initiated network path and multi-team authorization without replacing
+standalone or direct NetBird operation. It is tracked separately below because
+none of its runtime features are shipped yet.
 
 ### Track H — Hermes runtime and operator plugin
 
@@ -219,36 +223,92 @@ link persisted; no provider token appears in any daemon log, metadata, or event.
 **All met** as of the D.6 milestone, except the optional `gh pr review` posting,
 which is deferred.
 
-### Track B — Browser Control Center *(M1 complete; M2/M3 pending)*
+### Track B — Mesh-local Browser Control Center *(M1 complete; later plan superseded)*
 
 Phase 4 as designed ([`phases/04`](phases/04-browser-control-center.md)),
 reconciled by the
 [Track B plan](design/track-b-web-control-center-plan-2026-07-22.md): a thin
-**Bun backend** (`@pohunek/backend` — pure relay tunnels, host discovery via
+**Bun backend** (`@pohunek/backend` — pure transparent tunnels, host discovery via
 the local daemon, SPA serving) + browser-side aggregation in
 **`@pohunek/client-core`** + a **Svelte 5 SPA** (xterm.js) + optional
 single-cert **mobile PWA**, with the same provider seam. The browser speaks
-the public protocol verbatim over the relay tunnels; the backend holds no
+the public protocol verbatim over those tunnels; the backend holds no
 protocol state. It remains an optional surface for **mobile /
 from-any-device** access (the one thing a native desktop app cannot give
 you), reusing **Track S** (TS SDK).
 
 **M1 is implemented:** Slices B + C, the notifications inbox, and the
 in-browser terminal provide the multi-host sessions workspace and live session
-lifecycle through one backend origin. **M2 is pending** for TLS and the mobile
-PWA; **M3 is pending** for Linear/GitHub providers, using the same opaque-link
-store and prompt-template conventions as the desktop app and sway scripts.
+lifecycle through one mesh-local backend origin. This is a shipped owner-path
+client, not the accepted public team relay.
 
-Built **after** the desktop app proves the SDK and the provider seam. Nothing here
-changes the daemon (no gateway, no embedded assets, no daemon-side auth).
+The old M2/M3 production-backend direction is superseded by the
+[team-relay RFC](design/team-relay-control-plane-rfc.md). The Rust relay and its
+team web/CLI surfaces are implemented by
+[#71](https://github.com/zajca/pohunek/issues/71) and
+[#86](https://github.com/zajca/pohunek/issues/86); later provider delivery is
+tracked by [#73](https://github.com/zajca/pohunek/issues/73). Until #86 lands,
+the existing Bun backend remains documented and supported as the shipped
+mesh-local transparent browser transport.
+
+### Track R — Optional Team Relay *(accepted; not implemented)*
+
+Umbrella: [#56](https://github.com/zajca/pohunek/issues/56). Source of truth:
+the [accepted team-relay RFC](design/team-relay-control-plane-rfc.md).
+
+This track adds one trusted, public, PostgreSQL-backed Rust `pohunek-relayd`.
+Hosts initiate an embedded userspace WireGuard tunnel and every control/attach
+connection. The relay owns principals, service accounts, teams, roles, session
+ACLs, routing, aggregation, audit, and quotas; `pohunekd` owns stable host state,
+local `HostShare` ceilings, immutable session origin, PTYs, processes, and
+worktrees. Local and direct-NetBird sessions never become relay-visible.
+
+Standalone, direct NetBird, relay-only, and NetBird-plus-relay topologies remain
+first-class. A host has at most one relay enrollment but may expose multiple
+locally approved shares to multiple teams. The implementation order follows the
+live blocker graph:
+
+1. [#80](https://github.com/zajca/pohunek/issues/80) lands the RFC and aligns
+   canonical documentation.
+2. [#81](https://github.com/zajca/pohunek/issues/81) adds stable host identity,
+   exact principal-or-team ownership, and local ownership transfer;
+   [#85](https://github.com/zajca/pohunek/issues/85) builds the Rust relay,
+   PostgreSQL, OIDC, principals, teams, groups, roles, and service accounts.
+3. [#72](https://github.com/zajca/pohunek/issues/72), after completed
+   [#69](https://github.com/zajca/pohunek/issues/69) plus #81 and #85, adds
+   enrollment and host-initiated userspace WireGuard/TCP transport.
+4. [#70](https://github.com/zajca/pohunek/issues/70), after #72 and #81, makes
+   the coordinated protocol v4 host-link, `SessionOrigin`, and daemon relay
+   guard cutover. There is no v3 relay compatibility shim.
+5. [#82](https://github.com/zajca/pohunek/issues/82) and
+   [#83](https://github.com/zajca/pohunek/issues/83), after #70 and #85, add
+   locally approved `HostShare` policy and relay-side session authorization.
+   [#84](https://github.com/zajca/pohunek/issues/84), after #70 and #82, adds
+   subscription-first atomic snapshots and full resync without daemon replay.
+6. [#71](https://github.com/zajca/pohunek/issues/71), after #70, #72, #82,
+   #83, #84, and #85, completes relay host links, routing, aggregation, attach
+   proxying, and the typed public API.
+7. [#86](https://github.com/zajca/pohunek/issues/86), after #71, supplies the
+   team CLI and Svelte web surfaces and removes the production Bun backend
+   authority. [#87](https://github.com/zajca/pohunek/issues/87), after #71,
+   #72, and #85, completes audit, quotas, deployment, backup/restore,
+   observability, and incident hardening.
+
+Post-relay extensions are [#73](https://github.com/zajca/pohunek/issues/73)
+for provider webhooks and encrypted token storage, and
+[#88](https://github.com/zajca/pohunek/issues/88) for real profile-backed
+container and VM isolation. Neither is part of the first complete relay
+release.
 
 ---
 
 ## 4. Deferred / out of scope
 
-- **App-level auth / RBAC** — deferred while the trust boundary is NetBird/WireGuard
-  + filesystem permissions (single operator). Addable in the browser backend later
-  without daemon/protocol changes.
+- **Application auth in the shipped mesh-local Bun backend** — intentionally
+  absent under the owner-path NetBird/filesystem trust boundary. The future
+  team relay does require OIDC, service accounts, RBAC, and session ACLs from
+  its first complete release; [#85](https://github.com/zajca/pohunek/issues/85)
+  and [#83](https://github.com/zajca/pohunek/issues/83) own that work.
 - **In-tree provider adapters in the chassis** — never; providers stay shell-out
   (`gh`) / GraphQL (Linear) in the clients.
 - **libghostty / GTK / Electron native GUI** — dropped (replaced by the pure-native
@@ -261,16 +321,8 @@ changes the daemon (no gateway, no embedded assets, no daemon-side auth).
 
 ## 5. Recommended sequence
 
-1. **Track S.1** — extract the **Rust SDK** (`crates/client`); low-risk refactor,
-   unblocks the desktop app.
-2. **Track S.2** — document the public API + version negotiation.
-3. **Track D** — build the **native desktop companion app** (Iced control plane)
-   on the Rust SDK; see [`design/track-d-native-app.md`](design/track-d-native-app.md)
-   and [`phases/06`](phases/06-native-app.md). **v1:** D.1 (workspace + multi-host)
-   → D.3 (session/project/worktree) → D.4 (prompts) → D.5 (Linear + PRs); attach is
-   delegated (D.2 folded in). **v1.1:** D.6 (diff review + comment-to-session
-   loop) — shipped, minus the deferred `gh pr review` posting.
-4. **Track B (optional)** — M1 shipped the backend, Svelte SPA, notifications
-   inbox, and in-browser terminal on the completed S.3 TS SDK. Continue with M2
-   (TLS + mobile PWA), then M3 (provider parity), reusing the desktop app's
-   provider seam and the shared link store.
+Tracks S, D, and Browser M1 are shipped and remain usable throughout the relay
+work. The next sequence is Track R exactly as ordered above: #80, then #81/#85,
+#72, #70, #82/#83/#84, #71, and finally #86/#87. Existing owner-path work may
+continue independently only when it does not create a second production relay
+authority or pre-empt a locked RFC boundary.

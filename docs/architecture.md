@@ -1,46 +1,65 @@
 # pohunek Architecture
 
-This document describes the application architecture for `pohunek`.
+This document describes the shipped owner architecture and the accepted
+optional team-relay direction for `pohunek`.
 
 ## Status and Scope of This Revision
 
 `idea.md` captures the original, broad product brainstorm. This document is the
-**authoritative current direction** and intentionally narrows that vision into a
-single, coherent, buildable tool. Where this document and `idea.md` disagree,
-this document wins.
+**authoritative current direction**. Where this document and `idea.md` disagree,
+this document wins. Detailed relay decisions are authoritative in the
+[accepted team-relay RFC](design/team-relay-control-plane-rfc.md), tracked by
+[#56](https://github.com/zajca/pohunek/issues/56).
 
-The committed direction is a **single-user, personal multi-host tool**: one
-operator (you) running durable coding-agent sessions across your own machines,
-which are connected by a **NetBird** (WireGuard) private network.
+Pohunek has two explicit trust domains:
 
-Key consequences of that scope, decided explicitly:
+- **Owner paths, shipped today.** One operator controls a host through its
+  owner-private Unix socket or directly through a configured private overlay.
+  NetBird is the production overlay. These paths require no central service and
+  remain supported when no relay is configured.
+- **Optional team relay, accepted but not implemented.** A host may enroll with
+  one trusted public Rust relay and locally approve bounded `HostShare` records
+  for one or more teams. The relay owns end-user and service-account
+  authorization; the daemon owns the host-side share ceiling and session-origin
+  boundary. Enrolling does not replace or require NetBird.
 
-- **No multi-user authorization.** The machines and the network are yours. SSH
-  bridging, signed mesh manifests, key rotation, and tamper-evident audit logs
-  from the original plan are **out of scope**. The network (NetBird/WireGuard)
-  and ordinary filesystem permissions are the trust boundary.
-- **Remote transport is direct over NetBird**, not an SSH bridge.
-- **Agents run PTY/TUI-first** (real terminals). `pohunek` is a
-  terminal multiplexer for agents, not a re-rendered control plane.
-- **Discovery is tokenless NetBird-local**, with live capability queries instead
-  of signed manifest exchange.
-- **The GUI is deferred.** Interactive control happens by attaching to a session
-  from your existing terminal. The next GUI path is a Rust SDK followed by a
-  pure-native Rust desktop companion app. The browser control center is later and
-  optional; the daemon gains no GUI surface.
-- **Provider integration (Linear/GitHub) is deferred and shell-out based**
-  (`gh`, Linear GraphQL/MCP), not maintained in-tree adapters, and lives in the
-  client surfaces (the Phase 5 sway scripts and the Phase 4 browser backend),
-  never in the chassis.
+The following invariants span both domains:
+
+- **Host authority remains local.** Each `pohunekd` is authoritative for its own
+  logical sessions, workers, PTYs, processes, worktrees, and host policy.
+- **Remote owner transport is direct over NetBird**, not an SSH bridge or relay
+  fallback.
+- **Agents run PTY/TUI-first** in real terminals. Pohunek does not re-render an
+  agent-specific protocol as its execution model.
+- **Owner discovery is tokenless and overlay-local**, with live capability
+  queries instead of signed manifest exchange.
+- **Provider integration remains outside the daemon.** Client surfaces use
+  `gh` or Linear GraphQL; future relay provider delivery is separately tracked
+  by [#73](https://github.com/zajca/pohunek/issues/73).
+
+### Implementation status
+
+| Area | Status | Owner |
+|---|---|---|
+| Standalone Unix-socket owner operation | Shipped in public protocol v3 | Existing daemon, CLI, SDK, and GUI |
+| Direct configured-overlay operation, including NetBird | Shipped in public protocol v3 | Existing daemon and clients; generic overlay work completed in [#69](https://github.com/zajca/pohunek/issues/69) |
+| Mesh-local transparent Bun browser backend | Shipped owner-path client transport | Existing `web/backend`; replacement is [#86](https://github.com/zajca/pohunek/issues/86) |
+| Stable host identity and exact principal-or-team ownership | Accepted, not implemented | [#81](https://github.com/zajca/pohunek/issues/81) |
+| Rust relay foundation, PostgreSQL, OIDC, principals, teams, roles, and service accounts | Accepted, not implemented | [#85](https://github.com/zajca/pohunek/issues/85) |
+| Host-initiated userspace WireGuard link | Accepted, not implemented | [#72](https://github.com/zajca/pohunek/issues/72) |
+| Public protocol v4 relay host link, `SessionOrigin`, and daemon share guards | Accepted, not implemented | [#70](https://github.com/zajca/pohunek/issues/70) |
+| Locally approved `HostShare` and relay-side session ACLs | Accepted, not implemented | [#82](https://github.com/zajca/pohunek/issues/82), [#83](https://github.com/zajca/pohunek/issues/83) |
+| Atomic snapshot/watermark synchronization without replay | Accepted, not implemented | [#84](https://github.com/zajca/pohunek/issues/84) |
+| Relay routing, aggregation, attach proxy, API, clients, and operations | Accepted, not implemented | [#71](https://github.com/zajca/pohunek/issues/71), [#86](https://github.com/zajca/pohunek/issues/86), [#87](https://github.com/zajca/pohunek/issues/87) |
 
 ## Goals
 
 - Provide a CLI-first control plane for durable coding-agent work across your own
-  machines on a NetBird network.
+  machines, locally or through a configured overlay such as NetBird.
 - Keep every meaningful workflow available through `pohunek` commands with
   human-readable defaults and machine-readable `--json` output.
-- Run without a central application server. The CLI talks directly to a daemon on
-  each host (locally over a Unix socket, remotely over NetBird).
+- Keep standalone and direct-overlay owner operation independent of any central
+  application service.
 - Make each host authoritative for its own PTYs, agent processes, state, logs,
   and worktrees.
 - Support durable detach and reattach by giving every live session a dedicated
@@ -53,22 +72,29 @@ Key consequences of that scope, decided explicitly:
   hooks).
 - Be agent-operable: an operator agent can drive the whole tool through the same
   `--json` CLI and subscription API a human uses.
+- Add an optional multi-team relay whose authority never exceeds locally
+  approved host shares and which does not publish owner-path sessions.
 
 ## Non-Goals
 
-- Multi-user authorization or a shared-host trust model. Single operator only.
-- A central coordinator, SaaS control plane, or hosted dashboard. Future desktop
-  and browser clients are **user-run clients** that hold no authoritative state;
-  each host's daemon stays authoritative, and the CLI keeps working directly.
+- Requiring the relay for local or direct-overlay owner operation.
+- Moving PTY, process, worktree, or host-policy authority into the relay.
+- Publishing local or direct-overlay sessions to teams, even after host
+  enrollment.
+- Protecting a host from a compromised trusted relay within the union of its
+  active `HostShare` ceilings.
+- Treating direct-host execution under the daemon owner's Unix account as a
+  hostile-workload sandbox. Container and VM execution profiles are tracked by
+  [#88](https://github.com/zajca/pohunek/issues/88).
 - SSH bridging as the remote transport (NetBird direct transport replaces it).
-- A cryptographic mesh: signed manifests, snapshot reconciliation, key rotation.
+- A cryptographic owner mesh: signed manifests and replicated mesh state.
 - In-tree provider adapters in the core path (shell-out instead).
-- A GUI in the first version. GUI work is deferred to the SDK-first path in
-  `docs/ROADMAP.md`: native desktop first, browser later/optional.
 - ACP as the first agent runtime (deferred; PTY/TUI-first).
 - WebSocket as the core daemon protocol.
 
 ## High-Level Architecture
+
+### Shipped owner paths
 
 ```text
   CLI (local)                         CLI (remote)
@@ -93,12 +119,97 @@ Key consequences of that scope, decided explicitly:
    identity hooks --> worker; notifications --> daemon
 ```
 
-The host-local pohunek service is authoritative for live work. `pohunekd` is the
+The host-local Pohunek service is authoritative for live work. `pohunekd` is the
 logical-session authority and public control plane; a `pohunek-sessiond` worker
-is authoritative for one live PTY generation. There is no shared mesh state and
-no central coordinator. A remote host is reached by connecting the CLI directly
-to that host's daemon over NetBird using the same public protocol as the local
-Unix socket. Workers are never remotely addressable.
+is authoritative for one live PTY generation. Owner paths have no shared mesh
+state or coordinator. A remote owner reaches a host daemon directly over
+NetBird using the same public protocol as the local Unix socket. Workers are
+never remotely addressable.
+
+### Accepted optional relay topologies
+
+The relay design adds two topologies without changing the two owner topologies:
+
+```text
+1. Standalone
+
+owner client -- Unix socket --> pohunekd --> pohunek-sessiond
+
+2. Direct owner mesh
+
+owner client -- NetBird TCP --> pohunekd --> pohunek-sessiond
+
+3. Standalone host plus optional relay
+
+team client -- HTTPS/WSS --> pohunek-relayd
+                                  ^
+                                  | host-initiated userspace WireGuard + TCP
+                                  |
+                              pohunekd --> pohunek-sessiond
+
+4. Direct owner mesh plus optional relay enrollment
+
+owner client -- NetBird TCP ----------------------+
+                                                   v
+team client -- HTTPS/WSS --> pohunek-relayd <--- pohunekd
+                                                   |
+other owner clients -- NetBird TCP --> other pohunekd hosts
+```
+
+NetBird is neither replaced nor required by the relay. The relay publishes a
+public WireGuard UDP endpoint and discovers no host from NetBird: `pohunekd`
+enrolls explicitly and initiates the userspace WireGuard tunnel, long-lived
+control connection, and every attach connection. The relay never opens a
+connection to a host. The existing `pohunekd` binary
+contains the future connector; there is no sidecar. Both endpoints run
+WireGuard and bounded IPv4/TCP in process, with no kernel interface, system
+route, privileged helper, or `CAP_NET_ADMIN`. This transport belongs to
+[#72](https://github.com/zajca/pohunek/issues/72).
+
+The planned production relay is the single Rust `pohunek-relayd` authorization,
+routing, aggregation, audit, and quota authority, backed by PostgreSQL. The
+current Bun backend remains a mesh-local transparent owner-path client until
+[#86](https://github.com/zajca/pohunek/issues/86) replaces it as the production
+web backend. The relay does not own PTYs or durable terminal content.
+
+### Accepted relay model concepts
+
+- `HostId` is a stable opaque host identity independent of hostname, address,
+  daemon instance, WireGuard key, and tunnel address. A host has exactly one
+  principal-or-team owner and at most one active relay enrollment; ownership
+  transfer requires local confirmation. [#81](https://github.com/zajca/pohunek/issues/81)
+  owns this state.
+- Relay enrollment is an interactive local operation authorized through OIDC
+  device flow or an exact safe loopback callback. The host generates and keeps
+  its WireGuard private key; enrollment binds its public key and `HostId` to one
+  relay. [#72](https://github.com/zajca/pohunek/issues/72) owns enrollment and
+  transport.
+- `HostShare` is a revisioned, default-deny, locally approved ceiling binding a
+  host to one team. It restricts operations, registered projects and canonical
+  worktree roots, owner-authored profiles, resource limits, and future execution
+  backends. A host may approve multiple independent shares for multiple teams.
+  [#82](https://github.com/zajca/pohunek/issues/82) owns the lifecycle and policy.
+- `SessionOrigin` is immutable host-authored state: `LocalOwner`,
+  `DirectOverlayOwner`, or `Relay { relay_id, host_share_id }`. Relay operations
+  can reach only sessions created through the matching active share; local and
+  direct-overlay sessions never enter relay snapshots and cannot be published
+  later. Owner paths retain authority over relay-created sessions. [#70](https://github.com/zajca/pohunek/issues/70)
+  owns the v4 wire and daemon guard framework.
+- End-user identities, service accounts, teams, groups, roles, and session ACLs
+  belong only to the relay. `pohunekd` authenticates the enrolled relay and
+  enforces `HostShare` plus `SessionOrigin`; opaque attribution metadata is not
+  an authorization input. [#83](https://github.com/zajca/pohunek/issues/83) and
+  [#85](https://github.com/zajca/pohunek/issues/85) own relay authorization.
+
+Only relay-created sessions for active shares synchronize. The relay subscribes
+before requesting one atomic host-scoped snapshot covering all active shares,
+with one epoch, sequence, and watermark, then applies strictly ordered later
+events. A gap, overflow, epoch change, or
+disconnect discards the live cache and triggers a complete bounded snapshot;
+the daemon keeps no relay replay log. During relay or share outages, sessions
+keep running and owner paths remain available. Revoked-share sessions become
+owner-only without being stopped. [#84](https://github.com/zajca/pohunek/issues/84)
+owns this recovery contract.
 
 ## Host Daemon
 
@@ -205,11 +316,12 @@ fresh interactive input.
 
 ## Transport and Control Protocol
 
-There is one logical protocol exposed over two transports:
+Public protocol v3 currently exposes one logical owner protocol over two
+transport classes:
 
 - **Local:** Unix domain socket at `$XDG_RUNTIME_DIR/pohunek/daemon.sock`
   (directory mode `0700`, socket mode `0600`). This is the only access control
-  needed for the single-user model: the socket is owner-private.
+  needed for the owner path: the socket is owner-private.
 - **Remote:** one TCP listener per configured overlay, bound **only** to the
   provider's validated current local member address and per-overlay port, never
   `0.0.0.0`. Reachability and authentication are provided by that overlay;
@@ -233,6 +345,14 @@ or event on the connection. A genuinely incompatible pair fails with
 is a one-time coordinated pre-1.0 boundary with no compatibility shim. Once all
 clients and local/remote daemons cross it, later peers can overlap on an older
 common version instead of requiring exact maximum-version equality.
+
+The accepted relay path is a coordinated public protocol v4 cutover owned by
+[#70](https://github.com/zajca/pohunek/issues/70). Inside userspace WireGuard,
+the host opens a TCP control link and serves typed NDJSON requests from the
+enrolled relay; separate host-initiated TCP streams carry attach bytes. The v4
+connection origin is derived from the accepted listener/link and cannot be
+selected in request JSON. There is no v3 relay-path compatibility shim. Direct
+Unix and overlay owner contexts remain relay-independent.
 
 ## Attach Streaming
 
@@ -648,8 +768,11 @@ binding), `worktree`, and `project` — sharing one
 serialization lock and one atomic temp+rename write path, so a write of one
 record kind can never corrupt or drop another and any single update is
 crash-atomic. The event log is the local audit/debug trail. None of these is
-replicated across hosts — each host's daemon is authoritative and is answered
-live (see "High-Level Architecture"). An embedded SQLite `state.db`
+replicated across hosts by the shipped owner paths — each host's daemon is
+authoritative and is answered live (see "High-Level Architecture"). The
+planned relay may persist a reconstructible, explicitly stale session-catalog
+projection in PostgreSQL, but never terminal bytes or authoritative host state.
+An embedded host-local SQLite `state.db`
 (schema-versioned, with forward migrations) is a **deferred** option, to be
 adopted only if scale or query needs justify it; the schema is sketched in
 `docs/plan-phase-1.md` ("Deferred: SQLite Schema").
@@ -674,11 +797,13 @@ not contain environment values, prompts, input bytes, terminal bytes, rendered
 screens, tokens, or notification bodies. Live output history and terminal
 screens remain bounded in worker memory.
 
-## Security Model (Single-User Scope)
+## Security Model
 
-The threat model is a single operator on their own machines and NetBird network.
-Multi-user authorization is explicitly out of scope. The controls that remain are
-cheap, free-by-default, or inherited:
+### Shipped owner-path trust domain
+
+The shipped v3 threat model is one operator on their own machines and configured
+private overlays. It has no application-level user authorization. The controls
+that remain are cheap, free-by-default, or inherited:
 
 - **Local socket** in a `0700` directory with mode `0600`: owner-private, no
   authorization system needed.
@@ -698,8 +823,8 @@ cheap, free-by-default, or inherited:
   pair is atomic and is copied to dedicated wait connections. This narrowly
   prevents an in-session automation client from invoking those eight mutations
   against the PTY that hosts it, but it is not authentication: any same-user
-  process able to reach the owner socket remains inside the trusted
-  single-operator boundary.
+  process able to reach the owner socket remains inside the trusted owner-path
+  boundary.
 - **Prompt-injection / confused-deputy risk is inherited from the agents.** An
   operator agent that reads attacker-influenced text (a malicious issue, PR, or
   repository content) and then acts is a risk you already accept by running Codex
@@ -714,6 +839,34 @@ cheap, free-by-default, or inherited:
 
 External text (terminal output, provider responses) is data, never instructions
 to the control plane.
+
+Direct-host profiles execute under the daemon owner's Unix account. A malicious
+repository, command, agent, or collaborator inside such a session is not an
+isolated workload; same-UID access remains within the owner trust boundary.
+Profile-backed container and VM isolation is later work in
+[#88](https://github.com/zajca/pohunek/issues/88).
+
+### Accepted team-relay trust domain
+
+The relay process and operator are trusted with transient plaintext and the
+union of every active `HostShare`. Relay application RBAC can deny an
+infrastructure administrator ordinary API access to session content, but it
+does not protect against a compromised relay process or its operator.
+
+The relay authenticates human principals and service accounts and authorizes
+teams, groups, roles, and session ACLs. The daemon deliberately does not repeat
+those decisions. It authenticates only its enrolled relay and fails closed on
+the locally authoritative share, allowed operation, project/worktree root,
+profile, resource limits, and immutable session origin. Thus a compromised
+relay can exercise everything allowed by active shares, but cannot use the
+relay path to enumerate or control owner-origin sessions or exceed local share
+ceilings.
+
+Only relay-created session traffic may pass through the relay. The relay never
+persists PTY output, input, prompts, terminal snapshots, file contents, or raw
+secrets; audit and PostgreSQL contain bounded structured metadata only. The full
+claims, non-claims, data classification, and revocation model are specified in
+the [team-relay RFC](design/team-relay-control-plane-rfc.md).
 
 ## Observability
 
@@ -805,13 +958,13 @@ Integration tests:
 
 | Area | Original plan | This revision |
 |------|---------------|---------------|
-| Scope | Multi-host, team-capable | Single-user personal tool |
+| Scope | Multi-host, team-capable | Owner-first direct operation plus an accepted optional multi-team relay |
 | Remote transport | SSH bridge | Direct over NetBird/WireGuard |
 | Discovery | Tailscale + NetBird + signed manifests | NetBird-local + live capability query |
-| Mesh trust | Signed manifests, key rotation, snapshot sync | Dropped (NetBird + fs perms) |
-| Audit | Tamper-evident considered | Plain local event log (debug) |
+| Mesh trust | Signed manifests, key rotation, snapshot sync | Owner paths use overlay + filesystem permissions; relay uses explicit enrollment and local `HostShare` ceilings |
+| Audit | Tamper-evident considered | Plain local event log today; structured metadata-only relay audit planned in [#87](https://github.com/zajca/pohunek/issues/87) |
 | Agent state | Terminal heuristics | OSC title + screen-manifest + PTY activity (per herdr); hooks only capture the session ID for resume |
 | Providers | In-tree Linear/GitHub adapters | Deferred, shell-out (`gh`, Linear GraphQL/MCP) in the client surfaces, not the chassis |
-| GUI | libghostty client (MVP5) + spike (MVP0) | Deferred; SDK first, native Rust desktop primary, browser control center later/optional. libghostty client dropped |
+| GUI | libghostty client (MVP5) + spike (MVP0) | Native Rust desktop and mesh-local browser clients shipped; relay clients remain planned |
 | Attach framing | "separate stream mode" (unspecified) | Separate connection per PTY (specified) |
 | Agents | Codex + Claude Code | Codex + Claude Code + local-terminal Hermes Agent 0.20.0 |

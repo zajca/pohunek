@@ -12,6 +12,47 @@ Source of truth:
 - Rust SDK transport API: `crates/client`
 - Daemon dispatch behavior: `crates/daemon/src/api`
 
+## Status: Shipped v3 and Accepted Relay Evolution
+
+### Shipped now: protocol v3 owner paths
+
+Protocol v3 is the implemented contract. Local clients connect through the
+owner-only Unix socket, direct remote clients connect through a configured
+overlay such as NetBird, and browser clients can use the transparent Bun
+`@pohunek/backend` WebSocket transport described below. All three routes retain
+the existing owner trust domain. The Bun backend maps one WebSocket to one
+daemon connection; it is not a team service, authentication authority, state
+aggregator, or public `pohunek-relayd` implementation.
+
+### Accepted, not yet implemented: optional team relay
+
+The [team relay RFC](design/team-relay-control-plane-rfc.md) defines an accepted
+future extension, but none of its host-link or public relay API is part of the
+shipped contract yet. The extension keeps local Unix and direct overlay owner
+paths unchanged and adds a separate Rust `pohunek-relayd` authority. A host will
+initiate an authenticated userspace WireGuard tunnel and every control and
+attach TCP stream; the public relay will never dial the host.
+
+The coordinated protocol-v4 cutover in
+[#70](https://github.com/zajca/pohunek/issues/70) will add the authenticated host
+link, `HostShare` coordinates, immutable session origin, one atomic host-scoped
+snapshot covering all active shares with an epoch/watermark, and host-initiated
+outbound attach streams.
+There will be no v3 compatibility shim on the relay path and no change to the
+current direct-owner trust domain. Supporting work is owned by
+[#72](https://github.com/zajca/pohunek/issues/72) for the userspace WireGuard
+transport, [#85](https://github.com/zajca/pohunek/issues/85) for the relay and
+identity foundation, [#84](https://github.com/zajca/pohunek/issues/84) for
+full-resync state synchronization, and
+[#71](https://github.com/zajca/pohunek/issues/71) for relay routing and its typed
+public API.
+
+The current `@pohunek/backend` remains the shipped transparent browser
+transport until [#86](https://github.com/zajca/pohunek/issues/86) replaces its
+production runtime with the Rust relay and a typed relay client. Its current
+exported names, including `WsTransport.relay`, describe existing SDK API and do
+not imply that the accepted team relay has shipped.
+
 ## Compatibility Model
 
 The current public protocol version is `3` (`PROTOCOL_VERSION`), and this build
@@ -65,32 +106,36 @@ per line. The current daemon and Rust SDK cap control lines at 1 MiB.
 Raw terminal bytes are never multiplexed onto a JSON control connection. Attach
 uses a separate connection described in "Attach Stream".
 
-The TypeScript SDK also supports a WebSocket relay transport for browser and
-Bun/Node clients that cannot dial Unix sockets or daemon TCP directly. Browser
-code imports the browser-safe `@pohunek/sdk/browser` entry; the root
-`@pohunek/sdk` entry additionally exposes Bun/Node socket transports. The relay
-is not a daemon protocol endpoint and does not aggregate state. It is a pure
-one-WebSocket-to-one-daemon-connection tunnel:
+The TypeScript SDK also supports a transparent WebSocket backend transport for
+browser and Bun/Node clients that cannot dial Unix sockets or daemon TCP
+directly. Browser code imports the browser-safe `@pohunek/sdk/browser` entry; the root
+`@pohunek/sdk` entry additionally exposes Bun/Node socket transports. The
+current Bun backend is not a daemon protocol endpoint and does not aggregate
+state. It is a pure one-WebSocket-to-one-daemon-connection tunnel:
 
 - `GET /daemon/<host>/control` upgrades to a WebSocket whose text frames are
-  control lines. The relay writes each frame's UTF-8 bytes plus the daemon's
+  control lines. The backend writes each frame's UTF-8 bytes plus the daemon's
   newline delimiter to one daemon control connection, and sends each daemon
   newline-delimited response/event line back as one text frame.
 - `GET /daemon/<host>/attach` upgrades to a WebSocket whose binary frames are
-  opaque attach bytes. The relay forwards bytes unframed to/from one raw daemon
+  opaque attach bytes. The backend forwards bytes unframed to/from one raw daemon
   connection.
-- The relay enforces the 1 MiB control-line cap in both directions and closes
+- The backend enforces the 1 MiB control-line cap in both directions and closes
   the WebSocket on oversize input. It does not parse JSON, multiplex sessions,
   discover hosts, or retain protocol state.
-- The `<host>` URL segment is resolved only through the relay operator's static
-  target map. Unknown hosts are rejected during upgrade.
-- The relay must bind fail-closed to a NetBird CGNAT address
+- The `<host>` URL segment is resolved only through the backend's current host
+  catalog. The full control-center backend builds that catalog from its local
+  daemon's bounded `host.discover` pipeline and forces a fresh discovery before
+  each remote upgrade. Unknown, stale, or unreachable hosts are rejected during
+  upgrade. The lower-level transport core also accepts an explicit target map
+  for tests and embedding.
+- The backend must bind fail-closed to a NetBird CGNAT address
   (`100.64.0.0/10`). Loopback is allowed only for explicit local testing or
   development; wildcard addresses such as `0.0.0.0` and `::` are never valid.
 
-This WebSocket relay framing contract is pre-1.0 transport infrastructure. It
-is intentionally re-reviewable when Track B starts so the browser control
-center can validate the relay boundary before any stability promise is made.
+This transparent WebSocket framing contract is pre-1.0 transport
+infrastructure. It remains the current shipped browser path until #86 replaces
+the production Bun backend; it is not the accepted public team-relay contract.
 
 ## Envelopes
 
@@ -1292,9 +1337,9 @@ Attach stream rules:
   target runtime the client is already running inside, the daemon rejects the
   attach with `daemon/attach_self_feedback`; this remains correct after daemon
   replacement.
-- On the WebSocket relay transport, the attach prelude is sent as the first
-  bytes on the `/daemon/<host>/attach` binary WebSocket. After redemption, every
-  binary frame remains opaque PTY data.
+- On the current transparent WebSocket backend transport, the attach prelude is
+  sent as the first bytes on the `/daemon/<host>/attach` binary WebSocket. After
+  redemption, every binary frame remains opaque PTY data.
 
 Rust SDK helpers:
 
@@ -1447,7 +1492,8 @@ Public exports:
   TypeScript clients.
 - `SocketTransport`: direct Unix/TCP `node:net` transport for Bun/Node; exported
   only by the root `@pohunek/sdk` entry.
-- `WsTransport`: WebSocket relay transport using the WHATWG `WebSocket` global.
+- `WsTransport`: current transparent WebSocket backend transport using the
+  WHATWG `WebSocket` global.
 - `Transport`: pluggable transport interface with `control()` for framed
   control channels and `raw()` for unframed attach channels.
 - `ControlChannel`: `send(line)`, async `lines`, and `close()` for one framed
@@ -1488,18 +1534,20 @@ Public exports:
 
 Supported runtimes:
 
-- Bun: supports the direct socket transport and the WebSocket relay transport.
+- Bun: supports the direct socket transport and the current WebSocket backend
+  transport.
 - Node >= 18: supports the direct Unix/TCP socket transport through `node:net`.
-- Node >= 22: supports the WebSocket relay transport through the built-in WHATWG
-  `WebSocket` global.
-- Browser: import `@pohunek/sdk/browser`; it supports only the WebSocket relay
-  transport because browsers cannot dial daemon Unix sockets or NetBird TCP
-  directly.
+- Node >= 22: supports the current WebSocket backend transport through the
+  built-in WHATWG `WebSocket` global.
+- Browser: import `@pohunek/sdk/browser`; it supports only the current WebSocket
+  backend transport because browsers cannot dial daemon Unix sockets or
+  NetBird TCP directly.
 
 Connection APIs:
 
 - `Client.defaultOptions()`: returns resolved default timeouts.
-- `Client.connectWs(baseUrl, host, opts?)`: WebSocket relay. `baseUrl` may use
+- `Client.connectWs(baseUrl, host, opts?)`: current WebSocket backend transport.
+  `baseUrl` may use
   `http`, `https`, `ws`, or `wss`; the SDK connects to
   `/daemon/<host>/control` under that base URL.
 - `Client.connectTransport(transport, opts?, remoteHost?)`: injection point for
@@ -1508,8 +1556,9 @@ Connection APIs:
   root-entry Bun/Node helpers for a direct Unix socket or daemon TCP address.
 - `SocketTransport.unix(socketPath, opts?)` and `SocketTransport.tcp(host,
   {host, port}, opts?)`: construct direct socket transports.
-- `WsTransport.relay(baseUrl, host, opts?)`: constructs the WebSocket relay
-  transport for `/daemon/<host>/control` and `/daemon/<host>/attach`.
+- `WsTransport.relay(baseUrl, host, opts?)`: constructs the current WebSocket
+  backend transport for `/daemon/<host>/control` and
+  `/daemon/<host>/attach`. The method name predates the accepted team relay.
 
 Request APIs:
 
@@ -1540,7 +1589,7 @@ Attach APIs:
 - Root-entry `attachRaw(host, socketPath, streamId, opts?)` mirrors the Rust
   convenience helper for local hosts (`""` or `"local"`). The TypeScript SDK
   core does not perform NetBird host resolution; remote callers pass an
-  explicit address to `attachRawTcp` or use the WebSocket relay with
+  explicit address to `attachRawTcp` or use the current WebSocket backend with
   `attachRawWs`.
 - Root-entry `attachRawLocal` and `attachRawTcp`, plus shared `attachRawWs`, open
   a raw channel, write exactly one attach prelude, parse a failed redemption
@@ -1563,5 +1612,8 @@ transport-core server used by `WsTransport`:
 `startRelay({bindHost, port, targets, allowLoopbackBind?})`,
 `validateRelayBindAddr`, `isNetbirdIp`, `RelayBindAddrError`, and the
 `DaemonTarget`/`RelayHandle` types. The package rename and its added host
-discovery, `/api/hosts`, and SPA composition do not change the WebSocket relay
-framing contract documented above: it remains a transparent 1:1 tunnel.
+discovery, `/api/hosts`, and SPA composition do not change the WebSocket framing
+contract documented above: it remains a transparent 1:1 tunnel. It is
+the currently shipped mesh-local browser backend, not `pohunek-relayd`, and its
+production runtime is scheduled for replacement by #86 only after the complete
+typed relay client is available.
