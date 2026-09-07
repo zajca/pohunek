@@ -21,8 +21,9 @@
 
 mod support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -43,6 +44,7 @@ use tokio_util::codec::{Framed, LinesCodec};
 
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo};
 use pohunek_daemon::events::{spawn_drain, EventLog};
+use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::procwatch::LinuxInspector;
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
@@ -70,6 +72,18 @@ fn temp_dir(tag: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&dir).expect("create test dir");
     dir
+}
+
+async fn governance_service(socket: &Path) -> Arc<HostGovernanceService> {
+    let state_root = socket
+        .parent()
+        .expect("test socket has an isolated parent")
+        .join("state");
+    Arc::new(
+        HostGovernanceService::open(state_root)
+            .await
+            .expect("open real isolated host-governance service"),
+    )
 }
 
 /// Write `body` to `path` and mark it executable, for the stub sentinel agent.
@@ -296,6 +310,7 @@ async fn spawn_worker_backed_server(
     let state = DaemonState::new(
         HealthInfo::new(version),
         registry,
+        governance_service(socket).await,
         support::overlay_registry(),
     );
     let server = ControlServer::bind_with_state(socket, state)
@@ -310,6 +325,370 @@ async fn spawn_worker_backed_server(
             .await;
     });
     (tx, handle, worker_home)
+}
+
+#[tokio::test]
+async fn host_governance_inspect_never_exposes_private_governance_coordinates() {
+    let socket = temp_dir("governance-privacy-sentinel").join("daemon.sock");
+    let (shutdown, handle, _worker_home) =
+        spawn_worker_backed_server(&socket, "0.0.0", SessionRegistryConfig::default()).await;
+    let mut client = connect(&socket).await;
+    let request = Request::make(
+        "governance-privacy-sentinel",
+        method::HOST_GOVERNANCE_INSPECT,
+        serde_json::Value::Null,
+    );
+    let payload = ok_payload(exchange(&mut client, &request).await);
+    assert_safe_governance_payload(&payload);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn daemon_doctor_governance_checks_remain_structurally_redacted() {
+    let socket = temp_dir("daemon-doctor-privacy-sentinel").join("daemon.sock");
+    let (shutdown, handle, _worker_home) =
+        spawn_worker_backed_server(&socket, "0.0.0", SessionRegistryConfig::default()).await;
+    let mut client = connect(&socket).await;
+    let request = Request::make(
+        "daemon-doctor-privacy-sentinel",
+        method::DAEMON_DOCTOR,
+        serde_json::Value::Null,
+    );
+    let payload = ok_payload(exchange(&mut client, &request).await);
+    let report: protocol::DaemonDoctorResult =
+        serde_json::from_value(payload).expect("typed daemon doctor report");
+    let governance = report
+        .report
+        .checks
+        .into_iter()
+        .filter(|check| check.name.starts_with("host_"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        governance
+            .iter()
+            .map(|check| check.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "host_governance_durability",
+            "host_identity_stable",
+            "host_state_private_storage",
+            "host_governance_consistency",
+            "host_approval_key",
+            "host_governance_quarantine",
+        ]
+    );
+    for check in governance {
+        for forbidden in [
+            "/",
+            "key",
+            "signature",
+            "proposal",
+            "nonce",
+            "seed",
+            "session",
+            "terminal",
+        ] {
+            assert!(
+                !check.detail.to_ascii_lowercase().contains(forbidden),
+                "{} detail leaks forbidden {forbidden}",
+                check.name
+            );
+        }
+    }
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Assert the complete safe wire schema recursively, so any added field at the
+/// result, enrollment, or owner level fails even when a public identifier's
+/// base64url payload happens to contain a forbidden word as a substring.
+fn assert_safe_governance_payload(payload: &serde_json::Value) {
+    let root = object(payload, "host governance result");
+    assert_exact_fields(
+        root,
+        [
+            "approval_key_reference",
+            "enrollment",
+            "host_id",
+            "owner",
+            "owner_revision",
+            "quarantine",
+        ],
+        "host governance result",
+    );
+    assert_public_identifier(root, "host_id", "host_");
+    assert_public_identifier(root, "approval_key_reference", "approval_key_");
+    let enrollment = root.get("enrollment").expect("enrollment field");
+    let owner = root.get("owner").expect("owner field");
+    let owner_revision = root.get("owner_revision").expect("owner revision field");
+    let quarantine = root.get("quarantine").expect("quarantine field");
+    if enrollment.is_null() {
+        assert!(owner.is_null(), "never-enrolled host must have no owner");
+        assert!(
+            owner_revision.is_null(),
+            "never-enrolled host must have no owner revision"
+        );
+        assert!(
+            quarantine.is_null(),
+            "never-enrolled host must not be quarantined"
+        );
+        return;
+    }
+
+    let enrollment_status = assert_safe_enrollment(enrollment);
+    assert_safe_owner(owner);
+    assert_required_canonical_revision(owner_revision, "owner_revision");
+    assert_quarantine_matches_enrollment(quarantine, enrollment_status);
+}
+
+fn assert_safe_enrollment(value: &serde_json::Value) -> &str {
+    let enrollment = object(value, "enrollment");
+    assert_exact_fields(
+        enrollment,
+        ["relay_id", "revision", "status"],
+        "governance enrollment",
+    );
+    assert_public_identifier(enrollment, "relay_id", "relay_");
+    let status = assert_enrollment_status(enrollment.get("status").expect("enrollment status"));
+    assert_required_canonical_revision(
+        enrollment.get("revision").expect("enrollment revision"),
+        "enrollment revision",
+    );
+    status
+}
+
+fn assert_safe_owner(value: &serde_json::Value) {
+    let owner = object(value, "owner");
+    assert_exact_fields(owner, ["id", "kind"], "governance owner");
+    let kind = owner
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .expect("owner kind is a string");
+    let expected_prefix = match kind {
+        "principal" => "principal_",
+        "team" => "team_",
+        other => panic!("owner kind must be principal or team, got {other}"),
+    };
+    assert_public_identifier(owner, "id", expected_prefix);
+}
+
+fn assert_exact_fields<'a>(
+    object: &serde_json::Map<String, serde_json::Value>,
+    expected: impl IntoIterator<Item = &'a str>,
+    context: &str,
+) {
+    assert_eq!(
+        object.keys().cloned().collect::<BTreeSet<_>>(),
+        expected.into_iter().map(str::to_owned).collect(),
+        "{context} must remain the fixed safe governance projection"
+    );
+}
+
+fn assert_public_identifier(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    prefix: &str,
+) {
+    let value = object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .expect("public governance identifier is a string");
+    assert!(
+        value.starts_with(prefix),
+        "{field} must retain its safe public {prefix} identifier form"
+    );
+}
+
+fn assert_quarantine_matches_enrollment(value: &serde_json::Value, enrollment_status: &str) {
+    if enrollment_status != "quarantined" {
+        assert!(
+            value.is_null(),
+            "only quarantined enrollments may expose a quarantine reason"
+        );
+        return;
+    }
+    let reason = value
+        .as_str()
+        .expect("quarantined enrollment must expose a safe public reason");
+    assert!(
+        matches!(
+            reason,
+            "host_identity_clone" | "projection_conflict" | "enrollment_conflict"
+        ),
+        "quarantine must be a known safe public reason"
+    );
+}
+
+fn assert_enrollment_status(value: &serde_json::Value) -> &str {
+    let status = value
+        .as_str()
+        .expect("enrollment status must be a safe public string");
+    assert!(
+        matches!(
+            status,
+            "disabled"
+                | "pending_local_commit"
+                | "active"
+                | "rotating"
+                | "quarantined"
+                | "locally_unenrolled"
+        ),
+        "enrollment status must be a known safe public status"
+    );
+    status
+}
+
+fn assert_required_canonical_revision(value: &serde_json::Value, field: &str) {
+    let value = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{field} must be a canonical revision string"));
+    assert!(
+        value
+            .parse::<u64>()
+            .is_ok_and(|revision| revision > 0 && revision.to_string() == *value),
+        "{field} must be a canonical positive decimal revision"
+    );
+}
+
+fn object<'a>(
+    value: &'a serde_json::Value,
+    context: &str,
+) -> &'a serde_json::Map<String, serde_json::Value> {
+    value
+        .as_object()
+        .unwrap_or_else(|| panic!("{context} must be an object"))
+}
+
+fn enrolled_quarantined_governance_payload() -> serde_json::Value {
+    serde_json::json!({
+        "approval_key_reference": "approval_key_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "enrollment": {
+            "relay_id": "relay_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "revision": "2",
+            "status": "quarantined",
+        },
+        "host_id": "host_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "owner": {
+            "id": "team_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "kind": "team",
+        },
+        "owner_revision": "3",
+        "quarantine": "projection_conflict",
+    })
+}
+
+fn assert_governance_payload_is_rejected(payload: &serde_json::Value) {
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| assert_safe_governance_payload(payload))).is_err(),
+        "unsafe governance payload must be rejected: {payload}"
+    );
+}
+
+#[test]
+fn governance_privacy_schema_accepts_enrolled_quarantined_canonical_revisions() {
+    for revision in ["1", "2", "18446744073709551615"] {
+        let mut payload = enrolled_quarantined_governance_payload();
+        payload["owner_revision"] = serde_json::Value::String(revision.to_owned());
+        payload["enrollment"]["revision"] = serde_json::Value::String(revision.to_owned());
+        assert_safe_governance_payload(&payload);
+    }
+}
+
+#[test]
+fn governance_privacy_schema_rejects_noncanonical_revision_wires() {
+    for invalid in [
+        "0",
+        "00",
+        "01",
+        "+1",
+        "-1",
+        " 1",
+        "1 ",
+        "",
+        "one",
+        "18446744073709551616",
+    ] {
+        for field in ["owner_revision", "enrollment.revision"] {
+            let mut payload = enrolled_quarantined_governance_payload();
+            match field {
+                "owner_revision" => {
+                    payload["owner_revision"] = serde_json::Value::String(invalid.to_owned());
+                }
+                "enrollment.revision" => {
+                    payload["enrollment"]["revision"] =
+                        serde_json::Value::String(invalid.to_owned());
+                }
+                _ => unreachable!("the test only enumerates known revision fields"),
+            }
+            assert_governance_payload_is_rejected(&payload);
+        }
+    }
+
+    for field in ["owner_revision", "enrollment.revision"] {
+        let mut payload = enrolled_quarantined_governance_payload();
+        match field {
+            "owner_revision" => payload["owner_revision"] = serde_json::json!(1),
+            "enrollment.revision" => payload["enrollment"]["revision"] = serde_json::json!(1),
+            _ => unreachable!("the test only enumerates known revision fields"),
+        }
+        assert_governance_payload_is_rejected(&payload);
+    }
+}
+
+#[test]
+fn governance_privacy_schema_rejects_null_revisions_for_enrolled_team_hosts() {
+    for field in ["owner_revision", "enrollment.revision"] {
+        let mut payload = enrolled_quarantined_governance_payload();
+        match field {
+            "owner_revision" => payload["owner_revision"] = serde_json::Value::Null,
+            "enrollment.revision" => payload["enrollment"]["revision"] = serde_json::Value::Null,
+            _ => unreachable!("the test only enumerates known revision fields"),
+        }
+        assert_governance_payload_is_rejected(&payload);
+    }
+}
+
+#[test]
+fn governance_privacy_schema_rejects_partial_governance_state() {
+    for field in ["enrollment", "owner", "owner_revision", "quarantine"] {
+        let mut payload = enrolled_quarantined_governance_payload();
+        payload[field] = serde_json::Value::Null;
+        assert_governance_payload_is_rejected(&payload);
+    }
+
+    let mut never_enrolled = enrolled_quarantined_governance_payload();
+    never_enrolled["enrollment"] = serde_json::Value::Null;
+    never_enrolled["owner"] = serde_json::Value::Null;
+    never_enrolled["owner_revision"] = serde_json::Value::Null;
+    never_enrolled["quarantine"] = serde_json::Value::Null;
+    assert_safe_governance_payload(&never_enrolled);
+}
+
+#[test]
+fn governance_privacy_schema_rejects_private_fields_at_every_allowed_depth() {
+    for field in ["seed", "nonce", "proposal"] {
+        for level in ["root", "enrollment", "owner"] {
+            let mut payload = enrolled_quarantined_governance_payload();
+            let target = match level {
+                "root" => object(&payload, "synthetic governance root"),
+                "enrollment" => object(&payload["enrollment"], "synthetic enrollment"),
+                "owner" => object(&payload["owner"], "synthetic owner"),
+                _ => unreachable!("the test only enumerates known governance levels"),
+            };
+            let mut target = target.clone();
+            target.insert(field.to_owned(), serde_json::json!("private"));
+            match level {
+                "root" => payload = serde_json::Value::Object(target),
+                "enrollment" => payload["enrollment"] = serde_json::Value::Object(target),
+                "owner" => payload["owner"] = serde_json::Value::Object(target),
+                _ => unreachable!("the test only enumerates known governance levels"),
+            }
+            assert_governance_payload_is_rejected(&payload);
+        }
+    }
 }
 
 /// Milestone: Durable Session Workers RFC, Definition of Done item 4.

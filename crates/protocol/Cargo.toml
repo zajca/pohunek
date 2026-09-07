@@ -20,6 +20,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["parsing"] }
 ts-rs = { version = "12", optional = true, features = ["serde-json-impl", "format"] }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
 
 [lints]
 workspace = true

@@ -4,15 +4,15 @@ use std::collections::BTreeMap;
 
 use pohunek_client::Client;
 use protocol::{
-    method, IntegrationStatusParams, IntegrationStatusResult, NotificationDeleteParams,
-    NotificationDeleteResult, NotificationListParams, NotificationListResult,
-    NotificationPolicyParams, NotificationPolicyResult, NotificationRecord, NotificationStatus,
-    NotificationUpdateParams, NotificationUpdateResult, ProjectActionParams, ProjectActionResult,
-    ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams,
-    ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult,
-    ProjectRenameParams, ProjectShowParams, ProjectShowResult, SessionDiffParams,
-    SessionDiffResult, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
-    SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
+    method, HostGovernanceStatus, IntegrationStatusParams, IntegrationStatusResult,
+    NotificationDeleteParams, NotificationDeleteResult, NotificationListParams,
+    NotificationListResult, NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
+    NotificationStatus, NotificationUpdateParams, NotificationUpdateResult, ProjectActionParams,
+    ProjectActionResult, ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectInfo,
+    ProjectListParams, ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams,
+    ProjectRemoveResult, ProjectRenameParams, ProjectShowParams, ProjectShowResult,
+    SessionDiffParams, SessionDiffResult, SessionForkParams, SessionForkResult, SessionId,
+    SessionInfo, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
     SessionOutputResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
     SessionResumeResult, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
     SessionSetMetadataResult, SessionStopResult, SessionWaitParams, SessionWaitResult,
@@ -40,6 +40,38 @@ pub async fn load_host(config: HostConfig) -> DomainEvent {
 /// Load one host snapshot and return typed data for headless tests.
 pub async fn load_host_snapshot(config: &HostConfig) -> Result<HostSnapshot, CoreError> {
     load_host_snapshot_with_options(config, ConnectionOptions::default()).await
+}
+
+/// Inspect one host's safe stable-identity and governance status.
+///
+/// The configured [`HostConfig`] selects the daemon transport. The returned
+/// [`HostGovernanceStatus`] carries the distinct stable protocol host identity.
+///
+/// # Errors
+///
+/// Returns [`CoreError`] when the selected daemon transport cannot connect,
+/// exchange the read-only request, or decode its safe response.
+pub async fn inspect_host_governance(
+    config: &HostConfig,
+) -> Result<HostGovernanceStatus, CoreError> {
+    inspect_host_governance_with_options(config, ConnectionOptions::default()).await
+}
+
+/// Inspect safe host governance with explicit connection options.
+///
+/// # Errors
+///
+/// Returns [`CoreError`] when the selected daemon transport cannot connect,
+/// exchange the read-only request, or decode its safe response.
+pub async fn inspect_host_governance_with_options(
+    config: &HostConfig,
+    options: ConnectionOptions,
+) -> Result<HostGovernanceStatus, CoreError> {
+    let mut client = connect_client(config, options).await?;
+    client
+        .host_governance_inspect()
+        .await
+        .map_err(CoreError::from)
 }
 
 /// Inspect daemon-managed hook integrations on a host.

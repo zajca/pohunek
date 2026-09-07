@@ -5899,6 +5899,7 @@ async fn detection_rpc_returns_a_bounded_typed_error_for_oversized_previews() {
     let state = DaemonState::new(
         HealthInfo::new("test"),
         registry.clone(),
+        Arc::new(crate::governance::HostGovernanceService::open_test()),
         crate::test_support::overlay_registry(),
     );
 

@@ -13,7 +13,7 @@
 
 use std::fmt::Write as _;
 
-use protocol::{method, HostCapabilities, HostClass, HostRecord};
+use protocol::{method, HostCapabilities, HostClass, HostGovernanceStatus, HostOwner, HostRecord};
 
 use crate::client::Client;
 use crate::error::CliError;
@@ -71,6 +71,28 @@ pub(crate) async fn run_inspect(host: &str, paths: &Paths, json: bool) -> Result
         print!("{}", crate::commands::render_json(&caps)?);
     } else {
         print!("{}", render_capabilities_human(host, &caps));
+    }
+    Ok(())
+}
+
+/// Run `host governance inspect <host>` without changing host governance.
+///
+/// # Errors
+///
+/// Returns [`CliError`] when the host cannot be resolved or reached, or the
+/// daemon rejects the safe inspection request.
+pub(crate) async fn run_governance_inspect(
+    host: &str,
+    paths: &Paths,
+    json: bool,
+) -> Result<(), CliError> {
+    let mut client = Client::connect(host, paths).await?;
+    let status: HostGovernanceStatus = client.call::<method::HostGovernanceInspect>(()).await?;
+
+    if json {
+        print!("{}", crate::commands::render_json(&status)?);
+    } else {
+        print!("{}", render_governance_human(host, &status));
     }
     Ok(())
 }
@@ -174,9 +196,66 @@ fn render_capabilities_human(host: &str, caps: &HostCapabilities) -> String {
     output
 }
 
+/// Render only public, owner-safe governance information for one daemon route.
+fn render_governance_human(host: &str, status: &HostGovernanceStatus) -> String {
+    let mut output = format!("host {host} governance\n");
+    let _ = writeln!(output, "  host_id:                {}", status.host_id());
+    let _ = writeln!(
+        output,
+        "  approval_key_reference: {}",
+        status.approval_key_reference()
+    );
+
+    let Some(enrollment) = status.enrollment() else {
+        output.push_str("  enrollment:             never enrolled\n");
+        output.push_str("  owner:                  absent\n");
+        output.push_str("  owner_revision:         absent\n");
+        output.push_str("  quarantine:             none\n");
+        return output;
+    };
+
+    let _ = writeln!(
+        output,
+        "  relay_id:               {}",
+        enrollment.relay_id()
+    );
+    let _ = writeln!(
+        output,
+        "  enrollment_status:      {:?}",
+        enrollment.status()
+    );
+    let _ = writeln!(
+        output,
+        "  enrollment_revision:    {}",
+        enrollment.revision()
+    );
+    if let (Some(owner), Some(revision)) = (status.owner(), status.owner_revision()) {
+        match owner {
+            HostOwner::Principal(id) => {
+                let _ = writeln!(output, "  owner:                  principal {id}");
+            }
+            HostOwner::Team(id) => {
+                let _ = writeln!(output, "  owner:                  team {id}");
+            }
+        }
+        let _ = writeln!(output, "  owner_revision:         {revision}");
+    }
+    match status.quarantine() {
+        Some(reason) => {
+            let _ = writeln!(output, "  quarantine:             {reason:?}");
+        }
+        None => output.push_str("  quarantine:             none\n"),
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
-    use protocol::{AgentKind, AgentRuntime, ProtocolVersion};
+    use protocol::{
+        AgentKind, AgentRuntime, ApprovalKeyReference, EnrollmentInfo, EnrollmentRevision,
+        EnrollmentStatus, HostId, OwnerRevision, PrincipalId, ProtocolVersion, QuarantineReason,
+        RelayId, TeamId,
+    };
 
     use super::*;
 
@@ -234,6 +313,70 @@ mod tests {
         assert!(output.contains(
             "hermes   available=true  supported=true  version=0.20.0 path=/usr/bin/hermes"
         ));
+    }
+
+    fn id(prefix: &str) -> String {
+        format!("{prefix}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    }
+
+    #[test]
+    fn renders_safe_governance_for_never_enrolled_and_quarantined_hosts() {
+        let host_id = HostId::parse(&id("host_")).expect("host id");
+        let key = ApprovalKeyReference::from_ed25519_verifying_key_bytes([7; 32]);
+        let never_enrolled =
+            HostGovernanceStatus::new(host_id.clone(), None, None, None, None, key.clone())
+                .expect("valid never-enrolled status");
+        let absent = render_governance_human("local", &never_enrolled);
+        assert!(absent.contains(&format!("host_id:                {host_id}")));
+        assert!(absent.contains("approval_key_reference:"));
+        assert!(absent.contains("enrollment:             never enrolled"));
+        assert!(absent.contains("owner:                  absent"));
+        let json = crate::commands::render_json(&never_enrolled).expect("serialize safe JSON");
+        assert!(json.contains("\"host_id\""));
+        assert!(json.contains("\"approval_key_reference\""));
+        assert!(!json.contains("nonce"));
+        assert!(!json.contains("signature"));
+
+        let quarantined = HostGovernanceStatus::new(
+            host_id,
+            Some(EnrollmentInfo::new(
+                RelayId::parse(&id("relay_")).expect("relay id"),
+                EnrollmentStatus::Quarantined,
+                EnrollmentRevision::new(2).expect("revision"),
+            )),
+            Some(HostOwner::Principal(
+                PrincipalId::parse(&id("principal_")).expect("principal id"),
+            )),
+            Some(OwnerRevision::new(3).expect("owner revision")),
+            Some(QuarantineReason::ProjectionConflict),
+            key,
+        )
+        .expect("valid quarantined status");
+        let present = render_governance_human("host-b", &quarantined);
+        assert!(present.contains("relay_id:               relay_"));
+        assert!(present.contains("enrollment_status:      Quarantined"));
+        assert!(present.contains("owner:                  principal principal_"));
+        assert!(present.contains("owner_revision:         3"));
+        assert!(present.contains("quarantine:             ProjectionConflict"));
+
+        let team_owned = HostGovernanceStatus::new(
+            HostId::parse(&id("host_")).expect("host id"),
+            Some(EnrollmentInfo::new(
+                RelayId::parse(&id("relay_")).expect("relay id"),
+                EnrollmentStatus::Active,
+                EnrollmentRevision::new(4).expect("revision"),
+            )),
+            Some(HostOwner::Team(
+                TeamId::parse(&id("team_")).expect("team id"),
+            )),
+            Some(OwnerRevision::new(5).expect("owner revision")),
+            None,
+            ApprovalKeyReference::from_ed25519_verifying_key_bytes([8; 32]),
+        )
+        .expect("valid team-owned status");
+        let team_output = render_governance_human("host-c", &team_owned);
+        assert!(team_output.contains("owner:                  team team_"));
+        assert!(team_output.contains("owner_revision:         5"));
     }
 
     #[test]

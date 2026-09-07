@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use protocol::{Method, Request, SessionInputParams, SessionInputResult};
+use protocol::{DoctorReport, Method, Request, SessionInputParams, SessionInputResult};
 use serde_json::Value;
 
 use crate::error::CliError;
@@ -78,6 +78,11 @@ impl Client {
             .session_input(params)
             .await
             .map_err(map_client_error)
+    }
+
+    /// Run the daemon's redacted host diagnostics.
+    pub(crate) async fn daemon_doctor(&mut self) -> Result<DoctorReport, CliError> {
+        self.inner.daemon_doctor().await.map_err(map_client_error)
     }
 
     /// Convert this compatibility wrapper into the SDK client.

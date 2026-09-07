@@ -1163,6 +1163,81 @@ async fn request_response_get_notification_policy_sends_null_params_and_returns_
 }
 
 #[tokio::test]
+async fn host_governance_inspect_sends_null_params_and_returns_safe_status() {
+    let expected = protocol::HostGovernanceStatus::new(
+        protocol::HostId::parse("host_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+            .expect("valid host id"),
+        None,
+        None,
+        None,
+        None,
+        protocol::ApprovalKeyReference::from_ed25519_verifying_key_bytes([7; 32]),
+    )
+    .expect("valid never-enrolled safe status");
+    let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize status"));
+    let mut client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local echo daemon");
+
+    let result = client
+        .host_governance_inspect()
+        .await
+        .expect("safe governance inspection succeeds");
+
+    assert_eq!(result, expected);
+    let sent = parse_sent_request(&daemon.request_line.await.expect("daemon saw request"));
+    assert_eq!(sent.method(), protocol::method::HOST_GOVERNANCE_INSPECT);
+    assert_eq!(sent.params(), &Value::Null);
+    daemon.task.await.expect("echo daemon completed");
+}
+
+#[tokio::test]
+async fn daemon_doctor_sends_null_params_and_returns_typed_report() {
+    let expected = protocol::DaemonDoctorResult {
+        report: protocol::DoctorReport::from_checks(vec![protocol::DoctorCheck::new(
+            "host_identity_stable",
+            protocol::DoctorStatus::Ok,
+            "Stable host identity matches the retained durable state.",
+        )]),
+    };
+    let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize report"));
+    let mut client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local echo daemon");
+
+    let result = client.daemon_doctor().await.expect("doctor succeeds");
+
+    assert_eq!(result, expected.report);
+    let sent = parse_sent_request(&daemon.request_line.await.expect("daemon saw request"));
+    assert_eq!(sent.method(), protocol::method::DAEMON_DOCTOR);
+    assert_eq!(sent.params(), &Value::Null);
+    daemon.task.await.expect("echo daemon completed");
+}
+
+#[tokio::test]
+async fn daemon_doctor_preserves_typed_daemon_errors() {
+    let source = ProtocolError::new(
+        ErrorClass::Daemon,
+        "host_governance_unavailable",
+        "host governance status is unavailable",
+        Some("reload or restart the daemon, then retry".to_owned()),
+    );
+    let daemon = spawn_echo_error_daemon(source.clone());
+    let mut client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local echo daemon");
+
+    match client.daemon_doctor().await.expect_err("doctor error") {
+        ClientError::Protocol(error) => assert_eq!(error, source),
+        other => panic!("expected typed daemon error, got {other:?}"),
+    }
+    let sent = parse_sent_request(&daemon.request_line.await.expect("daemon saw request"));
+    assert_eq!(sent.method(), protocol::method::DAEMON_DOCTOR);
+    assert_eq!(sent.params(), &Value::Null);
+    daemon.task.await.expect("echo daemon completed");
+}
+
+#[tokio::test]
 async fn request_response_set_notification_policy_sends_method_and_returns_policy() {
     let params = protocol::NotificationPolicyParams {
         policy: sample_policy(),
@@ -1376,6 +1451,41 @@ fn spawn_echo_ok_daemon(ok_payload: Value) -> EchoDaemon {
         handle_echo_connection(stream, request_tx, ok_payload).await;
     });
 
+    EchoDaemon {
+        socket_path: socket_path.clone(),
+        request_line,
+        task,
+        _socket_file: SocketFile(socket_path),
+    }
+}
+
+fn spawn_echo_error_daemon(error: ProtocolError) -> EchoDaemon {
+    let socket_path = unique_socket_path();
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).expect("bind unix error test daemon");
+    let (request_tx, request_line) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (stream, _addr) = listener.accept().await.expect("accept unix client");
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .await
+            .expect("read request line");
+        let request: Request =
+            serde_json::from_str(trim_line_end(&request_line)).expect("parse request line");
+        request_tx
+            .send(trim_line_end(&request_line).to_owned())
+            .expect("send request line to test");
+        let response = Response::err(protocol::PROTOCOL_VERSION, request.id(), error)
+            .expect("valid error response");
+        let line = serde_json::to_string(&response).expect("serialize error response");
+        reader
+            .get_mut()
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("write error reply");
+    });
     EchoDaemon {
         socket_path: socket_path.clone(),
         request_line,

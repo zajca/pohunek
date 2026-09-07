@@ -25,6 +25,10 @@ center.
 2. Start the daemon with `pohunek daemon start --detach` if needed.
 3. Run `pohunek health --json` or `pohunek status --json`.
 4. Run `pohunek host inspect local --json` to confirm agent capabilities.
+5. Run `pohunek host governance inspect local --json` when verifying the
+   stable host identity and safe governance projection shown after a GUI host
+   snapshot. The GUI displays loading, failure, never-enrolled, enrolled, and
+   quarantined states without offering a governance mutation.
 
 The Linux v1 GUI is Wayland-only. If `WAYLAND_DISPLAY` is missing or empty,
 `pohunek-gui` exits before starting Iced. An X11-only `DISPLAY` is not a

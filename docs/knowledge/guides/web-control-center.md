@@ -19,6 +19,13 @@ sessions, events, and notifications, while per-session workers own live PTYs.
 The CLI and native GUI keep working when the backend is down. This is a
 mesh-local owner tool, not the accepted public team relay.
 
+The backend remains a transparent owner transport for the additive
+`host.governance.inspect` method. The generated TypeScript method map exposes
+the safe result to a caller that asks for it, but the current owner WebUI does
+not add a governance screen, team mode, relay-local mode, or an authority
+fallback. Existing create, attach, detach, and stop flows keep their unchanged
+owner behavior.
+
 The control center uses one persistent, session-first workspace shell. The
 session rail combines every host, groups normal work by project, and promotes
 blocked sessions into an Attention section. Search covers session, project,

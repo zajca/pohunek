@@ -96,6 +96,40 @@ impl Paths {
                 .join(id)
         })
     }
+
+    /// Returns the owner-private durable host-state directory.
+    #[must_use]
+    pub fn host_state_dir(&self) -> PathBuf {
+        self.state_dir.join(pohunek_paths::HOST_STATE_SUBDIR)
+    }
+
+    /// Returns the stable host identity record path.
+    #[must_use]
+    pub fn host_identity_path(&self) -> PathBuf {
+        self.host_state_dir()
+            .join(pohunek_paths::HOST_IDENTITY_NAME)
+    }
+
+    /// Returns the host approval signing secret path.
+    #[must_use]
+    pub fn host_approval_key_path(&self) -> PathBuf {
+        self.host_state_dir()
+            .join(pohunek_paths::HOST_APPROVAL_KEY_NAME)
+    }
+
+    /// Returns the durable host governance record path.
+    #[must_use]
+    pub fn host_governance_path(&self) -> PathBuf {
+        self.host_state_dir()
+            .join(pohunek_paths::HOST_GOVERNANCE_NAME)
+    }
+
+    /// Returns the cross-process host-state lock path.
+    #[must_use]
+    pub fn host_state_lock_path(&self) -> PathBuf {
+        self.host_state_dir()
+            .join(pohunek_paths::HOST_STATE_LOCK_NAME)
+    }
 }
 
 fn path_error(err: pohunek_paths::PathError) -> DaemonError {
@@ -273,6 +307,36 @@ mod tests {
         assert_eq!(
             crate::session::SessionRegistryConfig::default().config_dir,
             None
+        );
+    }
+
+    #[test]
+    fn host_state_paths_have_the_canonical_layout() {
+        let _env = EnvGuard::acquire();
+        let base = tmp_base("host-state");
+        set_all_present(&base);
+        let paths = Paths::resolve().expect("resolve paths");
+        let host = base
+            .join("state")
+            .join(APP_DIR)
+            .join(pohunek_paths::HOST_STATE_SUBDIR);
+
+        assert_eq!(paths.host_state_dir(), host);
+        assert_eq!(
+            paths.host_identity_path(),
+            host.join(pohunek_paths::HOST_IDENTITY_NAME)
+        );
+        assert_eq!(
+            paths.host_approval_key_path(),
+            host.join(pohunek_paths::HOST_APPROVAL_KEY_NAME)
+        );
+        assert_eq!(
+            paths.host_governance_path(),
+            host.join(pohunek_paths::HOST_GOVERNANCE_NAME)
+        );
+        assert_eq!(
+            paths.host_state_lock_path(),
+            host.join(pohunek_paths::HOST_STATE_LOCK_NAME)
         );
     }
 }

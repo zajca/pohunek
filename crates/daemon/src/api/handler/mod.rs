@@ -16,6 +16,7 @@
 
 mod assistant;
 mod daemon;
+mod governance;
 mod host;
 mod integration;
 mod notification;
@@ -29,11 +30,13 @@ use protocol::{
     SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde_json::json;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 use pohunek_client::OverlayRegistry;
 
 use crate::discovery::DiscoveryCache;
+use crate::governance::HostGovernanceService;
 use crate::notifications::{AttentionCoordinator, NotificationService};
 use crate::session::SessionRegistry;
 
@@ -53,6 +56,8 @@ pub struct DaemonState {
     pub health: HealthInfo,
     /// In-memory session registry.
     pub sessions: SessionRegistry,
+    /// Daemon-owned stable host governance, shared by every owner transport.
+    pub governance: Arc<HostGovernanceService>,
     /// Durable notification inbox, when configured by the daemon binary.
     pub notifications: Option<NotificationService>,
     /// Attention debounce coordinator, when notifications are configured.
@@ -64,8 +69,13 @@ pub struct DaemonState {
 impl DaemonState {
     /// Construct shared daemon state with a validated overlay registry.
     #[must_use]
-    pub fn new(health: HealthInfo, sessions: SessionRegistry, registry: OverlayRegistry) -> Self {
-        Self::new_with_discovery(health, sessions, DiscoveryCache::new(registry))
+    pub fn new(
+        health: HealthInfo,
+        sessions: SessionRegistry,
+        governance: Arc<HostGovernanceService>,
+        registry: OverlayRegistry,
+    ) -> Self {
+        Self::new_with_discovery(health, sessions, governance, DiscoveryCache::new(registry))
     }
 
     /// Construct shared daemon state with an existing discovery cache.
@@ -73,11 +83,13 @@ impl DaemonState {
     pub fn new_with_discovery(
         health: HealthInfo,
         sessions: SessionRegistry,
+        governance: Arc<HostGovernanceService>,
         discovery: DiscoveryCache,
     ) -> Self {
         Self {
             health,
             sessions,
+            governance,
             notifications: None,
             attention: None,
             discovery,
@@ -258,11 +270,14 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::SESSION_RELEASE_AGENT => {
             session::handle_session_release_agent(request, &state.sessions).await
         }
-        method::DAEMON_DOCTOR => daemon::handle_daemon_doctor(request).await,
+        method::DAEMON_DOCTOR => daemon::handle_daemon_doctor(request, &state.governance).await,
         method::ASSISTANT_MATERIALIZE => assistant::handle_assistant_materialize(request).await,
         method::INTEGRATION_INSTALL => integration::handle_integration_install(request).await,
         method::INTEGRATION_STATUS => integration::handle_integration_status(request).await,
         method::HOST_INSPECT => host::handle_host_inspect(request, &state.health, &state.sessions),
+        method::HOST_GOVERNANCE_INSPECT => {
+            governance::handle_host_governance_inspect(request, &state.governance).await
+        }
         method::HOST_DISCOVER => host::handle_host_discover(request, &state.discovery).await,
         method::NOTIFICATION_CREATE => {
             notification::handle_notification_create(
@@ -355,6 +370,7 @@ pub(crate) fn serialize_response(resp: &Response) -> String {
 mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use protocol::{
@@ -437,7 +453,12 @@ mod tests {
     }
 
     fn daemon_state(health: HealthInfo, sessions: SessionRegistry) -> DaemonState {
-        DaemonState::new(health, sessions, crate::test_support::overlay_registry())
+        DaemonState::new(
+            health,
+            sessions,
+            Arc::new(crate::governance::HostGovernanceService::open_test()),
+            crate::test_support::overlay_registry(),
+        )
     }
 
     #[tokio::test]
@@ -999,6 +1020,43 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.name == "socket_dir_writable"));
+        assert_eq!(
+            result
+                .report
+                .checks
+                .iter()
+                .filter(|check| check.name.starts_with("host_"))
+                .map(|check| check.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "host_governance_durability",
+                "host_identity_stable",
+                "host_state_private_storage",
+                "host_governance_consistency",
+                "host_approval_key",
+                "host_governance_quarantine",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_doctor_rejects_non_null_params() {
+        let _env = EnvGuard::set_all("daemon-doctor-invalid-params");
+        let state = daemon_state(
+            HealthInfo::new("test"),
+            SessionRegistry::new(SessionRegistryConfig::default()),
+        );
+        let request = request(
+            "daemon-doctor-invalid-params",
+            method::DAEMON_DOCTOR,
+            serde_json::json!({}),
+        );
+
+        let error = error_value(handle_request(&request, &state).await, "daemon.doctor");
+
+        assert_eq!(error.class, protocol::ErrorClass::Daemon);
+        assert_eq!(error.code, "bad_request");
+        assert_eq!(error.msg, "daemon.doctor does not accept params");
     }
 
     #[tokio::test]

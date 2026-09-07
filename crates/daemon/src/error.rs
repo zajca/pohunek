@@ -105,6 +105,10 @@ pub enum DaemonError {
     #[error("session worker reconciliation failed: {0}")]
     Reconcile(#[source] protocol::ProtocolError),
 
+    /// Owner-private host governance could not start safely.
+    #[error("host governance startup failed: {0}")]
+    Governance(#[from] crate::governance::HostGovernanceError),
+
     /// Generic I/O error not tied to a specific resource above.
     #[error("io error: {0}")]
     Io(#[from] io::Error),

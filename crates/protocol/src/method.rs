@@ -10,26 +10,27 @@ use serde::Serialize;
 
 use crate::{
     AssistantMaterializeParams, AssistantMaterializeResult, DaemonDoctorResult, DaemonHealthResult,
-    HostCapabilities, HostDiscoverParams, HostRecord, IntegrationInstallParams,
-    IntegrationInstallResult, IntegrationStatusParams, IntegrationStatusResult,
-    NotificationCreateParams, NotificationCreateResult, NotificationDeleteParams,
-    NotificationDeleteResult, NotificationListParams, NotificationListResult,
-    NotificationPolicyParams, NotificationPolicyResult, NotificationRetentionParams,
-    NotificationRetentionResult, NotificationUpdateParams, NotificationUpdateResult,
-    ProjectActionParams, ProjectActionResult, ProjectActionsParams, ProjectActionsResult,
-    ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams, ProjectPromptResult,
-    ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams, ProjectShowParams,
-    ProjectShowResult, RuntimeInventoryResult, SessionAttachParams, SessionAttachResult,
-    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
-    SessionDiffParams, SessionDiffResult, SessionForkParams, SessionForkResult, SessionId,
-    SessionInfo, SessionInputParams, SessionInputResult, SessionListParams, SessionNewParams,
-    SessionNewResult, SessionOutputParams, SessionOutputResult, SessionReadParams,
-    SessionReadResult, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
-    SessionRenameParams, SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionResumeResult, SessionScreenParams, SessionScreenResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult, SessionWaitParams,
-    SessionWaitResult, WorktreeRemoveParams, WorktreeRemoveResult,
+    HostCapabilities, HostDiscoverParams, HostGovernanceStatus, HostRecord,
+    IntegrationInstallParams, IntegrationInstallResult, IntegrationStatusParams,
+    IntegrationStatusResult, NotificationCreateParams, NotificationCreateResult,
+    NotificationDeleteParams, NotificationDeleteResult, NotificationListParams,
+    NotificationListResult, NotificationPolicyParams, NotificationPolicyResult,
+    NotificationRetentionParams, NotificationRetentionResult, NotificationUpdateParams,
+    NotificationUpdateResult, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
+    ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams,
+    ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
+    ProjectShowParams, ProjectShowResult, RuntimeInventoryResult, SessionAttachParams,
+    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
+    SessionDetectionResult, SessionDiffParams, SessionDiffResult, SessionForkParams,
+    SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
+    SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
+    SessionOutputResult, SessionReadParams, SessionReadResult, SessionReleaseAgentParams,
+    SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeResult,
+    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
+    SessionStopResult, SessionWaitParams, SessionWaitResult, WorktreeRemoveParams,
+    WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -131,6 +132,15 @@ method_table!(
     DaemonHealthResult,
     "null",
     "DaemonHealthResult";
+
+    /// Inspect stable host identity and safe local governance state.
+    HostGovernanceInspect,
+    HOST_GOVERNANCE_INSPECT,
+    "host.governance.inspect",
+    (),
+    HostGovernanceStatus,
+    "null",
+    "HostGovernanceStatus";
 
     /// Start a new agent session.
     SessionNew,

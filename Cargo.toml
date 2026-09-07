@@ -33,6 +33,10 @@ members = [
 # declared here as individual crates opt in.
 [workspace.dependencies]
 base64 = "0.22"
+# Host approval keys use the RFC 8032 Ed25519 implementation; the daemon
+# explicitly opts into the minimal `std` and zeroization support it needs.
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std", "zeroize"] }
+getrandom = "0.2"
 cli = { package = "pohunek-cli", path = "crates/cli" }
 knowledge = { package = "pohunek-knowledge", path = "crates/knowledge" }
 pohunek-cli = { path = "crates/cli" }
@@ -81,10 +85,12 @@ time = { version = "0.3", features = ["formatting"] }
 vt100 = "0.16.2"
 portable-pty = "0.9"
 tempfile = "3"
+proptest = "1"
 zbus = { version = "5.16", default-features = false, features = ["tokio"] }
 pulldown-cmark = "0.12"
 # Session identifiers need durable, globally collision-resistant generation.
 ulid = "1"
+zeroize = "1"
 
 # Single source of truth for the released version. Every crate opts in via
 # `version.workspace = true`, so `scripts/release` only bumps it here.

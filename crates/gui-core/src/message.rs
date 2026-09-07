@@ -3,10 +3,10 @@
 use std::path::PathBuf;
 
 use protocol::{
-    NotificationDeleteResult, NotificationPolicyResult, NotificationUpdateResult,
-    ProjectActionResult, ProjectActionsResult, ProjectInfo, ProjectPromptResult,
-    ProjectRemoveResult, ProjectShowResult, SessionForkResult, SessionId, SessionInfo,
-    SessionNewResult, SessionOutputResult, SessionRemoveResult, SessionRenameResult,
+    HostGovernanceStatus, NotificationDeleteResult, NotificationPolicyResult,
+    NotificationUpdateResult, ProjectActionResult, ProjectActionsResult, ProjectInfo,
+    ProjectPromptResult, ProjectRemoveResult, ProjectShowResult, SessionForkResult, SessionId,
+    SessionInfo, SessionNewResult, SessionOutputResult, SessionRemoveResult, SessionRenameResult,
     SessionResumeResult, SessionScreenResult, SessionSetMetadataResult, SessionStopResult,
     SessionWaitResult, WorktreeRemoveResult,
 };
@@ -34,6 +34,15 @@ pub enum DomainEvent {
     },
     HostSnapshotLoaded {
         snapshot: HostSnapshot,
+    },
+    /// A safe read-only governance inspection completed.
+    GovernanceLoaded {
+        /// GUI daemon-route selector, distinct from `status.host_id()`.
+        host_id: HostId,
+        /// Guards against an older request overwriting newer state.
+        request_id: crate::GovernanceRequestId,
+        /// The safe status or a displayable request error.
+        result: Result<HostGovernanceStatus, String>,
     },
     HostSubscribed {
         host_id: HostId,

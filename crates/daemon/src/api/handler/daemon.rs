@@ -4,6 +4,7 @@ use protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
 
 use super::util::{error_value, ok_value};
 use super::HealthInfo;
+use crate::governance::HostGovernanceService;
 
 /// `daemon.health`: report daemon version + protocol version.
 pub(super) fn handle_health(request: &Request, health: &HealthInfo) -> Response {
@@ -18,7 +19,10 @@ pub(super) fn handle_health(request: &Request, health: &HealthInfo) -> Response 
 }
 
 /// `daemon.doctor`: run host-side self-checks off the async runtime.
-pub(super) async fn handle_daemon_doctor(request: &Request) -> Response {
+pub(super) async fn handle_daemon_doctor(
+    request: &Request,
+    governance: &HostGovernanceService,
+) -> Response {
     if !request.params().is_null() {
         return error_value(
             request,
@@ -39,9 +43,9 @@ pub(super) async fn handle_daemon_doctor(request: &Request) -> Response {
             );
         }
     };
-    match tokio::task::spawn_blocking(move || crate::doctor::report(&paths)).await {
+    match crate::doctor::report(&paths, governance).await {
         Ok(report) => ok_value(request, &protocol::DaemonDoctorResult { report }),
-        Err(_) => error_value(
+        Err(()) => error_value(
             request,
             ProtocolError::new(
                 protocol::ErrorClass::Daemon,

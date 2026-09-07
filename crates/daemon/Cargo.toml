@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
 pohunek-knowledge = { workspace = true, features = ["protocol"] }
 pohunek-hostcheck = { workspace = true }
 pohunek-logging = { workspace = true }
@@ -43,12 +45,15 @@ rustix = { version = "1", features = ["fs"] }
 time = { workspace = true }
 zbus = { workspace = true }
 ulid = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 pohunek-session-worker = { workspace = true }
 # `test-util` enables tokio's paused clock (`start_paused`) so the attention
 # debounce coordinator tests advance time deterministically instead of sleeping.
 tokio = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
+wait-timeout = "0.2"
 
 [lints]
 workspace = true

@@ -51,6 +51,12 @@ The assistant must:
   create new registration files as owner-readable and owner-writable only.
 - Avoid weakening owner-only profile checks, name guards, path containment, or
   remote safety gates.
+- Treat host governance inspection as a read-only owner operation. The stable
+  protocol `HostId` is not a daemon route selector, and safe output must retain
+  explicit never-enrolled absence rather than synthesizing an owner or revision.
+  Never expose or log approval signing material, proposal/outcome coordinates,
+  nonces, signatures, retired state, or relay credentials. A governance failure
+  is unavailable state, not permission to reuse a previous snapshot.
 - Treat worker control sockets and journals as owner-private runtime authority.
   Never proxy a worker endpoint over NetBird, unlink a failed socket without
   proving unit inactivity and exact identity, or edit worker/runtime ids by

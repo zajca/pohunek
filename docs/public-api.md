@@ -24,6 +24,12 @@ the existing owner trust domain. The Bun backend maps one WebSocket to one
 daemon connection; it is not a team service, authentication authority, state
 aggregator, or public `pohunek-relayd` implementation.
 
+Version 3 also ships host-local stable identity and safe governance inspection.
+It does not ship a relay connection, relay-local transport, enrollment or owner
+mutation RPC, team WebUI, share API, or public transfer API. Existing local,
+direct-overlay, native-GUI, and transparent owner-WebUI paths remain owner-only
+and unchanged.
+
 ### Accepted, not yet implemented: optional team relay
 
 The [team relay RFC](design/team-relay-control-plane-rfc.md) defines an accepted
@@ -227,6 +233,7 @@ All params and result type names below refer to structs exported by
 | `daemon.doctor` | `null` | `DaemonDoctorResult` | Runs daemon-local checks. Non-null params are `daemon/bad_request`. |
 | `host.inspect` | `null` | `HostCapabilities` | Live capability snapshot for the daemon's host. |
 | `host.discover` | `HostDiscoverParams` or `null` | `Vec<HostRecord>` | Enumerates peers from configured overlay transports and classifies daemon reachability. |
+| `host.governance.inspect` | `null` | `HostGovernanceStatus` | Owner-safe, read-only snapshot of the daemon's stable host identity and local governance state. Explicit `null` and omitted params both succeed; every non-null JSON value returns `daemon/bad_request`. The method never changes enrollment, ownership, or sessions. On unavailable governance it returns the fixed redacted `daemon/host_governance_unavailable` error; reload or restart the daemon, then retry. |
 | `session.new` | `SessionNewParams` | `SessionNewResult` | Starts an agent PTY session. Bare and profile-based Hermes launches first require an executable whose isolated, bounded `--version` probe matches the pinned supported release; failure returns payload-free `agent_runtime_unsupported` before session, worker, or worktree creation. Optional `metadata` is written atomically with the session (see the `metadata` field note under `SessionInfo` below); the CLI exposes it as repeatable `--meta key=value`. |
 | `session.list` | `SessionListParams` or `null` | `Vec<SessionInfo>` | Lists sessions; filters use AND semantics. |
 | `session.inspect` | `SessionId` | `SessionInfo` | `SessionId` is a JSON string, e.g. `"s-1"`. |
@@ -330,6 +337,45 @@ wire shapes are the exported `crates/protocol` structs.
   to bypass collision checks.
 - The flattened host class remains `candidate`, `reachable_daemon`,
   `unreachable`, or `version_mismatch`.
+
+### `HostGovernanceStatus`
+
+`host.governance.inspect` has no parameters: explicit `params: null` and
+omitted `params` both succeed under the general parameterless-method rule.
+Every non-null JSON value, including an object, array, string, number, or
+boolean, returns the canonical `daemon/bad_request` error. Its result is a
+strict, public-safe object with exactly these six required fields. All six keys
+are always present. `host_id` and `approval_key_reference` are always non-null
+canonical IDs; only `enrollment`, `owner`, `owner_revision`, and `quarantine`
+are conditionally nullable according to the lifecycle invariants below. Unknown
+or missing fields are not a valid result:
+
+- `host_id`: the daemon's stable opaque `HostId`. It is distinct from a CLI,
+  GUI, or overlay route selector and from every other typed identity.
+- `enrollment`: `null` for a never-enrolled host, otherwise the one local
+  enrollment's relay ID, status, and canonical non-zero enrollment revision.
+- `owner`: `null` for a never-enrolled host, otherwise exactly one tagged
+  principal or team owner. Co-ownership is not representable.
+- `owner_revision`: `null` exactly when both `enrollment` and `owner` are
+  `null`; otherwise a canonical non-zero decimal string.
+- `quarantine`: `null` unless the enrollment status is `quarantined`; then it
+  contains the explicit quarantine reason.
+- `approval_key_reference`: the required public reference to the host approval
+  verification key. It is safe to inspect but is not signing material.
+
+The public result never contains an approval private key or seed, a proposal,
+transfer outcome, signature, nonce, retired-enrollment summary, relay
+credentials, or other private persistence data. The daemon validates all of
+those local records before publishing the snapshot. IDs are opaque canonical
+values and must not be parsed for routing or authorization meaning. Revisions
+are checked monotonically by the local governance state; JavaScript clients
+receive their decimal strings rather than lossy numbers.
+
+If the daemon cannot safely obtain the retained governance snapshot, the method
+returns exactly `daemon/host_governance_unavailable` with the fixed message
+`host governance status is unavailable` and recovery hint `reload or restart
+the daemon, then retry`. It does not reveal a state path, raw I/O error, record
+contents, key material, proposal, nonce, signature, or previous snapshot.
 
 ### `SessionInfo`
 
@@ -1081,7 +1127,7 @@ Canonical public codes currently emitted include:
 | Class | Codes |
 |---|---|
 | `configuration` | `paths_unavailable`, `netbird_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted` |
-| `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
+| `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
 | `transport` | `framing`, `host_unreachable`, `request_timeout` |
 | `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `remote_discovery_failed` |
 | `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy` |
@@ -1129,6 +1175,14 @@ rename made a session record authoritative but syncing the parent directory
 then failed, the daemon treats the commit as applied and logs a sanitized
 durability warning internally. That condition is not returned as
 `session_runtime_commit_stale`.
+
+Governance inspection also preserves the structured error taxonomy. A daemon
+that cannot safely open, revalidate, or reload its owner-private host state
+returns a typed error rather than publishing a guessed snapshot. Error messages
+and debug rendering are redacted: they do not export approval signing material,
+proposal nonces, signatures, or private record bytes. Clients must treat an
+inspection failure as unavailable state and must not synthesize an owner,
+revision, or enrollment from an earlier response.
 
 Clients must not parse `msg`. Branch on `class` and `code`, then display `msg`
 and `recover` for unknown codes.
@@ -1185,6 +1239,21 @@ standard `err` object. Usage failures retain exit code 2. No human text is
 mixed into stdout. Session output bytes are never logged; non-JSON
 `session output` decodes standard base64 and displays UTF-8 lossily, while JSON
 preserves the exact `SessionOutputResult`.
+
+`pohunek host governance inspect <host> [--json]` is the CLI surface for the
+read-only v3 governance snapshot. Human output labels the stable `HostId`,
+approval-key reference, never-enrolled absence, enrollment relay/status/revision,
+tagged principal-or-team owner and owner revision, and quarantine. `--json`
+emits only the public `HostGovernanceStatus` result through the normal CLI
+envelope. The command has no mutation sibling; it does not enroll, transfer an
+owner, unenroll, or expose approval or transfer secrets.
+
+The native GUI requests this same safe snapshot after a daemon-host snapshot is
+loaded. Its headless state keeps loading, error, never-enrolled, enrolled, and
+quarantined presentation distinct and ignores stale route responses. The Iced
+shell only renders that state; it does not own governance I/O or offer a
+governance mutation control. Its daemon route selector remains distinct from
+the stable protocol `HostId` displayed in the result.
 
 `session new` accepts either `--input <text>` or bounded UTF-8 stdin through
 `--input-stdin` / `--stdin`, never both. `session input` accepts either
@@ -1446,6 +1515,9 @@ Request APIs:
   responses that omit epoch- and runtime-scoped activity evidence.
 - `Client::session_wait(SessionWaitParams)`: automatically opens a dedicated
   connection for the bounded long poll.
+- `Client::host_governance_inspect()`: calls `host.governance.inspect` with
+  exact null parameters and returns the safe `HostGovernanceStatus` projection.
+  It has no local cache or mutation behavior.
 - `Client::session_resume`, `session_resize`, and `session_set_metadata`: typed
   lifecycle helpers used by automation clients.
 - `Client::integration_status(IntegrationStatusParams)`: reads the complete
@@ -1566,6 +1638,15 @@ Request APIs:
 
 - `client.call(method, params)`: typed call keyed by the generated `Methods`
   map. A configured origin is added to the wire request.
+- `client.call("host.governance.inspect", null)`: the generated method map
+  returns `HostGovernanceStatus` only after runtime validation of the exact six
+  required fields, canonical opaque IDs and revisions, known lifecycle and
+  quarantine values, and the enrollment/owner/quarantine invariants. A missing,
+  unknown, malformed, or inconsistent result fails closed as the redacted,
+  SDK-originated `daemon/host_governance_inspect_contract_mismatch` error; it
+  never includes the raw response payload. The TypeScript SDK deliberately has
+  no governance mutation convenience API and exports only the public-safe result
+  types.
 - `client.sessionInput(params)`: uses a dedicated connection when `wait` is
   present, budgets the wire timeout as the daemon's overall delivery-and-wait
   deadline plus fixed response headroom, and rejects successful responses that
@@ -1601,11 +1682,16 @@ SDK error mapping:
 
 - Daemon protocol errors are preserved as `ClientError.kind === "protocol"` or
   `"remoteProtocol"` and retain the daemon's original `class`, `code`, `msg`,
-  and `recover` fields.
-- SDK-originated errors map into the public protocol taxonomy through
+  and `recover` fields, except for the local TypeScript decoder's
+  `daemon/host_governance_inspect_contract_mismatch` result. That redacted
+  contract-mismatch error is SDK-originated even though it uses the normal
+  structured protocol shape.
+- Most SDK-originated errors map into the public protocol taxonomy through
   `ClientErrorClass` and `ClientErrorCode`: `daemon_unreachable`, `framing`,
   `host_unreachable`, `remote_daemon_unavailable`, `request_timeout`, `io_error`,
   `json_error`, `session_input_wait_contract_mismatch`, and `version_mismatch`.
+  `host_governance_inspect_contract_mismatch` is the separate fixed, redacted
+  SDK-originated governance-response validation error.
 - `ClientError.toProtocolError()` returns the structured `ProtocolError` for
   CLI/API rendering, and `recoverHint()` returns the optional recovery text.
 

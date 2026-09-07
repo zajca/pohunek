@@ -29,6 +29,16 @@ pub const ASSISTANT_RUNTIME_SUBDIR: &str = "assistant";
 pub const WORKERS_SUBDIR: &str = "workers";
 /// Worker control socket filename.
 pub const WORKER_SOCKET_NAME: &str = "control.sock";
+/// Owner-private durable host-state subdirectory under [`BasePaths::state_dir`].
+pub const HOST_STATE_SUBDIR: &str = "host";
+/// Stable host identity record filename.
+pub const HOST_IDENTITY_NAME: &str = "identity.json";
+/// Host approval signing secret filename.
+pub const HOST_APPROVAL_KEY_NAME: &str = "approval.key";
+/// Public host governance record filename.
+pub const HOST_GOVERNANCE_NAME: &str = "governance.json";
+/// Cross-process host-state lock filename.
+pub const HOST_STATE_LOCK_NAME: &str = "state.lock";
 
 /// XDG environment variable carrying the runtime base directory.
 pub const XDG_RUNTIME_DIR: &str = "XDG_RUNTIME_DIR";
@@ -175,6 +185,36 @@ impl BasePaths {
                 .join(worker_id)
                 .with_extension("json"),
         )
+    }
+
+    /// Returns the owner-private durable host-state directory.
+    #[must_use]
+    pub fn host_state_dir(&self) -> PathBuf {
+        self.state_dir.join(HOST_STATE_SUBDIR)
+    }
+
+    /// Returns the stable host identity record path.
+    #[must_use]
+    pub fn host_identity_path(&self) -> PathBuf {
+        self.host_state_dir().join(HOST_IDENTITY_NAME)
+    }
+
+    /// Returns the host approval secret key path.
+    #[must_use]
+    pub fn host_approval_key_path(&self) -> PathBuf {
+        self.host_state_dir().join(HOST_APPROVAL_KEY_NAME)
+    }
+
+    /// Returns the durable host governance record path.
+    #[must_use]
+    pub fn host_governance_path(&self) -> PathBuf {
+        self.host_state_dir().join(HOST_GOVERNANCE_NAME)
+    }
+
+    /// Returns the cross-process host-state lock path.
+    #[must_use]
+    pub fn host_state_lock_path(&self) -> PathBuf {
+        self.host_state_dir().join(HOST_STATE_LOCK_NAME)
     }
 }
 
@@ -513,5 +553,29 @@ mod tests {
         for invalid in ["", "../worker", "worker/name", "worker.name"] {
             assert_eq!(paths.worker_journal("s-42", invalid), None);
         }
+    }
+
+    #[test]
+    fn host_state_paths_have_the_canonical_layout() {
+        let _env = EnvGuard::acquire();
+        let base = tmp_base("host-state");
+        set_all_present(&base);
+        let paths = BasePaths::resolve().expect("resolve paths");
+        let host = base.join("state").join(APP_DIR).join(HOST_STATE_SUBDIR);
+
+        assert_eq!(paths.host_state_dir(), host);
+        assert_eq!(paths.host_identity_path(), host.join(HOST_IDENTITY_NAME));
+        assert_eq!(
+            paths.host_approval_key_path(),
+            host.join(HOST_APPROVAL_KEY_NAME)
+        );
+        assert_eq!(
+            paths.host_governance_path(),
+            host.join(HOST_GOVERNANCE_NAME)
+        );
+        assert_eq!(
+            paths.host_state_lock_path(),
+            host.join(HOST_STATE_LOCK_NAME)
+        );
     }
 }

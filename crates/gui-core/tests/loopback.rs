@@ -13,6 +13,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use pohunek_client::Client;
 use pohunek_daemon::api::{DaemonState, HealthInfo, RemoteServer};
+use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::notifications::NotificationService;
 use pohunek_daemon::procwatch::LinuxInspector;
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
@@ -20,20 +21,20 @@ use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_daemon::store::Store;
 use pohunek_gui_core::assistant::{self, AssistantPaths, Intent, LaunchParams};
 use pohunek_gui_core::{
-    add_project, dispatch_review, host_subscription_stream, inspect_session,
-    launch_action_prompt_with_options, launch_provider_item_with_options, list_project_actions,
-    list_projects, load_host_snapshot, parse_unified_diff, preview_action_prompt,
-    preview_prompt_content, read_session_output, read_session_screen, remove_project,
-    rename_project, render_review_prompt, resolve_project_action, resolve_project_prompt,
-    session_link_metadata, session_metadata_rows, set_notification_policy_with_options,
-    set_session_metadata, show_project, spawn_attach_command, stop_session as stop_gui_session,
-    wait_for_session, workspace_connection_stream, AgentStateEvent, AttachCommandSpawner,
-    AttachSpawnIntent, AttachTemplateValues, ConnState, ConnectionOptions, CoreError,
-    DiffFileStatus, DomainEvent, HealthSummary, HostConfig, HostEvent, HostId, HostSnapshot,
-    PromptContext, PromptLaunchParams, PromptPreview, ProviderLaunchItem, ProviderLaunchParams,
-    Review, ReviewComment, ReviewDispatchParams, ReviewSide, ReviewSource, ReviewStatus,
-    ReviewStore, Selection, SessionLinkKind, SessionLinkProvider, TreeNodeId, UiState, WindowSize,
-    Workspace,
+    add_project, dispatch_review, host_subscription_stream, inspect_host_governance,
+    inspect_session, launch_action_prompt_with_options, launch_provider_item_with_options,
+    list_project_actions, list_projects, load_host_snapshot, parse_unified_diff,
+    preview_action_prompt, preview_prompt_content, read_session_output, read_session_screen,
+    remove_project, rename_project, render_review_prompt, resolve_project_action,
+    resolve_project_prompt, session_link_metadata, session_metadata_rows,
+    set_notification_policy_with_options, set_session_metadata, show_project, spawn_attach_command,
+    stop_session as stop_gui_session, wait_for_session, workspace_connection_stream,
+    AgentStateEvent, AttachCommandSpawner, AttachSpawnIntent, AttachTemplateValues, ConnState,
+    ConnectionOptions, CoreError, DiffFileStatus, DomainEvent, HealthSummary, HostConfig,
+    HostEvent, HostId, HostSnapshot, PromptContext, PromptLaunchParams, PromptPreview,
+    ProviderLaunchItem, ProviderLaunchParams, Review, ReviewComment, ReviewDispatchParams,
+    ReviewSide, ReviewSource, ReviewStatus, ReviewStore, Selection, SessionLinkKind,
+    SessionLinkProvider, TreeNodeId, UiState, WindowSize, Workspace,
 };
 use protocol::{
     method, AgentActivity, AgentKind, ErrorClass, NotificationPolicyParams, ProcessStartIdentity,
@@ -66,6 +67,28 @@ const GUI_TEST_WAIT_MS: u32 = 100;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tokio::test]
+async fn governance_inspect_returns_safe_never_enrolled_status_over_tcp() {
+    let daemon = LoopbackDaemon::spawn("gui-governance-inspect", "0.5.0").await;
+    let host = HostConfig::tcp("host-governance", daemon.addr);
+
+    let status = inspect_host_governance(&host)
+        .await
+        .expect("governance inspect through the real TCP daemon");
+
+    assert!(status.host_id().to_string().starts_with("host_"));
+    assert!(status.enrollment().is_none());
+    assert!(status.owner().is_none());
+    assert!(status.owner_revision().is_none());
+    assert!(status.quarantine().is_none());
+    assert!(status
+        .approval_key_reference()
+        .to_string()
+        .starts_with("approval_key_"));
+
+    daemon.shutdown().await;
+}
 
 #[tokio::test]
 async fn loopback_hosts_seed_and_stream_agent_state() {
@@ -2011,6 +2034,7 @@ struct LoopbackDaemon {
     addr: SocketAddr,
     shutdown: oneshot::Sender<()>,
     handle: tokio::task::JoinHandle<()>,
+    _governance_state_root: PathBuf,
 }
 
 impl LoopbackDaemon {
@@ -2051,9 +2075,16 @@ impl LoopbackDaemon {
             config.shell_command = shell_command;
         }
         let sessions = worker_backed_registry(config);
+        let governance_state_root = private_temp_dir(&format!("{tag}-governance"));
+        let governance = Arc::new(
+            HostGovernanceService::open(governance_state_root.clone())
+                .await
+                .expect("open real isolated host-governance service"),
+        );
         let mut state = DaemonState::new(
             HealthInfo::new(version),
             sessions,
+            governance,
             pohunek_client::default_overlay_registry().expect("configured registry"),
         );
         if notifications_enabled {
@@ -2077,6 +2108,7 @@ impl LoopbackDaemon {
             addr,
             shutdown,
             handle,
+            _governance_state_root: governance_state_root,
         }
     }
 
@@ -2647,6 +2679,28 @@ fn temp_dir(tag: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).expect("create test dir");
     dir
 }
+
+/// Create an isolated owner-private directory for durable governance records.
+fn private_temp_dir(tag: &str) -> PathBuf {
+    let dir = temp_dir(tag);
+    make_owner_private(&dir);
+    dir
+}
+
+#[cfg(unix)]
+fn make_owner_private(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(dir)
+        .expect("governance test directory metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(dir, permissions)
+        .expect("make governance test directory owner-private");
+}
+
+#[cfg(not(unix))]
+fn make_owner_private(_dir: &Path) {}
 
 fn write_executable(path: &Path, body: &str) {
     std::fs::write(path, body).expect("write executable");

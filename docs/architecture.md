@@ -44,7 +44,7 @@ The following invariants span both domains:
 | Standalone Unix-socket owner operation | Shipped in public protocol v3 | Existing daemon, CLI, SDK, and GUI |
 | Direct configured-overlay operation, including NetBird | Shipped in public protocol v3 | Existing daemon and clients; generic overlay work completed in [#69](https://github.com/zajca/pohunek/issues/69) |
 | Local/direct-overlay transparent Bun browser backend | Shipped and retained owner-path client transport | Existing `web/backend`; team web mode is separate work in [#86](https://github.com/zajca/pohunek/issues/86) |
-| Stable host identity and exact principal-or-team ownership | Accepted, not implemented | [#81](https://github.com/zajca/pohunek/issues/81) |
+| Stable host identity, one exact principal-or-team owner, checked revisions, local lifecycle, and safe v3 inspection | Shipped host-local foundation; no relay API or mutation surface | [#81](https://github.com/zajca/pohunek/issues/81) |
 | Rust relay foundation, PostgreSQL, OIDC, principals, teams, roles, and service accounts | Accepted, not implemented | [#85](https://github.com/zajca/pohunek/issues/85) |
 | Host-initiated userspace WireGuard link | Accepted, not implemented | [#72](https://github.com/zajca/pohunek/issues/72) |
 | Public protocol v4 relay host link, `SessionOrigin`, and daemon share guards | Accepted, not implemented | [#70](https://github.com/zajca/pohunek/issues/70) |
@@ -128,6 +128,51 @@ state or coordinator. A remote owner reaches a host daemon directly over
 NetBird using the same public protocol as the local Unix socket. Workers are
 never remotely addressable.
 
+### Shipped host identity and local governance
+
+Every daemon bootstraps one stable, opaque `HostId`. It is not a hostname,
+address, daemon instance, overlay identity, or a selector for a transport
+route. The protocol keeps `HostId`, `RelayId`, principal IDs, and team IDs as
+separate validated types, so a value of one kind cannot be substituted for
+another on the wire.
+
+The daemon persists one owner-private host-governance record. Its safe public
+projection always includes the `HostId` and an approval-key reference. It has
+either no enrollment and no owner, or exactly one enrollment with exactly one
+tagged owner (`principal` or `team`) and non-zero, checked enrollment and owner
+revisions. It never represents co-ownership. Quarantine is explicit and is
+present only for a quarantined enrollment. The local lifecycle records disabled,
+pending-local-commit, active, rotating, quarantined, and locally-unenrolled
+states; a locally unenrolled record may retain the bounded retired summary
+needed to reject stale future coordination without exposing it through the
+public inspect response.
+
+The local record also has the primitives for exact owner-transfer proposals and
+signed outcomes. They bind the host, relay, current and target owner, revisions,
+proposal identity, nonce, expiry, suspension intent, and approval-key reference.
+They are durable local contract data, not public relay operations: protocol v3
+exports neither proposal/outcome material nor a mutation method.
+
+Host state is separate from session metadata under the owner's XDG state tree:
+`$XDG_STATE_HOME/pohunek/host/` (or `~/.local/state/pohunek/host/`). The stable
+identity record, private approval signing key, governance record, and process
+lock are owner-private. Startup takes the instance lock before opening this
+state. Descriptor-relative validation, exact modes, cross-process locking,
+atomic replacement, and file/directory synchronization protect it against
+unsafe paths and torn writes. If replacement has committed but durability is
+uncertain, the daemon discards the in-memory repository and refuses governance
+use until an explicit serialized reload; a visible reread is not treated as
+proof of durability. The retained, validated host-state directory is the lock
+authority that serializes cooperating daemon writers; record and lock-marker
+bindings are validated against that directory. This does not claim protection
+from hostile same-UID control or replacement of the complete XDG state root:
+that remains within the owner trust domain.
+
+This host-local foundation does not change session ownership. Local Unix,
+direct NetBird/WireGuard owner access, the native GUI, and the transparent owner
+WebUI remain available. Local unenrollment does not stop PTYs, revoke those
+owner paths, or create a relay-local mode.
+
 ### Accepted optional relay topologies
 
 The relay design adds two topologies without changing the two owner topologies:
@@ -180,11 +225,11 @@ terminal content.
 
 ### Accepted relay model concepts
 
-- `HostId` is a stable opaque host identity independent of hostname, address,
-  daemon instance, WireGuard key, and tunnel address. A host has exactly one
-  principal-or-team owner and at most one active relay enrollment; ownership
-  transfer requires local confirmation. [#81](https://github.com/zajca/pohunek/issues/81)
-  owns this state.
+- The shipped host-local identity/governance foundation gives a future relay a
+  stable opaque `HostId`, one exact principal-or-team owner, at most one local
+  enrollment record, checked revisions, and locally confirmed transfer
+  coordinates. It does not create a relay connection, public enrollment API,
+  or team surface. The relay-facing behavior remains future work.
 - Relay enrollment is an interactive local operation authorized through OIDC
   device flow or an exact safe loopback callback. The host generates and keeps
   its WireGuard private key; enrollment binds its public key and `HostId` to one
@@ -756,6 +801,24 @@ Structured logs under the user state directory:
                                          # 4 MiB each, 16 MiB per-session cap
 ~/.local/state/pohunek/workers/<session-id>/<worker-id>.json
 ```
+
+Durable host identity and governance state is a separate owner-private record
+set under the same state root:
+
+```text
+~/.local/state/pohunek/host/
+  identity.json      # stable opaque HostId (0600)
+  approval.key       # private approval signing material; never public API data (0600)
+  governance.json    # current enrollment/owner state and bounded retired data (0600)
+  state.lock         # cross-process host-state lock (0600)
+```
+
+The `host/` directory is mode `0700`. The daemon requires those exact
+owner-private directory/file modes, refuses unsafe path
+bindings, serializes host-state writers through `state.lock`, and uses atomic
+replacement plus synchronization. A post-rename synchronization failure is a
+durability-uncertain result, not a successful update: in-memory governance is
+discarded and can be used only after an explicit serialized reload.
 
 Daemon and session-worker logs rotate before a complete JSON event would exceed
 the per-file limit. All worker generations for one logical session serialize

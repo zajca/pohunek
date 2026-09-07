@@ -28,6 +28,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
 use pohunek_worker_protocol::{
@@ -46,6 +47,7 @@ use tracing::{error, info, warn};
 use overlay::OverlayTransport;
 
 use crate::error::DaemonError;
+use crate::governance::HostGovernanceService;
 use crate::session::{RedeemedAttach, RedeemedRuntime, SessionRegistry};
 
 #[cfg(not(test))]
@@ -93,11 +95,12 @@ impl ControlServer {
     pub async fn bind(
         socket_path: &Path,
         health: HealthInfo,
+        governance: Arc<HostGovernanceService>,
         registry: pohunek_client::OverlayRegistry,
     ) -> Result<Self, DaemonError> {
         Self::bind_with_state(
             socket_path,
-            DaemonState::new(health, SessionRegistry::default(), registry),
+            DaemonState::new(health, SessionRegistry::default(), governance, registry),
         )
         .await
     }

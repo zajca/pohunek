@@ -35,6 +35,7 @@ use tokio_util::codec::{Framed, LinesCodec};
 
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::error::DaemonError;
+use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::procwatch::LinuxInspector;
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
@@ -74,6 +75,18 @@ fn temp_dir(tag: &str) -> PathBuf {
 
 fn temp_socket(tag: &str) -> PathBuf {
     temp_dir(tag).join("daemon.sock")
+}
+
+async fn governance_service(socket: &Path) -> Arc<HostGovernanceService> {
+    let state_root = socket
+        .parent()
+        .expect("test socket has an isolated parent")
+        .join("state");
+    Arc::new(
+        HostGovernanceService::open(state_root)
+            .await
+            .expect("open real isolated host-governance service"),
+    )
 }
 
 /// Build a shell session config with bounded test stop grace.
@@ -126,16 +139,19 @@ async fn spawn_dual_servers(
     let state = DaemonState::new(
         HealthInfo::new(version),
         registry,
+        governance_service(&socket).await,
         support::overlay_registry(),
     );
-    let unix = ControlServer::bind_with_state(&socket, state.clone())
+    let remote_state = state.clone();
+    assert!(Arc::ptr_eq(&state.governance, &remote_state.governance));
+    let unix = ControlServer::bind_with_state(&socket, state)
         .await
         .expect("unix server binds");
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("loopback tcp bind");
-    let remote = RemoteServer::from_listener(listener, state);
+    let remote = RemoteServer::from_listener(listener, remote_state);
     let addr = remote.local_addr();
 
     let (tx, rx) = oneshot::channel::<()>();
@@ -599,6 +615,106 @@ async fn host_inspect_over_tcp_returns_capabilities() {
 }
 
 #[tokio::test]
+async fn host_governance_inspect_has_identical_unix_and_tcp_dispatch() {
+    let (addr, socket, shutdown, handle) =
+        spawn_dual_servers("remote-governance-inspect", "0.0.0", shell_config()).await;
+
+    let mut tcp_client = connect_tcp(addr).await;
+    let mut unix_client = connect_unix(&socket).await;
+    let request = Request::make(
+        "governance-inspect",
+        method::HOST_GOVERNANCE_INSPECT,
+        Value::Null,
+    );
+    let tcp_payload = ok_payload(exchange(&mut tcp_client, &request).await);
+    let unix_payload = ok_payload(exchange(&mut unix_client, &request).await);
+
+    assert_eq!(
+        tcp_payload, unix_payload,
+        "both owner transports must read the same shared governance service"
+    );
+    assert!(tcp_payload["host_id"].is_string());
+    assert!(tcp_payload["approval_key_reference"].is_string());
+    assert_eq!(tcp_payload["enrollment"], Value::Null);
+    assert_eq!(tcp_payload["owner"], Value::Null);
+
+    let invalid = Request::make(
+        "governance-invalid",
+        method::HOST_GOVERNANCE_INSPECT,
+        serde_json::json!({}),
+    );
+    let tcp_error = exchange(&mut tcp_client, &invalid)
+        .await
+        .into_result()
+        .expect_err("tcp rejects non-null governance params");
+    let unix_error = exchange(&mut unix_client, &invalid)
+        .await
+        .into_result()
+        .expect_err("unix rejects non-null governance params");
+    assert_eq!(tcp_error, unix_error);
+    assert_eq!(tcp_error.code, "bad_request");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn daemon_doctor_has_identical_unix_and_tcp_dispatch() {
+    let (addr, socket, shutdown, handle) =
+        spawn_dual_servers("remote-daemon-doctor", "0.0.0", shell_config()).await;
+
+    let mut tcp_client = connect_tcp(addr).await;
+    let mut unix_client = connect_unix(&socket).await;
+    let request = Request::make("daemon-doctor", method::DAEMON_DOCTOR, Value::Null);
+    let tcp_payload = ok_payload(exchange(&mut tcp_client, &request).await);
+    let unix_payload = ok_payload(exchange(&mut unix_client, &request).await);
+
+    assert_eq!(tcp_payload, unix_payload);
+    let checks = tcp_payload["report"]["checks"]
+        .as_array()
+        .expect("doctor checks array");
+    assert!(checks
+        .iter()
+        .any(|check| check["name"] == "host_identity_stable"));
+
+    let mut omitted_wire = serde_json::to_value(Request::make(
+        "daemon-doctor-omitted",
+        method::DAEMON_DOCTOR,
+        Value::Null,
+    ))
+    .expect("serialize daemon doctor request");
+    omitted_wire
+        .as_object_mut()
+        .expect("request object")
+        .remove("params");
+    let omitted: ProtocolRequest =
+        serde_json::from_value(omitted_wire).expect("omitted params normalize to null");
+    let tcp_omitted = ok_payload(exchange(&mut tcp_client, &omitted).await);
+    let unix_omitted = ok_payload(exchange(&mut unix_client, &omitted).await);
+    assert_eq!(tcp_omitted, tcp_payload);
+    assert_eq!(unix_omitted, unix_payload);
+
+    let invalid = Request::make(
+        "daemon-doctor-invalid",
+        method::DAEMON_DOCTOR,
+        serde_json::json!({}),
+    );
+    let tcp_error = exchange(&mut tcp_client, &invalid)
+        .await
+        .into_result()
+        .expect_err("tcp rejects daemon doctor params");
+    let unix_error = exchange(&mut unix_client, &invalid)
+        .await
+        .into_result()
+        .expect_err("unix rejects daemon doctor params");
+    assert_eq!(tcp_error, unix_error);
+    assert_eq!(tcp_error.code, "bad_request");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
 async fn daemon_health_payload_is_identical_over_unix_and_tcp() {
     let (addr, socket, shutdown, handle) =
         spawn_dual_servers("remote-parity", "5.5.5-test", shell_config()).await;
@@ -660,9 +776,15 @@ async fn version_mismatch_over_tcp_is_rejected_with_the_daemon_version() {
 async fn bind_rejects_non_netbird_address() {
     // A loopback address is never a NetBird address; bind must fail closed BEFORE
     // opening any socket. Deterministic without a NetBird interface present.
+    let root = temp_dir("remote-bind-rejection");
     let state = DaemonState::new(
         HealthInfo::new("0.0.0"),
         SessionRegistry::new(SessionRegistryConfig::default()),
+        Arc::new(
+            HostGovernanceService::open(root.join("state"))
+                .await
+                .expect("open real isolated host-governance service"),
+        ),
         support::overlay_registry(),
     );
     let addr: SocketAddr = "127.0.0.1:18722".parse().expect("parse loopback addr");
