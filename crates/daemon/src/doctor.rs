@@ -10,16 +10,27 @@ use protocol::{DoctorCheck, DoctorReport, DoctorStatus, QuarantineReason};
 use crate::governance::{HostGovernanceDiagnostic, HostGovernanceService};
 use crate::Paths;
 
+/// The bounded daemon doctor task did not produce a report.
+///
+/// This deliberately omits Tokio's join details because a task panic payload
+/// must not become part of a public diagnostic surface.
+#[derive(Debug, thiserror::Error)]
+#[error("daemon doctor host-check task failed")]
+pub struct DoctorReportError;
+
 /// Build a daemon-local doctor report on the host that owns the agent runtime.
 ///
 /// # Errors
 ///
-/// Returns `Err(())` only when the bounded blocking host-check task panics.
-pub async fn report(paths: &Paths, governance: &HostGovernanceService) -> Result<DoctorReport, ()> {
+/// Returns [`DoctorReportError`] when the bounded blocking host-check task fails.
+pub async fn report(
+    paths: &Paths,
+    governance: &HostGovernanceService,
+) -> Result<DoctorReport, DoctorReportError> {
     let paths = paths.clone();
     let mut checks = tokio::task::spawn_blocking(move || standard_checks(&paths))
         .await
-        .map_err(|_error| ())?;
+        .map_err(|_error| DoctorReportError)?;
     checks.extend(governance_checks(governance.diagnose().await));
     Ok(DoctorReport::from_checks(checks))
 }

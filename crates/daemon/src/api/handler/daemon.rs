@@ -45,7 +45,7 @@ pub(super) async fn handle_daemon_doctor(
     };
     match crate::doctor::report(&paths, governance).await {
         Ok(report) => ok_value(request, &protocol::DaemonDoctorResult { report }),
-        Err(()) => error_value(
+        Err(_error) => error_value(
             request,
             ProtocolError::new(
                 protocol::ErrorClass::Daemon,
