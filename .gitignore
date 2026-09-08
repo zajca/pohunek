@@ -21,6 +21,7 @@ web/**/*.tsbuildinfo
 
 # ts-rs default export directory; committed bindings live under web/shared.
 crates/protocol/bindings/
+crates/relay-protocol/bindings/
 
 # Local agent memory written by Claude Code subagents (per-machine; not shared)
 /.claude/agent-memory

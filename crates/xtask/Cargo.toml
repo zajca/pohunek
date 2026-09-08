@@ -14,6 +14,7 @@ path = "src/main.rs"
 knowledge = { workspace = true }
 cli = { workspace = true }
 pohunek-protocol = { workspace = true }
+pohunek-relay-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 httparse = { workspace = true }
@@ -28,6 +29,7 @@ vt100 = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+toml = { workspace = true }
 
 [lints]
 workspace = true

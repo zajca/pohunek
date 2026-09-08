@@ -1,0 +1,29 @@
+[package]
+name = "pohunek-relay-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Bounded HTTPS client for Pohunek relay authentication."
+
+[dependencies]
+base64.workspace = true
+pohunek-relay-protocol.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "pohunek-relay-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Typed public API contract for the Pohunek team relay."
+
+[lib]
+name = "relay_protocol"
+path = "src/lib.rs"
+
+[features]
+ts = ["dep:ts-rs"]
+
+[dependencies]
+base64.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+time = { workspace = true, features = ["parsing", "serde", "serde-well-known"] }
+zeroize.workspace = true
+uuid.workspace = true
+ts-rs = { version = "12", optional = true, features = ["serde-json-impl", "format", "uuid-impl"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

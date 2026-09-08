@@ -49,6 +49,12 @@ pub fn command() -> Command {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Authenticate with an optional team relay using OS keyring credentials.
+    Relay {
+        #[command(subcommand)]
+        action: commands::relay::Action,
+    },
+
     /// Attach this terminal to a local or remote session. Press Ctrl-] to detach.
     Attach {
         /// Session target: `session-id` or `<host>/<session-id>`.
@@ -1271,6 +1277,7 @@ impl Commands {
             Commands::Doctor { json } | Commands::Health { json } | Commands::Status { json } => {
                 *json
             }
+            Commands::Relay { action } => action.wants_json(),
             Commands::Session { action } => action.wants_json(),
             Commands::Integration { action } => action.wants_json(),
             Commands::Migration { action } => match action {
@@ -1296,7 +1303,8 @@ impl Commands {
     fn uses_all_hosts(&self) -> bool {
         match self {
             Commands::Notifications { action } => action.uses_all_hosts(),
-            Commands::Attach { .. }
+            Commands::Relay { .. }
+            | Commands::Attach { .. }
             | Commands::Completions { .. }
             | Commands::Doctor { .. }
             | Commands::Daemon { .. }
@@ -1521,6 +1529,10 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
     let global_host = cli.host;
 
     match cli.command {
+        Commands::Relay { action } => {
+            commands::relay::run(action).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Attach { target } => {
             let paths = Paths::resolve()?;
             let host = effective_host(&global_host, Some(&target));

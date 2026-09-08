@@ -1,0 +1,69 @@
+//! Shared current-state authorization checks for team administration.
+
+use sqlx::Transaction;
+use uuid::Uuid;
+
+use crate::{
+    authorization::revalidate_authentication,
+    store::{ActorContext, AuthorizationRequest, ResourceScope, StoreError},
+};
+
+/// Stable administrative permissions are deliberately distinct from content permissions.
+pub(crate) const TEAM_ADMIN_PERMISSION: &str = "team.admin";
+
+pub(crate) async fn require_team_admin(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    actor: ActorContext,
+    team_id: Uuid,
+) -> Result<(i64, i64), StoreError> {
+    let request = AuthorizationRequest {
+        actor,
+        team_id,
+        permission: TEAM_ADMIN_PERMISSION.to_owned(),
+        resource: ResourceScope::Team,
+        correlation_id: Uuid::now_v7(),
+    };
+    revalidate_authentication(transaction, &request).await?;
+    let row = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT t.policy_generation, r.recovery_generation FROM teams t \
+         JOIN memberships m ON m.team_id = t.team_id \
+         JOIN relay_identity r ON r.state = 'normal' \
+         WHERE t.team_id = $1 AND t.state = 'active' AND m.principal_id = $2 \
+         AND m.state = 'active' AND r.recovery_generation = $3 \
+         AND (m.builtin_role IN ('owner', 'admin') OR EXISTS (\
+              SELECT 1 FROM membership_custom_roles mr \
+              JOIN custom_role_permissions rp ON (rp.team_id, rp.role_id) = (mr.team_id, mr.role_id) \
+              JOIN custom_roles cr ON (cr.team_id, cr.role_id) = (mr.team_id, mr.role_id) \
+              WHERE mr.team_id = t.team_id AND mr.principal_id = m.principal_id \
+              AND cr.state = 'active' AND rp.permission = 'team.admin')) FOR SHARE",
+    )
+    .bind(team_id)
+    .bind(actor.principal_id())
+    .bind(actor.recovery_generation())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(StoreError::Database)?
+    .ok_or(StoreError::Forbidden)?;
+    Ok(row)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Audit rows deliberately carry each bounded durable coordinate."
+)]
+pub(crate) async fn audit_change(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    actor: ActorContext,
+    team_id: Uuid,
+    action: &str,
+    correlation_id: Uuid,
+    idempotency_key: Uuid,
+    parameter_code: &str,
+    parameter_value: &str,
+) -> Result<Uuid, StoreError> {
+    let audit_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO audit_events (audit_id,actor_principal_id,actor_kind,team_id,action,decision,policy_generation,recovery_generation,correlation_id,idempotency_key,parameter_code,parameter_value,outcome) SELECT $1,$2,$3,$4,$5,'changed',policy_generation,$6,$7,$8,$9,$10,'committed' FROM teams WHERE team_id=$4")
+        .bind(audit_id).bind(actor.principal_id()).bind(crate::store::actor_kind_name(actor.kind())).bind(team_id).bind(action).bind(actor.recovery_generation()).bind(correlation_id).bind(idempotency_key).bind(parameter_code).bind(parameter_value)
+        .execute(&mut **transaction).await.map_err(|_error| StoreError::AuditUnavailable)?;
+    Ok(audit_id)
+}

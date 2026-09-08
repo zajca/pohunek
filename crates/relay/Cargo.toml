@@ -1,0 +1,58 @@
+[package]
+name = "pohunek-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Pohunek optional team relay control plane."
+
+[features]
+default = []
+# Runs integration tests only when an explicitly provisioned disposable PostgreSQL fixture exists.
+postgres-tests = []
+
+[[bin]]
+name = "pohunek-relayd"
+path = "src/bin/pohunek-relayd.rs"
+
+[dependencies]
+axum.workspace = true
+axum-server.workspace = true
+clap.workspace = true
+base64.workspace = true
+ed25519-dalek = "2"
+getrandom.workspace = true
+hex = "0.4"
+hmac.workspace = true
+libc.workspace = true
+nix.workspace = true
+http.workspace = true
+openidconnect.workspace = true
+oauth2.workspace = true
+reqwest.workspace = true
+pohunek-logging.workspace = true
+relay-protocol = { package = "pohunek-relay-protocol", path = "../relay-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
