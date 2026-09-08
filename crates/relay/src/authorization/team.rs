@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::{
     authorization::{
         admin::{receipt, record_receipt, request_digest},
+        rbac::TEAM_MEMBERSHIP_READ_PERMISSION,
         revalidate_authentication,
     },
     store::{
@@ -168,7 +169,7 @@ impl Store {
             &AuthorizationRequest {
                 actor,
                 team_id: Uuid::nil(),
-                permission: "team.membership.read".to_owned(),
+                permission: TEAM_MEMBERSHIP_READ_PERMISSION.to_owned(),
                 resource: ResourceScope::Team,
                 correlation_id: Uuid::now_v7(),
             },

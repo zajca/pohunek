@@ -10,32 +10,33 @@ use crate::{
 
 /// Stable administrative permissions are deliberately distinct from content permissions.
 pub(crate) const TEAM_ADMIN_PERMISSION: &str = "team.admin";
+pub(crate) const TEAM_MEMBERSHIP_READ_PERMISSION: &str = "team.membership.read";
+pub(crate) const TEAM_MEMBERSHIP_MANAGE_PERMISSION: &str = "team.membership.manage";
+pub(crate) const TEAM_GROUP_MANAGE_PERMISSION: &str = "team.group.manage";
+pub(crate) const TEAM_ROLE_MANAGE_PERMISSION: &str = "team.role.manage";
+pub(crate) const TEAM_GRANT_MANAGE_PERMISSION: &str = "team.grant.manage";
 
-pub(crate) async fn require_team_admin(
+/// Requires one current team permission within an existing mutation transaction.
+pub(crate) async fn require_team_permission(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     actor: ActorContext,
     team_id: Uuid,
+    permission: &'static str,
 ) -> Result<(i64, i64), StoreError> {
     let request = AuthorizationRequest {
         actor,
         team_id,
-        permission: TEAM_ADMIN_PERMISSION.to_owned(),
+        permission: permission.to_owned(),
         resource: ResourceScope::Team,
         correlation_id: Uuid::now_v7(),
     };
     revalidate_authentication(transaction, &request).await?;
-    let row = sqlx::query_as::<_, (i64, i64)>(
-        "SELECT t.policy_generation, r.recovery_generation FROM teams t \
+    let row = sqlx::query_as::<_, (i64, i64, String)>(
+        "SELECT t.policy_generation, r.recovery_generation, m.builtin_role FROM teams t \
          JOIN memberships m ON m.team_id = t.team_id \
          JOIN relay_identity r ON r.state = 'normal' \
          WHERE t.team_id = $1 AND t.state = 'active' AND m.principal_id = $2 \
-         AND m.state = 'active' AND r.recovery_generation = $3 \
-         AND (m.builtin_role IN ('owner', 'admin') OR EXISTS (\
-              SELECT 1 FROM membership_custom_roles mr \
-              JOIN custom_role_permissions rp ON (rp.team_id, rp.role_id) = (mr.team_id, mr.role_id) \
-              JOIN custom_roles cr ON (cr.team_id, cr.role_id) = (mr.team_id, mr.role_id) \
-              WHERE mr.team_id = t.team_id AND mr.principal_id = m.principal_id \
-              AND cr.state = 'active' AND rp.permission = 'team.admin')) FOR SHARE",
+         AND m.state = 'active' AND r.recovery_generation = $3 FOR SHARE",
     )
     .bind(team_id)
     .bind(actor.principal_id())
@@ -44,7 +45,36 @@ pub(crate) async fn require_team_admin(
     .await
     .map_err(StoreError::Database)?
     .ok_or(StoreError::Forbidden)?;
-    Ok(row)
+    let allowed = super::builtin_permission(&row.2, permission, actor.kind())
+        || super::has_custom_role_permission(
+            transaction,
+            team_id,
+            actor.principal_id(),
+            permission,
+        )
+        .await?
+        || super::has_matching_grant(
+            transaction,
+            team_id,
+            actor.principal_id(),
+            permission,
+            "team",
+            "*",
+        )
+        .await?;
+    if !allowed {
+        return Err(StoreError::Forbidden);
+    }
+    Ok((row.0, row.1))
+}
+
+/// Requires the legacy broad administrative permission within a transaction.
+pub(crate) async fn require_team_admin(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    actor: ActorContext,
+    team_id: Uuid,
+) -> Result<(i64, i64), StoreError> {
+    require_team_permission(transaction, actor, team_id, TEAM_ADMIN_PERMISSION).await
 }
 
 #[expect(

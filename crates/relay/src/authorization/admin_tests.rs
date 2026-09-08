@@ -130,6 +130,46 @@ async fn team(store: &Store, owner: Uuid) -> Uuid {
     team
 }
 
+async fn human_actor(store: &Store, principal: Uuid) -> crate::store::ActorContext {
+    let credential = Uuid::now_v7();
+    sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,credential_kind,credential_generation,recovery_generation,expires_at,identity_id,digest_key_id,rotation_family_id) VALUES ($1,$2,decode(repeat('44',32),'hex'),$3,'human',1,1,clock_timestamp()+interval '1 hour',$3,'test',$1)")
+        .bind(credential).bind(credential.to_string()).bind(principal).execute(store.pool()).await.expect("seed human credential");
+    Store::authenticated_actor(
+        principal,
+        credential,
+        1,
+        1,
+        ActorKind::Human,
+        AuthenticationBinding::Credential,
+    )
+}
+
+async fn service_actor(store: &Store, team_id: Uuid) -> crate::store::ActorContext {
+    let principal = Uuid::now_v7();
+    let credential = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO principals (id,kind,state,generation) VALUES ($1,'service','active',1)",
+    )
+    .bind(principal)
+    .execute(store.pool())
+    .await
+    .expect("seed service principal");
+    sqlx::query("INSERT INTO service_accounts (principal_id,team_id,display_name) VALUES ($1,$2,'test service')")
+        .bind(principal).bind(team_id).execute(store.pool()).await.expect("seed service account");
+    sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,credential_kind,credential_generation,recovery_generation,expires_at,identity_id,digest_key_id,rotation_family_id) VALUES ($1,$2,decode(repeat('33',32),'hex'),$3,'service',1,1,clock_timestamp()+interval '1 hour',NULL,'test',$1)")
+        .bind(credential).bind(credential.to_string()).bind(principal).execute(store.pool()).await.expect("seed service credential");
+    sqlx::query("INSERT INTO memberships (membership_id,team_id,principal_id,builtin_role,state,revision,local_deny_generation) VALUES ($1,$2,$3,'owner','active',1,1)")
+        .bind(Uuid::now_v7()).bind(team_id).bind(principal).execute(store.pool()).await.expect("seed service membership");
+    Store::authenticated_actor(
+        principal,
+        credential,
+        1,
+        1,
+        ActorKind::Service,
+        AuthenticationBinding::Credential,
+    )
+}
+
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
@@ -246,6 +286,191 @@ async fn group_role_and_grant_are_team_scoped_and_idempotent() {
         error,
         crate::admission::AuthorityError::Store(crate::store::StoreError::Forbidden)
     ));
+    cleanup(store.pool(), &schema).await;
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "The permission boundaries share one PostgreSQL authority fixture."
+)]
+async fn management_permissions_are_narrow_for_custom_and_service_actors() {
+    let (store, schema, owner, member, credential) = fixture().await;
+    let team_id = team(&store, owner).await;
+    let owner_actor = owner_actor(owner, credential);
+    let (authority, _witness_directory) = authority(store.clone()).await;
+    sqlx::query("INSERT INTO memberships (membership_id,team_id,principal_id,builtin_role,state,revision,local_deny_generation) VALUES ($1,$2,$3,'member','active',1,1)")
+        .bind(Uuid::now_v7()).bind(team_id).bind(member).execute(store.pool()).await.expect("seed member");
+    let group_role = authority
+        .create_role(
+            owner_actor,
+            CreateRole {
+                team_id,
+                display_name: "group-manager".into(),
+                permissions: vec!["team.group.manage".into()],
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("create narrow group role");
+    authority
+        .change_role_assignment(
+            owner_actor,
+            RoleAssignmentChange {
+                team_id,
+                role_id: group_role.role_id,
+                principal_id: member,
+                assign: true,
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("assign narrow group role");
+    let member_actor = human_actor(&store, member).await;
+    store
+        .list_groups(
+            member_actor,
+            team_id,
+            super::GroupPage {
+                after: None,
+                limit: 1,
+            },
+        )
+        .await
+        .expect("custom group permission lists groups");
+    authority
+        .create_group(
+            member_actor,
+            CreateGroup {
+                team_id,
+                display_name: "custom-group".into(),
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("custom group permission creates group");
+    let error = authority
+        .create_role(
+            member_actor,
+            CreateRole {
+                team_id,
+                display_name: "forbidden-role".into(),
+                permissions: vec!["team.role.manage".into()],
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect_err("custom group permission cannot manage roles");
+    assert!(matches!(
+        error,
+        crate::admission::AuthorityError::Store(crate::store::StoreError::Forbidden)
+    ));
+
+    let service_actor = service_actor(&store, team_id).await;
+    let error = authority
+        .create_group(
+            service_actor,
+            CreateGroup {
+                team_id,
+                display_name: "builtin-service-group".into(),
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect_err("service owner membership has no built-in group permission");
+    assert!(matches!(
+        error,
+        crate::admission::AuthorityError::Store(crate::store::StoreError::Forbidden)
+    ));
+    let service_role = authority
+        .create_role(
+            owner_actor,
+            CreateRole {
+                team_id,
+                display_name: "service-group-manager".into(),
+                permissions: vec!["team.group.manage".into()],
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("create service custom role");
+    authority
+        .change_role_assignment(
+            owner_actor,
+            RoleAssignmentChange {
+                team_id,
+                role_id: service_role.role_id,
+                principal_id: service_actor.principal_id(),
+                assign: true,
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("assign service custom role");
+    authority
+        .create_group(
+            service_actor,
+            CreateGroup {
+                team_id,
+                display_name: "custom-service-group".into(),
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("service custom permission creates group");
+    let error = authority
+        .create_role(
+            service_actor,
+            CreateRole {
+                team_id,
+                display_name: "ungiven-service-role".into(),
+                permissions: vec!["team.role.manage".into()],
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect_err("service custom group permission cannot manage roles");
+    assert!(matches!(
+        error,
+        crate::admission::AuthorityError::Store(crate::store::StoreError::Forbidden)
+    ));
+    authority
+        .create_grant(
+            owner_actor,
+            CreateGrant {
+                team_id,
+                subject: GrantSubject::ServiceAccount(service_actor.principal_id()),
+                resource_kind: "team",
+                resource_id: "*".into(),
+                permission: "team.role.manage".into(),
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("grant service role permission");
+    authority
+        .create_role(
+            service_actor,
+            CreateRole {
+                team_id,
+                display_name: "granted-service-role".into(),
+                permissions: vec!["team.group.manage".into()],
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("service team grant manages roles");
     cleanup(store.pool(), &schema).await;
 }
 

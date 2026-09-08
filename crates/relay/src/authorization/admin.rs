@@ -5,7 +5,10 @@ use sqlx::{Row, Transaction};
 use uuid::Uuid;
 
 use crate::{
-    authorization::rbac::{audit_change, require_team_admin},
+    authorization::rbac::{
+        audit_change, require_team_permission, TEAM_GRANT_MANAGE_PERMISSION,
+        TEAM_GROUP_MANAGE_PERMISSION, TEAM_ROLE_MANAGE_PERMISSION,
+    },
     store::{bounded_coordinate, ActorContext, Store, StoreError},
 };
 
@@ -180,7 +183,7 @@ impl Store {
     ) -> Result<Vec<GroupRecord>, StoreError> {
         valid_page(page.limit)?;
         let mut tx = self.begin_serializable().await?;
-        require_team_admin(&mut tx, actor, team_id).await?;
+        require_team_permission(&mut tx, actor, team_id, TEAM_GROUP_MANAGE_PERMISSION).await?;
         let rows = sqlx::query("SELECT group_id,revision FROM groups WHERE team_id=$1 AND state='active' AND ($2::uuid IS NULL OR group_id>$2) ORDER BY group_id LIMIT $3")
             .bind(team_id).bind(page.after).bind(page.limit).fetch_all(&mut *tx).await.map_err(StoreError::Database)?;
         tx.commit().await.map_err(StoreError::Database)?;
@@ -412,7 +415,7 @@ impl Store {
     ) -> Result<Vec<RoleRecord>, StoreError> {
         valid_page(page.limit)?;
         let mut tx = self.begin_serializable().await?;
-        require_team_admin(&mut tx, actor, team_id).await?;
+        require_team_permission(&mut tx, actor, team_id, TEAM_ROLE_MANAGE_PERMISSION).await?;
         let rows = sqlx::query("SELECT role_id,revision FROM custom_roles WHERE team_id=$1 AND state='active' AND ($2::uuid IS NULL OR role_id>$2) ORDER BY role_id LIMIT $3").bind(team_id).bind(page.after).bind(page.limit).fetch_all(&mut *tx).await.map_err(StoreError::Database)?;
         tx.commit().await.map_err(StoreError::Database)?;
         Ok(rows
@@ -629,7 +632,7 @@ impl Store {
     ) -> Result<Vec<GrantRecord>, StoreError> {
         valid_page(page.limit)?;
         let mut tx = self.begin_serializable().await?;
-        require_team_admin(&mut tx, actor, team_id).await?;
+        require_team_permission(&mut tx, actor, team_id, TEAM_GRANT_MANAGE_PERMISSION).await?;
         let rows=sqlx::query("SELECT grant_id,revision FROM grants WHERE team_id=$1 AND state='active' AND ($2::uuid IS NULL OR grant_id>$2) ORDER BY grant_id LIMIT $3").bind(team_id).bind(page.after).bind(page.limit).fetch_all(&mut *tx).await.map_err(StoreError::Database)?;
         tx.commit().await.map_err(StoreError::Database)?;
         Ok(rows

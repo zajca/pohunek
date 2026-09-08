@@ -17,11 +17,16 @@ use uuid::Uuid;
 
 use crate::{
     authorization::{
-        rbac::require_team_admin, valid_name, valid_permissions, valid_resource_kind,
-        valid_team_name, verify_current_actor, CreateGrant, CreateGroup, CreateRole, CreateTeam,
-        DisableTeam, GrantRecord, GrantSubject, GroupMemberChange, GroupRecord, MembershipChange,
-        RemoveGrant, RemoveGroup, RemoveMember, RemoveRole, RoleAssignmentChange, RoleRecord,
-        TeamRecord, UpdateGrant, UpdateGroup, UpdateRole, UpdateTeam,
+        rbac::{
+            require_team_admin, require_team_permission, TEAM_ADMIN_PERMISSION,
+            TEAM_GRANT_MANAGE_PERMISSION, TEAM_GROUP_MANAGE_PERMISSION,
+            TEAM_MEMBERSHIP_MANAGE_PERMISSION, TEAM_ROLE_MANAGE_PERMISSION,
+        },
+        valid_name, valid_permissions, valid_resource_kind, valid_team_name, verify_current_actor,
+        CreateGrant, CreateGroup, CreateRole, CreateTeam, DisableTeam, GrantRecord, GrantSubject,
+        GroupMemberChange, GroupRecord, MembershipChange, RemoveGrant, RemoveGroup, RemoveMember,
+        RemoveRole, RoleAssignmentChange, RoleRecord, TeamRecord, UpdateGrant, UpdateGroup,
+        UpdateRole, UpdateTeam,
     },
     recovery::{DenyIncident, RecoveryError, WitnessRecord, WitnessStore},
     store::{
@@ -165,7 +170,7 @@ impl AuthMutationTarget {
 }
 
 macro_rules! management_transaction {
-    ($authority:expr, $actor:expr, $team_id:expr, $target:expr, $command:expr, $method:ident) => {{
+    ($authority:expr, $actor:expr, $team_id:expr, $permission:expr, $target:expr, $command:expr, $method:ident) => {{
         let management_team_id = $team_id;
         if $authority.closed.load(Ordering::Acquire) {
             return Err(AuthorityError::Cancelled);
@@ -184,7 +189,7 @@ macro_rules! management_transaction {
             $authority.close_all();
             return Err(error.into());
         }
-        require_team_admin(&mut transaction, $actor, management_team_id).await?;
+        require_team_permission(&mut transaction, $actor, management_team_id, $permission).await?;
         if !($target)
             .exists(&mut transaction, management_team_id)
             .await?
@@ -549,6 +554,7 @@ impl Authority {
             self,
             actor,
             command.team_id,
+            TEAM_ADMIN_PERMISSION,
             TeamTarget::Team,
             command,
             update_team_in_transaction
@@ -630,6 +636,7 @@ impl Authority {
             self,
             actor,
             command.team_id,
+            TEAM_ADMIN_PERMISSION,
             TeamTarget::Team,
             command,
             disable_team_in_transaction
@@ -647,6 +654,7 @@ impl Authority {
             self,
             actor,
             command.team_id,
+            TEAM_MEMBERSHIP_MANAGE_PERMISSION,
             TeamTarget::Membership(command.principal_id, command.role),
             command,
             change_member_in_transaction
@@ -663,6 +671,7 @@ impl Authority {
             self,
             actor,
             command.team_id,
+            TEAM_MEMBERSHIP_MANAGE_PERMISSION,
             TeamTarget::Membership(command.principal_id, None),
             command,
             remove_member_in_transaction
@@ -679,6 +688,7 @@ impl Authority {
             self,
             actor,
             command.team_id,
+            TEAM_ROLE_MANAGE_PERMISSION,
             TeamTarget::Role(command.role_id),
             command,
             remove_role_in_transaction
@@ -695,6 +705,7 @@ impl Authority {
             self,
             actor,
             command.team_id,
+            TEAM_GRANT_MANAGE_PERMISSION,
             TeamTarget::Grant(command.grant_id),
             command,
             remove_grant_in_transaction
@@ -712,6 +723,7 @@ impl Authority {
             self,
             actor,
             command.team_id,
+            TEAM_GROUP_MANAGE_PERMISSION,
             TeamTarget::Team,
             command,
             create_group_in_transaction
@@ -729,6 +741,7 @@ impl Authority {
             self,
             actor,
             command.team_id,
+            TEAM_GROUP_MANAGE_PERMISSION,
             TeamTarget::Group(command.group_id),
             command,
             update_group_in_transaction
@@ -745,6 +758,7 @@ impl Authority {
             self,
             actor,
             command.team_id,
+            TEAM_GROUP_MANAGE_PERMISSION,
             TeamTarget::Group(command.group_id),
             command,
             remove_group_in_transaction
@@ -761,6 +775,7 @@ impl Authority {
             self,
             actor,
             command.team_id,
+            TEAM_GROUP_MANAGE_PERMISSION,
             TeamTarget::GroupMembership(command.group_id, command.principal_id),
             command,
             change_group_member_in_transaction
@@ -779,6 +794,7 @@ impl Authority {
             self,
             actor,
             command.team_id,
+            TEAM_ROLE_MANAGE_PERMISSION,
             TeamTarget::Team,
             command,
             create_role_in_transaction
@@ -797,6 +813,7 @@ impl Authority {
             self,
             actor,
             command.team_id,
+            TEAM_ROLE_MANAGE_PERMISSION,
             TeamTarget::Role(command.role_id),
             command,
             update_role_in_transaction
@@ -813,6 +830,7 @@ impl Authority {
             self,
             actor,
             command.team_id,
+            TEAM_ROLE_MANAGE_PERMISSION,
             TeamTarget::RoleAssignment(command.role_id, command.principal_id),
             command,
             change_role_assignment_in_transaction
@@ -830,6 +848,7 @@ impl Authority {
             self,
             actor,
             command.team_id,
+            TEAM_GRANT_MANAGE_PERMISSION,
             TeamTarget::GrantSubject(command.subject),
             command,
             create_grant_in_transaction
@@ -855,6 +874,7 @@ impl Authority {
             self,
             actor,
             command.team_id,
+            TEAM_GRANT_MANAGE_PERMISSION,
             TeamTarget::GrantUpdate(command.grant_id, command.subject),
             command,
             update_grant_in_transaction
