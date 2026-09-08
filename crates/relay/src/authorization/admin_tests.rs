@@ -330,6 +330,310 @@ async fn group_role_and_grant_are_team_scoped_and_idempotent() {
 }
 
 #[tokio::test]
+async fn concurrent_group_create_replays_one_durable_mutation() {
+    let (store, schema, owner, _member, credential) = fixture().await;
+    let team_id = team(&store, owner).await;
+    let unaffected_team_id = team(&store, owner).await;
+    let actor = owner_actor(owner, credential);
+    let (authority, _witness_directory) = authority(store.clone()).await;
+    let authority = Arc::new(authority);
+    let unaffected_guard = authority
+        .admit(AuthorizationRequest {
+            actor,
+            team_id: unaffected_team_id,
+            permission: "session.metadata.read".to_owned(),
+            resource: ResourceScope::Team,
+            correlation_id: Uuid::now_v7(),
+        })
+        .await
+        .expect("admit unrelated live guard");
+    let state_before = management_state(&store, team_id).await;
+    let key = Uuid::now_v7();
+    let witness_before = authority.witness_sequence().expect("read witness sequence");
+    let epoch_before = authority.admission_epoch().expect("read admission epoch");
+    let start = Arc::new(tokio::sync::Barrier::new(2));
+    let first_authority = Arc::clone(&authority);
+    let first_start = Arc::clone(&start);
+    let first = async move {
+        first_start.wait().await;
+        first_authority
+            .create_group(
+                actor,
+                CreateGroup {
+                    team_id,
+                    display_name: "concurrent operators".into(),
+                    correlation_id: Uuid::now_v7(),
+                    idempotency_key: key,
+                },
+            )
+            .await
+    };
+    let second_authority = Arc::clone(&authority);
+    let second_start = Arc::clone(&start);
+    let second = async move {
+        second_start.wait().await;
+        second_authority
+            .create_group(
+                actor,
+                CreateGroup {
+                    team_id,
+                    display_name: "concurrent operators".into(),
+                    correlation_id: Uuid::now_v7(),
+                    idempotency_key: key,
+                },
+            )
+            .await
+    };
+    let (first, second) = tokio::join!(first, second);
+    assert_eq!(
+        first.expect("first replay").group_id,
+        second.expect("second replay").group_id
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM groups WHERE team_id=$1")
+            .bind(team_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("count groups"),
+        1
+    );
+    assert_eq!(
+        management_state(&store, team_id).await.5,
+        state_before.5 + 1
+    );
+    assert_eq!(
+        management_state(&store, team_id).await.6,
+        state_before.6 + 1
+    );
+    assert_eq!(
+        authority.witness_sequence().expect("read witness sequence"),
+        witness_before + 1
+    );
+    assert_eq!(
+        authority.admission_epoch().expect("read admission epoch"),
+        epoch_before + 1
+    );
+    assert!(
+        authority.management_retry_count() > 0,
+        "a stale snapshot waiting for the receipt lock retries before the witness boundary"
+    );
+    unaffected_guard
+        .validate()
+        .await
+        .expect("same-key retry leaves another team guard live");
+    assert!(!authority.is_closed());
+    cleanup(store.pool(), &schema).await;
+}
+
+#[tokio::test]
+async fn concurrent_group_create_with_different_payload_conflicts_without_closing_authority() {
+    let (store, schema, owner, _member, credential) = fixture().await;
+    let team_id = team(&store, owner).await;
+    let actor = owner_actor(owner, credential);
+    let (authority, _witness_directory) = authority(store.clone()).await;
+    let authority = Arc::new(authority);
+    let key = Uuid::now_v7();
+    let start = Arc::new(tokio::sync::Barrier::new(2));
+    let first_authority = Arc::clone(&authority);
+    let first_start = Arc::clone(&start);
+    let first = async move {
+        first_start.wait().await;
+        first_authority
+            .create_group(
+                actor,
+                CreateGroup {
+                    team_id,
+                    display_name: "first".into(),
+                    correlation_id: Uuid::now_v7(),
+                    idempotency_key: key,
+                },
+            )
+            .await
+    };
+    let second_authority = Arc::clone(&authority);
+    let second_start = Arc::clone(&start);
+    let second = async move {
+        second_start.wait().await;
+        second_authority
+            .create_group(
+                actor,
+                CreateGroup {
+                    team_id,
+                    display_name: "second".into(),
+                    correlation_id: Uuid::now_v7(),
+                    idempotency_key: key,
+                },
+            )
+            .await
+    };
+    let (first, second) = tokio::join!(first, second);
+    assert!(
+        first.is_ok() ^ second.is_ok(),
+        "one payload commits: {first:?} {second:?}"
+    );
+    let error = first.err().or(second.err()).expect("one payload conflicts");
+    assert!(matches!(
+        error,
+        crate::admission::AuthorityError::Store(StoreError::IdempotencyConflict)
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM groups WHERE team_id=$1")
+            .bind(team_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("count groups"),
+        1
+    );
+    assert_eq!(management_state(&store, team_id).await.5, 1);
+    assert_eq!(management_state(&store, team_id).await.6, 1);
+    assert!(!authority.is_closed());
+    cleanup(store.pool(), &schema).await;
+}
+
+#[tokio::test]
+async fn fresh_duplicate_group_member_add_has_no_management_effect() {
+    let (store, schema, owner, member, credential) = fixture().await;
+    let team_id = team(&store, owner).await;
+    let actor = owner_actor(owner, credential);
+    sqlx::query("INSERT INTO memberships (membership_id,team_id,principal_id,builtin_role,state,revision,local_deny_generation) VALUES ($1,$2,$3,'member','active',1,1)")
+        .bind(Uuid::now_v7())
+        .bind(team_id)
+        .bind(member)
+        .execute(store.pool())
+        .await
+        .expect("seed member");
+    let (authority, _witness_directory) = authority(store.clone()).await;
+    let group = authority
+        .create_group(
+            actor,
+            CreateGroup {
+                team_id,
+                display_name: "duplicate member".into(),
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("create group");
+    authority
+        .change_group_member(
+            actor,
+            GroupMemberChange {
+                team_id,
+                group_id: group.group_id,
+                principal_id: member,
+                add: true,
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("add member");
+    let state_before = management_state(&store, team_id).await;
+    let witness_before = authority.witness_sequence().expect("read witness sequence");
+    let epoch_before = authority.admission_epoch().expect("read admission epoch");
+    let error = authority
+        .change_group_member(
+            actor,
+            GroupMemberChange {
+                team_id,
+                group_id: group.group_id,
+                principal_id: member,
+                add: true,
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect_err("fresh duplicate add is a nonfatal stale mutation");
+    assert!(matches!(
+        error,
+        crate::admission::AuthorityError::Store(StoreError::StaleState)
+    ));
+    assert_eq!(management_state(&store, team_id).await, state_before);
+    assert_eq!(
+        authority.witness_sequence().expect("read witness sequence"),
+        witness_before
+    );
+    assert_eq!(
+        authority.admission_epoch().expect("read admission epoch"),
+        epoch_before
+    );
+    assert!(!authority.is_closed());
+    cleanup(store.pool(), &schema).await;
+}
+
+#[tokio::test]
+async fn service_grant_requires_an_active_canonical_same_team_account() {
+    let (store, schema, owner, _member, credential) = fixture().await;
+    let team_id = team(&store, owner).await;
+    let other_team = team(&store, owner).await;
+    let actor = owner_actor(owner, credential);
+    let (authority, _witness_directory) = authority(store.clone()).await;
+    for canonical_team in [None, Some(team_id), Some(other_team)] {
+        let principal_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO principals (id,kind,state,generation) VALUES ($1,'service','active',1)",
+        )
+        .bind(principal_id)
+        .execute(store.pool())
+        .await
+        .expect("seed service principal");
+        sqlx::query("INSERT INTO memberships (membership_id,team_id,principal_id,builtin_role,state,revision,local_deny_generation) VALUES ($1,$2,$3,'member','active',1,1)")
+            .bind(Uuid::now_v7())
+            .bind(team_id)
+            .bind(principal_id)
+            .execute(store.pool())
+            .await
+            .expect("seed service membership");
+        if let Some(canonical_team) = canonical_team {
+            sqlx::query("INSERT INTO service_accounts (principal_id,team_id,display_name,deprovisioned_at) VALUES ($1,$2,'service',$3)")
+                .bind(principal_id)
+                .bind(canonical_team)
+                .bind((canonical_team == team_id).then(time::OffsetDateTime::now_utc))
+                .execute(store.pool())
+                .await
+                .expect("seed canonical service account");
+        }
+        let state_before = management_state(&store, team_id).await;
+        let witness_before = authority.witness_sequence().expect("read witness sequence");
+        let epoch_before = authority.admission_epoch().expect("read admission epoch");
+        let error = authority
+            .create_grant(
+                actor,
+                CreateGrant {
+                    team_id,
+                    subject: GrantSubject::ServiceAccount(principal_id),
+                    resource_kind: "team",
+                    resource_id: "*".into(),
+                    permission: "team.membership.read".into(),
+                    correlation_id: Uuid::now_v7(),
+                    idempotency_key: Uuid::now_v7(),
+                },
+            )
+            .await
+            .expect_err(
+                "missing, deprovisioned, and foreign canonical service accounts deny grants",
+            );
+        assert!(matches!(
+            error,
+            crate::admission::AuthorityError::Store(StoreError::Forbidden)
+        ));
+        assert_eq!(management_state(&store, team_id).await, state_before);
+        assert_eq!(
+            authority.witness_sequence().expect("read witness sequence"),
+            witness_before
+        );
+        assert_eq!(
+            authority.admission_epoch().expect("read admission epoch"),
+            epoch_before
+        );
+    }
+    assert!(!authority.is_closed());
+    cleanup(store.pool(), &schema).await;
+}
+
+#[tokio::test]
 #[expect(
     clippy::too_many_lines,
     reason = "The replay cases share one PostgreSQL authority and durable-effect snapshot."

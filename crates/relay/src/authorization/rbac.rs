@@ -150,6 +150,21 @@ pub(crate) async fn audit_change(
     let audit_id = Uuid::now_v7();
     sqlx::query("INSERT INTO audit_events (audit_id,actor_principal_id,actor_kind,team_id,action,decision,policy_generation,recovery_generation,correlation_id,idempotency_key,parameter_code,parameter_value,outcome) SELECT $1,$2,$3,$4,$5,'changed',policy_generation,$6,$7,$8,$9,$10,'committed' FROM teams WHERE team_id=$4")
         .bind(audit_id).bind(actor.principal_id()).bind(crate::store::actor_kind_name(actor.kind())).bind(team_id).bind(action).bind(actor.recovery_generation()).bind(correlation_id).bind(idempotency_key).bind(parameter_code).bind(parameter_value)
-        .execute(&mut **transaction).await.map_err(|_error| StoreError::AuditUnavailable)?;
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| {
+            let database = error.as_database_error();
+            match database.and_then(|database| database.code()).as_deref() {
+                Some("40001" | "40P01") => StoreError::Database(error),
+                Some("23505")
+                    if database.is_some_and(|database| {
+                        database.constraint() == Some("audit_events_idempotency_idx")
+                    }) =>
+                {
+                    StoreError::Contended
+                }
+                _ => StoreError::AuditUnavailable,
+            }
+        })?;
     Ok(audit_id)
 }

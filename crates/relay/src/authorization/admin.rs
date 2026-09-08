@@ -365,10 +365,7 @@ impl Store {
         if command.add {
             let inserted = sqlx::query("INSERT INTO group_members (team_id,group_id,principal_id,revision) SELECT $1,$2,$3,1 WHERE EXISTS (SELECT 1 FROM groups WHERE team_id=$1 AND group_id=$2 AND state='active') AND EXISTS (SELECT 1 FROM memberships WHERE team_id=$1 AND principal_id=$3 AND state='active') ON CONFLICT DO NOTHING").bind(command.team_id).bind(command.group_id).bind(command.principal_id).execute(&mut **tx).await.map_err(StoreError::Database)?;
             if inserted.rows_affected() == 0 {
-                let current = sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM group_members WHERE team_id=$1 AND group_id=$2 AND principal_id=$3)").bind(command.team_id).bind(command.group_id).bind(command.principal_id).fetch_one(&mut **tx).await.map_err(StoreError::Database)?;
-                if !current {
-                    return Err(StoreError::Forbidden);
-                }
+                return Err(StoreError::StaleState);
             }
         } else {
             let removed = sqlx::query(
@@ -876,7 +873,7 @@ async fn verify_subject(
     kind: &str,
     id: Uuid,
 ) -> Result<(), StoreError> {
-    let sql=match kind{"group"=>"SELECT EXISTS (SELECT 1 FROM groups WHERE team_id=$1 AND group_id=$2 AND state='active')", "principal"=>"SELECT EXISTS (SELECT 1 FROM memberships m JOIN principals p ON p.id=m.principal_id WHERE m.team_id=$1 AND m.principal_id=$2 AND m.state='active' AND p.state='active' AND p.kind='human')", "service_account"=>"SELECT EXISTS (SELECT 1 FROM memberships m JOIN principals p ON p.id=m.principal_id WHERE m.team_id=$1 AND m.principal_id=$2 AND m.state='active' AND p.state='active' AND p.kind='service')", _=>return Err(StoreError::Forbidden)};
+    let sql=match kind{"group"=>"SELECT EXISTS (SELECT 1 FROM groups WHERE team_id=$1 AND group_id=$2 AND state='active')", "principal"=>"SELECT EXISTS (SELECT 1 FROM memberships m JOIN principals p ON p.id=m.principal_id WHERE m.team_id=$1 AND m.principal_id=$2 AND m.state='active' AND p.state='active' AND p.kind='human')", "service_account"=>"SELECT EXISTS (SELECT 1 FROM memberships m JOIN principals p ON p.id=m.principal_id JOIN service_accounts s ON s.principal_id=m.principal_id AND s.team_id=m.team_id WHERE m.team_id=$1 AND m.principal_id=$2 AND m.state='active' AND p.state='active' AND p.kind='service' AND s.deprovisioned_at IS NULL)", _=>return Err(StoreError::Forbidden)};
     if sqlx::query_scalar::<_, bool>(sql)
         .bind(team_id)
         .bind(id)
@@ -889,6 +886,31 @@ async fn verify_subject(
         Err(StoreError::Forbidden)
     }
 }
+
+/// Serializes one actor/action/key before any receipt or authorization query.
+pub(crate) async fn lock_management_receipt(
+    tx: &mut Transaction<'_, sqlx::Postgres>,
+    actor: ActorContext,
+    action: &str,
+    key: Uuid,
+) -> Result<(), StoreError> {
+    const RECEIPT_ADVISORY_LOCK_SEED: i64 = 85;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
+        .bind(format!("{}\u{1f}{action}\u{1f}{key}", actor.principal_id()))
+        .bind(RECEIPT_ADVISORY_LOCK_SEED)
+        .execute(&mut **tx)
+        .await
+        .map_err(StoreError::Database)?;
+    Ok(())
+}
+
+fn idempotency_receipt_conflict(error: &sqlx::Error, constraint: &str) -> bool {
+    error.as_database_error().is_some_and(|database| {
+        database.code().is_some_and(|code| code == "23505")
+            && database.constraint() == Some(constraint)
+    })
+}
+
 pub(crate) async fn receipt(
     tx: &mut Transaction<'_, sqlx::Postgres>,
     actor: ActorContext,
@@ -922,6 +944,6 @@ pub(crate) async fn record_receipt(
     result_id: Uuid,
     revision: i64,
 ) -> Result<(), StoreError> {
-    sqlx::query("INSERT INTO mutation_receipts (actor_principal_id,action,idempotency_key,request_digest,audit_id,outcome_code,result_id,result_revision) VALUES ($1,$2,$3,$4,$5,'committed',$6,$7)").bind(actor.principal_id()).bind(action).bind(key).bind(digest.as_slice()).bind(audit_id).bind(result_id).bind(revision).execute(&mut **tx).await.map_err(StoreError::Database)?;
+    sqlx::query("INSERT INTO mutation_receipts (actor_principal_id,action,idempotency_key,request_digest,audit_id,outcome_code,result_id,result_revision) VALUES ($1,$2,$3,$4,$5,'committed',$6,$7)").bind(actor.principal_id()).bind(action).bind(key).bind(digest.as_slice()).bind(audit_id).bind(result_id).bind(revision).execute(&mut **tx).await.map_err(|error| if idempotency_receipt_conflict(&error, "mutation_receipts_pkey") { StoreError::Contended } else { StoreError::Database(error) })?;
     Ok(())
 }

@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::{
     authorization::{
+        lock_management_receipt,
         rbac::{
             require_team_admin, require_team_permission, require_team_permission_for_replay,
             TEAM_ADMIN_PERMISSION, TEAM_GRANT_MANAGE_PERMISSION, TEAM_GROUP_MANAGE_PERMISSION,
@@ -43,6 +44,12 @@ pub struct AuthorityLimits {
     pub per_principal: usize,
 }
 
+/// Limits a fresh mutation retry to the database conflicts possible before witnessing.
+///
+/// Each retry starts a new serializable snapshot after a same-key transaction has
+/// committed. Retrying after the witness boundary would break fail-closed evidence.
+const MANAGEMENT_TRANSACTION_MAX_ATTEMPTS: usize = 3;
+
 /// Coordinates durable authorization with active cancellation registrations.
 #[derive(Debug)]
 pub struct Authority {
@@ -59,6 +66,8 @@ pub struct Authority {
     admission_hook: Mutex<Option<AdmissionHook>>,
     #[cfg(test)]
     mutation_hook: Mutex<Option<AdmissionHook>>,
+    #[cfg(test)]
+    management_retry_count: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -175,47 +184,118 @@ macro_rules! management_transaction {
         if $authority.closed.load(Ordering::Acquire) {
             return Err(AuthorityError::Cancelled);
         }
-        let mut transaction = match $authority.store.begin_serializable().await {
-            Ok(transaction) => transaction,
-            Err(error) => return Err($authority.management_pre_gate_error(error)),
-        };
         let lease = $authority
             .lease
             .lock()
             .map_err(|_error| AuthorityError::Cancelled)?
             .clone();
-        if let Err(error) = $authority
-            .store
-            .verify_lease_in_transaction(&mut transaction, &lease)
-            .await
-        {
-            $authority.close_all();
-            return Err(error.into());
-        }
         let replay_receipt = ManagementCommand::receipt(&$command);
-        if let Err(error) = require_team_permission_for_replay(
-            &mut transaction,
-            $actor,
-            management_team_id,
-            $permission,
-        )
-        .await
-        {
-            return Err($authority.management_pre_gate_error(error));
-        }
-        let replayed = match receipt(
-            &mut transaction,
-            $actor,
-            replay_receipt.action,
-            replay_receipt.key,
-            &replay_receipt.digest,
-        )
-        .await
-        {
-            Ok(replayed) => replayed,
-            Err(error) => return Err($authority.management_pre_gate_error(error)),
-        };
-        if let Some(replayed) = replayed {
+        'management: for _attempt in 0..MANAGEMENT_TRANSACTION_MAX_ATTEMPTS {
+            let mut transaction = match $authority.store.begin_serializable().await {
+                Ok(transaction) => transaction,
+                Err(error) => return Err($authority.management_pre_gate_error(error)),
+            };
+            macro_rules! pre_witness {
+                ($result:expr) => {
+                    match $result {
+                        Ok(value) => value,
+                        Err(error) if is_retryable_management_error(&error) => {
+                            #[cfg(test)]
+                            $authority
+                                .management_retry_count
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue 'management;
+                        }
+                        Err(error) => return Err($authority.management_pre_gate_error(error)),
+                    }
+                };
+            }
+            // This must be the first transactional query. A waiting serializable
+            // snapshot can predate its peer's receipt, so such conflicts retry
+            // before any witness, cancellation, or epoch change.
+            pre_witness!(
+                lock_management_receipt(
+                    &mut transaction,
+                    $actor,
+                    replay_receipt.action,
+                    replay_receipt.key,
+                )
+                .await
+            );
+            pre_witness!(
+                $authority
+                    .store
+                    .verify_lease_in_transaction(&mut transaction, &lease)
+                    .await
+            );
+            pre_witness!(
+                require_team_permission_for_replay(
+                    &mut transaction,
+                    $actor,
+                    management_team_id,
+                    $permission,
+                )
+                .await
+            );
+            let replayed = pre_witness!(
+                receipt(
+                    &mut transaction,
+                    $actor,
+                    replay_receipt.action,
+                    replay_receipt.key,
+                    &replay_receipt.digest,
+                )
+                .await
+            );
+            if let Some(replayed) = replayed {
+                pre_witness!(
+                    $authority
+                        .store
+                        .verify_lease_in_transaction(&mut transaction, &lease)
+                        .await
+                );
+                match transaction.commit().await.map_err(StoreError::Database) {
+                    Ok(()) => return Ok(ManagementCommand::replayed_response(&$command, replayed)),
+                    Err(error) if is_retryable_management_error(&error) => {
+                        #[cfg(test)]
+                        $authority
+                            .management_retry_count
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue 'management;
+                    }
+                    Err(error) => {
+                        $authority.close_all();
+                        return Err(error.into());
+                    }
+                }
+            }
+            pre_witness!(
+                require_team_permission(&mut transaction, $actor, management_team_id, $permission,)
+                    .await
+            );
+            let target_exists =
+                pre_witness!(($target).exists(&mut transaction, management_team_id).await);
+            if !target_exists {
+                return Err(AuthorityError::Store(StoreError::Forbidden));
+            }
+            let result = pre_witness!(
+                $authority
+                    .store
+                    .$method(&mut transaction, $actor, $command.clone())
+                    .await
+            );
+            let mutation = $authority.begin_mutation()?;
+            $authority.record_team_deny(management_team_id)?;
+            #[cfg(test)]
+            $authority.pause_mutation().await?;
+            if let Err(error) = $authority
+                .store
+                .verify_lease_in_transaction(&mut transaction, &lease)
+                .await
+            {
+                $authority.close_all();
+                return Err(error.into());
+            }
             if let Err(error) = $authority
                 .verify_fence_in_transaction(&mut transaction)
                 .await
@@ -227,53 +307,10 @@ macro_rules! management_transaction {
                 $authority.close_all();
                 return Err(error.into());
             }
-            return Ok(ManagementCommand::replayed_response(&$command, replayed));
+            mutation.complete()?;
+            return Ok(result);
         }
-        if let Err(error) =
-            require_team_permission(&mut transaction, $actor, management_team_id, $permission).await
-        {
-            return Err($authority.management_pre_gate_error(error));
-        }
-        let target_exists = match ($target).exists(&mut transaction, management_team_id).await {
-            Ok(exists) => exists,
-            Err(error) => return Err($authority.management_pre_gate_error(error)),
-        };
-        if !target_exists {
-            return Err(AuthorityError::Store(StoreError::Forbidden));
-        }
-        let result = $authority
-            .store
-            .$method(&mut transaction, $actor, $command)
-            .await;
-        let result = match result {
-            Ok(result) => result,
-            Err(error) => return Err($authority.management_pre_gate_error(error)),
-        };
-        let mutation = $authority.begin_mutation()?;
-        $authority.record_team_deny(management_team_id)?;
-        #[cfg(test)]
-        $authority.pause_mutation().await?;
-        if let Err(error) = $authority
-            .store
-            .verify_lease_in_transaction(&mut transaction, &lease)
-            .await
-        {
-            $authority.close_all();
-            return Err(error.into());
-        }
-        if let Err(error) = $authority
-            .verify_fence_in_transaction(&mut transaction)
-            .await
-        {
-            $authority.close_all();
-            return Err(error);
-        }
-        if let Err(error) = transaction.commit().await.map_err(StoreError::Database) {
-            $authority.close_all();
-            return Err(error.into());
-        }
-        mutation.complete()?;
-        Ok(result)
+        Err(AuthorityError::Store(StoreError::Contended))
     }};
 }
 
@@ -650,6 +687,8 @@ impl Authority {
             admission_hook: Mutex::new(None),
             #[cfg(test)]
             mutation_hook: Mutex::new(None),
+            #[cfg(test)]
+            management_retry_count: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -1425,6 +1464,11 @@ impl Authority {
             .epoch)
     }
 
+    #[cfg(test)]
+    pub(crate) fn management_retry_count(&self) -> usize {
+        self.management_retry_count.load(Ordering::Relaxed)
+    }
+
     /// Closes ingress after a failure and preserves the dirty witness latch.
     pub fn close_all(&self) {
         self.failed.store(true, Ordering::Release);
@@ -1628,7 +1672,7 @@ async fn grant_subject_exists(
             principal_id,
         ),
         GrantSubject::ServiceAccount(principal_id) => (
-            "SELECT EXISTS (SELECT 1 FROM memberships m JOIN principals p ON p.id=m.principal_id WHERE m.team_id=$1 AND m.principal_id=$2 AND m.state='active' AND p.state='active' AND p.kind='service')",
+            "SELECT EXISTS (SELECT 1 FROM memberships m JOIN principals p ON p.id=m.principal_id JOIN service_accounts s ON s.principal_id=m.principal_id AND s.team_id=m.team_id WHERE m.team_id=$1 AND m.principal_id=$2 AND m.state='active' AND p.state='active' AND p.kind='service' AND s.deprovisioned_at IS NULL)",
             principal_id,
         ),
     };
@@ -1649,6 +1693,18 @@ fn is_management_business_denial(error: &StoreError) -> bool {
             | StoreError::InputTooLarge
             | StoreError::IdempotencyConflict
     )
+}
+
+fn is_retryable_management_error(error: &StoreError) -> bool {
+    matches!(error, StoreError::Contended)
+        || matches!(
+            error,
+            StoreError::Database(database)
+                if database
+                    .as_database_error()
+                    .and_then(|error| error.code())
+                    .is_some_and(|code| code == "40001" || code == "40P01")
+        )
 }
 
 fn parse_scope_uuid(command: &RevocationCommand) -> Result<Uuid, AuthorityError> {

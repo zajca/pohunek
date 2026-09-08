@@ -13,7 +13,8 @@ mod team;
 mod admin_tests;
 
 pub(crate) use admin::{
-    receipt, request_digest, valid_name, valid_permissions, valid_resource_kind,
+    lock_management_receipt, receipt, request_digest, valid_name, valid_permissions,
+    valid_resource_kind,
 };
 #[doc(inline)]
 pub use admin::{

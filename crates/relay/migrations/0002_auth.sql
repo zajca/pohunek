@@ -310,6 +310,32 @@ CREATE TRIGGER service_accounts_identity_immutable
 BEFORE UPDATE OF principal_id, team_id ON service_accounts
 FOR EACH ROW EXECUTE FUNCTION prevent_service_account_reparenting();
 
+-- Service-account grants need the same canonical active, same-team parent as
+-- service credentials. The foundation migration cannot reference this table.
+CREATE OR REPLACE FUNCTION enforce_grant_subject() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.subject_kind = 'group' AND NOT EXISTS (
+        SELECT 1 FROM groups WHERE team_id = NEW.team_id AND group_id = NEW.subject_id AND state = 'active'
+    ) THEN
+        RAISE EXCEPTION 'grant group is not an active team group' USING ERRCODE = '23503';
+    ELSIF NEW.subject_kind = 'principal' AND NOT EXISTS (
+        SELECT 1 FROM memberships WHERE team_id = NEW.team_id AND principal_id = NEW.subject_id AND state = 'active'
+    ) THEN
+        RAISE EXCEPTION 'grant principal is not an active team member' USING ERRCODE = '23503';
+    ELSIF NEW.subject_kind = 'service_account' AND NOT EXISTS (
+        SELECT 1 FROM memberships m
+        JOIN principals p ON p.id = m.principal_id
+        JOIN service_accounts s ON s.principal_id = m.principal_id AND s.team_id = m.team_id
+        WHERE m.team_id = NEW.team_id AND m.principal_id = NEW.subject_id
+          AND m.state = 'active' AND p.state = 'active' AND p.kind = 'service'
+          AND s.deprovisioned_at IS NULL
+    ) THEN
+        RAISE EXCEPTION 'grant service account is not an active canonical team account' USING ERRCODE = '23503';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
 -- A service credential must reference its canonical service-account row. The
 -- generated column is NULL for human credentials, so the foreign key applies
 -- only to service credentials and PostgreSQL's referential locking closes
