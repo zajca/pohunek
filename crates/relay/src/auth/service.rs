@@ -2510,6 +2510,10 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn fixture() -> (Store, String, PgPool) {
+        fixture_at_generation(1).await
+    }
+
+    pub(crate) async fn fixture_at_generation(generation: i64) -> (Store, String, PgPool) {
         let url = env::var("POHUNEK_RELAY_TEST_DATABASE_URL")
             .expect("postgres-tests requires POHUNEK_RELAY_TEST_DATABASE_URL");
         let bootstrap = Store::connect(&url, BOOTSTRAP_CONNECTIONS)
@@ -2532,7 +2536,8 @@ pub(crate) mod tests {
         let store = Store::connect(&scoped_url, TEST_CONNECTIONS)
             .await
             .expect("connect schema-scoped PostgreSQL fixture");
-        sqlx::query("INSERT INTO relay_identity (relay_id,recovery_generation,state,revision) VALUES ('test-relay',1,'normal',1)")
+        sqlx::query("INSERT INTO relay_identity (relay_id,recovery_generation,state,revision) VALUES ('test-relay',$1,'normal',1)")
+            .bind(generation)
             .execute(store.pool())
             .await
             .expect("seed relay identity");
@@ -4229,7 +4234,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn inactive_rotation_targets_are_rejected_without_durable_effects() {
-        let (store, schema, bootstrap) = fixture().await;
+        let (store, schema, bootstrap) = fixture_at_generation(2).await;
         let (authority, directory) = authority(store.clone()).await;
         let service = AuthService::new(
             store.clone(),
@@ -4254,13 +4259,14 @@ pub(crate) mod tests {
             .execute(store.pool())
             .await
             .expect("seed shared identity");
+        let generation = 2_i64;
         for (label, state_sql) in [
             ("revoked", "revoked_at=clock_timestamp()"),
             (
                 "expired",
                 "issued_at=clock_timestamp()-interval '2 hours',expires_at=clock_timestamp()-interval '1 second'",
             ),
-            ("stale", "recovery_generation=2"),
+            ("stale", "recovery_generation=1"),
             (
                 "elapsed",
                 "rotation_overlap_ends_at=clock_timestamp()-interval '1 second'",
@@ -4269,11 +4275,12 @@ pub(crate) mod tests {
             let actor_id = Uuid::now_v7();
             let target_id = Uuid::now_v7();
             let secret = format!("inactive-rotation-{label}");
-            sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,expires_at) VALUES ($1,$2,$3,$4,$5,'test','human',1,$1,1,clock_timestamp()+interval '1 hour')")
-                .bind(actor_id).bind(actor_id.to_string()).bind(service.digest_key.digest(&secret).as_slice()).bind(principal_id).bind(identity_id)
+            sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,expires_at) VALUES ($1,$2,$3,$4,$5,'test','human',1,$1,$6,clock_timestamp()+interval '1 hour')")
+                .bind(actor_id).bind(actor_id.to_string()).bind(service.digest_key.digest(&secret).as_slice()).bind(principal_id).bind(identity_id).bind(generation)
                 .execute(store.pool()).await.expect("seed current actor credential");
-            sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,expires_at) VALUES ($1,$2,$3,$4,$5,'test','human',1,$1,1,clock_timestamp()+interval '1 hour')")
-                .bind(target_id).bind(target_id.to_string()).bind(service.digest_key.digest(&format!("inactive-target-{label}")).as_slice()).bind(principal_id).bind(identity_id)
+            let target_generation = if label == "stale" { 1_i64 } else { generation };
+            sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,expires_at) VALUES ($1,$2,$3,$4,$5,'test','human',1,$1,$6,clock_timestamp()+interval '1 hour')")
+                .bind(target_id).bind(target_id.to_string()).bind(service.digest_key.digest(&format!("inactive-target-{label}")).as_slice()).bind(principal_id).bind(identity_id).bind(target_generation)
                 .execute(store.pool()).await.expect("seed inactive target");
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE relay_credentials SET {state_sql} WHERE credential_id=$1"
@@ -4316,6 +4323,8 @@ pub(crate) mod tests {
             .expect("reopen witness")
             .latest()
             .expect("read witness");
+            let target_before: (i64, Option<time::OffsetDateTime>, time::OffsetDateTime, Option<time::OffsetDateTime>, i64) = sqlx::query_as("SELECT credential_generation,revoked_at,expires_at,rotation_overlap_ends_at,recovery_generation FROM relay_credentials WHERE credential_id=$1")
+                .bind(target_id).fetch_one(store.pool()).await.expect("snapshot target metadata");
             for _ in 0..2 {
                 assert!(matches!(
                     service
@@ -4327,6 +4336,9 @@ pub(crate) mod tests {
                         .await,
                     Err(AuthError::RotationRejected)
                 ));
+                let target_after: (i64, Option<time::OffsetDateTime>, time::OffsetDateTime, Option<time::OffsetDateTime>, i64) = sqlx::query_as("SELECT credential_generation,revoked_at,expires_at,rotation_overlap_ends_at,recovery_generation FROM relay_credentials WHERE credential_id=$1")
+                    .bind(target_id).fetch_one(store.pool()).await.expect("read target metadata after rejection");
+                assert_eq!(target_after, target_before, "{label} target remains exact");
             }
             assert_eq!(
                 sqlx::query_scalar::<_, i64>("SELECT count(*) FROM relay_credentials")
