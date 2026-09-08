@@ -108,6 +108,7 @@ impl Api for Relay {
         &self,
         _credential: &DeviceCredential,
         target: CredentialId,
+        _request: &RevokeCredentialRequest,
     ) -> Result<(), pohunek_relay_client::Error> {
         self.revocations.lock().expect("revocations").push(target);
         Ok(())
@@ -158,6 +159,7 @@ impl Api for Relay {
     async fn revoke(
         &self,
         credential: &DeviceCredential,
+        _request: &RevokeCredentialRequest,
     ) -> Result<(), pohunek_relay_client::Error> {
         self.revocations
             .lock()

@@ -12,8 +12,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use relay_protocol::{
     AccountRecord, CreateServiceAccountRequest, CredentialId, CredentialKind, CredentialMutation,
     CredentialPage, CredentialRecord, DeviceCredential, IdentityRecord, PageRequest, PrincipalId,
-    PrincipalKind, PrincipalState, RotateCredentialRequest, Secret, ServiceAccountCreated,
-    ServiceAccountPage, ServiceAccountRecord, TeamId,
+    PrincipalKind, PrincipalState, RevokeCredentialRequest, RotateCredentialRequest, Secret,
+    ServiceAccountCreated, ServiceAccountPage, ServiceAccountRecord, TeamId,
 };
 use sqlx::{Postgres, Row, Transaction};
 use tokio::sync::Mutex;
@@ -940,6 +940,7 @@ impl AuthService {
         &self,
         actor: AuthenticatedActor,
         credential_id: CredentialId,
+        request: RevokeCredentialRequest,
     ) -> Result<(), AuthError> {
         let context = actor.actor();
         let credential_id = credential_id.as_uuid();
@@ -955,6 +956,23 @@ impl AuthService {
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
             .map_err(|_| AuthError::CredentialInvalid)?;
+        let request_digest = revoke_request_digest(&self.digest_key, credential_id, &request)?;
+        if exact_receipt(
+            &mut transaction,
+            context,
+            "auth.credential.revoke",
+            request.idempotency.idempotency_key,
+            &request_digest,
+        )
+        .await?
+        .is_some()
+        {
+            self.authority
+                .commit_auth_mutation(transaction, false, None)
+                .await
+                .map_err(|_| AuthError::Durable)?;
+            return Ok(());
+        }
         #[cfg(test)]
         self.pause_revoke_before_update().await?;
         sqlx::query_scalar::<_, Uuid>(
@@ -1000,12 +1018,25 @@ impl AuthService {
             }
             return Err(AuthError::CredentialInvalid);
         }
-        audit_actor_mutation(
+        let audit_id = audit_actor_mutation(
             &mut transaction,
             context,
             "auth.credential.revoke",
             "credential",
+            credential_id,
+            None,
+            request.idempotency,
             database_error,
+        )
+        .await?;
+        insert_receipt(
+            &mut transaction,
+            context,
+            "auth.credential.revoke",
+            request.idempotency.idempotency_key,
+            &request_digest,
+            audit_id,
+            credential_id,
         )
         .await?;
         self.authority
@@ -1025,6 +1056,7 @@ impl AuthService {
         team_id: TeamId,
         principal_id: PrincipalId,
         credential_id: CredentialId,
+        request: RevokeCredentialRequest,
     ) -> Result<(), AuthError> {
         let context = actor.actor();
         let team_id = team_id.as_uuid();
@@ -1045,6 +1077,23 @@ impl AuthService {
         crate::authorization::rbac::require_team_admin(&mut transaction, context, team_id)
             .await
             .map_err(|_| AuthError::CredentialInvalid)?;
+        let request_digest = revoke_request_digest(&self.digest_key, credential_id, &request)?;
+        if exact_receipt(
+            &mut transaction,
+            context,
+            "auth.service_credential.revoke",
+            request.idempotency.idempotency_key,
+            &request_digest,
+        )
+        .await?
+        .is_some()
+        {
+            self.authority
+                .commit_auth_mutation(transaction, false, None)
+                .await
+                .map_err(|_| AuthError::Durable)?;
+            return Ok(());
+        }
         #[cfg(test)]
         self.pause_revoke_before_update().await?;
         sqlx::query_scalar::<_, Uuid>(
@@ -1094,12 +1143,25 @@ impl AuthService {
             }
             return Err(AuthError::CredentialInvalid);
         }
-        audit_actor_mutation(
+        let audit_id = audit_actor_mutation(
             &mut transaction,
             context,
             "auth.service_credential.revoke",
             "credential",
+            credential_id,
+            Some(team_id),
+            request.idempotency,
             database_error,
+        )
+        .await?;
+        insert_receipt(
+            &mut transaction,
+            context,
+            "auth.service_credential.revoke",
+            request.idempotency.idempotency_key,
+            &request_digest,
+            audit_id,
+            credential_id,
         )
         .await?;
         self.authority
@@ -1355,6 +1417,9 @@ impl AuthService {
             context,
             "auth.credential.rotate",
             "credential",
+            old_id,
+            team_id,
+            request.idempotency,
             retryable_database_error,
         )
         .await?;
@@ -1474,6 +1539,9 @@ impl AuthService {
             context,
             "auth.service_account.create",
             "service_account",
+            principal_id,
+            Some(team_id),
+            request.idempotency,
             database_error,
         )
         .await?;
@@ -1861,13 +1929,13 @@ impl AuthService {
         if updated.rows_affected() != 1 {
             return Err(AuthError::OidcInvalid);
         }
-        audit_auth(
+        audit_issued_credential(
             &mut transaction,
             "auth.browser.session.issue",
-            "allow",
             "browser_session",
-            "committed",
-            Some(recovery_generation),
+            session_id,
+            login_id,
+            recovery_generation,
         )
         .await?;
         self.commit_current(transaction).await?;
@@ -1969,13 +2037,13 @@ impl AuthService {
                 retry_after_seconds,
             });
         }
-        audit_auth(
+        audit_issued_credential(
             &mut transaction,
             "auth.human_credential.issue",
-            "allow",
-            "human_credential",
-            "committed",
-            Some(binding.recovery_generation),
+            "credential",
+            credential_id,
+            binding.login_id,
+            binding.recovery_generation,
         )
         .await?;
         self.commit_current(transaction).await?;
@@ -2123,25 +2191,52 @@ async fn audit_actor_mutation(
     transaction: &mut Transaction<'_, Postgres>,
     actor: crate::store::ActorContext,
     action: &'static str,
-    parameter_value: &'static str,
+    parameter_code: &'static str,
+    target_id: Uuid,
+    team_id: Option<Uuid>,
+    idempotency: relay_protocol::Idempotency,
     map_error: fn(sqlx::Error) -> AuthError,
 ) -> Result<Uuid, AuthError> {
     let audit_id = Uuid::now_v7();
-    let inserted = sqlx::query(
-        "INSERT INTO audit_events (audit_id, actor_principal_id, actor_kind, team_id, action, decision, policy_generation, recovery_generation, correlation_id, parameter_code, parameter_value, outcome) \
-         SELECT $1, $2, $3, NULL, $4, 'changed', 1, r.recovery_generation, $5, 'credential', $6, 'committed' \
-         FROM relay_identity r WHERE r.state = 'normal' AND r.recovery_generation = $7",
-    )
-    .bind(audit_id)
-    .bind(actor.principal_id())
-    .bind(crate::store::actor_kind_name(actor.kind()))
-    .bind(action)
-    .bind(Uuid::now_v7())
-    .bind(parameter_value)
-    .bind(actor.recovery_generation())
-    .execute(&mut **transaction)
-    .await
-    .map_err(map_error)?;
+    let inserted = if let Some(team_id) = team_id {
+        sqlx::query(
+            "INSERT INTO audit_events (audit_id, actor_principal_id, actor_kind, team_id, action, decision, policy_generation, recovery_generation, correlation_id, idempotency_key, parameter_code, parameter_value, outcome) \
+             SELECT $1, $2, $3, t.team_id, $4, 'changed', t.policy_generation, r.recovery_generation, $5, $6, $7, $8, 'committed' \
+             FROM teams t JOIN relay_identity r ON r.state = 'normal' \
+             WHERE t.team_id = $9 AND r.recovery_generation = $10",
+        )
+        .bind(audit_id)
+        .bind(actor.principal_id())
+        .bind(crate::store::actor_kind_name(actor.kind()))
+        .bind(action)
+        .bind(idempotency.correlation_id)
+        .bind(idempotency.idempotency_key)
+        .bind(parameter_code)
+        .bind(target_id.to_string())
+        .bind(team_id)
+        .bind(actor.recovery_generation())
+        .execute(&mut **transaction)
+        .await
+        .map_err(map_error)?
+    } else {
+        sqlx::query(
+            "INSERT INTO audit_events (audit_id, actor_principal_id, actor_kind, team_id, action, decision, policy_generation, recovery_generation, correlation_id, idempotency_key, parameter_code, parameter_value, outcome) \
+             SELECT $1, $2, $3, NULL, $4, 'changed', r.revision, r.recovery_generation, $5, $6, $7, $8, 'committed' \
+             FROM relay_identity r WHERE r.state = 'normal' AND r.recovery_generation = $9",
+        )
+        .bind(audit_id)
+        .bind(actor.principal_id())
+        .bind(crate::store::actor_kind_name(actor.kind()))
+        .bind(action)
+        .bind(idempotency.correlation_id)
+        .bind(idempotency.idempotency_key)
+        .bind(parameter_code)
+        .bind(target_id.to_string())
+        .bind(actor.recovery_generation())
+        .execute(&mut **transaction)
+        .await
+        .map_err(map_error)?
+    };
     if inserted.rows_affected() != 1 {
         return Err(AuthError::Durable);
     }
@@ -2160,6 +2255,14 @@ fn rotation_request_digest(
     key: &DigestKey,
     credential_id: Uuid,
     request: &RotateCredentialRequest,
+) -> Result<[u8; 32], AuthError> {
+    request_digest(key, &(credential_id, request))
+}
+
+fn revoke_request_digest(
+    key: &DigestKey,
+    credential_id: Uuid,
+    request: &RevokeCredentialRequest,
 ) -> Result<[u8; 32], AuthError> {
     request_digest(key, &(credential_id, request))
 }
@@ -2330,6 +2433,36 @@ fn seconds_i32(duration: Duration) -> Result<i32, AuthError> {
     i32::try_from(duration.as_secs()).map_err(|_| AuthError::Malformed)
 }
 
+async fn audit_issued_credential(
+    transaction: &mut Transaction<'_, Postgres>,
+    action: &'static str,
+    parameter_code: &'static str,
+    target_id: Uuid,
+    correlation_id: Uuid,
+    recovery_generation: i64,
+) -> Result<(), AuthError> {
+    // Browser and device login issuance is teamless. `relay_identity.revision`
+    // records the durable global authority coordinate for these audit events.
+    let inserted = sqlx::query(
+        "INSERT INTO audit_events (audit_id, actor_principal_id, actor_kind, team_id, action, decision, policy_generation, recovery_generation, correlation_id, idempotency_key, parameter_code, parameter_value, outcome) \
+         SELECT $1, NULL, 'system', NULL, $2, 'allow', r.revision, r.recovery_generation, $3, NULL, $4, $5, 'committed' \
+         FROM relay_identity r WHERE r.state = 'normal' AND r.recovery_generation = $6",
+    )
+    .bind(Uuid::now_v7())
+    .bind(action)
+    .bind(correlation_id)
+    .bind(parameter_code)
+    .bind(target_id.to_string())
+    .bind(recovery_generation)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| AuthError::Durable)?;
+    if inserted.rows_affected() != 1 {
+        return Err(AuthError::Durable);
+    }
+    Ok(())
+}
+
 async fn audit_auth(
     transaction: &mut Transaction<'_, Postgres>,
     action: &'static str,
@@ -2340,7 +2473,7 @@ async fn audit_auth(
 ) -> Result<(), AuthError> {
     let inserted = sqlx::query(
         "INSERT INTO audit_events (audit_id, actor_principal_id, actor_kind, team_id, action, decision, policy_generation, recovery_generation, correlation_id, parameter_code, parameter_value, outcome) \
-         SELECT $1, NULL, 'system', NULL, $2, $3, 1, r.recovery_generation, $4, 'transaction', $5, $6 \
+         SELECT $1, NULL, 'system', NULL, $2, $3, r.revision, r.recovery_generation, $4, 'transaction', $5, $6 \
          FROM relay_identity r WHERE r.state = 'normal' AND ($7::bigint IS NULL OR r.recovery_generation = $7)",
     )
     .bind(Uuid::now_v7())
@@ -2513,6 +2646,15 @@ pub(crate) mod tests {
             Duration::from_secs(60),
         )
         .expect("valid explicit authentication limits")
+    }
+
+    fn revoke_request() -> RevokeCredentialRequest {
+        RevokeCredentialRequest {
+            idempotency: relay_protocol::Idempotency {
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        }
     }
 
     #[test]
@@ -2886,6 +3028,30 @@ pub(crate) mod tests {
             .expect("exact replay succeeds");
         assert_eq!(replay.record.credential_id, new_id);
         assert!(replay.credential.is_none());
+        let audit: (Option<Uuid>, i64, i64, Uuid, Option<Uuid>, String, String, Uuid) =
+            sqlx::query_as(
+                "SELECT team_id, policy_generation, recovery_generation, correlation_id, idempotency_key, parameter_code, parameter_value, audit_id \
+                 FROM audit_events WHERE action = 'auth.credential.rotate'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("read self-rotation audit coordinates");
+        assert_eq!(audit.0, None, "self rotation is a global action");
+        assert_eq!(audit.1, 1, "global audit uses relay identity revision");
+        assert_eq!(audit.2, 1);
+        assert_eq!(audit.3, request.idempotency.correlation_id);
+        assert_eq!(audit.4, Some(request.idempotency.idempotency_key));
+        assert_eq!(audit.5, "credential");
+        assert_eq!(audit.6, credential_id.to_string());
+        assert_eq!(
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT audit_id FROM mutation_receipts WHERE action = 'auth.credential.rotate'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("read rotation receipt audit coordinate"),
+            audit.7
+        );
         let effects_before_repeat = (
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM relay_credentials")
                 .fetch_one(store.pool())
@@ -3017,7 +3183,7 @@ pub(crate) mod tests {
             audit_count
         );
         service
-            .revoke_credential(new_actor, new_id)
+            .revoke_credential(new_actor, new_id, revoke_request())
             .await
             .expect("revoke current credential");
         service
@@ -3441,6 +3607,28 @@ pub(crate) mod tests {
             .expect("replay account create");
         assert_eq!(replay.account.principal_id, principal);
         assert!(replay.issued.credential.is_none());
+        let create_audit: (Uuid, i64, Uuid, Option<Uuid>, String, String, Uuid) = sqlx::query_as(
+            "SELECT team_id, policy_generation, correlation_id, idempotency_key, parameter_code, parameter_value, audit_id \
+             FROM audit_events WHERE action = 'auth.service_account.create'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("read service-account audit coordinates");
+        assert_eq!(create_audit.0, team);
+        assert_eq!(create_audit.1, 1);
+        assert_eq!(create_audit.2, request.idempotency.correlation_id);
+        assert_eq!(create_audit.3, Some(request.idempotency.idempotency_key));
+        assert_eq!(create_audit.4, "service_account");
+        assert_eq!(create_audit.5, principal.as_uuid().to_string());
+        assert_eq!(
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT audit_id FROM mutation_receipts WHERE action = 'auth.service_account.create'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("read service-account receipt audit coordinate"),
+            create_audit.6
+        );
         assert!(matches!(
             service
                 .create_service_account(actor, TeamId::from_uuid(other_team), request.clone())
@@ -3497,18 +3685,151 @@ pub(crate) mod tests {
                 TeamId::from_uuid(other_team),
                 principal,
                 replacement.record.credential_id,
+                revoke_request(),
             )
             .await
             .is_err());
+        let revoke = revoke_request();
         service
             .revoke_service_credential(
                 actor,
                 TeamId::from_uuid(team),
                 principal,
                 replacement.record.credential_id,
+                revoke,
             )
             .await
             .expect("revoke service credential");
+        service
+            .revoke_service_credential(
+                actor,
+                TeamId::from_uuid(team),
+                principal,
+                replacement.record.credential_id,
+                revoke,
+            )
+            .await
+            .expect("exact service revocation replay");
+        let revoke_audit: (Uuid, i64, Uuid, Option<Uuid>, String, String, Uuid) = sqlx::query_as(
+            "SELECT team_id, policy_generation, correlation_id, idempotency_key, parameter_code, parameter_value, audit_id \
+             FROM audit_events WHERE action = 'auth.service_credential.revoke'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("read service revoke audit coordinates");
+        assert_eq!(revoke_audit.0, team);
+        assert_eq!(revoke_audit.1, 1);
+        assert_eq!(revoke_audit.2, revoke.idempotency.correlation_id);
+        assert_eq!(revoke_audit.3, Some(revoke.idempotency.idempotency_key));
+        assert_eq!(revoke_audit.4, "credential");
+        assert_eq!(
+            revoke_audit.5,
+            replacement.record.credential_id.as_uuid().to_string()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT audit_id FROM mutation_receipts WHERE action = 'auth.service_credential.revoke'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("read service revoke receipt audit coordinate"),
+            revoke_audit.6
+        );
+        cleanup(&bootstrap, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn rotation_audit_failure_rolls_back_lineage_receipt_and_delivery() {
+        let (store, schema, bootstrap) = fixture().await;
+        let (authority, _directory) = authority(store.clone()).await;
+        let service = AuthService::new(
+            store.clone(),
+            DigestKey::new("test".into(), b"ephemeral-test-key".to_vec()),
+            2,
+            limits(),
+            LoginPolicy::AnyAuthenticatedSubject,
+            Arc::clone(&authority),
+        );
+        let principal_id = Uuid::now_v7();
+        let identity_id = Uuid::now_v7();
+        let credential_id = Uuid::now_v7();
+        let secret = "rotation-audit-failure";
+        sqlx::query(
+            "INSERT INTO principals (id,kind,state,generation) VALUES ($1,'human','active',1)",
+        )
+        .bind(principal_id)
+        .execute(store.pool())
+        .await
+        .expect("seed principal");
+        sqlx::query("INSERT INTO oidc_identities (identity_id,issuer,subject,principal_id,link_generation) VALUES ($1,'issuer','rotation-audit-failure',$2,1)")
+            .bind(identity_id)
+            .bind(principal_id)
+            .execute(store.pool())
+            .await
+            .expect("seed identity");
+        sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,expires_at) VALUES ($1,$1::text,$2,$3,$4,'test','human',1,$1,1,clock_timestamp()+interval '1 hour')")
+            .bind(credential_id)
+            .bind(service.digest_key.digest(secret).as_slice())
+            .bind(principal_id)
+            .bind(identity_id)
+            .execute(store.pool())
+            .await
+            .expect("seed credential");
+        sqlx::raw_sql(
+            "CREATE FUNCTION reject_auth_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit unavailable'; END $$; \
+             CREATE TRIGGER reject_auth_audit BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION reject_auth_audit();",
+        )
+        .execute(store.pool())
+        .await
+        .expect("install audit failure trigger");
+        let actor = service
+            .authenticate_bearer(RelayBearerCredential::new(format!(
+                "{credential_id}.{secret}"
+            )))
+            .await
+            .expect("authenticate owner");
+        let request = RotateCredentialRequest {
+            overlap_seconds: 1,
+            idempotency: relay_protocol::Idempotency {
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+            expires_at: (time::OffsetDateTime::now_utc() + time::Duration::minutes(10))
+                .replace_nanosecond(0)
+                .expect("whole-second expiry"),
+        };
+        assert!(matches!(
+            service
+                .rotate_credential(actor, CredentialId::from_uuid(credential_id), request)
+                .await,
+            Err(AuthError::Durable)
+        ));
+        let state: (Option<time::OffsetDateTime>, i64) = sqlx::query_as(
+            "SELECT rotation_overlap_ends_at, credential_generation FROM relay_credentials WHERE credential_id = $1",
+        )
+        .bind(credential_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("read original credential after audit failure");
+        assert_eq!(state, (None, 1));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM relay_credentials")
+                .fetch_one(store.pool())
+                .await
+                .expect("count credentials after audit failure"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM mutation_receipts WHERE action = 'auth.credential.rotate'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count receipts after audit failure"),
+            0
+        );
+        assert!(authority.validate_fence().await.is_ok());
+        assert!(!authority.is_closed());
         cleanup(&bootstrap, &schema).await;
     }
 
@@ -3621,15 +3942,19 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         witness_before.sort();
         service
-            .revoke_credential(actor, CredentialId::from_uuid(stale_id))
+            .revoke_credential(actor, CredentialId::from_uuid(stale_id), revoke_request())
             .await
             .expect("stale owned credential is already desired state");
         service
-            .revoke_credential(actor, CredentialId::from_uuid(expired_id))
+            .revoke_credential(actor, CredentialId::from_uuid(expired_id), revoke_request())
             .await
             .expect("expired owned credential is already desired state");
         service
-            .revoke_credential(actor, CredentialId::from_uuid(elapsed_overlap_id))
+            .revoke_credential(
+                actor,
+                CredentialId::from_uuid(elapsed_overlap_id),
+                revoke_request(),
+            )
             .await
             .expect("elapsed-overlap owned credential is already desired state");
         service
@@ -3638,6 +3963,7 @@ pub(crate) mod tests {
                 TeamId::from_uuid(team_id),
                 PrincipalId::from_uuid(service_principal_id),
                 CredentialId::from_uuid(service_stale_id),
+                revoke_request(),
             )
             .await
             .expect("stale team service credential is already desired state");
@@ -3647,12 +3973,13 @@ pub(crate) mod tests {
                 TeamId::from_uuid(team_id),
                 PrincipalId::from_uuid(service_principal_id),
                 CredentialId::from_uuid(service_elapsed_overlap_id),
+                revoke_request(),
             )
             .await
             .expect("elapsed-overlap service credential is already desired state");
         assert!(matches!(
             service
-                .revoke_credential(actor, CredentialId::from_uuid(foreign_id))
+                .revoke_credential(actor, CredentialId::from_uuid(foreign_id), revoke_request())
                 .await,
             Err(AuthError::CredentialInvalid)
         ));
@@ -3663,6 +3990,7 @@ pub(crate) mod tests {
                     TeamId::from_uuid(other_team_id),
                     PrincipalId::from_uuid(service_principal_id),
                     CredentialId::from_uuid(service_stale_id),
+                    revoke_request(),
                 )
                 .await,
             Err(AuthError::CredentialInvalid)
@@ -3785,7 +4113,11 @@ pub(crate) mod tests {
         let retry_service = service.clone();
         let retry = tokio::spawn(async move {
             retry_service
-                .revoke_credential(actor, CredentialId::from_uuid(target_credential_id))
+                .revoke_credential(
+                    actor,
+                    CredentialId::from_uuid(target_credential_id),
+                    revoke_request(),
+                )
                 .await
         });
         entered_wait.await;
@@ -3937,6 +4269,28 @@ pub(crate) mod tests {
         .await
         .expect("audit count");
         assert_eq!(audits, 1);
+        let credential_id: Uuid = sqlx::query_scalar(
+            "SELECT credential_id FROM relay_credentials WHERE principal_id=$1 AND revoked_at IS NULL",
+        )
+        .bind(principal_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("issued credential");
+        let audit: (Option<Uuid>, i64, Uuid, String, String) = sqlx::query_as(
+            "SELECT team_id, policy_generation, correlation_id, parameter_code, parameter_value \
+             FROM audit_events WHERE action='auth.human_credential.issue'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("issued credential audit");
+        assert_eq!(audit.0, None, "human credential issuance is teamless");
+        assert_eq!(audit.1, 1, "global authority revision");
+        assert!(
+            [first, second].contains(&audit.2),
+            "audit correlation must be the durable device login ID"
+        );
+        assert_eq!(audit.3, "credential");
+        assert_eq!(audit.4, credential_id.to_string());
         cleanup(&bootstrap, &schema).await;
     }
 
@@ -4251,8 +4605,8 @@ pub(crate) mod tests {
                 1
             ),
         );
-        first.expect("first login succeeds");
-        second.expect("concurrent login succeeds");
+        let first = first.expect("first login succeeds");
+        let second = second.expect("concurrent login succeeds");
         let principals: i64 = sqlx::query_scalar("SELECT count(*) FROM principals")
             .fetch_one(store.pool())
             .await
@@ -4269,6 +4623,29 @@ pub(crate) mod tests {
         assert_eq!(principals, 1);
         assert_eq!(identities, 1);
         assert_eq!(session_principals, 1);
+        let audits: Vec<(Option<Uuid>, i64, Uuid, String, String)> = sqlx::query_as(
+            "SELECT team_id, policy_generation, correlation_id, parameter_code, parameter_value \
+             FROM audit_events WHERE action='auth.browser.session.issue' ORDER BY correlation_id",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("browser session issue audits");
+        assert_eq!(audits.len(), 2);
+        let mut actual = Vec::with_capacity(audits.len());
+        for (team_id, policy_generation, correlation_id, parameter_code, parameter_value) in audits
+        {
+            assert_eq!(team_id, None, "browser session issuance is teamless");
+            assert_eq!(policy_generation, 1, "global authority revision");
+            assert_eq!(parameter_code, "browser_session");
+            actual.push((correlation_id, parameter_value));
+        }
+        actual.sort_unstable();
+        let mut expected = vec![
+            (first_login, first.session_id.to_string()),
+            (second_login, second.session_id.to_string()),
+        ];
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
         cleanup(&bootstrap, &schema).await;
     }
 

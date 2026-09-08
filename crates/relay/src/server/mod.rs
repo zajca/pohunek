@@ -20,8 +20,8 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use relay_protocol::{
     ApiError, ApiErrorBody, CreateServiceAccountRequest, CredentialId, DeviceCredential,
-    DeviceLoginStart, DevicePollResult, LoginId, PageRequest, RotateCredentialRequest, Secret,
-    TeamId,
+    DeviceLoginStart, DevicePollResult, LoginId, PageRequest, RevokeCredentialRequest,
+    RotateCredentialRequest, Secret, TeamId,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -364,12 +364,13 @@ async fn revoke_credential(
     State(state): State<ServerState>,
     headers: HeaderMap,
     axum::extract::Path(credential_id): axum::extract::Path<CredentialId>,
+    Json(request): Json<RevokeCredentialRequest>,
 ) -> Result<StatusCode, ApiFailure> {
     gate(&state)?;
     let actor = authenticated(&state, &headers, true).await?;
     state
         .auth
-        .revoke_credential(actor, credential_id)
+        .revoke_credential(actor, credential_id, request)
         .await
         .map_err(ApiFailure::auth)?;
     Ok(StatusCode::NO_CONTENT)
@@ -378,6 +379,7 @@ async fn revoke_credential(
 async fn revoke_current_credential(
     State(state): State<ServerState>,
     headers: HeaderMap,
+    Json(request): Json<RevokeCredentialRequest>,
 ) -> Result<StatusCode, ApiFailure> {
     gate(&state)?;
     let actor = authenticated(&state, &headers, true).await?;
@@ -389,6 +391,7 @@ async fn revoke_current_credential(
         .revoke_credential(
             actor,
             CredentialId::from_uuid(actor.actor().authentication_id()),
+            request,
         )
         .await
         .map_err(ApiFailure::auth)?;
@@ -443,12 +446,13 @@ async fn revoke_service_credential(
         relay_protocol::PrincipalId,
         CredentialId,
     )>,
+    Json(request): Json<RevokeCredentialRequest>,
 ) -> Result<StatusCode, ApiFailure> {
     gate(&state)?;
     let actor = authenticated(&state, &headers, true).await?;
     state
         .auth
-        .revoke_service_credential(actor, team_id, principal_id, credential_id)
+        .revoke_service_credential(actor, team_id, principal_id, credential_id, request)
         .await
         .map_err(ApiFailure::auth)?;
     Ok(StatusCode::NO_CONTENT)
@@ -1015,6 +1019,12 @@ mod credential_router_tests {
             .as_str()
             .expect("replacement credential");
         let revoke_uri = format!("{uri}/{service_principal}/credentials/{replacement}/revoke");
+        let revoke = json!({
+            "idempotency": {
+                "correlation_id": Uuid::now_v7(),
+                "idempotency_key": Uuid::now_v7(),
+            },
+        });
         let revoked = app
             .clone()
             .oneshot(
@@ -1022,7 +1032,8 @@ mod credential_router_tests {
                     .method("POST")
                     .uri(revoke_uri)
                     .header(header::AUTHORIZATION, &bearer)
-                    .body(axum::body::Body::empty())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(revoke.to_string()))
                     .expect("revoke request"),
             )
             .await

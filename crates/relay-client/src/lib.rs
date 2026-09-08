@@ -9,7 +9,7 @@ use std::fmt::{Debug, Formatter};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use relay_protocol::{
     AccountRecord, CredentialId, CredentialMutation, DeviceCredential, DeviceLoginStart,
-    DevicePollResult, LoginId, RotateCredentialRequest, Secret,
+    DevicePollResult, LoginId, RevokeCredentialRequest, RotateCredentialRequest, Secret,
 };
 use reqwest::{
     header::{HeaderValue, AUTHORIZATION},
@@ -137,12 +137,21 @@ impl Client {
     }
 
     /// Revokes the calling credential, including compensation after keyring failure.
-    pub async fn revoke_self(&self, credential: &DeviceCredential) -> Result<(), Error> {
-        let request = self.authenticated(
-            credential,
-            "v1/auth/credentials/self/revoke",
-            reqwest::Method::POST,
-        )?;
+    ///
+    /// Reuse `request` after a transport failure while the credential can still
+    /// authenticate the retry.
+    pub async fn revoke_self(
+        &self,
+        credential: &DeviceCredential,
+        request: &RevokeCredentialRequest,
+    ) -> Result<(), Error> {
+        let request = self
+            .authenticated(
+                credential,
+                "v1/auth/credentials/self/revoke",
+                reqwest::Method::POST,
+            )?
+            .json(request);
         let response = match self.send(request).await {
             // A retry after a lost successful reply can no longer authenticate;
             // an expired/revoked credential already has the desired authority state.
@@ -160,14 +169,21 @@ impl Client {
     }
 
     /// Revokes an owned credential when its one-time secret delivery was lost.
+    ///
+    /// Reuse `request` after a transport failure to obtain the original result
+    /// without another durable mutation.
     pub async fn revoke_owned(
         &self,
         authentication: &DeviceCredential,
         target: CredentialId,
+        request: &RevokeCredentialRequest,
     ) -> Result<(), Error> {
         let path = format!("v1/account/credentials/{target}/revoke");
         let response = self
-            .send(self.authenticated(authentication, &path, reqwest::Method::POST)?)
+            .send(
+                self.authenticated(authentication, &path, reqwest::Method::POST)?
+                    .json(request),
+            )
             .await?;
         if response.status() != StatusCode::NO_CONTENT
             || !self.read_body(response).await?.is_empty()

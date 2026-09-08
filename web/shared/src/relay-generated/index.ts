@@ -36,6 +36,7 @@ export type { PrincipalState } from "./PrincipalState";
 export type { Record } from "./Record";
 export type { RelayId } from "./RelayId";
 export type { RemoveRequest } from "./RemoveRequest";
+export type { RevokeCredentialRequest } from "./RevokeCredentialRequest";
 export type { RoleAssignmentRequest } from "./RoleAssignmentRequest";
 export type { RotateCredentialRequest } from "./RotateCredentialRequest";
 export type { Secret } from "./Secret";

@@ -5,4 +5,7 @@ import type { CredentialRecord } from "./CredentialRecord";
 /**
  * A bounded cursor page of credential metadata.
  */
-export type CredentialPage = { records: Array<CredentialRecord> };
+export type CredentialPage = {
+  records: Array<CredentialRecord>;
+  next_cursor: string | null;
+};

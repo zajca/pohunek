@@ -5,4 +5,7 @@ import type { ServiceAccountRecord } from "./ServiceAccountRecord";
 /**
  * A bounded cursor page of team service accounts.
  */
-export type ServiceAccountPage = { records: Array<ServiceAccountRecord> };
+export type ServiceAccountPage = {
+  records: Array<ServiceAccountRecord>;
+  next_cursor: string | null;
+};

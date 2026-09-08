@@ -4,7 +4,7 @@ use pohunek_relay_client::{config::Origin, Client};
 use relay_protocol::{
     AccountRecord, CredentialId, CredentialKind, CredentialMutation, DeviceCredential,
     DeviceLoginStart, DevicePollResult, LoginId, PrincipalKind, PrincipalState,
-    RotateCredentialRequest, Secret,
+    RevokeCredentialRequest, RotateCredentialRequest, Secret,
 };
 use std::time::Duration;
 use tokio::time::{sleep, Instant};
@@ -30,6 +30,7 @@ pub(super) trait Api {
     async fn revoke(
         &self,
         credential: &DeviceCredential,
+        request: &RevokeCredentialRequest,
     ) -> Result<(), pohunek_relay_client::Error>;
     async fn rotate(
         &self,
@@ -41,6 +42,7 @@ pub(super) trait Api {
         &self,
         credential: &DeviceCredential,
         target: CredentialId,
+        request: &RevokeCredentialRequest,
     ) -> Result<(), pohunek_relay_client::Error>;
 }
 
@@ -49,8 +51,9 @@ impl Api for Client {
         &self,
         credential: &DeviceCredential,
         target: CredentialId,
+        request: &RevokeCredentialRequest,
     ) -> Result<(), pohunek_relay_client::Error> {
-        self.revoke_owned(credential, target).await
+        self.revoke_owned(credential, target, request).await
     }
     fn origin(&self) -> &Origin {
         self.origin()
@@ -74,8 +77,9 @@ impl Api for Client {
     async fn revoke(
         &self,
         credential: &DeviceCredential,
+        request: &RevokeCredentialRequest,
     ) -> Result<(), pohunek_relay_client::Error> {
-        self.revoke_self(credential).await
+        self.revoke_self(credential, request).await
     }
     async fn rotate(
         &self,
@@ -84,6 +88,15 @@ impl Api for Client {
         request: &RotateCredentialRequest,
     ) -> Result<CredentialMutation, pohunek_relay_client::Error> {
         self.rotate(credential, target, request).await
+    }
+}
+
+fn revoke_request() -> RevokeCredentialRequest {
+    RevokeCredentialRequest {
+        idempotency: relay_protocol::Idempotency {
+            correlation_id: uuid::Uuid::now_v7(),
+            idempotency_key: uuid::Uuid::now_v7(),
+        },
     }
 }
 
@@ -146,7 +159,8 @@ fn human_account(account: &AccountRecord) -> bool {
 }
 
 async fn reject_delivery(api: &impl Api, credential: &DeviceCredential) -> Result<(), Error> {
-    api.revoke(credential)
+    let request = revoke_request();
+    api.revoke(credential, &request)
         .await
         .map_err(|_error| Error::DeliveryUnrevoked)?;
     Err(Error::AccountKind)
@@ -158,7 +172,8 @@ async fn persist(
     credential: &DeviceCredential,
 ) -> Result<(), Error> {
     if let Err(_error) = store.save(api.origin(), credential).await {
-        return match api.revoke(credential).await {
+        let request = revoke_request();
+        return match api.revoke(credential, &request).await {
             Ok(()) => Err(Error::StorageRevoked),
             Err(_error) => Err(Error::StorageUnrevoked),
         };
@@ -174,7 +189,8 @@ pub(super) async fn status(api: &impl Api, store: &impl Store) -> Result<Account
 pub(super) async fn logout(api: &impl Api, store: &impl Store) -> Result<(), Error> {
     if let Some(credential) = store.load(api.origin()).await? {
         // Keep the exact credential available for retry when the relay is offline.
-        api.revoke(&credential).await?;
+        let request = revoke_request();
+        api.revoke(&credential, &request).await?;
         store.remove(api.origin()).await?;
     }
     Ok(())
@@ -275,7 +291,8 @@ async fn complete_rotation(
             // Credential persistence succeeded before a crash clearing the journal.
             return store.clear_pending(api.origin()).await;
         }
-        api.revoke_owned(current, issued.record.credential_id)
+        let request = revoke_request();
+        api.revoke_owned(current, issued.record.credential_id, &request)
             .await
             .map_err(|_error| Error::RotationPending)?;
         store.clear_pending(api.origin()).await?;

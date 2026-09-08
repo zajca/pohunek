@@ -19,8 +19,8 @@ mod revision;
 pub use account::{
     AccountLinkRequest, AccountRecord, CreateServiceAccountRequest, CredentialKind,
     CredentialMutation, CredentialPage, CredentialRecord, IdentityRecord, PrincipalKind,
-    PrincipalState, RotateCredentialRequest, ServiceAccountCreated, ServiceAccountPage,
-    ServiceAccountRecord,
+    PrincipalState, RevokeCredentialRequest, RotateCredentialRequest, ServiceAccountCreated,
+    ServiceAccountPage, ServiceAccountRecord,
 };
 pub use auth::{DeviceCredential, DeviceLoginStart, DevicePollResult, LoginId, Secret};
 pub use error::{ApiError, ApiErrorBody};

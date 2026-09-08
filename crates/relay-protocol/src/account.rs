@@ -152,6 +152,15 @@ pub struct RotateCredentialRequest {
     pub expires_at: OffsetDateTime,
 }
 
+/// Revokes a credential with an exact caller-provided retry coordinate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export))]
+#[serde(deny_unknown_fields)]
+pub struct RevokeCredentialRequest {
+    pub idempotency: Idempotency,
+}
+
 /// Starts explicit proof of a second identity for the current human account.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]

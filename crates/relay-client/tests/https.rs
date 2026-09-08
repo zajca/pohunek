@@ -15,7 +15,7 @@ use pohunek_relay_client::{
 };
 use relay_protocol::{
     AccountRecord, CredentialId, DeviceCredential, DeviceLoginStart, DevicePollResult, LoginId,
-    PrincipalId, PrincipalKind, PrincipalState, Secret,
+    PrincipalId, PrincipalKind, PrincipalState, RevokeCredentialRequest, Secret,
 };
 use std::{
     net::SocketAddr,
@@ -129,6 +129,15 @@ fn credential() -> DeviceCredential {
     }
 }
 
+fn revoke_request() -> RevokeCredentialRequest {
+    RevokeCredentialRequest {
+        idempotency: relay_protocol::Idempotency {
+            correlation_id: Uuid::now_v7(),
+            idempotency_key: Uuid::now_v7(),
+        },
+    }
+}
+
 fn login() -> DeviceLoginStart {
     DeviceLoginStart {
         login_id: LoginId::from_uuid(Uuid::nil()),
@@ -203,7 +212,14 @@ async fn account(State(state): State<AuthFixture>, headers: HeaderMap) -> Respon
     .into_response()
 }
 
-async fn revoke(State(state): State<AuthFixture>, headers: HeaderMap) -> StatusCode {
+async fn revoke(
+    State(state): State<AuthFixture>,
+    headers: HeaderMap,
+    Json(request): Json<RevokeCredentialRequest>,
+) -> StatusCode {
+    if request.idempotency.correlation_id.is_nil() || request.idempotency.idempotency_key.is_nil() {
+        return StatusCode::BAD_REQUEST;
+    }
     if !authenticated(&headers) || state.revoked.load(Ordering::SeqCst) {
         return StatusCode::UNAUTHORIZED;
     }
@@ -259,13 +275,14 @@ async fn device_poll_account_and_compensating_revoke_use_exact_protected_headers
             .kind,
         PrincipalKind::Human
     );
+    let request = revoke_request();
     client
-        .revoke_self(&credential)
+        .revoke_self(&credential, &request)
         .await
         .expect("compensating self revoke");
     assert!(state.revoked.load(Ordering::SeqCst));
     client
-        .revoke_self(&credential)
+        .revoke_self(&credential, &request)
         .await
         .expect("lost-reply retry already has no authority");
     assert_eq!(
@@ -283,9 +300,16 @@ async fn owned_revoke_preserves_authentication_and_targets_the_undelivered_crede
     let app = Router::new().route(
         "/v1/account/credentials/{id}/revoke",
         post(
-            |axum::extract::Path(id): axum::extract::Path<Uuid>, headers: HeaderMap| async move {
+            |axum::extract::Path(id): axum::extract::Path<Uuid>,
+             headers: HeaderMap,
+             Json(request): Json<RevokeCredentialRequest>| async move {
                 if !authenticated(&headers) {
                     return StatusCode::UNAUTHORIZED;
+                }
+                if request.idempotency.correlation_id.is_nil()
+                    || request.idempotency.idempotency_key.is_nil()
+                {
+                    return StatusCode::BAD_REQUEST;
                 }
                 if id != Uuid::from_u128(42) {
                     return StatusCode::NOT_FOUND;
@@ -296,19 +320,32 @@ async fn owned_revoke_preserves_authentication_and_targets_the_undelivered_crede
     );
     let fixture = Fixture::new(app).await;
     let client = fixture.client(4096);
+    let request = revoke_request();
     client
-        .revoke_owned(&credential(), CredentialId::from_uuid(Uuid::from_u128(42)))
+        .revoke_owned(
+            &credential(),
+            CredentialId::from_uuid(Uuid::from_u128(42)),
+            &request,
+        )
         .await
         .expect("revoke distinct owned target");
     client
-        .revoke_owned(&credential(), CredentialId::from_uuid(Uuid::from_u128(42)))
+        .revoke_owned(
+            &credential(),
+            CredentialId::from_uuid(Uuid::from_u128(42)),
+            &request,
+        )
         .await
         .expect("exact retry");
     let mut invalid = credential();
     invalid.credential_id = CredentialId::from_uuid(Uuid::from_u128(99));
     assert_eq!(
         client
-            .revoke_owned(&invalid, CredentialId::from_uuid(Uuid::from_u128(42)))
+            .revoke_owned(
+                &invalid,
+                CredentialId::from_uuid(Uuid::from_u128(42)),
+                &revoke_request(),
+            )
             .await
             .expect_err("wrong current actor"),
         Error::Unauthenticated
