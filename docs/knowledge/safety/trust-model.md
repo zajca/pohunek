@@ -124,6 +124,14 @@ responsibilities:
 - Each relay operation is bound to one active share and its current revision;
   permissions from different shares are never composed for one operation.
 
+The planned relay uses Keycloak as the reference broker for Google and GitHub,
+but Pohunek stays provider-neutral. Verified external eligibility is evidence,
+not an editable profile attribute: it expires no later than 60 minutes after
+authoritative upstream verification, and token refresh, activity, restart,
+unknown state, or provider failure cannot extend it. Confirmed removal and local
+revocation cancel affected relay access, including idle streams, without
+stopping host sessions. RFC §13 is normative; #92 owns this before #72 completes.
+
 The relay is explicitly trusted with transient terminal plaintext and all
 authority granted by active shares. A compromised relay can exercise that
 entire union, even though application RBAC gives an ordinary infrastructure
@@ -132,7 +140,8 @@ end-to-end encrypted from its operator. Relay persistence and telemetry must
 exclude PTY bytes, input, prompts, terminal snapshots, file contents, and raw
 secrets.
 
-Direct-host agent profiles run under the daemon owner's Unix account and are not
-hostile-workload isolation. `HostShare` limits reduce relay authority but do not
-turn direct processes into a sandbox. Container and VM-backed execution remains
-separate future work.
+The first relay release trusts collaborators at the daemon owner's Unix-account
+boundary. Direct-host agent profiles run under that account; relay API ACLs and
+`HostShare` limits reduce relay authority but are not command or hostile-workload
+isolation. Container and VM-backed execution is separate post-release work in
+#88.

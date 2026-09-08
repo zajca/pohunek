@@ -9,7 +9,7 @@ Status reflects the **code on `main`**. Where a phase/plan doc's own status
 header lags the code, the code wins and the lag is noted. Accepted future work
 is marked explicitly and must not be read as shipped functionality.
 
-Last reconciled: 2026-09-03.
+Last reconciled: 2026-09-08.
 
 ---
 
@@ -269,37 +269,30 @@ first-class. A host has at most one relay enrollment but may expose multiple
 locally approved shares to multiple teams. The implementation order follows the
 live blocker graph:
 
-1. [#80](https://github.com/zajca/pohunek/issues/80) lands the RFC and aligns
-   canonical documentation.
-2. [#81](https://github.com/zajca/pohunek/issues/81) adds stable host identity,
-   exact principal-or-team ownership, and local ownership transfer;
-   [#85](https://github.com/zajca/pohunek/issues/85) builds the Rust relay,
-   PostgreSQL, OIDC, principals, teams, groups, roles, and service accounts.
-3. [#72](https://github.com/zajca/pohunek/issues/72), after completed
-   [#69](https://github.com/zajca/pohunek/issues/69) plus #81 and #85, adds
-   enrollment and host-initiated userspace WireGuard/TCP transport.
-4. [#70](https://github.com/zajca/pohunek/issues/70), after #72 and #81, makes
-   the coordinated protocol v4 host-link, `SessionOrigin`, and daemon relay
-   guard cutover. There is no v3 relay compatibility shim.
-5. [#82](https://github.com/zajca/pohunek/issues/82) and
-   [#83](https://github.com/zajca/pohunek/issues/83), after #70 and #85, add
-   locally approved `HostShare` policy and relay-side session authorization.
-   [#84](https://github.com/zajca/pohunek/issues/84), after #70 and #82, adds
-   subscription-first atomic snapshots and full resync without daemon replay.
-6. [#71](https://github.com/zajca/pohunek/issues/71), after #70, #72, #82,
-   #83, #84, and #85, completes relay host links, routing, aggregation, attach
-   proxying, and the typed public API.
-7. [#86](https://github.com/zajca/pohunek/issues/86), after #71, supplies the
-   team CLI and Svelte web surfaces while preserving the owner WebUI as a
-   separate private gateway. [#87](https://github.com/zajca/pohunek/issues/87), after #71,
-   #72, and #85, completes audit, quotas, deployment, backup/restore,
-   observability, and incident hardening.
-
-Post-relay extensions are [#73](https://github.com/zajca/pohunek/issues/73)
-for provider webhooks and encrypted token storage, and
-[#88](https://github.com/zajca/pohunek/issues/88) for real profile-backed
-container and VM isolation. Neither is part of the first complete relay
-release.
+1. Completed [#69](https://github.com/zajca/pohunek/issues/69),
+   [#80](https://github.com/zajca/pohunek/issues/80), and
+   [#81](https://github.com/zajca/pohunek/issues/81) provide configured overlays,
+   the original accepted design, and host-local governance. [#91](https://github.com/zajca/pohunek/issues/91)
+   reconciles the normative RFC and canonical documentation.
+2. [#85](https://github.com/zajca/pohunek/issues/85) supplies the Rust relay,
+   PostgreSQL, OIDC, teams, authorization, durable audit/admission, database
+   lease fencing, and restore quarantine. [#92](https://github.com/zajca/pohunek/issues/92)
+   then supplies the Keycloak-brokered Google/GitHub verification and bounded
+   external-evidence flow. Only then can [#72](https://github.com/zajca/pohunek/issues/72)
+   complete host enrollment and the userspace WireGuard/TCP transport.
+3. After that foundation, [#70](https://github.com/zajca/pohunek/issues/70),
+   [#82](https://github.com/zajca/pohunek/issues/82),
+   [#83](https://github.com/zajca/pohunek/issues/83),
+   [#84](https://github.com/zajca/pohunek/issues/84), and
+   [#71](https://github.com/zajca/pohunek/issues/71) deliver the v4 host link,
+   `SessionOrigin`, `HostShare`, authorization, synchronization, routing, attach
+   proxying, and typed public API.
+4. [#86](https://github.com/zajca/pohunek/issues/86) delivers team clients and
+   the separate team web surface; [#87](https://github.com/zajca/pohunek/issues/87)
+   delivers operational audit, quota, deployment, backup/restore, observability,
+   and incident evidence. Post-release [#73](https://github.com/zajca/pohunek/issues/73)
+   and [#88](https://github.com/zajca/pohunek/issues/88) add provider delivery
+   and real workload isolation.
 
 ---
 
@@ -323,7 +316,8 @@ release.
 ## 5. Recommended sequence
 
 Tracks S, D, and Browser M1 are shipped and remain usable throughout the relay
-work. The next sequence is Track R exactly as ordered above: #80, then #81/#85,
-#72, #70, #82/#83/#84, #71, and finally #86/#87. Existing owner-path work may
+work. The next sequence is Track R exactly as ordered above: #91 → #85 → #92 →
+complete #72 → #70/#82/#83/#84/#71 → #86 and #87 → post-release #73/#88.
+Existing owner-path work may
 continue independently only when it does not create a second production relay
 authority or pre-empt a locked RFC boundary.

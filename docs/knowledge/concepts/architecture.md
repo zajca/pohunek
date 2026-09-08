@@ -61,6 +61,13 @@ implementation issues. Assistants must not infer future commands or fields from
 the RFC; verify currently available behavior in `docs/public-api.md` through
 the [source map](../assistant/source-map.md).
 
+The planned relay contract is normative only in the RFC sections on identity,
+recovery, scheduling, resources, snapshots, catalog, audit, and dependencies.
+Its implementation
+path is #85 → #92 → complete #72 → #70/#82/#83/#84/#71 → #86 and #87, then
+post-release #73/#88. The first relay release trusts collaborators at the host
+Unix-account boundary; its ACLs do not provide workload isolation.
+
 Related concepts:
 
 - [Sessions](sessions.md)

@@ -102,7 +102,9 @@ Web control center client:
 - `docs/design/track-b-web-control-center-plan-2026-07-22.md`
 - `docs/phases/04-browser-control-center.md`
 
-Accepted team-relay architecture (not yet implemented):
+Accepted team-relay architecture (not yet implemented; normative contract in
+the RFC's identity, recovery, scheduling, resource, snapshot, catalog, audit,
+and dependency sections; reconciled by #91):
 
 - `docs/design/team-relay-control-plane-rfc.md`
 - `docs/architecture.md`

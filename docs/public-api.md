@@ -39,19 +39,18 @@ paths unchanged and adds a separate Rust `pohunek-relayd` authority. A host will
 initiate an authenticated userspace WireGuard tunnel and every control and
 attach TCP stream; the public relay will never dial the host.
 
-The coordinated protocol-v4 cutover in
-[#70](https://github.com/zajca/pohunek/issues/70) will add the authenticated host
-link, `HostShare` coordinates, immutable session origin, one atomic host-scoped
-snapshot covering all active shares with an epoch/watermark, and host-initiated
-outbound attach streams.
-There will be no v3 compatibility shim on the relay path and no change to the
-current direct-owner trust domain. Supporting work is owned by
-[#72](https://github.com/zajca/pohunek/issues/72) for the userspace WireGuard
-transport, [#85](https://github.com/zajca/pohunek/issues/85) for the relay and
-identity foundation, [#84](https://github.com/zajca/pohunek/issues/84) for
-full-resync state synchronization, and
-[#71](https://github.com/zajca/pohunek/issues/71) for relay routing and its typed
-public API.
+The normative future contract is in the RFC's identity/evidence, recovery,
+host-link scheduling, resource, snapshot, catalog, audit, failure, and
+ownership sections. It does
+not add an API to this document before its owning issues ship. The coordinated
+protocol-v4 cutover in [#70](https://github.com/zajca/pohunek/issues/70) will
+add the authenticated host link, `HostShare` coordinates, immutable session
+origin, atomic host snapshots, and host-initiated attach streams. There will be
+no v3 relay compatibility shim and no change to the direct-owner trust domain.
+The dependency path is [#85](https://github.com/zajca/pohunek/issues/85) →
+[#92](https://github.com/zajca/pohunek/issues/92) → complete
+[#72](https://github.com/zajca/pohunek/issues/72), followed by #70, #82, #83,
+#84, and [#71](https://github.com/zajca/pohunek/issues/71).
 
 The current `@pohunek/backend` remains the supported owner-mode transparent
 browser transport after [#86](https://github.com/zajca/pohunek/issues/86) adds a

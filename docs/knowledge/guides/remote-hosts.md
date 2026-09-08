@@ -105,6 +105,8 @@ WireGuard link and all control and attach streams to one relay. Independently
 approved `HostShare` records can expose bounded project, profile, operation, and
 resource capacity to multiple teams. Local and direct-overlay sessions remain
 owner-only and never appear through the relay; only sessions created through a
-share are eligible. Until the implementation issues linked from the
+share are eligible. Relay enrollment and CLI authorization will use OIDC device
+flow, with no loopback fallback; browser login will use Authorization Code with
+PKCE. Until the implementation issues linked from the
 [team-relay concept](../concepts/team-relay.md) land, use only the owner commands
 documented above.
