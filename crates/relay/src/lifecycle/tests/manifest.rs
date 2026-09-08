@@ -207,10 +207,10 @@ async fn durable_quarantine_and_manifest_bind_service_and_credential_authority()
             identity,
         ),
         (
-            "UPDATE relay_credentials SET rotation_family_id=$1 WHERE credential_id=$2",
+            "UPDATE relay_credentials SET rotation_family_id=$1,predecessor_credential_id=$1 WHERE credential_id=$2",
             predecessor,
             credential,
-            "UPDATE relay_credentials SET rotation_family_id=$1 WHERE credential_id=$2",
+            "UPDATE relay_credentials SET rotation_family_id=$1,predecessor_credential_id=NULL WHERE credential_id=$2",
             credential,
         ),
         (
@@ -222,22 +222,30 @@ async fn durable_quarantine_and_manifest_bind_service_and_credential_authority()
         ),
     ];
     for (change, value, id, undo, original) in changes {
-        sqlx::query(AssertSqlSafe(change))
-            .bind(value)
-            .bind(id)
-            .execute(store.pool())
-            .await
-            .expect("change authority");
+        if change.starts_with("UPDATE relay_credentials") {
+            set_restored_credential_coordinate(&store, change, value, id).await;
+        } else {
+            sqlx::query(AssertSqlSafe(change))
+                .bind(value)
+                .bind(id)
+                .execute(store.pool())
+                .await
+                .expect("change authority");
+        }
         assert!(matches!(
             lifecycle.reopen_local(&advanced, &reviewed).await,
             Err(LifecycleError::ManifestMismatch)
         ));
-        sqlx::query(AssertSqlSafe(undo))
-            .bind(original)
-            .bind(id)
-            .execute(store.pool())
-            .await
-            .expect("restore authority");
+        if undo.starts_with("UPDATE relay_credentials") {
+            set_restored_credential_coordinate(&store, undo, original, id).await;
+        } else {
+            sqlx::query(AssertSqlSafe(undo))
+                .bind(original)
+                .bind(id)
+                .execute(store.pool())
+                .await
+                .expect("restore authority");
+        }
     }
     let changes = [
         ("UPDATE relay_credentials SET secret_digest=decode(repeat('15',32),'hex') WHERE credential_id=$1", credential,
@@ -256,20 +264,28 @@ async fn durable_quarantine_and_manifest_bind_service_and_credential_authority()
          "UPDATE service_accounts SET deprovisioned_at=NULL WHERE principal_id=$1"),
     ];
     for (change, id, undo) in changes {
-        sqlx::query(AssertSqlSafe(change))
-            .bind(id)
-            .execute(store.pool())
-            .await
-            .expect("change authority");
+        if change.starts_with("UPDATE relay_credentials") {
+            set_restored_credential_value(&store, change, id).await;
+        } else {
+            sqlx::query(AssertSqlSafe(change))
+                .bind(id)
+                .execute(store.pool())
+                .await
+                .expect("change authority");
+        }
         assert!(matches!(
             lifecycle.reopen_local(&advanced, &reviewed).await,
             Err(LifecycleError::ManifestMismatch)
         ));
-        sqlx::query(AssertSqlSafe(undo))
-            .bind(id)
-            .execute(store.pool())
-            .await
-            .expect("restore authority");
+        if undo.starts_with("UPDATE relay_credentials") {
+            set_restored_credential_value(&store, undo, id).await;
+        } else {
+            sqlx::query(AssertSqlSafe(undo))
+                .bind(id)
+                .execute(store.pool())
+                .await
+                .expect("restore authority");
+        }
     }
     sqlx::query("UPDATE relay_credentials SET last_used_at=clock_timestamp()")
         .execute(store.pool())
@@ -313,4 +329,56 @@ async fn set_restored_service_account_team(store: &Store, principal_id: Uuid, te
         .commit()
         .await
         .expect("commit restored-corruption fixture");
+}
+
+async fn set_restored_credential_coordinate(
+    store: &Store,
+    statement: &'static str,
+    value: Uuid,
+    credential_id: Uuid,
+) {
+    let mut transaction = store
+        .pool()
+        .begin()
+        .await
+        .expect("begin restored-corruption credential fixture");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .expect("suppress credential provenance trigger for restored-corruption fixture");
+    sqlx::query(AssertSqlSafe(statement))
+        .bind(value)
+        .bind(credential_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("set restored-corruption credential coordinate");
+    transaction
+        .commit()
+        .await
+        .expect("commit restored-corruption credential fixture");
+}
+
+async fn set_restored_credential_value(
+    store: &Store,
+    statement: &'static str,
+    credential_id: Uuid,
+) {
+    let mut transaction = store
+        .pool()
+        .begin()
+        .await
+        .expect("begin restored-corruption credential fixture");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .expect("suppress credential provenance trigger for restored-corruption fixture");
+    sqlx::query(AssertSqlSafe(statement))
+        .bind(credential_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("set restored-corruption credential value");
+    transaction
+        .commit()
+        .await
+        .expect("commit restored-corruption credential fixture");
 }

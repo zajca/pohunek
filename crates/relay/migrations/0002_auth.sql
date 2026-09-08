@@ -135,7 +135,7 @@ CREATE TABLE relay_credentials (
     digest_key_id TEXT NOT NULL CHECK (char_length(digest_key_id) BETWEEN 1 AND 128),
     credential_kind TEXT NOT NULL CHECK (credential_kind IN ('human', 'service')),
     credential_generation BIGINT NOT NULL CHECK (credential_generation > 0),
-    rotation_family_id UUID,
+    rotation_family_id UUID NOT NULL,
     predecessor_credential_id UUID REFERENCES relay_credentials(credential_id) ON DELETE RESTRICT,
     recovery_generation BIGINT NOT NULL CHECK (recovery_generation > 0),
     issued_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
@@ -146,12 +146,129 @@ CREATE TABLE relay_credentials (
     CHECK (expires_at > issued_at),
     CHECK (rotation_overlap_ends_at IS NULL OR rotation_overlap_ends_at <= expires_at),
     CHECK (public_id = credential_id::TEXT),
+    CHECK (
+        (predecessor_credential_id IS NULL AND rotation_family_id = credential_id)
+        OR (
+            predecessor_credential_id IS NOT NULL
+            AND rotation_family_id <> credential_id
+            AND predecessor_credential_id <> credential_id
+        )
+    ),
     CHECK ((credential_kind = 'human' AND identity_id IS NOT NULL) OR (credential_kind = 'service' AND identity_id IS NULL)),
-    FOREIGN KEY (identity_id, principal_id) REFERENCES oidc_identities(identity_id, principal_id) ON DELETE RESTRICT
+    FOREIGN KEY (identity_id, principal_id) REFERENCES oidc_identities(identity_id, principal_id) ON DELETE RESTRICT,
+    lineage_identity_id UUID GENERATED ALWAYS AS (
+        COALESCE(identity_id, '00000000-0000-0000-0000-000000000000'::UUID)
+    ) STORED,
+    lineage_identity_is_null BOOLEAN GENERATED ALWAYS AS (identity_id IS NULL) STORED,
+    UNIQUE (predecessor_credential_id),
+    UNIQUE (
+        credential_id,
+        principal_id,
+        credential_kind,
+        lineage_identity_id,
+        lineage_identity_is_null,
+        recovery_generation
+    ),
+    UNIQUE (
+        credential_id,
+        principal_id,
+        credential_kind,
+        lineage_identity_id,
+        lineage_identity_is_null,
+        recovery_generation,
+        rotation_family_id
+    ),
+    FOREIGN KEY (
+        rotation_family_id,
+        principal_id,
+        credential_kind,
+        lineage_identity_id,
+        lineage_identity_is_null,
+        recovery_generation
+    ) REFERENCES relay_credentials (
+        credential_id,
+        principal_id,
+        credential_kind,
+        lineage_identity_id,
+        lineage_identity_is_null,
+        recovery_generation
+    ) ON DELETE RESTRICT,
+    FOREIGN KEY (
+        predecessor_credential_id,
+        principal_id,
+        credential_kind,
+        lineage_identity_id,
+        lineage_identity_is_null,
+        recovery_generation,
+        rotation_family_id
+    ) REFERENCES relay_credentials (
+        credential_id,
+        principal_id,
+        credential_kind,
+        lineage_identity_id,
+        lineage_identity_is_null,
+        recovery_generation,
+        rotation_family_id
+    ) ON DELETE RESTRICT
 );
 
 CREATE INDEX relay_credentials_current_principal_idx
     ON relay_credentials(principal_id) WHERE revoked_at IS NULL;
+
+CREATE FUNCTION prevent_credential_provenance_change() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.credential_id IS DISTINCT FROM OLD.credential_id
+       OR NEW.public_id IS DISTINCT FROM OLD.public_id
+       OR NEW.secret_digest IS DISTINCT FROM OLD.secret_digest
+       OR NEW.principal_id IS DISTINCT FROM OLD.principal_id
+       OR NEW.identity_id IS DISTINCT FROM OLD.identity_id
+       OR NEW.digest_key_id IS DISTINCT FROM OLD.digest_key_id
+       OR NEW.credential_kind IS DISTINCT FROM OLD.credential_kind
+       OR NEW.rotation_family_id IS DISTINCT FROM OLD.rotation_family_id
+       OR NEW.predecessor_credential_id IS DISTINCT FROM OLD.predecessor_credential_id
+       OR NEW.recovery_generation IS DISTINCT FROM OLD.recovery_generation
+       OR NEW.issued_at IS DISTINCT FROM OLD.issued_at
+       OR NEW.expires_at IS DISTINCT FROM OLD.expires_at THEN
+        RAISE EXCEPTION 'credential provenance is immutable' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER relay_credentials_provenance_immutable
+BEFORE UPDATE ON relay_credentials
+FOR EACH ROW EXECUTE FUNCTION prevent_credential_provenance_change();
+
+CREATE FUNCTION prevent_credential_lineage_cycle() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.predecessor_credential_id IS NULL THEN
+        RETURN NULL;
+    END IF;
+    IF EXISTS (
+        WITH RECURSIVE lineage(credential_id, predecessor_credential_id, path) AS (
+            SELECT credential_id, predecessor_credential_id, ARRAY[credential_id]
+            FROM relay_credentials
+            WHERE credential_id = NEW.predecessor_credential_id
+            UNION ALL
+            SELECT credential.credential_id, credential.predecessor_credential_id,
+                lineage.path || credential.credential_id
+            FROM relay_credentials credential
+            JOIN lineage ON credential.credential_id = lineage.predecessor_credential_id
+            WHERE lineage.predecessor_credential_id IS NOT NULL
+              AND NOT credential.credential_id = ANY(lineage.path)
+        )
+        SELECT 1 FROM lineage WHERE credential_id = NEW.credential_id
+    ) THEN
+        RAISE EXCEPTION 'credential lineage cannot contain a cycle' USING ERRCODE = '23514';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER relay_credentials_lineage_acyclic
+AFTER INSERT OR UPDATE OF predecessor_credential_id ON relay_credentials
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION prevent_credential_lineage_cycle();
 
 -- Service accounts are explicit team-scoped service principals.  Membership
 -- grants remain separate: creation intentionally confers no authorization.

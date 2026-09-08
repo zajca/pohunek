@@ -1270,7 +1270,7 @@ impl AuthService {
         if old_revoked_at.is_some()
             || old_recovery_generation != context.recovery_generation()
             || old_expires_at <= evaluated_at
-            || old_overlap_ends_at.is_some_and(|ends_at| ends_at <= evaluated_at)
+            || old_overlap_ends_at.is_some()
         {
             self.commit_rotation_rejection(transaction, context).await?;
             return Err(AuthError::RotationRejected);
@@ -1306,7 +1306,7 @@ impl AuthService {
              AND r.state = 'normal' AND c.recovery_generation = r.recovery_generation \
              AND $3::timestamptz > statement_timestamp() \
              AND c.expires_at >= statement_timestamp() + $2::interval \
-             AND (c.rotation_overlap_ends_at IS NULL OR c.rotation_overlap_ends_at > statement_timestamp())",
+             AND c.rotation_overlap_ends_at IS NULL",
         )
         .bind(old_id)
         .bind(interval(overlap))
@@ -2593,6 +2593,33 @@ pub(crate) mod tests {
             .expect("remove isolated schema");
     }
 
+    async fn apply_restored_credential_change(
+        store: &Store,
+        credential_id: Uuid,
+        assignment: &'static str,
+    ) {
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .expect("begin restored-credential fixture");
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *transaction)
+            .await
+            .expect("suppress constraints only for restored-credential fixture");
+        sqlx::query(AssertSqlSafe(format!(
+            "UPDATE relay_credentials SET {assignment} WHERE credential_id = $1"
+        )))
+        .bind(credential_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("apply restored credential change");
+        transaction
+            .commit()
+            .await
+            .expect("commit restored-credential fixture");
+    }
+
     pub(crate) async fn authority(store: Store) -> (Arc<Authority>, tempfile::TempDir) {
         let directory = tempfile::tempdir().expect("create witness directory");
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
@@ -2759,13 +2786,12 @@ pub(crate) mod tests {
                 .await,
             Err(AuthError::RotationRejected)
         ));
-        sqlx::query(
-            "UPDATE relay_credentials SET expires_at = clock_timestamp() + interval '10 seconds' WHERE credential_id = $1",
+        apply_restored_credential_change(
+            &store,
+            credential_id,
+            "expires_at = clock_timestamp() + interval '10 seconds'",
         )
-        .bind(credential_id)
-        .execute(store.pool())
-        .await
-        .expect("shorten old credential for overlap policy test");
+        .await;
         let insufficient_remaining_lifetime = RotateCredentialRequest {
             overlap_seconds: 30,
             idempotency: relay_protocol::Idempotency {
@@ -2786,13 +2812,12 @@ pub(crate) mod tests {
                 .await,
             Err(AuthError::RotationRejected)
         ));
-        sqlx::query(
-            "UPDATE relay_credentials SET expires_at = clock_timestamp() + interval '1 hour' WHERE credential_id = $1",
+        apply_restored_credential_change(
+            &store,
+            credential_id,
+            "expires_at = clock_timestamp() + interval '1 hour'",
         )
-        .bind(credential_id)
-        .execute(store.pool())
-        .await
-        .expect("restore old credential after overlap policy test");
+        .await;
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM relay_credentials WHERE principal_id = $1"
@@ -2855,12 +2880,78 @@ pub(crate) mod tests {
             .rotate_credential(
                 replay_actor,
                 CredentialId::from_uuid(credential_id),
-                request,
+                request.clone(),
             )
             .await
             .expect("exact replay succeeds");
         assert_eq!(replay.record.credential_id, new_id);
         assert!(replay.credential.is_none());
+        let effects_before_repeat = (
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM relay_credentials")
+                .fetch_one(store.pool())
+                .await
+                .expect("count credentials before repeated rotation"),
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM audit_events WHERE action = 'auth.credential.rotate'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count audits before repeated rotation"),
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM mutation_receipts WHERE action = 'auth.credential.rotate'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count receipts before repeated rotation"),
+            authority
+                .witness_sequence()
+                .expect("read witness before repeated rotation"),
+        );
+        let rejected_repeat = service
+            .rotate_credential(
+                service
+                    .authenticate_bearer(RelayBearerCredential::new(format!(
+                        "{credential_id}.{secret}"
+                    )))
+                    .await
+                    .expect("old overlap remains current for repeat rejection"),
+                CredentialId::from_uuid(credential_id),
+                RotateCredentialRequest {
+                    idempotency: relay_protocol::Idempotency {
+                        correlation_id: Uuid::now_v7(),
+                        idempotency_key: Uuid::now_v7(),
+                    },
+                    ..request
+                },
+            )
+            .await;
+        assert!(matches!(rejected_repeat, Err(AuthError::RotationRejected)));
+        assert_eq!(
+            (
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM relay_credentials")
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("count credentials after repeated rotation"),
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM audit_events WHERE action = 'auth.credential.rotate'",
+                )
+                .fetch_one(store.pool())
+                .await
+                .expect("count audits after repeated rotation"),
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM mutation_receipts WHERE action = 'auth.credential.rotate'",
+                )
+                .fetch_one(store.pool())
+                .await
+                .expect("count receipts after repeated rotation"),
+                authority.witness_sequence().expect("read witness after repeated rotation"),
+            ),
+            effects_before_repeat
+        );
+        assert!(
+            !authority.is_closed(),
+            "repeat rejection keeps authority live"
+        );
         service
             .authenticate_bearer(RelayBearerCredential::new(format!(
                 "{}.{},",
@@ -3486,14 +3577,14 @@ pub(crate) mod tests {
             .execute(store.pool())
             .await
             .expect("seed service account");
-        sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,recovery_generation,issued_at,expires_at) VALUES ($1,$2,$3,$4,$5,'test','human',1,2,clock_timestamp()-interval '2 hours',clock_timestamp()+interval '1 hour'),($6,$7,decode(repeat('01',32),'hex'),$4,$5,'test','human',1,1,clock_timestamp()-interval '2 hours',clock_timestamp()+interval '1 hour'),($8,$9,decode(repeat('02',32),'hex'),$4,$5,'test','human',1,2,clock_timestamp()-interval '2 hours',clock_timestamp()-interval '1 second'),($10,$11,decode(repeat('03',32),'hex'),$12,$13,'test','human',1,1,clock_timestamp()-interval '2 hours',clock_timestamp()+interval '1 hour'),($14,$15,decode(repeat('04',32),'hex'),$16,NULL,'test','service',1,1,clock_timestamp()-interval '2 hours',clock_timestamp()+interval '1 hour')")
+        sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,issued_at,expires_at) VALUES ($1,$2,$3,$4,$5,'test','human',1,$1,2,clock_timestamp()-interval '2 hours',clock_timestamp()+interval '1 hour'),($6,$7,decode(repeat('01',32),'hex'),$4,$5,'test','human',1,$6,1,clock_timestamp()-interval '2 hours',clock_timestamp()+interval '1 hour'),($8,$9,decode(repeat('02',32),'hex'),$4,$5,'test','human',1,$8,2,clock_timestamp()-interval '2 hours',clock_timestamp()-interval '1 second'),($10,$11,decode(repeat('03',32),'hex'),$12,$13,'test','human',1,$10,1,clock_timestamp()-interval '2 hours',clock_timestamp()+interval '1 hour'),($14,$15,decode(repeat('04',32),'hex'),$16,NULL,'test','service',1,$14,1,clock_timestamp()-interval '2 hours',clock_timestamp()+interval '1 hour')")
             .bind(current_id).bind(current_id.to_string()).bind(service.digest_key.digest(current_secret).as_slice()).bind(principal_id).bind(identity_id)
             .bind(stale_id).bind(stale_id.to_string())
             .bind(expired_id).bind(expired_id.to_string())
             .bind(foreign_id).bind(foreign_id.to_string()).bind(foreign_principal_id).bind(foreign_identity_id)
             .bind(service_stale_id).bind(service_stale_id.to_string()).bind(service_principal_id)
             .execute(store.pool()).await.expect("seed current and inactive credentials");
-        sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,recovery_generation,rotation_overlap_ends_at,expires_at) VALUES ($1,$2,decode(repeat('05',32),'hex'),$3,$4,'test','human',1,2,clock_timestamp()-interval '1 second',clock_timestamp()+interval '1 hour'),($5,$6,decode(repeat('06',32),'hex'),$7,NULL,'test','service',1,2,clock_timestamp()-interval '1 second',clock_timestamp()+interval '1 hour')")
+        sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,rotation_overlap_ends_at,expires_at) VALUES ($1,$2,decode(repeat('05',32),'hex'),$3,$4,'test','human',1,$1,2,clock_timestamp()-interval '1 second',clock_timestamp()+interval '1 hour'),($5,$6,decode(repeat('06',32),'hex'),$7,NULL,'test','service',1,$5,2,clock_timestamp()-interval '1 second',clock_timestamp()+interval '1 hour')")
             .bind(elapsed_overlap_id)
             .bind(elapsed_overlap_id.to_string())
             .bind(principal_id)
@@ -3650,7 +3741,7 @@ pub(crate) mod tests {
             .execute(store.pool())
             .await
             .expect("seed identity");
-        sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,recovery_generation,rotation_overlap_ends_at,expires_at) VALUES ($1,$2,$3,$4,$5,'test','human',1,1,NULL,clock_timestamp()+interval '2 seconds'),($6,$7,decode(repeat('07',32),'hex'),$4,$5,'test','human',1,1,NULL,clock_timestamp()+interval '2 seconds')")
+        sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,rotation_overlap_ends_at,expires_at) VALUES ($1,$2,$3,$4,$5,'test','human',1,$1,1,NULL,clock_timestamp()+interval '2 seconds'),($6,$7,decode(repeat('07',32),'hex'),$4,$5,'test','human',1,$6,1,NULL,clock_timestamp()+interval '2 seconds')")
             .bind(actor_credential_id)
             .bind(actor_credential_id.to_string())
             .bind(service.digest_key.digest(secret).as_slice())
@@ -4402,7 +4493,7 @@ pub(crate) mod tests {
         .await
         .expect("seed infrastructure principal");
         sqlx::query("INSERT INTO oidc_identities (identity_id,issuer,subject,principal_id,link_generation) VALUES ($1,'issuer','infra',$2,1)").bind(identity_id).bind(principal_id).execute(store.pool()).await.expect("seed identity");
-        sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,recovery_generation,expires_at) VALUES ($1,$2,$3,$4,$5,'test','human',1,1,clock_timestamp()+interval '1 hour')")
+        sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,expires_at) VALUES ($1,$2,$3,$4,$5,'test','human',1,$1,1,clock_timestamp()+interval '1 hour')")
             .bind(credential_id)
             .bind(credential_id.to_string())
             .bind(service.digest_key.digest(secret).as_slice())
@@ -4464,7 +4555,7 @@ pub(crate) mod tests {
         .await
         .expect("seed principal");
         sqlx::query("INSERT INTO oidc_identities (identity_id,issuer,subject,principal_id,link_generation) VALUES ($1,'issuer','revoked',$2,1)").bind(identity).bind(principal).execute(store.pool()).await.expect("seed identity");
-        sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,recovery_generation,expires_at,revoked_at) VALUES ($1,$2,decode(repeat('03',32),'hex'),$3,$4,'test','human',1,1,clock_timestamp()+interval '1 hour',clock_timestamp())")
+        sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,expires_at,revoked_at) VALUES ($1,$2,decode(repeat('03',32),'hex'),$3,$4,'test','human',1,$1,1,clock_timestamp()+interval '1 hour',clock_timestamp())")
             .bind(credential)
             .bind(credential.to_string())
             .bind(principal)
@@ -4537,13 +4628,7 @@ pub(crate) mod tests {
             sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,expires_at) VALUES ($1,$2,$3,$4,$5,'test','human',1,$1,$6,clock_timestamp()+interval '1 hour')")
                 .bind(target_id).bind(target_id.to_string()).bind(service.digest_key.digest(&format!("inactive-target-{label}")).as_slice()).bind(principal_id).bind(identity_id).bind(target_generation)
                 .execute(store.pool()).await.expect("seed inactive target");
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "UPDATE relay_credentials SET {state_sql} WHERE credential_id=$1"
-            )))
-            .bind(target_id)
-            .execute(store.pool())
-            .await
-            .expect("make target inactive");
+            apply_restored_credential_change(&store, target_id, state_sql).await;
             let actor = service
                 .authenticate_bearer(RelayBearerCredential::new(format!("{actor_id}.{secret}")))
                 .await

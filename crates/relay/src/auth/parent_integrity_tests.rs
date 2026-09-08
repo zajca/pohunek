@@ -66,6 +66,31 @@ async fn insert_credential(
         .expect("seed credential");
 }
 
+async fn insert_lineage_credential(
+    store: &Store,
+    digest_key: &DigestKey,
+    credential_id: Uuid,
+    principal_id: Uuid,
+    identity_id: Option<Uuid>,
+    kind: &str,
+    secret: &str,
+    family_id: Uuid,
+    predecessor_id: Option<Uuid>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,predecessor_credential_id,recovery_generation,expires_at) VALUES ($1,$2,$3,$4,$5,'test',$6,1,$7,$8,1,clock_timestamp()+interval '1 hour')")
+        .bind(credential_id)
+        .bind(credential_id.to_string())
+        .bind(digest_key.digest(secret).as_slice())
+        .bind(principal_id)
+        .bind(identity_id)
+        .bind(kind)
+        .bind(family_id)
+        .bind(predecessor_id)
+        .execute(store.pool())
+        .await
+        .map(|_| ())
+}
+
 async fn insert_service_credential_for_race(
     transaction: &mut Transaction<'_, Postgres>,
     credential_id: Uuid,
@@ -457,5 +482,295 @@ async fn service_account_parent_integrity_denies_deprovisioned_or_missing_creden
             .await,
         Err(AuthError::CredentialInvalid)
     ));
+    cleanup(&bootstrap, &schema).await;
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "The lineage constraints require coordinated human and service PostgreSQL fixtures."
+)]
+async fn credential_lineage_constraints_enforce_immutable_linear_provenance() {
+    let (store, schema, bootstrap) = fixture().await;
+    let digest_key = DigestKey::new("test".into(), b"lineage-constraint-key".to_vec());
+    let human = Uuid::now_v7();
+    let other_human = Uuid::now_v7();
+    let service = Uuid::now_v7();
+    let identity = Uuid::now_v7();
+    let other_identity = Uuid::now_v7();
+    let team = Uuid::now_v7();
+    insert_principal(&store, human, "human").await;
+    insert_principal(&store, other_human, "human").await;
+    insert_principal(&store, service, "service").await;
+    insert_identity(&store, identity, human, "lineage-human").await;
+    insert_identity(&store, other_identity, other_human, "lineage-other-human").await;
+    insert_team(&store, team, "lineage-team").await;
+    sqlx::query("INSERT INTO service_accounts (principal_id,team_id,display_name) VALUES ($1,$2,'lineage-service')")
+        .bind(service)
+        .bind(team)
+        .execute(store.pool())
+        .await
+        .expect("seed service account");
+
+    let human_root = Uuid::now_v7();
+    let other_human_root = Uuid::now_v7();
+    let human_child = Uuid::now_v7();
+    let human_grandchild = Uuid::now_v7();
+    insert_lineage_credential(
+        &store,
+        &digest_key,
+        human_root,
+        human,
+        Some(identity),
+        "human",
+        "lineage-human-root",
+        human_root,
+        None,
+    )
+    .await
+    .expect("insert human root");
+    insert_lineage_credential(
+        &store,
+        &digest_key,
+        other_human_root,
+        human,
+        Some(identity),
+        "human",
+        "lineage-human-other-root",
+        other_human_root,
+        None,
+    )
+    .await
+    .expect("insert second human root");
+    insert_lineage_credential(
+        &store,
+        &digest_key,
+        human_child,
+        human,
+        Some(identity),
+        "human",
+        "lineage-human-child",
+        human_root,
+        Some(human_root),
+    )
+    .await
+    .expect("insert human child");
+    insert_lineage_credential(
+        &store,
+        &digest_key,
+        human_grandchild,
+        human,
+        Some(identity),
+        "human",
+        "lineage-human-grandchild",
+        human_root,
+        Some(human_child),
+    )
+    .await
+    .expect("insert human grandchild");
+
+    let service_root = Uuid::now_v7();
+    let other_service_root = Uuid::now_v7();
+    let service_child = Uuid::now_v7();
+    insert_lineage_credential(
+        &store,
+        &digest_key,
+        service_root,
+        service,
+        None,
+        "service",
+        "lineage-service-root",
+        service_root,
+        None,
+    )
+    .await
+    .expect("insert service root");
+    insert_lineage_credential(
+        &store,
+        &digest_key,
+        other_service_root,
+        service,
+        None,
+        "service",
+        "lineage-service-other-root",
+        other_service_root,
+        None,
+    )
+    .await
+    .expect("insert second service root");
+    insert_lineage_credential(
+        &store,
+        &digest_key,
+        service_child,
+        service,
+        None,
+        "service",
+        "lineage-service-child",
+        service_root,
+        Some(service_root),
+    )
+    .await
+    .expect("insert service child");
+
+    for (credential_id, principal_id, identity_id, kind, family_id, predecessor_id, label) in [
+        (
+            Uuid::now_v7(),
+            human,
+            Some(identity),
+            "human",
+            Uuid::now_v7(),
+            None,
+            "root family must be self",
+        ),
+        (
+            Uuid::now_v7(),
+            human,
+            Some(identity),
+            "human",
+            human_root,
+            Some(Uuid::now_v7()),
+            "missing predecessor rejected",
+        ),
+        (
+            Uuid::now_v7(),
+            other_human,
+            Some(other_identity),
+            "human",
+            human_root,
+            Some(human_root),
+            "cross-principal parent rejected",
+        ),
+        (
+            Uuid::now_v7(),
+            human,
+            Some(identity),
+            "human",
+            other_human_root,
+            Some(human_root),
+            "cross-family parent rejected",
+        ),
+        (
+            Uuid::now_v7(),
+            service,
+            None,
+            "service",
+            other_service_root,
+            Some(service_root),
+            "service child cannot bypass null identity parent checks",
+        ),
+    ] {
+        insert_lineage_credential(
+            &store,
+            &digest_key,
+            credential_id,
+            principal_id,
+            identity_id,
+            kind,
+            &format!("invalid-lineage-{credential_id}"),
+            family_id,
+            predecessor_id,
+        )
+        .await
+        .expect_err(label);
+    }
+    insert_lineage_credential(
+        &store,
+        &digest_key,
+        Uuid::now_v7(),
+        human,
+        Some(identity),
+        "human",
+        "duplicate-predecessor",
+        human_root,
+        Some(human_root),
+    )
+    .await
+    .expect_err("a predecessor has only one successor");
+    let self_referential = Uuid::now_v7();
+    insert_lineage_credential(
+        &store,
+        &digest_key,
+        self_referential,
+        human,
+        Some(identity),
+        "human",
+        "self-referential",
+        human_root,
+        Some(self_referential),
+    )
+    .await
+    .expect_err("a child cannot name itself as its predecessor");
+
+    for statement in [
+        "UPDATE relay_credentials SET public_id = 'changed' WHERE credential_id = $1",
+        "UPDATE relay_credentials SET secret_digest = decode(repeat('aa',32),'hex') WHERE credential_id = $1",
+        "UPDATE relay_credentials SET principal_id = $2 WHERE credential_id = $1",
+        "UPDATE relay_credentials SET identity_id = $3 WHERE credential_id = $1",
+        "UPDATE relay_credentials SET rotation_family_id = $1 WHERE credential_id = $1",
+        "UPDATE relay_credentials SET predecessor_credential_id = NULL WHERE credential_id = $1",
+        "UPDATE relay_credentials SET expires_at = expires_at + interval '1 minute' WHERE credential_id = $1",
+    ] {
+        let result = sqlx::query(sqlx::AssertSqlSafe(statement.to_owned()))
+            .bind(human_child)
+            .bind(other_human)
+            .bind(other_identity)
+            .execute(store.pool())
+            .await;
+        assert!(result.is_err(), "immutable credential field rejected: {statement}");
+    }
+    sqlx::query("UPDATE relay_credentials SET rotation_overlap_ends_at = clock_timestamp() + interval '1 minute', credential_generation = credential_generation + 1, last_used_at = clock_timestamp(), revoked_at = clock_timestamp() WHERE credential_id = $1")
+        .bind(human_child)
+        .execute(store.pool())
+        .await
+        .expect("operational credential fields remain mutable");
+    cleanup(&bootstrap, &schema).await;
+}
+
+#[tokio::test]
+async fn credential_lineage_rejects_deferred_two_row_cycles() {
+    let (store, schema, bootstrap) = fixture().await;
+    let digest_key = DigestKey::new("test".into(), b"lineage-cycle-key".to_vec());
+    let principal = Uuid::now_v7();
+    let identity = Uuid::now_v7();
+    insert_principal(&store, principal, "human").await;
+    insert_identity(&store, identity, principal, "lineage-cycle").await;
+    let root = Uuid::now_v7();
+    insert_lineage_credential(
+        &store,
+        &digest_key,
+        root,
+        principal,
+        Some(identity),
+        "human",
+        "cycle-root",
+        root,
+        None,
+    )
+    .await
+    .expect("insert root");
+    let left = Uuid::now_v7();
+    let right = Uuid::now_v7();
+    let mut transaction = store.pool().begin().await.expect("begin cycle transaction");
+    sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,predecessor_credential_id,recovery_generation,expires_at) VALUES ($1,$1::text,$2,$3,$4,'test','human',1,$5,$6,1,clock_timestamp()+interval '1 hour'),($6,$6::text,$7,$3,$4,'test','human',1,$5,$1,1,clock_timestamp()+interval '1 hour')")
+        .bind(left)
+        .bind(digest_key.digest("cycle-left").as_slice())
+        .bind(principal)
+        .bind(identity)
+        .bind(root)
+        .bind(right)
+        .bind(digest_key.digest("cycle-right").as_slice())
+        .execute(&mut *transaction)
+        .await
+        .expect("stage two-row lineage cycle");
+    let error = transaction
+        .commit()
+        .await
+        .expect_err("deferred cycle check rejects mutually-referential children");
+    assert!(
+        error
+            .to_string()
+            .contains("credential lineage cannot contain a cycle"),
+        "commit failed through the lineage cycle constraint: {error}"
+    );
     cleanup(&bootstrap, &schema).await;
 }
