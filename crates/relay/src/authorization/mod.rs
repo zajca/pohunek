@@ -139,7 +139,7 @@ pub(crate) async fn verify_current_actor(
     }
     let present = match actor.binding() {
         AuthenticationBinding::Credential => sqlx::query_scalar::<_, Uuid>(
-            "SELECT principal_id FROM relay_credentials WHERE credential_id = $1 AND principal_id = $2 AND credential_generation = $3 AND recovery_generation = $4 AND revoked_at IS NULL AND expires_at > clock_timestamp() AND (rotation_overlap_ends_at IS NULL OR rotation_overlap_ends_at > clock_timestamp()) FOR SHARE",
+            "SELECT c.principal_id FROM relay_credentials c WHERE c.credential_id = $1 AND c.principal_id = $2 AND c.credential_generation = $3 AND c.recovery_generation = $4 AND c.revoked_at IS NULL AND c.expires_at > clock_timestamp() AND (c.rotation_overlap_ends_at IS NULL OR c.rotation_overlap_ends_at > clock_timestamp()) AND (c.credential_kind <> 'service' OR EXISTS (SELECT 1 FROM service_accounts s WHERE s.principal_id = c.principal_id AND s.deprovisioned_at IS NULL FOR SHARE)) FOR SHARE",
         ).bind(actor.authentication_id()).bind(actor.principal_id())
             .bind(actor.authentication_generation()).bind(actor.recovery_generation())
             .fetch_optional(&mut **transaction).await.map_err(StoreError::Database)?,

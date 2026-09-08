@@ -810,7 +810,8 @@ impl AuthService {
              WHERE c.public_id = $1 AND c.secret_digest = $2 AND c.digest_key_id = $3 \
              AND c.revoked_at IS NULL AND c.expires_at > clock_timestamp() \
              AND (c.rotation_overlap_ends_at IS NULL OR c.rotation_overlap_ends_at > clock_timestamp()) \
-             AND p.state = 'active' AND c.recovery_generation = r.recovery_generation",
+             AND p.state = 'active' AND c.recovery_generation = r.recovery_generation \
+             AND (c.credential_kind <> 'service' OR EXISTS (SELECT 1 FROM service_accounts s WHERE s.principal_id = c.principal_id AND s.deprovisioned_at IS NULL))",
         )
         .bind(public_id)
         .bind(digest.as_slice())
@@ -2308,7 +2309,8 @@ async fn touch_credential(
          WHERE c.credential_id = $1 AND c.principal_id = p.id AND p.state = 'active' \
          AND r.state = 'normal' AND c.recovery_generation = r.recovery_generation \
          AND c.revoked_at IS NULL AND c.expires_at > clock_timestamp() \
-         AND (c.rotation_overlap_ends_at IS NULL OR c.rotation_overlap_ends_at > clock_timestamp())",
+         AND (c.rotation_overlap_ends_at IS NULL OR c.rotation_overlap_ends_at > clock_timestamp()) \
+         AND (c.credential_kind <> 'service' OR EXISTS (SELECT 1 FROM service_accounts s WHERE s.principal_id = c.principal_id AND s.deprovisioned_at IS NULL))",
     )
     .bind(credential_id)
     .execute(&mut **transaction)

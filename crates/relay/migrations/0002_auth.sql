@@ -1,6 +1,19 @@
 -- Relay authentication: OIDC transactions, opaque browser sessions, and credential digests.
 -- Raw OAuth values and bearer secrets intentionally never cross this persistence boundary.
 
+CREATE FUNCTION prevent_principal_kind_change() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.kind IS DISTINCT FROM OLD.kind THEN
+        RAISE EXCEPTION 'principal kind is immutable' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER principals_kind_immutable
+BEFORE UPDATE OF kind ON principals
+FOR EACH ROW EXECUTE FUNCTION prevent_principal_kind_change();
+
 CREATE TABLE oidc_identities (
     identity_id UUID PRIMARY KEY,
     issuer TEXT NOT NULL CHECK (char_length(issuer) BETWEEN 1 AND 2048),
@@ -13,16 +26,34 @@ CREATE TABLE oidc_identities (
     , UNIQUE (identity_id, principal_id)
 );
 
+CREATE FUNCTION enforce_oidc_identity_principal_kind() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM principals
+        WHERE id = NEW.principal_id AND kind IN ('human', 'infrastructure')
+    ) THEN
+        RAISE EXCEPTION 'OIDC identity principal must have human or infrastructure kind' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER oidc_identities_require_human_or_infrastructure_principal
+BEFORE INSERT OR UPDATE OF principal_id ON oidc_identities
+FOR EACH ROW EXECUTE FUNCTION enforce_oidc_identity_principal_kind();
+
 CREATE TABLE account_link_transactions (
     link_id UUID PRIMARY KEY,
     principal_id UUID NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
-    source_identity_id UUID NOT NULL REFERENCES oidc_identities(identity_id) ON DELETE RESTRICT,
+    source_identity_id UUID NOT NULL,
     account_link_generation BIGINT NOT NULL CHECK (account_link_generation > 0),
     recovery_generation BIGINT NOT NULL CHECK (recovery_generation > 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     expires_at TIMESTAMPTZ NOT NULL,
     completed_at TIMESTAMPTZ,
-    CHECK (expires_at > created_at)
+    CHECK (expires_at > created_at),
+    FOREIGN KEY (source_identity_id, principal_id)
+        REFERENCES oidc_identities(identity_id, principal_id) ON DELETE RESTRICT
 );
 
 CREATE TABLE browser_logins (
@@ -147,6 +178,36 @@ $$;
 CREATE TRIGGER service_accounts_require_service_principal
 BEFORE INSERT OR UPDATE OF principal_id ON service_accounts
 FOR EACH ROW EXECUTE FUNCTION enforce_service_account_principal();
+
+CREATE FUNCTION prevent_service_account_reparenting() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.principal_id IS DISTINCT FROM OLD.principal_id
+       OR NEW.team_id IS DISTINCT FROM OLD.team_id THEN
+        RAISE EXCEPTION 'service account principal and team are immutable' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER service_accounts_identity_immutable
+BEFORE UPDATE OF principal_id, team_id ON service_accounts
+FOR EACH ROW EXECUTE FUNCTION prevent_service_account_reparenting();
+
+CREATE FUNCTION prevent_service_account_credential_orphan() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM relay_credentials
+        WHERE principal_id = OLD.principal_id AND credential_kind = 'service'
+    ) THEN
+        RAISE EXCEPTION 'service account with credentials cannot be deleted' USING ERRCODE = '23503';
+    END IF;
+    RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER service_accounts_prevent_credential_orphan
+BEFORE DELETE ON service_accounts
+FOR EACH ROW EXECUTE FUNCTION prevent_service_account_credential_orphan();
 
 CREATE FUNCTION enforce_credential_principal_kind() RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN

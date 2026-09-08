@@ -190,14 +190,15 @@ async fn durable_quarantine_and_manifest_bind_service_and_credential_authority()
     }
     assert!(wire.contains("secret_digest_commitment"));
     assert!(wire.contains("service_account"));
+    // Normal writers cannot reparent a service account. This explicitly models
+    // a restored corrupt database so recovery still detects that parent change.
+    set_restored_service_account_team(&store, service, other_team).await;
+    assert!(matches!(
+        lifecycle.reopen_local(&advanced, &reviewed).await,
+        Err(LifecycleError::ManifestMismatch)
+    ));
+    set_restored_service_account_team(&store, service, team).await;
     let changes = [
-        (
-            "UPDATE service_accounts SET team_id=$1 WHERE principal_id=$2",
-            other_team,
-            service,
-            "UPDATE service_accounts SET team_id=$1 WHERE principal_id=$2",
-            team,
-        ),
         (
             "UPDATE relay_credentials SET identity_id=$1 WHERE credential_id=$2",
             second_identity,
@@ -290,4 +291,21 @@ async fn durable_quarantine_and_manifest_bind_service_and_credential_authority()
         .await
         .expect("reviewed reopen");
     cleanup(&pool, &schema).await;
+}
+
+async fn set_restored_service_account_team(store: &Store, principal_id: Uuid, team_id: Uuid) {
+    sqlx::query("ALTER TABLE service_accounts DISABLE TRIGGER service_accounts_identity_immutable")
+        .execute(store.pool())
+        .await
+        .expect("allow explicit restored-corruption fixture");
+    sqlx::query("UPDATE service_accounts SET team_id=$1 WHERE principal_id=$2")
+        .bind(team_id)
+        .bind(principal_id)
+        .execute(store.pool())
+        .await
+        .expect("set restored-corruption service-account team");
+    sqlx::query("ALTER TABLE service_accounts ENABLE TRIGGER service_accounts_identity_immutable")
+        .execute(store.pool())
+        .await
+        .expect("restore service-account reparenting protection");
 }

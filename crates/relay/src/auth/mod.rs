@@ -11,6 +11,9 @@ mod pending;
 mod secret;
 pub(crate) mod service;
 
+#[cfg(all(test, feature = "postgres-tests"))]
+mod parent_integrity_tests;
+
 use secret::SecretValue;
 
 #[doc(inline)]
