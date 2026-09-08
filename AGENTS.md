@@ -32,7 +32,11 @@ Hard constraints, decided on purpose — respect them in every change:
   trusted Rust `pohunek-relayd` authority for teams, end-user authorization,
   routing, audit, and quotas. Each host remains authoritative for its PTYs,
   processes, worktrees, session origin, and locally approved `HostShare`
-  ceilings. See the [accepted RFC](docs/design/team-relay-control-plane-rfc.md)
+  ceilings. The first release trusts collaborators at the host Unix-account
+  boundary: relay ACLs constrain relay actions but are not workload isolation;
+  [#88](https://github.com/zajca/pohunek/issues/88) owns that later boundary.
+  See the [accepted RFC](docs/design/team-relay-control-plane-rfc.md), especially
+  its identity, recovery, scheduling, catalog, audit, and dependency sections,
   and [#85](https://github.com/zajca/pohunek/issues/85); neither the relay binary
   nor team mode is shipped yet.
 - **PTY/TUI-first.** Agents run in real terminals (Codex, Claude Code, and the
@@ -239,9 +243,11 @@ feature — `--all-features` only covers the everything-on case.
   `cargo test -p pohunek-cli` and `cargo xtask docs check` before the full gates.
 - Comments and all repository text are in **English**.
 
-The first complete team-relay release intentionally runs direct-host profiles
-under the daemon owner's account. Real profile-backed container and VM
-isolation is a post-release track owned by
+The first complete team-relay release intentionally trusts collaborators at the
+host Unix-account boundary. Relay API ACLs are authorization controls, not
+command or hostile-workload isolation: direct-host profiles run under the
+daemon owner's account. Real profile-backed container and VM isolation is a
+post-release track owned by
 [#88](https://github.com/zajca/pohunek/issues/88); do not call the relay track a
 PoC or imply that current direct-host execution is a hostile-workload sandbox.
 

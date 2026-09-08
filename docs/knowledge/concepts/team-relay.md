@@ -40,12 +40,16 @@ at the same time. NetBird is neither replaced nor required by the relay.
 to the relay's public UDP endpoint and then initiates every control and attach
 TCP stream inside that tunnel. The relay never dials a host, and neither side
 needs a kernel WireGuard interface or `CAP_NET_ADMIN`. One host can have at most
-one active relay enrollment.
+one active relay enrollment. Human CLI authorization and host enrollment use
+OIDC device flow; browser login uses Authorization Code with PKCE. There is no
+loopback login fallback.
 
-The planned transport uses pinned released BoringTun and smoltcp dependencies.
-Protocol v4 will reuse Pohunek's typed NDJSON daemon operations and separate raw
-attach streams across the host-initiated link. There is no planned v3
-compatibility shim for that relay path.
+The planned transport has a pinned BoringTun/smoltcp evaluation profile.
+Padding, connectivity, MTU, rekey, NAT, idle, buffer, timer, privilege, and
+exact-version claims remain evidence to verify, not shipped capabilities or test
+results. RFC §10 assigns the contract and #72 owns implementation. Protocol v4
+will reuse typed NDJSON operations and separate raw attach streams; there is no
+v3 compatibility shim for that relay path.
 
 ## Ownership and sharing
 
@@ -68,6 +72,13 @@ usage, and future container or VM execution backends. Reversible suspension or
 terminal revocation removes relay access immediately without stopping existing
 sessions. A revoked `HostShareId` is never reused; a later approval gets a new
 ID and cannot republish sessions carrying the revoked origin.
+
+The first relay release trusts collaborators at the host Unix-account boundary.
+Relay API ACLs restrict relay actions but do not isolate commands or hostile
+workloads running under the daemon owner. #88 owns profile-backed container and
+VM isolation after release. RFC §12 defines immutable approved resources,
+revalidation, and session origin; this concept does not define a second resource
+or authorization contract.
 
 The daemon authenticates the enrolled relay and enforces the local share and
 session-origin ceiling. It does not know or authorize end users, service
@@ -101,33 +112,40 @@ protect against an operator with process access. Direct-host profiles also run
 under the daemon owner's account and are not hostile-workload isolation;
 container and VM isolation remains separate future work.
 
-Relay identity, authorization, catalog, and structured audit metadata are
-PostgreSQL-only. PTY output, input, prompts, terminal snapshots, file contents,
-and raw secrets are never persisted by the relay or included in its logs or
-audit records.
+Relay identity, authorization, catalog, and structured audit metadata will be
+PostgreSQL-only. #85 supplies durable audit and admission foundations, including
+fail-closed sensitive admission when its durable decision/audit store is
+unavailable; #87 supplies operational retention and load evidence. PTY output,
+input, prompts, terminal snapshots, file contents, and raw secrets are never
+persisted by the relay or included in its logs or audit records. RFC §19 defines
+recovery generation, while §17 defines catalog retention, audit, and admission.
 
-State recovery uses one host-scoped subscription: subscription-first
-registration is followed by an atomic snapshot of every active share, with one
-epoch, sequence, and watermark for that host link. The daemon keeps no relay
-replay log. Any gap, overflow, epoch change, malformed event, or reconnect
-causes the relay to discard the live cache and perform a bounded full snapshot.
+Recovery uses one host-scoped subscription and the relay must discard its live
+cache after a gap, overflow, epoch change, malformed event, or reconnect. The
+ordered-writer, bounded in-flight, cancellation, fairness, snapshot installation,
+and convergence rules are in RFC §§11 and 16. A snapshot is not offline history.
 Relay outages do not stop host sessions or affect local and NetBird owner
 operation; revoked-share sessions continue permanently as owner-only.
 
 ## Implementation references
 
-The complete contract is in
-`docs/design/team-relay-control-plane-rfc.md`; use the
+The complete normative contract is in
+`docs/design/team-relay-control-plane-rfc.md`, especially its identity,
+recovery, scheduling, resource, snapshot, catalog, audit, and dependency
+sections; use the
 [source map](../assistant/source-map.md) to locate it in a source checkout. The
 umbrella is [#56](https://github.com/zajca/pohunek/issues/56); implementation is
-split among host identity [#81](https://github.com/zajca/pohunek/issues/81),
-relay foundation [#85](https://github.com/zajca/pohunek/issues/85), transport
-[#72](https://github.com/zajca/pohunek/issues/72), protocol v4
+split among completed host identity [#81](https://github.com/zajca/pohunek/issues/81),
+relay foundation [#85](https://github.com/zajca/pohunek/issues/85), verified
+Keycloak-brokered external evidence [#92](https://github.com/zajca/pohunek/issues/92),
+then transport [#72](https://github.com/zajca/pohunek/issues/72), protocol v4
 [#70](https://github.com/zajca/pohunek/issues/70), shares
 [#82](https://github.com/zajca/pohunek/issues/82), session authorization
 [#83](https://github.com/zajca/pohunek/issues/83), synchronization
 [#84](https://github.com/zajca/pohunek/issues/84), relay routing
 [#71](https://github.com/zajca/pohunek/issues/71), clients
-[#86](https://github.com/zajca/pohunek/issues/86), and operations
-[#87](https://github.com/zajca/pohunek/issues/87). Until those issues land,
+[#86](https://github.com/zajca/pohunek/issues/86), operations
+[#87](https://github.com/zajca/pohunek/issues/87), then provider delivery
+[#73](https://github.com/zajca/pohunek/issues/73) and workload isolation
+[#88](https://github.com/zajca/pohunek/issues/88). Until those issues land,
 `docs/public-api.md` is authoritative for shipped v3 behavior.

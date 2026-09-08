@@ -45,8 +45,9 @@ The following invariants span both domains:
 | Direct configured-overlay operation, including NetBird | Shipped in public protocol v3 | Existing daemon and clients; generic overlay work completed in [#69](https://github.com/zajca/pohunek/issues/69) |
 | Local/direct-overlay transparent Bun browser backend | Shipped and retained owner-path client transport | Existing `web/backend`; team web mode is separate work in [#86](https://github.com/zajca/pohunek/issues/86) |
 | Stable host identity, one exact principal-or-team owner, checked revisions, local lifecycle, and safe v3 inspection | Shipped host-local foundation; no relay API or mutation surface | [#81](https://github.com/zajca/pohunek/issues/81) |
-| Rust relay foundation, PostgreSQL, OIDC, principals, teams, roles, and service accounts | Accepted, not implemented | [#85](https://github.com/zajca/pohunek/issues/85) |
-| Host-initiated userspace WireGuard link | Accepted, not implemented | [#72](https://github.com/zajca/pohunek/issues/72) |
+| Rust relay foundation, PostgreSQL, OIDC, principals, teams, roles, service accounts, durable audit, admission, and recovery quarantine | Accepted, not implemented | [#85](https://github.com/zajca/pohunek/issues/85) |
+| Verified Keycloak-brokered social identity and bounded external eligibility | Accepted, not implemented; blocks completion of transport enrollment | [#92](https://github.com/zajca/pohunek/issues/92) |
+| Host-initiated userspace WireGuard link | Accepted, not implemented; transport completion follows #92 | [#72](https://github.com/zajca/pohunek/issues/72) |
 | Public protocol v4 relay host link, `SessionOrigin`, and daemon share guards | Accepted, not implemented | [#70](https://github.com/zajca/pohunek/issues/70) |
 | Locally approved `HostShare` and relay-side session ACLs | Accepted, not implemented | [#82](https://github.com/zajca/pohunek/issues/82), [#83](https://github.com/zajca/pohunek/issues/83) |
 | Atomic snapshot/watermark synchronization without replay | Accepted, not implemented | [#84](https://github.com/zajca/pohunek/issues/84) |
@@ -230,11 +231,13 @@ terminal content.
   enrollment record, checked revisions, and locally confirmed transfer
   coordinates. It does not create a relay connection, public enrollment API,
   or team surface. The relay-facing behavior remains future work.
-- Relay enrollment is an interactive local operation authorized through OIDC
-  device flow or an exact safe loopback callback. The host generates and keeps
-  its WireGuard private key; enrollment binds its public key and `HostId` to one
-  relay. [#72](https://github.com/zajca/pohunek/issues/72) owns enrollment and
-  transport.
+- Relay enrollment and human CLI authorization use OIDC device flow; browser
+  login uses Authorization Code with PKCE. There is no loopback login fallback.
+  Keycloak is the pinned reference broker for Google and GitHub, while Pohunek
+  remains provider-neutral. Verified external eligibility expires within 60
+  minutes of upstream verification and refreshes, activity, restart, or provider
+  uncertainty never extend it. [#92](https://github.com/zajca/pohunek/issues/92)
+  owns the end-to-end evidence flow before #72 can complete.
 - `HostShare` is a revisioned, default-deny, locally approved ceiling binding a
   host to one team. It restricts operations, registered projects and canonical
   worktree roots, owner-authored profiles, resource limits, and future execution
@@ -252,14 +255,13 @@ terminal content.
   an authorization input. [#83](https://github.com/zajca/pohunek/issues/83) and
   [#85](https://github.com/zajca/pohunek/issues/85) own relay authorization.
 
-Only relay-created sessions for active shares synchronize. The relay subscribes
-before requesting one atomic host-scoped snapshot covering all active shares,
-with one epoch, sequence, and watermark, then applies strictly ordered later
-events. A gap, overflow, epoch change, or
-disconnect discards the live cache and triggers a complete bounded snapshot;
-the daemon keeps no relay replay log. During relay or share outages, sessions
-keep running and owner paths remain available. Revoked-share sessions become
-owner-only without being stopped. [#84](https://github.com/zajca/pohunek/issues/84)
+Only relay-created sessions for active shares synchronize. The complete
+single-subscription, ordered-writer, bounded snapshot, cancellation, fairness,
+and reconnect contract is normative in RFC §§11 and 16. A gap, overflow, epoch
+change, malformed event, or disconnect discards the live cache and triggers a
+bounded full snapshot; snapshots are not offline history. During relay or share
+outages, sessions keep running and owner paths remain available. Revoked-share
+sessions become owner-only without being stopped. [#84](https://github.com/zajca/pohunek/issues/84)
 owns this recovery contract.
 
 ## Host Daemon
@@ -1031,7 +1033,7 @@ Integration tests:
 | Remote transport | SSH bridge | Direct over NetBird/WireGuard |
 | Discovery | Tailscale + NetBird + signed manifests | NetBird-local + live capability query |
 | Mesh trust | Signed manifests, key rotation, snapshot sync | Owner paths use overlay + filesystem permissions; relay uses explicit enrollment and local `HostShare` ceilings |
-| Audit | Tamper-evident considered | Plain local event log today; structured metadata-only relay audit planned in [#87](https://github.com/zajca/pohunek/issues/87) |
+| Audit | Tamper-evident considered | Plain local event log today; durable relay audit and admission foundation planned in [#85](https://github.com/zajca/pohunek/issues/85), with operational retention and load evidence in [#87](https://github.com/zajca/pohunek/issues/87) |
 | Agent state | Terminal heuristics | OSC title + screen-manifest + PTY activity (per herdr); hooks only capture the session ID for resume |
 | Providers | In-tree Linear/GitHub adapters | Deferred, shell-out (`gh`, Linear GraphQL/MCP) in the client surfaces, not the chassis |
 | GUI | libghostty client (MVP5) + spike (MVP0) | Native Rust desktop and mesh-local browser clients shipped; relay clients remain planned |

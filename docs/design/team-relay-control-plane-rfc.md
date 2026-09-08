@@ -3,8 +3,9 @@
 - Status: Accepted for implementation
 - Date: 2026-09-02
 - Tracking issue: [#80](https://github.com/zajca/pohunek/issues/80)
+- Reconciliation: [#91](https://github.com/zajca/pohunek/issues/91), 2026-09-08, pending merge
 - Umbrella issue: [#56](https://github.com/zajca/pohunek/issues/56)
-- Related issues: [#69](https://github.com/zajca/pohunek/issues/69), [#70](https://github.com/zajca/pohunek/issues/70), [#71](https://github.com/zajca/pohunek/issues/71), [#72](https://github.com/zajca/pohunek/issues/72), [#73](https://github.com/zajca/pohunek/issues/73), [#81](https://github.com/zajca/pohunek/issues/81), [#82](https://github.com/zajca/pohunek/issues/82), [#83](https://github.com/zajca/pohunek/issues/83), [#84](https://github.com/zajca/pohunek/issues/84), [#85](https://github.com/zajca/pohunek/issues/85), [#86](https://github.com/zajca/pohunek/issues/86), [#87](https://github.com/zajca/pohunek/issues/87), and [#88](https://github.com/zajca/pohunek/issues/88)
+- Related issues: [#69](https://github.com/zajca/pohunek/issues/69), [#70](https://github.com/zajca/pohunek/issues/70), [#71](https://github.com/zajca/pohunek/issues/71), [#72](https://github.com/zajca/pohunek/issues/72), [#73](https://github.com/zajca/pohunek/issues/73), [#80](https://github.com/zajca/pohunek/issues/80), [#81](https://github.com/zajca/pohunek/issues/81), [#82](https://github.com/zajca/pohunek/issues/82), [#83](https://github.com/zajca/pohunek/issues/83), [#84](https://github.com/zajca/pohunek/issues/84), [#85](https://github.com/zajca/pohunek/issues/85), [#86](https://github.com/zajca/pohunek/issues/86), [#87](https://github.com/zajca/pohunek/issues/87), [#88](https://github.com/zajca/pohunek/issues/88), [#91](https://github.com/zajca/pohunek/issues/91), and [#92](https://github.com/zajca/pohunek/issues/92)
 
 ## 1. Summary
 
@@ -62,9 +63,10 @@ The following decisions are final for the first complete team-relay release:
    separate raw attach streams. It does not expose a second daemon API.
 8. A host has at most one active relay enrollment. One enrolled host can expose
    multiple independent shares to multiple teams on that relay.
-9. Human and host enrollment uses OIDC device authorization when available and
-   an exact loopback browser callback otherwise. WireGuard private keys are
-   generated and retained on the host.
+9. Browser login uses OIDC Authorization Code with PKCE. Human CLI login and
+   host enrollment use mandatory OIDC device authorization; there is no
+   loopback browser callback fallback. WireGuard private keys are generated and
+   retained on the host.
 10. `pohunekd` knows the relay and `HostShare`, but not end-user identities,
     groups, roles, or session ACLs.
 11. Local and direct-NetBird sessions are never published to or controllable by
@@ -302,19 +304,24 @@ never receives terminal bytes or host private keys.
 
 ### 8.5 Security invariant enforcement matrix
 
-| Invariant | Enforcing component | Required evidence |
-|---|---|---|
-| Only authenticated principals use the public API. | Relay OIDC/session and service-credential middleware | Authentication state-machine and credential rotation/revocation tests in [#85](https://github.com/zajca/pohunek/issues/85). |
-| Object IDs, errors, search, events, and caches never cross a team boundary. | Relay authorization/query layer and PostgreSQL constraints | Cross-team guessed-ID and differential error/event tests in [#85](https://github.com/zajca/pohunek/issues/85) and [#83](https://github.com/zajca/pohunek/issues/83). |
-| One operation cannot compose authority from multiple shares. | Relay router binds one share/revision; daemon re-resolves that exact local share | Per-method guard matrix and conflicting-share adversarial tests in [#70](https://github.com/zajca/pohunek/issues/70) and [#82](https://github.com/zajca/pohunek/issues/82). |
-| Local and direct-overlay sessions are unreachable through the relay. | Daemon immutable `SessionOrigin` guard | Migration, forged metadata, guessed-ID, list, attach, and mutation tests in [#70](https://github.com/zajca/pohunek/issues/70). |
-| Relay callers select only owner-authored profiles, registered projects, and bounded safe parameters. | Daemon profile/project/share-policy validation | Allowlist, canonical-path, parameter, and resource-limit tests in [#82](https://github.com/zajca/pohunek/issues/82). |
-| The relay never initiates a host connection. | Host connector and relay listener topology | Network-direction and no-host-listener integration tests in [#72](https://github.com/zajca/pohunek/issues/72). |
-| Ownership changes require exact local confirmation. | Daemon owner record and host approval signing key; relay conditional projection transaction | Replay, wrong-target, wrong-relay, stale-revision, crash, retry, and split-brain tests in [#81](https://github.com/zajca/pohunek/issues/81). |
-| A gap or daemon epoch change cannot leave an apparently current catalog. | Relay host-link state machine | Concurrent snapshot, overflow, reorder, duplicate, restart, and full-resync tests in [#84](https://github.com/zajca/pohunek/issues/84). |
-| Revocation cannot regain access to old sessions. | Daemon terminal share state and immutable, never-reused `HostShareId` | Suspend/reactivate and revoke/reapprove tests in [#82](https://github.com/zajca/pohunek/issues/82) and [#83](https://github.com/zajca/pohunek/issues/83). |
-| Terminal content and secret material never become durable relay data or telemetry. | Relay schema, redacting types, audit/logging APIs, and attach proxy | Schema inspection, sentinel leakage, log/audit, crash, and backup tests in [#71](https://github.com/zajca/pohunek/issues/71) and [#87](https://github.com/zajca/pohunek/issues/87). |
-| Relay loss or revocation never kills host sessions or removes owner access. | Daemon and session worker lifecycle boundary | Disconnect, unenrollment, revocation, restart, and owner-attach tests in [#70](https://github.com/zajca/pohunek/issues/70) and [#87](https://github.com/zajca/pohunek/issues/87). |
+Each row names the sole linearization state where one exists; references name
+the normative algorithm rather than introducing another one.
+
+| Invariant | Enforcer | Durable state / linearization | Failure behavior | Deterministic adversarial test | Owner |
+|---|---|---|---|---|---|
+| Only authenticated, current principals use the public API. | Relay OIDC/session and service-credential middleware. | #85 credential/session generation and current authorization decision, committed with its audit record. | Deny sensitive admission when decision or audit persistence is unavailable; revoke still closes access. | Replay a rotated/revoked credential, lost audit write, stale recovery generation, and cookie/bearer mix-up. | [#85](https://github.com/zajca/pohunek/issues/85), [#71](https://github.com/zajca/pohunek/issues/71) |
+| IDs, errors, search, events, caches, and multipart parts do not cross teams. | Relay authorization/query layer and PostgreSQL constraints. | Team-scoped row keys and the projection transaction in §16.2. | Return typed non-disclosure denial; discard an unauthorized cache/part. | Guess cross-team IDs and substitute a valid part, error, event, or cache row from another team. | [#83](https://github.com/zajca/pohunek/issues/83), [#84](https://github.com/zajca/pohunek/issues/84) |
+| One operation cannot compose authority from shares. | Relay router and daemon exact-share re-resolution. | Ticket/share revision and host journal CAS in §12.5. | Reject missing, stale, foreign, mixed, or changed-share coordinates. | Race conflicting shares and retry one ticket with a changed share or payload. | [#70](https://github.com/zajca/pohunek/issues/70), [#82](https://github.com/zajca/pohunek/issues/82) |
+| Relay cannot reach local/direct-overlay sessions or create authority from observed resources. | Immutable `SessionOrigin` and `ResourceBindingV1` checks. | Host create transaction and journal resource-prepared/commit states in §12.5. | Typed denial before worker registration; recover only recorded resources. | Forge origin/cwd, swap a symlink, remove a profile, and race fork/resume/native recovery. | [#70](https://github.com/zajca/pohunek/issues/70), [#82](https://github.com/zajca/pohunek/issues/82) |
+| A caller selects only owner-approved profiles, projects, safe parameters, and bounded resources. | Daemon profile/project/share-policy validation. | Locally approved share revision and immutable resource binding. | Reject unavailable revisions, path escape, unsafe parameters, or exhausted bound. | Use stale approval, transitive diff source, parameter overflow, and canonical-path escape. | [#82](https://github.com/zajca/pohunek/issues/82) |
+| The relay never dials a host. | Host connector and relay listener topology. | Active enrollment binds peer key/address/HostId; no relay host dial state exists. | Reject inbound host-facing route or mismatched peer binding. | Observe all socket opens while attempting relay-initiated control and attach connections. | [#72](https://github.com/zajca/pohunek/issues/72) |
+| Exact local confirmation fences ownership/governance changes. | Daemon owner record, host approval key, relay conditional transaction. | Daemon owner revision is authoritative; relay projection conditional on it (§9.1). | Quarantine governance/share mutations on missing, conflicting, or unverifiable projection. | Replay/wrong target, relay, nonce, revision, crash, retry, and split-brain confirmation. | [#81](https://github.com/zajca/pohunek/issues/81) |
+| Catalog, notification, and share projection never appear current across a gap, epoch, or incomplete multipart snapshot. | Daemon projection coordinator and relay host-link state machine. | One coordinator sequence; atomic relay manifest/parts/current-watermark transaction (§16.2). | Mark degraded, discard live cache, and resnapshot; never route by suspect state. | Reorder/duplicate/drop events, overflow queue, mutate notification during freeze, corrupt/miss a part, and crash the install transaction. | [#84](https://github.com/zajca/pohunek/issues/84) |
+| Journal/ticket replay cannot create a second mutation or turn uncertain terminal input into a retry. | Daemon ticket issuer and operation journal. | Ticket nonce/fingerprint and irreversible-commit CAS (§12.5). | Return recorded safe result/in-progress; reject compacted ticket; input disconnect is unknown and never replayed. | Lose issue/begin/result ACKs, crash every journal stage, race cancellation/revocation, and alter input bytes. | [#82](https://github.com/zajca/pohunek/issues/82) |
+| Revocation, evidence expiry, deletion suppression, and restore quarantine cannot resurrect old access/catalog state. | Relay cancellation registry, daemon terminal share state, recovery-generation gate, catalog suppression. | Never-reused `HostShareId`; decision/recovery generation; retirement checkpoint and compacted floor (§§13.1--13.6, 17.3, 19.1). | Close affected streams; quarantine restore; fence old host before publication; host PTY continues. | Reapprove after revoke, restore pre-revocation backup, reconnect old host backup, and lose a suppression ACK. | [#85](https://github.com/zajca/pohunek/issues/85), [#83](https://github.com/zajca/pohunek/issues/83), [#84](https://github.com/zajca/pohunek/issues/84), [#87](https://github.com/zajca/pohunek/issues/87) |
+| Terminal content, credentials, and raw tokens never become durable relay data or telemetry. | Schema, redacting types, audit/logging APIs, attach proxy. | Schema permits only metadata/digests; no terminal-content persistence point exists. | Redact/reject unsafe fields and fail closed when required audit cannot persist. | Inject content/secret sentinels through attach, error, crash, backup, log, audit, metric, and trace paths. | [#71](https://github.com/zajca/pohunek/issues/71), [#87](https://github.com/zajca/pohunek/issues/87) |
+| Relay loss, revocation, quota pressure, or multiwriter contention does not kill a host session or deny reserved owner control under the supported profile. | Daemon/worker lifecycle boundary and relay fair scheduler. | Per-share queue accounting plus reserved control slots in §18; worker input ordering per stream (§11.3). | Close/overload only producing relay work; owner inspect/stop/wait consumes reserved control capacity. | Saturate one share, use multiple writers/resizes, disconnect/revoke relay, then exercise owner controls. | [#70](https://github.com/zajca/pohunek/issues/70), [#71](https://github.com/zajca/pohunek/issues/71), [#87](https://github.com/zajca/pohunek/issues/87) |
+| Webhook observation gaps never impersonate durable delivery; snapshots never claim offline terminal history. | #73 webhook ingest/outbox and §16 projection consumer. | Source observation cursor is separate from admitted-event outbox sequence; snapshots use only frozen current projection. | Mark source gap/unknown and require reconciliation; do not synthesize history. | Drop/reorder upstream webhook before admission, duplicate after outbox commit, then compare cursor/outbox/projection. | [#73](https://github.com/zajca/pohunek/issues/73), [#84](https://github.com/zajca/pohunek/issues/84) |
 
 ## 9. Host identity, ownership, and enrollment
 
@@ -369,9 +376,10 @@ transfer and require a new explicit local activation under the new owner.
 
 1. The local host operator runs an interactive enrollment command handled by
    the existing `pohunekd` binary and authenticates the initial registered owner.
-2. The daemon starts OIDC device authorization. If the configured issuer lacks
-   device flow, it uses an exact loopback callback with PKCE, state, nonce, short
-   deadlines, and one-use callback state.
+2. The daemon starts mandatory OIDC device authorization and binds the successful
+   authentication to the exact one-use enrollment transaction and host proof. If
+   device authorization is unavailable, enrollment fails clearly; it never falls
+   back to a loopback callback.
 3. The host generates its WireGuard private key locally. The private key never
    leaves the host and never appears in argv, JSON output, logs, errors, or
    debug formatting.
@@ -403,27 +411,43 @@ must show both sides of the state.
 
 ### 10.1 Implementation
 
-Both `pohunekd` and `pohunek-relayd` embed:
+The following is an **evaluation-only, proposed and unmeasured** reference
+profile. It is not a Cargo edit, a selected production dependency, or evidence
+that a relay transport works: `boringtun = 0.7.1`, with
+`default-features = false` and no `device`, `ffi-bindings`, or `jni-bindings`;
+and `smoltcp = 0.14.0`, with `default-features = false` and only `std`,
+`medium-ip`, `proto-ipv4`, and `socket-tcp`. The resulting Cargo.lock must use
+the published crate checksums, record the complete resolved feature graph and
+license/advisory review, and build with the repository MSRV Rust 1.96. The
+evaluation record includes the exact crate archive SHA-256, Cargo.lock package
+checksum, rustc version/target, and upstream source revision for both packages.
+It is regenerated and reviewed on every candidate revision; it is never silently
+updated by a transitive dependency refresh.
 
-- a pinned released `boringtun` library for NoiseIK handshakes and WireGuard
-  packet encryption/decryption; and
-- a pinned `smoltcp` stack for bounded IPv4 and TCP sockets over decrypted
-  packets.
+The profile uses BoringTun's library `Tunn` API for NoiseIK and WireGuard packet
+crypto and smoltcp's explicit-buffer IP/TCP socket state machines. Their primary
+documentation respectively describes BoringTun as a WireGuard client library
+and smoltcp as a stack with application-owned socket buffers
+([BoringTun 0.7.1](https://docs.rs/boringtun/0.7.1/boringtun/),
+[smoltcp 0.14.0](https://docs.rs/smoltcp/0.14.0/smoltcp/)). The Pohunek adapter
+joins them over a single ordinary UDP socket; it does not use BoringTun's
+TUN-oriented CLI, a kernel network interface, system routes, `wg`, `wg-quick`,
+or a privileged helper.
 
-The implementation does not use BoringTun's TUN-oriented CLI, a kernel network
-interface, system routes, `wg`, `wg-quick`, or a privileged helper. BoringTun's
-library deliberately supplies the WireGuard protocol but not the network stack;
-the Pohunek adapter joins it to smoltcp.
-
-The dependency choice is guarded by:
-
-- exact versions in `Cargo.lock` and the repository dependency policy;
-- known-answer and cross-implementation WireGuard tests;
-- fuzz/property tests for packet and state-machine boundaries;
-- `cargo audit`, feature-powerset clippy, and license review;
-- explicit review of each dependency upgrade; and
-- a transport trait that isolates crypto/stack details without pretending a
-  different implementation is already supported.
+Before #72 can select a revision, it must record a disposition of every relevant
+newer upstream report. In particular, [BoringTun #494](https://github.com/cloudflare/boringtun/issues/494)
+is an open report that 0.7.1 lacks WireGuard's 16-byte data padding; it is not
+an interoperability claim and must be checked by a residue-0..15 packet-length
+differential golden against a known conforming peer. [BoringTun #495](https://github.com/cloudflare/boringtun/issues/495)
+is an open report of one-way loss 15--30 seconds after handshake in the precise
+library-`Tunn`/smoltcp/no-TUN pattern. It is relevant evidence, not a known
+Pohunek defect: reproduce its sustained bidirectional differential golden on the
+candidate and 0.6.0 control, including timer cadence and packet captures with
+payload redaction. If either report affects the candidate, the affected revision
+is a release blocker until a reviewed project-owned repair or an upstream fixed
+revision is pinned with a regression golden. A passing handshake alone is never
+a disposition. The WireGuard protocol's time-based rekey and keepalive behavior
+is the primary timer reference ([WireGuard protocol](https://www.wireguard.com/protocol/)).
 
 ### 10.2 Addressing and routing
 
@@ -438,13 +462,57 @@ The dependency choice is guarded by:
 - Tunnel addresses are identifiers for this transport, never authorization by
   themselves.
 
+The inner path is IPv4 only. The proposed inner MTU is 1,280 bytes and TCP MSS
+is 1,224 bytes (`1,280 - 20` IPv4 header `- 20` TCP header `- 16` worst-case
+padding reserve); smoltcp must account for TCP options and reduce the offered
+MSS further when required. The
+WireGuard transport packet adds 32 bytes before outer IP/UDP. Thus the default
+outer IPv4 datagram is at most 1,340 bytes (`1,280 + 32 + 8 + 20`) and outer
+IPv6 is at most 1,360 bytes (`1,280 + 32 + 8 + 40`). For #494 evaluation,
+the selected implementation must pad transport plaintext by zero through 15
+bytes to a multiple of 16. That is an acceptance obligation, not a claim about
+stock 0.7.1: if the report reproduces, #72 must pin a reviewed project patch or
+upstream fixed revision before using these maxima. The repaired implementation
+must budget padding outside the IPv4 packet but within the 1,280-byte encrypted
+plaintext limit, so it does not increase either outer maximum. Its differential
+golden must prove both outer-length residues and that a conforming peer recovers
+the exact IP length while ignoring only authenticated trailing padding.
+The adapter rejects an inner packet larger than the configured inner MTU before
+crypto or smoltcp, does not emit IPv4 fragments, and advertises/reduces MSS on a
+confirmed lower PMTU. A black-holed PMTU signal, unavailable ICMP, or a path
+below the configured safe floor causes bounded connection failure and reconnect,
+not outer fragmentation or an unbounded probe loop. Outer IPv4 and IPv6 are both
+supported UDP underlays; neither changes the IPv4-only tunnel address space.
+
 ### 10.3 Resource bounds
 
 Packet sizes, fragment behavior, handshake rates, peers, TCP sockets, socket
 buffers, retransmission queues, keepalive cadence, idle deadlines, and reconnect
-backoff are configurable and have hard maxima. IPv4 fragmentation is rejected
-unless the implementation can bound and test reassembly. The application does
-not expose general UDP or arbitrary TCP through the tunnel.
+backoff are configurable with hard maxima. The profile admits at most 10 peers,
+one host-link TCP socket and up to 10 host-initiated attach sockets per peer
+(11 TCP sockets at the worst concentrated host), and no general UDP or arbitrary
+TCP service. Governance/cancellation capacity is reserved on that single
+authenticated host link; it cannot create a second dispatcher, subscription,
+identity context, or API path. Every UDP datagram is length-checked
+against the outer maximum before BoringTun; decrypted packets are length-checked
+against the inner MTU before smoltcp. RX/TX UDP buffers, per-peer crypto queues,
+smoltcp TCP RX/TX buffers, timer work, and retransmission queues have independent
+byte and entry caps and return typed overload/drop outcomes rather than allocate.
+
+The event loop drives BoringTun timers and smoltcp polling from one monotonic
+deadline source; it schedules the earliest crypto, TCP retransmission, keepalive,
+idle, or reconnect deadline, drains bounded work, then yields. Rekey, NAT source
+port/address rebinding, peer restart, idle/keepalive, and reconnect-storm paths
+must preserve this bound and cannot create duplicate peer/socket state. #72 must
+prove it in an unprivileged two-endpoint harness with no network capabilities or
+TUN device: known-answer and cross-implementation packets; truncated, oversized,
+padding-residue, and output-buffer-exhaustion fuzz/property tests with zero
+panics; and sustained bidirectional TCP under repeated rekeys, NAT rebinding,
+idle/keepalive, loss, reorder, peer restart, PMTU reduction, and all-10-host
+reconnect storm. Each run records candidate checksums/features/MSRV, timer and
+buffer limits, packet counters, losses, reconnect/convergence distributions,
+CPU and RSS. It is acceptance evidence to be produced by #72, not a measured
+claim in this RFC.
 
 ## 11. Host-initiated application transport
 
@@ -493,6 +561,18 @@ Tokens expire quickly, are bound to one host link, session, runtime generation,
 and operation, and are consumed once. Half-close, disconnect, cancellation,
 share revocation, ACL revocation, and relay shutdown have explicit tested
 behavior. Terminal bytes are never logged or persisted.
+
+### 11.3 Concurrent dispatch and terminal writers
+
+The relay link has bounded concurrent in-flight dispatch, exactly one serialized
+NDJSON writer and one subscription. Per-share queues are fair; governance,
+revocation, cancellation and snapshot work reserve capacity and preempt ordinary
+work. All queues/deadlines are bounded; slow writer cancels dependents and closes
+the link. Responses remain ordered per operation and events per subscription,
+while independent operations may interleave. Multiple terminal writers are
+allowed. Input orders per attach stream and interleaves at worker arrival. Resize
+uses existing source monotonic sequences, global serialization across sources,
+last successfully applied geometry, and `attach_with_size` participation.
 
 ## 12. `HostShare` authorization
 
@@ -574,21 +654,243 @@ revoked share can never be reactivated: later approval creates a new
 `HostShareId`, and sessions carrying the revoked ID remain permanently
 owner-only. Republishing them under a new share is not supported by this RFC.
 
+### 12.5 Immutable binding and operation journal
+
+`ResourceBindingV1` is the immutable tuple `(origin, host_share_id,
+share_revision_at_creation, profile_id, profile_revision, project_id,
+project_revision, root_file_identity, canonical_root, launch_parameter_digest)`.
+`root_file_identity` is the device/inode (or platform equivalent) obtained from
+an opened root descriptor. The daemon persists this tuple in the same local
+transaction that makes the session visible. Observed process/OSC-7 cwd or
+detected project is projection metadata only and can never create authority.
+Before every create, fork, resume, native recovery, diff, hook, worktree create
+or removal, it reopens and canonicalizes source and destination beneath approved
+roots, compares descriptor identity and current approved profile/project revision,
+then performs the side effect from that descriptor. A deleted/changed relay
+profile yields `approved_profile_unavailable`; frozen resume fallback is never
+authority. Symlink replacement, escape, cross-share source, or a changed root
+yields a typed denial before worker registration.
+
+Relay mutation begins with `operation.ticket.issue`, not caller-chosen random
+idempotency. The daemon atomically admits an unconsumed ticket in the current
+enrollment/recovery namespace and returns a MAC-protected opaque ticket carrying
+host, enrollment, generation, share/revision, method class, issue/expiry and
+random nonce. A lost issue acknowledgement is retried by its relay correlation
+key and returns the same ticket. A non-ticket or invalid/foreign/expired ticket
+is always rejected, including after result compaction; therefore a delayed create
+can never be mistaken for a new operation.
+
+`operation.begin` carries the ticket and full bounded versioned typed payload.
+The daemon, never the relay, validates and canonicalizes that encoding and then
+computes the HMAC of complete payload including terminal input under its local
+journal key. Raw input is never retained. The relay retains correlation-to-ticket
+mapping through ticket expiry and never mints a replacement after a lost issue
+acknowledgement. The durable record uses CAS states: `issued`, `begun`,
+`resources_prepared`, `irreversible_commit`, `result_recorded`, `cancelled`, and
+`cleanup_complete`. Same ticket and fingerprint returns its typed safe result or
+`in_progress`; a changed fingerprint is `ticket_payload_mismatch`. The ticket
+is retained as a rejected tombstone through its encoded expiry. The complete
+minimal typed result remains through ticket expiry and relay durable creator/ACL
+reconciliation acknowledgement: session ID/origin, ResourceBinding/revisions,
+and safe owned worker/worktree/native references. Bounded outstanding tickets
+apply backpressure before admission. Only after both conditions may evidence
+compact to safe digest/status; post-expiry lookup may report reconciliation
+evidence but never executes. `operation.result.get` returns the retained result.
+
+Each enrollment/recovery namespace also persists a monotonic `ticket_expiry_floor`
+separate from catalog retirement. Before deleting any expired ticket/result row,
+the daemon advances that namespace floor to at least the ticket expiry and fsyncs
+the floor transaction; only then may compaction delete the row. `operation.begin`
+rejects any ticket with `expires_at <= ticket_expiry_floor` regardless of wall
+clock, so a restart or clock rollback cannot admit a MAC-valid compacted ticket.
+Read-only result lookup may return an exact still-retained result for an
+outstanding relay reconciliation acknowledgement, but it never reopens execution.
+
+Cancellation or revocation wins before `irreversible_commit`; it CASes to
+`cancelled` and runs cleanup. Once the irreversible commit CAS wins, it returns
+the one committed result even if cancellation arrives later. A terminal-input
+disconnect after begin returns `input_outcome_unknown`; it is never replayed.
+Creator/ACL intent is durable at the relay before ticket issue; no session is
+visible there until host result reconciliation confirms its exact origin. Cleanup
+durably records hook invocation, worktree creation, worker spawn, registration
+and removal stages. Before hook start, during hook execution, and after return
+before completion fsync, cancellation/revocation kill barriers are checked. A
+crash in that interval becomes durable `external_effect_unknown`, quarantines the
+operation and blocks team routing/new worker; it never automatically retries an
+arbitrary hook. Local owner repair explicitly resolves it. Recovery cleans only
+recorded resource identities; it never kills ambiguous/pre-existing resources or
+claims to undo external hook effects. #70 owns ticket protocol persistence, #82
+resource/lifecycle enforcement, and #71 relay intent reconciliation. Their tests
+cover every CAS/stage, lost ACK, delayed ticket, changed input, barrier, hook
+ambiguity, revocation race, symlink swap, transitive lifecycle, and compacted
+ticket followed by clock rollback, daemon restart, and repeated same-ticket begin.
+
 ## 13. Relay identity and authorization
 
-### 13.1 Human authentication
+Issue [#85](https://github.com/zajca/pohunek/issues/85) owns the PostgreSQL
+identity, credential, audit, and admission primitives. Issue
+[#92](https://github.com/zajca/pohunek/issues/92) owns the reference social
+broker, external-evidence verification, and self-service admission. #72 may
+consume only the completed authenticated enrollment transaction; it must not
+invent a parallel identity flow.
 
-Browser login uses OIDC Authorization Code with PKCE. CLI login and host
-enrollment use device authorization when supported, otherwise an exact loopback
-browser callback. All flows validate issuer, audience, redirect URI, state,
-nonce, PKCE verifier, code replay, clock bounds, and stable subject.
+### 13.1 Human flows and reference issuer
 
-Browser sessions are server-side, rotating, revocable, idle-bounded, and backed
-by Secure, HttpOnly, SameSite cookies. Mutations require CSRF protection.
-WebSocket upgrades require authentication and an exact Origin allowlist before
-any target lookup.
+The pinned reference deployment is Keycloak **26.6.2**, with its exact release
+artifact digest, realm export without secrets, enabled broker providers, client
+redirect URIs, and extension versions recorded as deployment evidence. The
+reference is not a claim that later Keycloak releases are compatible. Its
+official [26.6.2 release note](https://www.keycloak.org/2026/05/keycloak-2662-released)
+and [upgrading guide](https://www.keycloak.org/docs/latest/upgrading/) are the
+release and migration sources which #92 must review before pinning it.
 
-### 13.2 Service accounts
+Browser users use Authorization Code with PKCE through the relay's registered
+HTTPS callback. The relay creates a one-use `BrowserLogin` row before redirect:
+`login_id`, a secret digest of `state`, secret digest of `nonce`, PKCE verifier
+digest, exact redirect URI, Keycloak issuer/client/audience, requested action,
+account-link generation, recovery generation, creation and expiry timestamps,
+and `unused` state. The callback atomically consumes that row before code
+exchange; a mismatched, expired, replayed, or recovery-generation-stale callback
+is rejected and audited. A server-side browser session is a random opaque cookie
+whose digest, principal, session generation, expiry, idle deadline, and recovery
+generation are stored in PostgreSQL. Cookies are Secure, HttpOnly and SameSite;
+mutations require CSRF and WebSocket upgrades require an exact allowed Origin.
+
+CLI login and host enrollment use only the configured issuer's Device
+Authorization Grant. The relay creates a one-use, transaction-bound device row
+with the exact requested action, audience, expiry, polling interval, nonce,
+principal/account-link generation, and recovery generation. The terminal sees
+only the bounded user code and verification URI returned by the broker. There
+is no loopback callback, generic missing-Origin exception, or browser-cookie
+substitute for CLI/enrollment. A missing device endpoint, expired/denied code,
+wrong audience, or changed recovery generation fails the action; it never falls
+back to a less constrained flow.
+
+After either flow, the relay validates discovered issuer metadata and the token
+signature, issuer, audience/authorized party, expiry/not-before, nonce where
+present, subject, and the exact transaction binding. Humans are keyed by
+`(issuer, subject)`. Email, display name, Google `hd`, GitHub login, and broker
+attributes are attributes, never keys. Linking Google and GitHub identities is
+an explicit authenticated, audited transaction requiring both stable identities;
+matching email strings never link accounts.
+
+### 13.2 Versioned verified external evidence
+
+The relay accepts evidence only in one PostgreSQL transaction after a successful
+authenticated broker exchange and the broker extension's authoritative provider
+check. Version 1 has
+these immutable fields: `evidence_version`, `evidence_id`, `principal_id`,
+`issuer`, `keycloak_subject`, `provider`, `provider_subject`, `team_id`,
+`admission_rule_id`, `admission_rule_revision`, `account_link_generation`,
+`provider_identity_generation`, `checked_at_utc`, `checked_monotonic_epoch`,
+`expires_at_utc`, `method`, `outcome`, and a keyed digest of the binding
+transaction. It is audience-bound to the relay `RelayId` and target team; it
+cannot be copied to another relay, team, rule, or account link. `outcome` is
+`eligible`, `ineligible`, or `unknown`; only `eligible` can authorize access.
+The row is append-only evidence, while the current decision is a separately
+revisioned projection so denial, removal, and account-link changes can cancel
+access immediately.
+
+The broker extension serializes its attestation as canonical JSON and signs it
+with an active Keycloak evidence-signing key identified by `signing_key_id`.
+The relay pins issuer, audience, schema version and public-key set. Key rotation
+overlaps old/new keys only through the maximum evidence lifetime, then retires
+the old key. The relay rejects unknown, retired, wrong-audience, altered,
+generation-stale, or replayed attestations before authorization. The PostgreSQL
+row remains the authoritative revocation source; a valid signature is evidence,
+not a reusable bearer grant.
+
+The Keycloak integration has one narrow, versioned server-extension boundary:
+the `pohunek-evidence-v1` Keycloak provider performs the actual provider check,
+then calls the relay's authenticated internal `POST /internal/evidence/v1/issue`
+endpoint over mTLS. Before the check, the relay issued a one-use challenge bound
+to relay ID, audience, authenticated transaction ID, expected provider subject,
+nonce, account-link/rule generations, and expiry. The signed attestation returns
+that challenge, upstream subject, nonce, actual upstream `checked_at`, outcome,
+method and a digest of the upstream token/code, never raw upstream credentials.
+The relay validates schema/key/issuer/audience, challenge consumption, replay,
+rule/account-link generations and signature atomically. Signer rotation and a
+crash between challenge consumption and evidence commit are covered by a durable
+challenge/result transaction: retry returns the same evidence or safely fails;
+it cannot issue a second proof. The endpoint accepts no browser cookie or relay
+user credential and has no general query capability. The provider artifact digest
+and Keycloak SPI/API compatibility version are #92 release evidence; mismatch
+fails startup rather than silently dropping checks.
+
+`expires_at_utc` is at most 60 minutes after the actual upstream check. While
+the relay authorization process remains running, it enforces both its monotonic
+elapsed-time deadline and persisted wall deadline; a backwards wall clock is
+fail-closed. Restart of that authorization process invalidates its cached human
+evidence because its monotonic clock disappeared, so a fresh upstream check is
+required before human access resumes. A broker-only restart or outage while the
+relay remains running does not extend or reissue the prior relay-verified proof:
+it remains usable only until its original deadline. Any newly issued evidence
+still requires a new challenge and fresh upstream check. Cache reads, broker
+profile attributes, locally refreshed relay or Keycloak tokens, user activity,
+failed requests, retries, and restart never advance `checked_at_utc`. An unknown
+result, rate limit, broker outage, provider outage, or expired proof removes
+authority at the prior deadline and cancels that principal's control, event,
+observation, and attach streams. It does not stop host sessions or affect other
+valid participants.
+
+For a Google Workspace rule, the broker extension bypasses cached Keycloak SSO
+and starts a new upstream Google authorization-code transaction with new state
+and nonce. It accepts a one-use returned code only after a new upstream exchange
+and validates the signed Google ID token `iss`, `aud`, immutable `sub`,
+`email_verified`, exact `hd`, `nonce`, `iat`, and `exp`; `checked_at` is that
+upstream exchange time, not receipt of a cached token. An email suffix or
+`login_hint` is insufficient. Google
+documents that `sub` is the stable key and that `hd`, rather than email domain,
+identifies a Workspace/Cloud organization in its [OIDC reference](https://developers.google.com/identity/openid-connect/openid-connect).
+The user may need a new account-selection and consent interaction; consent alone
+is not reauthentication proof. The extension does not assert `prompt=login` or
+`max_age` support and does not treat optional `auth_time` as proof. Inability to
+obtain the fresh response is `unknown`.
+
+For a GitHub organization rule, the broker extension uses its protected upstream
+authorization, never relay PostgreSQL, with `Accept: application/vnd.github+json`
+and `X-GitHub-Api-Version: 2022-11-28`. It resolves the configured target
+organization to its stable numeric ID, first calls `GET /user` and binds numeric
+user `id`, then calls `GET /user/memberships/orgs/{org}` and binds that returned
+organization numeric ID. Only `state: active` is eligible; `pending` is
+ineligible. A 404 is authoritative absence only when the pinned API call proves
+the broker token's visibility, scope, and organization access; otherwise 403,
+404, rate limit, subject/org mismatch, and unavailable are `unknown`. A forbidden
+or ambiguous missing response never proves removal. The broker authorization requires
+`read:org` for the supported OAuth flow (or documented equivalent Members-read
+permission); private membership and SAML/OAuth restrictions fail closed if no
+authoritative answer is possible.
+The [GitHub membership endpoint documentation](https://docs.github.com/en/rest/orgs/members)
+defines that endpoint, permission, and state. Webhooks are observations with
+source-delivery gaps; they may trigger an early recheck but never renew evidence.
+#92 proves real removal on a dedicated test organization by a new authoritative
+recheck yielding confirmed `ineligible` and immediate stream cancellation; HTTP
+error status alone is never used as false confirmation.
+
+### 13.3 Admission and active authorization
+
+A matching fresh evidence row permits a configured self-service rule to create
+only a `Member` membership. The admission transaction checks current team
+capacity/quota, current rule revision, local administrator deny generation, and
+recovery generation while writing membership, decision audit, and cancellation
+registration atomically. It grants no Owner/Admin role, no share, profile,
+project, session ACL, or capacity by itself. A local administrator deny survives
+provider relinking and automatic rechecks until an explicit audited reversal.
+Teamless authentication may create a principal and a relay-native credential but
+authorizes no team resource; it remains valid for its exact device-bound host
+enrollment transaction only when the enrollment policy allows the principal.
+
+On successful login the relay issues a random human credential once for CLI
+storage in the OS keyring; it stores only a keyed digest, principal, credential
+generation, expiry, revocation state, last-used metadata, and recovery
+generation. Browser cookies are not bearer credentials, and browser sessions
+cannot authenticate the CLI. Every sensitive decision and active stream checks
+current credential, membership, grant, policy/recovery generation, evidence
+deadline, share revision, and cancellation registry. Credential rotation,
+revocation, local deny, membership removal, rule change, evidence expiry, and
+restore quarantine cancel affected idle and active streams promptly.
+
+### 13.4 Service accounts and human credentials
 
 A service account is a first-class principal. It authenticates with a random
 high-entropy credential consisting of a public credential ID and secret. The
@@ -598,10 +900,13 @@ immediate revocation. Raw credentials are shown once, never accepted in URLs or
 argv, and never logged.
 
 Credentials carry no embedded authorization scope. Current team membership,
-roles, and grants are resolved server-side on every authorization decision so
-revocation does not wait for credential expiry.
+roles, grants, team-disable state, recovery generation, credential expiry and
+revocation are resolved server-side on every authorization decision so revocation
+does not wait for credential expiry. The 60-minute external-evidence requirement
+applies only to human access governed by an external-eligibility rule; service
+accounts never satisfy or bypass that human self-service rule.
 
-### 13.3 Teams, groups, and roles
+### 13.5 Teams, groups, and roles
 
 The relay provides built-in `Owner`, `Admin`, and `Member` roles plus custom
 roles composed from stable permissions. Grants can target principals, service
@@ -617,6 +922,19 @@ Relay infrastructure administration is separate from team administration. An
 infrastructure administrator has no implicit application permission to read or
 control sessions. This is an application RBAC guarantee, not protection from a
 trusted operator with process or database access.
+
+### 13.6 Ownership and test summary
+
+The evidence, admission, credential, cancellation, durable state, and
+adversarial test contract is defined by §§13.1–13.5. #85 owns database/auth
+primitives and transaction tests; #92 owns the Keycloak extension, Google/GitHub
+freshness, signer rotation, challenge crash/replay, local-deny and join tests;
+#71 and #86 consume the current-decision check on every public action and stream.
+#92 also tests broker restart/outage with an old attestation: the relay may use
+only its unchanged original deadline while still alive, cannot reissue evidence
+without a fresh challenge/check, and cancels access at expiry. #85 tests relay
+authorization-process restart invalidating cached human evidence while preserving
+ordinary credentials and memberships.
 
 ## 14. Session visibility and sharing
 
@@ -738,23 +1056,44 @@ Every later event contains the same epoch and a higher sequence.
 
 ### 16.2 Subscription-first algorithm
 
-1. The relay establishes the host link and starts a bounded subscription.
-2. The daemon registers the subscriber before capturing the snapshot.
-3. Events arriving during snapshot construction enter the bounded subscriber
-   queue.
-4. The daemon returns the atomic snapshot and watermark.
-5. The relay installs the snapshot, discards buffered events at or below the
-   watermark, and applies higher sequences in exact order.
-6. Duplicate events are ignored only when their epoch and sequence are already
-   committed.
-7. Queue overflow, sequence gap, wrong order, epoch change, malformed event, or
-   host-link loss marks the host degraded, discards its live cache, and repeats
-   the entire bounded procedure.
+One daemon projection coordinator owns the commit order for safe session fields,
+notification state and active-share projection. It writes the changed host state
+and next sequence in one critical section before publication; no producer sends
+an event directly. `subscribe.freeze` first registers the sole subscriber at
+sequence `S`, then the coordinator freezes all three projections and allocates
+watermark `W >= S`. Events committed after W enter that subscriber's bounded
+queue. The frozen manifest contains snapshot ID, daemon epoch, W, total bytes,
+items and parts, and SHA-256 of each indexed part and of the canonical manifest.
+
+1. The relay requests subscribe/freeze and receives the manifest plus parts.
+2. Each part is independently frame-limited and authenticated by manifest index
+   and hash; no part can be substituted across epoch/snapshot.
+3. The relay validates the complete manifest and parts in memory/spool bounds.
+4. One PostgreSQL transaction installs manifest, all projection rows and W as
+   current, discards buffered events at or below W, and records next expected W+1.
+5. It applies higher events in order, each with a conditional expected-sequence
+   update. Duplicate already-committed events are ignored only for same epoch.
+6. Queue overflow, sequence gap, epoch/generation/link change, invalid part,
+   transaction failure, cancellation, or timeout rolls back/notifies no current
+   install, marks the host degraded, drops cache, and repeats the full procedure.
 
 The relay never continues from a suspected gap and never asks the daemon for
 replay. PostgreSQL may retain the last catalog as explicitly stale UI data, but
 it is not used for authorization or mutation routing until a current snapshot
 is installed.
+
+### 16.3 Frame and queue bounds
+
+Each multipart frame is below the existing 1 MiB protocol limit. The proposed
+limits profile supplies `max_snapshot_parts`, `max_snapshot_total_bytes`,
+`max_snapshot_items`, `max_snapshot_duration`, `max_event_entries`,
+`max_event_bytes`, and `max_projection_spool_bytes`; all are enforced separately.
+Event queues satisfy both entry and byte formulas: admitted maximum event rate
+times maximum snapshot duration plus reserved cancellation/revocation margin.
+Revocation is coordinator-priority work; it commits a sequence and cancellation
+before ordinary snapshot publication. #84 owns deterministic concurrent mutation,
+notification/share change, malformed manifest, missing part, database rollback,
+overflow, duplicate/gap, revocation-during-freeze and reconnect tests.
 
 ## 17. Audit, logging, and data retention
 
@@ -795,6 +1134,37 @@ destination and include correlation IDs, latency, sizes, and safe state
 transitions. They do not duplicate audit or terminal content. Metrics avoid
 unbounded labels and tenant-controlled strings.
 
+### 17.3 Catalog retirement and deletion
+
+Catalog retention is distinct from ACL, audit, ticket tombstones, admission,
+evidence and revocation safety records. Terminal lifecycle stores immutable
+`ended_at`, `catalog_retire_at` and terminal reason. The default is 30 days;
+team configuration may reduce or increase it only within operator hard bounds.
+Manual deletion immediately creates a durable suppression record and removes
+the relay catalog projection. It never removes a host session, PTY, worker or
+worktree, and it does not shorten audit or safety retention. Audit defaults to
+90 days and is operator-controlled.
+
+Each host has a monotonic `retirement_sequence`, a durable host-side retirement
+checkpoint and relay-side acknowledged contiguous floor. Suppression records
+carry that sequence; host snapshot/reconnect acknowledges the greatest contiguous
+sequence it has durably applied. Holes remain records, bounded by the configured
+hole limit; only records at or below the acknowledged contiguous floor and past
+the old-host reconnect horizon may compact. The relay persists a non-decreasing
+compacted floor independently from ordinary catalog backup. A reconnecting host
+whose checkpoint is behind that floor is fenced from catalog publication, receives
+the retained suppression/checkpoint proof, durably advances, then may snapshot.
+An old host backup therefore cannot resurrect a deleted catalog entry. Quota-full
+is a typed admission failure before new catalog/session reservation and preserves
+governance reserve. #84/#87 own deterministic delete-before-end, hole, old-backup,
+ack-loss, compaction, reconnect and quota-full tests.
+
+The host recovery manifest includes `retirement_sequence`, durable retirement
+checkpoint, acknowledged contiguous floor and compacted-floor witness. Restore
+and host-link reconciliation reject a manifest below the independently retained
+floor until local repair advances it; #87 tests witness rollback and #84 tests
+manifest/floor mismatch with snapshot recovery.
+
 ## 18. Quotas and backpressure
 
 The relay enforces independently configurable hard limits globally and per team,
@@ -811,8 +1181,89 @@ principal, service account, host, share, and session where applicable:
 - audit and asynchronous cancellation queues.
 
 Backpressure propagates to the producing stream or closes it with a stable typed
-overload error. No unbounded channel is permitted. One team, host, or client
-cannot consume global capacity or affect local/NetBird owner access.
+overload error. No unbounded channel is permitted. The fairness and owner-reserve
+claim below applies only to configured relay allocations and reserved
+control-plane capacity under the supported load profile. It does not claim
+hostile same-UID CPU, RAM, disk, or process isolation; [#88](https://github.com/zajca/pohunek/issues/88)
+owns that boundary. Local Unix and direct-NetBird owner operation do not depend
+on relay admission, but ordinary OS resource exhaustion remains outside this
+relay scheduler claim.
+
+### 18.1 Proposed unmeasured reference profile
+
+All values in this section are **PROPOSED UNMEASURED** design-acceptance
+candidates. They are inputs to #72/#84/#87 implementation and measurement, not
+shipped configuration defaults, product maxima, or benchmark results.
+
+The profile has one relay plus PostgreSQL and 10 Linux hosts. Each is a
+four-vCPU, 8 GiB RAM, NVMe-backed x86_64 Linux machine; the relay and PostgreSQL
+may be separate machines of that specification, each with a 1 Gbit/s network
+interface. The harness shapes every host-to-relay path to 20 ms RTT, 1%
+independent packet loss, 0.1% reorder, and 20 Mbit/s in each direction. It holds
+50 total live sessions, 10 simultaneous
+interactive attach streams. Its multiwriter case has 10 streams arranged as five
+sessions with two authorized writers each (and separately exercises 10 writers
+on one session); it never calls 20 streams "10 interactive streams". It retains
+500 ended catalog entries per host (5,000 total, budgeted at 1 KiB indexed metadata each) and
+2,000 notifications per host (20,000 total, budgeted at 512 bytes each): this
+is intentionally substantially larger than one protocol frame. History is
+paginated; a current snapshot is not an offline terminal-history substitute.
+
+| Resource or rate | Proposed unmeasured allocation | Accounting and overload behavior |
+|---|---:|---|
+| Public relay requests | Relay-wide: 250/s sustained; 500/s for 30 s burst | Body and response each <= 512 KiB; excess receives typed overload before host dispatch. |
+| Admitted host projection events | Per host: 500/s sustained; 1,000/s burst. All-10-host storm: 5,000/s sustained; 10,000/s burst. | Each entry <= 1 KiB. A host queue holds 12,288 entries / 12 MiB: `1,000 × 10 s + 16` revocation entries = 10,016 KiB required, leaving 2,272 entries / about 2.2 MiB headroom. |
+| Snapshots | Per host snapshot: <= 4 MiB, <= 16 parts, <= 10 s. All-10-host storm: <= 40 MiB aggregate and 10 concurrent snapshots. | Each part <= 256 KiB, within the existing 1 MiB frame ceiling; manifest, parts, and projection spool have separate bounds. A 4 MiB host snapshot in 10 s consumes 3.36 Mbit/s. A stalled snapshot releases ordinary slots but keeps the reserved cancellation path. |
+| Dispatch fairness | 32 operations / 256 KiB per share; 64 concurrent ordinary host RPCs relay-wide | Round-robin across nonempty shares; exceeding either per-share dimension stalls/overloads that producer only. |
+| Governance/cancellation reserve | 16 operations / 128 KiB relay-wide, separate from ordinary dispatch | Revocation and cancellation use this reserve before ordinary work; it is not workload resource isolation or the host owner reserve. |
+| Host owner-control reserve | 16 operations / 128 KiB per host daemon control queue | Local Unix/direct-NetBird owner `inspect`/`stop`/`wait` bypass relay scheduling and consume this separately reserved host control capacity. |
+| Interactive streams | 10 total; multiwriter uses 10 streams as five two-writer sessions, or 10 writers on one session | 64 KiB relay attach buffer per direction/stream, 1.5 MiB aggregate per host for the worst 10-stream concentration, and 3 Mbit/s aggregate relay attach bandwidth across all 10 streams; slow producer is closed without retaining terminal bytes. |
+| Transport sockets and buffers | <= 10 peers; <= 11 TCP sockets per peer; 256 KiB UDP RX + 256 KiB UDP TX per process; 128 KiB TCP RX + 128 KiB TCP TX per socket | The 11 sockets are one host link and up to 10 attach streams. Governance/cancellation reserve is queue capacity on the sole host link. Socket, crypto, TCP, and application queues are independently counted; no buffer borrows either reserve. |
+| PostgreSQL/admission | <= 128 concurrent relay DB operations; <= 32 cancellation/audit operations reserved | A failed durable authorization/audit transaction denies new sensitive work; revoke/deny continues through its reserved path. |
+
+At the stated maximum, the event queue arithmetic is deliberately based on the
+burst, not average, rate: `1,000 entries/s × 10 s + 16 reserved = 10,016`
+entries and `10,016 × 1 KiB = 9.79 MiB`; the proposed 12,288-entry / 12 MiB
+bound covers both dimensions without assuming average-size events. During the
+10-second snapshot window, one host's 1,000 1-KiB events/s budget consumes 8.19
+Mbit/s, its 4 MiB snapshot consumes 3.36 Mbit/s, and its capped attaches consume
+3 Mbit/s: 14.55 Mbit/s before protocol overhead, below its shaped 20 Mbit/s
+path. The all-10-host storm is therefore 81.9 Mbit/s events + 33.6 Mbit/s
+snapshots + 3 Mbit/s attaches = 118.5 Mbit/s before protocol overhead; #84/#87
+must measure relay ingress, CPU, database batching/latency, queue high-water
+marks, and overload behavior at this 10,000-event/s aggregate, not infer it from
+a one-host run. The retained catalog and notifications budget 15 MiB of indexed
+payload before database-row and index overhead; #87 must publish actual storage
+separately.
+
+### 18.2 Target outcomes and measurement procedure
+
+The acceptance targets are: relay process RSS <= 1.5 GiB and CPU <= 4 vCPUs;
+each host tunnel/host-link process RSS <= 256 MiB and CPU <= one vCPU; p95/p99
+owner `inspect` <= 250/500 ms, `stop` admission <= 500 ms/1 s, and `wait`
+registration <= 250/500 ms. At 20 ms RTT, p95/p99 authorization-to-first-byte
+targets are <= 250/500 ms; interactive input-to-host-write is <= 150/300 ms;
+p95/p99 reconnect is <= 10/15 s; and an all-host current projection converges
+within <= 30/45 s after relay recovery. Lease behavior remains §19's 5-second
+lease with renewal at most every second; the profile does not loosen those
+deadlines. These values are targets, never present-tense performance claims.
+
+#72 measures the unprivileged transport limits in §10.3; #84 measures frozen
+snapshot/event convergence; #87 runs the end-to-end profile. Each result must
+state release-mode build identity, exact dependency checksums/features/MSRV,
+hardware, kernel, PostgreSQL settings, network-shaper command/configuration,
+configured limits, seed, and raw latency/resource distributions. Run a 5-minute
+warm-up followed by a 30-minute measured interval, three cold-start and three
+warm-start repetitions, then an all-10-host reconnect storm while 50 sessions
+and 10 multiwriter streams remain active. Include normal load, one saturated
+share, queue overflow, slow writer, database/audit denial, loss/reorder, NAT
+rebinding, rekey, peer restart, PMTU reduction, revocation, and owner
+inspect/stop/wait during every storm. Report p50/p95/p99, maximum, rejected and
+closed counts, queue high-water marks, socket/packet drops, snapshot retries,
+lease loss behavior, CPU/RSS, and database latency; retain payload-free traces
+and configuration evidence. A missed target blocks the dependent acceptance or
+requires an explicitly reviewed new proposed profile; it cannot be hidden by
+raising a runtime limit.
 
 ## 19. Failure and recovery semantics
 
@@ -838,16 +1289,83 @@ Shutdown stops new ingress, cancels login/enrollment transactions, drains or
 fails bounded requests, closes streams, releases the active relay lease, and
 exits within a configured deadline.
 
+### 19.1 Restore quarantine and lease fencing
+
+Recovery state is not stored solely in the restorable PostgreSQL database. The
+deployment keeps a separately protected, append-only local witness containing
+`RelayId`, recovery generation, witness sequence, manifest digest, key ID,
+signature, catalog-suppression floor, and active-run latch. Its key and durable
+storage are backed up/restored by a procedure
+independent of the PostgreSQL backup. If the witness cannot be read, verified,
+advanced, or durably written, the relay fails stopped: it opens no public ingress,
+host link, or sensitive management route. This detects a restore to an older
+known witness; it does not claim detection of matching old database and witness
+copies without an independent witness.
+
+The supported restore phases are: (1) stop ingress and let the current lease
+expire; (2) advance and durably verify the witness generation before restoring
+the database; (3) start in `recovery_quarantine`, invalidate every browser
+session, human/service credential, device/browser/enrollment/attach transaction,
+authorization decision, cancellation lease, and host-link binding from an older
+generation; (4) produce an operator review manifest of principals, account links,
+memberships, rules, local denies, grants, ACLs, shares, catalog retention state,
+catalog-suppression floors/checkpoints, and outstanding incidents; (5) reconcile
+current host snapshots and require
+fresh login and external evidence; (6) commit one audited `reopen` decision
+naming the reviewed manifest digest and new witness generation; only then open
+team ingress. Keycloak broker sessions, upstream tokens, and account-link state
+never bypass quarantine. Broker restore requires the same review and explicit
+reopening. Ordinary process restart retains the unchanged generation and valid
+state; it is not a restore and must not invalidate credentials merely because
+the process restarted. External eligibility is different: after relay
+authorization-process restart it is `unknown` until a fresh upstream check
+completes. A broker-only restart/outage does not extend the original evidence
+deadline while the relay process remains alive. Within a running verifier,
+monotonic elapsed time and the wall deadline are both enforced; a backwards wall
+clock is fail-closed. A local fsynced time floor may detect regression but is not
+treated as trusted elapsed time across a reboot.
+
+The single active process holds a fenced PostgreSQL lease with a **5-second**
+expiry, renewed at most every **1 second**. The row contains `RelayId`, process
+instance ID, random fence token, recovery generation, expiry, and monotonic
+heartbeat sequence. Every public authorization, host dispatch, event delivery,
+attach byte forwarding, and idle-stream timer validates the current fence token,
+generation, and lease deadline before forwarding; idle streams are rechecked at
+least every **100 ms**. On failed renewal, database disconnection, stale fence,
+or deadline expiry, the process immediately stops ingress, cancels streams,
+closes host forwarding, and refuses new work. A later advisory lock acquisition
+does not make an old paused process safe. Tests pause/resume a process, sever its
+database connection, retain idle sockets past expiry, and race two instances;
+only the current fence may forward bytes or decisions.
+
+Before normal ingress, the process fsyncs an `active-run` latch in witness
+storage. An unclean prior latch forces startup review; only orderly shutdown may
+clear it after ingress and forwarding are closed. Sensitive admission writes its
+required decision audit transactionally before granting access. If
+PostgreSQL/audit is unavailable, no new sensitive grant may be made; the relay
+must not pretend it recorded an audit row. Revocation and deny immediately
+cancel affected streams while a durable fail-closed marker is written before the
+revocation acknowledgement completes. That marker has only safe incident and
+scope coordinates and prevents an old grant from reviving after restart. Failure
+to persist it, failure of any witness storage, or an unclean active-run latch
+leaves the latch dirty, fails the process stopped, and requires startup review;
+the design never pretends an fsync succeeded on a failed disk. #85 owns witness,
+lease, latch, audit/admission transactions, and crash tests; #87 owns rehearsal,
+retention, catalog-suppression-floor recovery, and operations.
+
 ## 20. Deployment and operations
 
 The supported first deployment is one active unprivileged `pohunek-relayd`
 process, PostgreSQL, one public HTTPS endpoint, and one public WireGuard UDP
 endpoint. It can run under systemd or in a container without `CAP_NET_ADMIN`.
 
-Exactly one active process may own a `RelayId`; a PostgreSQL advisory/lease
-record prevents accidental concurrent activation. Backup includes PostgreSQL
-and separately protected relay secret/key material. Restore procedures detect
-rollback of policy generations and duplicated active identity.
+Exactly one active process may own a `RelayId`; the fenced lease in §19.1,
+rather than advisory locking alone, prevents concurrent forwarding. Backup
+includes PostgreSQL and separately protected relay secret/key/witness material.
+The restore runbook advances and verifies the independent witness generation,
+enters quarantine, and requires manifest review and one reopen commit. It does
+not claim automatic detection of arbitrary complete deployment rollback without
+an independent witness.
 
 Readiness distinguishes PostgreSQL, migrations, relay identity, TLS, OIDC
 configuration, WireGuard bind, audit durability, and host connectivity.
@@ -927,21 +1445,24 @@ The implementation is delivered through the following GitHub issues. Each issue
 body is normative for its bounded implementation scope; this RFC wins if an old
 description conflicts until the issue is reconciled.
 
-| Order | Issue | Outcome |
-|---:|---|---|
-| 1 | [#80](https://github.com/zajca/pohunek/issues/80) | Land this RFC and update canonical architecture, roadmap, agent guidance, and knowledge. |
-| 2 | [#81](https://github.com/zajca/pohunek/issues/81) | Stable host identity, single relay enrollment state, exact owner, local ownership transfer. |
-| 3 | [#85](https://github.com/zajca/pohunek/issues/85) | Rust relay foundation, PostgreSQL schema, OIDC, principals, teams, groups, roles, and service credentials. |
-| 4 | [#72](https://github.com/zajca/pohunek/issues/72) | Embedded userspace WireGuard, address allocation, OIDC host enrollment, and host-initiated link transport. |
-| 5 | [#70](https://github.com/zajca/pohunek/issues/70) | Protocol v4 host link, daemon relay context, immutable origin, and share guard framework. |
-| 6 | [#82](https://github.com/zajca/pohunek/issues/82) | Locally approved `HostShare` lifecycle and profile/project/operation/resource policy. |
-| 7 | [#83](https://github.com/zajca/pohunek/issues/83) | Relay-side session visibility, creator rights, ACLs, admin authority, and revocation. |
-| 8 | [#84](https://github.com/zajca/pohunek/issues/84) | Subscription-first atomic snapshot/watermark and gap-triggered resync without replay. |
-| 9 | [#71](https://github.com/zajca/pohunek/issues/71) | Relay host-link manager, router, state aggregator, attach proxy, and typed public API. |
-| 10 | [#86](https://github.com/zajca/pohunek/issues/86) | Team CLI and Svelte relay surface, with explicit separation from the retained owner WebUI. |
-| 11 | [#87](https://github.com/zajca/pohunek/issues/87) | Audit, quotas, deployment, backup/restore, observability, and incident hardening. |
-| Later | [#73](https://github.com/zajca/pohunek/issues/73) | Provider webhook delivery and encrypted token vault. |
-| Later | [#88](https://github.com/zajca/pohunek/issues/88) | Real profile-backed container/VM runtime isolation. |
+| Order | Issue | Status | Outcome |
+|---:|---|---|---|
+| Complete | [#69](https://github.com/zajca/pohunek/issues/69) | Completed | Direct-overlay foundation. |
+| Complete | [#80](https://github.com/zajca/pohunek/issues/80) | Completed | Original accepted RFC/canonical documentation landing. |
+| Complete | [#81](https://github.com/zajca/pohunek/issues/81) | Completed | Stable host identity, single enrollment, exact owner and local transfer. |
+| Reconcile | [#91](https://github.com/zajca/pohunek/issues/91) | Pending merge | Documentation reconciliation; it is not closed by this RFC edit. |
+| 1 | [#85](https://github.com/zajca/pohunek/issues/85) | Planned | Relay/PostgreSQL foundation, OIDC, durable audit/admission, recovery generation/quarantine, lease fencing, principals and credentials. |
+| 2 | [#92](https://github.com/zajca/pohunek/issues/92) | Planned | Keycloak-brokered Google/GitHub admission and bounded external-evidence revalidation. |
+| 3 | [#72](https://github.com/zajca/pohunek/issues/72) | Planned | Embedded userspace WireGuard, address allocation, OIDC host enrollment, and host-initiated link transport. |
+| 4 | [#70](https://github.com/zajca/pohunek/issues/70) | Planned | Protocol v4 host link, daemon relay context, immutable origin, and share guard framework. |
+| 5 | [#82](https://github.com/zajca/pohunek/issues/82) | Planned | Locally approved `HostShare` lifecycle and profile/project/operation/resource policy. |
+| 6 | [#83](https://github.com/zajca/pohunek/issues/83) | Planned | Relay-side session visibility, creator rights, ACLs, admin authority, and revocation. |
+| 7 | [#84](https://github.com/zajca/pohunek/issues/84) | Planned | Subscription-first atomic snapshot/watermark and gap-triggered resync without replay. |
+| 8 | [#71](https://github.com/zajca/pohunek/issues/71) | Planned | Relay host-link manager, router, state aggregator, attach proxy, and typed public API. |
+| 9 | [#86](https://github.com/zajca/pohunek/issues/86) | Planned | Team CLI and Svelte relay surface, with explicit separation from retained owner WebUI. |
+| 10 | [#87](https://github.com/zajca/pohunek/issues/87) | Planned | Operational completion: audit/quotas retention, deployment, backup/restore, observability and incident evidence; not first audit persistence. |
+| Later | [#73](https://github.com/zajca/pohunek/issues/73) | Post-release | Provider webhook delivery and encrypted token vault. |
+| Later | [#88](https://github.com/zajca/pohunek/issues/88) | Post-release | Real profile-backed container/VM runtime isolation. |
 
 [#69](https://github.com/zajca/pohunek/issues/69) is complete and preserves the
 generic direct-overlay architecture used by NetBird. It is a prerequisite fact,
@@ -950,16 +1471,17 @@ not a reason to force the relay tunnel through the direct-overlay discovery API.
 The intended dependency graph is:
 
 ```text
-#80 -> #81, #85
-#69 + #81 + #85 -> #72
+#80 + #91 -> #85
+#85 + #91 -> #92
+#69 + #81 + #85 + #92 -> #72
 #72 + #81 -> #70
 #70 + #85 -> #82, #83
 #70 + #82 -> #84
 #70 + #72 + #82 + #83 + #84 + #85 -> #71
 #71 -> #86
 #71 + #72 + #85 -> #87
-#71 + #84 + #85 + #87 -> #73
-#82 -> #88
+#71 + #84 + #85 + #86 + #87 -> #73
+#82 + #86 + #87 -> #88
 ```
 
 ## 24. Definition of done
@@ -990,7 +1512,9 @@ The team relay track is complete only when all of the following are true:
 - relay and daemon restarts preserve host PTYs and converge catalog state;
 - revoking a share removes relay access without stopping its sessions;
 - no forbidden terminal or secret data reaches relay persistence or telemetry;
-- quotas and backpressure prevent one tenant or host from exhausting the relay;
+- under the declared supported profile, quotas and backpressure prevent one
+  tenant or host from exhausting other allocations, governance reserve, or host
+  owner-control reserve; this is not hostile OS/resource isolation;
 - CLI and web provide the same typed permissions and failure behavior;
 - the team path has exactly one auth/routing authority: the Rust relay;
 - the retained owner WebUI still reaches local and direct-overlay daemons when
@@ -1087,3 +1611,12 @@ fresh bounded observations after reconnect and never becomes a terminal archive.
   behavior before pinning it.
 - [WireGuard's project list](https://www.wireguard.com/repositories/) records the
   upstream status of WireGuard implementations used during dependency review.
+- [Keycloak 26.6.2 release](https://www.keycloak.org/2026/05/keycloak-2662-released)
+  is the pinned reference broker release; #92 records the exact artifact digest,
+  realm/broker configuration revision, and extension API version before use.
+- [Google's OpenID Connect reference](https://developers.google.com/identity/openid-connect/openid-connect)
+  defines the ID-token `sub`, `hd`, `nonce`, and optional `auth_time` semantics
+  used by §13.2. [GitHub's organization-membership API](https://docs.github.com/en/rest/orgs/members)
+  defines `GET /orgs/{org}/memberships/{username}`, its membership state, and
+  required organization-members read permission. These are identity references;
+  they do not alter the transport references above.
