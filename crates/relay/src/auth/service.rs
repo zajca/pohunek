@@ -2231,7 +2231,7 @@ async fn credential_row_for_owner(
     .bind(principal_id)
     .fetch_optional(&mut **transaction)
     .await
-    .map_err(database_error)?
+    .map_err(retryable_database_error)?
     .ok_or(AuthError::Durable)
 }
 
@@ -2380,7 +2380,7 @@ async fn enforce_credential_capacity(
     .bind(principal_id)
     .fetch_one(&mut **transaction)
     .await
-    .map_err(database_error)?;
+    .map_err(retryable_database_error)?;
     let count = usize::try_from(count).map_err(|_| AuthError::Durable)?;
     if count >= limit && !replacing_without_overlap {
         return Err(AuthError::Capacity);
