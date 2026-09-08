@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use nix::fcntl::{Flock, FlockArg};
 use nix::unistd::Uid;
 use serde::{Deserialize, Serialize};
@@ -28,6 +30,14 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 const MAX_REVIEW_INCIDENTS: usize = 256;
 /// A separate durable marker prevents a torn clean checkpoint from masking activity.
 const ACTIVE_RUN_LATCH: &str = "witness.active";
+/// Changes only when the canonical bootstrap commitment encoding changes.
+const BOOTSTRAP_COMMITMENT_VERSION: u8 = 1;
+/// Makes the derived bootstrap key independent from raw witness signing seed use.
+const BOOTSTRAP_COMMITMENT_HKDF_SALT: &[u8] = b"pohunek.relay.witness.bootstrap-commitment.salt.v1";
+/// Separates a bootstrap commitment from every other witness-key derivation.
+const BOOTSTRAP_COMMITMENT_HKDF_INFO: &[u8] = b"pohunek.relay.witness.bootstrap-commitment.v1";
+/// Separates HMAC input from its key derivation and record signature domains.
+const BOOTSTRAP_COMMITMENT_DOMAIN: &[u8] = b"pohunek.relay.bootstrap-commitment.v1\0";
 
 /// Stores signed witness history independently from `PostgreSQL`.
 pub struct WitnessStore {
@@ -94,20 +104,25 @@ pub struct WitnessRecord {
 }
 
 /// Names the durable checkpoint transition.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WitnessEvent {
     /// A normal runtime checkpoint.
     Run,
     /// A protected bootstrap, bound to its exact identity and audit coordinates.
     Bootstrap {
-        request_digest: [u8; 32],
+        commitment_version: u8,
+        commitment_key_id: String,
+        request_commitment: [u8; 32],
         principal_id: Uuid,
         identity_id: Uuid,
         audit_id: Uuid,
     },
     /// A protected migration, bound to the exact binary plan and prior authority.
     Migration {
-        plan_digest: [u8; 32],
+        base_migration_count: u16,
+        base_plan_digest: [u8; 32],
+        target_migration_count: u16,
+        target_plan_digest: [u8; 32],
         authority_digest: [u8; 32],
     },
     /// Recovery generation advanced before a database restore.
@@ -207,6 +222,37 @@ impl WitnessStore {
                 .map(Some);
         }
         Ok(history.latest)
+    }
+
+    /// Commits canonical bootstrap input without exposing stable identity values.
+    ///
+    /// The HMAC key is derived from the witness seed with HKDF, so this
+    /// commitment cannot be compared against guessed request values using a
+    /// public witness record or audit event.
+    pub(crate) fn bootstrap_commitment(
+        &self,
+        canonical_request: &[u8],
+    ) -> Result<[u8; 32], RecoveryError> {
+        let hkdf = Hkdf::<sha2::Sha256>::new(
+            Some(BOOTSTRAP_COMMITMENT_HKDF_SALT),
+            &self.signing_key.to_bytes(),
+        );
+        let mut key = [0_u8; 32];
+        hkdf.expand(BOOTSTRAP_COMMITMENT_HKDF_INFO, &mut key)
+            .map_err(|_error| RecoveryError::InvalidWitness)?;
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key)
+            .map_err(|_error| RecoveryError::InvalidWitness)?;
+        mac.update(BOOTSTRAP_COMMITMENT_DOMAIN);
+        mac.update(&[BOOTSTRAP_COMMITMENT_VERSION]);
+        update_length_prefixed(&mut mac, self.key_id.as_bytes());
+        update_length_prefixed(&mut mac, canonical_request);
+        Ok(mac.finalize().into_bytes().into())
+    }
+
+    /// Returns the version and key coordinate bound into bootstrap evidence.
+    #[must_use]
+    pub(crate) fn bootstrap_commitment_coordinate(&self) -> (u8, String) {
+        (BOOTSTRAP_COMMITMENT_VERSION, self.key_id.clone())
     }
 
     /// Returns denial scopes recorded since the last reviewed recovery checkpoint.
@@ -514,7 +560,7 @@ impl WitnessStore {
                 previous_digest: None,
                 active_run: true,
                 recovery_pending_review: false,
-                event,
+                event: event.clone(),
                 incident: None,
                 incident_digest: "0".repeat(64),
                 signature: String::new(),
@@ -632,6 +678,15 @@ impl WitnessStore {
                 .incident
                 .as_ref()
                 .is_some_and(|incident| !incident_is_valid(incident))
+            || matches!(
+                &record.event,
+                WitnessEvent::Bootstrap {
+                    commitment_version,
+                    commitment_key_id,
+                    ..
+                } if *commitment_version != BOOTSTRAP_COMMITMENT_VERSION
+                    || commitment_key_id != &record.key_id
+            )
         {
             return Err(RecoveryError::InvalidWitness);
         }
@@ -939,6 +994,11 @@ fn incident_is_valid(incident: &DenyIncident) -> bool {
 
 fn signature_text(key: &SigningKey, bytes: &[u8]) -> String {
     hex::encode(key.sign(bytes).to_bytes())
+}
+
+fn update_length_prefixed(mac: &mut Hmac<sha2::Sha256>, value: &[u8]) {
+    mac.update(&(value.len() as u64).to_be_bytes());
+    mac.update(value);
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), RecoveryError> {

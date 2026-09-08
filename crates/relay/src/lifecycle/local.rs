@@ -3,8 +3,8 @@
 use sqlx::AssertSqlSafe;
 
 use super::{
-    semantic_manifest, validate_bootstrap, BootstrapRequest, Digest, Lifecycle, LifecycleError,
-    Postgres, Sha256, Store, Transaction, Uuid, WitnessRecord,
+    validate_bootstrap, BootstrapRequest, Lifecycle, LifecycleError, Postgres, Store, Transaction,
+    Uuid, WitnessRecord,
 };
 use crate::recovery::WitnessEvent;
 
@@ -49,7 +49,11 @@ impl Lifecycle {
         request: BootstrapRequest,
     ) -> Result<WitnessRecord, LifecycleError> {
         validate_bootstrap(&request)?;
-        let request_digest = bootstrap_digest(&request);
+        let request_commitment = self
+            .witness
+            .bootstrap_commitment(&canonical_bootstrap_request(&request))?;
+        let (commitment_version, commitment_key_id) =
+            self.witness.bootstrap_commitment_coordinate();
         let checkpoint = self.witness.latest()?;
         let mut tx = self.begin_local_tables().await?;
         let occupied = locked_tables(&mut tx).await?;
@@ -67,7 +71,7 @@ impl Lifecycle {
         let active = match checkpoint {
             Some(checkpoint)
                 if checkpoint.relay_id == request.relay_id
-                    && matches!(checkpoint.event, WitnessEvent::Bootstrap { request_digest: expected, .. } if expected == request_digest) =>
+                    && matches!(&checkpoint.event, WitnessEvent::Bootstrap { commitment_version: expected_version, commitment_key_id: expected_key_id, request_commitment: expected, .. } if *expected_version == commitment_version && expected_key_id == &commitment_key_id && *expected == request_commitment) =>
             {
                 checkpoint
             }
@@ -79,7 +83,9 @@ impl Lifecycle {
                     &request.relay_id,
                     1,
                     WitnessEvent::Bootstrap {
-                        request_digest,
+                        commitment_version,
+                        commitment_key_id,
+                        request_commitment,
                         principal_id: Uuid::now_v7(),
                         identity_id: Uuid::now_v7(),
                         audit_id: Uuid::now_v7(),
@@ -92,13 +98,13 @@ impl Lifecycle {
             identity_id,
             audit_id,
             ..
-        } = active.event
+        } = &active.event
         else {
             return Err(LifecycleError::InvalidState);
         };
         let parameter = format!(
-            "principal={principal_id};identity={identity_id};request={}",
-            hex::encode(request_digest)
+            "principal={principal_id};identity={identity_id};commitment={}",
+            hex::encode(request_commitment)
         );
         if occupied.iter().all(|(_, occupied)| !occupied) && active.active_run {
             sqlx::query("INSERT INTO relay_identity (relay_id,recovery_generation,state,revision) VALUES ($1,1,'normal',1)")
@@ -141,6 +147,10 @@ impl Lifecycle {
     }
 
     /// Applies or resumes exactly the signed embedded migration plan with ingress stopped.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The pre-DDL and post-DDL verification boundaries must remain visibly adjacent."
+    )]
     pub async fn migrate_local(&self, expected_relay_id: &str) -> Result<(), LifecycleError> {
         let Some(checkpoint) = self.witness.latest()? else {
             let mut tx = self.begin_local_tables().await?;
@@ -157,12 +167,8 @@ impl Lifecycle {
         if checkpoint.relay_id != expected_relay_id || checkpoint.recovery_pending_review {
             return Err(LifecycleError::InvalidState);
         }
-        let plan_digest = Store::migration_plan_digest();
-        if checkpoint.active_run
-            && !matches!(checkpoint.event, WitnessEvent::Migration { plan_digest: expected, .. } if expected == plan_digest)
-        {
-            return Err(LifecycleError::InvalidState);
-        }
+        let target =
+            Store::migration_target_prefix().map_err(|error| migration_store_error(&error))?;
         let mut tx = self.begin().await?;
         let generation: Option<i64> = sqlx::query_scalar("SELECT recovery_generation FROM relay_identity WHERE relay_id=$1 AND state='normal' AND recovery_generation=$2 FOR UPDATE")
             .bind(expected_relay_id).bind(checkpoint.recovery_generation).fetch_optional(&mut *tx).await.map_err(|_error| LifecycleError::Durable)?;
@@ -171,18 +177,60 @@ impl Lifecycle {
         }
         self.require_no_live_lease(&mut tx, expected_relay_id)
             .await?;
+        // This takes `SHARE ROW EXCLUSIVE` locks before the database-derived
+        // digest. A pending migration therefore cannot be resumed from a
+        // swapped authority state before SQLx receives any DDL.
+        locked_tables(&mut tx).await?;
+        let observed = self
+            .store
+            .migration_prefix_in_transaction(&mut tx)
+            .await
+            .map_err(|error| migration_store_error(&error))?;
+        let authority_digest = self
+            .store
+            .migration_authority_digest_in_transaction(&mut tx)
+            .await
+            .map_err(|error| migration_store_error(&error))?;
         let active = if checkpoint.active_run {
+            let WitnessEvent::Migration {
+                base_migration_count,
+                base_plan_digest,
+                target_migration_count,
+                target_plan_digest,
+                authority_digest: expected_authority,
+            } = &checkpoint.event
+            else {
+                return Err(LifecycleError::InvalidState);
+            };
+            let signed_base = Store::embedded_migration_prefix_for_count(*base_migration_count)
+                .map_err(|error| migration_store_error(&error))?;
+            if signed_base.digest() != *base_plan_digest
+                || *target_migration_count != target.count()
+                || *target_plan_digest != target.digest()
+                || observed.count() < *base_migration_count
+                || observed.count() > *target_migration_count
+                || observed.count() > target.count()
+                || authority_digest != *expected_authority
+                || (observed.count() == *base_migration_count
+                    && observed.digest() != *base_plan_digest)
+            {
+                return Err(LifecycleError::InvalidState);
+            }
             checkpoint
         } else {
-            let incidents = self.witness.incident_review(&checkpoint)?;
-            let manifest = semantic_manifest(&mut tx, incidents, false).await?;
+            if self.witness.latest()?.as_ref() != Some(&checkpoint) {
+                return Err(LifecycleError::InvalidState);
+            }
             self.witness.begin_local(
                 Some(&checkpoint),
                 expected_relay_id,
                 checkpoint.recovery_generation,
                 WitnessEvent::Migration {
-                    plan_digest,
-                    authority_digest: *manifest.digest(),
+                    base_migration_count: observed.count(),
+                    base_plan_digest: observed.digest(),
+                    target_migration_count: target.count(),
+                    target_plan_digest: target.digest(),
+                    authority_digest,
                 },
             )?
         };
@@ -202,9 +250,19 @@ impl Lifecycle {
             .map_err(|_error| LifecycleError::InvalidState)?;
         self.require_no_live_lease(&mut tx, expected_relay_id)
             .await?;
-        let incidents = self.witness.incident_review_at(&active)?;
-        let manifest = semantic_manifest(&mut tx, incidents, false).await?;
-        if !matches!(active.event, WitnessEvent::Migration { authority_digest, .. } if manifest.digest() == &authority_digest)
+        locked_tables(&mut tx).await?;
+        let observed = self
+            .store
+            .migration_prefix_in_transaction(&mut tx)
+            .await
+            .map_err(|error| migration_store_error(&error))?;
+        let authority_digest = self
+            .store
+            .migration_authority_digest_in_transaction(&mut tx)
+            .await
+            .map_err(|error| migration_store_error(&error))?;
+        if observed != target
+            || !matches!(&active.event, WitnessEvent::Migration { authority_digest: expected, .. } if authority_digest == *expected)
         {
             return Err(LifecycleError::ManifestMismatch);
         }
@@ -216,14 +274,20 @@ impl Lifecycle {
     }
 }
 
-fn bootstrap_digest(request: &BootstrapRequest) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash.update(b"pohunek.relay.bootstrap.v1\0");
+pub(crate) fn canonical_bootstrap_request(request: &BootstrapRequest) -> Vec<u8> {
+    let mut bytes = Vec::new();
     for value in [&request.relay_id, &request.issuer, &request.subject] {
-        hash.update((value.len() as u64).to_be_bytes());
-        hash.update(value.as_bytes());
+        bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(value.as_bytes());
     }
-    hash.finalize().into()
+    bytes
+}
+
+fn migration_store_error(error: &crate::store::StoreError) -> LifecycleError {
+    match error {
+        crate::store::StoreError::StaleState => LifecycleError::InvalidState,
+        _ => LifecycleError::Durable,
+    }
 }
 
 fn require_empty(tables: &[(String, bool)], permitted: &[&str]) -> Result<(), LifecycleError> {
@@ -236,7 +300,7 @@ fn require_empty(tables: &[(String, bool)], permitted: &[&str]) -> Result<(), Li
     Ok(())
 }
 
-async fn locked_tables(
+pub(crate) async fn locked_tables(
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<Vec<(String, bool)>, LifecycleError> {
     let tables: Vec<(String, String, String)> = sqlx::query_as("SELECT tablename::text,format('LOCK TABLE %I.%I IN SHARE ROW EXCLUSIVE MODE',schemaname,tablename),format('SELECT EXISTS (SELECT 1 FROM %I.%I)',schemaname,tablename) FROM pg_tables WHERE schemaname=current_schema() AND tablename <> '_sqlx_migrations' ORDER BY tablename LIMIT $1")

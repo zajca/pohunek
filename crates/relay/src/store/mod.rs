@@ -7,7 +7,8 @@
 
 use std::time::Duration;
 
-use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Transaction};
+use sha2::{Digest as _, Sha256};
+use sqlx::{postgres::PgPoolOptions, AssertSqlSafe, PgPool, Postgres, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -20,6 +21,12 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 const MIN_FENCE_CONNECTIONS: u32 = 2;
 /// Cancellation needs at least one slot independent of public requests.
 const MIN_RESERVED_CONNECTIONS: u32 = 1;
+/// Limits migration catalog input independently from a restored database.
+const MAX_MIGRATION_TABLES: usize = 128;
+/// Binds prefix hashes to the exact embedded migration representation.
+const MIGRATION_PREFIX_DOMAIN: &[u8] = b"pohunek.relay.migration-prefix.v1\0";
+/// Binds SQL-side row digests to the local additive migration invariant.
+const MIGRATION_AUTHORITY_DOMAIN: &[u8] = b"pohunek.relay.migration-authority.v1\0";
 
 /// Holds `PostgreSQL` state for one relay process.
 #[derive(Debug, Clone)]
@@ -130,6 +137,27 @@ pub enum StoreError {
     IdempotencyConflict,
 }
 
+/// Identifies one exact checksum-valid prefix of the embedded migration plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MigrationPrefix {
+    count: u16,
+    digest: [u8; 32],
+}
+
+impl MigrationPrefix {
+    /// Returns the number of embedded migrations in this prefix.
+    #[must_use]
+    pub(crate) const fn count(self) -> u16 {
+        self.count
+    }
+
+    /// Returns the canonical checksum-bound prefix digest.
+    #[must_use]
+    pub(crate) const fn digest(self) -> [u8; 32] {
+        self.digest
+    }
+}
+
 impl Store {
     /// Connects a bounded `PostgreSQL` pool.
     ///
@@ -212,17 +240,99 @@ impl Store {
             .map_err(StoreError::Migration)
     }
 
+    #[cfg(all(test, feature = "postgres-tests"))]
+    pub(crate) async fn migrate_to_for_test(&self, target: i64) -> Result<(), StoreError> {
+        let mut connection = self.pool.acquire().await.map_err(StoreError::Database)?;
+        connection.close_on_drop();
+        MIGRATOR
+            .run_direct(Some(target), &mut *connection, false)
+            .await
+            .map_err(StoreError::Migration)
+    }
+
     /// Commits a local migration latch to the exact ordered embedded migration set.
+    #[cfg(test)]
     pub(crate) fn migration_plan_digest() -> [u8; 32] {
-        use sha2::{Digest as _, Sha256};
-        let mut digest = Sha256::new();
-        digest.update(b"pohunek.relay.migration-plan.v1\0");
-        for migration in MIGRATOR.iter() {
-            digest.update(migration.version.to_be_bytes());
-            digest.update((migration.checksum.len() as u64).to_be_bytes());
-            digest.update(&migration.checksum);
+        Self::embedded_migration_prefix(MIGRATOR.iter().count())
+            .expect("embedded migration count fits witness format")
+            .digest
+    }
+
+    /// Returns the complete prefix represented by this relay binary.
+    pub(crate) fn migration_target_prefix() -> Result<MigrationPrefix, StoreError> {
+        Self::embedded_migration_prefix(MIGRATOR.iter().count())
+    }
+
+    /// Returns one exact prefix from the embedded migration source.
+    pub(crate) fn embedded_migration_prefix_for_count(
+        count: u16,
+    ) -> Result<MigrationPrefix, StoreError> {
+        if usize::from(count) > MIGRATOR.iter().count() {
+            return Err(StoreError::StaleState);
         }
-        digest.finalize().into()
+        Self::embedded_migration_prefix(usize::from(count))
+    }
+
+    /// Validates and returns the database's exact embedded migration prefix.
+    pub(crate) async fn migration_prefix_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<MigrationPrefix, StoreError> {
+        let applied: Vec<(i64, Vec<u8>, bool)> = sqlx::query_as(
+            "SELECT version,checksum,success FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(StoreError::Database)?;
+        if applied.len() > MIGRATOR.iter().count() || applied.iter().any(|(_, _, success)| !success)
+        {
+            return Err(StoreError::StaleState);
+        }
+        for ((version, checksum, _success), embedded) in applied.iter().zip(MIGRATOR.iter()) {
+            if *version != embedded.version || checksum.as_slice() != embedded.checksum.as_ref() {
+                return Err(StoreError::StaleState);
+            }
+        }
+        Self::embedded_migration_prefix(applied.len())
+    }
+
+    /// Hashes current nonempty application rows after callers lock every table.
+    ///
+    /// `PostgreSQL` serializes `to_jsonb` and hashes each row before returning its
+    /// digest, so verifier values never enter application memory.
+    pub(crate) async fn migration_authority_digest_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<[u8; 32], StoreError> {
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT tablename::text FROM pg_tables WHERE schemaname=current_schema() AND tablename <> '_sqlx_migrations' ORDER BY tablename COLLATE \"C\" LIMIT $1",
+        )
+        .bind(i64::try_from(MAX_MIGRATION_TABLES + 1).map_err(|_error| StoreError::StaleState)?)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(StoreError::Database)?;
+        if tables.len() > MAX_MIGRATION_TABLES {
+            return Err(StoreError::StaleState);
+        }
+        let mut digest = Sha256::new();
+        digest.update(MIGRATION_AUTHORITY_DOMAIN);
+        for table in tables {
+            let statement = format!(
+                "SELECT encode(sha256(convert_to(string_agg(octet_length(convert_to(row_json,'UTF8'))::text || ':' || row_json,E'\\n' ORDER BY row_json COLLATE \"C\"),'UTF8')),'hex') FROM (SELECT to_jsonb(row_value)::text AS row_json FROM {} AS row_value) AS canonical_rows",
+                quote_identifier(&table),
+            );
+            let row_digest: Option<String> = sqlx::query_scalar(AssertSqlSafe(statement))
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(StoreError::Database)?;
+            let Some(row_digest) = row_digest else {
+                continue;
+            };
+            update_digest_field(&mut digest, table.as_bytes());
+            let row_digest = hex::decode(row_digest).map_err(|_error| StoreError::StaleState)?;
+            update_digest_field(&mut digest, &row_digest);
+        }
+        Ok(digest.finalize().into())
     }
 
     /// Returns the crate-internal pool for authenticated repository operations.
@@ -262,6 +372,32 @@ impl Store {
             binding,
         }
     }
+}
+
+impl Store {
+    fn embedded_migration_prefix(count: usize) -> Result<MigrationPrefix, StoreError> {
+        let count = u16::try_from(count).map_err(|_error| StoreError::StaleState)?;
+        let mut digest = Sha256::new();
+        digest.update(MIGRATION_PREFIX_DOMAIN);
+        digest.update(count.to_be_bytes());
+        for migration in MIGRATOR.iter().take(usize::from(count)) {
+            digest.update(migration.version.to_be_bytes());
+            update_digest_field(&mut digest, migration.checksum.as_ref());
+        }
+        Ok(MigrationPrefix {
+            count,
+            digest: digest.finalize().into(),
+        })
+    }
+}
+
+fn update_digest_field(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 async fn connect_pool(
