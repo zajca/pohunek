@@ -32,6 +32,42 @@ async fn migration_coordinates(store: &Store) -> (crate::store::MigrationPrefix,
     (prefix, authority)
 }
 
+async fn migration_coordinates_with_session_defaults(
+    store: &Store,
+    time_zone: &str,
+    bytea_output: &str,
+) -> (crate::store::MigrationPrefix, [u8; 32]) {
+    let mut tx = store
+        .begin_serializable()
+        .await
+        .expect("begin digest snapshot");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL TimeZone='{time_zone}'"
+    )))
+    .execute(&mut *tx)
+    .await
+    .expect("set test timezone");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL bytea_output='{bytea_output}'"
+    )))
+    .execute(&mut *tx)
+    .await
+    .expect("set test bytea output");
+    locked_tables(&mut tx)
+        .await
+        .expect("lock application tables");
+    let prefix = store
+        .migration_prefix_in_transaction(&mut tx)
+        .await
+        .expect("prefix");
+    let digest = store
+        .migration_authority_digest_in_transaction(&mut tx)
+        .await
+        .expect("digest");
+    tx.commit().await.expect("commit digest snapshot");
+    (prefix, digest)
+}
+
 fn migration_event(
     base: crate::store::MigrationPrefix,
     authority_digest: [u8; 32],
@@ -412,6 +448,42 @@ async fn migration_rejects_swapped_authority_before_auth_ddl() {
         .await
         .expect("verify auth schema was not created");
     assert!(!auth_table);
+    cleanup(&pool, &schema).await;
+}
+
+#[tokio::test]
+async fn migration_hash_is_stable_across_session_rendering_defaults() {
+    let (store, schema, pool, witness, directory) = foundation_fixture().await;
+    let principal = Uuid::now_v7();
+    let audit = Uuid::now_v7();
+    sqlx::query("INSERT INTO principals (id,kind,state,generation) VALUES ($1,'human','active',1)")
+        .bind(principal)
+        .execute(store.pool())
+        .await
+        .expect("seed timestamp row");
+    sqlx::query("INSERT INTO audit_events (audit_id,actor_kind,action,decision,policy_generation,recovery_generation,correlation_id,parameter_code,parameter_value,outcome) VALUES ($1,'system','migration.digest','changed',1,1,$1,'test','digest','committed')")
+        .bind(audit).execute(store.pool()).await.expect("seed audit receipt parent");
+    sqlx::query("INSERT INTO mutation_receipts (actor_principal_id,action,idempotency_key,request_digest,audit_id,outcome_code) VALUES ($1,'migration.digest',$2,decode(repeat('ab',32),'hex'),$3,'committed')")
+        .bind(principal).bind(Uuid::now_v7()).bind(audit).execute(store.pool()).await.expect("seed bytea row");
+    let (prague_prefix, prague_digest) =
+        migration_coordinates_with_session_defaults(&store, "Europe/Prague", "escape").await;
+    let (utc_prefix, utc_digest) =
+        migration_coordinates_with_session_defaults(&store, "UTC", "hex").await;
+    assert_eq!(prague_prefix, utc_prefix);
+    assert_eq!(prague_digest, utc_digest);
+    let clean = witness.latest().expect("witness").expect("clean");
+    witness
+        .begin_local(
+            Some(&clean),
+            "relay-test",
+            1,
+            migration_event(prague_prefix, prague_digest),
+        )
+        .expect("pending migration");
+    reopened(&store, directory.path())
+        .migrate_local("relay-test")
+        .await
+        .expect("retry under canonical defaults");
     cleanup(&pool, &schema).await;
 }
 

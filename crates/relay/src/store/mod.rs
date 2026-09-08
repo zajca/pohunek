@@ -304,6 +304,19 @@ impl Store {
         &self,
         tx: &mut Transaction<'_, Postgres>,
     ) -> Result<[u8; 32], StoreError> {
+        // `to_jsonb(... )::text` renders these values through session GUCs.
+        // Pin the current schema's timestamp and bytea forms before hashing so
+        // a retry after a role/default change has the same authority digest.
+        for statement in [
+            "SET LOCAL TimeZone='UTC'",
+            "SET LOCAL DateStyle='ISO, YMD'",
+            "SET LOCAL bytea_output='hex'",
+        ] {
+            sqlx::query(statement)
+                .execute(&mut **tx)
+                .await
+                .map_err(StoreError::Database)?;
+        }
         let tables: Vec<String> = sqlx::query_scalar(
             "SELECT tablename::text FROM pg_tables WHERE schemaname=current_schema() AND tablename <> '_sqlx_migrations' ORDER BY tablename COLLATE \"C\" LIMIT $1",
         )
