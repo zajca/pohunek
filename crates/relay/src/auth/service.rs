@@ -4226,4 +4226,145 @@ pub(crate) mod tests {
             .expect("release touch transaction before schema cleanup");
         cleanup(&bootstrap, &schema).await;
     }
+
+    #[tokio::test]
+    async fn inactive_rotation_targets_are_rejected_without_durable_effects() {
+        let (store, schema, bootstrap) = fixture().await;
+        let (authority, directory) = authority(store.clone()).await;
+        let service = AuthService::new(
+            store.clone(),
+            DigestKey::new("test".into(), b"ephemeral-test-key".to_vec()),
+            2,
+            limits(),
+            LoginPolicy::AnyAuthenticatedSubject,
+            Arc::clone(&authority),
+        );
+        let principal_id = Uuid::now_v7();
+        let identity_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO principals (id,kind,state,generation) VALUES ($1,'human','active',1)",
+        )
+        .bind(principal_id)
+        .execute(store.pool())
+        .await
+        .expect("seed shared principal");
+        sqlx::query("INSERT INTO oidc_identities (identity_id,issuer,subject,principal_id,link_generation) VALUES ($1,'issuer','inactive-rotation',$2,1)")
+            .bind(identity_id)
+            .bind(principal_id)
+            .execute(store.pool())
+            .await
+            .expect("seed shared identity");
+        for (label, state_sql) in [
+            ("revoked", "revoked_at=clock_timestamp()"),
+            (
+                "expired",
+                "issued_at=clock_timestamp()-interval '2 hours',expires_at=clock_timestamp()-interval '1 second'",
+            ),
+            ("stale", "recovery_generation=2"),
+            (
+                "elapsed",
+                "rotation_overlap_ends_at=clock_timestamp()-interval '1 second'",
+            ),
+        ] {
+            let actor_id = Uuid::now_v7();
+            let target_id = Uuid::now_v7();
+            let secret = format!("inactive-rotation-{label}");
+            sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,expires_at) VALUES ($1,$2,$3,$4,$5,'test','human',1,$1,1,clock_timestamp()+interval '1 hour')")
+                .bind(actor_id).bind(actor_id.to_string()).bind(service.digest_key.digest(&secret).as_slice()).bind(principal_id).bind(identity_id)
+                .execute(store.pool()).await.expect("seed current actor credential");
+            sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,expires_at) VALUES ($1,$2,$3,$4,$5,'test','human',1,$1,1,clock_timestamp()+interval '1 hour')")
+                .bind(target_id).bind(target_id.to_string()).bind(service.digest_key.digest(&format!("inactive-target-{label}")).as_slice()).bind(principal_id).bind(identity_id)
+                .execute(store.pool()).await.expect("seed inactive target");
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE relay_credentials SET {state_sql} WHERE credential_id=$1"
+            )))
+            .bind(target_id)
+            .execute(store.pool())
+            .await
+            .expect("make target inactive");
+            let actor = service
+                .authenticate_bearer(RelayBearerCredential::new(format!("{actor_id}.{secret}")))
+                .await
+                .expect("authenticate fresh actor");
+            let request = RotateCredentialRequest {
+                overlap_seconds: 1,
+                idempotency: relay_protocol::Idempotency {
+                    correlation_id: Uuid::now_v7(),
+                    idempotency_key: Uuid::now_v7(),
+                },
+                expires_at: (time::OffsetDateTime::now_utc() + time::Duration::minutes(10))
+                    .replace_nanosecond(0)
+                    .expect("whole-second expiry"),
+            };
+            let credentials: i64 = sqlx::query_scalar("SELECT count(*) FROM relay_credentials")
+                .fetch_one(store.pool())
+                .await
+                .expect("count credentials");
+            let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events")
+                .fetch_one(store.pool())
+                .await
+                .expect("count audits");
+            let receipts: i64 = sqlx::query_scalar("SELECT count(*) FROM mutation_receipts")
+                .fetch_one(store.pool())
+                .await
+                .expect("count receipts");
+            let witness = WitnessStore::open(
+                directory.path(),
+                SigningKey::from_bytes(&[9; 32]),
+                "test-key".into(),
+            )
+            .expect("reopen witness")
+            .latest()
+            .expect("read witness");
+            for _ in 0..2 {
+                assert!(matches!(
+                    service
+                        .rotate_credential(
+                            actor,
+                            CredentialId::from_uuid(target_id),
+                            request.clone()
+                        )
+                        .await,
+                    Err(AuthError::RotationRejected)
+                ));
+            }
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM relay_credentials")
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("count credentials after rejection"),
+                credentials
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM audit_events")
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("count audits after rejection"),
+                audits
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM mutation_receipts")
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("count receipts after rejection"),
+                receipts
+            );
+            assert_eq!(
+                WitnessStore::open(
+                    directory.path(),
+                    SigningKey::from_bytes(&[9; 32]),
+                    "test-key".into()
+                )
+                .expect("reopen witness")
+                .latest()
+                .expect("read witness after rejection"),
+                witness
+            );
+            assert!(
+                !authority.is_closed(),
+                "{label} rejection keeps authority live"
+            );
+        }
+        cleanup(&bootstrap, &schema).await;
+    }
 }
