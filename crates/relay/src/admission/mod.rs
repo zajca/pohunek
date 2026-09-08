@@ -630,6 +630,19 @@ impl Authority {
         mutation.complete()
     }
 
+    /// Fails stopped after an audited credential revocation cannot be recorded.
+    ///
+    /// The caller must drop its uncommitted database transaction after this
+    /// returns. Closing first prevents a failed witness write from leaving
+    /// active access live while the durable credential mutation rolls back.
+    pub(crate) fn fail_stop_auth_revocation(
+        &self,
+        target: AuthMutationTarget,
+    ) -> Result<(), AuthorityError> {
+        self.close_all();
+        self.record_deny_incident(target.incident(), None)
+    }
+
     fn begin_mutation(&self) -> Result<MutationGate, AuthorityError> {
         let mut registry = self
             .registry
@@ -2465,6 +2478,58 @@ mod tests {
             .await
             .expect("read revocations");
         assert_eq!(revocations, 0);
+        cleanup(&store, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn failed_auth_revocation_witness_stays_dirty_and_cancels_active_access() {
+        let (store, schema, owner, owner_credential, _administrator, _administrator_credential) =
+            fixture().await;
+        let team: Uuid = sqlx::query_scalar("SELECT team_id FROM teams")
+            .fetch_one(store.pool())
+            .await
+            .expect("read team");
+        let (authority, _directory) = authority(
+            store.clone(),
+            AuthorityLimits {
+                global: 2,
+                per_team: 2,
+                per_principal: 2,
+            },
+        )
+        .await;
+        let guard = authority
+            .admit(AuthorizationRequest {
+                actor: actor(owner, owner_credential, ActorKind::Human),
+                team_id: team,
+                permission: "session.metadata.read".to_owned(),
+                resource: crate::store::ResourceScope::Team,
+                correlation_id: Uuid::now_v7(),
+            })
+            .await
+            .expect("admit owner");
+        authority.witness.set_failpoint(Some("history_write"));
+
+        assert!(matches!(
+            authority.fail_stop_auth_revocation(AuthMutationTarget::Credential(owner_credential)),
+            Err(AuthorityError::Recovery(RecoveryError::Io(_)))
+        ));
+        authority.witness.set_failpoint(None);
+
+        assert!(authority.is_closed());
+        assert!(guard.cancelled());
+        assert!(matches!(
+            authority.release_clean().await,
+            Err(AuthorityError::Cancelled)
+        ));
+        assert!(
+            authority
+                .witness
+                .latest()
+                .expect("read dirty witness")
+                .expect("active witness")
+                .active_run
+        );
         cleanup(&store, &schema).await;
     }
 

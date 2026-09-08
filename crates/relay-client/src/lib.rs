@@ -138,8 +138,9 @@ impl Client {
 
     /// Revokes the calling credential, including compensation after keyring failure.
     ///
-    /// Reuse `request` after a transport failure while the credential can still
-    /// authenticate the retry.
+    /// Reuse `request` after a transport failure only while this credential can
+    /// still authenticate the retry. An unauthenticated response is not proof
+    /// that this request committed.
     pub async fn revoke_self(
         &self,
         credential: &DeviceCredential,
@@ -152,12 +153,7 @@ impl Client {
                 reqwest::Method::POST,
             )?
             .json(request);
-        let response = match self.send(request).await {
-            // A retry after a lost successful reply can no longer authenticate;
-            // an expired/revoked credential already has the desired authority state.
-            Err(Error::Unauthenticated) => return Ok(()),
-            result => result?,
-        };
+        let response = self.send(request).await?;
         if response.status() != StatusCode::NO_CONTENT {
             return Err(Error::Malformed);
         }

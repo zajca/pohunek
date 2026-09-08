@@ -71,6 +71,7 @@ struct Relay {
     poll_times: Mutex<Vec<Instant>>,
     revocations: Mutex<Vec<CredentialId>>,
     fail_revoke: AtomicBool,
+    revoke_error: Mutex<Option<pohunek_relay_client::Error>>,
     login_lifetime: time::Duration,
     rotation: Mutex<Option<CredentialMutation>>,
     rotation_targets: Mutex<Vec<CredentialId>>,
@@ -90,6 +91,7 @@ impl Relay {
             poll_times: Mutex::new(vec![]),
             revocations: Mutex::new(vec![]),
             fail_revoke: AtomicBool::new(false),
+            revoke_error: Mutex::new(None),
             login_lifetime: time::Duration::minutes(5),
             rotation: Mutex::new(None),
             rotation_targets: Mutex::new(vec![]),
@@ -165,6 +167,9 @@ impl Api for Relay {
             .lock()
             .expect("revocations")
             .push(credential.credential_id);
+        if let Some(error) = self.revoke_error.lock().expect("revoke error").take() {
+            return Err(error);
+        }
         if self.fail_revoke.load(Ordering::SeqCst) {
             Err(pohunek_relay_client::Error::Transport)
         } else {
@@ -506,6 +511,26 @@ async fn logout_retains_retry_credential_until_remote_revocation_succeeds() {
     api.fail_revoke.store(false, Ordering::SeqCst);
     logout(&api, &store).await.expect("retry succeeds");
     assert!(store.load(api.origin()).await.expect("store").is_none());
+}
+
+#[tokio::test]
+async fn logout_retains_the_keyring_credential_when_the_relay_rejects_it() {
+    let api = Relay::new(vec![]);
+    *api.revoke_error.lock().expect("revoke error") =
+        Some(pohunek_relay_client::Error::Unauthenticated);
+    let store = MemoryStore {
+        credential: Mutex::new(Some(credential(1))),
+        fail_save: false,
+        ..MemoryStore::default()
+    };
+
+    logout(&api, &store)
+        .await
+        .expect_err("unauthenticated revoke is not successful logout evidence");
+    assert!(
+        store.load(api.origin()).await.expect("store").is_some(),
+        "logout keeps the keyring credential without a successful revoke response"
+    );
 }
 
 #[tokio::test(start_paused = true)]

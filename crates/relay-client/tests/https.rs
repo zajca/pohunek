@@ -228,7 +228,7 @@ async fn revoke(
 }
 
 #[tokio::test]
-async fn device_poll_account_and_compensating_revoke_use_exact_protected_headers() {
+async fn device_poll_account_and_self_revoke_use_exact_protected_headers() {
     let state = AuthFixture {
         polls: Arc::new(AtomicUsize::new(0)),
         revoked: Arc::new(AtomicBool::new(false)),
@@ -281,10 +281,13 @@ async fn device_poll_account_and_compensating_revoke_use_exact_protected_headers
         .await
         .expect("compensating self revoke");
     assert!(state.revoked.load(Ordering::SeqCst));
-    client
-        .revoke_self(&credential, &request)
-        .await
-        .expect("lost-reply retry already has no authority");
+    assert_eq!(
+        client
+            .revoke_self(&credential, &request)
+            .await
+            .expect_err("unauthenticated retry is not durable revoke proof"),
+        Error::Unauthenticated
+    );
     assert_eq!(
         client
             .account(&credential)
@@ -293,6 +296,33 @@ async fn device_poll_account_and_compensating_revoke_use_exact_protected_headers
         Error::Unauthenticated
     );
     assert!(!format!("{client:?}").contains(credential.secret.expose()));
+}
+
+#[tokio::test]
+async fn self_revoke_rejects_a_valid_but_wrong_bearer_without_claiming_success() {
+    let state = AuthFixture {
+        polls: Arc::new(AtomicUsize::new(0)),
+        revoked: Arc::new(AtomicBool::new(false)),
+    };
+    let app = Router::new()
+        .route("/v1/auth/credentials/self/revoke", post(revoke))
+        .with_state(state.clone());
+    let fixture = Fixture::new(app).await;
+    let client = fixture.client(4096);
+    let mut wrong = credential();
+    wrong.secret = Secret::new(URL_SAFE_NO_PAD.encode([8; 32]));
+
+    assert_eq!(
+        client
+            .revoke_self(&wrong, &revoke_request())
+            .await
+            .expect_err("wrong valid bearer cannot prove self revoke"),
+        Error::Unauthenticated
+    );
+    assert!(
+        !state.revoked.load(Ordering::SeqCst),
+        "a rejected bearer must not revoke the actual credential"
+    );
 }
 
 #[tokio::test]

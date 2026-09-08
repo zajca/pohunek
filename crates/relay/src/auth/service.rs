@@ -801,6 +801,9 @@ impl AuthService {
         &self,
         credential: RelayBearerCredential,
     ) -> Result<AuthenticatedActor, AuthError> {
+        if self.authority.is_closed() {
+            return Err(AuthError::Durable);
+        }
         let (public_id, secret) = credential.parts()?;
         let digest = self.digest_key.digest(secret);
         let row = sqlx::query(
@@ -1018,7 +1021,7 @@ impl AuthService {
             }
             return Err(AuthError::CredentialInvalid);
         }
-        let audit_id = audit_actor_mutation(
+        let audit_id = match audit_actor_mutation(
             &mut transaction,
             context,
             "auth.credential.revoke",
@@ -1028,7 +1031,16 @@ impl AuthService {
             request.idempotency,
             database_error,
         )
-        .await?;
+        .await
+        {
+            Ok(audit_id) => audit_id,
+            Err(_error) => {
+                let _ = self
+                    .authority
+                    .fail_stop_auth_revocation(AuthMutationTarget::Credential(credential_id));
+                return Err(AuthError::Durable);
+            }
+        };
         insert_receipt(
             &mut transaction,
             context,
@@ -1143,7 +1155,7 @@ impl AuthService {
             }
             return Err(AuthError::CredentialInvalid);
         }
-        let audit_id = audit_actor_mutation(
+        let audit_id = match audit_actor_mutation(
             &mut transaction,
             context,
             "auth.service_credential.revoke",
@@ -1153,7 +1165,16 @@ impl AuthService {
             request.idempotency,
             database_error,
         )
-        .await?;
+        .await
+        {
+            Ok(audit_id) => audit_id,
+            Err(_error) => {
+                let _ = self
+                    .authority
+                    .fail_stop_auth_revocation(AuthMutationTarget::Credential(credential_id));
+                return Err(AuthError::Durable);
+            }
+        };
         insert_receipt(
             &mut transaction,
             context,
@@ -2800,6 +2821,283 @@ pub(crate) mod tests {
         )
         .expect("create authority");
         (Arc::new(authority), directory)
+    }
+
+    async fn seed_revocation_audit_failure_case(
+        service: &AuthService,
+        store: &Store,
+        service_target: bool,
+    ) -> (AuthenticatedActor, Uuid, String, Uuid, Uuid) {
+        let actor_principal_id = Uuid::now_v7();
+        let actor_credential_id = Uuid::now_v7();
+        let actor_identity_id = Uuid::now_v7();
+        let team_id = Uuid::now_v7();
+        let target_credential_id = Uuid::now_v7();
+        let actor_secret = "revoke-audit-actor-secret";
+        let target_secret = if service_target {
+            "revoke-audit-service-secret"
+        } else {
+            "revoke-audit-human-secret"
+        };
+        let target_principal_id = if service_target {
+            Uuid::now_v7()
+        } else {
+            actor_principal_id
+        };
+        sqlx::query(
+            "INSERT INTO principals (id,kind,state,generation) VALUES ($1,'human','active',1)",
+        )
+        .bind(actor_principal_id)
+        .execute(store.pool())
+        .await
+        .expect("seed revocation audit failure actor");
+        if service_target {
+            sqlx::query("INSERT INTO principals (id,kind,state,generation) VALUES ($1,'service','active',1)")
+                .bind(target_principal_id)
+                .execute(store.pool())
+                .await
+                .expect("seed revocation audit failure service principal");
+        }
+        sqlx::query(
+            "INSERT INTO teams (team_id,display_name,state,policy_generation,revision) \
+             VALUES ($1,'revoke-audit-team','active',1,1)",
+        )
+        .bind(team_id)
+        .execute(store.pool())
+        .await
+        .expect("seed revocation audit failure team");
+        sqlx::query(
+            "INSERT INTO memberships \
+             (membership_id,team_id,principal_id,builtin_role,state,revision,local_deny_generation) \
+             VALUES ($1,$2,$3,'owner','active',1,1)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(team_id)
+        .bind(actor_principal_id)
+        .execute(store.pool())
+        .await
+        .expect("seed revocation audit failure membership");
+        sqlx::query(
+            "INSERT INTO oidc_identities (identity_id,issuer,subject,principal_id,link_generation) \
+             VALUES ($1,'issuer','revoke-audit-actor',$2,1)",
+        )
+        .bind(actor_identity_id)
+        .bind(actor_principal_id)
+        .execute(store.pool())
+        .await
+        .expect("seed revocation audit failure identity");
+        if service_target {
+            sqlx::query(
+                "INSERT INTO service_accounts (principal_id,team_id,display_name) VALUES ($1,$2,'revoke-audit-service')",
+            )
+            .bind(target_principal_id)
+            .bind(team_id)
+            .execute(store.pool())
+            .await
+            .expect("seed service account");
+        }
+        sqlx::query(
+            "INSERT INTO relay_credentials\
+             (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,expires_at)\
+             VALUES ($1,$2,$3,$4,$5,'test','human',1,$1,1,clock_timestamp()+interval '1 hour')\
+             ,($6,$7,$8,$9,$10,'test',$11,1,$6,1,clock_timestamp()+interval '1 hour')",
+        )
+        .bind(actor_credential_id)
+        .bind(actor_credential_id.to_string())
+        .bind(service.digest_key.digest(actor_secret).as_slice())
+        .bind(actor_principal_id)
+        .bind(actor_identity_id)
+        .bind(target_credential_id)
+        .bind(target_credential_id.to_string())
+        .bind(service.digest_key.digest(target_secret).as_slice())
+        .bind(target_principal_id)
+        .bind(if service_target { None } else { Some(actor_identity_id) })
+        .bind(if service_target { "service" } else { "human" })
+        .execute(store.pool())
+        .await
+        .expect("seed revocation audit failure credentials");
+        let actor = service
+            .authenticate_bearer(RelayBearerCredential::new(format!(
+                "{actor_credential_id}.{actor_secret}"
+            )))
+            .await
+            .expect("authenticate revocation audit failure actor");
+        (
+            actor,
+            target_credential_id,
+            target_secret.to_owned(),
+            team_id,
+            target_principal_id,
+        )
+    }
+
+    async fn reject_revoke_audit(store: &Store, action: &'static str) {
+        let name = action.replace('.', "_");
+        let sql = format!(
+            "CREATE FUNCTION reject_{name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit unavailable'; END; $$; \
+             CREATE TRIGGER reject_{name} BEFORE INSERT ON audit_events FOR EACH ROW \
+             WHEN (NEW.action = '{action}') EXECUTE FUNCTION reject_{name}();"
+        );
+        sqlx::raw_sql(AssertSqlSafe(sql))
+            .execute(store.pool())
+            .await
+            .expect("install revocation audit failure trigger");
+    }
+
+    async fn assert_revocation_audit_failure(
+        service: &AuthService,
+        store: &Store,
+        authority: &Authority,
+        guard: crate::admission::AccessGuard,
+        target_credential_id: Uuid,
+        target_secret: &str,
+        action: &'static str,
+    ) {
+        assert!(authority.is_closed(), "audit outage fail-stops authority");
+        assert!(guard.cancelled(), "audit outage cancels active guard");
+        assert!(matches!(
+            service
+                .authenticate_bearer(RelayBearerCredential::new(format!(
+                    "{target_credential_id}.{target_secret}"
+                )))
+                .await,
+            Err(AuthError::Durable)
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM audit_events WHERE action = $1")
+                .bind(action)
+                .fetch_one(store.pool())
+                .await
+                .expect("count rolled back revoke audits"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM mutation_receipts WHERE action = $1"
+            )
+            .bind(action)
+            .fetch_one(store.pool())
+            .await
+            .expect("count rolled back revoke receipts"),
+            0
+        );
+        let target: (i64, Option<time::OffsetDateTime>) = sqlx::query_as(
+            "SELECT credential_generation, revoked_at FROM relay_credentials WHERE credential_id = $1",
+        )
+        .bind(target_credential_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("read rollback target credential");
+        assert_eq!(target.0, 1, "audit outage does not fake persisted revoke");
+        assert!(target.1.is_none(), "audit outage rolls back revoked_at");
+        assert_eq!(
+            authority
+                .witness_sequence()
+                .expect("read deny incident witness"),
+            2
+        );
+        assert!(matches!(
+            authority.release_clean().await,
+            Err(AuthorityError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn self_revoke_audit_outage_cancels_access_and_fails_stopped_without_a_receipt() {
+        let (store, schema, bootstrap) = fixture().await;
+        let (authority, _directory) = authority(store.clone()).await;
+        let service = AuthService::new(
+            store.clone(),
+            DigestKey::new("test".into(), b"ephemeral-test-key".to_vec()),
+            2,
+            limits(),
+            LoginPolicy::AnyAuthenticatedSubject,
+            Arc::clone(&authority),
+        );
+        let (actor, target_credential_id, target_secret, team_id, _) =
+            seed_revocation_audit_failure_case(&service, &store, false).await;
+        let guard = authority
+            .admit(AuthorizationRequest {
+                actor: actor.actor(),
+                team_id,
+                permission: "team.membership.read".to_owned(),
+                resource: ResourceScope::Team,
+                correlation_id: Uuid::now_v7(),
+            })
+            .await
+            .expect("admit self revoke actor before audit outage");
+        reject_revoke_audit(&store, "auth.credential.revoke").await;
+        assert!(matches!(
+            service
+                .revoke_credential(
+                    actor,
+                    CredentialId::from_uuid(target_credential_id),
+                    revoke_request(),
+                )
+                .await,
+            Err(AuthError::Durable)
+        ));
+        assert_revocation_audit_failure(
+            &service,
+            &store,
+            &authority,
+            guard,
+            target_credential_id,
+            &target_secret,
+            "auth.credential.revoke",
+        )
+        .await;
+        cleanup(&bootstrap, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn service_revoke_audit_outage_cancels_access_and_fails_stopped_without_a_receipt() {
+        let (store, schema, bootstrap) = fixture().await;
+        let (authority, _directory) = authority(store.clone()).await;
+        let service = AuthService::new(
+            store.clone(),
+            DigestKey::new("test".into(), b"ephemeral-test-key".to_vec()),
+            2,
+            limits(),
+            LoginPolicy::AnyAuthenticatedSubject,
+            Arc::clone(&authority),
+        );
+        let (actor, target_credential_id, target_secret, team_id, target_principal_id) =
+            seed_revocation_audit_failure_case(&service, &store, true).await;
+        let guard = authority
+            .admit(AuthorizationRequest {
+                actor: actor.actor(),
+                team_id,
+                permission: "team.membership.read".to_owned(),
+                resource: ResourceScope::Team,
+                correlation_id: Uuid::now_v7(),
+            })
+            .await
+            .expect("admit service revoke actor before audit outage");
+        reject_revoke_audit(&store, "auth.service_credential.revoke").await;
+        assert!(matches!(
+            service
+                .revoke_service_credential(
+                    actor,
+                    TeamId::from_uuid(team_id),
+                    PrincipalId::from_uuid(target_principal_id),
+                    CredentialId::from_uuid(target_credential_id),
+                    revoke_request(),
+                )
+                .await,
+            Err(AuthError::Durable)
+        ));
+        assert_revocation_audit_failure(
+            &service,
+            &store,
+            &authority,
+            guard,
+            target_credential_id,
+            &target_secret,
+            "auth.service_credential.revoke",
+        )
+        .await;
+        cleanup(&bootstrap, &schema).await;
     }
 
     #[tokio::test]
