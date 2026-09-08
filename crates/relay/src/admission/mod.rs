@@ -175,7 +175,10 @@ macro_rules! management_transaction {
         if $authority.closed.load(Ordering::Acquire) {
             return Err(AuthorityError::Cancelled);
         }
-        let mut transaction = $authority.store.begin_serializable().await?;
+        let mut transaction = match $authority.store.begin_serializable().await {
+            Ok(transaction) => transaction,
+            Err(error) => return Err($authority.management_pre_gate_error(error)),
+        };
         let lease = $authority
             .lease
             .lock()
@@ -189,11 +192,16 @@ macro_rules! management_transaction {
             $authority.close_all();
             return Err(error.into());
         }
-        require_team_permission(&mut transaction, $actor, management_team_id, $permission).await?;
-        if !($target)
-            .exists(&mut transaction, management_team_id)
-            .await?
+        if let Err(error) =
+            require_team_permission(&mut transaction, $actor, management_team_id, $permission).await
         {
+            return Err($authority.management_pre_gate_error(error));
+        }
+        let target_exists = match ($target).exists(&mut transaction, management_team_id).await {
+            Ok(exists) => exists,
+            Err(error) => return Err($authority.management_pre_gate_error(error)),
+        };
+        if !target_exists {
             return Err(AuthorityError::Store(StoreError::Forbidden));
         }
         let result = $authority
@@ -202,10 +210,7 @@ macro_rules! management_transaction {
             .await;
         let result = match result {
             Ok(result) => result,
-            Err(error) => {
-                $authority.close_all();
-                return Err(error.into());
-            }
+            Err(error) => return Err($authority.management_pre_gate_error(error)),
         };
         let mutation = $authority.begin_mutation()?;
         $authority.record_team_deny(management_team_id)?;
@@ -236,6 +241,13 @@ macro_rules! management_transaction {
 }
 
 impl Authority {
+    fn management_pre_gate_error(&self, error: StoreError) -> AuthorityError {
+        if !is_management_business_denial(&error) {
+            self.close_all();
+        }
+        error.into()
+    }
+
     /// Finalizes a prepared auth transaction without splitting its witness boundary.
     ///
     /// The caller must perform all predictable validation, idempotency receipt
@@ -574,7 +586,10 @@ impl Authority {
             return Err(AuthorityError::Store(StoreError::Forbidden));
         }
         valid_team_name(&command.display_name)?;
-        let mut transaction = self.store.begin_serializable().await?;
+        let mut transaction = match self.store.begin_serializable().await {
+            Ok(transaction) => transaction,
+            Err(error) => return Err(self.management_pre_gate_error(error)),
+        };
         let lease = self
             .lease
             .lock()
@@ -588,7 +603,9 @@ impl Authority {
             self.close_all();
             return Err(error.into());
         }
-        verify_current_actor(&mut transaction, actor).await?;
+        if let Err(error) = verify_current_actor(&mut transaction, actor).await {
+            return Err(self.management_pre_gate_error(error));
+        }
         let relay_id = self
             .current
             .lock()
@@ -601,10 +618,7 @@ impl Authority {
             .await
         {
             Ok(record) => record,
-            Err(error) => {
-                self.close_all();
-                return Err(error.into());
-            }
+            Err(error) => return Err(self.management_pre_gate_error(error)),
         };
         let mutation = self.begin_mutation()?;
         self.record_deny_incident(DenyIncident::Global { relay_id }, None)?;
@@ -1119,6 +1133,15 @@ impl Authority {
         self.closed.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn witness_sequence(&self) -> Result<i64, AuthorityError> {
+        Ok(self
+            .current
+            .lock()
+            .map_err(|_error| AuthorityError::Cancelled)?
+            .sequence)
+    }
+
     /// Closes ingress after a failure and preserves the dirty witness latch.
     pub fn close_all(&self) {
         self.failed.store(true, Ordering::Release);
@@ -1285,7 +1308,7 @@ impl TeamTarget {
             .await
             .map_err(StoreError::Database)?,
             Self::GrantSubject(subject) => {
-                grant_subject_exists(transaction, team_id, subject).await?.then(|| Uuid::nil())
+                grant_subject_exists(transaction, team_id, subject).await?.then(Uuid::nil)
             }
             Self::GrantUpdate(grant_id, subject) => {
                 let grant = sqlx::query_scalar::<_, Uuid>(
@@ -1332,6 +1355,17 @@ async fn grant_subject_exists(
         .fetch_one(&mut **transaction)
         .await
         .map_err(StoreError::Database)
+}
+
+fn is_management_business_denial(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::Forbidden
+            | StoreError::StaleState
+            | StoreError::Contended
+            | StoreError::InputTooLarge
+            | StoreError::IdempotencyConflict
+    )
 }
 
 fn parse_scope_uuid(command: &RevocationCommand) -> Result<Uuid, AuthorityError> {

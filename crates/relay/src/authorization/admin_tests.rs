@@ -8,10 +8,12 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use super::{
-    CreateGrant, CreateGroup, CreateRole, GrantSubject, GroupMemberChange, RoleAssignmentChange,
-    UpdateTeam,
+    CreateGrant, CreateGroup, CreateRole, GrantSubject, GroupMemberChange, RemoveMember,
+    RoleAssignmentChange, UpdateGroup, UpdateTeam,
 };
-use crate::store::{ActorKind, AuthenticationBinding, Store};
+use crate::store::{
+    ActorKind, AuthenticationBinding, AuthorizationRequest, ResourceScope, Store, StoreError,
+};
 use crate::{
     admission::{Authority, AuthorityLimits, RevocationCommand},
     authorization::CreateTeam,
@@ -167,6 +169,44 @@ async fn service_actor(store: &Store, team_id: Uuid) -> crate::store::ActorConte
         1,
         ActorKind::Service,
         AuthenticationBinding::Credential,
+    )
+}
+
+async fn management_state(store: &Store, team_id: Uuid) -> (String, i64, i64, i64, i64, i64, i64) {
+    let team: (String, i64, i64) =
+        sqlx::query_as("SELECT state,policy_generation,revision FROM teams WHERE team_id=$1")
+            .bind(team_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("read management team state");
+    let memberships: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM memberships WHERE team_id=$1 AND state='active'")
+            .bind(team_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("count active memberships");
+    let group_members: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM group_members WHERE team_id=$1")
+            .bind(team_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("count group memberships");
+    let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events")
+        .fetch_one(store.pool())
+        .await
+        .expect("count audit events");
+    let receipts: i64 = sqlx::query_scalar("SELECT count(*) FROM mutation_receipts")
+        .fetch_one(store.pool())
+        .await
+        .expect("count mutation receipts");
+    (
+        team.0,
+        team.1,
+        team.2,
+        memberships,
+        group_members,
+        audits,
+        receipts,
     )
 }
 
@@ -471,6 +511,272 @@ async fn management_permissions_are_narrow_for_custom_and_service_actors() {
         )
         .await
         .expect("service team grant manages roles");
+    cleanup(store.pool(), &schema).await;
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ManagementBusinessDenial {
+    StaleRevision,
+    MissingTarget,
+    CrossTeamTarget,
+    InputTooLarge,
+    IdempotencyConflict,
+    LastOwner,
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Each denial uses an isolated PostgreSQL schema to prove the full authority boundary."
+)]
+async fn management_business_denials_preserve_live_access_and_durable_state() {
+    for denial in [
+        ManagementBusinessDenial::StaleRevision,
+        ManagementBusinessDenial::MissingTarget,
+        ManagementBusinessDenial::CrossTeamTarget,
+        ManagementBusinessDenial::InputTooLarge,
+        ManagementBusinessDenial::IdempotencyConflict,
+        ManagementBusinessDenial::LastOwner,
+    ] {
+        let (store, schema, owner, member, credential) = fixture().await;
+        let team_id = team(&store, owner).await;
+        let second_team = team(&store, owner).await;
+        let actor = owner_actor(owner, credential);
+        sqlx::query("INSERT INTO memberships (membership_id,team_id,principal_id,builtin_role,state,revision,local_deny_generation) VALUES ($1,$2,$3,'member','active',1,1)")
+            .bind(Uuid::now_v7())
+            .bind(team_id)
+            .bind(member)
+            .execute(store.pool())
+            .await
+            .expect("seed removable member");
+        let group_id = Uuid::now_v7();
+        sqlx::query("INSERT INTO groups (team_id,group_id,display_name,state,revision) VALUES ($1,$2,'staged','active',1)")
+            .bind(team_id)
+            .bind(group_id)
+            .execute(store.pool())
+            .await
+            .expect("seed first-team group");
+        sqlx::query(
+            "INSERT INTO group_members (team_id,group_id,principal_id,revision) VALUES ($1,$2,$3,1)",
+        )
+            .bind(team_id)
+            .bind(group_id)
+            .bind(member)
+            .execute(store.pool())
+            .await
+            .expect("seed staged group membership");
+        let foreign_group_id = Uuid::now_v7();
+        sqlx::query("INSERT INTO groups (team_id,group_id,display_name,state,revision) VALUES ($1,$2,'foreign','active',1)")
+            .bind(second_team)
+            .bind(foreign_group_id)
+            .execute(store.pool())
+            .await
+            .expect("seed foreign group");
+        let (authority, _witness_directory) = authority(store.clone()).await;
+        let conflict_key = Uuid::now_v7();
+        if matches!(denial, ManagementBusinessDenial::IdempotencyConflict) {
+            authority
+                .create_group(
+                    actor,
+                    CreateGroup {
+                        team_id,
+                        display_name: "original".into(),
+                        correlation_id: Uuid::now_v7(),
+                        idempotency_key: conflict_key,
+                    },
+                )
+                .await
+                .expect("record initial idempotency receipt");
+        }
+        let guard = authority
+            .admit(AuthorizationRequest {
+                actor,
+                team_id,
+                permission: "session.metadata.read".to_owned(),
+                resource: ResourceScope::Team,
+                correlation_id: Uuid::now_v7(),
+            })
+            .await
+            .expect("admit unrelated live guard");
+        let state_before = management_state(&store, team_id).await;
+        let witness_before = authority.witness_sequence().expect("read witness sequence");
+        let error = match denial {
+            ManagementBusinessDenial::StaleRevision => {
+                authority
+                    .remove_member(
+                        actor,
+                        RemoveMember {
+                            team_id,
+                            principal_id: member,
+                            expected_revision: 0,
+                            correlation_id: Uuid::now_v7(),
+                            idempotency_key: Uuid::now_v7(),
+                        },
+                    )
+                    .await
+            }
+            ManagementBusinessDenial::MissingTarget => authority
+                .update_group(
+                    actor,
+                    UpdateGroup {
+                        team_id,
+                        group_id: Uuid::now_v7(),
+                        expected_revision: 1,
+                        display_name: "missing".into(),
+                        correlation_id: Uuid::now_v7(),
+                        idempotency_key: Uuid::now_v7(),
+                    },
+                )
+                .await
+                .map(|_record| ()),
+            ManagementBusinessDenial::CrossTeamTarget => authority
+                .update_group(
+                    actor,
+                    UpdateGroup {
+                        team_id,
+                        group_id: foreign_group_id,
+                        expected_revision: 1,
+                        display_name: "foreign".into(),
+                        correlation_id: Uuid::now_v7(),
+                        idempotency_key: Uuid::now_v7(),
+                    },
+                )
+                .await
+                .map(|_record| ()),
+            ManagementBusinessDenial::InputTooLarge => authority
+                .create_group(
+                    actor,
+                    CreateGroup {
+                        team_id,
+                        display_name: "x".repeat(257),
+                        correlation_id: Uuid::now_v7(),
+                        idempotency_key: Uuid::now_v7(),
+                    },
+                )
+                .await
+                .map(|_record| ()),
+            ManagementBusinessDenial::IdempotencyConflict => authority
+                .create_group(
+                    actor,
+                    CreateGroup {
+                        team_id,
+                        display_name: "conflicting".into(),
+                        correlation_id: Uuid::now_v7(),
+                        idempotency_key: conflict_key,
+                    },
+                )
+                .await
+                .map(|_record| ()),
+            ManagementBusinessDenial::LastOwner => {
+                authority
+                    .remove_member(
+                        actor,
+                        RemoveMember {
+                            team_id,
+                            principal_id: owner,
+                            expected_revision: 1,
+                            correlation_id: Uuid::now_v7(),
+                            idempotency_key: Uuid::now_v7(),
+                        },
+                    )
+                    .await
+            }
+        }
+        .expect_err("predictable management denial");
+        match denial {
+            ManagementBusinessDenial::StaleRevision => {
+                assert!(matches!(
+                    error,
+                    crate::admission::AuthorityError::Store(StoreError::StaleState)
+                ));
+            }
+            ManagementBusinessDenial::InputTooLarge => {
+                assert!(matches!(
+                    error,
+                    crate::admission::AuthorityError::Store(StoreError::InputTooLarge)
+                ));
+            }
+            ManagementBusinessDenial::IdempotencyConflict => {
+                assert!(matches!(
+                    error,
+                    crate::admission::AuthorityError::Store(StoreError::IdempotencyConflict)
+                ));
+            }
+            ManagementBusinessDenial::MissingTarget
+            | ManagementBusinessDenial::CrossTeamTarget
+            | ManagementBusinessDenial::LastOwner => {
+                assert!(matches!(
+                    error,
+                    crate::admission::AuthorityError::Store(StoreError::Forbidden)
+                ));
+            }
+        }
+        assert!(
+            !authority.is_closed(),
+            "{denial:?} must keep authority live"
+        );
+        assert_eq!(management_state(&store, team_id).await, state_before);
+        assert_eq!(
+            authority.witness_sequence().expect("read witness sequence"),
+            witness_before
+        );
+        guard
+            .validate()
+            .await
+            .expect("unrelated guard must survive denial");
+        cleanup(store.pool(), &schema).await;
+    }
+}
+
+#[tokio::test]
+async fn management_audit_failure_remains_fail_stop_and_rolls_back() {
+    let (store, schema, owner, _member, credential) = fixture().await;
+    let team_id = team(&store, owner).await;
+    let actor = owner_actor(owner, credential);
+    let (authority, _witness_directory) = authority(store.clone()).await;
+    let guard = authority
+        .admit(AuthorizationRequest {
+            actor,
+            team_id,
+            permission: "session.metadata.read".to_owned(),
+            resource: ResourceScope::Team,
+            correlation_id: Uuid::now_v7(),
+        })
+        .await
+        .expect("admit live guard");
+    let state_before = management_state(&store, team_id).await;
+    let witness_before = authority.witness_sequence().expect("read witness sequence");
+    sqlx::raw_sql(AssertSqlSafe("CREATE FUNCTION reject_group_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit unavailable'; END; $$; CREATE TRIGGER reject_group_audit BEFORE INSERT ON audit_events FOR EACH ROW WHEN (NEW.action = 'group.create') EXECUTE FUNCTION reject_group_audit();".to_owned()))
+        .execute(store.pool())
+        .await
+        .expect("install management audit failure trigger");
+    let error = authority
+        .create_group(
+            actor,
+            CreateGroup {
+                team_id,
+                display_name: "cannot-commit".into(),
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect_err("audit failure must not acknowledge management mutation");
+    assert!(matches!(
+        error,
+        crate::admission::AuthorityError::Store(StoreError::AuditUnavailable)
+    ));
+    assert!(authority.is_closed());
+    assert!(guard.cancelled());
+    assert!(matches!(
+        authority.release_clean().await,
+        Err(crate::admission::AuthorityError::Cancelled)
+    ));
+    assert_eq!(management_state(&store, team_id).await, state_before);
+    assert_eq!(
+        authority.witness_sequence().expect("read witness sequence"),
+        witness_before
+    );
     cleanup(store.pool(), &schema).await;
 }
 
