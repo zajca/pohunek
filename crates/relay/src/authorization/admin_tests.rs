@@ -1,6 +1,6 @@
 //! `PostgreSQL` integration coverage for team administration invariants.
 
-use std::{env, os::unix::fs::PermissionsExt as _, sync::Arc};
+use std::{env, os::unix::fs::PermissionsExt as _, sync::Arc, time::Duration};
 
 use ed25519_dalek::SigningKey;
 use sqlx::{AssertSqlSafe, PgPool};
@@ -22,6 +22,8 @@ use crate::{
 
 const BOOTSTRAP_CONNECTIONS: u32 = 1;
 const TEST_CONNECTIONS: u32 = 4;
+const ADVISORY_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const ADVISORY_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 async fn seed_identity(store: &Store, principal: Uuid) {
     sqlx::query("INSERT INTO oidc_identities (identity_id,issuer,subject,principal_id,link_generation) VALUES ($1,'https://issuer.test',$2,$1,1)")
@@ -208,6 +210,88 @@ async fn management_state(store: &Store, team_id: Uuid) -> (String, i64, i64, i6
         audits,
         receipts,
     )
+}
+
+async fn wait_for_management_replay_lock(pool: &PgPool) {
+    tokio::time::timeout(ADVISORY_WAIT_TIMEOUT, async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%pg_advisory_xact_lock%')",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("read PostgreSQL advisory-lock wait state");
+            if waiting {
+                return;
+            }
+            tokio::time::sleep(ADVISORY_WAIT_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("management replay waits for its receipt advisory lock");
+}
+
+async fn exact_replay_rejects_lost_local_authority(stop: impl FnOnce(&Authority)) {
+    let (store, schema, owner, _member, credential) = fixture().await;
+    let team_id = team(&store, owner).await;
+    let actor = owner_actor(owner, credential);
+    let (authority, _witness_directory) = authority(store.clone()).await;
+    let command = CreateGroup {
+        team_id,
+        display_name: "receipt replay".into(),
+        correlation_id: Uuid::now_v7(),
+        idempotency_key: Uuid::now_v7(),
+    };
+    authority
+        .create_group(actor, command.clone())
+        .await
+        .expect("create receipt before replay");
+
+    let mut lock = store
+        .begin_serializable()
+        .await
+        .expect("begin external receipt-lock transaction");
+    crate::authorization::lock_management_receipt(
+        &mut lock,
+        actor,
+        "group.create",
+        command.idempotency_key,
+    )
+    .await
+    .expect("hold external receipt advisory lock");
+
+    let authority = Arc::new(authority);
+    let replay = {
+        let authority = Arc::clone(&authority);
+        tokio::spawn(async move { authority.create_group(actor, command).await })
+    };
+    wait_for_management_replay_lock(store.pool()).await;
+    stop(&authority);
+    lock.rollback()
+        .await
+        .expect("release external receipt advisory lock");
+
+    assert!(matches!(
+        replay.await.expect("replay task completed"),
+        Err(crate::admission::AuthorityError::Cancelled)
+    ));
+    assert!(authority.is_closed());
+    cleanup(store.pool(), &schema).await;
+}
+
+#[tokio::test]
+async fn exact_management_replay_cancels_after_authority_closes_while_waiting() {
+    exact_replay_rejects_lost_local_authority(Authority::close_all).await;
+}
+
+#[tokio::test]
+async fn exact_management_replay_cancels_after_local_deadline_passes_while_waiting() {
+    exact_replay_rejects_lost_local_authority(|authority| {
+        authority
+            .expire_lease_deadline()
+            .expect("expire local authority deadline");
+    })
+    .await;
 }
 
 #[tokio::test]

@@ -254,6 +254,13 @@ macro_rules! management_transaction {
                         .verify_lease_in_transaction(&mut transaction, &lease)
                         .await
                 );
+                if let Err(error) = $authority
+                    .verify_fence_in_transaction(&mut transaction)
+                    .await
+                {
+                    $authority.close_all();
+                    return Err(error);
+                }
                 match transaction.commit().await.map_err(StoreError::Database) {
                     Ok(()) => return Ok(ManagementCommand::replayed_response(&$command, replayed)),
                     Err(error) if is_retryable_management_error(&error) => {
@@ -1467,6 +1474,15 @@ impl Authority {
     #[cfg(test)]
     pub(crate) fn management_retry_count(&self) -> usize {
         self.management_retry_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_lease_deadline(&self) -> Result<(), AuthorityError> {
+        *self
+            .lease_deadline
+            .lock()
+            .map_err(|_error| AuthorityError::Cancelled)? = Instant::now();
+        Ok(())
     }
 
     /// Closes ingress after a failure and preserves the dirty witness latch.
