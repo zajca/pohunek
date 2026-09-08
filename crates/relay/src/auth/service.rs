@@ -21,9 +21,9 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    admission::{AuthMutationTarget, Authority},
+    admission::{AuthMutationTarget, Authority, AuthorityError},
     config::LoginPolicy,
-    store::{ActorKind, AuthenticationBinding, Store},
+    store::{ActorKind, AuthenticationBinding, Store, StoreError},
 };
 
 use super::{
@@ -279,6 +279,8 @@ pub struct AuthService {
     #[cfg(test)]
     rotation_hook: Arc<Mutex<Option<RotationHook>>>,
     #[cfg(test)]
+    rotation_retry_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
     revoke_hook: Arc<Mutex<Option<RotationHook>>>,
 }
 
@@ -311,6 +313,8 @@ impl AuthService {
             authority,
             #[cfg(test)]
             rotation_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            rotation_retry_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             revoke_hook: Arc::new(Mutex::new(None)),
         }
@@ -1000,6 +1004,7 @@ impl AuthService {
             context,
             "auth.credential.revoke",
             "credential",
+            database_error,
         )
         .await?;
         self.authority
@@ -1093,6 +1098,7 @@ impl AuthService {
             context,
             "auth.service_credential.revoke",
             "credential",
+            database_error,
         )
         .await?;
         self.authority
@@ -1160,7 +1166,11 @@ impl AuthService {
                 )
                 .await
             {
-                Err(AuthError::Retryable) => continue,
+                Err(AuthError::Retryable) => {
+                    #[cfg(test)]
+                    self.rotation_retry_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 result => return result,
             }
         }
@@ -1195,11 +1205,11 @@ impl AuthService {
             .map_err(|_| AuthError::Durable)?;
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
-            .map_err(|_| AuthError::CredentialInvalid)?;
+            .map_err(rotation_store_error)?;
         if let Some(team_id) = team_id {
             crate::authorization::rbac::require_team_admin(&mut transaction, context, team_id)
                 .await
-                .map_err(|_| AuthError::CredentialInvalid)?;
+                .map_err(rotation_store_error)?;
             let service_account = sqlx::query_scalar::<_, Uuid>(
                 "SELECT principal_id FROM service_accounts WHERE principal_id = $1 AND team_id = $2 AND deprovisioned_at IS NULL FOR SHARE",
             )
@@ -1207,7 +1217,7 @@ impl AuthService {
             .bind(team_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(database_error)?;
+            .map_err(retryable_database_error)?;
             if service_account.is_none() {
                 return Err(AuthError::CredentialInvalid);
             }
@@ -1227,7 +1237,7 @@ impl AuthService {
             self.authority
                 .commit_auth_mutation(transaction, false, None)
                 .await
-                .map_err(|_| AuthError::Durable)?;
+                .map_err(retryable_rotation_authority_error)?;
             return Ok(CredentialMutation {
                 record: credential_record(row)?,
                 credential: None,
@@ -1288,10 +1298,6 @@ impl AuthService {
             self.commit_rotation_rejection(transaction, context).await?;
             return Err(AuthError::RotationRejected);
         }
-        if old_overlap_ends_at.is_some_and(|ends_at| ends_at <= evaluated_at) {
-            self.commit_rotation_rejection(transaction, context).await?;
-            return Err(AuthError::CredentialInvalid);
-        }
         let updated = sqlx::query(
             "UPDATE relay_credentials c SET rotation_overlap_ends_at = statement_timestamp() + $2::interval, \
              credential_generation = c.credential_generation + 1 \
@@ -1342,12 +1348,13 @@ impl AuthService {
         .bind(old_id)
         .fetch_one(&mut *transaction)
         .await
-        .map_err(database_error)?;
+        .map_err(retryable_database_error)?;
         let audit_id = audit_actor_mutation(
             &mut transaction,
             context,
             "auth.credential.rotate",
             "credential",
+            retryable_database_error,
         )
         .await?;
         insert_receipt(
@@ -1466,6 +1473,7 @@ impl AuthService {
             context,
             "auth.service_account.create",
             "service_account",
+            database_error,
         )
         .await?;
         insert_receipt(
@@ -1560,8 +1568,12 @@ impl AuthService {
     ) -> Result<(), AuthError> {
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
-            .map_err(|_| AuthError::CredentialInvalid)?;
-        self.commit_current(transaction).await
+            .map_err(rotation_store_error)?;
+        self.authority
+            .verify_fence_in_transaction(&mut transaction)
+            .await
+            .map_err(|_| AuthError::Durable)?;
+        transaction.commit().await.map_err(retryable_database_error)
     }
 
     async fn commit_revoke_retry(
@@ -2111,6 +2123,7 @@ async fn audit_actor_mutation(
     actor: crate::store::ActorContext,
     action: &'static str,
     parameter_value: &'static str,
+    map_error: fn(sqlx::Error) -> AuthError,
 ) -> Result<Uuid, AuthError> {
     let audit_id = Uuid::now_v7();
     let inserted = sqlx::query(
@@ -2127,7 +2140,7 @@ async fn audit_actor_mutation(
     .bind(actor.recovery_generation())
     .execute(&mut **transaction)
     .await
-    .map_err(|_| AuthError::Durable)?;
+    .map_err(map_error)?;
     if inserted.rows_affected() != 1 {
         return Err(AuthError::Durable);
     }
@@ -2201,7 +2214,7 @@ async fn insert_receipt(
     .bind(result_id)
     .execute(&mut **transaction)
     .await
-    .map_err(retryable_database_error)?;
+    .map_err(retryable_receipt_database_error)?;
     Ok(())
 }
 
@@ -2431,11 +2444,38 @@ fn retryable_database_error(error: sqlx::Error) -> AuthError {
     if error
         .as_database_error()
         .and_then(|database| database.code())
-        .is_some_and(|code| code == "40001" || code == "23505")
+        .is_some_and(|code| code == "40001" || code == "40P01")
     {
         AuthError::Retryable
     } else {
         AuthError::Durable
+    }
+}
+
+fn retryable_receipt_database_error(error: sqlx::Error) -> AuthError {
+    let is_receipt_conflict = error.as_database_error().is_some_and(|database| {
+        database.code().is_some_and(|code| code == "23505")
+            && database.constraint() == Some("mutation_receipts_pkey")
+    });
+    if is_receipt_conflict {
+        AuthError::Retryable
+    } else {
+        retryable_database_error(error)
+    }
+}
+
+fn retryable_rotation_authority_error(error: AuthorityError) -> AuthError {
+    match error {
+        AuthorityError::Store(StoreError::Database(error)) => retryable_database_error(error),
+        _ => AuthError::Durable,
+    }
+}
+
+fn rotation_store_error(error: StoreError) -> AuthError {
+    match error {
+        StoreError::Forbidden => AuthError::CredentialInvalid,
+        StoreError::Database(error) => retryable_database_error(error),
+        _ => AuthError::Durable,
     }
 }
 
@@ -3021,6 +3061,219 @@ pub(crate) mod tests {
         assert!(
             !authority.is_closed(),
             "expired retries keep authority live"
+        );
+        cleanup(&bootstrap, &schema).await;
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The contention fixture must keep synchronization and durable-effect assertions together."
+    )]
+    async fn distinct_concurrent_rotations_retry_before_the_witness_boundary() {
+        const CONTENTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let (store, schema, bootstrap) = fixture().await;
+        let (authority, _directory) = authority(store.clone()).await;
+        let limits = limits();
+        assert!(
+            limits.credentials_per_principal() >= 5,
+            "fixture quota permits three predecessors and two rotated credentials"
+        );
+        let service_a = AuthService::new(
+            store.clone(),
+            DigestKey::new("test".into(), b"ephemeral-test-key".to_vec()),
+            2,
+            limits.clone(),
+            LoginPolicy::AnyAuthenticatedSubject,
+            Arc::clone(&authority),
+        );
+        let service_b = AuthService::new(
+            store.clone(),
+            DigestKey::new("test".into(), b"ephemeral-test-key".to_vec()),
+            2,
+            limits,
+            LoginPolicy::AnyAuthenticatedSubject,
+            Arc::clone(&authority),
+        );
+        let principal_id = Uuid::now_v7();
+        let identity_id = Uuid::now_v7();
+        let actor_credential_id = Uuid::now_v7();
+        let first_predecessor_id = Uuid::now_v7();
+        let second_predecessor_id = Uuid::now_v7();
+        let actor_secret = "distinct-rotation-actor";
+        sqlx::query(
+            "INSERT INTO principals (id,kind,state,generation) VALUES ($1,'human','active',1)",
+        )
+        .bind(principal_id)
+        .execute(store.pool())
+        .await
+        .expect("seed principal");
+        sqlx::query("INSERT INTO oidc_identities (identity_id,issuer,subject,principal_id,link_generation) VALUES ($1,'issuer','distinct-concurrent-rotation',$2,1)")
+            .bind(identity_id)
+            .bind(principal_id)
+            .execute(store.pool())
+            .await
+            .expect("seed identity");
+        for (credential_id, secret) in [
+            (actor_credential_id, actor_secret),
+            (first_predecessor_id, "distinct-rotation-first"),
+            (second_predecessor_id, "distinct-rotation-second"),
+        ] {
+            sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,expires_at) VALUES ($1,$2,$3,$4,$5,'test','human',1,$1,1,clock_timestamp()+interval '1 hour')")
+                .bind(credential_id)
+                .bind(credential_id.to_string())
+                .bind(service_a.digest_key.digest(secret).as_slice())
+                .bind(principal_id)
+                .bind(identity_id)
+                .execute(store.pool())
+                .await
+                .expect("seed active credential");
+        }
+        let actor = service_a
+            .authenticate_bearer(RelayBearerCredential::new(format!(
+                "{actor_credential_id}.{actor_secret}"
+            )))
+            .await
+            .expect("authenticate independent actor credential");
+        let expires_at = (time::OffsetDateTime::now_utc() + time::Duration::minutes(10))
+            .replace_nanosecond(0)
+            .expect("whole-second rotation expiry");
+        let first_request = RotateCredentialRequest {
+            overlap_seconds: 1,
+            idempotency: relay_protocol::Idempotency {
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+            expires_at,
+        };
+        let second_request = RotateCredentialRequest {
+            overlap_seconds: 1,
+            idempotency: relay_protocol::Idempotency {
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+            expires_at,
+        };
+        assert_ne!(
+            first_request.idempotency.idempotency_key, second_request.idempotency.idempotency_key,
+            "competing rotations require distinct receipts"
+        );
+        let first_entered = Arc::new(tokio::sync::Notify::new());
+        let first_release = Arc::new(tokio::sync::Notify::new());
+        let second_entered = Arc::new(tokio::sync::Notify::new());
+        let second_release = Arc::new(tokio::sync::Notify::new());
+        let first_entered_wait = first_entered.notified();
+        let second_entered_wait = second_entered.notified();
+        tokio::pin!(first_entered_wait, second_entered_wait);
+        *service_a.rotation_hook.lock().await = Some(RotationHook {
+            entered: Arc::clone(&first_entered),
+            release: Arc::clone(&first_release),
+        });
+        *service_b.rotation_hook.lock().await = Some(RotationHook {
+            entered: Arc::clone(&second_entered),
+            release: Arc::clone(&second_release),
+        });
+        let first = tokio::spawn({
+            let service = service_a.clone();
+            async move {
+                service
+                    .rotate_credential(
+                        actor,
+                        CredentialId::from_uuid(first_predecessor_id),
+                        first_request,
+                    )
+                    .await
+            }
+        });
+        let second = tokio::spawn({
+            let service = service_b.clone();
+            async move {
+                service
+                    .rotate_credential(
+                        actor,
+                        CredentialId::from_uuid(second_predecessor_id),
+                        second_request,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(CONTENTION_TIMEOUT, async {
+            first_entered_wait.await;
+            second_entered_wait.await;
+        })
+        .await
+        .expect("both rotations reached the pre-witness barrier");
+        *service_a.rotation_hook.lock().await = None;
+        *service_b.rotation_hook.lock().await = None;
+        first_release.notify_one();
+        second_release.notify_one();
+        let (first_result, second_result) =
+            tokio::time::timeout(CONTENTION_TIMEOUT, async { tokio::join!(first, second) })
+                .await
+                .expect("competing rotations complete after the barrier opens");
+        let first_result = first_result.expect("join first rotation");
+        let second_result = second_result.expect("join second rotation");
+        assert!(
+            first_result.is_ok(),
+            "first rotation result: {first_result:?}"
+        );
+        assert!(
+            second_result.is_ok(),
+            "second rotation result: {second_result:?}"
+        );
+        assert!(
+            service_a
+                .rotation_retry_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+                + service_b
+                    .rotation_retry_count
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1,
+            "one pre-witness transaction must retry after PostgreSQL contention"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM relay_credentials WHERE principal_id = $1",
+            )
+            .bind(principal_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("count rotated credentials"),
+            5
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM relay_credentials WHERE predecessor_credential_id IN ($1, $2)",
+            )
+            .bind(first_predecessor_id)
+            .bind(second_predecessor_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("count new credentials by predecessor"),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM audit_events WHERE action = 'auth.credential.rotate'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count rotation audits"),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM mutation_receipts WHERE action = 'auth.credential.rotate'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count rotation receipts"),
+            2
+        );
+        assert!(
+            !authority.is_closed(),
+            "pre-witness retry keeps the authority live"
         );
         cleanup(&bootstrap, &schema).await;
     }
