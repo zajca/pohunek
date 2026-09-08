@@ -24,6 +24,7 @@ use overlay::{ConfiguredTransport, OverlayId, OverlayRegistry};
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::discovery::DiscoveryCache;
 use pohunek_daemon::events::{spawn_drain, EventLog};
+use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::lock::InstanceLock;
 use pohunek_daemon::notifications::{
     AttentionCoordinator, NotificationProjector, NotificationRetentionTask, NotificationService,
@@ -106,32 +107,44 @@ async fn main() -> ExitCode {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Daemon startup deliberately keeps ordered readiness gates in one auditable sequence."
+)]
 async fn run() -> Result<(), DaemonError> {
     // 1. Resolve all paths up front; fail fast on missing required env.
     let paths = Paths::resolve()?;
 
-    // 2. Initialize structured logging to the state log dir.
+    // 2. Ensure the runtime dir exists (0700) before taking the lock in it.
+    //    The control server enforces the same on bind, but the lock lives there
+    //    too and is acquired first. The data dir holds logical session state.
+    //    Do not create the state app directory here: B1 owns its safe creation.
+    ensure_private_dir(&paths.runtime_dir)?;
+    ensure_private_dir(&paths.data_dir)?;
+    ensure_private_dir(&paths.runtime_dir.join(WORKERS_SUBDIR))?;
+
+    // 3. Single-instance lock: a second daemon refuses to start.
+    let _lock = InstanceLock::acquire(&paths.lock)?;
+
+    // 4. Bootstrap stable host governance before session reconciliation or any
+    // listener can expose daemon readiness. This retains the owner-private
+    // cross-process host-state lock for the daemon lifetime and is the first
+    // creator and validator of the application state directory.
+    let governance = Arc::new(HostGovernanceService::open(paths.state_dir.clone()).await?);
+
+    // 5. Initialize structured logging and durable worker state below B1's
+    // owner-private application state directory.
     let _log_guard = logging::init(&paths.log_dir)?;
+    ensure_private_dir(&paths.state_dir.join(WORKERS_SUBDIR))?;
     info!(
         daemon_version = DAEMON_VERSION,
         runtime_dir = %paths.runtime_dir.display(),
         log_dir = %paths.log_dir.display(),
         "pohunekd starting"
     );
-
-    // 3. Ensure the runtime dir exists (0700) before taking the lock in it.
-    //    The control server enforces the same on bind, but the lock lives there
-    //    too and is acquired first. The data dir holds logical session state.
-    ensure_private_dir(&paths.runtime_dir)?;
-    ensure_private_dir(&paths.data_dir)?;
-    ensure_private_dir(&paths.runtime_dir.join(WORKERS_SUBDIR))?;
-    ensure_private_dir(&paths.state_dir.join(WORKERS_SUBDIR))?;
-
-    // 4. Single-instance lock: a second daemon refuses to start.
-    let _lock = InstanceLock::acquire(&paths.lock)?;
     info!(lock = %paths.lock.display(), "acquired single-instance lock");
 
-    // 5. Build the session registry with the hook-handshake socket path, the
+    // 6. Build the session registry with the hook-handshake socket path, the
     //    unified metadata store (logical sessions and related bindings), the
     //    worktrees root, and the event-log directory, so spawned agents can
     //    report native identity, logical sessions survive a restart, a
@@ -162,7 +175,7 @@ async fn run() -> Result<(), DaemonError> {
             source: std::io::Error::other(source),
         })?;
 
-    // 6. Start the append-only event log before anything emits, so worker
+    // 7. Start the append-only event log before anything emits, so worker
     //    reconciliation events are captured too. The log drains
     //    both session and notification control-plane events into one file.
     let event_logs = spawn_event_logs(
@@ -185,19 +198,24 @@ async fn run() -> Result<(), DaemonError> {
     );
     sessions.spawn_agent_state_hooks();
 
-    // 7. Adopt exact surviving worker runtimes before exposing the public API.
+    // 8. Adopt exact surviving worker runtimes before exposing the public API.
     //    Reconciliation never invokes provider-native resume.
     Box::pin(sessions.reconcile_workers())
         .await
         .map_err(DaemonError::Reconcile)?;
 
-    // 8. Bind the control socket (stale-socket recovery + 0600).
+    // 9. Bind the control socket (stale-socket recovery + 0600).
     let registry = netbird::configured_registry()?;
     let health = HealthInfo::new(DAEMON_VERSION);
     let discovery = DiscoveryCache::new(registry.clone());
-    let state = DaemonState::new_with_discovery(health, sessions.clone(), discovery.clone())
-        .with_notifications(notifications.clone())
-        .with_attention_coordinator(attention_coordinator.clone());
+    let state = DaemonState::new_with_discovery(
+        health,
+        sessions.clone(),
+        Arc::clone(&governance),
+        discovery.clone(),
+    )
+    .with_notifications(notifications.clone())
+    .with_attention_coordinator(attention_coordinator.clone());
     let server = ControlServer::bind_with_state(&paths.socket, state).await?;
     info!(socket = %server.socket_path().display(), "ready; serving control protocol");
 
@@ -206,6 +224,7 @@ async fn run() -> Result<(), DaemonError> {
     let remote_state = DaemonState::new_with_discovery(
         HealthInfo::new(DAEMON_VERSION),
         sessions.clone(),
+        governance,
         discovery,
     )
     .with_notifications(notifications.clone())
@@ -701,6 +720,7 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, RwLock};
     use std::time::Duration;
@@ -714,6 +734,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use pohunek_daemon::api::{DaemonState, HealthInfo};
+    use pohunek_daemon::governance::HostGovernanceService;
     use pohunek_daemon::session::SessionRegistry;
     use pohunek_daemon::DaemonError;
     use protocol::{method, Request, Response};
@@ -723,6 +744,18 @@ mod tests {
         bind_remote_server, next_retry_interval, serve_remote_with_retry, supervise_remote_tasks,
         RemoteBind, REMOTE_BIND_MAX_RETRY_INTERVAL,
     };
+
+    async fn governance_service() -> (tempfile::TempDir, Arc<HostGovernanceService>) {
+        let root = tempfile::tempdir().expect("create isolated host-governance root");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make isolated host-governance root owner-private");
+        let service = Arc::new(
+            HostGovernanceService::open(root.path().join("state"))
+                .await
+                .expect("open real isolated host-governance service"),
+        );
+        (root, service)
+    }
 
     #[test]
     fn remote_retry_interval_caps_at_configured_maximum() {
@@ -765,6 +798,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn remote_supervisor_serves_after_a_transient_bind_failure() {
+        let (_state_root, governance) = governance_service().await;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback remote listener");
@@ -774,6 +808,7 @@ mod tests {
         let state = DaemonState::new(
             HealthInfo::new("test"),
             SessionRegistry::default(),
+            governance,
             netbird::configured_registry().expect("configured registry"),
         );
         let mut remote = Some(pohunek_daemon::api::RemoteServer::from_listener(
@@ -886,6 +921,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn remote_supervisor_rebinds_when_listener_address_changes() {
+        let (_state_root, governance) = governance_service().await;
         let first_ip = "127.0.0.1".parse().expect("first IP");
         let second_ip = "127.0.0.2".parse().expect("second IP");
         let probe = TcpListener::bind((first_ip, 0)).await.expect("port probe");
@@ -900,6 +936,7 @@ mod tests {
         let state = DaemonState::new(
             HealthInfo::new("test"),
             SessionRegistry::default(),
+            governance,
             netbird::configured_registry().expect("configured registry"),
         );
         let shutdown = CancellationToken::new();

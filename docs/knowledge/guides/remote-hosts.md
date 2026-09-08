@@ -40,6 +40,10 @@ Use these commands for orientation:
   Status loading and peer probes are bounded by a complete discovery deadline.
 - `pohunek host inspect <host> --json` to inspect one host's daemon
   capabilities.
+- `pohunek host governance inspect <host> --json` to read the selected daemon's
+  safe stable host identity and local governance state. The route selector is
+  not the returned `HostId`; preserve each for its separate purpose. This call
+  is read-only and does not imply that the remote host is enrolled with a relay.
 
 Remote session creation should use a registered project or an explicit
 repository path valid on the remote host. Non-local starts preserve the existing

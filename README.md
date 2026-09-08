@@ -84,6 +84,14 @@ where they are doing it, and when they need you.
   `--refresh` re-probes.
   Status loading and peer probing have explicit bounded deadlines.
   `host inspect` queries live capabilities straight from the selected daemon.
+- **Stable host identity and safe governance inspection**: every daemon keeps a
+  stable opaque `HostId` and an owner-private local governance record. Inspect
+  it with `pohunek host governance inspect <host> [--json]` to see the safe
+  host ID, approval-key reference, explicit never-enrolled absence or one
+  enrolled relay/owner/revisions/quarantine state. This is read-only: no relay,
+  enrollment, ownership-transfer, or team-management command ships here.
+  It adds no required configuration; the daemon manages the owner-private state
+  under its existing XDG state directory.
 - **Shell completion**: generate static Bash, Zsh, or Fish completion from the
   clap command tree. An explicit `--dynamic` mode adds bounded, failure-silent
   host and session-target lookup without starting a daemon.
@@ -261,6 +269,7 @@ pohunek doctor
 # 2. Start the host daemon in the background
 pohunek daemon start --detach
 pohunek health
+pohunek host governance inspect local --json
 
 # 3. Install agent hooks (native session-id capture + notifications)
 pohunek integration install
@@ -378,6 +387,7 @@ port is retained.
 | `pohunek project add / list / show / rename / rm` | Manage git-repo-aware project records. |
 | `pohunek project actions / action / prompt` | Resolve per-project launch recipes and prompt templates. |
 | `pohunek host discover / list / inspect` | Find NetBird peers running daemons (standalone cache; `--refresh`) and query live capabilities. |
+| `pohunek host governance inspect <host>` | Read the safe stable host identity and local governance state; `--json` preserves explicit absence and canonical revisions. It does not mutate enrollment or ownership. |
 | `pohunek completions <bash\|zsh\|fish>` | Print static shell completion; add `--dynamic` for bounded host/session candidates. |
 | `pohunek notifications list / watch` | Inspect or stream the durable inbox; `--all-hosts` fans out. |
 | `pohunek notifications read / ack / archive / delete` | Drive one record's lifecycle (`host/id` targets a specific host). |
@@ -539,6 +549,9 @@ remappable through `[keybindings]`. Wayland-only on Linux v1.
 The bundled GUI is a **reference client**, not the only supported way in. It
 uses the same public protocol and SDKs documented below — so if it does not fit
 your workflow, the next section is your starting point for building your own.
+After each daemon-host snapshot it also presents the same safe, read-only host
+governance status, including explicit never-enrolled and quarantined states. It
+does not provide enrollment, transfer, relay, or team controls.
 
 ## Web control center
 
@@ -547,6 +560,9 @@ status, session lifecycle, live notifications, and in-browser terminal attach.
 `@pohunek/backend` discovers daemons through its local `pohunekd` and exposes
 the existing protocol as transparent WebSocket tunnels; it holds no
 authoritative session state, and the CLI and native GUI remain independent.
+The owner WebUI keeps this transparent behavior for the additive safe
+`host.governance.inspect` method; it does not add a governance UI, team mode,
+or relay-local fallback.
 
 The workspace is a persistent session-first shell. Its rail groups sessions by
 project, promotes blocked work into an Attention section, searches and filters
@@ -717,6 +733,10 @@ pohunek is built for **one operator on machines they own**:
   prompts, and logs are secret-free; provider tokens live in the OS keyring or
   provider CLIs (`gh`). Raw terminal scrollback is the one honest exception —
   it is stored owner-private.
+- The private host approval signing key is stored separately from the safe
+  governance response. Public inspection exposes only its verification-key
+  reference, never a seed, signing key, proposal nonce, signature, or transfer
+  outcome.
 
 ## Development
 

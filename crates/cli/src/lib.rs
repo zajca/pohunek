@@ -392,6 +392,24 @@ enum HostAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Inspect one host's safe stable identity and governance state.
+    Governance {
+        #[command(subcommand)]
+        action: HostGovernanceAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HostGovernanceAction {
+    /// Inspect safe governance state without changing enrollment or ownership.
+    Inspect {
+        /// Host name to inspect (a `NetBird` peer name, or `local`).
+        host: String,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1329,6 +1347,15 @@ impl HostAction {
             HostAction::Discover { json, .. }
             | HostAction::List { json, .. }
             | HostAction::Inspect { json, .. } => *json,
+            HostAction::Governance { action } => action.wants_json(),
+        }
+    }
+}
+
+impl HostGovernanceAction {
+    fn wants_json(&self) -> bool {
+        match self {
+            Self::Inspect { json, .. } => *json,
         }
     }
 }
@@ -1508,7 +1535,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         Commands::Doctor { json } => {
             // Doctor is purely a local environment check; it ignores `--host`.
             let paths = Paths::resolve()?;
-            let healthy = commands::doctor::run(&paths, json)?;
+            let healthy = commands::doctor::run(&paths, json).await?;
             Ok(if healthy {
                 ExitCode::SUCCESS
             } else {
@@ -1951,6 +1978,13 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 // `inspect` uses its positional host arg, not the global flag.
                 let paths = Paths::resolve()?;
                 commands::host::run_inspect(&host, &paths, json).await?;
+                Ok(ExitCode::SUCCESS)
+            }
+            HostAction::Governance {
+                action: HostGovernanceAction::Inspect { host, json },
+            } => {
+                let paths = Paths::resolve()?;
+                commands::host::run_governance_inspect(&host, &paths, json).await?;
                 Ok(ExitCode::SUCCESS)
             }
         },
@@ -3260,6 +3294,27 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_read_only_host_governance_inspect_with_json() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "host",
+            "governance",
+            "inspect",
+            "host-b",
+            "--json",
+        ])
+        .expect("parse governance inspection");
+        assert!(matches!(
+            cli.command,
+            Commands::Host {
+                action: HostAction::Governance {
+                    action: HostGovernanceAction::Inspect { host, json: true },
+                },
+            } if host == "host-b"
+        ));
     }
 
     #[test]

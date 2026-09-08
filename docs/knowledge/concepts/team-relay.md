@@ -15,6 +15,13 @@ such as NetBird. The shipped Bun web backend is a transparent mesh-local
 browser transport, not the team relay described here. Do not suggest relay
 commands or configuration until their owning issues have shipped.
 
+The shipped #81 host-local foundation is deliberately narrower. It persists a
+stable opaque host identity, one exact principal-or-team owner, at most one
+local enrollment record, checked revisions, quarantine state, and local
+transfer coordinates. Protocol v3 exposes only safe read-only inspection of
+that state. It does not connect to a relay, run OIDC, create a WireGuard key,
+publish a relay API, or provide a team UI.
+
 The owner WebUI remains supported alongside the relay. Its Bun backend discovers
 the local daemon and direct-overlay peers and transparently bridges browser
 WebSockets into the existing owner protocol. `pohunek-relayd` has no local mode;
@@ -42,13 +49,13 @@ compatibility shim for that relay path.
 
 ## Ownership and sharing
 
-A host has exactly one registered owner: a principal or a team. `pohunekd`
-stores that opaque owner record authoritatively without resolving relay users or
-memberships. A same-UID local host operator confirms an exact, short-lived
-transfer proposal; the daemon durably changes the owner, signs the outcome, and
-suspends every share before the relay conditionally updates its projection. An
-enrolled host may be shared with multiple teams through independent `HostShare`
-records.
+A host has exactly one registered owner: a principal or a team. The shipped
+host-local record already stores that opaque owner without resolving relay users
+or memberships. The later relay lifecycle will let a same-UID local host
+operator confirm an exact, short-lived transfer proposal; the daemon will
+durably change the owner, sign the outcome, and suspend every share before the
+relay conditionally updates its projection. An enrolled host may later be
+shared with multiple teams through independent `HostShare` records.
 The relay is multi-tenant and scopes every lookup, grant, cache entry, and audit
 record to a team before authorization.
 

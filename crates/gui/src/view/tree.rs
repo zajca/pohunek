@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 
 use iced::widget::{button, column, row, scrollable, text};
 use iced::{Center, Element, Fill, Theme};
-use pohunek_gui_core::{ConnState, HostId, TreeNodeId};
-use protocol::ProjectInfo;
+use pohunek_gui_core::{ConnState, GovernanceState, HostId, TreeNodeId};
+use protocol::{HostOwner, ProjectInfo};
 
 use crate::message::{Message, ModalView};
 use crate::selection::project_is_selected;
@@ -76,6 +76,7 @@ fn push_project_rows<'a>(
     host_id: &'a HostId,
     host: &'a pohunek_gui_core::HostView,
 ) -> iced::widget::Column<'a, Message> {
+    tree = push_governance_rows(tree, host);
     for project in host.projects.values() {
         tree = tree.push(project_row(app, host_id, project));
     }
@@ -91,6 +92,53 @@ fn push_project_rows<'a>(
         tree = tree.push(missing_project_row(app, host_id, &project_id));
     }
     tree
+}
+
+/// Render public read-only governance state. All fetching and state reduction
+/// stay in `gui-core` and the command layer.
+fn push_governance_rows<'a>(
+    mut tree: iced::widget::Column<'a, Message>,
+    host: &'a pohunek_gui_core::HostView,
+) -> iced::widget::Column<'a, Message> {
+    for row in governance_rows(&host.governance) {
+        tree = tree.push(indent(1, text(row).size(12)));
+    }
+    tree
+}
+
+fn governance_rows(governance: &GovernanceState) -> Vec<String> {
+    match governance {
+        GovernanceState::NotLoaded => vec!["Governance: not loaded".to_owned()],
+        GovernanceState::Loading { .. } => vec!["Governance: loading…".to_owned()],
+        GovernanceState::Error(error) => vec![format!("Governance error: {error}")],
+        GovernanceState::Loaded(status) => {
+            let mut rows = vec![
+                format!("Stable host ID: {}", status.host_id()),
+                format!("Approval key: {}", status.approval_key_reference()),
+            ];
+            let Some(enrollment) = status.enrollment() else {
+                rows.push("Enrollment: never enrolled".to_owned());
+                return rows;
+            };
+            rows.push(format!(
+                "Enrollment: {:?} via {} (revision {})",
+                enrollment.status(),
+                enrollment.relay_id(),
+                enrollment.revision()
+            ));
+            if let (Some(owner), Some(revision)) = (status.owner(), status.owner_revision()) {
+                let owner = match owner {
+                    HostOwner::Principal(id) => format!("principal {id}"),
+                    HostOwner::Team(id) => format!("team {id}"),
+                };
+                rows.push(format!("Owner: {owner} (revision {revision})"));
+            }
+            if let Some(reason) = status.quarantine() {
+                rows.push(format!("Quarantine: {reason:?}"));
+            }
+            rows
+        }
+    }
 }
 
 fn project_row(
@@ -135,5 +183,106 @@ pub(crate) fn conn_color(theme: &Theme, conn: &ConnState) -> iced::Color {
         ConnState::Connected => palette.success.base.color,
         ConnState::Connecting => palette.warning.base.color,
         ConnState::Disconnected | ConnState::Unreachable => palette.danger.base.color,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pohunek_gui_core::Workspace;
+    use protocol::{
+        ApprovalKeyReference, EnrollmentInfo, EnrollmentRevision, EnrollmentStatus,
+        HostGovernanceStatus, HostId, OwnerRevision, PrincipalId, QuarantineReason, RelayId,
+        TeamId,
+    };
+
+    use super::*;
+
+    fn status(
+        owner: Option<HostOwner>,
+        quarantine: Option<QuarantineReason>,
+    ) -> HostGovernanceStatus {
+        let owner_revision = owner
+            .as_ref()
+            .map(|_| OwnerRevision::new(3).expect("nonzero owner revision"));
+        HostGovernanceStatus::new(
+            HostId::parse("host_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                .expect("valid host id"),
+            owner.as_ref().map(|_| {
+                EnrollmentInfo::new(
+                    RelayId::parse("relay_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                        .expect("valid relay id"),
+                    if quarantine.is_some() {
+                        EnrollmentStatus::Quarantined
+                    } else {
+                        EnrollmentStatus::Active
+                    },
+                    EnrollmentRevision::new(2).expect("nonzero enrollment revision"),
+                )
+            }),
+            owner,
+            owner_revision,
+            quarantine,
+            ApprovalKeyReference::from_ed25519_verifying_key_bytes([7; 32]),
+        )
+        .expect("valid governance status")
+    }
+
+    #[test]
+    fn governance_rows_cover_every_public_presentation_branch() {
+        assert_eq!(
+            governance_rows(&GovernanceState::NotLoaded),
+            ["Governance: not loaded"]
+        );
+        let route = pohunek_gui_core::HostId::new("local");
+        let mut workspace = Workspace::default();
+        workspace
+            .begin_governance_request(route.clone())
+            .expect("request id");
+        assert_eq!(
+            governance_rows(workspace.governance(&route).expect("loading state")),
+            ["Governance: loading…"]
+        );
+        assert_eq!(
+            governance_rows(&GovernanceState::Error("offline".to_owned())),
+            ["Governance error: offline"]
+        );
+        assert_eq!(
+            governance_rows(&GovernanceState::Loaded(status(None, None)))[2],
+            "Enrollment: never enrolled"
+        );
+
+        let principal = HostOwner::Principal(
+            PrincipalId::parse("principal_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                .expect("valid principal id"),
+        );
+        assert!(
+            governance_rows(&GovernanceState::Loaded(status(Some(principal), None)))
+                .iter()
+                .any(|row| row.starts_with("Owner: principal "))
+        );
+        let team = HostOwner::Team(
+            TeamId::parse("team_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                .expect("valid team id"),
+        );
+        assert!(
+            governance_rows(&GovernanceState::Loaded(status(Some(team), None)))
+                .iter()
+                .any(|row| row.starts_with("Owner: team "))
+        );
+        let rows = governance_rows(&GovernanceState::Loaded(status(
+            Some(HostOwner::Principal(
+                PrincipalId::parse("principal_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                    .expect("valid principal id"),
+            )),
+            Some(QuarantineReason::ProjectionConflict),
+        )));
+        assert!(rows
+            .iter()
+            .any(|row| row == "Quarantine: ProjectionConflict"));
+        assert!(rows
+            .iter()
+            .all(|row| !["seed", "nonce", "signature", "private key"]
+                .iter()
+                .any(|forbidden| row.contains(forbidden))));
     }
 }

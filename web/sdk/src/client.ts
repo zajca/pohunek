@@ -20,6 +20,7 @@ import {
 } from "@pohunek/protocol";
 import { ClientError } from "./error";
 import { decodeResponse, type Request, type Response } from "./envelope";
+import { decodeHostGovernanceInspect } from "./governance";
 import { hasValidWireOrigin, type RequestOrigin } from "./origin";
 import { Subscription } from "./subscription";
 import type { ConnectOptions, ControlChannel, ResolvedConnectOptions, Transport } from "./transport";
@@ -105,6 +106,9 @@ export class Client {
       params,
     };
     const value = await this.request(request);
+    if (method === "host.governance.inspect") {
+      return decodeHostGovernanceInspect(value);
+    }
     return value as Methods[K]["output"];
   }
 

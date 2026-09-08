@@ -12,6 +12,7 @@ mod support;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -44,15 +45,29 @@ use tokio_util::codec::{Framed, LinesCodec};
 
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo};
 use pohunek_daemon::events::{spawn_drain, EventLog};
+use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::notifications::NotificationService;
 use pohunek_daemon::procwatch::LinuxInspector;
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_daemon::store::{ResumeBinding, Store, WorktreeBinding};
+use pohunek_paths::{
+    APP_DIR, HOST_APPROVAL_KEY_NAME, HOST_GOVERNANCE_NAME, HOST_IDENTITY_NAME,
+    HOST_STATE_LOCK_NAME, HOST_STATE_SUBDIR, LOGS_SUBDIR, WORKERS_SUBDIR,
+};
 
 static PATH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static XDG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Bounds startup readiness while still allowing a freshly spawned daemon to bind its socket.
+const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Avoids busy-spinning while waiting for the child daemon's Unix listener.
+const DAEMON_STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+/// Bounds every control request and socket operation in the real-daemon regression.
+const DAEMON_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounds child cleanup so a failed regression test cannot stall the suite indefinitely.
+const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Request;
 
@@ -207,6 +222,18 @@ fn temp_socket(tag: &str) -> std::path::PathBuf {
     temp_dir(tag).join("daemon.sock")
 }
 
+async fn governance_service(socket: &Path) -> Arc<HostGovernanceService> {
+    let state_root = socket
+        .parent()
+        .expect("test socket has an isolated parent")
+        .join("state");
+    Arc::new(
+        HostGovernanceService::open(state_root)
+            .await
+            .expect("open real isolated host-governance service"),
+    )
+}
+
 fn temp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -242,9 +269,14 @@ async fn spawn_server(
     version: &str,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let health = HealthInfo::new(version);
-    let server = ControlServer::bind(socket, health, support::overlay_registry())
-        .await
-        .expect("server binds");
+    let server = ControlServer::bind(
+        socket,
+        health,
+        governance_service(socket).await,
+        support::overlay_registry(),
+    )
+    .await
+    .expect("server binds");
     let (tx, rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
         server
@@ -436,6 +468,7 @@ async fn spawn_server_with_config(
     let state = DaemonState::new(
         HealthInfo::new(version),
         registry,
+        governance_service(socket).await,
         support::overlay_registry(),
     )
     .with_notifications(notifications);
@@ -492,6 +525,38 @@ async fn connect(socket: &std::path::Path) -> Framed<UnixStream, LinesCodec> {
     panic!("could not connect to test socket {}", socket.display());
 }
 
+/// Waits for a spawned daemon to expose its Unix control listener.
+async fn wait_for_daemon_socket(
+    child: &mut tokio::process::Child,
+    socket: &Path,
+) -> Framed<UnixStream, LinesCodec> {
+    tokio::time::timeout(DAEMON_STARTUP_TIMEOUT, async {
+        loop {
+            if let Some(status) = child.try_wait().expect("inspect daemon child") {
+                panic!("daemon exited before readiness with status {status}");
+            }
+            if let Ok(stream) = UnixStream::connect(socket).await {
+                return Framed::new(stream, LinesCodec::new());
+            }
+            tokio::time::sleep(DAEMON_STARTUP_RETRY_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("daemon reaches Unix-socket readiness before timeout")
+}
+
+fn assert_mode(path: &Path, expected_mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::metadata(path).expect("inspect private daemon state");
+    assert_eq!(
+        metadata.permissions().mode() & 0o777,
+        expected_mode,
+        "unexpected mode for {}",
+        path.display()
+    );
+}
+
 /// Connect a raw client to `socket` for attach-stream tests.
 async fn connect_raw(socket: &std::path::Path) -> UnixStream {
     for _ in 0..50 {
@@ -510,6 +575,17 @@ async fn exchange(
 ) -> Response {
     let line = serde_json::to_string(request).expect("serialize request");
     framed.send(line).await.expect("send");
+    let reply = framed
+        .next()
+        .await
+        .expect("a response line")
+        .expect("response framing ok");
+    serde_json::from_str(&reply).expect("parse response")
+}
+
+/// Send one raw control line and read one response line.
+async fn exchange_line(framed: &mut Framed<UnixStream, LinesCodec>, line: String) -> Response {
+    framed.send(line).await.expect("send raw request");
     let reply = framed
         .next()
         .await
@@ -1119,6 +1195,163 @@ async fn wait_for_persisted_resume_and_worktree(
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "This real-daemon regression keeps bounded startup, worker lifecycle, permission, and cleanup assertions in one auditable sequence."
+)]
+async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let xdg = XdgGuard::set_all("daemon-startup-private-state").await;
+    let guard_root = xdg.root.clone();
+    // The real worker nests its control socket below the XDG runtime root, and
+    // `sockaddr_un` imposes a small platform path bound. Keep this fixture short
+    // while retaining an isolated complete XDG environment.
+    let root = std::env::temp_dir().join(format!(
+        "pw-s-{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&root).expect("create short isolated XDG root");
+    let runtime_home = root.join("r");
+    let data_home = root.join("d");
+    let state_home = root.join("s");
+    let cache_home = root.join("c");
+    let config_home = root.join("g");
+    let home = root.join("h");
+    std::env::set_var("XDG_RUNTIME_DIR", &runtime_home);
+    std::env::set_var("XDG_DATA_HOME", &data_home);
+    std::env::set_var("XDG_STATE_HOME", &state_home);
+    std::env::set_var("XDG_CACHE_HOME", &cache_home);
+    std::env::set_var("XDG_CONFIG_HOME", &config_home);
+    std::env::set_var("HOME", &home);
+    std::env::set_var("CLAUDE_CONFIG_DIR", home.join(".claude"));
+    std::env::set_var("CODEX_HOME", home.join(".codex"));
+    std::fs::create_dir_all(&state_home).expect("create ordinary XDG state home");
+    std::fs::set_permissions(&state_home, std::fs::Permissions::from_mode(0o755))
+        .expect("make XDG state home ordinary owner-readable");
+    assert_mode(&state_home, 0o755);
+
+    let daemon = PathBuf::from(env!("CARGO_BIN_EXE_pohunekd"));
+    let mut child = tokio::process::Command::new(daemon)
+        .env("POHUNEK_WORKER_LAUNCHER", "subprocess")
+        .env("POHUNEK_WORKER_BIN", worker_binary())
+        .env("SHELL", "/bin/sh")
+        .env_remove("POHUNEK_DAEMON_ID")
+        .env_remove("POHUNEK_SESSION_ID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn real daemon");
+    let socket = runtime_home.join(APP_DIR).join("daemon.sock");
+    let mut client = wait_for_daemon_socket(&mut child, &socket).await;
+    let response = tokio::time::timeout(
+        DAEMON_CONTROL_REQUEST_TIMEOUT,
+        exchange(
+            &mut client,
+            &Request::make("startup-private-state", method::DAEMON_HEALTH, Value::Null),
+        ),
+    )
+    .await
+    .expect("daemon.health returns before control timeout");
+    assert!(response.is_ok(), "daemon health succeeds after bootstrap");
+
+    let session_request = Request::make(
+        "startup-private-state-session-new",
+        method::SESSION_NEW,
+        serde_json::to_value(session_params()).expect("serialize bounded shell session request"),
+    );
+    let created: SessionInfo = serde_json::from_value(ok_payload(
+        tokio::time::timeout(
+            DAEMON_CONTROL_REQUEST_TIMEOUT,
+            exchange(&mut client, &session_request),
+        )
+        .await
+        .expect("session.new returns before control timeout"),
+    ))
+    .expect("deserialize worker-backed session");
+    let runtime = created.runtime.as_ref().expect("session reports a runtime");
+    assert!(
+        runtime.worker_id.is_some(),
+        "session uses a real worker process"
+    );
+    assert!(
+        runtime.runtime_id.is_some(),
+        "session reports a worker runtime"
+    );
+
+    let list_request = Request::make(
+        "startup-private-state-session-list",
+        method::SESSION_LIST,
+        serde_json::to_value(SessionListParams::default()).expect("serialize session list request"),
+    );
+    let sessions: Vec<SessionInfo> = serde_json::from_value(ok_payload(
+        tokio::time::timeout(
+            DAEMON_CONTROL_REQUEST_TIMEOUT,
+            exchange(&mut client, &list_request),
+        )
+        .await
+        .expect("session.list returns before control timeout"),
+    ))
+    .expect("deserialize worker-backed session list");
+    assert!(
+        sessions.iter().any(|session| session.id == created.id
+            && session
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.worker_id.is_some())),
+        "listed session retains its real worker runtime"
+    );
+
+    let stop_request = Request::make(
+        "startup-private-state-session-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize worker-backed session id"),
+    );
+    let _: SessionStopResult = serde_json::from_value(ok_payload(
+        tokio::time::timeout(
+            DAEMON_CONTROL_REQUEST_TIMEOUT,
+            exchange(&mut client, &stop_request),
+        )
+        .await
+        .expect("session.stop returns before control timeout"),
+    ))
+    .expect("deserialize worker-backed session stop result");
+
+    tokio::time::timeout(DAEMON_CONTROL_REQUEST_TIMEOUT, client.get_mut().shutdown())
+        .await
+        .expect("close daemon health client before control timeout")
+        .expect("close daemon health client");
+
+    child.start_kill().expect("terminate real daemon");
+    let status = tokio::time::timeout(DAEMON_SHUTDOWN_TIMEOUT, child.wait())
+        .await
+        .expect("real daemon stops before cleanup timeout")
+        .expect("wait for real daemon");
+    assert!(!status.success(), "test termination stops the real daemon");
+
+    let app_state = state_home.join(APP_DIR);
+    let host_state = app_state.join(HOST_STATE_SUBDIR);
+    assert_mode(&app_state, 0o700);
+    assert_mode(&app_state.join(LOGS_SUBDIR), 0o700);
+    assert_mode(&app_state.join(WORKERS_SUBDIR), 0o700);
+    assert_mode(&host_state, 0o700);
+    for name in [
+        HOST_IDENTITY_NAME,
+        HOST_APPROVAL_KEY_NAME,
+        HOST_GOVERNANCE_NAME,
+        HOST_STATE_LOCK_NAME,
+    ] {
+        assert_mode(&host_state.join(name), 0o600);
+    }
+
+    std::fs::remove_dir_all(&root).expect("remove short isolated daemon state");
+    std::fs::remove_dir_all(guard_root).expect("remove XDG guard state");
+}
+
+#[tokio::test]
 async fn health_returns_versions() {
     let socket = temp_socket("health");
     let (shutdown, handle) = spawn_server(&socket, "9.9.9-test").await;
@@ -1200,6 +1433,73 @@ async fn unknown_method_returns_typed_error() {
 
     assert_eq!(resp.id(), "t-2");
     assert_eq!(err_payload(resp).code, "method_not_found");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn host_governance_inspect_requires_null_and_reports_never_enrolled_absence() {
+    let socket = temp_socket("host-governance-inspect");
+    let (shutdown, handle) = spawn_server(&socket, "0.0.0").await;
+    let mut client = connect(&socket).await;
+
+    let explicit = Request::make(
+        "governance-explicit-null",
+        method::HOST_GOVERNANCE_INSPECT,
+        Value::Null,
+    );
+    let explicit_payload = ok_payload(exchange(&mut client, &explicit).await);
+
+    let mut missing_wire = serde_json::to_value(Request::make(
+        "governance-missing-params",
+        method::HOST_GOVERNANCE_INSPECT,
+        Value::Null,
+    ))
+    .expect("serialize missing-params request");
+    missing_wire
+        .as_object_mut()
+        .expect("request is an object")
+        .remove("params");
+    let missing_payload = ok_payload(
+        exchange_line(
+            &mut client,
+            serde_json::to_string(&missing_wire).expect("encode missing-params request"),
+        )
+        .await,
+    );
+
+    for payload in [&explicit_payload, &missing_payload] {
+        assert!(payload["host_id"].is_string());
+        assert!(payload["approval_key_reference"].is_string());
+        assert_eq!(payload["enrollment"], Value::Null);
+        assert_eq!(payload["owner"], Value::Null);
+        assert_eq!(payload["owner_revision"], Value::Null);
+        assert_eq!(payload["quarantine"], Value::Null);
+    }
+    assert_eq!(
+        explicit_payload, missing_payload,
+        "the established omitted-params normalization must match explicit null"
+    );
+
+    for (index, params) in [
+        serde_json::json!({}),
+        serde_json::json!([]),
+        serde_json::json!("unexpected"),
+        serde_json::json!(1),
+        serde_json::json!(true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request_id = format!("governance-invalid-{index}");
+        let response = exchange(
+            &mut client,
+            &Request::make(&request_id, method::HOST_GOVERNANCE_INSPECT, params),
+        )
+        .await;
+        assert_eq!(err_payload(response).code, "bad_request");
+    }
 
     let _ = shutdown.send(());
     let _ = handle.await;

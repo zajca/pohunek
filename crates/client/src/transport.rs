@@ -11,12 +11,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::{SinkExt, StreamExt};
 use overlay::OverlayRegistry;
 use protocol::{
-    AttachHeader, Event, Method, ProtocolError, ProtocolVersion, ProtocolVersionRange, Request,
-    Response, SessionDetectionParams, SessionDetectionResult, SessionId, SessionInputParams,
-    SessionInputResult, SessionOutputParams, SessionOutputResult, SessionReadParams,
-    SessionReadResult, SessionResizeParams, SessionResizeResult, SessionResumeResult,
-    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
-    SessionWaitParams, SessionWaitResult, ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES,
+    AttachHeader, DoctorReport, Event, HostGovernanceStatus, Method, ProtocolError,
+    ProtocolVersion, ProtocolVersionRange, Request, Response, SessionDetectionParams,
+    SessionDetectionResult, SessionId, SessionInputParams, SessionInputResult, SessionOutputParams,
+    SessionOutputResult, SessionReadParams, SessionReadResult, SessionResizeParams,
+    SessionResizeResult, SessionResumeResult, SessionScreenParams, SessionScreenResult,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionWaitParams, SessionWaitResult,
+    ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES,
 };
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -412,6 +413,33 @@ impl Client {
                 "daemon health response did not select a protocol version".to_owned(),
             )
         })
+    }
+
+    /// Inspect the host's stable identity and safe governance status.
+    ///
+    /// This is a read-only request with canonical `null` parameters. The
+    /// returned status intentionally contains no approval private material.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the selected transport cannot exchange the
+    /// request or the daemon returns an invalid or unsuccessful response.
+    pub async fn host_governance_inspect(&mut self) -> Result<HostGovernanceStatus, ClientError> {
+        self.call::<protocol::method::HostGovernanceInspect>(())
+            .await
+    }
+
+    /// Run the daemon's redacted host diagnostics.
+    ///
+    /// This read-only request uses canonical `null` parameters and returns the
+    /// report without exposing daemon persistence details through the SDK.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when transport or response decoding fails.
+    pub async fn daemon_doctor(&mut self) -> Result<DoctorReport, ClientError> {
+        let result = self.call::<protocol::method::DaemonDoctor>(()).await?;
+        Ok(result.report)
     }
 
     /// Returns the version selected by the first valid response on this connection.

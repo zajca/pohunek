@@ -2,6 +2,11 @@
 
 ## Unreleased (2026-08-12)
 
+- Documented shipped host-local stable identity and safe governance inspection:
+  explicit never-enrolled state, exact principal-or-team owner, checked
+  revisions, quarantine, owner-private persistence, doctor checks, CLI, SDK,
+  GUI, and transparent owner-WebUI boundaries. Kept relay, team, enrollment,
+  transfer, and share APIs explicitly unshipped.
 - Added the accepted optional team-relay concept and separated its future
   protocol-v4, multi-team, `HostShare`, and trusted-relay boundaries from the
   currently shipped owner-only protocol v3 and transparent Bun web backend.

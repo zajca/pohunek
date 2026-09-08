@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { MAX_CONTROL_LINE_BYTES, MAX_SESSION_WAIT_MS, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, type ProtocolError, type SessionInfo } from "@pohunek/protocol";
+import {
+  MAX_CONTROL_LINE_BYTES,
+  MAX_SESSION_WAIT_MS,
+  PROTOCOL_VERSION,
+  SUPPORTED_PROTOCOL_VERSIONS,
+  type HostGovernanceStatus,
+  type ProtocolError,
+  type SessionInfo,
+} from "@pohunek/protocol";
 import {
   Client,
   ClientError,
@@ -95,6 +103,202 @@ describe("Client request/response", () => {
       expect(String(sent["id"])).toStartWith("sdk-session.list-");
     } finally {
       await daemon.close();
+    }
+  });
+
+  test("call carries the typed safe never-enrolled governance inspect contract", async () => {
+    const status = {
+      host_id: "host_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      enrollment: null,
+      owner: null,
+      owner_revision: null,
+      quarantine: null,
+      approval_key_reference: "approval_key_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    } satisfies HostGovernanceStatus;
+    const daemon = await startUnixDaemon([
+      { kind: "reply", line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), status) },
+    ]);
+    try {
+      const client = await connectClient(daemon);
+
+      const result = await client.call("host.governance.inspect", null);
+
+      expect(result).toEqual(status);
+      expect(Object.keys(result).sort()).toEqual([
+        "approval_key_reference",
+        "enrollment",
+        "host_id",
+        "owner",
+        "owner_revision",
+        "quarantine",
+      ]);
+      expect(/^host_[A-Za-z0-9_-]{43}$/.test(result.host_id)).toBe(true);
+      expect(/^approval_key_[A-Za-z0-9_-]{43}$/.test(result.approval_key_reference)).toBe(true);
+      expect(result.enrollment).toBeNull();
+      expect(result.owner).toBeNull();
+      expect(result.owner_revision).toBeNull();
+      expect(result.quarantine).toBeNull();
+
+      const sent = parseRequestLine(await daemon.nextRequest());
+      expect(sent["method"]).toBe("host.governance.inspect");
+      expect(sent["params"]).toBeNull();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("call accepts every canonical 32-byte Base64URL final character for host and approval-key identifiers", async () => {
+    for (const finalCharacter of "AEIMQUYcgkosw048") {
+      const status = {
+        host_id: governanceId("host_", finalCharacter),
+        enrollment: null,
+        owner: null,
+        owner_revision: null,
+        quarantine: null,
+        approval_key_reference: governanceId("approval_key_", finalCharacter),
+      } satisfies HostGovernanceStatus;
+      const daemon = await startUnixDaemon([
+        { kind: "reply", line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), status) },
+      ]);
+      try {
+        const client = await connectClient(daemon);
+
+        expect(await client.call("host.governance.inspect", null)).toEqual(status);
+      } finally {
+        await daemon.close();
+      }
+    }
+  });
+
+  test("call accepts every lifecycle value and a safe team-owned quarantined snapshot", async () => {
+    for (const lifecycle of [
+      "disabled",
+      "pending_local_commit",
+      "active",
+      "rotating",
+      "quarantined",
+      "locally_unenrolled",
+    ] as const) {
+      const ownerKind = lifecycle === "active" ? "principal" : "team";
+      const status = enrolledGovernanceStatus(lifecycle, undefined, ownerKind);
+      const daemon = await startUnixDaemon([
+        { kind: "reply", line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), status) },
+      ]);
+      try {
+        const client = await connectClient(daemon);
+        const result = await client.call("host.governance.inspect", null);
+
+        expect(result.enrollment?.status).toBe(lifecycle);
+        expect(result.owner).toEqual({
+          kind: ownerKind,
+          id: governanceId(ownerKind === "principal" ? "principal_" : "team_"),
+        });
+        expect(result.quarantine).toBe(
+          lifecycle === "quarantined" ? "projection_conflict" : null,
+        );
+      } finally {
+        await daemon.close();
+      }
+    }
+  });
+
+  test("call rejects malformed governance inspect responses without reflecting their payload", async () => {
+    const privateSentinel = "GOVERNANCE_PRIVATE_SENTINEL_04ec52";
+    const cases: ReadonlyArray<readonly [string, () => unknown]> = [
+      ["missing root field", () => withoutField(enrolledGovernanceStatus("active"), "quarantine")],
+      ["unknown root field", () => ({ ...enrolledGovernanceStatus("active"), seed: privateSentinel })],
+      ["noncanonical host id", () => ({
+        ...enrolledGovernanceStatus("active"),
+        host_id: `host_${"A".repeat(42)}B`,
+      })],
+      ["host id outside the Base64URL alphabet", () => ({
+        ...enrolledGovernanceStatus("active"),
+        host_id: `host_${"A".repeat(42)}+`,
+      })],
+      ["padded host id", () => ({
+        ...enrolledGovernanceStatus("active"),
+        host_id: `host_${"A".repeat(43)}=`,
+      })],
+      ["short host id", () => ({
+        ...enrolledGovernanceStatus("active"),
+        host_id: `host_${"A".repeat(42)}`,
+      })],
+      ["wrong approval key type", () => ({
+        ...enrolledGovernanceStatus("active"),
+        approval_key_reference: 1,
+      })],
+      ["wrong relay id length", () => ({
+        ...enrolledGovernanceStatus("active"),
+        enrollment: {
+          ...enrolledGovernanceStatus("active").enrollment,
+          relay_id: `relay_${"A".repeat(42)}`,
+        },
+      })],
+      ["nonpositive owner revision", () => ({
+        ...enrolledGovernanceStatus("active"),
+        owner_revision: "0",
+      })],
+      ["overflowing owner revision", () => ({
+        ...enrolledGovernanceStatus("active"),
+        owner_revision: "18446744073709551616",
+      })],
+      ["leading-zero enrollment revision", () => ({
+        ...enrolledGovernanceStatus("active"),
+        enrollment: { ...enrolledGovernanceStatus("active").enrollment, revision: "01" },
+      })],
+      ["numeric enrollment revision", () => ({
+        ...enrolledGovernanceStatus("active"),
+        enrollment: { ...enrolledGovernanceStatus("active").enrollment, revision: 1 },
+      })],
+      ["unknown enrollment field", () => ({
+        ...enrolledGovernanceStatus("active"),
+        enrollment: { ...enrolledGovernanceStatus("active").enrollment, nonce: privateSentinel },
+      })],
+      ["invalid lifecycle", () => ({
+        ...enrolledGovernanceStatus("active"),
+        enrollment: { ...enrolledGovernanceStatus("active").enrollment, status: "invented" },
+      })],
+      ["partial owner state", () => ({ ...enrolledGovernanceStatus("active"), owner: null })],
+      ["partial revision state", () => ({
+        ...enrolledGovernanceStatus("active"),
+        owner_revision: null,
+      })],
+      ["wrong owner identifier", () => ({
+        ...enrolledGovernanceStatus("active"),
+        owner: { kind: "team", id: governanceId("principal_") },
+      })],
+      ["unknown owner field", () => ({
+        ...enrolledGovernanceStatus("active"),
+        owner: { kind: "team", id: governanceId("team_"), proposal: privateSentinel },
+      })],
+      ["missing quarantine for quarantined enrollment", () => enrolledGovernanceStatus("quarantined", null)],
+      ["quarantine for active enrollment", () => enrolledGovernanceStatus("active", "projection_conflict")],
+    ];
+
+    for (const [name, createPayload] of cases) {
+      const daemon = await startUnixDaemon([
+        {
+          kind: "reply",
+          line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), createPayload()),
+        },
+      ]);
+      try {
+        const client = await connectClient(daemon);
+        const error = await expectClientError(client.call("host.governance.inspect", null));
+
+        expect(error.kind).toBe("protocol");
+        expect(error.toProtocolError()).toEqual({
+          class: "daemon",
+          code: "host_governance_inspect_contract_mismatch",
+          msg: "invalid host.governance.inspect response",
+        });
+        expect(error.message).toBe("daemon error: invalid host.governance.inspect response");
+        if (error.message.includes(privateSentinel)) {
+          throw new Error(`${name} reflected a private response field`);
+        }
+      } finally {
+        await daemon.close();
+      }
     }
   });
 
@@ -850,4 +1054,54 @@ async function expectClientError(promise: Promise<unknown>): Promise<ClientError
     return error as ClientError;
   }
   throw new Error("expected promise to reject with ClientError");
+}
+
+type GovernanceLifecycle =
+  | "disabled"
+  | "pending_local_commit"
+  | "active"
+  | "rotating"
+  | "quarantined"
+  | "locally_unenrolled";
+type GovernanceQuarantine = "host_identity_clone" | "projection_conflict" | "enrollment_conflict" | null;
+type GovernanceOwnerKind = "principal" | "team";
+type GovernancePayload = {
+  host_id: string;
+  enrollment: { relay_id: string; status: GovernanceLifecycle; revision: string | number };
+  owner: { kind: string; id: string } | null;
+  owner_revision: string | null;
+  quarantine: GovernanceQuarantine;
+  approval_key_reference: string | number;
+};
+
+function enrolledGovernanceStatus(
+  status: GovernanceLifecycle,
+  quarantine: GovernanceQuarantine = status === "quarantined" ? "projection_conflict" : null,
+  ownerKind: GovernanceOwnerKind = "team",
+): GovernancePayload {
+  return {
+    host_id: governanceId("host_"),
+    enrollment: {
+      relay_id: governanceId("relay_"),
+      status,
+      revision: "1",
+    },
+    owner: {
+      kind: ownerKind,
+      id: governanceId(ownerKind === "principal" ? "principal_" : "team_"),
+    },
+    owner_revision: "1",
+    quarantine,
+    approval_key_reference: governanceId("approval_key_"),
+  };
+}
+
+function governanceId(prefix: string, finalCharacter = "A"): string {
+  return `${prefix}${"A".repeat(42)}${finalCharacter}`;
+}
+
+function withoutField(value: Record<string, unknown>, field: string): Record<string, unknown> {
+  const copy = { ...value };
+  delete copy[field];
+  return copy;
 }

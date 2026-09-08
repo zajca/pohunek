@@ -37,6 +37,24 @@ pub const MAX_SESSION_ID_BYTES: usize = 128;
 /// so their wire contribution must remain bounded independently of provider.
 pub const MAX_RUNTIME_ID_BYTES: usize = 128;
 
+/// Exact payload length for canonical governance identifiers.
+///
+/// An unpadded base64url encoding of exactly 32 bytes is always 43 ASCII
+/// characters. The fixed width prevents alternate spellings and keeps every
+/// governance coordinate bounded in control envelopes and durable records.
+pub const GOVERNANCE_ID_PAYLOAD_BYTES: usize = 43;
+
+/// Exact decoded length of an Ed25519 host approval signature.
+///
+/// Ed25519 signatures are fixed at 64 bytes. Pinning the algorithm avoids an
+/// ambiguous host-approval proof format on the durable transfer wire.
+pub const ED25519_SIGNATURE_BYTES: usize = 64;
+
+/// Exact unpadded base64url length of one Ed25519 signature.
+///
+/// A 64-byte payload encodes to 86 base64url characters without padding.
+pub const ED25519_SIGNATURE_PAYLOAD_BYTES: usize = 86;
+
 /// Maximum bounded `session.wait` duration accepted on the public wire.
 ///
 /// Eight seconds releases abandoned daemon waiter slots promptly while still

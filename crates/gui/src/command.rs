@@ -9,13 +9,14 @@ use pohunek_gui_core::assistant::{AssistantPaths, LaunchParams as AssistantLaunc
 use pohunek_gui_core::{
     assistant as assistant_core, create_session_with_options, delete_notification_with_options,
     discover_hosts, fork_session_with_options, get_notification_policy_with_options,
-    inspect_session_with_options, list_project_actions_with_options, preview_action_prompt,
-    read_session_output_with_options, read_session_screen_with_options,
-    remove_session_with_options, rename_session_with_options, resolve_project_action_with_options,
-    resume_session_with_options, set_notification_policy_with_options,
-    set_session_metadata_with_options, stop_session_with_options, update_notification_with_options,
-    wait_for_session_with_options, ConnectionOptions, CoreError, DomainEvent as CoreEvent,
-    HostConfig, HostId, HostView, Selection, WindowSize,
+    inspect_host_governance_with_options, inspect_session_with_options,
+    list_project_actions_with_options, preview_action_prompt, read_session_output_with_options,
+    read_session_screen_with_options, remove_session_with_options, rename_session_with_options,
+    resolve_project_action_with_options, resume_session_with_options,
+    set_notification_policy_with_options, set_session_metadata_with_options,
+    stop_session_with_options, update_notification_with_options, wait_for_session_with_options,
+    ConnectionOptions, CoreError, DomainEvent as CoreEvent, HostConfig, HostId, HostView,
+    Selection, WindowSize,
 };
 use protocol::{
     ForkCwdMode, NotificationDeleteParams, NotificationId, NotificationPolicyParams,
@@ -56,7 +57,17 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
     let mut tasks = Vec::new();
     match message {
         Message::Core(event) => {
+            let governance_host = match &event {
+                CoreEvent::HostSnapshotLoaded { snapshot } => Some(snapshot.host_id.clone()),
+                _ => None,
+            };
             app.workspace.apply(event);
+            if let Some(host_id) = governance_host {
+                match governance_inspect_task(app, host_id) {
+                    Ok(task) => tasks.push(task),
+                    Err(err) => app.status = Some(err),
+                }
+            }
             normalize_inbox_cursor(app);
             tasks.push(notification_tasks(app));
         }
@@ -679,6 +690,29 @@ fn notification_tasks(app: &mut PohunekApp) -> Task<Message> {
             Message::NotificationSent,
         )
     }))
+}
+
+/// Request safe governance data after a host snapshot establishes the route.
+fn governance_inspect_task(app: &mut PohunekApp, host_id: HostId) -> Result<Task<Message>, String> {
+    let host = host_config(app, &host_id)?;
+    let options = connection_options(app)?;
+    let request_id = app
+        .workspace
+        .begin_governance_request(host_id.clone())
+        .map_err(|err| err.to_string())?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            let result = inspect_host_governance_with_options(&host, options)
+                .await
+                .map_err(|err| err.to_string());
+            CoreEvent::GovernanceLoaded {
+                host_id,
+                request_id,
+                result,
+            }
+        }),
+        Message::Core,
+    ))
 }
 
 /// Builds and dispatches session creation from the Start modal. The input is the
@@ -1313,11 +1347,12 @@ mod tests {
     use std::path::PathBuf;
 
     use pohunek_gui_core::{
-        ConnState, NotificationFilter, NotificationScope, PromptState, ProviderState, UiState,
-        Workspace,
+        ConnState, HealthSummary, NotificationFilter, NotificationScope, PromptState,
+        ProviderState, UiState, Workspace,
     };
     use protocol::{
-        AgentKind, AgentRuntime, NotificationKind, NotificationRecord, NotificationSeverity,
+        AgentKind, AgentRuntime, ApprovalKeyReference, HostGovernanceStatus,
+        HostId as StableHostId, NotificationKind, NotificationRecord, NotificationSeverity,
         NotificationSource, ProjectInfo, ProjectSource,
     };
 
@@ -1535,6 +1570,130 @@ mod tests {
         assert!(app.form_select.is_none());
     }
 
+    #[test]
+    fn governance_snapshot_dispatches_once_and_completion_does_not_loop() {
+        let mut app = app_with_governance_host();
+        let route = HostId::new("local");
+        let _snapshot_task = update(
+            &mut app,
+            Message::Core(CoreEvent::HostSnapshotLoaded {
+                snapshot: governance_snapshot("local"),
+            }),
+        );
+        let request_id = match app.workspace.governance(&route) {
+            Some(pohunek_gui_core::GovernanceState::Loading { request_id }) => *request_id,
+            other => panic!("snapshot must dispatch one governance request, got {other:?}"),
+        };
+        assert_eq!(request_id.get(), 1);
+
+        let _completion_task = update(
+            &mut app,
+            Message::Core(CoreEvent::GovernanceLoaded {
+                host_id: route.clone(),
+                request_id,
+                result: Ok(never_enrolled_governance_status()),
+            }),
+        );
+        assert!(matches!(
+            app.workspace.governance(&route),
+            Some(pohunek_gui_core::GovernanceState::Loaded(status)) if status.enrollment().is_none()
+        ));
+        let next = app
+            .workspace
+            .begin_governance_request(route)
+            .expect("completion must not have dispatched another request");
+        assert_eq!(next.get(), 2);
+    }
+
+    #[test]
+    fn governance_error_completion_does_not_dispatch_follow_up_request() {
+        let mut app = app_with_governance_host();
+        let route = HostId::new("local");
+        let _snapshot_task = update(
+            &mut app,
+            Message::Core(CoreEvent::HostSnapshotLoaded {
+                snapshot: governance_snapshot("local"),
+            }),
+        );
+        let request_id = match app.workspace.governance(&route) {
+            Some(pohunek_gui_core::GovernanceState::Loading { request_id }) => *request_id,
+            other => panic!("snapshot must dispatch one governance request, got {other:?}"),
+        };
+        assert_eq!(request_id.get(), 1);
+
+        let _completion_task = update(
+            &mut app,
+            Message::Core(CoreEvent::GovernanceLoaded {
+                host_id: route.clone(),
+                request_id,
+                result: Err("unreachable".to_owned()),
+            }),
+        );
+        assert_eq!(
+            app.workspace.governance(&route),
+            Some(&pohunek_gui_core::GovernanceState::Error(
+                "unreachable".to_owned()
+            ))
+        );
+
+        let next = app
+            .workspace
+            .begin_governance_request(route)
+            .expect("error completion must not have dispatched another request");
+        assert_eq!(next.get(), 2);
+    }
+
+    fn app_with_governance_host() -> PohunekApp {
+        let mut app = app_without_selection();
+        let local_host = HostConfig::tcp(
+            "local",
+            "127.0.0.1:9".parse().expect("valid inert test address"),
+        );
+        app.hosts = vec![local_host.clone()];
+        app.config = Ok(AppConfig {
+            attach_command: "attach {host} {id}".to_owned(),
+            pohunek_bin: "pohunek".to_owned(),
+            local_host,
+            connection_options: ConnectionOptions::default(),
+            terminal_size: crate::config::TerminalSize::default(),
+            notification_command: "notify-send".to_owned(),
+            keymap: keyboard::KeyMap::default(),
+        });
+        app
+    }
+
+    fn governance_snapshot(host_id: &str) -> pohunek_gui_core::HostSnapshot {
+        pohunek_gui_core::HostSnapshot {
+            host_id: HostId::new(host_id),
+            health: HealthSummary {
+                status: "ok".to_owned(),
+                daemon_version: "test".to_owned(),
+                protocol_version: protocol::PROTOCOL_VERSION,
+            },
+            sessions: Vec::new(),
+            projects: Vec::new(),
+            project_error: None,
+            notifications: Vec::new(),
+            supported_agents: Vec::new(),
+            runtimes: Vec::new(),
+            notification_providers: Vec::new(),
+            observation_capabilities: pohunek_gui_core::ObservationCapabilities::default(),
+        }
+    }
+
+    fn never_enrolled_governance_status() -> HostGovernanceStatus {
+        HostGovernanceStatus::new(
+            StableHostId::parse("host_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                .expect("valid stable host id"),
+            None,
+            None,
+            None,
+            None,
+            ApprovalKeyReference::from_ed25519_verifying_key_bytes([7; 32]),
+        )
+        .expect("valid never-enrolled governance status")
+    }
+
     fn test_host() -> HostView {
         HostView {
             conn: ConnState::Connected,
@@ -1552,6 +1711,7 @@ mod tests {
             runtimes: Vec::new(),
             notification_providers: Vec::new(),
             observation_capabilities: pohunek_gui_core::ObservationCapabilities::default(),
+            governance: pohunek_gui_core::GovernanceState::default(),
         }
     }
 

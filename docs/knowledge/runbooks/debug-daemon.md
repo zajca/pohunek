@@ -18,7 +18,13 @@ Use this runbook when commands report that the daemon is unreachable or unhealth
    `pohunek daemon start --detach`.
 4. Run `pohunek health --json` again and inspect the reported socket, version,
    and status.
-5. For remote hosts, run `pohunek host inspect <host> --json` and confirm the
+5. Run `pohunek host governance inspect local --json` to distinguish a healthy
+   daemon with a never-enrolled host from unavailable governance state. A
+   never-enrolled result has four explicit null fields (`enrollment`, `owner`,
+   `owner_revision`, and `quarantine`) plus a stable host ID and safe
+   approval-key reference. Do not edit owner-private host-state files or keys
+   to change this result.
+6. For remote hosts, run `pohunek host inspect <host> --json` and confirm the
    host daemon responds through the remote transport.
    If the remote daemon started before NetBird was ready, allow one retry
    interval for its NetBird-only listener to become available, then repeat the
@@ -28,9 +34,9 @@ Use this runbook when commands report that the daemon is unreachable or unhealth
    `remote listener supervisor failed; shutting down daemon` with the overlay
    identifier and exits after controlled cleanup instead of remaining ready
    without that listener.
-6. If a session was expected, run `pohunek session list --json` on the relevant
+7. If a session was expected, run `pohunek session list --json` on the relevant
    host and inspect the specific session with `pohunek session inspect <target>`.
-7. If the daemon restarted, do not infer session exit from the closed control or
+8. If the daemon restarted, do not infer session exit from the closed control or
    attach socket. Check the session's `runtime.state`, `worker_id`, and
    `runtime_id`, then use the
    [session runtime runbook](debug-session-runtime.md) for `reconnecting`,

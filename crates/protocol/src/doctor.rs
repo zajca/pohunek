@@ -66,17 +66,50 @@ pub struct DoctorReport {
 }
 
 impl DoctorReport {
+    /// Aggregate checks by their highest severity.
+    ///
+    /// An empty report and an all-`Ok` report are `Ok`. A `Warn` is retained
+    /// unless any check is `Fail`, which always takes precedence.
     #[must_use]
     pub fn from_checks(checks: Vec<DoctorCheck>) -> Self {
-        let overall = if checks
-            .iter()
-            .any(|check| check.status == DoctorStatus::Fail)
-        {
-            DoctorStatus::Fail
-        } else {
-            DoctorStatus::Ok
-        };
+        let overall = checks.iter().fold(DoctorStatus::Ok, |overall, check| {
+            match (overall, check.status) {
+                (DoctorStatus::Fail, _) | (_, DoctorStatus::Fail) => DoctorStatus::Fail,
+                (DoctorStatus::Warn, _) | (_, DoctorStatus::Warn) => DoctorStatus::Warn,
+                (DoctorStatus::Ok, DoctorStatus::Ok) => DoctorStatus::Ok,
+            }
+        });
         Self { checks, overall }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DoctorCheck, DoctorReport, DoctorStatus};
+
+    #[test]
+    fn aggregates_highest_check_severity() {
+        let cases = [
+            ("empty", Vec::new(), DoctorStatus::Ok),
+            ("ok", vec![DoctorStatus::Ok], DoctorStatus::Ok),
+            ("warn", vec![DoctorStatus::Warn], DoctorStatus::Warn),
+            ("fail", vec![DoctorStatus::Fail], DoctorStatus::Fail),
+            (
+                "warn and fail",
+                vec![DoctorStatus::Warn, DoctorStatus::Fail],
+                DoctorStatus::Fail,
+            ),
+        ];
+
+        for (name, statuses, expected) in cases {
+            let checks = statuses
+                .into_iter()
+                .enumerate()
+                .map(|(index, status)| DoctorCheck::new(format!("check-{index}"), status, name))
+                .collect();
+            let report = DoctorReport::from_checks(checks);
+            assert_eq!(report.overall, expected, "case {name}");
+        }
     }
 }
 

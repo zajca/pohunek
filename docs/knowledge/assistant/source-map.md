@@ -68,6 +68,7 @@ Native GUI client:
 - `crates/prompt/src/link.rs`
 - `crates/cli/tests/gui_prompt_parity.rs`
 - `docs/knowledge/guides/gui.md`
+- `docs/knowledge/concepts/host-governance.md`
 - `docs/phases/06-native-app.md`
 - `docs/design/track-d-native-app.md`
 
@@ -111,6 +112,30 @@ Accepted team-relay architecture (not yet implemented):
 - `docs/knowledge/safety/trust-model.md`
 - `docs/knowledge/guides/remote-hosts.md`
 - `docs/knowledge/guides/web-control-center.md`
+
+Shipped host-local identity and governance:
+
+- `crates/protocol/src/governance.rs`
+- `crates/protocol/src/method.rs`
+- `crates/daemon/src/governance.rs`
+- `crates/daemon/src/host_state/`
+- `crates/daemon/src/doctor.rs`
+- `crates/daemon/src/api/handler/governance.rs` — strict null-only
+  `host.governance.inspect` parameters, safe public projection, and the fixed
+  redacted governance-unavailable response.
+- `crates/daemon/src/api/handler/mod.rs` — central public method dispatch for
+  the shared owner-transport governance service.
+- `crates/client/src/transport.rs`
+- `crates/cli/src/commands/host.rs`
+- `crates/gui-core/src/sdk.rs`
+- `crates/gui-core/src/state.rs`
+- `crates/gui/src/command.rs`
+- `crates/gui/src/view/tree.rs`
+- `crates/xtask/src/generators/protocol.rs`
+- `web/sdk/src/governance.ts` — strict TypeScript validation of the public
+  `host.governance.inspect` response and its fixed redacted contract-mismatch
+  error.
+- `docs/knowledge/concepts/host-governance.md`
 
 Release packaging:
 

@@ -18,6 +18,10 @@ Start with structured inspection:
    responds.
 4. Run `pohunek host inspect local --json` to inspect local capabilities and
    available runtimes.
+5. Run `pohunek host governance inspect local --json` to inspect the stable
+   host ID and safe local governance state. A fresh host is valid with explicit
+   null enrollment, owner, owner revision, and quarantine fields; it still has
+   a public approval-key reference.
 
 On a worker-aware Linux installation, the daemon archive installs three
 systemd user units: `pohunekd.service`, the
@@ -45,7 +49,8 @@ prints the `fpath` line that must appear before `compinit`.
 Do not overwrite existing user config unless the user asks for that behavior and
 the command supports it. For launcher details, see [launcher](launcher.md). For
 profile and secret boundaries, see [agent profiles](../concepts/agent-profiles.md)
-and [secrets](../safety/secrets.md).
+and [secrets](../safety/secrets.md). For the governance storage and lifecycle
+boundary, see [host identity and local governance](../concepts/host-governance.md).
 
 For the separately managed Hermes operator integration, use its typed install,
 status, doctor, update, and uninstall commands. Do not edit Hermes YAML, a

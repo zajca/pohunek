@@ -33,6 +33,8 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone, Copy)]
 enum Scenario {
     Success,
+    GovernanceInspectSuccess,
+    GovernanceInspectError,
     Ambiguous,
     OutputRuntimeChanged,
     SlowWait,
@@ -129,6 +131,70 @@ impl TestHome {
 impl Drop for TestHome {
     fn drop(&mut self) {
         let _result = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn doctor_process_redacts_an_unavailable_local_daemon_in_human_and_json_output() {
+    let home = TestHome::new();
+    let socket = home.socket();
+    let expected_detail =
+        "Daemon governance inspection is unavailable; start the local daemon and retry.";
+
+    let human = home
+        .command()
+        .arg("doctor")
+        .output()
+        .expect("run doctor process");
+    assert!(
+        human.status.success(),
+        "human doctor failed: {}",
+        utf8(&human.stderr)
+    );
+    let human_stdout = utf8(&human.stdout);
+    assert_eq!(
+        human_stdout.matches("host_governance_inspection").count(),
+        1,
+        "human doctor must emit exactly one unavailable-governance check"
+    );
+    assert!(human_stdout.contains("warn"));
+    assert!(human_stdout.contains(expected_detail));
+    assert_redacted_doctor_output(&human_stdout, &socket);
+
+    let json = home
+        .command()
+        .args(["doctor", "--json"])
+        .output()
+        .expect("run JSON doctor process");
+    assert!(
+        json.status.success(),
+        "JSON doctor failed: {}",
+        utf8(&json.stderr)
+    );
+    let document: Value = serde_json::from_slice(&json.stdout).expect("doctor JSON envelope");
+    let checks = document["ok"]["checks"].as_array().expect("doctor checks");
+    let unavailable = checks
+        .iter()
+        .filter(|check| check["name"] == "host_governance_inspection")
+        .collect::<Vec<_>>();
+    assert_eq!(unavailable.len(), 1);
+    assert_eq!(unavailable[0]["status"], "warn");
+    assert_eq!(unavailable[0]["detail"], expected_detail);
+    assert_redacted_doctor_output(&utf8(&json.stdout), &socket);
+}
+
+fn assert_redacted_doctor_output(output: &str, socket: &Path) {
+    assert!(!output.contains(&socket.display().to_string()));
+    for forbidden in [
+        "client error",
+        "transport error",
+        "connection refused",
+        "os error",
+    ] {
+        assert!(
+            !output.to_ascii_lowercase().contains(forbidden),
+            "doctor output leaks unavailable-daemon detail: {forbidden}"
+        );
     }
 }
 
@@ -306,6 +372,9 @@ fn handle_connection<S>(
 }
 
 fn fixture_response(request: &Request, scenario: Scenario) -> Response {
+    if let Some(response) = governance_inspect_response(request, scenario) {
+        return response;
+    }
     if request.method() == protocol::method::SESSION_OUTPUT
         && matches!(scenario, Scenario::OutputRuntimeChanged)
     {
@@ -395,6 +464,54 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
         method => panic!("unexpected fixture method: {method}"),
     };
     Response::ok(PROTOCOL_VERSION, request.id(), ok).expect("valid success response")
+}
+
+fn governance_inspect_response(request: &Request, scenario: Scenario) -> Option<Response> {
+    if request.method() != protocol::method::HOST_GOVERNANCE_INSPECT {
+        return None;
+    }
+    match scenario {
+        Scenario::GovernanceInspectSuccess => Some(
+            Response::ok(PROTOCOL_VERSION, request.id(), governance_status())
+                .expect("valid governance inspection response"),
+        ),
+        Scenario::GovernanceInspectError => Some(
+            Response::err(
+                PROTOCOL_VERSION,
+                request.id(),
+                protocol::ProtocolError::new(
+                    protocol::ErrorClass::Daemon,
+                    "host_governance_unavailable",
+                    "safe governance inspection is unavailable",
+                    None,
+                ),
+            )
+            .expect("valid governance inspection error"),
+        ),
+        _ => None,
+    }
+}
+
+fn governance_status() -> Value {
+    json!({
+        "host_id": governance_identifier("host_"),
+        "enrollment": {
+            "relay_id": governance_identifier("relay_"),
+            "status": "quarantined",
+            "revision": "1"
+        },
+        "owner": {
+            "kind": "team",
+            "id": governance_identifier("team_")
+        },
+        "owner_revision": "1",
+        "quarantine": "projection_conflict",
+        "approval_key_reference": governance_identifier("approval_key_")
+    })
+}
+
+fn governance_identifier(prefix: &str) -> String {
+    format!("{prefix}{}", "A".repeat(43))
 }
 
 fn session_list(scenario: Scenario) -> Value {
@@ -538,6 +655,117 @@ fn assert_json_error(output: &Output, expected_code: &str) -> Value {
     assert_eq!(document["err"]["code"], expected_code);
     assert!(document.get("ok").is_none());
     document
+}
+
+#[test]
+fn host_governance_inspect_process_renders_safe_human_and_json_statuses() {
+    let human = run_governance_inspect(&["host", "governance", "inspect", "local"]);
+    assert!(
+        human.output.status.success(),
+        "human error: {}",
+        utf8(&human.output.stderr)
+    );
+    let human_stdout = utf8(&human.output.stdout);
+    assert!(human.output.stderr.is_empty());
+    assert!(human_stdout.contains("host local governance"));
+    assert!(human_stdout.contains("host_id:                host_"));
+    assert!(human_stdout.contains("approval_key_reference: approval_key_"));
+    assert!(human_stdout.contains("relay_id:               relay_"));
+    assert!(human_stdout.contains("owner:                  team team_"));
+    assert!(human_stdout.contains("owner_revision:         1"));
+    assert!(human_stdout.contains("quarantine:             ProjectionConflict"));
+    assert_safe_governance_output(&human_stdout);
+    assert_governance_inspect_request(&human.requests);
+
+    let json = run_governance_inspect(&["host", "governance", "inspect", "local", "--json"]);
+    let status = assert_json_success(&json.output);
+    assert_eq!(status["host_id"], governance_identifier("host_"));
+    assert_eq!(
+        status["enrollment"]["relay_id"],
+        governance_identifier("relay_")
+    );
+    assert_eq!(status["enrollment"]["status"], "quarantined");
+    assert_eq!(status["enrollment"]["revision"], "1");
+    assert_eq!(
+        status["owner"],
+        json!({"kind": "team", "id": governance_identifier("team_")})
+    );
+    assert_eq!(status["owner_revision"], "1");
+    assert_eq!(status["quarantine"], "projection_conflict");
+    assert_eq!(
+        status["approval_key_reference"],
+        governance_identifier("approval_key_")
+    );
+    assert_safe_governance_output(&utf8(&json.output.stdout));
+    assert_governance_inspect_request(&json.requests);
+}
+
+#[test]
+fn host_governance_inspect_process_renders_daemon_error_without_status_payload() {
+    let human = run_governance_inspect_error(&["host", "governance", "inspect", "local"]);
+    assert_eq!(human.output.status.code(), Some(1));
+    assert!(human.output.stdout.is_empty());
+    let human_stderr = utf8(&human.output.stderr);
+    assert!(human_stderr.contains("safe governance inspection is unavailable"));
+    assert_safe_governance_output(&human_stderr);
+    assert_governance_inspect_request(&human.requests);
+
+    let json = run_governance_inspect_error(&["host", "governance", "inspect", "local", "--json"]);
+    let document = assert_json_error(&json.output, "host_governance_unavailable");
+    assert_eq!(
+        document["err"]["msg"],
+        "safe governance inspection is unavailable"
+    );
+    assert_safe_governance_output(&utf8(&json.output.stdout));
+    assert_governance_inspect_request(&json.requests);
+}
+
+struct GovernanceInspectRun {
+    output: Output,
+    requests: Vec<Request>,
+}
+
+fn run_governance_inspect(args: &[&str]) -> GovernanceInspectRun {
+    run_governance_inspect_scenario(args, Scenario::GovernanceInspectSuccess)
+}
+
+fn run_governance_inspect_error(args: &[&str]) -> GovernanceInspectRun {
+    run_governance_inspect_scenario(args, Scenario::GovernanceInspectError)
+}
+
+fn run_governance_inspect_scenario(args: &[&str], scenario: Scenario) -> GovernanceInspectRun {
+    let home = TestHome::new();
+    let fixture = FixtureDaemon::start(&home.socket(), scenario);
+    let (output, requests) = run(&home, fixture, args);
+    GovernanceInspectRun { output, requests }
+}
+
+fn assert_governance_inspect_request(requests: &[Request]) {
+    assert_eq!(
+        requests.len(),
+        1,
+        "governance inspection sends one RPC request"
+    );
+    let request = requests.first().expect("governance inspection request");
+    assert_eq!(request.method(), protocol::method::HOST_GOVERNANCE_INSPECT);
+    assert_eq!(request.params(), &Value::Null);
+}
+
+fn assert_safe_governance_output(output: &str) {
+    for forbidden in [
+        "seed",
+        "nonce",
+        "proposal",
+        "signature",
+        "session",
+        "terminal",
+        "path",
+    ] {
+        assert!(
+            !output.to_ascii_lowercase().contains(forbidden),
+            "governance output leaked {forbidden}"
+        );
+    }
 }
 
 fn parse_single_json(stdout: &[u8]) -> Value {

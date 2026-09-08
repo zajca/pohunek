@@ -470,6 +470,22 @@ async function runBrowserScenario(
     expect(capabilities.protocol_version).toBe(PROTOCOL_VERSION);
     const agent = selectSafeAgent(capabilities.supported_agents, capabilities.runtimes);
 
+    const governance = await client.call("host.governance.inspect", null);
+    expect(Object.keys(governance).sort()).toEqual([
+      "approval_key_reference",
+      "enrollment",
+      "host_id",
+      "owner",
+      "owner_revision",
+      "quarantine",
+    ]);
+    expect(/^host_[A-Za-z0-9_-]{43}$/.test(governance.host_id)).toBe(true);
+    expect(/^approval_key_[A-Za-z0-9_-]{43}$/.test(governance.approval_key_reference)).toBe(true);
+    expect(governance.enrollment).toBe(null);
+    expect(governance.owner).toBe(null);
+    expect(governance.owner_revision).toBe(null);
+    expect(governance.quarantine).toBe(null);
+
     eventClient = await Client.connectWs(backend.url, LOCAL_HOST, connectOptions());
     const subscription = await eventClient.subscribe(subscribeRequest("backend-real-daemon-subscribe"));
 

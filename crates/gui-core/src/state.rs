@@ -1,15 +1,16 @@
 //! Headless workspace state machine and derived views for `gui-core`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::PathBuf;
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use protocol::{
-    AgentActivity, Event, NotificationId, NotificationKind, NotificationKindPolicy,
-    NotificationPolicy, NotificationRecord, NotificationSeverity, NotificationStatus, OutputOffset,
-    ProjectActionResult, ProjectActionsResult, ProjectInfo, ProjectPromptResult, ProjectShowResult,
-    RuntimeState, SessionId, SessionInfo, SessionRuntimeIdentity, SessionScreenResult,
-    SessionState, SessionWaitResult, StateSource,
+    AgentActivity, Event, HostGovernanceStatus, NotificationId, NotificationKind,
+    NotificationKindPolicy, NotificationPolicy, NotificationRecord, NotificationSeverity,
+    NotificationStatus, OutputOffset, ProjectActionResult, ProjectActionsResult, ProjectInfo,
+    ProjectPromptResult, ProjectShowResult, RuntimeState, SessionId, SessionInfo,
+    SessionRuntimeIdentity, SessionScreenResult, SessionState, SessionWaitResult, StateSource,
 };
 
 use crate::providers;
@@ -56,6 +57,53 @@ impl ProviderRequestId {
     pub const fn get(self) -> u64 {
         self.0
     }
+}
+
+/// Monotonic identifier for one safe-governance inspection request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GovernanceRequestId(u64);
+
+impl GovernanceRequestId {
+    /// Borrow the numeric request id.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Failure to allocate a new governance-inspection request identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernanceRequestError {
+    /// Every `u64` request identifier has already been allocated.
+    RequestIdExhausted,
+}
+
+impl fmt::Display for GovernanceRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RequestIdExhausted => write!(f, "governance request identifier space exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for GovernanceRequestError {}
+
+/// Read-only governance inspection state for one configured GUI host.
+///
+/// The GUI host selector identifies a daemon route; the [`HostGovernanceStatus`]
+/// contained in [`Self::Loaded`] carries the distinct protocol-level stable host
+/// identity returned by that daemon.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum GovernanceState {
+    /// No inspection has been requested yet.
+    #[default]
+    NotLoaded,
+    /// A read-only inspection request is in flight.
+    Loading { request_id: GovernanceRequestId },
+    /// The daemon returned a safe governance snapshot.
+    Loaded(HostGovernanceStatus),
+    /// The read-only inspection request failed.
+    Error(String),
 }
 
 /// Provider operation used to reject stale async completions.
@@ -437,6 +485,8 @@ pub struct HostView {
     /// Provider names reported by the host's runtime inventory.
     pub notification_providers: Vec<String>,
     pub observation_capabilities: ObservationCapabilities,
+    /// Safe stable-identity and governance information for this daemon route.
+    pub governance: GovernanceState,
 }
 
 /// Provider-neutral terminal observation retained for one GUI session pane.
@@ -510,6 +560,7 @@ impl HostView {
             runtimes: Vec::new(),
             notification_providers: Vec::new(),
             observation_capabilities: ObservationCapabilities::default(),
+            governance: GovernanceState::default(),
         }
     }
 }
@@ -527,9 +578,44 @@ pub struct Workspace {
     reconnecting_hosts: BTreeSet<HostId>,
     next_intent_id: u64,
     next_provider_request_id: u64,
+    next_governance_request_id: u64,
 }
 
 impl Workspace {
+    /// Returns the safe governance state for the configured daemon route.
+    ///
+    /// `host_id` is the GUI's route selector, not the protocol stable host id
+    /// within a loaded [`HostGovernanceStatus`].
+    #[must_use]
+    pub fn governance(&self, host_id: &HostId) -> Option<&GovernanceState> {
+        self.hosts.get(host_id).map(|host| &host.governance)
+    }
+
+    /// Start a safe governance inspection and return its staleness guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GovernanceRequestError::RequestIdExhausted`] without changing
+    /// the existing host state when the request-id space is exhausted. This
+    /// prevents an old response from becoming valid again through id reuse.
+    pub fn begin_governance_request(
+        &mut self,
+        host_id: HostId,
+    ) -> Result<GovernanceRequestId, GovernanceRequestError> {
+        let next = self
+            .next_governance_request_id
+            .checked_add(1)
+            .ok_or(GovernanceRequestError::RequestIdExhausted)?;
+        self.next_governance_request_id = next;
+        let request_id = GovernanceRequestId(next);
+        let host = self
+            .hosts
+            .entry(host_id)
+            .or_insert_with(HostView::connecting);
+        host.governance = GovernanceState::Loading { request_id };
+        Ok(request_id)
+    }
+
     /// Returns cached provider-neutral terminal observation for a session.
     #[must_use]
     pub fn session_observation(
@@ -743,6 +829,10 @@ impl Workspace {
                     .hosts
                     .get(&host_id)
                     .map_or_else(ReviewTabState::default, |host| host.review.clone());
+                let previous_governance = self
+                    .hosts
+                    .get(&host_id)
+                    .map_or_else(GovernanceState::default, |host| host.governance.clone());
                 // Notifications reconcile by merge, not wholesale replacement: the
                 // seed query returns a bounded recent window, so previously
                 // received records are preserved and missed records are folded in
@@ -772,8 +862,26 @@ impl Workspace {
                         runtimes: snapshot.runtimes,
                         notification_providers: snapshot.notification_providers,
                         observation_capabilities: snapshot.observation_capabilities,
+                        governance: previous_governance,
                     },
                 );
+            }
+            DomainEvent::GovernanceLoaded {
+                host_id,
+                request_id,
+                result,
+            } => {
+                let Some(host) = self.host_mut_if_known(&host_id, "governance inspection result")
+                else {
+                    return;
+                };
+                if host.governance != (GovernanceState::Loading { request_id }) {
+                    return;
+                }
+                host.governance = match result {
+                    Ok(status) => GovernanceState::Loaded(status),
+                    Err(error) => GovernanceState::Error(error),
+                };
             }
             DomainEvent::HostSubscribed { host_id } => {
                 self.hosts
@@ -2734,6 +2842,164 @@ mod tests {
     };
 
     use super::*;
+
+    fn never_enrolled_governance_status() -> protocol::HostGovernanceStatus {
+        protocol::HostGovernanceStatus::new(
+            protocol::HostId::parse("host_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                .expect("valid stable host id"),
+            None,
+            None,
+            None,
+            None,
+            protocol::ApprovalKeyReference::from_ed25519_verifying_key_bytes([7; 32]),
+        )
+        .expect("valid never-enrolled governance status")
+    }
+
+    fn quarantined_governance_status() -> protocol::HostGovernanceStatus {
+        protocol::HostGovernanceStatus::new(
+            protocol::HostId::parse("host_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                .expect("valid stable host id"),
+            Some(protocol::EnrollmentInfo::new(
+                protocol::RelayId::parse("relay_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                    .expect("valid relay id"),
+                protocol::EnrollmentStatus::Quarantined,
+                protocol::EnrollmentRevision::new(2).expect("nonzero enrollment revision"),
+            )),
+            Some(protocol::HostOwner::Principal(
+                protocol::PrincipalId::parse(
+                    "principal_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                )
+                .expect("valid principal id"),
+            )),
+            Some(protocol::OwnerRevision::new(3).expect("nonzero owner revision")),
+            Some(protocol::QuarantineReason::ProjectionConflict),
+            protocol::ApprovalKeyReference::from_ed25519_verifying_key_bytes([7; 32]),
+        )
+        .expect("valid quarantined governance status")
+    }
+
+    #[test]
+    fn governance_result_models_never_enrolled_errors_and_ignores_stale_responses() {
+        let route = HostId::new("local");
+        let mut workspace = Workspace::default();
+        workspace.apply(DomainEvent::HostConnecting {
+            host_id: route.clone(),
+        });
+
+        let first = workspace
+            .begin_governance_request(route.clone())
+            .expect("first request id");
+        workspace.apply(DomainEvent::GovernanceLoaded {
+            host_id: route.clone(),
+            request_id: first,
+            result: Ok(never_enrolled_governance_status()),
+        });
+        assert!(matches!(
+            workspace.governance(&route),
+            Some(GovernanceState::Loaded(status)) if status.enrollment().is_none()
+        ));
+
+        let second = workspace
+            .begin_governance_request(route.clone())
+            .expect("second request id");
+        workspace.apply(DomainEvent::GovernanceLoaded {
+            host_id: route.clone(),
+            request_id: first,
+            result: Err("stale failure".to_owned()),
+        });
+        assert_eq!(
+            workspace.governance(&route),
+            Some(&GovernanceState::Loading { request_id: second })
+        );
+
+        workspace.apply(DomainEvent::GovernanceLoaded {
+            host_id: route.clone(),
+            request_id: second,
+            result: Err("unreachable".to_owned()),
+        });
+        assert_eq!(
+            workspace.governance(&route),
+            Some(&GovernanceState::Error("unreachable".to_owned()))
+        );
+
+        let third = workspace
+            .begin_governance_request(route.clone())
+            .expect("third request id");
+        workspace.apply(DomainEvent::GovernanceLoaded {
+            host_id: route.clone(),
+            request_id: third,
+            result: Ok(quarantined_governance_status()),
+        });
+        assert!(matches!(
+            workspace.governance(&route),
+            Some(GovernanceState::Loaded(status))
+                if status.enrollment().is_some()
+                    && status.quarantine() == Some(protocol::QuarantineReason::ProjectionConflict)
+        ));
+    }
+
+    #[test]
+    fn governance_request_id_exhaustion_preserves_pending_maximum_request() {
+        let route = HostId::new("local");
+        let mut workspace = Workspace::default();
+        workspace.apply(DomainEvent::HostConnecting {
+            host_id: route.clone(),
+        });
+        workspace.next_governance_request_id = u64::MAX - 1;
+        let maximum = workspace
+            .begin_governance_request(route.clone())
+            .expect("last request id");
+        assert_eq!(maximum.get(), u64::MAX);
+        assert_eq!(
+            workspace
+                .begin_governance_request(route.clone())
+                .expect_err("request ids must not be reused"),
+            GovernanceRequestError::RequestIdExhausted
+        );
+        workspace.apply(DomainEvent::GovernanceLoaded {
+            host_id: route.clone(),
+            request_id: GovernanceRequestId(u64::MAX - 1),
+            result: Ok(never_enrolled_governance_status()),
+        });
+        assert_eq!(
+            workspace.governance(&route),
+            Some(&GovernanceState::Loading {
+                request_id: maximum
+            })
+        );
+    }
+
+    #[test]
+    fn governance_results_are_route_scoped_and_snapshot_refresh_preserves_pending_request() {
+        let local = HostId::new("local");
+        let remote = HostId::new("remote");
+        let mut workspace = Workspace::default();
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: snapshot("local", Vec::new()),
+        });
+        let request_id = workspace
+            .begin_governance_request(local.clone())
+            .expect("governance request id");
+
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: snapshot("local", Vec::new()),
+        });
+        assert_eq!(
+            workspace.governance(&local),
+            Some(&GovernanceState::Loading { request_id })
+        );
+
+        workspace.apply(DomainEvent::GovernanceLoaded {
+            host_id: remote,
+            request_id,
+            result: Ok(never_enrolled_governance_status()),
+        });
+        assert_eq!(
+            workspace.governance(&local),
+            Some(&GovernanceState::Loading { request_id })
+        );
+    }
 
     fn test_event(name: &str, payload: serde_json::Value) -> Event {
         Event::new(protocol::PROTOCOL_VERSION, name, payload).expect("test event is valid")

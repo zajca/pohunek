@@ -27,6 +27,7 @@ mod discovery;
 mod doctor;
 mod envelope;
 mod error;
+mod governance;
 mod integration;
 mod limits;
 pub mod method;
@@ -56,6 +57,15 @@ pub use envelope::{EnvelopeError, Event, Request, Response, StateSource};
 #[doc(inline)]
 pub use error::{ErrorClass, ProtocolError};
 #[doc(inline)]
+pub use governance::{
+    ApprovalKeyReference, EnrollmentInfo, EnrollmentRevision, EnrollmentStatus,
+    GovernanceWireError, HostApprovalAlgorithm, HostApprovalSignature, HostGovernanceStatus,
+    HostId, HostOwner, HostOwnerKind, OwnerRevision, PrincipalId, ProposalExpiry, ProposalId,
+    ProposalNonce, QuarantineReason, RelayId, ShareSuspensionIntent, SignedTransferOutcome, TeamId,
+    TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeError, TransferOutcomeId,
+    TransferProposal,
+};
+#[doc(inline)]
 pub use integration::{
     IntegrationAgentStatus, IntegrationInstallParams, IntegrationInstallReport,
     IntegrationInstallResult, IntegrationInstallState, IntegrationRecovery,
@@ -65,6 +75,7 @@ pub use integration::{
 };
 #[doc(inline)]
 pub use limits::{
+    ED25519_SIGNATURE_BYTES, ED25519_SIGNATURE_PAYLOAD_BYTES, GOVERNANCE_ID_PAYLOAD_BYTES,
     MAX_CONTROL_LINE_BYTES, MAX_IDENTITY_CLAIM_TTL_SECS, MAX_REQUEST_ID_BYTES,
     MAX_RUNTIME_ID_BYTES, MAX_SESSION_DIFF_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES,
     MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_READ_RESPONSE_BYTES,

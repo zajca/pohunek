@@ -41,6 +41,10 @@ static METHODS: &[MethodDescriptor] = &[
         description: "Enumerate and classify the local host's NetBird peers.",
     },
     MethodDescriptor {
+        wire_name: protocol::method::HOST_GOVERNANCE_INSPECT,
+        description: "Inspect the owner-safe stable host identity and local governance state without mutation or private key material.",
+    },
+    MethodDescriptor {
         wire_name: "host.inspect",
         description: "Live host capability probe.",
     },
@@ -305,4 +309,25 @@ pub(crate) fn generate(output_dir: &Path, since: &str) -> Result<usize, XtaskErr
     }
 
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render_method, METHODS};
+
+    #[test]
+    fn includes_owner_safe_governance_inspection_reference() {
+        let method = METHODS
+            .iter()
+            .find(|method| method.wire_name == "host.governance.inspect")
+            .expect("governance inspect descriptor");
+
+        assert_eq!(method.wire_name, "host.governance.inspect");
+        assert!(method.description.contains("owner-safe"));
+        assert!(method.description.contains("without mutation"));
+
+        let rendered = render_method(method, "0.0.0");
+        assert!(rendered.contains("host.governance.inspect"));
+        assert!(rendered.contains("private key material"));
+    }
 }

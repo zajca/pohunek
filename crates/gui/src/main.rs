@@ -420,6 +420,7 @@ mod tests {
             runtimes: Vec::new(),
             notification_providers: Vec::new(),
             observation_capabilities: pohunek_gui_core::ObservationCapabilities::default(),
+            governance: pohunek_gui_core::GovernanceState::default(),
         };
         host.projects.insert(project.id.clone(), project.clone());
 
@@ -505,6 +506,7 @@ mod tests {
             runtimes: Vec::new(),
             notification_providers: Vec::new(),
             observation_capabilities: pohunek_gui_core::ObservationCapabilities::default(),
+            governance: pohunek_gui_core::GovernanceState::default(),
         };
         host.projects.insert(project.id.clone(), project.clone());
         host.sessions.insert(session.id.0.clone(), session.clone());

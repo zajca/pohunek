@@ -25,3 +25,10 @@ hook script bodies, arbitrary config bodies, or credentials embedded in URLs.
 When a task requires editing secret-bearing config, explain the file and field to
 the user, but leave the value out of the response. Store secrets only through the
 project's established mechanism.
+
+Host governance has the same split. A safe `host.governance.inspect` response
+may contain a stable host ID and public approval-key reference, but it must
+never contain the private approval signing key or seed, a transfer proposal or
+outcome, a nonce, a signature, a retired-enrollment record, or relay
+credentials. Treat all of those values and the owner-private host-state files
+as secret-bearing operational material even when their filenames are known.

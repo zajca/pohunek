@@ -59,7 +59,8 @@ pub use review::{
 pub use sdk::{
     add_project, add_project_with_options, create_session, create_session_with_options,
     delete_notification, delete_notification_with_options, diff_session, diff_session_with_options,
-    fork_session, fork_session_with_options, get_notification_policy_with_options, inspect_session,
+    fork_session, fork_session_with_options, get_notification_policy_with_options,
+    inspect_host_governance, inspect_host_governance_with_options, inspect_session,
     inspect_session_with_options, integration_status, integration_status_with_options,
     launch_action_prompt_with_options, launch_provider_item_with_options, list_notifications,
     list_notifications_with_options, list_project_actions, list_project_actions_with_options,
@@ -78,11 +79,12 @@ pub use sdk::{
 #[doc(inline)]
 pub use state::{
     AgentStateEvent, ConnState, GitHubProviderScope, GitHubProviderState,
-    GitHubPullRequestStatusKey, HostEvent, HostView, LinearProviderState, NotificationFilter,
-    NotificationIntent, NotificationRow, NotificationScope, PromptState, ProviderOperation,
-    ProviderPanel, ProviderRequestId, ProviderState, ReviewCommentEditor, ReviewDiffStatus,
-    ReviewDispatchModal, ReviewLineTarget, ReviewTabState, RuntimeContinuity, SessionAccess,
-    SessionGroup, SessionObservation, SessionRow, Toast, Workspace,
+    GitHubPullRequestStatusKey, GovernanceRequestError, GovernanceRequestId, GovernanceState,
+    HostEvent, HostView, LinearProviderState, NotificationFilter, NotificationIntent,
+    NotificationRow, NotificationScope, PromptState, ProviderOperation, ProviderPanel,
+    ProviderRequestId, ProviderState, ReviewCommentEditor, ReviewDiffStatus, ReviewDispatchModal,
+    ReviewLineTarget, ReviewTabState, RuntimeContinuity, SessionAccess, SessionGroup,
+    SessionObservation, SessionRow, Toast, Workspace,
 };
 #[doc(inline)]
 pub use ui_state::{default_state_dir, Selection, TreeNodeId, UiState, UiStateError, WindowSize};

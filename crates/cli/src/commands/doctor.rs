@@ -10,8 +10,9 @@
 //! may run only one of the two agents.
 
 use hostcheck::StandardCheckInputs;
-use protocol::{DoctorReport as Report, DoctorStatus as Status};
+use protocol::{DoctorCheck, DoctorReport as Report, DoctorStatus as Status};
 
+use crate::client::Client;
 use crate::commands::render_json;
 use crate::error::CliError;
 use crate::paths::Paths;
@@ -22,10 +23,10 @@ use crate::paths::Paths;
 ///
 /// Only returns an error if paths cannot be resolved at all; individual failed
 /// checks are reported in the output, not returned as errors.
-pub(crate) fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
+pub(crate) async fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
     let launcher_bin_dir = paths.launcher_bin_dir();
     let sway_config_dir = paths.sway_config_dir();
-    let checks = hostcheck::standard_checks(StandardCheckInputs {
+    let mut checks = hostcheck::standard_checks(StandardCheckInputs {
         socket_dir: &paths.runtime_dir,
         state_dir: &paths.data_dir,
         log_dir: &paths.log_dir,
@@ -33,6 +34,13 @@ pub(crate) fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
         sway_config_dir: &sway_config_dir,
     });
 
+    match Client::connect("local", paths).await {
+        Ok(mut client) => match client.daemon_doctor().await {
+            Ok(remote) => merge_daemon_checks(&mut checks, remote.checks),
+            Err(_error) => checks.push(unavailable_daemon_check()),
+        },
+        Err(_error) => checks.push(unavailable_daemon_check()),
+    }
     let report = Report::from_checks(checks);
 
     if json {
@@ -42,6 +50,22 @@ pub(crate) fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
     }
 
     Ok(report.overall != Status::Fail)
+}
+
+fn merge_daemon_checks(checks: &mut Vec<DoctorCheck>, remote: Vec<DoctorCheck>) {
+    for check in remote {
+        if !checks.iter().any(|existing| existing.name == check.name) {
+            checks.push(check);
+        }
+    }
+}
+
+fn unavailable_daemon_check() -> DoctorCheck {
+    DoctorCheck::new(
+        "host_governance_inspection",
+        Status::Warn,
+        "Daemon governance inspection is unavailable; start the local daemon and retry.",
+    )
 }
 
 /// Render the report as an aligned human table.
@@ -101,16 +125,40 @@ mod tests {
     /// covered in the `hostcheck` crate). Writable temp dirs make the
     /// directory-writability checks pass; the result is rendered as JSON without
     /// error.
-    #[test]
-    fn run_assembles_report_without_error() {
+    #[tokio::test]
+    async fn run_assembles_report_without_error() {
         let base = unique_temp_dir();
         let paths = paths_at(&base);
 
-        let healthy = run(&paths, true).expect("doctor run resolves");
+        let healthy = run(&paths, true).await.expect("doctor run resolves");
         // We assert only that the run completed and produced a boolean verdict;
         // the exact value depends on which binaries exist on the test host.
         let _ = healthy;
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn merge_does_not_duplicate_local_host_checks() {
+        let mut checks = vec![DoctorCheck::new("state_dir_writable", Status::Ok, "local")];
+        merge_daemon_checks(
+            &mut checks,
+            vec![
+                DoctorCheck::new("state_dir_writable", Status::Fail, "remote"),
+                DoctorCheck::new("host_identity_stable", Status::Ok, "remote"),
+            ],
+        );
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].detail, "local");
+        assert_eq!(checks[1].name, "host_identity_stable");
+    }
+
+    #[test]
+    fn unavailable_daemon_check_is_redacted_warning() {
+        let check = unavailable_daemon_check();
+        assert_eq!(check.status, Status::Warn);
+        assert_eq!(check.name, "host_governance_inspection");
+        assert!(!check.detail.contains('/'));
+        assert!(!check.detail.contains("socket"));
     }
 }

@@ -7,6 +7,7 @@ import type {
   DaemonHealthResult,
   HostCapabilities,
   HostDiscoverParams,
+  HostGovernanceStatus,
   HostRecord,
   IntegrationInstallParams,
   IntegrationInstallResult,
@@ -89,6 +90,7 @@ export interface Methods {
   "daemon.doctor": { params: null; output: DaemonDoctorResult };
   "daemon.health": { params: null; output: DaemonHealthResult };
   "host.discover": { params: HostDiscoverParams; output: HostRecord[] };
+  "host.governance.inspect": { params: null; output: HostGovernanceStatus };
   "host.inspect": { params: null; output: HostCapabilities };
   "integration.install": { params: IntegrationInstallParams; output: IntegrationInstallResult };
   "integration.status": { params: IntegrationStatusParams; output: IntegrationStatusResult };

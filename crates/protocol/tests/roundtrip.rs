@@ -3,33 +3,38 @@
 
 use std::{collections::BTreeMap, path::PathBuf};
 
+use proptest::prelude::*;
 use protocol::{
     event, method, negotiate, ActivityRevision, AgentActivity, AgentKind, AgentRuntime,
-    AssistantMaterializeParams, AssistantMaterializeResult, AttachHeader, ConceptDeprecation,
-    ConceptIntent, ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult, DetectionRegionKind,
-    DetectionRegionPreview, DoctorCheck, DoctorReport, DoctorStatus, ErrorClass, Event,
-    ForkCwdMode, HostCapabilities, IntegrationInstallParams, IntegrationInstallReport,
-    IntegrationInstallResult, NotificationCreateParams, NotificationCreateResult,
-    NotificationCreatedEvent, NotificationDeleteParams, NotificationDeleteResult,
-    NotificationDeletedEvent, NotificationId, NotificationKind, NotificationKindPolicy,
-    NotificationListParams, NotificationListResult, NotificationPolicy, NotificationPolicyParams,
-    NotificationPolicyResult, NotificationRecord, NotificationRetentionParams,
-    NotificationRetentionPolicy, NotificationRetentionResult, NotificationSeverity,
-    NotificationSource, NotificationStatus, NotificationUpdateParams, NotificationUpdateResult,
-    NotificationUpdatedEvent, ObservationParamsError, OutputOffset, ProcessStartIdentity,
-    ProjectSource, ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind,
-    ReportSequence, Request, Response, RuntimeGeneration, SessionAttachParams, SessionAttachResult,
-    SessionCapabilities, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
-    SessionDetectionResult, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
-    SessionNewParams, SessionOutputGap, SessionOutputParams, SessionOutputResult,
-    SessionReadFormat, SessionReadParams, SessionReadResult, SessionReadSource,
-    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionRuntimeIdentity, SessionScreenParams,
-    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
-    SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning,
-    SessionWarningKind, StateSource, TerminalCursor, TerminalDimensions, TerminalWatermark,
+    ApprovalKeyReference, AssistantMaterializeParams, AssistantMaterializeResult, AttachHeader,
+    ConceptDeprecation, ConceptIntent, ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult,
+    DetectionRegionKind, DetectionRegionPreview, DoctorCheck, DoctorReport, DoctorStatus,
+    EnrollmentInfo, EnrollmentRevision, EnrollmentStatus, ErrorClass, Event, ForkCwdMode,
+    HostApprovalSignature, HostCapabilities, HostGovernanceStatus, HostId, HostOwner,
+    IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult,
+    NotificationCreateParams, NotificationCreateResult, NotificationCreatedEvent,
+    NotificationDeleteParams, NotificationDeleteResult, NotificationDeletedEvent, NotificationId,
+    NotificationKind, NotificationKindPolicy, NotificationListParams, NotificationListResult,
+    NotificationPolicy, NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
+    NotificationRetentionParams, NotificationRetentionPolicy, NotificationRetentionResult,
+    NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
+    NotificationUpdateResult, NotificationUpdatedEvent, ObservationParamsError, OutputOffset,
+    OwnerRevision, PrincipalId, ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId,
+    ProposalNonce, ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind,
+    QuarantineReason, RelayId, ReportSequence, Request, Response, RuntimeGeneration,
+    SessionAttachParams, SessionAttachResult, SessionCapabilities, SessionDetachParams,
+    SessionDetachResult, SessionDetectionParams, SessionDetectionResult, SessionForkParams,
+    SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
+    SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams, SessionOutputGap,
+    SessionOutputParams, SessionOutputResult, SessionReadFormat, SessionReadParams,
+    SessionReadResult, SessionReadSource, SessionReleaseAgentParams, SessionReleaseAgentResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionRuntimeIdentity,
+    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
+    SessionState, SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult,
+    SessionWarning, SessionWarningKind, ShareSuspensionIntent, SignedTransferOutcome, StateSource,
+    TeamId, TerminalCursor, TerminalDimensions, TerminalWatermark, TransferCoordinates,
+    TransferOutcomeCandidate, TransferOutcomeId, TransferProposal, GOVERNANCE_ID_PAYLOAD_BYTES,
     MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES, MAX_RUNTIME_ID_BYTES, MAX_SESSION_ID_BYTES,
     MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
     MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS,
@@ -56,6 +61,10 @@ fn metadata(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         .iter()
         .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
         .collect()
+}
+
+fn governance_id(prefix: &str) -> String {
+    format!("{prefix}{}", "A".repeat(GOVERNANCE_ID_PAYLOAD_BYTES))
 }
 
 #[expect(
@@ -3459,7 +3468,7 @@ fn daemon_doctor_report_json_shape_roundtrips() {
                         "detail": "'codex' not found on PATH"
                     }
                 ],
-                "overall": "ok"
+                "overall": "warn"
             }
         })
     );
@@ -3985,4 +3994,934 @@ fn typed_method_markers_pair_method_params_and_results() {
         protocol::WorktreeRemoveParams,
         protocol::WorktreeRemoveResult,
     >(protocol::method::WORKTREE_REMOVE);
+    assert_contract::<protocol::method::HostGovernanceInspect, (), HostGovernanceStatus>(
+        protocol::method::HOST_GOVERNANCE_INSPECT,
+    );
+}
+
+fn host_id() -> HostId {
+    HostId::parse(&governance_id("host_")).expect("valid host fixture id")
+}
+
+fn relay_id() -> RelayId {
+    RelayId::parse(&governance_id("relay_")).expect("valid relay fixture id")
+}
+
+fn principal_id() -> PrincipalId {
+    PrincipalId::parse(&governance_id("principal_")).expect("valid principal fixture id")
+}
+
+fn team_id() -> TeamId {
+    TeamId::parse(&governance_id("team_")).expect("valid team fixture id")
+}
+
+fn approval_key_reference() -> ApprovalKeyReference {
+    ApprovalKeyReference::from_ed25519_verifying_key_bytes([7; 32])
+}
+
+fn proposal() -> TransferProposal {
+    TransferProposal::new(
+        TransferCoordinates::new(
+            relay_id(),
+            host_id(),
+            OwnerRevision::new(7).expect("nonzero revision"),
+            HostOwner::Principal(principal_id()),
+            HostOwner::Team(team_id()),
+        ),
+        ProposalId::parse(&governance_id("proposal_")).expect("valid proposal id"),
+        ProposalNonce::parse(&governance_id("nonce_")).expect("valid nonce"),
+        ProposalExpiry::parse("2026-09-03T10:00:00Z").expect("canonical expiry"),
+    )
+}
+
+fn transfer_candidate() -> TransferOutcomeCandidate {
+    let proposal = proposal();
+    TransferOutcomeCandidate::new(
+        TransferOutcomeId::from_proposal_id(proposal.proposal_id()),
+        proposal,
+        OwnerRevision::new(8).expect("next revision"),
+        ShareSuspensionIntent::AllActiveShares,
+        approval_key_reference(),
+    )
+    .expect("candidate advances exactly once")
+}
+
+fn governance_id_with_byte(prefix: &str, byte: u8) -> String {
+    use base64::prelude::{Engine as _, BASE64_URL_SAFE_NO_PAD};
+
+    format!("{prefix}{}", BASE64_URL_SAFE_NO_PAD.encode([byte; 32]))
+}
+
+#[test]
+fn governance_identifiers_have_distinct_canonical_wire_types() {
+    let host = host_id();
+    let relay = relay_id();
+    let principal = principal_id();
+    let team = team_id();
+
+    assert_eq!(
+        serde_json::to_value(&host).expect("serialize host"),
+        json!(host.as_str())
+    );
+    assert_eq!(line_roundtrip(&host), host);
+    assert_eq!(line_roundtrip(&relay), relay);
+    assert_eq!(line_roundtrip(&principal), principal);
+    assert_eq!(line_roundtrip(&team), team);
+
+    for invalid in [
+        "host_",
+        "host_A",
+        &format!("host_{}", "A".repeat(GOVERNANCE_ID_PAYLOAD_BYTES - 1)),
+        &format!("host_{}", "A".repeat(GOVERNANCE_ID_PAYLOAD_BYTES + 1)),
+        &format!("host_{}", "a".repeat(GOVERNANCE_ID_PAYLOAD_BYTES)),
+        &format!("host_{}=", "A".repeat(GOVERNANCE_ID_PAYLOAD_BYTES - 1)),
+    ] {
+        HostId::parse(invalid).expect_err("noncanonical host id must fail");
+    }
+
+    for wrong_type in [relay.as_str(), principal.as_str(), team.as_str()] {
+        serde_json::from_value::<HostId>(json!(wrong_type))
+            .expect_err("a differently tagged identifier must not substitute for HostId");
+    }
+    for wrong_json_kind in [json!(null), json!(7), json!([]), json!({})] {
+        serde_json::from_value::<HostId>(wrong_json_kind)
+            .expect_err("identifier must be a canonical JSON string");
+    }
+}
+
+#[test]
+fn approval_key_reference_preserves_unvalidated_ed25519_payloads() {
+    let asymmetric = std::array::from_fn(|index| {
+        u8::try_from(index).expect("the fixed fixture index fits in u8")
+    });
+    for payload in [[0; 32], [u8::MAX; 32], asymmetric] {
+        let reference = ApprovalKeyReference::from_ed25519_verifying_key_bytes(payload);
+
+        assert_eq!(reference.ed25519_verifying_key_bytes(), payload);
+        assert_eq!(
+            ApprovalKeyReference::parse(reference.as_str())
+                .expect("canonical approval-key reference")
+                .ed25519_verifying_key_bytes(),
+            payload
+        );
+    }
+    assert_eq!(
+        ApprovalKeyReference::from_ed25519_verifying_key_bytes([42; 32]).as_str(),
+        governance_id_with_byte("approval_key_", 42)
+    );
+}
+
+#[test]
+fn transfer_outcome_id_uses_the_proposal_payload_with_its_own_type_tag() {
+    let proposal = ProposalId::parse("proposal_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8")
+        .expect("canonical asymmetric proposal id");
+    let outcome = TransferOutcomeId::from_proposal_id(&proposal);
+
+    assert_eq!(
+        outcome.as_str(),
+        "outcome_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+    );
+    assert_eq!(
+        TransferOutcomeId::from_proposal_id(&proposal),
+        outcome,
+        "derivation must be deterministic"
+    );
+    ProposalId::parse(outcome.as_str())
+        .expect_err("an outcome identifier must not substitute for a proposal identifier");
+    TransferOutcomeId::parse(proposal.as_str())
+        .expect_err("a proposal identifier must not substitute for an outcome identifier");
+}
+
+#[test]
+fn transfer_outcome_candidate_rejects_an_identity_not_derived_from_its_proposal() {
+    let proposal = proposal();
+    let arbitrary = TransferOutcomeId::parse(&governance_id_with_byte("outcome_", 1))
+        .expect("canonical but unrelated outcome id");
+
+    assert!(matches!(
+        TransferOutcomeCandidate::new(
+            arbitrary,
+            proposal,
+            OwnerRevision::new(8).expect("next revision"),
+            ShareSuspensionIntent::AllActiveShares,
+            approval_key_reference(),
+        ),
+        Err(protocol::TransferOutcomeError::OutcomeId)
+    ));
+}
+
+proptest! {
+    #[test]
+    fn approval_key_references_round_trip_every_unvalidated_32_byte_payload(bytes in prop::array::uniform32(any::<u8>())) {
+        let reference = ApprovalKeyReference::from_ed25519_verifying_key_bytes(bytes);
+        let parsed = ApprovalKeyReference::parse(reference.as_str())
+            .expect("constructor output must remain canonical");
+
+        prop_assert_eq!(parsed.ed25519_verifying_key_bytes(), bytes);
+        prop_assert_eq!(parsed, reference);
+    }
+
+    #[test]
+    fn transfer_outcome_ids_preserve_every_canonical_proposal_payload(bytes in prop::array::uniform32(any::<u8>())) {
+        use base64::prelude::{Engine as _, BASE64_URL_SAFE_NO_PAD};
+
+        let encoded = BASE64_URL_SAFE_NO_PAD.encode(bytes);
+        let proposal = ProposalId::parse(&format!("proposal_{encoded}"))
+            .expect("base64url encoding must form a canonical proposal id");
+        let outcome = TransferOutcomeId::from_proposal_id(&proposal);
+        let repeated = TransferOutcomeId::from_proposal_id(&proposal);
+        let mut different_bytes = bytes;
+        different_bytes[0] = different_bytes[0].wrapping_add(1);
+        let different_proposal = ProposalId::parse(&format!(
+            "proposal_{}",
+            BASE64_URL_SAFE_NO_PAD.encode(different_bytes)
+        ))
+        .expect("changed payload must form a canonical proposal id");
+        let different_outcome = TransferOutcomeId::from_proposal_id(&different_proposal);
+
+        prop_assert_eq!(outcome.as_str(), format!("outcome_{encoded}"));
+        prop_assert_eq!(outcome.as_str(), repeated.as_str());
+        prop_assert_ne!(outcome.as_str(), proposal.as_str());
+        prop_assert_ne!(outcome.as_str(), different_outcome.as_str());
+        prop_assert!(TransferOutcomeId::parse(outcome.as_str()).is_ok());
+        prop_assert!(ProposalId::parse(outcome.as_str()).is_err());
+    }
+}
+
+fn complete_governance_status(
+    enrollment_status: EnrollmentStatus,
+    quarantine: Option<QuarantineReason>,
+) -> HostGovernanceStatus {
+    HostGovernanceStatus::new(
+        host_id(),
+        Some(EnrollmentInfo::new(
+            relay_id(),
+            enrollment_status,
+            EnrollmentRevision::new(1).expect("nonzero enrollment revision"),
+        )),
+        Some(HostOwner::Principal(principal_id())),
+        Some(OwnerRevision::new(1).expect("nonzero owner revision")),
+        quarantine,
+        approval_key_reference(),
+    )
+    .expect("complete governance state")
+}
+
+#[test]
+fn governance_status_lifecycle_and_presence_matrix_is_strict() {
+    let statuses = [
+        (EnrollmentStatus::Disabled, None),
+        (EnrollmentStatus::PendingLocalCommit, None),
+        (EnrollmentStatus::Active, None),
+        (EnrollmentStatus::Rotating, None),
+        (
+            EnrollmentStatus::Quarantined,
+            Some(QuarantineReason::ProjectionConflict),
+        ),
+        (EnrollmentStatus::LocallyUnenrolled, None),
+    ];
+    let partial_coordinates = [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+        (true, true, false),
+        (true, false, true),
+        (false, true, true),
+    ];
+
+    for (enrollment_status, expected_quarantine) in statuses {
+        let status = complete_governance_status(enrollment_status, expected_quarantine);
+        assert_eq!(line_roundtrip(&status), status);
+        assert_eq!(status.quarantine(), expected_quarantine);
+
+        let incompatible_quarantine = if enrollment_status == EnrollmentStatus::Quarantined {
+            None
+        } else {
+            Some(QuarantineReason::HostIdentityClone)
+        };
+        HostGovernanceStatus::new(
+            host_id(),
+            Some(EnrollmentInfo::new(
+                relay_id(),
+                enrollment_status,
+                EnrollmentRevision::new(1).expect("nonzero enrollment revision"),
+            )),
+            Some(HostOwner::Principal(principal_id())),
+            Some(OwnerRevision::new(1).expect("nonzero owner revision")),
+            incompatible_quarantine,
+            approval_key_reference(),
+        )
+        .expect_err("only quarantined enrollment may carry exactly one quarantine reason");
+
+        for (has_enrollment, has_owner, has_revision) in partial_coordinates {
+            HostGovernanceStatus::new(
+                host_id(),
+                has_enrollment.then(|| {
+                    EnrollmentInfo::new(
+                        relay_id(),
+                        enrollment_status,
+                        EnrollmentRevision::new(1).expect("nonzero enrollment revision"),
+                    )
+                }),
+                has_owner.then(|| HostOwner::Principal(principal_id())),
+                has_revision.then(|| OwnerRevision::new(1).expect("nonzero owner revision")),
+                None,
+                approval_key_reference(),
+            )
+            .expect_err("every partial enrollment, owner, and revision combination must fail");
+        }
+    }
+}
+
+#[test]
+fn governance_status_raw_json_rejects_duplicate_missing_and_unknown_fields() {
+    let status = complete_governance_status(EnrollmentStatus::Active, None);
+    let wire = serde_json::to_string(&status).expect("serialize complete governance status");
+    let prefix = wire
+        .strip_suffix('}')
+        .expect("serialized status must be an object");
+
+    for field in [
+        "owner_revision",
+        "host_id",
+        "enrollment",
+        "owner",
+        "quarantine",
+        "approval_key_reference",
+    ] {
+        let duplicate = format!(r#"{prefix},"{field}":null}}"#);
+        serde_json::from_str::<HostGovernanceStatus>(&duplicate)
+            .expect_err("duplicate status field must fail before accepting its value");
+    }
+    let unknown = format!(r#"{prefix},"unknown":null}}"#);
+    serde_json::from_str::<HostGovernanceStatus>(&unknown)
+        .expect_err("unknown status field must fail closed");
+
+    let wire_value = serde_json::to_value(status).expect("serialize status as JSON value");
+    for field in [
+        "host_id",
+        "enrollment",
+        "owner",
+        "owner_revision",
+        "quarantine",
+        "approval_key_reference",
+    ] {
+        let mut missing = wire_value.clone();
+        missing
+            .as_object_mut()
+            .expect("serialized status must be an object")
+            .remove(field);
+        let missing =
+            serde_json::to_string(&missing).expect("serialize missing status as raw JSON");
+        let error = serde_json::from_str::<HostGovernanceStatus>(&missing)
+            .expect_err("required status field must not be omitted");
+        assert!(
+            error.to_string().contains("missing field") && error.to_string().contains(field),
+            "missing {field} must use Serde's missing-field error, got {error}",
+        );
+    }
+}
+
+proptest! {
+    #[test]
+    fn canonical_host_ids_round_trip_for_every_32_byte_payload(bytes in prop::array::uniform32(any::<u8>())) {
+        use base64::prelude::{Engine as _, BASE64_URL_SAFE_NO_PAD};
+
+        let encoded = BASE64_URL_SAFE_NO_PAD.encode(bytes);
+        prop_assert_eq!(encoded.len(), GOVERNANCE_ID_PAYLOAD_BYTES);
+        let value = format!("host_{encoded}");
+        let id = HostId::parse(&value).expect("base64url encoding must be canonical");
+        prop_assert_eq!(id.as_str(), value);
+        let serialized = serde_json::to_string(&id).expect("serialize host id");
+        let parsed: HostId = serde_json::from_str(&serialized).expect("deserialize host id");
+        prop_assert_eq!(parsed, id);
+    }
+}
+
+#[test]
+fn governance_revisions_are_nonzero_canonical_decimal_and_checked() {
+    OwnerRevision::new(0).expect_err("zero owner revision must fail");
+    EnrollmentRevision::new(0).expect_err("zero enrollment revision must fail");
+    for invalid in ["0", "01", "+1", "", "18446744073709551616"] {
+        OwnerRevision::parse(invalid).expect_err("noncanonical revision must fail");
+    }
+
+    let owner = OwnerRevision::new(9_007_199_254_740_993).expect("nonzero revision");
+    assert_eq!(
+        serde_json::to_value(owner).expect("serialize revision"),
+        json!("9007199254740993")
+    );
+    assert_eq!(line_roundtrip(&owner), owner);
+    assert_eq!(
+        owner.checked_next().expect("advance revision").get(),
+        owner.get() + 1
+    );
+    OwnerRevision::new(u64::MAX)
+        .expect("maximum revision is representable")
+        .checked_next()
+        .expect_err("revision overflow must fail instead of wrapping");
+}
+
+#[test]
+fn proposal_expiry_requires_a_canonical_rfc3339_json_string() {
+    for wrong_json_kind in [json!(null), json!(7), json!([]), json!({})] {
+        serde_json::from_value::<ProposalExpiry>(wrong_json_kind)
+            .expect_err("proposal expiry must be a JSON string");
+    }
+
+    ProposalExpiry::parse("2026-09-03T10:00:00Z").expect("canonical UTC expiry");
+    ProposalExpiry::parse("2026-09-03T10:00:00.1Z").expect("one-digit fractional UTC expiry");
+    ProposalExpiry::parse("2026-09-03T10:00:00.123456789Z")
+        .expect("maximum nanosecond fractional UTC expiry");
+    for invalid in [
+        "2026-09-03T10:00:00",
+        "2026-09-03T10:00:00+00:00",
+        "2026-09-03T10:00:00.000Z",
+        "2026-09-03T10:00:00.1230Z",
+        "2026-09-03T10:00:00.1234567890Z",
+        "2026-09-03t10:00:00Z",
+        "2026-09-03T10:00:00z",
+        "not-a-timestamp",
+    ] {
+        ProposalExpiry::parse(invalid)
+            .expect_err("expiry must use the exact canonical RFC3339 spelling");
+    }
+
+    let mut wire = serde_json::to_value(proposal()).expect("serialize proposal");
+    wire.as_object_mut()
+        .expect("proposal object")
+        .remove("expiry");
+    serde_json::from_value::<TransferProposal>(wire)
+        .expect_err("a transfer proposal must carry an expiry");
+}
+
+#[test]
+fn proposal_expiry_is_expired_at_uses_a_closed_boundary() {
+    let expiry = ProposalExpiry::parse("2026-09-03T10:00:00.123456789Z")
+        .expect("canonical fractional expiry");
+    let parse = |value| {
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+            .expect("canonical comparison time")
+    };
+
+    assert!(!expiry.is_expired_at(parse("2026-09-03T10:00:00.123456788Z")));
+    assert!(expiry.is_expired_at(parse("2026-09-03T10:00:00.123456789Z")));
+    assert!(expiry.is_expired_at(parse("2026-09-03T10:00:00.123456790Z")));
+}
+
+#[test]
+fn host_owner_and_governance_status_serialization_are_strict() {
+    let owner = HostOwner::Principal(principal_id());
+    assert_eq!(
+        serde_json::to_value(&owner).expect("serialize owner"),
+        json!({"kind":"principal", "id": governance_id("principal_")})
+    );
+    serde_json::from_value::<HostOwner>(json!({
+        "kind": "principal",
+        "id": governance_id("principal_"),
+        "team_id": governance_id("team_")
+    }))
+    .expect_err("owner must not represent co-ownership");
+
+    let status = quarantined_governance_status();
+    assert_eq!(line_roundtrip(&status), status);
+    assert!(status.enrollment().is_some());
+    assert!(status.owner().is_some());
+    assert_eq!(
+        status.owner_revision(),
+        Some(OwnerRevision::new(8).expect("nonzero owner revision"))
+    );
+    assert_eq!(
+        status.quarantine(),
+        Some(QuarantineReason::ProjectionConflict)
+    );
+}
+
+#[test]
+fn host_governance_status_rejects_inconsistent_coordinates() {
+    let status = quarantined_governance_status();
+
+    let mut missing_governed_revision =
+        serde_json::to_value(&status).expect("serialize governed status");
+    missing_governed_revision["owner_revision"] = Value::Null;
+    serde_json::from_value::<HostGovernanceStatus>(missing_governed_revision)
+        .expect_err("governance state must reject a null owner revision");
+
+    HostGovernanceStatus::new(
+        host_id(),
+        None,
+        Some(HostOwner::Team(team_id())),
+        None,
+        None,
+        approval_key_reference(),
+    )
+    .expect_err("an owner without enrollment must fail");
+    HostGovernanceStatus::new(
+        host_id(),
+        Some(EnrollmentInfo::new(
+            relay_id(),
+            EnrollmentStatus::Active,
+            EnrollmentRevision::new(1).expect("nonzero revision"),
+        )),
+        Some(HostOwner::Team(team_id())),
+        Some(OwnerRevision::new(1).expect("nonzero owner revision")),
+        Some(QuarantineReason::HostIdentityClone),
+        approval_key_reference(),
+    )
+    .expect_err("only quarantined enrollment may carry a quarantine reason");
+
+    let mut unknown = serde_json::to_value(&status).expect("serialize status");
+    unknown["private_key"] = json!("must-not-be-accepted");
+    serde_json::from_value::<HostGovernanceStatus>(unknown)
+        .expect_err("safe status must reject unknown fields");
+
+    HostGovernanceStatus::new(
+        host_id(),
+        Some(EnrollmentInfo::new(
+            relay_id(),
+            EnrollmentStatus::Active,
+            EnrollmentRevision::new(1).expect("nonzero enrollment revision"),
+        )),
+        Some(HostOwner::Team(team_id())),
+        None,
+        None,
+        approval_key_reference(),
+    )
+    .expect_err("governance state must carry an owner revision");
+    HostGovernanceStatus::new(
+        host_id(),
+        None,
+        None,
+        Some(OwnerRevision::new(1).expect("nonzero owner revision")),
+        None,
+        approval_key_reference(),
+    )
+    .expect_err("never-enrolled state must not carry an owner revision");
+}
+
+#[test]
+fn never_enrolled_governance_status_requires_reference_and_null_revision() {
+    let never_enrolled =
+        HostGovernanceStatus::new(host_id(), None, None, None, None, approval_key_reference())
+            .expect("a bootstrapped never-enrolled host remains inspectable");
+    let serialized =
+        serde_json::to_value(&never_enrolled).expect("serialize never-enrolled status");
+    assert_eq!(serialized["enrollment"], Value::Null);
+    assert_eq!(serialized["owner"], Value::Null);
+    assert_eq!(serialized["owner_revision"], Value::Null);
+    assert_eq!(
+        serialized["approval_key_reference"],
+        json!(approval_key_reference().as_str())
+    );
+    assert_eq!(
+        serde_json::from_value::<HostGovernanceStatus>(serialized.clone())
+            .expect("explicit null owner revision must remain valid when never enrolled"),
+        never_enrolled
+    );
+
+    let mut missing_reference = serialized.clone();
+    missing_reference
+        .as_object_mut()
+        .expect("governance status object")
+        .remove("approval_key_reference");
+    serde_json::from_value::<HostGovernanceStatus>(missing_reference)
+        .expect_err("a safe inspect response must include the approval-key reference");
+
+    let mut missing_revision = serialized.clone();
+    missing_revision
+        .as_object_mut()
+        .expect("governance status object")
+        .remove("owner_revision");
+    serde_json::from_value::<HostGovernanceStatus>(missing_revision)
+        .expect_err("a safe inspect response must include the owner revision");
+    let mut unexpected_revision = serialized.clone();
+    unexpected_revision["owner_revision"] = json!("1");
+    serde_json::from_value::<HostGovernanceStatus>(unexpected_revision)
+        .expect_err("never-enrolled status must reject an owner revision");
+    let mut null_reference = serialized;
+    null_reference["approval_key_reference"] = Value::Null;
+    serde_json::from_value::<HostGovernanceStatus>(null_reference)
+        .expect_err("a null approval-key reference must fail closed");
+}
+
+fn quarantined_governance_status() -> HostGovernanceStatus {
+    let enrollment = EnrollmentInfo::new(
+        relay_id(),
+        EnrollmentStatus::Quarantined,
+        EnrollmentRevision::new(4).expect("nonzero enrollment revision"),
+    );
+    HostGovernanceStatus::new(
+        host_id(),
+        Some(enrollment),
+        Some(HostOwner::Principal(principal_id())),
+        Some(OwnerRevision::new(8).expect("nonzero owner revision")),
+        Some(QuarantineReason::ProjectionConflict),
+        approval_key_reference(),
+    )
+    .expect("consistent governance status")
+}
+
+#[test]
+fn transfer_proposal_compares_only_its_private_nonce() {
+    let original = proposal();
+    let same_nonce_different_proposal = TransferProposal::new(
+        TransferCoordinates::new(
+            relay_id(),
+            host_id(),
+            OwnerRevision::new(8).expect("different nonzero revision"),
+            HostOwner::Team(team_id()),
+            HostOwner::Principal(principal_id()),
+        ),
+        ProposalId::parse(&governance_id_with_byte("proposal_", 1))
+            .expect("different canonical proposal id"),
+        ProposalNonce::parse(&governance_id("nonce_")).expect("same canonical nonce"),
+        ProposalExpiry::parse("2026-09-03T10:00:01Z").expect("different canonical expiry"),
+    );
+    let different_nonce_same_coordinates = TransferProposal::new(
+        TransferCoordinates::new(
+            original.relay_id().clone(),
+            original.host_id().clone(),
+            original.owner_revision(),
+            original.current_owner().clone(),
+            original.target().clone(),
+        ),
+        original.proposal_id().clone(),
+        ProposalNonce::parse(&governance_id_with_byte("nonce_", 1))
+            .expect("different canonical nonce"),
+        original.expiry().clone(),
+    );
+
+    assert!(original.has_same_nonce(&same_nonce_different_proposal));
+    assert_ne!(original, same_nonce_different_proposal);
+    assert!(!original.has_same_nonce(&different_nonce_same_coordinates));
+    assert_ne!(original, different_nonce_same_coordinates);
+
+    let debug = format!("{original:?}");
+    assert!(!debug.contains("nonce_"));
+    assert!(debug.contains("[REDACTED]"));
+    assert_eq!(
+        serde_json::to_value(&original).expect("serialize proposal")["nonce"],
+        json!(governance_id("nonce_")),
+        "the comparison seam must not change the canonical proposal wire field"
+    );
+}
+
+#[test]
+fn proposal_nonce_deserializes_canonically_without_exposing_its_value() {
+    let canonical = governance_id("nonce_");
+    let nonce = ProposalNonce::parse(&canonical).expect("canonical nonce");
+    assert_eq!(
+        serde_json::to_value(&nonce).expect("serialize nonce"),
+        json!(canonical),
+        "nonce serialization must preserve its canonical wire value"
+    );
+    assert_eq!(
+        serde_json::from_value::<ProposalNonce>(json!(canonical)).expect("deserialize nonce"),
+        nonce,
+        "nonce deserialization must retain its exact canonical value"
+    );
+    assert_eq!(
+        format!("{nonce:?}"),
+        "ProposalNonce([REDACTED])",
+        "the nonce debug representation must not disclose its canonical value"
+    );
+    assert!(
+        serde_json::from_value::<ProposalNonce>(json!(format!("{canonical}="))).is_err(),
+        "padded nonce wire values must remain noncanonical"
+    );
+}
+
+#[test]
+fn transfer_outcome_binds_all_coordinates_and_redacts_sensitive_values() {
+    let candidate = transfer_candidate();
+    assert_eq!(
+        candidate.outcome_id(),
+        &TransferOutcomeId::from_proposal_id(candidate.proposal().proposal_id()),
+        "a candidate must accept the proposal-derived outcome identity"
+    );
+    let payload = candidate
+        .canonical_payload()
+        .expect("encode canonical signing payload");
+    assert_eq!(payload.as_slice(), transfer_outcome_payload_golden());
+    assert_eq!(
+        candidate
+            .canonical_payload()
+            .expect("repeat canonical payload")
+            .as_slice(),
+        payload.as_slice()
+    );
+
+    let signature = HostApprovalSignature::parse(&format!("sig_{}", "A".repeat(86)))
+        .expect("canonical Ed25519 signature");
+    let outcome = SignedTransferOutcome::new(candidate, signature);
+    assert_eq!(line_roundtrip(&outcome), outcome);
+    assert_eq!(
+        outcome
+            .canonical_payload()
+            .expect("outcome payload")
+            .as_slice(),
+        payload.as_slice()
+    );
+
+    let debug = format!("{outcome:?}");
+    assert!(!debug.contains("nonce_"));
+    assert!(!debug.contains("sig_A"));
+    assert!(debug.contains("[REDACTED]"));
+
+    let mut unknown = serde_json::to_value(&outcome).expect("serialize outcome");
+    unknown["relay_signature"] = json!("must-not-be-accepted");
+    serde_json::from_value::<SignedTransferOutcome>(unknown)
+        .expect_err("outcome must reject unknown fields");
+    HostApprovalSignature::parse(&format!("sig_{}=", "A".repeat(85)))
+        .expect_err("padded signature must fail");
+    HostApprovalSignature::parse(&format!("sig_{}", "A".repeat(85)))
+        .expect_err("short signature must fail");
+    HostApprovalSignature::parse(&format!("sig_{}", "A".repeat(87)))
+        .expect_err("long signature must fail");
+    HostApprovalSignature::parse(&format!("sig_{}!", "A".repeat(85)))
+        .expect_err("non-base64url signature must fail");
+}
+
+fn transfer_outcome_payload_golden() -> Vec<u8> {
+    fn field(payload: &mut Vec<u8>, value: &str) {
+        let length = u32::try_from(value.len()).expect("fixture field length fits in u32");
+        payload.extend_from_slice(&length.to_be_bytes());
+        payload.extend_from_slice(value.as_bytes());
+    }
+
+    let mut expected = b"pohunek.host-approval.transfer-outcome.v1\0".to_vec();
+    field(&mut expected, &governance_id("outcome_"));
+    field(&mut expected, &governance_id("relay_"));
+    field(&mut expected, &governance_id("host_"));
+    expected.extend_from_slice(&7_u64.to_be_bytes());
+    expected.extend_from_slice(&8_u64.to_be_bytes());
+    expected.push(1);
+    field(&mut expected, &governance_id("principal_"));
+    expected.push(2);
+    field(&mut expected, &governance_id("team_"));
+    field(&mut expected, &governance_id("proposal_"));
+    field(&mut expected, &governance_id("nonce_"));
+    field(&mut expected, "2026-09-03T10:00:00Z");
+    expected.push(1);
+    expected.push(1);
+    field(&mut expected, approval_key_reference().as_str());
+    expected
+}
+
+fn payload_after_wire_tamper(wire: &Value, tamper: fn(&mut Value)) -> zeroize::Zeroizing<Vec<u8>> {
+    let mut tampered = wire.clone();
+    tamper(&mut tampered);
+    serde_json::from_value::<TransferOutcomeCandidate>(tampered)
+        .expect("tampered fixture remains a valid checked candidate")
+        .canonical_payload()
+        .expect("encode tampered candidate")
+}
+
+fn tamper_outcome_id(value: &mut Value) {
+    value["outcome_id"] = json!(governance_id_with_byte("outcome_", 1));
+}
+
+fn tamper_relay_id(value: &mut Value) {
+    value["proposal"]["relay_id"] = json!(governance_id_with_byte("relay_", 2));
+}
+
+fn tamper_host_id(value: &mut Value) {
+    value["proposal"]["host_id"] = json!(governance_id_with_byte("host_", 3));
+}
+
+fn tamper_checked_revisions(value: &mut Value) {
+    value["proposal"]["owner_revision"] = json!("8");
+    value["new_owner_revision"] = json!("9");
+}
+
+fn tamper_current_owner_value(value: &mut Value) {
+    value["proposal"]["current_owner"] = json!({
+        "kind": "principal",
+        "id": governance_id_with_byte("principal_", 4),
+    });
+}
+
+fn tamper_current_owner_kind(value: &mut Value) {
+    value["proposal"]["current_owner"] = json!({
+        "kind": "team",
+        "id": governance_id_with_byte("team_", 5),
+    });
+}
+
+fn tamper_target_owner_value(value: &mut Value) {
+    value["proposal"]["target"] = json!({
+        "kind": "team",
+        "id": governance_id_with_byte("team_", 6),
+    });
+}
+
+fn tamper_target_owner_kind(value: &mut Value) {
+    value["proposal"]["target"] = json!({
+        "kind": "principal",
+        "id": governance_id_with_byte("principal_", 7),
+    });
+}
+
+fn tamper_proposal_id(value: &mut Value) {
+    let proposal_id = ProposalId::parse(&governance_id_with_byte("proposal_", 8))
+        .expect("canonical tampered proposal id");
+    value["proposal"]["proposal_id"] = json!(proposal_id.as_str());
+    value["outcome_id"] = json!(TransferOutcomeId::from_proposal_id(&proposal_id).as_str());
+}
+
+fn tamper_nonce(value: &mut Value) {
+    value["proposal"]["nonce"] = json!(governance_id_with_byte("nonce_", 9));
+}
+
+fn tamper_expiry(value: &mut Value) {
+    value["proposal"]["expiry"] = json!("2026-09-03T10:00:01Z");
+}
+
+fn tamper_approval_key_reference(value: &mut Value) {
+    value["approval_key_reference"] = json!(governance_id_with_byte("approval_key_", 10));
+}
+
+#[test]
+fn every_independent_transfer_coordinate_changes_the_signed_payload() {
+    let wire = serde_json::to_value(transfer_candidate()).expect("serialize candidate");
+    let canonical = transfer_candidate()
+        .canonical_payload()
+        .expect("encode canonical candidate");
+
+    for (coordinate, tamper) in [
+        ("relay id", tamper_relay_id as fn(&mut Value)),
+        ("host id", tamper_host_id),
+        ("checked owner revisions", tamper_checked_revisions),
+        ("current owner value", tamper_current_owner_value),
+        ("current owner kind", tamper_current_owner_kind),
+        ("target owner value", tamper_target_owner_value),
+        ("target owner kind", tamper_target_owner_kind),
+        ("proposal id", tamper_proposal_id),
+        ("nonce", tamper_nonce),
+        ("expiry", tamper_expiry),
+        ("approval-key reference", tamper_approval_key_reference),
+    ] {
+        let tampered_payload = payload_after_wire_tamper(&wire, tamper);
+        assert_ne!(
+            tampered_payload.as_slice(),
+            canonical.as_slice(),
+            "altering {coordinate} must invalidate the signed payload"
+        );
+    }
+
+    let mut outcome_id_mismatch = wire;
+    tamper_outcome_id(&mut outcome_id_mismatch);
+    serde_json::from_value::<TransferOutcomeCandidate>(outcome_id_mismatch)
+        .expect_err("an outcome identity must derive from its proposal identity");
+}
+
+#[test]
+fn canonical_payload_owns_a_zeroizing_nonce_buffer() {
+    fn assert_zeroizing_buffer(_: &zeroize::Zeroizing<Vec<u8>>) {}
+
+    let mut payload = transfer_candidate()
+        .canonical_payload()
+        .expect("encode canonical payload");
+    assert_zeroizing_buffer(&payload);
+    assert!(payload
+        .windows(b"nonce_".len())
+        .any(|window| window == b"nonce_"));
+    zeroize::Zeroize::zeroize(&mut payload);
+    assert!(
+        payload.is_empty(),
+        "the owned payload buffer zeroizes its nonce-bearing bytes before drop"
+    );
+}
+
+#[test]
+fn fixed_signing_coordinates_have_pinned_domain_version_algorithm_and_tags() {
+    let payload = transfer_candidate()
+        .canonical_payload()
+        .expect("encode canonical payload");
+    let domain = b"pohunek.host-approval.transfer-outcome.v1\0";
+    assert!(
+        payload.starts_with(domain),
+        "signing domain and version must be pinned"
+    );
+    let mut cursor = domain.len();
+
+    for expected in [
+        governance_id("outcome_"),
+        governance_id("relay_"),
+        governance_id("host_"),
+    ] {
+        assert_eq!(
+            read_signing_field(&payload, &mut cursor),
+            expected.as_bytes()
+        );
+    }
+    let previous_revision = take_signing_bytes(&payload, &mut cursor, size_of::<u64>());
+    let new_revision = take_signing_bytes(&payload, &mut cursor, size_of::<u64>());
+    assert_eq!(previous_revision, 7_u64.to_be_bytes());
+    assert_eq!(new_revision, 8_u64.to_be_bytes());
+
+    assert_eq!(take_signing_bytes(&payload, &mut cursor, 1), [1]);
+    assert_eq!(
+        read_signing_field(&payload, &mut cursor),
+        governance_id("principal_").as_bytes()
+    );
+    assert_eq!(take_signing_bytes(&payload, &mut cursor, 1), [2]);
+    assert_eq!(
+        read_signing_field(&payload, &mut cursor),
+        governance_id("team_").as_bytes()
+    );
+    for expected in [
+        governance_id("proposal_"),
+        governance_id("nonce_"),
+        "2026-09-03T10:00:00Z".to_owned(),
+    ] {
+        assert_eq!(
+            read_signing_field(&payload, &mut cursor),
+            expected.as_bytes()
+        );
+    }
+    assert_eq!(take_signing_bytes(&payload, &mut cursor, 1), [1]);
+    assert_eq!(take_signing_bytes(&payload, &mut cursor, 1), [1]);
+    assert_eq!(
+        read_signing_field(&payload, &mut cursor),
+        approval_key_reference().as_str().as_bytes()
+    );
+    assert_eq!(cursor, payload.len());
+
+    for fixed_coordinate in [
+        (
+            "previous revision",
+            b"\x00\x00\x00\x00\x00\x00\x00\x07".as_slice(),
+        ),
+        (
+            "new revision",
+            b"\x00\x00\x00\x00\x00\x00\x00\x08".as_slice(),
+        ),
+        ("suspension intent", &[1]),
+        ("approval algorithm", &[1]),
+    ] {
+        assert!(
+            payload
+                .windows(fixed_coordinate.1.len())
+                .any(|window| window == fixed_coordinate.1),
+            "signed payload must contain the pinned {} coordinate",
+            fixed_coordinate.0
+        );
+    }
+}
+
+fn read_signing_field<'a>(payload: &'a [u8], cursor: &mut usize) -> &'a [u8] {
+    let length = u32::from_be_bytes(
+        take_signing_bytes(payload, cursor, size_of::<u32>())
+            .try_into()
+            .expect("length prefix is four bytes"),
+    ) as usize;
+    take_signing_bytes(payload, cursor, length)
+}
+
+fn take_signing_bytes<'a>(payload: &'a [u8], cursor: &mut usize, length: usize) -> &'a [u8] {
+    let end = *cursor + length;
+    let bytes = &payload[*cursor..end];
+    *cursor = end;
+    bytes
 }
