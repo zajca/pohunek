@@ -294,18 +294,23 @@ async fn durable_quarantine_and_manifest_bind_service_and_credential_authority()
 }
 
 async fn set_restored_service_account_team(store: &Store, principal_id: Uuid, team_id: Uuid) {
-    sqlx::query("ALTER TABLE service_accounts DISABLE TRIGGER service_accounts_identity_immutable")
-        .execute(store.pool())
+    let mut transaction = store
+        .pool()
+        .begin()
         .await
-        .expect("allow explicit restored-corruption fixture");
+        .expect("begin restored-corruption fixture");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .expect("suppress constraints only for restored-corruption fixture");
     sqlx::query("UPDATE service_accounts SET team_id=$1 WHERE principal_id=$2")
         .bind(team_id)
         .bind(principal_id)
-        .execute(store.pool())
+        .execute(&mut *transaction)
         .await
         .expect("set restored-corruption service-account team");
-    sqlx::query("ALTER TABLE service_accounts ENABLE TRIGGER service_accounts_identity_immutable")
-        .execute(store.pool())
+    transaction
+        .commit()
         .await
-        .expect("restore service-account reparenting protection");
+        .expect("commit restored-corruption fixture");
 }

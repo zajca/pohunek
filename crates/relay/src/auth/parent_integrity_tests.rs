@@ -2,8 +2,9 @@
 
 // Rust guideline compliant 2026-09-08
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use super::{
@@ -63,6 +64,133 @@ async fn insert_credential(
         .execute(store.pool())
         .await
         .expect("seed credential");
+}
+
+async fn insert_service_credential_for_race(
+    transaction: &mut Transaction<'_, Postgres>,
+    credential_id: Uuid,
+    principal_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,expires_at) VALUES ($1,$2,$3,$4,'test','service',1,$1,1,clock_timestamp()+interval '1 hour')")
+        .bind(credential_id)
+        .bind(credential_id.to_string())
+        .bind(vec![1_u8; 32])
+        .bind(principal_id)
+        .execute(&mut **transaction)
+        .await
+        .map(|_| ())
+}
+
+async fn seed_service_account_for_race(store: &Store) -> Uuid {
+    let principal_id = Uuid::now_v7();
+    let team_id = Uuid::now_v7();
+    insert_principal(store, principal_id, "service").await;
+    insert_team(store, team_id, "service-account-race-team").await;
+    sqlx::query("INSERT INTO service_accounts (principal_id,team_id,display_name) VALUES ($1,$2,'service-account-race')")
+        .bind(principal_id)
+        .bind(team_id)
+        .execute(store.pool())
+        .await
+        .expect("seed service account for race");
+    principal_id
+}
+
+async fn assert_no_orphaned_service_credentials(store: &Store) {
+    let orphaned_credentials: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM relay_credentials c LEFT JOIN service_accounts s ON s.principal_id = c.principal_id WHERE c.credential_kind = 'service' AND s.principal_id IS NULL",
+    )
+    .fetch_one(store.pool())
+    .await
+    .expect("count orphaned service credentials");
+    assert_eq!(
+        orphaned_credentials, 0,
+        "service credentials retain parents"
+    );
+}
+
+#[tokio::test]
+async fn service_credential_foreign_key_rejects_delete_first_race() {
+    // This duration only detects that PostgreSQL is waiting on the conflicting
+    // foreign-key operation; it is not a production timing guarantee.
+    const BLOCK_DETECTION_TIMEOUT: Duration = Duration::from_millis(100);
+
+    let (store, schema, bootstrap) = fixture().await;
+    let principal_id = seed_service_account_for_race(&store).await;
+    let mut delete_transaction = store.pool().begin().await.expect("begin parent delete");
+    sqlx::query("DELETE FROM service_accounts WHERE principal_id = $1")
+        .bind(principal_id)
+        .execute(&mut *delete_transaction)
+        .await
+        .expect("delete parent before conflicting credential insert");
+
+    let insert_pool = store.pool().clone();
+    let mut insert_credential = tokio::spawn(async move {
+        let mut transaction = insert_pool.begin().await.expect("begin credential insert");
+        insert_service_credential_for_race(&mut transaction, Uuid::now_v7(), principal_id).await?;
+        transaction.commit().await
+    });
+    assert!(
+        tokio::time::timeout(BLOCK_DETECTION_TIMEOUT, &mut insert_credential)
+            .await
+            .is_err(),
+        "credential insert waits for the uncommitted parent deletion"
+    );
+
+    delete_transaction
+        .commit()
+        .await
+        .expect("commit parent deletion");
+    assert!(
+        insert_credential
+            .await
+            .expect("join blocked credential insert")
+            .is_err(),
+        "credential insert fails after its parent deletion commits"
+    );
+    assert_no_orphaned_service_credentials(&store).await;
+    cleanup(&bootstrap, &schema).await;
+}
+
+#[tokio::test]
+async fn service_credential_foreign_key_rejects_insert_first_race() {
+    // This duration only detects that PostgreSQL is waiting on the conflicting
+    // foreign-key operation; it is not a production timing guarantee.
+    const BLOCK_DETECTION_TIMEOUT: Duration = Duration::from_millis(100);
+
+    let (store, schema, bootstrap) = fixture().await;
+    let principal_id = seed_service_account_for_race(&store).await;
+    let mut insert_transaction = store.pool().begin().await.expect("begin credential insert");
+    insert_service_credential_for_race(&mut insert_transaction, Uuid::now_v7(), principal_id)
+        .await
+        .expect("insert credential before conflicting parent deletion");
+
+    let delete_pool = store.pool().clone();
+    let mut delete_parent = tokio::spawn(async move {
+        sqlx::query("DELETE FROM service_accounts WHERE principal_id = $1")
+            .bind(principal_id)
+            .execute(&delete_pool)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(BLOCK_DETECTION_TIMEOUT, &mut delete_parent)
+            .await
+            .is_err(),
+        "parent deletion waits for the uncommitted credential insert"
+    );
+
+    insert_transaction
+        .commit()
+        .await
+        .expect("commit credential insert");
+    assert!(
+        delete_parent
+            .await
+            .expect("join blocked parent deletion")
+            .is_err(),
+        "parent deletion fails after its credential insert commits"
+    );
+    assert_no_orphaned_service_credentials(&store).await;
+    cleanup(&bootstrap, &schema).await;
 }
 
 #[tokio::test]
@@ -300,25 +428,27 @@ async fn service_account_parent_integrity_denies_deprovisioned_or_missing_creden
         .execute(store.pool())
         .await
         .expect("restore active service account for corruption simulation");
-    // A normal writer cannot delete this row. Simulate a restored corrupt database
-    // explicitly so authentication also rejects a dangling service credential.
-    sqlx::query(
-        "ALTER TABLE service_accounts DISABLE TRIGGER service_accounts_prevent_credential_orphan",
-    )
-    .execute(store.pool())
-    .await
-    .expect("allow explicit restored-corruption fixture");
+    // A normal writer cannot delete this row. A privileged recovery simulation
+    // suppresses constraints only inside this transaction, then authentication
+    // must reject the deliberately restored dangling credential.
+    let mut corruption_transaction = store
+        .pool()
+        .begin()
+        .await
+        .expect("begin restored-corruption fixture");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *corruption_transaction)
+        .await
+        .expect("suppress constraints only for restored-corruption fixture");
     sqlx::query("DELETE FROM service_accounts WHERE principal_id = $1")
         .bind(service_principal_id)
-        .execute(store.pool())
+        .execute(&mut *corruption_transaction)
         .await
         .expect("remove parent only for restored-corruption fixture");
-    sqlx::query(
-        "ALTER TABLE service_accounts ENABLE TRIGGER service_accounts_prevent_credential_orphan",
-    )
-    .execute(store.pool())
-    .await
-    .expect("restore service-account orphan protection");
+    corruption_transaction
+        .commit()
+        .await
+        .expect("commit restored-corruption fixture");
     assert!(matches!(
         service
             .authenticate_bearer(RelayBearerCredential::new(format!(

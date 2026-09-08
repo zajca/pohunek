@@ -193,21 +193,18 @@ CREATE TRIGGER service_accounts_identity_immutable
 BEFORE UPDATE OF principal_id, team_id ON service_accounts
 FOR EACH ROW EXECUTE FUNCTION prevent_service_account_reparenting();
 
-CREATE FUNCTION prevent_service_account_credential_orphan() RETURNS TRIGGER LANGUAGE plpgsql AS $$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM relay_credentials
-        WHERE principal_id = OLD.principal_id AND credential_kind = 'service'
-    ) THEN
-        RAISE EXCEPTION 'service account with credentials cannot be deleted' USING ERRCODE = '23503';
-    END IF;
-    RETURN OLD;
-END;
-$$;
-
-CREATE TRIGGER service_accounts_prevent_credential_orphan
-BEFORE DELETE ON service_accounts
-FOR EACH ROW EXECUTE FUNCTION prevent_service_account_credential_orphan();
+-- A service credential must reference its canonical service-account row. The
+-- generated column is NULL for human credentials, so the foreign key applies
+-- only to service credentials and PostgreSQL's referential locking closes
+-- concurrent insert/delete races.
+ALTER TABLE relay_credentials
+    ADD COLUMN service_account_principal_id UUID
+        GENERATED ALWAYS AS (
+            CASE WHEN credential_kind = 'service' THEN principal_id ELSE NULL END
+        ) STORED,
+    ADD CONSTRAINT relay_credentials_service_account_parent_fk
+        FOREIGN KEY (service_account_principal_id)
+        REFERENCES service_accounts(principal_id) ON DELETE RESTRICT;
 
 CREATE FUNCTION enforce_credential_principal_kind() RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
@@ -217,9 +214,6 @@ BEGIN
              OR (NEW.credential_kind = 'human' AND kind IN ('human', 'infrastructure')))
     ) THEN
         RAISE EXCEPTION 'credential kind does not match principal kind';
-    END IF;
-    IF NEW.credential_kind = 'service' AND NOT EXISTS (SELECT 1 FROM service_accounts WHERE principal_id = NEW.principal_id) THEN
-        RAISE EXCEPTION 'service credential requires service account';
     END IF;
     RETURN NEW;
 END;
