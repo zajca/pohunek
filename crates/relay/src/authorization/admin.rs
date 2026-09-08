@@ -371,7 +371,7 @@ impl Store {
                 }
             }
         } else {
-            sqlx::query(
+            let removed = sqlx::query(
                 "DELETE FROM group_members WHERE team_id=$1 AND group_id=$2 AND principal_id=$3",
             )
             .bind(command.team_id)
@@ -380,6 +380,9 @@ impl Store {
             .execute(&mut **tx)
             .await
             .map_err(StoreError::Database)?;
+            if removed.rows_affected() != 1 {
+                return Err(StoreError::StaleState);
+            }
         }
         let audit_id = audit_change(
             tx,
@@ -592,7 +595,10 @@ impl Store {
                 return Err(StoreError::Forbidden);
             }
         } else {
-            sqlx::query("DELETE FROM membership_custom_roles WHERE team_id=$1 AND principal_id=$2 AND role_id=$3").bind(command.team_id).bind(command.principal_id).bind(command.role_id).execute(&mut **tx).await.map_err(StoreError::Database)?;
+            let removed = sqlx::query("DELETE FROM membership_custom_roles WHERE team_id=$1 AND principal_id=$2 AND role_id=$3").bind(command.team_id).bind(command.principal_id).bind(command.role_id).execute(&mut **tx).await.map_err(StoreError::Database)?;
+            if removed.rows_affected() != 1 {
+                return Err(StoreError::StaleState);
+            }
         }
         let audit_id = audit_change(
             tx,

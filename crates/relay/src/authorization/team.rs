@@ -350,7 +350,7 @@ impl Store {
                 .await
                 .map_err(StoreError::Database)?;
         }
-        let updated = sqlx::query("UPDATE memberships SET state=CASE WHEN $1::text IS NULL THEN 'removed' ELSE 'active' END, builtin_role=COALESCE($1,builtin_role), revision=revision+1, removed_at=CASE WHEN $1::text IS NULL THEN clock_timestamp() ELSE NULL END WHERE team_id=$2 AND principal_id=$3 AND revision=$4")
+        let updated = sqlx::query("UPDATE memberships SET state=CASE WHEN $1::text IS NULL THEN 'removed' ELSE 'active' END, builtin_role=COALESCE($1,builtin_role), revision=revision+1, removed_at=CASE WHEN $1::text IS NULL THEN clock_timestamp() ELSE NULL END WHERE team_id=$2 AND principal_id=$3 AND state='active' AND revision=$4")
             .bind(command.role).bind(command.team_id).bind(command.principal_id).bind(command.expected_revision).execute(&mut **tx).await.map_err(StoreError::Database)?;
         if updated.rows_affected() != 1 {
             return Err(StoreError::StaleState);

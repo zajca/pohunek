@@ -12,7 +12,9 @@ mod team;
 #[cfg(all(test, feature = "postgres-tests"))]
 mod admin_tests;
 
-pub(crate) use admin::{valid_name, valid_permissions, valid_resource_kind};
+pub(crate) use admin::{
+    receipt, request_digest, valid_name, valid_permissions, valid_resource_kind,
+};
 #[doc(inline)]
 pub use admin::{
     CreateGrant, CreateGroup, CreateRole, GrantPage, GrantRecord, GrantSubject, GroupMemberChange,

@@ -18,15 +18,15 @@ use uuid::Uuid;
 use crate::{
     authorization::{
         rbac::{
-            require_team_admin, require_team_permission, TEAM_ADMIN_PERMISSION,
-            TEAM_GRANT_MANAGE_PERMISSION, TEAM_GROUP_MANAGE_PERMISSION,
+            require_team_admin, require_team_permission, require_team_permission_for_replay,
+            TEAM_ADMIN_PERMISSION, TEAM_GRANT_MANAGE_PERMISSION, TEAM_GROUP_MANAGE_PERMISSION,
             TEAM_MEMBERSHIP_MANAGE_PERMISSION, TEAM_ROLE_MANAGE_PERMISSION,
         },
-        valid_name, valid_permissions, valid_resource_kind, valid_team_name, verify_current_actor,
-        CreateGrant, CreateGroup, CreateRole, CreateTeam, DisableTeam, GrantRecord, GrantSubject,
-        GroupMemberChange, GroupRecord, MembershipChange, RemoveGrant, RemoveGroup, RemoveMember,
-        RemoveRole, RoleAssignmentChange, RoleRecord, TeamRecord, UpdateGrant, UpdateGroup,
-        UpdateRole, UpdateTeam,
+        receipt, request_digest, valid_name, valid_permissions, valid_resource_kind,
+        valid_team_name, verify_current_actor, CreateGrant, CreateGroup, CreateRole, CreateTeam,
+        DisableTeam, GrantRecord, GrantSubject, GroupMemberChange, GroupRecord, MembershipChange,
+        RemoveGrant, RemoveGroup, RemoveMember, RemoveRole, RoleAssignmentChange, RoleRecord,
+        TeamRecord, UpdateGrant, UpdateGroup, UpdateRole, UpdateTeam,
     },
     recovery::{DenyIncident, RecoveryError, WitnessRecord, WitnessStore},
     store::{
@@ -192,6 +192,43 @@ macro_rules! management_transaction {
             $authority.close_all();
             return Err(error.into());
         }
+        let replay_receipt = ManagementCommand::receipt(&$command);
+        if let Err(error) = require_team_permission_for_replay(
+            &mut transaction,
+            $actor,
+            management_team_id,
+            $permission,
+        )
+        .await
+        {
+            return Err($authority.management_pre_gate_error(error));
+        }
+        let replayed = match receipt(
+            &mut transaction,
+            $actor,
+            replay_receipt.action,
+            replay_receipt.key,
+            &replay_receipt.digest,
+        )
+        .await
+        {
+            Ok(replayed) => replayed,
+            Err(error) => return Err($authority.management_pre_gate_error(error)),
+        };
+        if let Some(replayed) = replayed {
+            if let Err(error) = $authority
+                .verify_fence_in_transaction(&mut transaction)
+                .await
+            {
+                $authority.close_all();
+                return Err(error);
+            }
+            if let Err(error) = transaction.commit().await.map_err(StoreError::Database) {
+                $authority.close_all();
+                return Err(error.into());
+            }
+            return Ok(ManagementCommand::replayed_response(&$command, replayed));
+        }
         if let Err(error) =
             require_team_permission(&mut transaction, $actor, management_team_id, $permission).await
         {
@@ -238,6 +275,243 @@ macro_rules! management_transaction {
         mutation.complete()?;
         Ok(result)
     }};
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ManagementReceipt {
+    action: &'static str,
+    key: Uuid,
+    digest: [u8; 32],
+}
+
+trait ManagementCommand {
+    type Response;
+
+    fn receipt(&self) -> ManagementReceipt;
+    fn replayed_response(&self, receipt: (Uuid, i64)) -> Self::Response;
+}
+
+macro_rules! management_command {
+    ($command:ty, $response:ty, $action:literal, |$value:ident| $digest:expr, $replay:expr) => {
+        impl ManagementCommand for $command {
+            type Response = $response;
+
+            fn receipt(&self) -> ManagementReceipt {
+                let $value = self;
+                ManagementReceipt {
+                    action: $action,
+                    key: $value.idempotency_key,
+                    digest: request_digest(&$digest),
+                }
+            }
+
+            fn replayed_response(&self, receipt: (Uuid, i64)) -> Self::Response {
+                let _ = self;
+                $replay(receipt)
+            }
+        }
+    };
+}
+
+management_command!(
+    UpdateTeam,
+    TeamRecord,
+    "team.update",
+    |command| format!(
+        "{}:{}:{:?}:{}",
+        command.team_id, command.expected_revision, command.display_name, command.disable
+    ),
+    |receipt: (Uuid, i64)| TeamRecord {
+        team_id: receipt.0,
+        revision: receipt.1
+    }
+);
+management_command!(
+    DisableTeam,
+    TeamRecord,
+    "team.update",
+    |command| format!(
+        "{}:{}:{:?}:{}",
+        command.team_id, command.expected_revision, None::<String>, true
+    ),
+    |receipt: (Uuid, i64)| TeamRecord {
+        team_id: receipt.0,
+        revision: receipt.1
+    }
+);
+management_command!(
+    MembershipChange,
+    (),
+    "team.member.change",
+    |command| format!(
+        "{}:{}:{}:{:?}",
+        command.team_id, command.principal_id, command.expected_revision, command.role
+    ),
+    |_| ()
+);
+management_command!(
+    RemoveMember,
+    (),
+    "team.member.change",
+    |command| format!(
+        "{}:{}:{}:{:?}",
+        command.team_id, command.principal_id, command.expected_revision, None::<&str>
+    ),
+    |_| ()
+);
+management_command!(
+    CreateGroup,
+    GroupRecord,
+    "group.create",
+    |command| format!("{}:{}", command.team_id, command.display_name),
+    |receipt: (Uuid, i64)| GroupRecord {
+        group_id: receipt.0,
+        revision: receipt.1
+    }
+);
+management_command!(
+    UpdateGroup,
+    GroupRecord,
+    "group.update",
+    |command| format!(
+        "{}:{}:{}:{}",
+        command.team_id, command.group_id, command.expected_revision, command.display_name
+    ),
+    |receipt: (Uuid, i64)| GroupRecord {
+        group_id: receipt.0,
+        revision: receipt.1
+    }
+);
+management_command!(
+    RemoveGroup,
+    (),
+    "group.remove",
+    |command| format!(
+        "{}:{}:{}",
+        command.team_id, command.group_id, command.expected_revision
+    ),
+    |_| ()
+);
+management_command!(
+    GroupMemberChange,
+    (),
+    "group.member.change",
+    |command| format!(
+        "{}:{}:{}:{}",
+        command.team_id, command.group_id, command.principal_id, command.add
+    ),
+    |_| ()
+);
+management_command!(
+    CreateRole,
+    RoleRecord,
+    "role.create",
+    |command| format!(
+        "{}:{:?}:{}:{:?}",
+        command.team_id, None::<(Uuid, i64)>, command.display_name, command.permissions
+    ),
+    |receipt: (Uuid, i64)| RoleRecord {
+        role_id: receipt.0,
+        revision: receipt.1
+    }
+);
+management_command!(
+    UpdateRole,
+    RoleRecord,
+    "role.update",
+    |command| format!(
+        "{}:{:?}:{}:{:?}",
+        command.team_id,
+        Some((command.role_id, command.expected_revision)),
+        command.display_name,
+        command.permissions
+    ),
+    |receipt: (Uuid, i64)| RoleRecord {
+        role_id: receipt.0,
+        revision: receipt.1
+    }
+);
+management_command!(
+    RemoveRole,
+    (),
+    "role.remove",
+    |command| format!(
+        "{}:{}:{}",
+        command.team_id, command.role_id, command.expected_revision
+    ),
+    |_| ()
+);
+management_command!(
+    RoleAssignmentChange,
+    (),
+    "role.assignment.change",
+    |command| format!(
+        "{}:{}:{}:{}",
+        command.team_id, command.role_id, command.principal_id, command.assign
+    ),
+    |_| ()
+);
+management_command!(
+    CreateGrant,
+    GrantRecord,
+    "grant.create",
+    |command| management_grant_digest(
+        command.team_id,
+        None,
+        command.subject,
+        command.resource_kind,
+        &command.resource_id,
+        &command.permission
+    ),
+    |receipt: (Uuid, i64)| GrantRecord {
+        grant_id: receipt.0,
+        revision: receipt.1
+    }
+);
+management_command!(
+    UpdateGrant,
+    GrantRecord,
+    "grant.update",
+    |command| management_grant_digest(
+        command.team_id,
+        Some((command.grant_id, command.expected_revision)),
+        command.subject,
+        command.resource_kind,
+        &command.resource_id,
+        &command.permission
+    ),
+    |receipt: (Uuid, i64)| GrantRecord {
+        grant_id: receipt.0,
+        revision: receipt.1
+    }
+);
+management_command!(
+    RemoveGrant,
+    (),
+    "grant.remove",
+    |command| format!(
+        "{}:{}:{}",
+        command.team_id, command.grant_id, command.expected_revision
+    ),
+    |_| ()
+);
+
+fn management_grant_digest(
+    team_id: Uuid,
+    existing: Option<(Uuid, i64)>,
+    subject: GrantSubject,
+    resource_kind: &str,
+    resource_id: &str,
+    permission: &str,
+) -> String {
+    let (subject_kind, subject_id) = match subject {
+        GrantSubject::Principal(id) => ("principal", id),
+        GrantSubject::ServiceAccount(id) => ("service_account", id),
+        GrantSubject::Group(id) => ("group", id),
+    };
+    format!(
+        "{team_id}:{existing:?}:{subject_kind}:{subject_id}:{resource_kind}:{resource_id}:{permission}"
+    )
 }
 
 impl Authority {
@@ -1140,6 +1414,15 @@ impl Authority {
             .lock()
             .map_err(|_error| AuthorityError::Cancelled)?
             .sequence)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admission_epoch(&self) -> Result<u64, AuthorityError> {
+        Ok(self
+            .registry
+            .lock()
+            .map_err(|_error| AuthorityError::Cancelled)?
+            .epoch)
     }
 
     /// Closes ingress after a failure and preserves the dirty witness latch.

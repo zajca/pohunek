@@ -8,8 +8,8 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use super::{
-    CreateGrant, CreateGroup, CreateRole, GrantSubject, GroupMemberChange, RemoveMember,
-    RoleAssignmentChange, UpdateGroup, UpdateTeam,
+    CreateGrant, CreateGroup, CreateRole, DisableTeam, GrantSubject, GroupMemberChange,
+    RemoveGrant, RemoveMember, RemoveRole, RoleAssignmentChange, UpdateGroup, UpdateTeam,
 };
 use crate::store::{
     ActorKind, AuthenticationBinding, AuthorizationRequest, ResourceScope, Store, StoreError,
@@ -326,6 +326,356 @@ async fn group_role_and_grant_are_team_scoped_and_idempotent() {
         error,
         crate::admission::AuthorityError::Store(crate::store::StoreError::Forbidden)
     ));
+    cleanup(store.pool(), &schema).await;
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "The replay cases share one PostgreSQL authority and durable-effect snapshot."
+)]
+async fn exact_management_replays_skip_removed_targets_without_new_effects() {
+    let (store, schema, owner, member, credential) = fixture().await;
+    let team_id = team(&store, owner).await;
+    let actor = owner_actor(owner, credential);
+    sqlx::query("INSERT INTO memberships (membership_id,team_id,principal_id,builtin_role,state,revision,local_deny_generation) VALUES ($1,$2,$3,'member','active',1,1)")
+        .bind(Uuid::now_v7())
+        .bind(team_id)
+        .bind(member)
+        .execute(store.pool())
+        .await
+        .expect("seed removable member");
+    let (authority, _witness_directory) = authority(store.clone()).await;
+    let role = authority
+        .create_role(
+            actor,
+            CreateRole {
+                team_id,
+                display_name: "removable role".into(),
+                permissions: vec!["team.group.manage".into()],
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("create removable role");
+    let grant = authority
+        .create_grant(
+            actor,
+            CreateGrant {
+                team_id,
+                subject: GrantSubject::Principal(owner),
+                resource_kind: "team",
+                resource_id: "*".into(),
+                permission: "team.membership.read".into(),
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("create removable grant");
+    let member_command = RemoveMember {
+        team_id,
+        principal_id: member,
+        expected_revision: 1,
+        correlation_id: Uuid::now_v7(),
+        idempotency_key: Uuid::now_v7(),
+    };
+    let role_command = RemoveRole {
+        team_id,
+        role_id: role.role_id,
+        expected_revision: role.revision,
+        correlation_id: Uuid::now_v7(),
+        idempotency_key: Uuid::now_v7(),
+    };
+    let grant_command = RemoveGrant {
+        team_id,
+        grant_id: grant.grant_id,
+        expected_revision: grant.revision,
+        correlation_id: Uuid::now_v7(),
+        idempotency_key: Uuid::now_v7(),
+    };
+    authority
+        .remove_member(actor, member_command)
+        .await
+        .expect("remove member");
+    authority
+        .remove_role(actor, role_command)
+        .await
+        .expect("remove role");
+    authority
+        .remove_grant(actor, grant_command)
+        .await
+        .expect("remove grant");
+    let guard = authority
+        .admit(AuthorizationRequest {
+            actor,
+            team_id,
+            permission: "session.metadata.read".to_owned(),
+            resource: ResourceScope::Team,
+            correlation_id: Uuid::now_v7(),
+        })
+        .await
+        .expect("admit owner after original removals");
+    let state_before = management_state(&store, team_id).await;
+    let witness_before = authority.witness_sequence().expect("read witness sequence");
+    let epoch_before = authority.admission_epoch().expect("read admission epoch");
+
+    authority
+        .remove_member(actor, member_command)
+        .await
+        .expect("replay removed member");
+    authority
+        .remove_role(actor, role_command)
+        .await
+        .expect("replay removed role");
+    authority
+        .remove_grant(actor, grant_command)
+        .await
+        .expect("replay removed grant");
+
+    assert_eq!(management_state(&store, team_id).await, state_before);
+    assert_eq!(
+        authority.witness_sequence().expect("read witness sequence"),
+        witness_before
+    );
+    assert_eq!(
+        authority.admission_epoch().expect("read admission epoch"),
+        epoch_before
+    );
+    guard
+        .validate()
+        .await
+        .expect("replay keeps admitted work live");
+
+    let conflict = authority
+        .remove_role(
+            actor,
+            RemoveRole {
+                expected_revision: role.revision + 1,
+                ..role_command
+            },
+        )
+        .await
+        .expect_err("changed request fingerprint conflicts before the removed target check");
+    assert!(matches!(
+        conflict,
+        crate::admission::AuthorityError::Store(StoreError::IdempotencyConflict)
+    ));
+    assert!(!authority.is_closed());
+    guard
+        .validate()
+        .await
+        .expect("conflict keeps admitted work live");
+    cleanup(store.pool(), &schema).await;
+}
+
+#[tokio::test]
+async fn disabled_team_receipt_replay_requires_current_actor_permission() {
+    let (store, schema, owner, member, credential) = fixture().await;
+    let team_id = team(&store, owner).await;
+    let actor = owner_actor(owner, credential);
+    let (authority, _witness_directory) = authority(store.clone()).await;
+    let command = DisableTeam {
+        team_id,
+        expected_revision: 1,
+        correlation_id: Uuid::now_v7(),
+        idempotency_key: Uuid::now_v7(),
+    };
+    let disabled = authority
+        .disable_team(actor, command)
+        .await
+        .expect("disable active team");
+    let state_before = management_state(&store, team_id).await;
+    let witness_before = authority.witness_sequence().expect("read witness sequence");
+    let epoch_before = authority.admission_epoch().expect("read admission epoch");
+    let replay = authority
+        .disable_team(actor, command)
+        .await
+        .expect("exact disabled-team replay");
+    assert_eq!(replay, disabled);
+    assert_eq!(management_state(&store, team_id).await, state_before);
+    assert_eq!(
+        authority.witness_sequence().expect("read witness sequence"),
+        witness_before
+    );
+    assert_eq!(
+        authority.admission_epoch().expect("read admission epoch"),
+        epoch_before
+    );
+
+    sqlx::query("INSERT INTO memberships (membership_id,team_id,principal_id,builtin_role,state,revision,local_deny_generation) VALUES ($1,$2,$3,'owner','active',1,1)")
+        .bind(Uuid::now_v7())
+        .bind(team_id)
+        .bind(member)
+        .execute(store.pool())
+        .await
+        .expect("seed independent owner after disable");
+    sqlx::query("UPDATE memberships SET state='removed', revision=revision+1 WHERE team_id=$1 AND principal_id=$2")
+        .bind(team_id)
+        .bind(owner)
+        .execute(store.pool())
+        .await
+        .expect("remove original actor membership");
+    let denied = authority
+        .disable_team(actor, command)
+        .await
+        .expect_err("removed actor cannot replay a disabled-team receipt");
+    assert!(matches!(
+        denied,
+        crate::admission::AuthorityError::Store(StoreError::Forbidden)
+    ));
+    assert!(!authority.is_closed());
+    cleanup(store.pool(), &schema).await;
+}
+
+#[tokio::test]
+async fn absent_management_removals_do_not_create_audit_or_cancellation() {
+    let (store, schema, owner, member, credential) = fixture().await;
+    let team_id = team(&store, owner).await;
+    let actor = owner_actor(owner, credential);
+    sqlx::query("INSERT INTO memberships (membership_id,team_id,principal_id,builtin_role,state,revision,local_deny_generation) VALUES ($1,$2,$3,'member','active',1,1)")
+        .bind(Uuid::now_v7())
+        .bind(team_id)
+        .bind(member)
+        .execute(store.pool())
+        .await
+        .expect("seed member without assignments");
+    let (authority, _witness_directory) = authority(store.clone()).await;
+    let group = authority
+        .create_group(
+            actor,
+            CreateGroup {
+                team_id,
+                display_name: "unassigned group".into(),
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("create group");
+    let role = authority
+        .create_role(
+            actor,
+            CreateRole {
+                team_id,
+                display_name: "unassigned role".into(),
+                permissions: vec!["team.group.manage".into()],
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("create role");
+    let state_before = management_state(&store, team_id).await;
+    let witness_before = authority.witness_sequence().expect("read witness sequence");
+    let epoch_before = authority.admission_epoch().expect("read admission epoch");
+    for error in [
+        authority
+            .change_group_member(
+                actor,
+                GroupMemberChange {
+                    team_id,
+                    group_id: group.group_id,
+                    principal_id: member,
+                    add: false,
+                    correlation_id: Uuid::now_v7(),
+                    idempotency_key: Uuid::now_v7(),
+                },
+            )
+            .await
+            .expect_err("absent group assignment rejected"),
+        authority
+            .change_role_assignment(
+                actor,
+                RoleAssignmentChange {
+                    team_id,
+                    role_id: role.role_id,
+                    principal_id: member,
+                    assign: false,
+                    correlation_id: Uuid::now_v7(),
+                    idempotency_key: Uuid::now_v7(),
+                },
+            )
+            .await
+            .expect_err("absent role assignment rejected"),
+        authority
+            .remove_member(
+                actor,
+                RemoveMember {
+                    team_id,
+                    principal_id: Uuid::now_v7(),
+                    expected_revision: 1,
+                    correlation_id: Uuid::now_v7(),
+                    idempotency_key: Uuid::now_v7(),
+                },
+            )
+            .await
+            .expect_err("absent member rejected"),
+    ] {
+        assert!(matches!(
+            error,
+            crate::admission::AuthorityError::Store(StoreError::StaleState | StoreError::Forbidden)
+        ));
+    }
+    assert!(!authority.is_closed());
+    assert_eq!(management_state(&store, team_id).await, state_before);
+    assert_eq!(
+        authority.witness_sequence().expect("read witness sequence"),
+        witness_before
+    );
+    assert_eq!(
+        authority.admission_epoch().expect("read admission epoch"),
+        epoch_before
+    );
+    cleanup(store.pool(), &schema).await;
+}
+
+#[tokio::test]
+async fn self_member_removal_blocks_replay_while_another_owner_remains_authorized() {
+    let (store, schema, owner, member, credential) = fixture().await;
+    let team_id = team(&store, owner).await;
+    let actor = owner_actor(owner, credential);
+    sqlx::query("INSERT INTO memberships (membership_id,team_id,principal_id,builtin_role,state,revision,local_deny_generation) VALUES ($1,$2,$3,'owner','active',1,1)")
+        .bind(Uuid::now_v7())
+        .bind(team_id)
+        .bind(member)
+        .execute(store.pool())
+        .await
+        .expect("seed independent owner");
+    let (authority, _witness_directory) = authority(store.clone()).await;
+    let command = RemoveMember {
+        team_id,
+        principal_id: owner,
+        expected_revision: 1,
+        correlation_id: Uuid::now_v7(),
+        idempotency_key: Uuid::now_v7(),
+    };
+    authority
+        .remove_member(actor, command)
+        .await
+        .expect("remove the original actor while an independent owner remains");
+    let denied = authority
+        .remove_member(actor, command)
+        .await
+        .expect_err("removed actor cannot replay their own membership removal");
+    assert!(matches!(
+        denied,
+        crate::admission::AuthorityError::Store(StoreError::Forbidden)
+    ));
+    assert!(!authority.is_closed());
+    authority
+        .create_group(
+            human_actor(&store, member).await,
+            CreateGroup {
+                team_id,
+                display_name: "independent owner remains authorized".into(),
+                correlation_id: Uuid::now_v7(),
+                idempotency_key: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("independent owner retains management permission");
     cleanup(store.pool(), &schema).await;
 }
 
