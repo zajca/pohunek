@@ -22,10 +22,12 @@ pub use admin::{
     GroupPage, GroupRecord, RemoveGrant, RemoveGroup, RemoveRole, RoleAssignmentChange, RolePage,
     RoleRecord, UpdateGrant, UpdateGroup, UpdateRole,
 };
+pub(crate) use rbac::audit_read;
 pub(crate) use team::valid_team_name;
 #[doc(inline)]
 pub use team::{
-    CreateTeam, DisableTeam, MembershipChange, RemoveMember, TeamPage, TeamRecord, UpdateTeam,
+    CreateTeam, DisableTeam, MemberPage, MemberRecord, MembershipChange, RemoveMember, TeamPage,
+    TeamRecord, UpdateTeam,
 };
 
 use crate::store::{

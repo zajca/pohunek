@@ -17,17 +17,19 @@ use uuid::Uuid;
 
 use crate::{
     authorization::{
-        lock_management_receipt,
+        audit_read, lock_management_receipt,
         rbac::{
             require_team_admin, require_team_permission, require_team_permission_for_replay,
             TEAM_ADMIN_PERMISSION, TEAM_GRANT_MANAGE_PERMISSION, TEAM_GROUP_MANAGE_PERMISSION,
-            TEAM_MEMBERSHIP_MANAGE_PERMISSION, TEAM_ROLE_MANAGE_PERMISSION,
+            TEAM_MEMBERSHIP_MANAGE_PERMISSION, TEAM_MEMBERSHIP_READ_PERMISSION,
+            TEAM_ROLE_MANAGE_PERMISSION,
         },
         receipt, request_digest, valid_name, valid_permissions, valid_resource_kind,
         valid_team_name, verify_current_actor, CreateGrant, CreateGroup, CreateRole, CreateTeam,
-        DisableTeam, GrantRecord, GrantSubject, GroupMemberChange, GroupRecord, MembershipChange,
-        RemoveGrant, RemoveGroup, RemoveMember, RemoveRole, RoleAssignmentChange, RoleRecord,
-        TeamRecord, UpdateGrant, UpdateGroup, UpdateRole, UpdateTeam,
+        DisableTeam, GrantPage, GrantRecord, GrantSubject, GroupMemberChange, GroupPage,
+        GroupRecord, MemberPage, MemberRecord, MembershipChange, RemoveGrant, RemoveGroup,
+        RemoveMember, RemoveRole, RoleAssignmentChange, RolePage, RoleRecord, TeamPage, TeamRecord,
+        UpdateGrant, UpdateGroup, UpdateRole, UpdateTeam,
     },
     recovery::{DenyIncident, RecoveryError, WitnessRecord, WitnessStore},
     store::{
@@ -42,6 +44,13 @@ pub struct AuthorityLimits {
     pub global: usize,
     pub per_team: usize,
     pub per_principal: usize,
+}
+
+/// A bounded keyset page returned only after authorization and audit commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListPage<T> {
+    pub records: Vec<T>,
+    pub next_cursor: Option<Uuid>,
 }
 
 /// Limits a fresh mutation retry to the database conflicts possible before witnessing.
@@ -66,6 +75,8 @@ pub struct Authority {
     admission_hook: Mutex<Option<AdmissionHook>>,
     #[cfg(test)]
     mutation_hook: Mutex<Option<AdmissionHook>>,
+    #[cfg(test)]
+    read_hook: Mutex<Option<AdmissionHook>>,
     #[cfg(test)]
     management_retry_count: std::sync::atomic::AtomicUsize,
 }
@@ -321,6 +332,62 @@ macro_rules! management_transaction {
     }};
 }
 
+macro_rules! management_read {
+    ($name:ident, $page:ty, $record:ty, $cursor:ident, $permission:expr, $action:literal, $method:ident) => {
+        pub async fn $name(
+            &self,
+            actor: ActorContext,
+            team_id: Uuid,
+            page: $page,
+        ) -> Result<ListPage<$record>, AuthorityError> {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(AuthorityError::Cancelled);
+            }
+            let mut transaction = self.store.begin_serializable().await?;
+            if let Err(error) = self.verify_fence_in_transaction(&mut transaction).await {
+                return Err(error);
+            }
+            if let Err(error) =
+                require_team_permission(&mut transaction, actor, team_id, $permission).await
+            {
+                return Err(self.management_pre_gate_error(error));
+            }
+            let limit = page.limit;
+            let correlation_id = page.correlation_id;
+            let records = self
+                .store
+                .$method(&mut transaction, team_id, page)
+                .await
+                .map_err(|error| self.management_pre_gate_error(error))?;
+            #[cfg(test)]
+            self.pause_read().await?;
+            let result = page_result(records, limit, |record: &$record| record.$cursor)?;
+            if let Err(error) = audit_read(
+                &mut transaction,
+                actor,
+                Some(team_id),
+                $action,
+                correlation_id,
+                "page",
+            )
+            .await
+            {
+                self.close_all();
+                return Err(error.into());
+            }
+            if let Err(error) = self.verify_fence_in_transaction(&mut transaction).await {
+                self.close_all();
+                return Err(error);
+            }
+            if let Err(error) = transaction.commit().await.map_err(StoreError::Database) {
+                self.close_all();
+                return Err(error.into());
+            }
+            Ok(result)
+        }
+    };
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ManagementReceipt {
     action: &'static str,
@@ -559,6 +626,88 @@ fn management_grant_digest(
 }
 
 impl Authority {
+    management_read!(
+        list_groups,
+        GroupPage,
+        GroupRecord,
+        group_id,
+        TEAM_GROUP_MANAGE_PERMISSION,
+        "group.list",
+        list_groups_in_transaction
+    );
+    management_read!(
+        list_roles,
+        RolePage,
+        RoleRecord,
+        role_id,
+        TEAM_ROLE_MANAGE_PERMISSION,
+        "role.list",
+        list_roles_in_transaction
+    );
+    management_read!(
+        list_grants,
+        GrantPage,
+        GrantRecord,
+        grant_id,
+        TEAM_GRANT_MANAGE_PERMISSION,
+        "grant.list",
+        list_grants_in_transaction
+    );
+    management_read!(
+        list_members,
+        MemberPage,
+        MemberRecord,
+        principal_id,
+        TEAM_MEMBERSHIP_READ_PERMISSION,
+        "member.list",
+        list_members_in_transaction
+    );
+
+    /// Lists every team currently visible to the authenticated actor.
+    pub async fn list_teams(
+        &self,
+        actor: ActorContext,
+        page: TeamPage,
+    ) -> Result<ListPage<TeamRecord>, AuthorityError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(AuthorityError::Cancelled);
+        }
+        let mut transaction = self.store.begin_serializable().await?;
+        self.verify_fence_in_transaction(&mut transaction).await?;
+        if let Err(error) = verify_current_actor(&mut transaction, actor).await {
+            return Err(self.management_pre_gate_error(error));
+        }
+        let limit = page.limit;
+        let correlation_id = page.correlation_id;
+        let records = self
+            .store
+            .list_teams_in_transaction(&mut transaction, actor, page)
+            .await
+            .map_err(|error| self.management_pre_gate_error(error))?;
+        #[cfg(test)]
+        self.pause_read().await?;
+        let result = page_result(records, limit, |record: &TeamRecord| record.team_id)?;
+        if let Err(error) = audit_read(
+            &mut transaction,
+            actor,
+            None,
+            "team.list",
+            correlation_id,
+            "page",
+        )
+        .await
+        {
+            self.close_all();
+            return Err(error.into());
+        }
+        self.verify_fence_in_transaction(&mut transaction).await?;
+        if let Err(error) = transaction.commit().await.map_err(StoreError::Database) {
+            self.close_all();
+            return Err(error.into());
+        }
+        Ok(result)
+    }
+
     fn management_pre_gate_error(&self, error: StoreError) -> AuthorityError {
         if !is_management_business_denial(&error) {
             self.close_all();
@@ -677,6 +826,20 @@ impl Authority {
         Ok(())
     }
 
+    #[cfg(test)]
+    async fn pause_read(&self) -> Result<(), AuthorityError> {
+        let hook = self
+            .read_hook
+            .lock()
+            .map_err(|_error| AuthorityError::Cancelled)?
+            .clone();
+        if let Some(hook) = hook {
+            hook.entered.wait().await;
+            hook.release.wait().await;
+        }
+        Ok(())
+    }
+
     /// Creates a fail-closed authority with explicit nonzero capacity limits.
     pub fn new(
         store: Store,
@@ -707,6 +870,8 @@ impl Authority {
             admission_hook: Mutex::new(None),
             #[cfg(test)]
             mutation_hook: Mutex::new(None),
+            #[cfg(test)]
+            read_hook: Mutex::new(None),
             #[cfg(test)]
             management_retry_count: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -1569,6 +1734,25 @@ impl Authority {
         }
         Ok(())
     }
+}
+
+fn page_result<T>(
+    mut records: Vec<T>,
+    limit: i64,
+    cursor: impl Fn(&T) -> Uuid,
+) -> Result<ListPage<T>, AuthorityError> {
+    let limit = usize::try_from(limit)
+        .map_err(|_error| AuthorityError::Store(StoreError::InputTooLarge))?;
+    let next_cursor = if records.len() > limit {
+        records.pop();
+        records.last().map(cursor)
+    } else {
+        None
+    };
+    Ok(ListPage {
+        records,
+        next_cursor,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2529,6 +2713,66 @@ mod tests {
                 .expect("read dirty witness")
                 .expect("active witness")
                 .active_run
+        );
+        cleanup(&store, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn management_read_cancels_when_the_local_fence_expires_before_acknowledgement() {
+        let (store, schema, owner, owner_credential, _administrator, _administrator_credential) =
+            fixture().await;
+        let team_id: Uuid = sqlx::query_scalar("SELECT team_id FROM teams")
+            .fetch_one(store.pool())
+            .await
+            .expect("read team");
+        let (authority, _directory) = authority(
+            store.clone(),
+            AuthorityLimits {
+                global: 1,
+                per_team: 1,
+                per_principal: 1,
+            },
+        )
+        .await;
+        let authority = Arc::new(authority);
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *authority.read_hook.lock().expect("read hook lock") = Some(AdmissionHook {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let pending = {
+            let authority = Arc::clone(&authority);
+            tokio::spawn(async move {
+                authority
+                    .list_members(
+                        actor(owner, owner_credential, ActorKind::Human),
+                        team_id,
+                        MemberPage {
+                            after: None,
+                            limit: 1,
+                            correlation_id: Uuid::now_v7(),
+                        },
+                    )
+                    .await
+            })
+        };
+        entered.wait().await;
+        authority
+            .expire_lease_deadline()
+            .expect("expire local fence while read is paused");
+        release.wait().await;
+        assert!(matches!(
+            pending.await.expect("read task completed"),
+            Err(AuthorityError::Cancelled)
+        ));
+        assert!(authority.is_closed());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM audit_events")
+                .fetch_one(store.pool())
+                .await
+                .expect("count read audits"),
+            0
         );
         cleanup(&store, &schema).await;
     }

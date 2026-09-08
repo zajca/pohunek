@@ -1107,13 +1107,14 @@ async fn management_permissions_are_narrow_for_custom_and_service_actors() {
         .await
         .expect("assign narrow group role");
     let member_actor = human_actor(&store, member).await;
-    store
+    authority
         .list_groups(
             member_actor,
             team_id,
             super::GroupPage {
                 after: None,
                 limit: 1,
+                correlation_id: Uuid::now_v7(),
             },
         )
         .await
@@ -1149,6 +1150,22 @@ async fn management_permissions_are_narrow_for_custom_and_service_actors() {
     ));
 
     let service_actor = service_actor(&store, team_id).await;
+    let error = authority
+        .list_groups(
+            service_actor,
+            team_id,
+            super::GroupPage {
+                after: None,
+                limit: 1,
+                correlation_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect_err("service owner membership has no built-in group read permission");
+    assert!(matches!(
+        error,
+        crate::admission::AuthorityError::Store(crate::store::StoreError::Forbidden)
+    ));
     let error = authority
         .create_group(
             service_actor,
@@ -1192,6 +1209,18 @@ async fn management_permissions_are_narrow_for_custom_and_service_actors() {
         )
         .await
         .expect("assign service custom role");
+    authority
+        .list_groups(
+            service_actor,
+            team_id,
+            super::GroupPage {
+                after: None,
+                limit: 1,
+                correlation_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("service custom group permission lists groups");
     authority
         .create_group(
             service_actor,
@@ -1237,6 +1266,18 @@ async fn management_permissions_are_narrow_for_custom_and_service_actors() {
         .await
         .expect("grant service role permission");
     authority
+        .list_roles(
+            service_actor,
+            team_id,
+            super::RolePage {
+                after: None,
+                limit: 1,
+                correlation_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("service grant lists roles");
+    authority
         .create_role(
             service_actor,
             CreateRole {
@@ -1249,6 +1290,333 @@ async fn management_permissions_are_narrow_for_custom_and_service_actors() {
         )
         .await
         .expect("service team grant manages roles");
+    cleanup(store.pool(), &schema).await;
+}
+
+#[tokio::test]
+async fn audited_management_reads_return_bounded_keyset_pages() {
+    let (store, schema, owner, member, credential) = fixture().await;
+    let first_team = team(&store, owner).await;
+    let _second_team = team(&store, owner).await;
+    let actor = owner_actor(owner, credential);
+    let (authority, _witness_directory) = authority(store.clone()).await;
+    sqlx::query("INSERT INTO memberships (membership_id,team_id,principal_id,builtin_role,state,revision,local_deny_generation) VALUES ($1,$2,$3,'member','active',1,1)")
+        .bind(Uuid::now_v7())
+        .bind(first_team)
+        .bind(member)
+        .execute(store.pool())
+        .await
+        .expect("seed readable member");
+    for display_name in ["first-group", "second-group"] {
+        sqlx::query("INSERT INTO groups (team_id,group_id,display_name,state,revision) VALUES ($1,$2,$3,'active',1)")
+            .bind(first_team)
+            .bind(Uuid::now_v7())
+            .bind(display_name)
+            .execute(store.pool())
+            .await
+            .expect("seed readable group");
+    }
+    for display_name in ["first-role", "second-role"] {
+        sqlx::query("INSERT INTO custom_roles (team_id,role_id,display_name,state,revision) VALUES ($1,$2,$3,'active',1)")
+            .bind(first_team)
+            .bind(Uuid::now_v7())
+            .bind(display_name)
+            .execute(store.pool())
+            .await
+            .expect("seed readable role");
+    }
+    for permission in ["team.group.manage", "team.role.manage"] {
+        sqlx::query("INSERT INTO grants (team_id,grant_id,subject_kind,subject_id,resource_kind,resource_id,permission,state,revision) VALUES ($1,$2,'principal',$3,'team','*',$4,'active',1)")
+            .bind(first_team)
+            .bind(Uuid::now_v7())
+            .bind(owner)
+            .bind(permission)
+            .execute(store.pool())
+            .await
+            .expect("seed readable grant");
+    }
+    let witness_before = authority.witness_sequence().expect("read witness sequence");
+
+    let teams = authority
+        .list_teams(
+            actor,
+            super::TeamPage {
+                after: None,
+                limit: 1,
+                correlation_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("list first team page");
+    let teams_next = authority
+        .list_teams(
+            actor,
+            super::TeamPage {
+                after: teams.next_cursor,
+                limit: 1,
+                correlation_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("list second team page");
+    assert_eq!(teams.records.len(), 1);
+    assert!(teams.next_cursor.is_some());
+    assert_eq!(teams_next.records.len(), 1);
+    assert!(teams_next.next_cursor.is_none());
+
+    sqlx::query("UPDATE teams SET policy_generation=2 WHERE team_id=$1")
+        .bind(first_team)
+        .execute(store.pool())
+        .await
+        .expect("advance current team policy");
+    let group_request_id = Uuid::now_v7();
+    let groups = authority
+        .list_groups(
+            actor,
+            first_team,
+            super::GroupPage {
+                after: None,
+                limit: 1,
+                correlation_id: group_request_id,
+            },
+        )
+        .await
+        .expect("list first group page");
+    let groups_next = authority
+        .list_groups(
+            actor,
+            first_team,
+            super::GroupPage {
+                after: groups.next_cursor,
+                limit: 1,
+                correlation_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("list second group page");
+    assert_eq!(groups.records.len(), 1);
+    assert!(groups.next_cursor.is_some());
+    assert_eq!(groups_next.records.len(), 1);
+    assert!(groups_next.next_cursor.is_none());
+    assert_eq!(
+        sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT correlation_id,policy_generation FROM audit_events WHERE action='group.list' AND correlation_id=$1",
+        )
+        .bind(group_request_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("read group audit header"),
+        (group_request_id, 2)
+    );
+
+    let roles = authority
+        .list_roles(
+            actor,
+            first_team,
+            super::RolePage {
+                after: None,
+                limit: 1,
+                correlation_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("list first role page");
+    let roles_next = authority
+        .list_roles(
+            actor,
+            first_team,
+            super::RolePage {
+                after: roles.next_cursor,
+                limit: 1,
+                correlation_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("list second role page");
+    assert_eq!(roles.records.len(), 1);
+    assert!(roles.next_cursor.is_some());
+    assert_eq!(roles_next.records.len(), 1);
+    assert!(roles_next.next_cursor.is_none());
+
+    let grants = authority
+        .list_grants(
+            actor,
+            first_team,
+            super::GrantPage {
+                after: None,
+                limit: 1,
+                correlation_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("list first grant page");
+    let grants_next = authority
+        .list_grants(
+            actor,
+            first_team,
+            super::GrantPage {
+                after: grants.next_cursor,
+                limit: 1,
+                correlation_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("list second grant page");
+    assert_eq!(grants.records.len(), 1);
+    assert!(grants.next_cursor.is_some());
+    assert_eq!(grants_next.records.len(), 1);
+    assert!(grants_next.next_cursor.is_none());
+
+    let members = authority
+        .list_members(
+            actor,
+            first_team,
+            super::MemberPage {
+                after: None,
+                limit: 1,
+                correlation_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("list first member page");
+    let members_next = authority
+        .list_members(
+            actor,
+            first_team,
+            super::MemberPage {
+                after: members.next_cursor,
+                limit: 1,
+                correlation_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("list second member page");
+    assert_eq!(members.records.len(), 1);
+    assert!(members.next_cursor.is_some());
+    assert_eq!(members_next.records.len(), 1);
+    assert!(members_next.next_cursor.is_none());
+    assert_eq!(
+        authority.witness_sequence().expect("read witness sequence"),
+        witness_before
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM mutation_receipts")
+            .fetch_one(store.pool())
+            .await
+            .expect("count mutation receipts"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM audit_events")
+            .fetch_one(store.pool())
+            .await
+            .expect("count read audits"),
+        10
+    );
+    cleanup(store.pool(), &schema).await;
+}
+
+#[tokio::test]
+async fn audited_management_reads_reject_changed_actor_and_cross_team_scope() {
+    let (store, schema, owner, member, _credential) = fixture().await;
+    let first_team = team(&store, owner).await;
+    let second_team = team(&store, owner).await;
+    sqlx::query("INSERT INTO memberships (membership_id,team_id,principal_id,builtin_role,state,revision,local_deny_generation) VALUES ($1,$2,$3,'member','active',1,1)")
+        .bind(Uuid::now_v7())
+        .bind(first_team)
+        .bind(member)
+        .execute(store.pool())
+        .await
+        .expect("seed first-team member");
+    let member_actor = human_actor(&store, member).await;
+    let (authority, _witness_directory) = authority(store.clone()).await;
+    let error = authority
+        .list_groups(
+            member_actor,
+            second_team,
+            super::GroupPage {
+                after: None,
+                limit: 1,
+                correlation_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect_err("member cannot read another team's groups");
+    assert!(matches!(
+        error,
+        crate::admission::AuthorityError::Store(StoreError::Forbidden)
+    ));
+    assert!(!authority.is_closed());
+    sqlx::query("UPDATE relay_credentials SET revoked_at=clock_timestamp() WHERE credential_id=$1")
+        .bind(member_actor.authentication_id())
+        .execute(store.pool())
+        .await
+        .expect("revoke read actor credential");
+    let error = authority
+        .list_members(
+            member_actor,
+            first_team,
+            super::MemberPage {
+                after: None,
+                limit: 1,
+                correlation_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect_err("revoked actor cannot read memberships");
+    assert!(matches!(
+        error,
+        crate::admission::AuthorityError::Store(StoreError::Forbidden)
+    ));
+    assert!(!authority.is_closed());
+    cleanup(store.pool(), &schema).await;
+}
+
+#[tokio::test]
+async fn audited_management_read_audit_failure_cancels_without_mutation_effects() {
+    let (store, schema, owner, _member, credential) = fixture().await;
+    let team_id = team(&store, owner).await;
+    let actor = owner_actor(owner, credential);
+    let (authority, _witness_directory) = authority(store.clone()).await;
+    let guard = authority
+        .admit(AuthorizationRequest {
+            actor,
+            team_id,
+            permission: "session.metadata.read".to_owned(),
+            resource: ResourceScope::Team,
+            correlation_id: Uuid::now_v7(),
+        })
+        .await
+        .expect("admit live guard");
+    let state_before = management_state(&store, team_id).await;
+    let witness_before = authority.witness_sequence().expect("read witness sequence");
+    sqlx::raw_sql(AssertSqlSafe("CREATE FUNCTION reject_group_list_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit unavailable'; END; $$; CREATE TRIGGER reject_group_list_audit BEFORE INSERT ON audit_events FOR EACH ROW WHEN (NEW.action = 'group.list') EXECUTE FUNCTION reject_group_list_audit();".to_owned()))
+        .execute(store.pool())
+        .await
+        .expect("install read audit failure trigger");
+    let error = authority
+        .list_groups(
+            actor,
+            team_id,
+            super::GroupPage {
+                after: None,
+                limit: 1,
+                correlation_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect_err("audit failure cannot acknowledge a read");
+    assert!(matches!(
+        error,
+        crate::admission::AuthorityError::Store(StoreError::AuditUnavailable)
+    ));
+    assert!(authority.is_closed());
+    assert!(guard.cancelled());
+    assert_eq!(management_state(&store, team_id).await, state_before);
+    assert_eq!(
+        authority.witness_sequence().expect("read witness sequence"),
+        witness_before
+    );
     cleanup(store.pool(), &schema).await;
 }
 

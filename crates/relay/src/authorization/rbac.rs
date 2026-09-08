@@ -36,11 +36,15 @@ pub(crate) async fn require_team_permission(
          JOIN memberships m ON m.team_id = t.team_id \
          JOIN relay_identity r ON r.state = 'normal' \
          WHERE t.team_id = $1 AND t.state = 'active' AND m.principal_id = $2 \
-         AND m.state = 'active' AND r.recovery_generation = $3 FOR SHARE",
+         AND m.state = 'active' AND r.recovery_generation = $3 \
+         AND ($4 <> 'service' OR EXISTS (SELECT 1 FROM service_accounts s \
+              WHERE s.principal_id = m.principal_id AND s.team_id = t.team_id \
+              AND s.deprovisioned_at IS NULL FOR SHARE)) FOR SHARE",
     )
     .bind(team_id)
     .bind(actor.principal_id())
     .bind(actor.recovery_generation())
+    .bind(crate::store::actor_kind_name(actor.kind()))
     .fetch_optional(&mut **transaction)
     .await
     .map_err(StoreError::Database)?
@@ -92,11 +96,15 @@ pub(crate) async fn require_team_permission_for_replay(
          JOIN memberships m ON m.team_id = t.team_id \
          JOIN relay_identity r ON r.state = 'normal' \
          WHERE t.team_id = $1 AND m.principal_id = $2 AND m.state = 'active' \
-         AND r.recovery_generation = $3 FOR SHARE",
+         AND r.recovery_generation = $3 \
+         AND ($4 <> 'service' OR EXISTS (SELECT 1 FROM service_accounts s \
+              WHERE s.principal_id = m.principal_id AND s.team_id = t.team_id \
+              AND s.deprovisioned_at IS NULL FOR SHARE)) FOR SHARE",
     )
     .bind(team_id)
     .bind(actor.principal_id())
     .bind(actor.recovery_generation())
+    .bind(crate::store::actor_kind_name(actor.kind()))
     .fetch_optional(&mut **transaction)
     .await
     .map_err(StoreError::Database)?
@@ -167,4 +175,19 @@ pub(crate) async fn audit_change(
             }
         })?;
     Ok(audit_id)
+}
+
+/// Records an acknowledged administrative read in its authorization transaction.
+pub(crate) async fn audit_read(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    actor: ActorContext,
+    team_id: Option<Uuid>,
+    action: &str,
+    correlation_id: Uuid,
+    parameter_value: &str,
+) -> Result<(), StoreError> {
+    sqlx::query("INSERT INTO audit_events (audit_id,actor_principal_id,actor_kind,team_id,action,decision,policy_generation,recovery_generation,correlation_id,parameter_code,parameter_value,outcome) SELECT $1,$2,$3,$4,$5,'allow',COALESCE((SELECT policy_generation FROM teams WHERE team_id=$4),1),$6,$7,'page',$8,'committed'")
+        .bind(Uuid::now_v7()).bind(actor.principal_id()).bind(crate::store::actor_kind_name(actor.kind())).bind(team_id).bind(action).bind(actor.recovery_generation()).bind(correlation_id).bind(parameter_value)
+        .execute(&mut **transaction).await.map_err(|_error| StoreError::AuditUnavailable)?;
+    Ok(())
 }

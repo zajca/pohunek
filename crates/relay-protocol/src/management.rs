@@ -44,6 +44,28 @@ pub struct Record {
     pub revision: i64,
 }
 
+/// A current team membership coordinate and optimistic revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export))]
+#[serde(deny_unknown_fields)]
+pub struct MemberRecord {
+    pub principal_id: Uuid,
+    #[serde(with = "crate::revision")]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
+    pub revision: i64,
+}
+
+/// A bounded cursor page of current team memberships.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export))]
+#[serde(deny_unknown_fields)]
+pub struct MembershipPage {
+    pub records: Vec<MemberRecord>,
+    pub next_cursor: Option<Uuid>,
+}
+
 /// Response after an idempotent mutation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -199,7 +221,8 @@ pub struct UpdateGrantRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::GrantSubject;
+    use super::{GrantSubject, MemberRecord, MembershipPage};
+    use uuid::Uuid;
 
     #[test]
     fn grant_subject_rejects_unknown_shape() {
@@ -207,5 +230,22 @@ mod tests {
             r#"{"kind":"group","id":"00000000-0000-0000-0000-000000000000","extra":true}"#,
         )
         .expect_err("unknown grant fields must be rejected");
+    }
+
+    #[test]
+    fn membership_page_serializes_revisions_as_decimal_strings() {
+        let page = MembershipPage {
+            records: vec![MemberRecord {
+                principal_id: Uuid::nil(),
+                revision: 7,
+            }],
+            next_cursor: None,
+        };
+        let value = serde_json::to_value(&page).expect("serialize membership page");
+        assert_eq!(value["records"][0]["revision"], "7");
+        assert_eq!(
+            serde_json::from_value::<MembershipPage>(value).expect("deserialize membership page"),
+            page
+        );
     }
 }

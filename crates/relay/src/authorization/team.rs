@@ -6,15 +6,11 @@ use sqlx::Transaction;
 use uuid::Uuid;
 
 use crate::{
-    authorization::{
-        admin::{receipt, record_receipt, request_digest},
-        rbac::TEAM_MEMBERSHIP_READ_PERMISSION,
-        revalidate_authentication,
-    },
-    store::{
-        actor_kind_name, ActorContext, AuthorizationRequest, ResourceScope, Store, StoreError,
-    },
+    authorization::admin::{receipt, record_receipt, request_digest},
+    store::{actor_kind_name, ActorContext, Store, StoreError},
 };
+
+const MAX_PAGE_SIZE: i64 = 128;
 
 /// Requests creation of a bounded team record.
 #[derive(Debug, Clone)]
@@ -43,8 +39,30 @@ pub struct TeamRecord {
 pub struct TeamPage {
     /// Exclusive UUID cursor from the preceding page.
     pub after: Option<Uuid>,
-    /// Maximum returned rows, limited to one hundred.
+    /// Maximum returned rows, limited to one hundred twenty-eight.
     pub limit: i64,
+    /// Ingress request coordinate preserved in the audit event.
+    pub correlation_id: Uuid,
+}
+
+/// Selects a bounded keyset page of current team memberships.
+#[derive(Debug, Clone, Copy)]
+pub struct MemberPage {
+    /// Exclusive principal UUID cursor from the preceding page.
+    pub after: Option<Uuid>,
+    /// Maximum returned rows, limited to one hundred twenty-eight.
+    pub limit: i64,
+    /// Ingress request coordinate preserved in the audit event.
+    pub correlation_id: Uuid,
+}
+
+/// A current team membership coordinate and optimistic revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemberRecord {
+    /// Principal coordinate of the active membership.
+    pub principal_id: Uuid,
+    /// Current optimistic revision.
+    pub revision: i64,
 }
 
 /// Changes a team display name or disables it at an expected revision.
@@ -154,34 +172,77 @@ impl Store {
         .await
     }
 
-    /// Lists teams in a bounded stable UUID page.
-    pub async fn list_teams(
+    /// Lists authorized teams in a caller-owned transaction.
+    pub(crate) async fn list_teams_in_transaction(
         &self,
+        tx: &mut Transaction<'_, sqlx::Postgres>,
         actor: ActorContext,
         page: TeamPage,
     ) -> Result<Vec<TeamRecord>, StoreError> {
-        if page.limit < 1 || page.limit > 100 {
-            return Err(StoreError::InputTooLarge);
-        }
-        let mut tx = self.begin_serializable().await?;
-        revalidate_authentication(
-            &mut tx,
-            &AuthorizationRequest {
-                actor,
-                team_id: Uuid::nil(),
-                permission: TEAM_MEMBERSHIP_READ_PERMISSION.to_owned(),
-                resource: ResourceScope::Team,
-                correlation_id: Uuid::now_v7(),
-            },
+        valid_page(page.limit)?;
+        let rows = sqlx::query(
+            "SELECT t.team_id,t.revision FROM teams t \
+             JOIN memberships m ON m.team_id=t.team_id \
+             JOIN relay_identity r ON r.state='normal' \
+             WHERE m.principal_id=$1 AND m.state='active' AND t.state='active' \
+             AND r.recovery_generation=$2 AND ($3::uuid IS NULL OR t.team_id>$3) \
+             AND ($4 <> 'service' OR EXISTS (SELECT 1 FROM service_accounts s \
+                  WHERE s.principal_id=m.principal_id AND s.team_id=t.team_id \
+                  AND s.deprovisioned_at IS NULL FOR SHARE)) \
+             AND (($4 <> 'service' AND m.builtin_role IN ('owner','admin','member')) \
+                  OR EXISTS (SELECT 1 FROM membership_custom_roles mr \
+                     JOIN custom_roles cr ON (cr.team_id,cr.role_id)=(mr.team_id,mr.role_id) \
+                     JOIN custom_role_permissions rp ON (rp.team_id,rp.role_id)=(mr.team_id,mr.role_id) \
+                     WHERE mr.team_id=t.team_id AND mr.principal_id=m.principal_id \
+                     AND cr.state='active' AND rp.permission='team.membership.read') \
+                  OR EXISTS (SELECT 1 FROM grants g WHERE g.team_id=t.team_id AND g.state='active' \
+                     AND g.permission='team.membership.read' AND g.resource_kind='team' AND g.resource_id='*' \
+                     AND ((g.subject_kind IN ('principal','service_account') AND g.subject_id=m.principal_id) \
+                          OR (g.subject_kind='group' AND EXISTS (SELECT 1 FROM group_members gm \
+                             JOIN groups gr ON (gr.team_id,gr.group_id)=(gm.team_id,gm.group_id) \
+                             WHERE gm.team_id=t.team_id AND gm.group_id=g.subject_id \
+                             AND gm.principal_id=m.principal_id AND gr.state='active'))))) \
+             ORDER BY t.team_id LIMIT $5",
         )
-        .await?;
-        let rows = sqlx::query("SELECT DISTINCT t.team_id,t.revision FROM teams t JOIN memberships m ON m.team_id=t.team_id JOIN relay_identity r ON r.state='normal' WHERE m.principal_id=$1 AND m.state='active' AND t.state='active' AND r.recovery_generation=$2 AND ($3::uuid IS NULL OR t.team_id>$3) ORDER BY t.team_id LIMIT $4")
-            .bind(actor.principal_id()).bind(actor.recovery_generation()).bind(page.after).bind(page.limit).fetch_all(&mut *tx).await.map_err(StoreError::Database)?;
-        tx.commit().await.map_err(StoreError::Database)?;
+        .bind(actor.principal_id())
+        .bind(actor.recovery_generation())
+        .bind(page.after)
+        .bind(actor_kind_name(actor.kind()))
+        .bind(page.limit + 1)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(StoreError::Database)?;
         Ok(rows
             .into_iter()
             .map(|row| TeamRecord {
                 team_id: sqlx::Row::get(&row, "team_id"),
+                revision: sqlx::Row::get(&row, "revision"),
+            })
+            .collect())
+    }
+
+    /// Lists a team's active memberships in a caller-owned transaction.
+    pub(crate) async fn list_members_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, sqlx::Postgres>,
+        team_id: Uuid,
+        page: MemberPage,
+    ) -> Result<Vec<MemberRecord>, StoreError> {
+        valid_page(page.limit)?;
+        let rows = sqlx::query(
+            "SELECT principal_id,revision FROM memberships WHERE team_id=$1 AND state='active' \
+             AND ($2::uuid IS NULL OR principal_id>$2) ORDER BY principal_id LIMIT $3",
+        )
+        .bind(team_id)
+        .bind(page.after)
+        .bind(page.limit + 1)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(StoreError::Database)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| MemberRecord {
+                principal_id: sqlx::Row::get(&row, "principal_id"),
                 revision: sqlx::Row::get(&row, "revision"),
             })
             .collect())
@@ -375,6 +436,14 @@ impl Store {
         )
         .await?;
         Ok(())
+    }
+}
+
+fn valid_page(limit: i64) -> Result<(), StoreError> {
+    if (1..=MAX_PAGE_SIZE).contains(&limit) {
+        Ok(())
+    } else {
+        Err(StoreError::InputTooLarge)
     }
 }
 

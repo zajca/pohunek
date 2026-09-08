@@ -27,6 +27,8 @@ export type { Idempotency } from "./Idempotency";
 export type { IdentityRecord } from "./IdentityRecord";
 export type { LoginId } from "./LoginId";
 export type { MemberChangeRequest } from "./MemberChangeRequest";
+export type { MemberRecord } from "./MemberRecord";
+export type { MembershipPage } from "./MembershipPage";
 export type { MutationReceipt } from "./MutationReceipt";
 export type { Page } from "./Page";
 export type { PageRequest } from "./PageRequest";

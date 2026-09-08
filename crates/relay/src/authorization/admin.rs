@@ -5,14 +5,11 @@ use sqlx::{Row, Transaction};
 use uuid::Uuid;
 
 use crate::{
-    authorization::rbac::{
-        audit_change, require_team_permission, TEAM_GRANT_MANAGE_PERMISSION,
-        TEAM_GROUP_MANAGE_PERMISSION, TEAM_ROLE_MANAGE_PERMISSION,
-    },
+    authorization::rbac::audit_change,
     store::{bounded_coordinate, ActorContext, Store, StoreError},
 };
 
-const MAX_PAGE_SIZE: i64 = 100;
+const MAX_PAGE_SIZE: i64 = 128;
 const MAX_PERMISSION_COUNT: usize = 100;
 const MAX_DISPLAY_NAME_BYTES: usize = 256;
 
@@ -21,18 +18,24 @@ const MAX_DISPLAY_NAME_BYTES: usize = 256;
 pub struct GroupPage {
     pub after: Option<Uuid>,
     pub limit: i64,
+    /// Ingress request coordinate preserved in the audit event.
+    pub correlation_id: Uuid,
 }
 /// A stable page request for custom roles.
 #[derive(Debug, Clone, Copy)]
 pub struct RolePage {
     pub after: Option<Uuid>,
     pub limit: i64,
+    /// Ingress request coordinate preserved in the audit event.
+    pub correlation_id: Uuid,
 }
 /// A stable page request for grants.
 #[derive(Debug, Clone, Copy)]
 pub struct GrantPage {
     pub after: Option<Uuid>,
     pub limit: i64,
+    /// Ingress request coordinate preserved in the audit event.
+    pub correlation_id: Uuid,
 }
 
 /// A group coordinate and revision.
@@ -174,23 +177,52 @@ pub struct RemoveGrant {
 }
 
 impl Store {
-    /// Lists active groups after validating the caller's current team authority.
-    pub async fn list_groups(
+    pub(crate) async fn list_groups_in_transaction(
         &self,
-        actor: ActorContext,
+        tx: &mut Transaction<'_, sqlx::Postgres>,
         team_id: Uuid,
         page: GroupPage,
     ) -> Result<Vec<GroupRecord>, StoreError> {
         valid_page(page.limit)?;
-        let mut tx = self.begin_serializable().await?;
-        require_team_permission(&mut tx, actor, team_id, TEAM_GROUP_MANAGE_PERMISSION).await?;
-        let rows = sqlx::query("SELECT group_id,revision FROM groups WHERE team_id=$1 AND state='active' AND ($2::uuid IS NULL OR group_id>$2) ORDER BY group_id LIMIT $3")
-            .bind(team_id).bind(page.after).bind(page.limit).fetch_all(&mut *tx).await.map_err(StoreError::Database)?;
-        tx.commit().await.map_err(StoreError::Database)?;
+        let rows = sqlx::query("SELECT group_id,revision FROM groups WHERE team_id=$1 AND state='active' AND ($2::uuid IS NULL OR group_id>$2) ORDER BY group_id LIMIT $3").bind(team_id).bind(page.after).bind(page.limit + 1).fetch_all(&mut **tx).await.map_err(StoreError::Database)?;
         Ok(rows
             .into_iter()
             .map(|row| GroupRecord {
                 group_id: row.get("group_id"),
+                revision: row.get("revision"),
+            })
+            .collect())
+    }
+
+    pub(crate) async fn list_roles_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, sqlx::Postgres>,
+        team_id: Uuid,
+        page: RolePage,
+    ) -> Result<Vec<RoleRecord>, StoreError> {
+        valid_page(page.limit)?;
+        let rows = sqlx::query("SELECT role_id,revision FROM custom_roles WHERE team_id=$1 AND state='active' AND ($2::uuid IS NULL OR role_id>$2) ORDER BY role_id LIMIT $3").bind(team_id).bind(page.after).bind(page.limit + 1).fetch_all(&mut **tx).await.map_err(StoreError::Database)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| RoleRecord {
+                role_id: row.get("role_id"),
+                revision: row.get("revision"),
+            })
+            .collect())
+    }
+
+    pub(crate) async fn list_grants_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, sqlx::Postgres>,
+        team_id: Uuid,
+        page: GrantPage,
+    ) -> Result<Vec<GrantRecord>, StoreError> {
+        valid_page(page.limit)?;
+        let rows=sqlx::query("SELECT grant_id,revision FROM grants WHERE team_id=$1 AND state='active' AND ($2::uuid IS NULL OR grant_id>$2) ORDER BY grant_id LIMIT $3").bind(team_id).bind(page.after).bind(page.limit + 1).fetch_all(&mut **tx).await.map_err(StoreError::Database)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| GrantRecord {
+                grant_id: row.get("grant_id"),
                 revision: row.get("revision"),
             })
             .collect())
@@ -406,27 +438,6 @@ impl Store {
         Ok(())
     }
 
-    /// Lists active custom roles after current authorization validation.
-    pub async fn list_roles(
-        &self,
-        actor: ActorContext,
-        team_id: Uuid,
-        page: RolePage,
-    ) -> Result<Vec<RoleRecord>, StoreError> {
-        valid_page(page.limit)?;
-        let mut tx = self.begin_serializable().await?;
-        require_team_permission(&mut tx, actor, team_id, TEAM_ROLE_MANAGE_PERMISSION).await?;
-        let rows = sqlx::query("SELECT role_id,revision FROM custom_roles WHERE team_id=$1 AND state='active' AND ($2::uuid IS NULL OR role_id>$2) ORDER BY role_id LIMIT $3").bind(team_id).bind(page.after).bind(page.limit).fetch_all(&mut *tx).await.map_err(StoreError::Database)?;
-        tx.commit().await.map_err(StoreError::Database)?;
-        Ok(rows
-            .into_iter()
-            .map(|row| RoleRecord {
-                role_id: row.get("role_id"),
-                revision: row.get("revision"),
-            })
-            .collect())
-    }
-
     /// Creates a custom role from known stable permissions.
     pub(crate) async fn create_role_in_transaction(
         &self,
@@ -624,27 +635,6 @@ impl Store {
         )
         .await?;
         Ok(())
-    }
-
-    /// Lists active grants after current authorization validation.
-    pub async fn list_grants(
-        &self,
-        actor: ActorContext,
-        team_id: Uuid,
-        page: GrantPage,
-    ) -> Result<Vec<GrantRecord>, StoreError> {
-        valid_page(page.limit)?;
-        let mut tx = self.begin_serializable().await?;
-        require_team_permission(&mut tx, actor, team_id, TEAM_GRANT_MANAGE_PERMISSION).await?;
-        let rows=sqlx::query("SELECT grant_id,revision FROM grants WHERE team_id=$1 AND state='active' AND ($2::uuid IS NULL OR grant_id>$2) ORDER BY grant_id LIMIT $3").bind(team_id).bind(page.after).bind(page.limit).fetch_all(&mut *tx).await.map_err(StoreError::Database)?;
-        tx.commit().await.map_err(StoreError::Database)?;
-        Ok(rows
-            .into_iter()
-            .map(|row| GrantRecord {
-                grant_id: row.get("grant_id"),
-                revision: row.get("revision"),
-            })
-            .collect())
     }
 
     /// Creates a validated narrowed grant.

@@ -31,9 +31,9 @@ pub use evidence::{
 pub use id::{CredentialId, PrincipalId, RelayId, TeamId};
 pub use management::{
     CreateGrantRequest, CreateGroupRequest, CreateRoleRequest, CreateTeamRequest, GrantSubject,
-    Idempotency, MemberChangeRequest, MutationReceipt, Page, PageRequest, Record, RemoveRequest,
-    RoleAssignmentRequest, UpdateGrantRequest, UpdateGroupRequest, UpdateRoleRequest,
-    UpdateTeamRequest,
+    Idempotency, MemberChangeRequest, MemberRecord, MembershipPage, MutationReceipt, Page,
+    PageRequest, Record, RemoveRequest, RoleAssignmentRequest, UpdateGrantRequest,
+    UpdateGroupRequest, UpdateRoleRequest, UpdateTeamRequest,
 };
 
 /// Current relay HTTP API version.
