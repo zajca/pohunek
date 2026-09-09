@@ -7,6 +7,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 use tokio::{
     io::AsyncReadExt,
@@ -21,6 +22,13 @@ struct Ingress {
     issuer_handle: Handle<SocketAddr>,
     issuer_task: JoinHandle<std::io::Result<()>>,
     device_entered: Arc<Notify>,
+    device_requests: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct DeviceIssuerState {
+    entered: Arc<Notify>,
+    requests: Arc<AtomicUsize>,
 }
 
 impl Ingress {
@@ -51,6 +59,7 @@ impl Ingress {
             "id_token_signing_alg_values_supported": ["RS256"]
         });
         let device_entered = Arc::new(Notify::new());
+        let device_requests = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
             .route(
                 "/issuer/.well-known/openid-configuration",
@@ -61,7 +70,10 @@ impl Ingress {
                 get(|| async { Json(serde_json::json!({"keys": []})) }),
             )
             .route("/issuer/device", axum::routing::post(held_device))
-            .with_state(Arc::clone(&device_entered));
+            .with_state(DeviceIssuerState {
+                entered: Arc::clone(&device_entered),
+                requests: Arc::clone(&device_requests),
+            });
         let issuer_handle = Handle::new();
         let server = axum_server::from_tcp_rustls(listener, tls)
             .expect("issuer socket")
@@ -72,6 +84,7 @@ impl Ingress {
         let config = configuration(&fixture, &issuer, certificate_file, private_key_file);
         let client = reqwest::Client::builder()
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .add_root_certificate(reqwest::Certificate::from_pem(&certificate).expect("fixture CA"))
             .timeout(Duration::from_secs(3))
             .pool_max_idle_per_host(0)
@@ -93,6 +106,7 @@ impl Ingress {
             issuer_handle,
             issuer_task,
             device_entered,
+            device_requests,
         }
     }
 
@@ -134,8 +148,9 @@ fn private_file(path: &Path, bytes: &[u8]) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private mode");
 }
 
-async fn held_device(State(entered): State<Arc<Notify>>) -> Json<serde_json::Value> {
-    entered.notify_one();
+async fn held_device(State(state): State<DeviceIssuerState>) -> Json<serde_json::Value> {
+    state.requests.fetch_add(1, Ordering::Relaxed);
+    state.entered.notify_one();
     std::future::pending().await
 }
 
@@ -183,6 +198,161 @@ async fn native_tls_runtime_serves_readiness_and_cleanly_restarts() {
                 .active_run
         );
     }
+    ingress.cleanup().await;
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "The security regression keeps one complete cross-flow HTTP sequence together."
+)]
+async fn browser_and_device_flows_share_capacity_and_control_bad_callbacks() {
+    let mut ingress = Ingress::new().await;
+    ingress.config.auth.pending_transactions = 1;
+    let running = ingress.start().await;
+    let browser = ingress
+        .client
+        .post(running.url("/v1/auth/browser/start"))
+        .header("origin", "https://localhost:9443")
+        .send()
+        .await
+        .expect("start browser login");
+    assert_eq!(browser.status(), reqwest::StatusCode::SEE_OTHER);
+    let authorization = url::Url::parse(
+        browser
+            .headers()
+            .get("location")
+            .expect("browser authorization redirect")
+            .to_str()
+            .expect("ASCII redirect"),
+    )
+    .expect("valid authorization URL");
+    let state = authorization
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then_some(value.into_owned()))
+        .expect("opaque browser state");
+    let login_cookie = browser
+        .headers()
+        .get("set-cookie")
+        .expect("browser binding cookie")
+        .to_str()
+        .expect("ASCII cookie")
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_owned();
+
+    let rejected = ingress
+        .client
+        .post(running.url("/v1/auth/device/start"))
+        .send()
+        .await
+        .expect("capacity rejection response");
+    assert_eq!(rejected.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        ingress.device_requests.load(Ordering::Relaxed),
+        0,
+        "a capacity rejection cannot call the issuer"
+    );
+
+    let malformed = ingress
+        .client
+        .get(running.url(&format!(
+            "/v1/auth/oidc/callback?state={state}&unexpected=sentinel"
+        )))
+        .header("cookie", &login_cookie)
+        .send()
+        .await
+        .expect("controlled malformed callback response");
+    assert_eq!(malformed.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(malformed.headers()["cache-control"], "no-store");
+    assert_eq!(malformed.headers()["pragma"], "no-cache");
+    let cleared = malformed
+        .headers()
+        .get("set-cookie")
+        .expect("malformed callback clears browser binding")
+        .to_str()
+        .expect("ASCII cleared cookie");
+    assert!(cleared.starts_with("__Host-pohunek-relay-login="));
+    assert!(cleared.contains("Secure; HttpOnly; SameSite=Lax; Max-Age=0"));
+
+    let missing_cookie = ingress
+        .client
+        .get(running.url(&format!("/v1/auth/oidc/callback?state={state}")))
+        .send()
+        .await
+        .expect("controlled missing-cookie callback response");
+    assert_eq!(missing_cookie.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(missing_cookie.headers()["cache-control"], "no-store");
+    assert!(missing_cookie
+        .headers()
+        .get("set-cookie")
+        .expect("missing-cookie response clears the binding")
+        .to_str()
+        .expect("ASCII cleared cookie")
+        .contains("Max-Age=0"));
+
+    let mixed = ingress
+        .client
+        .get(running.url(&format!("/v1/auth/oidc/callback?state={state}")))
+        .header("cookie", &login_cookie)
+        .header("authorization", "Bearer malformed-callback-coordinate")
+        .send()
+        .await
+        .expect("controlled mixed-auth callback response");
+    assert_eq!(mixed.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(mixed.headers()["cache-control"], "no-store");
+    assert!(mixed
+        .headers()
+        .get("set-cookie")
+        .expect("mixed callback clears browser binding")
+        .to_str()
+        .expect("ASCII cleared cookie")
+        .contains("Max-Age=0"));
+
+    let still_rejected = ingress
+        .client
+        .post(running.url("/v1/auth/device/start"))
+        .send()
+        .await
+        .expect("capacity remains occupied after unbound malformed callback");
+    assert_eq!(
+        still_rejected.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(ingress.device_requests.load(Ordering::Relaxed), 0);
+
+    let terminal = ingress
+        .client
+        .get(running.url(&format!(
+            "/v1/auth/oidc/callback?error=access_denied&state={state}"
+        )))
+        .header("cookie", &login_cookie)
+        .send()
+        .await
+        .expect("bound provider denial response");
+    assert_eq!(terminal.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let client = ingress.client.clone();
+    let device_url = running.url("/v1/auth/device/start");
+    let device = tokio::spawn(async move { client.post(device_url).send().await });
+    timeout(Duration::from_secs(1), ingress.device_entered.notified())
+        .await
+        .expect("device issuer request after terminal browser callback");
+    assert_eq!(ingress.device_requests.load(Ordering::Relaxed), 1);
+    device.abort();
+    let _ = device.await;
+    tokio::task::yield_now().await;
+
+    let replacement = ingress
+        .client
+        .post(running.url("/v1/auth/browser/start"))
+        .header("origin", "https://localhost:9443")
+        .send()
+        .await
+        .expect("cancelled device reservation releases browser admission");
+    assert_eq!(replacement.status(), reqwest::StatusCode::SEE_OTHER);
+    running.shutdown().await.expect("clean runtime shutdown");
     ingress.cleanup().await;
 }
 

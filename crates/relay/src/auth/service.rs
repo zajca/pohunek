@@ -4,7 +4,7 @@
 
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 
@@ -16,7 +16,6 @@ use relay_protocol::{
     ServiceAccountCreated, ServiceAccountPage, ServiceAccountRecord, TeamId,
 };
 use sqlx::{Postgres, Row, Transaction};
-use tokio::sync::Mutex;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -28,7 +27,7 @@ use crate::{
 
 use super::{
     oidc::{OidcClient, OidcDeviceAuthorization},
-    pending::{PendingDeviceCode, PendingDeviceCodes},
+    pending::{PendingDeviceCode, PendingDeviceCodes, PendingTransactions},
     AuthError, BrowserCallback, BrowserCallbackOutcome, BrowserCookie, DevicePollSecret, DigestKey,
     LoginBindingCookie, RelayBearerCredential,
 };
@@ -146,7 +145,6 @@ impl AuthLimits {
 struct PendingBrowserLogin {
     verifier: Zeroizing<String>,
     nonce: Zeroizing<String>,
-    expires_at: Instant,
 }
 
 struct DeviceIssueBinding {
@@ -271,17 +269,17 @@ pub struct AuthService {
     store: Store,
     digest_key: DigestKey,
     pending_device_codes: PendingDeviceCodes,
-    pending_browser_logins: Arc<Mutex<HashMap<Uuid, PendingBrowserLogin>>>,
-    pending_capacity: usize,
+    pending_browser_logins: Arc<StdMutex<HashMap<Uuid, PendingBrowserLogin>>>,
+    pending_transactions: PendingTransactions,
     limits: AuthLimits,
     login_policy: LoginPolicy,
     authority: Arc<Authority>,
     #[cfg(test)]
-    rotation_hook: Arc<Mutex<Option<RotationHook>>>,
+    rotation_hook: Arc<tokio::sync::Mutex<Option<RotationHook>>>,
     #[cfg(test)]
     rotation_retry_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
-    revoke_hook: Arc<Mutex<Option<RotationHook>>>,
+    revoke_hook: Arc<tokio::sync::Mutex<Option<RotationHook>>>,
 }
 
 #[cfg(test)]
@@ -305,18 +303,18 @@ impl AuthService {
         Self {
             store,
             digest_key,
-            pending_device_codes: PendingDeviceCodes::new(pending_device_capacity),
-            pending_browser_logins: Arc::new(Mutex::new(HashMap::new())),
-            pending_capacity: pending_device_capacity,
+            pending_device_codes: PendingDeviceCodes::default(),
+            pending_browser_logins: Arc::new(StdMutex::new(HashMap::new())),
+            pending_transactions: PendingTransactions::new(pending_device_capacity),
             limits,
             login_policy,
             authority,
             #[cfg(test)]
-            rotation_hook: Arc::new(Mutex::new(None)),
+            rotation_hook: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(test)]
             rotation_retry_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
-            revoke_hook: Arc::new(Mutex::new(None)),
+            revoke_hook: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -326,14 +324,10 @@ impl AuthService {
         oidc: &OidcClient,
         binding: LoginBindingCookie,
     ) -> Result<BrowserLoginStart, AuthError> {
+        self.prune_expired_pending().await?;
+        let reservation = self.pending_transactions.reserve()?;
         let authorization = oidc.begin_browser();
         let login_id = Uuid::now_v7();
-        self.prune_expired_pending().await?;
-        let mut pending = self.pending_browser_logins.lock().await;
-        pending.retain(|_, login| login.expires_at > Instant::now());
-        if pending.len() >= self.pending_capacity {
-            return Err(AuthError::Capacity);
-        }
         let redirect_uri = oidc.redirect_uri().ok_or(AuthError::OidcInvalid)?;
         let mut transaction = self
             .store
@@ -369,12 +363,17 @@ impl AuthService {
         )
         .await?;
         self.commit_current(transaction).await?;
+        let expires_at = Instant::now() + self.limits.login_lifetime;
+        reservation.commit(login_id, expires_at)?;
+        let mut pending = self
+            .pending_browser_logins
+            .lock()
+            .map_err(|_| AuthError::Durable)?;
         pending.insert(
             login_id,
             PendingBrowserLogin {
                 verifier: authorization.verifier,
                 nonce: authorization.nonce,
-                expires_at: Instant::now() + self.limits.login_lifetime,
             },
         );
         Ok(BrowserLoginStart {
@@ -388,11 +387,11 @@ impl AuthService {
         &self,
         oidc: &OidcClient,
     ) -> Result<DeviceLoginStart, AuthError> {
-        let reservation = self.pending_device_codes.reserve()?;
+        self.prune_expired_pending().await?;
+        let reservation = self.pending_transactions.reserve()?;
         let authorization = oidc.begin_device().await?;
         let login_id = Uuid::now_v7();
         let poll_secret = random_secret()?;
-        self.prune_expired_pending().await?;
         let mut transaction = self
             .store
             .begin_serializable()
@@ -423,9 +422,17 @@ impl AuthService {
         )
         .await?;
         self.commit_current(transaction).await?;
-        if let Err(error) =
-            reservation.commit(login_id, PendingDeviceCode::new(authorization.clone()))
+        let expires_at = Instant::now() + authorization.expires_in;
+        if let Err(error) = reservation.commit(login_id, expires_at) {
+            self.reject_device_login(login_id, "cancelled", None)
+                .await?;
+            return Err(error);
+        }
+        if let Err(error) = self
+            .pending_device_codes
+            .insert(login_id, PendingDeviceCode::new(authorization.clone()))
         {
+            self.pending_transactions.release(login_id);
             self.reject_device_login(login_id, "cancelled", None)
                 .await?;
             return Err(error);
@@ -478,6 +485,7 @@ impl AuthService {
         };
         let login_id: Uuid = row.get("login_id");
         let pending = self.remove_pending_browser_login(login_id).await;
+        self.pending_transactions.release(login_id);
         if row.get::<String, _>("issuer") != oidc.issuer()
             || row.get::<String, _>("client_id") != oidc.client_id()
             || row.get::<String, _>("audience") != oidc.client_id()
@@ -629,16 +637,19 @@ impl AuthService {
             .bind(login_id).bind(interval(self.limits.device_poll_lease)).bind(poll_lease_token.as_slice()).bind(oidc.issuer()).bind(oidc.client_id()).fetch_optional(&mut *claim_transaction).await.map_err(database_error)?.ok_or(AuthError::DeviceBusy { retry_after_seconds: poll_interval_seconds })?;
         self.commit_current(claim_transaction).await?;
         let recovery_generation: i64 = claimed.get("recovery_generation");
-        let pending = self.pending_device_codes.take(login_id).await;
+        let pending = self.pending_device_codes.take(login_id);
         let Some(pending) = pending else {
-            self.reject_device_login(login_id, "expired", Some(&poll_lease_token))
-                .await?;
+            let result = self
+                .reject_device_login(login_id, "expired", Some(&poll_lease_token))
+                .await;
+            self.pending_transactions.release(login_id);
+            result?;
             return Err(AuthError::DeviceExpired);
         };
         let identity = match oidc.poll_device(pending.authorization()).await {
             Ok(identity) => identity,
             Err(AuthError::DevicePending { .. }) => {
-                self.pending_device_codes.restore(login_id, pending).await;
+                self.pending_device_codes.restore(login_id, pending);
                 let mut transaction = self
                     .store
                     .begin_serializable()
@@ -661,7 +672,7 @@ impl AuthService {
                 });
             }
             Err(AuthError::DeviceSlowDown { .. }) => {
-                self.pending_device_codes.restore(login_id, pending).await;
+                self.pending_device_codes.restore(login_id, pending);
                 let mut transaction = self
                     .store
                     .begin_serializable()
@@ -711,18 +722,21 @@ impl AuthService {
                 .await?;
             return Err(AuthError::OidcInvalid);
         }
-        self.issue_human_credential(
-            identity.subject,
-            DeviceIssueBinding {
-                issuer: identity.issuer,
-                client_id: oidc.client_id().to_owned(),
-                login_id,
-                recovery_generation,
-                poll_interval_seconds,
-                poll_lease_token,
-            },
-        )
-        .await
+        let issued = self
+            .issue_human_credential(
+                identity.subject,
+                DeviceIssueBinding {
+                    issuer: identity.issuer,
+                    client_id: oidc.client_id().to_owned(),
+                    login_id,
+                    recovery_generation,
+                    poll_interval_seconds,
+                    poll_lease_token,
+                },
+            )
+            .await;
+        self.pending_transactions.release(login_id);
+        issued
     }
 
     /// Authenticates one opaque browser session cookie.
@@ -1701,7 +1715,7 @@ impl AuthService {
     }
 
     async fn remove_pending_browser_login(&self, login_id: Uuid) -> Option<PendingBrowserLogin> {
-        self.pending_browser_logins.lock().await.remove(&login_id)
+        self.pending_browser_logins.lock().ok()?.remove(&login_id)
     }
 
     /// Claims a device code after proving the polling possession secret.
@@ -1713,10 +1727,10 @@ impl AuthService {
         dead_code,
         reason = "The server polling route calls this auth boundary."
     )]
-    pub(crate) async fn take_device_code(
+    pub(crate) fn take_device_code(
         &self,
         login_id: Uuid,
-        poll_secret: DevicePollSecret,
+        poll_secret: &DevicePollSecret,
         stored_digest: &[u8],
     ) -> Result<PendingDeviceCode, AuthError> {
         if !self.digest_key.matches(poll_secret.expose(), stored_digest) {
@@ -1724,7 +1738,6 @@ impl AuthService {
         }
         self.pending_device_codes
             .take(login_id)
-            .await
             .ok_or(AuthError::DeviceExpired)
     }
 
@@ -1733,19 +1746,21 @@ impl AuthService {
         dead_code,
         reason = "The server polling route restores nonterminal provider responses."
     )]
-    pub(crate) async fn restore_device_code(&self, login_id: Uuid, device_code: PendingDeviceCode) {
-        self.pending_device_codes
-            .restore(login_id, device_code)
-            .await;
+    pub(crate) fn restore_device_code(&self, login_id: Uuid, device_code: PendingDeviceCode) {
+        self.pending_device_codes.restore(login_id, device_code);
     }
 
-    /// Clears every transient device code during shutdown or quarantine.
+    /// Clears every transient login secret during shutdown or quarantine.
     #[expect(
         dead_code,
         reason = "Shutdown and recovery quarantine call this lifecycle hook."
     )]
-    pub(crate) async fn clear_pending_device_codes(&self) {
-        self.pending_device_codes.clear().await;
+    pub(crate) fn clear_pending_device_codes(&self) {
+        self.pending_device_codes.clear();
+        if let Ok(mut logins) = self.pending_browser_logins.lock() {
+            logins.clear();
+        }
+        self.pending_transactions.clear();
     }
 
     async fn prune_expired_pending(&self) -> Result<(), AuthError> {
@@ -1773,6 +1788,7 @@ impl AuthService {
         .await
         .map_err(database_error)?;
         self.commit_current(transaction).await?;
+        self.pending_device_codes.prune_expired();
         Ok(())
     }
 
@@ -1814,6 +1830,7 @@ impl AuthService {
         )
         .await?;
         self.commit_current(transaction).await?;
+        self.pending_transactions.release(login_id);
         Ok(())
     }
 
@@ -4678,14 +4695,17 @@ pub(crate) mod tests {
                 &store, &key, login_id, "state", "binding", "nonce", "verifier",
             )
             .await;
-            service.pending_browser_logins.lock().await.insert(
-                login_id,
-                PendingBrowserLogin {
-                    verifier: Zeroizing::new("verifier".to_owned()),
-                    nonce: Zeroizing::new("nonce".to_owned()),
-                    expires_at: Instant::now() + Duration::from_secs(60),
-                },
-            );
+            service
+                .pending_browser_logins
+                .lock()
+                .expect("pending browser map")
+                .insert(
+                    login_id,
+                    PendingBrowserLogin {
+                        verifier: Zeroizing::new("verifier".to_owned()),
+                        nonce: Zeroizing::new("nonce".to_owned()),
+                    },
+                );
             assert!(matches!(
                 service
                     .complete_browser_login(
@@ -4699,7 +4719,7 @@ pub(crate) mod tests {
             assert!(!service
                 .pending_browser_logins
                 .lock()
-                .await
+                .expect("pending browser map")
                 .contains_key(&login_id));
             let audited: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE action='auth.browser.callback' AND decision='deny' AND outcome=$1")
                 .bind(expected).fetch_one(store.pool()).await.expect("read denial audit");

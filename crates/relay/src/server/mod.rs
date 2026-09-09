@@ -11,7 +11,7 @@ use std::sync::{
 };
 
 use axum::{
-    extract::State,
+    extract::{RawQuery, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -177,11 +177,19 @@ struct CallbackQuery {
 async fn browser_callback(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    axum::extract::Query(query): axum::extract::Query<CallbackQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Response, ApiFailure> {
-    gate(&state)?;
-    reject_mixed(&headers)?;
-    let binding = cookie(&headers, LOGIN_COOKIE)?.ok_or_else(ApiFailure::unauthenticated)?;
+    if gate(&state).is_err() || reject_mixed(&headers).is_err() {
+        return callback_failure_response(AuthError::Durable);
+    }
+    let query = match parse_callback_query(raw_query.as_deref()) {
+        Ok(query) => query,
+        Err(error) => return callback_failure_response(error),
+    };
+    let binding = match cookie(&headers, LOGIN_COOKIE) {
+        Ok(Some(binding)) => binding,
+        Ok(None) | Err(_) => return callback_failure_response(AuthError::OidcInvalid),
+    };
     let outcome = match (query.code, query.error) {
         (Some(code), None) => BrowserCallbackOutcome::Code(OidcCallbackCode::new(code)),
         (None, Some(_)) => BrowserCallbackOutcome::ProviderDenied,
@@ -217,6 +225,35 @@ async fn browser_callback(
         .headers_mut()
         .append(header::SET_COOKIE, cleared_cookie(LOGIN_COOKIE, true)?);
     Ok(no_store(response))
+}
+
+fn parse_callback_query(raw_query: Option<&str>) -> Result<CallbackQuery, AuthError> {
+    let raw_query = raw_query.ok_or(AuthError::OidcInvalid)?;
+    let mut state = None;
+    let mut code = None;
+    let mut error = None;
+    let mut issuer = None;
+    let mut session_state = None;
+    for (key, value) in url::form_urlencoded::parse(raw_query.as_bytes()) {
+        let target = match key.as_ref() {
+            "state" => &mut state,
+            "code" => &mut code,
+            "error" => &mut error,
+            "iss" => &mut issuer,
+            "session_state" => &mut session_state,
+            _ => return Err(AuthError::OidcInvalid),
+        };
+        if target.replace(value.into_owned()).is_some() {
+            return Err(AuthError::OidcInvalid);
+        }
+    }
+    Ok(CallbackQuery {
+        state: state.ok_or(AuthError::OidcInvalid)?,
+        code,
+        error,
+        iss: issuer,
+        session_state,
+    })
 }
 
 fn callback_failure_response(error: AuthError) -> Result<Response, ApiFailure> {
