@@ -1,0 +1,9 @@
+# RUSTSEC-2023-0071 is accepted only for public-key OIDC signature verification.
+# Private RSA operations would invalidate that exception and need a new review.
+disallowed-types = [
+    { path = "rsa::RsaPrivateKey", reason = "RUSTSEC-2023-0071: private RSA operations are outside the reviewed public-verification exception" },
+    { path = "openidconnect::core::CoreRsaPrivateSigningKey", reason = "RUSTSEC-2023-0071: relay OIDC verifies signatures and must not hold private RSA signing keys" },
+]
+disallowed-methods = [
+    { path = "openidconnect::core::CoreRsaPrivateSigningKey::from_pem", reason = "RUSTSEC-2023-0071: importing private RSA material invalidates the audit exception" },
+]

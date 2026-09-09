@@ -10,6 +10,9 @@
 resolver = "2"
 members = [
     "crates/protocol",
+    "crates/relay-protocol",
+    "crates/relay",
+    "crates/relay-client",
     "crates/knowledge",
     "crates/hostcheck",
     "crates/logging",
@@ -52,6 +55,9 @@ overlay = { package = "pohunek-overlay", path = "crates/overlay" }
 pohunek-paths = { path = "crates/paths" }
 pohunek-prompt = { path = "crates/prompt" }
 pohunek-protocol = { path = "crates/protocol" }
+pohunek-relay-protocol = { path = "crates/relay-protocol" }
+pohunek-relay = { path = "crates/relay" }
+pohunek-relay-client = { path = "crates/relay-client" }
 pohunek-terminal = { path = "crates/terminal" }
 pohunek-worker-protocol = { path = "crates/worker-protocol" }
 pohunek-session-worker = { path = "crates/session-worker" }
@@ -91,6 +97,21 @@ pulldown-cmark = "0.12"
 # Session identifiers need durable, globally collision-resistant generation.
 ulid = "1"
 zeroize = "1"
+axum = { version = "0.8.9", features = ["json", "macros", "ws"] }
+# Reuse the ring provider selected by reqwest/SQLx; enabling AWS-LC too makes
+# rustls default-provider selection ambiguous at native TLS startup.
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+http = "1"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "migrate", "macros", "time", "uuid", "tls-rustls"] }
+openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest"] }
+oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest"] }
+hmac = "0.12"
+hkdf = "0.12"
+subtle = "2"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "limit", "request-id", "trace"] }
+url = "2"
+uuid = { version = "1", features = ["v7", "serde"] }
 
 # Single source of truth for the released version. Every crate opts in via
 # `version.workspace = true`, so `scripts/release` only bumps it here.
@@ -119,6 +140,8 @@ unreachable_pub = "warn"
 rust_2018_idioms = "warn"
 
 [workspace.lints.clippy]
+disallowed_types = "deny"
+disallowed_methods = "deny"
 complexity = { level = "warn", priority = -1 }
 correctness = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }

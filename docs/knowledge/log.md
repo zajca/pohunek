@@ -2,6 +2,12 @@
 
 ## Unreleased (2026-08-12)
 
+- Documented the implemented reduced relay foundation: PostgreSQL fencing and
+  recovery, protected initial Owner/service-account provisioning, generic OIDC
+  browser and device authentication, bounded HTTPS account and credential
+  lifecycle, and the native HTTPS/keyring credential CLI. Kept host links,
+  routing, attach, account linking, complete team administration, provider
+  verification, and team clients explicitly deferred.
 - Documented shipped host-local stable identity and safe governance inspection:
   explicit never-enrolled state, exact principal-or-team owner, checked
   revisions, quarantine, owner-private persistence, doctor checks, CLI, SDK,

@@ -128,11 +128,13 @@ JSON control frames and raw attach bytes; it does not define a second protocol.
 
 ## Separate accepted team web surface
 
-The [optional team-relay design](../concepts/team-relay.md) is accepted but not
-implemented. The future Rust `pohunek-relayd` will be the single team-path
-authentication, authorization, routing, aggregation, and browser-API authority,
-and will serve a team-mode SPA. Team browser clients will use a typed relay API
-rather than forwarding arbitrary daemon NDJSON through a transparent tunnel.
+The [optional team-relay design](../concepts/team-relay.md) has an implemented
+foundation for generic OIDC authentication and bounded account and credential
+lifecycle. It has no team browser client or team WebUI. The future Rust
+`pohunek-relayd` will extend that foundation into the single team-path
+authorization, routing, aggregation, and browser-API authority, and will serve
+a team-mode SPA. Team browser clients will use a typed relay API rather than
+forwarding arbitrary daemon NDJSON through a transparent tunnel.
 
 The current `@pohunek/backend` runtime and the release/install instructions
 above remain supported after
@@ -141,5 +143,6 @@ surface. `pohunek-relayd` has no local mode. Owner and team WebUIs may share
 Svelte presentation components, but use separate explicit origins, API
 adapters, credentials, and state; neither silently falls back to the other.
 The Bun backend never becomes a team authorization or relay-routing authority.
-This accepted direction adds no usable relay command, endpoint, or
-configuration to the current release.
+The current foundation's native credential commands and bounded HTTPS endpoints
+do not create a team browser surface; [#86](https://github.com/zajca/pohunek/issues/86)
+owns that client.

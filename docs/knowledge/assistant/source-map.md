@@ -102,9 +102,12 @@ Web control center client:
 - `docs/design/track-b-web-control-center-plan-2026-07-22.md`
 - `docs/phases/04-browser-control-center.md`
 
-Accepted team-relay architecture (not yet implemented; normative contract in
-the RFC's identity, recovery, scheduling, resource, snapshot, catalog, audit,
-and dependency sections; reconciled by #91):
+Implemented reduced relay foundation and deferred team-relay architecture:
+PostgreSQL fencing and recovery, protected stopped-lifecycle provisioning,
+generic OIDC browser/device authentication, bounded HTTPS account and credential
+lifecycle, and native relay CLI are implemented. Host links, routing, attach,
+account linking, team administration, provider verification, and team clients
+remain deferred:
 
 - `docs/design/team-relay-control-plane-rfc.md`
 - `docs/architecture.md`
@@ -114,6 +117,23 @@ and dependency sections; reconciled by #91):
 - `docs/knowledge/safety/trust-model.md`
 - `docs/knowledge/guides/remote-hosts.md`
 - `docs/knowledge/guides/web-control-center.md`
+- `crates/relay-protocol/src/`
+- `crates/relay/migrations/`
+- `crates/relay/src/operator.rs`
+- `crates/relay/src/lifecycle.rs`
+- `crates/relay/src/lifecycle/local.rs`
+- `crates/relay/src/recovery/mod.rs`
+- `crates/relay/src/config.rs`
+- `crates/relay/src/store/`
+- `crates/relay/src/auth/`
+- `crates/relay/src/authorization/`
+- `crates/relay/src/admission/`
+- `crates/relay/src/server/mod.rs`
+- `crates/relay/src/runtime.rs`
+- `crates/relay/src/bin/pohunek-relayd.rs`
+- `crates/relay-client/src/`
+- `crates/cli/src/commands/relay.rs`
+- `crates/cli/src/commands/relay/`
 
 Shipped host-local identity and governance:
 

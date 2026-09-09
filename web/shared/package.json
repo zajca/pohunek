@@ -8,6 +8,11 @@
       "import": "./src/index.ts",
       "default": "./src/index.ts"
     },
+    "./relay": {
+      "types": "./src/relay.ts",
+      "import": "./src/relay.ts",
+      "default": "./src/relay.ts"
+    },
     "./fixtures/*": {
       "default": "./fixtures/*"
     }

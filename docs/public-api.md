@@ -12,7 +12,7 @@ Source of truth:
 - Rust SDK transport API: `crates/client`
 - Daemon dispatch behavior: `crates/daemon/src/api`
 
-## Status: Shipped v3 and Accepted Relay Evolution
+## Status: Shipped v3, Implemented Relay Foundation, and Deferred Relay Evolution
 
 ### Shipped now: protocol v3 owner paths
 
@@ -30,11 +30,26 @@ mutation RPC, team WebUI, share API, or public transfer API. Existing local,
 direct-overlay, native-GUI, and transparent owner-WebUI paths remain owner-only
 and unchanged.
 
-### Accepted, not yet implemented: optional team relay
+### Implemented relay foundation outside protocol v3
 
-The [team relay RFC](design/team-relay-control-plane-rfc.md) defines an accepted
-future extension, but none of its host-link or public relay API is part of the
-shipped contract yet. The extension keeps local Unix and direct overlay owner
+`pohunek-relayd` is an independently configured HTTPS authority, backed by
+PostgreSQL. It is not a `pohunekd` protocol-v3 endpoint and it does not add a
+host link, routing, attach, or team WebUI. The implemented bounded surface
+includes liveness/readiness, generic OIDC browser Authorization Code with PKCE
+and device authorization, account and credential lifecycle, and service-account
+credential lifecycle. It also has protected stopped-lifecycle `migrate`,
+`bootstrap`, `provision`, and recovery commands.
+
+The native `pohunek relay` commands use a separate HTTPS-only client and the OS
+keyring for `login`, `status`, `logout`, credential `rotate`, and interrupted
+rotation recovery. They bind a credential to one exact HTTPS origin. This is a
+foundation surface, not a complete team-management or host-control API.
+
+### Deferred optional team relay
+
+The [team relay RFC](design/team-relay-control-plane-rfc.md) defines the next
+extension. Its host-link and team API are not part of the shipped protocol-v3
+contract. The extension keeps local Unix and direct overlay owner
 paths unchanged and adds a separate Rust `pohunek-relayd` authority. A host will
 initiate an authenticated userspace WireGuard tunnel and every control and
 attach TCP stream; the public relay will never dial the host.
@@ -47,7 +62,9 @@ protocol-v4 cutover in [#70](https://github.com/zajca/pohunek/issues/70) will
 add the authenticated host link, `HostShare` coordinates, immutable session
 origin, atomic host snapshots, and host-initiated attach streams. There will be
 no v3 relay compatibility shim and no change to the direct-owner trust domain.
-The dependency path is [#85](https://github.com/zajca/pohunek/issues/85) →
+The dependency path after the completed reduced [#85](https://github.com/zajca/pohunek/issues/85) is
+[#107](https://github.com/zajca/pohunek/issues/107) and
+[#108](https://github.com/zajca/pohunek/issues/108) →
 [#92](https://github.com/zajca/pohunek/issues/92) → complete
 [#72](https://github.com/zajca/pohunek/issues/72), followed by #70, #82, #83,
 #84, and [#71](https://github.com/zajca/pohunek/issues/71).

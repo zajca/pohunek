@@ -10,8 +10,10 @@ intents: [setup, project, debug, help]
 # Remote Hosts
 
 This guide documents the current protocol-v3 owner path over configured
-overlays. The [optional team relay](../concepts/team-relay.md) is accepted but
-not implemented, and it has no commands in current releases.
+overlays. The [optional team relay](../concepts/team-relay.md) has an
+implemented authentication and credential foundation, including native `pohunek
+relay` commands, but it provides no remote-host enrollment, routing, attach, or
+team client. Those commands do not alter the owner path described here.
 
 Remote behavior is host-aware. The CLI uses `--host <host>` for commands that
 target a host, and session targets can use `<host>/<session-id>`.
@@ -100,13 +102,15 @@ overlay does not hide healthy peers from another overlay; discovery reports an
 error only when every provider fails.
 
 The future public team relay does not replace this direct overlay model and does
-not require NetBird. An enrolled `pohunekd` will initiate its own userspace
-WireGuard link and all control and attach streams to one relay. Independently
+not require NetBird. After host enrollment and transport work land, an enrolled
+`pohunekd` will initiate its own userspace WireGuard link and all control and
+attach streams to one relay. Independently
 approved `HostShare` records can expose bounded project, profile, operation, and
 resource capacity to multiple teams. Local and direct-overlay sessions remain
 owner-only and never appear through the relay; only sessions created through a
-share are eligible. Relay enrollment and CLI authorization will use OIDC device
-flow, with no loopback fallback; browser login will use Authorization Code with
-PKCE. Until the implementation issues linked from the
-[team-relay concept](../concepts/team-relay.md) land, use only the owner commands
-documented above.
+share are eligible. The implemented foundation already provides generic OIDC
+device flow and browser Authorization Code with PKCE for its credential
+lifecycle, with no loopback fallback. It does not authorize host enrollment or
+relay-created sessions. Until the host-link, routing, and team-client issues
+linked from the [team-relay concept](../concepts/team-relay.md) land, use only
+the owner commands documented above for remote hosts.

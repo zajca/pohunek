@@ -23,6 +23,10 @@ use protocol::{ErrorClass, ProtocolError};
 /// CLI error.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CliError {
+    /// A relay or native credential store operation failed safely.
+    #[error(transparent)]
+    Relay(#[from] crate::commands::relay::Error),
+
     /// A required environment variable is missing (fail fast, no invented path).
     #[error("required environment variable {var} is not set (no safe default exists)")]
     MissingEnv {
@@ -173,6 +177,9 @@ impl CliError {
     )]
     pub(crate) fn to_protocol_error(&self) -> ProtocolError {
         match self {
+            CliError::Relay(error) => {
+                ProtocolError::new(ErrorClass::Runtime, "relay_error", error.to_string(), None)
+            }
             CliError::Protocol(err) => err.clone(),
             CliError::Client(err) => err.to_protocol_error(),
             CliError::Prompt(err) => ProtocolError::new(

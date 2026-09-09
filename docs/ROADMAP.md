@@ -252,7 +252,7 @@ tracked by [#73](https://github.com/zajca/pohunek/issues/73). Presentation
 components may be shared, but owner and team transports, credentials, state,
 and origins remain explicit with no cross-mode fallback.
 
-### Track R — Optional Team Relay *(accepted; not implemented)*
+### Track R — Optional Team Relay *(foundation implemented; transport and team surfaces deferred)*
 
 Umbrella: [#56](https://github.com/zajca/pohunek/issues/56). Source of truth:
 the [accepted team-relay RFC](design/team-relay-control-plane-rfc.md).
@@ -274,11 +274,15 @@ live blocker graph:
    [#81](https://github.com/zajca/pohunek/issues/81) provide configured overlays,
    the original accepted design, and host-local governance. [#91](https://github.com/zajca/pohunek/issues/91)
    reconciles the normative RFC and canonical documentation.
-2. [#85](https://github.com/zajca/pohunek/issues/85) supplies the Rust relay,
-   PostgreSQL, OIDC, teams, authorization, durable audit/admission, database
-   lease fencing, and restore quarantine. [#92](https://github.com/zajca/pohunek/issues/92)
-   then supplies the Keycloak-brokered Google/GitHub verification and bounded
-   external-evidence flow. Only then can [#72](https://github.com/zajca/pohunek/issues/72)
+2. Completed [#85](https://github.com/zajca/pohunek/issues/85) supplies the
+   Rust relay foundation: PostgreSQL, lease fencing, recovery quarantine,
+   protected initial Owner/service-account provisioning, generic OIDC browser
+   and device login, bounded HTTPS auth/account/credential operations, and the
+   native credential CLI. [#107](https://github.com/zajca/pohunek/issues/107)
+   adds account linking, [#108](https://github.com/zajca/pohunek/issues/108)
+   adds team administration, and [#92](https://github.com/zajca/pohunek/issues/92)
+   supplies Keycloak-brokered Google/GitHub verification and bounded external
+   evidence. Only then can [#72](https://github.com/zajca/pohunek/issues/72)
    complete host enrollment and the userspace WireGuard/TCP transport.
 3. After that foundation, [#70](https://github.com/zajca/pohunek/issues/70),
    [#82](https://github.com/zajca/pohunek/issues/82),
@@ -299,10 +303,12 @@ live blocker graph:
 ## 4. Deferred / out of scope
 
 - **Application auth in the shipped mesh-local Bun backend** — intentionally
-  absent under the owner-path NetBird/filesystem trust boundary. The future
-  team relay does require OIDC, service accounts, RBAC, and session ACLs from
-  its first complete release; [#85](https://github.com/zajca/pohunek/issues/85)
-  and [#83](https://github.com/zajca/pohunek/issues/83) own that work.
+  absent under the owner-path NetBird/filesystem trust boundary. The separate
+  relay foundation now provides generic OIDC and credential lifecycle; its
+  account linking, complete team administration, and session ACLs remain
+  [#107](https://github.com/zajca/pohunek/issues/107),
+  [#108](https://github.com/zajca/pohunek/issues/108), and
+  [#83](https://github.com/zajca/pohunek/issues/83).
 - **In-tree provider adapters in the chassis** — never; providers stay shell-out
   (`gh`) / GraphQL (Linear) in the clients.
 - **libghostty / GTK / Electron native GUI** — dropped (replaced by the pure-native
@@ -316,7 +322,7 @@ live blocker graph:
 ## 5. Recommended sequence
 
 Tracks S, D, and Browser M1 are shipped and remain usable throughout the relay
-work. The next sequence is Track R exactly as ordered above: #91 → #85 → #92 →
+work. The remaining Track R sequence is #91 → completed #85 → #107/#108/#92 →
 complete #72 → #70/#82/#83/#84/#71 → #86 and #87 → post-release #73/#88.
 Existing owner-path work may
 continue independently only when it does not create a second production relay
