@@ -46,25 +46,25 @@ connection. Each host daemon remains authoritative for its sessions and each
 worker remains authoritative for one live PTY. This owner WebUI remains a
 supported local/direct-overlay path after the team relay ships.
 
-Pohunek also has an [accepted optional team-relay design](team-relay.md), but it
-is not implemented. The future relay is additive: standalone and direct
-NetBird modes remain independent. Hosts initiate every userspace WireGuard,
-control, and attach connection to a public Rust relay. The relay owns teams,
-principals, roles, session ACLs, routing, and aggregation; the daemon recognizes
-only the enrolled relay and enforces locally approved `HostShare` and immutable
-session-origin limits. Local and direct-overlay sessions never enter relay
-state. The relay has no local mode; its team WebUI and the retained owner WebUI
-use separate explicit API adapters, credentials, state, and origins.
+Pohunek has an [optional team-relay design](team-relay.md) with an implemented
+reduced foundation. The PostgreSQL-backed relay provides fencing, recovery,
+protected initial provisioning, generic OIDC browser/device authentication, and
+bounded HTTPS account and credential lifecycle. Standalone and direct NetBird
+modes remain independent. Host links, `HostShare`, session origin, routing,
+attach, team administration, and the team WebUI remain deferred. The relay has
+no local mode; its future team WebUI and the retained owner WebUI use separate
+explicit API adapters, credentials, state, and origins.
 
-Protocol v4 and the typed relay API will arrive only through their linked
-implementation issues. Assistants must not infer future commands or fields from
-the RFC; verify currently available behavior in `docs/public-api.md` through
-the [source map](../assistant/source-map.md).
+Protocol v4 and the typed host/team API will arrive only through their linked
+implementation issues. The current bounded foundation API and native relay CLI
+do not imply a host or team surface. Assistants must not infer future commands
+or fields from the RFC; verify currently available behavior in
+`docs/public-api.md` through the [source map](../assistant/source-map.md).
 
 The planned relay contract is normative only in the RFC sections on identity,
 recovery, scheduling, resources, snapshots, catalog, audit, and dependencies.
-Its implementation
-path is #85 → #92 → complete #72 → #70/#82/#83/#84/#71 → #86 and #87, then
+Its implementation path is completed reduced #85 → #107/#108/#92 → complete
+#72 → #70/#82/#83/#84/#71 → #86 and #87, then
 post-release #73/#88. The first relay release trusts collaborators at the host
 Unix-account boundary; its ACLs do not provide workload isolation.
 

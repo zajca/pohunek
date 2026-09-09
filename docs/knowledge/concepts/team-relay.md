@@ -2,20 +2,22 @@
 type: Concept
 id: concept/team-relay
 title: Optional team relay
-description: Accepted, not-yet-implemented architecture for sharing explicitly approved host capacity through a trusted multi-team relay.
+description: Implemented relay foundation and deferred architecture for sharing explicitly approved host capacity through a trusted multi-team relay.
 source_kind: manual
 intents: [setup, project, update, debug, help]
 ---
 
 # Optional Team Relay
 
-Status: the relay foundation has an owner-private stopped-lifecycle bootstrap
-and initial provisioning procedure. It has no public relay endpoint, host link,
-team client, team WebUI, routing, attach path, or host enrollment. Current
-Pohunek releases otherwise use public protocol v3 through an owner-only Unix
-socket or a direct configured overlay such as NetBird. The shipped Bun web
-backend is a transparent mesh-local browser transport, not the team relay
-described here.
+Status: the reduced relay foundation is implemented. It has PostgreSQL-backed
+lease fencing and recovery, protected stopped-lifecycle initial Owner and
+service-account provisioning, generic OIDC browser and device login, bounded
+HTTPS account and credential lifecycle, and a native HTTPS/keyring CLI. It has
+no host link, team client or WebUI, routing, attach path, host enrollment,
+account linking, or complete team-administration API. Current Pohunek releases
+otherwise use public protocol v3 through an owner-only Unix socket or a direct
+configured overlay such as NetBird. The shipped Bun web backend is a transparent
+mesh-local browser transport, not the team relay described here.
 
 ## Local foundation provisioning
 
@@ -62,11 +64,35 @@ fallback or session aggregation.
 The accepted design adds one optional public Rust `pohunek-relayd` authority.
 Standalone and direct NetBird operation remain first-class and never depend on
 the relay. A host may use either owner mode, enroll with the relay, or use both
-at the same time. NetBird is neither replaced nor required by the relay.
+at the same time after enrollment is implemented. NetBird is neither replaced
+nor required by the relay.
+
+## Foundation authentication and native credentials
+
+The running relay serves a bounded HTTPS API for generic OpenID Connect browser
+Authorization Code with PKCE and device authorization. Browser and bearer
+authentication remain separate. Login transaction state is bound to its issuer,
+redirect URI, nonce, verifier, cookie binding, expiry, and recovery generation;
+browser and device transactions share one bounded pending-login capacity.
+
+The API exposes only account, human credential, and service-account credential
+lifecycle needed by this foundation. `pohunek relay login`, `status`, `logout`,
+`rotate`, and `resume-rotation` use an HTTPS-only native client and origin-bound
+OS-keyring storage. Credentials expire, are delivered once, and are never put in
+URLs, routine output, or logs. A keyring write failure attempts compensating
+revocation.
+
+This generic OIDC implementation contains no Keycloak-specific provider or
+social-account verification. Account linking is deferred to
+[#107](https://github.com/zajca/pohunek/issues/107), complete team
+administration to [#108](https://github.com/zajca/pohunek/issues/108), and
+Keycloak-brokered Google/GitHub verification to
+[#92](https://github.com/zajca/pohunek/issues/92).
 
 ## Topology and connection direction
 
-`pohunekd` embeds the host connector. It initiates a userspace WireGuard tunnel
+After the host-link work lands, `pohunekd` will embed the host connector. It will
+initiate a userspace WireGuard tunnel
 to the relay's public UDP endpoint and then initiates every control and attach
 TCP stream inside that tunnel. The relay never dials a host, and neither side
 needs a kernel WireGuard interface or `CAP_NET_ADMIN`. One host can have at most
@@ -142,10 +168,10 @@ protect against an operator with process access. Direct-host profiles also run
 under the daemon owner's account and are not hostile-workload isolation;
 container and VM isolation remains separate future work.
 
-Relay identity, authorization, catalog, and structured audit metadata will be
-PostgreSQL-only. #85 supplies durable audit and admission foundations, including
-fail-closed sensitive admission when its durable decision/audit store is
-unavailable; #87 supplies operational retention and load evidence. PTY output,
+The implemented relay foundation stores its identity, authentication,
+credentials, recovery state, and structured audit metadata in PostgreSQL. It
+fails stopped on fencing, database, witness, audit, or recovery failure. #87
+supplies operational retention and load evidence. PTY output,
 input, prompts, terminal snapshots, file contents, and raw secrets are never
 persisted by the relay or included in its logs or audit records. RFC §19 defines
 recovery generation, while §17 defines catalog retention, audit, and admission.
@@ -166,7 +192,9 @@ sections; use the
 [source map](../assistant/source-map.md) to locate it in a source checkout. The
 umbrella is [#56](https://github.com/zajca/pohunek/issues/56); implementation is
 split among completed host identity [#81](https://github.com/zajca/pohunek/issues/81),
-relay foundation [#85](https://github.com/zajca/pohunek/issues/85), verified
+the reduced relay foundation [#85](https://github.com/zajca/pohunek/issues/85),
+account linking [#107](https://github.com/zajca/pohunek/issues/107), team
+administration [#108](https://github.com/zajca/pohunek/issues/108), verified
 Keycloak-brokered external evidence [#92](https://github.com/zajca/pohunek/issues/92),
 then transport [#72](https://github.com/zajca/pohunek/issues/72), protocol v4
 [#70](https://github.com/zajca/pohunek/issues/70), shares

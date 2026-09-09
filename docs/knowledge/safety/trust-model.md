@@ -99,16 +99,19 @@ boundaries in [secrets](secrets.md) and [repo `.pohunek/`](repo-pohunek.md).
 
 ## Accepted team-relay boundary
 
-The [optional team relay](../concepts/team-relay.md) is accepted architecture,
-not shipped functionality. Do not invent relay commands, configuration keys,
-protocol fields, or recovery steps. Current protocol-v3 local, overlay, and Bun
-browser paths remain one owner trust domain and remain supported after the
-relay ships. The relay has no local mode. Owner and team browser surfaces must
-not exchange credentials, state, or silently fall back between their explicit
-origins and API adapters.
+The [optional team relay](../concepts/team-relay.md) has an implemented reduced
+foundation: PostgreSQL-backed fencing and recovery, protected local
+provisioning, generic OIDC authentication, bounded HTTPS account and credential
+lifecycle, and a native HTTPS/keyring CLI. Do not invent host-link, routing,
+attach, team-administration, account-linking, provider-verification, or team
+browser commands, configuration keys, protocol fields, or recovery steps.
+Current protocol-v3 local, overlay, and Bun browser paths remain one owner trust
+domain and remain supported alongside the foundation. The relay has no local
+mode. Owner and team browser surfaces must not exchange credentials, state, or
+silently fall back between their explicit origins and API adapters.
 
-When relay support is implemented, preserve these independent authorization
-responsibilities:
+The implemented foundation authenticates generic OIDC subjects and credentials;
+future relay work must preserve these independent authorization responsibilities:
 
 - The relay authenticates and authorizes human principals, service accounts,
   teams, groups, roles, and session ACLs.
@@ -125,12 +128,13 @@ responsibilities:
   permissions from different shares are never composed for one operation.
 
 The planned relay uses Keycloak as the reference broker for Google and GitHub,
-but Pohunek stays provider-neutral. Verified external eligibility is evidence,
-not an editable profile attribute: it expires no later than 60 minutes after
-authoritative upstream verification, and token refresh, activity, restart,
-unknown state, or provider failure cannot extend it. Confirmed removal and local
-revocation cancel affected relay access, including idle streams, without
-stopping host sessions. RFC §13 is normative; #92 owns this before #72 completes.
+but the implemented foundation remains provider-neutral. Verified external
+eligibility is deferred to [#92](https://github.com/zajca/pohunek/issues/92);
+it will be evidence, not an editable profile attribute, and it expires no later
+than 60 minutes after authoritative upstream verification. Token refresh,
+activity, restart, unknown state, or provider failure cannot extend it.
+Confirmed removal and local revocation cancel affected relay access, including
+idle streams, without stopping host sessions. RFC §13 is normative.
 
 The relay is explicitly trusted with transient terminal plaintext and all
 authority granted by active shares. A compromised relay can exercise that

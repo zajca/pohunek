@@ -17,11 +17,12 @@ Pohunek has two explicit trust domains:
   owner-private Unix socket or directly through a configured private overlay.
   NetBird is the production overlay. These paths require no central service and
   remain supported when no relay is configured.
-- **Optional team relay, accepted but not implemented.** A host may enroll with
-  one trusted public Rust relay and locally approve bounded `HostShare` records
-  for one or more teams. The relay owns end-user and service-account
-  authorization; the daemon owns the host-side share ceiling and session-origin
-  boundary. Enrolling does not replace or require NetBird.
+- **Optional team relay, reduced foundation implemented.** `pohunek-relayd`
+  provides PostgreSQL-backed fenced authority, recovery, protected local
+  provisioning, generic OIDC authentication, and bounded HTTPS account and
+  credential operations. Host enrollment, shares, routing, attach, team clients,
+  and team administration remain deferred. Enrolling does not replace or require
+  NetBird.
 
 The following invariants span both domains:
 
@@ -45,13 +46,13 @@ The following invariants span both domains:
 | Direct configured-overlay operation, including NetBird | Shipped in public protocol v3 | Existing daemon and clients; generic overlay work completed in [#69](https://github.com/zajca/pohunek/issues/69) |
 | Local/direct-overlay transparent Bun browser backend | Shipped and retained owner-path client transport | Existing `web/backend`; team web mode is separate work in [#86](https://github.com/zajca/pohunek/issues/86) |
 | Stable host identity, one exact principal-or-team owner, checked revisions, local lifecycle, and safe v3 inspection | Shipped host-local foundation; no relay API or mutation surface | [#81](https://github.com/zajca/pohunek/issues/81) |
-| Rust relay foundation, PostgreSQL, OIDC, principals, teams, roles, service accounts, durable audit, admission, and recovery quarantine | Accepted, not implemented | [#85](https://github.com/zajca/pohunek/issues/85) |
+| Rust relay foundation: PostgreSQL, lease fencing, recovery quarantine, protected initial Owner/service-account provisioning, generic OIDC, HTTPS auth/account/credential operations, and native credential CLI | Implemented reduced foundation; no host link, routing, attach, account linking, or team administration API | [#85](https://github.com/zajca/pohunek/issues/85); follow-up [#107](https://github.com/zajca/pohunek/issues/107), [#108](https://github.com/zajca/pohunek/issues/108), [#92](https://github.com/zajca/pohunek/issues/92), and [#86](https://github.com/zajca/pohunek/issues/86) |
 | Verified Keycloak-brokered social identity and bounded external eligibility | Accepted, not implemented; blocks completion of transport enrollment | [#92](https://github.com/zajca/pohunek/issues/92) |
 | Host-initiated userspace WireGuard link | Accepted, not implemented; transport completion follows #92 | [#72](https://github.com/zajca/pohunek/issues/72) |
 | Public protocol v4 relay host link, `SessionOrigin`, and daemon share guards | Accepted, not implemented | [#70](https://github.com/zajca/pohunek/issues/70) |
 | Locally approved `HostShare` and relay-side session ACLs | Accepted, not implemented | [#82](https://github.com/zajca/pohunek/issues/82), [#83](https://github.com/zajca/pohunek/issues/83) |
 | Atomic snapshot/watermark synchronization without replay | Accepted, not implemented | [#84](https://github.com/zajca/pohunek/issues/84) |
-| Relay routing, aggregation, attach proxy, API, clients, and operations | Accepted, not implemented | [#71](https://github.com/zajca/pohunek/issues/71), [#86](https://github.com/zajca/pohunek/issues/86), [#87](https://github.com/zajca/pohunek/issues/87) |
+| Relay routing, aggregation, attach proxy, host/team API, and team clients | Accepted, not implemented; the bounded foundation HTTPS API is not a host or team surface | [#71](https://github.com/zajca/pohunek/issues/71), [#86](https://github.com/zajca/pohunek/issues/86), [#87](https://github.com/zajca/pohunek/issues/87) |
 
 ## Goals
 
@@ -174,7 +175,7 @@ direct NetBird/WireGuard owner access, the native GUI, and the transparent owner
 WebUI remain available. Local unenrollment does not stop PTYs, revoke those
 owner paths, or create a relay-local mode.
 
-### Accepted optional relay topologies
+### Deferred optional relay topologies
 
 The relay design adds two topologies without changing the two owner topologies:
 
@@ -214,8 +215,10 @@ WireGuard and bounded IPv4/TCP in process, with no kernel interface, system
 route, privileged helper, or `CAP_NET_ADMIN`. This transport belongs to
 [#72](https://github.com/zajca/pohunek/issues/72).
 
-The planned production relay is the single Rust `pohunek-relayd` authorization,
-routing, aggregation, audit, and quota authority, backed by PostgreSQL. The
+The implemented relay foundation is a PostgreSQL-backed, fenced HTTPS authority
+for generic authentication and credential lifecycle. The planned production
+relay extends it with routing, aggregation, team authorization, audit, and quota
+authority. The
 current Bun backend remains the production owner-path WebUI gateway for its
 local daemon and direct-overlay peers. It is not a relay authority and is not
 replaced by [#86](https://github.com/zajca/pohunek/issues/86). The Rust relay has
