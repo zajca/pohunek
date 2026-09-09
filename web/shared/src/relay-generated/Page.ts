@@ -5,4 +5,4 @@ import type { Record } from "./Record";
 /**
  * A stable page of revisioned records.
  */
-export type Page = { records: Array<Record> };
+export type Page = { records: Array<Record>; next_cursor: string | null };

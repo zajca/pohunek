@@ -30,6 +30,7 @@ pub struct PageRequest {
 #[serde(deny_unknown_fields)]
 pub struct Page {
     pub records: Vec<Record>,
+    pub next_cursor: Option<Uuid>,
 }
 
 /// Public UUID coordinate and optimistic revision.
@@ -143,7 +144,7 @@ pub struct RemoveRequest {
     pub expected_revision: i64,
     pub idempotency: Idempotency,
 }
-/// Changes a group member.
+/// Assigns or removes a custom role for one member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export))]
@@ -221,7 +222,7 @@ pub struct UpdateGrantRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::{GrantSubject, MemberRecord, MembershipPage};
+    use super::{GrantSubject, MemberRecord, MembershipPage, Page, Record};
     use uuid::Uuid;
 
     #[test]
@@ -247,5 +248,20 @@ mod tests {
             serde_json::from_value::<MembershipPage>(value).expect("deserialize membership page"),
             page
         );
+    }
+
+    #[test]
+    fn pages_keep_the_cursor_and_revisions_as_wire_strings() {
+        let cursor = Uuid::now_v7();
+        let page = Page {
+            records: vec![Record {
+                id: Uuid::nil(),
+                revision: 7,
+            }],
+            next_cursor: Some(cursor),
+        };
+        let value = serde_json::to_value(&page).expect("serialize page");
+        assert_eq!(value["records"][0]["revision"], "7");
+        assert_eq!(value["next_cursor"], cursor.to_string());
     }
 }

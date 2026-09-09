@@ -186,8 +186,25 @@ pub(crate) async fn audit_read(
     correlation_id: Uuid,
     parameter_value: &str,
 ) -> Result<(), StoreError> {
-    sqlx::query("INSERT INTO audit_events (audit_id,actor_principal_id,actor_kind,team_id,action,decision,policy_generation,recovery_generation,correlation_id,parameter_code,parameter_value,outcome) SELECT $1,$2,$3,$4,$5,'allow',COALESCE((SELECT policy_generation FROM teams WHERE team_id=$4),1),$6,$7,'page',$8,'committed'")
-        .bind(Uuid::now_v7()).bind(actor.principal_id()).bind(crate::store::actor_kind_name(actor.kind())).bind(team_id).bind(action).bind(actor.recovery_generation()).bind(correlation_id).bind(parameter_value)
-        .execute(&mut **transaction).await.map_err(|_error| StoreError::AuditUnavailable)?;
+    let inserted = sqlx::query(
+        "INSERT INTO audit_events (audit_id,actor_principal_id,actor_kind,team_id,action,decision,policy_generation,recovery_generation,correlation_id,parameter_code,parameter_value,outcome) \
+         SELECT $1,$2,$3,$4,$5,'allow',CASE WHEN $4 IS NULL THEN r.revision ELSE t.policy_generation END,r.recovery_generation,$6,'page',$7,'committed' \
+         FROM relay_identity r LEFT JOIN teams t ON t.team_id=$4 \
+         WHERE r.state='normal' AND r.recovery_generation=$8 AND ($4 IS NULL OR t.team_id IS NOT NULL)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(actor.principal_id())
+    .bind(crate::store::actor_kind_name(actor.kind()))
+    .bind(team_id)
+    .bind(action)
+    .bind(correlation_id)
+    .bind(parameter_value)
+    .bind(actor.recovery_generation())
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_error| StoreError::AuditUnavailable)?;
+    if inserted.rows_affected() != 1 {
+        return Err(StoreError::AuditUnavailable);
+    }
     Ok(())
 }

@@ -340,50 +340,74 @@ macro_rules! management_read {
             team_id: Uuid,
             page: $page,
         ) -> Result<ListPage<$record>, AuthorityError> {
-            if self.closed.load(Ordering::Acquire) {
-                return Err(AuthorityError::Cancelled);
-            }
-            let mut transaction = self.store.begin_serializable().await?;
-            if let Err(error) = self.verify_fence_in_transaction(&mut transaction).await {
-                return Err(error);
-            }
-            if let Err(error) =
-                require_team_permission(&mut transaction, actor, team_id, $permission).await
-            {
-                return Err(self.management_pre_gate_error(error));
-            }
             let limit = page.limit;
             let correlation_id = page.correlation_id;
-            let records = self
-                .store
-                .$method(&mut transaction, team_id, page)
+            'read: for _attempt in 0..MANAGEMENT_TRANSACTION_MAX_ATTEMPTS {
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(AuthorityError::Cancelled);
+                }
+                let mut transaction = match begin_management_read(&self.store).await {
+                    Ok(transaction) => transaction,
+                    Err(error) => return Err(self.management_pre_gate_error(error)),
+                };
+                if let Err(error) = self.verify_fence_in_transaction(&mut transaction).await {
+                    return Err(error);
+                }
+                if let Err(error) =
+                    require_team_permission(&mut transaction, actor, team_id, $permission).await
+                {
+                    return Err(self.management_pre_gate_error(error));
+                }
+                if let Err(error) =
+                    lock_team_read_authorization_state(&mut transaction, team_id).await
+                {
+                    return Err(self.management_pre_gate_error(error));
+                }
+                if let Err(error) =
+                    require_team_permission(&mut transaction, actor, team_id, $permission).await
+                {
+                    return Err(self.management_pre_gate_error(error));
+                }
+                let records = self
+                    .store
+                    .$method(&mut transaction, team_id, page)
+                    .await
+                    .map_err(|error| self.management_pre_gate_error(error))?;
+                #[cfg(test)]
+                self.pause_read().await?;
+                if let Err(error) =
+                    require_team_permission(&mut transaction, actor, team_id, $permission).await
+                {
+                    return Err(self.management_pre_gate_error(error));
+                }
+                let result = page_result(records, limit, |record: &$record| record.$cursor)?;
+                if let Err(error) = audit_read(
+                    &mut transaction,
+                    actor,
+                    Some(team_id),
+                    $action,
+                    correlation_id,
+                    "page",
+                )
                 .await
-                .map_err(|error| self.management_pre_gate_error(error))?;
-            #[cfg(test)]
-            self.pause_read().await?;
-            let result = page_result(records, limit, |record: &$record| record.$cursor)?;
-            if let Err(error) = audit_read(
-                &mut transaction,
-                actor,
-                Some(team_id),
-                $action,
-                correlation_id,
-                "page",
-            )
-            .await
-            {
-                self.close_all();
-                return Err(error.into());
+                {
+                    self.close_all();
+                    return Err(error.into());
+                }
+                if let Err(error) = self.verify_fence_in_transaction(&mut transaction).await {
+                    self.close_all();
+                    return Err(error);
+                }
+                match transaction.commit().await.map_err(StoreError::Database) {
+                    Ok(()) => return Ok(result),
+                    Err(error) if is_retryable_management_error(&error) => continue 'read,
+                    Err(error) => {
+                        self.close_all();
+                        return Err(error.into());
+                    }
+                }
             }
-            if let Err(error) = self.verify_fence_in_transaction(&mut transaction).await {
-                self.close_all();
-                return Err(error);
-            }
-            if let Err(error) = transaction.commit().await.map_err(StoreError::Database) {
-                self.close_all();
-                return Err(error.into());
-            }
-            Ok(result)
+            Err(AuthorityError::Store(StoreError::Contended))
         }
     };
 }
@@ -669,43 +693,61 @@ impl Authority {
         actor: ActorContext,
         page: TeamPage,
     ) -> Result<ListPage<TeamRecord>, AuthorityError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(AuthorityError::Cancelled);
-        }
-        let mut transaction = self.store.begin_serializable().await?;
-        self.verify_fence_in_transaction(&mut transaction).await?;
-        if let Err(error) = verify_current_actor(&mut transaction, actor).await {
-            return Err(self.management_pre_gate_error(error));
-        }
         let limit = page.limit;
         let correlation_id = page.correlation_id;
-        let records = self
-            .store
-            .list_teams_in_transaction(&mut transaction, actor, page)
+        'read: for _attempt in 0..MANAGEMENT_TRANSACTION_MAX_ATTEMPTS {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(AuthorityError::Cancelled);
+            }
+            let mut transaction = match begin_management_read(&self.store).await {
+                Ok(transaction) => transaction,
+                Err(error) => return Err(self.management_pre_gate_error(error)),
+            };
+            self.verify_fence_in_transaction(&mut transaction).await?;
+            if let Err(error) = verify_current_actor(&mut transaction, actor).await {
+                return Err(self.management_pre_gate_error(error));
+            }
+            if let Err(error) = lock_visible_team_list_state(&mut transaction, actor).await {
+                return Err(self.management_pre_gate_error(error));
+            }
+            if let Err(error) = verify_current_actor(&mut transaction, actor).await {
+                return Err(self.management_pre_gate_error(error));
+            }
+            let records = self
+                .store
+                .list_teams_in_transaction(&mut transaction, actor, page)
+                .await
+                .map_err(|error| self.management_pre_gate_error(error))?;
+            #[cfg(test)]
+            self.pause_read().await?;
+            if let Err(error) = verify_current_actor(&mut transaction, actor).await {
+                return Err(self.management_pre_gate_error(error));
+            }
+            let result = page_result(records, limit, |record: &TeamRecord| record.team_id)?;
+            if let Err(error) = audit_read(
+                &mut transaction,
+                actor,
+                None,
+                "team.list",
+                correlation_id,
+                "page",
+            )
             .await
-            .map_err(|error| self.management_pre_gate_error(error))?;
-        #[cfg(test)]
-        self.pause_read().await?;
-        let result = page_result(records, limit, |record: &TeamRecord| record.team_id)?;
-        if let Err(error) = audit_read(
-            &mut transaction,
-            actor,
-            None,
-            "team.list",
-            correlation_id,
-            "page",
-        )
-        .await
-        {
-            self.close_all();
-            return Err(error.into());
+            {
+                self.close_all();
+                return Err(error.into());
+            }
+            self.verify_fence_in_transaction(&mut transaction).await?;
+            match transaction.commit().await.map_err(StoreError::Database) {
+                Ok(()) => return Ok(result),
+                Err(error) if is_retryable_management_error(&error) => continue 'read,
+                Err(error) => {
+                    self.close_all();
+                    return Err(error.into());
+                }
+            }
         }
-        self.verify_fence_in_transaction(&mut transaction).await?;
-        if let Err(error) = transaction.commit().await.map_err(StoreError::Database) {
-            self.close_all();
-            return Err(error.into());
-        }
-        Ok(result)
+        Err(AuthorityError::Store(StoreError::Contended))
     }
 
     fn management_pre_gate_error(&self, error: StoreError) -> AuthorityError {
@@ -1755,6 +1797,74 @@ fn page_result<T>(
     })
 }
 
+async fn begin_management_read(store: &Store) -> Result<Transaction<'_, Postgres>, StoreError> {
+    let mut transaction = store.pool().begin().await.map_err(StoreError::Database)?;
+    // A management acknowledgement must observe a permission revocation that
+    // committed while this read waited for its row locks. PostgreSQL's
+    // serializable snapshots intentionally preserve the older view in that
+    // overlap, so the current authorization transaction uses read committed.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *transaction)
+        .await
+        .map_err(StoreError::Database)?;
+    Ok(transaction)
+}
+
+async fn lock_team_read_authorization_state(
+    transaction: &mut Transaction<'_, Postgres>,
+    team_id: Uuid,
+) -> Result<(), StoreError> {
+    // These queries lock only the RBAC rows for the requested team. Together
+    // with the actor, team, and membership locks in require_team_permission,
+    // they hold each existing source of an allow decision until audit commit.
+    for statement in [
+        "SELECT 1 FROM membership_custom_roles WHERE team_id=$1 FOR SHARE",
+        "SELECT 1 FROM custom_roles WHERE team_id=$1 FOR SHARE",
+        "SELECT 1 FROM custom_role_permissions WHERE team_id=$1 FOR SHARE",
+        "SELECT 1 FROM grants WHERE team_id=$1 FOR SHARE",
+        "SELECT 1 FROM groups WHERE team_id=$1 FOR SHARE",
+        "SELECT 1 FROM group_members WHERE team_id=$1 FOR SHARE",
+    ] {
+        sqlx::query(statement)
+            .bind(team_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(StoreError::Database)?;
+    }
+    Ok(())
+}
+
+async fn lock_visible_team_list_state(
+    transaction: &mut Transaction<'_, Postgres>,
+    actor: ActorContext,
+) -> Result<(), StoreError> {
+    // Team-list visibility can derive from an elevated membership, a custom
+    // role, or a grant. These locks cover only rows belonging to teams where
+    // the actor is already a member; grants or memberships added concurrently
+    // can only add visibility and cannot acknowledge a stale allow.
+    sqlx::query(
+        "SELECT 1 FROM memberships m JOIN teams t ON t.team_id=m.team_id WHERE m.principal_id=$1 FOR SHARE OF m,t",
+    )
+    .bind(actor.principal_id())
+    .execute(&mut **transaction)
+    .await
+    .map_err(StoreError::Database)?;
+    for statement in [
+        "SELECT 1 FROM membership_custom_roles mr JOIN memberships m ON (m.team_id,m.principal_id)=(mr.team_id,mr.principal_id) WHERE m.principal_id=$1 FOR SHARE OF mr",
+        "SELECT 1 FROM custom_roles cr JOIN membership_custom_roles mr ON (mr.team_id,mr.role_id)=(cr.team_id,cr.role_id) JOIN memberships m ON (m.team_id,m.principal_id)=(mr.team_id,mr.principal_id) WHERE m.principal_id=$1 FOR SHARE OF cr",
+        "SELECT 1 FROM custom_role_permissions rp JOIN membership_custom_roles mr ON (mr.team_id,mr.role_id)=(rp.team_id,rp.role_id) JOIN memberships m ON (m.team_id,m.principal_id)=(mr.team_id,mr.principal_id) WHERE m.principal_id=$1 FOR SHARE OF rp",
+        "SELECT 1 FROM grants g JOIN memberships m ON m.team_id=g.team_id WHERE m.principal_id=$1 FOR SHARE OF g",
+        "SELECT 1 FROM groups gr JOIN group_members gm ON (gm.team_id,gm.group_id)=(gr.team_id,gr.group_id) WHERE gm.principal_id=$1 FOR SHARE OF gr,gm",
+    ] {
+        sqlx::query(statement)
+            .bind(actor.principal_id())
+            .execute(&mut **transaction)
+            .await
+            .map_err(StoreError::Database)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 enum TeamTarget {
     Team,
@@ -2329,6 +2439,9 @@ mod tests {
 
     const BOOTSTRAP_CONNECTIONS: u32 = 1;
     const TEST_CONNECTIONS: u32 = 4;
+    const READ_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+    const READ_LOCK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+    const CREDENTIAL_EXPIRY_WAIT: Duration = Duration::from_millis(1_200);
 
     async fn seed_identity(store: &Store, principal: Uuid) {
         sqlx::query("INSERT INTO oidc_identities (identity_id,issuer,subject,principal_id,link_generation) VALUES ($1,'https://issuer.test',$2,$1,1)")
@@ -2440,6 +2553,63 @@ mod tests {
             .execute(store.pool())
             .await
             .expect("drop schema");
+    }
+
+    async fn wait_for_read_authorization_lock(pool: &sqlx::PgPool) {
+        tokio::time::timeout(READ_LOCK_WAIT_TIMEOUT, async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'SELECT t.policy_generation%')",
+                )
+                .fetch_one(pool)
+                .await
+                .expect("read PostgreSQL read-lock wait state");
+                if waiting {
+                    return;
+                }
+                tokio::time::sleep(READ_LOCK_WAIT_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("management read waits for concurrent permission write");
+    }
+
+    async fn wait_for_policy_revocation_lock(pool: &sqlx::PgPool) {
+        tokio::time::timeout(READ_LOCK_WAIT_TIMEOUT, async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'UPDATE teams SET state =%')",
+                )
+                .fetch_one(pool)
+                .await
+                .expect("read PostgreSQL policy-revocation wait state");
+                if waiting {
+                    return;
+                }
+                tokio::time::sleep(READ_LOCK_WAIT_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("policy revocation waits for management-read acknowledgement");
+    }
+
+    async fn wait_for_visible_team_list_lock(pool: &sqlx::PgPool) {
+        tokio::time::timeout(READ_LOCK_WAIT_TIMEOUT, async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'SELECT 1 FROM memberships m JOIN teams%')",
+                )
+                .fetch_one(pool)
+                .await
+                .expect("read PostgreSQL visible-team lock wait state");
+                if waiting {
+                    return;
+                }
+                tokio::time::sleep(READ_LOCK_WAIT_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("team list waits for concurrent team change");
     }
 
     #[tokio::test]
@@ -2765,6 +2935,387 @@ mod tests {
         assert!(matches!(
             pending.await.expect("read task completed"),
             Err(AuthorityError::Cancelled)
+        ));
+        assert!(authority.is_closed());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM audit_events")
+                .fetch_one(store.pool())
+                .await
+                .expect("count read audits"),
+            0
+        );
+        cleanup(&store, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn scratch_management_read_rechecks_expired_actor_before_acknowledgement() {
+        let (store, schema, owner, _owner_credential, _administrator, _administrator_credential) =
+            fixture().await;
+        let team_id: Uuid = sqlx::query_scalar("SELECT team_id FROM teams")
+            .fetch_one(store.pool())
+            .await
+            .expect("read team");
+        let expiring_credential = Uuid::now_v7();
+        sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,credential_kind,credential_generation,recovery_generation,expires_at,identity_id,digest_key_id,rotation_family_id) VALUES ($1,$2,decode(repeat('22',32),'hex'),$3,'human',1,1,clock_timestamp()+interval '1 second',$3,'test',$1)")
+        .bind(expiring_credential)
+        .bind(expiring_credential.to_string())
+        .bind(owner)
+        .execute(store.pool())
+        .await
+        .expect("seed expiring credential");
+        let (authority, _directory) = authority(
+            store.clone(),
+            AuthorityLimits {
+                global: 1,
+                per_team: 1,
+                per_principal: 1,
+            },
+        )
+        .await;
+        let authority = Arc::new(authority);
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *authority.read_hook.lock().expect("read hook lock") = Some(AdmissionHook {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let pending = {
+            let authority = Arc::clone(&authority);
+            tokio::spawn(async move {
+                authority
+                    .list_members(
+                        actor(owner, expiring_credential, ActorKind::Human),
+                        team_id,
+                        MemberPage {
+                            after: None,
+                            limit: 1,
+                            correlation_id: Uuid::now_v7(),
+                        },
+                    )
+                    .await
+            })
+        };
+        entered.wait().await;
+        tokio::time::sleep(CREDENTIAL_EXPIRY_WAIT).await;
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT expires_at <= clock_timestamp() FROM relay_credentials WHERE credential_id=$1",
+        )
+        .bind(expiring_credential)
+        .fetch_one(store.pool())
+        .await
+        .expect("verify credential expiry"));
+        release.wait().await;
+        assert!(matches!(
+            pending.await.expect("read task completed"),
+            Err(AuthorityError::Store(StoreError::Forbidden))
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM audit_events")
+                .fetch_one(store.pool())
+                .await
+                .expect("count read audits"),
+            0
+        );
+        cleanup(&store, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn management_read_observes_a_permission_revocation_that_commits_first() {
+        let (store, schema, owner, owner_credential, administrator, _administrator_credential) =
+            fixture().await;
+        let team_id: Uuid = sqlx::query_scalar("SELECT team_id FROM teams")
+            .fetch_one(store.pool())
+            .await
+            .expect("read team");
+        let (authority, _directory) = authority(
+            store.clone(),
+            AuthorityLimits {
+                global: 1,
+                per_team: 1,
+                per_principal: 1,
+            },
+        )
+        .await;
+        let mut revoke = store
+            .begin_serializable()
+            .await
+            .expect("begin permission revocation");
+        sqlx::query("INSERT INTO memberships (membership_id,team_id,principal_id,builtin_role,state,revision,local_deny_generation) VALUES ($1,$2,$3,'owner','active',1,1)")
+            .bind(Uuid::now_v7())
+            .bind(team_id)
+            .bind(administrator)
+            .execute(&mut *revoke)
+            .await
+            .expect("retain a second active owner");
+        sqlx::query("UPDATE memberships SET state='removed' WHERE team_id=$1 AND principal_id=$2")
+            .bind(team_id)
+            .bind(owner)
+            .execute(&mut *revoke)
+            .await
+            .expect("remove owner membership permission");
+
+        let pending = tokio::spawn(async move {
+            authority
+                .list_members(
+                    actor(owner, owner_credential, ActorKind::Human),
+                    team_id,
+                    MemberPage {
+                        after: None,
+                        limit: 1,
+                        correlation_id: Uuid::now_v7(),
+                    },
+                )
+                .await
+        });
+        wait_for_read_authorization_lock(store.pool()).await;
+        revoke.commit().await.expect("commit permission revocation");
+        let result = pending.await.expect("read task completed");
+        assert!(
+            matches!(result, Err(AuthorityError::Store(StoreError::Forbidden))),
+            "revoked read must deny, got {result:?}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM audit_events")
+                .fetch_one(store.pool())
+                .await
+                .expect("count read audits"),
+            0
+        );
+        cleanup(&store, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn management_read_holds_its_permission_until_the_audit_commits() {
+        let (store, schema, owner, owner_credential, _administrator, _administrator_credential) =
+            fixture().await;
+        let team_id: Uuid = sqlx::query_scalar("SELECT team_id FROM teams")
+            .fetch_one(store.pool())
+            .await
+            .expect("read team");
+        let (authority, _directory) = authority(
+            store.clone(),
+            AuthorityLimits {
+                global: 1,
+                per_team: 1,
+                per_principal: 1,
+            },
+        )
+        .await;
+        let authority = Arc::new(authority);
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *authority.read_hook.lock().expect("read hook lock") = Some(AdmissionHook {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let read = {
+            let authority = Arc::clone(&authority);
+            tokio::spawn(async move {
+                authority
+                    .list_members(
+                        actor(owner, owner_credential, ActorKind::Human),
+                        team_id,
+                        MemberPage {
+                            after: None,
+                            limit: 1,
+                            correlation_id: Uuid::now_v7(),
+                        },
+                    )
+                    .await
+            })
+        };
+        entered.wait().await;
+        let revoke = {
+            let authority = Arc::clone(&authority);
+            tokio::spawn(async move {
+                authority
+                    .revoke(RevocationCommand {
+                        actor: actor(owner, owner_credential, ActorKind::Human),
+                        team_id: Some(team_id),
+                        scope_kind: "policy",
+                        scope_id: team_id.to_string(),
+                        reason_code: "operator_revoke",
+                        correlation_id: Uuid::now_v7(),
+                    })
+                    .await
+            })
+        };
+        wait_for_policy_revocation_lock(store.pool()).await;
+        release.wait().await;
+        read.await
+            .expect("read task completed")
+            .expect("read commits before policy revocation");
+        revoke
+            .await
+            .expect("revoke task completed")
+            .expect("policy revocation completes after read");
+        let actions: Vec<String> =
+            sqlx::query_scalar("SELECT action FROM audit_events ORDER BY occurred_at, audit_id")
+                .fetch_all(store.pool())
+                .await
+                .expect("read audit order");
+        assert_eq!(actions, ["member.list", "authority.revoke"]);
+        cleanup(&store, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn team_list_audit_uses_the_current_global_identity_revision() {
+        let (store, schema, owner, owner_credential, _administrator, _administrator_credential) =
+            fixture().await;
+        const IDENTITY_REVISION: i64 = 7;
+        sqlx::query("UPDATE relay_identity SET revision=$1")
+            .bind(IDENTITY_REVISION)
+            .execute(store.pool())
+            .await
+            .expect("advance global identity revision");
+        let (authority, _directory) = authority(
+            store.clone(),
+            AuthorityLimits {
+                global: 1,
+                per_team: 1,
+                per_principal: 1,
+            },
+        )
+        .await;
+        let correlation_id = Uuid::now_v7();
+        authority
+            .list_teams(
+                actor(owner, owner_credential, ActorKind::Human),
+                TeamPage {
+                    after: None,
+                    limit: 1,
+                    correlation_id,
+                },
+            )
+            .await
+            .expect("list visible teams");
+        let audit: (Uuid, String, Option<Uuid>, String, String, i64, i64, Uuid, String, String) =
+            sqlx::query_as(
+                "SELECT actor_principal_id,actor_kind,team_id,action,decision,policy_generation,recovery_generation,correlation_id,parameter_code,parameter_value FROM audit_events WHERE action='team.list'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("read team-list audit");
+        assert_eq!(audit.0, owner);
+        assert_eq!(audit.1, "human");
+        assert_eq!(audit.2, None);
+        assert_eq!(audit.3, "team.list");
+        assert_eq!(audit.4, "allow");
+        assert_eq!(audit.5, IDENTITY_REVISION);
+        assert_eq!(audit.6, 1);
+        assert_eq!(audit.7, correlation_id);
+        assert_eq!(audit.8, "page");
+        assert_eq!(audit.9, "page");
+        cleanup(&store, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn team_list_omits_a_team_disabled_while_its_visibility_lock_waits() {
+        let (store, schema, owner, owner_credential, _administrator, _administrator_credential) =
+            fixture().await;
+        let original_team: Uuid = sqlx::query_scalar("SELECT team_id FROM teams")
+            .fetch_one(store.pool())
+            .await
+            .expect("read original team");
+        let disabled_team = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO teams (team_id,display_name,state,policy_generation,revision) VALUES ($1,'second team','active',1,1)",
+        )
+        .bind(disabled_team)
+        .execute(store.pool())
+        .await
+        .expect("seed second team");
+        sqlx::query("INSERT INTO memberships (membership_id,team_id,principal_id,builtin_role,state,revision,local_deny_generation) VALUES ($1,$2,$3,'owner','active',1,1)")
+            .bind(Uuid::now_v7())
+            .bind(disabled_team)
+            .bind(owner)
+            .execute(store.pool())
+            .await
+            .expect("seed second team owner");
+        let (authority, _directory) = authority(
+            store.clone(),
+            AuthorityLimits {
+                global: 1,
+                per_team: 1,
+                per_principal: 1,
+            },
+        )
+        .await;
+        let mut disable = store
+            .begin_serializable()
+            .await
+            .expect("begin team disable");
+        sqlx::query("UPDATE teams SET state='disabled' WHERE team_id=$1")
+            .bind(disabled_team)
+            .execute(&mut *disable)
+            .await
+            .expect("disable second team");
+        let pending = tokio::spawn(async move {
+            authority
+                .list_teams(
+                    actor(owner, owner_credential, ActorKind::Human),
+                    TeamPage {
+                        after: None,
+                        limit: 2,
+                        correlation_id: Uuid::now_v7(),
+                    },
+                )
+                .await
+        });
+        wait_for_visible_team_list_lock(store.pool()).await;
+        disable.commit().await.expect("commit team disable");
+        let page = pending
+            .await
+            .expect("team-list task completed")
+            .expect("list current visible teams");
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].team_id, original_team);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM audit_events WHERE action='team.list'"
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count team-list audits"),
+            1
+        );
+        cleanup(&store, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn management_read_audit_failure_closes_without_an_acknowledgement() {
+        let (store, schema, owner, owner_credential, _administrator, _administrator_credential) =
+            fixture().await;
+        let team_id: Uuid = sqlx::query_scalar("SELECT team_id FROM teams")
+            .fetch_one(store.pool())
+            .await
+            .expect("read team");
+        let (authority, _directory) = authority(
+            store.clone(),
+            AuthorityLimits {
+                global: 1,
+                per_team: 1,
+                per_principal: 1,
+            },
+        )
+        .await;
+        sqlx::raw_sql(AssertSqlSafe("CREATE FUNCTION reject_management_read_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit unavailable'; END; $$; CREATE TRIGGER reject_management_read_audit BEFORE INSERT ON audit_events FOR EACH ROW WHEN (NEW.action = 'member.list') EXECUTE FUNCTION reject_management_read_audit();".to_owned()))
+            .execute(store.pool())
+            .await
+            .expect("install read audit failure trigger");
+        assert!(matches!(
+            authority
+                .list_members(
+                    actor(owner, owner_credential, ActorKind::Human),
+                    team_id,
+                    MemberPage {
+                        after: None,
+                        limit: 1,
+                        correlation_id: Uuid::now_v7(),
+                    },
+                )
+                .await,
+            Err(AuthorityError::Store(StoreError::AuditUnavailable))
         ));
         assert!(authority.is_closed());
         assert_eq!(

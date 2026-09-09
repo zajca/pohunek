@@ -3,7 +3,7 @@
 import type { Idempotency } from "./Idempotency";
 
 /**
- * Changes a group member.
+ * Assigns or removes a custom role for one member.
  */
 export type RoleAssignmentRequest = {
   principal_id: string;
