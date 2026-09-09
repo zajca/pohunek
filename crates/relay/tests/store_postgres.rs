@@ -1,4 +1,4 @@
-//! Runs real PostgreSQL authority invariants when explicitly selected.
+//! Runs real `PostgreSQL` authority invariants when explicitly selected.
 
 #![cfg(feature = "postgres-tests")]
 

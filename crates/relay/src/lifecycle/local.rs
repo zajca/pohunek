@@ -514,7 +514,7 @@ fn validate_initial_provision(request: &InitialProvisionRequest) -> Result<(), L
         || request.digest_key_id.is_empty()
         || request.digest_key_id.len() > MAX_KEY_ID_BYTES
         || request.expires_at <= time::OffsetDateTime::now_utc()
-        || request.expires_at.nanosecond() % 1_000 != 0
+        || !request.expires_at.nanosecond().is_multiple_of(1_000)
         || [
             &request.relay_id,
             &request.issuer,
@@ -579,10 +579,6 @@ async fn bootstrap_baseline_matches(
     .map_err(|_error| LifecycleError::Durable)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The full signed provisioning coordinate must be verified in one durable query."
-)]
 async fn provision_rows_match(
     tx: &mut Transaction<'_, Postgres>,
     request: &InitialProvisionRequest,

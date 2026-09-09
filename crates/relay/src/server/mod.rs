@@ -81,7 +81,6 @@ impl ServerState {
 }
 
 /// Builds the bounded public relay API.
-#[must_use]
 pub fn router(state: ServerState) -> Router {
     let limits = state.config.limits.clone();
     let app = Router::new()
@@ -132,7 +131,11 @@ async fn readiness(State(state): State<ServerState>) -> Result<StatusCode, ApiFa
         .validate_fence()
         .await
         .map_err(|_error| ApiFailure::unavailable())?;
-    state.store.healthcheck().await.map_err(ApiFailure::store)?;
+    state
+        .store
+        .healthcheck()
+        .await
+        .map_err(|error| ApiFailure::store(&error))?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn account_ready(State(state): State<ServerState>) -> Result<Html<&'static str>, ApiFailure> {
@@ -152,7 +155,7 @@ async fn browser_start(
         .auth
         .begin_browser_login(&state.oidc, LoginBindingCookie::new(binding.clone()))
         .await
-        .map_err(ApiFailure::auth)?;
+        .map_err(|error| ApiFailure::auth(&error))?;
     let mut response = Redirect::to(login.authorization_url.as_str()).into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
@@ -180,15 +183,14 @@ async fn browser_callback(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, ApiFailure> {
     if gate(&state).is_err() || reject_mixed(&headers).is_err() {
-        return callback_failure_response(AuthError::Durable);
+        return callback_failure_response(&AuthError::Durable);
     }
     let query = match parse_callback_query(raw_query.as_deref()) {
         Ok(query) => query,
-        Err(error) => return callback_failure_response(error),
+        Err(error) => return callback_failure_response(&error),
     };
-    let binding = match cookie(&headers, LOGIN_COOKIE) {
-        Ok(Some(binding)) => binding,
-        Ok(None) | Err(_) => return callback_failure_response(AuthError::OidcInvalid),
+    let Ok(Some(binding)) = cookie(&headers, LOGIN_COOKIE) else {
+        return callback_failure_response(&AuthError::OidcInvalid);
     };
     let outcome = match (query.code, query.error) {
         (Some(code), None) => BrowserCallbackOutcome::Code(OidcCallbackCode::new(code)),
@@ -205,13 +207,13 @@ async fn browser_callback(
         .await;
     let session = match session {
         Ok(session) => session,
-        Err(error) => return callback_failure_response(error),
+        Err(error) => return callback_failure_response(&error),
     };
     let target = state
         .config
         .public_origin
         .join("account/ready")
-        .map_err(|_| ApiFailure::invalid())?;
+        .map_err(|_error| ApiFailure::invalid())?;
     let mut response = Redirect::temporary(target.as_str()).into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
@@ -256,7 +258,7 @@ fn parse_callback_query(raw_query: Option<&str>) -> Result<CallbackQuery, AuthEr
     })
 }
 
-fn callback_failure_response(error: AuthError) -> Result<Response, ApiFailure> {
+fn callback_failure_response(error: &AuthError) -> Result<Response, ApiFailure> {
     let mut response = ApiFailure::auth(error).into_response();
     response
         .headers_mut()
@@ -274,10 +276,10 @@ async fn device_start(
         .auth
         .begin_device_login(&state.oidc)
         .await
-        .map_err(ApiFailure::auth)?;
+        .map_err(|error| ApiFailure::auth(&error))?;
     let poll_secret = Secret::new(login.poll_secret().to_owned());
     let seconds = i64::try_from(login.authorization.expires_in.as_secs())
-        .map_err(|_| ApiFailure::invalid())?;
+        .map_err(|_error| ApiFailure::invalid())?;
     Ok(no_store(
         Json(DeviceLoginStart {
             login_id: LoginId::from_uuid(login.login_id),
@@ -289,7 +291,7 @@ async fn device_start(
             user_code: login.authorization.user_code,
             expires_at: time::OffsetDateTime::now_utc() + time::Duration::seconds(seconds),
             interval_seconds: u32::try_from(login.authorization.interval.as_secs())
-                .map_err(|_| ApiFailure::invalid())?,
+                .map_err(|_error| ApiFailure::invalid())?,
             poll_secret,
         })
         .into_response(),
@@ -320,7 +322,7 @@ async fn device_poll(
         Ok(credential) => DevicePollResult::Complete {
             credential: DeviceCredential {
                 credential_id: relay_protocol::CredentialId::parse(&credential.public_id)
-                    .map_err(|_| ApiFailure::invalid())?,
+                    .map_err(|_error| ApiFailure::invalid())?,
                 secret: Secret::new(credential.secret().to_owned()),
                 expires_at: credential.expires_at(),
             },
@@ -330,19 +332,19 @@ async fn device_poll(
         }) => DevicePollResult::Pending {
             retry_after_seconds,
         },
-        Err(AuthError::DeviceSlowDown {
-            retry_after_seconds,
-        }) => DevicePollResult::SlowDown {
-            retry_after_seconds,
-        },
-        Err(AuthError::DeviceBusy {
-            retry_after_seconds,
-        }) => DevicePollResult::SlowDown {
+        Err(
+            AuthError::DeviceSlowDown {
+                retry_after_seconds,
+            }
+            | AuthError::DeviceBusy {
+                retry_after_seconds,
+            },
+        ) => DevicePollResult::SlowDown {
             retry_after_seconds,
         },
         Err(AuthError::DeviceDenied) => DevicePollResult::Denied,
         Err(AuthError::DeviceExpired) => DevicePollResult::Expired,
-        Err(error) => return Err(ApiFailure::auth(error)),
+        Err(error) => return Err(ApiFailure::auth(&error)),
     };
     Ok(no_store(Json(result).into_response()))
 }
@@ -354,7 +356,14 @@ async fn account(
     gate(&state)?;
     let actor = authenticated(&state, &headers, false).await?;
     Ok(no_store(
-        Json(state.auth.account(actor).await.map_err(ApiFailure::auth)?).into_response(),
+        Json(
+            state
+                .auth
+                .account(actor)
+                .await
+                .map_err(|error| ApiFailure::auth(&error))?,
+        )
+        .into_response(),
     ))
 }
 
@@ -371,7 +380,7 @@ async fn list_credentials(
                 .auth
                 .list_credentials(actor, page)
                 .await
-                .map_err(ApiFailure::auth)?,
+                .map_err(|error| ApiFailure::auth(&error))?,
         )
         .into_response(),
     ))
@@ -391,7 +400,7 @@ async fn rotate_credential(
                 .auth
                 .rotate_credential(actor, credential_id, request)
                 .await
-                .map_err(ApiFailure::auth)?,
+                .map_err(|error| ApiFailure::auth(&error))?,
         )
         .into_response(),
     ))
@@ -409,7 +418,7 @@ async fn revoke_credential(
         .auth
         .revoke_credential(actor, credential_id, request)
         .await
-        .map_err(ApiFailure::auth)?;
+        .map_err(|error| ApiFailure::auth(&error))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -431,7 +440,7 @@ async fn revoke_current_credential(
             request,
         )
         .await
-        .map_err(ApiFailure::auth)?;
+        .map_err(|error| ApiFailure::auth(&error))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -449,7 +458,7 @@ async fn create_service_account(
                 .auth
                 .create_service_account(actor, team_id, request)
                 .await
-                .map_err(ApiFailure::auth)?,
+                .map_err(|error| ApiFailure::auth(&error))?,
         )
         .into_response(),
     ))
@@ -469,7 +478,7 @@ async fn list_service_accounts(
                 .auth
                 .list_service_accounts(actor, team_id, page)
                 .await
-                .map_err(ApiFailure::auth)?,
+                .map_err(|error| ApiFailure::auth(&error))?,
         )
         .into_response(),
     ))
@@ -491,7 +500,7 @@ async fn revoke_service_credential(
         .auth
         .revoke_service_credential(actor, team_id, principal_id, credential_id, request)
         .await
-        .map_err(ApiFailure::auth)?;
+        .map_err(|error| ApiFailure::auth(&error))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -513,7 +522,7 @@ async fn rotate_service_credential(
                 .auth
                 .rotate_service_credential(actor, team_id, principal_id, credential_id, request)
                 .await
-                .map_err(ApiFailure::auth)?,
+                .map_err(|error| ApiFailure::auth(&error))?,
         )
         .into_response(),
     ))
@@ -528,7 +537,9 @@ async fn authenticated(
         if headers.contains_key(header::COOKIE) || headers.contains_key(header::ORIGIN) {
             return Err(ApiFailure::invalid());
         }
-        let value = authorization.to_str().map_err(|_| ApiFailure::invalid())?;
+        let value = authorization
+            .to_str()
+            .map_err(|_error| ApiFailure::invalid())?;
         let bearer = value
             .strip_prefix("Bearer ")
             .ok_or_else(ApiFailure::invalid)?;
@@ -539,7 +550,7 @@ async fn authenticated(
             .auth
             .authenticate_bearer(RelayBearerCredential::new(bearer.to_owned()))
             .await
-            .map_err(ApiFailure::auth);
+            .map_err(|error| ApiFailure::auth(&error));
     }
     let session = cookie(headers, SESSION_COOKIE)?.ok_or_else(ApiFailure::unauthenticated)?;
     if mutation {
@@ -550,7 +561,7 @@ async fn authenticated(
             .auth
             .verify_browser_csrf(&session, &csrf)
             .await
-            .map_err(ApiFailure::auth)?;
+            .map_err(|error| ApiFailure::auth(&error))?;
         if csrf != expected {
             return Err(ApiFailure::unauthenticated());
         }
@@ -559,7 +570,7 @@ async fn authenticated(
         .auth
         .authenticate_browser(BrowserCookie::new(session))
         .await
-        .map_err(ApiFailure::auth)
+        .map_err(|error| ApiFailure::auth(&error))
 }
 
 fn reject_mixed(headers: &HeaderMap) -> Result<(), ApiFailure> {
@@ -610,7 +621,9 @@ fn cookie(headers: &HeaderMap, name: &str) -> Result<Option<String>, ApiFailure>
     let prefix = format!("{name}=");
     let mut selected = None;
     for header_value in &headers.get_all(header::COOKIE) {
-        let header_value = header_value.to_str().map_err(|_| ApiFailure::invalid())?;
+        let header_value = header_value
+            .to_str()
+            .map_err(|_error| ApiFailure::invalid())?;
         for part in header_value.split(';').map(str::trim) {
             let Some(value) = part.strip_prefix(&prefix) else {
                 continue;
@@ -632,7 +645,7 @@ fn required_header(headers: &HeaderMap, name: &str) -> Result<String, ApiFailure
 }
 fn random_cookie() -> Result<String, ApiFailure> {
     let mut bytes = [0_u8; BROWSER_BINDING_BYTES];
-    getrandom::getrandom(&mut bytes).map_err(|_| ApiFailure::unavailable())?;
+    getrandom::getrandom(&mut bytes).map_err(|_error| ApiFailure::unavailable())?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 fn protected_cookie(name: &str, value: &str, http_only: bool) -> Result<HeaderValue, ApiFailure> {
@@ -641,7 +654,7 @@ fn protected_cookie(name: &str, value: &str, http_only: bool) -> Result<HeaderVa
     } else {
         "; Path=/; Secure; SameSite=Strict"
     };
-    HeaderValue::from_str(&format!("{name}={value}{tail}")).map_err(|_| ApiFailure::invalid())
+    HeaderValue::from_str(&format!("{name}={value}{tail}")).map_err(|_error| ApiFailure::invalid())
 }
 fn cleared_cookie(name: &str, http_only: bool) -> Result<HeaderValue, ApiFailure> {
     let tail = if http_only {
@@ -649,7 +662,7 @@ fn cleared_cookie(name: &str, http_only: bool) -> Result<HeaderValue, ApiFailure
     } else {
         "; Path=/; Secure; SameSite=Strict; Max-Age=0"
     };
-    HeaderValue::from_str(&format!("{name}={tail}")).map_err(|_| ApiFailure::invalid())
+    HeaderValue::from_str(&format!("{name}={tail}")).map_err(|_error| ApiFailure::invalid())
 }
 
 #[derive(Debug)]
@@ -676,7 +689,7 @@ impl ApiFailure {
             code: "unavailable",
         }
     }
-    fn auth(error: AuthError) -> Self {
+    fn auth(error: &AuthError) -> Self {
         match error {
             AuthError::CredentialInvalid | AuthError::CsrfInvalid | AuthError::OriginInvalid => {
                 Self::unauthenticated()
@@ -699,7 +712,7 @@ impl ApiFailure {
             _ => Self::invalid(),
         }
     }
-    fn store(error: StoreError) -> Self {
+    fn store(error: &StoreError) -> Self {
         match error {
             StoreError::Database(_) | StoreError::Migration(_) | StoreError::AuditUnavailable => {
                 Self::unavailable()
@@ -759,17 +772,17 @@ mod credential_router_tests {
             },
             auth: AuthConfig {
                 pending_transactions: 2,
-                login_lifetime: Duration::from_secs(60),
-                browser_session_lifetime: Duration::from_secs(300),
-                browser_session_idle: Duration::from_secs(60),
-                human_credential_lifetime: Duration::from_secs(600),
-                service_credential_lifetime: Duration::from_secs(600),
+                login_lifetime: Duration::from_mins(1),
+                browser_session_lifetime: Duration::from_mins(5),
+                browser_session_idle: Duration::from_mins(1),
+                human_credential_lifetime: Duration::from_mins(10),
+                service_credential_lifetime: Duration::from_mins(10),
                 max_rotation_overlap: Duration::from_secs(30),
                 credentials_per_principal: 8,
                 service_accounts_per_team: 16,
                 device_poll_lease: Duration::from_secs(5),
                 device_slow_down_increment: Duration::from_secs(5),
-                max_device_poll_interval: Duration::from_secs(60),
+                max_device_poll_interval: Duration::from_mins(1),
             },
             login_policy: LoginPolicy::AnyAuthenticatedSubject,
         }
@@ -777,22 +790,26 @@ mod credential_router_tests {
 
     fn router_auth_limits() -> AuthLimits {
         AuthLimits::new(
-            Duration::from_secs(60),
-            Duration::from_secs(300),
-            Duration::from_secs(60),
-            Duration::from_secs(600),
-            Duration::from_secs(600),
+            Duration::from_mins(1),
+            Duration::from_mins(5),
+            Duration::from_mins(1),
+            Duration::from_mins(10),
+            Duration::from_mins(10),
             Duration::from_secs(30),
             8,
             16,
             Duration::from_secs(5),
             Duration::from_secs(5),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         )
         .expect("valid router authentication limits")
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The HTTP bearer-boundary and idempotency cases are one end-to-end security sequence."
+    )]
     async fn credential_routes_enforce_bearer_boundaries_and_exact_service_create_retry() {
         let (store, schema, bootstrap) = auth_tests::fixture().await;
         let (authority, _directory) = auth_tests::authority(store.clone()).await;
@@ -1155,7 +1172,7 @@ mod tests {
                 "__Host-pohunek-relay-login=first; __Host-pohunek-relay-login=second",
             ),
         );
-        assert!(cookie(&headers, LOGIN_COOKIE).is_err());
+        cookie(&headers, LOGIN_COOKIE).unwrap_err();
 
         let mut separate_headers = HeaderMap::new();
         separate_headers.append(
@@ -1166,13 +1183,13 @@ mod tests {
             header::COOKIE,
             HeaderValue::from_static("__Host-pohunek-relay-login=second"),
         );
-        assert!(cookie(&separate_headers, LOGIN_COOKIE).is_err());
+        cookie(&separate_headers, LOGIN_COOKIE).unwrap_err();
     }
 
     #[test]
     fn bound_callback_failure_clears_the_login_cookie() {
         let response =
-            callback_failure_response(AuthError::OidcInvalid).expect("serialize callback failure");
+            callback_failure_response(&AuthError::OidcInvalid).expect("serialize callback failure");
         let cookie = response
             .headers()
             .get_all(header::SET_COOKIE)

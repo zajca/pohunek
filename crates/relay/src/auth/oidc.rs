@@ -1,4 +1,4 @@
-//! Performs bounded OpenID Connect exchanges for relay authentication.
+//! Performs bounded `OpenID` Connect exchanges for relay authentication.
 //!
 //! This module is deliberately the only auth component that sees provider
 //! responses. It neither logs nor persists authorization codes, tokens, PKCE
@@ -81,9 +81,8 @@ impl OidcClientConfig {
 }
 
 impl Debug for OidcClientConfig {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("OidcClientConfig")
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcClientConfig")
             .field("issuer", &self.issuer)
             .field("client_id", &self.client_id)
             .field("redirect_uri", &self.redirect_uri)
@@ -190,9 +189,8 @@ type DeviceProviderMetadata = ProviderMetadata<
 >;
 
 impl Debug for OidcClient {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("OidcClient")
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcClient")
             .field("redacted", &true)
             .finish()
     }
@@ -207,9 +205,8 @@ pub(crate) struct BrowserAuthorization {
 }
 
 impl Debug for BrowserAuthorization {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("BrowserAuthorization")
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserAuthorization")
             .field("redacted", &true)
             .finish()
     }
@@ -233,14 +230,13 @@ pub struct OidcDeviceAuthorization {
 }
 
 impl Debug for OidcDeviceAuthorization {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("OidcDeviceAuthorization")
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcDeviceAuthorization")
             .field("verification_uri", &self.verification_uri)
             .field("expires_in", &self.expires_in)
             .field("interval", &self.interval)
             .field("redacted", &true)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -256,6 +252,10 @@ struct SignedTokenPayload {
     nbf: Option<i64>,
 }
 
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "The upstream ID-token verifier callback requires a Result return type."
+)]
 fn accept_optional_nonce(_nonce: Option<&Nonce>) -> Result<(), String> {
     // RFC 8628 has no browser nonce transaction. PKCE and the one-use device
     // code bind this flow, so an issuer nonce is accepted when present.
@@ -308,8 +308,8 @@ fn signed_token_payload(token: &str) -> Result<SignedTokenPayload, AuthError> {
     }
     let decoded = URL_SAFE_NO_PAD
         .decode(payload)
-        .map_err(|_| AuthError::OidcInvalid)?;
-    serde_json::from_slice(&decoded).map_err(|_| AuthError::OidcInvalid)
+        .map_err(|_error| AuthError::OidcInvalid)?;
+    serde_json::from_slice(&decoded).map_err(|_error| AuthError::OidcInvalid)
 }
 
 fn current_unix_seconds() -> Option<i64> {
@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn device_nonce_policy_accepts_absent_nonce_without_fabrication() {
-        assert!(accept_optional_nonce(None).is_ok());
+        accept_optional_nonce(None).unwrap();
     }
 
     #[test]
@@ -366,7 +366,7 @@ mod tests {
                     .expect("valid complete fixture URL"),
             ),
             user_code: "sentinel-user-code".to_owned(),
-            expires_in: Duration::from_secs(60),
+            expires_in: Duration::from_mins(1),
             interval: Duration::from_secs(1),
             device_code: Zeroizing::new("sentinel-device-code".to_owned()),
             verifier: Zeroizing::new("sentinel-verifier".to_owned()),
@@ -396,7 +396,7 @@ mod tests {
                 .expect("valid fixture URL"),
             verification_uri_complete: None,
             user_code: "user-code".to_owned(),
-            expires_in: Duration::from_secs(60),
+            expires_in: Duration::from_mins(1),
             interval: Duration::from_secs(1),
             device_code: Zeroizing::new("device-code".to_owned()),
             verifier,
@@ -474,29 +474,33 @@ impl OidcClient {
 
     /// Discovers and pins provider metadata with strict redirect and timeout policy.
     pub async fn discover(config: OidcClientConfig) -> Result<Self, AuthError> {
-        let issuer = IssuerUrl::new(config.issuer.to_string()).map_err(|_| AuthError::Malformed)?;
+        let issuer =
+            IssuerUrl::new(config.issuer.to_string()).map_err(|_error| AuthError::Malformed)?;
         let mut builder = ClientBuilder::new()
             .redirect(Policy::none())
             .timeout(config.request_timeout);
         if let Some(path) = &config.ca_file {
-            let certificate =
-                Certificate::from_pem(&fs::read(path).map_err(|_| AuthError::IssuerUnavailable)?)
-                    .map_err(|_| AuthError::IssuerUnavailable)?;
+            let certificate = Certificate::from_pem(
+                &fs::read(path).map_err(|_error| AuthError::IssuerUnavailable)?,
+            )
+            .map_err(|_error| AuthError::IssuerUnavailable)?;
             builder = builder.add_root_certificate(certificate);
         }
-        let client = builder.build().map_err(|_| AuthError::IssuerUnavailable)?;
+        let client = builder
+            .build()
+            .map_err(|_error| AuthError::IssuerUnavailable)?;
         let http = BoundedHttpClient {
             client,
             max_response_bytes: config.max_response_bytes,
         };
         let metadata = DeviceProviderMetadata::discover_async(issuer, &http)
             .await
-            .map_err(|_| AuthError::IssuerUnavailable)?;
+            .map_err(|_error| AuthError::IssuerUnavailable)?;
         if metadata.issuer().as_str() != config.issuer.as_str() {
             return Err(AuthError::OidcInvalid);
         }
-        let redirect =
-            RedirectUrl::new(config.redirect_uri.to_string()).map_err(|_| AuthError::Malformed)?;
+        let redirect = RedirectUrl::new(config.redirect_uri.to_string())
+            .map_err(|_error| AuthError::Malformed)?;
         let device_endpoint = metadata
             .additional_metadata()
             .device_authorization_endpoint
@@ -547,7 +551,7 @@ impl OidcClient {
 
     fn checked_identity(
         &self,
-        raw_token: String,
+        raw_token: &str,
         claims: &openidconnect::core::CoreIdTokenClaims,
     ) -> Result<OidcIdentity, AuthError> {
         if claims.audiences().len() != 1 || claims.audiences()[0].as_str() != self.client_id() {
@@ -559,7 +563,7 @@ impl OidcClient {
         {
             return Err(AuthError::OidcInvalid);
         }
-        let payload = signed_token_payload(&raw_token)?;
+        let payload = signed_token_payload(raw_token)?;
         if payload.azp.is_some_and(|party| party != self.client_id()) {
             return Err(AuthError::OidcInvalid);
         }
@@ -591,12 +595,12 @@ impl OidcClient {
             .add_extra_param("code_challenge_method", &**challenge.method())
             .request_async(&self.http)
             .await
-            .map_err(|_| AuthError::OidcInvalid)?;
-        let verification_uri =
-            Url::parse(response.verification_uri().as_str()).map_err(|_| AuthError::OidcInvalid)?;
+            .map_err(|_error| AuthError::OidcInvalid)?;
+        let verification_uri = Url::parse(response.verification_uri().as_str())
+            .map_err(|_error| AuthError::OidcInvalid)?;
         let verification_uri_complete = response
             .verification_uri_complete()
-            .map(|value| Url::parse(value.secret()).map_err(|_| AuthError::OidcInvalid))
+            .map(|value| Url::parse(value.secret()).map_err(|_error| AuthError::OidcInvalid))
             .transpose()?;
         Ok(OidcDeviceAuthorization {
             verification_uri,
@@ -621,12 +625,13 @@ impl OidcClient {
             return Err(device_poll_response_error(response.body()));
         }
         let token: openidconnect::core::CoreTokenResponse =
-            serde_json::from_slice(response.body()).map_err(|_| AuthError::OidcInvalid)?;
+            serde_json::from_slice(response.body()).map_err(|_error| AuthError::OidcInvalid)?;
         let id_token = token.id_token().ok_or(AuthError::OidcInvalid)?;
         let claims = id_token
             .claims(&self.client.id_token_verifier(), accept_optional_nonce)
-            .map_err(|_| AuthError::OidcInvalid)?;
-        self.checked_identity(id_token.to_string(), &claims)
+            .map_err(|_error| AuthError::OidcInvalid)?;
+        let raw_token = id_token.to_string();
+        self.checked_identity(&raw_token, claims)
     }
 
     /// Exchanges a one-use authorization code and verifies all standard ID-token claims.
@@ -639,19 +644,20 @@ impl OidcClient {
         let response = self
             .client
             .exchange_code(AuthorizationCode::new(code))
-            .map_err(|_| AuthError::OidcInvalid)?
+            .map_err(|_error| AuthError::OidcInvalid)?
             .set_pkce_verifier(PkceCodeVerifier::new(verifier.to_string()))
             .request_async(&self.http)
             .await
-            .map_err(|_| AuthError::OidcInvalid)?;
+            .map_err(|_error| AuthError::OidcInvalid)?;
         let token = response.id_token().ok_or(AuthError::OidcInvalid)?;
         let claims = token
             .claims(
                 &self.client.id_token_verifier(),
                 &Nonce::new(nonce.to_string()),
             )
-            .map_err(|_| AuthError::OidcInvalid)?;
-        self.checked_identity(token.to_string(), &claims)
+            .map_err(|_error| AuthError::OidcInvalid)?;
+        let raw_token = token.to_string();
+        self.checked_identity(&raw_token, claims)
     }
 }
 
@@ -670,10 +676,10 @@ impl BoundedHttpClient {
             .body(body)
             .send()
             .await
-            .map_err(|_| AuthError::OidcInvalid)?;
+            .map_err(|_error| AuthError::OidcInvalid)?;
         self.bounded_response(response)
             .await
-            .map_err(|_| AuthError::OidcInvalid)
+            .map_err(|_error| AuthError::OidcInvalid)
     }
 
     async fn bounded_response(

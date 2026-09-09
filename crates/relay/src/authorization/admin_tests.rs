@@ -1294,6 +1294,10 @@ async fn management_permissions_are_narrow_for_custom_and_service_actors() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "The audited keyset pagination cases must remain visible as one authorization sequence."
+)]
 async fn audited_management_reads_return_bounded_keyset_pages() {
     let (store, schema, owner, member, credential) = fixture().await;
     let first_team = team(&store, owner).await;

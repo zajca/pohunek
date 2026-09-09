@@ -1,7 +1,7 @@
 //! Authenticates relay humans and credentials.
 //!
 //! The module keeps raw OAuth exchanges and relay bearer secrets out of
-//! PostgreSQL. Durable rows contain keyed digests; pending device codes and
+//! `PostgreSQL`. Durable rows contain keyed digests; pending device codes and
 //! PKCE verifiers live only for the lifetime of this relay process.
 
 // Rust guideline compliant 2026-09-08
@@ -98,15 +98,15 @@ impl BrowserCookie {
         Self(SecretValue::new(value))
     }
 
+    #[must_use]
     pub fn expose(&self) -> &str {
         self.0.expose()
     }
 }
 
 impl Debug for BrowserCookie {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("BrowserCookie")
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserCookie")
             .field("redacted", &true)
             .finish()
     }
@@ -122,6 +122,7 @@ impl RelayBearerCredential {
         Self(SecretValue::new(value))
     }
 
+    #[must_use]
     pub fn expose(&self) -> &str {
         self.0.expose()
     }
@@ -135,15 +136,15 @@ impl RelayBearerCredential {
         if public_id.is_empty() || secret.is_empty() || secret.contains('.') {
             return Err(AuthError::CredentialInvalid);
         }
-        relay_protocol::CredentialId::parse(public_id).map_err(|_| AuthError::CredentialInvalid)?;
+        relay_protocol::CredentialId::parse(public_id)
+            .map_err(|_error| AuthError::CredentialInvalid)?;
         Ok((public_id, secret))
     }
 }
 
 impl Debug for RelayBearerCredential {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RelayBearerCredential")
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayBearerCredential")
             .field("redacted", &true)
             .finish()
     }
@@ -159,6 +160,7 @@ impl DevicePollSecret {
         Self(SecretValue::new(value))
     }
 
+    #[must_use]
     pub fn expose(&self) -> &str {
         self.0.expose()
     }
@@ -179,9 +181,8 @@ impl LoginBindingCookie {
 }
 
 impl Debug for LoginBindingCookie {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("LoginBindingCookie")
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginBindingCookie")
             .field("redacted", &true)
             .finish()
     }
@@ -202,9 +203,8 @@ impl OidcCallbackCode {
 }
 
 impl Debug for OidcCallbackCode {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("OidcCallbackCode")
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcCallbackCode")
             .field("redacted", &true)
             .finish()
     }
@@ -221,9 +221,8 @@ pub enum BrowserCallbackOutcome {
 }
 
 impl Debug for BrowserCallbackOutcome {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("BrowserCallbackOutcome")
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserCallbackOutcome")
             .field("redacted", &true)
             .finish()
     }
@@ -256,18 +255,16 @@ impl BrowserCallback {
 }
 
 impl Debug for BrowserCallback {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("BrowserCallback")
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserCallback")
             .field("redacted", &true)
             .finish()
     }
 }
 
 impl Debug for DevicePollSecret {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("DevicePollSecret")
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DevicePollSecret")
             .field("redacted", &true)
             .finish()
     }
@@ -306,11 +303,10 @@ impl IssuedCredential {
 }
 
 impl Debug for IssuedCredential {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("IssuedCredential")
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedCredential")
             .field("public_id", &self.public_id)
             .field("secret", &"<redacted>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }

@@ -34,7 +34,7 @@ use super::{
 
 const RANDOM_SECRET_BYTES: usize = 32;
 const IDENTITY_ADVISORY_LOCK_SEED: i64 = 0;
-/// Retries absorb normal PostgreSQL serializable conflicts without unbounded ingress work.
+/// Retries absorb normal `PostgreSQL` serializable conflicts without unbounded ingress work.
 const IDENTITY_ISSUE_MAX_ATTEMPTS: usize = 3;
 /// Provider session coordinates are opaque and bounded before durable processing.
 const MAX_CALLBACK_SESSION_STATE_BYTES: usize = 4 * 1024;
@@ -65,6 +65,10 @@ impl AuthLimits {
     /// # Errors
     /// Returns [`AuthError::Malformed`] when a lifetime is zero, an idle
     /// lifetime can outlive its session, or a poll bound is incoherent.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The policy limits are validated together because their bounds are interdependent."
+    )]
     pub fn new(
         login_lifetime: Duration,
         browser_session_lifetime: Duration,
@@ -163,9 +167,8 @@ struct HumanIdentity {
 }
 
 impl std::fmt::Debug for PendingBrowserLogin {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("PendingBrowserLogin")
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingBrowserLogin")
             .field("redacted", &true)
             .finish()
     }
@@ -179,12 +182,11 @@ pub struct BrowserLoginStart {
 }
 
 impl std::fmt::Debug for BrowserLoginStart {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("BrowserLoginStart")
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserLoginStart")
             .field("login_id", &self.login_id)
             .field("redacted", &true)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -205,7 +207,7 @@ impl std::fmt::Debug for DeviceLoginStart {
         f.debug_struct("DeviceLoginStart")
             .field("login_id", &self.login_id)
             .field("redacted", &true)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -233,12 +235,11 @@ impl IssuedBrowserSession {
     }
 }
 impl std::fmt::Debug for IssuedBrowserSession {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("IssuedBrowserSession")
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedBrowserSession")
             .field("session_id", &self.session_id)
             .field("redacted", &true)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -263,7 +264,7 @@ impl AuthenticatedActor {
     }
 }
 
-/// Resolves opaque browser and bearer authentication using PostgreSQL state.
+/// Resolves opaque browser and bearer authentication using `PostgreSQL` state.
 #[derive(Debug, Clone)]
 pub struct AuthService {
     store: Store,
@@ -333,11 +334,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         let inserted = sqlx::query(
             "INSERT INTO browser_logins (login_id, state_digest, nonce_digest, pkce_verifier_digest, login_binding_digest, issuer, client_id, audience, redirect_uri, action, account_link_generation, recovery_generation, expires_at) \
              SELECT $1, $2, $3, $4, $5, $6, $7, $7, $8, 'login', 1, r.recovery_generation, clock_timestamp() + $9::interval \
@@ -368,7 +369,7 @@ impl AuthService {
         let mut pending = self
             .pending_browser_logins
             .lock()
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         pending.insert(
             login_id,
             PendingBrowserLogin {
@@ -396,18 +397,18 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         let inserted = sqlx::query(
             "INSERT INTO device_logins (login_id, device_code_digest, poll_secret_digest, issuer, client_id, audience, action, account_link_generation, recovery_generation, expires_at, poll_interval_seconds, next_poll_at) \
              SELECT $1, $2, $3, $4, $5, $5, 'login', 1, r.recovery_generation, clock_timestamp() + $6::interval, $7, clock_timestamp() \
              FROM relay_identity r WHERE r.state = 'normal'",
         ).bind(login_id).bind(self.digest_key.digest(authorization.device_code()).as_slice()).bind(self.digest_key.digest(&poll_secret).as_slice())
         .bind(oidc.issuer()).bind(oidc.client_id()).bind(interval(authorization.expires_in))
-        .bind(i32::try_from(authorization.interval.as_secs()).map_err(|_| AuthError::Malformed)?)
+        .bind(i32::try_from(authorization.interval.as_secs()).map_err(|_error| AuthError::Malformed)?)
         .execute(&mut *transaction).await.map_err(database_error)?;
         if inserted.rows_affected() != 1 {
             return Err(AuthError::Durable);
@@ -445,6 +446,10 @@ impl AuthService {
     }
 
     /// Consumes a callback exactly once before exchanging its authorization code.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The browser callback must retain its security checks and durable transitions in review order."
+    )]
     pub async fn complete_browser_login(
         &self,
         oidc: &OidcClient,
@@ -455,11 +460,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         let row = sqlx::query(
             "UPDATE browser_logins b SET consumed_at = clock_timestamp(), outcome = 'failed' \
              FROM relay_identity r WHERE b.state_digest = $1 AND b.login_binding_digest = $2 \
@@ -484,7 +489,7 @@ impl AuthService {
             return Err(AuthError::OidcInvalid);
         };
         let login_id: Uuid = row.get("login_id");
-        let pending = self.remove_pending_browser_login(login_id).await;
+        let pending = self.remove_pending_browser_login(login_id);
         self.pending_transactions.release(login_id);
         if row.get::<String, _>("issuer") != oidc.issuer()
             || row.get::<String, _>("client_id") != oidc.client_id()
@@ -560,16 +565,13 @@ impl AuthService {
         let BrowserCallbackOutcome::Code(code) = callback.outcome else {
             return Err(AuthError::OidcInvalid);
         };
-        let identity = match oidc
+        let Ok(identity) = oidc
             .exchange_browser_code(code.expose().to_owned(), pending.verifier, pending.nonce)
             .await
-        {
-            Ok(identity) => identity,
-            Err(_) => {
-                self.audit_rejection("auth.browser.callback", "browser_login", "provider_invalid")
-                    .await?;
-                return Err(AuthError::OidcInvalid);
-            }
+        else {
+            self.audit_rejection("auth.browser.callback", "browser_login", "provider_invalid")
+                .await?;
+            return Err(AuthError::OidcInvalid);
         };
         if identity.issuer != oidc.issuer() {
             self.audit_rejection("auth.browser.callback", "browser_login", "issuer_invalid")
@@ -591,6 +593,10 @@ impl AuthService {
     }
 
     /// Owns one due device poll, exchanges it once, and delivers a relay credential once.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The device poll claim, provider exchange, and terminal transition are one reviewed sequence."
+    )]
     pub async fn poll_device_login(
         &self,
         oidc: &OidcClient,
@@ -628,11 +634,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut claim_transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         let claimed = sqlx::query("UPDATE device_logins d SET poll_lease_until = clock_timestamp() + $2::interval, poll_lease_token = $3 FROM relay_identity r WHERE d.login_id = $1 AND d.issuer = $4 AND d.client_id = $5 AND d.audience = $5 AND d.action = 'login' AND d.link_id IS NULL AND d.account_link_generation = 1 AND d.consumed_at IS NULL AND d.expires_at > clock_timestamp() AND d.next_poll_at <= clock_timestamp() AND (d.poll_lease_until IS NULL OR d.poll_lease_until < clock_timestamp()) AND d.recovery_generation = r.recovery_generation AND r.state = 'normal' RETURNING d.recovery_generation")
             .bind(login_id).bind(interval(self.limits.device_poll_lease)).bind(poll_lease_token.as_slice()).bind(oidc.issuer()).bind(oidc.client_id()).fetch_optional(&mut *claim_transaction).await.map_err(database_error)?.ok_or(AuthError::DeviceBusy { retry_after_seconds: poll_interval_seconds })?;
         self.commit_current(claim_transaction).await?;
@@ -654,11 +660,11 @@ impl AuthService {
                     .store
                     .begin_serializable()
                     .await
-                    .map_err(|_| AuthError::Durable)?;
+                    .map_err(|_error| AuthError::Durable)?;
                 self.authority
                     .verify_fence_in_transaction(&mut transaction)
                     .await
-                    .map_err(|_| AuthError::Durable)?;
+                    .map_err(|_error| AuthError::Durable)?;
                 let updated = sqlx::query("UPDATE device_logins SET poll_lease_until = NULL, poll_lease_token = NULL, next_poll_at = clock_timestamp() + make_interval(secs => poll_interval_seconds) WHERE login_id = $1 AND poll_lease_token = $2 AND consumed_at IS NULL AND expires_at > clock_timestamp() RETURNING poll_interval_seconds")
                     .bind(login_id).bind(poll_lease_token.as_slice()).fetch_optional(&mut *transaction).await.map_err(database_error)?;
                 self.commit_current(transaction).await?;
@@ -677,11 +683,11 @@ impl AuthService {
                     .store
                     .begin_serializable()
                     .await
-                    .map_err(|_| AuthError::Durable)?;
+                    .map_err(|_error| AuthError::Durable)?;
                 self.authority
                     .verify_fence_in_transaction(&mut transaction)
                     .await
-                    .map_err(|_| AuthError::Durable)?;
+                    .map_err(|_error| AuthError::Durable)?;
                 let updated = sqlx::query(
                     "UPDATE device_logins SET poll_lease_until = NULL, poll_lease_token = NULL, \
                      poll_interval_seconds = LEAST(poll_interval_seconds + $2, $3), \
@@ -865,14 +871,14 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
-            .map_err(|_| AuthError::CredentialInvalid)?;
+            .map_err(|_error| AuthError::CredentialInvalid)?;
         let row = sqlx::query(
             "SELECT p.kind, p.state FROM principals p JOIN relay_identity r ON r.state = 'normal' \
              WHERE p.id = $1 AND p.state = 'active' AND r.recovery_generation = $2",
@@ -920,14 +926,14 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
-            .map_err(|_| AuthError::CredentialInvalid)?;
+            .map_err(|_error| AuthError::CredentialInvalid)?;
         let mut records = sqlx::query(
             "SELECT c.credential_id, c.principal_id, c.credential_kind, c.issued_at, c.expires_at, \
              c.rotation_overlap_ends_at, c.last_used_at, c.revoked_at \
@@ -953,6 +959,10 @@ impl AuthService {
     }
 
     /// Revokes one credential owned by the authenticated account.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The credential revocation checks, audit, and commit form one fail-closed transaction."
+    )]
     pub async fn revoke_credential(
         &self,
         actor: AuthenticatedActor,
@@ -965,14 +975,14 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
-            .map_err(|_| AuthError::CredentialInvalid)?;
+            .map_err(|_error| AuthError::CredentialInvalid)?;
         let request_digest = revoke_request_digest(&self.digest_key, credential_id, &request)?;
         if exact_receipt(
             &mut transaction,
@@ -987,7 +997,7 @@ impl AuthService {
             self.authority
                 .commit_auth_mutation(transaction, false, None)
                 .await
-                .map_err(|_| AuthError::Durable)?;
+                .map_err(|_error| AuthError::Durable)?;
             return Ok(());
         }
         #[cfg(test)]
@@ -1003,7 +1013,7 @@ impl AuthService {
         .ok_or(AuthError::CredentialInvalid)?;
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
-            .map_err(|_| AuthError::CredentialInvalid)?;
+            .map_err(|_error| AuthError::CredentialInvalid)?;
         let changed = sqlx::query(
             "UPDATE relay_credentials c SET revoked_at = clock_timestamp(), credential_generation = credential_generation + 1 \
              FROM relay_identity r WHERE c.credential_id = $1 AND c.principal_id = $2 \
@@ -1072,10 +1082,14 @@ impl AuthService {
                 Some(AuthMutationTarget::Credential(credential_id)),
             )
             .await
-            .map_err(|_| AuthError::Durable)
+            .map_err(|_error| AuthError::Durable)
     }
 
     /// Revokes a service credential after a current team-administrator check.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The service revocation authorization, audit, and commit form one fail-closed transaction."
+    )]
     pub async fn revoke_service_credential(
         &self,
         actor: AuthenticatedActor,
@@ -1092,17 +1106,17 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
-            .map_err(|_| AuthError::CredentialInvalid)?;
+            .map_err(|_error| AuthError::CredentialInvalid)?;
         crate::authorization::rbac::require_team_admin(&mut transaction, context, team_id)
             .await
-            .map_err(|_| AuthError::CredentialInvalid)?;
+            .map_err(|_error| AuthError::CredentialInvalid)?;
         let request_digest = revoke_request_digest(&self.digest_key, credential_id, &request)?;
         if exact_receipt(
             &mut transaction,
@@ -1117,7 +1131,7 @@ impl AuthService {
             self.authority
                 .commit_auth_mutation(transaction, false, None)
                 .await
-                .map_err(|_| AuthError::Durable)?;
+                .map_err(|_error| AuthError::Durable)?;
             return Ok(());
         }
         #[cfg(test)]
@@ -1136,7 +1150,7 @@ impl AuthService {
         .ok_or(AuthError::CredentialInvalid)?;
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
-            .map_err(|_| AuthError::CredentialInvalid)?;
+            .map_err(|_error| AuthError::CredentialInvalid)?;
         let changed = sqlx::query(
             "UPDATE relay_credentials c SET revoked_at = clock_timestamp(), credential_generation = credential_generation + 1 \
              FROM service_accounts s JOIN relay_identity r ON r.state = 'normal' \
@@ -1206,7 +1220,7 @@ impl AuthService {
                 Some(AuthMutationTarget::Credential(credential_id)),
             )
             .await
-            .map_err(|_| AuthError::Durable)
+            .map_err(|_error| AuthError::Durable)
     }
 
     /// Replaces a current account credential with a bounded overlap.
@@ -1275,6 +1289,10 @@ impl AuthService {
         Err(AuthError::Durable)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The rotation currentness, overlap, audit, and commit checks form one fail-closed transaction."
+    )]
     async fn rotate_credential_for_once(
         &self,
         actor: AuthenticatedActor,
@@ -1296,11 +1314,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
             .map_err(rotation_store_error)?;
@@ -1343,7 +1361,7 @@ impl AuthService {
         }
         #[cfg(test)]
         self.pause_rotation_after_receipt().await?;
-        if request.expires_at.nanosecond() % 1_000 != 0 {
+        if !request.expires_at.nanosecond().is_multiple_of(1_000) {
             return Err(AuthError::Malformed);
         }
         let old = sqlx::query(
@@ -1363,7 +1381,7 @@ impl AuthService {
         let old_recovery_generation: i64 = old.get("recovery_generation");
         let old_revoked_at: Option<time::OffsetDateTime> = old.get("revoked_at");
         let requested_overlap =
-            time::Duration::try_from(overlap).map_err(|_| AuthError::Malformed)?;
+            time::Duration::try_from(overlap).map_err(|_error| AuthError::Malformed)?;
         if old_revoked_at.is_some()
             || old_recovery_generation != context.recovery_generation()
             || old_expires_at <= evaluated_at
@@ -1387,7 +1405,8 @@ impl AuthService {
             self.limits.human_credential_lifetime
         };
         if request.expires_at
-            > evaluated_at + time::Duration::try_from(lifetime).map_err(|_| AuthError::Malformed)?
+            > evaluated_at
+                + time::Duration::try_from(lifetime).map_err(|_error| AuthError::Malformed)?
         {
             self.commit_rotation_rejection(transaction, context).await?;
             return Err(AuthError::RotationRejected);
@@ -1475,7 +1494,7 @@ impl AuthService {
                 Some(AuthMutationTarget::Credential(old_id)),
             )
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         Ok(CredentialMutation {
             record: credential_record(row)?,
             credential: Some(DeviceCredential {
@@ -1487,6 +1506,10 @@ impl AuthService {
     }
 
     /// Creates a team-scoped service principal without assigning grants.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The service account limit, authorization, audit, and commit checks form one transaction."
+    )]
     pub async fn create_service_account(
         &self,
         actor: AuthenticatedActor,
@@ -1499,7 +1522,7 @@ impl AuthService {
         if request.display_name.is_empty()
             || request.display_name.len() > MAX_SERVICE_ACCOUNT_NAME_BYTES
             || request.expires_at <= time::OffsetDateTime::now_utc()
-            || request.expires_at.nanosecond() % 1_000 != 0
+            || !request.expires_at.nanosecond().is_multiple_of(1_000)
             || request.expires_at
                 > time::OffsetDateTime::now_utc() + self.limits.service_credential_lifetime
         {
@@ -1512,17 +1535,17 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
-            .map_err(|_| AuthError::CredentialInvalid)?;
+            .map_err(|_error| AuthError::CredentialInvalid)?;
         crate::authorization::rbac::require_team_admin(&mut transaction, context, team_id)
             .await
-            .map_err(|_| AuthError::CredentialInvalid)?;
+            .map_err(|_error| AuthError::CredentialInvalid)?;
         let request_digest = request_digest(&self.digest_key, &(team_id, &request))?;
         if let Some(principal_id) = exact_receipt(
             &mut transaction,
@@ -1538,7 +1561,7 @@ impl AuthService {
             self.authority
                 .commit_auth_mutation(transaction, false, None)
                 .await
-                .map_err(|_| AuthError::Durable)?;
+                .map_err(|_error| AuthError::Durable)?;
             return Ok(replay);
         }
         let count: i64 = sqlx::query_scalar(
@@ -1548,7 +1571,7 @@ impl AuthService {
         .fetch_one(&mut *transaction)
         .await
         .map_err(database_error)?;
-        if usize::try_from(count).map_err(|_| AuthError::Durable)?
+        if usize::try_from(count).map_err(|_error| AuthError::Durable)?
             >= self.limits.service_accounts_per_team
         {
             return Err(AuthError::Capacity);
@@ -1597,7 +1620,7 @@ impl AuthService {
                 Some(AuthMutationTarget::Principal(principal_id)),
             )
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         Ok(ServiceAccountCreated {
             account: ServiceAccountRecord {
                 principal_id: PrincipalId::from_uuid(principal_id),
@@ -1630,14 +1653,14 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         crate::authorization::rbac::require_team_admin(&mut transaction, context, team_id)
             .await
-            .map_err(|_| AuthError::CredentialInvalid)?;
+            .map_err(|_error| AuthError::CredentialInvalid)?;
         let mut records = sqlx::query(
             "SELECT s.principal_id, s.team_id, s.display_name, p.state FROM service_accounts s \
              JOIN principals p ON p.id = s.principal_id WHERE s.team_id = $1 AND ($2::uuid IS NULL OR s.principal_id > $2) ORDER BY s.principal_id ASC LIMIT $3",
@@ -1661,8 +1684,11 @@ impl AuthService {
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
-        transaction.commit().await.map_err(|_| AuthError::Durable)
+            .map_err(|_error| AuthError::Durable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_error| AuthError::Durable)
     }
 
     async fn commit_rotation_rejection(
@@ -1676,7 +1702,7 @@ impl AuthService {
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         transaction.commit().await.map_err(retryable_database_error)
     }
 
@@ -1687,11 +1713,11 @@ impl AuthService {
     ) -> Result<(), AuthError> {
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
-            .map_err(|_| AuthError::CredentialInvalid)?;
+            .map_err(|_error| AuthError::CredentialInvalid)?;
         self.authority
             .commit_auth_mutation(transaction, false, None)
             .await
-            .map_err(|_| AuthError::Durable)
+            .map_err(|_error| AuthError::Durable)
     }
 
     #[cfg(test)]
@@ -1714,7 +1740,7 @@ impl AuthService {
         Ok(())
     }
 
-    async fn remove_pending_browser_login(&self, login_id: Uuid) -> Option<PendingBrowserLogin> {
+    fn remove_pending_browser_login(&self, login_id: Uuid) -> Option<PendingBrowserLogin> {
         self.pending_browser_logins.lock().ok()?.remove(&login_id)
     }
 
@@ -1768,11 +1794,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         sqlx::query(
             "UPDATE browser_logins SET consumed_at = clock_timestamp(), outcome = 'expired' \
              WHERE consumed_at IS NULL AND expires_at <= clock_timestamp()",
@@ -1802,18 +1828,18 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         let updated = sqlx::query(
             "UPDATE device_logins SET consumed_at = clock_timestamp(), outcome = $2, poll_lease_until = NULL, poll_lease_token = NULL \
              WHERE login_id = $1 AND consumed_at IS NULL AND ($3::bytea IS NULL OR (poll_lease_token = $3 AND expires_at > clock_timestamp()))",
         )
         .bind(login_id)
         .bind(outcome)
-        .bind(poll_lease_token.map(|token| token.as_slice()))
+        .bind(poll_lease_token.map(<[u8; 32]>::as_slice))
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -1844,11 +1870,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         audit_auth(
             &mut transaction,
             action,
@@ -1892,7 +1918,7 @@ impl AuthService {
                 )
                 .await
             {
-                Err(AuthError::Retryable) => continue,
+                Err(AuthError::Retryable) => {}
                 result => return result,
             }
         }
@@ -1915,11 +1941,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         let bound = sqlx::query(
             "SELECT b.login_id FROM browser_logins b JOIN relay_identity r ON r.recovery_generation = b.recovery_generation \
              WHERE b.login_id = $1 AND b.issuer = $2 AND b.client_id = $3 AND b.audience = $3 AND b.redirect_uri = $4 \
@@ -1995,7 +2021,7 @@ impl AuthService {
                 .issue_human_credential_once(subject.clone(), &binding)
                 .await
             {
-                Err(AuthError::Retryable) => continue,
+                Err(AuthError::Retryable) => {}
                 result => return result,
             }
         }
@@ -2014,11 +2040,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         let bound = sqlx::query(
             "SELECT d.login_id, d.poll_interval_seconds FROM device_logins d JOIN relay_identity r ON r.recovery_generation = d.recovery_generation \
              WHERE d.login_id = $1 AND d.poll_lease_token = $2 AND d.poll_lease_until > clock_timestamp() \
@@ -2102,11 +2128,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         touch_browser_session(
             &mut transaction,
             session_id,
@@ -2121,11 +2147,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_| AuthError::Durable)?;
+            .map_err(|_error| AuthError::Durable)?;
         touch_credential(&mut transaction, credential_id).await?;
         self.commit_current(transaction).await
     }
@@ -2137,14 +2163,18 @@ fn random_secret() -> Result<String, AuthError> {
 
 fn random_token() -> Result<[u8; RANDOM_SECRET_BYTES], AuthError> {
     let mut bytes = [0_u8; RANDOM_SECRET_BYTES];
-    getrandom::getrandom(&mut bytes).map_err(|_| AuthError::Durable)?;
+    getrandom::getrandom(&mut bytes).map_err(|_error| AuthError::Durable)?;
     Ok(bytes)
 }
 
 fn interval_seconds(value: i32) -> Result<u32, AuthError> {
-    u32::try_from(value).map_err(|_| AuthError::Durable)
+    u32::try_from(value).map_err(|_error| AuthError::Durable)
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "SQLx decodes the durable actor kind as an owned value before this safe classification."
+)]
 fn browser_actor_kind(principal_kind: String) -> Result<ActorKind, AuthError> {
     match principal_kind.as_str() {
         "human" => Ok(ActorKind::Human),
@@ -2153,6 +2183,10 @@ fn browser_actor_kind(principal_kind: String) -> Result<ActorKind, AuthError> {
     }
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "SQLx decodes both durable kind coordinates as owned values before classification."
+)]
 fn credential_actor_kind(
     principal_kind: String,
     credential_kind: String,
@@ -2165,6 +2199,10 @@ fn credential_actor_kind(
     }
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "SQLx decodes the durable principal kind as an owned value before classification."
+)]
 fn principal_kind(value: String) -> Result<PrincipalKind, AuthError> {
     match value.as_str() {
         "human" => Ok(PrincipalKind::Human),
@@ -2174,6 +2212,10 @@ fn principal_kind(value: String) -> Result<PrincipalKind, AuthError> {
     }
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "SQLx decodes the durable principal state as an owned value before classification."
+)]
 fn principal_state(value: String) -> Result<PrincipalState, AuthError> {
     match value.as_str() {
         "active" => Ok(PrincipalState::Active),
@@ -2206,6 +2248,10 @@ fn service_account_cursor(records: &mut Vec<ServiceAccountRecord>, limit: i64) -
     records.last().map(|record| record.principal_id.as_uuid())
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Rows are consumed while mapping a bounded query result into a credential record."
+)]
 fn credential_record(row: sqlx::postgres::PgRow) -> Result<CredentialRecord, AuthError> {
     let kind: String = row.get("credential_kind");
     let kind = match kind.as_str() {
@@ -2225,6 +2271,10 @@ fn credential_record(row: sqlx::postgres::PgRow) -> Result<CredentialRecord, Aut
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The audit row requires the complete mutation coordinate to stay atomic with its transaction."
+)]
 async fn audit_actor_mutation(
     transaction: &mut Transaction<'_, Postgres>,
     actor: crate::store::ActorContext,
@@ -2285,7 +2335,7 @@ fn request_digest<T: serde::Serialize>(
     key: &DigestKey,
     request: &T,
 ) -> Result<[u8; 32], AuthError> {
-    let value = serde_json::to_string(request).map_err(|_| AuthError::Malformed)?;
+    let value = serde_json::to_string(request).map_err(|_error| AuthError::Malformed)?;
     Ok(key.digest(&value))
 }
 
@@ -2468,7 +2518,7 @@ fn interval(duration: Duration) -> String {
 }
 
 fn seconds_i32(duration: Duration) -> Result<i32, AuthError> {
-    i32::try_from(duration.as_secs()).map_err(|_| AuthError::Malformed)
+    i32::try_from(duration.as_secs()).map_err(|_error| AuthError::Malformed)
 }
 
 async fn audit_issued_credential(
@@ -2494,7 +2544,7 @@ async fn audit_issued_credential(
     .bind(recovery_generation)
     .execute(&mut **transaction)
     .await
-    .map_err(|_| AuthError::Durable)?;
+    .map_err(|_error| AuthError::Durable)?;
     if inserted.rows_affected() != 1 {
         return Err(AuthError::Durable);
     }
@@ -2523,7 +2573,7 @@ async fn audit_auth(
     .bind(expected_recovery_generation)
     .execute(&mut **transaction)
     .await
-    .map_err(|_| AuthError::Durable)?;
+    .map_err(|_error| AuthError::Durable)?;
     if inserted.rows_affected() != 1 {
         return Err(AuthError::Durable);
     }
@@ -2554,7 +2604,7 @@ async fn enforce_credential_capacity(
     .fetch_one(&mut **transaction)
     .await
     .map_err(retryable_database_error)?;
-    let count = usize::try_from(count).map_err(|_| AuthError::Durable)?;
+    let count = usize::try_from(count).map_err(|_error| AuthError::Durable)?;
     if count >= limit && !replacing_without_overlap {
         return Err(AuthError::Capacity);
     }
@@ -2613,10 +2663,14 @@ fn database_error(_error: sqlx::Error) -> AuthError {
     AuthError::Durable
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Result::map_err transfers the SQLx failure by value for immediate safe classification."
+)]
 fn retryable_database_error(error: sqlx::Error) -> AuthError {
     if error
         .as_database_error()
-        .and_then(|database| database.code())
+        .and_then(sqlx::error::DatabaseError::code)
         .is_some_and(|code| code == "40001" || code == "40P01")
     {
         AuthError::Retryable
@@ -2671,17 +2725,17 @@ pub(crate) mod tests {
 
     pub(crate) fn limits() -> AuthLimits {
         AuthLimits::new(
-            Duration::from_secs(300),
-            Duration::from_secs(600),
-            Duration::from_secs(60),
-            Duration::from_secs(900),
-            Duration::from_secs(900),
-            Duration::from_secs(60),
+            Duration::from_mins(5),
+            Duration::from_mins(10),
+            Duration::from_mins(1),
+            Duration::from_mins(15),
+            Duration::from_mins(15),
+            Duration::from_mins(1),
             8,
             16,
             Duration::from_secs(30),
             Duration::from_secs(5),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         )
         .expect("valid explicit authentication limits")
     }
@@ -2711,7 +2765,7 @@ pub(crate) mod tests {
                     .expect("valid fixture URL"),
                 verification_uri_complete: None,
                 user_code: "sentinel-user-code".to_owned(),
-                expires_in: Duration::from_secs(60),
+                expires_in: Duration::from_mins(1),
                 interval: Duration::from_secs(1),
                 device_code: Zeroizing::new("sentinel-device-code".to_owned()),
                 verifier: Zeroizing::new("sentinel-verifier".to_owned()),
@@ -2840,6 +2894,10 @@ pub(crate) mod tests {
         (Arc::new(authority), directory)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The fixture preserves the complete audit-failure setup for both credential scopes."
+    )]
     async fn seed_revocation_audit_failure_case(
         service: &AuthService,
         store: &Store,
@@ -3118,6 +3176,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The rotation and revocation assertions verify one complete credential lifecycle."
+    )]
     async fn rotation_is_idempotent_and_revocation_invalidates_the_bearer() {
         let (store, schema, bootstrap) = fixture().await;
         let (authority, _directory) = authority(store.clone()).await;
@@ -3474,10 +3536,10 @@ pub(crate) mod tests {
             },
             expires_at: first.record.expires_at,
         };
-        assert!(service
+        service
             .rotate_credential(new_actor, CredentialId::from_uuid(credential_id), stale)
             .await
-            .is_err());
+            .unwrap_err();
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM relay_credentials WHERE principal_id = $1"
@@ -3513,6 +3575,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The concurrent expiry test must retain its complete transaction ordering evidence."
+    )]
     async fn expired_concurrent_rotation_cannot_publish_an_orphaned_credential() {
         let (store, schema, bootstrap) = fixture().await;
         let (authority, _directory) = authority(store.clone()).await;
@@ -3853,6 +3919,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The service-account authorization and retry cases are one durable sequence."
+    )]
     async fn service_account_is_team_scoped_grantless_and_retry_safe() {
         let (store, schema, bootstrap) = fixture().await;
         let (authority, _directory) = authority(store.clone()).await;
@@ -4143,12 +4213,16 @@ pub(crate) mod tests {
             .expect("count receipts after audit failure"),
             0
         );
-        assert!(authority.validate_fence().await.is_ok());
+        authority.validate_fence().await.unwrap();
         assert!(!authority.is_closed());
         cleanup(&bootstrap, &schema).await;
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The revocation retry cases must retain their complete ownership matrix."
+    )]
     async fn revoke_retry_accepts_only_owned_or_team_scoped_inactive_credentials() {
         let (store, schema, bootstrap) = fixture().await;
         sqlx::query("UPDATE relay_identity SET recovery_generation = 2")
@@ -4355,6 +4429,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The concurrent expiry test must retain its complete authorization ordering."
+    )]
     async fn revoke_retry_rechecks_an_actor_that_expires_while_the_target_is_locked() {
         let (store, schema, bootstrap) = fixture().await;
         let (authority, directory) = authority(store.clone()).await;
@@ -4499,21 +4577,25 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The capacity-race test must retain both concurrent transaction outcomes."
+    )]
     async fn concurrent_device_issuance_at_credential_cap_commits_once() {
         let (store, schema, bootstrap) = fixture().await;
         let (authority, _directory) = authority(store.clone()).await;
         let limits = AuthLimits::new(
-            Duration::from_secs(300),
-            Duration::from_secs(600),
-            Duration::from_secs(60),
-            Duration::from_secs(900),
-            Duration::from_secs(900),
-            Duration::from_secs(60),
+            Duration::from_mins(5),
+            Duration::from_mins(10),
+            Duration::from_mins(1),
+            Duration::from_mins(15),
+            Duration::from_mins(15),
+            Duration::from_mins(1),
             1,
             16,
             Duration::from_secs(30),
             Duration::from_secs(5),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         )
         .expect("cap-one limits");
         let service = AuthService::new(
@@ -4657,6 +4739,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The callback test must retain every terminal outcome and verifier-consumption check."
+    )]
     async fn terminal_bound_callbacks_consume_pending_verifiers_and_audit_denials() {
         let (store, schema, bootstrap) = fixture().await;
         let (authority, _directory) = authority(store.clone()).await;
@@ -4775,7 +4861,7 @@ pub(crate) mod tests {
 
     #[test]
     fn limits_reject_incoherent_idle_or_poll_windows() {
-        assert!(AuthLimits::new(
+        AuthLimits::new(
             Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(2),
@@ -4788,7 +4874,7 @@ pub(crate) mod tests {
             Duration::from_secs(1),
             Duration::from_secs(1),
         )
-        .is_err());
+        .unwrap_err();
     }
 
     #[tokio::test]
@@ -4862,7 +4948,7 @@ pub(crate) mod tests {
             .begin_serializable()
             .await
             .expect("begin touch transaction");
-        touch_browser_session(&mut transaction, session, Duration::from_secs(60))
+        touch_browser_session(&mut transaction, session, Duration::from_mins(1))
             .await
             .expect("touch current session");
         transaction
@@ -4891,7 +4977,7 @@ pub(crate) mod tests {
             2,
             limits(),
             LoginPolicy::AnyAuthenticatedSubject,
-            authority.clone(),
+            Arc::clone(&authority),
         );
         let second = AuthService::new(
             store.clone(),
@@ -5174,7 +5260,7 @@ pub(crate) mod tests {
             2,
             limits(),
             LoginPolicy::AnyAuthenticatedSubject,
-            authority.clone(),
+            Arc::clone(&authority),
         );
         let principal_id = Uuid::now_v7();
         let credential_id = Uuid::now_v7();
@@ -5232,8 +5318,8 @@ pub(crate) mod tests {
             credential_actor_kind("infrastructure".to_owned(), "human".to_owned()),
             Ok(ActorKind::Infrastructure)
         ));
-        assert!(credential_actor_kind("service".to_owned(), "human".to_owned()).is_err());
-        assert!(browser_actor_kind("service".to_owned()).is_err());
+        credential_actor_kind("service".to_owned(), "human".to_owned()).unwrap_err();
+        browser_actor_kind("service".to_owned()).unwrap_err();
     }
 
     #[tokio::test]
@@ -5274,6 +5360,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The inactive-target matrix must retain all no-durable-effect assertions."
+    )]
     async fn inactive_rotation_targets_are_rejected_without_durable_effects() {
         let (store, schema, bootstrap) = fixture_at_generation(2).await;
         let (authority, directory) = authority(store.clone()).await;

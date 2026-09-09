@@ -342,7 +342,7 @@ macro_rules! management_read {
         ) -> Result<ListPage<$record>, AuthorityError> {
             let limit = page.limit;
             let correlation_id = page.correlation_id;
-            'read: for _attempt in 0..MANAGEMENT_TRANSACTION_MAX_ATTEMPTS {
+            for _attempt in 0..MANAGEMENT_TRANSACTION_MAX_ATTEMPTS {
                 if self.closed.load(Ordering::Acquire) {
                     return Err(AuthorityError::Cancelled);
                 }
@@ -350,9 +350,7 @@ macro_rules! management_read {
                     Ok(transaction) => transaction,
                     Err(error) => return Err(self.management_pre_gate_error(error)),
                 };
-                if let Err(error) = self.verify_fence_in_transaction(&mut transaction).await {
-                    return Err(error);
-                }
+                self.verify_fence_in_transaction(&mut transaction).await?;
                 if let Err(error) =
                     require_team_permission(&mut transaction, actor, team_id, $permission).await
                 {
@@ -400,7 +398,7 @@ macro_rules! management_read {
                 }
                 match transaction.commit().await.map_err(StoreError::Database) {
                     Ok(()) => return Ok(result),
-                    Err(error) if is_retryable_management_error(&error) => continue 'read,
+                    Err(error) if is_retryable_management_error(&error) => {}
                     Err(error) => {
                         self.close_all();
                         return Err(error.into());
@@ -695,7 +693,7 @@ impl Authority {
     ) -> Result<ListPage<TeamRecord>, AuthorityError> {
         let limit = page.limit;
         let correlation_id = page.correlation_id;
-        'read: for _attempt in 0..MANAGEMENT_TRANSACTION_MAX_ATTEMPTS {
+        for _attempt in 0..MANAGEMENT_TRANSACTION_MAX_ATTEMPTS {
             if self.closed.load(Ordering::Acquire) {
                 return Err(AuthorityError::Cancelled);
             }
@@ -740,7 +738,7 @@ impl Authority {
             self.verify_fence_in_transaction(&mut transaction).await?;
             match transaction.commit().await.map_err(StoreError::Database) {
                 Ok(()) => return Ok(result),
-                Err(error) if is_retryable_management_error(&error) => continue 'read,
+                Err(error) if is_retryable_management_error(&error) => {}
                 Err(error) => {
                     self.close_all();
                     return Err(error.into());
@@ -2025,7 +2023,7 @@ fn is_retryable_management_error(error: &StoreError) -> bool {
             StoreError::Database(database)
                 if database
                     .as_database_error()
-                    .and_then(|error| error.code())
+                    .and_then(sqlx::error::DatabaseError::code)
                     .is_some_and(|code| code == "40001" || code == "40P01")
         )
 }
@@ -3162,9 +3160,9 @@ mod tests {
     async fn team_list_audit_uses_the_current_global_identity_revision() {
         let (store, schema, owner, owner_credential, _administrator, _administrator_credential) =
             fixture().await;
-        const IDENTITY_REVISION: i64 = 7;
+        let identity_revision = 7_i64;
         sqlx::query("UPDATE relay_identity SET revision=$1")
-            .bind(IDENTITY_REVISION)
+            .bind(identity_revision)
             .execute(store.pool())
             .await
             .expect("advance global identity revision");
@@ -3201,7 +3199,7 @@ mod tests {
         assert_eq!(audit.2, None);
         assert_eq!(audit.3, "team.list");
         assert_eq!(audit.4, "allow");
-        assert_eq!(audit.5, IDENTITY_REVISION);
+        assert_eq!(audit.5, identity_revision);
         assert_eq!(audit.6, 1);
         assert_eq!(audit.7, correlation_id);
         assert_eq!(audit.8, "page");

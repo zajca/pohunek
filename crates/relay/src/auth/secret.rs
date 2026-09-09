@@ -27,9 +27,8 @@ impl SecretValue {
 }
 
 impl Debug for SecretValue {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("SecretValue")
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretValue")
             .field("redacted", &true)
             .finish()
     }
@@ -44,6 +43,7 @@ pub struct DigestKey {
 
 impl DigestKey {
     /// Creates one active digest key from protected runtime configuration.
+    #[must_use]
     pub fn new(key_id: String, bytes: Vec<u8>) -> Self {
         Self {
             key_id,
@@ -52,6 +52,7 @@ impl DigestKey {
     }
 
     /// Returns the configured safe key identifier.
+    #[must_use]
     pub fn key_id(&self) -> &str {
         &self.key_id
     }
@@ -72,12 +73,11 @@ impl DigestKey {
 }
 
 impl Debug for DigestKey {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("DigestKey")
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DigestKey")
             .field("key_id", &self.key_id)
             .field("redacted", &true)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

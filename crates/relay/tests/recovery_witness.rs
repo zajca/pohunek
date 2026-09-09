@@ -213,7 +213,7 @@ fn altered_history_signature_fails_closed() {
     std::fs::set_permissions(history, std::fs::Permissions::from_mode(0o600))
         .expect("restore private history mode");
 
-    assert!(store.latest().is_err());
+    store.latest().unwrap_err();
 }
 
 #[test]
@@ -223,7 +223,7 @@ fn unsafe_file_permissions_and_symlinks_fail_closed() {
     let current = directory.path().join("witness.current");
     std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o644))
         .expect("make current world-readable");
-    assert!(store.latest().is_err());
+    store.latest().unwrap_err();
 
     std::fs::remove_file(&current).expect("remove unsafe current fixture");
     std::os::unix::fs::symlink(
@@ -231,7 +231,7 @@ fn unsafe_file_permissions_and_symlinks_fail_closed() {
         &current,
     )
     .expect("create malicious current symlink");
-    assert!(store.latest().is_err());
+    store.latest().unwrap_err();
 }
 
 #[test]
@@ -262,6 +262,6 @@ fn dirty_latch_remains_set_after_deny_incident() {
 fn witness_identity_and_generation_are_immutable_across_transitions() {
     let (_directory, store) = witness();
     let first = store.begin_run(None, "relay_test", 2).expect("begin run");
-    assert!(store.begin_run(Some(&first), "other_relay", 2).is_err());
-    assert!(store.begin_run(Some(&first), "relay_test", 1).is_err());
+    store.begin_run(Some(&first), "other_relay", 2).unwrap_err();
+    store.begin_run(Some(&first), "relay_test", 1).unwrap_err();
 }

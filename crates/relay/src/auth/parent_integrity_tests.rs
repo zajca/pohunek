@@ -1,4 +1,4 @@
-//! Exercises PostgreSQL parent constraints for relay authentication rows.
+//! Exercises `PostgreSQL` parent constraints for relay authentication rows.
 
 // Rust guideline compliant 2026-09-08
 
@@ -66,6 +66,10 @@ async fn insert_credential(
         .expect("seed credential");
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The fixture must specify each parent coordinate to test durable lineage integrity."
+)]
 async fn insert_lineage_credential(
     store: &Store,
     digest_key: &DigestKey,
@@ -292,6 +296,10 @@ async fn postgres_auth_parents_reject_invalid_identity_and_link_coordinates() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "The PostgreSQL parent-integrity cases stay together as one durable adversarial sequence."
+)]
 async fn service_account_parent_integrity_denies_deprovisioned_or_missing_credentials() {
     let (store, schema, bootstrap) = fixture().await;
     let (authority, _directory) = authority(store.clone()).await;

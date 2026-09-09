@@ -505,7 +505,7 @@ impl WitnessStore {
         validate_transition(current, &next)?;
         next.sequence = current.map_or(1, |record| record.sequence + 1);
         next.previous_digest = current.map(digest_record);
-        next.key_id = self.key_id.clone();
+        next.key_id.clone_from(&self.key_id);
         next.signature = signature_text(&self.signing_key, &unsigned_bytes(&next)?);
         self.verify(&next)?;
         Ok(next)
@@ -712,7 +712,7 @@ impl WitnessStore {
             return Err(RecoveryError::InvalidWitness);
         }
         let mut next = current.clone();
-        next.manifest_digest = manifest_digest.to_owned();
+        manifest_digest.clone_into(&mut next.manifest_digest);
         next.active_run = false;
         next.recovery_pending_review = false;
         next.event = WitnessEvent::RecoveryReviewed;
@@ -767,7 +767,7 @@ impl WitnessStore {
             *self
                 .scan_incident_peak
                 .lock()
-                .map_err(|_error| RecoveryError::InvalidWitness)? = 0
+                .map_err(|_error| RecoveryError::InvalidWitness)? = 0;
         };
         let mut count = 0_i64;
         let mut max_sequence = 0_i64;
@@ -821,7 +821,7 @@ impl WitnessStore {
                             .scan_incident_peak
                             .lock()
                             .map_err(|_error| RecoveryError::InvalidWitness)?;
-                        *peak = (*peak).max(incidents.len())
+                        *peak = (*peak).max(incidents.len());
                     };
                     if incidents.len() > MAX_REVIEW_INCIDENTS {
                         overflow = true;

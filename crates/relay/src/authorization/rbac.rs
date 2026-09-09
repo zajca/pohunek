@@ -162,7 +162,7 @@ pub(crate) async fn audit_change(
         .await
         .map_err(|error| {
             let database = error.as_database_error();
-            match database.and_then(|database| database.code()).as_deref() {
+            match database.and_then(sqlx::error::DatabaseError::code).as_deref() {
                 Some("40001" | "40P01") => StoreError::Database(error),
                 Some("23505")
                     if database.is_some_and(|database| {

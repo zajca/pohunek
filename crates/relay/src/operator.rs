@@ -223,7 +223,7 @@ fn parse_artifact(bytes: &[u8]) -> Result<CredentialArtifact, OperatorError> {
     );
     if artifact.version != CREDENTIAL_ARTIFACT_VERSION
         || decoded.len() != SERVICE_SECRET_BYTES
-        || artifact.expires_at.nanosecond() % 1_000 != 0
+        || !artifact.expires_at.nanosecond().is_multiple_of(1_000)
     {
         return Err(OperatorError::CredentialOutput);
     }
