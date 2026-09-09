@@ -216,9 +216,11 @@ fn artifact_digest(bytes: &[u8]) -> [u8; 32] {
 fn parse_artifact(bytes: &[u8]) -> Result<CredentialArtifact, OperatorError> {
     let artifact: CredentialArtifactRead =
         serde_json::from_slice(bytes).map_err(|_error| OperatorError::CredentialOutput)?;
-    let decoded = URL_SAFE_NO_PAD
-        .decode(&artifact.secret)
-        .map_err(|_error| OperatorError::CredentialOutput)?;
+    let decoded = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(&artifact.secret)
+            .map_err(|_error| OperatorError::CredentialOutput)?,
+    );
     if artifact.version != CREDENTIAL_ARTIFACT_VERSION
         || decoded.len() != SERVICE_SECRET_BYTES
         || artifact.expires_at.nanosecond() % 1_000 != 0
@@ -242,8 +244,9 @@ fn write_new_artifact(
     expires_at: OffsetDateTime,
 ) -> Result<(CredentialArtifact, [u8; 32]), OperatorError> {
     let parent = private_output_parent(path)?;
-    let mut secret_bytes = [0_u8; SERVICE_SECRET_BYTES];
-    getrandom::getrandom(&mut secret_bytes).map_err(|_error| OperatorError::CredentialOutput)?;
+    let mut secret_bytes = Zeroizing::new([0_u8; SERVICE_SECRET_BYTES]);
+    getrandom::getrandom(secret_bytes.as_mut())
+        .map_err(|_error| OperatorError::CredentialOutput)?;
     let artifact = CredentialArtifact {
         team_id: Uuid::now_v7(),
         owner_membership_id: Uuid::now_v7(),
@@ -252,7 +255,7 @@ fn write_new_artifact(
         credential_id: Uuid::now_v7(),
         audit_id: Uuid::now_v7(),
         expires_at,
-        secret: Zeroizing::new(URL_SAFE_NO_PAD.encode(secret_bytes)),
+        secret: Zeroizing::new(URL_SAFE_NO_PAD.encode(secret_bytes.as_ref())),
     };
     let encoded = serde_json::to_vec(&CredentialArtifactWrite {
         version: CREDENTIAL_ARTIFACT_VERSION,
@@ -266,6 +269,7 @@ fn write_new_artifact(
         secret: &artifact.secret,
     })
     .map_err(|_error| OperatorError::CredentialOutput)?;
+    let encoded = Zeroizing::new(encoded);
     let mut file = File::from(
         rustix::fs::openat(
             &parent,
@@ -327,7 +331,7 @@ fn read_artifact(path: &Path) -> Result<(CredentialArtifact, [u8; 32]), Operator
     {
         return Err(OperatorError::CredentialOutput);
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Zeroizing::new(Vec::new());
     file.take(MAX_CREDENTIAL_ARTIFACT_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_error| OperatorError::CredentialOutput)?;
