@@ -117,6 +117,8 @@ remain deferred:
 - `docs/knowledge/safety/trust-model.md`
 - `docs/knowledge/guides/remote-hosts.md`
 - `docs/knowledge/guides/web-control-center.md`
+- `crates/relay-protocol/src/`
+- `crates/relay/migrations/`
 - `crates/relay/src/operator.rs`
 - `crates/relay/src/lifecycle.rs`
 - `crates/relay/src/lifecycle/local.rs`
@@ -131,6 +133,7 @@ remain deferred:
 - `crates/relay/src/bin/pohunek-relayd.rs`
 - `crates/relay-client/src/`
 - `crates/cli/src/commands/relay.rs`
+- `crates/cli/src/commands/relay/`
 
 Shipped host-local identity and governance:
 

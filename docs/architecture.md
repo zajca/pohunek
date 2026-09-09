@@ -222,10 +222,10 @@ authority. The
 current Bun backend remains the production owner-path WebUI gateway for its
 local daemon and direct-overlay peers. It is not a relay authority and is not
 replaced by [#86](https://github.com/zajca/pohunek/issues/86). The Rust relay has
-no local mode: it serves a separate typed team surface. The two web surfaces may
-share presentation components, but they use explicit origins, transports,
-credentials, and state without fallback. The relay does not own PTYs or durable
-terminal content.
+no local mode: its future typed team surface will remain separate. The two web
+surfaces may share presentation components, but they use explicit origins,
+transports, credentials, and state without fallback. The relay does not own PTYs
+or durable terminal content.
 
 ### Accepted relay model concepts
 
@@ -1036,9 +1036,9 @@ Integration tests:
 | Remote transport | SSH bridge | Direct over NetBird/WireGuard |
 | Discovery | Tailscale + NetBird + signed manifests | NetBird-local + live capability query |
 | Mesh trust | Signed manifests, key rotation, snapshot sync | Owner paths use overlay + filesystem permissions; relay uses explicit enrollment and local `HostShare` ceilings |
-| Audit | Tamper-evident considered | Plain local event log today; durable relay audit and admission foundation planned in [#85](https://github.com/zajca/pohunek/issues/85), with operational retention and load evidence in [#87](https://github.com/zajca/pohunek/issues/87) |
+| Audit | Tamper-evident considered | Plain local event log today; durable relay audit and admission foundation implemented in [#85](https://github.com/zajca/pohunek/issues/85), with operational retention and load evidence in [#87](https://github.com/zajca/pohunek/issues/87) |
 | Agent state | Terminal heuristics | OSC title + screen-manifest + PTY activity (per herdr); hooks only capture the session ID for resume |
 | Providers | In-tree Linear/GitHub adapters | Deferred, shell-out (`gh`, Linear GraphQL/MCP) in the client surfaces, not the chassis |
-| GUI | libghostty client (MVP5) + spike (MVP0) | Native Rust desktop and mesh-local browser clients shipped; relay clients remain planned |
+| GUI | libghostty client (MVP5) + spike (MVP0) | Native Rust desktop and mesh-local browser clients shipped; the HTTPS native relay credential CLI is implemented, while the full team client and UI remain [#86](https://github.com/zajca/pohunek/issues/86) |
 | Attach framing | "separate stream mode" (unspecified) | Separate connection per PTY (specified) |
 | Agents | Codex + Claude Code | Codex + Claude Code + local-terminal Hermes Agent 0.20.0 |

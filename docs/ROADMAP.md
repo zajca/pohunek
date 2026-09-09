@@ -322,7 +322,7 @@ live blocker graph:
 ## 5. Recommended sequence
 
 Tracks S, D, and Browser M1 are shipped and remain usable throughout the relay
-work. The next sequence is Track R exactly as ordered above: #91 → completed #85 → #92 →
+work. The remaining Track R sequence is #91 → completed #85 → #107/#108/#92 →
 complete #72 → #70/#82/#83/#84/#71 → #86 and #87 → post-release #73/#88.
 Existing owner-path work may
 continue independently only when it does not create a second production relay

@@ -57,9 +57,9 @@ publish a relay API, or provide a team UI.
 The owner WebUI remains supported alongside the relay. Its Bun backend discovers
 the local daemon and direct-overlay peers and transparently bridges browser
 WebSockets into the existing owner protocol. `pohunek-relayd` has no local mode;
-its team WebUI uses a separate typed API, credential set, state adapter, and
-origin. Presentation components may be shared, but there is no cross-mode
-fallback or session aggregation.
+its future team WebUI will use a separate typed API, credential set, state
+adapter, and origin. Presentation components may be shared, but there is no
+cross-mode fallback or session aggregation.
 
 The accepted design adds one optional public Rust `pohunek-relayd` authority.
 Standalone and direct NetBird operation remain first-class and never depend on
