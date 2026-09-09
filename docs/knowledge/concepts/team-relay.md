@@ -9,11 +9,41 @@ intents: [setup, project, update, debug, help]
 
 # Optional Team Relay
 
-Status: accepted design, not implemented. Current Pohunek releases use public
-protocol v3 through an owner-only Unix socket or a direct configured overlay
-such as NetBird. The shipped Bun web backend is a transparent mesh-local
-browser transport, not the team relay described here. Do not suggest relay
-commands or configuration until their owning issues have shipped.
+Status: the relay foundation has an owner-private stopped-lifecycle bootstrap
+and initial provisioning procedure. It has no public relay endpoint, host link,
+team client, team WebUI, routing, attach path, or host enrollment. Current
+Pohunek releases otherwise use public protocol v3 through an owner-only Unix
+socket or a direct configured overlay such as NetBird. The shipped Bun web
+backend is a transparent mesh-local browser transport, not the team relay
+described here.
+
+## Local foundation provisioning
+
+`pohunek-relayd migrate` and `pohunek-relayd bootstrap` are protected local
+procedures. Bootstrap binds exactly one configured issuer and owner-private
+stable OIDC subject to an active infrastructure principal. It grants no team,
+session, or implicit administrative permission.
+
+While the relay is stopped, `pohunek-relayd provision` requires the same
+owner-private identity file, an explicit team name, service-account name,
+RFC 3339 expiry, and a new absolute `--credential-output` path. Its parent
+directory must be owner-owned mode 0700; the artifact is created once as a
+regular owner-owned mode 0600 file with no symlink following, file fsync, and
+parent-directory fsync. The artifact contains the sole service credential and
+is never printed, logged, returned in generic JSON output, or redelivered.
+
+The procedure explicitly assigns the bootstrap infrastructure principal as the
+new team's Owner, then creates one team-scoped service account with no grants.
+It creates an expiring service credential and records audit and independently
+signed witness coordinates. The command's normal result contains only durable
+IDs and expiry. A collision, unsafe artifact, owner mismatch, active serving
+lease, stale recovery state, or failed audit stops the operation.
+
+An artifact written before a witness binding is an unbound orphan: it must not
+be adopted or deleted by a retry. The operator must resolve that collision
+manually after verifying it is safe. Once the witness binds the artifact hash,
+an exact retry may resume the stopped lifecycle and verify the same durable
+rows; it never creates a second credential or emits another secret.
 
 The shipped #81 host-local foundation is deliberately narrower. It persists a
 stable opaque host identity, one exact principal-or-team owner, at most one

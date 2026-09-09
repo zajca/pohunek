@@ -8,11 +8,14 @@
 
 mod local;
 
+pub(crate) use local::canonical_initial_provision_request;
+
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
 use thiserror::Error;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
@@ -34,6 +37,41 @@ pub struct BootstrapRequest {
     pub relay_id: String,
     pub issuer: String,
     pub subject: String,
+}
+
+/// Binds the one local initial-team operation to durable owner and delivery coordinates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitialProvisionRequest {
+    /// Relay coordinate that must match the stopped local authority.
+    pub relay_id: String,
+    /// Configured issuer of the bootstrap identity.
+    pub issuer: String,
+    /// Protected bootstrap identity subject selected as the explicit team owner.
+    pub subject: String,
+    /// Bounded initial team display name.
+    pub team_name: String,
+    /// Bounded service-account display name.
+    pub service_account_name: String,
+    /// Explicit bounded service credential expiry.
+    pub expires_at: OffsetDateTime,
+    /// Hash of the owner-private credential artifact.
+    pub artifact_digest: [u8; 32],
+    /// HMAC verifier of the sole delivered credential secret.
+    pub credential_secret_digest: [u8; 32],
+    /// Active digest key coordinate.
+    pub digest_key_id: String,
+    /// Preallocated durable team coordinate.
+    pub team_id: Uuid,
+    /// Preallocated explicit owner membership coordinate.
+    pub owner_membership_id: Uuid,
+    /// Preallocated service principal coordinate.
+    pub service_principal_id: Uuid,
+    /// Preallocated service membership coordinate.
+    pub service_membership_id: Uuid,
+    /// Preallocated credential coordinate.
+    pub credential_id: Uuid,
+    /// Preallocated audit coordinate.
+    pub audit_id: Uuid,
 }
 
 /// Holds a digest of a complete, locally derived authority review manifest.

@@ -31,6 +31,7 @@ http.workspace = true
 openidconnect.workspace = true
 oauth2.workspace = true
 reqwest.workspace = true
+rustix = { version = "1", features = ["fs"] }
 pohunek-logging.workspace = true
 relay-protocol = { package = "pohunek-relay-protocol", path = "../relay-protocol" }
 serde.workspace = true

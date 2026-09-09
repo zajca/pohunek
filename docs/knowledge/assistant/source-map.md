@@ -102,9 +102,9 @@ Web control center client:
 - `docs/design/track-b-web-control-center-plan-2026-07-22.md`
 - `docs/phases/04-browser-control-center.md`
 
-Accepted team-relay architecture (not yet implemented; normative contract in
-the RFC's identity, recovery, scheduling, resource, snapshot, catalog, audit,
-and dependency sections; reconciled by #91):
+Relay foundation and accepted team-relay architecture (the owner-private
+stopped bootstrap/provision procedure is implemented; public relay transport,
+host links, routing, and team clients remain deferred):
 
 - `docs/design/team-relay-control-plane-rfc.md`
 - `docs/architecture.md`
@@ -114,6 +114,11 @@ and dependency sections; reconciled by #91):
 - `docs/knowledge/safety/trust-model.md`
 - `docs/knowledge/guides/remote-hosts.md`
 - `docs/knowledge/guides/web-control-center.md`
+- `crates/relay/src/operator.rs`
+- `crates/relay/src/lifecycle.rs`
+- `crates/relay/src/lifecycle/local.rs`
+- `crates/relay/src/recovery/mod.rs`
+- `crates/relay/src/bin/pohunek-relayd.rs`
 
 Shipped host-local identity and governance:
 

@@ -38,6 +38,14 @@ const BOOTSTRAP_COMMITMENT_HKDF_SALT: &[u8] = b"pohunek.relay.witness.bootstrap-
 const BOOTSTRAP_COMMITMENT_HKDF_INFO: &[u8] = b"pohunek.relay.witness.bootstrap-commitment.v1";
 /// Separates HMAC input from its key derivation and record signature domains.
 const BOOTSTRAP_COMMITMENT_DOMAIN: &[u8] = b"pohunek.relay.bootstrap-commitment.v1\0";
+/// Changes only when the canonical local-provision commitment encoding changes.
+const PROVISION_COMMITMENT_VERSION: u8 = 1;
+/// Keeps provisioning commitments independent from bootstrap identity commitments.
+const PROVISION_COMMITMENT_HKDF_SALT: &[u8] = b"pohunek.relay.witness.provision-commitment.salt.v1";
+/// Separates the derived provisioning commitment key from all other witness uses.
+const PROVISION_COMMITMENT_HKDF_INFO: &[u8] = b"pohunek.relay.witness.provision-commitment.v1";
+/// Binds the HMAC input to the local provisioning operation only.
+const PROVISION_COMMITMENT_DOMAIN: &[u8] = b"pohunek.relay.provision-commitment.v1\0";
 
 /// Stores signed witness history independently from `PostgreSQL`.
 pub struct WitnessStore {
@@ -124,6 +132,20 @@ pub enum WitnessEvent {
         target_migration_count: u16,
         target_plan_digest: [u8; 32],
         authority_digest: [u8; 32],
+    },
+    /// Initial explicit team ownership and service credential provisioning.
+    Provision {
+        commitment_version: u8,
+        commitment_key_id: String,
+        request_commitment: [u8; 32],
+        artifact_digest: [u8; 32],
+        credential_secret_digest: [u8; 32],
+        team_id: Uuid,
+        owner_membership_id: Uuid,
+        service_principal_id: Uuid,
+        service_membership_id: Uuid,
+        credential_id: Uuid,
+        audit_id: Uuid,
     },
     /// Recovery generation advanced before a database restore.
     RecoveryAdvance,
@@ -253,6 +275,33 @@ impl WitnessStore {
     #[must_use]
     pub(crate) fn bootstrap_commitment_coordinate(&self) -> (u8, String) {
         (BOOTSTRAP_COMMITMENT_VERSION, self.key_id.clone())
+    }
+
+    /// Commits local provisioning input without disclosing its identity coordinates.
+    pub(crate) fn provision_commitment(
+        &self,
+        canonical_request: &[u8],
+    ) -> Result<[u8; 32], RecoveryError> {
+        let hkdf = Hkdf::<sha2::Sha256>::new(
+            Some(PROVISION_COMMITMENT_HKDF_SALT),
+            &self.signing_key.to_bytes(),
+        );
+        let mut key = [0_u8; 32];
+        hkdf.expand(PROVISION_COMMITMENT_HKDF_INFO, &mut key)
+            .map_err(|_error| RecoveryError::InvalidWitness)?;
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key)
+            .map_err(|_error| RecoveryError::InvalidWitness)?;
+        mac.update(PROVISION_COMMITMENT_DOMAIN);
+        mac.update(&[PROVISION_COMMITMENT_VERSION]);
+        update_length_prefixed(&mut mac, self.key_id.as_bytes());
+        update_length_prefixed(&mut mac, canonical_request);
+        Ok(mac.finalize().into_bytes().into())
+    }
+
+    /// Returns the version and key coordinate bound into provisioning evidence.
+    #[must_use]
+    pub(crate) fn provision_commitment_coordinate(&self) -> (u8, String) {
+        (PROVISION_COMMITMENT_VERSION, self.key_id.clone())
     }
 
     /// Returns denial scopes recorded since the last reviewed recovery checkpoint.
@@ -544,7 +593,9 @@ impl WitnessStore {
     ) -> Result<WitnessRecord, RecoveryError> {
         if !matches!(
             event,
-            WitnessEvent::Bootstrap { .. } | WitnessEvent::Migration { .. }
+            WitnessEvent::Bootstrap { .. }
+                | WitnessEvent::Migration { .. }
+                | WitnessEvent::Provision { .. }
         ) {
             return Err(RecoveryError::InvalidWitness);
         }
@@ -580,7 +631,9 @@ impl WitnessStore {
         if current.recovery_pending_review
             || !matches!(
                 current.event,
-                WitnessEvent::Bootstrap { .. } | WitnessEvent::Migration { .. }
+                WitnessEvent::Bootstrap { .. }
+                    | WitnessEvent::Migration { .. }
+                    | WitnessEvent::Provision { .. }
             )
         {
             return Err(RecoveryError::InvalidWitness);
@@ -685,6 +738,15 @@ impl WitnessStore {
                     commitment_key_id,
                     ..
                 } if *commitment_version != BOOTSTRAP_COMMITMENT_VERSION
+                    || commitment_key_id != &record.key_id
+            )
+            || matches!(
+                &record.event,
+                WitnessEvent::Provision {
+                    commitment_version,
+                    commitment_key_id,
+                    ..
+                } if *commitment_version != PROVISION_COMMITMENT_VERSION
                     || commitment_key_id != &record.key_id
             )
         {

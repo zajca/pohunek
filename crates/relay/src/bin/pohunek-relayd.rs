@@ -37,6 +37,42 @@ fn command() -> Command {
                 ),
         )
         .subcommand(
+            Command::new("provision")
+                .about("Create the first explicit team owner and service credential while stopped")
+                .arg(
+                    Arg::new("identity-file")
+                        .long("identity-file")
+                        .required(true)
+                        .value_parser(value_parser!(PathBuf))
+                        .help("Owner-private JSON containing the bootstrap owner's stable OIDC subject"),
+                )
+                .arg(
+                    Arg::new("team-name")
+                        .long("team-name")
+                        .required(true)
+                        .help("Initial team display name"),
+                )
+                .arg(
+                    Arg::new("service-account-name")
+                        .long("service-account-name")
+                        .required(true)
+                        .help("Initial service account display name"),
+                )
+                .arg(
+                    Arg::new("expires-at")
+                        .long("expires-at")
+                        .required(true)
+                        .help("Explicit RFC 3339 service credential expiry within configured limits"),
+                )
+                .arg(
+                    Arg::new("credential-output")
+                        .long("credential-output")
+                        .required(true)
+                        .value_parser(value_parser!(PathBuf))
+                        .help("New owner-private 0600 credential artifact path; never reuse or print it"),
+                ),
+        )
+        .subcommand(
             Command::new("recovery")
                 .subcommand_required(true)
                 .about("Review and recover stopped relay authority")
@@ -80,6 +116,28 @@ fn local_action(args: &ArgMatches) -> Option<Action> {
             identity_file: args
                 .get_one::<PathBuf>("identity-file")
                 .expect("required identity file")
+                .clone(),
+        },
+        Some(("provision", args)) => Action::Provision {
+            identity_file: args
+                .get_one::<PathBuf>("identity-file")
+                .expect("required identity file")
+                .clone(),
+            team_name: args
+                .get_one::<String>("team-name")
+                .expect("required team name")
+                .clone(),
+            service_account_name: args
+                .get_one::<String>("service-account-name")
+                .expect("required service account name")
+                .clone(),
+            expires_at: args
+                .get_one::<String>("expires-at")
+                .expect("required expiry")
+                .clone(),
+            credential_output: args
+                .get_one::<PathBuf>("credential-output")
+                .expect("required credential output")
                 .clone(),
         },
         Some(("recovery", args)) => match args.subcommand() {
@@ -161,6 +219,7 @@ mod tests {
         assert!(local_action(&args).is_none());
         for tail in [
             vec!["bootstrap"],
+            vec!["provision"],
             vec!["recovery", "advance"],
             vec!["recovery", "reopen"],
         ] {
@@ -178,6 +237,25 @@ mod tests {
         assert!(matches!(
             local_action(&args),
             Some(Action::Bootstrap { .. })
+        ));
+        let args = command()
+            .try_get_matches_from(base.into_iter().chain([
+                "provision",
+                "--identity-file",
+                "/private/admin.json",
+                "--team-name",
+                "team",
+                "--service-account-name",
+                "service",
+                "--expires-at",
+                "2030-01-01T00:00:00Z",
+                "--credential-output",
+                "/private/credential.json",
+            ]))
+            .expect("explicit protected provisioning coordinates");
+        assert!(matches!(
+            local_action(&args),
+            Some(Action::Provision { .. })
         ));
         let digest = "ab".repeat(32);
         let args = command()

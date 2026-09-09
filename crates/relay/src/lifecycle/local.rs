@@ -3,8 +3,8 @@
 use sqlx::AssertSqlSafe;
 
 use super::{
-    validate_bootstrap, BootstrapRequest, Lifecycle, LifecycleError, Postgres, Store, Transaction,
-    Uuid, WitnessRecord,
+    validate_bootstrap, BootstrapRequest, InitialProvisionRequest, Lifecycle, LifecycleError,
+    Postgres, Store, Transaction, Uuid, WitnessRecord,
 };
 use crate::recovery::WitnessEvent;
 
@@ -132,6 +132,224 @@ impl Lifecycle {
             if !exact {
                 return Err(LifecycleError::InvalidState);
             }
+        }
+        if self.witness.latest()?.as_ref() != Some(&active) {
+            return Err(LifecycleError::InvalidState);
+        }
+        tx.commit()
+            .await
+            .map_err(|_error| LifecycleError::Durable)?;
+        if active.active_run {
+            self.witness.complete_local(&active).map_err(Into::into)
+        } else {
+            Ok(active)
+        }
+    }
+
+    /// Creates the first explicit team owner and service account while the relay is stopped.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The witnessed precondition, mutation, and exact replay checks form one recovery boundary."
+    )]
+    pub async fn provision_initial_operator_local(
+        &self,
+        request: InitialProvisionRequest,
+    ) -> Result<WitnessRecord, LifecycleError> {
+        validate_initial_provision(&request)?;
+        let request_commitment = self
+            .witness
+            .provision_commitment(&canonical_initial_provision_request(&request))?;
+        let (commitment_version, commitment_key_id) =
+            self.witness.provision_commitment_coordinate();
+        let checkpoint = self.witness.latest()?.ok_or(LifecycleError::InvalidState)?;
+        if checkpoint.relay_id != request.relay_id || checkpoint.recovery_pending_review {
+            return Err(LifecycleError::InvalidState);
+        }
+        let mut tx = self.begin().await?;
+        self.store
+            .lock_relay_identity_in_transaction(&mut tx, &request.relay_id)
+            .await
+            .map_err(|_error| LifecycleError::InvalidState)?;
+        self.require_no_live_lease(&mut tx, &request.relay_id)
+            .await?;
+        let occupied = locked_tables(&mut tx).await?;
+        let owner: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT p.id,i.identity_id FROM principals p JOIN oidc_identities i ON i.principal_id=p.id \
+             WHERE i.issuer=$1 AND i.subject=$2 AND i.link_generation=1 AND i.removed_at IS NULL \
+             AND p.kind='infrastructure' AND p.state='active' AND p.generation=1 FOR SHARE",
+        )
+        .bind(&request.issuer)
+        .bind(&request.subject)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_error| LifecycleError::Durable)?;
+        let [(owner_principal_id, owner_identity_id)] = owner.as_slice() else {
+            return Err(LifecycleError::InvalidState);
+        };
+        let active = match checkpoint {
+            checkpoint if checkpoint.active_run => {
+                let WitnessEvent::Provision {
+                    commitment_version: expected_version,
+                    commitment_key_id: expected_key_id,
+                    request_commitment: expected_commitment,
+                    artifact_digest,
+                    credential_secret_digest,
+                    team_id,
+                    owner_membership_id,
+                    service_principal_id,
+                    service_membership_id,
+                    credential_id,
+                    audit_id,
+                } = &checkpoint.event
+                else {
+                    return Err(LifecycleError::InvalidState);
+                };
+                if *expected_version != commitment_version
+                    || expected_key_id != &commitment_key_id
+                    || *expected_commitment != request_commitment
+                    || *artifact_digest != request.artifact_digest
+                    || *credential_secret_digest != request.credential_secret_digest
+                    || *team_id != request.team_id
+                    || *owner_membership_id != request.owner_membership_id
+                    || *service_principal_id != request.service_principal_id
+                    || *service_membership_id != request.service_membership_id
+                    || *credential_id != request.credential_id
+                    || *audit_id != request.audit_id
+                {
+                    return Err(LifecycleError::InvalidState);
+                }
+                checkpoint
+            }
+            checkpoint if matches!(checkpoint.event, WitnessEvent::Provision { .. }) => {
+                let WitnessEvent::Provision {
+                    commitment_version: expected_version,
+                    commitment_key_id: expected_key_id,
+                    request_commitment: expected_commitment,
+                    artifact_digest,
+                    credential_secret_digest,
+                    team_id,
+                    owner_membership_id,
+                    service_principal_id,
+                    service_membership_id,
+                    credential_id,
+                    audit_id,
+                } = &checkpoint.event
+                else {
+                    return Err(LifecycleError::InvalidState);
+                };
+                if *expected_version != commitment_version
+                    || expected_key_id != &commitment_key_id
+                    || *expected_commitment != request_commitment
+                    || *artifact_digest != request.artifact_digest
+                    || *credential_secret_digest != request.credential_secret_digest
+                    || *team_id != request.team_id
+                    || *owner_membership_id != request.owner_membership_id
+                    || *service_principal_id != request.service_principal_id
+                    || *service_membership_id != request.service_membership_id
+                    || *credential_id != request.credential_id
+                    || *audit_id != request.audit_id
+                {
+                    return Err(LifecycleError::InvalidState);
+                }
+                checkpoint
+            }
+            checkpoint => {
+                require_empty(
+                    &occupied,
+                    &[
+                        "relay_identity",
+                        "principals",
+                        "oidc_identities",
+                        "audit_events",
+                        "relay_lease",
+                    ],
+                )?;
+                if !bootstrap_baseline_matches(
+                    &mut tx,
+                    &request,
+                    *owner_principal_id,
+                    *owner_identity_id,
+                    checkpoint.recovery_generation,
+                )
+                .await?
+                    || self.witness.latest()?.as_ref() != Some(&checkpoint)
+                {
+                    return Err(LifecycleError::InvalidState);
+                }
+                self.witness.begin_local(
+                    Some(&checkpoint),
+                    &request.relay_id,
+                    checkpoint.recovery_generation,
+                    WitnessEvent::Provision {
+                        commitment_version,
+                        commitment_key_id,
+                        request_commitment,
+                        artifact_digest: request.artifact_digest,
+                        credential_secret_digest: request.credential_secret_digest,
+                        team_id: request.team_id,
+                        owner_membership_id: request.owner_membership_id,
+                        service_principal_id: request.service_principal_id,
+                        service_membership_id: request.service_membership_id,
+                        credential_id: request.credential_id,
+                        audit_id: request.audit_id,
+                    },
+                )?
+            }
+        };
+        let parameter = format!(
+            "owner={owner_principal_id};identity={owner_identity_id};commitment={}",
+            hex::encode(request_commitment)
+        );
+        if active.active_run {
+            let exact = provision_rows_match(
+                &mut tx,
+                &request,
+                *owner_principal_id,
+                *owner_identity_id,
+                active.recovery_generation,
+                &parameter,
+                &occupied,
+            )
+            .await?;
+            if !exact {
+                if !bootstrap_baseline_matches(
+                    &mut tx,
+                    &request,
+                    *owner_principal_id,
+                    *owner_identity_id,
+                    active.recovery_generation,
+                )
+                .await?
+                {
+                    return Err(LifecycleError::InvalidState);
+                }
+                sqlx::query("INSERT INTO teams (team_id,display_name,state,policy_generation,revision) VALUES ($1,$2,'active',1,1)")
+                    .bind(request.team_id).bind(&request.team_name).execute(&mut *tx).await.map_err(|_error| LifecycleError::Durable)?;
+                sqlx::query("INSERT INTO memberships (membership_id,team_id,principal_id,builtin_role,state,revision,local_deny_generation) VALUES ($1,$2,$3,'owner','active',1,1)")
+                    .bind(request.owner_membership_id).bind(request.team_id).bind(*owner_principal_id).execute(&mut *tx).await.map_err(|_error| LifecycleError::Durable)?;
+                sqlx::query("INSERT INTO principals (id,kind,state,generation) VALUES ($1,'service','active',1)")
+                    .bind(request.service_principal_id).execute(&mut *tx).await.map_err(|_error| LifecycleError::Durable)?;
+                sqlx::query("INSERT INTO service_accounts (principal_id,team_id,display_name) VALUES ($1,$2,$3)")
+                    .bind(request.service_principal_id).bind(request.team_id).bind(&request.service_account_name).execute(&mut *tx).await.map_err(|_error| LifecycleError::Durable)?;
+                sqlx::query("INSERT INTO memberships (membership_id,team_id,principal_id,builtin_role,state,revision,local_deny_generation) VALUES ($1,$2,$3,'member','active',1,1)")
+                    .bind(request.service_membership_id).bind(request.team_id).bind(request.service_principal_id).execute(&mut *tx).await.map_err(|_error| LifecycleError::Durable)?;
+                sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,expires_at) VALUES ($1,$2,$3,$4,$5,'service',1,$1,$6,$7)")
+                    .bind(request.credential_id).bind(request.credential_id.to_string()).bind(request.credential_secret_digest.as_slice()).bind(request.service_principal_id).bind(&request.digest_key_id).bind(active.recovery_generation).bind(request.expires_at).execute(&mut *tx).await.map_err(|_error| LifecycleError::Durable)?;
+                sqlx::query("INSERT INTO audit_events (audit_id,actor_principal_id,actor_kind,team_id,action,decision,policy_generation,recovery_generation,correlation_id,parameter_code,parameter_value,outcome) VALUES ($1,$2,'infrastructure',$3,'lifecycle.provision','changed',1,$4,$1,'lifecycle',$5,'committed')")
+                    .bind(request.audit_id).bind(*owner_principal_id).bind(request.team_id).bind(active.recovery_generation).bind(&parameter).execute(&mut *tx).await.map_err(|_error| LifecycleError::Durable)?;
+            }
+        } else if !provision_rows_match(
+            &mut tx,
+            &request,
+            *owner_principal_id,
+            *owner_identity_id,
+            active.recovery_generation,
+            &parameter,
+            &occupied,
+        )
+        .await?
+        {
+            return Err(LifecycleError::InvalidState);
         }
         if self.witness.latest()?.as_ref() != Some(&active) {
             return Err(LifecycleError::InvalidState);
@@ -281,6 +499,155 @@ pub(crate) fn canonical_bootstrap_request(request: &BootstrapRequest) -> Vec<u8>
         bytes.extend_from_slice(value.as_bytes());
     }
     bytes
+}
+
+fn validate_initial_provision(request: &InitialProvisionRequest) -> Result<(), LifecycleError> {
+    const MAX_NAME_BYTES: usize = 256;
+    const MAX_KEY_ID_BYTES: usize = 64;
+    if request.relay_id.is_empty()
+        || request.issuer.is_empty()
+        || request.subject.is_empty()
+        || request.team_name.is_empty()
+        || request.team_name.len() > MAX_NAME_BYTES
+        || request.service_account_name.is_empty()
+        || request.service_account_name.len() > MAX_NAME_BYTES
+        || request.digest_key_id.is_empty()
+        || request.digest_key_id.len() > MAX_KEY_ID_BYTES
+        || request.expires_at <= time::OffsetDateTime::now_utc()
+        || request.expires_at.nanosecond() % 1_000 != 0
+        || [
+            &request.relay_id,
+            &request.issuer,
+            &request.subject,
+            &request.team_name,
+            &request.service_account_name,
+            &request.digest_key_id,
+        ]
+        .into_iter()
+        .any(|value| value.contains('\0'))
+    {
+        return Err(LifecycleError::InvalidState);
+    }
+    Ok(())
+}
+
+pub(crate) fn canonical_initial_provision_request(request: &InitialProvisionRequest) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"pohunek.relay.initial-provision.v1\0");
+    for value in [
+        &request.relay_id,
+        &request.issuer,
+        &request.subject,
+        &request.team_name,
+        &request.service_account_name,
+        &request.digest_key_id,
+    ] {
+        bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+    bytes.extend_from_slice(&request.expires_at.unix_timestamp().to_be_bytes());
+    bytes.extend_from_slice(&request.expires_at.nanosecond().to_be_bytes());
+    bytes
+}
+
+async fn bootstrap_baseline_matches(
+    tx: &mut Transaction<'_, Postgres>,
+    request: &InitialProvisionRequest,
+    owner_principal_id: Uuid,
+    owner_identity_id: Uuid,
+    recovery_generation: i64,
+) -> Result<bool, LifecycleError> {
+    sqlx::query_scalar(
+        "SELECT \
+         (SELECT count(*)=1 FROM relay_identity) \
+         AND EXISTS (SELECT 1 FROM relay_identity WHERE relay_id=$1 AND state='normal' AND recovery_generation=$2) \
+         AND (SELECT count(*)=1 FROM principals) \
+         AND EXISTS (SELECT 1 FROM principals WHERE id=$3 AND kind='infrastructure' AND state='active' AND generation=1) \
+         AND (SELECT count(*)=1 FROM oidc_identities) \
+         AND EXISTS (SELECT 1 FROM oidc_identities WHERE identity_id=$4 AND principal_id=$3 AND issuer=$5 AND subject=$6 AND link_generation=1 AND removed_at IS NULL) \
+         AND (SELECT count(*)=1 FROM audit_events) \
+         AND EXISTS (SELECT 1 FROM audit_events WHERE actor_principal_id IS NULL AND actor_kind='system' AND team_id IS NULL AND action='lifecycle.bootstrap' AND decision='changed' AND policy_generation=1 AND recovery_generation=$2 AND parameter_code='lifecycle' AND outcome='committed')",
+    )
+    .bind(&request.relay_id)
+    .bind(recovery_generation)
+    .bind(owner_principal_id)
+    .bind(owner_identity_id)
+    .bind(&request.issuer)
+    .bind(&request.subject)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|_error| LifecycleError::Durable)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The full signed provisioning coordinate must be verified in one durable query."
+)]
+async fn provision_rows_match(
+    tx: &mut Transaction<'_, Postgres>,
+    request: &InitialProvisionRequest,
+    owner_principal_id: Uuid,
+    owner_identity_id: Uuid,
+    recovery_generation: i64,
+    parameter: &str,
+    occupied: &[(String, bool)],
+) -> Result<bool, LifecycleError> {
+    require_empty(
+        occupied,
+        &[
+            "relay_identity",
+            "principals",
+            "oidc_identities",
+            "audit_events",
+            "teams",
+            "memberships",
+            "service_accounts",
+            "relay_credentials",
+            "relay_lease",
+        ],
+    )?;
+    sqlx::query_scalar(
+        "SELECT \
+         (SELECT count(*)=1 FROM relay_identity) \
+         AND EXISTS (SELECT 1 FROM relay_identity WHERE relay_id=$1 AND state='normal' AND recovery_generation=$2) \
+         AND (SELECT count(*)=2 FROM principals) \
+         AND EXISTS (SELECT 1 FROM principals WHERE id=$3 AND kind='infrastructure' AND state='active' AND generation=1) \
+         AND EXISTS (SELECT 1 FROM principals WHERE id=$4 AND kind='service' AND state='active' AND generation=1) \
+         AND (SELECT count(*)=1 FROM oidc_identities) \
+         AND EXISTS (SELECT 1 FROM oidc_identities WHERE identity_id=$5 AND principal_id=$3 AND issuer=$6 AND subject=$7 AND link_generation=1 AND removed_at IS NULL) \
+         AND (SELECT count(*)=1 FROM teams) \
+         AND EXISTS (SELECT 1 FROM teams WHERE team_id=$8 AND display_name=$9 AND state='active' AND policy_generation=1 AND revision=1) \
+         AND (SELECT count(*)=2 FROM memberships) \
+         AND EXISTS (SELECT 1 FROM memberships WHERE membership_id=$10 AND team_id=$8 AND principal_id=$3 AND builtin_role='owner' AND state='active' AND revision=1 AND local_deny_generation=1) \
+         AND EXISTS (SELECT 1 FROM memberships WHERE membership_id=$11 AND team_id=$8 AND principal_id=$4 AND builtin_role='member' AND state='active' AND revision=1 AND local_deny_generation=1) \
+         AND (SELECT count(*)=1 FROM service_accounts) \
+         AND EXISTS (SELECT 1 FROM service_accounts WHERE principal_id=$4 AND team_id=$8 AND display_name=$12 AND deprovisioned_at IS NULL) \
+         AND (SELECT count(*)=1 FROM relay_credentials) \
+         AND EXISTS (SELECT 1 FROM relay_credentials WHERE credential_id=$13 AND public_id=$13::text AND secret_digest=$14 AND principal_id=$4 AND identity_id IS NULL AND digest_key_id=$15 AND credential_kind='service' AND credential_generation=1 AND rotation_family_id=$13 AND predecessor_credential_id IS NULL AND recovery_generation=$2 AND expires_at=$16 AND rotation_overlap_ends_at IS NULL AND revoked_at IS NULL) \
+         AND (SELECT count(*)=2 FROM audit_events) \
+         AND EXISTS (SELECT 1 FROM audit_events WHERE audit_id=$17 AND actor_principal_id=$3 AND actor_kind='infrastructure' AND team_id=$8 AND host_id IS NULL AND idempotency_key IS NULL AND action='lifecycle.provision' AND decision='changed' AND policy_generation=1 AND recovery_generation=$2 AND correlation_id=$17 AND parameter_code='lifecycle' AND parameter_value=$18 AND outcome='committed')",
+    )
+    .bind(&request.relay_id)
+    .bind(recovery_generation)
+    .bind(owner_principal_id)
+    .bind(request.service_principal_id)
+    .bind(owner_identity_id)
+    .bind(&request.issuer)
+    .bind(&request.subject)
+    .bind(request.team_id)
+    .bind(&request.team_name)
+    .bind(request.owner_membership_id)
+    .bind(request.service_membership_id)
+    .bind(&request.service_account_name)
+    .bind(request.credential_id)
+    .bind(request.credential_secret_digest.as_slice())
+    .bind(&request.digest_key_id)
+    .bind(request.expires_at)
+    .bind(request.audit_id)
+    .bind(parameter)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|_error| LifecycleError::Durable)
 }
 
 fn migration_store_error(error: &crate::store::StoreError) -> LifecycleError {
