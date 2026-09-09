@@ -251,7 +251,7 @@ impl Store {
     }
 
     /// Commits a local migration latch to the exact ordered embedded migration set.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "postgres-tests"))]
     pub(crate) fn migration_plan_digest() -> [u8; 32] {
         Self::embedded_migration_prefix(MIGRATOR.iter().count())
             .expect("embedded migration count fits witness format")

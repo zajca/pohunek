@@ -1680,7 +1680,7 @@ impl Authority {
             .sequence)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "postgres-tests"))]
     pub(crate) fn admission_epoch(&self) -> Result<u64, AuthorityError> {
         Ok(self
             .registry
@@ -1689,12 +1689,12 @@ impl Authority {
             .epoch)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "postgres-tests"))]
     pub(crate) fn management_retry_count(&self) -> usize {
         self.management_retry_count.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "postgres-tests"))]
     pub(crate) fn expire_lease_deadline(&self) -> Result<(), AuthorityError> {
         *self
             .lease_deadline
