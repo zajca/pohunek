@@ -149,6 +149,13 @@ impl AuthLimits {
 struct PendingBrowserLogin {
     verifier: Zeroizing<String>,
     nonce: Zeroizing<String>,
+    expires_at: Instant,
+}
+
+impl PendingBrowserLogin {
+    fn expired(&self, now: Instant) -> bool {
+        self.expires_at <= now
+    }
 }
 
 struct DeviceIssueBinding {
@@ -375,6 +382,7 @@ impl AuthService {
             PendingBrowserLogin {
                 verifier: authorization.verifier,
                 nonce: authorization.nonce,
+                expires_at,
             },
         );
         Ok(BrowserLoginStart {
@@ -489,8 +497,8 @@ impl AuthService {
             return Err(AuthError::OidcInvalid);
         };
         let login_id: Uuid = row.get("login_id");
+        let _capacity_guard = self.pending_transactions.claim(login_id)?;
         let pending = self.remove_pending_browser_login(login_id);
-        self.pending_transactions.release(login_id);
         if row.get::<String, _>("issuer") != oidc.issuer()
             || row.get::<String, _>("client_id") != oidc.client_id()
             || row.get::<String, _>("audience") != oidc.client_id()
@@ -1744,6 +1752,12 @@ impl AuthService {
         self.pending_browser_logins.lock().ok()?.remove(&login_id)
     }
 
+    fn prune_expired_browser_logins(&self) {
+        if let Ok(mut logins) = self.pending_browser_logins.lock() {
+            logins.retain(|_, login| !login.expired(Instant::now()));
+        }
+    }
+
     /// Claims a device code after proving the polling possession secret.
     ///
     /// # Errors
@@ -1815,6 +1829,7 @@ impl AuthService {
         .map_err(database_error)?;
         self.commit_current(transaction).await?;
         self.pending_device_codes.prune_expired();
+        self.prune_expired_browser_logins();
         Ok(())
     }
 
@@ -4790,6 +4805,7 @@ pub(crate) mod tests {
                     PendingBrowserLogin {
                         verifier: Zeroizing::new("verifier".to_owned()),
                         nonce: Zeroizing::new("nonce".to_owned()),
+                        expires_at: Instant::now() + Duration::from_mins(1),
                     },
                 );
             assert!(matches!(
@@ -4856,6 +4872,45 @@ pub(crate) mod tests {
         let replay_audit: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE action='auth.browser.callback' AND outcome='rejected'")
             .fetch_one(store.pool()).await.expect("read replay audit");
         assert_eq!(replay_audit, 1);
+        cleanup(&bootstrap, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn expired_browser_pending_secrets_are_pruned_before_capacity_is_reused() {
+        let (store, schema, bootstrap) = fixture().await;
+        let (authority, _directory) = authority(store.clone()).await;
+        let mut expired_limits = limits();
+        expired_limits.login_lifetime = Duration::from_millis(1);
+        let service = AuthService::new(
+            store.clone(),
+            DigestKey::new("test".into(), b"ephemeral-test-key".to_vec()),
+            1,
+            expired_limits,
+            LoginPolicy::AnyAuthenticatedSubject,
+            authority,
+        );
+        let oidc = OidcClient::test_client();
+        let expired = service
+            .begin_browser_login(&oidc, LoginBindingCookie::new("first-binding".to_owned()))
+            .await
+            .expect("start browser login");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        service
+            .prune_expired_pending()
+            .await
+            .expect("prune expired login");
+        assert!(
+            !service
+                .pending_browser_logins
+                .lock()
+                .expect("pending browser map")
+                .contains_key(&expired.login_id),
+            "expiry removes the in-memory verifier and nonce"
+        );
+        service
+            .begin_browser_login(&oidc, LoginBindingCookie::new("second-binding".to_owned()))
+            .await
+            .expect("expired browser login releases capacity");
         cleanup(&bootstrap, &schema).await;
     }
 

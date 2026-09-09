@@ -2,6 +2,7 @@
 
 use super::*;
 use axum::{extract::State, routing::get, Json, Router};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use std::{
     fs,
     net::SocketAddr,
@@ -23,12 +24,22 @@ struct Ingress {
     issuer_task: JoinHandle<std::io::Result<()>>,
     device_entered: Arc<Notify>,
     device_requests: Arc<AtomicUsize>,
+    token_entered: Arc<Notify>,
+    token_release: Arc<Notify>,
+    token_requests: Arc<AtomicUsize>,
+    token_nonce: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]
-struct DeviceIssuerState {
+struct IssuerState {
     entered: Arc<Notify>,
     requests: Arc<AtomicUsize>,
+    token_entered: Arc<Notify>,
+    token_release: Arc<Notify>,
+    token_requests: Arc<AtomicUsize>,
+    token_nonce: Arc<Mutex<Option<String>>>,
+    signing_key: PathBuf,
+    issuer: String,
 }
 
 impl Ingress {
@@ -48,6 +59,8 @@ impl Ingress {
             .expect("async issuer listener");
         let issuer_address = listener.local_addr().expect("issuer address");
         let issuer = format!("https://{issuer_address}/issuer");
+        let signing_key = issuer_signing_key(directory);
+        let jwks = issuer_jwks(&signing_key);
         let metadata = serde_json::json!({
             "issuer": issuer,
             "authorization_endpoint": format!("{issuer}/authorize"),
@@ -60,6 +73,10 @@ impl Ingress {
         });
         let device_entered = Arc::new(Notify::new());
         let device_requests = Arc::new(AtomicUsize::new(0));
+        let token_entered = Arc::new(Notify::new());
+        let token_release = Arc::new(Notify::new());
+        let token_requests = Arc::new(AtomicUsize::new(0));
+        let token_nonce = Arc::new(Mutex::new(None));
         let app = Router::new()
             .route(
                 "/issuer/.well-known/openid-configuration",
@@ -67,12 +84,22 @@ impl Ingress {
             )
             .route(
                 "/issuer/jwks",
-                get(|| async { Json(serde_json::json!({"keys": []})) }),
+                get(move || {
+                    let jwks = jwks.clone();
+                    async move { Json(jwks) }
+                }),
             )
             .route("/issuer/device", axum::routing::post(held_device))
-            .with_state(DeviceIssuerState {
+            .route("/issuer/token", axum::routing::post(held_token))
+            .with_state(IssuerState {
                 entered: Arc::clone(&device_entered),
                 requests: Arc::clone(&device_requests),
+                token_entered: Arc::clone(&token_entered),
+                token_release: Arc::clone(&token_release),
+                token_requests: Arc::clone(&token_requests),
+                token_nonce: Arc::clone(&token_nonce),
+                signing_key,
+                issuer: issuer.clone(),
             });
         let issuer_handle = Handle::new();
         let server = axum_server::from_tcp_rustls(listener, tls)
@@ -107,6 +134,10 @@ impl Ingress {
             issuer_task,
             device_entered,
             device_requests,
+            token_entered,
+            token_release,
+            token_requests,
+            token_nonce,
         }
     }
 
@@ -148,10 +179,27 @@ fn private_file(path: &Path, bytes: &[u8]) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private mode");
 }
 
-async fn held_device(State(state): State<DeviceIssuerState>) -> Json<serde_json::Value> {
+async fn held_device(State(state): State<IssuerState>) -> Json<serde_json::Value> {
     state.requests.fetch_add(1, Ordering::Relaxed);
     state.entered.notify_one();
     std::future::pending().await
+}
+
+async fn held_token(State(state): State<IssuerState>) -> Json<serde_json::Value> {
+    state.token_requests.fetch_add(1, Ordering::Relaxed);
+    state.token_entered.notify_one();
+    state.token_release.notified().await;
+    let nonce = state
+        .token_nonce
+        .lock()
+        .expect("token nonce lock")
+        .clone()
+        .expect("callback nonce");
+    Json(serde_json::json!({
+        "access_token": "fixture-access-token",
+        "token_type": "Bearer",
+        "id_token": signed_id_token(&state.signing_key, &state.issuer, &nonce),
+    }))
 }
 
 struct Running {
@@ -258,19 +306,19 @@ async fn browser_and_device_flows_share_capacity_and_control_bad_callbacks() {
     let malformed = ingress
         .client
         .get(running.url(&format!(
-            "/v1/auth/oidc/callback?state={state}&unexpected=sentinel"
+            "/v1/auth/oidc/callback?state={state}&state=duplicate"
         )))
         .header("cookie", &login_cookie)
         .send()
         .await
-        .expect("controlled malformed callback response");
+        .expect("controlled duplicate callback response");
     assert_eq!(malformed.status(), reqwest::StatusCode::BAD_REQUEST);
     assert_eq!(malformed.headers()["cache-control"], "no-store");
     assert_eq!(malformed.headers()["pragma"], "no-cache");
     let cleared = malformed
         .headers()
         .get("set-cookie")
-        .expect("malformed callback clears browser binding")
+        .expect("duplicate callback clears browser binding")
         .to_str()
         .expect("ASCII cleared cookie");
     assert!(cleared.starts_with("__Host-pohunek-relay-login="));
@@ -325,7 +373,7 @@ async fn browser_and_device_flows_share_capacity_and_control_bad_callbacks() {
     let terminal = ingress
         .client
         .get(running.url(&format!(
-            "/v1/auth/oidc/callback?error=access_denied&state={state}"
+            "/v1/auth/oidc/callback?error=access_denied&state={state}&error_description=provider+detail&error_uri=https%3A%2F%2Fissuer.example%2Ferror"
         )))
         .header("cookie", &login_cookie)
         .send()
@@ -351,6 +399,93 @@ async fn browser_and_device_flows_share_capacity_and_control_bad_callbacks() {
         .send()
         .await
         .expect("cancelled device reservation releases browser admission");
+    assert_eq!(replacement.status(), reqwest::StatusCode::SEE_OTHER);
+    running.shutdown().await.expect("clean runtime shutdown");
+    ingress.cleanup().await;
+}
+
+#[tokio::test]
+async fn successful_browser_callback_holds_shared_capacity_until_session_issue_finishes() {
+    let mut ingress = Ingress::new().await;
+    ingress.config.auth.pending_transactions = 1;
+    let running = ingress.start().await;
+    let browser = ingress
+        .client
+        .post(running.url("/v1/auth/browser/start"))
+        .header("origin", "https://localhost:9443")
+        .send()
+        .await
+        .expect("start browser login");
+    assert_eq!(browser.status(), reqwest::StatusCode::SEE_OTHER);
+    let authorization = url::Url::parse(
+        browser
+            .headers()
+            .get("location")
+            .expect("browser authorization redirect")
+            .to_str()
+            .expect("ASCII redirect"),
+    )
+    .expect("valid authorization URL");
+    let mut query = authorization.query_pairs();
+    let state = query
+        .clone()
+        .find_map(|(key, value)| (key == "state").then_some(value.into_owned()))
+        .expect("opaque browser state");
+    let nonce = query
+        .find_map(|(key, value)| (key == "nonce").then_some(value.into_owned()))
+        .expect("opaque browser nonce");
+    *ingress.token_nonce.lock().expect("token nonce lock") = Some(nonce);
+    let login_cookie = browser
+        .headers()
+        .get("set-cookie")
+        .expect("browser binding cookie")
+        .to_str()
+        .expect("ASCII cookie")
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_owned();
+    let client = ingress.client.clone();
+    let callback_url = running.url(&format!(
+        "/v1/auth/oidc/callback?code=fixture-code&state={state}&session_state=provider-session"
+    ));
+    let callback = tokio::spawn(async move {
+        client
+            .get(callback_url)
+            .header("cookie", login_cookie)
+            .send()
+            .await
+    });
+    timeout(Duration::from_secs(1), ingress.token_entered.notified())
+        .await
+        .expect("browser callback entered token exchange");
+    let rejected = ingress
+        .client
+        .post(running.url("/v1/auth/device/start"))
+        .send()
+        .await
+        .expect("capacity rejection response");
+    assert_eq!(rejected.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        ingress.device_requests.load(Ordering::Relaxed),
+        0,
+        "an over-capacity flow cannot call its issuer endpoint"
+    );
+    ingress.token_release.notify_one();
+    let callback = timeout(Duration::from_secs(2), callback)
+        .await
+        .expect("completed browser callback")
+        .expect("callback task")
+        .expect("callback response");
+    assert_eq!(callback.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(ingress.token_requests.load(Ordering::Relaxed), 1);
+    let replacement = ingress
+        .client
+        .post(running.url("/v1/auth/browser/start"))
+        .header("origin", "https://localhost:9443")
+        .send()
+        .await
+        .expect("capacity reuse after successful browser callback");
     assert_eq!(replacement.status(), reqwest::StatusCode::SEE_OTHER);
     running.shutdown().await.expect("clean runtime shutdown");
     ingress.cleanup().await;
@@ -531,6 +666,101 @@ fn tls_files(directory: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
     let certificate = fs::read(&certificate_file).expect("fixture certificate");
 
     (certificate_file, private_key_file, certificate)
+}
+
+fn issuer_signing_key(directory: &Path) -> PathBuf {
+    let key = directory.join("issuer-signing.key");
+    let output = Command::new("openssl")
+        .args([
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+        ])
+        .arg("-out")
+        .arg(&key)
+        .output()
+        .expect("OpenSSL issuer key generator");
+    assert!(output.status.success(), "generate ephemeral issuer key");
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("private issuer key");
+    key
+}
+
+fn issuer_jwks(key: &Path) -> serde_json::Value {
+    let public_key = key.with_extension("pub");
+    let output = Command::new("openssl")
+        .arg("rsa")
+        .arg("-in")
+        .arg(key)
+        .arg("-pubout")
+        .arg("-out")
+        .arg(&public_key)
+        .output()
+        .expect("OpenSSL issuer public key");
+    assert!(output.status.success(), "derive issuer public key");
+    let output = Command::new("openssl")
+        .arg("rsa")
+        .arg("-pubin")
+        .arg("-in")
+        .arg(&public_key)
+        .args(["-text", "-noout"])
+        .output()
+        .expect("OpenSSL issuer public key inspection");
+    assert!(output.status.success(), "inspect issuer public key");
+    let text = String::from_utf8(output.stdout).expect("ASCII issuer public key");
+    let modulus = text
+        .split("Modulus:")
+        .nth(1)
+        .and_then(|value| value.split("Exponent:").next())
+        .expect("RSA modulus");
+    let modulus: String = modulus.chars().filter(char::is_ascii_hexdigit).collect();
+    let mut modulus = hex::decode(modulus).expect("hexadecimal RSA modulus");
+    if modulus.first() == Some(&0) {
+        modulus.remove(0);
+    }
+    serde_json::json!({
+        "keys": [{
+            "kty": "RSA",
+            "kid": "fixture",
+            "alg": "RS256",
+            "use": "sig",
+            "n": URL_SAFE_NO_PAD.encode(modulus),
+            "e": "AQAB",
+        }]
+    })
+}
+
+fn signed_id_token(key: &Path, issuer: &str, nonce: &str) -> String {
+    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","kid":"fixture","typ":"JWT"}"#);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let payload = URL_SAFE_NO_PAD.encode(
+        serde_json::json!({
+            "iss": issuer,
+            "sub": "fixture-subject",
+            "aud": "fixture",
+            "exp": now + 60,
+            "iat": now,
+            "nonce": nonce,
+        })
+        .to_string(),
+    );
+    let input = format!("{header}.{payload}");
+    let directory = key.parent().expect("issuer key parent");
+    let input_file = directory.join("issuer-token-input");
+    let signature_file = directory.join("issuer-token-signature");
+    private_file(&input_file, input.as_bytes());
+    let output = Command::new("openssl")
+        .args(["dgst", "-sha256", "-sign"])
+        .arg(key)
+        .arg("-out")
+        .arg(&signature_file)
+        .arg(&input_file)
+        .output()
+        .expect("OpenSSL ID token signer");
+    assert!(output.status.success(), "sign fixture ID token");
+    let signature = fs::read(&signature_file).expect("ID token signature");
+    format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature))
 }
 
 fn configuration(

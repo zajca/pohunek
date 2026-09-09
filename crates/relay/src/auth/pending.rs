@@ -108,8 +108,14 @@ pub(crate) struct PendingTransactions {
 
 #[derive(Debug, Default)]
 struct PendingTransactionState {
-    transactions: HashMap<Uuid, Instant>,
+    transactions: HashMap<Uuid, PendingTransaction>,
     reservations: usize,
+}
+
+#[derive(Debug)]
+enum PendingTransaction {
+    Pending { expires_at: Instant },
+    InFlight,
 }
 
 /// Holds one capacity unit before a transaction performs durable or issuer work.
@@ -117,6 +123,13 @@ struct PendingTransactionState {
 pub(crate) struct PendingTransactionReservation {
     state: Arc<Mutex<PendingTransactionState>>,
     active: bool,
+}
+
+/// Keeps a claimed callback inside the shared pending-transaction capacity.
+#[derive(Debug)]
+pub(crate) struct PendingTransactionGuard {
+    state: Arc<Mutex<PendingTransactionState>>,
+    login_id: Option<Uuid>,
 }
 
 impl PendingTransactions {
@@ -131,9 +144,9 @@ impl PendingTransactions {
     /// Reserves capacity before a flow can make durable or issuer work.
     pub(crate) fn reserve(&self) -> Result<PendingTransactionReservation, AuthError> {
         let mut state = self.state.lock().map_err(|_error| AuthError::Durable)?;
-        state
-            .transactions
-            .retain(|_, expires_at| *expires_at > Instant::now());
+        state.transactions.retain(|_, transaction| {
+            !matches!(transaction, PendingTransaction::Pending { expires_at } if *expires_at <= Instant::now())
+        });
         if state.transactions.len().saturating_add(state.reservations) >= self.capacity {
             return Err(AuthError::Capacity);
         }
@@ -151,6 +164,26 @@ impl PendingTransactions {
         }
     }
 
+    /// Claims a durably consumed browser login until its callback finishes.
+    ///
+    /// A durable callback claim has already proved its database expiry. Once
+    /// claimed, local expiry pruning cannot free this capacity unit while the
+    /// token exchange or session issuance remains in progress.
+    pub(crate) fn claim(&self, login_id: Uuid) -> Result<PendingTransactionGuard, AuthError> {
+        let mut state = self.state.lock().map_err(|_error| AuthError::Durable)?;
+        let login_id = match state.transactions.get_mut(&login_id) {
+            Some(transaction @ PendingTransaction::Pending { .. }) => {
+                *transaction = PendingTransaction::InFlight;
+                Some(login_id)
+            }
+            Some(PendingTransaction::InFlight) | None => None,
+        };
+        Ok(PendingTransactionGuard {
+            state: Arc::clone(&self.state),
+            login_id,
+        })
+    }
+
     /// Clears every transaction during shutdown or recovery quarantine.
     pub(crate) fn clear(&self) {
         if let Ok(mut state) = self.state.lock() {
@@ -165,7 +198,10 @@ impl PendingTransactionReservation {
         let mut state = self.state.lock().map_err(|_error| AuthError::Durable)?;
         if !self.active
             || state.reservations == 0
-            || state.transactions.insert(login_id, expires_at).is_some()
+            || state
+                .transactions
+                .insert(login_id, PendingTransaction::Pending { expires_at })
+                .is_some()
         {
             return Err(AuthError::Malformed);
         }
@@ -181,6 +217,17 @@ impl Drop for PendingTransactionReservation {
             if let Ok(mut state) = self.state.lock() {
                 state.reservations = state.reservations.saturating_sub(1);
             }
+        }
+    }
+}
+
+impl Drop for PendingTransactionGuard {
+    fn drop(&mut self) {
+        let Some(login_id) = self.login_id else {
+            return;
+        };
+        if let Ok(mut state) = self.state.lock() {
+            state.transactions.remove(&login_id);
         }
     }
 }
@@ -232,5 +279,22 @@ mod tests {
         pending
             .reserve()
             .expect("terminal flow releases capacity for the next admission");
+    }
+
+    #[test]
+    fn claimed_callback_keeps_capacity_after_its_pending_expiry() {
+        let pending = PendingTransactions::new(1);
+        let login_id = Uuid::now_v7();
+        pending
+            .reserve()
+            .expect("reserve active flow")
+            .commit(login_id, Instant::now())
+            .expect("commit expiring callback");
+        let guard = pending.claim(login_id).expect("claim durable callback");
+        assert!(matches!(pending.reserve(), Err(AuthError::Capacity)));
+        drop(guard);
+        pending
+            .reserve()
+            .expect("completed callback releases capacity");
     }
 }

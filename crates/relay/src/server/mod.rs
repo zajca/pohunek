@@ -165,7 +165,6 @@ async fn browser_start(
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CallbackQuery {
     state: String,
     #[serde(default)]
@@ -236,6 +235,8 @@ fn parse_callback_query(raw_query: Option<&str>) -> Result<CallbackQuery, AuthEr
     let mut error = None;
     let mut issuer = None;
     let mut session_state = None;
+    let mut error_description_seen = false;
+    let mut error_uri_seen = false;
     for (key, value) in url::form_urlencoded::parse(raw_query.as_bytes()) {
         let target = match key.as_ref() {
             "state" => &mut state,
@@ -243,7 +244,21 @@ fn parse_callback_query(raw_query: Option<&str>) -> Result<CallbackQuery, AuthEr
             "error" => &mut error,
             "iss" => &mut issuer,
             "session_state" => &mut session_state,
-            _ => return Err(AuthError::OidcInvalid),
+            "error_description" => {
+                if error_description_seen {
+                    return Err(AuthError::OidcInvalid);
+                }
+                error_description_seen = true;
+                continue;
+            }
+            "error_uri" => {
+                if error_uri_seen {
+                    return Err(AuthError::OidcInvalid);
+                }
+                error_uri_seen = true;
+                continue;
+            }
+            _ => continue,
         };
         if target.replace(value.into_owned()).is_some() {
             return Err(AuthError::OidcInvalid);
@@ -1123,7 +1138,7 @@ mod tests {
     };
 
     use super::{
-        callback_failure_response, cookie, protected_cookie, random_cookie, CallbackQuery,
+        callback_failure_response, cookie, parse_callback_query, protected_cookie, random_cookie,
         LOGIN_COOKIE,
     };
     use crate::auth::AuthError;
@@ -1135,23 +1150,24 @@ mod tests {
     }
 
     #[test]
-    fn callback_accepts_standard_keycloak_coordinates_only() {
-        let callback: CallbackQuery = serde_json::from_str(
-            r#"{"code":"opaque-code","state":"opaque-state","iss":"https://issuer.example","session_state":"opaque-session"}"#,
-        )
-        .expect("Keycloak callback coordinates parse");
+    fn callback_ignores_extension_coordinates_but_rejects_duplicate_core_coordinates() {
+        let callback = parse_callback_query(Some(
+            "code=opaque-code&state=opaque-state&iss=https%3A%2F%2Fissuer.example&session_state=opaque-session&provider_diagnostic=sentinel",
+        ))
+        .expect("standard callback and extension coordinate parse");
         assert_eq!(callback.iss.as_deref(), Some("https://issuer.example"));
         assert!(callback.session_state.is_some());
-        assert!(serde_json::from_str::<CallbackQuery>(
-            r#"{"code":"opaque-code","state":"opaque-state","unexpected":"value"}"#
-        )
-        .is_err());
-        let denial: CallbackQuery = serde_json::from_str(
-            r#"{"error":"access_denied","state":"opaque-state","iss":"https://issuer.example"}"#,
-        )
+        let denial = parse_callback_query(Some(
+            "error=access_denied&state=opaque-state&iss=https%3A%2F%2Fissuer.example&error_description=provider+detail&error_uri=https%3A%2F%2Fissuer.example%2Ferror",
+        ))
         .expect("provider denial coordinates parse for the auth audit boundary");
         assert!(denial.code.is_none());
         assert_eq!(denial.error.as_deref(), Some("access_denied"));
+        assert!(parse_callback_query(Some("state=first&state=second&code=opaque-code")).is_err());
+        assert!(parse_callback_query(Some(
+            "state=opaque-state&error=access_denied&error=server_error"
+        ))
+        .is_err());
     }
 
     #[test]
