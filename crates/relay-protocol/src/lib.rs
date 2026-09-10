@@ -9,6 +9,7 @@
 // Rust guideline compliant 2026-09-08
 
 mod account;
+mod admission;
 mod auth;
 mod error;
 mod evidence;
@@ -21,6 +22,10 @@ pub use account::{
     CredentialMutation, CredentialPage, CredentialRecord, IdentityRecord, PrincipalKind,
     PrincipalState, RevokeCredentialRequest, RotateCredentialRequest, ServiceAccountCreated,
     ServiceAccountPage, ServiceAccountRecord,
+};
+pub use admission::{
+    AdmissionMethod, AdmissionProvider, AdmissionRuleRecord, AdmissionRuleState,
+    CreateAdmissionRuleRequest, EvidenceResultRecord, UpdateAdmissionRuleRequest,
 };
 pub use auth::{DeviceCredential, DeviceLoginStart, DevicePollResult, LoginId, Secret};
 pub use error::{ApiError, ApiErrorBody};
