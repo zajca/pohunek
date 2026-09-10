@@ -117,6 +117,8 @@ pub enum ManifestKind {
     BrowserSession,
     Credential,
     EvidenceChallenge,
+    AdmissionRule,
+    EvidenceResult,
     HistorySummary,
     ServiceAccount,
 }
@@ -749,6 +751,8 @@ async fn semantic_manifest(
         (ManifestKind::Credential, &["credential_id", "public_id", "principal_id", "identity_id", "digest_key_id", "credential_kind", "credential_generation", "rotation_family_id", "predecessor_credential_id", "recovery_generation", "issued_at", "expires_at", "rotation_overlap_ends_at", "revoked_at", "secret_digest_commitment"], "SELECT credential_id::text,public_id::text,principal_id::text,identity_id::text,digest_key_id::text,credential_kind::text,credential_generation::text,rotation_family_id::text,predecessor_credential_id::text,recovery_generation::text,issued_at::text,expires_at::text,rotation_overlap_ends_at::text,revoked_at::text,encode(sha256(convert_to('pohunek-recovery-manifest-v2/relay_credentials/secret_digest/','UTF8') || uuid_send(credential_id) || secret_digest),'hex') FROM relay_credentials ORDER BY credential_id"),
         (ManifestKind::ServiceAccount, &["principal_id", "team_id", "display_name", "deprovisioned_at"], "SELECT principal_id::text,team_id::text,display_name::text,deprovisioned_at::text FROM service_accounts ORDER BY principal_id"),
         (ManifestKind::EvidenceChallenge, &["challenge_id", "relay_id", "principal_id", "audience", "team_id", "admission_rule_revision", "account_link_generation", "recovery_generation", "expires_at", "consumed_at"], "SELECT challenge_id::text,relay_id::text,principal_id::text,audience::text,team_id::text,admission_rule_revision::text,account_link_generation::text,recovery_generation::text,expires_at::text,consumed_at::text FROM evidence_challenges ORDER BY challenge_id"),
+        (ManifestKind::AdmissionRule, &["admission_rule_id", "team_id", "provider", "method", "revision", "state"], "SELECT admission_rule_id::text,team_id::text,provider::text,method::text,revision::text,state::text FROM admission_rules ORDER BY admission_rule_id"),
+        (ManifestKind::EvidenceResult, &["evidence_id", "challenge_id", "principal_id", "team_id", "admission_rule_id", "admission_rule_revision", "outcome", "checked_at", "expires_at"], "SELECT evidence_id::text,challenge_id::text,principal_id::text,team_id::text,admission_rule_id::text,admission_rule_revision::text,outcome::text,checked_at::text,expires_at::text FROM evidence_results ORDER BY evidence_id"),
     ];
     // Timestamp text is authority evidence: connection/server locale changes
     // must not alter the representation of the same stored instant.
