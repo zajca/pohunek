@@ -3,10 +3,11 @@
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # POHUNEK_INTEGRATION_ID=codex
-# POHUNEK_INTEGRATION_VERSION=4
+# POHUNEK_INTEGRATION_VERSION=5
 #
-# SessionStart hook: report active-agent identity, then capture the agent's
-# native session id for direct-session resume. Fire-and-forget: any missing
+# Session and subagent lifecycle hook: report active-agent identity, capture the
+# native session id for direct-session resume, and journal sanitized child state.
+# Fire-and-forget: any missing
 # handshake env, missing python3, or socket failure is a silent no-op (exit 0)
 # so the hook can never break the agent.
 
@@ -19,7 +20,7 @@ trap 'rm -f "$hook_input_file"' EXIT HUP INT TERM
 cat >"$hook_input_file" 2>/dev/null || true
 
 case "$action" in
-  session) ;;
+  session|subagent-start|subagent-stop) ;;
   *) exit 0 ;;
 esac
 
@@ -32,6 +33,7 @@ command -v python3 >/dev/null 2>&1 || exit 0
 # `set -e` would never reach): an abnormal python exit (OOM, hook timeout kill,
 # SIGPIPE) must still leave the SessionStart hook exiting 0 so it never breaks
 # the agent.
+POHUNEK_HOOK_ACTION="$action" \
 POHUNEK_AGENT_PID="$agent_pid" \
 POHUNEK_HOOK_INPUT_FILE="$hook_input_file" \
 python3 - <<'PY' || exit 0
@@ -42,6 +44,8 @@ import time
 from datetime import datetime, timedelta, timezone
 
 agent = "codex"
+ACTION_SUBAGENT_START = "subagent-start"
+ACTION_SUBAGENT_STOP = "subagent-stop"
 TIMESTAMP_MS_FACTOR = 1000
 SOCKET_TIMEOUT_SECS = 0.5
 RESPONSE_BYTES = 4096
@@ -49,6 +53,7 @@ MIN_AGENT_PID = 1
 IDENTITY_TTL_SECS = 30
 
 session_id = os.environ.get("POHUNEK_SESSION_ID")
+action = os.environ.get("POHUNEK_HOOK_ACTION")
 socket_path = os.environ.get("POHUNEK_SOCKET_PATH")
 worker_socket_path = os.environ.get("POHUNEK_WORKER_SOCKET_PATH")
 protocol_raw = os.environ.get("POHUNEK_PROTOCOL_VERSION")
@@ -87,10 +92,8 @@ native_session_id = native if isinstance(native, str) and native else None
 transcript = hook_input.get("transcript_path")
 transcript_path = transcript if isinstance(transcript, str) and transcript else None
 
-if not native_session_id:
-    raise SystemExit(0)
-
 timestamp_ms = int(time.time() * TIMESTAMP_MS_FACTOR)
+sequence = time.monotonic_ns()
 
 
 def process_start_identity(pid):
@@ -117,13 +120,49 @@ def send_worker_identity():
         "provider": agent,
         "pid": agent_pid,
         "start_identity": start_identity,
-        "sequence": timestamp_ms,
+        "sequence": sequence,
         "expires_at": (
             datetime.now(timezone.utc) + timedelta(seconds=IDENTITY_TTL_SECS)
         ).isoformat().replace("+00:00", "Z"),
         "reference_kind": reference_kind,
         "native_reference": native_reference if reference_kind in ("id", "path") else None,
     }
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(SOCKET_TIMEOUT_SECS)
+        client.connect(worker_socket_path)
+        client.sendall((json.dumps(request) + "\n").encode())
+        response = client.recv(RESPONSE_BYTES)
+        client.close()
+        result = json.loads(response.splitlines()[0])
+        return result.get("ok") is True
+    except Exception:
+        return False
+
+
+def send_worker_subagent(request_type):
+    if not worker_socket_path or not runtime_id or agent_pid is None:
+        return False
+    start_identity = process_start_identity(agent_pid)
+    subagent_id = hook_input.get("agent_id")
+    if start_identity is None or not isinstance(subagent_id, str) or not subagent_id:
+        return False
+    agent_type = hook_input.get("agent_type")
+    parent_id = hook_input.get("parent_agent_id")
+    request = {
+        "type": request_type,
+        "runtime_id": runtime_id,
+        "provider": agent,
+        "pid": agent_pid,
+        "start_identity": start_identity,
+        "sequence": sequence,
+        "subagent_id": subagent_id,
+    }
+    if request_type == "subagent_start":
+        request["agent_type"] = agent_type if isinstance(agent_type, str) else None
+        request["parent_id"] = parent_id if isinstance(parent_id, str) else None
+    else:
+        request["outcome"] = "completed"
     try:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.settimeout(SOCKET_TIMEOUT_SECS)
@@ -157,6 +196,17 @@ def send_request(method, params, suffix):
     except Exception:
         pass
 
+
+if action == ACTION_SUBAGENT_START:
+    send_worker_subagent("subagent_start")
+    raise SystemExit(0)
+
+if action == ACTION_SUBAGENT_STOP:
+    send_worker_subagent("subagent_stop")
+    raise SystemExit(0)
+
+if not native_session_id:
+    raise SystemExit(0)
 
 if worker_socket_path and send_worker_identity():
     raise SystemExit(0)

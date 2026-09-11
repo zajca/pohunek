@@ -134,6 +134,9 @@ where they are doing it, and when they need you.
   Assistant, Activity, hosts, and project context.
 - Clicking a session opens its detail in a modal over the list. Eligible rows
   expose direct Open/Resume, Terminate, and confirmed Delete actions.
+- Session detail shows concurrent Claude/Codex subagents and their durable
+  running or terminal lifecycle; the browser workspace shows the same state
+  above an attached terminal.
 - The **Activity** modal is a quiet, chronological cross-host history with
   Recent, Unread, and Archived views. Current approvals and blocked state are
   shown directly on session rows and in session detail; failed sessions carry a
@@ -373,8 +376,8 @@ port is retained.
 | `pohunek daemon start [--detach]` | Run the host daemon (foreground or background). |
 | `pohunek health` / `status` | Daemon liveness, build, and protocol version. |
 | `pohunek session new` | Start a session: `--agent`, `--name`, `--project`/`--repo`, `--branch`, `--base-branch`, `--cwd`, `--input`, `--request-timeout-ms`, `--meta k=v`. |
-| `pohunek session list` | List sessions; `--filter state=running --filter agent=codex` (ANDed), `-q` for ids only. |
-| `pohunek session inspect <target>` | Full logical session record: agent state, runtime state and generation, cwd, project, branch, worktree, recovery binding. |
+| `pohunek session list` | List sessions, including a `running/recent` subagent count; `--filter state=running --filter agent=codex` (ANDed), `-q` for ids only. |
+| `pohunek session inspect <target>` | Full logical session record: agent state, current/recent subagents, runtime state and generation, cwd, project, branch, worktree, recovery binding. |
 | `pohunek attach <target>` | Attach the current terminal; `Ctrl-]` detaches. |
 | `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing; use `--stdin` for non-argv input. |
 | `pohunek session screen <target>` | Read the current rendered terminal; `--json` preserves runtime identity, watermark, geometry, cursor, and visible lines. |

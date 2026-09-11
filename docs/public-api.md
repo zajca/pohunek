@@ -274,7 +274,7 @@ All params and result type names below refer to structs exported by
 | `session.rename` | `SessionRenameParams` | `SessionRenameResult` | Sets or clears a session's owner display name (`name: null` clears). Cosmetic; the daemon trims it and rejects a control character or over-long name. |
 | `session.diff` | `SessionDiffParams` | `SessionDiffResult` | Computes a unified diff of a session's worktree against a base ref. `base: null` defers to the worktree binding's recorded base branch, then the repository default. A session without a bound worktree returns `session_no_worktree`; a hostile explicit `base` (empty, leading `-`, or a control character) returns `invalid_branch`; a `base` that cannot be resolved to a merge-base against `HEAD` returns `session_diff_base_unresolved`. See `SessionDiffResult` under Core Payloads for the size cap and truncation semantics. |
 | `subscribe` | `null` | `{subscribed: true}` then event stream | Consumes the connection into a one-way event stream. |
-| `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for active-agent state, native session id capture, and provider notifications. |
+| `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for active-agent state, native session id capture, provider-managed subagent lifecycle, and notifications. |
 | `integration.status` | `IntegrationStatusParams` or `null` | `IntegrationStatusResult` | Returns a read-only per-agent report for managed Codex and Claude hooks: availability, expected and present asset paths, inspected registration paths, installed and expected versions, aggregate health (`not_installed`, `current`, or `outdated`), typed recovery (`none`, `reinstall`, or `repair_configuration`), and non-secret warnings. `null` selects both agents; unknown parameter fields return `bad_request`. `current` requires exact managed executable permissions and exactly one registration under each installer-owned event. Inspection is size-bounded and runs outside the Tokio request task. It never mutates provider configuration. |
 | `assistant.materialize` | `AssistantMaterializeParams` | `AssistantMaterializeResult` | Materializes the assistant knowledge bundle on the daemon host. |
 | `notification.create` | `NotificationCreateParams` | `NotificationCreateResult` | Creates a host-local notification. Daemon policy is enforced for every producer, including provider hooks and daemon projectors. Dedupe may return `created: false` with an existing or upgraded record. `agent_blocked`/`approval_required` with `attention:<session_id>` and `turn_completed` with `turn:<session_id>` are deferred: the result still reports `created: true` with a minted id, but the record is held pending until `attention_debounce_secs` elapses; see `NotificationPolicy`. |
@@ -425,6 +425,14 @@ Important fields:
   metadata for the active nested agent. These fields are display/runtime
   metadata only and do not make the parent session resumable as that nested
   agent.
+- `subagents`: provider-managed child agents observed through current Claude
+  and Codex lifecycle hooks. Each item contains `id`, optional `parent_id`,
+  `provider`, optional `agent_type`, `lifecycle`, optional coarse `activity`, a
+  decimal-string `revision`, worker timestamps, and optional terminal time.
+  Multiple children may run concurrently. The bounded recent history survives
+  daemon/client reconnects; running children become `lost` when the owning PTY
+  runtime ends. No prompt, result, transcript path, or raw hook payload is
+  exposed.
 - `cwd`: current host-local working directory. It starts as the launch
   directory and can change while the session runs when procwatch observes the
   focus process in a new directory or the PTY emits an OSC 7 cwd hint.
@@ -788,7 +796,7 @@ The result is exactly `{"recorded":true}` or `{"recorded":false}`.
 `pid` is the OS process id for the active nested agent. When present, the daemon
 binds the active claim to that process and clears the claim when procwatch sees
 the process exit. The shipped integration state hooks use
-`POHUNEK_INTEGRATION_VERSION=2` and send the hook process's parent PID on
+`POHUNEK_INTEGRATION_VERSION=5` and send the hook process's parent PID on
 `SessionStart`.
 
 `session.release_agent` accepts the same `source`/`agent` identity plus an
@@ -999,6 +1007,12 @@ answer different questions:
 `integration.install` installs durable state and notification hook adapters for
 current Codex and Claude builds only. There is no fallback for older provider
 hook APIs.
+
+The state adapter also registers `SubagentStart` and `SubagentStop` for both
+providers. These callbacks target only the owner-private worker endpoint and
+silently no-op when it is unavailable. They copy only lifecycle identifiers and
+agent type; provider prompts, results, messages, and transcript paths are
+discarded.
 
 `integration.status` is the corresponding read-only drift report. Bare status
 reports both daemon-managed agents; `--agent codex` and `--agent claude` select
@@ -1226,6 +1240,7 @@ The daemon then writes these events:
 | `session_runtime_discovered` | `{entry: RuntimeInventoryEntry}` | Startup reconciliation classified a discovered durable worker that is not a plainly managed runtime (orphaned, conflicting, incompatible, or identity-mismatched). Emitted once per non-managed discovery so operators can inspect quarantined runtimes. |
 | `session_native_recovered` | `{session: SessionInfo, previous_runtime_id?: string, runtime_id?: string}` | Explicit provider-native recovery created a new worker and runtime generation for the same logical session. `previous_runtime_id` can be absent for a one-time migrated legacy session; production worker recovery includes the new `runtime_id`. |
 | `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource, runtime?: SessionRuntimeIdentity, activity_epoch?: string, revision?: ActivityRevision}` | Agent activity changed. `source` may be `report` when a hook report supplied explicit active-agent state. Current daemons emit `runtime`, `activity_epoch`, and decimal-string `revision`, making `(activity_epoch, runtime, revision)` exact reconnect-safe evidence rather than a hint to re-read only the latest snapshot; the fields remain additive for general v2 subscribers, while input-wait success requires them through `SessionInputResult`. |
+| `subagent_state` | `{session_id: SessionId, subagent: SubagentInfo, runtime?: SessionRuntimeIdentity}` | One provider-managed subagent changed. Current daemons emit `runtime`; clients ignore an event without a runtime identity or whose runtime id/generation does not match the session snapshot, then apply only a newer decimal-string `subagent.revision` for the same provider/id. `session.list` and `session.inspect` remain the reconnect seed through `SessionInfo.subagents`. |
 | `attach_opened` | `{session_id: SessionId, stream_id: string}` | A pending attach token was redeemed and a raw stream opened. |
 | `attach_closed` | `{session_id: SessionId, stream_id: string}` | A raw attach stream ended or was detached. |
 | `notification_created` | `{record: NotificationRecord}` | A durable notification record was created. |

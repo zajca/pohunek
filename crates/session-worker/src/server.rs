@@ -1,6 +1,6 @@
 //! Serves the private daemon-worker Unix protocol.
 
-// Rust guideline compliant 2026-08-06
+// Rust guideline compliant 2026-09-11
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -22,8 +22,9 @@ use protocol::{
     FrameKind, Initialize, InspectSnapshot, LeaseChallenge, LeaseId, OutputGap,
     ProcessIdentity as WireProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
     RequestKind, ResponseKind, RuntimeId, RuntimePhase as WireRuntimePhase, RuntimeScope,
-    SessionId, StreamId, StreamMode, TerminalSnapshot as WireTerminalSnapshot, TransactionId,
-    Version, WorkerId, WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
+    SessionId, StreamId, StreamMode, SubagentPhase as WireSubagentPhase, SubagentSnapshot,
+    TerminalSnapshot as WireTerminalSnapshot, TransactionId, Version, WorkerId, WriteAck, WriteId,
+    ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
 };
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -35,7 +36,7 @@ use tracing::{event, Level};
 
 use crate::journal::{
     ActiveIdentity, ChildIdentity, JournalRecord, LaunchIdentity, ReleasedIdentity, RuntimeOutcome,
-    RuntimePhase as JournalPhase,
+    RuntimePhase as JournalPhase, SubagentPhase as JournalSubagentPhase, SubagentRecord,
 };
 use crate::{
     Command, ControllerLease, Exit, InputFragment, InputPlan, Journal, LeaseError, LeaseOwner,
@@ -44,6 +45,14 @@ use crate::{
 
 /// Number of worker events buffered per control connection.
 const EVENT_BUFFER: usize = 256;
+/// Maximum simultaneously running subagents accepted from provider hooks.
+const ACTIVE_SUBAGENT_CAPACITY: usize = 64;
+/// Recent terminal subagents retained for reconnecting clients.
+const TERMINAL_SUBAGENT_CAPACITY: usize = 32;
+/// Maximum accepted provider-native subagent identifier length.
+const MAX_SUBAGENT_ID_BYTES: usize = 256;
+/// Maximum accepted provider-defined subagent type length.
+const MAX_SUBAGENT_TYPE_BYTES: usize = 128;
 /// Maximum outstanding one-use data tokens per worker.
 const DATA_TOKEN_CAPACITY: usize = 4_096;
 /// Entropy bytes used for opaque worker credentials and runtime IDs.
@@ -560,6 +569,9 @@ where
                 event = events.recv() => {
                     match event {
                         Ok(event) => {
+                            if !event_visible_to_connection(&event, connection) {
+                                continue;
+                            }
                             writer.write(&ControlMessage::Event(event)).await
                                 .map_err(|error| WorkerError::Protocol(error.to_string()))?;
                             continue;
@@ -1341,6 +1353,22 @@ async fn inspect_snapshot(shared: &Shared, state: &State) -> Result<InspectSnaps
                 })
             })
             .transpose()?,
+        subagents: state
+            .journal
+            .subagents
+            .iter()
+            .map(|subagent| SubagentSnapshot {
+                id: subagent.id.clone(),
+                parent_id: subagent.parent_id.clone(),
+                provider: subagent.provider.clone(),
+                agent_type: subagent.agent_type.clone(),
+                phase: wire_subagent_phase(subagent.phase),
+                revision: subagent.revision,
+                started_at_ms: subagent.started_at_ms,
+                updated_at_ms: subagent.updated_at_ms,
+                finished_at_ms: subagent.finished_at_ms,
+            })
+            .collect(),
     })
 }
 
@@ -1404,6 +1432,7 @@ fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: Runtim
             state.phase = WireRuntimePhase::Exited;
             state.exit = Some(status.clone());
             state.journal.phase = JournalPhase::Terminal;
+            mark_running_subagents_lost(&mut state.journal, status.exited_at_ms);
             state.journal.outcome = Some(RuntimeOutcome {
                 exit_code: exit.exit_code,
                 signal: exit.signal.clone(),
@@ -1448,11 +1477,23 @@ async fn wait_runtime_exit(pty: &PtyOwner) -> Result<Exit, PtyError> {
 }
 
 async fn mark_runtime_faulted(shared: &Shared, runtime_id: RuntimeId, error: WorkerError) {
-    let mut state = shared.state.lock().await;
-    state.phase = WireRuntimePhase::Faulted;
-    state.journal.phase = JournalPhase::Faulted;
-    state.journal.updated_at = timestamp();
-    drop(state);
+    let record = {
+        let mut state = shared.state.lock().await;
+        state.phase = WireRuntimePhase::Faulted;
+        state.journal.phase = JournalPhase::Faulted;
+        mark_running_subagents_lost(&mut state.journal, unix_ms());
+        state.journal.updated_at = timestamp();
+        state.journal.clone()
+    };
+    if let Err(persist_error) = persist(shared.journal.clone(), record).await {
+        event!(
+            name: "worker.journal.write.failed",
+            Level::ERROR,
+            error.type = "journal",
+            error.message = %persist_error,
+            "worker journal write failed: {{error.message}}",
+        );
+    }
     shared.emit(EventKind::RuntimeFault {
         runtime_id: Some(runtime_id),
         error: control_error(ControlCode::RuntimeFault, error, false),
@@ -2184,6 +2225,25 @@ enum HookRequest {
         start_identity: u64,
         sequence: u64,
     },
+    SubagentStart {
+        runtime_id: String,
+        provider: String,
+        pid: u32,
+        start_identity: u64,
+        sequence: u64,
+        subagent_id: String,
+        parent_id: Option<String>,
+        agent_type: Option<String>,
+    },
+    SubagentStop {
+        runtime_id: String,
+        provider: String,
+        pid: u32,
+        start_identity: u64,
+        sequence: u64,
+        subagent_id: String,
+        outcome: Option<JournalSubagentPhase>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -2206,7 +2266,7 @@ where
 {
     let request: HookRequest =
         serde_json::from_value(value).map_err(|error| WorkerError::Protocol(error.to_string()))?;
-    let (accepted, launch_identity_accepted, runtime_id) = match request {
+    let (accepted, launch_identity_accepted, runtime_id, subagent_changed) = match request {
         HookRequest::IdentityReport {
             runtime_id,
             provider,
@@ -2223,7 +2283,7 @@ where
                 || current_runtime.as_deref() != Some(runtime_id.as_str())
                 || !valid_identity_expiry(&expires_at)
             {
-                (false, false, current_runtime)
+                (false, false, current_runtime, false)
             } else {
                 let pty = state.pty.as_ref().ok_or_else(|| {
                     WorkerError::Protocol("runtime is not initialized".to_owned())
@@ -2233,7 +2293,7 @@ where
                     validate_hook_process(pid, start_identity, root_identity.pid).is_ok();
                 let sequence_valid = identity_sequence_is_fresh(&state.journal, sequence);
                 if !process_valid || !sequence_valid {
-                    (false, false, current_runtime)
+                    (false, false, current_runtime, false)
                 } else {
                     let mut journal = state.journal.clone();
                     let process = ChildIdentity {
@@ -2292,7 +2352,7 @@ where
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
-                    (true, launch_identity_accepted, current_runtime)
+                    (true, launch_identity_accepted, current_runtime, false)
                 }
             }
         }
@@ -2308,7 +2368,7 @@ where
             if !known_identity_provider(&provider)
                 || current_runtime.as_deref() != Some(runtime_id.as_str())
             {
-                (false, false, current_runtime)
+                (false, false, current_runtime, false)
             } else {
                 let pty = state.pty.as_ref().ok_or_else(|| {
                     WorkerError::Protocol("runtime is not initialized".to_owned())
@@ -2346,16 +2406,107 @@ where
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
-                    (true, false, current_runtime)
+                    (true, false, current_runtime, false)
                 } else {
-                    (false, false, current_runtime)
+                    (false, false, current_runtime, false)
                 }
+            }
+        }
+        HookRequest::SubagentStart {
+            runtime_id,
+            provider,
+            pid,
+            start_identity,
+            sequence,
+            subagent_id,
+            parent_id,
+            agent_type,
+        } => {
+            let occurred_at_ms = unix_ms();
+            let mut state = shared.state.lock().await;
+            let current_runtime = state.runtime_id.as_ref().map(ToString::to_string);
+            let valid = known_subagent_provider(&provider)
+                && current_runtime.as_deref() == Some(runtime_id.as_str())
+                && state.phase == WireRuntimePhase::Running
+                && valid_subagent_text(&subagent_id, MAX_SUBAGENT_ID_BYTES)
+                && parent_id
+                    .as_deref()
+                    .is_none_or(|value| valid_subagent_text(value, MAX_SUBAGENT_ID_BYTES))
+                && agent_type
+                    .as_deref()
+                    .is_none_or(|value| valid_subagent_text(value, MAX_SUBAGENT_TYPE_BYTES));
+            let process_valid = state.pty.as_ref().is_some_and(|pty| {
+                validate_hook_process(pid, start_identity, pty.identity().pid).is_ok()
+            });
+            if !valid || !process_valid {
+                (false, false, current_runtime, false)
+            } else {
+                let mut journal = state.journal.clone();
+                let accepted = start_subagent(
+                    &mut journal,
+                    provider,
+                    subagent_id,
+                    parent_id,
+                    agent_type,
+                    sequence,
+                    occurred_at_ms,
+                );
+                if accepted {
+                    journal.updated_at = timestamp();
+                    persist(shared.journal.clone(), journal.clone()).await?;
+                    state.journal = journal;
+                }
+                (accepted, false, current_runtime, accepted)
+            }
+        }
+        HookRequest::SubagentStop {
+            runtime_id,
+            provider,
+            pid,
+            start_identity,
+            sequence,
+            subagent_id,
+            outcome,
+        } => {
+            let occurred_at_ms = unix_ms();
+            let mut state = shared.state.lock().await;
+            let current_runtime = state.runtime_id.as_ref().map(ToString::to_string);
+            let valid = known_subagent_provider(&provider)
+                && current_runtime.as_deref() == Some(runtime_id.as_str())
+                && state.phase == WireRuntimePhase::Running
+                && valid_subagent_text(&subagent_id, MAX_SUBAGENT_ID_BYTES)
+                && outcome.is_none_or(|phase| phase != JournalSubagentPhase::Running);
+            let process_valid = state.pty.as_ref().is_some_and(|pty| {
+                validate_hook_process(pid, start_identity, pty.identity().pid).is_ok()
+            });
+            if !valid || !process_valid {
+                (false, false, current_runtime, false)
+            } else {
+                let mut journal = state.journal.clone();
+                let accepted = stop_subagent(
+                    &mut journal,
+                    &provider,
+                    &subagent_id,
+                    outcome.unwrap_or(JournalSubagentPhase::Completed),
+                    sequence,
+                    occurred_at_ms,
+                );
+                if accepted {
+                    journal.updated_at = timestamp();
+                    persist(shared.journal.clone(), journal.clone()).await?;
+                    state.journal = journal;
+                }
+                (accepted, false, current_runtime, accepted)
             }
         }
     };
     if accepted {
         if let Some(runtime_id) = runtime_id.and_then(|value| RuntimeId::new(value).ok()) {
-            shared.emit(EventKind::IdentityChanged { runtime_id });
+            if subagent_changed {
+                shared.emit(EventKind::SubagentsChanged { runtime_id });
+            } else {
+                shared.emit(EventKind::IdentityChanged { runtime_id });
+            }
         }
     }
     writer
@@ -2369,6 +2520,147 @@ where
 
 fn known_identity_provider(provider: &str) -> bool {
     matches!(provider, "shell" | "codex" | "claude" | "hermes")
+}
+
+fn event_visible_to_connection(event: &protocol::ControlEvent, connection: &Connection) -> bool {
+    !matches!(&event.kind, EventKind::SubagentsChanged { .. })
+        || connection
+            .capabilities
+            .contains(&Capability::SubagentObservation)
+}
+
+fn known_subagent_provider(provider: &str) -> bool {
+    matches!(provider, "codex" | "claude")
+}
+
+fn valid_subagent_text(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+}
+
+fn start_subagent(
+    journal: &mut JournalRecord,
+    provider: String,
+    id: String,
+    parent_id: Option<String>,
+    agent_type: Option<String>,
+    sequence: u64,
+    occurred_at_ms: u64,
+) -> bool {
+    if journal
+        .subagents
+        .iter()
+        .any(|item| item.provider == provider && item.id == id)
+    {
+        return false;
+    }
+    if journal
+        .subagents
+        .iter()
+        .filter(|item| item.phase == JournalSubagentPhase::Running)
+        .count()
+        >= ACTIVE_SUBAGENT_CAPACITY
+    {
+        return false;
+    }
+    journal.subagent_revision = journal.subagent_revision.saturating_add(1);
+    journal.subagents.push(SubagentRecord {
+        id,
+        parent_id,
+        provider,
+        agent_type,
+        phase: JournalSubagentPhase::Running,
+        sequence,
+        revision: journal.subagent_revision,
+        started_at_ms: occurred_at_ms,
+        updated_at_ms: occurred_at_ms,
+        finished_at_ms: None,
+    });
+    true
+}
+
+fn stop_subagent(
+    journal: &mut JournalRecord,
+    provider: &str,
+    id: &str,
+    phase: JournalSubagentPhase,
+    sequence: u64,
+    occurred_at_ms: u64,
+) -> bool {
+    let existing_index = journal
+        .subagents
+        .iter()
+        .position(|item| item.provider == provider && item.id == id);
+    if existing_index.is_some_and(|index| {
+        journal.subagents[index].phase != JournalSubagentPhase::Running
+            || sequence <= journal.subagents[index].sequence
+    }) {
+        return false;
+    }
+    journal.subagent_revision = journal.subagent_revision.saturating_add(1);
+    if let Some(index) = existing_index {
+        let subagent = &mut journal.subagents[index];
+        subagent.phase = phase;
+        subagent.sequence = sequence;
+        subagent.revision = journal.subagent_revision;
+        subagent.updated_at_ms = occurred_at_ms;
+        subagent.finished_at_ms = Some(occurred_at_ms);
+    } else {
+        journal.subagents.push(SubagentRecord {
+            id: id.to_owned(),
+            parent_id: None,
+            provider: provider.to_owned(),
+            agent_type: None,
+            phase,
+            sequence,
+            revision: journal.subagent_revision,
+            started_at_ms: occurred_at_ms,
+            updated_at_ms: occurred_at_ms,
+            finished_at_ms: Some(occurred_at_ms),
+        });
+    }
+    prune_terminal_subagents(journal);
+    true
+}
+
+fn mark_running_subagents_lost(journal: &mut JournalRecord, occurred_at_ms: u64) {
+    for subagent in journal
+        .subagents
+        .iter_mut()
+        .filter(|item| item.phase == JournalSubagentPhase::Running)
+    {
+        journal.subagent_revision = journal.subagent_revision.saturating_add(1);
+        subagent.phase = JournalSubagentPhase::Lost;
+        subagent.revision = journal.subagent_revision;
+        subagent.updated_at_ms = occurred_at_ms;
+        subagent.finished_at_ms = Some(occurred_at_ms);
+    }
+    prune_terminal_subagents(journal);
+}
+
+fn prune_terminal_subagents(journal: &mut JournalRecord) {
+    let mut terminal = journal
+        .subagents
+        .iter()
+        .filter(|item| item.phase != JournalSubagentPhase::Running)
+        .map(|item| item.revision)
+        .collect::<Vec<_>>();
+    terminal.sort_unstable_by(|left, right| right.cmp(left));
+    let cutoff = terminal.get(TERMINAL_SUBAGENT_CAPACITY).copied();
+    if let Some(cutoff) = cutoff {
+        journal
+            .subagents
+            .retain(|item| item.phase == JournalSubagentPhase::Running || item.revision > cutoff);
+    }
+}
+
+const fn wire_subagent_phase(phase: JournalSubagentPhase) -> WireSubagentPhase {
+    match phase {
+        JournalSubagentPhase::Running => WireSubagentPhase::Running,
+        JournalSubagentPhase::Completed => WireSubagentPhase::Completed,
+        JournalSubagentPhase::Failed => WireSubagentPhase::Failed,
+        JournalSubagentPhase::Cancelled => WireSubagentPhase::Cancelled,
+        JournalSubagentPhase::Lost => WireSubagentPhase::Lost,
+    }
 }
 
 fn identity_sequence_is_fresh(journal: &JournalRecord, sequence: u64) -> bool {
@@ -2595,6 +2887,9 @@ fn capabilities(version: Version) -> Vec<Capability> {
     }
     if version >= protocol::CONTROL_PLANE_OBSERVATION_VERSION {
         capabilities.push(Capability::ControlPlaneObservation);
+    }
+    if version >= protocol::SUBAGENT_OBSERVATION_VERSION {
+        capabilities.push(Capability::SubagentObservation);
     }
     capabilities
 }
@@ -2998,9 +3293,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        await_observation_page, capabilities, control_input_id, identity_sequence_is_fresh,
-        known_identity_provider, observation_timed_out, parse_stat, random_value,
-        redeem_data_grant, signal_number, valid_identity_expiry, validate_attach_write_id,
+        await_observation_page, capabilities, control_input_id, event_visible_to_connection,
+        identity_sequence_is_fresh, known_identity_provider, mark_running_subagents_lost,
+        observation_timed_out, parse_stat, random_value, redeem_data_grant, signal_number,
+        start_subagent, stop_subagent, valid_identity_expiry, validate_attach_write_id,
         validate_data_start, validate_observation_request, validate_terminal_snapshot_dimensions,
         validate_terminal_snapshot_response, wait_runtime_exit, write_data_error,
         write_observation_page, write_output_chunks, write_terminal_chunks, Connection,
@@ -3011,14 +3307,15 @@ mod tests {
     use nix::unistd::Pid;
     use pohunek_worker_protocol::{
         self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
-        ControlResponse, Cursor, DataToken, Dimensions, FrameHeader, FrameKind, LeaseId, RequestId,
-        ResponseKind, RuntimeId, StreamId, StreamMode, Version, WriteId, CURRENT_VERSION,
-        MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
+        ControlResponse, Cursor, DataToken, Dimensions, EventKind, FrameHeader, FrameKind, LeaseId,
+        RequestId, ResponseKind, RuntimeId, StreamId, StreamMode, Version, WriteId,
+        CURRENT_VERSION, MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
 
+    use crate::journal::SubagentPhase;
     use crate::{ChildIdentity, JournalRecord, ReleasedIdentity};
 
     /// Extra bytes force exactly one partial frame after a full wire payload.
@@ -3085,6 +3382,123 @@ mod tests {
         assert!(!identity_sequence_is_fresh(&journal, 7));
         assert!(!identity_sequence_is_fresh(&journal, 8));
         assert!(identity_sequence_is_fresh(&journal, 9));
+    }
+
+    #[test]
+    fn subagent_lifecycle_is_ordered_and_runtime_exit_marks_running_entries_lost() {
+        let mut journal = JournalRecord::bootstrap(
+            "s-subagents".to_owned(),
+            "worker-subagents".to_owned(),
+            10,
+            "100".to_owned(),
+            (4, 5),
+            "2026-09-11T00:00:00Z".to_owned(),
+        );
+
+        assert!(start_subagent(
+            &mut journal,
+            "claude".to_owned(),
+            "child-a".to_owned(),
+            None,
+            Some("Explore".to_owned()),
+            10,
+            100,
+        ));
+        assert!(!stop_subagent(
+            &mut journal,
+            "claude",
+            "child-a",
+            SubagentPhase::Completed,
+            9,
+            101,
+        ));
+        assert!(start_subagent(
+            &mut journal,
+            "codex".to_owned(),
+            "child-b".to_owned(),
+            Some("child-a".to_owned()),
+            None,
+            20,
+            110,
+        ));
+        assert!(stop_subagent(
+            &mut journal,
+            "claude",
+            "child-a",
+            SubagentPhase::Completed,
+            11,
+            120,
+        ));
+
+        mark_running_subagents_lost(&mut journal, 130);
+
+        assert_eq!(journal.subagents[0].phase, SubagentPhase::Completed);
+        assert_eq!(journal.subagents[1].phase, SubagentPhase::Lost);
+        assert_eq!(journal.subagents[1].finished_at_ms, Some(130));
+        assert!(journal.subagents[1].revision > journal.subagents[0].revision);
+        let lost_revision = journal.subagents[1].revision;
+        assert!(!stop_subagent(
+            &mut journal,
+            "codex",
+            "child-b",
+            SubagentPhase::Completed,
+            21,
+            140,
+        ));
+        assert!(!start_subagent(
+            &mut journal,
+            "codex".to_owned(),
+            "child-b".to_owned(),
+            None,
+            None,
+            22,
+            150,
+        ));
+        assert_eq!(journal.subagents[1].phase, SubagentPhase::Lost);
+        assert_eq!(journal.subagents[1].revision, lost_revision);
+    }
+
+    #[test]
+    fn subagent_stop_tombstone_rejects_a_delayed_start() {
+        let mut journal = JournalRecord::bootstrap(
+            "s-subagents".to_owned(),
+            "worker-subagents".to_owned(),
+            10,
+            "100".to_owned(),
+            (4, 5),
+            "2026-09-11T00:00:00Z".to_owned(),
+        );
+
+        assert!(stop_subagent(
+            &mut journal,
+            "codex",
+            "child-a",
+            SubagentPhase::Completed,
+            20,
+            120,
+        ));
+        assert!(!start_subagent(
+            &mut journal,
+            "codex".to_owned(),
+            "child-a".to_owned(),
+            None,
+            Some("explore".to_owned()),
+            19,
+            100,
+        ));
+        assert!(!start_subagent(
+            &mut journal,
+            "codex".to_owned(),
+            "child-a".to_owned(),
+            None,
+            Some("explore".to_owned()),
+            21,
+            130,
+        ));
+
+        assert_eq!(journal.subagents.len(), 1);
+        assert_eq!(journal.subagents[0].phase, SubagentPhase::Completed);
+        assert_eq!(journal.subagents[0].sequence, 20);
     }
 
     #[tokio::test]
@@ -3225,8 +3639,29 @@ mod tests {
     #[test]
     fn observation_capability_starts_at_private_version_four() {
         assert!(capabilities(CURRENT_VERSION).contains(&Capability::ControlPlaneObservation));
-        assert!(!capabilities(PREVIOUS_VERSION).contains(&Capability::ControlPlaneObservation));
+        assert!(capabilities(PREVIOUS_VERSION).contains(&Capability::ControlPlaneObservation));
+        assert!(capabilities(CURRENT_VERSION).contains(&Capability::SubagentObservation));
+        assert!(!capabilities(PREVIOUS_VERSION).contains(&Capability::SubagentObservation));
         assert!(capabilities(PREVIOUS_VERSION).contains(&Capability::AttachSnapshot));
+    }
+
+    #[test]
+    fn subagent_events_are_hidden_from_version_four_connections() {
+        let event = protocol::ControlEvent {
+            event_sequence: 1,
+            kind: EventKind::SubagentsChanged {
+                runtime_id: RuntimeId::new("runtime-1").expect("runtime id"),
+            },
+        };
+        let mut previous = Connection::new(1, 1);
+        previous.selected_version = Some(PREVIOUS_VERSION);
+        previous.capabilities = capabilities(PREVIOUS_VERSION);
+        let mut current = Connection::new(1, 1);
+        current.selected_version = Some(CURRENT_VERSION);
+        current.capabilities = capabilities(CURRENT_VERSION);
+
+        assert!(!event_visible_to_connection(&event, &previous));
+        assert!(event_visible_to_connection(&event, &current));
     }
 
     fn data_grant(

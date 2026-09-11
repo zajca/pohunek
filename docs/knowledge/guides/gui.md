@@ -120,7 +120,8 @@ rename, metadata, terminate, and delete controls according to current
 capabilities. Worktree path and branch can still appear as read-only session
 metadata; the GUI does not browse or manage worktrees. Session detail separates
 Current attention from Recent activity and links to the host-filtered Activity
-view.
+view. It also lists the durable current and recent Claude/Codex subagents,
+including how many are still working.
 
 ## Navigation and Keyboard
 

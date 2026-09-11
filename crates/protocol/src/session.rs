@@ -13,7 +13,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     envelope::StateSource, ActivityRevision, OutputOffset, ProcessStartIdentity, ProtocolError,
-    ReportSequence, RuntimeGeneration, TerminalWatermark, MAX_RUNTIME_ID_BYTES,
+    ReportSequence, RuntimeGeneration, SubagentRevision, TerminalWatermark, MAX_RUNTIME_ID_BYTES,
     MAX_SESSION_ID_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_MS,
 };
 
@@ -122,6 +122,62 @@ pub enum AgentActivity {
     Blocked,
     /// The agent is running but not currently producing work.
     Idle,
+}
+
+/// Lifecycle of one provider-managed subagent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SubagentLifecycle.ts"))]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentLifecycle {
+    /// The provider reports that the subagent is still running.
+    Running,
+    /// The provider reports a successful completion.
+    Completed,
+    /// The provider reports an unsuccessful completion.
+    Failed,
+    /// The provider reports an explicit cancellation.
+    Cancelled,
+    /// The owning runtime ended before the provider reported completion.
+    Lost,
+}
+
+/// Sanitized durable state for one provider-managed subagent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SubagentInfo.ts"))]
+pub struct SubagentInfo {
+    /// Provider-native identifier used only to correlate lifecycle hooks.
+    pub id: String,
+    /// Parent provider-native identifier for a nested subagent, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub parent_id: Option<String>,
+    /// Provider that owns this subagent.
+    pub provider: AgentKind,
+    /// Provider-defined subagent type, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub agent_type: Option<String>,
+    /// Current lifecycle state.
+    pub lifecycle: SubagentLifecycle,
+    /// Current coarse activity while the subagent is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub activity: Option<AgentActivity>,
+    /// Worker-owned monotonic revision for stale-event rejection.
+    pub revision: SubagentRevision,
+    /// Millisecond Unix timestamp of the first accepted start hook.
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub started_at_ms: u64,
+    /// Millisecond Unix timestamp of the latest accepted transition.
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub updated_at_ms: u64,
+    /// Millisecond Unix timestamp of the terminal transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub finished_at_ms: Option<u64>,
 }
 
 impl AgentActivity {
@@ -2316,6 +2372,9 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub activity: Option<AgentActivity>,
+    /// Durable provider-managed subagents, including bounded recent history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<SubagentInfo>,
     /// Active nested agent profile name reported by a session-level hook.
     ///
     /// This is runtime metadata only: it does not change the launch identity in
@@ -2469,6 +2528,21 @@ pub struct AgentStateEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub revision: Option<ActivityRevision>,
+}
+
+/// Payload for a `subagent_state` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SubagentStateEvent.ts"))]
+pub struct SubagentStateEvent {
+    /// Session that owns the subagent.
+    pub session_id: SessionId,
+    /// Complete current state for the changed subagent.
+    pub subagent: SubagentInfo,
+    /// Runtime that accepted the provider hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub runtime: Option<SessionRuntimeIdentity>,
 }
 
 /// Payload shared by attach lifecycle events.
@@ -2668,6 +2742,7 @@ mod tests {
             state: SessionState::Running,
             state_source: StateSource::Process,
             activity: Some(AgentActivity::Working),
+            subagents: Vec::new(),
             active_agent: None,
             active_agent_base: None,
             active_agent_pid: None,

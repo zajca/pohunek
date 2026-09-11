@@ -4,7 +4,7 @@
 //! ranges. Every worker-aware release supports the current protocol and the
 //! immediately preceding protocol.
 
-// Rust guideline compliant 2026-08-04
+// Rust guideline compliant 2026-09-11
 
 use std::fmt::{Display, Formatter};
 
@@ -12,10 +12,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 /// Current worker protocol version.
-pub const CURRENT_VERSION: Version = Version(4);
+pub const CURRENT_VERSION: Version = Version(5);
 
 /// Immediately preceding worker protocol version.
-pub const PREVIOUS_VERSION: Version = Version(3);
+pub const PREVIOUS_VERSION: Version = Version(4);
 
 /// First version with atomic attach snapshots.
 ///
@@ -26,6 +26,9 @@ pub const ATTACH_SNAPSHOT_VERSION: Version = Version(3);
 
 /// First version with bounded control-plane terminal observation.
 pub const CONTROL_PLANE_OBSERVATION_VERSION: Version = Version(4);
+
+/// First version with durable provider-managed subagent observation.
+pub const SUBAGENT_OBSERVATION_VERSION: Version = Version(5);
 
 /// Versions supported by this crate release.
 pub const SUPPORTED_RANGE: VersionRange = VersionRange {
@@ -218,8 +221,8 @@ mod tests {
     #[test]
     fn negotiation_rejects_disjoint_ranges() {
         let remote = VersionRange::new(
-            Version::new(5).expect("valid version"),
             Version::new(6).expect("valid version"),
+            Version::new(7).expect("valid version"),
         )
         .expect("ordered range");
 

@@ -11,6 +11,7 @@ use protocol::{
     NotificationStatus, OutputOffset, ProjectActionResult, ProjectActionsResult, ProjectInfo,
     ProjectPromptResult, ProjectShowResult, RuntimeState, SessionId, SessionInfo,
     SessionRuntimeIdentity, SessionScreenResult, SessionState, SessionWaitResult, StateSource,
+    SubagentStateEvent,
 };
 
 use crate::providers;
@@ -303,6 +304,7 @@ pub struct AgentStateEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostEvent {
     AgentState(AgentStateEvent),
+    SubagentState(SubagentStateEvent),
     SessionCreated(SessionInfo),
     SessionUpdated(SessionInfo),
     SessionStopped(SessionInfo),
@@ -2654,6 +2656,29 @@ fn apply_host_event(
             }
             host.last_agent_state = Some(state);
         }
+        HostEvent::SubagentState(state) => {
+            if let Some(session) = host.sessions.get_mut(&state.session_id.0) {
+                let runtime_matches = state.runtime.as_ref().is_some_and(|event_runtime| {
+                    session.runtime.as_ref().is_some_and(|session_runtime| {
+                        session_runtime.runtime_id.as_deref() == Some(event_runtime.runtime_id())
+                            && session_runtime.runtime_generation
+                                == event_runtime.runtime_generation()
+                    })
+                });
+                if !runtime_matches {
+                    return;
+                }
+                match session.subagents.iter_mut().find(|subagent| {
+                    subagent.provider == state.subagent.provider && subagent.id == state.subagent.id
+                }) {
+                    Some(current) if current.revision < state.subagent.revision => {
+                        *current = state.subagent;
+                    }
+                    None => session.subagents.push(state.subagent),
+                    Some(_) => {}
+                }
+            }
+        }
         HostEvent::SessionCreated(session)
         | HostEvent::SessionUpdated(session)
         | HostEvent::SessionStopped(session) => {
@@ -2720,6 +2745,7 @@ fn observation_invalidation_for_host_event(host: &HostView, event: &HostEvent) -
         | HostEvent::RuntimeConflict(session) => session,
         HostEvent::SessionRemoved(session) => return Some(session.id.0.clone()),
         HostEvent::AgentState(_)
+        | HostEvent::SubagentState(_)
         | HostEvent::NotificationCreated(_)
         | HostEvent::NotificationUpdated(_)
         | HostEvent::NotificationDeleted(_)
@@ -3039,6 +3065,65 @@ mod tests {
                 .map(|event| event.session_id.0.as_str()),
             Some("s-1")
         );
+    }
+
+    #[test]
+    fn workspace_applies_only_newer_subagent_revisions() {
+        let mut workspace = Workspace::default();
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![session_with_runtime("s-1", "runtime-1")]),
+        });
+        let event = |runtime_id: &str, revision, lifecycle| {
+            HostEvent::SubagentState(SubagentStateEvent {
+                session_id: SessionId("s-1".to_owned()),
+                subagent: protocol::SubagentInfo {
+                    id: "child-1".to_owned(),
+                    parent_id: None,
+                    provider: protocol::AgentKind::Claude,
+                    agent_type: Some("Explore".to_owned()),
+                    lifecycle,
+                    activity: (lifecycle == protocol::SubagentLifecycle::Running)
+                        .then_some(AgentActivity::Working),
+                    revision: protocol::SubagentRevision::new(revision),
+                    started_at_ms: 100,
+                    updated_at_ms: 100 + revision,
+                    finished_at_ms: None,
+                },
+                runtime: Some(
+                    SessionRuntimeIdentity::new(
+                        runtime_id.to_owned(),
+                        protocol::RuntimeGeneration::new(1),
+                    )
+                    .expect("runtime identity"),
+                ),
+            })
+        };
+
+        workspace.apply(DomainEvent::HostEvent {
+            host_id: HostId::new("local"),
+            event: event("runtime-1", 2, protocol::SubagentLifecycle::Completed),
+        });
+        workspace.apply(DomainEvent::HostEvent {
+            host_id: HostId::new("local"),
+            event: event("runtime-1", 1, protocol::SubagentLifecycle::Running),
+        });
+
+        let subagent = &workspace.hosts[&HostId::new("local")].sessions["s-1"].subagents[0];
+        assert_eq!(subagent.lifecycle, protocol::SubagentLifecycle::Completed);
+        assert_eq!(subagent.revision, protocol::SubagentRevision::new(2));
+
+        workspace.apply(DomainEvent::HostEvent {
+            host_id: HostId::new("local"),
+            event: HostEvent::NativeRecovered(session_with_runtime("s-1", "runtime-2")),
+        });
+        workspace.apply(DomainEvent::HostEvent {
+            host_id: HostId::new("local"),
+            event: event("runtime-1", 99, protocol::SubagentLifecycle::Running),
+        });
+
+        assert!(workspace.hosts[&HostId::new("local")].sessions["s-1"]
+            .subagents
+            .is_empty());
     }
 
     #[test]
@@ -5129,6 +5214,7 @@ mod tests {
             state: protocol::SessionState::Running,
             state_source: StateSource::Process,
             activity,
+            subagents: Vec::new(),
             native_session_id: None,
             native_session_path: None,
             active_agent: None,

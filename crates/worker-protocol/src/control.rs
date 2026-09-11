@@ -4,7 +4,7 @@
 //! connection. Unknown additive object fields are ignored by serde, while
 //! unknown operations fail deserialization and affect only that connection.
 
-// Rust guideline compliant 2026-08-04
+// Rust guideline compliant 2026-09-11
 
 use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
@@ -33,6 +33,8 @@ pub enum Capability {
     AttachSnapshot,
     /// One-shot, runtime-bound terminal and retained-output observation.
     ControlPlaneObservation,
+    /// Durable provider-managed subagent lifecycle observation.
+    SubagentObservation,
 }
 
 /// Describes the worker runtime lifecycle.
@@ -575,6 +577,45 @@ pub struct ExitStatus {
     pub exited_at_ms: u64,
 }
 
+/// Lifecycle of one provider-managed subagent in the worker snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentPhase {
+    /// The subagent is running.
+    Running,
+    /// The subagent completed successfully.
+    Completed,
+    /// The subagent failed.
+    Failed,
+    /// The subagent was cancelled.
+    Cancelled,
+    /// The owning runtime ended before completion was reported.
+    Lost,
+}
+
+/// Sanitized durable state for one provider-managed subagent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentSnapshot {
+    /// Provider-native lifecycle correlation identifier.
+    pub id: String,
+    /// Parent subagent identifier, when reported.
+    pub parent_id: Option<String>,
+    /// Provider base name.
+    pub provider: String,
+    /// Provider-defined subagent type, when reported.
+    pub agent_type: Option<String>,
+    /// Current lifecycle phase.
+    pub phase: SubagentPhase,
+    /// Worker-owned monotonic revision.
+    pub revision: u64,
+    /// First accepted start timestamp.
+    pub started_at_ms: u64,
+    /// Latest accepted transition timestamp.
+    pub updated_at_ms: u64,
+    /// Terminal transition timestamp, when terminal.
+    pub finished_at_ms: Option<u64>,
+}
+
 /// Reports current worker and runtime authority facts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectSnapshot {
@@ -605,6 +646,9 @@ pub struct InspectSnapshot {
     /// Explicit release tombstone, absent when no private release was accepted.
     #[serde(default)]
     pub active_identity_release: Option<ReleasedIdentityClaim>,
+    /// Durable provider-managed subagent state.
+    #[serde(default)]
+    pub subagents: Vec<SubagentSnapshot>,
 }
 
 /// Defines one daemon-to-worker request.
@@ -903,6 +947,11 @@ pub enum EventKind {
     },
     /// Worker-local provider identity state changed.
     IdentityChanged {
+        /// Runtime generation.
+        runtime_id: RuntimeId,
+    },
+    /// Provider-managed subagent state changed.
+    SubagentsChanged {
         /// Runtime generation.
         runtime_id: RuntimeId,
     },

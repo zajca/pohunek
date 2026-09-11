@@ -46,7 +46,7 @@ pub use capabilities::{AgentRuntime, HostCapabilities};
 #[doc(inline)]
 pub use decimal::{
     ActivityRevision, DecimalWireError, OutputOffset, ProcessStartIdentity, ReportSequence,
-    RuntimeGeneration, TerminalWatermark,
+    RuntimeGeneration, SubagentRevision, TerminalWatermark,
 };
 #[doc(inline)]
 pub use discovery::{HostClass, HostDiscoverParams, HostRecord};
@@ -120,8 +120,8 @@ pub use session::{
     SessionResizeResult, SessionResumeResult, SessionRuntime, SessionRuntimeIdentity,
     SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
     SessionState, SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult,
-    SessionWarning, SessionWarningKind, TerminalCursor, TerminalDimensions,
-    TerminalDimensionsError,
+    SessionWarning, SessionWarningKind, SubagentInfo, SubagentLifecycle, SubagentStateEvent,
+    TerminalCursor, TerminalDimensions, TerminalDimensionsError,
 };
 #[doc(inline)]
 pub use version::{
@@ -178,6 +178,7 @@ pub mod event {
 
     event_table!(
         AGENT_STATE, "agent_state", crate::AgentStateEvent, "AgentStateEvent";
+        SUBAGENT_STATE, "subagent_state", crate::SubagentStateEvent, "SubagentStateEvent";
         ATTACH_OPENED, "attach_opened", crate::AttachEvent, "AttachEvent";
         ATTACH_CLOSED, "attach_closed", crate::AttachEvent, "AttachEvent";
         NOTIFICATION_CREATED, "notification_created", crate::NotificationCreatedEvent, "NotificationCreatedEvent";

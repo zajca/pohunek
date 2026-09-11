@@ -10,6 +10,7 @@ import type {
   RuntimeInventoryEvent,
   SessionEvent,
   SessionNativeRecoveredEvent,
+  SubagentStateEvent,
 } from "./index";
 
 export type ProtocolEvent =
@@ -28,4 +29,5 @@ export type ProtocolEvent =
   | ({ v: ProtocolVersion; event: "session_runtime_reconnected"; id?: string } & SessionEvent)
   | ({ v: ProtocolVersion; event: "session_stopped"; id?: string } & SessionEvent)
   | ({ v: ProtocolVersion; event: "session_updated"; id?: string } & SessionEvent)
+  | ({ v: ProtocolVersion; event: "subagent_state"; id?: string } & SubagentStateEvent)
 ;

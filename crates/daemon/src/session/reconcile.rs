@@ -6,23 +6,27 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use pohunek_worker_protocol::{ControlCode, InspectSnapshot, ReleasedIdentityClaim, RuntimePhase};
-use protocol::{RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus};
+use protocol::{
+    AgentActivity, AgentKind, RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus,
+    SessionRuntimeIdentity, SubagentInfo, SubagentLifecycle, SubagentRevision, SubagentStateEvent,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    event, event_payload, identity_claim_expiry_is_valid, mpsc, runtime_error, timestamp_now,
-    watch, ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig,
-    DetectorConfigUpdate, DetectorInputs, DetectorScope, Mutex, Notify, ObservedAgent,
-    ProtocolError, ResumeSnapshot, RuntimeHandle, RuntimeState, RuntimeWatchIdentity, SessionEntry,
-    SessionId, SessionRecord, SessionRef, SessionRefKind, SessionRegistry, SessionRuntime,
-    SessionState, StateSource, Worker, WorkerError, WORKER_CONNECT_RETRY,
+    current_time_millis, event, event_payload, identity_claim_expiry_is_valid, mpsc, runtime_error,
+    sort_subagents, terminalize_running_subagents, timestamp_now, watch, ActiveAgentReport,
+    CancellationToken, DesiredState, DetectorConfig, DetectorConfigUpdate, DetectorInputs,
+    DetectorScope, Mutex, Notify, ObservedAgent, ProtocolError, ResumeSnapshot, RuntimeHandle,
+    RuntimeState, RuntimeWatchIdentity, SessionEntry, SessionId, SessionRecord, SessionRef,
+    SessionRefKind, SessionRegistry, SessionRuntime, SessionState, StateSource, Worker,
+    WorkerError, WORKER_CONNECT_RETRY,
 };
 use crate::procwatch::ProcessInspector;
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-09-01
+// Rust guideline compliant 2026-09-11
 
 #[derive(Debug, Clone)]
 struct DiscoveredWorker {
@@ -41,6 +45,8 @@ struct JournalEvidence {
     rows: Option<u16>,
     phase: JournalPhase,
     outcome: Option<JournalOutcome>,
+    #[serde(default)]
+    subagents: Vec<pohunek_worker_protocol::SubagentSnapshot>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,7 +90,11 @@ impl WorkerIdentityProjection {
 }
 
 impl SessionRegistry {
-    pub(super) async fn apply_worker_identity_snapshot(
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one locked projection keeps identity and subagent snapshot updates atomic"
+    )]
+    pub(super) async fn apply_worker_metadata_snapshot(
         &self,
         id: &SessionId,
         snapshot: &InspectSnapshot,
@@ -106,10 +116,16 @@ impl SessionRegistry {
                 return false;
             }
         }
-        if let Err(reason) = validate_worker_identity_processes(&*self.inner.inspector, snapshot) {
-            tracing::warn!(session_id = %id.0, reason, "rejected worker identity process claim");
-            return false;
-        }
+        let identities_valid = match validate_worker_identity_processes(
+            &*self.inner.inspector,
+            snapshot,
+        ) {
+            Ok(()) => true,
+            Err(reason) => {
+                tracing::warn!(session_id = %id.0, reason, "rejected worker identity process claim");
+                false
+            }
+        };
 
         let updated = {
             let mut sessions = self.inner.sessions.lock().await;
@@ -126,14 +142,38 @@ impl SessionRegistry {
                 return false;
             }
             let mut candidate = Self::session_record(id, entry, entry.desired_state, None);
-            let projection = match import_worker_identities(&mut candidate, snapshot) {
-                Ok(projection) => projection,
+            let projection = if identities_valid {
+                match import_worker_identities(&mut candidate, snapshot) {
+                    Ok(projection) => projection,
+                    Err(reason) => {
+                        tracing::warn!(session_id = %id.0, reason, "rejected worker identity snapshot");
+                        WorkerIdentityProjection::unreported()
+                    }
+                }
+            } else {
+                WorkerIdentityProjection::unreported()
+            };
+            let subagents = match import_worker_subagents(snapshot) {
+                Ok(subagents) => subagents,
                 Err(reason) => {
-                    tracing::warn!(session_id = %id.0, reason, "rejected worker identity snapshot");
+                    tracing::warn!(session_id = %id.0, reason, "rejected worker subagent snapshot");
                     return false;
                 }
             };
-            let changed = apply_identity_projection(entry, &candidate, &projection, snapshot);
+            let subagent_events = subagents
+                .iter()
+                .filter(|subagent| {
+                    entry.info.subagents.iter().find(|current| {
+                        current.provider == subagent.provider && current.id == subagent.id
+                    }) != Some(*subagent)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut changed = apply_identity_projection(entry, &candidate, &projection, snapshot);
+            if entry.info.subagents != subagents {
+                entry.info.subagents = subagents;
+                changed = true;
+            }
             if changed {
                 entry.info.updated_at = timestamp_now();
             }
@@ -141,6 +181,7 @@ impl SessionRegistry {
                 changed,
                 entry.info.clone(),
                 Self::session_record(id, entry, entry.desired_state, None),
+                subagent_events,
             )
         };
         if let Err(error) = self.write_session_record(updated.2).await {
@@ -150,6 +191,22 @@ impl SessionRegistry {
         if updated.0 {
             self.persist_resume_binding(id).await;
             self.emit(event::SESSION_UPDATED, &updated.1);
+            let runtime = updated.1.runtime.as_ref().and_then(|runtime| {
+                runtime.runtime_id.as_ref().and_then(|runtime_id| {
+                    SessionRuntimeIdentity::new(runtime_id.clone(), runtime.runtime_generation).ok()
+                })
+            });
+            for subagent in updated.3 {
+                let event = crate::events::event(
+                    event::SUBAGENT_STATE,
+                    event_payload(SubagentStateEvent {
+                        session_id: id.clone(),
+                        subagent,
+                        runtime: runtime.clone(),
+                    }),
+                );
+                let _ = self.inner.events.send(event);
+            }
         }
         true
     }
@@ -319,6 +376,12 @@ impl SessionRegistry {
                 runtime.runtime_generation
             });
         record.transaction = None;
+        match map_worker_subagents(&evidence.subagents) {
+            Ok(subagents) => record.info.subagents = subagents,
+            Err(reason) => {
+                tracing::warn!(session_id = %record.session_id, reason, "rejected terminal worker subagent journal");
+            }
+        }
         record.info.pid = evidence.child.as_ref().map_or(0, |child| child.pid);
         if let Some(cols) = evidence.cols {
             record.info.cols = cols;
@@ -458,6 +521,18 @@ impl SessionRegistry {
             } else {
                 RuntimeState::Lost
             };
+            match import_worker_subagents(&snapshot) {
+                Ok(subagents) if !subagents.is_empty() || record.info.subagents.is_empty() => {
+                    record.info.subagents = subagents;
+                }
+                Ok(_) => {}
+                Err(reason) => {
+                    self.insert_unavailable_record(record, RuntimeState::Conflict, reason)
+                        .await;
+                    return;
+                }
+            }
+            terminalize_running_subagents(&mut record.info.subagents, current_time_millis());
             if let Some(exit) = snapshot.exit {
                 record.info.exit_code = exit.code;
                 record.info.state = if exit.stopped_by_user {
@@ -632,6 +707,14 @@ impl SessionRegistry {
         }
         let identity_projection = match import_worker_identities(&mut record, &snapshot) {
             Ok(projection) => projection,
+            Err(reason) => {
+                self.insert_unavailable_record(record, RuntimeState::Conflict, reason)
+                    .await;
+                return;
+            }
+        };
+        record.info.subagents = match import_worker_subagents(&snapshot) {
+            Ok(subagents) => subagents,
             Err(reason) => {
                 self.insert_unavailable_record(record, RuntimeState::Conflict, reason)
                     .await;
@@ -824,6 +907,9 @@ impl SessionRegistry {
         runtime.loss_reason = (state != RuntimeState::Terminal).then(|| reason.to_owned());
         record.runtime.state = state;
         record.runtime.reason = runtime.loss_reason.clone();
+        if matches!(state, RuntimeState::Lost | RuntimeState::Terminal) {
+            terminalize_running_subagents(&mut record.info.subagents, current_time_millis());
+        }
         record.info.updated_at = now;
         let recovery = record.recovery.clone();
         let input_rules = recovery.as_ref().map_or_else(
@@ -991,6 +1077,47 @@ impl SessionRegistry {
             }
         }
     }
+}
+
+fn import_worker_subagents(snapshot: &InspectSnapshot) -> Result<Vec<SubagentInfo>, &'static str> {
+    map_worker_subagents(&snapshot.subagents)
+}
+
+fn map_worker_subagents(
+    subagents: &[pohunek_worker_protocol::SubagentSnapshot],
+) -> Result<Vec<SubagentInfo>, &'static str> {
+    let mut mapped = subagents
+        .iter()
+        .map(|subagent| {
+            let provider = match subagent.provider.as_str() {
+                "codex" => AgentKind::Codex,
+                "claude" => AgentKind::Claude,
+                _ => return Err("subagent_provider_invalid"),
+            };
+            let lifecycle = match subagent.phase {
+                pohunek_worker_protocol::SubagentPhase::Running => SubagentLifecycle::Running,
+                pohunek_worker_protocol::SubagentPhase::Completed => SubagentLifecycle::Completed,
+                pohunek_worker_protocol::SubagentPhase::Failed => SubagentLifecycle::Failed,
+                pohunek_worker_protocol::SubagentPhase::Cancelled => SubagentLifecycle::Cancelled,
+                pohunek_worker_protocol::SubagentPhase::Lost => SubagentLifecycle::Lost,
+            };
+            Ok(SubagentInfo {
+                id: subagent.id.clone(),
+                parent_id: subagent.parent_id.clone(),
+                provider,
+                agent_type: subagent.agent_type.clone(),
+                lifecycle,
+                activity: (lifecycle == SubagentLifecycle::Running)
+                    .then_some(AgentActivity::Working),
+                revision: SubagentRevision::new(subagent.revision),
+                started_at_ms: subagent.started_at_ms,
+                updated_at_ms: subagent.updated_at_ms,
+                finished_at_ms: subagent.finished_at_ms,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    sort_subagents(&mut mapped);
+    Ok(mapped)
 }
 
 fn merge_persisted_recovery(
@@ -1716,6 +1843,7 @@ fn scan_worker_journals(
                     rows: None,
                     phase: JournalPhase::Faulted,
                     outcome: None,
+                    subagents: Vec::new(),
                 });
             journals
                 .entry(session_id.clone())
@@ -1882,10 +2010,11 @@ mod tests {
         ControlResponse, ControlWriter, Dimensions, Initialize, InitializeLimits, InspectSnapshot,
         LaunchIdentity, ProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
         ResponseKind, RuntimeId, RuntimePhase as WorkerRuntimePhase, SecretEnv,
-        SessionId as WorkerSessionId, StopPolicy, TransactionId, Version, WorkerId,
+        SessionId as WorkerSessionId, StopPolicy, SubagentPhase, SubagentSnapshot, TransactionId,
+        Version, WorkerId,
     };
     use protocol::{
-        AgentKind, CwdSource, ForkCwdMode, ProcessStartIdentity, ReportSequence,
+        AgentActivity, AgentKind, CwdSource, ForkCwdMode, ProcessStartIdentity, ReportSequence,
         RuntimeInventoryStatus, RuntimeState, SessionForkParams, SessionId, SessionInfo,
         SessionNewParams, SessionReportNativeIdParams, SessionRuntime, SessionState, StateSource,
     };
@@ -1897,8 +2026,8 @@ mod tests {
     use tokio::net::UnixStream;
 
     use super::{
-        import_legacy_manifest, import_worker_identities, merge_persisted_recovery,
-        validate_worker_identity_process_facts, SessionRegistry,
+        import_legacy_manifest, import_worker_identities, import_worker_subagents,
+        merge_persisted_recovery, validate_worker_identity_process_facts, SessionRegistry,
     };
     use crate::agent::{ForkMode, InputRules, ResumeMode, SessionRefKind};
     use crate::session::SessionRegistryConfig;
@@ -2148,6 +2277,7 @@ mod tests {
                 signal: None,
                 success: true,
             }),
+            subagents: Vec::new(),
         };
         let mut mismatch = exact.clone();
         mismatch.worker_id = "different-worker".to_owned();
@@ -2374,6 +2504,7 @@ mod tests {
             state: SessionState::Running,
             state_source: StateSource::Process,
             activity: None,
+            subagents: Vec::new(),
             active_agent: Some("claude".to_owned()),
             active_agent_base: Some(AgentKind::Claude),
             active_agent_pid: Some(released_pid),
@@ -2916,6 +3047,21 @@ mod tests {
             exited_at: "2026-07-23T00:01:00Z".to_owned(),
             reason: "natural_exit".to_owned(),
         });
+        let mut journal_value = serde_json::to_value(&journal).expect("serialize journal fixture");
+        journal_value["subagent_revision"] = serde_json::json!(4);
+        journal_value["subagents"] = serde_json::json!([{
+            "id": "child-terminal",
+            "parent_id": null,
+            "provider": "codex",
+            "agent_type": "worker",
+            "phase": "running",
+            "sequence": 1,
+            "revision": 4,
+            "started_at_ms": 1,
+            "updated_at_ms": 1,
+            "finished_at_ms": null
+        }]);
+        journal = serde_json::from_value(journal_value).expect("deserialize journal fixture");
         Journal::new(state_root.join("s-205/worker-terminal.json"))
             .write(&journal)
             .expect("persist terminal journal");
@@ -2941,6 +3087,9 @@ mod tests {
             imported.runtime.expect("runtime").state,
             RuntimeState::Terminal
         );
+        let subagent = imported.subagents.first().expect("terminal subagent");
+        assert_eq!(subagent.lifecycle, protocol::SubagentLifecycle::Lost);
+        assert!(subagent.revision.get() > 4);
     }
 
     #[tokio::test]
@@ -3443,6 +3592,7 @@ mod tests {
                 state: SessionState::Running,
                 state_source: StateSource::Process,
                 activity: None,
+                subagents: Vec::new(),
                 active_agent: None,
                 active_agent_base: None,
                 active_agent_pid: None,
@@ -3816,7 +3966,43 @@ mod tests {
                 native_reference: Some("nested-native".to_owned()),
             }),
             active_identity_release: None,
+            subagents: Vec::new(),
         }
+    }
+
+    #[test]
+    fn worker_subagents_map_to_public_state_without_provider_payloads() {
+        let mut snapshot = identity_snapshot("launch-native");
+        snapshot.subagents.push(SubagentSnapshot {
+            id: "child-finished".to_owned(),
+            parent_id: None,
+            provider: "codex".to_owned(),
+            agent_type: None,
+            phase: SubagentPhase::Completed,
+            revision: 6,
+            started_at_ms: 200,
+            updated_at_ms: 210,
+            finished_at_ms: Some(210),
+        });
+        snapshot.subagents.push(SubagentSnapshot {
+            id: "child-1".to_owned(),
+            parent_id: Some("parent-1".to_owned()),
+            provider: "claude".to_owned(),
+            agent_type: Some("Explore".to_owned()),
+            phase: SubagentPhase::Running,
+            revision: 7,
+            started_at_ms: 100,
+            updated_at_ms: 110,
+            finished_at_ms: None,
+        });
+
+        let mapped = import_worker_subagents(&snapshot).expect("valid subagent snapshot");
+
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(mapped[0].id, "child-1");
+        assert_eq!(mapped[0].provider, AgentKind::Claude);
+        assert_eq!(mapped[0].activity, Some(AgentActivity::Working));
+        assert_eq!(mapped[0].revision, protocol::SubagentRevision::new(7));
     }
 
     /// A minimal legacy-manifest session snapshot, as `pohunek migration
@@ -3840,6 +4026,7 @@ mod tests {
             state,
             state_source: StateSource::Process,
             activity: None,
+            subagents: Vec::new(),
             active_agent: None,
             active_agent_base: None,
             active_agent_pid: None,

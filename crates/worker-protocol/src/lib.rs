@@ -11,7 +11,7 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-08-04
+// Rust guideline compliant 2026-09-11
 
 /// Maximum lifetime accepted for a worker-private identity claim.
 ///
@@ -36,7 +36,7 @@ pub use control::{
     ExitStatus, Initialize, InitializeLimits, InputFragment, InputPlan, InspectSnapshot,
     LaunchIdentity, OutputGap, ProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
     RequestKind, ResizeRequest, ResponseKind, RuntimePhase, RuntimeScope, StopPolicy, StopRequest,
-    StreamMode, WriteAck,
+    StreamMode, SubagentPhase, SubagentSnapshot, WriteAck,
 };
 #[doc(inline)]
 pub use data::{
@@ -55,5 +55,6 @@ pub use token::{TokenClaims, TokenError, TokenVault};
 #[doc(inline)]
 pub use version::{
     negotiate, Version, VersionError, VersionRange, ATTACH_SNAPSHOT_VERSION,
-    CONTROL_PLANE_OBSERVATION_VERSION, CURRENT_VERSION, PREVIOUS_VERSION, SUPPORTED_RANGE,
+    CONTROL_PLANE_OBSERVATION_VERSION, CURRENT_VERSION, PREVIOUS_VERSION,
+    SUBAGENT_OBSERVATION_VERSION, SUPPORTED_RANGE,
 };

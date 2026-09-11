@@ -50,7 +50,7 @@ pub const ENV_PROTOCOL_VERSION: &str = "POHUNEK_PROTOCOL_VERSION";
 /// Every managed daemon hook asset carries this version marker. It is exposed
 /// through `protocol` because CLI and SDK consumers need the same expected value
 /// without linking the daemon implementation.
-pub const EXPECTED_INTEGRATION_VERSION: u32 = 4;
+pub const EXPECTED_INTEGRATION_VERSION: u32 = 5;
 
 /// Parameters for `integration.install`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

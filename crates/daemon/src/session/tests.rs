@@ -17,7 +17,8 @@ use protocol::{
     SessionNewParams, SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadSource,
     SessionReleaseAgentParams, SessionReportAgentParams, SessionReportNativeIdParams,
     SessionRuntime, SessionRuntimeIdentity, SessionState, SessionWaitParams, SessionWaitReason,
-    StateSource, TerminalWatermark, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
+    StateSource, SubagentInfo, SubagentLifecycle, SubagentRevision, TerminalWatermark,
+    MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
 };
 
 use crate::agent::LaunchCommand;
@@ -33,9 +34,9 @@ use crate::project::detect::project_id;
 use crate::runtime::{Worker, WorkerError};
 
 use super::{
-    native_report_is_current, worker_error_to_protocol, InputSubmission, RuntimeExit,
-    RuntimeHandle, RuntimeWatchIdentity, SessionEntry, SessionRegistry, SessionRegistryConfig,
-    ShellCommand, MAX_SESSION_NAME_BYTES,
+    native_report_is_current, terminalize_running_subagents, worker_error_to_protocol,
+    InputSubmission, RuntimeExit, RuntimeHandle, RuntimeWatchIdentity, SessionEntry,
+    SessionRegistry, SessionRegistryConfig, ShellCommand, MAX_SESSION_NAME_BYTES,
 };
 
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.
@@ -154,6 +155,39 @@ fn params() -> SessionNewParams {
         input: None,
         metadata: BTreeMap::new(),
     }
+}
+
+fn running_subagent(id: &str, revision: u64) -> SubagentInfo {
+    SubagentInfo {
+        id: id.to_owned(),
+        provider: AgentKind::Codex,
+        parent_id: None,
+        agent_type: Some("worker".to_owned()),
+        lifecycle: SubagentLifecycle::Running,
+        activity: Some(AgentActivity::Working),
+        revision: SubagentRevision::new(revision),
+        started_at_ms: 1,
+        updated_at_ms: 1,
+        finished_at_ms: None,
+    }
+}
+
+#[test]
+fn terminalizing_running_subagents_restores_public_order() {
+    let mut older_running = running_subagent("older-running", 7);
+    older_running.started_at_ms = 10;
+    let mut newer_completed = running_subagent("newer-completed", 8);
+    newer_completed.lifecycle = SubagentLifecycle::Completed;
+    newer_completed.activity = None;
+    newer_completed.started_at_ms = 20;
+    newer_completed.finished_at_ms = Some(25);
+    let mut subagents = vec![older_running, newer_completed];
+
+    terminalize_running_subagents(&mut subagents, 30);
+
+    assert_eq!(subagents[0].id, "newer-completed");
+    assert_eq!(subagents[1].id, "older-running");
+    assert_eq!(subagents[1].lifecycle, SubagentLifecycle::Lost);
 }
 
 #[test]
@@ -3583,6 +3617,11 @@ async fn stop_marks_running_session_stopped() {
     });
 
     let created = registry.create(params()).await.expect("create session");
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("live session");
+    entry.runtime_watch_cancel.cancel();
+    entry.info.subagents.push(running_subagent("child-stop", 7));
+    drop(sessions);
     let stopped = registry.stop(&created.id).await.expect("stop session");
     let inspected = registry
         .inspect(&created.id)
@@ -3591,6 +3630,8 @@ async fn stop_marks_running_session_stopped() {
 
     assert!(stopped.stopped);
     assert_eq!(inspected.state, SessionState::Stopped);
+    assert_eq!(inspected.subagents[0].lifecycle, SubagentLifecycle::Lost);
+    assert!(inspected.subagents[0].revision > SubagentRevision::new(7));
 }
 
 #[tokio::test]
@@ -5070,6 +5111,131 @@ async fn daemon_reconnect_scopes_reset_activity_revision_with_new_epoch() {
     drop(sessions);
     let _ = first.stop(&first_session.id).await;
     let _ = second.stop(&second_session.id).await;
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the hook-to-journal reconnect scenario is intentionally linear so the trust-boundary assertions remain ordered"
+)]
+async fn codex_hook_journal_survives_daemon_reconciliation() {
+    let store_path = temp_store_path("subagent-hook-reconcile");
+    let worker_state_root = store_path
+        .parent()
+        .expect("store parent")
+        .join("worker-state");
+    let worker_runtime_root = std::env::temp_dir().join(format!(
+        "pw-hook-{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let hook_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src/integration/assets/codex/pohunek-agent-state.sh");
+    let payload = serde_json::json!({
+        "session_id": "native-parent",
+        "turn_id": "turn-child",
+        "hook_event_name": "SubagentStart",
+        "agent_id": "child-reconciled",
+        "agent_type": "reviewer",
+        "transcript_path": "/must/not/cross.jsonl",
+        "prompt": "must not cross the hook boundary"
+    });
+    let command = format!(
+        "printf '%s' '{}' | sh '{}' subagent-start; sleep 30",
+        payload,
+        hook_path.display()
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", command.as_str()]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        worker_runtime_root: Some(worker_runtime_root.clone()),
+        worker_state_root: Some(worker_state_root.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+
+    let observed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let info = registry
+                .inspect(&created.id)
+                .await
+                .expect("inspect session");
+            if let Some(subagent) = info.subagents.first() {
+                break subagent.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("hook observation deadline");
+    assert_eq!(observed.id, "child-reconciled");
+    assert_eq!(observed.lifecycle, SubagentLifecycle::Running);
+
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    assert_eq!(
+        worker
+            .inspect()
+            .await
+            .expect("inspect worker journal")
+            .subagents
+            .len(),
+        1
+    );
+    registry.begin_daemon_shutdown();
+    worker
+        .release_controller()
+        .await
+        .expect("release previous daemon controller");
+    let store = crate::store::Store::new(store_path.clone());
+    let mut record = store
+        .load_sessions()
+        .expect("load logical record")
+        .pop()
+        .expect("logical record");
+    record.info.subagents.clear();
+    store
+        .record_session(&record)
+        .expect("persist pre-observation daemon snapshot");
+    let socket_path = worker_runtime_root
+        .join(&created.id.0)
+        .join(pohunek_paths::WORKER_SOCKET_NAME);
+    let reconnected = Worker::connect_discovered(&socket_path, "replacement-daemon")
+        .await
+        .expect("reconnect worker");
+    let snapshot = reconnected
+        .inspect()
+        .await
+        .expect("inspect after reconnect");
+    assert_eq!(snapshot.subagents.len(), 1, "worker journal retained child");
+    assert!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        "reconnected snapshot applies"
+    );
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .expect("session entry")
+        .runtime = RuntimeHandle::Worker(reconnected);
+
+    let restored = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect restored");
+    let subagent = restored.subagents.first().expect("restored subagent");
+    assert_eq!(subagent.id, "child-reconciled");
+    assert_eq!(subagent.agent_type.as_deref(), Some("reviewer"));
+    assert_eq!(subagent.lifecycle, SubagentLifecycle::Running);
+    let serialized = serde_json::to_string(subagent).expect("serialize public subagent");
+    assert!(!serialized.contains("transcript"));
+    assert!(!serialized.contains("prompt"));
+
+    let _ = registry.stop(&created.id).await;
 }
 
 #[tokio::test]
@@ -7720,6 +7886,16 @@ async fn lost_transition_retries_precommit_failure_before_single_event() {
             )
             .await
     );
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .expect("session entry")
+        .info
+        .subagents
+        .push(running_subagent("child-lost", 8));
     let mut events = registry.subscribe();
     registry
         .inner
@@ -7749,6 +7925,10 @@ async fn lost_transition_retries_precommit_failure_before_single_event() {
         RuntimeState::Reconnecting
     );
     assert_lost_transition_applied(&registry, &created.id, &expected).await;
+    let inspected = registry.inspect(&created.id).await.expect("inspect lost");
+    let subagent = inspected.subagents.first().expect("lost subagent");
+    assert_eq!(subagent.lifecycle, SubagentLifecycle::Lost);
+    assert!(subagent.revision.get() > 8);
     assert_eq!(
         next_runtime_event(&mut events).await,
         protocol::event::SESSION_RUNTIME_LOST

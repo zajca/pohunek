@@ -26,6 +26,7 @@ export const EVENT_SESSION_RUNTIME_LOST = "session_runtime_lost" as const;
 export const EVENT_SESSION_RUNTIME_RECONNECTED = "session_runtime_reconnected" as const;
 export const EVENT_SESSION_STOPPED = "session_stopped" as const;
 export const EVENT_SESSION_UPDATED = "session_updated" as const;
+export const EVENT_SUBAGENT_STATE = "subagent_state" as const;
 
 export const EVENT_NAMES = [
   EVENT_AGENT_STATE,
@@ -43,6 +44,7 @@ export const EVENT_NAMES = [
   EVENT_SESSION_RUNTIME_RECONNECTED,
   EVENT_SESSION_STOPPED,
   EVENT_SESSION_UPDATED,
+  EVENT_SUBAGENT_STATE,
 ] as const;
 
 export type EventName = (typeof EVENT_NAMES)[number];

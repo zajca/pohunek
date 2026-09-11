@@ -9,6 +9,7 @@ import type { SessionRuntime } from "./SessionRuntime";
 import type { SessionState } from "./SessionState";
 import type { SessionWarning } from "./SessionWarning";
 import type { StateSource } from "./StateSource";
+import type { SubagentInfo } from "./SubagentInfo";
 
 /**
  * Summary returned by session lifecycle methods and published by events.
@@ -83,6 +84,10 @@ export type SessionInfo = {
    * Current detected agent activity, when the detector has published one.
    */
   activity?: AgentActivity;
+  /**
+   * Durable provider-managed subagents, including bounded recent history.
+   */
+  subagents?: Array<SubagentInfo>;
   /**
    * Active nested agent profile name reported by a session-level hook.
    *
