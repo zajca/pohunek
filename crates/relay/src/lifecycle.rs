@@ -29,7 +29,7 @@ const MAX_IDENTITY_BYTES: usize = 2_048;
 const MAX_MANIFEST_ROWS: usize = 4_096;
 /// Bounds database-to-process manifest material before text values are decoded.
 const MAX_MANIFEST_BYTES: i64 = 1_048_576;
-const MANIFEST_VERSION: u16 = 2;
+const MANIFEST_VERSION: u16 = 3;
 
 /// Identifies the only local infrastructure administrator created at bootstrap.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -753,11 +753,14 @@ async fn semantic_manifest(
         (ManifestKind::EvidenceChallenge, &["challenge_id", "relay_id", "principal_id", "audience", "team_id", "admission_rule_id", "admission_rule_revision", "account_link_generation", "recovery_generation", "expires_at", "consumed_at"], "SELECT challenge_id::text,relay_id::text,principal_id::text,audience::text,team_id::text,admission_rule_id::text,admission_rule_revision::text,account_link_generation::text,recovery_generation::text,expires_at::text,consumed_at::text FROM evidence_challenges ORDER BY challenge_id"),
         (ManifestKind::AdmissionRule, &["admission_rule_id", "team_id", "provider", "method", "match_value", "current_revision", "state"], "SELECT admission_rule_id::text,team_id::text,provider::text,method::text,match_value::text,current_revision::text,state::text FROM admission_rules ORDER BY admission_rule_id"),
         // Evidence is append-only and unbounded at rest, so it is committed into
-        // one bounded summary row (count + SHA-256 of every security-relevant
-        // field) instead of one manifest row per historical check. That keeps
-        // recovery under the row/byte ceilings and still lets any tampering
-        // change the reviewed digest.
-        (ManifestKind::EvidenceResult, &["result_count", "result_digest"], "SELECT (SELECT count(*) FROM evidence_results)::text, encode(sha256(convert_to(coalesce(string_agg(evidence_id::text || '|' || challenge_id::text || '|' || principal_id::text || '|' || team_id::text || '|' || admission_rule_id::text || '|' || admission_rule_revision::text || '|' || provider::text || '|' || provider_subject::text || '|' || method::text || '|' || signing_key_id::text || '|' || outcome::text || '|' || checked_at::text || '|' || expires_at::text, E'\\n' ORDER BY evidence_id), ''), 'UTF8')), 'hex') FROM evidence_results"),
+        // one bounded summary row. Each evidence row is hashed individually with a
+        // domain separator that includes its unique evidence_id, producing a fixed
+        // 64-char hex digest. Those digests are aggregated (unambiguous: fixed
+        // width, no delimiter collision) and hashed again, so the final digest
+        // binds the full ordered set. This keeps recovery under the row/byte
+        // ceilings (one manifest row, one fixed digest) and lets any tampering
+        // with any field, subject, or signer change the reviewed digest.
+        (ManifestKind::EvidenceResult, &["result_count", "result_digest"], "SELECT (SELECT count(*) FROM evidence_results)::text, encode(sha256(convert_to(coalesce(string_agg(encode(sha256(convert_to('pohunek-recovery-manifest-v3/evidence_results/row/' || evidence_id::text || '/' || challenge_id::text || '/' || principal_id::text || '/' || team_id::text || '/' || admission_rule_id::text || '/' || admission_rule_revision::text || '/' || provider::text || '/' || provider_subject::text || '/' || method::text || '/' || signing_key_id::text || '/' || outcome::text || '/' || checked_at::text || '/' || expires_at::text, 'UTF8')), 'hex'), E'\\n' ORDER BY evidence_id), ''), 'UTF8')), 'hex') FROM evidence_results"),
     ];
     // Timestamp text is authority evidence: connection/server locale changes
     // must not alter the representation of the same stored instant.

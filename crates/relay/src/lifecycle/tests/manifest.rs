@@ -173,7 +173,7 @@ async fn durable_quarantine_and_manifest_bind_service_and_credential_authority()
         );
         tx.commit().await.expect("locale transaction commit");
     }
-    assert_eq!(reviewed.version(), 2);
+    assert_eq!(reviewed.version(), 3);
     assert_eq!(
         reviewed,
         lifecycle
