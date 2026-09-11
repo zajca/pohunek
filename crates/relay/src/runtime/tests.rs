@@ -220,7 +220,7 @@ async fn occupied_application_pool_and_transaction_fence_do_not_starve_control()
 #[tokio::test]
 async fn invalid_checkpoint_cannot_run_pending_database_migrations() {
     let fixture = Fixture::new().await;
-    sqlx::query("DELETE FROM _sqlx_migrations WHERE version=2")
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version>=2")
         .execute(fixture.store.pool())
         .await
         .expect("represent pending migration");
