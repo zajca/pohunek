@@ -39,6 +39,12 @@ pub(crate) struct BoundedListener {
 impl axum_server::AddrListener<BoundedStream<tokio::net::TcpStream>, BoundedAddress>
     for BoundedListener
 {
+    // The trait requires an async signature even though binding is fully
+    // synchronous (socket create + bind + listen).
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "The AddrListener trait requires an async signature while binding is synchronous."
+    )]
     async fn bind_to(addr: BoundedAddress) -> io::Result<Self> {
         let socket = if addr.socket.is_ipv4() {
             tokio::net::TcpSocket::new_v4()?

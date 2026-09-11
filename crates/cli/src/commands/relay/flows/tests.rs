@@ -1,3 +1,7 @@
+#![expect(
+    clippy::unused_async_trait_impl,
+    reason = "Test fixtures implement trait-mandated async signatures with synchronous bodies."
+)]
 use super::*;
 use relay_protocol::{CredentialRecord, PrincipalId};
 use std::{
@@ -190,12 +194,23 @@ impl Api for Relay {
             .lock()
             .expect("rotation requests")
             .push(request.clone());
-        if matches!(
-            self.transport_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining
-                    .checked_sub(1)),
-            Ok(_previous)
-        ) {
+        // Version-neutral CAS loop: `try_update` postdates the workspace MSRV
+        // and `fetch_update` is deprecated on newer toolchains. A zero counter
+        // stays untouched and does not fire, matching the replaced update.
+        let triggered = loop {
+            let remaining = self.transport_failures.load(Ordering::SeqCst);
+            let Some(next) = remaining.checked_sub(1) else {
+                break false;
+            };
+            if self
+                .transport_failures
+                .compare_exchange(remaining, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break true;
+            }
+        };
+        if triggered {
             return Err(pohunek_relay_client::Error::Transport);
         }
         if let Some(error) = self.rotation_error.lock().expect("rotation error").take() {
