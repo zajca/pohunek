@@ -235,8 +235,11 @@ optional agent type. The worker journals multiple concurrent children, assigns
 monotonic decimal-string revisions, and retains bounded completed history across
 daemon and client reconnects. A running child is marked `lost` when its owning
 runtime terminates. This collection does not change the parent session's
-`activity`, launch identity, or recovery binding, and it never contains prompts,
-results, messages, transcript paths, or raw hook payloads.
+`activity`, launch identity, or recovery binding. The hook validates its action
+and Pohunek handshake before reading a bounded payload directly from stdin; it
+does not create a payload file. Only the lifecycle fields are retained, so the
+collection never contains prompts, results, messages, transcript paths, or raw
+hook payloads.
 
 Human-readable `pohunek session list` shows the running/recent child count, and
 `pohunek session inspect` includes the corresponding lifecycle rows. Streaming

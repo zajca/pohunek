@@ -14,19 +14,20 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    current_time_millis, event, event_payload, identity_claim_expiry_is_valid, mpsc, runtime_error,
-    sort_subagents, terminalize_running_subagents, timestamp_now, watch, ActiveAgentReport,
-    CancellationToken, DesiredState, DetectorConfig, DetectorConfigUpdate, DetectorInputs,
-    DetectorScope, Mutex, Notify, ObservedAgent, ProtocolError, ResumeSnapshot, RuntimeHandle,
-    RuntimeState, RuntimeWatchIdentity, SessionEntry, SessionId, SessionRecord, SessionRef,
-    SessionRefKind, SessionRegistry, SessionRuntime, SessionState, StateSource, Worker,
-    WorkerError, WORKER_CONNECT_RETRY,
+    current_time_millis, event, event_payload, identity_claim_expiry_is_valid, mpsc,
+    preserve_durable_worker_metadata, preserve_newer_updated_at, runtime_error, sort_subagents,
+    terminalize_running_subagents, timestamp_now, watch, ActiveAgentReport, CancellationToken,
+    DesiredState, DetectorConfig, DetectorConfigUpdate, DetectorInputs, DetectorScope, Mutex,
+    Notify, ObservedAgent, ProtocolError, ResumeSnapshot, RuntimeHandle, RuntimeState,
+    RuntimeWatchIdentity, SessionEntry, SessionId, SessionRecord, SessionRef, SessionRefKind,
+    SessionRegistry, SessionRuntime, SessionState, StateSource, Worker, WorkerError,
+    WorkerMetadataApplyOutcome, WORKER_CONNECT_RETRY,
 };
 use crate::procwatch::ProcessInspector;
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-09-11
+// Rust guideline compliant 2026-09-12
 
 #[derive(Debug, Clone)]
 struct DiscoveredWorker {
@@ -98,68 +99,135 @@ impl SessionRegistry {
         &self,
         id: &SessionId,
         snapshot: &InspectSnapshot,
-    ) -> bool {
+    ) -> WorkerMetadataApplyOutcome {
         let expected_worker_id = snapshot.worker_id.to_string();
         let expected_runtime_id = snapshot.runtime_id.as_ref().map(ToString::to_string);
-        {
+        let mut memory_base = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(id) else {
-                return false;
+                return WorkerMetadataApplyOutcome::Discarded;
             };
-            let Some(runtime) = entry.info.runtime.as_ref() else {
-                return false;
-            };
-            if runtime.state != RuntimeState::Live
-                || runtime.worker_id.as_deref() != Some(expected_worker_id.as_str())
-                || runtime.runtime_id != expected_runtime_id
+            let record = Self::session_record(id, entry, entry.desired_state, None);
+            if !worker_metadata_record_is_current(
+                &record,
+                &expected_worker_id,
+                expected_runtime_id.as_deref(),
+            ) {
+                return WorkerMetadataApplyOutcome::Discarded;
+            }
+            record
+        };
+        let mut outcome = WorkerMetadataApplyOutcome::Applied;
+        let mut identities_accepted = true;
+        if snapshot.launch_identity.is_some() || snapshot.active_identity.is_some() {
+            if let Err(failure) =
+                validate_worker_identity_processes(&*self.inner.inspector, snapshot)
             {
-                return false;
+                let (reason, retryable) = failure.reason_and_retryability();
+                tracing::warn!(session_id = %id.0, reason, retryable, "rejected worker identity process claim");
+                identities_accepted = false;
+                outcome = if retryable {
+                    WorkerMetadataApplyOutcome::Retryable
+                } else {
+                    WorkerMetadataApplyOutcome::Discarded
+                };
             }
         }
-        let identities_valid = match validate_worker_identity_processes(
-            &*self.inner.inspector,
-            snapshot,
-        ) {
-            Ok(()) => true,
+        let subagents = match import_worker_subagents(snapshot) {
+            Ok(subagents) => subagents,
             Err(reason) => {
-                tracing::warn!(session_id = %id.0, reason, "rejected worker identity process claim");
-                false
+                tracing::warn!(session_id = %id.0, reason, "rejected worker subagent snapshot");
+                return WorkerMetadataApplyOutcome::Discarded;
             }
         };
+        let durable_base = match self.load_durable_session_record(id).await {
+            Ok(Some(record)) => record,
+            Ok(None) if self.inner.store.is_none() => memory_base.clone(),
+            Ok(None) => return WorkerMetadataApplyOutcome::Discarded,
+            Err(error) => {
+                tracing::warn!(session_id = %id.0, error = %error, "failed to load durable worker metadata base");
+                return WorkerMetadataApplyOutcome::Retryable;
+            }
+        };
+        if !worker_metadata_record_is_current(
+            &durable_base,
+            &expected_worker_id,
+            expected_runtime_id.as_deref(),
+        ) {
+            return WorkerMetadataApplyOutcome::Discarded;
+        }
+        let mut candidate = memory_base.clone();
+        preserve_durable_worker_metadata(&durable_base, &mut candidate);
+        let projection = if identities_accepted {
+            match import_worker_identities(&mut candidate, snapshot) {
+                Ok(projection) => projection,
+                Err(reason) => {
+                    tracing::warn!(session_id = %id.0, reason, "rejected worker identity snapshot");
+                    identities_accepted = false;
+                    outcome = WorkerMetadataApplyOutcome::Discarded;
+                    WorkerIdentityProjection::unreported()
+                }
+            }
+        } else {
+            WorkerIdentityProjection::unreported()
+        };
+        candidate.info.subagents.clone_from(&subagents);
+        if candidate != durable_base {
+            candidate.info.updated_at = timestamp_now();
+        }
+        preserve_newer_updated_at(&memory_base.info.updated_at, &mut candidate.info.updated_at);
+        if candidate != durable_base {
+            if let Err(error) = self
+                .write_session_record_if_current(durable_base, candidate.clone())
+                .await
+            {
+                tracing::warn!(session_id = %id.0, error = %error, "failed to persist worker metadata snapshot");
+                return metadata_write_failure_outcome(&error);
+            }
+        }
+
+        let current_after_store = {
+            let sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get(id) else {
+                return WorkerMetadataApplyOutcome::Discarded;
+            };
+            let current = Self::session_record(id, entry, entry.desired_state, None);
+            if !worker_metadata_record_is_current(
+                &current,
+                &expected_worker_id,
+                expected_runtime_id.as_deref(),
+            ) {
+                return WorkerMetadataApplyOutcome::Discarded;
+            }
+            current
+        };
+        if current_after_store != memory_base {
+            let durable_before_rebase = candidate.clone();
+            candidate = current_after_store.clone();
+            preserve_durable_worker_metadata(&durable_before_rebase, &mut candidate);
+            if candidate != durable_before_rebase {
+                if let Err(error) = self
+                    .write_session_record_if_current(durable_before_rebase, candidate.clone())
+                    .await
+                {
+                    tracing::warn!(session_id = %id.0, error = %error, "failed to persist rebased worker metadata snapshot");
+                    return metadata_write_failure_outcome(&error);
+                }
+            }
+            memory_base = current_after_store;
+        }
 
         let updated = {
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(id) else {
-                return false;
+                return WorkerMetadataApplyOutcome::Discarded;
             };
-            let Some(runtime) = entry.info.runtime.as_ref() else {
-                return false;
-            };
-            if runtime.state != RuntimeState::Live
-                || runtime.worker_id.as_deref() != Some(expected_worker_id.as_str())
-                || runtime.runtime_id != expected_runtime_id
-            {
-                return false;
+            let current = Self::session_record(id, entry, entry.desired_state, None);
+            // The narrow projection may rebase once across a benign live-state
+            // change, but another concurrent change keeps the snapshot retryable.
+            if current != memory_base {
+                return WorkerMetadataApplyOutcome::Retryable;
             }
-            let mut candidate = Self::session_record(id, entry, entry.desired_state, None);
-            let projection = if identities_valid {
-                match import_worker_identities(&mut candidate, snapshot) {
-                    Ok(projection) => projection,
-                    Err(reason) => {
-                        tracing::warn!(session_id = %id.0, reason, "rejected worker identity snapshot");
-                        WorkerIdentityProjection::unreported()
-                    }
-                }
-            } else {
-                WorkerIdentityProjection::unreported()
-            };
-            let subagents = match import_worker_subagents(snapshot) {
-                Ok(subagents) => subagents,
-                Err(reason) => {
-                    tracing::warn!(session_id = %id.0, reason, "rejected worker subagent snapshot");
-                    return false;
-                }
-            };
             let subagent_events = subagents
                 .iter()
                 .filter(|subagent| {
@@ -174,20 +242,16 @@ impl SessionRegistry {
                 entry.info.subagents = subagents;
                 changed = true;
             }
+            entry
+                .last_native_report
+                .clone_from(&candidate.native_identity_ordering);
             if changed {
-                entry.info.updated_at = timestamp_now();
+                let mut updated_at = candidate.info.updated_at.clone();
+                preserve_newer_updated_at(&entry.info.updated_at, &mut updated_at);
+                entry.info.updated_at = updated_at;
             }
-            (
-                changed,
-                entry.info.clone(),
-                Self::session_record(id, entry, entry.desired_state, None),
-                subagent_events,
-            )
+            (changed, entry.info.clone(), subagent_events)
         };
-        if let Err(error) = self.write_session_record(updated.2).await {
-            tracing::warn!(session_id = %id.0, error = %error, "failed to persist worker identity snapshot");
-            return false;
-        }
         if updated.0 {
             self.persist_resume_binding(id).await;
             self.emit(event::SESSION_UPDATED, &updated.1);
@@ -196,7 +260,7 @@ impl SessionRegistry {
                     SessionRuntimeIdentity::new(runtime_id.clone(), runtime.runtime_generation).ok()
                 })
             });
-            for subagent in updated.3 {
+            for subagent in updated.2 {
                 let event = crate::events::event(
                     event::SUBAGENT_STATE,
                     event_payload(SubagentStateEvent {
@@ -208,7 +272,11 @@ impl SessionRegistry {
                 let _ = self.inner.events.send(event);
             }
         }
-        true
+        if identities_accepted {
+            WorkerMetadataApplyOutcome::Applied
+        } else {
+            outcome
+        }
     }
 
     /// Loads logical records and adopts their exact surviving workers.
@@ -700,10 +768,15 @@ impl SessionRegistry {
                 .await;
             return;
         };
-        if let Err(reason) = validate_worker_identity_processes(&*self.inner.inspector, &snapshot) {
-            self.insert_unavailable_record(record, RuntimeState::Conflict, reason)
-                .await;
-            return;
+        if snapshot.launch_identity.is_some() || snapshot.active_identity.is_some() {
+            if let Err(failure) =
+                validate_worker_identity_processes(&*self.inner.inspector, &snapshot)
+            {
+                let (reason, _retryable) = failure.reason_and_retryability();
+                self.insert_unavailable_record(record, RuntimeState::Conflict, reason)
+                    .await;
+                return;
+            }
         }
         let identity_projection = match import_worker_identities(&mut record, &snapshot) {
             Ok(projection) => projection,
@@ -1287,22 +1360,68 @@ fn apply_identity_projection(
     true
 }
 
+fn worker_metadata_record_is_current(
+    record: &SessionRecord,
+    worker_id: &str,
+    runtime_id: Option<&str>,
+) -> bool {
+    let Some(runtime) = record.info.runtime.as_ref() else {
+        return false;
+    };
+    record.desired_state == DesiredState::Running
+        && record.transaction.is_none()
+        && record.info.state == SessionState::Running
+        && runtime.state == RuntimeState::Live
+        && runtime.worker_id.as_deref() == Some(worker_id)
+        && runtime.runtime_id.as_deref() == runtime_id
+        && record.runtime.state == RuntimeState::Live
+        && record.runtime.worker_id.as_deref() == Some(worker_id)
+        && record.runtime.runtime_id.as_deref() == runtime_id
+}
+
+fn metadata_write_failure_outcome(error: &ProtocolError) -> WorkerMetadataApplyOutcome {
+    match error.code.as_str() {
+        "session_runtime_commit_stale" => WorkerMetadataApplyOutcome::Discarded,
+        _ => WorkerMetadataApplyOutcome::Retryable,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityValidationFailure {
+    Retryable(&'static str),
+    Permanent(&'static str),
+}
+
+impl IdentityValidationFailure {
+    fn reason_and_retryability(self) -> (&'static str, bool) {
+        match self {
+            Self::Retryable(reason) => (reason, true),
+            Self::Permanent(reason) => (reason, false),
+        }
+    }
+}
+
 fn validate_worker_identity_processes(
     inspector: &dyn ProcessInspector,
     snapshot: &InspectSnapshot,
-) -> Result<(), &'static str> {
+) -> Result<(), IdentityValidationFailure> {
     let root = snapshot
         .child_process
         .as_ref()
-        .ok_or("worker_child_missing")?;
+        .ok_or(IdentityValidationFailure::Permanent("worker_child_missing"))?;
     let current_root = inspector
         .process(root.pid)
-        .map_err(|_error| "identity_process_inspection_failed")?
-        .ok_or("identity_process_root_missing")?;
-    let descendants = inspector
-        .descendants(root.pid)
-        .map_err(|_error| "identity_process_inspection_failed")?;
+        .map_err(|_error| {
+            IdentityValidationFailure::Retryable("identity_process_inspection_failed")
+        })?
+        .ok_or(IdentityValidationFailure::Permanent(
+            "identity_process_root_missing",
+        ))?;
+    let descendants = inspector.descendants(root.pid).map_err(|_error| {
+        IdentityValidationFailure::Retryable("identity_process_inspection_failed")
+    })?;
     validate_worker_identity_process_facts(snapshot, &current_root, &descendants)
+        .map_err(IdentityValidationFailure::Permanent)
 }
 
 fn validate_worker_identity_process_facts(

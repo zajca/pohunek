@@ -796,7 +796,8 @@ The result is exactly `{"recorded":true}` or `{"recorded":false}`.
 `pid` is the OS process id for the active nested agent. When present, the daemon
 binds the active claim to that process and clears the claim when procwatch sees
 the process exit. The shipped integration state hooks use
-`POHUNEK_INTEGRATION_VERSION=5` and send the hook process's parent PID on
+`POHUNEK_INTEGRATION_VERSION=6`, read provider JSON through a bounded direct
+pipe without staging it on disk, and send the hook process's parent PID on
 `SessionStart`.
 
 `session.release_agent` accepts the same `source`/`agent` identity plus an
@@ -1011,8 +1012,9 @@ hook APIs.
 The state adapter also registers `SubagentStart` and `SubagentStop` for both
 providers. These callbacks target only the owner-private worker endpoint and
 silently no-op when it is unavailable. They copy only lifecycle identifiers and
-agent type; provider prompts, results, messages, and transcript paths are
-discarded.
+agent type. The hook validates its action and Pohunek handshake before reading,
+rejects oversized JSON, and never stages the payload on disk; provider prompts,
+results, messages, and transcript paths are discarded.
 
 `integration.status` is the corresponding read-only drift report. Bare status
 reports both daemon-managed agents; `--agent codex` and `--agent claude` select

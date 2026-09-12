@@ -34,9 +34,10 @@ use crate::project::detect::project_id;
 use crate::runtime::{Worker, WorkerError};
 
 use super::{
-    native_report_is_current, terminalize_running_subagents, worker_error_to_protocol,
-    InputSubmission, RuntimeExit, RuntimeHandle, RuntimeWatchIdentity, SessionEntry,
-    SessionRegistry, SessionRegistryConfig, ShellCommand, MAX_SESSION_NAME_BYTES,
+    native_report_is_current, terminalize_running_subagents, timestamp_now,
+    worker_error_to_protocol, InputSubmission, RuntimeExit, RuntimeHandle, RuntimeWatchIdentity,
+    SessionEntry, SessionRegistry, SessionRegistryConfig, ShellCommand, WorkerMetadataApplyOutcome,
+    MAX_SESSION_NAME_BYTES,
 };
 
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.
@@ -1090,6 +1091,13 @@ impl MockInspector {
             .lock()
             .expect("mock inspector lock")
             .descendants_error = Some(kind);
+    }
+
+    fn clear_descendants_error(&self) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .descendants_error = None;
     }
 
     fn fail_foreground_with(&self, kind: std::io::ErrorKind) {
@@ -5208,10 +5216,11 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
         .await
         .expect("inspect after reconnect");
     assert_eq!(snapshot.subagents.len(), 1, "worker journal retained child");
-    assert!(
+    assert_eq!(
         registry
             .apply_worker_metadata_snapshot(&created.id, &snapshot)
             .await,
+        WorkerMetadataApplyOutcome::Applied,
         "reconnected snapshot applies"
     );
     registry
@@ -5236,6 +5245,518 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
     assert!(!serialized.contains("prompt"));
 
     let _ = registry.stop(&created.id).await;
+}
+
+fn worker_subagent_snapshot(id: &str) -> pohunek_worker_protocol::SubagentSnapshot {
+    pohunek_worker_protocol::SubagentSnapshot {
+        id: id.to_owned(),
+        parent_id: None,
+        provider: "codex".to_owned(),
+        agent_type: Some("reviewer".to_owned()),
+        phase: pohunek_worker_protocol::SubagentPhase::Running,
+        revision: 1,
+        started_at_ms: 1,
+        updated_at_ms: 1,
+        finished_at_ms: None,
+    }
+}
+
+#[tokio::test]
+async fn worker_metadata_cannot_overwrite_a_terminal_durable_record() {
+    let store_path = temp_store_path("worker-metadata-terminal-race");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    snapshot
+        .subagents
+        .push(worker_subagent_snapshot("late-child"));
+
+    let store = crate::store::Store::new(store_path);
+    let mut terminal = store
+        .load_sessions()
+        .expect("load live record")
+        .pop()
+        .expect("live record");
+    terminal.desired_state = crate::store::DesiredState::Stopped;
+    terminal.info.state = SessionState::Stopped;
+    terminal.info.runtime.as_mut().expect("runtime").state = RuntimeState::Terminal;
+    terminal.runtime.state = RuntimeState::Terminal;
+    store
+        .record_session(&terminal)
+        .expect("persist terminal record");
+
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Discarded,
+        "terminal durable state must reject late worker metadata"
+    );
+    assert!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect memory")
+            .subagents
+            .is_empty(),
+        "rejected metadata must not mutate memory"
+    );
+    let durable = store
+        .load_sessions()
+        .expect("reload terminal record")
+        .pop()
+        .expect("terminal record");
+    assert_eq!(durable.info.state, SessionState::Stopped);
+    assert_eq!(
+        durable.info.runtime.expect("runtime").state,
+        RuntimeState::Terminal
+    );
+    assert!(durable.info.subagents.is_empty());
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn worker_metadata_cannot_recreate_a_removed_durable_record() {
+    let store_path = temp_store_path("worker-metadata-remove-race");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    snapshot
+        .subagents
+        .push(worker_subagent_snapshot("removed-child"));
+    let store = crate::store::Store::new(store_path);
+    assert!(
+        store
+            .remove_session(&created.id.0)
+            .expect("remove durable session"),
+        "test must remove the durable record"
+    );
+
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Discarded,
+        "removed durable state must reject late worker metadata"
+    );
+    assert!(
+        store
+            .load_sessions()
+            .expect("reload removed store")
+            .is_empty(),
+        "late metadata must not recreate the removed durable record"
+    );
+    assert!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect memory")
+            .subagents
+            .is_empty(),
+        "rejected metadata must not mutate memory"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn failed_worker_metadata_persistence_leaves_memory_retryable() {
+    let store_path = temp_store_path("worker-metadata-write-failure");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    snapshot
+        .subagents
+        .push(worker_subagent_snapshot("retry-child"));
+    let mut events = registry.subscribe();
+    registry
+        .inner
+        .store
+        .as_ref()
+        .expect("registry store")
+        .fail_next_write_before_rename();
+
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Retryable,
+        "failed durable commit must keep the fingerprint retryable"
+    );
+    assert!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect memory")
+            .subagents
+            .is_empty(),
+        "failed persistence must not mutate memory"
+    );
+
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied,
+        "the unchanged snapshot must apply after storage recovers"
+    );
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect recovered memory")
+            .subagents
+            .first()
+            .map(|subagent| subagent.id.as_str()),
+        Some("retry-child")
+    );
+    let event = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let event = events.recv().await.expect("worker metadata event");
+            if event.event() == protocol::event::SUBAGENT_STATE {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("subagent retry event timeout");
+    assert_eq!(event.event(), protocol::event::SUBAGENT_STATE);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn transient_identity_validation_failure_retries_the_same_snapshot() {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            procwatch_poll: Duration::from_mins(1),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    let root = snapshot.child_process.expect("worker child");
+    snapshot.active_identity = Some(pohunek_worker_protocol::ActiveIdentityClaim {
+        provider: "codex".to_owned(),
+        process: root,
+        sequence: 1,
+        expires_at: native_report_expiry(),
+        reference_kind: None,
+        native_reference: None,
+    });
+    snapshot
+        .subagents
+        .push(worker_subagent_snapshot("safe-child"));
+    inspector.fail_descendants_with(std::io::ErrorKind::Interrupted);
+
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Retryable,
+        "transient process inspection failure must request a retry"
+    );
+    let first = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect first pass");
+    assert!(first.active_agent.is_none());
+    assert_eq!(first.subagents.len(), 1, "safe subagents may still commit");
+
+    inspector.clear_descendants_error();
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied,
+        "the same fingerprint must validate after the transient error clears"
+    );
+    let retried = registry.inspect(&created.id).await.expect("inspect retry");
+    assert_eq!(retried.active_agent.as_deref(), Some("codex"));
+    assert_eq!(retried.subagents.len(), 1);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn subagent_only_metadata_skips_identity_process_validation() {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            procwatch_poll: Duration::from_mins(1),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    snapshot.launch_identity = None;
+    snapshot.active_identity = None;
+    snapshot.active_identity_release = None;
+    snapshot
+        .subagents
+        .push(worker_subagent_snapshot("safe-only-child"));
+    inspector.fail_descendants_with(std::io::ErrorKind::Interrupted);
+
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied,
+        "safe metadata must not depend on process-tree inspection"
+    );
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect safe metadata")
+            .subagents
+            .first()
+            .map(|subagent| subagent.id.as_str()),
+        Some("safe-only-child")
+    );
+    inspector.clear_descendants_error();
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn worker_metadata_retry_preserves_newer_memory_timestamp() {
+    let store_path = temp_store_path("worker-metadata-monotonic-timestamp");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    snapshot
+        .subagents
+        .push(worker_subagent_snapshot("timestamp-child"));
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied,
+        "initial worker metadata must commit"
+    );
+
+    let newer_timestamp = "2099-01-01T00:00:00Z";
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("session entry");
+    entry.info.subagents.clear();
+    entry.info.cwd = PathBuf::from("/tmp/concurrent-cwd");
+    entry.info.project_id = Some("p-concurrent".to_owned());
+    entry.info.is_linked_worktree = Some(true);
+    entry.info.repo = Some(PathBuf::from("/tmp/concurrent-repo"));
+    entry.info.branch = Some("concurrent-branch".to_owned());
+    entry.info.worktree_path = Some(PathBuf::from("/tmp/concurrent-cwd"));
+    entry.info.updated_at = newer_timestamp.to_owned();
+    drop(sessions);
+
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied,
+        "unchanged durable metadata must rebase onto the current memory record"
+    );
+    let retried = registry.inspect(&created.id).await.expect("inspect retry");
+    assert_eq!(retried.updated_at, newer_timestamp);
+    assert_eq!(retried.cwd, PathBuf::from("/tmp/concurrent-cwd"));
+    assert_eq!(retried.project_id.as_deref(), Some("p-concurrent"));
+    assert_eq!(retried.branch.as_deref(), Some("concurrent-branch"));
+    assert_eq!(
+        retried
+            .subagents
+            .first()
+            .map(|subagent| subagent.id.as_str()),
+        Some("timestamp-child")
+    );
+    let durable = crate::store::Store::new(store_path)
+        .load_sessions()
+        .expect("reload rebased metadata")
+        .pop()
+        .expect("rebased session record");
+    assert_eq!(durable.info.updated_at, newer_timestamp);
+    assert_eq!(durable.info.cwd, PathBuf::from("/tmp/concurrent-cwd"));
+    assert_eq!(durable.info.project_id.as_deref(), Some("p-concurrent"));
+    assert_eq!(durable.info.is_linked_worktree, Some(true));
+    assert_eq!(
+        durable.info.repo,
+        Some(PathBuf::from("/tmp/concurrent-repo"))
+    );
+    assert_eq!(durable.info.branch.as_deref(), Some("concurrent-branch"));
+    assert_eq!(
+        durable.info.worktree_path,
+        Some(PathBuf::from("/tmp/concurrent-cwd"))
+    );
+    let recovery = durable.recovery.expect("durable recovery binding");
+    assert_eq!(recovery.cwd, PathBuf::from("/tmp/concurrent-cwd"));
+    assert_eq!(recovery.project_id.as_deref(), Some("p-concurrent"));
+    assert_eq!(recovery.is_linked_worktree, Some(true));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn exit_transition_preserves_subagents_committed_ahead_of_memory() {
+    let store_path = temp_store_path("worker-metadata-exit-race");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    snapshot
+        .subagents
+        .push(worker_subagent_snapshot("durable-exit-child"));
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied,
+        "worker metadata must commit before the simulated race"
+    );
+
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("session entry");
+    entry.runtime_watch_cancel.cancel();
+    entry.info.subagents.clear();
+    entry.info.activity = Some(AgentActivity::Working);
+    entry.info.updated_at = timestamp_now();
+    drop(sessions);
+
+    assert!(
+        registry
+            .record_exit(
+                &created.id,
+                RuntimeExit {
+                    exit_code: Some(0),
+                    success: true,
+                },
+                false,
+                Some(&identity),
+                None,
+            )
+            .await
+            .expect("record exited worker"),
+        "exit transition must commit"
+    );
+    let terminal = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect terminal");
+    assert_eq!(terminal.state, SessionState::Done);
+    let child = terminal.subagents.first().expect("terminal subagent");
+    assert_eq!(child.id, "durable-exit-child");
+    assert_eq!(child.lifecycle, SubagentLifecycle::Lost);
+
+    let durable = crate::store::Store::new(store_path)
+        .load_sessions()
+        .expect("reload terminal session")
+        .pop()
+        .expect("terminal record");
+    let durable_child = durable
+        .info
+        .subagents
+        .first()
+        .expect("durable terminal subagent");
+    assert_eq!(durable_child.id, "durable-exit-child");
+    assert_eq!(durable_child.lifecycle, SubagentLifecycle::Lost);
+    stop_test_worker(worker).await;
+}
+
+#[tokio::test]
+async fn user_stop_preserves_subagents_committed_ahead_of_memory() {
+    let store_path = temp_store_path("worker-metadata-stop-race");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    snapshot
+        .subagents
+        .push(worker_subagent_snapshot("durable-stop-child"));
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied,
+        "worker metadata must commit before the simulated stop race"
+    );
+
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .expect("session entry")
+        .info
+        .subagents
+        .clear();
+
+    assert!(
+        registry
+            .stop(&created.id)
+            .await
+            .expect("stop session")
+            .stopped,
+        "user stop must complete"
+    );
+    let terminal = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect stopped session");
+    let child = terminal.subagents.first().expect("terminal subagent");
+    assert_eq!(child.id, "durable-stop-child");
+    assert_eq!(child.lifecycle, SubagentLifecycle::Lost);
+
+    let durable = crate::store::Store::new(store_path)
+        .load_sessions()
+        .expect("reload stopped session")
+        .pop()
+        .expect("stopped record");
+    let durable_child = durable
+        .info
+        .subagents
+        .first()
+        .expect("durable terminal subagent");
+    assert_eq!(durable_child.id, "durable-stop-child");
+    assert_eq!(durable_child.lifecycle, SubagentLifecycle::Lost);
 }
 
 #[tokio::test]
