@@ -3,7 +3,7 @@
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # POHUNEK_INTEGRATION_ID=codex
-# POHUNEK_INTEGRATION_VERSION=5
+# POHUNEK_INTEGRATION_VERSION=6
 #
 # Session and subagent lifecycle hook: report active-agent identity, capture the
 # native session id for direct-session resume, and journal sanitized child state.
@@ -14,11 +14,6 @@
 set -eu
 
 action="${1:-}"
-agent_pid="$PPID"
-hook_input_file="$(mktemp "${TMPDIR:-/tmp}/pohunek-codex-hook.XXXXXX")" || exit 0
-trap 'rm -f "$hook_input_file"' EXIT HUP INT TERM
-cat >"$hook_input_file" 2>/dev/null || true
-
 case "$action" in
   session|subagent-start|subagent-stop) ;;
   *) exit 0 ;;
@@ -28,6 +23,7 @@ esac
 [ -n "${POHUNEK_WORKER_SOCKET_PATH:-}" ] || [ -n "${POHUNEK_SOCKET_PATH:-}" ] || exit 0
 [ -n "${POHUNEK_SESSION_ID:-}" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
+agent_pid="$PPID"
 
 # `|| exit 0` on the heredoc command itself (NOT a trailing `exit 0`, which
 # `set -e` would never reach): an abnormal python exit (OOM, hook timeout kill,
@@ -35,8 +31,7 @@ command -v python3 >/dev/null 2>&1 || exit 0
 # the agent.
 POHUNEK_HOOK_ACTION="$action" \
 POHUNEK_AGENT_PID="$agent_pid" \
-POHUNEK_HOOK_INPUT_FILE="$hook_input_file" \
-python3 - <<'PY' || exit 0
+python3 - 3<&0 <<'PY' || exit 0
 import json
 import os
 import socket
@@ -51,6 +46,8 @@ SOCKET_TIMEOUT_SECS = 0.5
 RESPONSE_BYTES = 4096
 MIN_AGENT_PID = 1
 IDENTITY_TTL_SECS = 30
+# Bounds provider JSON before decoding; oversized payloads are rejected whole.
+MAX_HOOK_INPUT_BYTES = 65536
 
 session_id = os.environ.get("POHUNEK_SESSION_ID")
 action = os.environ.get("POHUNEK_HOOK_ACTION")
@@ -58,7 +55,6 @@ socket_path = os.environ.get("POHUNEK_SOCKET_PATH")
 worker_socket_path = os.environ.get("POHUNEK_WORKER_SOCKET_PATH")
 protocol_raw = os.environ.get("POHUNEK_PROTOCOL_VERSION")
 runtime_id = os.environ.get("POHUNEK_RUNTIME_ID")
-hook_input_file = os.environ.get("POHUNEK_HOOK_INPUT_FILE")
 agent_pid_raw = os.environ.get("POHUNEK_AGENT_PID")
 
 if not session_id or (not worker_socket_path and (not socket_path or not protocol_raw)):
@@ -77,15 +73,26 @@ except ValueError:
     parsed_agent_pid = None
 agent_pid = parsed_agent_pid if parsed_agent_pid and parsed_agent_pid >= MIN_AGENT_PID else None
 
-hook_input = {}
-if hook_input_file:
+def read_hook_input():
     try:
-        with open(hook_input_file, encoding="utf-8") as handle:
-            content = handle.read()
-        if content.strip():
-            hook_input = json.loads(content)
-    except Exception:
-        hook_input = {}
+        with os.fdopen(3, "rb") as handle:
+            content = handle.read(MAX_HOOK_INPUT_BYTES + 1)
+        if len(content) > MAX_HOOK_INPUT_BYTES or not content.strip():
+            return {}
+        parsed = json.loads(content)
+        if not isinstance(parsed, dict):
+            return {}
+        fields = (
+            ("agent_id", "agent_type", "parent_agent_id")
+            if action in (ACTION_SUBAGENT_START, ACTION_SUBAGENT_STOP)
+            else ("session_id", "transcript_path")
+        )
+        return {field: parsed.get(field) for field in fields}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+
+
+hook_input = read_hook_input()
 
 native = hook_input.get("session_id")
 native_session_id = native if isinstance(native, str) and native else None

@@ -26,7 +26,7 @@ use crate::procwatch::ProcessInspector;
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-09-11
+// Rust guideline compliant 2026-09-12
 
 #[derive(Debug, Clone)]
 struct DiscoveredWorker {
@@ -101,22 +101,22 @@ impl SessionRegistry {
     ) -> bool {
         let expected_worker_id = snapshot.worker_id.to_string();
         let expected_runtime_id = snapshot.runtime_id.as_ref().map(ToString::to_string);
-        {
+        let memory_base = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(id) else {
                 return false;
             };
-            let Some(runtime) = entry.info.runtime.as_ref() else {
-                return false;
-            };
-            if runtime.state != RuntimeState::Live
-                || runtime.worker_id.as_deref() != Some(expected_worker_id.as_str())
-                || runtime.runtime_id != expected_runtime_id
-            {
+            let record = Self::session_record(id, entry, entry.desired_state, None);
+            if !worker_metadata_record_is_current(
+                &record,
+                &expected_worker_id,
+                expected_runtime_id.as_deref(),
+            ) {
                 return false;
             }
-        }
-        let identities_valid = match validate_worker_identity_processes(
+            record
+        };
+        let mut identities_accepted = match validate_worker_identity_processes(
             &*self.inner.inspector,
             snapshot,
         ) {
@@ -126,40 +126,62 @@ impl SessionRegistry {
                 false
             }
         };
+        let subagents = match import_worker_subagents(snapshot) {
+            Ok(subagents) => subagents,
+            Err(reason) => {
+                tracing::warn!(session_id = %id.0, reason, "rejected worker subagent snapshot");
+                return false;
+            }
+        };
+        let durable_base = match self.load_durable_session_record(id).await {
+            Ok(Some(record)) => record,
+            Ok(None) => memory_base.clone(),
+            Err(error) => {
+                tracing::warn!(session_id = %id.0, error = %error, "failed to load durable worker metadata base");
+                return false;
+            }
+        };
+        if !worker_metadata_record_is_current(
+            &durable_base,
+            &expected_worker_id,
+            expected_runtime_id.as_deref(),
+        ) {
+            return false;
+        }
+        let mut candidate = durable_base.clone();
+        let projection = if identities_accepted {
+            match import_worker_identities(&mut candidate, snapshot) {
+                Ok(projection) => projection,
+                Err(reason) => {
+                    tracing::warn!(session_id = %id.0, reason, "rejected worker identity snapshot");
+                    identities_accepted = false;
+                    WorkerIdentityProjection::unreported()
+                }
+            }
+        } else {
+            WorkerIdentityProjection::unreported()
+        };
+        candidate.info.subagents.clone_from(&subagents);
+        if candidate != durable_base {
+            candidate.info.updated_at = timestamp_now();
+            if let Err(error) = self
+                .write_session_record_if_current(durable_base, candidate.clone())
+                .await
+            {
+                tracing::warn!(session_id = %id.0, error = %error, "failed to persist worker metadata snapshot");
+                return false;
+            }
+        }
 
         let updated = {
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(id) else {
                 return false;
             };
-            let Some(runtime) = entry.info.runtime.as_ref() else {
-                return false;
-            };
-            if runtime.state != RuntimeState::Live
-                || runtime.worker_id.as_deref() != Some(expected_worker_id.as_str())
-                || runtime.runtime_id != expected_runtime_id
-            {
+            let current = Self::session_record(id, entry, entry.desired_state, None);
+            if current != memory_base {
                 return false;
             }
-            let mut candidate = Self::session_record(id, entry, entry.desired_state, None);
-            let projection = if identities_valid {
-                match import_worker_identities(&mut candidate, snapshot) {
-                    Ok(projection) => projection,
-                    Err(reason) => {
-                        tracing::warn!(session_id = %id.0, reason, "rejected worker identity snapshot");
-                        WorkerIdentityProjection::unreported()
-                    }
-                }
-            } else {
-                WorkerIdentityProjection::unreported()
-            };
-            let subagents = match import_worker_subagents(snapshot) {
-                Ok(subagents) => subagents,
-                Err(reason) => {
-                    tracing::warn!(session_id = %id.0, reason, "rejected worker subagent snapshot");
-                    return false;
-                }
-            };
             let subagent_events = subagents
                 .iter()
                 .filter(|subagent| {
@@ -174,20 +196,14 @@ impl SessionRegistry {
                 entry.info.subagents = subagents;
                 changed = true;
             }
+            entry
+                .last_native_report
+                .clone_from(&candidate.native_identity_ordering);
             if changed {
-                entry.info.updated_at = timestamp_now();
+                entry.info.updated_at.clone_from(&candidate.info.updated_at);
             }
-            (
-                changed,
-                entry.info.clone(),
-                Self::session_record(id, entry, entry.desired_state, None),
-                subagent_events,
-            )
+            (changed, entry.info.clone(), subagent_events)
         };
-        if let Err(error) = self.write_session_record(updated.2).await {
-            tracing::warn!(session_id = %id.0, error = %error, "failed to persist worker identity snapshot");
-            return false;
-        }
         if updated.0 {
             self.persist_resume_binding(id).await;
             self.emit(event::SESSION_UPDATED, &updated.1);
@@ -196,7 +212,7 @@ impl SessionRegistry {
                     SessionRuntimeIdentity::new(runtime_id.clone(), runtime.runtime_generation).ok()
                 })
             });
-            for subagent in updated.3 {
+            for subagent in updated.2 {
                 let event = crate::events::event(
                     event::SUBAGENT_STATE,
                     event_payload(SubagentStateEvent {
@@ -208,7 +224,7 @@ impl SessionRegistry {
                 let _ = self.inner.events.send(event);
             }
         }
-        true
+        identities_accepted
     }
 
     /// Loads logical records and adopts their exact surviving workers.
@@ -1285,6 +1301,25 @@ fn apply_identity_projection(
         });
     }
     true
+}
+
+fn worker_metadata_record_is_current(
+    record: &SessionRecord,
+    worker_id: &str,
+    runtime_id: Option<&str>,
+) -> bool {
+    let Some(runtime) = record.info.runtime.as_ref() else {
+        return false;
+    };
+    record.desired_state == DesiredState::Running
+        && record.transaction.is_none()
+        && record.info.state == SessionState::Running
+        && runtime.state == RuntimeState::Live
+        && runtime.worker_id.as_deref() == Some(worker_id)
+        && runtime.runtime_id.as_deref() == runtime_id
+        && record.runtime.state == RuntimeState::Live
+        && record.runtime.worker_id.as_deref() == Some(worker_id)
+        && record.runtime.runtime_id.as_deref() == runtime_id
 }
 
 fn validate_worker_identity_processes(
