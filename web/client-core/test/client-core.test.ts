@@ -232,6 +232,68 @@ describe("@pohunek/client-core", () => {
     expect(recovered.sessions["s-runtime"]?.session.runtime?.runtime_id).toBe("runtime-2");
   });
 
+  test("reduces subagent state and rejects stale revisions", () => {
+    const initial = hostDataFromSnapshot([session("s-subagent", "runtime-1")], []);
+    const completed = reduceHostEvent(initial, {
+      v: PROTOCOL_VERSION,
+      event: "subagent_state",
+      session_id: "s-subagent",
+      runtime: { runtime_id: "runtime-1", runtime_generation: "1" },
+      subagent: {
+        id: "child-1",
+        provider: "codex",
+        agent_type: "explorer",
+        lifecycle: "completed",
+        revision: "2",
+        started_at_ms: 100,
+        updated_at_ms: 120,
+        finished_at_ms: 120,
+      },
+    });
+    const stale = reduceHostEvent(completed, {
+      v: PROTOCOL_VERSION,
+      event: "subagent_state",
+      session_id: "s-subagent",
+      runtime: { runtime_id: "runtime-1", runtime_generation: "1" },
+      subagent: {
+        id: "child-1",
+        provider: "codex",
+        lifecycle: "running",
+        activity: "working",
+        revision: "1",
+        started_at_ms: 100,
+        updated_at_ms: 110,
+      },
+    });
+
+    expect(stale).toBe(completed);
+    expect(stale.sessions["s-subagent"]?.session.subagents?.[0]?.lifecycle).toBe("completed");
+
+    const recovered = reduceHostEvent(stale, {
+      v: PROTOCOL_VERSION,
+      event: "session_native_recovered",
+      session: session("s-subagent", "runtime-2"),
+    });
+    const delayedOldRuntime = reduceHostEvent(recovered, {
+      v: PROTOCOL_VERSION,
+      event: "subagent_state",
+      session_id: "s-subagent",
+      runtime: { runtime_id: "runtime-1", runtime_generation: "1" },
+      subagent: {
+        id: "child-1",
+        provider: "codex",
+        lifecycle: "running",
+        activity: "working",
+        revision: "99",
+        started_at_ms: 100,
+        updated_at_ms: 200,
+      },
+    });
+
+    expect(delayedOldRuntime).toBe(recovered);
+    expect(delayedOldRuntime.sessions["s-subagent"]?.session.subagents).toBeUndefined();
+  });
+
   test("reduces every live session, attach, agent, and notification transition", async () => {
     const daemon = await startTcpFixture({});
     const relay = await relayFor(new Map([["events", tcpTarget(daemon)]]));

@@ -33,6 +33,18 @@
   "rows": 32,
   "state": "done",
   "state_source": "report",
+  "subagents": [
+    {
+      "activity": "working",
+      "agent_type": "Explore",
+      "id": "agent-fixture-1",
+      "lifecycle": "running",
+      "provider": "claude",
+      "revision": "1",
+      "started_at_ms": 1788825600000,
+      "updated_at_ms": 1788825600000
+    }
+  ],
   "updated_at": "2026-07-08T00:01:00Z",
   "warnings": [
     {

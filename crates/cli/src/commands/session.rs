@@ -24,7 +24,7 @@ use protocol::{
     SessionReadParams, SessionReadResult, SessionReadSource, SessionRemoveResult,
     SessionRenameParams, SessionResizeParams, SessionRuntimeIdentity, SessionScreenParams,
     SessionSetMetadataParams, SessionState, SessionStopResult, SessionWaitParams,
-    SessionWarningKind, StateSource, TerminalWatermark, MAX_SESSION_INPUT_BYTES,
+    SessionWarningKind, StateSource, SubagentLifecycle, TerminalWatermark, MAX_SESSION_INPUT_BYTES,
     MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
 };
 
@@ -1362,13 +1362,13 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
     let mut output = String::new();
     let _ = writeln!(
         output,
-        "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  CWD",
-        "ID", "NAME", "AGENT", "ORIGIN", "STATE", "ACTIVITY", "SOURCE", "PID", "SIZE", "PROJECT", "BRANCH", "WARN",
+        "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {:<9}  CWD",
+        "ID", "NAME", "AGENT", "ORIGIN", "STATE", "ACTIVITY", "SOURCE", "PID", "SIZE", "PROJECT", "BRANCH", "WARN", "SUBAGENTS",
     );
     for session in sessions {
         let _ = writeln!(
             output,
-            "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {}",
+            "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {:<9}  {}",
             session.id.0,
             name_label(session),
             session_agent_label(session),
@@ -1381,6 +1381,7 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
             project_label(session),
             branch_label(session),
             warn_count_label(session),
+            subagent_count_label(session),
             session.cwd.display(),
         );
     }
@@ -1449,6 +1450,18 @@ fn warn_count_label(info: &SessionInfo) -> String {
     } else {
         info.warnings.len().to_string()
     }
+}
+
+fn subagent_count_label(info: &SessionInfo) -> String {
+    if info.subagents.is_empty() {
+        return "-".to_owned();
+    }
+    let running = info
+        .subagents
+        .iter()
+        .filter(|subagent| subagent.lifecycle == SubagentLifecycle::Running)
+        .count();
+    format!("{running}/{}", info.subagents.len())
 }
 
 fn origin_label(info: &SessionInfo) -> &'static str {
@@ -1522,6 +1535,15 @@ fn render_inspect_human(info: &SessionInfo) -> String {
                 .map_or_else(none, |p| p.display().to_string()),
         ),
         ("warnings", warn_count_label(info)),
+        (
+            "subagents_running",
+            info.subagents
+                .iter()
+                .filter(|subagent| subagent.lifecycle == SubagentLifecycle::Running)
+                .count()
+                .to_string(),
+        ),
+        ("subagents_recent", info.subagents.len().to_string()),
         ("created_at", info.created_at.clone()),
         ("updated_at", info.updated_at.clone()),
         (
@@ -1559,20 +1581,45 @@ fn render_inspect_human(info: &SessionInfo) -> String {
     for (field, value) in &rows {
         let _ = writeln!(output, "{field:<width$}  {value}");
     }
+    append_inspect_details(&mut output, info);
+    output
+}
+
+fn append_inspect_details(output: &mut String, info: &SessionInfo) {
     // Each non-fatal warning is detailed below the table so a worktree session
     // surfaces exactly what happened and what was done instead.
     for warning in &info.warnings {
         let _ = writeln!(
-            output,
+            *output,
             "warning [{}]: {}",
             warning_kind_label(warning.kind),
             warning.message
         );
         if let Some(detail) = &warning.detail {
-            let _ = writeln!(output, "  detail: {detail}");
+            let _ = writeln!(*output, "  detail: {detail}");
         }
     }
-    output
+    for subagent in &info.subagents {
+        let kind = subagent.agent_type.as_deref().unwrap_or("agent");
+        let _ = writeln!(
+            *output,
+            "subagent [{}:{}]: {} {}",
+            agent_kind_label(&subagent.provider),
+            subagent.id,
+            kind,
+            subagent_lifecycle_label(subagent.lifecycle),
+        );
+    }
+}
+
+const fn subagent_lifecycle_label(lifecycle: SubagentLifecycle) -> &'static str {
+    match lifecycle {
+        SubagentLifecycle::Running => "running",
+        SubagentLifecycle::Completed => "completed",
+        SubagentLifecycle::Failed => "failed",
+        SubagentLifecycle::Cancelled => "cancelled",
+        SubagentLifecycle::Lost => "lost",
+    }
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -1712,6 +1759,7 @@ mod tests {
             state: SessionState::Running,
             state_source: StateSource::Process,
             activity: None,
+            subagents: Vec::new(),
             native_session_id: None,
             native_session_path: None,
             active_agent: None,
@@ -2526,11 +2574,20 @@ mod tests {
 
         let header = output.lines().next().expect("header line");
         for column in [
-            "ID", "NAME", "AGENT", "ORIGIN", "STATE", "PROJECT", "BRANCH", "WARN", "CWD",
+            "ID",
+            "NAME",
+            "AGENT",
+            "ORIGIN",
+            "STATE",
+            "PROJECT",
+            "BRANCH",
+            "WARN",
+            "SUBAGENTS",
+            "CWD",
         ] {
             assert!(header.contains(column), "header missing {column}: {header}");
         }
-        // Columns: ID NAME AGENT ORIGIN STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN CWD.
+        // Columns: ID NAME AGENT ORIGIN STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN SUBAGENTS CWD.
         assert_eq!(
             list_row(&output, "s-42"),
             vec![
@@ -2546,6 +2603,7 @@ mod tests {
                 "-", // PROJECT
                 "-", // BRANCH
                 "-", // WARN
+                "-", // SUBAGENTS
                 "/workspace/project",
             ]
         );
@@ -2574,6 +2632,7 @@ mod tests {
                 "-", // PROJECT
                 "-", // BRANCH
                 "-", // WARN
+                "-", // SUBAGENTS
                 "/workspace/project",
             ]
         );
@@ -2637,7 +2696,7 @@ mod tests {
 
         let output = render_list_human(&[session]);
         let row = list_row(&output, "s-42");
-        // Columns: ID NAME AGENT ORIGIN STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN CWD.
+        // Columns: ID NAME AGENT ORIGIN STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN SUBAGENTS CWD.
         assert_eq!(
             row[9], "login-ui",
             "project column shows the label: {row:?}"
@@ -2645,9 +2704,49 @@ mod tests {
         assert_eq!(row[10], "feature/login", "branch column: {row:?}");
         assert_eq!(row[11], "1", "warning-count column: {row:?}");
         assert_eq!(
-            row[12], "/data/worktrees/s-42-project-feature-login",
+            row[13], "/data/worktrees/s-42-project-feature-login",
             "cwd is the worktree path: {row:?}"
         );
+    }
+
+    #[test]
+    fn renders_subagent_summary_in_list_and_details_in_inspect() {
+        let mut session = running_session("s-42");
+        session.subagents = vec![
+            protocol::SubagentInfo {
+                id: "child-running".to_owned(),
+                parent_id: None,
+                provider: protocol::AgentKind::Claude,
+                agent_type: Some("Explore".to_owned()),
+                lifecycle: protocol::SubagentLifecycle::Running,
+                activity: Some(AgentActivity::Working),
+                revision: protocol::SubagentRevision::new(1),
+                started_at_ms: 100,
+                updated_at_ms: 100,
+                finished_at_ms: None,
+            },
+            protocol::SubagentInfo {
+                id: "child-done".to_owned(),
+                parent_id: None,
+                provider: protocol::AgentKind::Codex,
+                agent_type: None,
+                lifecycle: protocol::SubagentLifecycle::Completed,
+                activity: None,
+                revision: protocol::SubagentRevision::new(2),
+                started_at_ms: 90,
+                updated_at_ms: 110,
+                finished_at_ms: Some(110),
+            },
+        ];
+
+        let list = render_list_human(&[session.clone()]);
+        assert_eq!(list_row(&list, "s-42")[12], "1/2");
+
+        let inspect = render_inspect_human(&session);
+        assert!(has_row(&inspect, "subagents_running", "1"));
+        assert!(has_row(&inspect, "subagents_recent", "2"));
+        assert!(inspect.contains("subagent [claude:child-running]: Explore running"));
+        assert!(inspect.contains("subagent [codex:child-done]: agent completed"));
     }
 
     /// Whether the rendered field/value table contains a `field value` row,

@@ -1,6 +1,6 @@
 //! Derived notifications from session events.
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-09-11
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -719,6 +719,7 @@ mod tests {
             state,
             state_source: StateSource::Process,
             activity: None,
+            subagents: Vec::new(),
             active_agent: None,
             active_agent_base: None,
             active_agent_pid: None,

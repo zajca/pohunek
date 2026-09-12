@@ -94,7 +94,9 @@ Web control center client:
 - `web/backend/systemd/pohunek-backend.service.in`
 - `web/release/`
 - `web/client-core/src/index.ts`
+- `web/client-core/src/reducer.ts`
 - `web/frontend/src/App.svelte`
+- `web/frontend/src/components/SessionMain.svelte`
 - `web/frontend/src/lib/agent-presentation.ts`
 - `web/frontend/src/components/NewSessionDialog.svelte`
 - `web/scripts/dev.ts`

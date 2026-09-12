@@ -43,6 +43,43 @@ test("keeps every host in one session rail and promotes live blocked work", asyn
   await expect(localSession).toBeHidden();
 });
 
+test("shows live subagent work and its terminal transition", async ({ page, stack }) => {
+  await page.goto(stack.backend.url);
+  await expect(hostMarker(page, FIXTURE_LOCAL_HOST).locator("[data-connection]"))
+    .toHaveAttribute("data-connection", "connected");
+  await sessionRow(page, FIXTURE_LOCAL_HOST, FIXTURE_LOCAL_SESSION_ID).click();
+  await expect(page.getByRole("heading", { name: "Local coding session" })).toBeVisible();
+
+  stack.local.scenario.setSubagentState(FIXTURE_LOCAL_SESSION_ID, {
+    id: "child-1",
+    provider: "claude",
+    agent_type: "Explore",
+    lifecycle: "running",
+    activity: "working",
+    revision: "1",
+    started_at_ms: 100,
+    updated_at_ms: 100,
+  });
+
+  const subagents = page.getByRole("region", { name: "Observed subagents" });
+  await expect(subagents).toContainText("1 running");
+  await expect(subagents).toContainText("Explore · working");
+
+  stack.local.scenario.setSubagentState(FIXTURE_LOCAL_SESSION_ID, {
+    id: "child-1",
+    provider: "claude",
+    agent_type: "Explore",
+    lifecycle: "completed",
+    revision: "2",
+    started_at_ms: 100,
+    updated_at_ms: 200,
+    finished_at_ms: 200,
+  });
+
+  await expect(subagents).toContainText("0 running");
+  await expect(subagents).toContainText("Explore · completed");
+});
+
 test("creates on the chosen host, attaches immediately, and stops from the toolbar", async ({ page, stack }) => {
   await page.goto(stack.backend.url);
   await expect(hostMarker(page, FIXTURE_PEER_HOST).locator("[data-connection]"))

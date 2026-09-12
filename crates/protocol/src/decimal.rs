@@ -118,6 +118,11 @@ decimal_wire_type!(
     "ActivityRevision.ts"
 );
 decimal_wire_type!(
+    /// Monotonic provider-subagent revision scoped to one PTY runtime.
+    SubagentRevision,
+    "SubagentRevision.ts"
+);
+decimal_wire_type!(
     /// Monotonic lifecycle-report sequence.
     ReportSequence,
     "ReportSequence.ts"

@@ -78,6 +78,10 @@
         return "This running session does not expose an attachable terminal.";
     }
   }
+
+  function lifecycleLabel(value: string): string {
+    return value === "running" ? "working" : value;
+  }
 </script>
 
 <main class="session-main">
@@ -121,6 +125,21 @@
       </div>
     </header>
 
+    {#if (entry.session.subagents?.length ?? 0) > 0}
+      <section class="subagent-strip" aria-label="Observed subagents">
+        <strong>
+          Subagents · {entry.session.subagents?.filter((subagent) => subagent.lifecycle === "running").length ?? 0} running
+        </strong>
+        <div class="subagent-list">
+          {#each entry.session.subagents ?? [] as subagent (`${subagent.provider}:${subagent.id}`)}
+            <span class:subagent-running={subagent.lifecycle === "running"}>
+              {subagent.agent_type ?? "agent"} · {lifecycleLabel(subagent.lifecycle)}
+            </span>
+          {/each}
+        </div>
+      </section>
+    {/if}
+
     {#if canAttach}
       {#key `${entry.host}:${entry.session.id}`}
         <EmbeddedTerminal workspace={workspace} host={entry.host} sessionId={entry.session.id} />
@@ -143,3 +162,32 @@
     {/if}
   {/if}
 </main>
+
+<style>
+  .subagent-strip {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.55rem 0.85rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.78rem;
+  }
+
+  .subagent-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+
+  .subagent-list span {
+    padding: 0.2rem 0.45rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--muted);
+  }
+
+  .subagent-list span.subagent-running {
+    color: var(--accent-strong);
+    border-color: var(--success);
+  }
+</style>

@@ -1,6 +1,6 @@
 //! Explicit one-time migration preflight for daemon-owned PTYs.
 
-// Rust guideline compliant 2026-07-28
+// Rust guideline compliant 2026-09-11
 
 use std::fmt::Write as _;
 use std::fs;
@@ -302,6 +302,7 @@ mod tests {
             state,
             state_source: StateSource::Process,
             activity: None,
+            subagents: Vec::new(),
             native_session_id: None,
             native_session_path: None,
             active_agent: None,

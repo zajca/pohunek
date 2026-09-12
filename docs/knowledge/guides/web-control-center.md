@@ -42,7 +42,9 @@ native recovery. Lost, conflicting, incompatible, and observe-only sessions
 show a summary instead. The
 terminal toolbar can rename, stop, resume, fork, or permanently remove eligible
 sessions, while the inspector edits individual metadata keys. External observed
-sessions never expose mutating controls. Removal always requires confirmation
+sessions never expose mutating controls. When provider lifecycle hooks have
+reported Claude/Codex subagents, a durable status strip above the terminal shows
+their type and running or terminal lifecycle. Removal always requires confirmation
 and warns when it will also stop a live PTY. Session creation is a modal that
 measures terminal geometry invisibly and attaches after creation, and the Inbox
 is an unread-first drawer. Opening a session-backed notification marks it read

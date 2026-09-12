@@ -6,6 +6,7 @@ import type {
   NotificationRecord,
   SessionId,
   StateSource,
+  SubagentInfo,
   TerminalDimensions,
 } from "@pohunek/protocol";
 
@@ -33,6 +34,7 @@ export interface ScenarioResize {
 
 export interface ScenarioBackend {
   setAgentState(sessionId: SessionId, activity: AgentActivity, source: StateSource): void;
+  setSubagentState(sessionId: SessionId, subagent: SubagentInfo): void;
   removeSession(sessionId: SessionId): void;
   createScenarioNotification(input: ScenarioNotificationInput): NotificationRecord;
   deleteNotification(id: NotificationId): void;
@@ -67,6 +69,10 @@ export class FixtureScenario {
     source: StateSource = DEFAULT_AGENT_STATE_SOURCE,
   ): void {
     this.backend.setAgentState(sessionId, activity, source);
+  }
+
+  public setSubagentState(sessionId: SessionId, subagent: SubagentInfo): void {
+    this.backend.setSubagentState(sessionId, subagent);
   }
 
   /** Removes a fixture session and emits `session_removed` to subscribers. */

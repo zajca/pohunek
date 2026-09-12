@@ -50,6 +50,10 @@ const CLAUDE_NOTIFY_HOOK_ASSET: &str = include_str!("assets/claude/pohunek-agent
 const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/pohunek-agent-state.sh");
 /// The Codex notification hook script, embedded at compile time.
 const CODEX_NOTIFY_HOOK_ASSET: &str = include_str!("assets/codex/pohunek-agent-notify.sh");
+/// Sanitized payloads matching the upstream Codex subagent hook schema.
+#[cfg(test)]
+const CODEX_SUBAGENT_COMPATIBILITY_FIXTURE: &str =
+    include_str!("../../../../compat/codex/subagent-hooks.json");
 /// Managed hook assets are currently below 8 KiB; 64 KiB leaves ample growth
 /// while bounding status memory and I/O for installer-owned executable files.
 const MANAGED_ASSET_INSPECTION_LIMIT_BYTES: usize = 64 * 1024;
@@ -71,10 +75,18 @@ const HOOK_TIMEOUT_SECS: u64 = 10;
 const HOOK_ACTION: &str = "session";
 /// Action argument passed to the hook script for the `SessionEnd` event.
 const HOOK_RELEASE_ACTION: &str = "release";
+/// Action argument passed to the hook script when a provider subagent starts.
+const SUBAGENT_START_ACTION: &str = "subagent-start";
+/// Action argument passed to the hook script when a provider subagent stops.
+const SUBAGENT_STOP_ACTION: &str = "subagent-stop";
 /// `SessionStart` event name in the agents' hook config.
 const SESSION_START_EVENT: &str = "SessionStart";
 /// `SessionEnd` event name in Claude's hook config.
 const SESSION_END_EVENT: &str = "SessionEnd";
+/// Provider lifecycle event fired when a subagent starts.
+const SUBAGENT_START_EVENT: &str = "SubagentStart";
+/// Provider lifecycle event fired when a subagent stops.
+const SUBAGENT_STOP_EVENT: &str = "SubagentStop";
 /// Codex lifecycle event fired before provider approval prompts.
 const CODEX_PERMISSION_REQUEST_EVENT: &str = "PermissionRequest";
 /// Codex lifecycle event fired when a turn completes.
@@ -91,11 +103,17 @@ const CODEX_SESSION_START_TRUST_EVENT: &str = "session_start";
 const CODEX_PERMISSION_REQUEST_TRUST_EVENT: &str = "permission_request";
 /// Codex trust identity name for `Stop`.
 const CODEX_STOP_TRUST_EVENT: &str = "stop";
+/// Codex trust identity name for `SubagentStart`.
+const CODEX_SUBAGENT_START_TRUST_EVENT: &str = "subagent_start";
+/// Codex trust identity name for `SubagentStop`.
+const CODEX_SUBAGENT_STOP_TRUST_EVENT: &str = "subagent_stop";
 /// Codex trust keys owned by this installer across all managed lifecycle hooks.
 const CODEX_MANAGED_TRUST_EVENTS: &[&str] = &[
     CODEX_SESSION_START_TRUST_EVENT,
     CODEX_PERMISSION_REQUEST_TRUST_EVENT,
     CODEX_STOP_TRUST_EVENT,
+    CODEX_SUBAGENT_START_TRUST_EVENT,
+    CODEX_SUBAGENT_STOP_TRUST_EVENT,
 ];
 /// Action argument passed to notification hook scripts for approval prompts.
 const PERMISSION_REQUEST_ACTION: &str = "permission_request";
@@ -930,6 +948,20 @@ fn inspect_claude_registration(
             trust_event: None,
         },
         HookSpec {
+            label: "Claude SubagentStart".to_owned(),
+            event: SUBAGENT_START_EVENT,
+            command: hook_command(state_path, SUBAGENT_START_ACTION),
+            matcher: Some("*"),
+            trust_event: None,
+        },
+        HookSpec {
+            label: "Claude SubagentStop".to_owned(),
+            event: SUBAGENT_STOP_EVENT,
+            command: hook_command(state_path, SUBAGENT_STOP_ACTION),
+            matcher: Some("*"),
+            trust_event: None,
+        },
+        HookSpec {
             label: "Claude SessionEnd".to_owned(),
             event: SESSION_END_EVENT,
             command: hook_command(state_path, HOOK_RELEASE_ACTION),
@@ -986,6 +1018,20 @@ fn inspect_codex_registration(
             command: hook_command(state_path, HOOK_ACTION),
             matcher: None,
             trust_event: Some(CODEX_SESSION_START_TRUST_EVENT),
+        },
+        HookSpec {
+            label: "Codex SubagentStart".to_owned(),
+            event: SUBAGENT_START_EVENT,
+            command: hook_command(state_path, SUBAGENT_START_ACTION),
+            matcher: None,
+            trust_event: Some(CODEX_SUBAGENT_START_TRUST_EVENT),
+        },
+        HookSpec {
+            label: "Codex SubagentStop".to_owned(),
+            event: SUBAGENT_STOP_EVENT,
+            command: hook_command(state_path, SUBAGENT_STOP_ACTION),
+            matcher: None,
+            trust_event: Some(CODEX_SUBAGENT_STOP_TRUST_EVENT),
         },
         HookSpec {
             label: "Codex PermissionRequest".to_owned(),
@@ -1467,8 +1513,8 @@ pub fn codex_config_dir() -> Result<PathBuf, ProtocolError> {
 /// Install the Claude hooks into `claude_dir`.
 ///
 /// Writes managed scripts under `hooks/` and merges `SessionStart`,
-/// `SessionEnd`,
-/// `Notification`, `Stop`, and `StopFailure` hooks into `settings.json`,
+/// `SessionEnd`, `SubagentStart`, `SubagentStop`, `Notification`, `Stop`, and
+/// `StopFailure` hooks into `settings.json`,
 /// stripping any hooks this installer owns first so reinstall is idempotent.
 ///
 /// # Errors
@@ -1500,6 +1546,8 @@ pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> 
     let state_hook_commands = [
         hook_command(&hook_path, HOOK_ACTION),
         hook_command(&hook_path, HOOK_RELEASE_ACTION),
+        hook_command(&hook_path, SUBAGENT_START_ACTION),
+        hook_command(&hook_path, SUBAGENT_STOP_ACTION),
     ];
     remove_owned_command_hooks(hooks, &state_hook_commands);
     remove_owned_command_hooks(hooks, &claude_notify_hook_commands(&notify_hook_path));
@@ -1510,6 +1558,18 @@ pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> 
         Some("*"),
     )?;
     ensure_command_hook(hooks, SESSION_END_EVENT, &state_hook_commands[1], Some("*"))?;
+    ensure_command_hook(
+        hooks,
+        SUBAGENT_START_EVENT,
+        &state_hook_commands[2],
+        Some("*"),
+    )?;
+    ensure_command_hook(
+        hooks,
+        SUBAGENT_STOP_EVENT,
+        &state_hook_commands[3],
+        Some("*"),
+    )?;
     for matcher in CLAUDE_NOTIFICATION_MATCHERS {
         ensure_command_hook(
             hooks,
@@ -1558,14 +1618,18 @@ pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> 
 
 /// Install the Codex hooks into `codex_dir`.
 ///
-/// Writes managed scripts, merges `SessionStart`, `PermissionRequest`, and
-/// `Stop` hooks into `hooks.json`, and enables `[features] hooks = true` in
-/// `config.toml`, idempotently.
+/// Writes managed scripts, merges `SessionStart`, `SubagentStart`,
+/// `SubagentStop`, `PermissionRequest`, and `Stop` hooks into `hooks.json`, and
+/// enables `[features] hooks = true` in `config.toml`, idempotently.
 ///
 /// # Errors
 ///
 /// Fails fast if `codex_dir` is absent, if `hooks.json` is malformed, or on any
 /// I/O error.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Codex hook and trust registration is one atomic configuration transaction"
+)]
 pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
     validate_config_dir(codex_dir.to_path_buf(), "Codex config directory")?;
     if !codex_dir.is_dir() {
@@ -1586,7 +1650,14 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
         &hooks_path,
     )?;
     let hooks = ensure_hooks_object(&mut hooks_file, &hooks_path)?;
-    remove_owned_command_hooks(hooks, &[hook_command(&hook_path, HOOK_ACTION)]);
+    remove_owned_command_hooks(
+        hooks,
+        &[
+            hook_command(&hook_path, HOOK_ACTION),
+            hook_command(&hook_path, SUBAGENT_START_ACTION),
+            hook_command(&hook_path, SUBAGENT_STOP_ACTION),
+        ],
+    );
     remove_owned_command_hooks(hooks, &codex_notify_hook_commands(&notify_hook_path));
     // Codex exposes `Stop` for turn completion, not session/process exit. Do
     // not wire state release to it; procwatch is the lifecycle backstop.
@@ -1595,6 +1666,16 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
             event: SESSION_START_EVENT,
             trust_event: CODEX_SESSION_START_TRUST_EVENT,
             command: hook_command(&hook_path, HOOK_ACTION),
+        },
+        CodexManagedHook {
+            event: SUBAGENT_START_EVENT,
+            trust_event: CODEX_SUBAGENT_START_TRUST_EVENT,
+            command: hook_command(&hook_path, SUBAGENT_START_ACTION),
+        },
+        CodexManagedHook {
+            event: SUBAGENT_STOP_EVENT,
+            trust_event: CODEX_SUBAGENT_STOP_TRUST_EVENT,
+            command: hook_command(&hook_path, SUBAGENT_STOP_ACTION),
         },
         CodexManagedHook {
             event: CODEX_PERMISSION_REQUEST_EVENT,
@@ -2603,10 +2684,11 @@ mod tests {
         codex_command_hook_trusted_hash, codex_hook_trust_key, hook_command, install_claude,
         install_codex, shell_single_quote, toml_basic_string, CLAUDE_HOOK_ASSET,
         CLAUDE_NOTIFY_HOOK_ASSET, CODEX_HOOK_ASSET, CODEX_NOTIFY_HOOK_ASSET,
-        CODEX_SESSION_START_TRUST_EVENT, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID,
-        ENV_SOCKET_PATH, EXPECTED_INTEGRATION_VERSION, HOOK_TIMEOUT_SECS,
-        INTEGRATION_VERSION_PREFIX, NOTIFY_HOOK_INSTALL_NAME, SESSION_START_EVENT,
-        STATE_HOOK_INSTALL_NAME,
+        CODEX_SESSION_START_TRUST_EVENT, CODEX_SUBAGENT_COMPATIBILITY_FIXTURE, ENV_FLAG,
+        ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH, EXPECTED_INTEGRATION_VERSION,
+        HOOK_TIMEOUT_SECS, INTEGRATION_VERSION_PREFIX, NOTIFY_HOOK_INSTALL_NAME,
+        SESSION_START_EVENT, STATE_HOOK_INSTALL_NAME, SUBAGENT_START_ACTION, SUBAGENT_START_EVENT,
+        SUBAGENT_STOP_ACTION, SUBAGENT_STOP_EVENT,
     };
 
     /// Large enough to expose unbounded hook stdin reads through pipe backpressure.
@@ -2628,7 +2710,7 @@ mod tests {
     /// State-hook requests expected from a successful release callback.
     const STATE_RELEASE_REQUEST_COUNT: usize = 1;
     /// Integration asset version expected after PID-bearing state hooks ship.
-    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=4";
+    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=5";
     /// Action argument for state-hook `SessionStart` reporting.
     const STATE_SESSION_ACTION: &str = "session";
     /// Action argument for state-hook release reporting.
@@ -3466,6 +3548,65 @@ mod tests {
     }
 
     #[test]
+    fn state_hooks_forward_only_sanitized_subagent_lifecycle_fields() {
+        for agent in ["claude", "codex"] {
+            let start = run_worker_state_asset(
+                agent,
+                SUBAGENT_START_ACTION,
+                &json!({
+                    "agent_id": "child-1",
+                    "agent_type": "Explore",
+                    "parent_agent_id": "parent-1",
+                    "prompt": "must not cross the hook boundary",
+                    "transcript_path": "/secret/transcript.jsonl",
+                }),
+            );
+            assert_eq!(start["type"], "subagent_start");
+            assert_eq!(start["provider"], agent);
+            assert_eq!(start["subagent_id"], "child-1");
+            assert_eq!(start["agent_type"], "Explore");
+            assert_eq!(start["parent_id"], "parent-1");
+            assert!(start.get("prompt").is_none());
+            assert!(start.get("transcript_path").is_none());
+
+            let stop = run_worker_state_asset(
+                agent,
+                SUBAGENT_STOP_ACTION,
+                &json!({
+                    "agent_id": "child-1",
+                    "last_assistant_message": "must not cross the hook boundary",
+                }),
+            );
+            assert_eq!(stop["type"], "subagent_stop");
+            assert_eq!(stop["subagent_id"], "child-1");
+            assert_eq!(stop["outcome"], "completed");
+            assert!(stop.get("last_assistant_message").is_none());
+        }
+    }
+
+    #[test]
+    fn codex_subagent_compatibility_fixture_crosses_only_the_lifecycle_boundary() {
+        let fixture: Value = serde_json::from_str(CODEX_SUBAGENT_COMPATIBILITY_FIXTURE)
+            .expect("valid Codex compatibility fixture");
+
+        let start = run_worker_state_asset("codex", SUBAGENT_START_ACTION, &fixture["start"]);
+        assert_eq!(start["type"], "subagent_start");
+        assert_eq!(start["provider"], "codex");
+        assert_eq!(start["subagent_id"], "agent-child-1");
+        assert_eq!(start["agent_type"], "reviewer");
+        assert!(start.get("transcript_path").is_none());
+        assert!(start.get("prompt").is_none());
+
+        let stop = run_worker_state_asset("codex", SUBAGENT_STOP_ACTION, &fixture["stop"]);
+        assert_eq!(stop["type"], "subagent_stop");
+        assert_eq!(stop["provider"], "codex");
+        assert_eq!(stop["subagent_id"], "agent-child-1");
+        assert_eq!(stop["outcome"], "completed");
+        assert!(stop.get("agent_transcript_path").is_none());
+        assert!(stop.get("last_assistant_message").is_none());
+    }
+
+    #[test]
     fn rejected_worker_identity_reports_fall_back_to_public_methods() {
         for agent in ["claude", "codex"] {
             let (worker_request, public_requests) = run_worker_state_asset_with_response(
@@ -3570,6 +3711,14 @@ mod tests {
             settings["hooks"][CLAUDE_SESSION_END_EVENT][0]["matcher"],
             json!("*")
         );
+        for (event, action) in [
+            (SUBAGENT_START_EVENT, SUBAGENT_START_ACTION),
+            (SUBAGENT_STOP_EVENT, SUBAGENT_STOP_ACTION),
+        ] {
+            let commands = command_hooks(&settings, event);
+            assert_eq!(commands.len(), 1, "exactly one {event} hook");
+            assert!(commands[0].ends_with(action));
+        }
     }
 
     #[test]
@@ -5141,6 +5290,14 @@ mod tests {
         assert_eq!(commands.len(), 1);
         // Codex SessionStart hook carries no matcher key.
         assert!(hooks["hooks"]["SessionStart"][0].get("matcher").is_none());
+        for (event, action) in [
+            (SUBAGENT_START_EVENT, SUBAGENT_START_ACTION),
+            (SUBAGENT_STOP_EVENT, SUBAGENT_STOP_ACTION),
+        ] {
+            let commands = command_hooks(&hooks, event);
+            assert_eq!(commands.len(), 1, "exactly one {event} hook");
+            assert!(commands[0].ends_with(action));
+        }
 
         let config = fs::read_to_string(codex_dir.join("config.toml")).expect("config.toml");
         assert!(config.contains("[features]"), "config: {config}");

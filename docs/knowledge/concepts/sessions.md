@@ -228,6 +228,22 @@ backed by a live process and age out when unbound. `active_agent`,
 filtering, and detector behavior; they do not change the launch `agent` /
 `agent_base`.
 
+Current Claude and Codex integrations separately observe provider-managed
+subagents. Their `SubagentStart` and `SubagentStop` hooks report only lifecycle
+metadata to the PTY-owning worker: provider, child id, optional parent id, and
+optional agent type. The worker journals multiple concurrent children, assigns
+monotonic decimal-string revisions, and retains bounded completed history across
+daemon and client reconnects. A running child is marked `lost` when its owning
+runtime terminates. This collection does not change the parent session's
+`activity`, launch identity, or recovery binding, and it never contains prompts,
+results, messages, transcript paths, or raw hook payloads.
+
+Human-readable `pohunek session list` shows the running/recent child count, and
+`pohunek session inspect` includes the corresponding lifecycle rows. Streaming
+clients accept `subagent_state` only when its runtime id and generation match
+the current session snapshot; a full list or inspect snapshot seeds state after
+reconnect or native recovery.
+
 Foreground reconciliation selects the recognized process-group leader first;
 when the leader is an unidentified wrapper, it selects a recognized member of
 the same foreground PGID. It never selects a nested agent by kind from another
@@ -263,8 +279,8 @@ logical session id but changes the worker and runtime ids.
 
 `SessionInfo.capabilities.resume` and `.fork` are independent, frozen flags.
 Clients must use them instead of guessing from the provider name. Long-lived
-wire counters (`runtime_generation`, output offsets, terminal watermarks, and
-hook sequences) are canonical unsigned decimal strings so JavaScript clients do
+wire counters (`runtime_generation`, output offsets, terminal watermarks, hook
+sequences, and subagent revisions) are canonical unsigned decimal strings so JavaScript clients do
 not lose precision.
 
 `lost` means the worker or host runtime is gone and the PTY cannot be
@@ -317,6 +333,9 @@ prefer the worker endpoint so accepted state survives daemon outage. Nested
 active-agent reports remain runtime evidence only: they can expose the active
 agent and active native metadata while that process runs, but never populate or
 replace `native_session_id` / `native_session_path` for the parent session.
+Subagent lifecycle hooks use the same owner-private endpoint without a public
+daemon fallback, so their durable worker state continues to advance while the
+daemon or GUI is disconnected.
 Startup reconciliation merges the worker's immutable launch identity into the
 persisted session and recovery binding; it does not replace an already captured
 native reference with an empty worker field.

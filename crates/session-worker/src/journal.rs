@@ -1,6 +1,6 @@
 //! Persists the worker-owned runtime journal atomically.
 
-// Rust guideline compliant 2026-07-23
+// Rust guideline compliant 2026-09-11
 
 use std::fmt::{Debug, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -167,6 +167,47 @@ pub struct ReleasedIdentity {
     pub sequence: u64,
 }
 
+/// Durable lifecycle of one provider-managed subagent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentPhase {
+    /// The subagent is running.
+    Running,
+    /// The subagent completed successfully.
+    Completed,
+    /// The subagent failed.
+    Failed,
+    /// The subagent was cancelled.
+    Cancelled,
+    /// The owning runtime ended before completion was reported.
+    Lost,
+}
+
+/// Sanitized lifecycle state retained by the PTY-owning worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentRecord {
+    /// Provider-native lifecycle correlation identifier.
+    pub id: String,
+    /// Parent subagent identifier, when reported.
+    pub parent_id: Option<String>,
+    /// Provider base name.
+    pub provider: String,
+    /// Provider-defined subagent type, when reported.
+    pub agent_type: Option<String>,
+    /// Current lifecycle phase.
+    pub phase: SubagentPhase,
+    /// Latest provider-supplied ordering sequence.
+    pub sequence: u64,
+    /// Worker-owned monotonic revision.
+    pub revision: u64,
+    /// First accepted start timestamp.
+    pub started_at_ms: u64,
+    /// Latest accepted transition timestamp.
+    pub updated_at_ms: u64,
+    /// Terminal transition timestamp, when terminal.
+    pub finished_at_ms: Option<u64>,
+}
+
 /// Durable non-secret worker state.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalRecord {
@@ -205,6 +246,12 @@ pub struct JournalRecord {
     /// Latest accepted release, distinguishing explicit release from no report.
     #[serde(default)]
     pub active_identity_release: Option<ReleasedIdentity>,
+    /// Worker-owned revision assigned to the next subagent mutation.
+    #[serde(default)]
+    pub subagent_revision: u64,
+    /// Active subagents plus bounded recent terminal history.
+    #[serde(default)]
+    pub subagents: Vec<SubagentRecord>,
     /// Next raw-output byte offset.
     pub next_output_offset: u64,
     /// Whether a daemon durably imported terminal state.
@@ -233,6 +280,8 @@ impl Debug for JournalRecord {
             .field("launch_identity", &self.launch_identity)
             .field("active_identity", &self.active_identity)
             .field("active_identity_release", &self.active_identity_release)
+            .field("subagent_revision", &self.subagent_revision)
+            .field("subagents", &self.subagents)
             .field("next_output_offset", &self.next_output_offset)
             .field("terminal_acknowledged", &self.terminal_acknowledged)
             .field("updated_at", &self.updated_at)
@@ -269,6 +318,8 @@ impl JournalRecord {
             launch_identity: None,
             active_identity: None,
             active_identity_release: None,
+            subagent_revision: 0,
+            subagents: Vec::new(),
             next_output_offset: 0,
             terminal_acknowledged: false,
             updated_at,
@@ -466,7 +517,10 @@ fn temp_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{Journal, JournalError, JournalRecord, LaunchIdentity, ReleasedIdentity};
+    use super::{
+        Journal, JournalError, JournalRecord, LaunchIdentity, ReleasedIdentity, SubagentPhase,
+        SubagentRecord,
+    };
     use crate::ChildIdentity;
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
@@ -510,6 +564,19 @@ mod tests {
                 start_identity: "start-3".to_owned(),
             },
             sequence: 8,
+        });
+        record.subagent_revision = 1;
+        record.subagents.push(SubagentRecord {
+            id: "child-1".to_owned(),
+            parent_id: None,
+            provider: "codex".to_owned(),
+            agent_type: Some("explore".to_owned()),
+            phase: SubagentPhase::Running,
+            sequence: 9,
+            revision: 1,
+            started_at_ms: 100,
+            updated_at_ms: 100,
+            finished_at_ms: None,
         });
         record
     }

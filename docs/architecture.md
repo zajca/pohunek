@@ -460,10 +460,10 @@ Runtime responsibilities:
 ### Agent state detection
 
 This was validated against the source of `herdr` (same Rust + portable-pty +
-Tokio stack) and `Kandev`. Correction to the early assumption: **Codex and Claude
-Code do not report live state via hooks** — herdr explicitly removes their
-lifecycle hooks as unreliable, and Kandev derives PTY state from a virtual
-terminal emulator. State is derived from the terminal stream, in priority order:
+Tokio stack), `Kandev`, and the provider hook contracts. The parent agent's
+coarse activity remains terminal-derived; provider hooks are not treated as a
+replacement for PTY evidence. State is derived from the terminal stream, in
+priority order:
 
 1. **OSC title / progress (primary).** Agents emit OSC 0/2 (title) and OSC 9
    (progress) for their own UIs. A working agent shows a spinner (Braille range
@@ -507,6 +507,15 @@ Hooks have two separate roles:
   `active_agent`, `active_agent_base`, and optional active native metadata, but
   it does not change the shell session's launch `agent` / `agent_base` and does
   not overwrite `native_session_id` / `native_session_path`.
+- **Provider-managed subagent lifecycle.** Current Claude and Codex
+  `SubagentStart` / `SubagentStop` hooks send only the provider, subagent id,
+  optional parent id, and optional agent type to the owner-private worker. The
+  worker validates the runtime and reporting process, rejects stale per-child
+  sequences, journals concurrent subagents, and retains bounded terminal
+  history. Prompt text, results, transcript paths, and raw hook payloads never
+  cross this boundary. Running children become `lost` when their PTY runtime
+  terminates. This state is independent of the parent session's coarse
+  `activity` and survives daemon and GUI reconnects.
 
 Live state remains detector-first: OSC, screen, PTY activity, and process state
 continue to drive normal activity transitions. Notification hooks still target
@@ -1037,7 +1046,7 @@ Integration tests:
 | Discovery | Tailscale + NetBird + signed manifests | NetBird-local + live capability query |
 | Mesh trust | Signed manifests, key rotation, snapshot sync | Owner paths use overlay + filesystem permissions; relay uses explicit enrollment and local `HostShare` ceilings |
 | Audit | Tamper-evident considered | Plain local event log today; durable relay audit and admission foundation implemented in [#85](https://github.com/zajca/pohunek/issues/85), with operational retention and load evidence in [#87](https://github.com/zajca/pohunek/issues/87) |
-| Agent state | Terminal heuristics | OSC title + screen-manifest + PTY activity (per herdr); hooks only capture the session ID for resume |
+| Agent state | Terminal heuristics | OSC title + screen-manifest + PTY activity for parent state; hooks capture recovery identity and durable Claude/Codex subagent lifecycle |
 | Providers | In-tree Linear/GitHub adapters | Deferred, shell-out (`gh`, Linear GraphQL/MCP) in the client surfaces, not the chassis |
 | GUI | libghostty client (MVP5) + spike (MVP0) | Native Rust desktop and mesh-local browser clients shipped; the HTTPS native relay credential CLI is implemented, while the full team client and UI remain [#86](https://github.com/zajca/pohunek/issues/86) |
 | Attach framing | "separate stream mode" (unspecified) | Separate connection per PTY (specified) |

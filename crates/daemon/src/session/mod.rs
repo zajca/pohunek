@@ -20,7 +20,8 @@ use protocol::{
     SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
     SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
     SessionRuntime, SessionRuntimeIdentity, SessionSetMetadataResult, SessionState,
-    SessionStopResult, SessionWarning, StateSource, WorktreeRemoveResult, PROTOCOL_VERSION,
+    SessionStopResult, SessionWarning, StateSource, SubagentInfo, SubagentLifecycle,
+    SubagentRevision, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, Notify};
@@ -689,6 +690,7 @@ fn exit_transition(
     };
     candidate.info.state_source = StateSource::Process;
     candidate.info.activity = None;
+    terminalize_running_subagents(&mut candidate.info.subagents, current_time_millis());
     candidate.active_agent = None;
     candidate.last_agent_report = None;
     candidate.info.active_agent = None;
@@ -2633,7 +2635,7 @@ impl SessionRegistry {
         tokio::spawn(async move {
             let socket_path = initial_worker.socket_path().to_path_buf();
             let mut worker = initial_worker;
-            let mut last_worker_identity = None;
+            let mut last_worker_metadata = None;
             loop {
                 let inspected = tokio::select! {
                     () = cancel.cancelled() => return,
@@ -2641,20 +2643,20 @@ impl SessionRegistry {
                 };
                 match inspected {
                     Ok(snapshot) => {
-                        let worker_identity = worker_identity_fingerprint(&snapshot);
-                        let initial_empty_identity = last_worker_identity.is_none()
-                            && worker_identity_is_empty(&worker_identity);
-                        if !initial_empty_identity
-                            && last_worker_identity.as_ref() != Some(&worker_identity)
+                        let worker_metadata = worker_metadata_fingerprint(&snapshot);
+                        let initial_empty_metadata = last_worker_metadata.is_none()
+                            && worker_metadata_is_empty(&worker_metadata);
+                        if !initial_empty_metadata
+                            && last_worker_metadata.as_ref() != Some(&worker_metadata)
                         {
                             if registry
-                                .apply_worker_identity_snapshot(&id, &snapshot)
+                                .apply_worker_metadata_snapshot(&id, &snapshot)
                                 .await
                             {
-                                last_worker_identity = Some(worker_identity.clone());
+                                last_worker_metadata = Some(worker_metadata.clone());
                             }
                         } else {
-                            last_worker_identity = Some(worker_identity.clone());
+                            last_worker_metadata = Some(worker_metadata.clone());
                         }
                         if snapshot.phase == pohunek_worker_protocol::RuntimePhase::Exited {
                             let exit = snapshot.exit.map_or(
@@ -2800,6 +2802,7 @@ impl SessionRegistry {
             let base = Self::session_record(id, entry, entry.desired_state, None);
             let mut candidate = entry.clone();
             candidate.runtime = RuntimeHandle::Unavailable(RuntimeState::Lost);
+            terminalize_running_subagents(&mut candidate.info.subagents, current_time_millis());
             if let Some(runtime) = candidate.info.runtime.as_mut() {
                 runtime.state = RuntimeState::Lost;
                 runtime.loss_reason = Some("worker_process_lost".to_owned());
@@ -3275,24 +3278,26 @@ impl SessionRegistry {
     }
 }
 
-type WorkerIdentityFingerprint = (
+type WorkerMetadataFingerprint = (
     Option<pohunek_worker_protocol::ReportedLaunchIdentity>,
     Option<pohunek_worker_protocol::ActiveIdentityClaim>,
     Option<pohunek_worker_protocol::ReleasedIdentityClaim>,
+    Vec<pohunek_worker_protocol::SubagentSnapshot>,
 );
 
-fn worker_identity_fingerprint(
+fn worker_metadata_fingerprint(
     snapshot: &pohunek_worker_protocol::InspectSnapshot,
-) -> WorkerIdentityFingerprint {
+) -> WorkerMetadataFingerprint {
     (
         snapshot.launch_identity.clone(),
         snapshot.active_identity.clone(),
         snapshot.active_identity_release.clone(),
+        snapshot.subagents.clone(),
     )
 }
 
-fn worker_identity_is_empty(identity: &WorkerIdentityFingerprint) -> bool {
-    identity.0.is_none() && identity.1.is_none() && identity.2.is_none()
+fn worker_metadata_is_empty(identity: &WorkerMetadataFingerprint) -> bool {
+    identity.0.is_none() && identity.1.is_none() && identity.2.is_none() && identity.3.is_empty()
 }
 
 fn identity_claim_expiry_is_valid(value: &str) -> bool {
@@ -3367,6 +3372,7 @@ fn external_session_info(
         state: SessionState::Running,
         state_source: StateSource::Process,
         activity: None,
+        subagents: Vec::new(),
         active_agent: None,
         active_agent_base: None,
         active_agent_pid: None,
@@ -3825,6 +3831,38 @@ fn current_time_millis() -> u64 {
         .unwrap_or_default()
         .as_millis();
     u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+fn terminalize_running_subagents(subagents: &mut [SubagentInfo], occurred_at_ms: u64) {
+    let mut revision = subagents
+        .iter()
+        .map(|subagent| subagent.revision.get())
+        .max()
+        .unwrap_or(0);
+    for subagent in subagents
+        .iter_mut()
+        .filter(|subagent| subagent.lifecycle == SubagentLifecycle::Running)
+    {
+        revision = revision.saturating_add(1);
+        subagent.lifecycle = SubagentLifecycle::Lost;
+        subagent.activity = None;
+        subagent.revision = SubagentRevision::new(revision);
+        subagent.updated_at_ms = occurred_at_ms;
+        subagent.finished_at_ms = Some(occurred_at_ms);
+    }
+    sort_subagents(subagents);
+}
+
+fn sort_subagents(subagents: &mut [SubagentInfo]) {
+    subagents.sort_by(|left, right| {
+        let left_terminal = left.lifecycle != SubagentLifecycle::Running;
+        let right_terminal = right.lifecycle != SubagentLifecycle::Running;
+        left_terminal
+            .cmp(&right_terminal)
+            .then_with(|| right.started_at_ms.cmp(&left.started_at_ms))
+            .then_with(|| left.provider.as_wire().cmp(right.provider.as_wire()))
+            .then_with(|| left.id.cmp(&right.id))
+    });
 }
 
 #[cfg(test)]

@@ -277,6 +277,9 @@ pub(crate) fn parse_event_message(host_id: &HostId, line: &str) -> Result<Domain
     let raw: Event = serde_json::from_str(line)?;
     let event = match raw.event() {
         event::AGENT_STATE => HostEvent::AgentState(parse_agent_state(raw)?),
+        event::SUBAGENT_STATE => {
+            HostEvent::SubagentState(serde_json::from_value(raw.payload().clone())?)
+        }
         event::SESSION_CREATED => HostEvent::SessionCreated(parse_session_event(&raw)?),
         event::SESSION_UPDATED => HostEvent::SessionUpdated(parse_session_event(&raw)?),
         event::SESSION_STOPPED => HostEvent::SessionStopped(parse_session_event(&raw)?),

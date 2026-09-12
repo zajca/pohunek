@@ -1,0 +1,29 @@
+{
+  "source": "https://github.com/openai/codex/blob/main/codex-rs/hooks/src/schema.rs",
+  "captured_at": "2026-09-11",
+  "start": {
+    "session_id": "session-parent-1",
+    "turn_id": "turn-child-1",
+    "transcript_path": "/sanitized/parent.jsonl",
+    "cwd": "/sanitized/project",
+    "hook_event_name": "SubagentStart",
+    "model": "sanitized-model",
+    "permission_mode": "default",
+    "agent_id": "agent-child-1",
+    "agent_type": "reviewer"
+  },
+  "stop": {
+    "session_id": "session-parent-1",
+    "turn_id": "turn-child-1",
+    "transcript_path": "/sanitized/parent.jsonl",
+    "agent_transcript_path": "/sanitized/child.jsonl",
+    "cwd": "/sanitized/project",
+    "hook_event_name": "SubagentStop",
+    "model": "sanitized-model",
+    "permission_mode": "default",
+    "stop_hook_active": false,
+    "agent_id": "agent-child-1",
+    "agent_type": "reviewer",
+    "last_assistant_message": "sanitized result that must not cross the hook boundary"
+  }
+}

@@ -17,7 +17,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-// Rust guideline compliant 2026-08-31
+// Rust guideline compliant 2026-09-11
 
 /// Prefix for daemon-generated, producer-scoped control input identifiers.
 const INPUT_WRITE_ID_PREFIX: &str = "input";
@@ -959,12 +959,15 @@ fn requested_capabilities(selected_version: Version, advertised: &[Capability]) 
         Capability::IdentityHook,
         Capability::AttachSnapshot,
         Capability::ControlPlaneObservation,
+        Capability::SubagentObservation,
     ]
     .into_iter()
     .filter(|capability| {
         (*capability != Capability::AttachSnapshot || selected_version >= ATTACH_SNAPSHOT_VERSION)
             && (*capability != Capability::ControlPlaneObservation
                 || selected_version >= pohunek_worker_protocol::CONTROL_PLANE_OBSERVATION_VERSION)
+            && (*capability != Capability::SubagentObservation
+                || selected_version >= pohunek_worker_protocol::SUBAGENT_OBSERVATION_VERSION)
             && advertised.contains(capability)
     })
     .collect()
@@ -1249,7 +1252,7 @@ mod tests {
     }
 
     #[test]
-    fn previous_negotiation_preserves_attach_snapshot_but_not_observation() {
+    fn previous_negotiation_preserves_established_capabilities() {
         let requested = requested_capabilities(
             pohunek_worker_protocol::PREVIOUS_VERSION,
             &[
@@ -1261,7 +1264,11 @@ mod tests {
 
         assert_eq!(
             requested,
-            vec![Capability::AtomicReplay, Capability::AttachSnapshot]
+            vec![
+                Capability::AtomicReplay,
+                Capability::AttachSnapshot,
+                Capability::ControlPlaneObservation,
+            ]
         );
     }
 
@@ -1272,6 +1279,21 @@ mod tests {
             &[Capability::ControlPlaneObservation],
         );
         assert_eq!(requested, vec![Capability::ControlPlaneObservation]);
+    }
+
+    #[test]
+    fn subagent_observation_requires_current_protocol() {
+        let current = requested_capabilities(
+            pohunek_worker_protocol::CURRENT_VERSION,
+            &[Capability::SubagentObservation],
+        );
+        let previous = requested_capabilities(
+            pohunek_worker_protocol::PREVIOUS_VERSION,
+            &[Capability::SubagentObservation],
+        );
+
+        assert_eq!(current, vec![Capability::SubagentObservation]);
+        assert!(previous.is_empty());
     }
 
     #[tokio::test]

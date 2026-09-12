@@ -12,6 +12,7 @@ import {
   EVENT_SESSION_REMOVED,
   EVENT_SESSION_STOPPED,
   EVENT_SESSION_UPDATED,
+  EVENT_SUBAGENT_STATE,
   MAX_CONTROL_LINE_BYTES,
   MAX_RUNTIME_ID_BYTES,
   MAX_SESSION_OUTPUT_BYTES,
@@ -74,6 +75,7 @@ import {
   type SessionWaitResult,
   type WorktreeRemoveParams,
   type StateSource,
+  type SubagentInfo,
   type TerminalDimensions,
 } from "@pohunek/protocol";
 import { ActivePtyAttach, FixturePtyRegistry, type FixturePtyEvents, type FixturePtyOptions } from "./pty";
@@ -364,6 +366,31 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     for (const waiter of [...(this.activityWaiters.get(sessionId) ?? [])]) {
       waiter({ kind: "activity", evidence });
     }
+  }
+
+  public setSubagentState(sessionId: string, subagent: SubagentInfo): void {
+    const session = this.requireSession(sessionId);
+    const observation = this.observation(sessionId);
+    const index = (session.subagents ?? []).findIndex(
+      (current) => current.provider === subagent.provider && current.id === subagent.id,
+    );
+    session.subagents ??= [];
+    if (index >= 0) {
+      session.subagents[index] = cloneValue(subagent);
+    } else {
+      session.subagents.push(cloneValue(subagent));
+    }
+    session.updated_at = timestamp();
+    this.emitEvent({
+      v: PROTOCOL_VERSION,
+      event: EVENT_SUBAGENT_STATE,
+      session_id: sessionId,
+      subagent: cloneValue(subagent),
+      runtime: {
+        runtime_id: observation.runtime_id,
+        runtime_generation: observation.runtime_generation.toString(),
+      },
+    });
   }
 
   public removeSession(sessionId: string): void {

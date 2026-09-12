@@ -3,6 +3,8 @@ import type {
   NotificationRecord,
   ProtocolEvent,
   SessionInfo,
+  SubagentInfo,
+  SessionRuntimeIdentity,
 } from "@pohunek/protocol";
 
 export interface ReducedSession {
@@ -73,6 +75,9 @@ export function reduceHostEvent(state: HostDataState, event: ReducerEvent): Host
   if (isEventName(event, "agent_state")) {
     return updateAgentState(state, event.session_id, event.activity, event.source);
   }
+  if (isEventName(event, "subagent_state")) {
+    return updateSubagentState(state, event.session_id, event.subagent, event.runtime);
+  }
   if (isEventName(event, "attach_opened")) {
     return updateAttach(state, event.session_id, event.stream_id, true);
   }
@@ -86,6 +91,47 @@ export function reduceHostEvent(state: HostDataState, event: ReducerEvent): Host
     return removeNotification(state, event.notification_id);
   }
   return state;
+}
+
+function updateSubagentState(
+  state: HostDataState,
+  sessionId: string,
+  subagent: SubagentInfo,
+  runtime: SessionRuntimeIdentity | undefined,
+): HostDataState {
+  const existing = state.sessions[sessionId];
+  if (existing === undefined) {
+    return state;
+  }
+  if (
+    runtime === undefined
+    || existing.session.runtime?.runtime_id !== runtime.runtime_id
+    || existing.session.runtime.runtime_generation !== runtime.runtime_generation
+  ) {
+    return state;
+  }
+  const subagents = [...(existing.session.subagents ?? [])];
+  const index = subagents.findIndex(
+    (current) => current.provider === subagent.provider && current.id === subagent.id,
+  );
+  if (index >= 0 && BigInt(subagents[index]!.revision) >= BigInt(subagent.revision)) {
+    return state;
+  }
+  if (index >= 0) {
+    subagents[index] = structuredClone(subagent);
+  } else {
+    subagents.push(structuredClone(subagent));
+  }
+  return {
+    ...state,
+    sessions: {
+      ...state.sessions,
+      [sessionId]: {
+        ...existing,
+        session: { ...existing.session, subagents },
+      },
+    },
+  };
 }
 
 function upsertSession(

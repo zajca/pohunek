@@ -1,6 +1,6 @@
 //! Native Iced shell for the pohunek control plane.
 
-// Rust guideline compliant 2026-08-28
+// Rust guideline compliant 2026-09-11
 #![forbid(unsafe_code)]
 
 mod attach;
@@ -367,6 +367,7 @@ mod tests {
             state,
             state_source: protocol::StateSource::Process,
             activity: None,
+            subagents: Vec::new(),
             active_agent: None,
             active_agent_base: None,
             active_agent_pid: None,
