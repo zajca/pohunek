@@ -762,6 +762,11 @@ mod credential_router_tests {
         limits.body_bytes = 8 * 1024;
         limits.response_bytes = 64 * 1024;
         limits.requests_per_window = 100;
+        // The shared fixture's 20 ms request budget is tight enough that a loaded
+        // CI runner can time out the very bearer request this suite asserts on
+        // (408 instead of 200). Give router tests the configured production-scale
+        // ceiling; the in-bound request timeout still bounds stalled work.
+        limits.request_timeout = Duration::from_millis(crate::config::MAX_REQUEST_TIMEOUT_MS);
         Config {
             relay_id: "test-relay".to_owned(),
             bind: "127.0.0.1:0".parse().expect("test bind"),

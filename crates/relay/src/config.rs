@@ -41,7 +41,8 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PENDING_LOGINS: usize = 1024;
 const MAX_REQUESTS_PER_WINDOW: u32 = 10_000;
-const MAX_REQUEST_TIMEOUT_MS: u64 = 30_000;
+/// Configured ceiling for one in-bound HTTP request; also the router-test budget.
+pub(crate) const MAX_REQUEST_TIMEOUT_MS: u64 = 30_000;
 const MAX_CONNECTION_LIFETIME_MS: u64 = 3_600_000;
 const MAX_RATE_WINDOW_MS: u64 = 60_000;
 const MAX_LOGIN_LIFETIME_MS: u64 = 15 * 60_000;
