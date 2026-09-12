@@ -124,7 +124,11 @@ impl SessionRegistry {
                 validate_worker_identity_processes(&*self.inner.inspector, snapshot)
             {
                 let (reason, retryable) = failure.reason_and_retryability();
-                tracing::warn!(session_id = %id.0, reason, retryable, "rejected worker identity process claim");
+                if retryable {
+                    tracing::debug!(session_id = %id.0, reason, "worker identity process validation is retryable");
+                } else {
+                    tracing::warn!(session_id = %id.0, reason, "rejected worker identity process claim");
+                }
                 identities_accepted = false;
                 outcome = if retryable {
                     WorkerMetadataApplyOutcome::Retryable
@@ -145,7 +149,7 @@ impl SessionRegistry {
             Ok(None) if self.inner.store.is_none() => memory_base.clone(),
             Ok(None) => return WorkerMetadataApplyOutcome::Discarded,
             Err(error) => {
-                tracing::warn!(session_id = %id.0, error = %error, "failed to load durable worker metadata base");
+                tracing::debug!(session_id = %id.0, error = %error, "worker metadata store load is retryable");
                 return WorkerMetadataApplyOutcome::Retryable;
             }
         };
@@ -181,7 +185,7 @@ impl SessionRegistry {
                 .write_session_record_if_current(durable_base, candidate.clone())
                 .await
             {
-                tracing::warn!(session_id = %id.0, error = %error, "failed to persist worker metadata snapshot");
+                tracing::debug!(session_id = %id.0, error = %error, "worker metadata store write did not commit");
                 return metadata_write_failure_outcome(&error);
             }
         }
@@ -210,7 +214,7 @@ impl SessionRegistry {
                     .write_session_record_if_current(durable_before_rebase, candidate.clone())
                     .await
                 {
-                    tracing::warn!(session_id = %id.0, error = %error, "failed to persist rebased worker metadata snapshot");
+                    tracing::debug!(session_id = %id.0, error = %error, "rebased worker metadata store write did not commit");
                     return metadata_write_failure_outcome(&error);
                 }
             }

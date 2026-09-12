@@ -105,8 +105,10 @@ const DEFAULT_WORKER_CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 const WORKER_CONNECT_RETRY: Duration = Duration::from_millis(100);
 /// Bounds optimistic terminal-state CAS retries before surfacing contention.
 const MAX_RUNTIME_TRANSITION_COMMIT_ATTEMPTS: usize = 8;
-/// Bounds repeated processing of one unchanged worker metadata fingerprint.
-const MAX_WORKER_METADATA_RETRY_ATTEMPTS: usize = 3;
+/// Caps retry load while preserving eventual recovery of unchanged metadata.
+const MAX_WORKER_METADATA_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// Prevents a persistent retryable failure from flooding daemon logs.
+const WORKER_METADATA_RETRY_WARN_INTERVAL: Duration = Duration::from_secs(30);
 /// Per-subscriber worker output queue. It absorbs repaint bursts without
 /// duplicating the larger raw-history budget for every subscriber.
 const DEFAULT_WORKER_SUBSCRIBER_BYTES: u64 = 1_000_000;
@@ -2676,8 +2678,7 @@ impl SessionRegistry {
         tokio::spawn(async move {
             let socket_path = initial_worker.socket_path().to_path_buf();
             let mut worker = initial_worker;
-            let mut last_worker_metadata = None;
-            let mut pending_worker_metadata = None;
+            let mut metadata = WorkerMetadataTracker::default();
             loop {
                 let mut retry_delay = WORKER_CONNECT_RETRY;
                 let inspected = tokio::select! {
@@ -2687,45 +2688,32 @@ impl SessionRegistry {
                 match inspected {
                     Ok(snapshot) => {
                         let worker_metadata = worker_metadata_fingerprint(&snapshot);
-                        let initial_empty_metadata = last_worker_metadata.is_none()
-                            && worker_metadata_is_empty(&worker_metadata);
-                        if !initial_empty_metadata
-                            && last_worker_metadata.as_ref() != Some(&worker_metadata)
-                        {
+                        let initial_empty_metadata =
+                            metadata.is_initial() && worker_metadata_is_empty(&worker_metadata);
+                        if !initial_empty_metadata && metadata.should_apply(&worker_metadata) {
                             match registry
                                 .apply_worker_metadata_snapshot(&id, &snapshot)
                                 .await
                             {
                                 WorkerMetadataApplyOutcome::Applied
                                 | WorkerMetadataApplyOutcome::Discarded => {
-                                    last_worker_metadata = Some(worker_metadata.clone());
-                                    pending_worker_metadata = None;
+                                    metadata.complete(worker_metadata.clone());
                                 }
                                 WorkerMetadataApplyOutcome::Retryable => {
-                                    let attempts = pending_worker_metadata
-                                        .as_ref()
-                                        .filter(|(pending, _)| pending == &worker_metadata)
-                                        .map_or(1, |(_, attempts)| attempts + 1);
-                                    if attempts >= MAX_WORKER_METADATA_RETRY_ATTEMPTS {
+                                    let retry = metadata.retry(&worker_metadata, Instant::now());
+                                    if retry.should_warn {
                                         warn!(
                                             session_id = %id.0,
-                                            attempts,
-                                            "worker metadata retry limit reached"
+                                            attempts = retry.attempts,
+                                            retry_delay_ms = retry.delay.as_millis(),
+                                            "worker metadata remains retryable"
                                         );
-                                        last_worker_metadata = Some(worker_metadata.clone());
-                                        pending_worker_metadata = None;
-                                    } else {
-                                        retry_delay = WORKER_CONNECT_RETRY.saturating_mul(
-                                            u32::try_from(attempts + 1).unwrap_or(u32::MAX),
-                                        );
-                                        pending_worker_metadata =
-                                            Some((worker_metadata.clone(), attempts));
                                     }
+                                    retry_delay = retry.delay;
                                 }
                             }
                         } else {
-                            last_worker_metadata = Some(worker_metadata.clone());
-                            pending_worker_metadata = None;
+                            metadata.complete(worker_metadata.clone());
                         }
                         if snapshot.phase == pohunek_worker_protocol::RuntimePhase::Exited {
                             let exit = snapshot.exit.map_or(
@@ -3374,6 +3362,65 @@ enum WorkerMetadataApplyOutcome {
     Discarded,
 }
 
+#[derive(Debug, Default)]
+struct WorkerMetadataTracker {
+    completed: Option<WorkerMetadataFingerprint>,
+    pending: Option<(WorkerMetadataFingerprint, usize)>,
+    last_retry_warning: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerMetadataRetry {
+    attempts: usize,
+    delay: Duration,
+    should_warn: bool,
+}
+
+impl WorkerMetadataTracker {
+    fn is_initial(&self) -> bool {
+        self.completed.is_none() && self.pending.is_none()
+    }
+
+    fn should_apply(&self, fingerprint: &WorkerMetadataFingerprint) -> bool {
+        self.completed.as_ref() != Some(fingerprint)
+    }
+
+    fn complete(&mut self, fingerprint: WorkerMetadataFingerprint) {
+        self.completed = Some(fingerprint);
+        self.pending = None;
+        self.last_retry_warning = None;
+    }
+
+    fn retry(
+        &mut self,
+        fingerprint: &WorkerMetadataFingerprint,
+        now: Instant,
+    ) -> WorkerMetadataRetry {
+        let attempts = self
+            .pending
+            .as_ref()
+            .filter(|(pending, _)| pending == fingerprint)
+            .map_or(1, |(_, attempts)| attempts.saturating_add(1));
+        self.pending = Some((fingerprint.clone(), attempts));
+        let multiplier =
+            2_u32.saturating_pow(u32::try_from(attempts.saturating_sub(1)).unwrap_or(u32::MAX));
+        let delay = WORKER_CONNECT_RETRY
+            .saturating_mul(multiplier)
+            .min(MAX_WORKER_METADATA_RETRY_DELAY);
+        let should_warn = self.last_retry_warning.is_none_or(|last_warning| {
+            now.saturating_duration_since(last_warning) >= WORKER_METADATA_RETRY_WARN_INTERVAL
+        });
+        if should_warn {
+            self.last_retry_warning = Some(now);
+        }
+        WorkerMetadataRetry {
+            attempts,
+            delay,
+            should_warn,
+        }
+    }
+}
+
 fn worker_metadata_fingerprint(
     snapshot: &pohunek_worker_protocol::InspectSnapshot,
 ) -> WorkerMetadataFingerprint {
@@ -3948,6 +3995,26 @@ fn preserve_durable_worker_metadata(existing: &SessionRecord, replacement: &mut 
         .info
         .active_agent_session_path
         .clone_from(&existing.info.active_agent_session_path);
+    replacement
+        .info
+        .native_session_id
+        .clone_from(&existing.info.native_session_id);
+    replacement
+        .info
+        .native_session_path
+        .clone_from(&existing.info.native_session_path);
+    match (replacement.recovery.as_mut(), existing.recovery.as_ref()) {
+        (Some(replacement), Some(existing)) => {
+            replacement
+                .native_session_id
+                .clone_from(&existing.native_session_id);
+            replacement
+                .native_session_path
+                .clone_from(&existing.native_session_path);
+        }
+        (None, Some(existing)) => replacement.recovery = Some(existing.clone()),
+        _ => {}
+    }
     crate::store::preserve_newer_native_identity(existing, replacement);
     preserve_newer_updated_at(&existing.info.updated_at, &mut replacement.info.updated_at);
 }

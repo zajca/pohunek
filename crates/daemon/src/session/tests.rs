@@ -34,10 +34,11 @@ use crate::project::detect::project_id;
 use crate::runtime::{Worker, WorkerError};
 
 use super::{
-    native_report_is_current, terminalize_running_subagents, timestamp_now,
-    worker_error_to_protocol, InputSubmission, RuntimeExit, RuntimeHandle, RuntimeWatchIdentity,
-    SessionEntry, SessionRegistry, SessionRegistryConfig, ShellCommand, WorkerMetadataApplyOutcome,
-    MAX_SESSION_NAME_BYTES,
+    native_report_is_current, preserve_durable_worker_metadata, terminalize_running_subagents,
+    timestamp_now, worker_error_to_protocol, InputSubmission, RuntimeExit, RuntimeHandle,
+    RuntimeWatchIdentity, SessionEntry, SessionRegistry, SessionRegistryConfig, ShellCommand,
+    WorkerMetadataApplyOutcome, WorkerMetadataTracker, MAX_SESSION_NAME_BYTES,
+    MAX_WORKER_METADATA_RETRY_DELAY, WORKER_METADATA_RETRY_WARN_INTERVAL,
 };
 
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.
@@ -5622,6 +5623,127 @@ async fn worker_metadata_retry_preserves_newer_memory_timestamp() {
     assert_eq!(recovery.project_id.as_deref(), Some("p-concurrent"));
     assert_eq!(recovery.is_linked_worktree, Some(true));
     let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn durable_launch_identity_survives_worker_metadata_rebase() {
+    let store_path = temp_store_path("worker-launch-identity-rebase");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        agents_dir: Some(temp_resumable_agents_dir("worker-launch-identity-rebase")),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(SessionNewParams {
+            agent: "resumable".to_owned(),
+            ..params()
+        })
+        .await
+        .expect("create resumable session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    snapshot.launch_identity = Some(pohunek_worker_protocol::ReportedLaunchIdentity {
+        provider: "claude".to_owned(),
+        process: snapshot.child_process.expect("worker child"),
+        reference_kind: "id".to_owned(),
+        native_reference: "durable-launch-native".to_owned(),
+    });
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied,
+        "launch identity must commit"
+    );
+
+    let durable = crate::store::Store::new(store_path)
+        .load_sessions()
+        .expect("load launch identity")
+        .pop()
+        .expect("durable session");
+    assert!(
+        durable.native_identity_ordering.is_none(),
+        "launch identity has no sequenced ordering key"
+    );
+    let mut rebased = durable.clone();
+    rebased.info.native_session_id = None;
+    rebased
+        .recovery
+        .as_mut()
+        .expect("recovery binding")
+        .native_session_id = None;
+    rebased.info.cwd = PathBuf::from("/tmp/concurrent-launch-cwd");
+
+    preserve_durable_worker_metadata(&durable, &mut rebased);
+
+    assert_eq!(
+        rebased.info.native_session_id.as_deref(),
+        Some("durable-launch-native")
+    );
+    assert_eq!(
+        rebased
+            .recovery
+            .as_ref()
+            .and_then(|recovery| recovery.native_session_id.as_deref()),
+        Some("durable-launch-native")
+    );
+    assert_eq!(
+        rebased.info.cwd,
+        PathBuf::from("/tmp/concurrent-launch-cwd")
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[test]
+fn metadata_tracker_recovers_unchanged_fingerprint_after_previous_limit() {
+    let fingerprint = (None, None, None, Vec::new());
+    let mut tracker = WorkerMetadataTracker::default();
+    let now = Instant::now();
+
+    let mut last_retry = None;
+    for expected_attempt in 1..=8 {
+        assert!(
+            tracker.should_apply(&fingerprint),
+            "retryable fingerprint must remain pending after attempt {expected_attempt}"
+        );
+        let retry = tracker.retry(&fingerprint, now);
+        assert_eq!(retry.attempts, expected_attempt);
+        assert_eq!(retry.should_warn, expected_attempt == 1);
+        last_retry = Some(retry);
+    }
+    assert_eq!(
+        last_retry.expect("retry result").delay,
+        MAX_WORKER_METADATA_RETRY_DELAY,
+        "exponential retry delay must stop at the configured ceiling"
+    );
+    assert!(
+        tracker.should_apply(&fingerprint),
+        "the old three-attempt boundary must not complete retryable metadata"
+    );
+    assert!(
+        !tracker
+            .retry(
+                &fingerprint,
+                (now + WORKER_METADATA_RETRY_WARN_INTERVAL)
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("warning interval exceeds one millisecond"),
+            )
+            .should_warn,
+        "retry warning must remain throttled inside the interval"
+    );
+    assert!(
+        tracker
+            .retry(&fingerprint, now + WORKER_METADATA_RETRY_WARN_INTERVAL,)
+            .should_warn,
+        "retry warning may repeat after the throttle interval"
+    );
+
+    tracker.complete(fingerprint.clone());
+    assert!(
+        !tracker.should_apply(&fingerprint),
+        "successful recovery completes the unchanged fingerprint"
+    );
 }
 
 #[tokio::test]
