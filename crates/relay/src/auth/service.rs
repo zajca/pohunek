@@ -57,6 +57,7 @@ pub struct AuthLimits {
     device_poll_lease: Duration,
     device_slow_down_increment: Duration,
     max_device_poll_interval: Duration,
+    evidence_challenge_lifetime: Duration,
 }
 
 impl AuthLimits {
@@ -81,6 +82,7 @@ impl AuthLimits {
         device_poll_lease: Duration,
         device_slow_down_increment: Duration,
         max_device_poll_interval: Duration,
+        evidence_challenge_lifetime: Duration,
     ) -> Result<Self, AuthError> {
         if login_lifetime.is_zero()
             || browser_session_lifetime.is_zero()
@@ -93,6 +95,7 @@ impl AuthLimits {
             || device_poll_lease.is_zero()
             || device_slow_down_increment.is_zero()
             || max_device_poll_interval.is_zero()
+            || evidence_challenge_lifetime.is_zero()
             || browser_session_idle > browser_session_lifetime
             || device_slow_down_increment > max_device_poll_interval
             || max_rotation_overlap > human_credential_lifetime
@@ -112,6 +115,7 @@ impl AuthLimits {
             device_poll_lease,
             device_slow_down_increment,
             max_device_poll_interval,
+            evidence_challenge_lifetime,
         })
     }
 
@@ -143,6 +147,12 @@ impl AuthLimits {
     #[must_use]
     pub const fn service_accounts_per_team(&self) -> usize {
         self.service_accounts_per_team
+    }
+
+    /// Returns the one-use evidence challenge lifetime.
+    #[must_use]
+    pub const fn evidence_challenge_lifetime(&self) -> Duration {
+        self.evidence_challenge_lifetime
     }
 }
 
@@ -2751,6 +2761,7 @@ pub(crate) mod tests {
             Duration::from_secs(30),
             Duration::from_secs(5),
             Duration::from_mins(1),
+            Duration::from_mins(5),
         )
         .expect("valid explicit authentication limits")
     }
@@ -2816,9 +2827,10 @@ pub(crate) mod tests {
             .await
             .expect("create isolated schema");
         sqlx::raw_sql(AssertSqlSafe(format!(
-            "SET search_path TO {schema};{};{}",
+            "SET search_path TO {schema};{};{};{}",
             include_str!("../../migrations/0001_relay_foundation.sql"),
-            include_str!("../../migrations/0002_auth.sql")
+            include_str!("../../migrations/0002_auth.sql"),
+            include_str!("../../migrations/0003_evidence_v1.sql")
         )))
         .execute(bootstrap.pool())
         .await
@@ -4611,6 +4623,7 @@ pub(crate) mod tests {
             Duration::from_secs(30),
             Duration::from_secs(5),
             Duration::from_mins(1),
+            Duration::from_mins(5),
         )
         .expect("cap-one limits");
         let service = AuthService::new(
@@ -4925,6 +4938,7 @@ pub(crate) mod tests {
             Duration::from_secs(1),
             1,
             1,
+            Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(1),

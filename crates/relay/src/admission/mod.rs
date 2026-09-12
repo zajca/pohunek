@@ -2458,9 +2458,10 @@ mod tests {
             .await
             .expect("create isolated schema");
         sqlx::raw_sql(AssertSqlSafe(format!(
-            "SET search_path TO {schema};{};{}",
+            "SET search_path TO {schema};{};{};{}",
             include_str!("../../migrations/0001_relay_foundation.sql"),
-            include_str!("../../migrations/0002_auth.sql")
+            include_str!("../../migrations/0002_auth.sql"),
+            include_str!("../../migrations/0003_evidence_v1.sql")
         )))
         .execute(bootstrap.pool())
         .await

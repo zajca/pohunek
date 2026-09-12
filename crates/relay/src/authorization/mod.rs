@@ -217,6 +217,7 @@ fn builtin_permission(role: &str, permission: &str, actor_kind: crate::store::Ac
             | "team.membership.read"
             | "team.membership.manage"
             | "team.group.manage"
+            | "team.admission.manage"
             | "team.role.manage"
             | "team.grant.manage"
             | "session.metadata.read"
@@ -230,4 +231,25 @@ fn builtin_permission(role: &str, permission: &str, actor_kind: crate::store::Ac
         && known
         && (matches!(role, "owner" | "admin")
             || (role == "member" && permission == "team.membership.read"))
+}
+#[cfg(test)]
+mod tests {
+    use crate::store::ActorKind;
+
+    use super::builtin_permission;
+
+    #[test]
+    fn admission_manage_is_granted_to_owner_and_admin_but_not_member_or_service() {
+        let human_kinds = [ActorKind::Human, ActorKind::Infrastructure];
+        for kind in human_kinds {
+            assert!(builtin_permission("owner", "team.admission.manage", kind));
+            assert!(builtin_permission("admin", "team.admission.manage", kind));
+            assert!(!builtin_permission("member", "team.admission.manage", kind));
+        }
+        assert!(!builtin_permission(
+            "owner",
+            "team.admission.manage",
+            ActorKind::Service
+        ));
+    }
 }

@@ -39,19 +39,12 @@ pub(crate) struct BoundedListener {
 impl axum_server::AddrListener<BoundedStream<tokio::net::TcpStream>, BoundedAddress>
     for BoundedListener
 {
-    async fn bind_to(addr: BoundedAddress) -> io::Result<Self> {
-        let socket = if addr.socket.is_ipv4() {
-            tokio::net::TcpSocket::new_v4()?
-        } else {
-            tokio::net::TcpSocket::new_v6()?
-        };
-        socket.bind(addr.socket)?;
-        Ok(Self {
-            socket: socket.listen(addr.limits.backlog)?,
-            capacity: Arc::new(Semaphore::new(addr.limits.connections)),
-            limits: addr.limits,
-            shutdown: addr.shutdown,
-        })
+    // The trait mandates a future-returning signature. Binding is fully
+    // synchronous (socket create + bind + listen), so the future is a plain
+    // `ready` wrapper: `async fn` would trip `clippy::unused_async_trait_impl`,
+    // a lint that postdates the workspace MSRV.
+    fn bind_to(addr: BoundedAddress) -> impl Future<Output = io::Result<Self>> {
+        std::future::ready(Self::bind_sync(addr))
     }
 
     async fn accept_stream(
@@ -88,6 +81,23 @@ impl axum_server::AddrListener<BoundedStream<tokio::net::TcpStream>, BoundedAddr
             socket: self.socket.local_addr()?,
             limits: self.limits.clone(),
             shutdown: self.shutdown.clone(),
+        })
+    }
+}
+
+impl BoundedListener {
+    fn bind_sync(addr: BoundedAddress) -> io::Result<Self> {
+        let socket = if addr.socket.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        socket.bind(addr.socket)?;
+        Ok(Self {
+            socket: socket.listen(addr.limits.backlog)?,
+            capacity: Arc::new(Semaphore::new(addr.limits.connections)),
+            limits: addr.limits,
+            shutdown: addr.shutdown,
         })
     }
 }

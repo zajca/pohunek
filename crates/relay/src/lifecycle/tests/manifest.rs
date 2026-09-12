@@ -173,7 +173,7 @@ async fn durable_quarantine_and_manifest_bind_service_and_credential_authority()
         );
         tx.commit().await.expect("locale transaction commit");
     }
-    assert_eq!(reviewed.version(), 2);
+    assert_eq!(reviewed.version(), 4);
     assert_eq!(
         reviewed,
         lifecycle
@@ -307,6 +307,169 @@ async fn durable_quarantine_and_manifest_bind_service_and_credential_authority()
         .await
         .expect("reviewed reopen");
     cleanup(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "One recovery test seeds both unbounded histories and verifies restored corruption"
+)]
+async fn history_summaries_are_bounded_and_bind_every_row() {
+    let (store, schema, pool, witness, _directory) = fixture().await;
+    let lifecycle = Lifecycle::new(store.clone(), witness);
+    lifecycle
+        .bootstrap_local(request())
+        .await
+        .expect("bootstrap");
+    let principal: Uuid = sqlx::query_scalar("SELECT id FROM principals")
+        .fetch_one(store.pool())
+        .await
+        .expect("bootstrap principal");
+    let team = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO teams (team_id,display_name,state,policy_generation,revision) VALUES ($1,'History team','active',1,1)",
+    )
+        .bind(team)
+        .execute(store.pool())
+        .await
+        .expect("seed history team");
+    let rule = Uuid::now_v7();
+    let version_count = i64::try_from(MAX_MANIFEST_ROWS + 1).expect("test count fits i64");
+    sqlx::query(
+        "INSERT INTO admission_rule_versions (admission_rule_id,revision,team_id,provider,method,match_value,state) SELECT $1,revision,$2,'github','github_organization','example-org','active' FROM generate_series(1,$3) AS revision",
+    )
+    .bind(rule)
+    .bind(team)
+    .bind(version_count)
+    .execute(store.pool())
+    .await
+    .expect("seed rule-version history beyond the manifest row limit");
+    sqlx::query(
+        "INSERT INTO admission_rules (admission_rule_id,team_id,provider,method,match_value,state,current_revision) VALUES ($1,$2,'github','github_organization','example-org','active',$3)",
+    )
+    .bind(rule)
+    .bind(team)
+    .bind(version_count)
+    .execute(store.pool())
+    .await
+    .expect("seed current rule projection");
+    let evidence_count = version_count;
+    sqlx::query(
+        "INSERT INTO evidence_challenges (challenge_id,relay_id,principal_id,audience,nonce_digest,team_id,admission_rule_id,admission_rule_revision,transaction_id,issuer,keycloak_subject,provider,expected_provider_subject,method,account_link_generation,provider_identity_generation,recovery_generation,checked_monotonic_epoch,binding_transaction_digest,expires_at) SELECT ('00000000-0000-0000-0000-' || lpad(to_hex(sequence),12,'0'))::uuid,'relay-test',$1,'relay-test',decode(repeat('ab',32),'hex'),$2,$3,$5,('00000000-0000-0000-0000-' || lpad(to_hex(sequence),12,'0'))::uuid,CASE WHEN sequence <= $6 THEN repeat(chr(1),2048) ELSE 'https://issuer.test' END,CASE WHEN sequence <= $6 THEN repeat(chr(1),2048) ELSE 'broker-subject' END,'github',CASE WHEN sequence=1 THEN 'a' WHEN sequence <= $6 THEN repeat(chr(1),2048) ELSE 'example-user' END,'github_organization',1,1,1,('00000000-0000-0000-0000-' || lpad(to_hex(sequence),12,'0'))::uuid,CASE WHEN sequence <= $6 THEN repeat(chr(1),256) ELSE 'binding-digest' END,clock_timestamp()+interval '10 minutes' FROM generate_series(1,$4) AS sequence",
+    )
+    .bind(principal)
+    .bind(team)
+    .bind(rule)
+    .bind(evidence_count)
+    .bind(version_count)
+    .bind(EVIDENCE_HISTORY_PAGE_ROWS)
+    .execute(store.pool())
+    .await
+    .expect("seed evidence challenges across multiple summary pages");
+    sqlx::query(
+        "INSERT INTO evidence_results (evidence_id,challenge_id,evidence_version,transaction_id,audience,issuer,keycloak_subject,provider_identity_generation,account_link_generation,recovery_generation,checked_monotonic_epoch,binding_transaction_digest,upstream_exchange_digest,principal_id,team_id,admission_rule_id,admission_rule_revision,provider,provider_subject,outcome,method,checked_at,expires_at,signing_key_id) SELECT challenge_id,challenge_id,1,transaction_id,audience,issuer,keycloak_subject,provider_identity_generation,account_link_generation,recovery_generation,checked_monotonic_epoch,binding_transaction_digest,CASE WHEN char_length(issuer)=2048 THEN repeat(chr(1),256) ELSE 'upstream-digest' END,principal_id,team_id,admission_rule_id,admission_rule_revision,provider,expected_provider_subject,'eligible',method,clock_timestamp(),clock_timestamp()+interval '29 minutes',CASE WHEN expected_provider_subject='a' THEN 'b/github_organization/c' WHEN char_length(issuer)=2048 THEN repeat(chr(1),256) ELSE 'signing-key-1' END FROM evidence_challenges",
+    )
+    .execute(store.pool())
+    .await
+    .expect("seed evidence history across multiple summary pages");
+
+    let reviewed = lifecycle
+        .snapshot_authority_manifest()
+        .await
+        .expect("summarize histories beyond their page and manifest limits");
+    assert_eq!(
+        summary_value(
+            &reviewed,
+            ManifestKind::AdmissionRuleVersion,
+            "version_count"
+        ),
+        version_count.to_string()
+    );
+    assert_eq!(
+        summary_value(&reviewed, ManifestKind::EvidenceResult, "result_count"),
+        evidence_count.to_string()
+    );
+    assert_eq!(
+        summary_value(
+            &reviewed,
+            ManifestKind::EvidenceChallenge,
+            "challenge_count"
+        ),
+        evidence_count.to_string()
+    );
+
+    set_restored_value(
+        &store,
+        "UPDATE admission_rule_versions SET match_value='restored-change' WHERE admission_rule_id=$1 AND revision=1",
+        rule,
+    )
+    .await;
+    assert_ne!(
+        reviewed.digest(),
+        lifecycle
+            .snapshot_authority_manifest()
+            .await
+            .expect("summarize changed historical rule")
+            .digest(),
+        "historical rule changes must alter the recovery digest"
+    );
+    set_restored_value(
+        &store,
+        "UPDATE admission_rule_versions SET match_value='example-org' WHERE admission_rule_id=$1 AND revision=1",
+        rule,
+    )
+    .await;
+
+    let first_evidence =
+        Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("fixed test UUID");
+    set_restored_value(
+        &store,
+        "UPDATE evidence_results SET provider_subject='a/github_organization/b',signing_key_id='c' WHERE evidence_id=$1",
+        first_evidence,
+    )
+    .await;
+    assert_ne!(
+        reviewed.digest(),
+        lifecycle
+            .snapshot_authority_manifest()
+            .await
+            .expect("summarize delimiter-collision regression fixture")
+            .digest(),
+        "length-delimited evidence fields must distinguish the old delimiter collision"
+    );
+    cleanup(&pool, &schema).await;
+}
+
+fn summary_value(manifest: &ReviewedManifest, kind: ManifestKind, name: &str) -> String {
+    manifest
+        .rows()
+        .iter()
+        .find(|row| row.kind() == kind)
+        .and_then(|row| row.fields().iter().find(|field| field.name() == name))
+        .and_then(ManifestField::value)
+        .unwrap_or_else(|| panic!("missing {name} summary field"))
+        .to_owned()
+}
+
+async fn set_restored_value(store: &Store, statement: &'static str, id: Uuid) {
+    let mut transaction = store
+        .pool()
+        .begin()
+        .await
+        .expect("begin restored-corruption fixture");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .expect("suppress constraints only for restored-corruption fixture");
+    sqlx::query(AssertSqlSafe(statement))
+        .bind(id)
+        .execute(&mut *transaction)
+        .await
+        .expect("set restored-corruption value");
+    transaction
+        .commit()
+        .await
+        .expect("commit restored-corruption fixture");
 }
 
 async fn set_restored_service_account_team(store: &Store, principal_id: Uuid, team_id: Uuid) {

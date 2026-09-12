@@ -830,6 +830,14 @@ fn configuration(
             device_slow_down_increment: Duration::from_secs(5),
             max_device_poll_interval: Duration::from_secs(10),
         },
+        evidence: crate::config::EvidenceConfig::new(
+            PathBuf::from("/test/signing-keys"),
+            "127.0.0.1:0".parse().expect("test evidence bind"),
+            PathBuf::from("/test/evidence-client-ca"),
+            Duration::from_mins(5),
+            16 * 1024,
+        )
+        .expect("valid test evidence knobs"),
         login_policy: crate::config::LoginPolicy::AnyAuthenticatedSubject,
     }
 }

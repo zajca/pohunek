@@ -41,7 +41,8 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PENDING_LOGINS: usize = 1024;
 const MAX_REQUESTS_PER_WINDOW: u32 = 10_000;
-const MAX_REQUEST_TIMEOUT_MS: u64 = 30_000;
+/// Configured ceiling for one in-bound HTTP request; also the router-test budget.
+pub(crate) const MAX_REQUEST_TIMEOUT_MS: u64 = 30_000;
 const MAX_CONNECTION_LIFETIME_MS: u64 = 3_600_000;
 const MAX_RATE_WINDOW_MS: u64 = 60_000;
 const MAX_LOGIN_LIFETIME_MS: u64 = 15 * 60_000;
@@ -56,6 +57,14 @@ const MAX_CREDENTIALS_PER_PRINCIPAL: usize = 128;
 const MAX_SERVICE_ACCOUNTS_PER_TEAM: usize = 1_024;
 const MAX_DEVICE_POLL_LEASE_MS: u64 = 30_000;
 const MAX_DEVICE_INTERVAL_MS: u64 = 60_000;
+/// One-use evidence challenges stay short-lived so replay exposure is bounded.
+const MAX_EVIDENCE_CHALLENGE_MS: u64 = 900_000;
+/// Default one-use evidence challenge TTL when the operator omits the knob.
+const DEFAULT_EVIDENCE_CHALLENGE_MS: u64 = 300_000;
+/// Provider attestations stay small enough to keep ingress memory finite.
+const MAX_EVIDENCE_BYTES: usize = 64 * 1024;
+/// Default attestation cap when the operator omits the knob.
+const DEFAULT_EVIDENCE_BYTES: usize = 16 * 1024;
 const MAX_LOG_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LOG_FILES: usize = 32;
 
@@ -101,6 +110,7 @@ pub struct Config {
     pub limits: Limits,
     pub logging: LogConfig,
     pub auth: AuthConfig,
+    pub evidence: EvidenceConfig,
     pub login_policy: LoginPolicy,
 }
 
@@ -120,6 +130,8 @@ impl Debug for Config {
             .field("ca_file", &self.ca_file.as_ref().map(|_| "REDACTED_PATH"))
             .field("witness_dir", &"REDACTED_PATH")
             .field("limits", &self.limits)
+            .field("auth", &self.auth)
+            .field("evidence", &self.evidence)
             .field("login_policy", &self.login_policy)
             .finish_non_exhaustive()
     }
@@ -210,8 +222,68 @@ struct Raw {
     limits: RawLimits,
     logging: LogConfig,
     auth: RawAuth,
+    evidence: RawEvidence,
     login_policy: RawLoginPolicy,
 }
+/// Required bounded evidence-admission knobs for the internal mTLS endpoint.
+///
+/// The pinned files authenticate the evidence broker before any attestation is
+/// accepted. The challenge TTL bounds one-use replay exposure, and the byte cap
+/// keeps provider attestations finite at ingress.
+#[derive(Clone)]
+pub struct EvidenceConfig {
+    pub signing_keys_file: PathBuf,
+    pub internal_bind: std::net::SocketAddr,
+    pub internal_client_ca_file: PathBuf,
+    pub challenge_lifetime: Duration,
+    pub max_evidence_bytes: usize,
+}
+
+impl Debug for EvidenceConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvidenceConfig")
+            .field("signing_keys_file", &"REDACTED_PATH")
+            .field("internal_bind", &self.internal_bind)
+            .field("internal_client_ca_file", &"REDACTED_PATH")
+            .field("challenge_lifetime", &self.challenge_lifetime)
+            .field("max_evidence_bytes", &self.max_evidence_bytes)
+            .finish()
+    }
+}
+
+impl EvidenceConfig {
+    /// Validates explicitly configured evidence-admission knobs.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] when a pinned path is empty, the
+    /// challenge TTL is zero or above its ceiling, or the attestation cap is
+    /// zero or above its ceiling.
+    pub fn new(
+        signing_keys_file: PathBuf,
+        internal_bind: std::net::SocketAddr,
+        internal_client_ca_file: PathBuf,
+        challenge_lifetime: Duration,
+        max_evidence_bytes: usize,
+    ) -> Result<Self, ConfigError> {
+        if signing_keys_file.as_os_str().is_empty()
+            || internal_client_ca_file.as_os_str().is_empty()
+            || challenge_lifetime.is_zero()
+            || challenge_lifetime > Duration::from_millis(MAX_EVIDENCE_CHALLENGE_MS)
+            || max_evidence_bytes == 0
+            || max_evidence_bytes > MAX_EVIDENCE_BYTES
+        {
+            return Err(ConfigError::Invalid { field: "evidence" });
+        }
+        Ok(Self {
+            signing_keys_file,
+            internal_bind,
+            internal_client_ca_file,
+            challenge_lifetime,
+            max_evidence_bytes,
+        })
+    }
+}
+
 /// Required bounded authentication lifetimes and transaction budgets.
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
@@ -243,6 +315,25 @@ struct RawAuth {
     device_poll_lease_ms: u64,
     device_slow_down_increment_ms: u64,
     max_device_poll_interval_ms: u64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEvidence {
+    signing_keys_file: PathBuf,
+    internal_bind: String,
+    internal_client_ca_file: PathBuf,
+    #[serde(default = "default_evidence_challenge_ms")]
+    challenge_lifetime_ms: u64,
+    #[serde(default = "default_evidence_bytes")]
+    max_evidence_bytes: usize,
+}
+
+fn default_evidence_challenge_ms() -> u64 {
+    DEFAULT_EVIDENCE_CHALLENGE_MS
+}
+
+fn default_evidence_bytes() -> usize {
+    DEFAULT_EVIDENCE_BYTES
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -341,6 +432,7 @@ impl Config {
         }
         let limits = limits(&raw.limits)?;
         let auth = auth_limits(&raw.auth)?;
+        let evidence = evidence_limits(&raw.evidence)?;
         let login_policy = match raw.login_policy {
             RawLoginPolicy::AnyAuthenticatedSubject => LoginPolicy::AnyAuthenticatedSubject,
             RawLoginPolicy::AllowedSubjects { subjects } => {
@@ -373,6 +465,7 @@ impl Config {
             limits,
             logging: raw.logging,
             auth,
+            evidence,
             login_policy,
         })
     }
@@ -391,6 +484,7 @@ impl Config {
             self.auth.device_poll_lease,
             self.auth.device_slow_down_increment,
             self.auth.max_device_poll_interval,
+            self.evidence.challenge_lifetime,
         )
         .map_err(|_error| ConfigError::Invalid { field: "auth" })
     }
@@ -475,6 +569,32 @@ fn auth_limits(raw: &RawAuth) -> Result<AuthConfig, ConfigError> {
         return Err(ConfigError::Invalid { field: "auth" });
     }
     Ok(result)
+}
+
+fn evidence_limits(raw: &RawEvidence) -> Result<EvidenceConfig, ConfigError> {
+    require_private_file(&raw.signing_keys_file, "evidence.signing_keys_file")?;
+    require_private_file(
+        &raw.internal_client_ca_file,
+        "evidence.internal_client_ca_file",
+    )?;
+    let internal_bind: std::net::SocketAddr =
+        raw.internal_bind
+            .parse()
+            .map_err(|_error| ConfigError::Invalid {
+                field: "evidence.internal_bind",
+            })?;
+    if !internal_bind.ip().is_loopback() {
+        return Err(ConfigError::Invalid {
+            field: "evidence.internal_bind",
+        });
+    }
+    EvidenceConfig::new(
+        raw.signing_keys_file.clone(),
+        internal_bind,
+        raw.internal_client_ca_file.clone(),
+        Duration::from_millis(raw.challenge_lifetime_ms),
+        raw.max_evidence_bytes,
+    )
 }
 
 fn exact_https(value: &str, field: &'static str) -> Result<Url, ConfigError> {
@@ -657,6 +777,7 @@ pub(crate) fn fixture_limits() -> Limits {
 pub(crate) mod tests {
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::time::Duration;
 
     use super::{exact_https, issuer_https, require_private_file};
 
@@ -667,6 +788,13 @@ pub(crate) mod tests {
         let key = directory.path().join("fixture-key");
         fs::write(&key, [7_u8; 32]).expect("fixture key");
         fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("private file");
+        let signing_keys = directory.path().join("signing-keys");
+        fs::write(&signing_keys, [9_u8; 32]).expect("signing keys");
+        fs::set_permissions(&signing_keys, fs::Permissions::from_mode(0o600))
+            .expect("private file");
+        let client_ca = directory.path().join("evidence-client-ca");
+        fs::write(&client_ca, [11_u8; 32]).expect("client CA");
+        fs::set_permissions(&client_ca, fs::Permissions::from_mode(0o600)).expect("private file");
         let path = directory.path().join("relay.toml");
         let config = format!(
             r#"
@@ -720,13 +848,21 @@ service_accounts_per_team = 16
 device_poll_lease_ms = 5000
 device_slow_down_increment_ms = 5000
 max_device_poll_interval_ms = 30000
+[evidence]
+signing_keys_file = "{}"
+internal_bind = "127.0.0.1:0"
+internal_client_ca_file = "{}"
+challenge_lifetime_ms = 300000
+max_evidence_bytes = 16384
 "#,
             "A".repeat(43),
             key.display(),
             key.display(),
             key.display(),
             directory.path().display(),
-            directory.path().join("logs").display()
+            directory.path().join("logs").display(),
+            signing_keys.display(),
+            client_ca.display()
         );
         fs::write(&path, &config).expect("write config");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private config");
@@ -740,6 +876,15 @@ max_device_poll_interval_ms = 30000
         assert_eq!(config.limits.database_connections, 8);
         assert_eq!(config.limits.per_principal, 4);
         assert_eq!(config.digest_key_id, "digest-1");
+        assert_eq!(config.evidence.challenge_lifetime, Duration::from_mins(5));
+        assert_eq!(config.evidence.max_evidence_bytes, 16_384);
+        assert_eq!(
+            config
+                .auth_limits()
+                .expect("derived auth limits")
+                .evidence_challenge_lifetime(),
+            Duration::from_mins(5)
+        );
         for (before, after) in [
             ("database_connections = 8", ""),
             ("database_connections = 8", "database_connections = 0"),
@@ -765,6 +910,16 @@ max_device_poll_interval_ms = 30000
                 "credentials_per_principal = 0",
             ),
             ("service_accounts_per_team = 16", ""),
+            ("[evidence]", ""),
+            (
+                "challenge_lifetime_ms = 300000",
+                "challenge_lifetime_ms = 0",
+            ),
+            ("max_evidence_bytes = 16384", "max_evidence_bytes = 0"),
+            (
+                "internal_bind = \"127.0.0.1:0\"",
+                "internal_bind = \"0.0.0.0:0\"",
+            ),
         ] {
             fs::write(&path, source.replace(before, after)).expect("write invalid config");
             super::Config::load(&path).expect_err("unsafe or missing setting rejected");
@@ -813,6 +968,8 @@ max_device_poll_interval_ms = 30000
             ("max_rotation_overlap_ms", super::MAX_ROTATION_OVERLAP_MS),
             ("device_poll_lease_ms", super::MAX_DEVICE_POLL_LEASE_MS),
             ("max_device_poll_interval_ms", super::MAX_DEVICE_INTERVAL_MS),
+            ("challenge_lifetime_ms", super::MAX_EVIDENCE_CHALLENGE_MS),
+            ("max_evidence_bytes", super::MAX_EVIDENCE_BYTES as u64),
             ("max_file_bytes", super::MAX_LOG_FILE_BYTES),
             ("max_files", super::MAX_LOG_FILES as u64),
         ] {
@@ -843,7 +1000,89 @@ max_device_poll_interval_ms = 30000
         };
         config.login_policy =
             super::LoginPolicy::AllowedSubjects(vec!["sentinel-subject".to_owned()]);
+        config.evidence.signing_keys_file = "/sentinel-signing-keys".into();
+        config.evidence.internal_client_ca_file = "/sentinel-evidence-ca".into();
         assert!(!format!("{config:?}").contains("sentinel"));
+    }
+
+    #[test]
+    fn evidence_defaults_apply_and_missing_evidence_fails_fast() {
+        let (directory, path, source) = config_fixture();
+        let without_optional = source
+            .lines()
+            .filter(|line| {
+                !line.starts_with("challenge_lifetime_ms = ")
+                    && !line.starts_with("max_evidence_bytes = ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, without_optional).expect("evidence defaults config");
+        let config = super::Config::load(&path).expect("evidence defaults load");
+        assert_eq!(
+            config.evidence.challenge_lifetime,
+            Duration::from_millis(super::DEFAULT_EVIDENCE_CHALLENGE_MS)
+        );
+        assert_eq!(
+            config.evidence.max_evidence_bytes,
+            super::DEFAULT_EVIDENCE_BYTES
+        );
+
+        let without_section = source
+            .lines()
+            .filter(|line| {
+                *line != "[evidence]"
+                    && !line.starts_with("signing_keys_file = ")
+                    && !line.starts_with("internal_bind = ")
+                    && !line.starts_with("internal_client_ca_file = ")
+                    && !line.starts_with("challenge_lifetime_ms = ")
+                    && !line.starts_with("max_evidence_bytes = ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, without_section).expect("missing evidence config");
+        super::Config::load(&path).expect_err("missing evidence section rejected");
+        let _guard = directory;
+    }
+
+    #[test]
+    fn evidence_rejects_invalid_values() {
+        for (before, after) in [
+            (
+                "signing_keys_file = ",
+                "signing_keys_file = \"/nonexistent-signing-keys\"",
+            ),
+            (
+                "internal_bind = \"127.0.0.1:0\"",
+                "internal_bind = \"not-a-socket\"",
+            ),
+            (
+                "internal_client_ca_file = ",
+                "internal_client_ca_file = \"/nonexistent-client-ca\"",
+            ),
+        ] {
+            let (_directory, path, source) = config_fixture();
+            let invalid = source
+                .lines()
+                .map(|line| {
+                    if line.starts_with(before) {
+                        after.to_owned()
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(&path, invalid).expect("invalid evidence config");
+            super::Config::load(&path).expect_err("invalid evidence rejected");
+        }
+        super::EvidenceConfig::new(
+            "".into(),
+            "127.0.0.1:0".parse().expect("evidence bind"),
+            "/evidence-ca".into(),
+            Duration::from_mins(5),
+            16_384,
+        )
+        .expect_err("empty signing keys rejected");
     }
 
     #[test]

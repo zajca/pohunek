@@ -360,7 +360,7 @@ async fn migration_restarts_from_exact_foundation_prefix_and_repairs_publication
             .fetch_all(store.pool())
             .await
             .expect("read committed prefix");
-    assert_eq!(versions, vec![1, 2]);
+    assert_eq!(versions, vec![1, 2, 3]);
     let auth_table: bool = sqlx::query_scalar("SELECT to_regclass('oidc_identities') IS NOT NULL")
         .fetch_one(store.pool())
         .await

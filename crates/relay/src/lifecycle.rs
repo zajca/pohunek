@@ -29,7 +29,91 @@ const MAX_IDENTITY_BYTES: usize = 2_048;
 const MAX_MANIFEST_ROWS: usize = 4_096;
 /// Bounds database-to-process manifest material before text values are decoded.
 const MAX_MANIFEST_BYTES: i64 = 1_048_576;
-const MANIFEST_VERSION: u16 = 2;
+/// Evidence rows hashed per bounded page. Sixteen worst-case valid rows remain
+/// below one MiB even when every bounded text character needs six-byte JSON
+/// escaping; the byte preflight rejects restored values outside that proof.
+const EVIDENCE_HISTORY_PAGE_ROWS: i64 = 16;
+/// Rule-version rows hashed per page. A valid row has only one caller-sized
+/// 256-character field, so 256 rows remain below the same one-MiB budget even
+/// under worst-case JSON escaping.
+const ADMISSION_RULE_VERSION_HISTORY_PAGE_ROWS: i64 = 256;
+/// Prevents restored oversized text from crossing the database/process boundary
+/// before a history page is decoded and hashed.
+const MAX_HISTORY_PAGE_BYTES: i64 = MAX_MANIFEST_BYTES;
+/// Canonical field order for one committed evidence result.
+const EVIDENCE_FIELDS: &[&str] = &[
+    "evidence_id",
+    "challenge_id",
+    "principal_id",
+    "team_id",
+    "admission_rule_id",
+    "admission_rule_revision",
+    "issuer",
+    "keycloak_subject",
+    "audience",
+    "transaction_id",
+    "provider_identity_generation",
+    "account_link_generation",
+    "recovery_generation",
+    "checked_monotonic_epoch",
+    "provider",
+    "method",
+    "provider_subject",
+    "binding_transaction_digest",
+    "upstream_exchange_digest",
+    "signing_key_id",
+    "outcome",
+    "checked_at",
+    "expires_at",
+    "evidence_version",
+];
+/// Canonical field order for one frozen admission-rule revision.
+const ADMISSION_RULE_VERSION_FIELDS: &[&str] = &[
+    "admission_rule_id",
+    "revision",
+    "team_id",
+    "provider",
+    "method",
+    "match_value",
+    "state",
+    "created_at",
+];
+/// Canonical field order for one durable challenge. The nonce digest is
+/// committed through a domain-separated digest so review output never exposes
+/// even the stored verifier.
+const EVIDENCE_CHALLENGE_FIELDS: &[&str] = &[
+    "challenge_id",
+    "relay_id",
+    "principal_id",
+    "audience",
+    "nonce_digest_commitment",
+    "team_id",
+    "admission_rule_id",
+    "admission_rule_revision",
+    "transaction_id",
+    "issuer",
+    "keycloak_subject",
+    "provider",
+    "expected_provider_subject",
+    "method",
+    "account_link_generation",
+    "provider_identity_generation",
+    "recovery_generation",
+    "checked_monotonic_epoch",
+    "binding_transaction_digest",
+    "consumption_state",
+    "created_at",
+    "expires_at",
+    "consumed_at",
+];
+const EVIDENCE_HISTORY_PAGE_QUERY: &str = "SELECT evidence_id::text,challenge_id::text,principal_id::text,team_id::text,admission_rule_id::text,admission_rule_revision::text,issuer::text,keycloak_subject::text,audience::text,transaction_id::text,provider_identity_generation::text,account_link_generation::text,recovery_generation::text,checked_monotonic_epoch::text,provider::text,method::text,provider_subject::text,binding_transaction_digest::text,upstream_exchange_digest::text,signing_key_id::text,outcome::text,checked_at::text,expires_at::text,evidence_version::text FROM evidence_results AS result WHERE ($1::uuid IS NULL OR result.evidence_id > $1) ORDER BY result.evidence_id LIMIT $2";
+const EVIDENCE_CHALLENGE_HISTORY_PAGE_QUERY: &str = "SELECT challenge_id::text,relay_id::text,principal_id::text,audience::text,encode(sha256(convert_to('pohunek-recovery-manifest-v4/evidence_challenges/nonce_digest/','UTF8') || uuid_send(challenge_id) || nonce_digest),'hex'),team_id::text,admission_rule_id::text,admission_rule_revision::text,transaction_id::text,issuer::text,keycloak_subject::text,provider::text,expected_provider_subject::text,method::text,account_link_generation::text,provider_identity_generation::text,recovery_generation::text,checked_monotonic_epoch::text,binding_transaction_digest::text,consumption_state::text,created_at::text,expires_at::text,consumed_at::text FROM evidence_challenges AS challenge WHERE ($1::uuid IS NULL OR challenge.challenge_id > $1) ORDER BY challenge.challenge_id LIMIT $2";
+const ADMISSION_RULE_VERSION_HISTORY_PAGE_QUERY: &str = "SELECT admission_rule_id::text,revision::text,team_id::text,provider::text,method::text,match_value::text,state::text,created_at::text FROM admission_rule_versions AS version WHERE ($1::uuid IS NULL OR (version.admission_rule_id,version.revision) > ($1,$2)) ORDER BY version.admission_rule_id,version.revision LIMIT $3";
+/// Semantic-review format version. Version 4 commits frozen rule revisions in
+/// their own bounded summary kind and replaces both challenge and evidence
+/// history with length-delimited paged digests; these changes also bind the
+/// challenge disposition and alter the serialized manifest shape.
+const MANIFEST_VERSION: u16 = 4;
 
 /// Identifies the only local infrastructure administrator created at bootstrap.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +201,9 @@ pub enum ManifestKind {
     BrowserSession,
     Credential,
     EvidenceChallenge,
+    AdmissionRule,
+    AdmissionRuleVersion,
+    EvidenceResult,
     HistorySummary,
     ServiceAccount,
 }
@@ -352,7 +439,7 @@ impl Lifecycle {
         for statement in [
             "UPDATE browser_logins SET consumed_at=clock_timestamp(),outcome='cancelled' WHERE consumed_at IS NULL",
             "UPDATE device_logins SET consumed_at=clock_timestamp(),outcome='cancelled',poll_lease_until=NULL WHERE consumed_at IS NULL",
-            "UPDATE evidence_challenges SET consumed_at=clock_timestamp() WHERE consumed_at IS NULL",
+            "UPDATE evidence_challenges SET consumed_at=clock_timestamp(),consumption_state='invalidated' WHERE consumed_at IS NULL AND consumption_state='unused'",
         ] {
             sqlx::query(statement)
                 .execute(&mut *tx)
@@ -685,7 +772,7 @@ async fn invalidate_old_generation(
         "UPDATE browser_logins SET consumed_at=clock_timestamp(),outcome='cancelled' WHERE consumed_at IS NULL",
         "UPDATE device_logins SET consumed_at=clock_timestamp(),outcome='cancelled',poll_lease_until=NULL WHERE consumed_at IS NULL",
         "UPDATE account_link_transactions SET completed_at=clock_timestamp() WHERE completed_at IS NULL",
-        "UPDATE evidence_challenges SET consumed_at=clock_timestamp() WHERE consumed_at IS NULL",
+        "UPDATE evidence_challenges SET consumed_at=clock_timestamp(),consumption_state='invalidated' WHERE consumed_at IS NULL AND consumption_state='unused'",
         "UPDATE teams SET policy_generation=policy_generation+1,revision=revision+1,updated_at=clock_timestamp()",
         "DELETE FROM relay_lease",
     ] { sqlx::query(statement).execute(&mut **tx).await.map_err(|_error| LifecycleError::Durable)?; }
@@ -724,6 +811,251 @@ async fn audit(
     Ok(id)
 }
 
+/// Commits append-only one-use challenges into one bounded summary row.
+async fn evidence_challenge_summary_row(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<(ManifestRow, i64), LifecycleError> {
+    let mut challenge_hash = Sha256::new();
+    challenge_hash.update(b"pohunek-recovery-manifest-v4/evidence_challenges/rows\0");
+    let mut challenge_count = 0_u64;
+    let mut last_challenge_id = None;
+    loop {
+        let page_bytes: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COALESCE(sum(octet_length(row_to_json(history_row)::text)),0)::bigint FROM ({EVIDENCE_CHALLENGE_HISTORY_PAGE_QUERY}) AS history_row"
+        )))
+        .bind(last_challenge_id)
+        .bind(EVIDENCE_HISTORY_PAGE_ROWS)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_error| LifecycleError::Durable)?;
+        if page_bytes > MAX_HISTORY_PAGE_BYTES {
+            return Err(LifecycleError::Durable);
+        }
+        let page = sqlx::query(EVIDENCE_CHALLENGE_HISTORY_PAGE_QUERY)
+            .bind(last_challenge_id)
+            .bind(EVIDENCE_HISTORY_PAGE_ROWS)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|_error| LifecycleError::Durable)?;
+        if page.is_empty() {
+            break;
+        }
+        let last_id = page
+            .last()
+            .ok_or(LifecycleError::Durable)?
+            .try_get::<String, _>(0)
+            .map_err(|_error| LifecycleError::Durable)?;
+        last_challenge_id =
+            Some(Uuid::parse_str(&last_id).map_err(|_error| LifecycleError::Durable)?);
+        for row in page {
+            let row = manifest_row(
+                ManifestKind::EvidenceChallenge,
+                EVIDENCE_CHALLENGE_FIELDS,
+                &row,
+            )?;
+            hash_manifest_row(&mut challenge_hash, &row)?;
+            challenge_count = challenge_count
+                .checked_add(1)
+                .ok_or(LifecycleError::Durable)?;
+        }
+    }
+    challenge_hash.update(b"count\0");
+    challenge_hash.update(challenge_count.to_be_bytes());
+    summary_manifest_row(
+        ManifestKind::EvidenceChallenge,
+        "challenge_count",
+        challenge_count,
+        "challenge_digest",
+        hex::encode(challenge_hash.finalize()),
+    )
+}
+
+/// Commits the append-only evidence history into one bounded summary row. The
+/// table is hashed in fixed-size ordered pages, so recovery memory stays
+/// proportional to the page, not to the whole history, and every row feed is
+/// length-delimited so distinct contents can never share a preimage.
+async fn evidence_summary_row(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<(ManifestRow, i64), LifecycleError> {
+    let mut evidence_hash = Sha256::new();
+    evidence_hash.update(b"pohunek-recovery-manifest-v4/evidence_results/rows\0");
+    let mut evidence_count = 0_u64;
+    let mut last_evidence_id = None;
+    loop {
+        let page_bytes: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COALESCE(sum(octet_length(row_to_json(history_row)::text)),0)::bigint FROM ({EVIDENCE_HISTORY_PAGE_QUERY}) AS history_row"
+        )))
+        .bind(last_evidence_id)
+        .bind(EVIDENCE_HISTORY_PAGE_ROWS)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_error| LifecycleError::Durable)?;
+        if page_bytes > MAX_HISTORY_PAGE_BYTES {
+            return Err(LifecycleError::Durable);
+        }
+        let page = sqlx::query(EVIDENCE_HISTORY_PAGE_QUERY)
+            .bind(last_evidence_id)
+            .bind(EVIDENCE_HISTORY_PAGE_ROWS)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|_error| LifecycleError::Durable)?;
+        if page.is_empty() {
+            break;
+        }
+        let last_id = page
+            .last()
+            .ok_or(LifecycleError::Durable)?
+            .try_get::<String, _>(0)
+            .map_err(|_error| LifecycleError::Durable)?;
+        last_evidence_id =
+            Some(Uuid::parse_str(&last_id).map_err(|_error| LifecycleError::Durable)?);
+        for row in page {
+            let row = manifest_row(ManifestKind::EvidenceResult, EVIDENCE_FIELDS, &row)?;
+            hash_manifest_row(&mut evidence_hash, &row)?;
+            evidence_count = evidence_count
+                .checked_add(1)
+                .ok_or(LifecycleError::Durable)?;
+        }
+    }
+    evidence_hash.update(b"count\0");
+    evidence_hash.update(evidence_count.to_be_bytes());
+    let evidence_digest = hex::encode(evidence_hash.finalize());
+    summary_manifest_row(
+        ManifestKind::EvidenceResult,
+        "result_count",
+        evidence_count,
+        "result_digest",
+        evidence_digest,
+    )
+}
+
+/// Commits all frozen admission-rule revisions into one bounded summary row.
+async fn admission_rule_version_summary_row(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<(ManifestRow, i64), LifecycleError> {
+    let mut version_hash = Sha256::new();
+    version_hash.update(b"pohunek-recovery-manifest-v4/admission_rule_versions/rows\0");
+    let mut version_count = 0_u64;
+    let mut last_rule_id = None;
+    let mut last_revision = 0_i64;
+    loop {
+        let page_bytes: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COALESCE(sum(octet_length(row_to_json(history_row)::text)),0)::bigint FROM ({ADMISSION_RULE_VERSION_HISTORY_PAGE_QUERY}) AS history_row"
+        )))
+        .bind(last_rule_id)
+        .bind(last_revision)
+        .bind(ADMISSION_RULE_VERSION_HISTORY_PAGE_ROWS)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_error| LifecycleError::Durable)?;
+        if page_bytes > MAX_HISTORY_PAGE_BYTES {
+            return Err(LifecycleError::Durable);
+        }
+        let page = sqlx::query(ADMISSION_RULE_VERSION_HISTORY_PAGE_QUERY)
+            .bind(last_rule_id)
+            .bind(last_revision)
+            .bind(ADMISSION_RULE_VERSION_HISTORY_PAGE_ROWS)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|_error| LifecycleError::Durable)?;
+        if page.is_empty() {
+            break;
+        }
+        let last = page.last().ok_or(LifecycleError::Durable)?;
+        let rule_id = last
+            .try_get::<String, _>(0)
+            .map_err(|_error| LifecycleError::Durable)?;
+        last_rule_id = Some(Uuid::parse_str(&rule_id).map_err(|_error| LifecycleError::Durable)?);
+        last_revision = last
+            .try_get::<String, _>(1)
+            .map_err(|_error| LifecycleError::Durable)?
+            .parse()
+            .map_err(|_error| LifecycleError::Durable)?;
+        for row in page {
+            let row = manifest_row(
+                ManifestKind::AdmissionRuleVersion,
+                ADMISSION_RULE_VERSION_FIELDS,
+                &row,
+            )?;
+            hash_manifest_row(&mut version_hash, &row)?;
+            version_count = version_count
+                .checked_add(1)
+                .ok_or(LifecycleError::Durable)?;
+        }
+    }
+    version_hash.update(b"count\0");
+    version_hash.update(version_count.to_be_bytes());
+    summary_manifest_row(
+        ManifestKind::AdmissionRuleVersion,
+        "version_count",
+        version_count,
+        "version_digest",
+        hex::encode(version_hash.finalize()),
+    )
+}
+
+/// Builds one fixed-size manifest summary and reports its decoded byte budget.
+fn summary_manifest_row(
+    kind: ManifestKind,
+    count_name: &'static str,
+    count: u64,
+    digest_name: &'static str,
+    digest: String,
+) -> Result<(ManifestRow, i64), LifecycleError> {
+    let row = ManifestRow {
+        kind,
+        fields: vec![
+            ManifestField {
+                name: count_name,
+                value: Some(count.to_string()),
+            },
+            ManifestField {
+                name: digest_name,
+                value: Some(digest),
+            },
+        ],
+    };
+    let bytes = i64::try_from(
+        row.fields
+            .iter()
+            .map(|field| field.name.len() + field.value.as_ref().map_or(0, String::len) + 2)
+            .sum::<usize>(),
+    )
+    .map_err(|_error| LifecycleError::Durable)?;
+    Ok((row, bytes))
+}
+
+/// Adds one manifest row using an unambiguous length-delimited encoding.
+fn hash_manifest_row(hash: &mut Sha256, row: &ManifestRow) -> Result<(), LifecycleError> {
+    hash.update([row.kind as u8]);
+    hash.update(
+        u64::try_from(row.fields.len())
+            .map_err(|_error| LifecycleError::Durable)?
+            .to_be_bytes(),
+    );
+    for field in &row.fields {
+        hash_manifest_bytes(hash, field.name.as_bytes())?;
+        if let Some(value) = &field.value {
+            hash.update([1]);
+            hash_manifest_bytes(hash, value.as_bytes())?;
+        } else {
+            hash.update([0]);
+        }
+    }
+    Ok(())
+}
+
+/// Adds one byte string with an eight-byte big-endian length prefix.
+fn hash_manifest_bytes(hash: &mut Sha256, value: &[u8]) -> Result<(), LifecycleError> {
+    hash.update(
+        u64::try_from(value.len())
+            .map_err(|_error| LifecycleError::Durable)?
+            .to_be_bytes(),
+    );
+    hash.update(value);
+    Ok(())
+}
+
 async fn semantic_manifest(
     tx: &mut Transaction<'_, Postgres>,
     incidents: IncidentReview,
@@ -748,7 +1080,10 @@ async fn semantic_manifest(
         (ManifestKind::BrowserSession, &["session_id", "principal_id", "identity_id", "digest_key_id", "session_generation", "recovery_generation", "expires_at", "idle_deadline", "revoked_at", "cookie_digest_commitment", "csrf_digest_commitment"], "SELECT session_id::text,principal_id::text,identity_id::text,digest_key_id::text,session_generation::text,recovery_generation::text,expires_at::text,idle_deadline::text,revoked_at::text,encode(sha256(convert_to('pohunek-recovery-manifest-v2/browser_sessions/cookie_digest/','UTF8') || uuid_send(session_id) || cookie_digest),'hex'),encode(sha256(convert_to('pohunek-recovery-manifest-v2/browser_sessions/csrf_digest/','UTF8') || uuid_send(session_id) || csrf_digest),'hex') FROM browser_sessions ORDER BY session_id"),
         (ManifestKind::Credential, &["credential_id", "public_id", "principal_id", "identity_id", "digest_key_id", "credential_kind", "credential_generation", "rotation_family_id", "predecessor_credential_id", "recovery_generation", "issued_at", "expires_at", "rotation_overlap_ends_at", "revoked_at", "secret_digest_commitment"], "SELECT credential_id::text,public_id::text,principal_id::text,identity_id::text,digest_key_id::text,credential_kind::text,credential_generation::text,rotation_family_id::text,predecessor_credential_id::text,recovery_generation::text,issued_at::text,expires_at::text,rotation_overlap_ends_at::text,revoked_at::text,encode(sha256(convert_to('pohunek-recovery-manifest-v2/relay_credentials/secret_digest/','UTF8') || uuid_send(credential_id) || secret_digest),'hex') FROM relay_credentials ORDER BY credential_id"),
         (ManifestKind::ServiceAccount, &["principal_id", "team_id", "display_name", "deprovisioned_at"], "SELECT principal_id::text,team_id::text,display_name::text,deprovisioned_at::text FROM service_accounts ORDER BY principal_id"),
-        (ManifestKind::EvidenceChallenge, &["challenge_id", "relay_id", "principal_id", "audience", "team_id", "admission_rule_revision", "account_link_generation", "recovery_generation", "expires_at", "consumed_at"], "SELECT challenge_id::text,relay_id::text,principal_id::text,audience::text,team_id::text,admission_rule_revision::text,account_link_generation::text,recovery_generation::text,expires_at::text,consumed_at::text FROM evidence_challenges ORDER BY challenge_id"),
+        (ManifestKind::AdmissionRule, &["admission_rule_id", "team_id", "provider", "method", "match_value", "current_revision", "state"], "SELECT admission_rule_id::text,team_id::text,provider::text,method::text,match_value::text,current_revision::text,state::text FROM admission_rules ORDER BY admission_rule_id"),
+        // Append-only challenges, rule revisions, and evidence are committed
+        // through bounded keyset-paged summaries below. Their summary kinds
+        // still sort with the other manifest rows.
     ];
     // Timestamp text is authority evidence: connection/server locale changes
     // must not alter the representation of the same stored instant.
@@ -756,6 +1091,11 @@ async fn semantic_manifest(
         .execute(&mut **tx)
         .await
         .map_err(|_error| LifecycleError::Durable)?;
+
+    // Append-only histories join the other relations as fixed-size summaries.
+    let (challenge_row, challenge_bytes) = evidence_challenge_summary_row(&mut *tx).await?;
+    let (version_row, version_bytes) = admission_rule_version_summary_row(&mut *tx).await?;
+    let (evidence_row, evidence_bytes) = evidence_summary_row(&mut *tx).await?;
 
     let relay_query = if normalize_reopen_identity {
         "SELECT relay_id::text,recovery_generation::text,CASE WHEN state='normal' THEN 'recovery_quarantine' ELSE state END::text,CASE WHEN state='normal' THEN revision-1 ELSE revision END::text FROM relay_identity ORDER BY relay_id"
@@ -807,6 +1147,19 @@ async fn semantic_manifest(
             rows.push(manifest_row(*kind, names, &row)?);
         }
     }
+    manifest_bytes = manifest_bytes
+        .checked_add(challenge_bytes)
+        .ok_or(LifecycleError::Durable)?
+        .checked_add(version_bytes)
+        .ok_or(LifecycleError::Durable)?
+        .checked_add(evidence_bytes)
+        .ok_or(LifecycleError::Durable)?;
+    if manifest_bytes > MAX_MANIFEST_BYTES || rows.len().saturating_add(3) > MAX_MANIFEST_ROWS {
+        return Err(LifecycleError::Durable);
+    }
+    rows.push(challenge_row);
+    rows.push(version_row);
+    rows.push(evidence_row);
     // Query order need not mirror enum order. Preserve each query's primary-key
     // order while canonicalizing the relation order for all populated tables.
     rows.sort_by_key(|row| row.kind);
@@ -1703,6 +2056,53 @@ mod tests {
             .execute(store.pool())
             .await
             .expect("seed oversized corrupt authority value");
+        assert!(matches!(
+            lifecycle.snapshot_authority_manifest().await,
+            Err(LifecycleError::Durable)
+        ));
+        cleanup(&pool, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn oversized_history_text_is_rejected_before_history_page_is_loaded() {
+        let (store, schema, pool, witness, _directory) = fixture().await;
+        let lifecycle = Lifecycle::new(store.clone(), witness);
+        lifecycle
+            .bootstrap_local(request())
+            .await
+            .expect("bootstrap");
+        let team = Uuid::now_v7();
+        let rule = Uuid::now_v7();
+        sqlx::query("INSERT INTO teams (team_id,display_name,state,policy_generation,revision) VALUES ($1,'History team','active',1,1)")
+            .bind(team)
+            .execute(store.pool())
+            .await
+            .expect("seed history team");
+        sqlx::query("INSERT INTO admission_rule_versions (admission_rule_id,revision,team_id,provider,method,match_value,state) VALUES ($1,1,$2,'github','github_organization','example-org','active')")
+            .bind(rule)
+            .bind(team)
+            .execute(store.pool())
+            .await
+            .expect("seed rule version");
+        sqlx::query("ALTER TABLE admission_rule_versions DROP CONSTRAINT admission_rule_versions_match_value_check")
+            .execute(store.pool())
+            .await
+            .expect("relax restored fixture constraint");
+        let mut tx = store
+            .begin_serializable()
+            .await
+            .expect("begin restored corruption transaction");
+        sqlx::raw_sql("SET LOCAL session_replication_role = 'replica'")
+            .execute(&mut *tx)
+            .await
+            .expect("model restored trigger bypass");
+        sqlx::query("UPDATE admission_rule_versions SET match_value=repeat('x',$1::integer) WHERE admission_rule_id=$2")
+            .bind(i32::try_from(MAX_HISTORY_PAGE_BYTES + 1).expect("history bound fits i32"))
+            .bind(rule)
+            .execute(&mut *tx)
+            .await
+            .expect("seed oversized corrupt history value");
+        tx.commit().await.expect("commit restored corruption");
         assert!(matches!(
             lifecycle.snapshot_authority_manifest().await,
             Err(LifecycleError::Durable)

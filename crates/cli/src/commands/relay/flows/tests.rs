@@ -2,6 +2,7 @@ use super::*;
 use relay_protocol::{CredentialRecord, PrincipalId};
 use std::{
     collections::VecDeque,
+    future::Future,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Mutex,
@@ -33,35 +34,49 @@ struct MemoryStore {
 }
 
 impl Store for MemoryStore {
-    async fn pending(&self, _origin: &Origin) -> Result<Option<PendingRotation>, Error> {
-        Ok(self.pending.lock().expect("pending rotation").clone())
+    fn pending(
+        &self,
+        _origin: &Origin,
+    ) -> impl Future<Output = Result<Option<PendingRotation>, Error>> {
+        std::future::ready(Ok(self.pending.lock().expect("pending rotation").clone()))
     }
-    async fn save_pending(&self, _origin: &Origin, pending: &PendingRotation) -> Result<(), Error> {
+    fn save_pending(
+        &self,
+        _origin: &Origin,
+        pending: &PendingRotation,
+    ) -> impl Future<Output = Result<(), Error>> {
         *self.pending.lock().expect("pending rotation") = Some(pending.clone());
-        Ok(())
+        std::future::ready(Ok(()))
     }
-    async fn clear_pending(&self, _origin: &Origin) -> Result<(), Error> {
+    fn clear_pending(&self, _origin: &Origin) -> impl Future<Output = Result<(), Error>> {
         *self.pending.lock().expect("pending rotation") = None;
-        Ok(())
+        std::future::ready(Ok(()))
     }
-    async fn load(&self, _origin: &Origin) -> Result<Option<DeviceCredential>, Error> {
-        Ok(self
+    fn load(
+        &self,
+        _origin: &Origin,
+    ) -> impl Future<Output = Result<Option<DeviceCredential>, Error>> {
+        std::future::ready(Ok(self
             .credential
             .lock()
             .expect("stored credential")
             .as_ref()
-            .map(duplicate))
+            .map(duplicate)))
     }
-    async fn save(&self, _origin: &Origin, credential: &DeviceCredential) -> Result<(), Error> {
+    fn save(
+        &self,
+        _origin: &Origin,
+        credential: &DeviceCredential,
+    ) -> impl Future<Output = Result<(), Error>> {
         if self.fail_save {
-            return Err(Error::Keyring);
+            return std::future::ready(Err(Error::Keyring));
         }
         *self.credential.lock().expect("stored credential") = Some(duplicate(credential));
-        Ok(())
+        std::future::ready(Ok(()))
     }
-    async fn remove(&self, _origin: &Origin) -> Result<(), Error> {
+    fn remove(&self, _origin: &Origin) -> impl Future<Output = Result<(), Error>> {
         *self.credential.lock().expect("stored credential") = None;
-        Ok(())
+        std::future::ready(Ok(()))
     }
 }
 
@@ -106,20 +121,20 @@ impl Relay {
 }
 
 impl Api for Relay {
-    async fn revoke_owned(
+    fn revoke_owned(
         &self,
         _credential: &DeviceCredential,
         target: CredentialId,
         _request: &RevokeCredentialRequest,
-    ) -> Result<(), pohunek_relay_client::Error> {
+    ) -> impl Future<Output = Result<(), pohunek_relay_client::Error>> {
         self.revocations.lock().expect("revocations").push(target);
-        Ok(())
+        std::future::ready(Ok(()))
     }
     fn origin(&self) -> &Origin {
         &self.origin
     }
-    async fn start(&self) -> Result<DeviceLoginStart, pohunek_relay_client::Error> {
-        Ok(DeviceLoginStart {
+    fn start(&self) -> impl Future<Output = Result<DeviceLoginStart, pohunek_relay_client::Error>> {
+        std::future::ready(Ok(DeviceLoginStart {
             login_id: LoginId::from_uuid(Uuid::nil()),
             verification_uri: "https://issuer.example/device".to_owned(),
             verification_uri_complete: None,
@@ -127,61 +142,63 @@ impl Api for Relay {
             expires_at: time::OffsetDateTime::now_utc() + self.login_lifetime,
             interval_seconds: 1,
             poll_secret: Secret::new("sentinel-poll-secret".to_owned()),
-        })
+        }))
     }
-    async fn poll(
+    fn poll(
         &self,
         _id: &LoginId,
         _secret: &Secret,
-    ) -> Result<DevicePollResult, pohunek_relay_client::Error> {
+    ) -> impl Future<Output = Result<DevicePollResult, pohunek_relay_client::Error>> {
         self.poll_times
             .lock()
             .expect("poll times")
             .push(Instant::now());
-        self.polls
-            .lock()
-            .expect("polls")
-            .pop_front()
-            .ok_or(pohunek_relay_client::Error::Malformed)
+        std::future::ready(
+            self.polls
+                .lock()
+                .expect("polls")
+                .pop_front()
+                .ok_or(pohunek_relay_client::Error::Malformed),
+        )
     }
-    async fn account(
+    fn account(
         &self,
         credential: &DeviceCredential,
-    ) -> Result<AccountRecord, pohunek_relay_client::Error> {
+    ) -> impl Future<Output = Result<AccountRecord, pohunek_relay_client::Error>> {
         if self.invalid_account == Some(credential.credential_id) {
-            return Err(pohunek_relay_client::Error::Unauthenticated);
+            return std::future::ready(Err(pohunek_relay_client::Error::Unauthenticated));
         }
-        Ok(AccountRecord {
+        std::future::ready(Ok(AccountRecord {
             principal_id: PrincipalId::from_uuid(Uuid::nil()),
             kind: self.account_kind.clone(),
             state: self.account_state.clone(),
             identities: vec![],
-        })
+        }))
     }
-    async fn revoke(
+    fn revoke(
         &self,
         credential: &DeviceCredential,
         _request: &RevokeCredentialRequest,
-    ) -> Result<(), pohunek_relay_client::Error> {
+    ) -> impl Future<Output = Result<(), pohunek_relay_client::Error>> {
         self.revocations
             .lock()
             .expect("revocations")
             .push(credential.credential_id);
         if let Some(error) = self.revoke_error.lock().expect("revoke error").take() {
-            return Err(error);
+            return std::future::ready(Err(error));
         }
         if self.fail_revoke.load(Ordering::SeqCst) {
-            Err(pohunek_relay_client::Error::Transport)
+            std::future::ready(Err(pohunek_relay_client::Error::Transport))
         } else {
-            Ok(())
+            std::future::ready(Ok(()))
         }
     }
-    async fn rotate(
+    fn rotate(
         &self,
         _credential: &DeviceCredential,
         target: CredentialId,
         request: &RotateCredentialRequest,
-    ) -> Result<CredentialMutation, pohunek_relay_client::Error> {
+    ) -> impl Future<Output = Result<CredentialMutation, pohunek_relay_client::Error>> {
         self.rotation_targets
             .lock()
             .expect("rotation targets")
@@ -190,22 +207,35 @@ impl Api for Relay {
             .lock()
             .expect("rotation requests")
             .push(request.clone());
-        if matches!(
-            self.transport_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining
-                    .checked_sub(1)),
-            Ok(_previous)
-        ) {
-            return Err(pohunek_relay_client::Error::Transport);
+        // Version-neutral CAS loop: `try_update` postdates the workspace MSRV
+        // and `fetch_update` is deprecated on newer toolchains. A zero counter
+        // stays untouched and does not fire, matching the replaced update.
+        let triggered = loop {
+            let remaining = self.transport_failures.load(Ordering::SeqCst);
+            let Some(next) = remaining.checked_sub(1) else {
+                break false;
+            };
+            if self
+                .transport_failures
+                .compare_exchange(remaining, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break true;
+            }
+        };
+        if triggered {
+            return std::future::ready(Err(pohunek_relay_client::Error::Transport));
         }
         if let Some(error) = self.rotation_error.lock().expect("rotation error").take() {
-            return Err(error);
+            return std::future::ready(Err(error));
         }
-        self.rotation
-            .lock()
-            .expect("rotation result")
-            .take()
-            .ok_or(pohunek_relay_client::Error::Remote(409))
+        std::future::ready(
+            self.rotation
+                .lock()
+                .expect("rotation result")
+                .take()
+                .ok_or(pohunek_relay_client::Error::Remote(409)),
+        )
     }
 }
 
