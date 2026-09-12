@@ -36,7 +36,8 @@ use crate::runtime::{Worker, WorkerError};
 use super::{
     native_report_is_current, terminalize_running_subagents, timestamp_now,
     worker_error_to_protocol, InputSubmission, RuntimeExit, RuntimeHandle, RuntimeWatchIdentity,
-    SessionEntry, SessionRegistry, SessionRegistryConfig, ShellCommand, MAX_SESSION_NAME_BYTES,
+    SessionEntry, SessionRegistry, SessionRegistryConfig, ShellCommand, WorkerMetadataApplyOutcome,
+    MAX_SESSION_NAME_BYTES,
 };
 
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.
@@ -5215,10 +5216,11 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
         .await
         .expect("inspect after reconnect");
     assert_eq!(snapshot.subagents.len(), 1, "worker journal retained child");
-    assert!(
+    assert_eq!(
         registry
             .apply_worker_metadata_snapshot(&created.id, &snapshot)
             .await,
+        WorkerMetadataApplyOutcome::Applied,
         "reconnected snapshot applies"
     );
     registry
@@ -5289,10 +5291,11 @@ async fn worker_metadata_cannot_overwrite_a_terminal_durable_record() {
         .record_session(&terminal)
         .expect("persist terminal record");
 
-    assert!(
-        !registry
+    assert_eq!(
+        registry
             .apply_worker_metadata_snapshot(&created.id, &snapshot)
             .await,
+        WorkerMetadataApplyOutcome::Discarded,
         "terminal durable state must reject late worker metadata"
     );
     assert!(
@@ -5341,10 +5344,11 @@ async fn worker_metadata_cannot_recreate_a_removed_durable_record() {
         "test must remove the durable record"
     );
 
-    assert!(
-        !registry
+    assert_eq!(
+        registry
             .apply_worker_metadata_snapshot(&created.id, &snapshot)
             .await,
+        WorkerMetadataApplyOutcome::Discarded,
         "removed durable state must reject late worker metadata"
     );
     assert!(
@@ -5389,10 +5393,11 @@ async fn failed_worker_metadata_persistence_leaves_memory_retryable() {
         .expect("registry store")
         .fail_next_write_before_rename();
 
-    assert!(
-        !registry
+    assert_eq!(
+        registry
             .apply_worker_metadata_snapshot(&created.id, &snapshot)
             .await,
+        WorkerMetadataApplyOutcome::Retryable,
         "failed durable commit must keep the fingerprint retryable"
     );
     assert!(
@@ -5405,10 +5410,11 @@ async fn failed_worker_metadata_persistence_leaves_memory_retryable() {
         "failed persistence must not mutate memory"
     );
 
-    assert!(
+    assert_eq!(
         registry
             .apply_worker_metadata_snapshot(&created.id, &snapshot)
             .await,
+        WorkerMetadataApplyOutcome::Applied,
         "the unchanged snapshot must apply after storage recovers"
     );
     assert_eq!(
@@ -5465,10 +5471,11 @@ async fn transient_identity_validation_failure_retries_the_same_snapshot() {
         .push(worker_subagent_snapshot("safe-child"));
     inspector.fail_descendants_with(std::io::ErrorKind::Interrupted);
 
-    assert!(
-        !registry
+    assert_eq!(
+        registry
             .apply_worker_metadata_snapshot(&created.id, &snapshot)
             .await,
+        WorkerMetadataApplyOutcome::Retryable,
         "transient process inspection failure must request a retry"
     );
     let first = registry
@@ -5479,15 +5486,61 @@ async fn transient_identity_validation_failure_retries_the_same_snapshot() {
     assert_eq!(first.subagents.len(), 1, "safe subagents may still commit");
 
     inspector.clear_descendants_error();
-    assert!(
+    assert_eq!(
         registry
             .apply_worker_metadata_snapshot(&created.id, &snapshot)
             .await,
+        WorkerMetadataApplyOutcome::Applied,
         "the same fingerprint must validate after the transient error clears"
     );
     let retried = registry.inspect(&created.id).await.expect("inspect retry");
     assert_eq!(retried.active_agent.as_deref(), Some("codex"));
     assert_eq!(retried.subagents.len(), 1);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn subagent_only_metadata_skips_identity_process_validation() {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            procwatch_poll: Duration::from_mins(1),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    snapshot.launch_identity = None;
+    snapshot.active_identity = None;
+    snapshot.active_identity_release = None;
+    snapshot
+        .subagents
+        .push(worker_subagent_snapshot("safe-only-child"));
+    inspector.fail_descendants_with(std::io::ErrorKind::Interrupted);
+
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied,
+        "safe metadata must not depend on process-tree inspection"
+    );
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect safe metadata")
+            .subagents
+            .first()
+            .map(|subagent| subagent.id.as_str()),
+        Some("safe-only-child")
+    );
+    inspector.clear_descendants_error();
     let _ = registry.stop(&created.id).await;
 }
 
@@ -5506,10 +5559,11 @@ async fn worker_metadata_retry_preserves_newer_memory_timestamp() {
     snapshot
         .subagents
         .push(worker_subagent_snapshot("timestamp-child"));
-    assert!(
+    assert_eq!(
         registry
             .apply_worker_metadata_snapshot(&created.id, &snapshot)
             .await,
+        WorkerMetadataApplyOutcome::Applied,
         "initial worker metadata must commit"
     );
 
@@ -5518,18 +5572,26 @@ async fn worker_metadata_retry_preserves_newer_memory_timestamp() {
     let entry = sessions.get_mut(&created.id).expect("session entry");
     entry.info.subagents.clear();
     entry.info.cwd = PathBuf::from("/tmp/concurrent-cwd");
+    entry.info.project_id = Some("p-concurrent".to_owned());
+    entry.info.is_linked_worktree = Some(true);
+    entry.info.repo = Some(PathBuf::from("/tmp/concurrent-repo"));
+    entry.info.branch = Some("concurrent-branch".to_owned());
+    entry.info.worktree_path = Some(PathBuf::from("/tmp/concurrent-cwd"));
     entry.info.updated_at = newer_timestamp.to_owned();
     drop(sessions);
 
-    assert!(
+    assert_eq!(
         registry
             .apply_worker_metadata_snapshot(&created.id, &snapshot)
             .await,
+        WorkerMetadataApplyOutcome::Applied,
         "unchanged durable metadata must rebase onto the current memory record"
     );
     let retried = registry.inspect(&created.id).await.expect("inspect retry");
     assert_eq!(retried.updated_at, newer_timestamp);
     assert_eq!(retried.cwd, PathBuf::from("/tmp/concurrent-cwd"));
+    assert_eq!(retried.project_id.as_deref(), Some("p-concurrent"));
+    assert_eq!(retried.branch.as_deref(), Some("concurrent-branch"));
     assert_eq!(
         retried
             .subagents
@@ -5543,6 +5605,22 @@ async fn worker_metadata_retry_preserves_newer_memory_timestamp() {
         .pop()
         .expect("rebased session record");
     assert_eq!(durable.info.updated_at, newer_timestamp);
+    assert_eq!(durable.info.cwd, PathBuf::from("/tmp/concurrent-cwd"));
+    assert_eq!(durable.info.project_id.as_deref(), Some("p-concurrent"));
+    assert_eq!(durable.info.is_linked_worktree, Some(true));
+    assert_eq!(
+        durable.info.repo,
+        Some(PathBuf::from("/tmp/concurrent-repo"))
+    );
+    assert_eq!(durable.info.branch.as_deref(), Some("concurrent-branch"));
+    assert_eq!(
+        durable.info.worktree_path,
+        Some(PathBuf::from("/tmp/concurrent-cwd"))
+    );
+    let recovery = durable.recovery.expect("durable recovery binding");
+    assert_eq!(recovery.cwd, PathBuf::from("/tmp/concurrent-cwd"));
+    assert_eq!(recovery.project_id.as_deref(), Some("p-concurrent"));
+    assert_eq!(recovery.is_linked_worktree, Some(true));
     let _ = registry.stop(&created.id).await;
 }
 
@@ -5561,10 +5639,11 @@ async fn exit_transition_preserves_subagents_committed_ahead_of_memory() {
     snapshot
         .subagents
         .push(worker_subagent_snapshot("durable-exit-child"));
-    assert!(
+    assert_eq!(
         registry
             .apply_worker_metadata_snapshot(&created.id, &snapshot)
             .await,
+        WorkerMetadataApplyOutcome::Applied,
         "worker metadata must commit before the simulated race"
     );
 
@@ -5614,6 +5693,70 @@ async fn exit_transition_preserves_subagents_committed_ahead_of_memory() {
     assert_eq!(durable_child.id, "durable-exit-child");
     assert_eq!(durable_child.lifecycle, SubagentLifecycle::Lost);
     stop_test_worker(worker).await;
+}
+
+#[tokio::test]
+async fn user_stop_preserves_subagents_committed_ahead_of_memory() {
+    let store_path = temp_store_path("worker-metadata-stop-race");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    snapshot
+        .subagents
+        .push(worker_subagent_snapshot("durable-stop-child"));
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied,
+        "worker metadata must commit before the simulated stop race"
+    );
+
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .expect("session entry")
+        .info
+        .subagents
+        .clear();
+
+    assert!(
+        registry
+            .stop(&created.id)
+            .await
+            .expect("stop session")
+            .stopped,
+        "user stop must complete"
+    );
+    let terminal = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect stopped session");
+    let child = terminal.subagents.first().expect("terminal subagent");
+    assert_eq!(child.id, "durable-stop-child");
+    assert_eq!(child.lifecycle, SubagentLifecycle::Lost);
+
+    let durable = crate::store::Store::new(store_path)
+        .load_sessions()
+        .expect("reload stopped session")
+        .pop()
+        .expect("stopped record");
+    let durable_child = durable
+        .info
+        .subagents
+        .first()
+        .expect("durable terminal subagent");
+    assert_eq!(durable_child.id, "durable-stop-child");
+    assert_eq!(durable_child.lifecycle, SubagentLifecycle::Lost);
 }
 
 #[tokio::test]

@@ -105,6 +105,8 @@ const DEFAULT_WORKER_CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 const WORKER_CONNECT_RETRY: Duration = Duration::from_millis(100);
 /// Bounds optimistic terminal-state CAS retries before surfacing contention.
 const MAX_RUNTIME_TRANSITION_COMMIT_ATTEMPTS: usize = 8;
+/// Bounds repeated processing of one unchanged worker metadata fingerprint.
+const MAX_WORKER_METADATA_RETRY_ATTEMPTS: usize = 3;
 /// Per-subscriber worker output queue. It absorbs repaint bursts without
 /// duplicating the larger raw-history budget for every subscriber.
 const DEFAULT_WORKER_SUBSCRIBER_BYTES: u64 = 1_000_000;
@@ -2421,11 +2423,13 @@ impl SessionRegistry {
                 ),
             )
         };
-        let terminal_base = durable_intent.clone();
-        if let Err(error) = self.write_session_record(durable_intent).await {
-            self.clear_stopping(id).await;
-            return Err(error);
-        }
+        let terminal_base = match self.commit_stop_intent(id, durable_intent).await {
+            Ok(record) => record,
+            Err(error) => {
+                self.clear_stopping(id).await;
+                return Err(error);
+            }
+        };
 
         detector_cancel.cancel();
         procwatch_cancel.cancel();
@@ -2470,6 +2474,43 @@ impl SessionRegistry {
         // `stop()` returns.
         self.persist_resume_binding(id).await;
         Ok(SessionStopResult { stopped: true })
+    }
+
+    async fn commit_stop_intent(
+        &self,
+        id: &SessionId,
+        intent: SessionRecord,
+    ) -> Result<SessionRecord, ProtocolError> {
+        for _ in 0..MAX_RUNTIME_TRANSITION_COMMIT_ATTEMPTS {
+            let durable_base = self
+                .load_durable_session_record(id)
+                .await?
+                .unwrap_or_else(|| intent.clone());
+            let mut candidate = intent.clone();
+            preserve_durable_worker_metadata(&durable_base, &mut candidate);
+            match self
+                .write_session_record_if_current(durable_base, candidate.clone())
+                .await
+            {
+                Ok(()) => return Ok(candidate),
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "session_record_commit_stale" | "session_runtime_commit_stale"
+                    ) =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(runtime_error(
+            "session_stop_intent_busy",
+            format!(
+                "session {} kept changing while committing its stop intent",
+                id.0
+            ),
+        ))
     }
 
     async fn commit_user_stop_exit(
@@ -2636,7 +2677,9 @@ impl SessionRegistry {
             let socket_path = initial_worker.socket_path().to_path_buf();
             let mut worker = initial_worker;
             let mut last_worker_metadata = None;
+            let mut pending_worker_metadata = None;
             loop {
+                let mut retry_delay = WORKER_CONNECT_RETRY;
                 let inspected = tokio::select! {
                     () = cancel.cancelled() => return,
                     inspected = worker.inspect() => inspected,
@@ -2649,14 +2692,40 @@ impl SessionRegistry {
                         if !initial_empty_metadata
                             && last_worker_metadata.as_ref() != Some(&worker_metadata)
                         {
-                            if registry
+                            match registry
                                 .apply_worker_metadata_snapshot(&id, &snapshot)
                                 .await
                             {
-                                last_worker_metadata = Some(worker_metadata.clone());
+                                WorkerMetadataApplyOutcome::Applied
+                                | WorkerMetadataApplyOutcome::Discarded => {
+                                    last_worker_metadata = Some(worker_metadata.clone());
+                                    pending_worker_metadata = None;
+                                }
+                                WorkerMetadataApplyOutcome::Retryable => {
+                                    let attempts = pending_worker_metadata
+                                        .as_ref()
+                                        .filter(|(pending, _)| pending == &worker_metadata)
+                                        .map_or(1, |(_, attempts)| attempts + 1);
+                                    if attempts >= MAX_WORKER_METADATA_RETRY_ATTEMPTS {
+                                        warn!(
+                                            session_id = %id.0,
+                                            attempts,
+                                            "worker metadata retry limit reached"
+                                        );
+                                        last_worker_metadata = Some(worker_metadata.clone());
+                                        pending_worker_metadata = None;
+                                    } else {
+                                        retry_delay = WORKER_CONNECT_RETRY.saturating_mul(
+                                            u32::try_from(attempts + 1).unwrap_or(u32::MAX),
+                                        );
+                                        pending_worker_metadata =
+                                            Some((worker_metadata.clone(), attempts));
+                                    }
+                                }
                             }
                         } else {
                             last_worker_metadata = Some(worker_metadata.clone());
+                            pending_worker_metadata = None;
                         }
                         if snapshot.phase == pohunek_worker_protocol::RuntimePhase::Exited {
                             let exit = snapshot.exit.map_or(
@@ -2691,7 +2760,7 @@ impl SessionRegistry {
                 }
                 tokio::select! {
                     () = cancel.cancelled() => return,
-                    () = tokio::time::sleep(WORKER_CONNECT_RETRY) => {}
+                    () = tokio::time::sleep(retry_delay) => {}
                 }
             }
         });
@@ -3298,6 +3367,13 @@ type WorkerMetadataFingerprint = (
     Vec<pohunek_worker_protocol::SubagentSnapshot>,
 );
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerMetadataApplyOutcome {
+    Applied,
+    Retryable,
+    Discarded,
+}
+
 fn worker_metadata_fingerprint(
     snapshot: &pohunek_worker_protocol::InspectSnapshot,
 ) -> WorkerMetadataFingerprint {
@@ -3848,6 +3924,32 @@ fn preserve_newer_updated_at(existing: &str, replacement: &mut String) {
         replacement.clear();
         replacement.push_str(existing);
     }
+}
+
+fn preserve_durable_worker_metadata(existing: &SessionRecord, replacement: &mut SessionRecord) {
+    replacement
+        .info
+        .subagents
+        .clone_from(&existing.info.subagents);
+    replacement
+        .info
+        .active_agent
+        .clone_from(&existing.info.active_agent);
+    replacement
+        .info
+        .active_agent_base
+        .clone_from(&existing.info.active_agent_base);
+    replacement.info.active_agent_pid = existing.info.active_agent_pid;
+    replacement
+        .info
+        .active_agent_session_id
+        .clone_from(&existing.info.active_agent_session_id);
+    replacement
+        .info
+        .active_agent_session_path
+        .clone_from(&existing.info.active_agent_session_path);
+    crate::store::preserve_newer_native_identity(existing, replacement);
+    preserve_newer_updated_at(&existing.info.updated_at, &mut replacement.info.updated_at);
 }
 
 fn current_time_millis() -> u64 {
