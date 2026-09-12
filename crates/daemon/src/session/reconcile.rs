@@ -14,13 +14,13 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    current_time_millis, event, event_payload, identity_claim_expiry_is_valid, mpsc, runtime_error,
-    sort_subagents, terminalize_running_subagents, timestamp_now, watch, ActiveAgentReport,
-    CancellationToken, DesiredState, DetectorConfig, DetectorConfigUpdate, DetectorInputs,
-    DetectorScope, Mutex, Notify, ObservedAgent, ProtocolError, ResumeSnapshot, RuntimeHandle,
-    RuntimeState, RuntimeWatchIdentity, SessionEntry, SessionId, SessionRecord, SessionRef,
-    SessionRefKind, SessionRegistry, SessionRuntime, SessionState, StateSource, Worker,
-    WorkerError, WORKER_CONNECT_RETRY,
+    current_time_millis, event, event_payload, identity_claim_expiry_is_valid, mpsc,
+    preserve_newer_updated_at, runtime_error, sort_subagents, terminalize_running_subagents,
+    timestamp_now, watch, ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig,
+    DetectorConfigUpdate, DetectorInputs, DetectorScope, Mutex, Notify, ObservedAgent,
+    ProtocolError, ResumeSnapshot, RuntimeHandle, RuntimeState, RuntimeWatchIdentity, SessionEntry,
+    SessionId, SessionRecord, SessionRef, SessionRefKind, SessionRegistry, SessionRuntime,
+    SessionState, StateSource, Worker, WorkerError, WORKER_CONNECT_RETRY,
 };
 use crate::procwatch::ProcessInspector;
 use crate::session::target::open_detector_output;
@@ -101,7 +101,7 @@ impl SessionRegistry {
     ) -> bool {
         let expected_worker_id = snapshot.worker_id.to_string();
         let expected_runtime_id = snapshot.runtime_id.as_ref().map(ToString::to_string);
-        let memory_base = {
+        let mut memory_base = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(id) else {
                 return false;
@@ -164,6 +164,9 @@ impl SessionRegistry {
         candidate.info.subagents.clone_from(&subagents);
         if candidate != durable_base {
             candidate.info.updated_at = timestamp_now();
+        }
+        preserve_newer_updated_at(&memory_base.info.updated_at, &mut candidate.info.updated_at);
+        if candidate != durable_base {
             if let Err(error) = self
                 .write_session_record_if_current(durable_base, candidate.clone())
                 .await
@@ -173,12 +176,47 @@ impl SessionRegistry {
             }
         }
 
+        let current_after_store = {
+            let sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get(id) else {
+                return false;
+            };
+            let current = Self::session_record(id, entry, entry.desired_state, None);
+            if !worker_metadata_record_is_current(
+                &current,
+                &expected_worker_id,
+                expected_runtime_id.as_deref(),
+            ) {
+                return false;
+            }
+            current
+        };
+        if current_after_store != memory_base {
+            let durable_before_rebase = candidate.clone();
+            preserve_newer_updated_at(
+                &current_after_store.info.updated_at,
+                &mut candidate.info.updated_at,
+            );
+            if candidate != durable_before_rebase {
+                if let Err(error) = self
+                    .write_session_record_if_current(durable_before_rebase, candidate.clone())
+                    .await
+                {
+                    tracing::warn!(session_id = %id.0, error = %error, "failed to persist rebased worker metadata timestamp");
+                    return false;
+                }
+            }
+            memory_base = current_after_store;
+        }
+
         let updated = {
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(id) else {
                 return false;
             };
             let current = Self::session_record(id, entry, entry.desired_state, None);
+            // The narrow projection may rebase once across a benign live-state
+            // change, but another concurrent change keeps the snapshot retryable.
             if current != memory_base {
                 return false;
             }
@@ -200,7 +238,9 @@ impl SessionRegistry {
                 .last_native_report
                 .clone_from(&candidate.native_identity_ordering);
             if changed {
-                entry.info.updated_at.clone_from(&candidate.info.updated_at);
+                let mut updated_at = candidate.info.updated_at.clone();
+                preserve_newer_updated_at(&entry.info.updated_at, &mut updated_at);
+                entry.info.updated_at = updated_at;
             }
             (changed, entry.info.clone(), subagent_events)
         };

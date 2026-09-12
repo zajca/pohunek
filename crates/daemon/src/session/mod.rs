@@ -2992,7 +2992,20 @@ impl SessionRegistry {
             };
             &loaded_durable_base
         };
-        let updated = *updated;
+        let mut updated = *updated;
+        // Worker metadata may commit while benign live fields change in memory.
+        // Terminalization must start from that durable child history so the
+        // final record cannot erase an already acknowledged snapshot.
+        updated
+            .candidate
+            .info
+            .subagents
+            .clone_from(&durable_base.info.subagents);
+        terminalize_running_subagents(&mut updated.candidate.info.subagents, current_time_millis());
+        preserve_newer_updated_at(
+            &durable_base.info.updated_at,
+            &mut updated.candidate.info.updated_at,
+        );
 
         let committed_info = match Box::pin(self.commit_runtime_transition(
             id,
@@ -3823,6 +3836,18 @@ fn validate_observation_config(config: &SessionRegistryConfig) -> Result<(), Pro
 
 fn timestamp_now() -> String {
     now_rfc3339()
+}
+
+fn preserve_newer_updated_at(existing: &str, replacement: &mut String) {
+    let existing_time = OffsetDateTime::parse(existing, &Rfc3339);
+    let replacement_time = OffsetDateTime::parse(replacement, &Rfc3339);
+    if matches!(
+        (existing_time, replacement_time),
+        (Ok(existing_time), Ok(replacement_time)) if existing_time > replacement_time
+    ) {
+        replacement.clear();
+        replacement.push_str(existing);
+    }
 }
 
 fn current_time_millis() -> u64 {
