@@ -5722,6 +5722,10 @@ fn metadata_tracker_recovers_unchanged_fingerprint_after_previous_limit() {
         "the old three-attempt boundary must not complete retryable metadata"
     );
     assert!(
+        !tracker.is_complete(&fingerprint),
+        "retryable final metadata must block terminalization"
+    );
+    assert!(
         !tracker
             .retry(
                 &fingerprint,
@@ -5743,6 +5747,10 @@ fn metadata_tracker_recovers_unchanged_fingerprint_after_previous_limit() {
     assert!(
         !tracker.should_apply(&fingerprint),
         "successful recovery completes the unchanged fingerprint"
+    );
+    assert!(
+        tracker.is_complete(&fingerprint),
+        "recovered final metadata permits terminalization"
     );
 }
 
@@ -5815,6 +5823,187 @@ async fn exit_transition_preserves_subagents_committed_ahead_of_memory() {
     assert_eq!(durable_child.id, "durable-exit-child");
     assert_eq!(durable_child.lifecycle, SubagentLifecycle::Lost);
     stop_test_worker(worker).await;
+}
+
+#[tokio::test]
+async fn exit_transition_preserves_launch_identity_committed_ahead_of_memory() {
+    let store_path = temp_store_path("worker-launch-identity-exit-race");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        agents_dir: Some(temp_resumable_agents_dir(
+            "worker-launch-identity-exit-race",
+        )),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(SessionNewParams {
+            agent: "resumable".to_owned(),
+            ..params()
+        })
+        .await
+        .expect("create resumable session");
+    let (worker, identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    snapshot.launch_identity = Some(pohunek_worker_protocol::ReportedLaunchIdentity {
+        provider: "claude".to_owned(),
+        process: snapshot.child_process.expect("worker child"),
+        reference_kind: "id".to_owned(),
+        native_reference: "durable-exit-native".to_owned(),
+    });
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied,
+        "launch identity must commit before the simulated race"
+    );
+
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("session entry");
+    entry.runtime_watch_cancel.cancel();
+    entry.info.native_session_id = None;
+    entry.info.native_session_path = None;
+    drop(sessions);
+
+    assert!(
+        registry
+            .record_exit(
+                &created.id,
+                RuntimeExit {
+                    exit_code: Some(0),
+                    success: true,
+                },
+                false,
+                Some(&identity),
+                None,
+            )
+            .await
+            .expect("record exited worker"),
+        "exit transition must commit"
+    );
+    let terminal = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect terminal");
+    assert_eq!(terminal.state, SessionState::Done);
+    assert_eq!(
+        terminal.native_session_id.as_deref(),
+        Some("durable-exit-native")
+    );
+
+    let durable = crate::store::Store::new(store_path)
+        .load_sessions()
+        .expect("reload terminal session")
+        .pop()
+        .expect("terminal record");
+    assert_eq!(
+        durable.info.native_session_id.as_deref(),
+        Some("durable-exit-native")
+    );
+    assert_eq!(
+        durable
+            .recovery
+            .as_ref()
+            .and_then(|recovery| recovery.native_session_id.as_deref()),
+        Some("durable-exit-native")
+    );
+    stop_test_worker(worker).await;
+}
+
+#[tokio::test]
+async fn failed_stop_intent_persistence_restores_memory_desired_state() {
+    let store_path = temp_store_path("stop-intent-rollback");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    registry
+        .inner
+        .store
+        .as_ref()
+        .expect("registry store")
+        .fail_next_write_before_rename();
+
+    let error = registry
+        .stop(&created.id)
+        .await
+        .expect_err("stop intent persistence must fail");
+    assert_eq!(error.code, "session_store_failed");
+    let sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get(&created.id).expect("session entry");
+    assert_eq!(entry.desired_state, crate::store::DesiredState::Running);
+    assert!(!entry.stopping);
+    assert!(entry.stop_transaction_id.is_none());
+    assert_eq!(entry.info.state, SessionState::Running);
+    drop(sessions);
+
+    let durable = crate::store::Store::new(store_path)
+        .load_sessions()
+        .expect("reload session after failed stop")
+        .pop()
+        .expect("durable session");
+    assert_eq!(durable.desired_state, crate::store::DesiredState::Running);
+    assert!(
+        registry
+            .stop(&created.id)
+            .await
+            .expect("stop session after storage recovers")
+            .stopped
+    );
+}
+
+#[tokio::test]
+async fn failed_stop_intent_rollback_does_not_overwrite_replacement_runtime() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (_worker, original_runtime) = live_worker_and_identity(&registry, &created.id).await;
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("session entry");
+    entry.stopping = true;
+    entry.stop_transaction_id = Some("original-stop".to_owned());
+    entry.desired_state = crate::store::DesiredState::Stopped;
+    entry
+        .info
+        .runtime
+        .as_mut()
+        .expect("runtime metadata")
+        .runtime_id = Some("replacement-runtime".to_owned());
+    drop(sessions);
+
+    registry
+        .rollback_stop_intent(
+            &created.id,
+            crate::store::DesiredState::Running,
+            crate::store::DesiredState::Stopped,
+            "original-stop",
+            Some(&original_runtime),
+        )
+        .await;
+
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("session entry");
+    assert_eq!(entry.desired_state, crate::store::DesiredState::Stopped);
+    assert!(entry.stopping);
+    assert_eq!(entry.stop_transaction_id.as_deref(), Some("original-stop"));
+    entry.stopping = false;
+    entry.stop_transaction_id = None;
+    entry.desired_state = crate::store::DesiredState::Running;
+    entry
+        .info
+        .runtime
+        .as_mut()
+        .expect("runtime metadata")
+        .runtime_id = Some(original_runtime.runtime_id);
+    drop(sessions);
+    let _ = registry.stop(&created.id).await;
 }
 
 #[tokio::test]

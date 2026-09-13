@@ -482,6 +482,7 @@ struct SessionEntry {
     runtime_watch_cancel: CancellationToken,
     procwatch_rescan: Arc<Notify>,
     stopping: bool,
+    stop_transaction_id: Option<String>,
     /// Resolved input-framing rules (base-kind defaults, profile-overridden), used
     /// by `session.input` so a profile's `[input_rules]` is honored on every write.
     input_rules: InputRules,
@@ -682,6 +683,7 @@ fn exit_transition(
     let stopped =
         stopped_by_user || candidate.stopping || candidate.info.state == SessionState::Stopped;
     candidate.stopping = false;
+    candidate.stop_transaction_id = None;
     let stop_reason = if stopped {
         candidate.info.state = SessionState::Stopped;
         "stopped"
@@ -2380,6 +2382,10 @@ impl SessionRegistry {
             .await
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the stop transaction stays linear so durable intent, runtime shutdown, and terminal commit ordering remain explicit"
+    )]
     async fn stop_with_intent(
         &self,
         id: &SessionId,
@@ -2395,7 +2401,15 @@ impl SessionRegistry {
             TransactionKind::Recover => "recover",
         };
         let transaction_id = format!("{operation}-{sequence}");
-        let (runtime, detector_cancel, procwatch_cancel, runtime_watch_cancel, durable_intent) = {
+        let (
+            runtime,
+            detector_cancel,
+            procwatch_cancel,
+            runtime_watch_cancel,
+            previous_desired_state,
+            stop_runtime,
+            durable_intent,
+        ) = {
             let mut sessions = self.inner.sessions.lock().await;
             let entry = sessions
                 .get_mut(id)
@@ -2404,13 +2418,18 @@ impl SessionRegistry {
                 return Ok(SessionStopResult { stopped: false });
             }
 
+            let previous_desired_state = entry.desired_state;
+            let stop_runtime = RuntimeWatchIdentity::from_info(&entry.info);
             entry.stopping = true;
+            entry.stop_transaction_id = Some(transaction_id.clone());
             entry.desired_state = desired_state;
             (
                 entry.runtime.clone(),
                 entry.detector_cancel.clone(),
                 entry.procwatch_cancel.clone(),
                 entry.runtime_watch_cancel.clone(),
+                previous_desired_state,
+                stop_runtime,
                 Self::session_record(
                     id,
                     entry,
@@ -2428,7 +2447,14 @@ impl SessionRegistry {
         let terminal_base = match self.commit_stop_intent(id, durable_intent).await {
             Ok(record) => record,
             Err(error) => {
-                self.clear_stopping(id).await;
+                self.rollback_stop_intent(
+                    id,
+                    previous_desired_state,
+                    desired_state,
+                    &transaction_id,
+                    stop_runtime.as_ref(),
+                )
+                .await;
                 return Err(error);
             }
         };
@@ -2440,19 +2466,22 @@ impl SessionRegistry {
 
         let exit = match runtime {
             RuntimeHandle::Worker(worker) => {
-                let transaction = pohunek_worker_protocol::TransactionId::new(transaction_id)
-                    .map_err(|error| runtime_error("worker_stop_invalid", error.to_string()))?;
+                let transaction =
+                    pohunek_worker_protocol::TransactionId::new(transaction_id.clone())
+                        .map_err(|error| runtime_error("worker_stop_invalid", error.to_string()))?;
                 let status = match worker.stop(transaction).await {
                     Ok(Some(status)) => status,
                     Ok(None) => {
-                        self.clear_stopping(id).await;
+                        self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
+                            .await;
                         return Err(runtime_error(
                             "worker_stop_incomplete",
                             format!("worker for {} did not return a terminal outcome", id.0),
                         ));
                     }
                     Err(error) => {
-                        self.clear_stopping(id).await;
+                        self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
+                            .await;
                         return Err(worker_error_to_protocol(error));
                     }
                 };
@@ -2462,7 +2491,8 @@ impl SessionRegistry {
                 }
             }
             RuntimeHandle::Unavailable(state) => {
-                self.clear_stopping(id).await;
+                self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
+                    .await;
                 return Err(unavailable_runtime_error(id, state));
             }
         };
@@ -2715,7 +2745,9 @@ impl SessionRegistry {
                         } else {
                             metadata.complete(worker_metadata.clone());
                         }
-                        if snapshot.phase == pohunek_worker_protocol::RuntimePhase::Exited {
+                        if snapshot.phase == pohunek_worker_protocol::RuntimePhase::Exited
+                            && metadata.is_complete(&worker_metadata)
+                        {
                             let exit = snapshot.exit.map_or(
                                 RuntimeExit {
                                     exit_code: None,
@@ -3058,6 +3090,11 @@ impl SessionRegistry {
             .info
             .subagents
             .clone_from(&durable_base.info.subagents);
+        let _ = preserve_durable_launch_identity(
+            durable_base,
+            &mut updated.candidate.info,
+            updated.candidate.last_native_report.is_some(),
+        );
         terminalize_running_subagents(&mut updated.candidate.info.subagents, current_time_millis());
         preserve_newer_updated_at(
             &durable_base.info.updated_at,
@@ -3108,12 +3145,56 @@ impl SessionRegistry {
         Ok(true)
     }
 
-    async fn clear_stopping(&self, id: &SessionId) {
+    async fn clear_stopping(
+        &self,
+        id: &SessionId,
+        transaction_id: &str,
+        expected_runtime: Option<&RuntimeWatchIdentity>,
+    ) {
         let mut sessions = self.inner.sessions.lock().await;
         if let Some(entry) = sessions.get_mut(id) {
-            if !is_terminal(entry.info.state) {
+            let runtime_matches = expected_runtime.map_or_else(
+                || RuntimeWatchIdentity::from_info(&entry.info).is_none(),
+                |expected| expected.matches(entry),
+            );
+            if !is_terminal(entry.info.state)
+                && runtime_matches
+                && entry.stop_transaction_id.as_deref() == Some(transaction_id)
+            {
                 entry.stopping = false;
+                entry.stop_transaction_id = None;
             }
+        }
+    }
+
+    async fn rollback_stop_intent(
+        &self,
+        id: &SessionId,
+        previous_desired_state: DesiredState,
+        attempted_desired_state: DesiredState,
+        attempted_transaction_id: &str,
+        expected_runtime: Option<&RuntimeWatchIdentity>,
+    ) {
+        let mut sessions = self.inner.sessions.lock().await;
+        let Some(entry) = sessions.get_mut(id) else {
+            return;
+        };
+        let runtime_matches = expected_runtime.map_or_else(
+            || RuntimeWatchIdentity::from_info(&entry.info).is_none(),
+            |expected| expected.matches(entry),
+        );
+        // The failed durable writer may finish after runtime replacement or a
+        // newer stop/remove request. Only undo the exact in-memory intent that
+        // belonged to the writer.
+        if runtime_matches
+            && !is_terminal(entry.info.state)
+            && entry.stopping
+            && entry.desired_state == attempted_desired_state
+            && entry.stop_transaction_id.as_deref() == Some(attempted_transaction_id)
+        {
+            entry.stopping = false;
+            entry.stop_transaction_id = None;
+            entry.desired_state = previous_desired_state;
         }
     }
 
@@ -3383,6 +3464,10 @@ impl WorkerMetadataTracker {
 
     fn should_apply(&self, fingerprint: &WorkerMetadataFingerprint) -> bool {
         self.completed.as_ref() != Some(fingerprint)
+    }
+
+    fn is_complete(&self, fingerprint: &WorkerMetadataFingerprint) -> bool {
+        self.completed.as_ref() == Some(fingerprint) && self.pending.is_none()
     }
 
     fn complete(&mut self, fingerprint: WorkerMetadataFingerprint) {
@@ -3995,28 +4080,44 @@ fn preserve_durable_worker_metadata(existing: &SessionRecord, replacement: &mut 
         .info
         .active_agent_session_path
         .clone_from(&existing.info.active_agent_session_path);
-    replacement
-        .info
-        .native_session_id
-        .clone_from(&existing.info.native_session_id);
-    replacement
-        .info
-        .native_session_path
-        .clone_from(&existing.info.native_session_path);
-    match (replacement.recovery.as_mut(), existing.recovery.as_ref()) {
-        (Some(replacement), Some(existing)) => {
-            replacement
-                .native_session_id
-                .clone_from(&existing.native_session_id);
-            replacement
-                .native_session_path
-                .clone_from(&existing.native_session_path);
+    let preserved_launch = preserve_durable_launch_identity(
+        existing,
+        &mut replacement.info,
+        replacement.native_identity_ordering.is_some(),
+    );
+    if preserved_launch {
+        match (replacement.recovery.as_mut(), existing.recovery.as_ref()) {
+            (Some(replacement), Some(existing)) => {
+                replacement
+                    .native_session_id
+                    .clone_from(&existing.native_session_id);
+                replacement
+                    .native_session_path
+                    .clone_from(&existing.native_session_path);
+            }
+            (None, Some(existing)) => replacement.recovery = Some(existing.clone()),
+            _ => {}
         }
-        (None, Some(existing)) => replacement.recovery = Some(existing.clone()),
-        _ => {}
     }
     crate::store::preserve_newer_native_identity(existing, replacement);
     preserve_newer_updated_at(&existing.info.updated_at, &mut replacement.info.updated_at);
+}
+
+fn preserve_durable_launch_identity(
+    existing: &SessionRecord,
+    replacement: &mut SessionInfo,
+    replacement_has_ordering: bool,
+) -> bool {
+    if existing.native_identity_ordering.is_some() || replacement_has_ordering {
+        return false;
+    }
+    replacement
+        .native_session_id
+        .clone_from(&existing.info.native_session_id);
+    replacement
+        .native_session_path
+        .clone_from(&existing.info.native_session_path);
+    true
 }
 
 fn current_time_millis() -> u64 {
