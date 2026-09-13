@@ -109,21 +109,30 @@ impl SubprocessWorkerLauncher {
             prepare_private_directory(&self.environment.state_home.join("pohunek/workers"))?;
 
             let mut children = self.children.lock().await;
+            let previous_exited = children
+                .get_mut(id.as_str())
+                .map(tokio::process::Child::try_wait)
+                .transpose()
+                .map_err(|source| operation("inspect_before_start", source))?
+                .flatten()
+                .is_some();
+            if children.contains_key(id.as_str()) && !replace && !previous_exited {
+                return Err(operation(
+                    "start",
+                    std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "worker is already supervised",
+                    ),
+                ));
+            }
             if let Some(mut previous) = children.remove(id.as_str()) {
-                if !replace {
-                    children.insert(id.to_string(), previous);
-                    return Err(operation(
-                        "start",
-                        std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            "worker is already supervised",
-                        ),
-                    ));
+                if !previous_exited {
+                    debug_assert!(replace, "active child replacement was validated above");
+                    previous
+                        .start_kill()
+                        .map_err(|source| operation("replace", source))?;
+                    let _ = previous.wait().await;
                 }
-                previous
-                    .start_kill()
-                    .map_err(|source| operation("replace", source))?;
-                let _ = previous.wait().await;
             } else if replace {
                 tracing::debug!(
                     session_id = id.as_str(),
@@ -402,14 +411,20 @@ mod test_support {
                     // otherwise flakes as `worker socket already accepts
                     // connections` under load.
                     let _ = std::fs::remove_file(&socket_path);
-                } else if tasks.contains_key(session_id) {
-                    return Err(operation(
-                        "start",
-                        std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            "worker is already supervised",
-                        ),
-                    ));
+                } else if let Some(task) = tasks.get(session_id) {
+                    if !task.is_finished() {
+                        return Err(operation(
+                            "start",
+                            std::io::Error::new(
+                                std::io::ErrorKind::AlreadyExists,
+                                "worker is already supervised",
+                            ),
+                        ));
+                    }
+                    if let Some(task) = tasks.remove(session_id) {
+                        let _ = task.await;
+                    }
+                    let _ = std::fs::remove_file(&socket_path);
                 }
                 let sequence = WORKER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
                 let worker_id = format!("worker-test-{sequence}");
@@ -499,5 +514,84 @@ mod test_support {
                 Ok(())
             })
         }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use pohunek_platform::supervisor::{ServiceId, ServiceState, Supervisor};
+
+        use super::InProcessWorkerLauncher;
+
+        #[tokio::test]
+        async fn start_reactivates_a_finished_task() {
+            let root = tempfile::tempdir().expect("temporary worker root");
+            let launcher = InProcessWorkerLauncher::new(
+                root.path().join("runtime"),
+                root.path().join("state"),
+            );
+            let id = ServiceId::parse("s-42").expect("valid service id");
+            let task = tokio::spawn(async {});
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            launcher.tasks.lock().await.insert(id.to_string(), task);
+
+            launcher
+                .start(&id)
+                .await
+                .expect("finished task can be started again");
+            assert_eq!(
+                launcher.inspect(&id).await.expect("active task").state,
+                ServiceState::Running
+            );
+            launcher.retire(&id).await.expect("retire active task");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use pohunek_platform::supervisor::{ServiceId, ServiceState, Supervisor};
+
+    use super::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
+
+    /// Bounds the regression test while allowing a loaded CI runner to reap the
+    /// deliberately short-lived child.
+    const CHILD_EXIT_ATTEMPTS: usize = 100;
+    const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    #[tokio::test]
+    async fn subprocess_start_reactivates_an_exited_child() {
+        let root = tempfile::tempdir().expect("temporary worker root");
+        let launcher = SubprocessWorkerLauncher::new(
+            "true".into(),
+            SubprocessWorkerEnvironment {
+                runtime_home: root.path().join("runtime"),
+                state_home: root.path().join("state"),
+                data_home: root.path().join("data"),
+                config_home: root.path().join("config"),
+                cache_home: root.path().join("cache"),
+                daemon_socket: root.path().join("daemon.sock"),
+            },
+        );
+        let id = ServiceId::parse("s-42").expect("valid service id");
+        launcher.start(&id).await.expect("first child starts");
+
+        let mut stopped = false;
+        for _ in 0..CHILD_EXIT_ATTEMPTS {
+            if launcher.inspect(&id).await.expect("child state").state == ServiceState::Stopped {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(CHILD_EXIT_POLL_INTERVAL).await;
+        }
+        assert!(stopped, "short-lived child did not exit before deadline");
+
+        launcher
+            .start(&id)
+            .await
+            .expect("exited child can be started again");
     }
 }

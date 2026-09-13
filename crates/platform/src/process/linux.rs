@@ -73,7 +73,7 @@ impl LinuxInspector {
     /// Returns typed boot-identity inspection failures.
     pub fn boot_identity(&self) -> Result<BootIdentity, Error> {
         let value = fs::read_to_string(BOOT_ID_PATH)
-            .map_err(|source| Error::from_io("read_boot_identity", source))?;
+            .map_err(|source| facility_error("read_boot_identity", source))?;
         BootIdentity::parse(value.trim())
     }
 }
@@ -81,7 +81,7 @@ impl LinuxInspector {
 impl ProcessInspector for LinuxInspector {
     fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, Error> {
         let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
-        read_process_fact(pid, euid).map_err(|source| Error::from_io("inspect_process", source))
+        read_process_fact(pid, euid).map_err(|source| process_error("inspect_process", source))
     }
 
     fn same_user_processes(&self) -> Result<Vec<ProcessFact>, Error> {
@@ -110,7 +110,7 @@ impl ProcessInspector for LinuxInspector {
 
     fn cwd(&self, pid: Pid) -> Result<PathBuf, Error> {
         fs::read_link(proc_path(pid).join("cwd"))
-            .map_err(|source| Error::from_io("read_cwd", source))
+            .map_err(|source| process_error("read_cwd", source))
     }
 
     fn exit_watch(&self, pid: Pid) -> Result<ExitWatch, Error> {
@@ -124,7 +124,7 @@ impl ProcessInspector for LinuxInspector {
                 operation: "open_exit_watch",
             })?;
         let fd = pidfd_open(native, PidfdFlags::empty())
-            .map_err(|source| Error::from_io("open_exit_watch", source.into()))?;
+            .map_err(|source| process_error("open_exit_watch", source.into()))?;
         let fd =
             AsyncFd::new(fd).map_err(|source| Error::from_io("register_exit_watch", source))?;
         Ok(ExitWatch::from_future(async move {
@@ -137,12 +137,12 @@ impl ProcessInspector for LinuxInspector {
     }
 
     fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, Error> {
-        ownership_markers(pid).map_err(|source| Error::from_io("read_ownership_markers", source))
+        ownership_markers(pid).map_err(|source| process_error("read_ownership_markers", source))
     }
 
     fn foreground_process_group(&self, root_pid: Pid) -> Result<Option<Pid>, Error> {
         foreground_process_group(root_pid)
-            .map_err(|source| Error::from_io("read_foreground_process_group", source))
+            .map_err(|source| process_error("read_foreground_process_group", source))
     }
 }
 
@@ -420,6 +420,22 @@ fn is_process_race(err: &io::Error) -> bool {
         || err.raw_os_error() == Some(nix::errno::Errno::ESRCH as i32)
 }
 
+fn process_error(operation: &'static str, source: io::Error) -> Error {
+    if is_process_race(&source) {
+        Error::Race { operation }
+    } else {
+        Error::from_io(operation, source)
+    }
+}
+
+fn facility_error(operation: &'static str, source: io::Error) -> Error {
+    if source.kind() == io::ErrorKind::NotFound {
+        Error::Unavailable { operation }
+    } else {
+        Error::from_io(operation, source)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +509,22 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn exited_process_errno_is_a_race() {
+        let error = io::Error::from_raw_os_error(nix::errno::Errno::ESRCH as i32);
+        assert!(process_error("open_exit_watch", error).is_race());
+    }
+
+    #[test]
+    fn missing_boot_identity_facility_is_unavailable() {
+        let error = io::Error::from_raw_os_error(nix::errno::Errno::ENOENT as i32);
+        assert!(matches!(
+            facility_error("read_boot_identity", error),
+            Error::Unavailable {
+                operation: "read_boot_identity"
+            }
+        ));
     }
 }

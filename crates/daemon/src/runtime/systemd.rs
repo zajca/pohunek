@@ -173,7 +173,7 @@ impl Units {
             let Some(id) = self.template.service_id(&name) else {
                 continue;
             };
-            observations.push(self.inspect_service(&id).await?);
+            push_discovered_observation(&mut observations, self.inspect_service(&id).await)?;
         }
         observations.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(observations)
@@ -290,6 +290,18 @@ fn validate_discovery_count(count: usize) -> Result<(), SupervisorError> {
                 "worker namespace contains {count} units; maximum is {MAX_DISCOVERED_WORKERS}"
             ),
         });
+    }
+    Ok(())
+}
+
+fn push_discovered_observation(
+    observations: &mut Vec<ServiceObservation>,
+    result: Result<ServiceObservation, SupervisorError>,
+) -> Result<(), SupervisorError> {
+    match result {
+        Ok(observation) => observations.push(observation),
+        Err(SupervisorError::NotFound(_)) => {}
+        Err(error) => return Err(error),
     }
     Ok(())
 }
@@ -422,5 +434,23 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn discovery_skips_units_that_disappear_during_inspection() {
+        let vanished = ServiceId::parse("s-42").expect("valid service id");
+        let remaining = ServiceObservation {
+            id: ServiceId::parse("s-43").expect("valid service id"),
+            state: ServiceState::Running,
+            process: None,
+        };
+        let mut observations = Vec::new();
+
+        push_discovered_observation(&mut observations, Err(SupervisorError::NotFound(vanished)))
+            .expect("vanished unit is an expected discovery race");
+        push_discovered_observation(&mut observations, Ok(remaining.clone()))
+            .expect("remaining unit is retained");
+
+        assert_eq!(observations, vec![remaining]);
     }
 }

@@ -207,13 +207,15 @@ pub enum Error {
 }
 
 impl Error {
-    /// Classifies an operating-system error without exposing process contents.
+    /// Classifies a general operating-system error without exposing contents.
+    ///
+    /// Process backends must classify target-specific disappearance errors at
+    /// their operation call sites before using this fallback.
     #[must_use]
     pub fn from_io(operation: &'static str, source: std::io::Error) -> Self {
         match source.kind() {
             std::io::ErrorKind::PermissionDenied => Self::PermissionDenied { operation, source },
             std::io::ErrorKind::Unsupported => Self::Unavailable { operation },
-            std::io::ErrorKind::NotFound => Self::Race { operation },
             std::io::ErrorKind::InvalidData => Self::InvalidData { operation },
             _ => Self::Io { operation, source },
         }
@@ -353,11 +355,13 @@ mod tests {
             ),
             Error::PermissionDenied { .. }
         ));
-        assert!(Error::from_io(
-            "inspect",
-            std::io::Error::from(std::io::ErrorKind::NotFound)
-        )
-        .is_race());
+        assert!(matches!(
+            Error::from_io(
+                "inspect",
+                std::io::Error::from(std::io::ErrorKind::NotFound)
+            ),
+            Error::Io { .. }
+        ));
         assert!(matches!(
             Error::from_io(
                 "inspect",
