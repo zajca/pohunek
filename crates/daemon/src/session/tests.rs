@@ -37,8 +37,9 @@ use super::{
     native_report_is_current, preserve_durable_worker_metadata, terminalize_running_subagents,
     timestamp_now, worker_error_to_protocol, InputSubmission, RuntimeExit, RuntimeHandle,
     RuntimeWatchIdentity, SessionEntry, SessionRegistry, SessionRegistryConfig, ShellCommand,
-    WorkerMetadataApplyOutcome, WorkerMetadataTracker, MAX_SESSION_NAME_BYTES,
-    MAX_WORKER_METADATA_RETRY_DELAY, WORKER_METADATA_RETRY_WARN_INTERVAL,
+    WorkerMetadataApplyOutcome, WorkerMetadataProgress, WorkerMetadataRetryCause,
+    WorkerMetadataTracker, MAX_SESSION_NAME_BYTES, MAX_WORKER_METADATA_RETRY_DELAY,
+    WORKER_METADATA_RETRY_WARN_INTERVAL,
 };
 
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.
@@ -5398,7 +5399,7 @@ async fn failed_worker_metadata_persistence_leaves_memory_retryable() {
         registry
             .apply_worker_metadata_snapshot(&created.id, &snapshot)
             .await,
-        WorkerMetadataApplyOutcome::Retryable,
+        WorkerMetadataApplyOutcome::Retryable(WorkerMetadataRetryCause::Commit),
         "failed durable commit must keep the fingerprint retryable"
     );
     assert!(
@@ -5476,7 +5477,7 @@ async fn transient_identity_validation_failure_retries_the_same_snapshot() {
         registry
             .apply_worker_metadata_snapshot(&created.id, &snapshot)
             .await,
-        WorkerMetadataApplyOutcome::Retryable,
+        WorkerMetadataApplyOutcome::Retryable(WorkerMetadataRetryCause::IdentityValidation),
         "transient process inspection failure must request a retry"
     );
     let first = registry
@@ -5754,6 +5755,42 @@ fn metadata_tracker_recovers_unchanged_fingerprint_after_previous_limit() {
     );
 }
 
+#[test]
+fn terminal_identity_retry_finishes_without_completing_commit_failures() {
+    let fingerprint = (None, None, None, Vec::new());
+    let now = Instant::now();
+    let mut identity_tracker = WorkerMetadataTracker::default();
+
+    assert_eq!(
+        identity_tracker.record(
+            fingerprint.clone(),
+            WorkerMetadataApplyOutcome::Retryable(WorkerMetadataRetryCause::IdentityValidation),
+            pohunek_worker_protocol::RuntimePhase::Exited,
+            now,
+        ),
+        WorkerMetadataProgress::IdentityDiscarded
+    );
+    assert!(
+        identity_tracker.is_complete(&fingerprint),
+        "unverified terminal identity must not block a known process exit"
+    );
+
+    let mut commit_tracker = WorkerMetadataTracker::default();
+    assert!(matches!(
+        commit_tracker.record(
+            fingerprint.clone(),
+            WorkerMetadataApplyOutcome::Retryable(WorkerMetadataRetryCause::Commit),
+            pohunek_worker_protocol::RuntimePhase::Exited,
+            now,
+        ),
+        WorkerMetadataProgress::Retry(_)
+    ));
+    assert!(
+        !commit_tracker.is_complete(&fingerprint),
+        "terminalization must still wait for safe metadata persistence"
+    );
+}
+
 #[tokio::test]
 async fn exit_transition_preserves_subagents_committed_ahead_of_memory() {
     let store_path = temp_store_path("worker-metadata-exit-race");
@@ -5908,6 +5945,93 @@ async fn exit_transition_preserves_launch_identity_committed_ahead_of_memory() {
             .and_then(|recovery| recovery.native_session_id.as_deref()),
         Some("durable-exit-native")
     );
+    stop_test_worker(worker).await;
+}
+
+#[tokio::test]
+async fn lost_transition_preserves_worker_metadata_committed_ahead_of_memory() {
+    let store_path = temp_store_path("worker-metadata-lost-race");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        agents_dir: Some(temp_resumable_agents_dir("worker-metadata-lost-race")),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(SessionNewParams {
+            agent: "resumable".to_owned(),
+            ..params()
+        })
+        .await
+        .expect("create resumable session");
+    let (worker, identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    snapshot.launch_identity = Some(pohunek_worker_protocol::ReportedLaunchIdentity {
+        provider: "claude".to_owned(),
+        process: snapshot.child_process.expect("worker child"),
+        reference_kind: "id".to_owned(),
+        native_reference: "durable-lost-native".to_owned(),
+    });
+    snapshot
+        .subagents
+        .push(worker_subagent_snapshot("durable-lost-child"));
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied,
+        "worker metadata must commit before the simulated projection race"
+    );
+
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("session entry");
+    entry.runtime_watch_cancel.cancel();
+    entry.info.subagents.clear();
+    entry.info.native_session_id = None;
+    entry.info.native_session_path = None;
+    drop(sessions);
+
+    assert!(matches!(
+        registry
+            .mark_worker_lost(
+                &created.id,
+                &identity,
+                &WorkerError::Protocol("test lost after durable metadata".to_owned()),
+            )
+            .await,
+        super::RuntimeTransitionOutcome::Applied(_)
+    ));
+    let lost = registry.inspect(&created.id).await.expect("inspect lost");
+    assert_eq!(
+        lost.runtime.expect("lost runtime").state,
+        RuntimeState::Lost
+    );
+    assert_eq!(
+        lost.native_session_id.as_deref(),
+        Some("durable-lost-native")
+    );
+    let child = lost.subagents.first().expect("preserved lost subagent");
+    assert_eq!(child.id, "durable-lost-child");
+    assert_eq!(child.lifecycle, SubagentLifecycle::Lost);
+
+    let durable = crate::store::Store::new(store_path)
+        .load_sessions()
+        .expect("reload lost session")
+        .pop()
+        .expect("durable lost record");
+    assert_eq!(
+        durable.info.native_session_id.as_deref(),
+        Some("durable-lost-native")
+    );
+    assert_eq!(
+        durable
+            .recovery
+            .as_ref()
+            .and_then(|recovery| recovery.native_session_id.as_deref()),
+        Some("durable-lost-native")
+    );
+    assert_eq!(durable.info.subagents[0].id, "durable-lost-child");
+    assert_eq!(durable.info.subagents[0].lifecycle, SubagentLifecycle::Lost);
     stop_test_worker(worker).await;
 }
 

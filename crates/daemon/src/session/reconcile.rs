@@ -27,7 +27,7 @@ use crate::procwatch::ProcessInspector;
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-09-12
+// Rust guideline compliant 2026-09-13
 
 #[derive(Debug, Clone)]
 struct DiscoveredWorker {
@@ -131,7 +131,9 @@ impl SessionRegistry {
                 }
                 identities_accepted = false;
                 outcome = if retryable {
-                    WorkerMetadataApplyOutcome::Retryable
+                    WorkerMetadataApplyOutcome::Retryable(
+                        super::WorkerMetadataRetryCause::IdentityValidation,
+                    )
                 } else {
                     WorkerMetadataApplyOutcome::Discarded
                 };
@@ -150,7 +152,9 @@ impl SessionRegistry {
             Ok(None) => return WorkerMetadataApplyOutcome::Discarded,
             Err(error) => {
                 tracing::debug!(session_id = %id.0, error = %error, "worker metadata store load is retryable");
-                return WorkerMetadataApplyOutcome::Retryable;
+                return WorkerMetadataApplyOutcome::Retryable(
+                    super::WorkerMetadataRetryCause::Commit,
+                );
             }
         };
         if !worker_metadata_record_is_current(
@@ -230,7 +234,9 @@ impl SessionRegistry {
             // The narrow projection may rebase once across a benign live-state
             // change, but another concurrent change keeps the snapshot retryable.
             if current != memory_base {
-                return WorkerMetadataApplyOutcome::Retryable;
+                return WorkerMetadataApplyOutcome::Retryable(
+                    super::WorkerMetadataRetryCause::Commit,
+                );
             }
             let subagent_events = subagents
                 .iter()
@@ -772,22 +778,37 @@ impl SessionRegistry {
                 .await;
             return;
         };
+        let mut retry_identity = false;
         if snapshot.launch_identity.is_some() || snapshot.active_identity.is_some() {
             if let Err(failure) =
                 validate_worker_identity_processes(&*self.inner.inspector, &snapshot)
             {
-                let (reason, _retryable) = failure.reason_and_retryability();
-                self.insert_unavailable_record(record, RuntimeState::Conflict, reason)
-                    .await;
-                return;
+                let (reason, retryable) = failure.reason_and_retryability();
+                if retryable {
+                    tracing::debug!(
+                        session_id = %id.0,
+                        reason,
+                        "deferring startup worker identity validation"
+                    );
+                    retry_identity = true;
+                } else {
+                    self.insert_unavailable_record(record, RuntimeState::Conflict, reason)
+                        .await;
+                    return;
+                }
             }
         }
-        let identity_projection = match import_worker_identities(&mut record, &snapshot) {
-            Ok(projection) => projection,
-            Err(reason) => {
-                self.insert_unavailable_record(record, RuntimeState::Conflict, reason)
-                    .await;
-                return;
+        let identity_projection = if retry_identity {
+            clear_active_identity(&mut record.info);
+            WorkerIdentityProjection::unreported()
+        } else {
+            match import_worker_identities(&mut record, &snapshot) {
+                Ok(projection) => projection,
+                Err(reason) => {
+                    self.insert_unavailable_record(record, RuntimeState::Conflict, reason)
+                        .await;
+                    return;
+                }
             }
         };
         record.info.subagents = match import_worker_subagents(&snapshot) {
@@ -1388,7 +1409,7 @@ fn worker_metadata_record_is_current(
 fn metadata_write_failure_outcome(error: &ProtocolError) -> WorkerMetadataApplyOutcome {
     match error.code.as_str() {
         "session_runtime_commit_stale" => WorkerMetadataApplyOutcome::Discarded,
-        _ => WorkerMetadataApplyOutcome::Retryable,
+        _ => WorkerMetadataApplyOutcome::Retryable(super::WorkerMetadataRetryCause::Commit),
     }
 }
 
@@ -1480,6 +1501,14 @@ fn active_report_from_info(info: &protocol::SessionInfo) -> Option<ActiveAgentRe
     })
 }
 
+fn clear_active_identity(info: &mut protocol::SessionInfo) {
+    info.active_agent = None;
+    info.active_agent_base = None;
+    info.active_agent_pid = None;
+    info.active_agent_session_id = None;
+    info.active_agent_session_path = None;
+}
+
 fn release_tombstone(
     snapshot: &InspectSnapshot,
     release: &ReleasedIdentityClaim,
@@ -1514,11 +1543,7 @@ fn apply_worker_identities(
         let release_matches = record.info.active_agent.as_deref() == Some(&release.provider)
             && record.info.active_agent_pid == Some(release.process.pid);
         if release_matches {
-            record.info.active_agent = None;
-            record.info.active_agent_base = None;
-            record.info.active_agent_pid = None;
-            record.info.active_agent_session_id = None;
-            record.info.active_agent_session_path = None;
+            clear_active_identity(&mut record.info);
         }
         return Ok(WorkerIdentityProjection {
             active: None,
@@ -2123,6 +2148,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use pohunek_session_worker::{
@@ -2155,6 +2182,9 @@ mod tests {
         merge_persisted_recovery, validate_worker_identity_process_facts, SessionRegistry,
     };
     use crate::agent::{ForkMode, InputRules, ResumeMode, SessionRefKind};
+    use crate::procwatch::{
+        ExitWatch, LinuxInspector, OwnershipMarkers, Pid, ProcessFact, ProcessInspector,
+    };
     use crate::session::SessionRegistryConfig;
     use crate::store::{
         DesiredState, NativeIdentityOrdering, ResumeBinding, RuntimeRecord, SessionRecord,
@@ -2167,6 +2197,60 @@ mod tests {
             .expect("time after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("ph-rec-{}-{nanos}", std::process::id()))
+    }
+
+    #[derive(Debug, Default)]
+    struct RetryInspector {
+        fail_descendants: AtomicBool,
+        descendant_calls: AtomicUsize,
+        inner: LinuxInspector,
+    }
+
+    impl RetryInspector {
+        fn fail_descendants(&self, fail: bool) {
+            self.fail_descendants.store(fail, Ordering::Release);
+        }
+
+        fn descendant_calls(&self) -> usize {
+            self.descendant_calls.load(Ordering::Acquire)
+        }
+    }
+
+    impl ProcessInspector for RetryInspector {
+        fn process(&self, pid: Pid) -> std::io::Result<Option<ProcessFact>> {
+            self.inner.process(pid)
+        }
+
+        fn same_user_processes(&self) -> std::io::Result<Vec<ProcessFact>> {
+            self.inner.same_user_processes()
+        }
+
+        fn descendants(&self, root: Pid) -> std::io::Result<Vec<ProcessFact>> {
+            self.descendant_calls.fetch_add(1, Ordering::AcqRel);
+            if self.fail_descendants.load(Ordering::Acquire) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "transient process inspection failure",
+                ));
+            }
+            self.inner.descendants(root)
+        }
+
+        fn cwd(&self, pid: Pid) -> std::io::Result<PathBuf> {
+            self.inner.cwd(pid)
+        }
+
+        fn exit_watch(&self, pid: Pid) -> std::io::Result<ExitWatch> {
+            self.inner.exit_watch(pid)
+        }
+
+        fn ownership_markers(&self, pid: Pid) -> std::io::Result<OwnershipMarkers> {
+            self.inner.ownership_markers(pid)
+        }
+
+        fn foreground_process_group(&self, root_pid: Pid) -> std::io::Result<Option<Pid>> {
+            self.inner.foreground_process_group(root_pid)
+        }
     }
 
     async fn send_identity_hook(socket: &Path, request: serde_json::Value) -> bool {
@@ -2492,6 +2576,145 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "startup retry test owns one complete worker adoption lifecycle fixture"
+    )]
+    async fn startup_retries_transient_identity_validation_after_adopting_worker() {
+        let root = temp_root();
+        let runtime_root = root.join("runtime/workers");
+        let session_id = "s-209";
+        let worker_id = "worker-startup-identity-retry";
+        let (controller, runtime_id, child_pid, server_task) =
+            spawn_initialized_worker(&root, &runtime_root, session_id, worker_id).await;
+        let socket = controller.socket_path().to_path_buf();
+        let child = controller
+            .inspect()
+            .await
+            .expect("inspect initialized worker")
+            .child_process
+            .expect("worker child identity");
+        let expires_at = (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+            .format(&Rfc3339)
+            .expect("format identity expiry");
+        assert!(
+            send_identity_hook(
+                &socket,
+                serde_json::json!({
+                    "type": "identity_report",
+                    "runtime_id": runtime_id.as_str(),
+                    "provider": "codex",
+                    "pid": child.pid,
+                    "start_identity": child.start_identity,
+                    "sequence": 1,
+                    "expires_at": expires_at,
+                    "reference_kind": null,
+                    "native_reference": null
+                }),
+            )
+            .await,
+            "worker accepts the active identity fixture"
+        );
+        assert!(
+            controller
+                .inspect()
+                .await
+                .expect("inspect reported identity")
+                .active_identity
+                .is_some(),
+            "worker retains the active identity for startup reconciliation"
+        );
+
+        let mut record = identity_record();
+        record.session_id = session_id.to_owned();
+        record.info.id = SessionId(session_id.to_owned());
+        record.info.agent = "shell".to_owned();
+        record.info.agent_base = AgentKind::Shell;
+        record.info.cwd = root.clone();
+        record.info.pid = child_pid;
+        let info_runtime = record.info.runtime.as_mut().expect("runtime info");
+        info_runtime.worker_id = Some(worker_id.to_owned());
+        info_runtime.runtime_id = Some(runtime_id.to_string());
+        record.runtime.worker_id = Some(worker_id.to_owned());
+        record.runtime.runtime_id = Some(runtime_id.to_string());
+        let recovery = record.recovery.as_mut().expect("recovery binding");
+        recovery.session_id = session_id.to_owned();
+        recovery.agent = "shell".to_owned();
+        recovery.agent_base = AgentKind::Shell;
+        recovery.cwd = root.clone();
+        recovery.program = "/bin/sh".to_owned();
+        recovery.args = vec!["-c".to_owned(), "sleep 30".to_owned()];
+        let store_path = root.join("data/metadata.jsonl");
+        Store::new(store_path.clone())
+            .record_session(&record)
+            .expect("persist logical record");
+        drop(controller);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let inspector = Arc::new(RetryInspector::default());
+        inspector.fail_descendants(true);
+        let registry_inspector: Arc<dyn ProcessInspector> =
+            Arc::<RetryInspector>::clone(&inspector);
+        let replacement = SessionRegistry::new_with_inspector(
+            SessionRegistryConfig {
+                store_path: Some(store_path),
+                worker_runtime_root: Some(runtime_root),
+                worker_connect_deadline: Duration::from_millis(300),
+                procwatch_poll: Duration::from_secs(60),
+                ..SessionRegistryConfig::default()
+            },
+            registry_inspector,
+        );
+
+        Box::pin(replacement.reconcile_workers())
+            .await
+            .expect("adopt worker with deferred identity validation");
+        let adopted = replacement
+            .inspect(&SessionId(session_id.to_owned()))
+            .await
+            .expect("worker remains available during identity retry");
+        assert_eq!(
+            adopted.runtime.expect("runtime").state,
+            RuntimeState::Live,
+            "transient optional identity validation must not quarantine a live worker"
+        );
+        assert!(adopted.active_agent.is_none());
+        replacement
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(&SessionId(session_id.to_owned()))
+            .expect("adopted session entry")
+            .procwatch_cancel
+            .cancel();
+
+        inspector.fail_descendants(false);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let retried = replacement
+                .inspect(&SessionId(session_id.to_owned()))
+                .await
+                .expect("inspect retried identity");
+            if retried.active_agent.as_deref() == Some("codex") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "startup watcher did not retry the deferred identity after {} validation calls",
+                inspector.descendant_calls()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        replacement
+            .stop(&SessionId(session_id.to_owned()))
+            .await
+            .expect("stop adopted worker");
+        server_task.abort();
     }
 
     #[tokio::test]

@@ -661,6 +661,12 @@ enum RuntimeTransitionOutcome {
     RetryableConcurrentChange,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeMetadataPolicy {
+    Live,
+    Terminal,
+}
+
 struct ExitTransition {
     event: &'static str,
     stop_reason: &'static str,
@@ -2721,16 +2727,23 @@ impl SessionRegistry {
                         let initial_empty_metadata =
                             metadata.is_initial() && worker_metadata_is_empty(&worker_metadata);
                         if !initial_empty_metadata && metadata.should_apply(&worker_metadata) {
-                            match registry
+                            let outcome = registry
                                 .apply_worker_metadata_snapshot(&id, &snapshot)
-                                .await
-                            {
-                                WorkerMetadataApplyOutcome::Applied
-                                | WorkerMetadataApplyOutcome::Discarded => {
-                                    metadata.complete(worker_metadata.clone());
+                                .await;
+                            match metadata.record(
+                                worker_metadata.clone(),
+                                outcome,
+                                snapshot.phase,
+                                Instant::now(),
+                            ) {
+                                WorkerMetadataProgress::Complete => {}
+                                WorkerMetadataProgress::IdentityDiscarded => {
+                                    warn!(
+                                        session_id = %id.0,
+                                        "discarding unverified terminal worker identity after safe metadata commit"
+                                    );
                                 }
-                                WorkerMetadataApplyOutcome::Retryable => {
-                                    let retry = metadata.retry(&worker_metadata, Instant::now());
+                                WorkerMetadataProgress::Retry(retry) => {
                                     if retry.should_warn {
                                         warn!(
                                             session_id = %id.0,
@@ -2891,7 +2904,6 @@ impl SessionRegistry {
             let base = Self::session_record(id, entry, entry.desired_state, None);
             let mut candidate = entry.clone();
             candidate.runtime = RuntimeHandle::Unavailable(RuntimeState::Lost);
-            terminalize_running_subagents(&mut candidate.info.subagents, current_time_millis());
             if let Some(runtime) = candidate.info.runtime.as_mut() {
                 runtime.state = RuntimeState::Lost;
                 runtime.loss_reason = Some("worker_process_lost".to_owned());
@@ -2905,7 +2917,14 @@ impl SessionRegistry {
             Err(error) => return RuntimeTransitionOutcome::RetryablePersistenceFailure(error),
         };
         let outcome = self
-            .commit_runtime_transition(id, expected, &base, &durable_base, candidate)
+            .commit_runtime_transition(
+                id,
+                expected,
+                &base,
+                &durable_base,
+                candidate,
+                RuntimeMetadataPolicy::Terminal,
+            )
             .await;
         if let RuntimeTransitionOutcome::RetryablePersistenceFailure(store_error) = &outcome {
             warn!(
@@ -2965,7 +2984,14 @@ impl SessionRegistry {
             Err(error) => return RuntimeTransitionOutcome::RetryablePersistenceFailure(error),
         };
         let outcome = self
-            .commit_runtime_transition(id, expected, &base, &durable_base, candidate)
+            .commit_runtime_transition(
+                id,
+                expected,
+                &base,
+                &durable_base,
+                candidate,
+                RuntimeMetadataPolicy::Live,
+            )
             .await;
         if let RuntimeTransitionOutcome::RetryablePersistenceFailure(error) = &outcome {
             warn!(session_id = %id.0, error = %error, "failed to persist reconnected worker");
@@ -2983,7 +3009,9 @@ impl SessionRegistry {
         memory_base: &SessionRecord,
         durable_base: &SessionRecord,
         mut candidate: SessionEntry,
+        metadata_policy: RuntimeMetadataPolicy,
     ) -> RuntimeTransitionOutcome {
+        preserve_durable_transition_metadata(durable_base, &mut candidate, metadata_policy);
         let mut record = Self::session_record(id, &candidate, candidate.desired_state, None);
         crate::store::preserve_newer_native_identity(durable_base, &mut record);
         candidate
@@ -3081,32 +3109,14 @@ impl SessionRegistry {
             };
             &loaded_durable_base
         };
-        let mut updated = *updated;
-        // Worker metadata may commit while benign live fields change in memory.
-        // Terminalization must start from that durable child history so the
-        // final record cannot erase an already acknowledged snapshot.
-        updated
-            .candidate
-            .info
-            .subagents
-            .clone_from(&durable_base.info.subagents);
-        let _ = preserve_durable_launch_identity(
-            durable_base,
-            &mut updated.candidate.info,
-            updated.candidate.last_native_report.is_some(),
-        );
-        terminalize_running_subagents(&mut updated.candidate.info.subagents, current_time_millis());
-        preserve_newer_updated_at(
-            &durable_base.info.updated_at,
-            &mut updated.candidate.info.updated_at,
-        );
-
+        let updated = *updated;
         let committed_info = match Box::pin(self.commit_runtime_transition(
             id,
             &updated.expected,
             &updated.base,
             durable_base,
             updated.candidate,
+            RuntimeMetadataPolicy::Terminal,
         ))
         .await
         {
@@ -3439,8 +3449,14 @@ type WorkerMetadataFingerprint = (
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerMetadataApplyOutcome {
     Applied,
-    Retryable,
+    Retryable(WorkerMetadataRetryCause),
     Discarded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerMetadataRetryCause {
+    Commit,
+    IdentityValidation,
 }
 
 #[derive(Debug, Default)]
@@ -3455,6 +3471,13 @@ struct WorkerMetadataRetry {
     attempts: usize,
     delay: Duration,
     should_warn: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerMetadataProgress {
+    Complete,
+    IdentityDiscarded,
+    Retry(WorkerMetadataRetry),
 }
 
 impl WorkerMetadataTracker {
@@ -3502,6 +3525,30 @@ impl WorkerMetadataTracker {
             attempts,
             delay,
             should_warn,
+        }
+    }
+
+    fn record(
+        &mut self,
+        fingerprint: WorkerMetadataFingerprint,
+        outcome: WorkerMetadataApplyOutcome,
+        phase: pohunek_worker_protocol::RuntimePhase,
+        now: Instant,
+    ) -> WorkerMetadataProgress {
+        match outcome {
+            WorkerMetadataApplyOutcome::Applied | WorkerMetadataApplyOutcome::Discarded => {
+                self.complete(fingerprint);
+                WorkerMetadataProgress::Complete
+            }
+            WorkerMetadataApplyOutcome::Retryable(WorkerMetadataRetryCause::IdentityValidation)
+                if phase == pohunek_worker_protocol::RuntimePhase::Exited =>
+            {
+                self.complete(fingerprint);
+                WorkerMetadataProgress::IdentityDiscarded
+            }
+            WorkerMetadataApplyOutcome::Retryable(_) => {
+                WorkerMetadataProgress::Retry(self.retry(&fingerprint, now))
+            }
         }
     }
 }
@@ -4100,6 +4147,39 @@ fn preserve_durable_worker_metadata(existing: &SessionRecord, replacement: &mut 
         }
     }
     crate::store::preserve_newer_native_identity(existing, replacement);
+    preserve_newer_updated_at(&existing.info.updated_at, &mut replacement.info.updated_at);
+}
+
+fn preserve_durable_transition_metadata(
+    existing: &SessionRecord,
+    replacement: &mut SessionEntry,
+    policy: RuntimeMetadataPolicy,
+) {
+    // Active identity is intentionally not copied from storage: terminal
+    // transitions must clear it, while live transitions retain the richer
+    // in-memory report needed for ordering and later process validation.
+    for durable in &existing.info.subagents {
+        match replacement
+            .info
+            .subagents
+            .iter_mut()
+            .find(|current| current.provider == durable.provider && current.id == durable.id)
+        {
+            Some(current) if durable.revision > current.revision => current.clone_from(durable),
+            Some(_) => {}
+            None => replacement.info.subagents.push(durable.clone()),
+        }
+    }
+    let _ = preserve_durable_launch_identity(
+        existing,
+        &mut replacement.info,
+        replacement.last_native_report.is_some(),
+    );
+    if policy == RuntimeMetadataPolicy::Terminal {
+        terminalize_running_subagents(&mut replacement.info.subagents, current_time_millis());
+    } else {
+        sort_subagents(&mut replacement.info.subagents);
+    }
     preserve_newer_updated_at(&existing.info.updated_at, &mut replacement.info.updated_at);
 }
 
