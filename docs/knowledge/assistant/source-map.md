@@ -179,6 +179,13 @@ Release packaging:
 
 Daemon, sessions, integrations, and project state:
 
+- `docs/design/macos-support-rfc.md`
+- `crates/platform/src/lib.rs`
+- `crates/platform/src/process/`
+- `crates/platform/src/peer/`
+- `crates/platform/src/supervisor.rs`
+- `.github/workflows/ci.yml`
+
 - `crates/daemon/src/assistant.rs`
 - `crates/daemon/src/main.rs`
 - `crates/daemon/src/lib.rs`
@@ -197,7 +204,6 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/external/mod.rs`
 - `crates/daemon/tests/procwatch.rs`
 - `crates/daemon/src/procwatch/mod.rs`
-- `crates/daemon/src/procwatch/linux.rs`
 - `crates/daemon/src/project/mod.rs`
 - `crates/daemon/src/project/config.rs`
 - `crates/daemon/src/project/detect.rs`

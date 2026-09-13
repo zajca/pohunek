@@ -4,57 +4,25 @@
 //! ownership remain inside `pohunek-sessiond` (or the worker server used by
 //! daemon unit tests).
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 
 use super::{UnitTemplate, Units};
+use pohunek_platform::process::{LinuxInspector, ProcessInspector};
+pub use pohunek_platform::supervisor::{
+    Error as WorkerLaunchError, Operation as WorkerLaunchFuture,
+};
+use pohunek_platform::supervisor::{ServiceId, ServiceObservation, ServiceState, Supervisor};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 // Rust guideline compliant 2026-07-24
 
-/// Whether activation creates a new worker or replaces a terminal generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkerLaunchMode {
-    /// Start a previously absent worker unit.
-    Start,
-    /// Replace a stopped or failed worker for explicit native recovery.
-    Replace,
-}
+/// Daemon-facing durable worker supervisor.
+pub trait WorkerLauncher: Supervisor {}
 
-/// Errors returned by worker launch backends.
-#[derive(Debug, thiserror::Error)]
-pub enum WorkerLaunchError {
-    /// The systemd user manager could not activate the worker.
-    #[error(transparent)]
-    Systemd(#[from] super::UnitsError),
-    /// A separate worker process could not be prepared or spawned.
-    #[error("worker subprocess operation `{operation}` failed: {source}")]
-    Subprocess {
-        /// Stable operation label.
-        operation: &'static str,
-        /// Underlying operating-system failure.
-        #[source]
-        source: std::io::Error,
-    },
-    /// A test worker could not prepare its runtime resources.
-    #[cfg(test)]
-    #[error("test worker launch failed: {0}")]
-    Test(String),
-}
-
-/// Boxed launch operation returned by [`WorkerLauncher`].
-pub type WorkerLaunchFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<(), WorkerLaunchError>> + Send + 'a>>;
-
-/// Starts and replaces durable worker processes without owning their PTYs.
-pub trait WorkerLauncher: std::fmt::Debug + Send + Sync {
-    /// Activates the worker for `session_id`.
-    fn launch<'a>(&'a self, session_id: &'a str, mode: WorkerLaunchMode) -> WorkerLaunchFuture<'a>;
-}
+impl<T: Supervisor + ?Sized> WorkerLauncher for T {}
 
 /// XDG roots and daemon endpoint passed to a separate worker process.
 #[derive(Debug, Clone)]
@@ -111,17 +79,11 @@ impl SubprocessWorkerLauncher {
         };
         child
             .start_kill()
-            .map_err(|source| WorkerLaunchError::Subprocess {
-                operation: "crash_injection",
-                source,
-            })?;
+            .map_err(|source| operation("crash_injection", source))?;
         child
             .wait()
             .await
-            .map_err(|source| WorkerLaunchError::Subprocess {
-                operation: "crash_injection_wait",
-                source,
-            })?;
+            .map_err(|source| operation("crash_injection_wait", source))?;
         Ok(true)
     }
 
@@ -135,8 +97,8 @@ impl SubprocessWorkerLauncher {
     }
 }
 
-impl WorkerLauncher for SubprocessWorkerLauncher {
-    fn launch<'a>(&'a self, session_id: &'a str, mode: WorkerLaunchMode) -> WorkerLaunchFuture<'a> {
+impl SubprocessWorkerLauncher {
+    fn activate<'a>(&'a self, id: &'a ServiceId, replace: bool) -> WorkerLaunchFuture<'a, ()> {
         Box::pin(async move {
             prepare_private_directory(&self.environment.runtime_home)?;
             prepare_private_directory(&self.environment.state_home)?;
@@ -147,17 +109,24 @@ impl WorkerLauncher for SubprocessWorkerLauncher {
             prepare_private_directory(&self.environment.state_home.join("pohunek/workers"))?;
 
             let mut children = self.children.lock().await;
-            if let Some(mut previous) = children.remove(session_id) {
+            if let Some(mut previous) = children.remove(id.as_str()) {
+                if !replace {
+                    children.insert(id.to_string(), previous);
+                    return Err(operation(
+                        "start",
+                        std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "worker is already supervised",
+                        ),
+                    ));
+                }
                 previous
                     .start_kill()
-                    .map_err(|source| WorkerLaunchError::Subprocess {
-                        operation: "replace",
-                        source,
-                    })?;
+                    .map_err(|source| operation("replace", source))?;
                 let _ = previous.wait().await;
-            } else if mode == WorkerLaunchMode::Replace {
+            } else if replace {
                 tracing::debug!(
-                    session_id,
+                    session_id = id.as_str(),
                     "replacement worker has no subprocess retained by this launcher"
                 );
             }
@@ -165,7 +134,7 @@ impl WorkerLauncher for SubprocessWorkerLauncher {
             let mut command = Command::new(&self.binary);
             command
                 .arg("--session-id")
-                .arg(session_id)
+                .arg(id.as_str())
                 .arg("--daemon-socket-path")
                 .arg(&self.environment.daemon_socket)
                 .env("XDG_RUNTIME_DIR", &self.environment.runtime_home)
@@ -180,11 +149,89 @@ impl WorkerLauncher for SubprocessWorkerLauncher {
             std::os::unix::process::CommandExt::process_group(command.as_std_mut(), 0);
             let child = command
                 .spawn()
-                .map_err(|source| WorkerLaunchError::Subprocess {
-                    operation: "spawn",
-                    source,
-                })?;
-            children.insert(session_id.to_owned(), child);
+                .map_err(|source| operation("spawn", source))?;
+            children.insert(id.to_string(), child);
+            Ok(())
+        })
+    }
+}
+
+impl Supervisor for SubprocessWorkerLauncher {
+    fn start<'a>(&'a self, id: &'a ServiceId) -> WorkerLaunchFuture<'a, ()> {
+        self.activate(id, false)
+    }
+
+    fn discover(&self) -> WorkerLaunchFuture<'_, Vec<ServiceObservation>> {
+        Box::pin(async move {
+            let ids = self
+                .children
+                .lock()
+                .await
+                .keys()
+                .map(|value| ServiceId::parse(value.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut observations = Vec::with_capacity(ids.len());
+            for id in ids {
+                observations.push(self.inspect(&id).await?);
+            }
+            observations.sort_by(|left, right| left.id.cmp(&right.id));
+            Ok(observations)
+        })
+    }
+
+    fn inspect<'a>(&'a self, id: &'a ServiceId) -> WorkerLaunchFuture<'a, ServiceObservation> {
+        Box::pin(async move {
+            let mut children = self.children.lock().await;
+            let child = children
+                .get_mut(id.as_str())
+                .ok_or_else(|| WorkerLaunchError::NotFound(id.clone()))?;
+            let pid = child.id();
+            let exited = child
+                .try_wait()
+                .map_err(|source| operation("inspect", source))?
+                .is_some();
+            let process = if exited {
+                None
+            } else {
+                match pid {
+                    Some(pid) => LinuxInspector::new()
+                        .process(pid)
+                        .map_err(|source| operation("inspect_process_identity", source))?
+                        .map(|fact| fact.identity()),
+                    None => None,
+                }
+            };
+            Ok(ServiceObservation {
+                id: id.clone(),
+                state: if exited {
+                    ServiceState::Stopped
+                } else {
+                    ServiceState::Running
+                },
+                process,
+            })
+        })
+    }
+
+    fn replace<'a>(&'a self, id: &'a ServiceId) -> WorkerLaunchFuture<'a, ()> {
+        self.activate(id, true)
+    }
+
+    fn retire<'a>(&'a self, id: &'a ServiceId) -> WorkerLaunchFuture<'a, ()> {
+        Box::pin(async move {
+            let mut child = self
+                .children
+                .lock()
+                .await
+                .remove(id.as_str())
+                .ok_or_else(|| WorkerLaunchError::NotFound(id.clone()))?;
+            child
+                .start_kill()
+                .map_err(|source| operation("retire", source))?;
+            child
+                .wait()
+                .await
+                .map_err(|source| operation("retire_wait", source))?;
             Ok(())
         })
     }
@@ -193,16 +240,10 @@ impl WorkerLauncher for SubprocessWorkerLauncher {
 fn prepare_private_directory(path: &std::path::Path) -> Result<(), WorkerLaunchError> {
     use std::os::unix::fs::PermissionsExt;
 
-    std::fs::create_dir_all(path).map_err(|source| WorkerLaunchError::Subprocess {
-        operation: "create_private_directory",
-        source,
-    })?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
-        WorkerLaunchError::Subprocess {
-            operation: "secure_private_directory",
-            source,
-        }
-    })
+    std::fs::create_dir_all(path)
+        .map_err(|source| operation("create_private_directory", source))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|source| operation("secure_private_directory", source))
 }
 
 /// Production launcher backed by the native systemd user-manager API.
@@ -219,20 +260,74 @@ impl SystemdWorkerLauncher {
     }
 }
 
-impl WorkerLauncher for SystemdWorkerLauncher {
-    fn launch<'a>(&'a self, session_id: &'a str, mode: WorkerLaunchMode) -> WorkerLaunchFuture<'a> {
+impl Supervisor for SystemdWorkerLauncher {
+    fn start<'a>(&'a self, id: &'a ServiceId) -> WorkerLaunchFuture<'a, ()> {
         Box::pin(async move {
-            let units = Units::connect(self.template.clone()).await?;
-            match mode {
-                WorkerLaunchMode::Start => {
-                    units.start(session_id).await?;
-                }
-                WorkerLaunchMode::Replace => {
-                    units.restart(session_id).await?;
-                }
-            }
+            let units = self.units().await?;
+            units
+                .start(id.as_str())
+                .await
+                .map_err(|source| operation("start", source))?;
             Ok(())
         })
+    }
+
+    fn discover(&self) -> WorkerLaunchFuture<'_, Vec<ServiceObservation>> {
+        Box::pin(async move { self.units().await?.discover().await })
+    }
+
+    fn inspect<'a>(&'a self, id: &'a ServiceId) -> WorkerLaunchFuture<'a, ServiceObservation> {
+        Box::pin(async move { self.units().await?.inspect_service(id).await })
+    }
+
+    fn replace<'a>(&'a self, id: &'a ServiceId) -> WorkerLaunchFuture<'a, ()> {
+        Box::pin(async move {
+            self.units()
+                .await?
+                .restart(id.as_str())
+                .await
+                .map_err(|source| operation("replace", source))?;
+            Ok(())
+        })
+    }
+
+    fn retire<'a>(&'a self, id: &'a ServiceId) -> WorkerLaunchFuture<'a, ()> {
+        Box::pin(async move {
+            self.units()
+                .await?
+                .stop(id.as_str())
+                .await
+                .map_err(|source| operation("retire", source))?;
+            Ok(())
+        })
+    }
+}
+
+impl SystemdWorkerLauncher {
+    async fn units(&self) -> Result<Units, WorkerLaunchError> {
+        Units::connect(self.template.clone())
+            .await
+            .map_err(|source| unavailable("connect", source))
+    }
+}
+
+fn unavailable(
+    operation_name: &'static str,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> WorkerLaunchError {
+    WorkerLaunchError::Unavailable {
+        operation: operation_name,
+        source: Box::new(source),
+    }
+}
+
+fn operation(
+    operation_name: &'static str,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> WorkerLaunchError {
+    WorkerLaunchError::Operation {
+        operation: operation_name,
+        source: Box::new(source),
     }
 }
 
@@ -250,7 +345,9 @@ mod test_support {
     use tokio::sync::Mutex;
     use tokio::task::JoinHandle;
 
-    use super::{WorkerLaunchError, WorkerLaunchFuture, WorkerLaunchMode, WorkerLauncher};
+    use pohunek_platform::supervisor::{ServiceId, ServiceObservation, ServiceState, Supervisor};
+
+    use super::{operation, WorkerLaunchError, WorkerLaunchFuture};
 
     static WORKER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -279,17 +376,14 @@ mod test_support {
         }
     }
 
-    impl WorkerLauncher for InProcessWorkerLauncher {
-        fn launch<'a>(
-            &'a self,
-            session_id: &'a str,
-            mode: WorkerLaunchMode,
-        ) -> WorkerLaunchFuture<'a> {
+    impl InProcessWorkerLauncher {
+        fn activate<'a>(&'a self, id: &'a ServiceId, replace: bool) -> WorkerLaunchFuture<'a, ()> {
             Box::pin(async move {
                 let mut tasks = self.tasks.lock().await;
+                let session_id = id.as_str();
                 let runtime_dir = self.runtime_root.join(session_id);
                 let socket_path = runtime_dir.join(pohunek_paths::WORKER_SOCKET_NAME);
-                if mode == WorkerLaunchMode::Replace {
+                if replace {
                     if let Some(task) = tasks.remove(session_id) {
                         task.abort();
                         // `abort()` only requests cancellation; it does not wait
@@ -308,6 +402,14 @@ mod test_support {
                     // otherwise flakes as `worker socket already accepts
                     // connections` under load.
                     let _ = std::fs::remove_file(&socket_path);
+                } else if tasks.contains_key(session_id) {
+                    return Err(operation(
+                        "start",
+                        std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "worker is already supervised",
+                        ),
+                    ));
                 }
                 let sequence = WORKER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
                 let worker_id = format!("worker-test-{sequence}");
@@ -321,13 +423,79 @@ mod test_support {
                     config: WorkerConfig::new(),
                 })
                 .await
-                .map_err(|error| WorkerLaunchError::Test(error.to_string()))?;
+                .map_err(|error| operation("start_test_worker", error))?;
                 tasks.insert(
                     session_id.to_owned(),
                     tokio::spawn(async move {
                         let _ = server.serve().await;
                     }),
                 );
+                Ok(())
+            })
+        }
+    }
+
+    impl Supervisor for InProcessWorkerLauncher {
+        fn start<'a>(&'a self, id: &'a ServiceId) -> WorkerLaunchFuture<'a, ()> {
+            self.activate(id, false)
+        }
+
+        fn discover(&self) -> WorkerLaunchFuture<'_, Vec<ServiceObservation>> {
+            Box::pin(async move {
+                let mut observations = self
+                    .tasks
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|(id, task)| {
+                        Ok(ServiceObservation {
+                            id: ServiceId::parse(id.clone())?,
+                            state: if task.is_finished() {
+                                ServiceState::Stopped
+                            } else {
+                                ServiceState::Running
+                            },
+                            process: None,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, WorkerLaunchError>>()?;
+                observations.sort_by(|left, right| left.id.cmp(&right.id));
+                Ok(observations)
+            })
+        }
+
+        fn inspect<'a>(&'a self, id: &'a ServiceId) -> WorkerLaunchFuture<'a, ServiceObservation> {
+            Box::pin(async move {
+                let tasks = self.tasks.lock().await;
+                let task = tasks
+                    .get(id.as_str())
+                    .ok_or_else(|| WorkerLaunchError::NotFound(id.clone()))?;
+                Ok(ServiceObservation {
+                    id: id.clone(),
+                    state: if task.is_finished() {
+                        ServiceState::Stopped
+                    } else {
+                        ServiceState::Running
+                    },
+                    process: None,
+                })
+            })
+        }
+
+        fn replace<'a>(&'a self, id: &'a ServiceId) -> WorkerLaunchFuture<'a, ()> {
+            self.activate(id, true)
+        }
+
+        fn retire<'a>(&'a self, id: &'a ServiceId) -> WorkerLaunchFuture<'a, ()> {
+            Box::pin(async move {
+                let task = self
+                    .tasks
+                    .lock()
+                    .await
+                    .remove(id.as_str())
+                    .ok_or_else(|| WorkerLaunchError::NotFound(id.clone()))?;
+                task.abort();
+                let _ = task.await;
                 Ok(())
             })
         }

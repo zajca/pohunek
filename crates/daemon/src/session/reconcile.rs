@@ -1460,13 +1460,13 @@ fn validate_worker_identity_process_facts(
         .child_process
         .as_ref()
         .ok_or("worker_child_missing")?;
-    if current_root.pid != root.pid || current_root.start_identity != root.start_identity {
+    if current_root.pid != root.pid || current_root.start_identity.get() != root.start_identity {
         return Err("identity_process_root_reused");
     }
     let matches = |process: &pohunek_worker_protocol::ProcessIdentity| {
         (process.pid == root.pid && process.start_identity == root.start_identity)
             || descendants.iter().any(|fact| {
-                fact.pid == process.pid && fact.start_identity == process.start_identity
+                fact.pid == process.pid && fact.start_identity.get() == process.start_identity
             })
     };
     if snapshot
@@ -2217,38 +2217,44 @@ mod tests {
     }
 
     impl ProcessInspector for RetryInspector {
-        fn process(&self, pid: Pid) -> std::io::Result<Option<ProcessFact>> {
+        fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, crate::procwatch::Error> {
             self.inner.process(pid)
         }
 
-        fn same_user_processes(&self) -> std::io::Result<Vec<ProcessFact>> {
+        fn same_user_processes(&self) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
             self.inner.same_user_processes()
         }
 
-        fn descendants(&self, root: Pid) -> std::io::Result<Vec<ProcessFact>> {
+        fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
             self.descendant_calls.fetch_add(1, Ordering::AcqRel);
             if self.fail_descendants.load(Ordering::Acquire) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "transient process inspection failure",
+                return Err(crate::procwatch::Error::from_io(
+                    "test_descendants",
+                    std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "transient process inspection failure",
+                    ),
                 ));
             }
             self.inner.descendants(root)
         }
 
-        fn cwd(&self, pid: Pid) -> std::io::Result<PathBuf> {
+        fn cwd(&self, pid: Pid) -> Result<PathBuf, crate::procwatch::Error> {
             self.inner.cwd(pid)
         }
 
-        fn exit_watch(&self, pid: Pid) -> std::io::Result<ExitWatch> {
+        fn exit_watch(&self, pid: Pid) -> Result<ExitWatch, crate::procwatch::Error> {
             self.inner.exit_watch(pid)
         }
 
-        fn ownership_markers(&self, pid: Pid) -> std::io::Result<OwnershipMarkers> {
+        fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, crate::procwatch::Error> {
             self.inner.ownership_markers(pid)
         }
 
-        fn foreground_process_group(&self, root_pid: Pid) -> std::io::Result<Option<Pid>> {
+        fn foreground_process_group(
+            &self,
+            root_pid: Pid,
+        ) -> Result<Option<Pid>, crate::procwatch::Error> {
             self.inner.foreground_process_group(root_pid)
         }
     }
@@ -2422,7 +2428,7 @@ mod tests {
             pid: 50,
             pgid: 50,
             ppid: 1,
-            start_identity: 500,
+            start_identity: crate::procwatch::StartIdentity::new(500),
             comm: "codex".to_owned(),
             cmdline: vec!["codex".to_owned()],
         };
@@ -2430,7 +2436,7 @@ mod tests {
             pid: 60,
             pgid: 50,
             ppid: 50,
-            start_identity: 600,
+            start_identity: crate::procwatch::StartIdentity::new(600),
             comm: "claude".to_owned(),
             cmdline: vec!["claude".to_owned()],
         };
@@ -2438,7 +2444,7 @@ mod tests {
             .expect("current descendant identity");
 
         let reused = crate::procwatch::ProcessFact {
-            start_identity: 601,
+            start_identity: crate::procwatch::StartIdentity::new(601),
             ..descendant
         };
         assert_eq!(

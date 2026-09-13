@@ -48,9 +48,7 @@ use crate::integration::{
 use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessInspector};
 use crate::project::detect::{project_id, DetectedProject};
 use crate::project::{detect_at, ProjectManager};
-use crate::runtime::{
-    DimensionUpdate, SystemdWorkerLauncher, Worker, WorkerError, WorkerLaunchMode, WorkerLauncher,
-};
+use crate::runtime::{DimensionUpdate, SystemdWorkerLauncher, Worker, WorkerError, WorkerLauncher};
 use crate::store::{
     DesiredState, ProjectRecord, ResumeBinding, RuntimeRecord, SessionRecord, SessionTransaction,
     SessionWriteOutcome, Store, TransactionKind, WorktreeStatus,

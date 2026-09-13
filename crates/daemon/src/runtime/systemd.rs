@@ -1,5 +1,9 @@
 //! Native systemd user-manager client for worker units.
 
+use pohunek_platform::process::{LinuxInspector, ProcessInspector};
+use pohunek_platform::supervisor::{
+    Error as SupervisorError, ServiceId, ServiceObservation, ServiceState,
+};
 use zbus::zvariant::OwnedObjectPath;
 
 // Rust guideline compliant 2026-07-23
@@ -7,10 +11,14 @@ use zbus::zvariant::OwnedObjectPath;
 const SYSTEMD_DESTINATION: &str = "org.freedesktop.systemd1";
 const SYSTEMD_MANAGER_PATH: &str = "/org/freedesktop/systemd1";
 const SYSTEMD_MANAGER_INTERFACE: &str = "org.freedesktop.systemd1.Manager";
+const SYSTEMD_UNIT_INTERFACE: &str = "org.freedesktop.systemd1.Unit";
 const SYSTEMD_SERVICE_INTERFACE: &str = "org.freedesktop.systemd1.Service";
 const START_MODE: &str = "replace";
 const RESTART_MODE: &str = "fail";
 const STOP_MODE: &str = "fail";
+/// Bounds memory and D-Bus follow-up work if the manager returns an unexpectedly
+/// large namespace.
+const MAX_DISCOVERED_WORKERS: usize = 4_096;
 /// Installed production template for durable session workers.
 pub const DEFAULT_WORKER_UNIT_TEMPLATE: &str = "pohunek-session@.service";
 
@@ -50,15 +58,6 @@ impl Default for UnitTemplate {
     fn default() -> Self {
         Self(DEFAULT_WORKER_UNIT_TEMPLATE.to_owned())
     }
-}
-
-/// Validated information about one systemd worker unit.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnitInfo {
-    /// Unit name used by the user manager.
-    pub name: String,
-    /// Current main process ID.
-    pub main_pid: u32,
 }
 
 /// Errors returned by native user-manager operations.
@@ -138,24 +137,110 @@ impl Units {
         Ok(proxy.call("StopUnit", &(unit, STOP_MODE)).await?)
     }
 
-    /// Reads the main PID for one worker unit.
+    /// Discovers worker units inside the configured template namespace.
     ///
     /// # Errors
     ///
-    /// Returns [`UnitsError`] when the unit is absent or D-Bus is unavailable.
-    pub async fn inspect(&self, session_id: &str) -> Result<UnitInfo, UnitsError> {
-        let name = unit_name(&self.template, session_id)?;
-        let manager = self.manager().await?;
-        let path: OwnedObjectPath = manager.call("GetUnit", &(name.as_str(),)).await?;
+    /// Returns a typed supervisor error when D-Bus or process inspection fails.
+    pub async fn discover(&self) -> Result<Vec<ServiceObservation>, SupervisorError> {
+        type NativeUnit = (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            OwnedObjectPath,
+            u32,
+            String,
+            OwnedObjectPath,
+        );
+
+        let manager = self
+            .manager()
+            .await
+            .map_err(|source| unavailable("connect", source))?;
+        let states: Vec<&str> = Vec::new();
+        let pattern = self.template.pattern();
+        let patterns = vec![pattern.as_str()];
+        let units: Vec<NativeUnit> = manager
+            .call("ListUnitsByPatterns", &(states, patterns))
+            .await
+            .map_err(|source| operation("discover", source))?;
+        validate_discovery_count(units.len())?;
+        let mut observations = Vec::with_capacity(units.len());
+        for (name, _, _, _, _, _, _, _, _, _) in units {
+            let Some(id) = self.template.service_id(&name) else {
+                continue;
+            };
+            observations.push(self.inspect_service(&id).await?);
+        }
+        observations.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(observations)
+    }
+
+    /// Reads portable state and process identity for one worker unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed supervisor error when the unit is absent or inspection
+    /// fails.
+    pub async fn inspect_service(
+        &self,
+        id: &ServiceId,
+    ) -> Result<ServiceObservation, SupervisorError> {
+        let session_id = id.as_str();
+        let name = unit_name(&self.template, session_id)
+            .map_err(|source| operation("validate_service_id", source))?;
+        let manager = self
+            .manager()
+            .await
+            .map_err(|source| unavailable("connect", source))?;
+        let path: OwnedObjectPath = manager
+            .call("GetUnit", &(name.as_str(),))
+            .await
+            .map_err(|source| map_get_unit_error(id, source))?;
+        let unit = zbus::Proxy::new(
+            &self.connection,
+            SYSTEMD_DESTINATION,
+            path.clone(),
+            SYSTEMD_UNIT_INTERFACE,
+        )
+        .await
+        .map_err(|source| operation("inspect_unit", source))?;
         let service = zbus::Proxy::new(
             &self.connection,
             SYSTEMD_DESTINATION,
             path,
             SYSTEMD_SERVICE_INTERFACE,
         )
-        .await?;
-        let main_pid = service.get_property("MainPID").await?;
-        Ok(UnitInfo { name, main_pid })
+        .await
+        .map_err(|source| operation("inspect_service", source))?;
+        let active_state: String = unit
+            .get_property("ActiveState")
+            .await
+            .map_err(|source| operation("inspect_active_state", source))?;
+        let sub_state: String = unit
+            .get_property("SubState")
+            .await
+            .map_err(|source| operation("inspect_sub_state", source))?;
+        let main_pid: u32 = service
+            .get_property("MainPID")
+            .await
+            .map_err(|source| operation("inspect_main_pid", source))?;
+        let process = if main_pid == 0 {
+            None
+        } else {
+            LinuxInspector::new()
+                .process(main_pid)
+                .map_err(|source| operation("inspect_process_identity", source))?
+                .map(|fact| fact.identity())
+        };
+        Ok(ServiceObservation {
+            id: id.clone(),
+            state: portable_state(&active_state, &sub_state),
+            process,
+        })
     }
 
     async fn manager(&self) -> Result<zbus::Proxy<'_>, zbus::Error> {
@@ -166,6 +251,77 @@ impl Units {
             SYSTEMD_MANAGER_INTERFACE,
         )
         .await
+    }
+}
+
+impl UnitTemplate {
+    fn pattern(&self) -> String {
+        self.0.replace("@.service", "@*.service")
+    }
+
+    fn service_id(&self, unit_name: &str) -> Option<ServiceId> {
+        let (prefix, suffix) = self.0.split_once('@')?;
+        let value = unit_name.strip_prefix(&format!("{prefix}@"))?;
+        let value = value.strip_suffix(suffix)?;
+        let id = ServiceId::parse(value).ok()?;
+        pohunek_paths::valid_worker_session_id(id.as_str())
+            .is_some()
+            .then_some(id)
+    }
+}
+
+fn portable_state(active: &str, sub: &str) -> ServiceState {
+    match active {
+        "activating" => ServiceState::Starting,
+        "active" | "reloading" => ServiceState::Running,
+        "deactivating" => ServiceState::Stopping,
+        "inactive" => ServiceState::Stopped,
+        "failed" => ServiceState::Failed,
+        _ if sub == "failed" => ServiceState::Failed,
+        _ => ServiceState::Unknown,
+    }
+}
+
+fn validate_discovery_count(count: usize) -> Result<(), SupervisorError> {
+    if count > MAX_DISCOVERED_WORKERS {
+        return Err(SupervisorError::InvalidData {
+            operation: "discover",
+            detail: format!(
+                "worker namespace contains {count} units; maximum is {MAX_DISCOVERED_WORKERS}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn unavailable(
+    operation_name: &'static str,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> SupervisorError {
+    SupervisorError::Unavailable {
+        operation: operation_name,
+        source: Box::new(source),
+    }
+}
+
+fn operation(
+    operation_name: &'static str,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> SupervisorError {
+    SupervisorError::Operation {
+        operation: operation_name,
+        source: Box::new(source),
+    }
+}
+
+fn map_get_unit_error(id: &ServiceId, source: zbus::Error) -> SupervisorError {
+    match &source {
+        zbus::Error::MethodError(name, _, _)
+            if name.as_str() == "org.freedesktop.systemd1.NoSuchUnit" =>
+        {
+            SupervisorError::NotFound(id.clone())
+        }
+        _ => operation("inspect", source),
     }
 }
 
@@ -226,5 +382,45 @@ mod tests {
                 Err(UnitsError::InvalidTemplate(value)) if value == invalid
             ));
         }
+    }
+
+    #[test]
+    fn templates_parse_only_their_own_service_ids() {
+        let template = UnitTemplate::default();
+        assert_eq!(
+            template
+                .service_id("pohunek-session@s-42.service")
+                .expect("managed unit")
+                .as_str(),
+            "s-42"
+        );
+        assert!(template.service_id("other@s-42.service").is_none());
+        assert!(template
+            .service_id("pohunek-session@../x.service")
+            .is_none());
+    }
+
+    #[test]
+    fn native_states_map_to_portable_states() {
+        assert_eq!(
+            portable_state("activating", "start"),
+            ServiceState::Starting
+        );
+        assert_eq!(portable_state("active", "running"), ServiceState::Running);
+        assert_eq!(portable_state("inactive", "dead"), ServiceState::Stopped);
+        assert_eq!(portable_state("failed", "failed"), ServiceState::Failed);
+        assert_eq!(portable_state("maintenance", "dead"), ServiceState::Unknown);
+    }
+
+    #[test]
+    fn discovery_rejects_an_unbounded_namespace() {
+        validate_discovery_count(MAX_DISCOVERED_WORKERS).expect("bounded namespace");
+        assert!(matches!(
+            validate_discovery_count(MAX_DISCOVERED_WORKERS + 1),
+            Err(SupervisorError::InvalidData {
+                operation: "discover",
+                ..
+            })
+        ));
     }
 }

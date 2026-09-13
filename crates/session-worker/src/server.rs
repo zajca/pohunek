@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use pohunek_platform::peer;
+use pohunek_platform::process::{LinuxInspector, ProcessInspector};
 use pohunek_worker_protocol as protocol;
 use protocol::{
     ActiveIdentityClaim, AttachStart, Capability, CloseReason, ControlCode, ControlError,
@@ -453,7 +454,7 @@ impl Connection {
 }
 
 async fn serve_connection(shared: Arc<Shared>, mut stream: UnixStream) -> Result<(), WorkerError> {
-    verify_peer(&stream)?;
+    let peer = verify_peer(&stream)?;
     let mut prefix = [0_u8; 1];
     let read = stream
         .read_exact(&mut prefix)
@@ -464,7 +465,7 @@ async fn serve_connection(shared: Arc<Shared>, mut stream: UnixStream) -> Result
     }
     let prefixed = PrefixStream::new(prefix[0], stream);
     if prefix[0] == b'{' {
-        serve_json(shared, prefixed).await
+        serve_json(shared, prefixed, peer).await
     } else {
         serve_data(shared, prefixed).await
     }
@@ -473,12 +474,10 @@ async fn serve_connection(shared: Arc<Shared>, mut stream: UnixStream) -> Result
 async fn serve_json(
     shared: Arc<Shared>,
     stream: PrefixStream<UnixStream>,
+    peer: peer::Credentials,
 ) -> Result<(), WorkerError> {
-    let credentials = getsockopt(stream.inner(), PeerCredentials)
-        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
-    let peer_pid = u32::try_from(credentials.pid())
-        .map_err(|_range_error| WorkerError::Protocol("peer PID is invalid".to_owned()))?;
-    let peer_start = process_start(peer_pid)?;
+    let peer_pid = peer.pid;
+    let peer_start = process_start(peer.pid)?;
     let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = ControlReader::new(read_half);
     let mut writer = ControlWriter::new(write_half);
@@ -3020,15 +3019,15 @@ async fn persist_control(journal: Journal, record: JournalRecord) -> Result<(), 
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))
 }
 
-fn verify_peer(stream: &UnixStream) -> Result<(), WorkerError> {
-    let credentials = getsockopt(stream, PeerCredentials)
-        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
-    if credentials.uid() != nix::unistd::Uid::effective().as_raw() {
+fn verify_peer(stream: &UnixStream) -> Result<peer::Credentials, WorkerError> {
+    let credentials =
+        peer::credentials(stream).map_err(|error| WorkerError::Protocol(error.to_string()))?;
+    if credentials.uid != nix::unistd::Uid::effective().as_raw() {
         return Err(WorkerError::Protocol(
             "worker peer UID does not match effective UID".to_owned(),
         ));
     }
-    Ok(())
+    Ok(credentials)
 }
 
 async fn prepare_socket(path: &Path) -> Result<(), WorkerError> {
@@ -3128,34 +3127,19 @@ fn unix_ms() -> u64 {
 }
 
 fn process_start(pid: u32) -> Result<u64, WorkerError> {
-    let stat_path = format!("/proc/{pid}/stat");
-    let stat = fs::read_to_string(&stat_path).map_err(|source| WorkerError::Filesystem {
-        path: PathBuf::from(&stat_path),
-        source,
-    })?;
-    parse_stat(&stat)
-        .map(|(_, start)| start)
-        .ok_or_else(|| WorkerError::Protocol("process stat is malformed".to_owned()))
+    LinuxInspector::new()
+        .process(pid)
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?
+        .map(|fact| fact.start_identity.get())
+        .ok_or_else(|| WorkerError::Protocol("process no longer exists".to_owned()))
 }
 
 fn process_parent(pid: u32) -> Result<u32, WorkerError> {
-    let stat_path = format!("/proc/{pid}/stat");
-    let stat = fs::read_to_string(&stat_path).map_err(|source| WorkerError::Filesystem {
-        path: PathBuf::from(&stat_path),
-        source,
-    })?;
-    parse_stat(&stat)
-        .map(|(parent, _)| parent)
-        .ok_or_else(|| WorkerError::Protocol("process stat is malformed".to_owned()))
-}
-
-fn parse_stat(stat: &str) -> Option<(u32, u64)> {
-    let close = stat.rfind(')')?;
-    let mut fields = stat[close + 1..].split_whitespace();
-    let _state = fields.next()?;
-    let parent = fields.next()?.parse().ok()?;
-    let start_identity = fields.nth(17)?.parse().ok()?;
-    Some((parent, start_identity))
+    LinuxInspector::new()
+        .process(pid)
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?
+        .map(|fact| fact.ppid)
+        .ok_or_else(|| WorkerError::Protocol("process no longer exists".to_owned()))
 }
 
 fn is_descendant(mut pid: u32, root: u32) -> Result<bool, WorkerError> {
@@ -3179,25 +3163,19 @@ fn designated_launch_process(
     root: u32,
     provider: &str,
 ) -> Result<Option<WireProcessIdentity>, WorkerError> {
+    let inspector = LinuxInspector::new();
+    let mut processes = inspector
+        .descendants(root)
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+    if let Some(root) = inspector
+        .process(root)
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?
+    {
+        processes.push(root);
+    }
     let mut candidates = Vec::new();
-    for entry in fs::read_dir("/proc").map_err(|source| WorkerError::Filesystem {
-        path: PathBuf::from("/proc"),
-        source,
-    })? {
-        let entry = entry.map_err(|source| WorkerError::Filesystem {
-            path: PathBuf::from("/proc"),
-            source,
-        })?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let Ok(pid) = name.parse::<u32>() else {
-            continue;
-        };
-        if !is_descendant(pid, root).unwrap_or(false) {
-            continue;
-        }
-        let Ok(executable) = fs::read_link(entry.path().join("exe")) else {
+    for process in processes {
+        let Ok(Some(executable)) = inspector.executable(process.pid) else {
             continue;
         };
         let executable_name = executable
@@ -3208,12 +3186,10 @@ fn designated_launch_process(
         if !executable_name.contains(&provider.to_ascii_lowercase()) {
             continue;
         }
-        if let Ok(start_identity) = process_start(pid) {
-            candidates.push(WireProcessIdentity {
-                pid,
-                start_identity,
-            });
-        }
+        candidates.push(WireProcessIdentity {
+            pid: process.pid,
+            start_identity: process.start_identity.get(),
+        });
     }
     candidates.sort_by_key(|candidate| (candidate.start_identity, candidate.pid));
     Ok(candidates.into_iter().next())
@@ -3237,10 +3213,6 @@ impl<S> PrefixStream<S> {
             prefix: Some(prefix),
             inner,
         }
-    }
-
-    fn inner(&self) -> &S {
-        &self.inner
     }
 }
 
@@ -3295,9 +3267,9 @@ mod tests {
     use super::{
         await_observation_page, capabilities, control_input_id, event_visible_to_connection,
         identity_sequence_is_fresh, known_identity_provider, mark_running_subagents_lost,
-        observation_timed_out, parse_stat, random_value, redeem_data_grant, signal_number,
-        start_subagent, stop_subagent, valid_identity_expiry, validate_attach_write_id,
-        validate_data_start, validate_observation_request, validate_terminal_snapshot_dimensions,
+        observation_timed_out, random_value, redeem_data_grant, signal_number, start_subagent,
+        stop_subagent, valid_identity_expiry, validate_attach_write_id, validate_data_start,
+        validate_observation_request, validate_terminal_snapshot_dimensions,
         validate_terminal_snapshot_response, wait_runtime_exit, write_data_error,
         write_observation_page, write_output_chunks, write_terminal_chunks, Connection,
         ControlInputId, DataGrant, ObservationGrant, ObservationWaitOutcome, PrefixStream,
@@ -3548,16 +3520,6 @@ mod tests {
         .await
         .expect("descendant cleanup deadline")
         .expect("descendant cleanup");
-    }
-
-    #[test]
-    fn proc_stat_parser_handles_spaces_and_parentheses_in_name() {
-        let mut fields = vec!["S".to_owned(), "10".to_owned()];
-        fields.extend((0..17).map(|value| value.to_string()));
-        fields.push("4242".to_owned());
-        let stat = format!("20 (name with ) parens) {}", fields.join(" "));
-
-        assert_eq!(parse_stat(&stat), Some((10, 4242)));
     }
 
     #[test]

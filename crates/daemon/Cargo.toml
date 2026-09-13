@@ -19,6 +19,7 @@ pohunek-hostcheck = { workspace = true }
 pohunek-logging = { workspace = true }
 pohunek-protocol = { workspace = true }
 pohunek-netbird = { workspace = true }
+pohunek-platform = { workspace = true }
 overlay = { workspace = true }
 pohunek-paths = { workspace = true }
 pohunek-terminal = { workspace = true }
@@ -41,11 +42,13 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true }
-rustix = { version = "1", features = ["fs"] }
+rustix = { workspace = true, features = ["fs"] }
 time = { workspace = true }
-zbus = { workspace = true }
 ulid = { workspace = true }
 zeroize = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { workspace = true }
 
 [dev-dependencies]
 pohunek-session-worker = { workspace = true }

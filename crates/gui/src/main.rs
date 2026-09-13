@@ -556,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn gui_manifest_uses_wayland_only_iced_features() {
+    fn gui_manifest_keeps_wayland_features_linux_only() {
         let manifest: toml::Value =
             toml::from_str(include_str!("../Cargo.toml")).expect("gui manifest parses");
         let iced = manifest
@@ -573,10 +573,30 @@ mod tests {
             iced.get("default-features").and_then(toml::Value::as_bool),
             Some(false)
         );
-        assert!(features
+        assert!(!features
             .iter()
             .any(|feature| feature.as_str() == Some("wayland")));
         assert!(!features
+            .iter()
+            .any(|feature| feature.as_str() == Some("x11")));
+
+        let linux_iced = manifest
+            .get("target")
+            .and_then(toml::Value::as_table)
+            .and_then(|targets| targets.get("cfg(target_os = \"linux\")"))
+            .and_then(toml::Value::as_table)
+            .and_then(|target| target.get("dependencies"))
+            .and_then(toml::Value::as_table)
+            .and_then(|dependencies| dependencies.get("iced"))
+            .expect("Linux Iced dependency");
+        let linux_features = linux_iced
+            .get("features")
+            .and_then(toml::Value::as_array)
+            .expect("explicit Linux Iced features");
+        assert!(linux_features
+            .iter()
+            .any(|feature| feature.as_str() == Some("wayland")));
+        assert!(!linux_features
             .iter()
             .any(|feature| feature.as_str() == Some("x11")));
     }

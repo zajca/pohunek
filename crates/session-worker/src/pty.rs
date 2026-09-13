@@ -15,6 +15,7 @@ use nix::errno::Errno;
 use nix::sys::epoll::{self, EpollCreateFlags, EpollEvent, EpollFlags, EpollOp};
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::{close, Pid};
+use pohunek_platform::process::{LinuxInspector, ProcessInspector};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use rustix::fd::OwnedFd;
 use rustix::fs::{open, Mode, OFlags};
@@ -921,18 +922,11 @@ where
 }
 
 fn read_process_start(pid: u32) -> Result<String, io::Error> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let close = stat.rfind(')').ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "proc stat command field is unterminated",
-        )
-    })?;
-    let start_identity = stat[close + 1..]
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "proc stat has no start time"))?;
-    Ok(start_identity.to_owned())
+    LinuxInspector::new()
+        .process(pid)
+        .map_err(io::Error::other)?
+        .map(|fact| fact.start_identity.to_string())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "process no longer exists"))
 }
 
 async fn join_thread(slot: &Arc<Mutex<Option<thread::JoinHandle<()>>>>) -> Result<(), PtyError> {

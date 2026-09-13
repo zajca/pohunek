@@ -16,6 +16,6 @@ pub use client::{DataStream, DimensionUpdate, Worker, WorkerError};
 pub use launcher::InProcessWorkerLauncher;
 pub use launcher::{
     SubprocessWorkerEnvironment, SubprocessWorkerLauncher, SystemdWorkerLauncher,
-    WorkerLaunchError, WorkerLaunchFuture, WorkerLaunchMode, WorkerLauncher,
+    WorkerLaunchError, WorkerLaunchFuture, WorkerLauncher,
 };
-pub use systemd::{UnitInfo, UnitTemplate, Units, UnitsError, DEFAULT_WORKER_UNIT_TEMPLATE};
+pub use systemd::{UnitTemplate, Units, UnitsError, DEFAULT_WORKER_UNIT_TEMPLATE};

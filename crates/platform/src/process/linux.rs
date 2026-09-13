@@ -6,24 +6,25 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
-use protocol::{ENV_DAEMON_ID, ENV_SESSION_ID};
+use rustix::process::{pidfd_open, Pid as NativePid, PidfdFlags};
+use tokio::io::unix::AsyncFd;
 
-use super::{ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessInspector};
+use super::{
+    BootIdentity, Error, ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessInspector,
+    StartIdentity,
+};
 
 /// Linux proc filesystem root.
 ///
 /// All process facts come from procfs because it is available to unprivileged
 /// same-user processes and does not require kernel capabilities.
 const PROC_ROOT: &str = "/proc";
-/// Flags passed to `pidfd_open(2)`.
-///
-/// The syscall currently defines no behavioral flags for our use case; `0`
-/// requests the default pidfd suitable for readiness polling.
-const PIDFD_OPEN_FLAGS: libc::c_uint = 0;
+const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
+const ENV_DAEMON_ID: &str = "POHUNEK_DAEMON_ID";
+const ENV_SESSION_ID: &str = "POHUNEK_SESSION_ID";
 /// `/proc/<pid>/stat` process-group field number (`pgrp`).
 const STAT_PGRP_FIELD: usize = 5;
 /// `/proc/<pid>/stat` controlling-terminal foreground group field number
@@ -47,46 +48,101 @@ impl LinuxInspector {
     pub fn new() -> Self {
         Self
     }
+
+    /// Returns the executable path for one same-user process.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed process inspection failures.
+    pub fn executable(&self, pid: Pid) -> Result<Option<PathBuf>, Error> {
+        let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
+        if !same_user(pid, euid) {
+            return Ok(None);
+        }
+        match fs::read_link(proc_path(pid).join("exe")) {
+            Ok(path) => Ok(Some(path)),
+            Err(error) if is_process_race(&error) => Ok(None),
+            Err(source) => Err(Error::from_io("read_executable", source)),
+        }
+    }
+
+    /// Returns the current opaque Linux boot identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed boot-identity inspection failures.
+    pub fn boot_identity(&self) -> Result<BootIdentity, Error> {
+        let value = fs::read_to_string(BOOT_ID_PATH)
+            .map_err(|source| Error::from_io("read_boot_identity", source))?;
+        BootIdentity::parse(value.trim())
+    }
 }
 
 impl ProcessInspector for LinuxInspector {
-    fn process(&self, pid: Pid) -> io::Result<Option<ProcessFact>> {
-        read_process_fact(pid, current_euid()?)
+    fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, Error> {
+        let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
+        read_process_fact(pid, euid).map_err(|source| Error::from_io("inspect_process", source))
     }
 
-    fn same_user_processes(&self) -> io::Result<Vec<ProcessFact>> {
-        same_user_processes()
+    fn same_user_processes(&self) -> Result<Vec<ProcessFact>, Error> {
+        same_user_processes().map_err(|source| Error::from_io("inspect_process_table", source))
     }
 
-    fn descendants(&self, root: Pid) -> io::Result<Vec<ProcessFact>> {
-        let euid = current_euid()?;
-        let pids = match descendants_from_children(root, euid)? {
+    fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, Error> {
+        let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
+        let pids = match descendants_from_children(root, euid)
+            .map_err(|source| Error::from_io("inspect_descendants", source))?
+        {
             Some(pids) => pids,
-            None => descendants_from_ppid_scan(root, euid)?,
+            None => descendants_from_ppid_scan(root, euid)
+                .map_err(|source| Error::from_io("inspect_descendants", source))?,
         };
         let mut facts = Vec::with_capacity(pids.len());
         for pid in pids {
-            if let Some(fact) = read_process_fact(pid, euid)? {
+            if let Some(fact) = read_process_fact(pid, euid)
+                .map_err(|source| Error::from_io("inspect_descendant", source))?
+            {
                 facts.push(fact);
             }
         }
         Ok(facts)
     }
 
-    fn cwd(&self, pid: Pid) -> io::Result<PathBuf> {
+    fn cwd(&self, pid: Pid) -> Result<PathBuf, Error> {
         fs::read_link(proc_path(pid).join("cwd"))
+            .map_err(|source| Error::from_io("read_cwd", source))
     }
 
-    fn exit_watch(&self, pid: Pid) -> io::Result<ExitWatch> {
-        ExitWatch::from_fd(pidfd_open(pid)?)
+    fn exit_watch(&self, pid: Pid) -> Result<ExitWatch, Error> {
+        let native =
+            NativePid::from_raw(
+                i32::try_from(pid).map_err(|_range_error| Error::OutOfRange {
+                    operation: "open_exit_watch",
+                })?,
+            )
+            .ok_or(Error::OutOfRange {
+                operation: "open_exit_watch",
+            })?;
+        let fd = pidfd_open(native, PidfdFlags::empty())
+            .map_err(|source| Error::from_io("open_exit_watch", source.into()))?;
+        let fd =
+            AsyncFd::new(fd).map_err(|source| Error::from_io("register_exit_watch", source))?;
+        Ok(ExitWatch::from_future(async move {
+            let _ready = fd
+                .readable()
+                .await
+                .map_err(|source| Error::from_io("wait_for_exit", source))?;
+            Ok(())
+        }))
     }
 
-    fn ownership_markers(&self, pid: Pid) -> io::Result<OwnershipMarkers> {
-        ownership_markers(pid)
+    fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, Error> {
+        ownership_markers(pid).map_err(|source| Error::from_io("read_ownership_markers", source))
     }
 
-    fn foreground_process_group(&self, root_pid: Pid) -> io::Result<Option<Pid>> {
+    fn foreground_process_group(&self, root_pid: Pid) -> Result<Option<Pid>, Error> {
         foreground_process_group(root_pid)
+            .map_err(|source| Error::from_io("read_foreground_process_group", source))
     }
 }
 
@@ -104,7 +160,7 @@ fn read_stat_process_group(process_id: Pid) -> io::Result<Option<Pid>> {
 }
 
 fn parse_stat_pid_field(stat: &str, field_number: usize) -> Option<Pid> {
-    parse_stat_field::<libc::pid_t>(stat, field_number).and_then(|value| Pid::try_from(value).ok())
+    parse_stat_field::<i32>(stat, field_number).and_then(|value| Pid::try_from(value).ok())
 }
 
 fn parse_stat_field<T>(stat: &str, field_number: usize) -> Option<T>
@@ -299,7 +355,7 @@ fn read_process_fact(process_id: Pid, euid: u32) -> io::Result<Option<ProcessFac
         pid: process_id,
         pgid,
         ppid: parent_id,
-        start_identity,
+        start_identity: StartIdentity::new(start_identity),
         comm,
         cmdline: read_cmdline(process_id)?,
     }))
@@ -360,31 +416,8 @@ fn parse_pid_str(value: &str) -> Option<Pid> {
 }
 
 fn is_process_race(err: &io::Error) -> bool {
-    err.kind() == io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ESRCH)
-}
-
-#[expect(unsafe_code, reason = "pidfd_open requires a raw Linux syscall")]
-fn pidfd_open(pid: Pid) -> io::Result<OwnedFd> {
-    #[expect(
-        clippy::cast_possible_wrap,
-        reason = "process id is bounded by PID_MAX, far below i32::MAX"
-    )]
-    let pid = pid as libc::pid_t;
-    // SAFETY: `syscall` is invoked with the Linux `pidfd_open` number, a pid from
-    // the OS process table, and documented zero flags. It returns either `-1`
-    // with errno set or a new owned file descriptor.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, PIDFD_OPEN_FLAGS) };
-    if fd == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let raw_fd = RawFd::try_from(fd).map_err(|err| {
-        io::Error::other(format!(
-            "pidfd_open returned invalid file descriptor {fd}: {err}"
-        ))
-    })?;
-    // SAFETY: `pidfd_open` returned a fresh file descriptor owned by this process,
-    // and `OwnedFd` takes responsibility for closing it exactly once.
-    Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+    err.kind() == io::ErrorKind::NotFound
+        || err.raw_os_error() == Some(nix::errno::Errno::ESRCH as i32)
 }
 
 #[cfg(test)]

@@ -17,8 +17,8 @@ use super::{
     ResumeBinding, ResumeSnapshot, RuntimeHandle, RuntimeRecord, RuntimeState,
     RuntimeWatchIdentity, SessionEntry, SessionId, SessionInfo, SessionNewParams, SessionRecord,
     SessionRefKind, SessionRegistry, SessionRuntime, SessionState, SessionTransaction,
-    SessionWarning, ShellCommand, StateSource, TransactionKind, Worker, WorkerLaunchMode,
-    WorktreeRequest, DEFAULT_WORKER_SUBSCRIBER_BYTES, DEFAULT_WORKER_TERMINAL_RETENTION,
+    SessionWarning, ShellCommand, StateSource, TransactionKind, Worker, WorktreeRequest,
+    DEFAULT_WORKER_SUBSCRIBER_BYTES, DEFAULT_WORKER_TERMINAL_RETENTION,
     DEFAULT_WORKER_WRITE_DEDUP_ENTRIES, SESSION_RECORD_SCHEMA_VERSION, WORKER_CONNECT_RETRY,
 };
 use crate::store::StoredInputRules;
@@ -766,21 +766,19 @@ impl SessionRegistry {
                 "session launch requires a durable worker runtime root",
             ));
         };
-        let launch_mode = if replace_worker {
-            WorkerLaunchMode::Replace
+        let service_id = pohunek_platform::supervisor::ServiceId::parse(id.0.clone())
+            .map_err(|error| runtime_error("invalid_worker_identity", error.to_string()))?;
+        let activation = if replace_worker {
+            self.inner.launcher.replace(&service_id)
         } else {
-            WorkerLaunchMode::Start
+            self.inner.launcher.start(&service_id)
         };
-        self.inner
-            .launcher
-            .launch(&id.0, launch_mode)
-            .await
-            .map_err(|error| {
-                runtime_error(
-                    "worker_manager_unavailable",
-                    format!("failed to activate session worker {}: {error}", id.0),
-                )
-            })?;
+        activation.await.map_err(|error| {
+            runtime_error(
+                "worker_manager_unavailable",
+                format!("failed to activate session worker {}: {error}", id.0),
+            )
+        })?;
 
         let socket_path = worker_root
             .join(&id.0)

@@ -394,7 +394,7 @@ fn pidfd_is_available() -> bool {
     let inspector = LinuxInspector::new();
     match inspector.exit_watch(std::process::id()) {
         Ok(_) => true,
-        Err(err) if err.raw_os_error() == Some(libc::ENOSYS) => false,
+        Err(pohunek_daemon::procwatch::Error::Unavailable { .. }) => false,
         Err(err) => panic!("pidfd_open failed unexpectedly: {err}"),
     }
 }

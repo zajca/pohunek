@@ -601,7 +601,7 @@ mod tests {
             pid: process_id,
             pgid: process_id,
             ppid: 1,
-            start_identity: u64::from(process_id),
+            start_identity: crate::procwatch::StartIdentity::new(u64::from(process_id)),
             comm: comm.to_owned(),
             cmdline: cmdline
                 .iter()

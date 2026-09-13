@@ -73,6 +73,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/paths`    | Shared XDG path and local socket contract for daemon, CLI, and GUI clients. |
 | `crates/hostcheck`| Host environment probes shared by `doctor` and the daemon's `doctor` RPC. |
 | `crates/logging` | Process-safe size rotation and retention for daemon and per-session worker logs. |
+| `crates/platform` | Target-neutral process, peer-identity, and native-supervisor contracts plus concrete OS backends. |
 | `crates/gui-core` | Pure, headless state + SDK bridge for the GUI (no Iced dependency; fully unit-testable). |
 | `crates/gui`      | Native Iced shell that wraps `gui-core` in `Task`/`Subscription`. |
 | `crates/xtask`    | Workspace automation (docs, TypeScript generation, and pinned Hermes compatibility evidence). |
@@ -96,6 +97,11 @@ cargo build --workspace --release                        # release profile must 
 cargo xtask docs check                                   # schema/drift/source-map/secrets/runbooks
 cargo xtask hermes compatibility --pohunek-bin ABS       # pinned, model-free Hermes CLI/golden gate
 ```
+
+Shared platform contracts also run natively on Apple Silicon and Intel macOS
+CI with `MACOSX_DEPLOYMENT_TARGET=14.0`. This gate covers the portable library,
+not complete macOS host support; the ordered release scope is tracked by
+`docs/design/macos-support-rfc.md` and issues #96-#105.
 
 Web workspace gates:
 

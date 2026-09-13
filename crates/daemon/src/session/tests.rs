@@ -1180,7 +1180,7 @@ impl MockInspector {
 }
 
 impl ProcessInspector for MockInspector {
-    fn process(&self, pid: Pid) -> std::io::Result<Option<ProcessFact>> {
+    fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, crate::procwatch::Error> {
         let fact = self
             .inner
             .lock()
@@ -1196,7 +1196,7 @@ impl ProcessInspector for MockInspector {
         }
     }
 
-    fn same_user_processes(&self) -> std::io::Result<Vec<ProcessFact>> {
+    fn same_user_processes(&self) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
         let mut facts = self
             .inner
             .lock()
@@ -1211,25 +1211,30 @@ impl ProcessInspector for MockInspector {
         Ok(facts)
     }
 
-    fn descendants(&self, root: Pid) -> std::io::Result<Vec<ProcessFact>> {
+    fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
         let inner = self.inner.lock().expect("mock inspector lock");
         if let Some(kind) = inner.descendants_error {
-            return Err(std::io::Error::new(kind, "mock descendants failure"));
+            return Err(crate::procwatch::Error::from_io(
+                "mock_descendants",
+                std::io::Error::new(kind, "mock descendants failure"),
+            ));
         }
         Ok(inner.descendants.get(&root).cloned().unwrap_or_default())
     }
 
-    fn cwd(&self, pid: Pid) -> std::io::Result<PathBuf> {
+    fn cwd(&self, pid: Pid) -> Result<PathBuf, crate::procwatch::Error> {
         self.inner
             .lock()
             .expect("mock inspector lock")
             .cwd
             .get(&pid)
             .cloned()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing mock cwd"))
+            .ok_or(crate::procwatch::Error::Race {
+                operation: "mock_cwd",
+            })
     }
 
-    fn exit_watch(&self, pid: Pid) -> std::io::Result<ExitWatch> {
+    fn exit_watch(&self, pid: Pid) -> Result<ExitWatch, crate::procwatch::Error> {
         let (sender, receiver) = tokio::sync::watch::channel(false);
         self.inner
             .lock()
@@ -1238,10 +1243,24 @@ impl ProcessInspector for MockInspector {
             .entry(pid)
             .or_default()
             .push(sender);
-        Ok(ExitWatch::from_test_signal(receiver))
+        Ok(ExitWatch::from_future(async move {
+            let mut receiver = receiver;
+            while !*receiver.borrow_and_update() {
+                receiver.changed().await.map_err(|_closed| {
+                    crate::procwatch::Error::from_io(
+                        "mock_exit_watch",
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "test exit signal dropped",
+                        ),
+                    )
+                })?;
+            }
+            Ok(())
+        }))
     }
 
-    fn ownership_markers(&self, pid: Pid) -> std::io::Result<OwnershipMarkers> {
+    fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, crate::procwatch::Error> {
         Ok(self
             .inner
             .lock()
@@ -1252,7 +1271,10 @@ impl ProcessInspector for MockInspector {
             .unwrap_or_default())
     }
 
-    fn foreground_process_group(&self, root_pid: Pid) -> std::io::Result<Option<Pid>> {
+    fn foreground_process_group(
+        &self,
+        root_pid: Pid,
+    ) -> Result<Option<Pid>, crate::procwatch::Error> {
         let (kind, foreground, block) = {
             let inner = self.inner.lock().expect("mock inspector lock");
             (
@@ -1268,7 +1290,10 @@ impl ProcessInspector for MockInspector {
             }
         }
         if let Some(kind) = kind {
-            return Err(std::io::Error::new(kind, "mock foreground failure"));
+            return Err(crate::procwatch::Error::from_io(
+                "mock_foreground_process_group",
+                std::io::Error::new(kind, "mock foreground failure"),
+            ));
         }
         Ok(foreground)
     }
@@ -1587,14 +1612,14 @@ async fn first_foreground_scan_binds_hook_identity_without_replacing_metadata() 
                 .active_agent
                 .as_ref()
                 .and_then(|active| active.start_identity),
-            Some(observed.start_identity)
+            Some(observed.start_identity.get())
         );
         assert_eq!(
             entry
                 .last_agent_report
                 .as_ref()
                 .and_then(|active| active.start_identity),
-            Some(observed.start_identity)
+            Some(observed.start_identity.get())
         );
     };
 
@@ -7519,7 +7544,7 @@ fn codex_fact(process_id: Pid, parent_id: Pid) -> ProcessFact {
         pid: process_id,
         pgid: process_id,
         ppid: parent_id,
-        start_identity: u64::from(process_id),
+        start_identity: crate::procwatch::StartIdentity::new(u64::from(process_id)),
         comm: "codex".to_owned(),
         cmdline: vec!["/usr/bin/codex".to_owned()],
     }
@@ -7530,7 +7555,7 @@ fn claude_fact(process_id: Pid, parent_id: Pid) -> ProcessFact {
         pid: process_id,
         pgid: process_id,
         ppid: parent_id,
-        start_identity: u64::from(process_id),
+        start_identity: crate::procwatch::StartIdentity::new(u64::from(process_id)),
         comm: "claude".to_owned(),
         cmdline: vec!["/usr/bin/claude".to_owned()],
     }
@@ -7771,7 +7796,8 @@ async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
     };
 
     let mut replacement = claude_fact(PID_REUSE_AGENT_PID, created.pid);
-    replacement.start_identity = u64::from(PID_REUSE_AGENT_PID) + 1;
+    replacement.start_identity =
+        crate::procwatch::StartIdentity::new(u64::from(PID_REUSE_AGENT_PID) + 1);
     replacement.pgid = PID_REUSE_AGENT_PID + 10;
     inspector.set_descendants(created.pid, vec![replacement]);
     let second_scan = first_seen + PID_REUSE_RESCAN_DELAY;

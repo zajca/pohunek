@@ -9,7 +9,6 @@ description = "Pure state and SDK bridge logic for the pohunek native GUI."
 [dependencies]
 base64 = { workspace = true }
 futures = { workspace = true }
-keyring = { workspace = true }
 pohunek-client = { workspace = true }
 pohunek-knowledge = { workspace = true, features = ["protocol"] }
 pohunek-paths = { workspace = true }
@@ -29,3 +28,9 @@ pohunek-daemon = { workspace = true }
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true, features = ["async-secret-service", "tokio", "crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }

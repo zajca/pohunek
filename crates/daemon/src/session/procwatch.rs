@@ -223,7 +223,7 @@ impl SessionRegistry {
                     ObservedAgent {
                         pid: fact.pid,
                         pgid: fact.pgid,
-                        start_identity: fact.start_identity,
+                        start_identity: fact.start_identity.get(),
                         agent_base,
                         first_seen: now,
                         cwd,

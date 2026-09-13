@@ -315,7 +315,7 @@ mod tests {
             pid: 100,
             pgid: 100,
             ppid: 1,
-            start_identity: 100,
+            start_identity: crate::procwatch::StartIdentity::new(100),
             comm: "codex".to_owned(),
             cmdline: vec!["/usr/bin/other".to_owned()],
         }));
@@ -323,7 +323,7 @@ mod tests {
             pid: 101,
             pgid: 101,
             ppid: 1,
-            start_identity: 101,
+            start_identity: crate::procwatch::StartIdentity::new(101),
             comm: "sleep".to_owned(),
             cmdline: vec!["/tmp/tools/codex".to_owned(), "30".to_owned()],
         }));
@@ -331,7 +331,7 @@ mod tests {
             pid: 102,
             pgid: 102,
             ppid: 1,
-            start_identity: 102,
+            start_identity: crate::procwatch::StartIdentity::new(102),
             comm: "sleep".to_owned(),
             cmdline: vec!["/tmp/tools/not-codex".to_owned(), "30".to_owned()],
         }));
