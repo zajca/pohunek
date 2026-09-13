@@ -2709,8 +2709,8 @@ mod tests {
     const STATE_SESSION_REQUEST_COUNT: usize = 2;
     /// State-hook requests expected from a successful release callback.
     const STATE_RELEASE_REQUEST_COUNT: usize = 1;
-    /// Integration asset version expected after PID-bearing state hooks ship.
-    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=5";
+    /// Integration asset version expected after bounded in-memory state hooks ship.
+    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=6";
     /// Action argument for state-hook `SessionStart` reporting.
     const STATE_SESSION_ACTION: &str = "session";
     /// Action argument for state-hook release reporting.
@@ -2877,6 +2877,63 @@ mod tests {
             String::from_utf8(output.stdout).expect("hook stdout utf8"),
             String::from_utf8(output.stderr).expect("hook stderr utf8"),
             requests,
+        )
+    }
+
+    fn run_state_asset_with_large_input(
+        agent: &str,
+        action: &str,
+        input: &[u8],
+    ) -> (
+        std::process::ExitStatus,
+        String,
+        String,
+        usize,
+        Vec<PathBuf>,
+    ) {
+        let temp = temp_dir(&format!("{agent}-state-bounded-input"));
+        let mut child = Command::new("sh")
+            .arg(state_asset(agent))
+            .arg(action)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("TMPDIR", &temp)
+            .env(ENV_FLAG, "1")
+            .env(
+                "POHUNEK_WORKER_SOCKET_PATH",
+                temp.join("missing-worker.sock"),
+            )
+            .env(ENV_SESSION_ID, "session-123")
+            .env("POHUNEK_RUNTIME_ID", "runtime-123")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn bounded state hook");
+        let mut bytes_written = 0;
+        if let Some(mut stdin) = child.stdin.take() {
+            while bytes_written < input.len() {
+                match stdin.write(&input[bytes_written..]) {
+                    Ok(0) => break,
+                    Ok(written) => bytes_written += written,
+                    Err(err) if err.kind() == ErrorKind::BrokenPipe => break,
+                    Err(err) => panic!("write state hook stdin: {err}"),
+                }
+            }
+        }
+        let output = child
+            .wait_with_output()
+            .expect("wait for bounded state hook");
+        let files = fs::read_dir(&temp)
+            .expect("read state hook temp dir")
+            .map(|entry| entry.expect("read state hook temp entry").path())
+            .collect::<Vec<_>>();
+        (
+            output.status,
+            String::from_utf8(output.stdout).expect("state hook stdout utf8"),
+            String::from_utf8(output.stderr).expect("state hook stderr utf8"),
+            bytes_written,
+            files,
         )
     }
 
@@ -3369,7 +3426,7 @@ mod tests {
             );
             assert!(
                 asset.contains(STATE_ASSET_VERSION_HEADER),
-                "{agent} hook must carry integration version 3"
+                "{agent} hook must carry the current integration version"
             );
             assert!(
                 asset.contains(method::SESSION_REPORT_AGENT),
@@ -3425,8 +3482,16 @@ mod tests {
             // abnormal interpreter exit (OOM, hook timeout kill) under `set -e`
             // never propagates a non-zero status that could break the agent.
             assert!(
-                asset.contains("python3 - <<'PY' || exit 0"),
+                asset.contains("python3 - 3<&0 <<'PY' || exit 0"),
                 "the python heredoc must be guarded with `|| exit 0`"
+            );
+            assert!(
+                !asset.contains("mktemp") && !asset.contains("POHUNEK_HOOK_INPUT_FILE"),
+                "{agent} state hook must not persist provider payloads"
+            );
+            assert!(
+                asset.contains("handle.read(MAX_HOOK_INPUT_BYTES + 1)"),
+                "{agent} state hook must bound provider input before decoding"
             );
         }
 
@@ -3581,6 +3646,31 @@ mod tests {
             assert_eq!(stop["subagent_id"], "child-1");
             assert_eq!(stop["outcome"], "completed");
             assert!(stop.get("last_assistant_message").is_none());
+        }
+    }
+
+    #[test]
+    fn state_hooks_validate_before_reading_and_bound_provider_input_without_files() {
+        let oversized = vec![b'x'; LARGE_HOOK_INPUT_BYTES];
+        for agent in ["claude", "codex"] {
+            for action in ["ignored-action", SUBAGENT_START_ACTION] {
+                let (status, stdout, stderr, bytes_written, files) =
+                    run_state_asset_with_large_input(agent, action, &oversized);
+                assert!(
+                    status.success(),
+                    "{agent} hook exited with {status}: {stderr}"
+                );
+                assert_eq!(stdout, "", "{agent} state hook must not print stdout");
+                assert_eq!(stderr, "", "{agent} state hook must not print stderr");
+                assert!(
+                    bytes_written < LARGE_HOOK_INPUT_BYTES,
+                    "{agent} {action} consumed the full oversized stdin"
+                );
+                assert!(
+                    files.is_empty(),
+                    "{agent} {action} persisted hook input: {files:?}"
+                );
+            }
         }
     }
 

@@ -105,6 +105,10 @@ const DEFAULT_WORKER_CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 const WORKER_CONNECT_RETRY: Duration = Duration::from_millis(100);
 /// Bounds optimistic terminal-state CAS retries before surfacing contention.
 const MAX_RUNTIME_TRANSITION_COMMIT_ATTEMPTS: usize = 8;
+/// Caps retry load while preserving eventual recovery of unchanged metadata.
+const MAX_WORKER_METADATA_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// Prevents a persistent retryable failure from flooding daemon logs.
+const WORKER_METADATA_RETRY_WARN_INTERVAL: Duration = Duration::from_secs(30);
 /// Per-subscriber worker output queue. It absorbs repaint bursts without
 /// duplicating the larger raw-history budget for every subscriber.
 const DEFAULT_WORKER_SUBSCRIBER_BYTES: u64 = 1_000_000;
@@ -478,6 +482,7 @@ struct SessionEntry {
     runtime_watch_cancel: CancellationToken,
     procwatch_rescan: Arc<Notify>,
     stopping: bool,
+    stop_transaction_id: Option<String>,
     /// Resolved input-framing rules (base-kind defaults, profile-overridden), used
     /// by `session.input` so a profile's `[input_rules]` is honored on every write.
     input_rules: InputRules,
@@ -656,6 +661,12 @@ enum RuntimeTransitionOutcome {
     RetryableConcurrentChange,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeMetadataPolicy {
+    Live,
+    Terminal,
+}
+
 struct ExitTransition {
     event: &'static str,
     stop_reason: &'static str,
@@ -678,6 +689,7 @@ fn exit_transition(
     let stopped =
         stopped_by_user || candidate.stopping || candidate.info.state == SessionState::Stopped;
     candidate.stopping = false;
+    candidate.stop_transaction_id = None;
     let stop_reason = if stopped {
         candidate.info.state = SessionState::Stopped;
         "stopped"
@@ -2376,6 +2388,10 @@ impl SessionRegistry {
             .await
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the stop transaction stays linear so durable intent, runtime shutdown, and terminal commit ordering remain explicit"
+    )]
     async fn stop_with_intent(
         &self,
         id: &SessionId,
@@ -2391,7 +2407,15 @@ impl SessionRegistry {
             TransactionKind::Recover => "recover",
         };
         let transaction_id = format!("{operation}-{sequence}");
-        let (runtime, detector_cancel, procwatch_cancel, runtime_watch_cancel, durable_intent) = {
+        let (
+            runtime,
+            detector_cancel,
+            procwatch_cancel,
+            runtime_watch_cancel,
+            previous_desired_state,
+            stop_runtime,
+            durable_intent,
+        ) = {
             let mut sessions = self.inner.sessions.lock().await;
             let entry = sessions
                 .get_mut(id)
@@ -2400,13 +2424,18 @@ impl SessionRegistry {
                 return Ok(SessionStopResult { stopped: false });
             }
 
+            let previous_desired_state = entry.desired_state;
+            let stop_runtime = RuntimeWatchIdentity::from_info(&entry.info);
             entry.stopping = true;
+            entry.stop_transaction_id = Some(transaction_id.clone());
             entry.desired_state = desired_state;
             (
                 entry.runtime.clone(),
                 entry.detector_cancel.clone(),
                 entry.procwatch_cancel.clone(),
                 entry.runtime_watch_cancel.clone(),
+                previous_desired_state,
+                stop_runtime,
                 Self::session_record(
                     id,
                     entry,
@@ -2421,11 +2450,20 @@ impl SessionRegistry {
                 ),
             )
         };
-        let terminal_base = durable_intent.clone();
-        if let Err(error) = self.write_session_record(durable_intent).await {
-            self.clear_stopping(id).await;
-            return Err(error);
-        }
+        let terminal_base = match self.commit_stop_intent(id, durable_intent).await {
+            Ok(record) => record,
+            Err(error) => {
+                self.rollback_stop_intent(
+                    id,
+                    previous_desired_state,
+                    desired_state,
+                    &transaction_id,
+                    stop_runtime.as_ref(),
+                )
+                .await;
+                return Err(error);
+            }
+        };
 
         detector_cancel.cancel();
         procwatch_cancel.cancel();
@@ -2434,19 +2472,22 @@ impl SessionRegistry {
 
         let exit = match runtime {
             RuntimeHandle::Worker(worker) => {
-                let transaction = pohunek_worker_protocol::TransactionId::new(transaction_id)
-                    .map_err(|error| runtime_error("worker_stop_invalid", error.to_string()))?;
+                let transaction =
+                    pohunek_worker_protocol::TransactionId::new(transaction_id.clone())
+                        .map_err(|error| runtime_error("worker_stop_invalid", error.to_string()))?;
                 let status = match worker.stop(transaction).await {
                     Ok(Some(status)) => status,
                     Ok(None) => {
-                        self.clear_stopping(id).await;
+                        self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
+                            .await;
                         return Err(runtime_error(
                             "worker_stop_incomplete",
                             format!("worker for {} did not return a terminal outcome", id.0),
                         ));
                     }
                     Err(error) => {
-                        self.clear_stopping(id).await;
+                        self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
+                            .await;
                         return Err(worker_error_to_protocol(error));
                     }
                 };
@@ -2456,7 +2497,8 @@ impl SessionRegistry {
                 }
             }
             RuntimeHandle::Unavailable(state) => {
-                self.clear_stopping(id).await;
+                self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
+                    .await;
                 return Err(unavailable_runtime_error(id, state));
             }
         };
@@ -2470,6 +2512,43 @@ impl SessionRegistry {
         // `stop()` returns.
         self.persist_resume_binding(id).await;
         Ok(SessionStopResult { stopped: true })
+    }
+
+    async fn commit_stop_intent(
+        &self,
+        id: &SessionId,
+        intent: SessionRecord,
+    ) -> Result<SessionRecord, ProtocolError> {
+        for _ in 0..MAX_RUNTIME_TRANSITION_COMMIT_ATTEMPTS {
+            let durable_base = self
+                .load_durable_session_record(id)
+                .await?
+                .unwrap_or_else(|| intent.clone());
+            let mut candidate = intent.clone();
+            preserve_durable_worker_metadata(&durable_base, &mut candidate);
+            match self
+                .write_session_record_if_current(durable_base, candidate.clone())
+                .await
+            {
+                Ok(()) => return Ok(candidate),
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "session_record_commit_stale" | "session_runtime_commit_stale"
+                    ) =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(runtime_error(
+            "session_stop_intent_busy",
+            format!(
+                "session {} kept changing while committing its stop intent",
+                id.0
+            ),
+        ))
     }
 
     async fn commit_user_stop_exit(
@@ -2635,8 +2714,9 @@ impl SessionRegistry {
         tokio::spawn(async move {
             let socket_path = initial_worker.socket_path().to_path_buf();
             let mut worker = initial_worker;
-            let mut last_worker_metadata = None;
+            let mut metadata = WorkerMetadataTracker::default();
             loop {
+                let mut retry_delay = WORKER_CONNECT_RETRY;
                 let inspected = tokio::select! {
                     () = cancel.cancelled() => return,
                     inspected = worker.inspect() => inspected,
@@ -2644,21 +2724,43 @@ impl SessionRegistry {
                 match inspected {
                     Ok(snapshot) => {
                         let worker_metadata = worker_metadata_fingerprint(&snapshot);
-                        let initial_empty_metadata = last_worker_metadata.is_none()
-                            && worker_metadata_is_empty(&worker_metadata);
-                        if !initial_empty_metadata
-                            && last_worker_metadata.as_ref() != Some(&worker_metadata)
-                        {
-                            if registry
+                        let initial_empty_metadata =
+                            metadata.is_initial() && worker_metadata_is_empty(&worker_metadata);
+                        if !initial_empty_metadata && metadata.should_apply(&worker_metadata) {
+                            let outcome = registry
                                 .apply_worker_metadata_snapshot(&id, &snapshot)
-                                .await
-                            {
-                                last_worker_metadata = Some(worker_metadata.clone());
+                                .await;
+                            match metadata.record(
+                                worker_metadata.clone(),
+                                outcome,
+                                snapshot.phase,
+                                Instant::now(),
+                            ) {
+                                WorkerMetadataProgress::Complete => {}
+                                WorkerMetadataProgress::IdentityDiscarded => {
+                                    warn!(
+                                        session_id = %id.0,
+                                        "discarding unverified terminal worker identity after safe metadata commit"
+                                    );
+                                }
+                                WorkerMetadataProgress::Retry(retry) => {
+                                    if retry.should_warn {
+                                        warn!(
+                                            session_id = %id.0,
+                                            attempts = retry.attempts,
+                                            retry_delay_ms = retry.delay.as_millis(),
+                                            "worker metadata remains retryable"
+                                        );
+                                    }
+                                    retry_delay = retry.delay;
+                                }
                             }
                         } else {
-                            last_worker_metadata = Some(worker_metadata.clone());
+                            metadata.complete(worker_metadata.clone());
                         }
-                        if snapshot.phase == pohunek_worker_protocol::RuntimePhase::Exited {
+                        if snapshot.phase == pohunek_worker_protocol::RuntimePhase::Exited
+                            && metadata.is_complete(&worker_metadata)
+                        {
                             let exit = snapshot.exit.map_or(
                                 RuntimeExit {
                                     exit_code: None,
@@ -2691,7 +2793,7 @@ impl SessionRegistry {
                 }
                 tokio::select! {
                     () = cancel.cancelled() => return,
-                    () = tokio::time::sleep(WORKER_CONNECT_RETRY) => {}
+                    () = tokio::time::sleep(retry_delay) => {}
                 }
             }
         });
@@ -2802,7 +2904,6 @@ impl SessionRegistry {
             let base = Self::session_record(id, entry, entry.desired_state, None);
             let mut candidate = entry.clone();
             candidate.runtime = RuntimeHandle::Unavailable(RuntimeState::Lost);
-            terminalize_running_subagents(&mut candidate.info.subagents, current_time_millis());
             if let Some(runtime) = candidate.info.runtime.as_mut() {
                 runtime.state = RuntimeState::Lost;
                 runtime.loss_reason = Some("worker_process_lost".to_owned());
@@ -2816,7 +2917,14 @@ impl SessionRegistry {
             Err(error) => return RuntimeTransitionOutcome::RetryablePersistenceFailure(error),
         };
         let outcome = self
-            .commit_runtime_transition(id, expected, &base, &durable_base, candidate)
+            .commit_runtime_transition(
+                id,
+                expected,
+                &base,
+                &durable_base,
+                candidate,
+                RuntimeMetadataPolicy::Terminal,
+            )
             .await;
         if let RuntimeTransitionOutcome::RetryablePersistenceFailure(store_error) = &outcome {
             warn!(
@@ -2876,7 +2984,14 @@ impl SessionRegistry {
             Err(error) => return RuntimeTransitionOutcome::RetryablePersistenceFailure(error),
         };
         let outcome = self
-            .commit_runtime_transition(id, expected, &base, &durable_base, candidate)
+            .commit_runtime_transition(
+                id,
+                expected,
+                &base,
+                &durable_base,
+                candidate,
+                RuntimeMetadataPolicy::Live,
+            )
             .await;
         if let RuntimeTransitionOutcome::RetryablePersistenceFailure(error) = &outcome {
             warn!(session_id = %id.0, error = %error, "failed to persist reconnected worker");
@@ -2894,7 +3009,9 @@ impl SessionRegistry {
         memory_base: &SessionRecord,
         durable_base: &SessionRecord,
         mut candidate: SessionEntry,
+        metadata_policy: RuntimeMetadataPolicy,
     ) -> RuntimeTransitionOutcome {
+        preserve_durable_transition_metadata(durable_base, &mut candidate, metadata_policy);
         let mut record = Self::session_record(id, &candidate, candidate.desired_state, None);
         crate::store::preserve_newer_native_identity(durable_base, &mut record);
         candidate
@@ -2993,13 +3110,13 @@ impl SessionRegistry {
             &loaded_durable_base
         };
         let updated = *updated;
-
         let committed_info = match Box::pin(self.commit_runtime_transition(
             id,
             &updated.expected,
             &updated.base,
             durable_base,
             updated.candidate,
+            RuntimeMetadataPolicy::Terminal,
         ))
         .await
         {
@@ -3038,12 +3155,56 @@ impl SessionRegistry {
         Ok(true)
     }
 
-    async fn clear_stopping(&self, id: &SessionId) {
+    async fn clear_stopping(
+        &self,
+        id: &SessionId,
+        transaction_id: &str,
+        expected_runtime: Option<&RuntimeWatchIdentity>,
+    ) {
         let mut sessions = self.inner.sessions.lock().await;
         if let Some(entry) = sessions.get_mut(id) {
-            if !is_terminal(entry.info.state) {
+            let runtime_matches = expected_runtime.map_or_else(
+                || RuntimeWatchIdentity::from_info(&entry.info).is_none(),
+                |expected| expected.matches(entry),
+            );
+            if !is_terminal(entry.info.state)
+                && runtime_matches
+                && entry.stop_transaction_id.as_deref() == Some(transaction_id)
+            {
                 entry.stopping = false;
+                entry.stop_transaction_id = None;
             }
+        }
+    }
+
+    async fn rollback_stop_intent(
+        &self,
+        id: &SessionId,
+        previous_desired_state: DesiredState,
+        attempted_desired_state: DesiredState,
+        attempted_transaction_id: &str,
+        expected_runtime: Option<&RuntimeWatchIdentity>,
+    ) {
+        let mut sessions = self.inner.sessions.lock().await;
+        let Some(entry) = sessions.get_mut(id) else {
+            return;
+        };
+        let runtime_matches = expected_runtime.map_or_else(
+            || RuntimeWatchIdentity::from_info(&entry.info).is_none(),
+            |expected| expected.matches(entry),
+        );
+        // The failed durable writer may finish after runtime replacement or a
+        // newer stop/remove request. Only undo the exact in-memory intent that
+        // belonged to the writer.
+        if runtime_matches
+            && !is_terminal(entry.info.state)
+            && entry.stopping
+            && entry.desired_state == attempted_desired_state
+            && entry.stop_transaction_id.as_deref() == Some(attempted_transaction_id)
+        {
+            entry.stopping = false;
+            entry.stop_transaction_id = None;
+            entry.desired_state = previous_desired_state;
         }
     }
 
@@ -3284,6 +3445,113 @@ type WorkerMetadataFingerprint = (
     Option<pohunek_worker_protocol::ReleasedIdentityClaim>,
     Vec<pohunek_worker_protocol::SubagentSnapshot>,
 );
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerMetadataApplyOutcome {
+    Applied,
+    Retryable(WorkerMetadataRetryCause),
+    Discarded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerMetadataRetryCause {
+    Commit,
+    IdentityValidation,
+}
+
+#[derive(Debug, Default)]
+struct WorkerMetadataTracker {
+    completed: Option<WorkerMetadataFingerprint>,
+    pending: Option<(WorkerMetadataFingerprint, usize)>,
+    last_retry_warning: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerMetadataRetry {
+    attempts: usize,
+    delay: Duration,
+    should_warn: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerMetadataProgress {
+    Complete,
+    IdentityDiscarded,
+    Retry(WorkerMetadataRetry),
+}
+
+impl WorkerMetadataTracker {
+    fn is_initial(&self) -> bool {
+        self.completed.is_none() && self.pending.is_none()
+    }
+
+    fn should_apply(&self, fingerprint: &WorkerMetadataFingerprint) -> bool {
+        self.completed.as_ref() != Some(fingerprint)
+    }
+
+    fn is_complete(&self, fingerprint: &WorkerMetadataFingerprint) -> bool {
+        self.completed.as_ref() == Some(fingerprint) && self.pending.is_none()
+    }
+
+    fn complete(&mut self, fingerprint: WorkerMetadataFingerprint) {
+        self.completed = Some(fingerprint);
+        self.pending = None;
+        self.last_retry_warning = None;
+    }
+
+    fn retry(
+        &mut self,
+        fingerprint: &WorkerMetadataFingerprint,
+        now: Instant,
+    ) -> WorkerMetadataRetry {
+        let attempts = self
+            .pending
+            .as_ref()
+            .filter(|(pending, _)| pending == fingerprint)
+            .map_or(1, |(_, attempts)| attempts.saturating_add(1));
+        self.pending = Some((fingerprint.clone(), attempts));
+        let multiplier =
+            2_u32.saturating_pow(u32::try_from(attempts.saturating_sub(1)).unwrap_or(u32::MAX));
+        let delay = WORKER_CONNECT_RETRY
+            .saturating_mul(multiplier)
+            .min(MAX_WORKER_METADATA_RETRY_DELAY);
+        let should_warn = self.last_retry_warning.is_none_or(|last_warning| {
+            now.saturating_duration_since(last_warning) >= WORKER_METADATA_RETRY_WARN_INTERVAL
+        });
+        if should_warn {
+            self.last_retry_warning = Some(now);
+        }
+        WorkerMetadataRetry {
+            attempts,
+            delay,
+            should_warn,
+        }
+    }
+
+    fn record(
+        &mut self,
+        fingerprint: WorkerMetadataFingerprint,
+        outcome: WorkerMetadataApplyOutcome,
+        phase: pohunek_worker_protocol::RuntimePhase,
+        now: Instant,
+    ) -> WorkerMetadataProgress {
+        match outcome {
+            WorkerMetadataApplyOutcome::Applied | WorkerMetadataApplyOutcome::Discarded => {
+                self.complete(fingerprint);
+                WorkerMetadataProgress::Complete
+            }
+            WorkerMetadataApplyOutcome::Retryable(WorkerMetadataRetryCause::IdentityValidation)
+                if phase == pohunek_worker_protocol::RuntimePhase::Exited =>
+            {
+                self.complete(fingerprint);
+                WorkerMetadataProgress::IdentityDiscarded
+            }
+            WorkerMetadataApplyOutcome::Retryable(_) => {
+                WorkerMetadataProgress::Retry(self.retry(&fingerprint, now))
+            }
+        }
+    }
+}
 
 fn worker_metadata_fingerprint(
     snapshot: &pohunek_worker_protocol::InspectSnapshot,
@@ -3823,6 +4091,113 @@ fn validate_observation_config(config: &SessionRegistryConfig) -> Result<(), Pro
 
 fn timestamp_now() -> String {
     now_rfc3339()
+}
+
+fn preserve_newer_updated_at(existing: &str, replacement: &mut String) {
+    let existing_time = OffsetDateTime::parse(existing, &Rfc3339);
+    let replacement_time = OffsetDateTime::parse(replacement, &Rfc3339);
+    if matches!(
+        (existing_time, replacement_time),
+        (Ok(existing_time), Ok(replacement_time)) if existing_time > replacement_time
+    ) {
+        replacement.clear();
+        replacement.push_str(existing);
+    }
+}
+
+fn preserve_durable_worker_metadata(existing: &SessionRecord, replacement: &mut SessionRecord) {
+    replacement
+        .info
+        .subagents
+        .clone_from(&existing.info.subagents);
+    replacement
+        .info
+        .active_agent
+        .clone_from(&existing.info.active_agent);
+    replacement
+        .info
+        .active_agent_base
+        .clone_from(&existing.info.active_agent_base);
+    replacement.info.active_agent_pid = existing.info.active_agent_pid;
+    replacement
+        .info
+        .active_agent_session_id
+        .clone_from(&existing.info.active_agent_session_id);
+    replacement
+        .info
+        .active_agent_session_path
+        .clone_from(&existing.info.active_agent_session_path);
+    let preserved_launch = preserve_durable_launch_identity(
+        existing,
+        &mut replacement.info,
+        replacement.native_identity_ordering.is_some(),
+    );
+    if preserved_launch {
+        match (replacement.recovery.as_mut(), existing.recovery.as_ref()) {
+            (Some(replacement), Some(existing)) => {
+                replacement
+                    .native_session_id
+                    .clone_from(&existing.native_session_id);
+                replacement
+                    .native_session_path
+                    .clone_from(&existing.native_session_path);
+            }
+            (None, Some(existing)) => replacement.recovery = Some(existing.clone()),
+            _ => {}
+        }
+    }
+    crate::store::preserve_newer_native_identity(existing, replacement);
+    preserve_newer_updated_at(&existing.info.updated_at, &mut replacement.info.updated_at);
+}
+
+fn preserve_durable_transition_metadata(
+    existing: &SessionRecord,
+    replacement: &mut SessionEntry,
+    policy: RuntimeMetadataPolicy,
+) {
+    // Active identity is intentionally not copied from storage: terminal
+    // transitions must clear it, while live transitions retain the richer
+    // in-memory report needed for ordering and later process validation.
+    for durable in &existing.info.subagents {
+        match replacement
+            .info
+            .subagents
+            .iter_mut()
+            .find(|current| current.provider == durable.provider && current.id == durable.id)
+        {
+            Some(current) if durable.revision > current.revision => current.clone_from(durable),
+            Some(_) => {}
+            None => replacement.info.subagents.push(durable.clone()),
+        }
+    }
+    let _ = preserve_durable_launch_identity(
+        existing,
+        &mut replacement.info,
+        replacement.last_native_report.is_some(),
+    );
+    if policy == RuntimeMetadataPolicy::Terminal {
+        terminalize_running_subagents(&mut replacement.info.subagents, current_time_millis());
+    } else {
+        sort_subagents(&mut replacement.info.subagents);
+    }
+    preserve_newer_updated_at(&existing.info.updated_at, &mut replacement.info.updated_at);
+}
+
+fn preserve_durable_launch_identity(
+    existing: &SessionRecord,
+    replacement: &mut SessionInfo,
+    replacement_has_ordering: bool,
+) -> bool {
+    if existing.native_identity_ordering.is_some() || replacement_has_ordering {
+        return false;
+    }
+    replacement
+        .native_session_id
+        .clone_from(&existing.info.native_session_id);
+    replacement
+        .native_session_path
+        .clone_from(&existing.info.native_session_path);
+    true
 }
 
 fn current_time_millis() -> u64 {

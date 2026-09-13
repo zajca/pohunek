@@ -512,10 +512,12 @@ Hooks have two separate roles:
   optional parent id, and optional agent type to the owner-private worker. The
   worker validates the runtime and reporting process, rejects stale per-child
   sequences, journals concurrent subagents, and retains bounded terminal
-  history. Prompt text, results, transcript paths, and raw hook payloads never
-  cross this boundary. Running children become `lost` when their PTY runtime
-  terminates. This state is independent of the parent session's coarse
-  `activity` and survives daemon and GUI reconnects.
+  history. The state hooks validate their action and Pohunek handshake before
+  reading, reject oversized JSON through a bounded direct pipe, and never stage
+  provider payloads on disk. Prompt text, results, transcript paths, and raw
+  hook payloads never cross this boundary. Running children become `lost` when
+  their PTY runtime terminates. This state is independent of the parent
+  session's coarse `activity` and survives daemon and GUI reconnects.
 
 Live state remains detector-first: OSC, screen, PTY activity, and process state
 continue to drive normal activity transitions. Notification hooks still target

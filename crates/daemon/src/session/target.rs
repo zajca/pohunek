@@ -663,6 +663,7 @@ impl SessionRegistry {
             runtime_watch_cancel: runtime_watch_cancel.clone(),
             procwatch_rescan: Arc::clone(&procwatch_rescan),
             stopping: false,
+            stop_transaction_id: None,
             input_rules,
             snapshot,
             active_agent: None,
