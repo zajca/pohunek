@@ -252,8 +252,9 @@ fn read_stat_pid_field(process_id: Pid, field_number: usize) -> io::Result<Optio
     Ok(parse_stat_pid_field(&stat, field_number))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StatFact {
+    comm: String,
     parent_id: Pid,
     pgid: Pid,
     start_identity: StartIdentity,
@@ -269,6 +270,12 @@ fn read_process_stat_at(root: &Path, process_id: Pid) -> io::Result<Option<StatF
         Err(err) if is_process_race(&err) => return Ok(None),
         Err(err) => return Err(err),
     };
+    let command_start = stat.find('(').ok_or_else(invalid_process_stat_error)?;
+    let command_end = stat.rfind(')').ok_or_else(invalid_process_stat_error)?;
+    let comm = stat
+        .get(command_start + 1..command_end)
+        .ok_or_else(invalid_process_stat_error)?
+        .to_owned();
     let parent_id =
         parse_stat_pid_field(&stat, STAT_PPID_FIELD).ok_or_else(invalid_process_stat_error)?;
     let pgid =
@@ -276,6 +283,7 @@ fn read_process_stat_at(root: &Path, process_id: Pid) -> io::Result<Option<StatF
     let start_identity =
         parse_stat_field(&stat, STAT_STARTTIME_FIELD).ok_or_else(invalid_process_stat_error)?;
     Ok(Some(StatFact {
+        comm,
         parent_id,
         pgid,
         start_identity: StartIdentity::new(start_identity),
@@ -490,22 +498,43 @@ fn descendants_from_ppid_scan(root: Pid, euid: u32) -> io::Result<Vec<Pid>> {
 }
 
 fn read_process_fact(process_id: Pid, euid: u32) -> io::Result<Option<ProcessFact>> {
-    if !same_user(process_id, euid) {
+    if checked_same_user_at(Path::new(PROC_ROOT), process_id, euid)? != Some(true) {
         return Ok(None);
     }
-    let Some((comm, parent_id)) = read_status(process_id)? else {
+    let fact = sample_process_fact(
+        process_id,
+        || read_process_stat(process_id),
+        || read_cmdline(process_id),
+    )?;
+    if fact.is_none() || checked_same_user_at(Path::new(PROC_ROOT), process_id, euid)? != Some(true)
+    {
+        return Ok(None);
+    }
+    Ok(fact)
+}
+
+fn sample_process_fact(
+    process_id: Pid,
+    mut read_stat: impl FnMut() -> io::Result<Option<StatFact>>,
+    read_cmdline: impl FnOnce() -> io::Result<Vec<String>>,
+) -> io::Result<Option<ProcessFact>> {
+    let Some(initial) = read_stat()? else {
         return Ok(None);
     };
-    let Some(stat) = read_process_stat(process_id)? else {
+    let cmdline = read_cmdline()?;
+    let Some(final_stat) = read_stat()? else {
         return Ok(None);
     };
+    if final_stat.start_identity != initial.start_identity {
+        return Ok(None);
+    }
     Ok(Some(ProcessFact {
         pid: process_id,
-        pgid: stat.pgid,
-        ppid: parent_id,
-        start_identity: stat.start_identity,
-        comm,
-        cmdline: read_cmdline(process_id)?,
+        pgid: initial.pgid,
+        ppid: initial.parent_id,
+        start_identity: initial.start_identity,
+        comm: initial.comm,
+        cmdline,
     }))
 }
 
@@ -639,6 +668,69 @@ mod tests {
         assert_eq!(
             parse_stat_field::<u64>(stat, STAT_STARTTIME_FIELD),
             Some(987_654)
+        );
+    }
+
+    #[test]
+    fn process_fact_sampling_discards_a_reused_pid_after_metadata_reads() {
+        let reads = std::cell::RefCell::new(Vec::new());
+        let stats = std::cell::RefCell::new(VecDeque::from([
+            StatFact {
+                comm: "old-agent".to_owned(),
+                parent_id: 7,
+                pgid: 456,
+                start_identity: StartIdentity::new(987_654),
+            },
+            StatFact {
+                comm: "new-agent".to_owned(),
+                parent_id: 8,
+                pgid: 457,
+                start_identity: StartIdentity::new(987_655),
+            },
+        ]));
+
+        let fact = sample_process_fact(
+            123,
+            || {
+                reads.borrow_mut().push("stat");
+                Ok(stats.borrow_mut().pop_front())
+            },
+            || {
+                reads.borrow_mut().push("cmdline");
+                Ok(vec!["new-agent".to_owned()])
+            },
+        )
+        .expect("process fact sampling");
+
+        assert_eq!(fact, None);
+        assert_eq!(*reads.borrow(), ["stat", "cmdline", "stat"]);
+    }
+
+    #[test]
+    fn process_fact_sampling_uses_one_stable_stat_generation() {
+        let stat = StatFact {
+            comm: "agent".to_owned(),
+            parent_id: 7,
+            pgid: 456,
+            start_identity: StartIdentity::new(987_654),
+        };
+        let stats = std::cell::RefCell::new(VecDeque::from([stat.clone(), stat]));
+
+        assert_eq!(
+            sample_process_fact(
+                123,
+                || Ok(stats.borrow_mut().pop_front()),
+                || Ok(vec!["agent".to_owned(), "--resume".to_owned()]),
+            )
+            .expect("process fact sampling"),
+            Some(ProcessFact {
+                pid: 123,
+                pgid: 456,
+                ppid: 7,
+                start_identity: StartIdentity::new(987_654),
+                comm: "agent".to_owned(),
+                cmdline: vec!["agent".to_owned(), "--resume".to_owned()],
+            })
         );
     }
 

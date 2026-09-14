@@ -458,6 +458,15 @@ struct SessionRegistryInner {
     procwatch_seq: AtomicU64,
     /// Read-only external agent sessions observed outside pohunek-owned PTYs.
     external: ExternalSessions,
+    #[cfg(test)]
+    external_association_block: std::sync::Mutex<Option<Arc<ExternalAssociationBlock>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ExternalAssociationBlock {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 #[derive(Debug, Clone)]
@@ -1146,6 +1155,8 @@ impl SessionRegistry {
                 inspector,
                 procwatch_seq: AtomicU64::new(current_time_millis()),
                 external: external.clone(),
+                #[cfg(test)]
+                external_association_block: std::sync::Mutex::new(None),
             }),
         };
         if let Some(config) = external_observer {
@@ -3279,13 +3290,37 @@ impl SessionRegistry {
                     continue;
                 }
             };
-            observed_pids.insert(fact.pid);
             let candidate = transcripts.best_match(&agent_base, &cwd, &fact);
             let association = self
                 .resolve_external_cwd_association(fact.pid, cwd.clone())
                 .await;
             let info = external_session_info(&fact, agent_base, cwd, candidate, association);
-            let upsert = self.inner.external.upsert(fact.identity(), info).await;
+            let identity = fact.identity();
+            let upsert = match self
+                .inner
+                .external
+                .upsert_if_current(identity, info, || {
+                    self.inner
+                        .inspector
+                        .identity(identity.pid)
+                        .map(|current| current == Some(identity))
+                })
+                .await
+            {
+                Ok(Some(upsert)) => upsert,
+                Ok(None) => continue,
+                Err(err) if err.is_race() => continue,
+                Err(err) => {
+                    debug!(
+                        pid = identity.pid,
+                        error = %err,
+                        "failed to revalidate external agent identity"
+                    );
+                    observed_pids.insert(identity.pid);
+                    continue;
+                }
+            };
+            observed_pids.insert(identity.pid);
             if let Some(identity) = upsert.watch_identity {
                 self.spawn_external_exit_watch(identity);
             }
@@ -3341,6 +3376,19 @@ impl SessionRegistry {
         pid: Pid,
         cwd: PathBuf,
     ) -> Option<CwdAssociation> {
+        #[cfg(test)]
+        {
+            let block = self
+                .inner
+                .external_association_block
+                .lock()
+                .expect("external association test lock")
+                .clone();
+            if let Some(block) = block {
+                block.entered.notify_one();
+                block.release.notified().await;
+            }
+        }
         let store = self.inner.store.clone();
         match tokio::task::spawn_blocking(move || {
             resolve_cwd_association(cwd.as_path(), store.as_deref())

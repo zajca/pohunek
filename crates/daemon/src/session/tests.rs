@@ -37,11 +37,11 @@ use crate::runtime::{Worker, WorkerError};
 
 use super::{
     native_report_is_current, preserve_durable_worker_metadata, terminalize_running_subagents,
-    timestamp_now, worker_error_to_protocol, InputSubmission, RuntimeExit, RuntimeHandle,
-    RuntimeWatchIdentity, SessionEntry, SessionRegistry, SessionRegistryConfig, ShellCommand,
-    WorkerMetadataApplyOutcome, WorkerMetadataProgress, WorkerMetadataRetryCause,
-    WorkerMetadataTracker, MAX_SESSION_NAME_BYTES, MAX_WORKER_METADATA_RETRY_DELAY,
-    WORKER_METADATA_RETRY_WARN_INTERVAL,
+    timestamp_now, worker_error_to_protocol, ExternalAssociationBlock, InputSubmission,
+    RuntimeExit, RuntimeHandle, RuntimeWatchIdentity, SessionEntry, SessionRegistry,
+    SessionRegistryConfig, ShellCommand, WorkerMetadataApplyOutcome, WorkerMetadataProgress,
+    WorkerMetadataRetryCause, WorkerMetadataTracker, MAX_SESSION_NAME_BYTES,
+    MAX_WORKER_METADATA_RETRY_DELAY, WORKER_METADATA_RETRY_WARN_INTERVAL,
 };
 
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.
@@ -1090,6 +1090,8 @@ struct MockInspectorState {
     foreground_error: Option<std::io::ErrorKind>,
     foreground_block: Option<Arc<ForegroundBlock>>,
     cwd: HashMap<Pid, PathBuf>,
+    identity_overrides: HashMap<Pid, Option<ProcessIdentity>>,
+    identity_errors: HashMap<Pid, std::io::ErrorKind>,
     exits: HashMap<Pid, Vec<tokio::sync::watch::Sender<bool>>>,
     ownership_markers: HashMap<Pid, OwnershipMarkers>,
 }
@@ -1186,6 +1188,22 @@ impl MockInspector {
             .insert(pid, cwd);
     }
 
+    fn set_identity(&self, pid: Pid, identity: Option<ProcessIdentity>) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .identity_overrides
+            .insert(pid, identity);
+    }
+
+    fn fail_identity_with(&self, pid: Pid, kind: std::io::ErrorKind) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .identity_errors
+            .insert(pid, kind);
+    }
+
     fn set_ownership_markers(&self, pid: Pid, markers: OwnershipMarkers) {
         self.inner
             .lock()
@@ -1205,6 +1223,29 @@ impl MockInspector {
 
 impl ProcessInspector for MockInspector {
     fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, crate::procwatch::Error> {
+        if let Some(kind) = self
+            .inner
+            .lock()
+            .expect("mock inspector lock")
+            .identity_errors
+            .get(&pid)
+            .copied()
+        {
+            return Err(crate::procwatch::Error::from_io(
+                "mock_identity",
+                std::io::Error::new(kind, "mock identity failure"),
+            ));
+        }
+        if let Some(identity) = self
+            .inner
+            .lock()
+            .expect("mock inspector lock")
+            .identity_overrides
+            .get(&pid)
+            .copied()
+        {
+            return Ok(identity);
+        }
         self.process(pid)
             .map(|fact| fact.map(|fact| fact.identity()))
     }
@@ -4271,14 +4312,17 @@ async fn session_input_wait_preserves_external_read_only_error() {
     registry
         .inner
         .external
-        .upsert(
+        .upsert_if_current(
             ProcessIdentity {
                 pid: external.pid,
                 start_identity: StartIdentity::new(1),
             },
             external,
+            || Ok::<_, std::convert::Infallible>(true),
         )
-        .await;
+        .await
+        .expect("infallible external session validation")
+        .expect("current external session");
 
     let error = registry
         .input(protocol::SessionInputParams {
@@ -4324,14 +4368,22 @@ async fn stale_external_exit_watch_does_not_remove_reused_pid() {
     let first = registry
         .inner
         .external
-        .upsert(old_identity, external.clone())
-        .await;
+        .upsert_if_current(old_identity, external.clone(), || {
+            Ok::<_, std::convert::Infallible>(true)
+        })
+        .await
+        .expect("infallible old identity validation")
+        .expect("current old identity");
     assert_eq!(first.watch_identity, Some(old_identity));
     let replacement = registry
         .inner
         .external
-        .upsert(new_identity, external.clone())
-        .await;
+        .upsert_if_current(new_identity, external.clone(), || {
+            Ok::<_, std::convert::Infallible>(true)
+        })
+        .await
+        .expect("infallible new identity validation")
+        .expect("current new identity");
     assert_eq!(replacement.watch_identity, Some(new_identity));
 
     assert_eq!(
@@ -8129,6 +8181,93 @@ async fn external_rescan_skips_processes_marked_by_any_pohunek_daemon() {
     assert_eq!(sessions.len(), 1, "unmarked agent surfaces as external");
     assert_eq!(sessions[0].external, Some(true));
     assert_eq!(sessions[0].pid, FOREIGN_AGENT_PID);
+}
+
+#[tokio::test]
+async fn external_rescan_discards_a_candidate_that_changes_generation_before_upsert() {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    let fact = codex_fact(FOREIGN_AGENT_PID, 1);
+    inspector.set_descendants(1, vec![fact.clone()]);
+    inspector.set_cwd(FOREIGN_AGENT_PID, temp_dir("external-reused-pid"));
+    let association_block = Arc::new(ExternalAssociationBlock::default());
+    *registry
+        .inner
+        .external_association_block
+        .lock()
+        .expect("external association test lock") = Some(Arc::clone(&association_block));
+    let rescan_registry = registry.clone();
+    let rescan = tokio::spawn(async move {
+        rescan_registry
+            .rescan_external_agents(&TranscriptIndex::default())
+            .await;
+    });
+    association_block.entered.notified().await;
+    inspector.set_identity(
+        FOREIGN_AGENT_PID,
+        Some(ProcessIdentity {
+            pid: FOREIGN_AGENT_PID,
+            start_identity: StartIdentity::new(fact.start_identity.get() + 1),
+        }),
+    );
+    association_block.release.notify_one();
+    rescan.await.expect("external rescan task");
+
+    assert!(
+        registry.list().await.is_empty(),
+        "a stale process generation must not surface as an external session"
+    );
+    assert_eq!(
+        inspector.exit_watch_count(FOREIGN_AGENT_PID),
+        0,
+        "a stale process generation must not arm an exit watch"
+    );
+}
+
+#[tokio::test]
+async fn external_rescan_preserves_verified_entry_on_identity_inspection_failure() {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    inspector.set_descendants(1, vec![codex_fact(FOREIGN_AGENT_PID, 1)]);
+    inspector.set_cwd(
+        FOREIGN_AGENT_PID,
+        temp_dir("external-identity-inspection-failure"),
+    );
+    registry
+        .rescan_external_agents(&TranscriptIndex::default())
+        .await;
+    let verified = registry
+        .list()
+        .await
+        .into_iter()
+        .next()
+        .expect("verified external session");
+
+    inspector.fail_identity_with(FOREIGN_AGENT_PID, std::io::ErrorKind::Interrupted);
+    registry
+        .rescan_external_agents(&TranscriptIndex::default())
+        .await;
+
+    assert_eq!(registry.list().await, vec![verified]);
+    assert_eq!(
+        inspector.exit_watch_count(FOREIGN_AGENT_PID),
+        1,
+        "an inconclusive refresh must not replace the existing exit watch"
+    );
 }
 
 #[tokio::test]

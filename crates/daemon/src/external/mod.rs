@@ -240,13 +240,17 @@ impl ExternalSessions {
         self.inspect(id).await.is_some()
     }
 
-    /// Inserts or refreshes an external session snapshot.
-    pub(crate) async fn upsert(
+    /// Inserts or refreshes an external session snapshot while it is current.
+    pub(crate) async fn upsert_if_current<E>(
         &self,
         identity: ProcessIdentity,
         mut info: SessionInfo,
-    ) -> ExternalUpsert {
+        validate: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Option<ExternalUpsert>, E> {
         let mut entries = self.inner.entries.lock().await;
+        if !validate()? {
+            return Ok(None);
+        }
         let Some(existing) = entries.get(&info.pid) else {
             entries.insert(
                 info.pid,
@@ -255,19 +259,19 @@ impl ExternalSessions {
                     info: info.clone(),
                 },
             );
-            return ExternalUpsert {
+            return Ok(Some(ExternalUpsert {
                 change: Some(ExternalSessionChange::Created(info)),
                 watch_identity: Some(identity),
-            };
+            }));
         };
 
         if existing.identity == identity {
             info.created_at.clone_from(&existing.info.created_at);
             if external_info_matches(&existing.info, &info) {
-                return ExternalUpsert {
+                return Ok(Some(ExternalUpsert {
                     change: None,
                     watch_identity: None,
-                };
+                }));
             }
         }
         let watch_identity = (existing.identity != identity).then_some(identity);
@@ -278,10 +282,10 @@ impl ExternalSessions {
                 info: info.clone(),
             },
         );
-        ExternalUpsert {
+        Ok(Some(ExternalUpsert {
             change: Some(ExternalSessionChange::Updated(info)),
             watch_identity,
-        }
+        }))
     }
 
     /// Removes entries whose pids were absent from a successful sweep.

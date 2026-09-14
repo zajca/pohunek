@@ -23,6 +23,7 @@ impl ServiceId {
     pub fn parse(value: impl Into<String>) -> Result<Self, Error> {
         let value = value.into();
         if value.is_empty()
+            || matches!(value.as_str(), "." | "..")
             || value.len() > MAX_SERVICE_ID_BYTES
             || !value
                 .bytes()
@@ -144,13 +145,27 @@ mod tests {
 
     #[test]
     fn service_ids_are_bounded_and_namespace_safe() {
-        for valid in ["s-42", "pohunek.worker_1", &"a".repeat(128)] {
+        for valid in [
+            "s-42",
+            ".worker",
+            "worker.",
+            "a..b",
+            "pohunek.worker_1",
+            &"a".repeat(128),
+        ] {
             assert_eq!(
                 ServiceId::parse(valid).expect("valid identifier").as_str(),
                 valid
             );
         }
-        for invalid in ["", "../worker", "worker/service", &"a".repeat(129)] {
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "../worker",
+            "worker/service",
+            &"a".repeat(129),
+        ] {
             assert!(matches!(
                 ServiceId::parse(invalid),
                 Err(Error::InvalidServiceId(value)) if value == invalid
