@@ -27,7 +27,7 @@ use crate::procwatch::ProcessInspector;
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-09-13
+// Rust guideline compliant 2026-09-14
 
 #[derive(Debug, Clone)]
 struct DiscoveredWorker {
@@ -2217,6 +2217,17 @@ mod tests {
     }
 
     impl ProcessInspector for RetryInspector {
+        fn identity(
+            &self,
+            pid: Pid,
+        ) -> Result<Option<crate::procwatch::ProcessIdentity>, crate::procwatch::Error> {
+            self.inner.identity(pid)
+        }
+
+        fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, crate::procwatch::Error> {
+            self.inner.parent_pid(pid)
+        }
+
         fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, crate::procwatch::Error> {
             self.inner.process(pid)
         }

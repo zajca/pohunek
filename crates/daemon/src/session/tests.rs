@@ -29,7 +29,9 @@ use crate::external::{external_session_id, TranscriptIndex};
 use crate::integration::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
-use crate::procwatch::{ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessInspector};
+use crate::procwatch::{
+    ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity, ProcessInspector,
+};
 use crate::project::detect::project_id;
 use crate::runtime::{Worker, WorkerError};
 
@@ -1180,6 +1182,15 @@ impl MockInspector {
 }
 
 impl ProcessInspector for MockInspector {
+    fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, crate::procwatch::Error> {
+        self.process(pid)
+            .map(|fact| fact.map(|fact| fact.identity()))
+    }
+
+    fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, crate::procwatch::Error> {
+        self.process(pid).map(|fact| fact.map(|fact| fact.ppid))
+    }
+
     fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, crate::procwatch::Error> {
         let fact = self
             .inner

@@ -17,7 +17,7 @@ use pohunek_platform::supervisor::{ServiceId, ServiceObservation, ServiceState, 
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-// Rust guideline compliant 2026-07-24
+// Rust guideline compliant 2026-09-14
 
 /// Daemon-facing durable worker supervisor.
 pub trait WorkerLauncher: Supervisor {}
@@ -204,9 +204,8 @@ impl Supervisor for SubprocessWorkerLauncher {
             } else {
                 match pid {
                     Some(pid) => LinuxInspector::new()
-                        .process(pid)
-                        .map_err(|source| operation("inspect_process_identity", source))?
-                        .map(|fact| fact.identity()),
+                        .identity(pid)
+                        .map_err(|source| operation("inspect_process_identity", source))?,
                     None => None,
                 }
             };

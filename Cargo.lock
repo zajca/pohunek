@@ -4317,6 +4317,7 @@ version = "0.31.6"
 dependencies = [
  "nix 0.29.0",
  "rustix 1.1.4",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]

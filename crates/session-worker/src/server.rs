@@ -1,6 +1,6 @@
 //! Serves the private daemon-worker Unix protocol.
 
-// Rust guideline compliant 2026-09-11
+// Rust guideline compliant 2026-09-14
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -3128,17 +3128,16 @@ fn unix_ms() -> u64 {
 
 fn process_start(pid: u32) -> Result<u64, WorkerError> {
     LinuxInspector::new()
-        .process(pid)
+        .identity(pid)
         .map_err(|error| WorkerError::Protocol(error.to_string()))?
-        .map(|fact| fact.start_identity.get())
+        .map(|identity| identity.start_identity.get())
         .ok_or_else(|| WorkerError::Protocol("process no longer exists".to_owned()))
 }
 
 fn process_parent(pid: u32) -> Result<u32, WorkerError> {
     LinuxInspector::new()
-        .process(pid)
+        .parent_pid(pid)
         .map_err(|error| WorkerError::Protocol(error.to_string()))?
-        .map(|fact| fact.ppid)
         .ok_or_else(|| WorkerError::Protocol("process no longer exists".to_owned()))
 }
 

@@ -5,7 +5,7 @@ use std::pin::Pin;
 
 use crate::process::ProcessIdentity;
 
-// Rust guideline compliant 2026-09-13
+// Rust guideline compliant 2026-09-14
 
 const MAX_SERVICE_ID_BYTES: usize = 128;
 
@@ -83,6 +83,12 @@ pub enum Error {
     /// The requested logical service does not exist.
     #[error("supervisor service `{0}` was not found")]
     NotFound(ServiceId),
+    /// The service changed generation during one observation.
+    #[error("supervisor service changed during `{operation}`")]
+    Race {
+        /// Stable operation label.
+        operation: &'static str,
+    },
     /// The native supervisor or one of its required facilities is unavailable.
     #[error("supervisor operation `{operation}` is unavailable: {source}")]
     Unavailable {

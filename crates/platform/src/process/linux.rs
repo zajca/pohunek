@@ -1,20 +1,20 @@
 //! Linux `/proc` and pidfd process inspection.
 
-// Rust guideline compliant 2026-08-28
+// Rust guideline compliant 2026-09-14
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rustix::process::{pidfd_open, Pid as NativePid, PidfdFlags};
 use tokio::io::unix::AsyncFd;
 
 use super::{
-    BootIdentity, Error, ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessInspector,
-    StartIdentity,
+    BootIdentity, Error, ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity,
+    ProcessInspector, StartIdentity,
 };
 
 /// Linux proc filesystem root.
@@ -27,6 +27,8 @@ const ENV_DAEMON_ID: &str = "POHUNEK_DAEMON_ID";
 const ENV_SESSION_ID: &str = "POHUNEK_SESSION_ID";
 /// `/proc/<pid>/stat` process-group field number (`pgrp`).
 const STAT_PGRP_FIELD: usize = 5;
+/// `/proc/<pid>/stat` parent-process field number (`ppid`).
+const STAT_PPID_FIELD: usize = 4;
 /// `/proc/<pid>/stat` controlling-terminal foreground group field number
 /// (`tpgid`). The value is signed; `-1` means no controlling terminal.
 const STAT_TPGID_FIELD: usize = 8;
@@ -76,9 +78,35 @@ impl LinuxInspector {
             .map_err(|source| facility_error("read_boot_identity", source))?;
         BootIdentity::parse(value.trim())
     }
+
+    /// Returns whether a process belongs to a cgroup or one of its subgroups.
+    ///
+    /// The check reads only `/proc/<pid>/cgroup`. Callers that require a stable
+    /// binding must compare process identities before and after this operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed failures when cgroup membership cannot be inspected.
+    pub fn is_in_control_group(&self, pid: Pid, control_group: &str) -> Result<bool, Error> {
+        let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
+        read_control_group_membership_at(Path::new(PROC_ROOT), pid, euid, control_group)
+            .map_err(|source| process_error("inspect_control_group", source))
+    }
 }
 
 impl ProcessInspector for LinuxInspector {
+    fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, Error> {
+        let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
+        read_process_identity_at(Path::new(PROC_ROOT), pid, euid)
+            .map_err(|source| process_error("inspect_process_identity", source))
+    }
+
+    fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, Error> {
+        let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
+        read_process_parent_at(Path::new(PROC_ROOT), pid, euid)
+            .map_err(|source| process_error("inspect_process_parent", source))
+    }
+
     fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, Error> {
         let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
         read_process_fact(pid, euid).map_err(|source| process_error("inspect_process", source))
@@ -186,11 +214,25 @@ fn read_stat_pid_field(process_id: Pid, field_number: usize) -> io::Result<Optio
     Ok(parse_stat_pid_field(&stat, field_number))
 }
 
-fn read_process_stat(process_id: Pid) -> io::Result<Option<(Pid, u64)>> {
-    let stat = match fs::read_to_string(proc_path(process_id).join("stat")) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatFact {
+    parent_id: Pid,
+    pgid: Pid,
+    start_identity: StartIdentity,
+}
+
+fn read_process_stat(process_id: Pid) -> io::Result<Option<StatFact>> {
+    read_process_stat_at(Path::new(PROC_ROOT), process_id)
+}
+
+fn read_process_stat_at(root: &Path, process_id: Pid) -> io::Result<Option<StatFact>> {
+    let stat = match fs::read_to_string(proc_path_at(root, process_id).join("stat")) {
         Ok(stat) => stat,
         Err(err) if is_process_race(&err) => return Ok(None),
         Err(err) => return Err(err),
+    };
+    let Some(parent_id) = parse_stat_pid_field(&stat, STAT_PPID_FIELD) else {
+        return Ok(None);
     };
     let Some(pgid) = parse_stat_pid_field(&stat, STAT_PGRP_FIELD) else {
         return Ok(None);
@@ -198,7 +240,63 @@ fn read_process_stat(process_id: Pid) -> io::Result<Option<(Pid, u64)>> {
     let Some(start_identity) = parse_stat_field(&stat, STAT_STARTTIME_FIELD) else {
         return Ok(None);
     };
-    Ok(Some((pgid, start_identity)))
+    Ok(Some(StatFact {
+        parent_id,
+        pgid,
+        start_identity: StartIdentity::new(start_identity),
+    }))
+}
+
+fn read_process_identity_at(
+    root: &Path,
+    process_id: Pid,
+    euid: u32,
+) -> io::Result<Option<ProcessIdentity>> {
+    if !same_user_at(root, process_id, euid) {
+        return Ok(None);
+    }
+    Ok(
+        read_process_stat_at(root, process_id)?.map(|stat| ProcessIdentity {
+            pid: process_id,
+            start_identity: stat.start_identity,
+        }),
+    )
+}
+
+fn read_process_parent_at(root: &Path, process_id: Pid, euid: u32) -> io::Result<Option<Pid>> {
+    if !same_user_at(root, process_id, euid) {
+        return Ok(None);
+    }
+    Ok(read_process_stat_at(root, process_id)?.map(|stat| stat.parent_id))
+}
+
+fn read_control_group_membership_at(
+    root: &Path,
+    process_id: Pid,
+    euid: u32,
+    expected: &str,
+) -> io::Result<bool> {
+    if expected.is_empty() || !same_user_at(root, process_id, euid) {
+        return Ok(false);
+    }
+    let cgroups = fs::read_to_string(proc_path_at(root, process_id).join("cgroup"))?;
+    Ok(cgroups.lines().any(|line| {
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields.next();
+        let controllers = fields.next();
+        let path = fields.next();
+        let is_systemd_hierarchy = matches!((hierarchy, controllers), (Some("0"), Some("")))
+            || controllers.is_some_and(|value| value.split(',').any(|name| name == "name=systemd"));
+        is_systemd_hierarchy && path.is_some_and(|path| cgroup_path_matches(path, expected))
+    }))
+}
+
+fn cgroup_path_matches(actual: &str, expected: &str) -> bool {
+    (expected == "/" && actual.starts_with('/'))
+        || actual == expected
+        || actual
+            .strip_prefix(expected)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 /// Reads `POHUNEK_DAEMON_ID` / `POHUNEK_SESSION_ID` from `/proc/<pid>/environ`.
@@ -348,14 +446,14 @@ fn read_process_fact(process_id: Pid, euid: u32) -> io::Result<Option<ProcessFac
     let Some((comm, parent_id)) = read_status(process_id)? else {
         return Ok(None);
     };
-    let Some((pgid, start_identity)) = read_process_stat(process_id)? else {
+    let Some(stat) = read_process_stat(process_id)? else {
         return Ok(None);
     };
     Ok(Some(ProcessFact {
         pid: process_id,
-        pgid,
+        pgid: stat.pgid,
         ppid: parent_id,
-        start_identity: StartIdentity::new(start_identity),
+        start_identity: stat.start_identity,
         comm,
         cmdline: read_cmdline(process_id)?,
     }))
@@ -400,11 +498,19 @@ fn current_euid() -> io::Result<u32> {
 }
 
 fn same_user(pid: Pid, euid: u32) -> bool {
-    fs::metadata(proc_path(pid)).is_ok_and(|metadata| metadata.uid() == euid)
+    same_user_at(Path::new(PROC_ROOT), pid, euid)
+}
+
+fn same_user_at(root: &Path, pid: Pid, euid: u32) -> bool {
+    fs::metadata(proc_path_at(root, pid)).is_ok_and(|metadata| metadata.uid() == euid)
 }
 
 fn proc_path(pid: Pid) -> PathBuf {
-    PathBuf::from(PROC_ROOT).join(pid.to_string())
+    proc_path_at(Path::new(PROC_ROOT), pid)
+}
+
+fn proc_path_at(root: &Path, pid: Pid) -> PathBuf {
+    root.join(pid.to_string())
 }
 
 fn parse_pid(value: &OsStr) -> Option<Pid> {
@@ -468,6 +574,72 @@ mod tests {
         assert_eq!(
             parse_stat_field::<u64>(stat, STAT_STARTTIME_FIELD),
             Some(987_654)
+        );
+    }
+
+    #[test]
+    fn narrow_identity_and_parent_reads_ignore_unreadable_cmdline() {
+        let root = tempfile::tempdir().expect("temporary proc root");
+        let process_id = 123;
+        let process_dir = root.path().join(process_id.to_string());
+        fs::create_dir(&process_dir).expect("process directory");
+        fs::write(
+            process_dir.join("stat"),
+            concat!(
+                "123 (agent) S 7 456 3 4 789 0 0 0 0 0 0 0 0 0 ",
+                "20 0 1 0 987654"
+            ),
+        )
+        .expect("process stat");
+        fs::create_dir(process_dir.join("cmdline")).expect("unreadable cmdline stand-in");
+        let euid = fs::metadata(&process_dir).expect("process metadata").uid();
+
+        assert_eq!(
+            read_process_identity_at(root.path(), process_id, euid).expect("identity inspection"),
+            Some(ProcessIdentity {
+                pid: process_id,
+                start_identity: StartIdentity::new(987_654),
+            })
+        );
+        assert_eq!(
+            read_process_parent_at(root.path(), process_id, euid).expect("parent inspection"),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn control_group_membership_requires_a_component_boundary() {
+        let root = tempfile::tempdir().expect("temporary proc root");
+        let process_id = 123;
+        let process_dir = root.path().join(process_id.to_string());
+        fs::create_dir(&process_dir).expect("process directory");
+        fs::write(
+            process_dir.join("cgroup"),
+            concat!(
+                "2:cpu:/user.slice/pohunek-session@s-4\n",
+                "0::/user.slice/pohunek-session@s-42.service/agent.scope\n"
+            ),
+        )
+        .expect("process cgroup");
+        let euid = fs::metadata(&process_dir).expect("process metadata").uid();
+
+        assert!(read_control_group_membership_at(
+            root.path(),
+            process_id,
+            euid,
+            "/user.slice/pohunek-session@s-42.service",
+        )
+        .expect("cgroup membership"));
+        assert!(!read_control_group_membership_at(
+            root.path(),
+            process_id,
+            euid,
+            "/user.slice/pohunek-session@s-4",
+        )
+        .expect("sibling cgroup rejection"));
+        assert!(
+            read_control_group_membership_at(root.path(), process_id, euid, "/")
+                .expect("root cgroup membership")
         );
     }
 

@@ -4,9 +4,10 @@ use pohunek_platform::process::{LinuxInspector, ProcessInspector};
 use pohunek_platform::supervisor::{
     Error as SupervisorError, ServiceId, ServiceObservation, ServiceState,
 };
+use zbus::proxy::CacheProperties;
 use zbus::zvariant::OwnedObjectPath;
 
-// Rust guideline compliant 2026-07-23
+// Rust guideline compliant 2026-09-14
 
 const SYSTEMD_DESTINATION: &str = "org.freedesktop.systemd1";
 const SYSTEMD_MANAGER_PATH: &str = "/org/freedesktop/systemd1";
@@ -200,45 +201,51 @@ impl Units {
             .call("GetUnit", &(name.as_str(),))
             .await
             .map_err(|source| map_get_unit_error(id, source))?;
-        let unit = zbus::Proxy::new(
-            &self.connection,
-            SYSTEMD_DESTINATION,
-            path.clone(),
-            SYSTEMD_UNIT_INTERFACE,
-        )
-        .await
-        .map_err(|source| operation("inspect_unit", source))?;
-        let service = zbus::Proxy::new(
-            &self.connection,
-            SYSTEMD_DESTINATION,
-            path,
-            SYSTEMD_SERVICE_INTERFACE,
-        )
-        .await
-        .map_err(|source| operation("inspect_service", source))?;
-        let active_state: String = unit
-            .get_property("ActiveState")
+        let unit = zbus::proxy::Builder::new(&self.connection)
+            .destination(SYSTEMD_DESTINATION)
+            .and_then(|builder| builder.path(path.clone()))
+            .and_then(|builder| builder.interface(SYSTEMD_UNIT_INTERFACE))
+            .map_err(|source| operation("inspect_unit", source))?
+            .cache_properties(CacheProperties::No)
+            .build()
             .await
-            .map_err(|source| operation("inspect_active_state", source))?;
-        let sub_state: String = unit
-            .get_property("SubState")
+            .map_err(|source| operation("inspect_unit", source))?;
+        let service = zbus::proxy::Builder::new(&self.connection)
+            .destination(SYSTEMD_DESTINATION)
+            .and_then(|builder| builder.path(path))
+            .and_then(|builder| builder.interface(SYSTEMD_SERVICE_INTERFACE))
+            .map_err(|source| operation("inspect_service", source))?
+            .cache_properties(CacheProperties::No)
+            .build()
             .await
-            .map_err(|source| operation("inspect_sub_state", source))?;
-        let main_pid: u32 = service
-            .get_property("MainPID")
-            .await
-            .map_err(|source| operation("inspect_main_pid", source))?;
-        let process = if main_pid == 0 {
+            .map_err(|source| operation("inspect_service", source))?;
+        let before = read_service_snapshot(&unit, &service, "inspect_service_snapshot").await?;
+        let inspector = LinuxInspector::new();
+        let process = if before.main_pid == 0 {
             None
         } else {
-            LinuxInspector::new()
-                .process(main_pid)
-                .map_err(|source| operation("inspect_process_identity", source))?
-                .map(|fact| fact.identity())
+            let identity_before = inspector
+                .identity(before.main_pid)
+                .map_err(|source| map_process_error("inspect_process_identity", source))?
+                .ok_or_else(inspect_race)?;
+            let in_control_group = inspector
+                .is_in_control_group(before.main_pid, &before.control_group)
+                .map_err(|source| map_process_error("inspect_process_control_group", source))?;
+            let after =
+                read_service_snapshot(&unit, &service, "reinspect_service_snapshot").await?;
+            let identity_after = inspector
+                .identity(before.main_pid)
+                .map_err(|source| map_process_error("reinspect_process_identity", source))?
+                .ok_or_else(inspect_race)?;
+            validate_stable_observation(&before, &after)?;
+            validate_process_binding(identity_before, identity_after, in_control_group)?;
+            Some(identity_after)
         };
+        let after = read_service_snapshot(&unit, &service, "reinspect_service_snapshot").await?;
+        validate_stable_observation(&before, &after)?;
         Ok(ServiceObservation {
             id: id.clone(),
-            state: portable_state(&active_state, &sub_state),
+            state: portable_state(&after.active_state, &after.sub_state),
             process,
         })
     }
@@ -300,10 +307,81 @@ fn push_discovered_observation(
 ) -> Result<(), SupervisorError> {
     match result {
         Ok(observation) => observations.push(observation),
-        Err(SupervisorError::NotFound(_)) => {}
+        Err(SupervisorError::NotFound(_) | SupervisorError::Race { .. }) => {}
         Err(error) => return Err(error),
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeServiceSnapshot {
+    active_state: String,
+    sub_state: String,
+    main_pid: u32,
+    control_group: String,
+}
+
+async fn read_service_snapshot(
+    unit: &zbus::Proxy<'_>,
+    service: &zbus::Proxy<'_>,
+    operation_name: &'static str,
+) -> Result<NativeServiceSnapshot, SupervisorError> {
+    Ok(NativeServiceSnapshot {
+        active_state: unit
+            .get_property("ActiveState")
+            .await
+            .map_err(|source| operation(operation_name, source))?,
+        sub_state: unit
+            .get_property("SubState")
+            .await
+            .map_err(|source| operation(operation_name, source))?,
+        main_pid: service
+            .get_property("MainPID")
+            .await
+            .map_err(|source| operation(operation_name, source))?,
+        control_group: service
+            .get_property("ControlGroup")
+            .await
+            .map_err(|source| operation(operation_name, source))?,
+    })
+}
+
+fn validate_stable_observation(
+    before: &NativeServiceSnapshot,
+    after: &NativeServiceSnapshot,
+) -> Result<(), SupervisorError> {
+    if before != after {
+        return Err(inspect_race());
+    }
+    Ok(())
+}
+
+fn validate_process_binding(
+    before: pohunek_platform::process::ProcessIdentity,
+    after: pohunek_platform::process::ProcessIdentity,
+    in_control_group: bool,
+) -> Result<(), SupervisorError> {
+    if before != after || !in_control_group {
+        return Err(inspect_race());
+    }
+    Ok(())
+}
+
+fn inspect_race() -> SupervisorError {
+    SupervisorError::Race {
+        operation: "inspect_service",
+    }
+}
+
+fn map_process_error(
+    operation_name: &'static str,
+    source: pohunek_platform::process::Error,
+) -> SupervisorError {
+    if source.is_race() {
+        inspect_race()
+    } else {
+        operation(operation_name, source)
+    }
 }
 
 fn unavailable(
@@ -452,5 +530,58 @@ mod tests {
             .expect("remaining unit is retained");
 
         assert_eq!(observations, vec![remaining]);
+    }
+
+    #[test]
+    fn inspection_rejects_a_service_generation_change() {
+        let before = NativeServiceSnapshot {
+            active_state: "active".to_owned(),
+            sub_state: "running".to_owned(),
+            main_pid: 42,
+            control_group: "/worker.slice/session.service".to_owned(),
+        };
+        let mut changed_pid = before.clone();
+        changed_pid.main_pid = 43;
+        validate_stable_observation(&before, &changed_pid).expect_err("changed main PID is a race");
+        let mut changed_state = before.clone();
+        changed_state.active_state = "deactivating".to_owned();
+        changed_state.sub_state = "stop-sigterm".to_owned();
+        validate_stable_observation(&before, &changed_state).expect_err("changed state is a race");
+        let mut changed_control_group = before.clone();
+        changed_control_group.control_group = "/worker.slice/replacement.service".to_owned();
+        validate_stable_observation(&before, &changed_control_group)
+            .expect_err("changed control group is a race");
+        validate_stable_observation(&before, &before).expect("stable observation");
+    }
+
+    #[test]
+    fn inspection_rejects_process_reuse_and_wrong_unit_membership() {
+        let before = pohunek_platform::process::ProcessIdentity {
+            pid: 42,
+            start_identity: pohunek_platform::process::StartIdentity::new(100),
+        };
+        let reused = pohunek_platform::process::ProcessIdentity {
+            pid: 42,
+            start_identity: pohunek_platform::process::StartIdentity::new(101),
+        };
+
+        validate_process_binding(before, reused, true).expect_err("PID reuse is a race");
+        validate_process_binding(before, before, false).expect_err("different cgroup is a race");
+        validate_process_binding(before, before, true).expect("stable process binding");
+    }
+
+    #[test]
+    fn discovery_skips_service_generation_races() {
+        let mut observations = Vec::new();
+
+        push_discovered_observation(
+            &mut observations,
+            Err(SupervisorError::Race {
+                operation: "inspect_service",
+            }),
+        )
+        .expect("generation changes are expected discovery races");
+
+        assert!(observations.is_empty());
     }
 }

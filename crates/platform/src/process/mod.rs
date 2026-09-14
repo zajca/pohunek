@@ -5,7 +5,7 @@
 //! for equality only; they are not portable timestamps. Persisted callers that
 //! cross a reboot boundary must additionally bind records to a [`BootIdentity`].
 
-// Rust guideline compliant 2026-09-13
+// Rust guideline compliant 2026-09-14
 
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
@@ -259,6 +259,22 @@ impl ExitWatch {
 
 /// Injectable process observer used by lifecycle reconciliation.
 pub trait ProcessInspector: Debug + Send + Sync + 'static {
+    /// Returns the PID-reuse-safe identity without reading unrelated facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed failures when the minimal platform process record cannot be inspected.
+    fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, Error>;
+
+    /// Returns the current parent PID without reading unrelated process facts.
+    ///
+    /// The returned PID is an instantaneous relationship, not a stable identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed failures when the minimal platform process record cannot be inspected.
+    fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, Error>;
+
     /// Returns current facts for one same-user process, or `None` if it exited.
     ///
     /// # Errors
