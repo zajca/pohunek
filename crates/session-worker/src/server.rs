@@ -38,9 +38,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{event, Level};
 
 use crate::journal::{
-    ActiveIdentity, ChildIdentity, JournalRecord, LaunchIdentity, ReleasedIdentity, RuntimeOutcome,
-    RuntimePhase as JournalPhase, SubagentPhase as JournalSubagentPhase, SubagentRecord,
+    ActiveIdentity, ChildIdentity, JournalRecord, LaunchIdentity, PendingLaunchClaim,
+    ReleasedIdentity, RuntimeOutcome, RuntimePhase as JournalPhase,
+    SubagentPhase as JournalSubagentPhase, SubagentRecord,
 };
+use crate::launch::{self, LaunchClaimStatus};
 use crate::{
     Command, ControllerLease, Exit, InputFragment, InputPlan, Journal, LeaseError, LeaseOwner,
     OutputChunk, OutputEvent, ProcessIdentity, PtyError, PtyOwner, WorkerConfig, WorkerError,
@@ -185,10 +187,20 @@ impl Server {
         let deadline = tokio::time::sleep(self.shared.config.initialize_deadline);
         tokio::pin!(deadline);
         let mut initialized = self.shared.initialized_tx.subscribe();
+        let mut launch_retry =
+            tokio::time::interval(self.shared.config.launch_claim_retry_interval);
+        launch_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
                 () = self.shared.shutdown.cancelled() => return Ok(()),
+                _ = launch_retry.tick() => {
+                    if let Err(error) = retry_launch_claims(&self.shared, verify_launch_claim).await {
+                        event!(name: "worker.launch_identity.retry.failed", Level::ERROR,
+                            error.type = "journal", error.message = %error,
+                            "launch identity retry commit failed: {{error.message}}");
+                    }
+                }
                 result = initialized.changed(), if !*initialized.borrow() => {
                     if result.is_err() {
                         return Err(WorkerError::Protocol(
@@ -254,14 +266,11 @@ struct Shared {
 
 impl Shared {
     async fn record_never_initialized(&self) -> Result<(), WorkerError> {
-        let record = {
-            let mut state = self.state.lock().await;
-            state.phase = WireRuntimePhase::Faulted;
-            state.journal.phase = JournalPhase::NeverInitialized;
-            state.journal.updated_at = timestamp();
-            state.journal.clone()
-        };
-        persist(self.journal.clone(), record).await
+        let mut state = self.state.lock().await;
+        state.phase = WireRuntimePhase::Faulted;
+        state.journal.phase = JournalPhase::NeverInitialized;
+        state.journal.updated_at = timestamp();
+        persist(self.journal.clone(), state.journal.clone()).await
     }
 
     fn emit(&self, kind: EventKind) {
@@ -850,7 +859,7 @@ async fn initialize_request(
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
     let runtime_id = RuntimeId::new(runtime_value)
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
-    let starting = {
+    {
         let mut state = shared.state.lock().await;
         state.phase = WireRuntimePhase::Starting;
         state.initialize_transaction = Some(initialize.transaction_id.clone());
@@ -858,9 +867,8 @@ async fn initialize_request(
         state.journal.phase = JournalPhase::Starting;
         state.journal.runtime_id = Some(runtime_id.to_string());
         state.journal.updated_at = timestamp();
-        state.journal.clone()
+        persist_control(shared.journal.clone(), state.journal.clone()).await?;
     };
-    persist_control(shared.journal.clone(), starting).await?;
 
     let command = command_from_initialize(shared, &initialize, &runtime_id);
     let history_bytes = usize::try_from(initialize.limits.output_history_bytes())
@@ -884,7 +892,7 @@ async fn initialize_request(
         .map_err(|error| control_error(ControlCode::InvalidRequest, error, false))?;
     let pty = spawn_pty(command, &effective_config)?;
     let child_process = wire_identity(pty.identity())?;
-    let live = {
+    let live_commit = {
         let mut state = shared.state.lock().await;
         state.phase = WireRuntimePhase::Running;
         state.stop_grace = stop_grace;
@@ -897,9 +905,9 @@ async fn initialize_request(
         state.journal.rows = Some(initialize.dimensions.rows());
         state.journal.updated_at = timestamp();
         state.pty = Some(pty.clone());
-        state.journal.clone()
+        persist(shared.journal.clone(), state.journal.clone()).await
     };
-    if let Err(error) = persist(shared.journal.clone(), live).await {
+    if let Err(error) = live_commit {
         let _ = pty.stop("journal-failure", stop_grace).await;
         return Err(control_error(ControlCode::RuntimeFault, error, false));
     }
@@ -1256,16 +1264,15 @@ async fn acknowledge_request(
     scope: &RuntimeScope,
 ) -> Result<ResponseKind, ControlError> {
     validate_scope(shared, connection, scope).await?;
-    let record = {
+    {
         let mut state = shared.state.lock().await;
         if state.phase != WireRuntimePhase::Exited {
             return Err(invalid_state("runtime is not terminal"));
         }
         state.journal.terminal_acknowledged = true;
         state.journal.updated_at = timestamp();
-        state.journal.clone()
+        persist_control(shared.journal.clone(), state.journal.clone()).await?;
     };
-    persist_control(shared.journal.clone(), record).await?;
     shared.shutdown.cancel();
     Ok(ResponseKind::TerminalAcknowledged)
 }
@@ -1397,13 +1404,13 @@ fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: Runtim
                         });
                     }
                     OutputEvent::Exit { next_offset } => {
-                        let record = {
+                        let result = {
                             let mut state = output_shared.state.lock().await;
                             state.journal.next_output_offset = next_offset;
                             state.journal.updated_at = timestamp();
-                            state.journal.clone()
+                            persist(output_shared.journal.clone(), state.journal.clone()).await
                         };
-                        if let Err(error) = persist(output_shared.journal.clone(), record).await {
+                        if let Err(error) = result {
                             event!(
                                 name: "worker.journal.write.failed",
                                 Level::ERROR,
@@ -1427,12 +1434,13 @@ fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: Runtim
                 return;
             }
         };
-        let (status, retention, record) = {
+        let (status, retention, commit) = {
             let mut state = shared.state.lock().await;
             let status = exit_status(&exit, state.stop_requested);
             state.phase = WireRuntimePhase::Exited;
             state.exit = Some(status.clone());
             state.journal.phase = JournalPhase::Terminal;
+            state.journal.pending_launch_claims.clear();
             mark_running_subagents_lost(&mut state.journal, status.exited_at_ms);
             state.journal.outcome = Some(RuntimeOutcome {
                 exit_code: exit.exit_code,
@@ -1447,9 +1455,10 @@ fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: Runtim
             });
             state.journal.next_output_offset = pty.output().next_offset();
             state.journal.updated_at = timestamp();
-            (status, state.terminal_retention, state.journal.clone())
+            let commit = persist(shared.journal.clone(), state.journal.clone()).await;
+            (status, state.terminal_retention, commit)
         };
-        if let Err(error) = persist(shared.journal.clone(), record).await {
+        if let Err(error) = commit {
             event!(
                 name: "worker.journal.write.failed",
                 Level::ERROR,
@@ -1478,15 +1487,16 @@ async fn wait_runtime_exit(pty: &PtyOwner) -> Result<Exit, PtyError> {
 }
 
 async fn mark_runtime_faulted(shared: &Shared, runtime_id: RuntimeId, error: WorkerError) {
-    let record = {
+    let commit = {
         let mut state = shared.state.lock().await;
         state.phase = WireRuntimePhase::Faulted;
         state.journal.phase = JournalPhase::Faulted;
+        state.journal.pending_launch_claims.clear();
         mark_running_subagents_lost(&mut state.journal, unix_ms());
         state.journal.updated_at = timestamp();
-        state.journal.clone()
+        persist(shared.journal.clone(), state.journal.clone()).await
     };
-    if let Err(persist_error) = persist(shared.journal.clone(), record).await {
+    if let Err(persist_error) = commit {
         event!(
             name: "worker.journal.write.failed",
             Level::ERROR,
@@ -2251,12 +2261,9 @@ enum HookRequest {
 struct HookResponse {
     ok: bool,
     launch_identity_accepted: bool,
+    launch_identity_status: LaunchClaimStatus,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "identity report and release share one validated response path"
-)]
 async fn serve_identity_hook<W>(
     shared: Arc<Shared>,
     writer: &mut ControlWriter<W>,
@@ -2265,8 +2272,25 @@ async fn serve_identity_hook<W>(
 where
     W: AsyncWrite + Unpin + Send,
 {
+    serve_identity_hook_with_probe(shared, writer, value, verify_launch_claim).await
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "identity report and release share one validated response path"
+)]
+async fn serve_identity_hook_with_probe<W>(
+    shared: Arc<Shared>,
+    writer: &mut ControlWriter<W>,
+    value: serde_json::Value,
+    mut verify: impl FnMut(&PendingLaunchClaim) -> Result<bool, WorkerError> + Send,
+) -> Result<(), WorkerError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
     let request: HookRequest =
         serde_json::from_value(value).map_err(|error| WorkerError::Protocol(error.to_string()))?;
+    let mut launch_identity_status = LaunchClaimStatus::NotApplicable;
     let (accepted, launch_identity_accepted, runtime_id, subagent_changed) = match request {
         HookRequest::IdentityReport {
             runtime_id,
@@ -2281,6 +2305,7 @@ where
             let mut state = shared.state.lock().await;
             let current_runtime = state.runtime_id.as_ref().map(ToString::to_string);
             if !known_identity_provider(&provider)
+                || state.phase != WireRuntimePhase::Running
                 || current_runtime.as_deref() != Some(runtime_id.as_str())
                 || !valid_identity_expiry(&expires_at)
             {
@@ -2306,75 +2331,54 @@ where
                         provider: provider.clone(),
                         process: process.clone(),
                         sequence,
-                        expires_at,
+                        expires_at: expires_at.clone(),
                         reference_kind: reference_kind.clone(),
                         native_reference: native_reference.clone(),
                     });
                     journal.active_identity_release = None;
-                    let mut launch_identity_accepted = false;
                     if let (Some(reference_kind), Some(native_reference), Some(launch_base)) = (
                         reference_kind,
                         native_reference,
                         state.launch_agent_base.as_ref(),
                     ) {
                         if &provider == launch_base {
-                            let root_process_identity = OsProcessIdentity {
-                                pid: root_identity.pid,
-                                start_identity: root_identity
-                                    .start_identity
-                                    .parse::<StartIdentity>()
-                                    .map_err(|error| WorkerError::Protocol(error.to_string()))?,
+                            let claim = PendingLaunchClaim {
+                                retry_pending: true,
+                                runtime_id,
+                                root: journal_identity(&root_identity),
+                                identity: LaunchIdentity {
+                                    provider,
+                                    process,
+                                    reference_kind,
+                                    native_reference,
+                                },
+                                expires_at,
                             };
-                            let designated =
-                                match designated_launch_process(root_process_identity, launch_base)
-                                {
-                                    Ok(designated) => designated,
-                                    Err(error) => {
-                                        event!(
-                                            name: "worker.launch_identity.inspect.failed",
-                                            Level::WARN,
-                                            process.pid = pid,
-                                            error.type = "process_observation",
-                                            error.message = %error,
-                                            "launch identity inspection failed: {{error.message}}",
-                                        );
-                                        None
+                            launch_identity_status = launch::submit(
+                                &mut journal,
+                                claim,
+                                shared.config.pending_launch_claims,
+                                |claim| {
+                                    let result = verify(claim);
+                                    if let Err(error) = &result {
+                                        event!(name: "worker.launch_identity.inspect.deferred", Level::WARN,
+                                            process.pid = pid, error.type = "process_observation", error.message = %error,
+                                            "launch identity verification deferred: {{error.message}}");
                                     }
-                                };
-                            if let Some(designated) = designated {
-                                if designated.pid == pid
-                                    && designated.start_identity == start_identity
-                                {
-                                    match journal.launch_identity.as_ref() {
-                                        None => {
-                                            journal.launch_identity = Some(LaunchIdentity {
-                                                provider,
-                                                process,
-                                                reference_kind,
-                                                native_reference,
-                                            });
-                                            launch_identity_accepted = true;
-                                        }
-                                        Some(existing)
-                                            if existing.process.pid == pid
-                                                && existing.process.start_identity
-                                                    == start_identity.to_string()
-                                                && existing.reference_kind == reference_kind
-                                                && existing.native_reference
-                                                    == native_reference =>
-                                        {
-                                            launch_identity_accepted = true;
-                                        }
-                                        Some(_) => {}
-                                    }
-                                }
-                            }
+                                    result
+                                },
+                            )?;
                         }
                     }
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
-                    (true, launch_identity_accepted, current_runtime, false)
+                    (
+                        true,
+                        launch_identity_status == LaunchClaimStatus::Accepted,
+                        current_runtime,
+                        false,
+                    )
                 }
             }
         }
@@ -2535,6 +2539,7 @@ where
         .write(&HookResponse {
             ok: accepted,
             launch_identity_accepted,
+            launch_identity_status,
         })
         .await
         .map_err(|error| WorkerError::Protocol(error.to_string()))
@@ -2542,6 +2547,74 @@ where
 
 fn known_identity_provider(provider: &str) -> bool {
     matches!(provider, "shell" | "codex" | "claude" | "hermes")
+}
+
+fn verify_launch_claim(claim: &PendingLaunchClaim) -> Result<bool, WorkerError> {
+    let exact_identity = |process: &ChildIdentity| -> Result<OsProcessIdentity, WorkerError> {
+        Ok(OsProcessIdentity {
+            pid: process.pid,
+            start_identity: process
+                .start_identity
+                .parse::<StartIdentity>()
+                .map_err(|error| WorkerError::Protocol(error.to_string()))?,
+        })
+    };
+    let root = exact_identity(&claim.root)?;
+    let candidate = exact_identity(&claim.identity.process)?;
+    for expected in [root, candidate] {
+        match LinuxInspector.identity(expected.pid) {
+            Ok(Some(current)) if current == expected => {}
+            Ok(_) | Err(pohunek_platform::process::Error::Race { .. }) => return Ok(false),
+            Err(error) => return Err(WorkerError::Protocol(error.to_string())),
+        }
+    }
+    // This probe also rechecks root/candidate generations after executable and
+    // ancestry inspection. The stored PID alone never authorizes a retry.
+    let designated = designated_launch_process(root, &claim.identity.provider)?;
+    Ok(designated.is_some_and(|process| {
+        process.pid == candidate.pid
+            && process.start_identity.to_string() == candidate.start_identity.to_string()
+    }))
+}
+
+async fn retry_launch_claims(
+    shared: &Shared,
+    mut verify: impl FnMut(&PendingLaunchClaim) -> Result<bool, WorkerError>,
+) -> Result<(), WorkerError> {
+    let mut state = shared.state.lock().await;
+    if !state
+        .journal
+        .pending_launch_claims
+        .iter()
+        .any(|claim| claim.retry_pending)
+    {
+        return Ok(());
+    }
+    let running = state.phase == WireRuntimePhase::Running;
+    let mut journal = state.journal.clone();
+    let launch_was_accepted = journal.launch_identity.is_some();
+    let changed = launch::retry(&mut journal, time::OffsetDateTime::now_utc(), |claim| {
+        if running {
+            verify(claim)
+        } else {
+            Ok(false)
+        }
+    });
+    if changed {
+        let launch_became_accepted = !launch_was_accepted && journal.launch_identity.is_some();
+        journal.updated_at = timestamp();
+        // All journal writers share this lock: a stale output/terminal snapshot
+        // cannot overwrite ownership or a subsequently verified launch identity.
+        persist(shared.journal.clone(), journal.clone()).await?;
+        state.journal = journal;
+        if let (true, Some(runtime_id)) = (launch_became_accepted, state.runtime_id.clone()) {
+            shared.emit(EventKind::IdentityChanged { runtime_id });
+        }
+        event!(name: "worker.launch_identity.retry.resolved", Level::INFO,
+            launch.accepted = state.journal.launch_identity.is_some(),
+            "deferred launch identity verification updated");
+    }
+    Ok(())
 }
 
 fn event_visible_to_connection(event: &protocol::ControlEvent, connection: &Connection) -> bool {
@@ -3356,6 +3429,162 @@ mod tests {
 
     /// Extra bytes force exactly one partial frame after a full wire payload.
     const OVERSIZED_PAYLOAD_EXTRA: usize = 257;
+
+    async fn launch_claim_fixture() -> (super::Server, crate::PtyOwner, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(random_value("worker-claim").unwrap());
+        let config = crate::WorkerConfig::new();
+        let server = super::Server::bind(super::ServerArgs {
+            session_id: "s-112".into(),
+            worker_id: "worker-claim".into(),
+            socket_path: directory.join("worker.sock"),
+            journal_path: directory.join("journal.json"),
+            daemon_socket_path: directory.join("daemon.sock"),
+            config: config.clone(),
+        })
+        .await
+        .unwrap();
+        let pty = super::spawn_pty(
+            crate::Command {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "read -r line".into()],
+                env: Vec::new(),
+                cwd: directory.clone(),
+                cols: 80,
+                rows: 24,
+            },
+            &config,
+        )
+        .unwrap();
+        {
+            let mut state = server.shared.state.lock().await;
+            state.phase = super::WireRuntimePhase::Running;
+            state.runtime_id = Some(RuntimeId::new("runtime-claim").unwrap());
+            state.launch_agent_base = Some("claude".into());
+            state.pty = Some(pty.clone());
+            state.journal.phase = super::JournalPhase::Live;
+            state.journal.runtime_id = Some("runtime-claim".into());
+            state.journal.child = Some(super::journal_identity(pty.identity()));
+        };
+        (server, pty, directory)
+    }
+
+    fn launch_report(pty: &crate::PtyOwner, sequence: u64, reference: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "identity_report", "runtime_id": "runtime-claim", "provider": "claude",
+            "pid": pty.identity().pid,
+            "start_identity": pty.identity().start_identity.parse::<u64>().unwrap(),
+            "sequence": sequence,
+            "expires_at": (time::OffsetDateTime::now_utc() + time::Duration::seconds(30))
+                .format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "reference_kind": "id", "native_reference": reference,
+        })
+    }
+
+    #[tokio::test]
+    async fn deferred_launch_ack_owns_durable_original_claim_and_retry_commits_before_event() {
+        let (server, pty, directory) = launch_claim_fixture().await;
+        let mut bytes = Vec::new();
+        super::serve_identity_hook_with_probe(
+            std::sync::Arc::clone(&server.shared),
+            &mut super::ControlWriter::new(&mut bytes),
+            launch_report(&pty, 1, "original"),
+            |_| {
+                Err(crate::WorkerError::Protocol(
+                    "transient observation error".into(),
+                ))
+            },
+        )
+        .await
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            response,
+            serde_json::json!({"ok": true, "launch_identity_accepted": false, "launch_identity_status": "pending"})
+        );
+        let owned = server.shared.journal.load().unwrap();
+        assert_eq!(
+            owned.pending_launch_claims[0].identity.native_reference,
+            "original"
+        );
+        assert!(owned.launch_identity.is_none());
+
+        bytes.clear();
+        super::serve_identity_hook_with_probe(
+            std::sync::Arc::clone(&server.shared),
+            &mut super::ControlWriter::new(&mut bytes),
+            launch_report(&pty, 2, "continuation"),
+            |_| panic!("later report cannot replace pending claim"),
+        )
+        .await
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["launch_identity_status"], "rejected");
+        let mut events = server.shared.events.subscribe();
+        super::retry_launch_claims(&server.shared, |claim| {
+            assert_eq!(claim.identity.native_reference, "original");
+            Ok(true)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap().kind,
+            EventKind::IdentityChanged { .. }
+        ));
+        let committed = server.shared.journal.load().unwrap();
+        assert_eq!(
+            committed.launch_identity.unwrap().native_reference,
+            "original"
+        );
+        assert_eq!(
+            committed
+                .active_identity
+                .unwrap()
+                .native_reference
+                .as_deref(),
+            Some("continuation")
+        );
+        assert!(committed.pending_launch_claims.is_empty());
+        pty.stop("test-cleanup", server.shared.config.stop_grace)
+            .await
+            .unwrap();
+        drop(server);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_pending_commit_never_acknowledges_or_changes_memory() {
+        let (server, pty, directory) = launch_claim_fixture().await;
+        std::fs::rename(
+            server.shared.journal.path(),
+            directory.join("original.json"),
+        )
+        .unwrap();
+        std::fs::create_dir(server.shared.journal.path()).unwrap();
+        let mut bytes = Vec::new();
+        let error = super::serve_identity_hook_with_probe(
+            std::sync::Arc::clone(&server.shared),
+            &mut super::ControlWriter::new(&mut bytes),
+            launch_report(&pty, 1, "original"),
+            |_| {
+                Err(crate::WorkerError::Protocol(
+                    "transient observation error".into(),
+                ))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, crate::WorkerError::Journal(_)));
+        assert!(bytes.is_empty());
+        let state = server.shared.state.lock().await;
+        assert!(state.journal.pending_launch_claims.is_empty());
+        assert!(state.journal.active_identity.is_none());
+        drop(state);
+        pty.stop("test-cleanup", server.shared.config.stop_grace)
+            .await
+            .unwrap();
+        drop(server);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn identity_provider_allowlist_is_exact() {

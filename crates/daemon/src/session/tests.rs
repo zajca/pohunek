@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -1093,6 +1093,8 @@ struct MockInspectorState {
     identity_overrides: HashMap<Pid, Option<ProcessIdentity>>,
     identity_errors: HashMap<Pid, std::io::ErrorKind>,
     exits: HashMap<Pid, Vec<tokio::sync::watch::Sender<bool>>>,
+    immediate_exits: HashSet<Pid>,
+    events_expected_before_watch: HashMap<Pid, tokio::sync::broadcast::Receiver<Event>>,
     ownership_markers: HashMap<Pid, OwnershipMarkers>,
 }
 
@@ -1156,6 +1158,26 @@ impl MockInspector {
         for sender in inner.exits.entry(pid).or_default() {
             sender.send_replace(true);
         }
+    }
+
+    fn set_immediate_exit(&self, pid: Pid) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .immediate_exits
+            .insert(pid);
+    }
+
+    fn expect_created_before_exit_watch(
+        &self,
+        pid: Pid,
+        events: tokio::sync::broadcast::Receiver<Event>,
+    ) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .events_expected_before_watch
+            .insert(pid, events);
     }
 
     fn fire_exit_watch(&self, pid: Pid, generation: usize) {
@@ -1310,14 +1332,21 @@ impl ProcessInspector for MockInspector {
 
     fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, crate::procwatch::Error> {
         let (sender, receiver) = tokio::sync::watch::channel(false);
-        self.inner
-            .lock()
-            .expect("mock inspector lock")
-            .exits
-            .entry(identity.pid)
-            .or_default()
-            .push(sender);
+        let immediate = {
+            let mut inner = self.inner.lock().expect("mock inspector lock");
+            inner.exits.entry(identity.pid).or_default().push(sender);
+            if let Some(mut events) = inner.events_expected_before_watch.remove(&identity.pid) {
+                let event = events
+                    .try_recv()
+                    .expect("external creation must be published before its exit watch is armed");
+                assert_eq!(event.event(), protocol::event::SESSION_CREATED);
+            }
+            inner.immediate_exits.contains(&identity.pid)
+        };
         Ok(ExitWatch::from_future(async move {
+            if immediate {
+                return Ok(());
+            }
             let mut receiver = receiver;
             while !*receiver.borrow_and_update() {
                 receiver.changed().await.map_err(|_closed| {
@@ -4319,6 +4348,7 @@ async fn session_input_wait_preserves_external_read_only_error() {
             },
             external,
             || Ok::<_, std::convert::Infallible>(true),
+            |_| {},
         )
         .await
         .expect("infallible external session validation")
@@ -4364,13 +4394,22 @@ async fn stale_external_exit_watch_does_not_remove_reused_pid() {
         pid,
         start_identity: StartIdentity::new(11),
     };
+    let published = Mutex::new(Vec::new());
 
     let first = registry
         .inner
         .external
-        .upsert_if_current(old_identity, external.clone(), || {
-            Ok::<_, std::convert::Infallible>(true)
-        })
+        .upsert_if_current(
+            old_identity,
+            external.clone(),
+            || Ok::<_, std::convert::Infallible>(true),
+            |change| {
+                published
+                    .lock()
+                    .expect("published events lock")
+                    .push(change.clone());
+            },
+        )
         .await
         .expect("infallible old identity validation")
         .expect("current old identity");
@@ -4378,18 +4417,32 @@ async fn stale_external_exit_watch_does_not_remove_reused_pid() {
     let replacement = registry
         .inner
         .external
-        .upsert_if_current(new_identity, external.clone(), || {
-            Ok::<_, std::convert::Infallible>(true)
-        })
+        .upsert_if_current(
+            new_identity,
+            external.clone(),
+            || Ok::<_, std::convert::Infallible>(true),
+            |change| {
+                published
+                    .lock()
+                    .expect("published events lock")
+                    .push(change.clone());
+            },
+        )
         .await
         .expect("infallible new identity validation")
         .expect("current new identity");
     assert_eq!(replacement.watch_identity, Some(new_identity));
 
-    assert_eq!(
-        registry.inner.external.remove_identity(old_identity).await,
-        None
+    assert!(
+        !registry
+            .inner
+            .external
+            .remove_identity(old_identity, |info| {
+                panic!("stale watch published removal for {}", info.id.0)
+            })
+            .await
     );
+    assert_eq!(published.lock().expect("published events lock").len(), 2);
     assert_eq!(
         registry.inner.external.inspect(&external.id).await,
         Some(external)
@@ -8181,6 +8234,47 @@ async fn external_rescan_skips_processes_marked_by_any_pohunek_daemon() {
     assert_eq!(sessions.len(), 1, "unmarked agent surfaces as external");
     assert_eq!(sessions[0].external, Some(true));
     assert_eq!(sessions[0].pid, FOREIGN_AGENT_PID);
+}
+
+#[tokio::test]
+async fn external_immediate_exit_is_published_after_creation() {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    inspector.set_descendants(1, vec![codex_fact(FOREIGN_AGENT_PID, 1)]);
+    inspector.set_cwd(FOREIGN_AGENT_PID, temp_dir("external-immediate-exit"));
+    inspector.set_immediate_exit(FOREIGN_AGENT_PID);
+    let mut events = registry.subscribe();
+    inspector.expect_created_before_exit_watch(FOREIGN_AGENT_PID, registry.subscribe());
+
+    registry
+        .rescan_external_agents(&TranscriptIndex::default())
+        .await;
+
+    let created = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("created event timeout")
+        .expect("created event");
+    assert_eq!(created.event(), protocol::event::SESSION_CREATED);
+    let removed = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("removed event timeout")
+        .expect("removed event");
+    assert_eq!(removed.event(), protocol::event::SESSION_REMOVED);
+    assert_eq!(
+        created.payload()["session"]["id"],
+        removed.payload()["session"]["id"]
+    );
+    assert!(
+        registry.list().await.is_empty(),
+        "an immediately exited external process must not remain observable"
+    );
 }
 
 #[tokio::test]

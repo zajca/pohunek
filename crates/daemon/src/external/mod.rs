@@ -105,8 +105,6 @@ struct ExternalEntry {
 /// Atomic result of inserting or refreshing an external session.
 #[derive(Debug)]
 pub(crate) struct ExternalUpsert {
-    /// User-visible session change, when metadata changed.
-    pub(crate) change: Option<ExternalSessionChange>,
     /// Exact process generation that needs a new exit watch.
     pub(crate) watch_identity: Option<ProcessIdentity>,
 }
@@ -241,11 +239,16 @@ impl ExternalSessions {
     }
 
     /// Inserts or refreshes an external session snapshot while it is current.
+    ///
+    /// `publish` runs synchronously while the entry lock is held so a competing
+    /// exit or sweep cannot publish a later lifecycle event first. It must not
+    /// block or re-enter this store.
     pub(crate) async fn upsert_if_current<E>(
         &self,
         identity: ProcessIdentity,
         mut info: SessionInfo,
         validate: impl FnOnce() -> Result<bool, E>,
+        publish: impl FnOnce(&ExternalSessionChange),
     ) -> Result<Option<ExternalUpsert>, E> {
         let mut entries = self.inner.entries.lock().await;
         if !validate()? {
@@ -259,8 +262,8 @@ impl ExternalSessions {
                     info: info.clone(),
                 },
             );
+            publish(&ExternalSessionChange::Created(info));
             return Ok(Some(ExternalUpsert {
-                change: Some(ExternalSessionChange::Created(info)),
                 watch_identity: Some(identity),
             }));
         };
@@ -269,7 +272,6 @@ impl ExternalSessions {
             info.created_at.clone_from(&existing.info.created_at);
             if external_info_matches(&existing.info, &info) {
                 return Ok(Some(ExternalUpsert {
-                    change: None,
                     watch_identity: None,
                 }));
             }
@@ -282,33 +284,50 @@ impl ExternalSessions {
                 info: info.clone(),
             },
         );
-        Ok(Some(ExternalUpsert {
-            change: Some(ExternalSessionChange::Updated(info)),
-            watch_identity,
-        }))
+        publish(&ExternalSessionChange::Updated(info));
+        Ok(Some(ExternalUpsert { watch_identity }))
     }
 
-    /// Removes entries whose pids were absent from a successful sweep.
-    pub(crate) async fn remove_unobserved(&self, observed: &HashSet<Pid>) -> Vec<SessionInfo> {
+    /// Removes and publishes entries whose pids were absent from a successful sweep.
+    ///
+    /// `publish` has the same nonblocking, non-reentrant contract as the upsert
+    /// publisher and runs before another mutation can acquire the entry lock.
+    pub(crate) async fn remove_unobserved(
+        &self,
+        observed: &HashSet<Pid>,
+        mut publish: impl FnMut(&SessionInfo),
+    ) {
         let mut entries = self.inner.entries.lock().await;
         let stale = entries
             .keys()
             .copied()
             .filter(|pid| !observed.contains(pid))
             .collect::<Vec<_>>();
-        stale
-            .into_iter()
-            .filter_map(|pid| entries.remove(&pid).map(|entry| entry.info))
-            .collect()
+        for pid in stale {
+            if let Some(entry) = entries.remove(&pid) {
+                publish(&entry.info);
+            }
+        }
     }
 
-    /// Removes one external entry only if its exact exit watch still owns it.
-    pub(crate) async fn remove_identity(&self, identity: ProcessIdentity) -> Option<SessionInfo> {
+    /// Removes and publishes one entry only if its exact exit watch still owns it.
+    ///
+    /// `publish` has the same nonblocking, non-reentrant contract as the upsert
+    /// publisher and runs before another mutation can acquire the entry lock.
+    pub(crate) async fn remove_identity(
+        &self,
+        identity: ProcessIdentity,
+        publish: impl FnOnce(&SessionInfo),
+    ) -> bool {
         let mut entries = self.inner.entries.lock().await;
         if entries.get(&identity.pid).map(|entry| entry.identity) != Some(identity) {
-            return None;
+            return false;
         }
-        entries.remove(&identity.pid).map(|entry| entry.info)
+        let entry = entries
+            .remove(&identity.pid)
+            .expect("validated external identity must remain present while locked");
+        publish(&entry.info);
+        true
     }
 }
 

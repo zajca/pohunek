@@ -1016,13 +1016,16 @@ static unsigned long long process_start_identity(void) {
 
 static enum hook_response parse_hook_response(const char *response) {
     static const char accepted[] =
-        "{\"ok\":true,\"launch_identity_accepted\":true}\n";
-    static const char retryable[] =
-        "{\"ok\":true,\"launch_identity_accepted\":false}\n";
+        "{\"ok\":true,\"launch_identity_accepted\":true,\"launch_identity_status\":\"accepted\"}\n";
+    static const char pending[] =
+        "{\"ok\":true,\"launch_identity_accepted\":false,\"launch_identity_status\":\"pending\"}\n";
+    static const char rejected_claim[] =
+        "{\"ok\":true,\"launch_identity_accepted\":false,\"launch_identity_status\":\"rejected\"}\n";
     static const char rejected[] =
-        "{\"ok\":false,\"launch_identity_accepted\":false}\n";
+        "{\"ok\":false,\"launch_identity_accepted\":false,\"launch_identity_status\":\"not_applicable\"}\n";
     if (strcmp(response, accepted) == 0) return HOOK_RESPONSE_ACCEPTED;
-    if (strcmp(response, retryable) == 0) return HOOK_RESPONSE_RETRY;
+    if (strcmp(response, pending) == 0) return HOOK_RESPONSE_RETRY;
+    if (strcmp(response, rejected_claim) == 0) return HOOK_RESPONSE_TERMINAL;
     if (strcmp(response, rejected) == 0) return HOOK_RESPONSE_TERMINAL;
     return HOOK_RESPONSE_TERMINAL;
 }

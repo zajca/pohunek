@@ -1,6 +1,6 @@
 //! Defines validated worker runtime policy.
 
-// Rust guideline compliant 2026-08-04
+// Rust guideline compliant 2026-09-14
 
 use std::time::Duration;
 
@@ -35,6 +35,12 @@ pub(crate) const DEFAULT_MAX_SNAPSHOT_ROWS: u16 = 512;
 pub(crate) const DEFAULT_MAX_SNAPSHOT_COLUMNS: u16 = 512;
 /// Default maximum serialized terminal-snapshot control response.
 pub(crate) const DEFAULT_MAX_SNAPSHOT_BYTES: usize = DEFAULT_CONTROL_LINE_BYTES;
+/// Retry cadence for durable launch claims while their hook lease remains valid.
+const DEFAULT_LAUNCH_CLAIM_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// Bounds deferred claims from concurrent provider descendants.
+const DEFAULT_PENDING_LAUNCH_CLAIMS: usize = 16;
+/// Hard cap for deferred launch-identity work and retained references.
+const MAX_PENDING_LAUNCH_CLAIMS: usize = 64;
 
 /// Hard cap preventing one worker from consuming excessive output memory.
 const MAX_HISTORY_BYTES: usize = 256 * 1024 * 1024;
@@ -117,6 +123,10 @@ pub struct WorkerConfig {
     pub max_snapshot_columns: u16,
     /// Maximum serialized terminal-snapshot control response bytes.
     pub max_snapshot_bytes: usize,
+    /// Interval between retries of unverified launch claims.
+    pub launch_claim_retry_interval: Duration,
+    /// Maximum retained unverified launch claims.
+    pub pending_launch_claims: usize,
 }
 
 impl WorkerConfig {
@@ -137,6 +147,8 @@ impl WorkerConfig {
             max_snapshot_rows: DEFAULT_MAX_SNAPSHOT_ROWS,
             max_snapshot_columns: DEFAULT_MAX_SNAPSHOT_COLUMNS,
             max_snapshot_bytes: DEFAULT_MAX_SNAPSHOT_BYTES,
+            launch_claim_retry_interval: DEFAULT_LAUNCH_CLAIM_RETRY_INTERVAL,
+            pending_launch_claims: DEFAULT_PENDING_LAUNCH_CLAIMS,
         }
     }
 
@@ -146,6 +158,15 @@ impl WorkerConfig {
     ///
     /// Returns [`ConfigError`] when a duration is zero or a bound is unsafe.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        validate_duration(
+            "launch_claim_retry_interval",
+            self.launch_claim_retry_interval,
+        )?;
+        validate_count(
+            "pending_launch_claims",
+            self.pending_launch_claims,
+            MAX_PENDING_LAUNCH_CLAIMS,
+        )?;
         validate_duration("initialize_deadline", self.initialize_deadline)?;
         validate_bytes("history_bytes", self.history_bytes, MAX_HISTORY_BYTES)?;
         validate_bytes(
@@ -325,5 +346,31 @@ mod tests {
                 ..
             })
         ));
+    }
+    #[test]
+    fn launch_claim_work_is_nonzero_and_capacity_bounded() {
+        let zero_interval = WorkerConfig {
+            launch_claim_retry_interval: Duration::ZERO,
+            ..WorkerConfig::new()
+        };
+        assert!(matches!(
+            zero_interval.validate(),
+            Err(ConfigError::Duration {
+                field: "launch_claim_retry_interval"
+            })
+        ));
+        for capacity in [0, super::MAX_PENDING_LAUNCH_CLAIMS + 1] {
+            let invalid = WorkerConfig {
+                pending_launch_claims: capacity,
+                ..WorkerConfig::new()
+            };
+            assert!(matches!(
+                invalid.validate(),
+                Err(ConfigError::Count {
+                    field: "pending_launch_claims",
+                    ..
+                })
+            ));
+        }
     }
 }

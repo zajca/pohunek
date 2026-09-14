@@ -882,6 +882,20 @@ class HookTests(unittest.TestCase):
         self.assertEqual([item["native_reference"] for item in captured], ["launch", "continuation"])
         self.assertLess(captured[0]["sequence"], captured[1]["sequence"])
 
+    def test_pending_launch_is_worker_owned_and_does_not_trigger_public_fallback(self) -> None:
+        reporter = HookReporter({
+            "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_RUNTIME_ID": "r-1",
+            "POHUNEK_WORKER_SOCKET_PATH": "/tmp/worker", "POHUNEK_SOCKET_PATH": "/tmp/daemon",
+            "POHUNEK_PROTOCOL_VERSION": "1",
+        })
+        reporter._start_identity = 1
+        response = {"ok": True, "launch_identity_accepted": False, "launch_identity_status": "pending"}
+        with mock.patch.object(reporter, "_send", return_value=response) as send, mock.patch.object(reporter, "_send_public") as public:
+            reporter.on_session_start({"session_id": "launch"})
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.args[1]["native_reference"], "launch")
+        public.assert_not_called()
+
     def test_finalize_prefers_private_release_and_transition_mapping_is_payload_free(self) -> None:
         reporter = HookReporter({
             "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_RUNTIME_ID": "r-1",

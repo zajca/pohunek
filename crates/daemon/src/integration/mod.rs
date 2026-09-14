@@ -3735,6 +3735,22 @@ mod tests {
     }
 
     #[test]
+    fn pending_worker_launch_claims_do_not_fall_back_to_public_methods() {
+        const PENDING_RESPONSE: &[u8] = b"{\"ok\":true,\"launch_identity_accepted\":false,\"launch_identity_status\":\"pending\"}\n";
+        for agent in ["claude", "codex"] {
+            let (worker_request, public_requests) = run_worker_state_asset_with_response(
+                agent,
+                STATE_SESSION_ACTION,
+                &json!({"session_id": format!("{agent}-native")}),
+                PENDING_RESPONSE,
+                0,
+            );
+            assert_eq!(worker_request["type"], "identity_report");
+            assert!(public_requests.is_empty());
+        }
+    }
+
+    #[test]
     fn claude_state_hook_release_sends_release_agent() {
         let (status, stdout, stderr, requests) = run_state_asset(
             "claude",

@@ -142,6 +142,7 @@ def send_worker_identity():
         response = client.recv(RESPONSE_BYTES)
         client.close()
         result = json.loads(response.splitlines()[0])
+        # Pending launch verification is durably owned and retried by the worker.
         return result.get("ok") is True
     except Exception:
         return False

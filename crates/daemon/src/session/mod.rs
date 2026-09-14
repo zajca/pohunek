@@ -3299,12 +3299,24 @@ impl SessionRegistry {
             let upsert = match self
                 .inner
                 .external
-                .upsert_if_current(identity, info, || {
-                    self.inner
-                        .inspector
-                        .identity(identity.pid)
-                        .map(|current| current == Some(identity))
-                })
+                .upsert_if_current(
+                    identity,
+                    info,
+                    || {
+                        self.inner
+                            .inspector
+                            .identity(identity.pid)
+                            .map(|current| current == Some(identity))
+                    },
+                    |change| match change {
+                        ExternalSessionChange::Created(info) => {
+                            self.emit(event::SESSION_CREATED, info);
+                        }
+                        ExternalSessionChange::Updated(info) => {
+                            self.emit(event::SESSION_UPDATED, info);
+                        }
+                    },
+                )
                 .await
             {
                 Ok(Some(upsert)) => upsert,
@@ -3324,20 +3336,14 @@ impl SessionRegistry {
             if let Some(identity) = upsert.watch_identity {
                 self.spawn_external_exit_watch(identity);
             }
-            match upsert.change {
-                Some(ExternalSessionChange::Created(info)) => {
-                    self.emit(event::SESSION_CREATED, &info);
-                }
-                Some(ExternalSessionChange::Updated(info)) => {
-                    self.emit(event::SESSION_UPDATED, &info);
-                }
-                None => {}
-            }
         }
 
-        for removed in self.inner.external.remove_unobserved(&observed_pids).await {
-            self.emit(event::SESSION_REMOVED, &removed);
-        }
+        self.inner
+            .external
+            .remove_unobserved(&observed_pids, |removed| {
+                self.emit(event::SESSION_REMOVED, removed);
+            })
+            .await;
     }
 
     async fn owned_process_pids(&self, facts: &[ProcessFact]) -> HashSet<Pid> {
@@ -3454,9 +3460,10 @@ impl SessionRegistry {
     }
 
     async fn on_external_agent_exit(&self, identity: ProcessIdentity) {
-        if let Some(info) = self.inner.external.remove_identity(identity).await {
-            self.emit(event::SESSION_REMOVED, &info);
-        }
+        self.inner
+            .external
+            .remove_identity(identity, |info| self.emit(event::SESSION_REMOVED, info))
+            .await;
     }
 
     fn emit(&self, name: &str, info: &SessionInfo) {
