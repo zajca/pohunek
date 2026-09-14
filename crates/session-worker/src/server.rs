@@ -14,7 +14,9 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pohunek_platform::peer;
-use pohunek_platform::process::{LinuxInspector, ProcessInspector};
+use pohunek_platform::process::{
+    LinuxInspector, ProcessIdentity as OsProcessIdentity, ProcessInspector, StartIdentity,
+};
 use pohunek_worker_protocol as protocol;
 use protocol::{
     ActiveIdentityClaim, AttachStart, Capability, CloseReason, ControlCode, ControlError,
@@ -2316,9 +2318,30 @@ where
                         state.launch_agent_base.as_ref(),
                     ) {
                         if &provider == launch_base {
-                            if let Some(designated) =
-                                designated_launch_process(root_identity.pid, launch_base)?
-                            {
+                            let root_process_identity = OsProcessIdentity {
+                                pid: root_identity.pid,
+                                start_identity: root_identity
+                                    .start_identity
+                                    .parse::<StartIdentity>()
+                                    .map_err(|error| WorkerError::Protocol(error.to_string()))?,
+                            };
+                            let designated =
+                                match designated_launch_process(root_process_identity, launch_base)
+                                {
+                                    Ok(designated) => designated,
+                                    Err(error) => {
+                                        event!(
+                                            name: "worker.launch_identity.inspect.failed",
+                                            Level::WARN,
+                                            process.pid = pid,
+                                            error.type = "process_observation",
+                                            error.message = %error,
+                                            "launch identity inspection failed: {{error.message}}",
+                                        );
+                                        None
+                                    }
+                                };
+                            if let Some(designated) = designated {
                                 if designated.pid == pid
                                     && designated.start_identity == start_identity
                                 {
@@ -3159,22 +3182,21 @@ fn is_descendant(mut pid: u32, root: u32) -> Result<bool, WorkerError> {
 }
 
 fn designated_launch_process(
-    root: u32,
+    root: OsProcessIdentity,
     provider: &str,
 ) -> Result<Option<WireProcessIdentity>, WorkerError> {
     let inspector = LinuxInspector::new();
     let mut processes = inspector
-        .descendants(root)
+        .descendant_identities(root)
         .map_err(|error| WorkerError::Protocol(error.to_string()))?;
-    if let Some(root) = inspector
-        .process(root)
-        .map_err(|error| WorkerError::Protocol(error.to_string()))?
-    {
-        processes.push(root);
-    }
+    processes.push(root);
+    let provider = provider.to_ascii_lowercase();
     let mut candidates = Vec::new();
     for process in processes {
-        let Ok(Some(executable)) = inspector.executable(process.pid) else {
+        let Some(executable) = inspector
+            .executable(process.pid)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?
+        else {
             continue;
         };
         let executable_name = executable
@@ -3182,8 +3204,17 @@ fn designated_launch_process(
             .and_then(std::ffi::OsStr::to_str)
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if !executable_name.contains(&provider.to_ascii_lowercase()) {
+        if !executable_name.contains(&provider) {
             continue;
+        }
+        if inspector
+            .identity(process.pid)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?
+            != Some(process)
+        {
+            return Err(WorkerError::Protocol(
+                "launch candidate changed identity during inspection".to_owned(),
+            ));
         }
         candidates.push(WireProcessIdentity {
             pid: process.pid,
@@ -3191,7 +3222,28 @@ fn designated_launch_process(
         });
     }
     candidates.sort_by_key(|candidate| (candidate.start_identity, candidate.pid));
-    Ok(candidates.into_iter().next())
+    let Some(candidate) = candidates.into_iter().next() else {
+        return Ok(None);
+    };
+    let exact_candidate = OsProcessIdentity {
+        pid: candidate.pid,
+        start_identity: StartIdentity::new(candidate.start_identity),
+    };
+    if inspector
+        .identity(root.pid)
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?
+        != Some(root)
+        || inspector
+            .identity(candidate.pid)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?
+            != Some(exact_candidate)
+        || !is_descendant(candidate.pid, root.pid)?
+    {
+        return Err(WorkerError::Protocol(
+            "launch candidate changed ancestry during inspection".to_owned(),
+        ));
+    }
+    Ok(Some(candidate))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

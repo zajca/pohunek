@@ -172,16 +172,11 @@ impl Supervisor for SubprocessWorkerLauncher {
 
     fn discover(&self) -> WorkerLaunchFuture<'_, Vec<ServiceObservation>> {
         Box::pin(async move {
-            let ids = self
-                .children
-                .lock()
-                .await
-                .keys()
-                .map(|value| ServiceId::parse(value.clone()))
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut observations = Vec::with_capacity(ids.len());
-            for id in ids {
-                observations.push(self.inspect(&id).await?);
+            let mut children = self.children.lock().await;
+            let mut observations = Vec::with_capacity(children.len());
+            for (value, child) in children.iter_mut() {
+                let id = ServiceId::parse(value.clone())?;
+                observations.push(inspect_child(&id, child)?);
             }
             observations.sort_by(|left, right| left.id.cmp(&right.id));
             Ok(observations)
@@ -194,30 +189,7 @@ impl Supervisor for SubprocessWorkerLauncher {
             let child = children
                 .get_mut(id.as_str())
                 .ok_or_else(|| WorkerLaunchError::NotFound(id.clone()))?;
-            let pid = child.id();
-            let exited = child
-                .try_wait()
-                .map_err(|source| operation("inspect", source))?
-                .is_some();
-            let process = if exited {
-                None
-            } else {
-                match pid {
-                    Some(pid) => LinuxInspector::new()
-                        .identity(pid)
-                        .map_err(|source| operation("inspect_process_identity", source))?,
-                    None => None,
-                }
-            };
-            Ok(ServiceObservation {
-                id: id.clone(),
-                state: if exited {
-                    ServiceState::Stopped
-                } else {
-                    ServiceState::Running
-                },
-                process,
-            })
+            inspect_child(id, child)
         })
     }
 
@@ -243,6 +215,36 @@ impl Supervisor for SubprocessWorkerLauncher {
             Ok(())
         })
     }
+}
+
+fn inspect_child(
+    id: &ServiceId,
+    child: &mut Child,
+) -> Result<ServiceObservation, WorkerLaunchError> {
+    let pid = child.id();
+    let exited = child
+        .try_wait()
+        .map_err(|source| operation("inspect", source))?
+        .is_some();
+    let process = if exited {
+        None
+    } else {
+        match pid {
+            Some(pid) => LinuxInspector::new()
+                .identity(pid)
+                .map_err(|source| operation("inspect_process_identity", source))?,
+            None => None,
+        }
+    };
+    Ok(ServiceObservation {
+        id: id.clone(),
+        state: if exited {
+            ServiceState::Stopped
+        } else {
+            ServiceState::Running
+        },
+        process,
+    })
 }
 
 fn prepare_private_directory(path: &std::path::Path) -> Result<(), WorkerLaunchError> {

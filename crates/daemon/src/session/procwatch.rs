@@ -1,6 +1,6 @@
 //! Per-session process watcher and active-agent reconciliation.
 
-// Rust guideline compliant 2026-09-01
+// Rust guideline compliant 2026-09-14
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -10,7 +10,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
 
 use crate::detect::{identify_agent, DetectorConfig};
-use crate::procwatch::{ExitWatch, Pid, ProcessFact};
+use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessIdentity, StartIdentity};
 
 use super::{
     agent_kind_label, clear_active_agent, is_terminal, report_is_current, send_detector_config,
@@ -293,7 +293,11 @@ impl SessionRegistry {
             if existing.contains(&identity) {
                 continue;
             }
-            match self.inner.inspector.exit_watch(observation.pid) {
+            let process_identity = ProcessIdentity {
+                pid: observation.pid,
+                start_identity: StartIdentity::new(observation.start_identity),
+            };
+            match self.inner.inspector.exit_watch(process_identity) {
                 Ok(watch) => {
                     watches.insert(identity, watch);
                 }

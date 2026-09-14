@@ -5,7 +5,7 @@
 //! controls external processes; it only publishes read-only `SessionInfo`
 //! snapshots for UI and CLI visibility.
 
-// Rust guideline compliant 2026-07-07
+// Rust guideline compliant 2026-09-14
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr, OsString};
@@ -26,7 +26,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::procwatch::{Pid, ProcessFact};
+use crate::procwatch::{Pid, ProcessFact, ProcessIdentity};
 use crate::session::SessionRegistry;
 
 /// Prefix for synthetic session ids assigned to external processes.
@@ -91,9 +91,24 @@ pub(crate) struct ExternalSessions {
 
 #[derive(Debug)]
 struct ExternalSessionsInner {
-    entries: AsyncMutex<HashMap<Pid, SessionInfo>>,
+    entries: AsyncMutex<HashMap<Pid, ExternalEntry>>,
     rescan: Notify,
     shutdown: CancellationToken,
+}
+
+#[derive(Debug, Clone)]
+struct ExternalEntry {
+    identity: ProcessIdentity,
+    info: SessionInfo,
+}
+
+/// Atomic result of inserting or refreshing an external session.
+#[derive(Debug)]
+pub(crate) struct ExternalUpsert {
+    /// User-visible session change, when metadata changed.
+    pub(crate) change: Option<ExternalSessionChange>,
+    /// Exact process generation that needs a new exit watch.
+    pub(crate) watch_identity: Option<ProcessIdentity>,
 }
 
 /// Change produced by inserting or refreshing an external session.
@@ -203,7 +218,7 @@ impl ExternalSessions {
             .lock()
             .await
             .values()
-            .cloned()
+            .map(|entry| entry.info.clone())
             .collect::<Vec<_>>();
         sessions.sort_by(|left, right| left.id.0.cmp(&right.id.0));
         sessions
@@ -212,7 +227,12 @@ impl ExternalSessions {
     /// Finds one external session by id.
     pub(crate) async fn inspect(&self, id: &SessionId) -> Option<SessionInfo> {
         let pid = external_pid(id)?;
-        self.inner.entries.lock().await.get(&pid).cloned()
+        self.inner
+            .entries
+            .lock()
+            .await
+            .get(&pid)
+            .map(|entry| entry.info.clone())
     }
 
     /// Whether `id` currently belongs to an observed external process.
@@ -220,25 +240,48 @@ impl ExternalSessions {
         self.inspect(id).await.is_some()
     }
 
-    /// Returns currently known external pids.
-    pub(crate) async fn pids(&self) -> HashSet<Pid> {
-        self.inner.entries.lock().await.keys().copied().collect()
-    }
-
     /// Inserts or refreshes an external session snapshot.
-    pub(crate) async fn upsert(&self, mut info: SessionInfo) -> Option<ExternalSessionChange> {
+    pub(crate) async fn upsert(
+        &self,
+        identity: ProcessIdentity,
+        mut info: SessionInfo,
+    ) -> ExternalUpsert {
         let mut entries = self.inner.entries.lock().await;
         let Some(existing) = entries.get(&info.pid) else {
-            entries.insert(info.pid, info.clone());
-            return Some(ExternalSessionChange::Created(info));
+            entries.insert(
+                info.pid,
+                ExternalEntry {
+                    identity,
+                    info: info.clone(),
+                },
+            );
+            return ExternalUpsert {
+                change: Some(ExternalSessionChange::Created(info)),
+                watch_identity: Some(identity),
+            };
         };
 
-        info.created_at.clone_from(&existing.created_at);
-        if external_info_matches(existing, &info) {
-            return None;
+        if existing.identity == identity {
+            info.created_at.clone_from(&existing.info.created_at);
+            if external_info_matches(&existing.info, &info) {
+                return ExternalUpsert {
+                    change: None,
+                    watch_identity: None,
+                };
+            }
         }
-        entries.insert(info.pid, info.clone());
-        Some(ExternalSessionChange::Updated(info))
+        let watch_identity = (existing.identity != identity).then_some(identity);
+        entries.insert(
+            info.pid,
+            ExternalEntry {
+                identity,
+                info: info.clone(),
+            },
+        );
+        ExternalUpsert {
+            change: Some(ExternalSessionChange::Updated(info)),
+            watch_identity,
+        }
     }
 
     /// Removes entries whose pids were absent from a successful sweep.
@@ -251,13 +294,17 @@ impl ExternalSessions {
             .collect::<Vec<_>>();
         stale
             .into_iter()
-            .filter_map(|pid| entries.remove(&pid))
+            .filter_map(|pid| entries.remove(&pid).map(|entry| entry.info))
             .collect()
     }
 
-    /// Removes one external entry after its exit watch fires.
-    pub(crate) async fn remove_pid(&self, pid: Pid) -> Option<SessionInfo> {
-        self.inner.entries.lock().await.remove(&pid)
+    /// Removes one external entry only if its exact exit watch still owns it.
+    pub(crate) async fn remove_identity(&self, identity: ProcessIdentity) -> Option<SessionInfo> {
+        let mut entries = self.inner.entries.lock().await;
+        if entries.get(&identity.pid).map(|entry| entry.identity) != Some(identity) {
+            return None;
+        }
+        entries.remove(&identity.pid).map(|entry| entry.info)
     }
 }
 

@@ -2183,7 +2183,8 @@ mod tests {
     };
     use crate::agent::{ForkMode, InputRules, ResumeMode, SessionRefKind};
     use crate::procwatch::{
-        ExitWatch, LinuxInspector, OwnershipMarkers, Pid, ProcessFact, ProcessInspector,
+        ExitWatch, LinuxInspector, OwnershipMarkers, Pid, ProcessFact,
+        ProcessIdentity as OsProcessIdentity, ProcessInspector,
     };
     use crate::session::SessionRegistryConfig;
     use crate::store::{
@@ -2254,8 +2255,11 @@ mod tests {
             self.inner.cwd(pid)
         }
 
-        fn exit_watch(&self, pid: Pid) -> Result<ExitWatch, crate::procwatch::Error> {
-            self.inner.exit_watch(pid)
+        fn exit_watch(
+            &self,
+            identity: OsProcessIdentity,
+        ) -> Result<ExitWatch, crate::procwatch::Error> {
+            self.inner.exit_watch(identity)
         }
 
         fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, crate::procwatch::Error> {

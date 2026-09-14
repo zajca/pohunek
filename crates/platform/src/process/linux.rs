@@ -136,23 +136,52 @@ impl ProcessInspector for LinuxInspector {
         Ok(facts)
     }
 
+    fn descendant_identities(&self, root: ProcessIdentity) -> Result<Vec<ProcessIdentity>, Error> {
+        const OPERATION: &str = "inspect_descendant_identities";
+
+        let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
+        require_identity(root, euid, OPERATION)?;
+        let pids = match descendants_from_children(root.pid, euid)
+            .map_err(|source| process_error(OPERATION, source))?
+        {
+            Some(pids) => pids,
+            None => descendants_from_ppid_scan(root.pid, euid)
+                .map_err(|source| process_error(OPERATION, source))?,
+        };
+        let mut identities = Vec::with_capacity(pids.len());
+        for pid in pids {
+            let identity = read_process_identity_at(Path::new(PROC_ROOT), pid, euid)
+                .map_err(|source| process_error(OPERATION, source))?
+                .ok_or(Error::Race {
+                    operation: OPERATION,
+                })?;
+            identities.push(identity);
+        }
+        require_identity(root, euid, OPERATION)?;
+        Ok(identities)
+    }
+
     fn cwd(&self, pid: Pid) -> Result<PathBuf, Error> {
         fs::read_link(proc_path(pid).join("cwd"))
             .map_err(|source| process_error("read_cwd", source))
     }
 
-    fn exit_watch(&self, pid: Pid) -> Result<ExitWatch, Error> {
-        let native =
-            NativePid::from_raw(
-                i32::try_from(pid).map_err(|_range_error| Error::OutOfRange {
-                    operation: "open_exit_watch",
-                })?,
-            )
-            .ok_or(Error::OutOfRange {
-                operation: "open_exit_watch",
-            })?;
+    fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, Error> {
+        const OPERATION: &str = "open_exit_watch";
+
+        let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
+        require_identity(identity, euid, OPERATION)?;
+        let native = NativePid::from_raw(i32::try_from(identity.pid).map_err(|_range_error| {
+            Error::OutOfRange {
+                operation: OPERATION,
+            }
+        })?)
+        .ok_or(Error::OutOfRange {
+            operation: OPERATION,
+        })?;
         let fd = pidfd_open(native, PidfdFlags::empty())
-            .map_err(|source| process_error("open_exit_watch", source.into()))?;
+            .map_err(|source| process_error(OPERATION, source.into()))?;
+        require_identity(identity, euid, OPERATION)?;
         let fd =
             AsyncFd::new(fd).map_err(|source| Error::from_io("register_exit_watch", source))?;
         Ok(ExitWatch::from_future(async move {
@@ -171,6 +200,20 @@ impl ProcessInspector for LinuxInspector {
     fn foreground_process_group(&self, root_pid: Pid) -> Result<Option<Pid>, Error> {
         foreground_process_group(root_pid)
             .map_err(|source| process_error("read_foreground_process_group", source))
+    }
+}
+
+fn require_identity(
+    expected: ProcessIdentity,
+    euid: u32,
+    operation: &'static str,
+) -> Result<(), Error> {
+    let actual = read_process_identity_at(Path::new(PROC_ROOT), expected.pid, euid)
+        .map_err(|source| process_error(operation, source))?;
+    if actual == Some(expected) {
+        Ok(())
+    } else {
+        Err(Error::Race { operation })
     }
 }
 
@@ -687,6 +730,26 @@ mod tests {
     fn exited_process_errno_is_a_race() {
         let error = io::Error::from_raw_os_error(nix::errno::Errno::ESRCH as i32);
         assert!(process_error("open_exit_watch", error).is_race());
+    }
+
+    #[test]
+    fn exit_watch_rejects_a_stale_process_generation() {
+        let inspector = LinuxInspector::new();
+        let current = inspector
+            .identity(std::process::id())
+            .expect("inspect current process")
+            .expect("current process exists");
+        let stale = ProcessIdentity {
+            pid: current.pid,
+            start_identity: StartIdentity::new(current.start_identity.get().saturating_add(1)),
+        };
+
+        assert!(matches!(
+            inspector.exit_watch(stale),
+            Err(Error::Race {
+                operation: "open_exit_watch"
+            })
+        ));
     }
 
     #[test]

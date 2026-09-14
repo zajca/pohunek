@@ -296,6 +296,36 @@ pub trait ProcessInspector: Debug + Send + Sync + 'static {
     /// Returns typed ancestry inspection failures.
     fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, Error>;
 
+    /// Returns minimal identities for descendants of an exact process root.
+    ///
+    /// This operation avoids optional process metadata so lifecycle checks do
+    /// not depend on readable command lines.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Race`] when `root` changes identity during the scan,
+    /// or another typed process observation failure.
+    fn descendant_identities(&self, root: ProcessIdentity) -> Result<Vec<ProcessIdentity>, Error> {
+        const OPERATION: &str = "inspect_descendant_identities";
+
+        if self.identity(root.pid)? != Some(root) {
+            return Err(Error::Race {
+                operation: OPERATION,
+            });
+        }
+        let identities = self
+            .descendants(root.pid)?
+            .into_iter()
+            .map(|fact| fact.identity())
+            .collect();
+        if self.identity(root.pid)? != Some(root) {
+            return Err(Error::Race {
+                operation: OPERATION,
+            });
+        }
+        Ok(identities)
+    }
+
     /// Returns the current working directory for `pid`.
     ///
     /// # Errors
@@ -303,12 +333,12 @@ pub trait ProcessInspector: Debug + Send + Sync + 'static {
     /// Returns typed process inspection failures.
     fn cwd(&self, pid: Pid) -> Result<PathBuf, Error>;
 
-    /// Arms an identity-safe exit watch for `pid`.
+    /// Arms an exit watch for one exact process identity.
     ///
     /// # Errors
     ///
     /// Returns typed registration failures.
-    fn exit_watch(&self, pid: Pid) -> Result<ExitWatch, Error>;
+    fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, Error>;
 
     /// Returns only the allowlisted Pohunek environment markers.
     ///

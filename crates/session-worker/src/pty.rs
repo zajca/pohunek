@@ -1,13 +1,13 @@
 //! Owns one PTY master and its managed process identity.
 
-// Rust guideline compliant 2026-08-09
+// Rust guideline compliant 2026-09-14
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::io::{self, Read};
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use nix::sys::epoll::{self, EpollCreateFlags, EpollEvent, EpollFlags, EpollOp};
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::{close, Pid};
 use pohunek_platform::process::{LinuxInspector, ProcessInspector};
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
 use rustix::fd::OwnedFd;
 use rustix::fs::{open, Mode, OFlags};
 use rustix::termios::{tcflow, Action};
@@ -202,6 +202,101 @@ pub struct PtyOwner {
     stop: Arc<AsyncMutex<Option<(String, Exit)>>>,
 }
 
+/// Owns a spawned child until construction commits it to the wait thread.
+struct SpawnGuard {
+    child: Option<Box<dyn PtyChild + Send + Sync>>,
+    process_group: Option<i32>,
+}
+
+/// Holds startup threads until every fallible ownership handoff succeeds.
+#[derive(Debug, Clone, Default)]
+struct StartupLatch {
+    inner: Arc<(Mutex<StartupState>, Condvar)>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum StartupState {
+    #[default]
+    Pending,
+    Committed,
+    Aborted,
+}
+
+impl StartupLatch {
+    fn wait(&self) -> bool {
+        let (state, changed) = &*self.inner;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *state == StartupState::Pending {
+            state = changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *state == StartupState::Committed
+    }
+
+    fn commit(&self) {
+        self.set(StartupState::Committed);
+    }
+
+    fn abort(&self) {
+        self.set(StartupState::Aborted);
+    }
+
+    fn set(&self, next: StartupState) {
+        let (state, changed) = &*self.inner;
+        *state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+        changed.notify_all();
+    }
+}
+
+impl Debug for SpawnGuard {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnGuard")
+            .field("has_child", &self.child.is_some())
+            .field("process_group", &self.process_group)
+            .finish()
+    }
+}
+
+impl SpawnGuard {
+    fn new(child: Box<dyn PtyChild + Send + Sync>) -> Self {
+        Self {
+            child: Some(child),
+            process_group: None,
+        }
+    }
+
+    fn set_process_group(&mut self, process_group: i32) {
+        self.process_group = Some(process_group);
+    }
+
+    fn wait(&mut self) -> io::Result<portable_pty::ExitStatus> {
+        let child = self.child.as_mut().expect("spawn guard owns child");
+        let result = child.wait();
+        if result.is_ok() {
+            self.child = None;
+        }
+        result
+    }
+}
+
+impl Drop for SpawnGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if let Some(process_group) = self.process_group {
+            let _ = killpg(Pid::from_raw(process_group), Signal::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 impl Debug for PtyOwner {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PtyOwner")
@@ -276,36 +371,7 @@ impl PtyOwner {
         }
         builder.cwd(&command.cwd);
 
-        let mut child = pair.slave.spawn_command(builder).map_err(|_source| {
-            let program = Path::new(&command.program);
-            PtyError::Spawn {
-                message: "process launch failed".to_owned(),
-                not_found: program.is_absolute() && !program.exists(),
-            }
-        })?;
-        let pid = child.process_id().ok_or(PtyError::MissingPid)?;
-        let process_group =
-            pair.master
-                .process_group_leader()
-                .unwrap_or(i32::try_from(pid).map_err(|_range_error| {
-                    PtyError::ProcessIdentity {
-                        pid,
-                        source: io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "PID exceeds pid_t range",
-                        ),
-                    }
-                })?);
-        let start_identity =
-            read_process_start(pid).map_err(|source| PtyError::ProcessIdentity { pid, source })?;
-        let identity = ProcessIdentity {
-            pid,
-            process_group,
-            start_identity,
-        };
         let tty_name = Arc::new(pair.master.tty_name().ok_or(PtyError::MissingTtyName)?);
-        drop(pair.slave);
-
         let master_fd = pair.master.as_raw_fd().ok_or(PtyError::MissingMasterFd)?;
         let output_readiness = Arc::new(OutputReadiness::new(master_fd)?);
         let output_reader = Arc::new(Mutex::new(
@@ -322,14 +388,51 @@ impl PtyOwner {
         let output = OutputHub::new(history_bytes, subscriber_bytes, command.rows, command.cols)?;
         let output_order = Arc::new(Mutex::new(()));
 
+        let child = pair.slave.spawn_command(builder).map_err(|_source| {
+            let program = Path::new(&command.program);
+            PtyError::Spawn {
+                message: "process launch failed".to_owned(),
+                not_found: program.is_absolute() && !program.exists(),
+            }
+        })?;
+        let mut child = SpawnGuard::new(child);
+        let pid = child
+            .child
+            .as_ref()
+            .and_then(|child| child.process_id())
+            .ok_or(PtyError::MissingPid)?;
+        let native_pid = i32::try_from(pid).map_err(|_range_error| PtyError::ProcessIdentity {
+            pid,
+            source: io::Error::new(io::ErrorKind::InvalidData, "PID exceeds pid_t range"),
+        })?;
+        child.set_process_group(native_pid);
+        // portable-pty creates the PTY root as a session and process-group
+        // leader. Unlike the terminal foreground group, this owned PGID stays
+        // bound to the unreaped root throughout construction rollback.
+        let process_group = native_pid;
+        let start_identity =
+            read_process_start(pid).map_err(|source| PtyError::ProcessIdentity { pid, source })?;
+        let identity = ProcessIdentity {
+            pid,
+            process_group,
+            start_identity,
+        };
+        drop(pair.slave);
+
         let reader_output = output.clone();
         let reader_output_order = Arc::clone(&output_order);
         let thread_output_reader = Arc::clone(&output_reader);
         let thread_output_readiness = Arc::clone(&output_readiness);
         let reader_pid = pid;
+        let startup = StartupLatch::default();
+        let reader_startup = startup.clone();
         let reader_thread = thread::Builder::new()
             .name(format!("pohunek-worker-pty-{pid}"))
             .spawn(move || {
+                if !reader_startup.wait() {
+                    reader_output.mark_exit();
+                    return;
+                }
                 let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
                 loop {
                     if let Err(error) = wait_for_output(&*thread_output_readiness) {
@@ -373,9 +476,13 @@ impl PtyOwner {
             .map_err(PtyError::Io)?;
 
         let (exit_tx, exit_rx) = watch::channel(None);
+        let child_startup = startup.clone();
         let child_thread = thread::Builder::new()
             .name(format!("pohunek-worker-child-{pid}"))
             .spawn(move || {
+                if !child_startup.wait() {
+                    return;
+                }
                 let exit = match child.wait() {
                     Ok(status) => Exit {
                         exit_code: status
@@ -403,8 +510,16 @@ impl PtyOwner {
                     }
                 };
                 let _ = exit_tx.send(Some(exit));
-            })
-            .map_err(PtyError::Io)?;
+            });
+        let child_thread = match child_thread {
+            Ok(child_thread) => child_thread,
+            Err(source) => {
+                startup.abort();
+                reader_thread.join().map_err(|_panic| PtyError::Task)?;
+                return Err(PtyError::Io(source));
+            }
+        };
+        startup.commit();
 
         Ok(Self {
             identity,
@@ -923,9 +1038,9 @@ where
 
 fn read_process_start(pid: u32) -> Result<String, io::Error> {
     LinuxInspector::new()
-        .process(pid)
+        .identity(pid)
         .map_err(io::Error::other)?
-        .map(|fact| fact.start_identity.to_string())
+        .map(|identity| identity.start_identity.to_string())
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "process no longer exists"))
 }
 
@@ -948,14 +1063,21 @@ fn lock_result<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, PtyE
 mod tests {
     use super::{
         commit_resize_before_resume, drain_available_output, drain_snapshot_boundary, Command,
-        OutputReadState, OutputReady, PtyError, PtyOwner, ResizeCommit, ResizeState,
-        OUTPUT_DRAIN_BATCH_BYTES, READ_CHUNK_BYTES,
+        OutputReadState, OutputReady, PtyError, PtyOwner, ResizeCommit, ResizeState, SpawnGuard,
+        StartupLatch, OUTPUT_DRAIN_BATCH_BYTES, READ_CHUNK_BYTES,
     };
     use crate::{InputFragment, InputPlan, OutputEvent, OutputHub, WorkerConfig};
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::collections::{HashMap, VecDeque};
     use std::io::Cursor;
     use std::sync::Mutex;
     use std::time::Duration;
+
+    /// Allows the rollback fixture to create a signal-resistant descendant.
+    const ROLLBACK_CHILD_START_DELAY: Duration = Duration::from_millis(100);
 
     fn shell(script: &str) -> Command {
         Command {
@@ -1264,5 +1386,48 @@ mod tests {
         let rendered = format!("{command:?}");
         assert!(rendered.contains("[REDACTED"));
         assert!(!rendered.contains(secret));
+    }
+
+    #[test]
+    fn spawn_guard_kills_the_uncommitted_process_group() {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("allocate rollback PTY");
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "trap '' HUP TERM; sleep 30 & wait"]);
+        let child = pair
+            .slave
+            .spawn_command(command)
+            .expect("spawn rollback fixture");
+        let pid = child.process_id().expect("fixture child PID");
+        let process_group = i32::try_from(pid).expect("PID fits pid_t");
+        let mut guard = SpawnGuard::new(child);
+        guard.set_process_group(process_group);
+        drop(pair.slave);
+
+        std::thread::sleep(ROLLBACK_CHILD_START_DELAY);
+        drop(guard);
+
+        assert_eq!(
+            kill(Pid::from_raw(-process_group), None),
+            Err(Errno::ESRCH),
+            "rollback left a process in the owned group"
+        );
+    }
+
+    #[test]
+    fn startup_abort_releases_reader_without_waiting_for_pty_eof() {
+        let startup = StartupLatch::default();
+        let waiter = startup.clone();
+        let reader = std::thread::spawn(move || waiter.wait());
+
+        startup.abort();
+
+        assert!(!reader.join().expect("startup waiter"));
     }
 }

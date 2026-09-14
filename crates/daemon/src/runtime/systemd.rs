@@ -330,19 +330,19 @@ async fn read_service_snapshot(
         active_state: unit
             .get_property("ActiveState")
             .await
-            .map_err(|source| operation(operation_name, source))?,
+            .map_err(|source| map_snapshot_error(operation_name, source))?,
         sub_state: unit
             .get_property("SubState")
             .await
-            .map_err(|source| operation(operation_name, source))?,
+            .map_err(|source| map_snapshot_error(operation_name, source))?,
         main_pid: service
             .get_property("MainPID")
             .await
-            .map_err(|source| operation(operation_name, source))?,
+            .map_err(|source| map_snapshot_error(operation_name, source))?,
         control_group: service
             .get_property("ControlGroup")
             .await
-            .map_err(|source| operation(operation_name, source))?,
+            .map_err(|source| map_snapshot_error(operation_name, source))?,
     })
 }
 
@@ -405,14 +405,34 @@ fn operation(
 }
 
 fn map_get_unit_error(id: &ServiceId, source: zbus::Error) -> SupervisorError {
-    match &source {
-        zbus::Error::MethodError(name, _, _)
-            if name.as_str() == "org.freedesktop.systemd1.NoSuchUnit" =>
-        {
-            SupervisorError::NotFound(id.clone())
-        }
-        _ => operation("inspect", source),
+    if is_unit_disappearance(&source) {
+        SupervisorError::NotFound(id.clone())
+    } else {
+        operation("inspect", source)
     }
+}
+
+fn map_snapshot_error(operation_name: &'static str, source: zbus::Error) -> SupervisorError {
+    if is_unit_disappearance(&source) {
+        inspect_race()
+    } else {
+        operation(operation_name, source)
+    }
+}
+
+fn is_unit_disappearance(source: &zbus::Error) -> bool {
+    match source {
+        zbus::Error::MethodError(name, _, _) => is_unit_disappearance_name(name.as_str()),
+        zbus::Error::FDO(error) => matches!(error.as_ref(), zbus::fdo::Error::UnknownObject(_)),
+        _ => false,
+    }
+}
+
+fn is_unit_disappearance_name(name: &str) -> bool {
+    matches!(
+        name,
+        "org.freedesktop.systemd1.NoSuchUnit" | "org.freedesktop.DBus.Error.UnknownObject"
+    )
 }
 
 fn unit_name(template: &UnitTemplate, session_id: &str) -> Result<String, UnitsError> {
@@ -583,5 +603,39 @@ mod tests {
         .expect("generation changes are expected discovery races");
 
         assert!(observations.is_empty());
+    }
+
+    #[test]
+    fn snapshot_errors_classify_only_unit_disappearance_as_a_race() {
+        let no_such_unit = method_error("org.freedesktop.systemd1.NoSuchUnit");
+        let unknown_object = method_error("org.freedesktop.DBus.Error.UnknownObject");
+        let unknown_property = method_error("org.freedesktop.DBus.Error.UnknownProperty");
+        let fdo_unknown_object =
+            zbus::Error::FDO(Box::new(zbus::fdo::Error::UnknownObject("gone".to_owned())));
+        let fdo_access_denied = zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
+            "denied".to_owned(),
+        )));
+
+        for source in [no_such_unit, unknown_object, fdo_unknown_object] {
+            assert!(matches!(
+                map_snapshot_error("snapshot", source),
+                SupervisorError::Race { .. }
+            ));
+        }
+        for source in [unknown_property, fdo_access_denied] {
+            assert!(matches!(
+                map_snapshot_error("snapshot", source),
+                SupervisorError::Operation { .. }
+            ));
+        }
+    }
+
+    fn method_error(name: &'static str) -> zbus::Error {
+        let name = zbus::names::OwnedErrorName::try_from(name).expect("valid D-Bus error name");
+        let message = zbus::Message::method_call("/org/example/Test", "Inspect")
+            .expect("valid method call")
+            .build(&())
+            .expect("build method call");
+        zbus::Error::MethodError(name, None, message)
     }
 }

@@ -30,7 +30,7 @@ use crate::integration::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
 use crate::procwatch::{
-    ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity, ProcessInspector,
+    ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity, ProcessInspector, StartIdentity,
 };
 use crate::project::detect::project_id;
 use crate::runtime::{Worker, WorkerError};
@@ -843,10 +843,21 @@ async fn session_read_preserves_alternate_screen_state_during_fallback() {
     )
     .expect("read params");
 
-    let result = registry
-        .session_read(&params)
-        .await
-        .expect("read alternate screen");
+    let read_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let result = loop {
+        let result = registry
+            .session_read(&params)
+            .await
+            .expect("read alternate screen");
+        if result.alternate_screen && result.text == "TUI-one\nTUI-two" {
+            break result;
+        }
+        assert!(
+            tokio::time::Instant::now() < read_deadline,
+            "timed out waiting for alternate-screen output: {result:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
 
     assert_eq!(result.source_used, SessionReadSource::Visible);
     assert!(result.alternate_screen);
@@ -1256,13 +1267,13 @@ impl ProcessInspector for MockInspector {
             })
     }
 
-    fn exit_watch(&self, pid: Pid) -> Result<ExitWatch, crate::procwatch::Error> {
+    fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, crate::procwatch::Error> {
         let (sender, receiver) = tokio::sync::watch::channel(false);
         self.inner
             .lock()
             .expect("mock inspector lock")
             .exits
-            .entry(pid)
+            .entry(identity.pid)
             .or_default()
             .push(sender);
         Ok(ExitWatch::from_future(async move {
@@ -4257,7 +4268,17 @@ async fn session_input_wait_preserves_external_read_only_error() {
     external.id = external_id.clone();
     external.pid = 91_337;
     external.external = Some(true);
-    registry.inner.external.upsert(external).await;
+    registry
+        .inner
+        .external
+        .upsert(
+            ProcessIdentity {
+                pid: external.pid,
+                start_identity: StartIdentity::new(1),
+            },
+            external,
+        )
+        .await;
 
     let error = registry
         .input(protocol::SessionInputParams {
@@ -4272,6 +4293,56 @@ async fn session_input_wait_preserves_external_read_only_error() {
         .expect_err("external waited input remains read-only");
 
     assert_eq!(error.code, "session_external_read_only");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn stale_external_exit_watch_does_not_remove_reused_pid() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: observable_input_shell(),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create managed session fixture");
+    let pid = 91_338;
+    let mut external = created.clone();
+    external.id = external_session_id(pid);
+    external.pid = pid;
+    external.external = Some(true);
+    let old_identity = ProcessIdentity {
+        pid,
+        start_identity: StartIdentity::new(10),
+    };
+    let new_identity = ProcessIdentity {
+        pid,
+        start_identity: StartIdentity::new(11),
+    };
+
+    let first = registry
+        .inner
+        .external
+        .upsert(old_identity, external.clone())
+        .await;
+    assert_eq!(first.watch_identity, Some(old_identity));
+    let replacement = registry
+        .inner
+        .external
+        .upsert(new_identity, external.clone())
+        .await;
+    assert_eq!(replacement.watch_identity, Some(new_identity));
+
+    assert_eq!(
+        registry.inner.external.remove_identity(old_identity).await,
+        None
+    );
+    assert_eq!(
+        registry.inner.external.inspect(&external.id).await,
+        Some(external)
+    );
+
     let _ = registry.stop(&created.id).await;
 }
 

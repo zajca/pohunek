@@ -45,7 +45,7 @@ use crate::external::{
 use crate::integration::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
-use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessInspector};
+use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessIdentity, ProcessInspector};
 use crate::project::detect::{project_id, DetectedProject};
 use crate::project::{detect_at, ProjectManager};
 use crate::runtime::{DimensionUpdate, SystemdWorkerLauncher, Worker, WorkerError, WorkerLauncher};
@@ -3243,7 +3243,6 @@ impl SessionRegistry {
             }
         };
         let owned_pids = self.owned_process_pids(&facts).await;
-        let existing_pids = self.inner.external.pids().await;
         let mut observed_pids = HashSet::new();
 
         for fact in facts {
@@ -3286,12 +3285,12 @@ impl SessionRegistry {
                 .resolve_external_cwd_association(fact.pid, cwd.clone())
                 .await;
             let info = external_session_info(&fact, agent_base, cwd, candidate, association);
-            let change = self.inner.external.upsert(info).await;
-            match change {
+            let upsert = self.inner.external.upsert(fact.identity(), info).await;
+            if let Some(identity) = upsert.watch_identity {
+                self.spawn_external_exit_watch(identity);
+            }
+            match upsert.change {
                 Some(ExternalSessionChange::Created(info)) => {
-                    if !existing_pids.contains(&fact.pid) {
-                        self.spawn_external_exit_watch(fact.pid);
-                    }
                     self.emit(event::SESSION_CREATED, &info);
                 }
                 Some(ExternalSessionChange::Updated(info)) => {
@@ -3368,22 +3367,23 @@ impl SessionRegistry {
         }
     }
 
-    fn spawn_external_exit_watch(&self, pid: Pid) {
-        let watch = match self.inner.inspector.exit_watch(pid) {
+    fn spawn_external_exit_watch(&self, identity: ProcessIdentity) {
+        let watch = match self.inner.inspector.exit_watch(identity) {
             Ok(watch) => watch,
             Err(err) => {
                 debug!(
-                    pid,
+                    pid = identity.pid,
+                    process_start_identity = identity.start_identity.get(),
                     error = %err,
                     "failed to arm external agent exit watch; falling back to poll cleanup"
                 );
                 return;
             }
         };
-        self.spawn_external_exit_watch_task(pid, watch);
+        self.spawn_external_exit_watch_task(identity, watch);
     }
 
-    fn spawn_external_exit_watch_task(&self, pid: Pid, watch: ExitWatch) {
+    fn spawn_external_exit_watch_task(&self, identity: ProcessIdentity, watch: ExitWatch) {
         let registry = self.clone();
         let shutdown = self.inner.external.shutdown_token();
         tokio::spawn(async move {
@@ -3392,20 +3392,21 @@ impl SessionRegistry {
                 result = watch.wait() => {
                     if let Err(err) = result {
                         debug!(
-                            pid,
+                            pid = identity.pid,
+                            process_start_identity = identity.start_identity.get(),
                             error = %err,
                             "external process exit watch failed"
                         );
                         return;
                     }
-                    registry.on_external_agent_exit(pid).await;
+                    registry.on_external_agent_exit(identity).await;
                 }
             }
         });
     }
 
-    async fn on_external_agent_exit(&self, pid: Pid) {
-        if let Some(info) = self.inner.external.remove_pid(pid).await {
+    async fn on_external_agent_exit(&self, identity: ProcessIdentity) {
+        if let Some(info) = self.inner.external.remove_identity(identity).await {
             self.emit(event::SESSION_REMOVED, &info);
         }
     }
