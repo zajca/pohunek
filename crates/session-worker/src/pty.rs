@@ -1067,17 +1067,19 @@ mod tests {
         StartupLatch, OUTPUT_DRAIN_BATCH_BYTES, READ_CHUNK_BYTES,
     };
     use crate::{InputFragment, InputPlan, OutputEvent, OutputHub, WorkerConfig};
-    use nix::errno::Errno;
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
+    use pohunek_platform::process::{LinuxInspector, ProcessInspector};
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::collections::{HashMap, VecDeque};
     use std::io::Cursor;
     use std::sync::Mutex;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    /// Allows the rollback fixture to create a signal-resistant descendant.
-    const ROLLBACK_CHILD_START_DELAY: Duration = Duration::from_millis(100);
+    /// Bounds observation of the rollback fixture's signal-resistant descendant.
+    const ROLLBACK_CHILD_READY_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Avoids busy-spinning while the rollback fixture creates its descendant.
+    const ROLLBACK_CHILD_READY_POLL: Duration = Duration::from_millis(10);
+    /// Bounds delivery of the rollback kill to both exact process generations.
+    const ROLLBACK_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 
     fn shell(script: &str) -> Command {
         Command {
@@ -1388,8 +1390,8 @@ mod tests {
         assert!(!rendered.contains(secret));
     }
 
-    #[test]
-    fn spawn_guard_kills_the_uncommitted_process_group() {
+    #[tokio::test]
+    async fn spawn_guard_kills_the_uncommitted_process_group() {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -1410,14 +1412,46 @@ mod tests {
         guard.set_process_group(process_group);
         drop(pair.slave);
 
-        std::thread::sleep(ROLLBACK_CHILD_START_DELAY);
+        let inspector = LinuxInspector::new();
+        let root = inspector
+            .identity(pid)
+            .expect("inspect rollback root")
+            .expect("rollback root remains live");
+        let ready_deadline = Instant::now() + ROLLBACK_CHILD_READY_TIMEOUT;
+        let descendant = loop {
+            let descendants = inspector
+                .descendant_identities(root)
+                .expect("inspect rollback descendants");
+            if let Some(descendant) = descendants.into_iter().next() {
+                break descendant;
+            }
+            assert!(
+                Instant::now() < ready_deadline,
+                "rollback fixture did not create its descendant"
+            );
+            tokio::time::sleep(ROLLBACK_CHILD_READY_POLL).await;
+        };
+        assert_eq!(
+            inspector
+                .process(descendant.pid)
+                .expect("inspect rollback descendant")
+                .expect("rollback descendant remains live")
+                .pgid,
+            u32::try_from(process_group).expect("positive process group"),
+            "rollback descendant did not join the owned process group"
+        );
+        let root_exit = inspector.exit_watch(root).expect("watch rollback root");
+        let descendant_exit = inspector
+            .exit_watch(descendant)
+            .expect("watch rollback descendant");
         drop(guard);
 
-        assert_eq!(
-            kill(Pid::from_raw(-process_group), None),
-            Err(Errno::ESRCH),
-            "rollback left a process in the owned group"
-        );
+        tokio::time::timeout(ROLLBACK_EXIT_TIMEOUT, async {
+            tokio::try_join!(root_exit.wait(), descendant_exit.wait())
+        })
+        .await
+        .expect("rollback did not terminate the exact process generations")
+        .expect("rollback exit watch failed");
     }
 
     #[test]
