@@ -760,10 +760,21 @@ async fn session_read_returns_visible_tail_and_truthful_source_fallbacks() {
         let id = created.id.clone();
         SessionReadParams::new(id, Some(source), lines, None).expect("valid read params")
     };
-    let visible = registry
-        .session_read(&read(SessionReadSource::Visible, Some(2)))
-        .await
-        .expect("visible read");
+    let visible_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let visible = loop {
+        let visible = registry
+            .session_read(&read(SessionReadSource::Visible, Some(2)))
+            .await
+            .expect("visible read");
+        if visible.text == "beta\ngamma" {
+            break visible;
+        }
+        assert!(
+            tokio::time::Instant::now() < visible_deadline,
+            "timed out waiting for the shell output: {visible:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert_eq!(visible.text, "beta\ngamma");
     assert!(visible.truncated);
     assert_eq!(visible.source_used, SessionReadSource::Visible);
