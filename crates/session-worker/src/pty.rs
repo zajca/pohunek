@@ -7,7 +7,6 @@ use std::fmt::{Debug, Formatter};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -27,6 +26,7 @@ use rustix::termios::{tcflow, Action};
 use tokio::sync::{watch, Mutex as AsyncMutex};
 use tracing::{event, Level};
 
+use crate::output::OutputCompletion;
 use crate::{OutputEvent, OutputHub, OutputSubscriber, RingError, WriteCoordinator};
 
 /// Blocking PTY read size.
@@ -216,7 +216,6 @@ pub struct PtyOwner {
     output_order: Arc<Mutex<()>>,
     output_reader: Arc<Mutex<Box<dyn Read + Send>>>,
     output_readiness: Arc<OutputReadiness>,
-    output_forced_closed: Arc<AtomicBool>,
     tty_name: Arc<PathBuf>,
     input: WriteCoordinator,
     resize: Arc<AsyncMutex<ResizeState>>,
@@ -229,7 +228,7 @@ enum CleanupState {
     Active,
     AuthorityReleased,
     ForcedClosing,
-    ForcedAuthorityReleased,
+    OutputAuthorityReleased(OutputCompletion),
     ForcedClosed,
     ObservationAuthorityReleased(String),
     ObservationFailed(String),
@@ -463,7 +462,6 @@ impl PtyOwner {
         let reader_output_order = Arc::clone(&output_order);
         let thread_output_reader = Arc::clone(&output_reader);
         let thread_output_readiness = Arc::clone(&output_readiness);
-        let output_forced_closed = Arc::new(AtomicBool::new(false));
         let reader_pid = pid;
         let startup = StartupLatch::default();
         let reader_startup = startup.clone();
@@ -567,7 +565,6 @@ impl PtyOwner {
             output_order,
             output_reader,
             output_readiness,
-            output_forced_closed,
             tty_name,
             input,
             resize: Arc::new(AsyncMutex::new(ResizeState {
@@ -775,11 +772,12 @@ impl PtyOwner {
             CleanupState::Finished(exit) => return Ok(exit.clone()),
             CleanupState::ForcedClosed => return Err(PtyError::OutputForcedClosed),
             CleanupState::ForcedClosing => {
-                self.force_and_release_output(&mut cleanup)?;
-                return self.finish_forced_cleanup(&mut cleanup, grace).await;
+                let completion = self.seal_and_release_output(&mut cleanup)?;
+                return self.finish_sealed_cleanup(&mut cleanup, completion).await;
             }
-            CleanupState::ForcedAuthorityReleased => {
-                return self.finish_forced_cleanup(&mut cleanup, grace).await;
+            CleanupState::OutputAuthorityReleased(completion) => {
+                let completion = *completion;
+                return self.finish_sealed_cleanup(&mut cleanup, completion).await;
             }
             CleanupState::ObservationAuthorityReleased(message) => {
                 let message = message.clone();
@@ -828,8 +826,8 @@ impl PtyOwner {
                         if matches!(&*self.exit_rx.borrow(), Some(RootObservation::Exited(_))) =>
                     {
                         *cleanup = CleanupState::ForcedClosing;
-                        self.force_and_release_output(&mut cleanup)?;
-                        return self.finish_forced_cleanup(&mut cleanup, grace).await;
+                        let completion = self.seal_and_release_output(&mut cleanup)?;
+                        return self.finish_sealed_cleanup(&mut cleanup, completion).await;
                     }
                     Err(_elapsed) => return Err(PtyError::ExitTimeout),
                 }
@@ -851,8 +849,13 @@ impl PtyOwner {
         match &*cleanup {
             CleanupState::Finished(exit) => return Ok(exit.clone()),
             CleanupState::ForcedClosed => return Err(PtyError::OutputForcedClosed),
-            CleanupState::ForcedClosing | CleanupState::ForcedAuthorityReleased => {
-                return Err(PtyError::OutputForcedClosed);
+            CleanupState::ForcedClosing => {
+                let completion = self.seal_and_release_output(&mut cleanup)?;
+                return self.finish_sealed_cleanup(&mut cleanup, completion).await;
+            }
+            CleanupState::OutputAuthorityReleased(completion) => {
+                let completion = *completion;
+                return self.finish_sealed_cleanup(&mut cleanup, completion).await;
             }
             CleanupState::ObservationAuthorityReleased(message)
             | CleanupState::ObservationFailed(message) => {
@@ -899,7 +902,15 @@ impl PtyOwner {
 
     /// Returns whether the reader was closed by the lifecycle deadline.
     pub(crate) fn output_forced_closed(&self) -> bool {
-        self.output_forced_closed.load(Ordering::Acquire)
+        matches!(
+            self.output.completion(),
+            Some(OutputCompletion::ForcedClosed { .. })
+        )
+    }
+
+    /// Returns the immutable PTY output completion once sealed.
+    pub(crate) fn output_completion(&self) -> Option<OutputCompletion> {
+        self.output.completion()
     }
 
     async fn wait_root_and_output(&self) -> Result<Exit, PtyError> {
@@ -923,24 +934,39 @@ impl PtyOwner {
         }
     }
 
-    fn force_output_close(&self) -> Result<(), PtyError> {
-        self.output_forced_closed.store(true, Ordering::Release);
-        self.output_readiness.cancel()
+    fn force_output_close(&self) -> Result<OutputCompletion, PtyError> {
+        let completion = self.output.force_close();
+        self.output_readiness.cancel()?;
+        Ok(completion)
     }
 
-    fn force_and_release_output(&self, cleanup: &mut CleanupState) -> Result<(), PtyError> {
-        self.force_output_close()?;
-        self.release_authority(cleanup, CleanupState::ForcedAuthorityReleased)
-    }
-
-    async fn finish_forced_cleanup(
+    fn seal_and_release_output(
         &self,
         cleanup: &mut CleanupState,
-        deadline: Duration,
+    ) -> Result<OutputCompletion, PtyError> {
+        let completion = self.force_output_close()?;
+        self.release_authority(cleanup, CleanupState::OutputAuthorityReleased(completion))?;
+        Ok(completion)
+    }
+
+    async fn finish_sealed_cleanup(
+        &self,
+        cleanup: &mut CleanupState,
+        completion: OutputCompletion,
     ) -> Result<Exit, PtyError> {
-        let _ = tokio::time::timeout(deadline, self.join_threads()).await;
-        *cleanup = CleanupState::ForcedClosed;
-        Err(PtyError::OutputForcedClosed)
+        match completion {
+            OutputCompletion::Eof { .. } => {
+                let exit = self.wait_exit().await?;
+                self.detach_threads()?;
+                *cleanup = CleanupState::Finished(exit.clone());
+                Ok(exit)
+            }
+            OutputCompletion::ForcedClosed { .. } => {
+                self.detach_threads()?;
+                *cleanup = CleanupState::ForcedClosed;
+                Err(PtyError::OutputForcedClosed)
+            }
+        }
     }
 
     fn finish_observation_failure(
@@ -1378,10 +1404,11 @@ fn lock_result<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, PtyE
 mod tests {
     use super::{
         commit_resize_before_resume, drain_available_output, drain_snapshot_boundary,
-        read_process_start, wait_for_child_status, Command, OutputReadState, OutputReady,
-        OutputReadyState, PtyError, PtyOwner, ResizeCommit, ResizeState, SpawnGuard, StartupLatch,
-        OUTPUT_DRAIN_BATCH_BYTES, READ_CHUNK_BYTES,
+        read_process_start, wait_for_child_status, CleanupState, Command, OutputReadState,
+        OutputReady, OutputReadyState, PtyError, PtyOwner, ResizeCommit, ResizeState, SpawnGuard,
+        StartupLatch, OUTPUT_DRAIN_BATCH_BYTES, READ_CHUNK_BYTES,
     };
+    use crate::output::OutputCompletion;
     use crate::{InputFragment, InputPlan, OutputEvent, OutputHub, WorkerConfig};
     use pohunek_platform::process::{LinuxInspector, ProcessInspector};
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -1629,6 +1656,59 @@ mod tests {
         assert!(
             read_process_start(pty.identity().pid).is_err(),
             "root must be reaped after the final safe group signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn natural_eof_wins_a_concurrent_forced_cleanup() {
+        let barrier = tempfile::tempdir().expect("create EOF race barrier");
+        let ready = barrier.path().join("ready");
+        let pty = spawn(Command {
+            program: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                concat!(
+                    "trap '' HUP; ",
+                    "setsid sh -c 'trap \"\" HUP TERM; ",
+                    "printf ready > \"$2\"; ",
+                    "while [ -d \"$1\" ]; do sleep 0.01; done' escaped \"$1\" \"$2\" & ",
+                    "while [ ! -e \"$2\" ]; do sleep 0.01; done"
+                )
+                .to_owned(),
+                "pohunek-eof-race".to_owned(),
+                barrier.path().to_string_lossy().into_owned(),
+                ready.to_string_lossy().into_owned(),
+            ],
+            env: Vec::new(),
+            cwd: std::env::temp_dir(),
+            cols: 80,
+            rows: 24,
+        });
+        let root_exit = tokio::time::timeout(Duration::from_secs(2), pty.wait_exit())
+            .await
+            .expect("root exit deadline")
+            .expect("root exit");
+        pty.output().mark_exit();
+
+        let mut cleanup = pty.cleanup.lock().await;
+        *cleanup = CleanupState::ForcedClosing;
+        let completion = pty
+            .seal_and_release_output(&mut cleanup)
+            .expect("seal raced output");
+        assert!(matches!(completion, OutputCompletion::Eof { .. }));
+        let finished = pty
+            .finish_sealed_cleanup(&mut cleanup, completion)
+            .await
+            .expect("finish natural winner");
+        drop(cleanup);
+
+        assert_eq!(finished, root_exit);
+        assert!(!pty.output_forced_closed());
+        assert_eq!(
+            pty.stop("repeat-after-natural-winner", Duration::from_millis(50))
+                .await
+                .expect("repeat stop"),
+            root_exit
         );
     }
 

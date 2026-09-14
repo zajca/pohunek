@@ -11,6 +11,7 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+async-io.workspace = true
 nix = { workspace = true, features = ["socket"] }
 rustix = { workspace = true, features = ["process"] }
 

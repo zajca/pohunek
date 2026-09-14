@@ -9,8 +9,8 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use async_io::Async;
 use rustix::process::{pidfd_open, Pid as NativePid, PidfdFlags};
-use tokio::io::unix::AsyncFd;
 
 use super::{
     BootIdentity, Error, ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity,
@@ -185,11 +185,10 @@ impl ProcessInspector for LinuxInspector {
         let fd = pidfd_open(native, PidfdFlags::empty())
             .map_err(|source| process_error(OPERATION, source.into()))?;
         require_identity(identity, euid, OPERATION)?;
-        let fd =
-            AsyncFd::new(fd).map_err(|source| Error::from_io("register_exit_watch", source))?;
+        let fd = Async::new_nonblocking(fd)
+            .map_err(|source| Error::from_io("register_exit_watch", source))?;
         Ok(ExitWatch::from_future(async move {
-            let _ready = fd
-                .readable()
+            fd.readable()
                 .await
                 .map_err(|source| Error::from_io("wait_for_exit", source))?;
             Ok(())
@@ -996,6 +995,31 @@ mod tests {
                 operation: "open_exit_watch"
             })
         ));
+    }
+
+    #[test]
+    fn exit_watch_created_without_tokio_observes_exit_in_runtime_without_io() {
+        let inspector = LinuxInspector::new();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn watched child");
+        let identity = inspector
+            .identity(child.id())
+            .expect("inspect watched child")
+            .expect("watched child exists");
+
+        let watch = inspector
+            .exit_watch(identity)
+            .expect("create exit watch outside Tokio");
+        child.kill().expect("terminate watched child");
+        child.wait().expect("reap watched child");
+
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime without I/O driver")
+            .block_on(watch.wait())
+            .expect("observe exit without Tokio I/O driver");
     }
 
     #[test]

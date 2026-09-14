@@ -43,6 +43,7 @@ use crate::journal::{
     SubagentPhase as JournalSubagentPhase, SubagentRecord,
 };
 use crate::launch::{self, LaunchClaimStatus};
+use crate::output::OutputCompletion;
 use crate::{
     Command, ControllerLease, Exit, InputFragment, InputPlan, Journal, LeaseError, LeaseOwner,
     OutputChunk, OutputEvent, ProcessIdentity, PtyError, PtyOwner, WorkerConfig, WorkerError,
@@ -1483,12 +1484,6 @@ fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: Runtim
     ));
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutputCompletion {
-    Eof { next_offset: u64 },
-    ForcedClosed { next_offset: u64 },
-}
-
 async fn monitor_runtime_output(
     shared: &Shared,
     pty: &PtyOwner,
@@ -1515,10 +1510,17 @@ async fn monitor_runtime_output(
                 });
             }
             Some(OutputEvent::Exit { next_offset }) => {
-                if pty.output_forced_closed() {
-                    return Ok(OutputCompletion::ForcedClosed { next_offset });
+                let completion = pty.output_completion().ok_or_else(|| {
+                    WorkerError::Protocol(
+                        "PTY output closed without a completion record".to_owned(),
+                    )
+                })?;
+                if completion.next_offset() != next_offset {
+                    return Err(WorkerError::Protocol(
+                        "PTY output completion offset changed after closure".to_owned(),
+                    ));
                 }
-                return Ok(OutputCompletion::Eof { next_offset });
+                return Ok(completion);
             }
             None => {
                 return Err(WorkerError::Protocol(
@@ -1529,10 +1531,6 @@ async fn monitor_runtime_output(
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "root exit, bounded PTY drain, cleanup, and durable publication form one ordered lifecycle"
-)]
 async fn coordinate_runtime_completion(
     shared: Arc<Shared>,
     pty: PtyOwner,
@@ -1558,45 +1556,10 @@ async fn coordinate_runtime_completion(
         )
     };
     let exited_at = timestamp();
-    let output_completion =
-        match tokio::time::timeout(shared.config.post_exit_drain_timeout, &mut output_eof_rx).await
-        {
-            Ok(completion) => completion,
-            Err(_elapsed) => {
-                event!(
-                    name: "worker.pty.drain.expired",
-                    Level::WARN,
-                    process.pid = pty.identity().pid,
-                    "PTY drain deadline expired; terminating the retained process group",
-                );
-                let grace = {
-                    let state = shared.state.lock().await;
-                    state.stop_grace
-                };
-                if let Err(error) = pty.stop("natural-drain-timeout", grace).await {
-                    if !matches!(error, PtyError::OutputForcedClosed) {
-                        mark_runtime_faulted(&shared, runtime_id, WorkerError::Pty(error)).await;
-                        shared.shutdown.cancel();
-                        return;
-                    }
-                }
-                output_eof_rx.await
-            }
-        };
-    let completion = match output_completion {
-        Ok(Ok(completion)) => completion,
-        Ok(Err(error)) => {
+    let completion = match wait_for_output_completion(&shared, &pty, &mut output_eof_rx).await {
+        Ok(completion) => completion,
+        Err(error) => {
             mark_runtime_faulted(&shared, runtime_id, error).await;
-            shared.shutdown.cancel();
-            return;
-        }
-        Err(_closed) => {
-            mark_runtime_faulted(
-                &shared,
-                runtime_id,
-                WorkerError::Protocol("PTY output monitor stopped before EOF".to_owned()),
-            )
-            .await;
             shared.shutdown.cancel();
             return;
         }
@@ -1640,6 +1603,43 @@ async fn coordinate_runtime_completion(
         () = tokio::time::sleep(retention) => shared.shutdown.cancel(),
         () = shared.shutdown.cancelled() => {}
     }
+}
+
+async fn wait_for_output_completion(
+    shared: &Shared,
+    pty: &PtyOwner,
+    output_eof_rx: &mut oneshot::Receiver<Result<OutputCompletion, WorkerError>>,
+) -> Result<OutputCompletion, WorkerError> {
+    let completion =
+        match tokio::time::timeout(shared.config.post_exit_drain_timeout, output_eof_rx).await {
+            Ok(Ok(Ok(completion))) => completion,
+            Ok(Ok(Err(error))) => return Err(error),
+            Ok(Err(_closed)) => pty.output_completion().ok_or_else(|| {
+                WorkerError::Protocol("PTY output monitor stopped before EOF".to_owned())
+            })?,
+            Err(_elapsed) => {
+                event!(
+                    name: "worker.pty.drain.expired",
+                    Level::WARN,
+                    process.pid = pty.identity().pid,
+                    "PTY drain deadline expired; terminating the retained process group",
+                );
+                let grace = {
+                    let state = shared.state.lock().await;
+                    state.stop_grace
+                };
+                match pty.stop("natural-drain-timeout", grace).await {
+                    Ok(_) | Err(PtyError::OutputForcedClosed) => {}
+                    Err(error) => return Err(WorkerError::Pty(error)),
+                }
+                pty.output_completion().ok_or_else(|| {
+                    WorkerError::Protocol(
+                        "PTY cleanup returned without sealing output completion".to_owned(),
+                    )
+                })?
+            }
+        };
+    Ok(completion)
 }
 
 async fn retry_runtime_completion(
@@ -4322,6 +4322,72 @@ mod tests {
             super::process_start(pty.identity().pid).is_err(),
             "root must be reaped after automatic cleanup"
         );
+    }
+
+    #[tokio::test]
+    async fn forced_output_completion_does_not_wait_for_the_output_monitor() {
+        let directory = BarrierDirectory::new();
+        let ready = directory.path().join("held-monitor-ready");
+        let config = crate::WorkerConfig {
+            post_exit_drain_timeout: Duration::from_millis(50),
+            stop_grace: Duration::from_millis(50),
+            ..crate::WorkerConfig::new()
+        };
+        let server = super::Server::bind(super::ServerArgs {
+            session_id: "s-115".to_owned(),
+            worker_id: "worker-held-monitor".to_owned(),
+            socket_path: directory.path().join("worker.sock"),
+            journal_path: directory.path().join("journal.json"),
+            daemon_socket_path: directory.path().join("daemon.sock"),
+            config: config.clone(),
+        })
+        .await
+        .expect("bind worker");
+        let pty = super::spawn_pty(
+            crate::Command {
+                program: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    concat!(
+                        "trap '' HUP; ",
+                        "setsid sh -c 'trap \"\" HUP TERM; printf ready > \"$2\"; ",
+                        "while [ -d \"$1\" ]; do sleep 0.01; done' escaped \"$1\" \"$2\" & ",
+                        "while [ ! -e \"$2\" ]; do sleep 0.01; done; ",
+                        "printf 'root-exited\\n'"
+                    )
+                    .to_owned(),
+                    "pohunek-held-monitor".to_owned(),
+                    directory.path().to_string_lossy().into_owned(),
+                    ready.to_string_lossy().into_owned(),
+                ],
+                env: Vec::new(),
+                cwd: directory.path().to_path_buf(),
+                cols: 80,
+                rows: 24,
+            },
+            &config,
+        )
+        .expect("spawn PTY");
+        server.shared.state.lock().await.stop_grace = config.stop_grace;
+        tokio::time::timeout(Duration::from_secs(2), pty.wait_exit())
+            .await
+            .expect("root exit deadline")
+            .expect("root exit");
+
+        let (_output_eof_tx, mut output_eof_rx) = tokio::sync::oneshot::channel();
+        let completion = tokio::time::timeout(
+            Duration::from_secs(1),
+            super::wait_for_output_completion(&server.shared, &pty, &mut output_eof_rx),
+        )
+        .await
+        .expect("forced completion deadline")
+        .expect("forced completion");
+
+        assert!(matches!(
+            completion,
+            crate::output::OutputCompletion::ForcedClosed { next_offset }
+                if next_offset == pty.output().next_offset() && next_offset > 0
+        ));
     }
 
     #[tokio::test]

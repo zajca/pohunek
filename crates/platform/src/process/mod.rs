@@ -348,9 +348,12 @@ pub trait ProcessInspector: Debug + Send + Sync + 'static {
 
     /// Arms an exit watch for one exact process identity.
     ///
+    /// Implementations must not require an active async runtime while arming
+    /// the watch. Runtime or reactor limitations are reported as typed errors.
+    ///
     /// # Errors
     ///
-    /// Returns typed registration failures.
+    /// Returns typed identity, facility, or registration failures.
     fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, Error>;
 
     /// Returns only the allowlisted Pohunek environment markers.
