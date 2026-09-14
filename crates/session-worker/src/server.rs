@@ -1479,11 +1479,7 @@ fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: Runtim
 }
 
 async fn wait_runtime_exit(pty: &PtyOwner) -> Result<Exit, PtyError> {
-    let exit = pty.wait_exit().await;
-    // Child exit is authoritative even while descendants keep the slave PTY
-    // open, so observation waiters cannot depend on master EOF.
-    pty.output().mark_exit();
-    exit
+    pty.wait_exit().await
 }
 
 async fn mark_runtime_faulted(shared: &Shared, runtime_id: RuntimeId, error: WorkerError) {
@@ -1815,8 +1811,10 @@ where
     W: AsyncWrite + Unpin + Send,
 {
     let output = pty.output();
+    let mut runtime_exit = pty.exit_receiver();
     let outcome = await_observation_page(
         output,
+        &mut runtime_exit,
         after_offset,
         observation,
         &shared.shutdown,
@@ -1895,8 +1893,13 @@ enum ObservationWaitOutcome {
     InvalidInput,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "observation waiting keeps output, root lifecycle, lease, shutdown, and peer I/O cancellation sources explicit"
+)]
 async fn await_observation_page<R>(
     output: &crate::OutputHub,
+    runtime_exit: &mut watch::Receiver<Option<Exit>>,
     after_offset: Option<u64>,
     observation: ObservationGrant,
     shutdown: &CancellationToken,
@@ -1920,7 +1923,7 @@ where
             && page.start_offset == page.runtime_end_offset
             && !page.exited
             && !observation.wait.is_zero();
-        if !waiting_at_end {
+        if !waiting_at_end || runtime_exit.borrow().is_some() {
             if *lease_epoch.borrow() != expected_lease_epoch {
                 return Ok(ObservationWaitOutcome::LeaseReleased);
             }
@@ -1933,6 +1936,20 @@ where
             () = output.wait_for_observation(page.runtime_end_offset, shutdown) => {
                 if shutdown.is_cancelled() {
                     return Ok(ObservationWaitOutcome::Shutdown);
+                }
+            }
+            changed = runtime_exit.changed() => {
+                if changed.is_err() {
+                    return Ok(ObservationWaitOutcome::Shutdown);
+                }
+                if runtime_exit.borrow().is_some() {
+                    let final_page = output
+                        .observe(after_offset, observation.max_bytes)
+                        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+                    return Ok(ObservationWaitOutcome::Page {
+                        page: final_page,
+                        timed_out: false,
+                    });
                 }
             }
             changed = lease_epoch.changed() => {
@@ -1956,7 +1973,8 @@ where
                 let final_page = output
                     .observe(after_offset, observation.max_bytes)
                     .map_err(|error| WorkerError::Protocol(error.to_string()))?;
-                let timed_out = observation_timed_out(after_offset, &final_page);
+                let timed_out = runtime_exit.borrow().is_none()
+                    && observation_timed_out(after_offset, &final_page);
                 return Ok(ObservationWaitOutcome::Page { page: final_page, timed_out });
             }
         }
@@ -3399,6 +3417,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::task::Poll;
     use std::time::Duration;
 
     use super::{
@@ -3412,8 +3432,6 @@ mod tests {
         ControlInputId, DataGrant, ObservationGrant, ObservationWaitOutcome, PrefixStream,
         TokenState, WireTerminalSnapshot,
     };
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
     use pohunek_worker_protocol::{
         self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
         ControlResponse, Cursor, DataToken, Dimensions, EventKind, FrameHeader, FrameKind, LeaseId,
@@ -3429,6 +3447,33 @@ mod tests {
 
     /// Extra bytes force exactly one partial frame after a full wire payload.
     const OVERSIZED_PAYLOAD_EXTRA: usize = 257;
+
+    struct BarrierDirectory(std::path::PathBuf);
+
+    impl BarrierDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(random_value("output-barrier").unwrap());
+            std::fs::create_dir(&path).expect("create output barrier directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for BarrierDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn pending_runtime_exit() -> (
+        watch::Sender<Option<crate::Exit>>,
+        watch::Receiver<Option<crate::Exit>>,
+    ) {
+        watch::channel(None)
+    }
 
     async fn launch_claim_fixture() -> (super::Server, crate::PtyOwner, std::path::PathBuf) {
         let directory = std::env::temp_dir().join(random_value("worker-claim").unwrap());
@@ -3544,6 +3589,57 @@ mod tests {
             Some("continuation")
         );
         assert!(committed.pending_launch_claims.is_empty());
+        pty.stop("test-cleanup", server.shared.config.stop_grace)
+            .await
+            .unwrap();
+        drop(server);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn immediate_launch_rejection_commits_fence_before_acknowledgment() {
+        let (server, pty, directory) = launch_claim_fixture().await;
+        let mut bytes = Vec::new();
+        super::serve_identity_hook_with_probe(
+            std::sync::Arc::clone(&server.shared),
+            &mut super::ControlWriter::new(&mut bytes),
+            launch_report(&pty, 1, "original"),
+            |_| Ok(false),
+        )
+        .await
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            response,
+            serde_json::json!({"ok": true, "launch_identity_accepted": false, "launch_identity_status": "rejected"})
+        );
+        let committed = server.shared.journal.load().unwrap();
+        assert!(committed.launch_identity.is_none());
+        assert_eq!(committed.pending_launch_claims.len(), 1);
+        assert!(!committed.pending_launch_claims[0].retry_pending);
+        assert_eq!(
+            committed.pending_launch_claims[0].identity.native_reference,
+            "original"
+        );
+
+        bytes.clear();
+        super::serve_identity_hook_with_probe(
+            std::sync::Arc::clone(&server.shared),
+            &mut super::ControlWriter::new(&mut bytes),
+            launch_report(&pty, 2, "replacement"),
+            |_| panic!("rejection fence must not be reprobed"),
+        )
+        .await
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["launch_identity_status"], "rejected");
+        let committed = server.shared.journal.load().unwrap();
+        assert!(committed.launch_identity.is_none());
+        assert_eq!(
+            committed.pending_launch_claims[0].identity.native_reference,
+            "original"
+        );
+
         pty.stop("test-cleanup", server.shared.config.stop_grace)
             .await
             .unwrap();
@@ -3767,15 +3863,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_exit_wakes_observation_while_a_descendant_holds_the_slave_pty() {
+    async fn root_exit_preserves_descendant_output_until_pty_eof() {
         let config = crate::WorkerConfig::new();
+        let barrier = BarrierDirectory::new();
+        let release = barrier.path().join("release");
         let pty = crate::PtyOwner::spawn(
             crate::Command {
                 program: "/bin/sh".to_owned(),
                 args: vec![
                     "-c".to_owned(),
-                    "(trap '' HUP; sleep 30) & printf 'descendant:%s\\n' \"$!\"; sleep 1"
-                        .to_owned(),
+                    concat!(
+                        "trap '' HUP; (",
+                        "while [ ! -e \"$1\" ] && [ -d \"$2\" ]; do sleep 0.01; done; ",
+                        "if [ -e \"$1\" ]; then printf 'late-descendant-output\\n'; fi) & ",
+                        "printf 'root-exited:%s\\n' \"$!\""
+                    )
+                    .to_owned(),
+                    "pohunek-descendant-output".to_owned(),
+                    release.to_string_lossy().into_owned(),
+                    barrier.path().to_string_lossy().into_owned(),
                 ],
                 env: Vec::new(),
                 cwd: std::env::temp_dir(),
@@ -3787,32 +3893,44 @@ mod tests {
             config.input_dedup_entries,
         )
         .expect("spawn PTY");
+        let mut subscriber = pty.subscribe_output(Some(0)).expect("subscribe output");
 
         tokio::time::timeout(Duration::from_secs(3), wait_runtime_exit(&pty))
             .await
             .expect("root process exit deadline")
             .expect("root process exit");
         let page = pty.output().observe(None, 1_024).expect("output page");
-        assert!(page.exited, "root exit must be authoritative for output");
-        let rendered = String::from_utf8_lossy(&page.bytes);
-        let descendant = rendered
-            .split_whitespace()
-            .find_map(|field| field.strip_prefix("descendant:"))
-            .and_then(|pid| pid.parse::<i32>().ok())
-            .expect("descendant PID in PTY output");
-        let descendant = Pid::from_raw(descendant);
-        assert!(
-            kill(descendant, None).is_ok(),
-            "descendant must still hold the slave PTY when the root exits"
-        );
-        let _ = kill(descendant, Signal::SIGKILL);
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            pty.stop("cleanup-descendant", Duration::from_millis(100)),
-        )
+        assert!(!page.exited, "root exit must not claim PTY EOF");
+        std::fs::write(&release, b"release").expect("release descendant output");
+
+        let (observed, final_offset) = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut observed = Vec::new();
+            loop {
+                match subscriber.recv().await.expect("output event before EOF") {
+                    crate::OutputEvent::Replay(chunk) | crate::OutputEvent::Output(chunk) => {
+                        observed.extend_from_slice(&chunk.bytes);
+                    }
+                    crate::OutputEvent::TerminalSnapshot(chunk) => {
+                        observed.extend_from_slice(&chunk.bytes);
+                    }
+                    crate::OutputEvent::Gap { .. } => observed.clear(),
+                    crate::OutputEvent::Exit { next_offset } => break (observed, next_offset),
+                }
+            }
+        })
         .await
-        .expect("descendant cleanup deadline")
-        .expect("descendant cleanup");
+        .expect("descendant output and EOF deadline");
+        assert!(
+            String::from_utf8_lossy(&observed).contains("late-descendant-output"),
+            "subscriber missed output produced after root exit"
+        );
+        assert_eq!(final_offset, pty.output().next_offset());
+        let page = pty
+            .output()
+            .observe(None, 1_024)
+            .expect("final output page");
+        assert!(page.exited, "reader EOF must close output");
+        assert_eq!(page.runtime_end_offset, final_offset);
     }
 
     #[test]
@@ -4266,6 +4384,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_exit_releases_observation_without_claiming_output_eof() {
+        let output = crate::OutputHub::new(64, 64, 2, 10).expect("output hub");
+        let shutdown = CancellationToken::new();
+        let (runtime_exit_tx, mut runtime_exit) = watch::channel(None);
+        let (_lease_tx, mut lease_rx) = watch::channel(0_u64);
+        let (mut reader, _writer) = tokio::io::duplex(64);
+        let waiting = await_observation_page(
+            &output,
+            &mut runtime_exit,
+            Some(0),
+            ObservationGrant {
+                max_bytes: 64,
+                wait: Duration::from_secs(10),
+            },
+            &shutdown,
+            0,
+            &mut lease_rx,
+            &mut reader,
+        );
+        tokio::pin!(waiting);
+        std::future::poll_fn(|context| {
+            assert!(
+                waiting.as_mut().poll(context).is_pending(),
+                "observation unexpectedly completed before root exit"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        runtime_exit_tx.send_replace(Some(crate::Exit {
+            exit_code: Some(0),
+            signal: None,
+            success: true,
+        }));
+
+        let outcome = tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+            .await
+            .expect("root exit releases observation")
+            .expect("observation result");
+        assert!(matches!(
+            outcome,
+            ObservationWaitOutcome::Page {
+                page: crate::ObservationPage { exited: false, .. },
+                timed_out: false,
+            }
+        ));
+        output
+            .push(b"late-output")
+            .expect("root exit leaves output open");
+    }
+
+    #[tokio::test]
+    async fn completed_root_before_observation_registration_returns_without_eof() {
+        let output = crate::OutputHub::new(64, 64, 2, 10).expect("output hub");
+        let shutdown = CancellationToken::new();
+        let (_runtime_exit_tx, mut runtime_exit) = watch::channel(Some(crate::Exit {
+            exit_code: Some(0),
+            signal: None,
+            success: true,
+        }));
+        let (_lease_tx, mut lease_rx) = watch::channel(0_u64);
+        let (mut reader, _writer) = tokio::io::duplex(64);
+
+        let outcome = await_observation_page(
+            &output,
+            &mut runtime_exit,
+            Some(0),
+            ObservationGrant {
+                max_bytes: 64,
+                wait: Duration::from_secs(10),
+            },
+            &shutdown,
+            0,
+            &mut lease_rx,
+            &mut reader,
+        )
+        .await
+        .expect("observation result");
+        assert!(matches!(
+            outcome,
+            ObservationWaitOutcome::Page {
+                page: crate::ObservationPage { exited: false, .. },
+                timed_out: false,
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn waiting_observation_releases_on_disconnect_lease_and_shutdown() {
         let output = crate::OutputHub::new(64, 64, 2, 10).expect("output hub");
         let shutdown = CancellationToken::new();
@@ -4273,10 +4478,12 @@ mod tests {
         let (mut disconnected_reader, disconnected_writer) = tokio::io::duplex(64);
         drop(disconnected_writer);
         let (_lease_tx, mut lease_rx) = watch::channel(0_u64);
+        let (_runtime_exit_tx, mut runtime_exit) = pending_runtime_exit();
         let disconnected = tokio::time::timeout(
             Duration::from_millis(100),
             await_observation_page(
                 &output,
+                &mut runtime_exit,
                 Some(0),
                 ObservationGrant {
                     max_bytes: 64,
@@ -4299,11 +4506,13 @@ mod tests {
             .expect("retained output");
         let (mut lease_reader, _lease_writer) = tokio::io::duplex(64);
         let (lease_tx, mut lease_rx) = watch::channel(0_u64);
+        let (_runtime_exit_tx, mut runtime_exit) = pending_runtime_exit();
         // The receiver is registered before redemption. Releasing here models
         // the exact handoff gap before observation wait registration.
         lease_tx.send_replace(1);
         let released = await_observation_page(
             &released_output,
+            &mut runtime_exit,
             Some(0),
             ObservationGrant {
                 max_bytes: 64,
@@ -4320,8 +4529,10 @@ mod tests {
 
         let (mut timeout_reader, _timeout_writer) = tokio::io::duplex(64);
         let (_lease_tx, mut lease_rx) = watch::channel(0_u64);
+        let (_runtime_exit_tx, mut runtime_exit) = pending_runtime_exit();
         let timed_out = await_observation_page(
             &output,
+            &mut runtime_exit,
             Some(0),
             ObservationGrant {
                 max_bytes: 64,
@@ -4344,9 +4555,11 @@ mod tests {
 
         let (mut shutdown_reader, _shutdown_writer) = tokio::io::duplex(64);
         let (_lease_tx, mut lease_rx) = watch::channel(0_u64);
+        let (_runtime_exit_tx, mut runtime_exit) = pending_runtime_exit();
         shutdown.cancel();
         let stopped = await_observation_page(
             &output,
+            &mut runtime_exit,
             Some(0),
             ObservationGrant {
                 max_bytes: 64,

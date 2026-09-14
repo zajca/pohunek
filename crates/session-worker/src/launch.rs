@@ -51,15 +51,20 @@ pub(crate) fn submit(
             journal.pending_launch_claims.clear();
             Ok(LaunchClaimStatus::Accepted)
         }
-        Ok(false) => Ok(LaunchClaimStatus::Rejected),
-        Err(_) => {
+        outcome => {
             if journal.pending_launch_claims.len() >= capacity {
                 return Err(WorkerError::Protocol(
                     "pending launch claim capacity exhausted".to_owned(),
                 ));
             }
+            let mut claim = claim;
+            claim.retry_pending = outcome.is_err();
             journal.pending_launch_claims.push(claim);
-            Ok(LaunchClaimStatus::Pending)
+            Ok(if outcome.is_err() {
+                LaunchClaimStatus::Pending
+            } else {
+                LaunchClaimStatus::Rejected
+            })
         }
     }
 }
@@ -231,6 +236,41 @@ mod tests {
     }
 
     #[test]
+    fn immediate_rejection_persists_an_immutable_fence() {
+        let (mut journal, claim, now) = fixture();
+        assert_eq!(
+            submit(&mut journal, claim.clone(), 1, |_| Ok(false)).unwrap(),
+            LaunchClaimStatus::Rejected
+        );
+        assert_eq!(journal.pending_launch_claims.len(), 1);
+        assert!(!journal.pending_launch_claims[0].retry_pending);
+
+        let mut journal: JournalRecord =
+            serde_json::from_slice(&serde_json::to_vec(&journal).unwrap()).unwrap();
+        assert!(!retry(&mut journal, now, |_| panic!(
+            "rejection fence must not be retried"
+        )));
+        for reference in ["first-reference", "replacement-reference"] {
+            let mut later = claim.clone();
+            later.identity.native_reference = reference.into();
+            assert_eq!(
+                submit(&mut journal, later, 1, |_| panic!(
+                    "rejection fence must not be reprobed"
+                ))
+                .unwrap(),
+                LaunchClaimStatus::Rejected
+            );
+        }
+        assert_eq!(
+            journal.pending_launch_claims,
+            vec![PendingLaunchClaim {
+                retry_pending: false,
+                ..claim
+            }]
+        );
+    }
+
+    #[test]
     fn duplicate_does_not_extend_expiry_and_capacity_fails_before_acknowledgment() {
         let (mut journal, claim, _) = fixture();
         submit(&mut journal, claim.clone(), 1, unavailable).unwrap();
@@ -246,5 +286,20 @@ mod tests {
         let error = submit(&mut journal, other, 1, unavailable).unwrap_err();
         assert!(error.to_string().contains("capacity exhausted"));
         assert_eq!(journal.pending_launch_claims.len(), 1);
+    }
+
+    #[test]
+    fn immediate_rejection_capacity_failure_leaves_the_journal_unchanged() {
+        let (mut journal, first, _) = fixture();
+        assert_eq!(
+            submit(&mut journal, first.clone(), 1, |_| Ok(false)).unwrap(),
+            LaunchClaimStatus::Rejected
+        );
+        let before = journal.clone();
+        let mut second = first;
+        second.identity.process.pid += 1;
+        let error = submit(&mut journal, second, 1, |_| Ok(false)).unwrap_err();
+        assert!(error.to_string().contains("capacity exhausted"));
+        assert_eq!(journal, before);
     }
 }

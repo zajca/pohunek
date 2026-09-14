@@ -777,6 +777,11 @@ impl PtyOwner {
         }
     }
 
+    /// Subscribes to the root-process lifecycle without conflating it with PTY EOF.
+    pub(crate) fn exit_receiver(&self) -> watch::Receiver<Option<Exit>> {
+        self.exit_rx.clone()
+    }
+
     fn signal_group(&self, signal: Signal) -> Result<(), PtyError> {
         match read_process_start(self.identity.pid) {
             Ok(start) if start == self.identity.start_identity => {}

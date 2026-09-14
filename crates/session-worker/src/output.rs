@@ -31,6 +31,9 @@ pub enum RingError {
         /// Current next offset.
         next: u64,
     },
+    /// Bytes were submitted after the PTY output reached EOF.
+    #[error("runtime output is already closed")]
+    Closed,
 }
 
 /// Contiguous PTY output with its runtime offset.
@@ -203,6 +206,9 @@ impl OutputHub {
     /// Returns [`RingError::OffsetOverflow`] instead of wrapping offsets.
     pub fn push(&self, bytes: &[u8]) -> Result<OutputChunk, RingError> {
         let mut state = lock(&self.inner);
+        if state.exited && !bytes.is_empty() {
+            return Err(RingError::Closed);
+        }
         let chunk = state.ring.push(bytes)?;
         if bytes.is_empty() {
             return Ok(chunk);
@@ -314,6 +320,9 @@ impl OutputHub {
     /// Marks output EOF and wakes every subscriber.
     pub fn mark_exit(&self) {
         let mut state = lock(&self.inner);
+        if state.exited {
+            return;
+        }
         state.exited = true;
         let next_offset = state.ring.next_offset;
         for weak in state.subscribers.drain(..) {
@@ -747,7 +756,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutputEvent, OutputHub, OutputSnapshot};
+    use super::{OutputEvent, OutputHub, OutputSnapshot, RingError};
     use pohunek_terminal::TerminalSnapshot;
     use pohunek_worker_protocol::MAX_DATA_PAYLOAD_BYTES;
 
@@ -806,6 +815,27 @@ mod tests {
         let exited = hub.observe(Some(0), 64).expect("empty exited page");
         assert!(exited.bytes.is_empty());
         assert!(exited.exited);
+    }
+
+    #[tokio::test]
+    async fn eof_is_idempotent_and_rejects_late_output() {
+        let hub = OutputHub::new(64, 64, 2, 10).expect("hub");
+        hub.push(b"complete").expect("push before EOF");
+        let mut subscriber = hub.subscribe(Some(0)).expect("subscribe");
+        hub.mark_exit();
+        hub.mark_exit();
+
+        assert_eq!(hub.push(b"late"), Err(RingError::Closed));
+        assert_eq!(hub.next_offset(), 8);
+        assert!(matches!(
+            subscriber.recv().await,
+            Some(OutputEvent::Replay(chunk)) if chunk.bytes == b"complete"
+        ));
+        assert_eq!(
+            subscriber.recv().await,
+            Some(OutputEvent::Exit { next_offset: 8 })
+        );
+        assert_eq!(subscriber.recv().await, None);
     }
 
     #[test]
