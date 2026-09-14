@@ -779,12 +779,20 @@ impl SessionRegistry {
             return;
         };
         let mut retry_identity = false;
+        let mut root_missing_during_drain = false;
         if snapshot.launch_identity.is_some() || snapshot.active_identity.is_some() {
             if let Err(failure) =
                 validate_worker_identity_processes(&*self.inner.inspector, &snapshot)
             {
                 let (reason, retryable) = failure.reason_and_retryability();
-                if retryable {
+                if failure.is_missing_root() {
+                    tracing::debug!(
+                        session_id = %id.0,
+                        reason,
+                        "preserving durable identity while an adopted worker drains its PTY"
+                    );
+                    root_missing_during_drain = true;
+                } else if retryable {
                     tracing::debug!(
                         session_id = %id.0,
                         reason,
@@ -798,7 +806,7 @@ impl SessionRegistry {
                 }
             }
         }
-        let identity_projection = if retry_identity {
+        let identity_projection = if root_missing_during_drain || retry_identity {
             clear_active_identity(&mut record.info);
             WorkerIdentityProjection::unreported()
         } else {
@@ -972,7 +980,18 @@ impl SessionRegistry {
             config: detector_config_rx,
             preview: detector_preview_rx,
         });
-        self.spawn_procwatch(id.clone(), child.pid, procwatch_cancel, procwatch_rescan);
+        if !root_missing_during_drain {
+            self.spawn_procwatch(
+                id.clone(),
+                expected.clone(),
+                crate::procwatch::ProcessIdentity {
+                    pid: child.pid,
+                    start_identity: crate::procwatch::StartIdentity::new(child.start_identity),
+                },
+                procwatch_cancel,
+                procwatch_rescan,
+            );
+        }
         self.spawn_worker_exit_watcher(id, worker, expected, runtime_watch_cancel);
         if let Some(previous_runtime_id) = native_recovery {
             self.emit_native_recovered(&info, previous_runtime_id);
@@ -1425,6 +1444,10 @@ impl IdentityValidationFailure {
             Self::Retryable(reason) => (reason, true),
             Self::Permanent(reason) => (reason, false),
         }
+    }
+
+    fn is_missing_root(self) -> bool {
+        self == Self::Permanent("identity_process_root_missing")
     }
 }
 
@@ -2152,6 +2175,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use base64::Engine as _;
     use pohunek_session_worker::{
         ChildIdentity as JournalChildIdentity, Journal, JournalRecord,
         RuntimeOutcome as JournalRuntimeOutcome, RuntimePhase as JournalRuntimePhase, Server,
@@ -2198,6 +2222,16 @@ mod tests {
             .expect("time after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("ph-rec-{}-{nanos}", std::process::id()))
+    }
+
+    struct ReleaseFiles(Vec<PathBuf>);
+
+    impl Drop for ReleaseFiles {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::write(path, b"release");
+            }
+        }
     }
 
     #[derive(Debug, Default)]
@@ -2735,6 +2769,196 @@ mod tests {
             .stop(&SessionId(session_id.to_owned()))
             .await
             .expect("stop adopted worker");
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "draining restart test owns the worker, durable identity, and output barriers"
+    )]
+    async fn replacement_registry_adopts_native_identity_while_worker_drains_pty() {
+        let root = temp_root();
+        let runtime_root = root.join("runtime/workers");
+        let session_id = "s-210";
+        let worker_id = "worker-draining-restart";
+        let root_release = root.join("root-release");
+        let root_exited = root.join("root-exited");
+        let descendant_release = root.join("descendant-release");
+        let _release_files = ReleaseFiles(vec![root_release.clone(), descendant_release.clone()]);
+        let command = format!(
+            concat!(
+                "trap '' HUP; root_pid=$$; (",
+                "while kill -0 \"$root_pid\" 2>/dev/null; do sleep 0.01; done; ",
+                "printf exited > '{}'; ",
+                "while [ ! -e '{}' ]; do sleep 0.01; done; ",
+                "printf 'late-restart-output\\n') & ",
+                "while [ ! -e '{}' ]; do sleep 0.01; done"
+            ),
+            root_exited.display(),
+            descendant_release.display(),
+            root_release.display(),
+        );
+        let (controller, runtime_id, child_pid, server_task) =
+            spawn_initialized_worker_with_command(
+                &root,
+                &runtime_root,
+                session_id,
+                worker_id,
+                command,
+            )
+            .await;
+        let socket = controller.socket_path().to_path_buf();
+        let child = controller
+            .inspect()
+            .await
+            .expect("inspect initialized worker")
+            .child_process
+            .expect("worker child identity");
+        let expires_at = (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+            .format(&Rfc3339)
+            .expect("format identity expiry");
+        assert!(
+            send_identity_hook(
+                &socket,
+                serde_json::json!({
+                    "type": "identity_report",
+                    "runtime_id": runtime_id.as_str(),
+                    "provider": "codex",
+                    "pid": child.pid,
+                    "start_identity": child.start_identity,
+                    "sequence": 1,
+                    "expires_at": expires_at,
+                    "reference_kind": "id",
+                    "native_reference": "native-before-drain"
+                }),
+            )
+            .await,
+            "worker accepts the durable native identity fixture"
+        );
+
+        let mut record = identity_record();
+        record.session_id = session_id.to_owned();
+        record.info.id = SessionId(session_id.to_owned());
+        record.info.agent = "shell".to_owned();
+        record.info.agent_base = AgentKind::Shell;
+        record.info.cwd = root.clone();
+        record.info.pid = child_pid;
+        record.info.active_agent = Some("codex".to_owned());
+        record.info.active_agent_base = Some(AgentKind::Codex);
+        record.info.active_agent_pid = Some(child_pid);
+        record.info.active_agent_session_id = Some("native-before-drain".to_owned());
+        record.info.native_session_id = Some("native-before-drain".to_owned());
+        let info_runtime = record.info.runtime.as_mut().expect("runtime info");
+        info_runtime.worker_id = Some(worker_id.to_owned());
+        info_runtime.runtime_id = Some(runtime_id.to_string());
+        record.runtime.worker_id = Some(worker_id.to_owned());
+        record.runtime.runtime_id = Some(runtime_id.to_string());
+        record.native_identity_ordering = Some(NativeIdentityOrdering {
+            runtime_id: runtime_id.to_string(),
+            pid: child.pid,
+            pid_start_identity: child.start_identity,
+            sequence: 1,
+        });
+        let recovery = record.recovery.as_mut().expect("recovery binding");
+        recovery.session_id = session_id.to_owned();
+        recovery.agent = "shell".to_owned();
+        recovery.agent_base = AgentKind::Shell;
+        recovery.cwd = root.clone();
+        recovery.program = "/bin/sh".to_owned();
+        recovery.args = vec!["-c".to_owned(), "draining fixture".to_owned()];
+        recovery.native_session_id = Some("native-before-drain".to_owned());
+        let store_path = root.join("data/metadata.jsonl");
+        Store::new(store_path.clone())
+            .record_session(&record)
+            .expect("persist draining logical record");
+
+        std::fs::write(&root_release, b"release").expect("release root process");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !root_exited.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for identity-safe root exit"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(controller);
+
+        let replacement = SessionRegistry::new(SessionRegistryConfig {
+            store_path: Some(store_path),
+            worker_runtime_root: Some(runtime_root),
+            procwatch_poll: Duration::from_secs(60),
+            ..SessionRegistryConfig::default()
+        });
+        Box::pin(replacement.reconcile_workers())
+            .await
+            .expect("adopt worker while PTY drains");
+        let adopted = replacement
+            .inspect(&SessionId(session_id.to_owned()))
+            .await
+            .expect("draining worker remains public");
+        assert_eq!(adopted.state, SessionState::Running);
+        assert!(
+            adopted.active_agent.is_none(),
+            "a dead root cannot retain an active process claim"
+        );
+        assert_eq!(
+            adopted.native_session_id.as_deref(),
+            Some("native-before-drain"),
+            "restart must preserve immutable durable native recovery metadata"
+        );
+
+        let output_params = protocol::SessionOutputParams::new(
+            SessionId(session_id.to_owned()),
+            Some(
+                protocol::SessionRuntimeIdentity::new(
+                    runtime_id.as_str(),
+                    protocol::RuntimeGeneration::new(1),
+                )
+                .expect("runtime identity"),
+            ),
+            Some(protocol::OutputOffset::new(0)),
+            4_096,
+            Some(1_000),
+        )
+        .expect("output params");
+        let output = replacement.output(&output_params);
+        tokio::pin!(output);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut output)
+                .await
+                .is_err(),
+            "output wait must be registered before descendant release"
+        );
+        std::fs::write(&descendant_release, b"release").expect("release descendant");
+        let page = tokio::time::timeout(Duration::from_secs(3), &mut output)
+            .await
+            .expect("late output deadline")
+            .expect("late output page");
+        let decoded = base64::prelude::BASE64_STANDARD
+            .decode(page.data_base64())
+            .expect("valid output base64");
+        assert!(decoded
+            .windows(19)
+            .any(|window| window == b"late-restart-output"));
+
+        let terminal_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let state = replacement
+                .inspect(&SessionId(session_id.to_owned()))
+                .await
+                .expect("inspect completed draining runtime")
+                .state;
+            if state != SessionState::Running {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < terminal_deadline,
+                "worker did not publish terminal state after PTY EOF"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
         server_task.abort();
     }
 
@@ -3791,6 +4015,28 @@ mod tests {
         u32,
         tokio::task::JoinHandle<()>,
     ) {
+        spawn_initialized_worker_with_command(
+            root,
+            runtime_root,
+            session_id,
+            worker_id,
+            "sleep 30".to_owned(),
+        )
+        .await
+    }
+
+    async fn spawn_initialized_worker_with_command(
+        root: &std::path::Path,
+        runtime_root: &std::path::Path,
+        session_id: &str,
+        worker_id: &str,
+        command: String,
+    ) -> (
+        crate::runtime::Worker,
+        RuntimeId,
+        u32,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (socket, task) =
             spawn_uninitialized_worker(root, runtime_root, session_id, session_id, worker_id).await;
         let controller = crate::runtime::Worker::connect(&socket, session_id, "crash-replay-setup")
@@ -3808,7 +4054,7 @@ mod tests {
                     reference_kind: None,
                 },
                 executable: PathBuf::from("/bin/sh"),
-                arguments: vec!["-c".to_owned(), "sleep 30".to_owned()],
+                arguments: vec!["-c".to_owned(), command],
                 cwd: root.to_path_buf(),
                 dimensions: Dimensions::new(80, 24).expect("dimensions"),
                 environment: SecretEnv::new(BTreeMap::new()).expect("environment"),

@@ -37,11 +37,11 @@ use crate::runtime::{Worker, WorkerError};
 
 use super::{
     native_report_is_current, preserve_durable_worker_metadata, terminalize_running_subagents,
-    timestamp_now, worker_error_to_protocol, ExternalAssociationBlock, InputSubmission,
-    RuntimeExit, RuntimeHandle, RuntimeWatchIdentity, SessionEntry, SessionRegistry,
-    SessionRegistryConfig, ShellCommand, WorkerMetadataApplyOutcome, WorkerMetadataProgress,
-    WorkerMetadataRetryCause, WorkerMetadataTracker, MAX_SESSION_NAME_BYTES,
-    MAX_WORKER_METADATA_RETRY_DELAY, WORKER_METADATA_RETRY_WARN_INTERVAL,
+    timestamp_now, worker_error_to_protocol, ActiveAgentReport, ExternalAssociationBlock,
+    InputSubmission, RuntimeExit, RuntimeHandle, RuntimeWatchIdentity, SessionEntry,
+    SessionRegistry, SessionRegistryConfig, ShellCommand, WorkerMetadataApplyOutcome,
+    WorkerMetadataProgress, WorkerMetadataRetryCause, WorkerMetadataTracker,
+    MAX_SESSION_NAME_BYTES, MAX_WORKER_METADATA_RETRY_DELAY, WORKER_METADATA_RETRY_WARN_INTERVAL,
 };
 
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.
@@ -316,8 +316,14 @@ async fn managed_observation_returns_runtime_bound_screen_output_and_wait() {
 
     let output = registry
         .output(
-            &SessionOutputParams::new(created.id.clone(), None, None, 4096, None)
-                .expect("output params"),
+            &SessionOutputParams::new(
+                created.id.clone(),
+                Some(screen.runtime.clone()),
+                Some(OutputOffset::new(0)),
+                4096,
+                Some(1_000),
+            )
+            .expect("output params"),
         )
         .await
         .expect("output page");
@@ -368,6 +374,108 @@ async fn managed_observation_returns_runtime_bound_screen_output_and_wait() {
     assert_eq!(stale.code, "session_runtime_changed");
 
     let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn managed_output_remains_available_until_descendant_pty_eof() {
+    use base64::prelude::{Engine as _, BASE64_STANDARD};
+
+    let barrier = tempfile::tempdir().expect("create output barrier");
+    let root_exited = barrier.path().join("root-exited");
+    let release = barrier.path().join("release");
+    let root_exited_arg = root_exited.to_string_lossy().into_owned();
+    let release_arg = release.to_string_lossy().into_owned();
+    let barrier_arg = barrier.path().to_string_lossy().into_owned();
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new(
+            "/bin/sh",
+            [
+                "-c",
+                concat!(
+                    "trap '' HUP; root_pid=$$; (",
+                    "while kill -0 \"$root_pid\" 2>/dev/null; do sleep 0.01; done; ",
+                    "printf exited > \"$1\"; ",
+                    "while [ ! -e \"$2\" ] && [ -d \"$3\" ]; do sleep 0.01; done; ",
+                    "if [ -e \"$2\" ]; then printf 'late-descendant-output\\n'; fi",
+                    ") &"
+                ),
+                "pohunek-descendant-output",
+                &root_exited_arg,
+                &release_arg,
+                &barrier_arg,
+            ],
+        ),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let live_runtime = created.runtime.as_ref().expect("live runtime");
+    let runtime = SessionRuntimeIdentity::new(
+        live_runtime
+            .runtime_id
+            .clone()
+            .expect("live runtime identifier"),
+        live_runtime.runtime_generation,
+    )
+    .expect("valid runtime identity");
+
+    let root_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !root_exited.exists() {
+        assert!(
+            tokio::time::Instant::now() < root_deadline,
+            "timed out waiting for root exit marker"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect draining session")
+            .state,
+        SessionState::Running,
+        "root exit must not hide output while a descendant holds the PTY"
+    );
+
+    let output_params = SessionOutputParams::new(
+        created.id.clone(),
+        Some(runtime),
+        Some(OutputOffset::new(0)),
+        4_096,
+        Some(1_000),
+    )
+    .expect("output params");
+    let output = registry.output(&output_params);
+    tokio::pin!(output);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut output)
+            .await
+            .is_err(),
+        "authorized output long-poll must remain registered after root exit"
+    );
+    fs::write(&release, b"release").expect("release descendant");
+
+    let output = tokio::time::timeout(Duration::from_secs(3), &mut output)
+        .await
+        .expect("descendant output deadline")
+        .expect("public output page");
+    let decoded = BASE64_STANDARD
+        .decode(output.data_base64())
+        .expect("valid output base64");
+    assert!(
+        decoded
+            .windows(b"late-descendant-output".len())
+            .any(|window| window == b"late-descendant-output"),
+        "daemon output API lost bytes produced after root exit"
+    );
+    assert_eq!(
+        registry
+            .wait_for_exit(&created.id, Duration::from_secs(3))
+            .await
+            .expect("terminal session")
+            .state,
+        SessionState::Done
+    );
 }
 
 #[tokio::test]
@@ -896,12 +1004,25 @@ async fn session_read_identity_guard_rejects_runtime_replacement_race() {
     assert_eq!(error.code, "session_runtime_changed");
     {
         let mut sessions = registry.inner.sessions.lock().await;
-        sessions
-            .get_mut(&created.id)
-            .and_then(|entry| entry.info.runtime.as_mut())
+        let entry = sessions.get_mut(&created.id).expect("registered session");
+        entry
+            .info
+            .runtime
+            .as_mut()
             .expect("live runtime")
             .runtime_generation = observed.runtime_generation;
+        entry.info.state = SessionState::Done;
+        entry.info.runtime.as_mut().expect("terminal runtime").state = RuntimeState::Terminal;
     };
+    registry
+        .verify_managed_identity(&created.id, &observed)
+        .await
+        .expect("same in-flight runtime remains valid after terminal transition");
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("registered session");
+    entry.info.state = SessionState::Running;
+    entry.info.runtime.as_mut().expect("live runtime").state = RuntimeState::Live;
+    drop(sessions);
     let _ = registry.stop(&created.id).await;
 }
 
@@ -1091,6 +1212,8 @@ struct MockInspectorState {
     foreground_block: Option<Arc<ForegroundBlock>>,
     cwd: HashMap<Pid, PathBuf>,
     identity_overrides: HashMap<Pid, Option<ProcessIdentity>>,
+    identity_after_descendants: HashMap<Pid, ProcessIdentity>,
+    identity_after_cwd: HashMap<Pid, (usize, ProcessIdentity)>,
     identity_errors: HashMap<Pid, std::io::ErrorKind>,
     exits: HashMap<Pid, Vec<tokio::sync::watch::Sender<bool>>>,
     immediate_exits: HashSet<Pid>,
@@ -1218,6 +1341,22 @@ impl MockInspector {
             .insert(pid, identity);
     }
 
+    fn change_identity_after_descendants(&self, pid: Pid, identity: ProcessIdentity) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .identity_after_descendants
+            .insert(pid, identity);
+    }
+
+    fn change_identity_after_cwd(&self, pid: Pid, identity: ProcessIdentity) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .identity_after_cwd
+            .insert(pid, (2, identity));
+    }
+
     fn fail_identity_with(&self, pid: Pid, kind: std::io::ErrorKind) {
         self.inner
             .lock()
@@ -1308,26 +1447,35 @@ impl ProcessInspector for MockInspector {
     }
 
     fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
-        let inner = self.inner.lock().expect("mock inspector lock");
+        let mut inner = self.inner.lock().expect("mock inspector lock");
         if let Some(kind) = inner.descendants_error {
             return Err(crate::procwatch::Error::from_io(
                 "mock_descendants",
                 std::io::Error::new(kind, "mock descendants failure"),
             ));
         }
-        Ok(inner.descendants.get(&root).cloned().unwrap_or_default())
+        let descendants = inner.descendants.get(&root).cloned().unwrap_or_default();
+        if let Some(identity) = inner.identity_after_descendants.remove(&root) {
+            inner.identity_overrides.insert(root, Some(identity));
+        }
+        Ok(descendants)
     }
 
     fn cwd(&self, pid: Pid) -> Result<PathBuf, crate::procwatch::Error> {
-        self.inner
-            .lock()
-            .expect("mock inspector lock")
-            .cwd
-            .get(&pid)
-            .cloned()
-            .ok_or(crate::procwatch::Error::Race {
-                operation: "mock_cwd",
-            })
+        let mut inner = self.inner.lock().expect("mock inspector lock");
+        let cwd = inner.cwd.get(&pid).cloned();
+        if let Some((remaining, identity)) = inner.identity_after_cwd.get_mut(&pid) {
+            if *remaining == 1 {
+                let identity = *identity;
+                inner.identity_after_cwd.remove(&pid);
+                inner.identity_overrides.insert(pid, Some(identity));
+            } else {
+                *remaining -= 1;
+            }
+        }
+        cwd.ok_or(crate::procwatch::Error::Race {
+            operation: "mock_cwd",
+        })
     }
 
     fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, crate::procwatch::Error> {
@@ -6086,6 +6234,55 @@ async fn exit_transition_preserves_subagents_committed_ahead_of_memory() {
 }
 
 #[tokio::test]
+async fn natural_exit_keeps_an_authorized_attach_open_for_ordered_worker_close() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, identity) = live_worker_and_identity(&registry, &created.id).await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    registry.inner.active_attaches.lock().await.insert(
+        "natural-exit-attach".to_owned(),
+        super::ActiveAttach {
+            session_id: created.id.clone(),
+            cancel: cancel.clone(),
+        },
+    );
+
+    assert!(
+        registry
+            .record_exit(
+                &created.id,
+                RuntimeExit {
+                    exit_code: Some(0),
+                    success: true,
+                },
+                false,
+                Some(&identity),
+                None,
+            )
+            .await
+            .expect("record natural exit"),
+        "natural exit transition must commit"
+    );
+    assert!(
+        !cancel.is_cancelled(),
+        "natural exit must let the worker deliver queued output and close in order"
+    );
+
+    registry
+        .inner
+        .active_attaches
+        .lock()
+        .await
+        .remove("natural-exit-attach");
+    cancel.cancel();
+    stop_test_worker(worker).await;
+}
+
+#[tokio::test]
 async fn exit_transition_preserves_launch_identity_committed_ahead_of_memory() {
     let store_path = temp_store_path("worker-launch-identity-exit-race");
     let registry = SessionRegistry::new(SessionRegistryConfig {
@@ -7805,6 +8002,185 @@ async fn mock_procwatch_registry(tag: &str) -> (SessionRegistry, Arc<MockInspect
         .await
         .expect("create shell session");
     (registry, inspector, created)
+}
+
+#[tokio::test]
+async fn procwatch_retires_root_authority_before_reused_pid_can_drive_state() {
+    let (registry, inspector, created) = mock_procwatch_registry("root-reuse").await;
+    let safe_cwd = created.cwd.clone();
+    let unrelated_cwd = temp_dir("reused-root-cwd");
+    let unrelated_agent = codex_fact(PID_REUSE_AGENT_PID, created.pid);
+    inspector.set_descendants(created.pid, vec![unrelated_agent]);
+    inspector.set_cwd(created.pid, unrelated_cwd.clone());
+    inspector.set_cwd(PID_REUSE_AGENT_PID, unrelated_cwd);
+
+    let (rescan, cancel) = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("live session entry");
+        entry.active_agent = Some(ActiveAgentReport {
+            source: "test-root-claim".to_owned(),
+            agent: "shell".to_owned(),
+            seq: Some(1),
+            pid: Some(created.pid),
+            start_identity: Some(1),
+            reported_at: Instant::now(),
+            activity_reported: false,
+        });
+        entry.info.active_agent = Some("shell".to_owned());
+        entry.info.active_agent_base = Some(AgentKind::Shell);
+        entry.info.active_agent_pid = Some(created.pid);
+        (
+            Arc::clone(&entry.procwatch_rescan),
+            entry.procwatch_cancel.clone(),
+        )
+    };
+    inspector.set_identity(
+        created.pid,
+        Some(ProcessIdentity {
+            pid: created.pid,
+            start_identity: StartIdentity::new(u64::MAX),
+        }),
+    );
+    rescan.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), cancel.cancelled())
+        .await
+        .expect("procwatch retires a reused root generation");
+
+    let inspected = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert!(inspected.active_agent.is_none());
+    assert_eq!(
+        inspected.cwd, safe_cwd,
+        "a reused root PID must not drive descendant or cwd reconciliation"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn procwatch_discards_scan_when_root_generation_changes_inside_bracket() {
+    let (registry, inspector, created) = mock_procwatch_registry("root-bracket").await;
+    let safe_cwd = created.cwd.clone();
+    inspector.set_descendants(
+        created.pid,
+        vec![codex_fact(PID_REUSE_AGENT_PID, created.pid)],
+    );
+    inspector.set_cwd(created.pid, temp_dir("root-bracket-reused"));
+    inspector.change_identity_after_descendants(
+        created.pid,
+        ProcessIdentity {
+            pid: created.pid,
+            start_identity: StartIdentity::new(u64::MAX),
+        },
+    );
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+
+    let inspected = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert!(inspected.active_agent.is_none());
+    assert_eq!(inspected.cwd, safe_cwd);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn procwatch_discards_cwd_when_focus_generation_changes_inside_bracket() {
+    let (registry, inspector, created) = mock_procwatch_registry("focus-bracket").await;
+    let safe_cwd = created.cwd.clone();
+    let agent = codex_fact(PID_REUSE_AGENT_PID, created.pid);
+    inspector.set_descendants(created.pid, vec![agent.clone()]);
+    inspector.set_cwd(PID_REUSE_AGENT_PID, temp_dir("focus-bracket-reused"));
+    {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("live session entry");
+        entry.active_agent = Some(ActiveAgentReport {
+            source: "test-focus-claim".to_owned(),
+            agent: "codex".to_owned(),
+            seq: Some(1),
+            pid: Some(agent.pid),
+            start_identity: Some(agent.start_identity.get()),
+            reported_at: Instant::now(),
+            activity_reported: false,
+        });
+        entry.info.active_agent = Some("codex".to_owned());
+        entry.info.active_agent_base = Some(AgentKind::Codex);
+        entry.info.active_agent_pid = Some(agent.pid);
+    };
+    inspector.change_identity_after_cwd(
+        agent.pid,
+        ProcessIdentity {
+            pid: agent.pid,
+            start_identity: StartIdentity::new(agent.start_identity.get() + 1),
+        },
+    );
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session")
+            .cwd,
+        safe_cwd,
+        "a reused focus PID cannot apply its cwd"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn stale_procwatch_retirement_cannot_clear_replacement_runtime() {
+    let (registry, _inspector, created) = mock_procwatch_registry("stale-retirement").await;
+    let expected = RuntimeWatchIdentity::from_info(&created).expect("runtime identity");
+    let () = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("live session entry");
+        let runtime = entry.info.runtime.as_mut().expect("runtime info");
+        runtime.runtime_id = Some("runtime-replacement".to_owned());
+        runtime.runtime_generation = RuntimeGeneration::new(runtime.runtime_generation.get() + 1);
+        entry.active_agent = Some(ActiveAgentReport {
+            source: "replacement-claim".to_owned(),
+            agent: "codex".to_owned(),
+            seq: Some(2),
+            pid: Some(PID_REUSE_AGENT_PID),
+            start_identity: Some(2),
+            reported_at: Instant::now(),
+            activity_reported: false,
+        });
+        entry.info.active_agent = Some("codex".to_owned());
+        entry.info.active_agent_base = Some(AgentKind::Codex);
+        entry.info.active_agent_pid = Some(PID_REUSE_AGENT_PID);
+    };
+
+    registry
+        .retire_procwatch_root(&created.id, &expected, Instant::now())
+        .await;
+
+    let inspected = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect replacement");
+    assert_eq!(inspected.active_agent.as_deref(), Some("codex"));
+    assert_eq!(
+        inspected
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.runtime_id.as_deref()),
+        Some("runtime-replacement")
+    );
+    let () = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("replacement entry");
+        entry.info.runtime = created.runtime.clone();
+    };
+    let _ = registry.stop(&created.id).await;
 }
 
 async fn mock_direct_codex_registry(

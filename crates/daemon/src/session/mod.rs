@@ -677,6 +677,7 @@ enum RuntimeMetadataPolicy {
 struct ExitTransition {
     event: &'static str,
     stop_reason: &'static str,
+    cancel_attaches: bool,
     detector_cancel: CancellationToken,
     procwatch_cancel: CancellationToken,
     expected: RuntimeWatchIdentity,
@@ -731,6 +732,7 @@ fn exit_transition(
             event::SESSION_UPDATED
         },
         stop_reason,
+        cancel_attaches: stopped,
         detector_cancel: candidate.detector_cancel.clone(),
         procwatch_cancel: candidate.procwatch_cancel.clone(),
         expected,
@@ -3143,7 +3145,9 @@ impl SessionRegistry {
         };
         updated.detector_cancel.cancel();
         updated.procwatch_cancel.cancel();
-        self.cancel_session_attaches(id).await;
+        if updated.cancel_attaches {
+            self.cancel_session_attaches(id).await;
+        }
         self.remove_pending_attaches_for_session(id).await;
         // A terminal session must not resurrect on the next daemon restart:
         // resume is for sessions whose live PTY a restart killed, not for ones

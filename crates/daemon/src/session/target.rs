@@ -21,6 +21,7 @@ use super::{
     DEFAULT_WORKER_SUBSCRIBER_BYTES, DEFAULT_WORKER_TERMINAL_RETENTION,
     DEFAULT_WORKER_WRITE_DEDUP_ENTRIES, SESSION_RECORD_SCHEMA_VERSION, WORKER_CONNECT_RETRY,
 };
+use crate::procwatch::{ProcessIdentity, StartIdentity};
 use crate::store::StoredInputRules;
 
 /// Everything needed to spawn and register one PTY-backed session, shared by
@@ -606,7 +607,7 @@ impl SessionRegistry {
             config: default_detector_config.clone(),
         });
         let (detector_preview, detector_preview_rx) = mpsc::channel(1);
-        let root_pid = started.root_pid;
+        let root_pid = started.root_process.pid;
 
         let now = timestamp_now();
         let info = SessionInfo {
@@ -618,7 +619,7 @@ impl SessionRegistry {
             agent_base,
             cwd,
             cwd_source: Some(CwdSource::Launch),
-            pid: started.root_pid,
+            pid: root_pid,
             runtime: started.runtime_info,
             cols,
             rows,
@@ -697,7 +698,13 @@ impl SessionRegistry {
             config: detector_config_rx,
             preview: detector_preview_rx,
         });
-        self.spawn_procwatch(id.clone(), root_pid, procwatch_cancel, procwatch_rescan);
+        self.spawn_procwatch(
+            id.clone(),
+            expected.clone(),
+            started.root_process,
+            procwatch_cancel,
+            procwatch_rescan,
+        );
         match started.handle {
             RuntimeHandle::Worker(worker) => {
                 self.spawn_worker_exit_watcher(id, worker, expected, runtime_watch_cancel);
@@ -891,7 +898,10 @@ impl SessionRegistry {
         Ok(StartedRuntime {
             handle: RuntimeHandle::Worker(worker),
             detector_output,
-            root_pid: child.pid,
+            root_process: ProcessIdentity {
+                pid: child.pid,
+                start_identity: StartIdentity::new(child.start_identity),
+            },
             runtime_info: Some(SessionRuntime {
                 state: RuntimeState::Live,
                 runtime_generation,
@@ -908,7 +918,7 @@ impl SessionRegistry {
 struct StartedRuntime {
     handle: RuntimeHandle,
     detector_output: tokio::sync::broadcast::Receiver<Vec<u8>>,
-    root_pid: u32,
+    root_process: ProcessIdentity,
     runtime_info: Option<SessionRuntime>,
 }
 

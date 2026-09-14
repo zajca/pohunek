@@ -777,7 +777,7 @@ impl PtyOwner {
         }
     }
 
-    /// Subscribes to the root-process lifecycle without conflating it with PTY EOF.
+    /// Subscribes to the retained root-process outcome.
     pub(crate) fn exit_receiver(&self) -> watch::Receiver<Option<Exit>> {
         self.exit_rx.clone()
     }

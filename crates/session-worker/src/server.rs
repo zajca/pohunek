@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, watch, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, oneshot, watch, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{event, Level};
 
@@ -54,6 +54,11 @@ const EVENT_BUFFER: usize = 256;
 const ACTIVE_SUBAGENT_CAPACITY: usize = 64;
 /// Recent terminal subagents retained for reconnecting clients.
 const TERMINAL_SUBAGENT_CAPACITY: usize = 32;
+/// Delay between terminal-journal retries after a transient storage failure.
+///
+/// A quarter second keeps the runtime publicly draining without either a busy
+/// loop or a long recovery delay once the journal becomes writable again.
+const TERMINAL_JOURNAL_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// Maximum accepted provider-native subagent identifier length.
 const MAX_SUBAGENT_ID_BYTES: usize = 256;
 /// Maximum accepted provider-defined subagent type length.
@@ -1381,101 +1386,198 @@ async fn inspect_snapshot(shared: &Shared, state: &State) -> Result<InspectSnaps
 }
 
 fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: RuntimeId) {
+    let (output_eof_tx, output_eof_rx) = oneshot::channel();
     let output_shared = Arc::clone(&shared);
     let output_pty = pty.clone();
     let output_runtime = runtime_id.clone();
     tokio::spawn(async move {
-        if let Ok(mut subscriber) = output_pty.subscribe_output(Some(0)) {
-            while let Some(event) = subscriber.recv().await {
-                match event {
-                    OutputEvent::Replay(_) | OutputEvent::TerminalSnapshot(_) => {}
-                    OutputEvent::Output(chunk) => {
-                        output_shared.emit(EventKind::OutputAdvanced {
-                            runtime_id: output_runtime.clone(),
-                            next_offset: chunk.offset.saturating_add(
-                                u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX),
-                            ),
-                        });
-                    }
-                    OutputEvent::Gap { watermark, .. } => {
-                        output_shared.emit(EventKind::TerminalChanged {
-                            runtime_id: output_runtime.clone(),
-                            watermark,
-                        });
-                    }
-                    OutputEvent::Exit { next_offset } => {
-                        let result = {
-                            let mut state = output_shared.state.lock().await;
-                            state.journal.next_output_offset = next_offset;
-                            state.journal.updated_at = timestamp();
-                            persist(output_shared.journal.clone(), state.journal.clone()).await
-                        };
-                        if let Err(error) = result {
-                            event!(
-                                name: "worker.journal.write.failed",
-                                Level::ERROR,
-                                error.type = "journal",
-                                error.message = %error,
-                                "worker journal write failed: {{error.message}}",
-                            );
-                        }
-                        break;
-                    }
+        let result = monitor_runtime_output(&output_shared, &output_pty, &output_runtime).await;
+        let _ = output_eof_tx.send(result);
+    });
+
+    tokio::spawn(coordinate_runtime_completion(
+        shared,
+        pty,
+        runtime_id,
+        output_eof_rx,
+    ));
+}
+
+async fn monitor_runtime_output(
+    shared: &Shared,
+    pty: &PtyOwner,
+    runtime_id: &RuntimeId,
+) -> Result<u64, WorkerError> {
+    let mut subscriber = pty
+        .subscribe_output(Some(0))
+        .map_err(|error| WorkerError::Pty(PtyError::Output(error)))?;
+    loop {
+        match subscriber.recv().await {
+            Some(OutputEvent::Replay(_) | OutputEvent::TerminalSnapshot(_)) => {}
+            Some(OutputEvent::Output(chunk)) => {
+                shared.emit(EventKind::OutputAdvanced {
+                    runtime_id: runtime_id.clone(),
+                    next_offset: chunk
+                        .offset
+                        .saturating_add(u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX)),
+                });
+            }
+            Some(OutputEvent::Gap { watermark, .. }) => {
+                shared.emit(EventKind::TerminalChanged {
+                    runtime_id: runtime_id.clone(),
+                    watermark,
+                });
+            }
+            Some(OutputEvent::Exit { next_offset }) => return Ok(next_offset),
+            None => {
+                return Err(WorkerError::Protocol(
+                    "PTY output monitor closed before EOF".to_owned(),
+                ));
+            }
+        }
+    }
+}
+
+async fn coordinate_runtime_completion(
+    shared: Arc<Shared>,
+    pty: PtyOwner,
+    runtime_id: RuntimeId,
+    output_eof_rx: oneshot::Receiver<Result<u64, WorkerError>>,
+) {
+    let exit = match wait_runtime_exit(&pty).await {
+        Ok(exit) => exit,
+        Err(error) => {
+            mark_runtime_faulted(&shared, runtime_id, WorkerError::Pty(error)).await;
+            return;
+        }
+    };
+    let (status, stopped_by_user) = {
+        let state = shared.state.lock().await;
+        (
+            exit_status(&exit, state.stop_requested),
+            state.stop_requested,
+        )
+    };
+    let exited_at = timestamp();
+    let next_output_offset = match output_eof_rx.await {
+        Ok(Ok(next_output_offset)) => next_output_offset,
+        Ok(Err(error)) => {
+            mark_runtime_faulted(&shared, runtime_id, error).await;
+            return;
+        }
+        Err(_closed) => {
+            mark_runtime_faulted(
+                &shared,
+                runtime_id,
+                WorkerError::Protocol("PTY output monitor stopped before EOF".to_owned()),
+            )
+            .await;
+            return;
+        }
+    };
+    let Some(retention) = retry_runtime_completion(
+        &shared,
+        &exit,
+        &status,
+        stopped_by_user,
+        &exited_at,
+        next_output_offset,
+    )
+    .await
+    else {
+        return;
+    };
+    shared.emit(EventKind::ChildExited {
+        runtime_id,
+        exit: status,
+    });
+    tokio::select! {
+        () = tokio::time::sleep(retention) => shared.shutdown.cancel(),
+        () = shared.shutdown.cancelled() => {}
+    }
+}
+
+async fn retry_runtime_completion(
+    shared: &Shared,
+    exit: &Exit,
+    status: &ExitStatus,
+    stopped_by_user: bool,
+    exited_at: &str,
+    next_output_offset: u64,
+) -> Option<Duration> {
+    let mut terminal_commit_failed = false;
+    loop {
+        match commit_runtime_completion(
+            shared,
+            exit,
+            status,
+            stopped_by_user,
+            exited_at,
+            next_output_offset,
+        )
+        .await
+        {
+            Ok(retention) => {
+                if terminal_commit_failed {
+                    event!(
+                        name: "worker.terminal_commit.recovered",
+                        Level::INFO,
+                        "worker terminal journal commit recovered",
+                    );
+                }
+                return Some(retention);
+            }
+            Err(error) => {
+                if !terminal_commit_failed {
+                    event!(
+                        name: "worker.terminal_commit.retry",
+                        Level::WARN,
+                        error.type = "journal",
+                        error.message = %error,
+                        "worker terminal journal commit failed; retrying: {{error.message}}",
+                    );
+                    terminal_commit_failed = true;
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(TERMINAL_JOURNAL_RETRY_DELAY) => {}
+                    () = shared.shutdown.cancelled() => return None,
                 }
             }
         }
-    });
+    }
+}
 
-    tokio::spawn(async move {
-        let exit = match wait_runtime_exit(&pty).await {
-            Ok(exit) => exit,
-            Err(error) => {
-                mark_runtime_faulted(&shared, runtime_id, WorkerError::Pty(error)).await;
-                return;
-            }
-        };
-        let (status, retention, commit) = {
-            let mut state = shared.state.lock().await;
-            let status = exit_status(&exit, state.stop_requested);
-            state.phase = WireRuntimePhase::Exited;
-            state.exit = Some(status.clone());
-            state.journal.phase = JournalPhase::Terminal;
-            state.journal.pending_launch_claims.clear();
-            mark_running_subagents_lost(&mut state.journal, status.exited_at_ms);
-            state.journal.outcome = Some(RuntimeOutcome {
-                exit_code: exit.exit_code,
-                signal: exit.signal.clone(),
-                success: exit.success,
-                exited_at: timestamp(),
-                reason: if state.stop_requested {
-                    "explicit_stop".to_owned()
-                } else {
-                    "natural_exit".to_owned()
-                },
-            });
-            state.journal.next_output_offset = pty.output().next_offset();
-            state.journal.updated_at = timestamp();
-            let commit = persist(shared.journal.clone(), state.journal.clone()).await;
-            (status, state.terminal_retention, commit)
-        };
-        if let Err(error) = commit {
-            event!(
-                name: "worker.journal.write.failed",
-                Level::ERROR,
-                error.type = "journal",
-                error.message = %error,
-                "worker terminal journal write failed: {{error.message}}",
-            );
-        }
-        shared.emit(EventKind::ChildExited {
-            runtime_id,
-            exit: status,
-        });
-        tokio::select! {
-            () = tokio::time::sleep(retention) => shared.shutdown.cancel(),
-            () = shared.shutdown.cancelled() => {}
-        }
+async fn commit_runtime_completion(
+    shared: &Shared,
+    exit: &Exit,
+    status: &ExitStatus,
+    stopped_by_user: bool,
+    exited_at: &str,
+    next_output_offset: u64,
+) -> Result<Duration, WorkerError> {
+    let mut state = shared.state.lock().await;
+    let mut journal = state.journal.clone();
+    journal.phase = JournalPhase::Terminal;
+    journal.pending_launch_claims.clear();
+    mark_running_subagents_lost(&mut journal, status.exited_at_ms);
+    journal.outcome = Some(RuntimeOutcome {
+        exit_code: exit.exit_code,
+        signal: exit.signal.clone(),
+        success: exit.success,
+        exited_at: exited_at.to_owned(),
+        reason: if stopped_by_user {
+            "explicit_stop".to_owned()
+        } else {
+            "natural_exit".to_owned()
+        },
     });
+    journal.next_output_offset = next_output_offset;
+    journal.updated_at = timestamp();
+    persist(shared.journal.clone(), journal.clone()).await?;
+    state.phase = WireRuntimePhase::Exited;
+    state.exit = Some(status.clone());
+    state.journal = journal;
+    Ok(state.terminal_retention)
 }
 
 async fn wait_runtime_exit(pty: &PtyOwner) -> Result<Exit, PtyError> {
@@ -1624,6 +1726,8 @@ async fn serve_data(
     let stream_id = header.stream_id;
     let runtime_id = header.runtime_id;
     let mut next_input_sequence = 1_u64;
+    let mut root_exit = pty.exit_receiver();
+    let mut pending_output_exit = None;
 
     loop {
         tokio::select! {
@@ -1641,10 +1745,35 @@ async fn serve_data(
                 ).await?;
                 return Ok(());
             }
-            output = subscriber.recv() => {
+            changed = root_exit.changed(), if pending_output_exit.is_some() => {
+                changed.map_err(|_closed| WorkerError::Pty(PtyError::ExitTimeout))?;
+                if root_exit.borrow().is_some() {
+                    let output = pending_output_exit
+                        .take()
+                        .expect("guarded pending PTY EOF");
+                    if *lease_epoch.borrow() != grant.lease_epoch {
+                        return Ok(());
+                    }
+                    write_output_event(
+                        &mut write_half,
+                        version,
+                        &stream_id,
+                        &runtime_id,
+                        shared.config.data_payload_bytes,
+                        output,
+                    ).await?;
+                }
+            }
+            output = subscriber.recv(), if pending_output_exit.is_none() => {
                 let Some(output) = output else {
                     return Ok(());
                 };
+                if matches!(&output, OutputEvent::Exit { .. })
+                    && root_exit.borrow().is_none()
+                {
+                    pending_output_exit = Some(output);
+                    continue;
+                }
                 write_output_event(
                     &mut write_half,
                     version,
@@ -1654,7 +1783,7 @@ async fn serve_data(
                     output,
                 ).await?;
             }
-            input = protocol::read_frame(&mut read_half), if mode == StreamMode::Attach => {
+            input = protocol::read_frame(&mut read_half) => {
                 let input = match input {
                     Ok(Some(input)) => input,
                     Ok(None) => return Ok(()),
@@ -1668,6 +1797,19 @@ async fn serve_data(
                         ).await;
                     }
                 };
+                if mode != StreamMode::Attach {
+                    return write_data_error(
+                        &mut write_half,
+                        version,
+                        &stream_id,
+                        &runtime_id,
+                        control_error_message(
+                            ControlCode::InvalidRequest,
+                            "output data stream received a client frame",
+                            false,
+                        ),
+                    ).await;
+                }
                 let (input_header, bytes) = input.into_parts();
                 let FrameKind::Input { write_id } = input_header.kind else {
                     return write_data_error(
@@ -1811,10 +1953,8 @@ where
     W: AsyncWrite + Unpin + Send,
 {
     let output = pty.output();
-    let mut runtime_exit = pty.exit_receiver();
     let outcome = await_observation_page(
         output,
-        &mut runtime_exit,
         after_offset,
         observation,
         &shared.shutdown,
@@ -1893,13 +2033,8 @@ enum ObservationWaitOutcome {
     InvalidInput,
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "observation waiting keeps output, root lifecycle, lease, shutdown, and peer I/O cancellation sources explicit"
-)]
 async fn await_observation_page<R>(
     output: &crate::OutputHub,
-    runtime_exit: &mut watch::Receiver<Option<Exit>>,
     after_offset: Option<u64>,
     observation: ObservationGrant,
     shutdown: &CancellationToken,
@@ -1923,7 +2058,7 @@ where
             && page.start_offset == page.runtime_end_offset
             && !page.exited
             && !observation.wait.is_zero();
-        if !waiting_at_end || runtime_exit.borrow().is_some() {
+        if !waiting_at_end {
             if *lease_epoch.borrow() != expected_lease_epoch {
                 return Ok(ObservationWaitOutcome::LeaseReleased);
             }
@@ -1936,20 +2071,6 @@ where
             () = output.wait_for_observation(page.runtime_end_offset, shutdown) => {
                 if shutdown.is_cancelled() {
                     return Ok(ObservationWaitOutcome::Shutdown);
-                }
-            }
-            changed = runtime_exit.changed() => {
-                if changed.is_err() {
-                    return Ok(ObservationWaitOutcome::Shutdown);
-                }
-                if runtime_exit.borrow().is_some() {
-                    let final_page = output
-                        .observe(after_offset, observation.max_bytes)
-                        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
-                    return Ok(ObservationWaitOutcome::Page {
-                        page: final_page,
-                        timed_out: false,
-                    });
                 }
             }
             changed = lease_epoch.changed() => {
@@ -1973,8 +2094,7 @@ where
                 let final_page = output
                     .observe(after_offset, observation.max_bytes)
                     .map_err(|error| WorkerError::Protocol(error.to_string()))?;
-                let timed_out = runtime_exit.borrow().is_none()
-                    && observation_timed_out(after_offset, &final_page);
+                let timed_out = observation_timed_out(after_offset, &final_page);
                 return Ok(ObservationWaitOutcome::Page { page: final_page, timed_out });
             }
         }
@@ -3417,8 +3537,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
-    use std::task::Poll;
     use std::time::Duration;
 
     use super::{
@@ -3434,9 +3552,9 @@ mod tests {
     };
     use pohunek_worker_protocol::{
         self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
-        ControlResponse, Cursor, DataToken, Dimensions, EventKind, FrameHeader, FrameKind, LeaseId,
-        RequestId, ResponseKind, RuntimeId, StreamId, StreamMode, Version, WriteId,
-        CURRENT_VERSION, MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
+        ControlResponse, Cursor, DataToken, Dimensions, EventKind, ExitStatus, FrameHeader,
+        FrameKind, LeaseId, RequestId, ResponseKind, RuntimeId, StreamId, StreamMode, Version,
+        WriteId, CURRENT_VERSION, MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::watch;
@@ -3466,13 +3584,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
-    }
-
-    fn pending_runtime_exit() -> (
-        watch::Sender<Option<crate::Exit>>,
-        watch::Receiver<Option<crate::Exit>>,
-    ) {
-        watch::channel(None)
     }
 
     async fn launch_claim_fixture() -> (super::Server, crate::PtyOwner, std::path::PathBuf) {
@@ -3933,6 +4044,65 @@ mod tests {
         assert_eq!(page.runtime_end_offset, final_offset);
     }
 
+    #[tokio::test]
+    async fn terminal_commit_retries_before_publishing_exited_state() {
+        let (server, pty, directory) = launch_claim_fixture().await;
+        let journal_path = server.shared.journal.path().to_path_buf();
+        std::fs::remove_file(&journal_path).expect("remove writable journal fixture");
+        std::fs::create_dir(&journal_path).expect("block journal replacement with a directory");
+        let exit = crate::Exit {
+            exit_code: Some(0),
+            signal: None,
+            success: true,
+        };
+        let status = ExitStatus {
+            code: Some(0),
+            signal: None,
+            stopped_by_user: false,
+            exited_at_ms: 100,
+        };
+        let shared = std::sync::Arc::clone(&server.shared);
+        let completion = super::retry_runtime_completion(
+            &shared,
+            &exit,
+            &status,
+            false,
+            "2026-09-14T00:00:00Z",
+            42,
+        );
+        tokio::pin!(completion);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut completion)
+                .await
+                .is_err(),
+            "failed terminal persistence must remain retryable"
+        );
+        assert_eq!(
+            server.shared.state.lock().await.phase,
+            super::WireRuntimePhase::Running,
+            "terminal state cannot be public before its journal commit"
+        );
+
+        std::fs::remove_dir(&journal_path).expect("restore writable journal path");
+        let retention = tokio::time::timeout(Duration::from_secs(2), &mut completion)
+            .await
+            .expect("terminal commit retry deadline")
+            .expect("completion remains active until commit");
+        assert!(!retention.is_zero());
+        assert_eq!(
+            server.shared.state.lock().await.phase,
+            super::WireRuntimePhase::Exited
+        );
+        let journal = server.shared.journal.load().expect("load terminal journal");
+        assert_eq!(journal.phase, super::JournalPhase::Terminal);
+        assert_eq!(journal.next_output_offset, 42);
+        pty.stop("test-cleanup", Duration::from_millis(100))
+            .await
+            .expect("stop fixture PTY");
+        drop(server);
+        std::fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+
     #[test]
     fn generated_credentials_use_protocol_safe_bytes() {
         let value = random_value("worker").expect("operating-system entropy");
@@ -4384,93 +4554,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_exit_releases_observation_without_claiming_output_eof() {
-        let output = crate::OutputHub::new(64, 64, 2, 10).expect("output hub");
-        let shutdown = CancellationToken::new();
-        let (runtime_exit_tx, mut runtime_exit) = watch::channel(None);
-        let (_lease_tx, mut lease_rx) = watch::channel(0_u64);
-        let (mut reader, _writer) = tokio::io::duplex(64);
-        let waiting = await_observation_page(
-            &output,
-            &mut runtime_exit,
-            Some(0),
-            ObservationGrant {
-                max_bytes: 64,
-                wait: Duration::from_secs(10),
-            },
-            &shutdown,
-            0,
-            &mut lease_rx,
-            &mut reader,
-        );
-        tokio::pin!(waiting);
-        std::future::poll_fn(|context| {
-            assert!(
-                waiting.as_mut().poll(context).is_pending(),
-                "observation unexpectedly completed before root exit"
-            );
-            Poll::Ready(())
-        })
-        .await;
-        runtime_exit_tx.send_replace(Some(crate::Exit {
-            exit_code: Some(0),
-            signal: None,
-            success: true,
-        }));
-
-        let outcome = tokio::time::timeout(Duration::from_millis(100), &mut waiting)
-            .await
-            .expect("root exit releases observation")
-            .expect("observation result");
-        assert!(matches!(
-            outcome,
-            ObservationWaitOutcome::Page {
-                page: crate::ObservationPage { exited: false, .. },
-                timed_out: false,
-            }
-        ));
-        output
-            .push(b"late-output")
-            .expect("root exit leaves output open");
-    }
-
-    #[tokio::test]
-    async fn completed_root_before_observation_registration_returns_without_eof() {
-        let output = crate::OutputHub::new(64, 64, 2, 10).expect("output hub");
-        let shutdown = CancellationToken::new();
-        let (_runtime_exit_tx, mut runtime_exit) = watch::channel(Some(crate::Exit {
-            exit_code: Some(0),
-            signal: None,
-            success: true,
-        }));
-        let (_lease_tx, mut lease_rx) = watch::channel(0_u64);
-        let (mut reader, _writer) = tokio::io::duplex(64);
-
-        let outcome = await_observation_page(
-            &output,
-            &mut runtime_exit,
-            Some(0),
-            ObservationGrant {
-                max_bytes: 64,
-                wait: Duration::from_secs(10),
-            },
-            &shutdown,
-            0,
-            &mut lease_rx,
-            &mut reader,
-        )
-        .await
-        .expect("observation result");
-        assert!(matches!(
-            outcome,
-            ObservationWaitOutcome::Page {
-                page: crate::ObservationPage { exited: false, .. },
-                timed_out: false,
-            }
-        ));
-    }
-
-    #[tokio::test]
     async fn waiting_observation_releases_on_disconnect_lease_and_shutdown() {
         let output = crate::OutputHub::new(64, 64, 2, 10).expect("output hub");
         let shutdown = CancellationToken::new();
@@ -4478,12 +4561,10 @@ mod tests {
         let (mut disconnected_reader, disconnected_writer) = tokio::io::duplex(64);
         drop(disconnected_writer);
         let (_lease_tx, mut lease_rx) = watch::channel(0_u64);
-        let (_runtime_exit_tx, mut runtime_exit) = pending_runtime_exit();
         let disconnected = tokio::time::timeout(
             Duration::from_millis(100),
             await_observation_page(
                 &output,
-                &mut runtime_exit,
                 Some(0),
                 ObservationGrant {
                     max_bytes: 64,
@@ -4506,13 +4587,11 @@ mod tests {
             .expect("retained output");
         let (mut lease_reader, _lease_writer) = tokio::io::duplex(64);
         let (lease_tx, mut lease_rx) = watch::channel(0_u64);
-        let (_runtime_exit_tx, mut runtime_exit) = pending_runtime_exit();
         // The receiver is registered before redemption. Releasing here models
         // the exact handoff gap before observation wait registration.
         lease_tx.send_replace(1);
         let released = await_observation_page(
             &released_output,
-            &mut runtime_exit,
             Some(0),
             ObservationGrant {
                 max_bytes: 64,
@@ -4529,10 +4608,8 @@ mod tests {
 
         let (mut timeout_reader, _timeout_writer) = tokio::io::duplex(64);
         let (_lease_tx, mut lease_rx) = watch::channel(0_u64);
-        let (_runtime_exit_tx, mut runtime_exit) = pending_runtime_exit();
         let timed_out = await_observation_page(
             &output,
-            &mut runtime_exit,
             Some(0),
             ObservationGrant {
                 max_bytes: 64,
@@ -4555,11 +4632,9 @@ mod tests {
 
         let (mut shutdown_reader, _shutdown_writer) = tokio::io::duplex(64);
         let (_lease_tx, mut lease_rx) = watch::channel(0_u64);
-        let (_runtime_exit_tx, mut runtime_exit) = pending_runtime_exit();
         shutdown.cancel();
         let stopped = await_observation_page(
             &output,
-            &mut runtime_exit,
             Some(0),
             ObservationGrant {
                 max_bytes: 64,

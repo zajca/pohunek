@@ -37,7 +37,7 @@ pub struct RedeemedAttach {
     pub session_id: SessionId,
     /// Runtime stream backing the public bridge.
     pub runtime: RedeemedRuntime,
-    /// Cancellation signal fired by `session.detach` or session exit.
+    /// Cancellation signal fired by detach or explicit lifecycle revocation.
     pub cancel: CancellationToken,
 }
 

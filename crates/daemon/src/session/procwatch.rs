@@ -15,7 +15,7 @@ use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessIdentity, StartIdenti
 use super::{
     agent_kind_label, clear_active_agent, is_terminal, report_is_current, send_detector_config,
     timestamp_now, ActiveAgentReport, CancellationToken, Notify, ObservedAgent, Ordering,
-    SessionEntry, SessionId, SessionRegistry,
+    RuntimeWatchIdentity, SessionEntry, SessionId, SessionRegistry,
 };
 
 const PROCWATCH_SOURCE: &str = "pohunek:procwatch";
@@ -43,7 +43,8 @@ impl SessionRegistry {
     pub(super) fn spawn_procwatch(
         &self,
         id: SessionId,
-        root_pid: Pid,
+        expected: RuntimeWatchIdentity,
+        root: ProcessIdentity,
         cancel: CancellationToken,
         rescan: std::sync::Arc<Notify>,
     ) {
@@ -55,14 +56,74 @@ impl SessionRegistry {
                 tokio::select! {
                     () = cancel.cancelled() => break,
                     _ = tick.tick() => {
-                        registry.rescan_procwatch_at(&id, root_pid, Instant::now()).await;
+                        if !registry.rescan_live_root(&id, &expected, root, Instant::now()).await {
+                            cancel.cancel();
+                            break;
+                        }
                     }
                     () = rescan.notified() => {
-                        registry.rescan_procwatch_at(&id, root_pid, Instant::now()).await;
+                        if !registry.rescan_live_root(&id, &expected, root, Instant::now()).await {
+                            cancel.cancel();
+                            break;
+                        }
                     }
                 }
             }
         });
+    }
+
+    async fn rescan_live_root(
+        &self,
+        id: &SessionId,
+        expected: &RuntimeWatchIdentity,
+        root: ProcessIdentity,
+        now: Instant,
+    ) -> bool {
+        match self.inner.inspector.identity(root.pid) {
+            Ok(Some(current)) if current == root => {
+                self.rescan_guarded_procwatch_at(id, expected, root, now)
+                    .await
+            }
+            Ok(_) => {
+                self.retire_procwatch_root(id, expected, now).await;
+                false
+            }
+            Err(err) => {
+                debug!(
+                    session_id = %id.0,
+                    root_pid = root.pid,
+                    error = %err,
+                    "failed to validate procwatch root identity"
+                );
+                true
+            }
+        }
+    }
+
+    pub(super) async fn retire_procwatch_root(
+        &self,
+        id: &SessionId,
+        expected: &RuntimeWatchIdentity,
+        now: Instant,
+    ) {
+        let updated = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get_mut(id) else {
+                return;
+            };
+            if !expected.matches(entry) {
+                return;
+            }
+            entry.observed_agents.clear();
+            entry.foreground_process_group = None;
+            entry
+                .active_agent
+                .clone()
+                .map(|active| clear_active_agent(entry, self.procwatch_tombstone_for(&active, now)))
+        };
+        if let Some(info) = updated {
+            self.emit(event::SESSION_UPDATED, &info);
+        }
     }
 
     fn probe_foreground_group(&self, id: &SessionId, root_pid: Pid) -> ForegroundProbe {
@@ -80,7 +141,18 @@ impl SessionRegistry {
         }
     }
 
-    pub(super) async fn rescan_procwatch_at(&self, id: &SessionId, root_pid: Pid, now: Instant) {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one identity bracket keeps process collection, state projection, and cwd validation ordered"
+    )]
+    async fn rescan_guarded_procwatch_at(
+        &self,
+        id: &SessionId,
+        expected: &RuntimeWatchIdentity,
+        root: ProcessIdentity,
+        now: Instant,
+    ) -> bool {
+        let root_pid = root.pid;
         let observed_refresh = match self.inner.inspector.descendants(root_pid) {
             Ok(facts) => Some(self.observed_agents_from_facts(id, facts, now)),
             Err(err) => {
@@ -96,6 +168,22 @@ impl SessionRegistry {
         // Procfs inspection is synchronous. Keep it outside the global session
         // mutex so a slow or permission-gated probe cannot stall unrelated RPCs.
         let foreground_probe = self.probe_foreground_group(id, root_pid);
+        match self.inner.inspector.identity(root_pid) {
+            Ok(Some(current)) if current == root => {}
+            Ok(_) => {
+                self.retire_procwatch_root(id, expected, now).await;
+                return false;
+            }
+            Err(err) => {
+                debug!(
+                    session_id = %id.0,
+                    root_pid,
+                    error = %err,
+                    "failed to close procwatch root identity bracket"
+                );
+                return true;
+            }
+        }
         let mut exit_watches = match observed_refresh.as_ref() {
             Some(observed) => {
                 let existing = self.existing_observed_identities(id).await;
@@ -104,14 +192,17 @@ impl SessionRegistry {
             None => HashMap::new(),
         };
 
-        let (to_spawn, updated, focus_pid, foreground_group, foreground_changed) = {
+        let (to_spawn, updated, focus, foreground_group, foreground_changed) = {
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(id) else {
                 debug!(session_id = %id.0, "procwatch rescan for unknown session");
-                return;
+                return false;
             };
+            if !expected.matches(entry) {
+                return false;
+            }
             if entry.stopping || is_terminal(entry.info.state) {
-                return;
+                return false;
             }
 
             let to_spawn = apply_observed_refresh(entry, observed_refresh, &mut exit_watches);
@@ -123,15 +214,28 @@ impl SessionRegistry {
                 ForegroundDecision::Preserve => None,
                 ForegroundDecision::Updated => Some(entry.info.clone()),
             };
-            let focus_pid = entry
+            let focus = entry
                 .active_agent
                 .as_ref()
-                .and_then(|active| active.pid)
-                .unwrap_or(root_pid);
+                .and_then(|active| {
+                    let pid = active.pid?;
+                    let start_identity = active.start_identity.or_else(|| {
+                        entry
+                            .observed_agents
+                            .iter()
+                            .find(|observed| observed.pid == pid)
+                            .map(|observed| observed.start_identity)
+                    })?;
+                    Some((pid, start_identity))
+                })
+                .map_or(root, |(pid, start_identity)| ProcessIdentity {
+                    pid,
+                    start_identity: StartIdentity::new(start_identity),
+                });
             (
                 to_spawn,
                 updated,
-                focus_pid,
+                focus,
                 entry.foreground_process_group,
                 foreground_changed,
             )
@@ -144,7 +248,7 @@ impl SessionRegistry {
             debug!(
                 session_id = %id.0,
                 root_pid,
-                focus_pid,
+                focus_pid = focus.pid,
                 foreground_pgid = foreground_group,
                 "session process focus reconciled"
             );
@@ -152,20 +256,52 @@ impl SessionRegistry {
         if let Some(info) = updated {
             self.emit(event::SESSION_UPDATED, &info);
         }
-        match self.inner.inspector.cwd(focus_pid) {
+        let focus_is_current = || {
+            self.inner
+                .inspector
+                .identity(focus.pid)
+                .is_ok_and(|current| current == Some(focus))
+        };
+        if !focus_is_current() {
+            return true;
+        }
+        match self.inner.inspector.cwd(focus.pid) {
             Ok(cwd) => {
-                self.apply_cwd_change(id, cwd, CwdSource::Procwatch, None)
-                    .await;
+                if focus_is_current() {
+                    self.apply_cwd_change(id, cwd, CwdSource::Procwatch, Some(expected))
+                        .await;
+                }
             }
             Err(err) => {
                 debug!(
                     session_id = %id.0,
-                    focus_pid,
+                    focus_pid = focus.pid,
                     error = %err,
                     "failed to inspect focus process cwd"
                 );
             }
         }
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) async fn rescan_procwatch_at(&self, id: &SessionId, root_pid: Pid, now: Instant) {
+        let expected = {
+            let sessions = self.inner.sessions.lock().await;
+            sessions
+                .get(id)
+                .and_then(|entry| RuntimeWatchIdentity::from_info(&entry.info))
+                .expect("test procwatch session has a live runtime identity")
+        };
+        let root = self
+            .inner
+            .inspector
+            .identity(root_pid)
+            .expect("test procwatch root identity probe")
+            .expect("test procwatch root process");
+        let _ = self
+            .rescan_guarded_procwatch_at(id, &expected, root, now)
+            .await;
     }
 
     pub(super) async fn on_observed_agent_exit(&self, id: &SessionId, identity: ObservedIdentity) {
