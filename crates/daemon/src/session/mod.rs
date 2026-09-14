@@ -3145,6 +3145,12 @@ impl SessionRegistry {
         updated.procwatch_cancel.cancel();
         self.cancel_session_attaches(id).await;
         self.remove_pending_attaches_for_session(id).await;
+        // A terminal session must not resurrect on the next daemon restart:
+        // resume is for sessions whose live PTY a restart killed, not for ones
+        // the user stopped or that exited. The session is now terminal, so
+        // `persist_resume_binding` re-reads it as terminal and removes its
+        // binding (serialized against any racing resize/capture write).
+        self.persist_resume_binding(id).await;
         self.spawn_session_hook(SessionHookRequest {
             event: HookEvent::SessionStop,
             cwd: committed_info.cwd.clone(),
@@ -3154,12 +3160,6 @@ impl SessionRegistry {
             stop_reason: Some(updated.stop_reason),
             activity: None,
         });
-        // A terminal session must not resurrect on the next daemon restart:
-        // resume is for sessions whose live PTY a restart killed, not for ones
-        // the user stopped or that exited. The session is now terminal, so
-        // `persist_resume_binding` re-reads it as terminal and removes its
-        // binding (serialized against any racing resize/capture write).
-        self.persist_resume_binding(id).await;
         self.emit(updated.event, committed_info.as_ref());
         Ok(true)
     }
