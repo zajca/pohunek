@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, oneshot, watch, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, oneshot, watch, Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{event, Level};
 
@@ -171,6 +171,7 @@ impl Server {
             started: Instant::now(),
             initialized_tx,
             lease_epoch_tx,
+            state_changed: Notify::new(),
             shutdown: CancellationToken::new(),
         });
         Ok(Self { listener, shared })
@@ -266,6 +267,7 @@ struct Shared {
     started: Instant,
     initialized_tx: watch::Sender<bool>,
     lease_epoch_tx: watch::Sender<u64>,
+    state_changed: Notify,
     shutdown: CancellationToken,
 }
 
@@ -1247,20 +1249,98 @@ async fn stop_request(
     scope: &RuntimeScope,
     transaction_id: TransactionId,
 ) -> Result<ResponseKind, ControlError> {
-    let pty = scoped_pty(shared, connection, scope).await?;
-    let grace = {
+    validate_scope(shared, connection, scope).await?;
+    let preparation = {
         let mut state = shared.state.lock().await;
-        state.stop_requested = true;
-        state.phase = WireRuntimePhase::Stopping;
-        state.stop_grace
+        prepare_stop(&mut state)?
     };
-    let exit = pty
-        .stop(transaction_id.as_str(), grace)
+    let (pty, grace) = match preparation {
+        StopPreparation::AlreadyCommitted(exit) => {
+            return Ok(ResponseKind::Stopped { exit: Some(exit) });
+        }
+        StopPreparation::Begin { pty, grace } => (pty, grace),
+    };
+    pty.stop(transaction_id.as_str(), grace)
         .await
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
+    let committed = tokio::time::timeout(
+        shared.config.terminal_commit_wait_timeout,
+        wait_for_terminal_commit(shared),
+    )
+    .await
+    .map_err(|_elapsed| {
+        control_error_message(
+            ControlCode::RuntimeFault,
+            "terminal journal commit is still pending; retry stop",
+            true,
+        )
+    })??;
     Ok(ResponseKind::Stopped {
-        exit: Some(exit_status(&exit, true)),
+        exit: Some(committed),
     })
+}
+
+enum StopPreparation {
+    AlreadyCommitted(ExitStatus),
+    Begin { pty: PtyOwner, grace: Duration },
+}
+
+fn prepare_stop(state: &mut State) -> Result<StopPreparation, ControlError> {
+    if state.phase == WireRuntimePhase::Exited {
+        let exit = state.exit.clone().ok_or_else(|| {
+            control_error_message(
+                ControlCode::RuntimeFault,
+                "terminal journal commit has no exit status",
+                false,
+            )
+        })?;
+        return Ok(StopPreparation::AlreadyCommitted(exit));
+    }
+    if state.phase == WireRuntimePhase::Faulted {
+        return Err(control_error_message(
+            ControlCode::RuntimeFault,
+            "runtime faulted before its terminal journal commit",
+            false,
+        ));
+    }
+    let pty = state
+        .pty
+        .clone()
+        .ok_or_else(|| invalid_state("runtime has no PTY"))?;
+    state.stop_requested = true;
+    state.phase = WireRuntimePhase::Stopping;
+    Ok(StopPreparation::Begin {
+        pty,
+        grace: state.stop_grace,
+    })
+}
+
+async fn wait_for_terminal_commit(shared: &Shared) -> Result<ExitStatus, ControlError> {
+    loop {
+        let notified = shared.state_changed.notified();
+        let state = shared.state.lock().await;
+        match state.phase {
+            WireRuntimePhase::Exited => {
+                return state.exit.clone().ok_or_else(|| {
+                    control_error_message(
+                        ControlCode::RuntimeFault,
+                        "terminal journal commit has no exit status",
+                        false,
+                    )
+                });
+            }
+            WireRuntimePhase::Faulted => {
+                return Err(control_error_message(
+                    ControlCode::RuntimeFault,
+                    "runtime faulted before its terminal journal commit",
+                    false,
+                ));
+            }
+            _ => {}
+        }
+        drop(state);
+        notified.await;
+    }
 }
 
 async fn acknowledge_request(
@@ -1403,11 +1483,17 @@ fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: Runtim
     ));
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputCompletion {
+    Eof { next_offset: u64 },
+    ForcedClosed { next_offset: u64 },
+}
+
 async fn monitor_runtime_output(
     shared: &Shared,
     pty: &PtyOwner,
     runtime_id: &RuntimeId,
-) -> Result<u64, WorkerError> {
+) -> Result<OutputCompletion, WorkerError> {
     let mut subscriber = pty
         .subscribe_output(Some(0))
         .map_err(|error| WorkerError::Pty(PtyError::Output(error)))?;
@@ -1428,7 +1514,12 @@ async fn monitor_runtime_output(
                     watermark,
                 });
             }
-            Some(OutputEvent::Exit { next_offset }) => return Ok(next_offset),
+            Some(OutputEvent::Exit { next_offset }) => {
+                if pty.output_forced_closed() {
+                    return Ok(OutputCompletion::ForcedClosed { next_offset });
+                }
+                return Ok(OutputCompletion::Eof { next_offset });
+            }
             None => {
                 return Err(WorkerError::Protocol(
                     "PTY output monitor closed before EOF".to_owned(),
@@ -1438,16 +1529,24 @@ async fn monitor_runtime_output(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "root exit, bounded PTY drain, cleanup, and durable publication form one ordered lifecycle"
+)]
 async fn coordinate_runtime_completion(
     shared: Arc<Shared>,
     pty: PtyOwner,
     runtime_id: RuntimeId,
-    output_eof_rx: oneshot::Receiver<Result<u64, WorkerError>>,
+    mut output_eof_rx: oneshot::Receiver<Result<OutputCompletion, WorkerError>>,
 ) {
     let exit = match wait_runtime_exit(&pty).await {
         Ok(exit) => exit,
         Err(error) => {
+            let _ = pty
+                .stop("root-observation-failure", shared.config.stop_grace)
+                .await;
             mark_runtime_faulted(&shared, runtime_id, WorkerError::Pty(error)).await;
+            shared.shutdown.cancel();
             return;
         }
     };
@@ -1459,10 +1558,36 @@ async fn coordinate_runtime_completion(
         )
     };
     let exited_at = timestamp();
-    let next_output_offset = match output_eof_rx.await {
-        Ok(Ok(next_output_offset)) => next_output_offset,
+    let output_completion =
+        match tokio::time::timeout(shared.config.post_exit_drain_timeout, &mut output_eof_rx).await
+        {
+            Ok(completion) => completion,
+            Err(_elapsed) => {
+                event!(
+                    name: "worker.pty.drain.expired",
+                    Level::WARN,
+                    process.pid = pty.identity().pid,
+                    "PTY drain deadline expired; terminating the retained process group",
+                );
+                let grace = {
+                    let state = shared.state.lock().await;
+                    state.stop_grace
+                };
+                if let Err(error) = pty.stop("natural-drain-timeout", grace).await {
+                    if !matches!(error, PtyError::OutputForcedClosed) {
+                        mark_runtime_faulted(&shared, runtime_id, WorkerError::Pty(error)).await;
+                        shared.shutdown.cancel();
+                        return;
+                    }
+                }
+                output_eof_rx.await
+            }
+        };
+    let completion = match output_completion {
+        Ok(Ok(completion)) => completion,
         Ok(Err(error)) => {
             mark_runtime_faulted(&shared, runtime_id, error).await;
+            shared.shutdown.cancel();
             return;
         }
         Err(_closed) => {
@@ -1472,9 +1597,29 @@ async fn coordinate_runtime_completion(
                 WorkerError::Protocol("PTY output monitor stopped before EOF".to_owned()),
             )
             .await;
+            shared.shutdown.cancel();
             return;
         }
     };
+    let next_output_offset = match completion {
+        OutputCompletion::Eof { next_offset } => next_offset,
+        OutputCompletion::ForcedClosed { next_offset } => {
+            mark_runtime_faulted_at_offset(
+                &shared,
+                runtime_id,
+                WorkerError::Pty(PtyError::OutputForcedClosed),
+                Some(next_offset),
+            )
+            .await;
+            shared.shutdown.cancel();
+            return;
+        }
+    };
+    if let Err(error) = pty.finish_natural().await {
+        mark_runtime_faulted(&shared, runtime_id, WorkerError::Pty(error)).await;
+        shared.shutdown.cancel();
+        return;
+    }
     let Some(retention) = retry_runtime_completion(
         &shared,
         &exit,
@@ -1577,6 +1722,7 @@ async fn commit_runtime_completion(
     state.phase = WireRuntimePhase::Exited;
     state.exit = Some(status.clone());
     state.journal = journal;
+    shared.state_changed.notify_waiters();
     Ok(state.terminal_retention)
 }
 
@@ -1585,15 +1731,28 @@ async fn wait_runtime_exit(pty: &PtyOwner) -> Result<Exit, PtyError> {
 }
 
 async fn mark_runtime_faulted(shared: &Shared, runtime_id: RuntimeId, error: WorkerError) {
+    mark_runtime_faulted_at_offset(shared, runtime_id, error, None).await;
+}
+
+async fn mark_runtime_faulted_at_offset(
+    shared: &Shared,
+    runtime_id: RuntimeId,
+    error: WorkerError,
+    next_output_offset: Option<u64>,
+) {
     let commit = {
         let mut state = shared.state.lock().await;
         state.phase = WireRuntimePhase::Faulted;
         state.journal.phase = JournalPhase::Faulted;
+        if let Some(next_output_offset) = next_output_offset {
+            state.journal.next_output_offset = next_output_offset;
+        }
         state.journal.pending_launch_claims.clear();
         mark_running_subagents_lost(&mut state.journal, unix_ms());
         state.journal.updated_at = timestamp();
         persist(shared.journal.clone(), state.journal.clone()).await
     };
+    shared.state_changed.notify_waiters();
     if let Err(persist_error) = commit {
         event!(
             name: "worker.journal.write.failed",
@@ -1754,13 +1913,14 @@ async fn serve_data(
                     if *lease_epoch.borrow() != grant.lease_epoch {
                         return Ok(());
                     }
-                    write_output_event(
+                    write_runtime_output_event(
                         &mut write_half,
                         version,
                         &stream_id,
                         &runtime_id,
                         shared.config.data_payload_bytes,
                         output,
+                        pty.output_forced_closed(),
                     ).await?;
                 }
             }
@@ -1774,13 +1934,14 @@ async fn serve_data(
                     pending_output_exit = Some(output);
                     continue;
                 }
-                write_output_event(
+                write_runtime_output_event(
                     &mut write_half,
                     version,
                     &stream_id,
                     &runtime_id,
                     shared.config.data_payload_bytes,
                     output,
+                    pty.output_forced_closed(),
                 ).await?;
             }
             input = protocol::read_frame(&mut read_half) => {
@@ -2267,6 +2428,43 @@ where
             .await
         }
     }
+}
+
+async fn write_runtime_output_event<W>(
+    writer: &mut W,
+    version: Version,
+    stream_id: &StreamId,
+    runtime_id: &RuntimeId,
+    payload_limit: usize,
+    output: OutputEvent,
+    forced_closed: bool,
+) -> Result<(), WorkerError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    if forced_closed && matches!(output, OutputEvent::Exit { .. }) {
+        return write_data_error(
+            writer,
+            version,
+            stream_id,
+            runtime_id,
+            control_error(
+                ControlCode::RuntimeFault,
+                PtyError::OutputForcedClosed,
+                false,
+            ),
+        )
+        .await;
+    }
+    write_output_event(
+        writer,
+        version,
+        stream_id,
+        runtime_id,
+        payload_limit,
+        output,
+    )
+    .await
 }
 
 async fn write_output_chunks<W>(
@@ -3546,9 +3744,9 @@ mod tests {
         stop_subagent, valid_identity_expiry, validate_attach_write_id, validate_data_start,
         validate_observation_request, validate_terminal_snapshot_dimensions,
         validate_terminal_snapshot_response, wait_runtime_exit, write_data_error,
-        write_observation_page, write_output_chunks, write_terminal_chunks, Connection,
-        ControlInputId, DataGrant, ObservationGrant, ObservationWaitOutcome, PrefixStream,
-        TokenState, WireTerminalSnapshot,
+        write_observation_page, write_output_chunks, write_runtime_output_event,
+        write_terminal_chunks, Connection, ControlInputId, DataGrant, ObservationGrant,
+        ObservationWaitOutcome, PrefixStream, TokenState, WireTerminalSnapshot,
     };
     use pohunek_worker_protocol::{
         self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
@@ -4045,6 +4243,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn natural_exit_bounds_a_descendant_that_never_closes_the_pty() {
+        let directory = BarrierDirectory::new();
+        let config = crate::WorkerConfig {
+            post_exit_drain_timeout: Duration::from_millis(50),
+            stop_grace: Duration::from_millis(50),
+            ..crate::WorkerConfig::new()
+        };
+        let server = super::Server::bind(super::ServerArgs {
+            session_id: "s-113".to_owned(),
+            worker_id: "worker-bounded-drain".to_owned(),
+            socket_path: directory.path().join("worker.sock"),
+            journal_path: directory.path().join("journal.json"),
+            daemon_socket_path: directory.path().join("daemon.sock"),
+            config: config.clone(),
+        })
+        .await
+        .expect("bind worker");
+        let pty = super::spawn_pty(
+            crate::Command {
+                program: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    concat!(
+                        "trap '' HUP; ",
+                        "sh -c 'trap \"\" HUP TERM; while :; do sleep 1; done' & ",
+                        "printf 'root-exited\\n'"
+                    )
+                    .to_owned(),
+                ],
+                env: Vec::new(),
+                cwd: directory.path().to_path_buf(),
+                cols: 80,
+                rows: 24,
+            },
+            &config,
+        )
+        .expect("spawn PTY");
+        let runtime_id = RuntimeId::new("runtime-bounded-drain").expect("runtime id");
+        let mut state = server.shared.state.lock().await;
+        state.phase = super::WireRuntimePhase::Running;
+        state.runtime_id = Some(runtime_id.clone());
+        state.pty = Some(pty.clone());
+        state.stop_grace = config.stop_grace;
+        state.journal.phase = super::JournalPhase::Live;
+        state.journal.runtime_id = Some(runtime_id.as_str().to_owned());
+        state.journal.child = Some(super::journal_identity(pty.identity()));
+        drop(state);
+        super::spawn_runtime_monitors(
+            std::sync::Arc::clone(&server.shared),
+            pty.clone(),
+            runtime_id,
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server.shared.state.lock().await.phase == super::WireRuntimePhase::Exited {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bounded natural drain completion");
+        let state = server.shared.state.lock().await;
+        assert_eq!(
+            state
+                .journal
+                .outcome
+                .as_ref()
+                .expect("terminal outcome")
+                .reason,
+            "natural_exit"
+        );
+        assert!(state.journal.next_output_offset > 0);
+        drop(state);
+        assert!(
+            super::process_start(pty.identity().pid).is_err(),
+            "root must be reaped after automatic cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn escaped_pty_holder_faults_with_the_exact_final_output_offset() {
+        let directory = BarrierDirectory::new();
+        let ready = directory.path().join("escaped-ready");
+        let config = crate::WorkerConfig {
+            post_exit_drain_timeout: Duration::from_millis(50),
+            stop_grace: Duration::from_millis(50),
+            ..crate::WorkerConfig::new()
+        };
+        let server = super::Server::bind(super::ServerArgs {
+            session_id: "s-114".to_owned(),
+            worker_id: "worker-escaped-output".to_owned(),
+            socket_path: directory.path().join("worker.sock"),
+            journal_path: directory.path().join("journal.json"),
+            daemon_socket_path: directory.path().join("daemon.sock"),
+            config: config.clone(),
+        })
+        .await
+        .expect("bind worker");
+        let pty = super::spawn_pty(
+            crate::Command {
+                program: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    concat!(
+                        "trap '' HUP; ",
+                        "setsid sh -c 'trap \"\" HUP TERM; printf ready > \"$2\"; ",
+                        "while [ -d \"$1\" ]; do sleep 0.01; done' escaped \"$1\" \"$2\" & ",
+                        "while [ ! -e \"$2\" ]; do sleep 0.01; done; ",
+                        "printf 'root-exited\\n'"
+                    )
+                    .to_owned(),
+                    "pohunek-escaped-output".to_owned(),
+                    directory.path().to_string_lossy().into_owned(),
+                    ready.to_string_lossy().into_owned(),
+                ],
+                env: Vec::new(),
+                cwd: directory.path().to_path_buf(),
+                cols: 80,
+                rows: 24,
+            },
+            &config,
+        )
+        .expect("spawn PTY");
+        let runtime_id = RuntimeId::new("runtime-escaped-output").expect("runtime id");
+        let () = {
+            let mut state = server.shared.state.lock().await;
+            state.phase = super::WireRuntimePhase::Running;
+            state.runtime_id = Some(runtime_id.clone());
+            state.pty = Some(pty.clone());
+            state.stop_grace = config.stop_grace;
+            state.journal.phase = super::JournalPhase::Live;
+            state.journal.runtime_id = Some(runtime_id.as_str().to_owned());
+            state.journal.child = Some(super::journal_identity(pty.identity()));
+        };
+        super::spawn_runtime_monitors(
+            std::sync::Arc::clone(&server.shared),
+            pty.clone(),
+            runtime_id,
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server.shared.state.lock().await.phase == super::WireRuntimePhase::Faulted {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bounded forced-close fault");
+        let final_offset = pty.output().next_offset();
+        let journal = server.shared.journal.load().expect("load fault journal");
+        assert_eq!(journal.phase, super::JournalPhase::Faulted);
+        assert_eq!(journal.next_output_offset, final_offset);
+        assert!(final_offset > 0);
+    }
+
+    #[tokio::test]
     async fn terminal_commit_retries_before_publishing_exited_state() {
         let (server, pty, directory) = launch_claim_fixture().await;
         let journal_path = server.shared.journal.path().to_path_buf();
@@ -4071,6 +4429,8 @@ mod tests {
             42,
         );
         tokio::pin!(completion);
+        let terminal_confirmation = super::wait_for_terminal_commit(&shared);
+        tokio::pin!(terminal_confirmation);
         assert!(
             tokio::time::timeout(Duration::from_millis(100), &mut completion)
                 .await
@@ -4081,6 +4441,12 @@ mod tests {
             server.shared.state.lock().await.phase,
             super::WireRuntimePhase::Running,
             "terminal state cannot be public before its journal commit"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut terminal_confirmation)
+                .await
+                .is_err(),
+            "stop confirmation cannot precede durable terminal state"
         );
 
         std::fs::remove_dir(&journal_path).expect("restore writable journal path");
@@ -4096,6 +4462,22 @@ mod tests {
         let journal = server.shared.journal.load().expect("load terminal journal");
         assert_eq!(journal.phase, super::JournalPhase::Terminal);
         assert_eq!(journal.next_output_offset, 42);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), &mut terminal_confirmation)
+                .await
+                .expect("terminal confirmation deadline")
+                .expect("terminal confirmation"),
+            status
+        );
+        let () = {
+            let mut state = server.shared.state.lock().await;
+            let retry = super::prepare_stop(&mut state).expect("prepare repeated stop");
+            let super::StopPreparation::AlreadyCommitted(retry_status) = retry else {
+                panic!("repeated stop must reuse the durable terminal commit");
+            };
+            assert_eq!(retry_status, status);
+            assert_eq!(state.phase, super::WireRuntimePhase::Exited);
+        };
         pty.stop("test-cleanup", Duration::from_millis(100))
             .await
             .expect("stop fixture PTY");
@@ -4689,6 +5071,36 @@ mod tests {
         assert_eq!(frame.header().stream_id, stream_id);
         assert_eq!(frame.header().runtime_id, runtime_id);
         assert_eq!(frame.header().kind, FrameKind::Error { error: expected });
+    }
+
+    #[tokio::test]
+    async fn forced_output_close_is_framed_as_a_runtime_fault() {
+        let stream_id = StreamId::new("forced-close").expect("stream id");
+        let runtime_id = RuntimeId::new("runtime-forced-close").expect("runtime id");
+        let (mut reader, mut writer) = tokio::io::duplex(4_096);
+
+        write_runtime_output_event(
+            &mut writer,
+            CURRENT_VERSION,
+            &stream_id,
+            &runtime_id,
+            1_024,
+            crate::OutputEvent::Exit { next_offset: 42 },
+            true,
+        )
+        .await
+        .expect("write forced-close fault");
+        let frame = protocol::read_frame(&mut reader)
+            .await
+            .expect("read forced-close frame")
+            .expect("forced-close frame");
+
+        let FrameKind::Error { error } = &frame.header().kind else {
+            panic!("forced close must not be framed as normal runtime exit");
+        };
+        assert_eq!(error.code, ControlCode::RuntimeFault);
+        assert!(!error.retryable);
+        assert!(error.message.contains("force-closed"));
     }
 
     #[tokio::test]

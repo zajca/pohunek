@@ -393,7 +393,7 @@ async fn managed_output_remains_available_until_descendant_pty_eof() {
                 "-c",
                 concat!(
                     "trap '' HUP; root_pid=$$; (",
-                    "while kill -0 \"$root_pid\" 2>/dev/null; do sleep 0.01; done; ",
+                    "while [ \"$(sed -n 's/^.*) \\([^ ]\\).*/\\1/p' \"/proc/$root_pid/stat\" 2>/dev/null)\" != Z ]; do sleep 0.01; done; ",
                     "printf exited > \"$1\"; ",
                     "while [ ! -e \"$2\" ] && [ -d \"$3\" ]; do sleep 0.01; done; ",
                     "if [ -e \"$2\" ]; then printf 'late-descendant-output\\n'; fi",
@@ -475,6 +475,61 @@ async fn managed_output_remains_available_until_descendant_pty_eof() {
             .expect("terminal session")
             .state,
         SessionState::Done
+    );
+}
+
+#[tokio::test]
+async fn stop_after_root_exit_terminates_a_descendant_that_keeps_the_pty_open() {
+    let barrier = tempfile::tempdir().expect("create stop barrier");
+    let root_exited = barrier.path().join("root-exited");
+    let descendant_ready = barrier.path().join("descendant-ready");
+    let root_exited_arg = root_exited.to_string_lossy().into_owned();
+    let descendant_ready_arg = descendant_ready.to_string_lossy().into_owned();
+    let barrier_arg = barrier.path().to_string_lossy().into_owned();
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new(
+            "/bin/sh",
+            [
+                "-c",
+                concat!(
+                    "trap '' HUP; root_pid=$$; (",
+                    "trap '' HUP TERM; printf ready > \"$2\"; ",
+                    "while [ \"$(sed -n 's/^.*) \\([^ ]\\).*/\\1/p' \"/proc/$root_pid/stat\" 2>/dev/null)\" != Z ]; do sleep 0.01; done; ",
+                    "printf exited > \"$1\"; ",
+                    "while [ -d \"$3\" ]; do sleep 0.01; done",
+                    ") & while [ ! -e \"$2\" ]; do sleep 0.01; done"
+                ),
+                "pohunek-stop-after-root-exit",
+                &root_exited_arg,
+                &descendant_ready_arg,
+                &barrier_arg,
+            ],
+        ),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let root_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !root_exited.exists() {
+        assert!(
+            tokio::time::Instant::now() < root_deadline,
+            "timed out waiting for root exit"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let stopped = tokio::time::timeout(Duration::from_secs(2), registry.stop(&created.id))
+        .await
+        .expect("bounded public stop deadline")
+        .expect("stop draining session");
+    assert!(stopped.stopped);
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect stopped session")
+            .state,
+        SessionState::Stopped
     );
 }
 
@@ -1215,6 +1270,7 @@ struct MockInspectorState {
     identity_after_descendants: HashMap<Pid, ProcessIdentity>,
     identity_after_cwd: HashMap<Pid, (usize, ProcessIdentity)>,
     identity_errors: HashMap<Pid, std::io::ErrorKind>,
+    non_running: HashSet<ProcessIdentity>,
     exits: HashMap<Pid, Vec<tokio::sync::watch::Sender<bool>>>,
     immediate_exits: HashSet<Pid>,
     events_expected_before_watch: HashMap<Pid, tokio::sync::broadcast::Receiver<Event>>,
@@ -1341,6 +1397,14 @@ impl MockInspector {
             .insert(pid, identity);
     }
 
+    fn set_not_running(&self, identity: ProcessIdentity) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .non_running
+            .insert(identity);
+    }
+
     fn change_identity_after_descendants(&self, pid: Pid, identity: ProcessIdentity) {
         self.inner
             .lock()
@@ -1409,6 +1473,19 @@ impl ProcessInspector for MockInspector {
         }
         self.process(pid)
             .map(|fact| fact.map(|fact| fact.identity()))
+    }
+
+    fn is_running(&self, identity: ProcessIdentity) -> Result<bool, crate::procwatch::Error> {
+        if self
+            .inner
+            .lock()
+            .expect("mock inspector lock")
+            .non_running
+            .contains(&identity)
+        {
+            return Ok(false);
+        }
+        Ok(self.identity(identity.pid)? == Some(identity))
     }
 
     fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, crate::procwatch::Error> {
@@ -8055,6 +8132,47 @@ async fn procwatch_retires_root_authority_before_reused_pid_can_drive_state() {
         inspected.cwd, safe_cwd,
         "a reused root PID must not drive descendant or cwd reconciliation"
     );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn procwatch_retires_a_zombie_root_with_its_exact_generation() {
+    let (registry, inspector, created) = mock_procwatch_registry("zombie-root").await;
+    let root = inspector
+        .identity(created.pid)
+        .expect("root identity probe")
+        .expect("live root identity");
+    let expected = RuntimeWatchIdentity::from_info(&created).expect("runtime identity");
+    let () = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("live session entry");
+        entry.active_agent = Some(ActiveAgentReport {
+            source: "test-zombie-claim".to_owned(),
+            agent: "shell".to_owned(),
+            seq: Some(1),
+            pid: Some(root.pid),
+            start_identity: Some(root.start_identity.get()),
+            reported_at: Instant::now(),
+            activity_reported: false,
+        });
+        entry.info.active_agent = Some("shell".to_owned());
+        entry.info.active_agent_base = Some(AgentKind::Shell);
+        entry.info.active_agent_pid = Some(root.pid);
+    };
+    inspector.set_not_running(root);
+
+    assert!(
+        !registry
+            .rescan_live_root(&created.id, &expected, root, Instant::now())
+            .await,
+        "a zombie must release procwatch root authority"
+    );
+    assert!(registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session")
+        .active_agent
+        .is_none());
     let _ = registry.stop(&created.id).await;
 }
 

@@ -29,6 +29,8 @@ const ENV_SESSION_ID: &str = "POHUNEK_SESSION_ID";
 const STAT_PGRP_FIELD: usize = 5;
 /// `/proc/<pid>/stat` parent-process field number (`ppid`).
 const STAT_PPID_FIELD: usize = 4;
+/// `/proc/<pid>/stat` process-state field number.
+const STAT_STATE_FIELD: usize = 3;
 /// `/proc/<pid>/stat` controlling-terminal foreground group field number
 /// (`tpgid`). The value is signed; `-1` means no controlling terminal.
 const STAT_TPGID_FIELD: usize = 8;
@@ -99,6 +101,12 @@ impl ProcessInspector for LinuxInspector {
         let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
         read_process_identity_at(Path::new(PROC_ROOT), pid, euid)
             .map_err(|source| process_error("inspect_process_identity", source))
+    }
+
+    fn is_running(&self, identity: ProcessIdentity) -> Result<bool, Error> {
+        let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
+        process_is_running_at(Path::new(PROC_ROOT), identity, euid)
+            .map_err(|source| process_error("inspect_process_liveness", source))
     }
 
     fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, Error> {
@@ -255,6 +263,7 @@ fn read_stat_pid_field(process_id: Pid, field_number: usize) -> io::Result<Optio
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StatFact {
     comm: String,
+    state: char,
     parent_id: Pid,
     pgid: Pid,
     start_identity: StartIdentity,
@@ -262,6 +271,16 @@ struct StatFact {
 
 fn read_process_stat(process_id: Pid) -> io::Result<Option<StatFact>> {
     read_process_stat_at(Path::new(PROC_ROOT), process_id)
+}
+
+fn process_is_running_at(root: &Path, identity: ProcessIdentity, euid: u32) -> io::Result<bool> {
+    if checked_same_user_at(root, identity.pid, euid)? != Some(true) {
+        return Ok(false);
+    }
+    let Some(stat) = read_process_stat_at(root, identity.pid)? else {
+        return Ok(false);
+    };
+    Ok(stat.start_identity == identity.start_identity && !matches!(stat.state, 'Z' | 'X' | 'x'))
 }
 
 fn read_process_stat_at(root: &Path, process_id: Pid) -> io::Result<Option<StatFact>> {
@@ -276,6 +295,7 @@ fn read_process_stat_at(root: &Path, process_id: Pid) -> io::Result<Option<StatF
         .get(command_start + 1..command_end)
         .ok_or_else(invalid_process_stat_error)?
         .to_owned();
+    let state = parse_stat_field(&stat, STAT_STATE_FIELD).ok_or_else(invalid_process_stat_error)?;
     let parent_id =
         parse_stat_pid_field(&stat, STAT_PPID_FIELD).ok_or_else(invalid_process_stat_error)?;
     let pgid =
@@ -284,6 +304,7 @@ fn read_process_stat_at(root: &Path, process_id: Pid) -> io::Result<Option<StatF
         parse_stat_field(&stat, STAT_STARTTIME_FIELD).ok_or_else(invalid_process_stat_error)?;
     Ok(Some(StatFact {
         comm,
+        state,
         parent_id,
         pgid,
         start_identity: StartIdentity::new(start_identity),
@@ -677,12 +698,14 @@ mod tests {
         let stats = std::cell::RefCell::new(VecDeque::from([
             StatFact {
                 comm: "old-agent".to_owned(),
+                state: 'S',
                 parent_id: 7,
                 pgid: 456,
                 start_identity: StartIdentity::new(987_654),
             },
             StatFact {
                 comm: "new-agent".to_owned(),
+                state: 'S',
                 parent_id: 8,
                 pgid: 457,
                 start_identity: StartIdentity::new(987_655),
@@ -710,6 +733,7 @@ mod tests {
     fn process_fact_sampling_uses_one_stable_stat_generation() {
         let stat = StatFact {
             comm: "agent".to_owned(),
+            state: 'S',
             parent_id: 7,
             pgid: 456,
             start_identity: StartIdentity::new(987_654),
@@ -762,6 +786,41 @@ mod tests {
             read_process_parent_at(root.path(), process_id, euid).expect("parent inspection"),
             Some(7)
         );
+    }
+
+    #[test]
+    fn exact_liveness_rejects_zombies_and_reused_identities() {
+        let root = tempfile::tempdir().expect("temporary proc root");
+        let process_id = 123;
+        let process_dir = root.path().join(process_id.to_string());
+        fs::create_dir(&process_dir).expect("process directory");
+        let euid = fs::metadata(&process_dir).expect("process metadata").uid();
+        let identity = ProcessIdentity {
+            pid: process_id,
+            start_identity: StartIdentity::new(987_654),
+        };
+        let write_state = |state| {
+            fs::write(
+                process_dir.join("stat"),
+                format!("123 (agent) {state} 7 456 3 4 789 0 0 0 0 0 0 0 0 0 20 0 1 0 987654"),
+            )
+            .expect("process stat");
+        };
+
+        write_state('S');
+        assert!(process_is_running_at(root.path(), identity, euid).expect("running process"));
+        write_state('Z');
+        assert!(!process_is_running_at(root.path(), identity, euid).expect("zombie process"));
+        write_state('S');
+        assert!(!process_is_running_at(
+            root.path(),
+            ProcessIdentity {
+                start_identity: StartIdentity::new(987_655),
+                ..identity
+            },
+            euid,
+        )
+        .expect("reused process"));
     }
 
     #[test]

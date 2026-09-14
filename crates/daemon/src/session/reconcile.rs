@@ -1459,6 +1459,17 @@ fn validate_worker_identity_processes(
         .child_process
         .as_ref()
         .ok_or(IdentityValidationFailure::Permanent("worker_child_missing"))?;
+    let expected_root = crate::procwatch::ProcessIdentity {
+        pid: root.pid,
+        start_identity: crate::procwatch::StartIdentity::new(root.start_identity),
+    };
+    if !inspector.is_running(expected_root).map_err(|_error| {
+        IdentityValidationFailure::Retryable("identity_process_inspection_failed")
+    })? {
+        return Err(IdentityValidationFailure::Permanent(
+            "identity_process_root_missing",
+        ));
+    }
     let current_root = inspector
         .process(root.pid)
         .map_err(|_error| {
@@ -2789,7 +2800,7 @@ mod tests {
         let command = format!(
             concat!(
                 "trap '' HUP; root_pid=$$; (",
-                "while kill -0 \"$root_pid\" 2>/dev/null; do sleep 0.01; done; ",
+                "while [ \"$(sed -n 's/^.*) \\([^ ]\\).*/\\1/p' \"/proc/$root_pid/stat\" 2>/dev/null)\" != Z ]; do sleep 0.01; done; ",
                 "printf exited > '{}'; ",
                 "while [ ! -e '{}' ]; do sleep 0.01; done; ",
                 "printf 'late-restart-output\\n') & ",

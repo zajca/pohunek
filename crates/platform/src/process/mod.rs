@@ -266,6 +266,18 @@ pub trait ProcessInspector: Debug + Send + Sync + 'static {
     /// Returns typed failures when the minimal platform process record cannot be inspected.
     fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, Error>;
 
+    /// Returns whether an exact process identity is still executing.
+    ///
+    /// Exited processes retained as zombies are not running. The default is
+    /// conservative for platforms that cannot distinguish that state.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed failures when the minimal process record cannot be inspected.
+    fn is_running(&self, identity: ProcessIdentity) -> Result<bool, Error> {
+        Ok(self.identity(identity.pid)? == Some(identity))
+    }
+
     /// Returns the current parent PID without reading unrelated process facts.
     ///
     /// The returned PID is an instantaneous relationship, not a stable identity.

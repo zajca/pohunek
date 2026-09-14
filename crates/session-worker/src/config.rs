@@ -22,6 +22,10 @@ pub(crate) const DEFAULT_DATA_TOKEN_TTL: Duration = Duration::from_secs(10);
 pub(crate) const DEFAULT_INPUT_DEDUP_ENTRIES: usize = 4_096;
 /// Default graceful stop window before hard termination.
 pub(crate) const DEFAULT_STOP_GRACE: Duration = Duration::from_millis(500);
+/// Default window for descendants to finish writing after the root exits.
+pub(crate) const DEFAULT_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default wait for a durable terminal commit before acknowledging stop.
+pub(crate) const DEFAULT_TERMINAL_COMMIT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default final-screen retention while the daemon is unavailable.
 pub(crate) const DEFAULT_TERMINAL_RETENTION: Duration = Duration::from_hours(24);
 /// Default maximum time occupied by one stalled observation request.
@@ -113,6 +117,10 @@ pub struct WorkerConfig {
     pub input_dedup_entries: usize,
     /// Grace period between soft and hard stop.
     pub stop_grace: Duration,
+    /// Maximum natural PTY drain after the root process exits.
+    pub post_exit_drain_timeout: Duration,
+    /// Maximum wait for terminal journal persistence in a stop RPC.
+    pub terminal_commit_wait_timeout: Duration,
     /// Retention after terminal outcome when unacknowledged.
     pub terminal_retention: Duration,
     /// Maximum duration of one control-plane output wait.
@@ -142,6 +150,8 @@ impl WorkerConfig {
             data_token_ttl: DEFAULT_DATA_TOKEN_TTL,
             input_dedup_entries: DEFAULT_INPUT_DEDUP_ENTRIES,
             stop_grace: DEFAULT_STOP_GRACE,
+            post_exit_drain_timeout: DEFAULT_POST_EXIT_DRAIN_TIMEOUT,
+            terminal_commit_wait_timeout: DEFAULT_TERMINAL_COMMIT_WAIT_TIMEOUT,
             terminal_retention: DEFAULT_TERMINAL_RETENTION,
             max_observation_wait: DEFAULT_MAX_OBSERVATION_WAIT,
             max_snapshot_rows: DEFAULT_MAX_SNAPSHOT_ROWS,
@@ -191,6 +201,11 @@ impl WorkerConfig {
             MAX_INPUT_DEDUP_ENTRIES,
         )?;
         validate_duration("stop_grace", self.stop_grace)?;
+        validate_duration("post_exit_drain_timeout", self.post_exit_drain_timeout)?;
+        validate_duration(
+            "terminal_commit_wait_timeout",
+            self.terminal_commit_wait_timeout,
+        )?;
         validate_duration("terminal_retention", self.terminal_retention)?;
         validate_duration("max_observation_wait", self.max_observation_wait)?;
         if self.max_observation_wait > MAX_OBSERVATION_WAIT {
@@ -275,6 +290,36 @@ mod tests {
             config.validate(),
             Err(ConfigError::Duration {
                 field: "stop_grace"
+            })
+        );
+    }
+
+    #[test]
+    fn zero_post_exit_drain_timeout_is_rejected() {
+        let config = WorkerConfig {
+            post_exit_drain_timeout: Duration::ZERO,
+            ..WorkerConfig::new()
+        };
+
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::Duration {
+                field: "post_exit_drain_timeout"
+            })
+        );
+    }
+
+    #[test]
+    fn zero_terminal_commit_wait_timeout_is_rejected() {
+        let config = WorkerConfig {
+            terminal_commit_wait_timeout: Duration::ZERO,
+            ..WorkerConfig::new()
+        };
+
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::Duration {
+                field: "terminal_commit_wait_timeout"
             })
         );
     }

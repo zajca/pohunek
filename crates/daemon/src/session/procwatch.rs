@@ -72,19 +72,19 @@ impl SessionRegistry {
         });
     }
 
-    async fn rescan_live_root(
+    pub(super) async fn rescan_live_root(
         &self,
         id: &SessionId,
         expected: &RuntimeWatchIdentity,
         root: ProcessIdentity,
         now: Instant,
     ) -> bool {
-        match self.inner.inspector.identity(root.pid) {
-            Ok(Some(current)) if current == root => {
+        match self.inner.inspector.is_running(root) {
+            Ok(true) => {
                 self.rescan_guarded_procwatch_at(id, expected, root, now)
                     .await
             }
-            Ok(_) => {
+            Ok(false) => {
                 self.retire_procwatch_root(id, expected, now).await;
                 false
             }
@@ -168,9 +168,9 @@ impl SessionRegistry {
         // Procfs inspection is synchronous. Keep it outside the global session
         // mutex so a slow or permission-gated probe cannot stall unrelated RPCs.
         let foreground_probe = self.probe_foreground_group(id, root_pid);
-        match self.inner.inspector.identity(root_pid) {
-            Ok(Some(current)) if current == root => {}
-            Ok(_) => {
+        match self.inner.inspector.is_running(root) {
+            Ok(true) => {}
+            Ok(false) => {
                 self.retire_procwatch_root(id, expected, now).await;
                 return false;
             }
