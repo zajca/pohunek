@@ -299,7 +299,8 @@ pub trait ProcessInspector: Debug + Send + Sync + 'static {
     /// Returns minimal identities for descendants of an exact process root.
     ///
     /// This operation avoids optional process metadata so lifecycle checks do
-    /// not depend on readable command lines.
+    /// not depend on readable command lines. Descendants that exit while the
+    /// snapshot is being collected are omitted.
     ///
     /// # Errors
     ///

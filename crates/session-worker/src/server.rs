@@ -3243,6 +3243,19 @@ fn designated_launch_process(
             "launch candidate changed ancestry during inspection".to_owned(),
         ));
     }
+    if inspector
+        .identity(root.pid)
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?
+        != Some(root)
+        || inspector
+            .identity(candidate.pid)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?
+            != Some(exact_candidate)
+    {
+        return Err(WorkerError::Protocol(
+            "launch candidate changed identity during ancestry inspection".to_owned(),
+        ));
+    }
     Ok(Some(candidate))
 }
 

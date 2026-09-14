@@ -148,15 +148,10 @@ impl ProcessInspector for LinuxInspector {
             None => descendants_from_ppid_scan(root.pid, euid)
                 .map_err(|source| process_error(OPERATION, source))?,
         };
-        let mut identities = Vec::with_capacity(pids.len());
-        for pid in pids {
-            let identity = read_process_identity_at(Path::new(PROC_ROOT), pid, euid)
-                .map_err(|source| process_error(OPERATION, source))?
-                .ok_or(Error::Race {
-                    operation: OPERATION,
-                })?;
-            identities.push(identity);
-        }
+        let identities = collect_live_identities(&pids, |pid| {
+            read_process_identity_at(Path::new(PROC_ROOT), pid, euid)
+                .map_err(|source| process_error(OPERATION, source))
+        })?;
         require_identity(root, euid, OPERATION)?;
         Ok(identities)
     }
@@ -274,15 +269,12 @@ fn read_process_stat_at(root: &Path, process_id: Pid) -> io::Result<Option<StatF
         Err(err) if is_process_race(&err) => return Ok(None),
         Err(err) => return Err(err),
     };
-    let Some(parent_id) = parse_stat_pid_field(&stat, STAT_PPID_FIELD) else {
-        return Ok(None);
-    };
-    let Some(pgid) = parse_stat_pid_field(&stat, STAT_PGRP_FIELD) else {
-        return Ok(None);
-    };
-    let Some(start_identity) = parse_stat_field(&stat, STAT_STARTTIME_FIELD) else {
-        return Ok(None);
-    };
+    let parent_id =
+        parse_stat_pid_field(&stat, STAT_PPID_FIELD).ok_or_else(invalid_process_stat_error)?;
+    let pgid =
+        parse_stat_pid_field(&stat, STAT_PGRP_FIELD).ok_or_else(invalid_process_stat_error)?;
+    let start_identity =
+        parse_stat_field(&stat, STAT_STARTTIME_FIELD).ok_or_else(invalid_process_stat_error)?;
     Ok(Some(StatFact {
         parent_id,
         pgid,
@@ -295,7 +287,7 @@ fn read_process_identity_at(
     process_id: Pid,
     euid: u32,
 ) -> io::Result<Option<ProcessIdentity>> {
-    if !same_user_at(root, process_id, euid) {
+    if checked_same_user_at(root, process_id, euid)? != Some(true) {
         return Ok(None);
     }
     Ok(
@@ -306,8 +298,23 @@ fn read_process_identity_at(
     )
 }
 
+fn collect_live_identities(
+    process_ids: &[Pid],
+    mut inspect: impl FnMut(Pid) -> Result<Option<ProcessIdentity>, Error>,
+) -> Result<Vec<ProcessIdentity>, Error> {
+    let mut identities = Vec::with_capacity(process_ids.len());
+    for &process_id in process_ids {
+        match inspect(process_id) {
+            Ok(Some(identity)) => identities.push(identity),
+            Ok(None) | Err(Error::Race { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(identities)
+}
+
 fn read_process_parent_at(root: &Path, process_id: Pid, euid: u32) -> io::Result<Option<Pid>> {
-    if !same_user_at(root, process_id, euid) {
+    if checked_same_user_at(root, process_id, euid)? != Some(true) {
         return Ok(None);
     }
     Ok(read_process_stat_at(root, process_id)?.map(|stat| stat.parent_id))
@@ -319,7 +326,7 @@ fn read_control_group_membership_at(
     euid: u32,
     expected: &str,
 ) -> io::Result<bool> {
-    if expected.is_empty() || !same_user_at(root, process_id, euid) {
+    if expected.is_empty() || checked_same_user_at(root, process_id, euid)? != Some(true) {
         return Ok(false);
     }
     let cgroups = fs::read_to_string(proc_path_at(root, process_id).join("cgroup"))?;
@@ -548,6 +555,21 @@ fn same_user_at(root: &Path, pid: Pid, euid: u32) -> bool {
     fs::metadata(proc_path_at(root, pid)).is_ok_and(|metadata| metadata.uid() == euid)
 }
 
+fn checked_same_user_at(root: &Path, pid: Pid, euid: u32) -> io::Result<Option<bool>> {
+    match fs::metadata(proc_path_at(root, pid)) {
+        Ok(metadata) => Ok(Some(metadata.uid() == euid)),
+        Err(error) if is_process_race(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn invalid_process_stat_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "process stat is missing a required numeric field",
+    )
+}
+
 fn proc_path(pid: Pid) -> PathBuf {
     proc_path_at(Path::new(PROC_ROOT), pid)
 }
@@ -648,6 +670,79 @@ mod tests {
             read_process_parent_at(root.path(), process_id, euid).expect("parent inspection"),
             Some(7)
         );
+    }
+
+    #[test]
+    fn descendant_identity_scan_skips_a_child_that_already_disappeared() {
+        let live_process_id = 123;
+        let exited_process_id = 456;
+        let live_identity = ProcessIdentity {
+            pid: live_process_id,
+            start_identity: StartIdentity::new(987_654),
+        };
+
+        assert_eq!(
+            collect_live_identities(&[live_process_id, exited_process_id], |pid| {
+                Ok((pid == live_process_id).then_some(live_identity))
+            })
+            .expect("descendant identity scan"),
+            vec![live_identity]
+        );
+    }
+
+    #[test]
+    fn descendant_identity_scan_skips_an_explicit_process_race() {
+        let live_identity = ProcessIdentity {
+            pid: 123,
+            start_identity: StartIdentity::new(987_654),
+        };
+
+        assert_eq!(
+            collect_live_identities(&[live_identity.pid, 456], |pid| {
+                if pid == live_identity.pid {
+                    Ok(Some(live_identity))
+                } else {
+                    Err(Error::Race {
+                        operation: "inspect_descendant_identities",
+                    })
+                }
+            })
+            .expect("descendant identity scan"),
+            vec![live_identity]
+        );
+    }
+
+    #[test]
+    fn descendant_identity_scan_propagates_non_race_failures() {
+        let error = collect_live_identities(&[123], |_pid| {
+            Err(Error::from_io(
+                "inspect_descendant_identities",
+                io::Error::from(io::ErrorKind::PermissionDenied),
+            ))
+        })
+        .expect_err("permission failure must remain visible");
+
+        assert!(matches!(
+            error,
+            Error::PermissionDenied {
+                operation: "inspect_descendant_identities",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn narrow_identity_reports_malformed_process_stat() {
+        let root = tempfile::tempdir().expect("temporary proc root");
+        let process_id = 123;
+        let process_dir = root.path().join(process_id.to_string());
+        fs::create_dir(&process_dir).expect("process directory");
+        fs::write(process_dir.join("stat"), "123 (truncated) S 7").expect("malformed process stat");
+        let euid = fs::metadata(&process_dir).expect("process metadata").uid();
+
+        let error = read_process_identity_at(root.path(), process_id, euid)
+            .expect_err("malformed stat must remain visible");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
