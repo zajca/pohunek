@@ -23,6 +23,7 @@ _PLUGIN_PACKAGE_NAME = "pohunek_e2e_plugin"
 _MARKER = "pohunek-hermes-plugin-e2e-marker"
 _REMOTE_MARKER = "pohunek-hermes-plugin-remote-marker"
 _NATIVE_REFERENCE = "hermes-e2e-native"
+_HERMES_EXIT_INPUT = "pohunek-hermes-exit\n"
 _GAP_COMPLETE_MARKER = "pohunek-hermes-gap-output-complete"
 _GAP_OUTPUT_BYTES = 11_000_000
 _MAX_RETRIES = 200
@@ -445,6 +446,9 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
     forked = invoke(handlers, "pohunek_session_fork", {"session": hermes_id})
     if forked != {"fork_supported": False, "error": {"code": "agent_fork_unsupported"}}:
         raise FixtureError("Hermes fork was not returned as structured unsupported data")
+    invoke(handlers, "pohunek_session_send", {
+        "session": hermes_id, "input": _HERMES_EXIT_INPUT,
+    })
     inspect_until_terminal(handlers, hermes_id)
     resumed = invoke(handlers, "pohunek_session_resume", {"session": hermes_id})
     if not isinstance(resumed, dict):

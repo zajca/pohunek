@@ -37,6 +37,16 @@ highest overlap for that connection. The old integer-v1 request envelope is not
 accepted. Waiting observation calls open dedicated connections so they do not
 block the caller's ordinary control connection.
 
+The shipped platform foundation centralizes target-neutral process identity,
+kernel Unix peer identity, and native service supervision contracts in
+`crates/platform`. Linux daemon and worker code use the real procfs, pidfd,
+peer-credential, and systemd backends. Native Apple Silicon and Intel CI compile
+and test the shared contract with a macOS 14 deployment target, but this does
+not mean macOS host or client support is available. Secure runtime paths,
+Darwin process and peer inspection, portable PTY readiness, launchd, client and
+WebUI integration, signed artifacts, and native acceptance remain explicitly
+deferred through issues #96-#105 under the accepted macOS RFC.
+
 ## Owner paths and the accepted relay direction
 
 Current protocol-v3 operation is owner-only. Local clients connect to the Unix

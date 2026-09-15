@@ -131,6 +131,8 @@ class HookReporter:
         try:
             response = self._send(self._worker_socket, message)
             if isinstance(response, dict) and response.get("ok") is True and "err" not in response:
+                # A pending launch claim is durably owned and retried by the worker.
+                # Public fallback must not race that immutable launch decision.
                 return True
             self._record_failure()
             return False

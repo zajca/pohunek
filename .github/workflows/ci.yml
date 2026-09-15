@@ -21,6 +21,42 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  platform-contracts:
+    name: platform contracts (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    env:
+      # Compile against the oldest supported macOS SDK contract. Runtime
+      # acceptance on macOS 14 remains an explicit release milestone.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify native runner architecture
+        shell: bash
+        run: test "$(uname -m)" = "${{ matrix.arch }}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: platform-${{ matrix.arch }}
+
+      - name: Check shared platform contracts
+        run: cargo check --locked -p pohunek-platform --all-targets
+
+      - name: Test shared platform contracts
+        run: cargo test --locked -p pohunek-platform
+
   test:
     name: fmt + clippy + test + build
     runs-on: ubuntu-latest

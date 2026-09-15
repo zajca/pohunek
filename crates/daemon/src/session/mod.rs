@@ -45,12 +45,10 @@ use crate::external::{
 use crate::integration::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
-use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessInspector};
+use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessIdentity, ProcessInspector};
 use crate::project::detect::{project_id, DetectedProject};
 use crate::project::{detect_at, ProjectManager};
-use crate::runtime::{
-    DimensionUpdate, SystemdWorkerLauncher, Worker, WorkerError, WorkerLaunchMode, WorkerLauncher,
-};
+use crate::runtime::{DimensionUpdate, SystemdWorkerLauncher, Worker, WorkerError, WorkerLauncher};
 use crate::store::{
     DesiredState, ProjectRecord, ResumeBinding, RuntimeRecord, SessionRecord, SessionTransaction,
     SessionWriteOutcome, Store, TransactionKind, WorktreeStatus,
@@ -460,6 +458,15 @@ struct SessionRegistryInner {
     procwatch_seq: AtomicU64,
     /// Read-only external agent sessions observed outside pohunek-owned PTYs.
     external: ExternalSessions,
+    #[cfg(test)]
+    external_association_block: std::sync::Mutex<Option<Arc<ExternalAssociationBlock>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ExternalAssociationBlock {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 #[derive(Debug, Clone)]
@@ -670,6 +677,7 @@ enum RuntimeMetadataPolicy {
 struct ExitTransition {
     event: &'static str,
     stop_reason: &'static str,
+    cancel_attaches: bool,
     detector_cancel: CancellationToken,
     procwatch_cancel: CancellationToken,
     expected: RuntimeWatchIdentity,
@@ -724,6 +732,7 @@ fn exit_transition(
             event::SESSION_UPDATED
         },
         stop_reason,
+        cancel_attaches: stopped,
         detector_cancel: candidate.detector_cancel.clone(),
         procwatch_cancel: candidate.procwatch_cancel.clone(),
         expected,
@@ -1148,6 +1157,8 @@ impl SessionRegistry {
                 inspector,
                 procwatch_seq: AtomicU64::new(current_time_millis()),
                 external: external.clone(),
+                #[cfg(test)]
+                external_association_block: std::sync::Mutex::new(None),
             }),
         };
         if let Some(config) = external_observer {
@@ -3134,8 +3145,16 @@ impl SessionRegistry {
         };
         updated.detector_cancel.cancel();
         updated.procwatch_cancel.cancel();
-        self.cancel_session_attaches(id).await;
+        if updated.cancel_attaches {
+            self.cancel_session_attaches(id).await;
+        }
         self.remove_pending_attaches_for_session(id).await;
+        // A terminal session must not resurrect on the next daemon restart:
+        // resume is for sessions whose live PTY a restart killed, not for ones
+        // the user stopped or that exited. The session is now terminal, so
+        // `persist_resume_binding` re-reads it as terminal and removes its
+        // binding (serialized against any racing resize/capture write).
+        self.persist_resume_binding(id).await;
         self.spawn_session_hook(SessionHookRequest {
             event: HookEvent::SessionStop,
             cwd: committed_info.cwd.clone(),
@@ -3145,12 +3164,6 @@ impl SessionRegistry {
             stop_reason: Some(updated.stop_reason),
             activity: None,
         });
-        // A terminal session must not resurrect on the next daemon restart:
-        // resume is for sessions whose live PTY a restart killed, not for ones
-        // the user stopped or that exited. The session is now terminal, so
-        // `persist_resume_binding` re-reads it as terminal and removes its
-        // binding (serialized against any racing resize/capture write).
-        self.persist_resume_binding(id).await;
         self.emit(updated.event, committed_info.as_ref());
         Ok(true)
     }
@@ -3245,7 +3258,6 @@ impl SessionRegistry {
             }
         };
         let owned_pids = self.owned_process_pids(&facts).await;
-        let existing_pids = self.inner.external.pids().await;
         let mut observed_pids = HashSet::new();
 
         for fact in facts {
@@ -3282,30 +3294,60 @@ impl SessionRegistry {
                     continue;
                 }
             };
-            observed_pids.insert(fact.pid);
             let candidate = transcripts.best_match(&agent_base, &cwd, &fact);
             let association = self
                 .resolve_external_cwd_association(fact.pid, cwd.clone())
                 .await;
             let info = external_session_info(&fact, agent_base, cwd, candidate, association);
-            let change = self.inner.external.upsert(info).await;
-            match change {
-                Some(ExternalSessionChange::Created(info)) => {
-                    if !existing_pids.contains(&fact.pid) {
-                        self.spawn_external_exit_watch(fact.pid);
-                    }
-                    self.emit(event::SESSION_CREATED, &info);
+            let identity = fact.identity();
+            let upsert = match self
+                .inner
+                .external
+                .upsert_if_current(
+                    identity,
+                    info,
+                    || {
+                        self.inner
+                            .inspector
+                            .identity(identity.pid)
+                            .map(|current| current == Some(identity))
+                    },
+                    |change| match change {
+                        ExternalSessionChange::Created(info) => {
+                            self.emit(event::SESSION_CREATED, info);
+                        }
+                        ExternalSessionChange::Updated(info) => {
+                            self.emit(event::SESSION_UPDATED, info);
+                        }
+                    },
+                )
+                .await
+            {
+                Ok(Some(upsert)) => upsert,
+                Ok(None) => continue,
+                Err(err) if err.is_race() => continue,
+                Err(err) => {
+                    debug!(
+                        pid = identity.pid,
+                        error = %err,
+                        "failed to revalidate external agent identity"
+                    );
+                    observed_pids.insert(identity.pid);
+                    continue;
                 }
-                Some(ExternalSessionChange::Updated(info)) => {
-                    self.emit(event::SESSION_UPDATED, &info);
-                }
-                None => {}
+            };
+            observed_pids.insert(identity.pid);
+            if let Some(identity) = upsert.watch_identity {
+                self.spawn_external_exit_watch(identity);
             }
         }
 
-        for removed in self.inner.external.remove_unobserved(&observed_pids).await {
-            self.emit(event::SESSION_REMOVED, &removed);
-        }
+        self.inner
+            .external
+            .remove_unobserved(&observed_pids, |removed| {
+                self.emit(event::SESSION_REMOVED, removed);
+            })
+            .await;
     }
 
     async fn owned_process_pids(&self, facts: &[ProcessFact]) -> HashSet<Pid> {
@@ -3344,6 +3386,19 @@ impl SessionRegistry {
         pid: Pid,
         cwd: PathBuf,
     ) -> Option<CwdAssociation> {
+        #[cfg(test)]
+        {
+            let block = self
+                .inner
+                .external_association_block
+                .lock()
+                .expect("external association test lock")
+                .clone();
+            if let Some(block) = block {
+                block.entered.notify_one();
+                block.release.notified().await;
+            }
+        }
         let store = self.inner.store.clone();
         match tokio::task::spawn_blocking(move || {
             resolve_cwd_association(cwd.as_path(), store.as_deref())
@@ -3370,22 +3425,23 @@ impl SessionRegistry {
         }
     }
 
-    fn spawn_external_exit_watch(&self, pid: Pid) {
-        let watch = match self.inner.inspector.exit_watch(pid) {
+    fn spawn_external_exit_watch(&self, identity: ProcessIdentity) {
+        let watch = match self.inner.inspector.exit_watch(identity) {
             Ok(watch) => watch,
             Err(err) => {
                 debug!(
-                    pid,
+                    pid = identity.pid,
+                    process_start_identity = identity.start_identity.get(),
                     error = %err,
                     "failed to arm external agent exit watch; falling back to poll cleanup"
                 );
                 return;
             }
         };
-        self.spawn_external_exit_watch_task(pid, watch);
+        self.spawn_external_exit_watch_task(identity, watch);
     }
 
-    fn spawn_external_exit_watch_task(&self, pid: Pid, watch: ExitWatch) {
+    fn spawn_external_exit_watch_task(&self, identity: ProcessIdentity, watch: ExitWatch) {
         let registry = self.clone();
         let shutdown = self.inner.external.shutdown_token();
         tokio::spawn(async move {
@@ -3394,22 +3450,24 @@ impl SessionRegistry {
                 result = watch.wait() => {
                     if let Err(err) = result {
                         debug!(
-                            pid,
+                            pid = identity.pid,
+                            process_start_identity = identity.start_identity.get(),
                             error = %err,
                             "external process exit watch failed"
                         );
                         return;
                     }
-                    registry.on_external_agent_exit(pid).await;
+                    registry.on_external_agent_exit(identity).await;
                 }
             }
         });
     }
 
-    async fn on_external_agent_exit(&self, pid: Pid) {
-        if let Some(info) = self.inner.external.remove_pid(pid).await {
-            self.emit(event::SESSION_REMOVED, &info);
-        }
+    async fn on_external_agent_exit(&self, identity: ProcessIdentity) {
+        self.inner
+            .external
+            .remove_identity(identity, |info| self.emit(event::SESSION_REMOVED, info))
+            .await;
     }
 
     fn emit(&self, name: &str, info: &SessionInfo) {

@@ -1,6 +1,6 @@
 //! Maintains bounded output history and atomic subscriptions.
 
-// Rust guideline compliant 2026-08-04
+// Rust guideline compliant 2026-09-14
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -31,6 +31,9 @@ pub enum RingError {
         /// Current next offset.
         next: u64,
     },
+    /// Bytes were submitted after the PTY output reached EOF.
+    #[error("runtime output is already closed")]
+    Closed,
 }
 
 /// Contiguous PTY output with its runtime offset.
@@ -112,6 +115,24 @@ pub enum OutputEvent {
     },
 }
 
+/// Immutable reason and offset recorded when PTY output closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputCompletion {
+    /// The PTY reader observed natural EOF.
+    Eof { next_offset: u64 },
+    /// Lifecycle cleanup sealed output before the reader observed EOF.
+    ForcedClosed { next_offset: u64 },
+}
+
+impl OutputCompletion {
+    /// Returns the immutable terminal output offset.
+    pub(crate) const fn next_offset(self) -> u64 {
+        match self {
+            Self::Eof { next_offset } | Self::ForcedClosed { next_offset } => next_offset,
+        }
+    }
+}
+
 impl OutputEvent {
     fn payload_bytes(&self) -> usize {
         match self {
@@ -189,7 +210,7 @@ impl OutputHub {
                 terminal,
                 terminal_snapshot,
                 subscribers: Vec::new(),
-                exited: false,
+                completion: None,
             })),
             subscriber_limit,
             observation: Arc::new(Notify::new()),
@@ -203,6 +224,9 @@ impl OutputHub {
     /// Returns [`RingError::OffsetOverflow`] instead of wrapping offsets.
     pub fn push(&self, bytes: &[u8]) -> Result<OutputChunk, RingError> {
         let mut state = lock(&self.inner);
+        if state.completion.is_some() && !bytes.is_empty() {
+            return Err(RingError::Closed);
+        }
         let chunk = state.ring.push(bytes)?;
         if bytes.is_empty() {
             return Ok(chunk);
@@ -247,8 +271,8 @@ impl OutputHub {
 
     fn register_subscriber(&self, state: &mut HubState, seed: QueueSeed) -> OutputSubscriber {
         let queue = Arc::new(SubscriberQueue::new(self.subscriber_limit, seed));
-        if state.exited {
-            queue.push_terminal(state.ring.next_offset);
+        if let Some(completion) = state.completion {
+            queue.push_terminal(completion.next_offset());
         } else {
             state.subscribers.push(Arc::downgrade(&queue));
         }
@@ -294,7 +318,7 @@ impl OutputHub {
         notified.as_mut().enable();
         {
             let state = lock(&self.inner);
-            if state.ring.next_offset != observed_end || state.exited {
+            if state.ring.next_offset != observed_end || state.completion.is_some() {
                 return;
             }
         }
@@ -313,9 +337,30 @@ impl OutputHub {
 
     /// Marks output EOF and wakes every subscriber.
     pub fn mark_exit(&self) {
+        self.close(OutputCloseReason::Eof);
+    }
+
+    /// Seals output at its current offset for lifecycle-forced cleanup.
+    pub(crate) fn force_close(&self) -> OutputCompletion {
+        self.close(OutputCloseReason::Forced)
+    }
+
+    /// Returns the immutable output completion once sealed.
+    pub(crate) fn completion(&self) -> Option<OutputCompletion> {
+        lock(&self.inner).completion
+    }
+
+    fn close(&self, reason: OutputCloseReason) -> OutputCompletion {
         let mut state = lock(&self.inner);
-        state.exited = true;
+        if let Some(completion) = state.completion {
+            return completion;
+        }
         let next_offset = state.ring.next_offset;
+        let completion = match reason {
+            OutputCloseReason::Eof => OutputCompletion::Eof { next_offset },
+            OutputCloseReason::Forced => OutputCompletion::ForcedClosed { next_offset },
+        };
+        state.completion = Some(completion);
         for weak in state.subscribers.drain(..) {
             if let Some(queue) = weak.upgrade() {
                 queue.push_terminal(next_offset);
@@ -323,6 +368,7 @@ impl OutputHub {
         }
         drop(state);
         self.observation.notify_waiters();
+        completion
     }
 
     /// Returns the next output offset.
@@ -351,7 +397,13 @@ struct HubState {
     terminal: TerminalTracker,
     terminal_snapshot: Arc<TerminalSnapshot>,
     subscribers: Vec<Weak<SubscriberQueue>>,
-    exited: bool,
+    completion: Option<OutputCompletion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputCloseReason {
+    Eof,
+    Forced,
 }
 
 impl HubState {
@@ -392,7 +444,7 @@ impl HubState {
             bytes,
             gap,
             has_more: next_offset < runtime_end_offset,
-            exited: self.exited,
+            exited: self.completion.is_some(),
         })
     }
     fn subscription_seed(&self, after_offset: Option<u64>) -> Result<QueueSeed, RingError> {
@@ -747,7 +799,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutputEvent, OutputHub, OutputSnapshot};
+    use super::{OutputCompletion, OutputEvent, OutputHub, OutputSnapshot, RingError};
     use pohunek_terminal::TerminalSnapshot;
     use pohunek_worker_protocol::MAX_DATA_PAYLOAD_BYTES;
 
@@ -806,6 +858,52 @@ mod tests {
         let exited = hub.observe(Some(0), 64).expect("empty exited page");
         assert!(exited.bytes.is_empty());
         assert!(exited.exited);
+    }
+
+    #[tokio::test]
+    async fn eof_is_idempotent_and_rejects_late_output() {
+        let hub = OutputHub::new(64, 64, 2, 10).expect("hub");
+        hub.push(b"complete").expect("push before EOF");
+        let mut subscriber = hub.subscribe(Some(0)).expect("subscribe");
+        hub.mark_exit();
+        hub.mark_exit();
+
+        assert_eq!(hub.push(b"late"), Err(RingError::Closed));
+        assert_eq!(hub.next_offset(), 8);
+        assert!(matches!(
+            subscriber.recv().await,
+            Some(OutputEvent::Replay(chunk)) if chunk.bytes == b"complete"
+        ));
+        assert_eq!(
+            subscriber.recv().await,
+            Some(OutputEvent::Exit { next_offset: 8 })
+        );
+        assert_eq!(subscriber.recv().await, None);
+    }
+
+    #[test]
+    fn first_output_completion_is_immutable() {
+        let naturally_closed = OutputHub::new(64, 64, 2, 10).expect("natural hub");
+        naturally_closed.push(b"natural").expect("natural output");
+        naturally_closed.mark_exit();
+        assert_eq!(
+            naturally_closed.force_close(),
+            OutputCompletion::Eof { next_offset: 7 }
+        );
+
+        let forced_closed = OutputHub::new(64, 64, 2, 10).expect("forced hub");
+        forced_closed.push(b"forced").expect("forced output");
+        assert_eq!(
+            forced_closed.force_close(),
+            OutputCompletion::ForcedClosed { next_offset: 6 }
+        );
+        forced_closed.mark_exit();
+        assert_eq!(
+            forced_closed.completion(),
+            Some(OutputCompletion::ForcedClosed { next_offset: 6 })
+        );
+        assert_eq!(forced_closed.push(b"late"), Err(RingError::Closed));
+        assert_eq!(forced_closed.next_offset(), 6);
     }
 
     #[test]

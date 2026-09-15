@@ -16,6 +16,7 @@ members = [
     "crates/knowledge",
     "crates/hostcheck",
     "crates/logging",
+    "crates/platform",
     "crates/paths",
     "crates/xtask",
     "crates/netbird",
@@ -52,6 +53,7 @@ pohunek-logging = { path = "crates/logging" }
 pohunek-netbird = { path = "crates/netbird" }
 netbird = { package = "pohunek-netbird", path = "crates/netbird" }
 overlay = { package = "pohunek-overlay", path = "crates/overlay" }
+pohunek-platform = { path = "crates/platform" }
 pohunek-paths = { path = "crates/paths" }
 pohunek-prompt = { path = "crates/prompt" }
 pohunek-protocol = { path = "crates/protocol" }
@@ -62,6 +64,7 @@ pohunek-terminal = { path = "crates/terminal" }
 pohunek-worker-protocol = { path = "crates/worker-protocol" }
 pohunek-session-worker = { path = "crates/session-worker" }
 iced = { version = "0.14", default-features = false }
+async-io = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -75,7 +78,7 @@ regex = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "fs", "time", "process"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"
-keyring = { version = "3", features = ["async-secret-service", "tokio", "crypto-rust"] }
+keyring = { version = "3", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
@@ -86,6 +89,7 @@ clap_complete = { version = "4", features = ["unstable-dynamic"] }
 # lock and 0600 socket. Minimal, standard FFI surface; needed for milestone 2.
 libc = "0.2"
 nix = { version = "0.29", features = ["fs", "user"] }
+rustix = { version = "1", features = ["fs"] }
 # RFC3339 timestamps for session metadata (milestone 3). Formatting only.
 time = { version = "0.3", features = ["formatting"] }
 vt100 = "0.16.2"

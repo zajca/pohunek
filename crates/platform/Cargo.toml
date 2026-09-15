@@ -1,0 +1,22 @@
+[package]
+name = "pohunek-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared operating-system contracts for Pohunek host processes."
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+async-io.workspace = true
+nix = { workspace = true, features = ["socket"] }
+rustix = { workspace = true, features = ["process"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

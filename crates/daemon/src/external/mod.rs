@@ -5,7 +5,7 @@
 //! controls external processes; it only publishes read-only `SessionInfo`
 //! snapshots for UI and CLI visibility.
 
-// Rust guideline compliant 2026-07-07
+// Rust guideline compliant 2026-09-14
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr, OsString};
@@ -26,7 +26,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::procwatch::{Pid, ProcessFact};
+use crate::procwatch::{Pid, ProcessFact, ProcessIdentity};
 use crate::session::SessionRegistry;
 
 /// Prefix for synthetic session ids assigned to external processes.
@@ -91,9 +91,22 @@ pub(crate) struct ExternalSessions {
 
 #[derive(Debug)]
 struct ExternalSessionsInner {
-    entries: AsyncMutex<HashMap<Pid, SessionInfo>>,
+    entries: AsyncMutex<HashMap<Pid, ExternalEntry>>,
     rescan: Notify,
     shutdown: CancellationToken,
+}
+
+#[derive(Debug, Clone)]
+struct ExternalEntry {
+    identity: ProcessIdentity,
+    info: SessionInfo,
+}
+
+/// Atomic result of inserting or refreshing an external session.
+#[derive(Debug)]
+pub(crate) struct ExternalUpsert {
+    /// Exact process generation that needs a new exit watch.
+    pub(crate) watch_identity: Option<ProcessIdentity>,
 }
 
 /// Change produced by inserting or refreshing an external session.
@@ -203,7 +216,7 @@ impl ExternalSessions {
             .lock()
             .await
             .values()
-            .cloned()
+            .map(|entry| entry.info.clone())
             .collect::<Vec<_>>();
         sessions.sort_by(|left, right| left.id.0.cmp(&right.id.0));
         sessions
@@ -212,7 +225,12 @@ impl ExternalSessions {
     /// Finds one external session by id.
     pub(crate) async fn inspect(&self, id: &SessionId) -> Option<SessionInfo> {
         let pid = external_pid(id)?;
-        self.inner.entries.lock().await.get(&pid).cloned()
+        self.inner
+            .entries
+            .lock()
+            .await
+            .get(&pid)
+            .map(|entry| entry.info.clone())
     }
 
     /// Whether `id` currently belongs to an observed external process.
@@ -220,44 +238,96 @@ impl ExternalSessions {
         self.inspect(id).await.is_some()
     }
 
-    /// Returns currently known external pids.
-    pub(crate) async fn pids(&self) -> HashSet<Pid> {
-        self.inner.entries.lock().await.keys().copied().collect()
-    }
-
-    /// Inserts or refreshes an external session snapshot.
-    pub(crate) async fn upsert(&self, mut info: SessionInfo) -> Option<ExternalSessionChange> {
+    /// Inserts or refreshes an external session snapshot while it is current.
+    ///
+    /// `publish` runs synchronously while the entry lock is held so a competing
+    /// exit or sweep cannot publish a later lifecycle event first. It must not
+    /// block or re-enter this store.
+    pub(crate) async fn upsert_if_current<E>(
+        &self,
+        identity: ProcessIdentity,
+        mut info: SessionInfo,
+        validate: impl FnOnce() -> Result<bool, E>,
+        publish: impl FnOnce(&ExternalSessionChange),
+    ) -> Result<Option<ExternalUpsert>, E> {
         let mut entries = self.inner.entries.lock().await;
+        if !validate()? {
+            return Ok(None);
+        }
         let Some(existing) = entries.get(&info.pid) else {
-            entries.insert(info.pid, info.clone());
-            return Some(ExternalSessionChange::Created(info));
+            entries.insert(
+                info.pid,
+                ExternalEntry {
+                    identity,
+                    info: info.clone(),
+                },
+            );
+            publish(&ExternalSessionChange::Created(info));
+            return Ok(Some(ExternalUpsert {
+                watch_identity: Some(identity),
+            }));
         };
 
-        info.created_at.clone_from(&existing.created_at);
-        if external_info_matches(existing, &info) {
-            return None;
+        if existing.identity == identity {
+            info.created_at.clone_from(&existing.info.created_at);
+            if external_info_matches(&existing.info, &info) {
+                return Ok(Some(ExternalUpsert {
+                    watch_identity: None,
+                }));
+            }
         }
-        entries.insert(info.pid, info.clone());
-        Some(ExternalSessionChange::Updated(info))
+        let watch_identity = (existing.identity != identity).then_some(identity);
+        entries.insert(
+            info.pid,
+            ExternalEntry {
+                identity,
+                info: info.clone(),
+            },
+        );
+        publish(&ExternalSessionChange::Updated(info));
+        Ok(Some(ExternalUpsert { watch_identity }))
     }
 
-    /// Removes entries whose pids were absent from a successful sweep.
-    pub(crate) async fn remove_unobserved(&self, observed: &HashSet<Pid>) -> Vec<SessionInfo> {
+    /// Removes and publishes entries whose pids were absent from a successful sweep.
+    ///
+    /// `publish` has the same nonblocking, non-reentrant contract as the upsert
+    /// publisher and runs before another mutation can acquire the entry lock.
+    pub(crate) async fn remove_unobserved(
+        &self,
+        observed: &HashSet<Pid>,
+        mut publish: impl FnMut(&SessionInfo),
+    ) {
         let mut entries = self.inner.entries.lock().await;
         let stale = entries
             .keys()
             .copied()
             .filter(|pid| !observed.contains(pid))
             .collect::<Vec<_>>();
-        stale
-            .into_iter()
-            .filter_map(|pid| entries.remove(&pid))
-            .collect()
+        for pid in stale {
+            if let Some(entry) = entries.remove(&pid) {
+                publish(&entry.info);
+            }
+        }
     }
 
-    /// Removes one external entry after its exit watch fires.
-    pub(crate) async fn remove_pid(&self, pid: Pid) -> Option<SessionInfo> {
-        self.inner.entries.lock().await.remove(&pid)
+    /// Removes and publishes one entry only if its exact exit watch still owns it.
+    ///
+    /// `publish` has the same nonblocking, non-reentrant contract as the upsert
+    /// publisher and runs before another mutation can acquire the entry lock.
+    pub(crate) async fn remove_identity(
+        &self,
+        identity: ProcessIdentity,
+        publish: impl FnOnce(&SessionInfo),
+    ) -> bool {
+        let mut entries = self.inner.entries.lock().await;
+        if entries.get(&identity.pid).map(|entry| entry.identity) != Some(identity) {
+            return false;
+        }
+        let entry = entries
+            .remove(&identity.pid)
+            .expect("validated external identity must remain present while locked");
+        publish(&entry.info);
+        true
     }
 }
 

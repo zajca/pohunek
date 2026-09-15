@@ -940,7 +940,7 @@ enum {
 
 enum hook_response {
     HOOK_RESPONSE_TERMINAL = -1,
-    HOOK_RESPONSE_RETRY = 0,
+    HOOK_RESPONSE_PENDING = 0,
     HOOK_RESPONSE_ACCEPTED = 1,
 };
 
@@ -1016,13 +1016,16 @@ static unsigned long long process_start_identity(void) {
 
 static enum hook_response parse_hook_response(const char *response) {
     static const char accepted[] =
-        "{\"ok\":true,\"launch_identity_accepted\":true}\n";
-    static const char retryable[] =
-        "{\"ok\":true,\"launch_identity_accepted\":false}\n";
+        "{\"ok\":true,\"launch_identity_accepted\":true,\"launch_identity_status\":\"accepted\"}\n";
+    static const char pending[] =
+        "{\"ok\":true,\"launch_identity_accepted\":false,\"launch_identity_status\":\"pending\"}\n";
+    static const char rejected_claim[] =
+        "{\"ok\":true,\"launch_identity_accepted\":false,\"launch_identity_status\":\"rejected\"}\n";
     static const char rejected[] =
-        "{\"ok\":false,\"launch_identity_accepted\":false}\n";
+        "{\"ok\":false,\"launch_identity_accepted\":false,\"launch_identity_status\":\"not_applicable\"}\n";
     if (strcmp(response, accepted) == 0) return HOOK_RESPONSE_ACCEPTED;
-    if (strcmp(response, retryable) == 0) return HOOK_RESPONSE_RETRY;
+    if (strcmp(response, pending) == 0) return HOOK_RESPONSE_PENDING;
+    if (strcmp(response, rejected_claim) == 0) return HOOK_RESPONSE_TERMINAL;
     if (strcmp(response, rejected) == 0) return HOOK_RESPONSE_TERMINAL;
     return HOOK_RESPONSE_TERMINAL;
 }
@@ -1108,33 +1111,35 @@ static enum hook_response read_response(int fd, long long total_deadline) {
     }
 }
 
-static int report_identity(void) {
+static enum hook_response report_identity(void) {
     const char *endpoint = getenv("POHUNEK_WORKER_SOCKET_PATH");
     const char *runtime = getenv("POHUNEK_RUNTIME_ID");
-    if (endpoint == NULL || runtime == NULL) return 0;
+    if (endpoint == NULL || runtime == NULL) return HOOK_RESPONSE_TERMINAL;
     unsigned long long start = process_start_identity();
-    if (start == 0) return 0;
+    if (start == 0) return HOOK_RESPONSE_TERMINAL;
     time_t current_time = time(NULL);
-    if (current_time == (time_t)-1) return 0;
+    if (current_time == (time_t)-1) return HOOK_RESPONSE_TERMINAL;
     time_t expiry_time = current_time + 30;
     struct tm expiry;
     char expires[32];
-    if (gmtime_r(&expiry_time, &expiry) == NULL) return 0;
-    if (strftime(expires, sizeof(expires), "%Y-%m-%dT%H:%M:%SZ", &expiry) == 0) return 0;
+    if (gmtime_r(&expiry_time, &expiry) == NULL) return HOOK_RESPONSE_TERMINAL;
+    if (strftime(expires, sizeof(expires), "%Y-%m-%dT%H:%M:%SZ", &expiry) == 0) {
+        return HOOK_RESPONSE_TERMINAL;
+    }
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
-    if (strlen(endpoint) >= sizeof(address.sun_path)) return 0;
+    if (strlen(endpoint) >= sizeof(address.sun_path)) return HOOK_RESPONSE_TERMINAL;
     strcpy(address.sun_path, endpoint);
     socklen_t address_length = (socklen_t)(
         offsetof(struct sockaddr_un, sun_path) + strlen(address.sun_path) + 1
     );
     long long started = monotonic_millis();
-    if (started < 0) return 0;
+    if (started < 0) return HOOK_RESPONSE_TERMINAL;
     long long total_deadline = started + IDENTITY_TOTAL_CEILING_MS;
 
     for (int attempt = 0; attempt < IDENTITY_RETRY_ATTEMPTS; attempt++) {
-        if (remaining_millis(total_deadline) == 0) return 0;
+        if (remaining_millis(total_deadline) == 0) return HOOK_RESPONSE_TERMINAL;
         char request[2048];
         unsigned int sequence = (unsigned int)attempt + 1U;
         int request_length = snprintf(request, sizeof(request),
@@ -1143,7 +1148,9 @@ static int report_identity(void) {
             "\"sequence\":%u,\"expires_at\":\"%s\",\"reference_kind\":\"id\","
             "\"native_reference\":\"hermes-e2e-native\"}\n",
             runtime, (long)getpid(), start, sequence, expires);
-        if (request_length <= 0 || (size_t)request_length >= sizeof(request)) return 0;
+        if (request_length <= 0 || (size_t)request_length >= sizeof(request)) {
+            return HOOK_RESPONSE_TERMINAL;
+        }
 
         // Each fresh sequence gets one fresh owner-private nonblocking connection. Only a
         // failure before any request byte is sent is safe to retry without a response.
@@ -1159,15 +1166,13 @@ static int report_identity(void) {
         }
         if (!send_request(fd, request, (size_t)request_length, total_deadline)) {
             close(fd);
-            return 0;
+            return HOOK_RESPONSE_TERMINAL;
         }
         enum hook_response response = read_response(fd, total_deadline);
         close(fd);
-        if (response == HOOK_RESPONSE_ACCEPTED) return 1;
-        if (response == HOOK_RESPONSE_TERMINAL) return 0;
-        if (attempt + 1 < IDENTITY_RETRY_ATTEMPTS) wait_before_retry(total_deadline);
+        return response;
     }
-    return 0;
+    return HOOK_RESPONSE_TERMINAL;
 }
 
 int main(int argc, char **argv) {
@@ -1179,19 +1184,18 @@ int main(int argc, char **argv) {
     int resumed = argc == 4 && strcmp(argv[2], "--resume") == 0 &&
                   strcmp(argv[3], "hermes-e2e-native") == 0;
     if (argc != 2 && !resumed) return 2;
-    if (!report_identity()) {
+    enum hook_response identity = report_identity();
+    if (identity == HOOK_RESPONSE_TERMINAL) {
         fputs("controlled Hermes launch identity was not accepted\n", stderr);
         return 1;
     }
     puts("hermes-e2e-ready");
     fflush(stdout);
-    if (!resumed) {
-        usleep(500000);
-        return 0;
-    }
     char input[4096];
-    while (read(STDIN_FILENO, input, sizeof(input)) >= 0) pause();
-    return 0;
+    while (fgets(input, sizeof(input), stdin) != NULL) {
+        if (!resumed && strstr(input, "pohunek-hermes-exit") != NULL) return 0;
+    }
+    return resumed ? 0 : 1;
 }
 `;
 

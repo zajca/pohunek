@@ -10,6 +10,9 @@ optional team-relay direction for `pohunek`.
 this document wins. Detailed relay decisions are authoritative in the
 [accepted team-relay RFC](design/team-relay-control-plane-rfc.md), tracked by
 [#56](https://github.com/zajca/pohunek/issues/56).
+The accepted complete macOS contract lives in the
+[macOS support RFC](design/macos-support-rfc.md), tracked by
+[#94](https://github.com/zajca/pohunek/issues/94).
 
 Pohunek has two explicit trust domains:
 
@@ -44,6 +47,7 @@ The following invariants span both domains:
 |---|---|---|
 | Standalone Unix-socket owner operation | Shipped in public protocol v3 | Existing daemon, CLI, SDK, and GUI |
 | Direct configured-overlay operation, including NetBird | Shipped in public protocol v3 | Existing daemon and clients; generic overlay work completed in [#69](https://github.com/zajca/pohunek/issues/69) |
+| Shared Linux/macOS platform contracts and native Darwin library CI | Shipped foundation; Linux backends are active, while complete macOS host/client support remains deferred | [#95](https://github.com/zajca/pohunek/issues/95); remaining delivery [#96](https://github.com/zajca/pohunek/issues/96)-[#105](https://github.com/zajca/pohunek/issues/105) |
 | Local/direct-overlay transparent Bun browser backend | Shipped and retained owner-path client transport | Existing `web/backend`; team web mode is separate work in [#86](https://github.com/zajca/pohunek/issues/86) |
 | Stable host identity, one exact principal-or-team owner, checked revisions, local lifecycle, and safe v3 inspection | Shipped host-local foundation; no relay API or mutation surface | [#81](https://github.com/zajca/pohunek/issues/81) |
 | Rust relay foundation: PostgreSQL, lease fencing, recovery quarantine, protected initial Owner/service-account provisioning, generic OIDC, HTTPS auth/account/credential operations, and native credential CLI | Implemented reduced foundation; no host link, routing, attach, account linking, or team administration API | [#85](https://github.com/zajca/pohunek/issues/85); follow-up [#107](https://github.com/zajca/pohunek/issues/107), [#108](https://github.com/zajca/pohunek/issues/108), [#92](https://github.com/zajca/pohunek/issues/92), and [#86](https://github.com/zajca/pohunek/issues/86) |
@@ -268,6 +272,26 @@ sessions become owner-only without being stopped. [#84](https://github.com/zajca
 owns this recovery contract.
 
 ## Host Daemon
+
+### Platform boundary
+
+`crates/platform` defines the narrow operating-system contracts shared by the
+daemon and session worker. Process facts use a PID plus opaque same-boot start
+identity, with a separate boot identity where persistence crosses reboots.
+Kernel peer credentials are captured in the platform backend while
+authorization policy stays with the accepting service.
+
+Native service supervision exposes validated logical IDs, portable states, and
+stable process identities through start, bounded discovery, inspect, replace,
+and retire operations. Linux implements that contract through systemd without
+exposing unit names, D-Bus paths, or raw `MainPID` semantics to session code.
+Worker readiness and authority still come from the private worker handshake.
+
+The shared contract crate compiles and tests natively on Apple Silicon and
+Intel Darwin with a macOS 14 deployment target. This is foundation evidence,
+not a claim that macOS host support ships: secure paths, native process and peer
+inspection, portable PTY I/O, launchd, clients, packaging, and full acceptance
+remain ordered work in #96-#105.
 
 The host daemon is the local control plane for one machine, written in Rust.
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -29,17 +29,19 @@ use crate::external::{external_session_id, TranscriptIndex};
 use crate::integration::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
-use crate::procwatch::{ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessInspector};
+use crate::procwatch::{
+    ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity, ProcessInspector, StartIdentity,
+};
 use crate::project::detect::project_id;
 use crate::runtime::{Worker, WorkerError};
 
 use super::{
     native_report_is_current, preserve_durable_worker_metadata, terminalize_running_subagents,
-    timestamp_now, worker_error_to_protocol, InputSubmission, RuntimeExit, RuntimeHandle,
-    RuntimeWatchIdentity, SessionEntry, SessionRegistry, SessionRegistryConfig, ShellCommand,
-    WorkerMetadataApplyOutcome, WorkerMetadataProgress, WorkerMetadataRetryCause,
-    WorkerMetadataTracker, MAX_SESSION_NAME_BYTES, MAX_WORKER_METADATA_RETRY_DELAY,
-    WORKER_METADATA_RETRY_WARN_INTERVAL,
+    timestamp_now, worker_error_to_protocol, ActiveAgentReport, ExternalAssociationBlock,
+    InputSubmission, RuntimeExit, RuntimeHandle, RuntimeWatchIdentity, SessionEntry,
+    SessionRegistry, SessionRegistryConfig, ShellCommand, WorkerMetadataApplyOutcome,
+    WorkerMetadataProgress, WorkerMetadataRetryCause, WorkerMetadataTracker,
+    MAX_SESSION_NAME_BYTES, MAX_WORKER_METADATA_RETRY_DELAY, WORKER_METADATA_RETRY_WARN_INTERVAL,
 };
 
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.
@@ -314,8 +316,14 @@ async fn managed_observation_returns_runtime_bound_screen_output_and_wait() {
 
     let output = registry
         .output(
-            &SessionOutputParams::new(created.id.clone(), None, None, 4096, None)
-                .expect("output params"),
+            &SessionOutputParams::new(
+                created.id.clone(),
+                Some(screen.runtime.clone()),
+                Some(OutputOffset::new(0)),
+                4096,
+                Some(1_000),
+            )
+            .expect("output params"),
         )
         .await
         .expect("output page");
@@ -366,6 +374,163 @@ async fn managed_observation_returns_runtime_bound_screen_output_and_wait() {
     assert_eq!(stale.code, "session_runtime_changed");
 
     let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn managed_output_remains_available_until_descendant_pty_eof() {
+    use base64::prelude::{Engine as _, BASE64_STANDARD};
+
+    let barrier = tempfile::tempdir().expect("create output barrier");
+    let root_exited = barrier.path().join("root-exited");
+    let release = barrier.path().join("release");
+    let root_exited_arg = root_exited.to_string_lossy().into_owned();
+    let release_arg = release.to_string_lossy().into_owned();
+    let barrier_arg = barrier.path().to_string_lossy().into_owned();
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new(
+            "/bin/sh",
+            [
+                "-c",
+                concat!(
+                    "trap '' HUP; root_pid=$$; (",
+                    "while [ \"$(sed -n 's/^.*) \\([^ ]\\).*/\\1/p' \"/proc/$root_pid/stat\" 2>/dev/null)\" != Z ]; do sleep 0.01; done; ",
+                    "printf exited > \"$1\"; ",
+                    "while [ ! -e \"$2\" ] && [ -d \"$3\" ]; do sleep 0.01; done; ",
+                    "if [ -e \"$2\" ]; then printf 'late-descendant-output\\n'; fi",
+                    ") &"
+                ),
+                "pohunek-descendant-output",
+                &root_exited_arg,
+                &release_arg,
+                &barrier_arg,
+            ],
+        ),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let live_runtime = created.runtime.as_ref().expect("live runtime");
+    let runtime = SessionRuntimeIdentity::new(
+        live_runtime
+            .runtime_id
+            .clone()
+            .expect("live runtime identifier"),
+        live_runtime.runtime_generation,
+    )
+    .expect("valid runtime identity");
+
+    let root_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !root_exited.exists() {
+        assert!(
+            tokio::time::Instant::now() < root_deadline,
+            "timed out waiting for root exit marker"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect draining session")
+            .state,
+        SessionState::Running,
+        "root exit must not hide output while a descendant holds the PTY"
+    );
+
+    let output_params = SessionOutputParams::new(
+        created.id.clone(),
+        Some(runtime),
+        Some(OutputOffset::new(0)),
+        4_096,
+        Some(1_000),
+    )
+    .expect("output params");
+    let output = registry.output(&output_params);
+    tokio::pin!(output);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut output)
+            .await
+            .is_err(),
+        "authorized output long-poll must remain registered after root exit"
+    );
+    fs::write(&release, b"release").expect("release descendant");
+
+    let output = tokio::time::timeout(Duration::from_secs(3), &mut output)
+        .await
+        .expect("descendant output deadline")
+        .expect("public output page");
+    let decoded = BASE64_STANDARD
+        .decode(output.data_base64())
+        .expect("valid output base64");
+    assert!(
+        decoded
+            .windows(b"late-descendant-output".len())
+            .any(|window| window == b"late-descendant-output"),
+        "daemon output API lost bytes produced after root exit"
+    );
+    assert_eq!(
+        registry
+            .wait_for_exit(&created.id, Duration::from_secs(3))
+            .await
+            .expect("terminal session")
+            .state,
+        SessionState::Done
+    );
+}
+
+#[tokio::test]
+async fn stop_after_root_exit_terminates_a_descendant_that_keeps_the_pty_open() {
+    let barrier = tempfile::tempdir().expect("create stop barrier");
+    let root_exited = barrier.path().join("root-exited");
+    let descendant_ready = barrier.path().join("descendant-ready");
+    let root_exited_arg = root_exited.to_string_lossy().into_owned();
+    let descendant_ready_arg = descendant_ready.to_string_lossy().into_owned();
+    let barrier_arg = barrier.path().to_string_lossy().into_owned();
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new(
+            "/bin/sh",
+            [
+                "-c",
+                concat!(
+                    "trap '' HUP; root_pid=$$; (",
+                    "trap '' HUP TERM; printf ready > \"$2\"; ",
+                    "while [ \"$(sed -n 's/^.*) \\([^ ]\\).*/\\1/p' \"/proc/$root_pid/stat\" 2>/dev/null)\" != Z ]; do sleep 0.01; done; ",
+                    "printf exited > \"$1\"; ",
+                    "while [ -d \"$3\" ]; do sleep 0.01; done",
+                    ") & while [ ! -e \"$2\" ]; do sleep 0.01; done"
+                ),
+                "pohunek-stop-after-root-exit",
+                &root_exited_arg,
+                &descendant_ready_arg,
+                &barrier_arg,
+            ],
+        ),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let root_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !root_exited.exists() {
+        assert!(
+            tokio::time::Instant::now() < root_deadline,
+            "timed out waiting for root exit"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let stopped = tokio::time::timeout(Duration::from_secs(2), registry.stop(&created.id))
+        .await
+        .expect("bounded public stop deadline")
+        .expect("stop draining session");
+    assert!(stopped.stopped);
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect stopped session")
+            .state,
+        SessionState::Stopped
+    );
 }
 
 #[tokio::test]
@@ -758,10 +923,21 @@ async fn session_read_returns_visible_tail_and_truthful_source_fallbacks() {
         let id = created.id.clone();
         SessionReadParams::new(id, Some(source), lines, None).expect("valid read params")
     };
-    let visible = registry
-        .session_read(&read(SessionReadSource::Visible, Some(2)))
-        .await
-        .expect("visible read");
+    let visible_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let visible = loop {
+        let visible = registry
+            .session_read(&read(SessionReadSource::Visible, Some(2)))
+            .await
+            .expect("visible read");
+        if visible.text == "beta\ngamma" {
+            break visible;
+        }
+        assert!(
+            tokio::time::Instant::now() < visible_deadline,
+            "timed out waiting for the shell output: {visible:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert_eq!(visible.text, "beta\ngamma");
     assert!(visible.truncated);
     assert_eq!(visible.source_used, SessionReadSource::Visible);
@@ -830,10 +1006,21 @@ async fn session_read_preserves_alternate_screen_state_during_fallback() {
     )
     .expect("read params");
 
-    let result = registry
-        .session_read(&params)
-        .await
-        .expect("read alternate screen");
+    let read_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let result = loop {
+        let result = registry
+            .session_read(&params)
+            .await
+            .expect("read alternate screen");
+        if result.alternate_screen && result.text == "TUI-one\nTUI-two" {
+            break result;
+        }
+        assert!(
+            tokio::time::Instant::now() < read_deadline,
+            "timed out waiting for alternate-screen output: {result:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
 
     assert_eq!(result.source_used, SessionReadSource::Visible);
     assert!(result.alternate_screen);
@@ -872,12 +1059,25 @@ async fn session_read_identity_guard_rejects_runtime_replacement_race() {
     assert_eq!(error.code, "session_runtime_changed");
     {
         let mut sessions = registry.inner.sessions.lock().await;
-        sessions
-            .get_mut(&created.id)
-            .and_then(|entry| entry.info.runtime.as_mut())
+        let entry = sessions.get_mut(&created.id).expect("registered session");
+        entry
+            .info
+            .runtime
+            .as_mut()
             .expect("live runtime")
             .runtime_generation = observed.runtime_generation;
+        entry.info.state = SessionState::Done;
+        entry.info.runtime.as_mut().expect("terminal runtime").state = RuntimeState::Terminal;
     };
+    registry
+        .verify_managed_identity(&created.id, &observed)
+        .await
+        .expect("same in-flight runtime remains valid after terminal transition");
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("registered session");
+    entry.info.state = SessionState::Running;
+    entry.info.runtime.as_mut().expect("live runtime").state = RuntimeState::Live;
+    drop(sessions);
     let _ = registry.stop(&created.id).await;
 }
 
@@ -1066,7 +1266,14 @@ struct MockInspectorState {
     foreground_error: Option<std::io::ErrorKind>,
     foreground_block: Option<Arc<ForegroundBlock>>,
     cwd: HashMap<Pid, PathBuf>,
+    identity_overrides: HashMap<Pid, Option<ProcessIdentity>>,
+    identity_after_descendants: HashMap<Pid, ProcessIdentity>,
+    identity_after_cwd: HashMap<Pid, (usize, ProcessIdentity)>,
+    identity_errors: HashMap<Pid, std::io::ErrorKind>,
+    non_running: HashSet<ProcessIdentity>,
     exits: HashMap<Pid, Vec<tokio::sync::watch::Sender<bool>>>,
+    immediate_exits: HashSet<Pid>,
+    events_expected_before_watch: HashMap<Pid, tokio::sync::broadcast::Receiver<Event>>,
     ownership_markers: HashMap<Pid, OwnershipMarkers>,
 }
 
@@ -1132,6 +1339,26 @@ impl MockInspector {
         }
     }
 
+    fn set_immediate_exit(&self, pid: Pid) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .immediate_exits
+            .insert(pid);
+    }
+
+    fn expect_created_before_exit_watch(
+        &self,
+        pid: Pid,
+        events: tokio::sync::broadcast::Receiver<Event>,
+    ) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .events_expected_before_watch
+            .insert(pid, events);
+    }
+
     fn fire_exit_watch(&self, pid: Pid, generation: usize) {
         let sender = self
             .inner
@@ -1162,6 +1389,46 @@ impl MockInspector {
             .insert(pid, cwd);
     }
 
+    fn set_identity(&self, pid: Pid, identity: Option<ProcessIdentity>) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .identity_overrides
+            .insert(pid, identity);
+    }
+
+    fn set_not_running(&self, identity: ProcessIdentity) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .non_running
+            .insert(identity);
+    }
+
+    fn change_identity_after_descendants(&self, pid: Pid, identity: ProcessIdentity) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .identity_after_descendants
+            .insert(pid, identity);
+    }
+
+    fn change_identity_after_cwd(&self, pid: Pid, identity: ProcessIdentity) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .identity_after_cwd
+            .insert(pid, (2, identity));
+    }
+
+    fn fail_identity_with(&self, pid: Pid, kind: std::io::ErrorKind) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .identity_errors
+            .insert(pid, kind);
+    }
+
     fn set_ownership_markers(&self, pid: Pid, markers: OwnershipMarkers) {
         self.inner
             .lock()
@@ -1180,7 +1447,52 @@ impl MockInspector {
 }
 
 impl ProcessInspector for MockInspector {
-    fn process(&self, pid: Pid) -> std::io::Result<Option<ProcessFact>> {
+    fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, crate::procwatch::Error> {
+        if let Some(kind) = self
+            .inner
+            .lock()
+            .expect("mock inspector lock")
+            .identity_errors
+            .get(&pid)
+            .copied()
+        {
+            return Err(crate::procwatch::Error::from_io(
+                "mock_identity",
+                std::io::Error::new(kind, "mock identity failure"),
+            ));
+        }
+        if let Some(identity) = self
+            .inner
+            .lock()
+            .expect("mock inspector lock")
+            .identity_overrides
+            .get(&pid)
+            .copied()
+        {
+            return Ok(identity);
+        }
+        self.process(pid)
+            .map(|fact| fact.map(|fact| fact.identity()))
+    }
+
+    fn is_running(&self, identity: ProcessIdentity) -> Result<bool, crate::procwatch::Error> {
+        if self
+            .inner
+            .lock()
+            .expect("mock inspector lock")
+            .non_running
+            .contains(&identity)
+        {
+            return Ok(false);
+        }
+        Ok(self.identity(identity.pid)? == Some(identity))
+    }
+
+    fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, crate::procwatch::Error> {
+        self.process(pid).map(|fact| fact.map(|fact| fact.ppid))
+    }
+
+    fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, crate::procwatch::Error> {
         let fact = self
             .inner
             .lock()
@@ -1196,7 +1508,7 @@ impl ProcessInspector for MockInspector {
         }
     }
 
-    fn same_user_processes(&self) -> std::io::Result<Vec<ProcessFact>> {
+    fn same_user_processes(&self) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
         let mut facts = self
             .inner
             .lock()
@@ -1211,37 +1523,72 @@ impl ProcessInspector for MockInspector {
         Ok(facts)
     }
 
-    fn descendants(&self, root: Pid) -> std::io::Result<Vec<ProcessFact>> {
-        let inner = self.inner.lock().expect("mock inspector lock");
+    fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
+        let mut inner = self.inner.lock().expect("mock inspector lock");
         if let Some(kind) = inner.descendants_error {
-            return Err(std::io::Error::new(kind, "mock descendants failure"));
+            return Err(crate::procwatch::Error::from_io(
+                "mock_descendants",
+                std::io::Error::new(kind, "mock descendants failure"),
+            ));
         }
-        Ok(inner.descendants.get(&root).cloned().unwrap_or_default())
+        let descendants = inner.descendants.get(&root).cloned().unwrap_or_default();
+        if let Some(identity) = inner.identity_after_descendants.remove(&root) {
+            inner.identity_overrides.insert(root, Some(identity));
+        }
+        Ok(descendants)
     }
 
-    fn cwd(&self, pid: Pid) -> std::io::Result<PathBuf> {
-        self.inner
-            .lock()
-            .expect("mock inspector lock")
-            .cwd
-            .get(&pid)
-            .cloned()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing mock cwd"))
+    fn cwd(&self, pid: Pid) -> Result<PathBuf, crate::procwatch::Error> {
+        let mut inner = self.inner.lock().expect("mock inspector lock");
+        let cwd = inner.cwd.get(&pid).cloned();
+        if let Some((remaining, identity)) = inner.identity_after_cwd.get_mut(&pid) {
+            if *remaining == 1 {
+                let identity = *identity;
+                inner.identity_after_cwd.remove(&pid);
+                inner.identity_overrides.insert(pid, Some(identity));
+            } else {
+                *remaining -= 1;
+            }
+        }
+        cwd.ok_or(crate::procwatch::Error::Race {
+            operation: "mock_cwd",
+        })
     }
 
-    fn exit_watch(&self, pid: Pid) -> std::io::Result<ExitWatch> {
+    fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, crate::procwatch::Error> {
         let (sender, receiver) = tokio::sync::watch::channel(false);
-        self.inner
-            .lock()
-            .expect("mock inspector lock")
-            .exits
-            .entry(pid)
-            .or_default()
-            .push(sender);
-        Ok(ExitWatch::from_test_signal(receiver))
+        let immediate = {
+            let mut inner = self.inner.lock().expect("mock inspector lock");
+            inner.exits.entry(identity.pid).or_default().push(sender);
+            if let Some(mut events) = inner.events_expected_before_watch.remove(&identity.pid) {
+                let event = events
+                    .try_recv()
+                    .expect("external creation must be published before its exit watch is armed");
+                assert_eq!(event.event(), protocol::event::SESSION_CREATED);
+            }
+            inner.immediate_exits.contains(&identity.pid)
+        };
+        Ok(ExitWatch::from_future(async move {
+            if immediate {
+                return Ok(());
+            }
+            let mut receiver = receiver;
+            while !*receiver.borrow_and_update() {
+                receiver.changed().await.map_err(|_closed| {
+                    crate::procwatch::Error::from_io(
+                        "mock_exit_watch",
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "test exit signal dropped",
+                        ),
+                    )
+                })?;
+            }
+            Ok(())
+        }))
     }
 
-    fn ownership_markers(&self, pid: Pid) -> std::io::Result<OwnershipMarkers> {
+    fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, crate::procwatch::Error> {
         Ok(self
             .inner
             .lock()
@@ -1252,7 +1599,10 @@ impl ProcessInspector for MockInspector {
             .unwrap_or_default())
     }
 
-    fn foreground_process_group(&self, root_pid: Pid) -> std::io::Result<Option<Pid>> {
+    fn foreground_process_group(
+        &self,
+        root_pid: Pid,
+    ) -> Result<Option<Pid>, crate::procwatch::Error> {
         let (kind, foreground, block) = {
             let inner = self.inner.lock().expect("mock inspector lock");
             (
@@ -1268,7 +1618,10 @@ impl ProcessInspector for MockInspector {
             }
         }
         if let Some(kind) = kind {
-            return Err(std::io::Error::new(kind, "mock foreground failure"));
+            return Err(crate::procwatch::Error::from_io(
+                "mock_foreground_process_group",
+                std::io::Error::new(kind, "mock foreground failure"),
+            ));
         }
         Ok(foreground)
     }
@@ -1587,14 +1940,14 @@ async fn first_foreground_scan_binds_hook_identity_without_replacing_metadata() 
                 .active_agent
                 .as_ref()
                 .and_then(|active| active.start_identity),
-            Some(observed.start_identity)
+            Some(observed.start_identity.get())
         );
         assert_eq!(
             entry
                 .last_agent_report
                 .as_ref()
                 .and_then(|active| active.start_identity),
-            Some(observed.start_identity)
+            Some(observed.start_identity.get())
         );
     };
 
@@ -4210,7 +4563,21 @@ async fn session_input_wait_preserves_external_read_only_error() {
     external.id = external_id.clone();
     external.pid = 91_337;
     external.external = Some(true);
-    registry.inner.external.upsert(external).await;
+    registry
+        .inner
+        .external
+        .upsert_if_current(
+            ProcessIdentity {
+                pid: external.pid,
+                start_identity: StartIdentity::new(1),
+            },
+            external,
+            || Ok::<_, std::convert::Infallible>(true),
+            |_| {},
+        )
+        .await
+        .expect("infallible external session validation")
+        .expect("current external session");
 
     let error = registry
         .input(protocol::SessionInputParams {
@@ -4225,6 +4592,87 @@ async fn session_input_wait_preserves_external_read_only_error() {
         .expect_err("external waited input remains read-only");
 
     assert_eq!(error.code, "session_external_read_only");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn stale_external_exit_watch_does_not_remove_reused_pid() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: observable_input_shell(),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create managed session fixture");
+    let pid = 91_338;
+    let mut external = created.clone();
+    external.id = external_session_id(pid);
+    external.pid = pid;
+    external.external = Some(true);
+    let old_identity = ProcessIdentity {
+        pid,
+        start_identity: StartIdentity::new(10),
+    };
+    let new_identity = ProcessIdentity {
+        pid,
+        start_identity: StartIdentity::new(11),
+    };
+    let published = Mutex::new(Vec::new());
+
+    let first = registry
+        .inner
+        .external
+        .upsert_if_current(
+            old_identity,
+            external.clone(),
+            || Ok::<_, std::convert::Infallible>(true),
+            |change| {
+                published
+                    .lock()
+                    .expect("published events lock")
+                    .push(change.clone());
+            },
+        )
+        .await
+        .expect("infallible old identity validation")
+        .expect("current old identity");
+    assert_eq!(first.watch_identity, Some(old_identity));
+    let replacement = registry
+        .inner
+        .external
+        .upsert_if_current(
+            new_identity,
+            external.clone(),
+            || Ok::<_, std::convert::Infallible>(true),
+            |change| {
+                published
+                    .lock()
+                    .expect("published events lock")
+                    .push(change.clone());
+            },
+        )
+        .await
+        .expect("infallible new identity validation")
+        .expect("current new identity");
+    assert_eq!(replacement.watch_identity, Some(new_identity));
+
+    assert!(
+        !registry
+            .inner
+            .external
+            .remove_identity(old_identity, |info| {
+                panic!("stale watch published removal for {}", info.id.0)
+            })
+            .await
+    );
+    assert_eq!(published.lock().expect("published events lock").len(), 2);
+    assert_eq!(
+        registry.inner.external.inspect(&external.id).await,
+        Some(external)
+    );
+
     let _ = registry.stop(&created.id).await;
 }
 
@@ -5859,6 +6307,55 @@ async fn exit_transition_preserves_subagents_committed_ahead_of_memory() {
         .expect("durable terminal subagent");
     assert_eq!(durable_child.id, "durable-exit-child");
     assert_eq!(durable_child.lifecycle, SubagentLifecycle::Lost);
+    stop_test_worker(worker).await;
+}
+
+#[tokio::test]
+async fn natural_exit_keeps_an_authorized_attach_open_for_ordered_worker_close() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, identity) = live_worker_and_identity(&registry, &created.id).await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    registry.inner.active_attaches.lock().await.insert(
+        "natural-exit-attach".to_owned(),
+        super::ActiveAttach {
+            session_id: created.id.clone(),
+            cancel: cancel.clone(),
+        },
+    );
+
+    assert!(
+        registry
+            .record_exit(
+                &created.id,
+                RuntimeExit {
+                    exit_code: Some(0),
+                    success: true,
+                },
+                false,
+                Some(&identity),
+                None,
+            )
+            .await
+            .expect("record natural exit"),
+        "natural exit transition must commit"
+    );
+    assert!(
+        !cancel.is_cancelled(),
+        "natural exit must let the worker deliver queued output and close in order"
+    );
+
+    registry
+        .inner
+        .active_attaches
+        .lock()
+        .await
+        .remove("natural-exit-attach");
+    cancel.cancel();
     stop_test_worker(worker).await;
 }
 
@@ -7519,7 +8016,7 @@ fn codex_fact(process_id: Pid, parent_id: Pid) -> ProcessFact {
         pid: process_id,
         pgid: process_id,
         ppid: parent_id,
-        start_identity: u64::from(process_id),
+        start_identity: crate::procwatch::StartIdentity::new(u64::from(process_id)),
         comm: "codex".to_owned(),
         cmdline: vec!["/usr/bin/codex".to_owned()],
     }
@@ -7530,7 +8027,7 @@ fn claude_fact(process_id: Pid, parent_id: Pid) -> ProcessFact {
         pid: process_id,
         pgid: process_id,
         ppid: parent_id,
-        start_identity: u64::from(process_id),
+        start_identity: crate::procwatch::StartIdentity::new(u64::from(process_id)),
         comm: "claude".to_owned(),
         cmdline: vec!["/usr/bin/claude".to_owned()],
     }
@@ -7582,6 +8079,226 @@ async fn mock_procwatch_registry(tag: &str) -> (SessionRegistry, Arc<MockInspect
         .await
         .expect("create shell session");
     (registry, inspector, created)
+}
+
+#[tokio::test]
+async fn procwatch_retires_root_authority_before_reused_pid_can_drive_state() {
+    let (registry, inspector, created) = mock_procwatch_registry("root-reuse").await;
+    let safe_cwd = created.cwd.clone();
+    let unrelated_cwd = temp_dir("reused-root-cwd");
+    let unrelated_agent = codex_fact(PID_REUSE_AGENT_PID, created.pid);
+    inspector.set_descendants(created.pid, vec![unrelated_agent]);
+    inspector.set_cwd(created.pid, unrelated_cwd.clone());
+    inspector.set_cwd(PID_REUSE_AGENT_PID, unrelated_cwd);
+
+    let (rescan, cancel) = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("live session entry");
+        entry.active_agent = Some(ActiveAgentReport {
+            source: "test-root-claim".to_owned(),
+            agent: "shell".to_owned(),
+            seq: Some(1),
+            pid: Some(created.pid),
+            start_identity: Some(1),
+            reported_at: Instant::now(),
+            activity_reported: false,
+        });
+        entry.info.active_agent = Some("shell".to_owned());
+        entry.info.active_agent_base = Some(AgentKind::Shell);
+        entry.info.active_agent_pid = Some(created.pid);
+        (
+            Arc::clone(&entry.procwatch_rescan),
+            entry.procwatch_cancel.clone(),
+        )
+    };
+    inspector.set_identity(
+        created.pid,
+        Some(ProcessIdentity {
+            pid: created.pid,
+            start_identity: StartIdentity::new(u64::MAX),
+        }),
+    );
+    rescan.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), cancel.cancelled())
+        .await
+        .expect("procwatch retires a reused root generation");
+
+    let inspected = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert!(inspected.active_agent.is_none());
+    assert_eq!(
+        inspected.cwd, safe_cwd,
+        "a reused root PID must not drive descendant or cwd reconciliation"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn procwatch_retires_a_zombie_root_with_its_exact_generation() {
+    let (registry, inspector, created) = mock_procwatch_registry("zombie-root").await;
+    let root = inspector
+        .identity(created.pid)
+        .expect("root identity probe")
+        .expect("live root identity");
+    let expected = RuntimeWatchIdentity::from_info(&created).expect("runtime identity");
+    let () = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("live session entry");
+        entry.active_agent = Some(ActiveAgentReport {
+            source: "test-zombie-claim".to_owned(),
+            agent: "shell".to_owned(),
+            seq: Some(1),
+            pid: Some(root.pid),
+            start_identity: Some(root.start_identity.get()),
+            reported_at: Instant::now(),
+            activity_reported: false,
+        });
+        entry.info.active_agent = Some("shell".to_owned());
+        entry.info.active_agent_base = Some(AgentKind::Shell);
+        entry.info.active_agent_pid = Some(root.pid);
+    };
+    inspector.set_not_running(root);
+
+    assert!(
+        !registry
+            .rescan_live_root(&created.id, &expected, root, Instant::now())
+            .await,
+        "a zombie must release procwatch root authority"
+    );
+    assert!(registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session")
+        .active_agent
+        .is_none());
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn procwatch_discards_scan_when_root_generation_changes_inside_bracket() {
+    let (registry, inspector, created) = mock_procwatch_registry("root-bracket").await;
+    let safe_cwd = created.cwd.clone();
+    inspector.set_descendants(
+        created.pid,
+        vec![codex_fact(PID_REUSE_AGENT_PID, created.pid)],
+    );
+    inspector.set_cwd(created.pid, temp_dir("root-bracket-reused"));
+    inspector.change_identity_after_descendants(
+        created.pid,
+        ProcessIdentity {
+            pid: created.pid,
+            start_identity: StartIdentity::new(u64::MAX),
+        },
+    );
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+
+    let inspected = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert!(inspected.active_agent.is_none());
+    assert_eq!(inspected.cwd, safe_cwd);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn procwatch_discards_cwd_when_focus_generation_changes_inside_bracket() {
+    let (registry, inspector, created) = mock_procwatch_registry("focus-bracket").await;
+    let safe_cwd = created.cwd.clone();
+    let agent = codex_fact(PID_REUSE_AGENT_PID, created.pid);
+    inspector.set_descendants(created.pid, vec![agent.clone()]);
+    inspector.set_cwd(PID_REUSE_AGENT_PID, temp_dir("focus-bracket-reused"));
+    {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("live session entry");
+        entry.active_agent = Some(ActiveAgentReport {
+            source: "test-focus-claim".to_owned(),
+            agent: "codex".to_owned(),
+            seq: Some(1),
+            pid: Some(agent.pid),
+            start_identity: Some(agent.start_identity.get()),
+            reported_at: Instant::now(),
+            activity_reported: false,
+        });
+        entry.info.active_agent = Some("codex".to_owned());
+        entry.info.active_agent_base = Some(AgentKind::Codex);
+        entry.info.active_agent_pid = Some(agent.pid);
+    };
+    inspector.change_identity_after_cwd(
+        agent.pid,
+        ProcessIdentity {
+            pid: agent.pid,
+            start_identity: StartIdentity::new(agent.start_identity.get() + 1),
+        },
+    );
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session")
+            .cwd,
+        safe_cwd,
+        "a reused focus PID cannot apply its cwd"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn stale_procwatch_retirement_cannot_clear_replacement_runtime() {
+    let (registry, _inspector, created) = mock_procwatch_registry("stale-retirement").await;
+    let expected = RuntimeWatchIdentity::from_info(&created).expect("runtime identity");
+    let () = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("live session entry");
+        let runtime = entry.info.runtime.as_mut().expect("runtime info");
+        runtime.runtime_id = Some("runtime-replacement".to_owned());
+        runtime.runtime_generation = RuntimeGeneration::new(runtime.runtime_generation.get() + 1);
+        entry.active_agent = Some(ActiveAgentReport {
+            source: "replacement-claim".to_owned(),
+            agent: "codex".to_owned(),
+            seq: Some(2),
+            pid: Some(PID_REUSE_AGENT_PID),
+            start_identity: Some(2),
+            reported_at: Instant::now(),
+            activity_reported: false,
+        });
+        entry.info.active_agent = Some("codex".to_owned());
+        entry.info.active_agent_base = Some(AgentKind::Codex);
+        entry.info.active_agent_pid = Some(PID_REUSE_AGENT_PID);
+    };
+
+    registry
+        .retire_procwatch_root(&created.id, &expected, Instant::now())
+        .await;
+
+    let inspected = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect replacement");
+    assert_eq!(inspected.active_agent.as_deref(), Some("codex"));
+    assert_eq!(
+        inspected
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.runtime_id.as_deref()),
+        Some("runtime-replacement")
+    );
+    let () = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("replacement entry");
+        entry.info.runtime = created.runtime.clone();
+    };
+    let _ = registry.stop(&created.id).await;
 }
 
 async fn mock_direct_codex_registry(
@@ -7771,7 +8488,8 @@ async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
     };
 
     let mut replacement = claude_fact(PID_REUSE_AGENT_PID, created.pid);
-    replacement.start_identity = u64::from(PID_REUSE_AGENT_PID) + 1;
+    replacement.start_identity =
+        crate::procwatch::StartIdentity::new(u64::from(PID_REUSE_AGENT_PID) + 1);
     replacement.pgid = PID_REUSE_AGENT_PID + 10;
     inspector.set_descendants(created.pid, vec![replacement]);
     let second_scan = first_seen + PID_REUSE_RESCAN_DELAY;
@@ -8010,6 +8728,134 @@ async fn external_rescan_skips_processes_marked_by_any_pohunek_daemon() {
     assert_eq!(sessions.len(), 1, "unmarked agent surfaces as external");
     assert_eq!(sessions[0].external, Some(true));
     assert_eq!(sessions[0].pid, FOREIGN_AGENT_PID);
+}
+
+#[tokio::test]
+async fn external_immediate_exit_is_published_after_creation() {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    inspector.set_descendants(1, vec![codex_fact(FOREIGN_AGENT_PID, 1)]);
+    inspector.set_cwd(FOREIGN_AGENT_PID, temp_dir("external-immediate-exit"));
+    inspector.set_immediate_exit(FOREIGN_AGENT_PID);
+    let mut events = registry.subscribe();
+    inspector.expect_created_before_exit_watch(FOREIGN_AGENT_PID, registry.subscribe());
+
+    registry
+        .rescan_external_agents(&TranscriptIndex::default())
+        .await;
+
+    let created = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("created event timeout")
+        .expect("created event");
+    assert_eq!(created.event(), protocol::event::SESSION_CREATED);
+    let removed = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("removed event timeout")
+        .expect("removed event");
+    assert_eq!(removed.event(), protocol::event::SESSION_REMOVED);
+    assert_eq!(
+        created.payload()["session"]["id"],
+        removed.payload()["session"]["id"]
+    );
+    assert!(
+        registry.list().await.is_empty(),
+        "an immediately exited external process must not remain observable"
+    );
+}
+
+#[tokio::test]
+async fn external_rescan_discards_a_candidate_that_changes_generation_before_upsert() {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    let fact = codex_fact(FOREIGN_AGENT_PID, 1);
+    inspector.set_descendants(1, vec![fact.clone()]);
+    inspector.set_cwd(FOREIGN_AGENT_PID, temp_dir("external-reused-pid"));
+    let association_block = Arc::new(ExternalAssociationBlock::default());
+    *registry
+        .inner
+        .external_association_block
+        .lock()
+        .expect("external association test lock") = Some(Arc::clone(&association_block));
+    let rescan_registry = registry.clone();
+    let rescan = tokio::spawn(async move {
+        rescan_registry
+            .rescan_external_agents(&TranscriptIndex::default())
+            .await;
+    });
+    association_block.entered.notified().await;
+    inspector.set_identity(
+        FOREIGN_AGENT_PID,
+        Some(ProcessIdentity {
+            pid: FOREIGN_AGENT_PID,
+            start_identity: StartIdentity::new(fact.start_identity.get() + 1),
+        }),
+    );
+    association_block.release.notify_one();
+    rescan.await.expect("external rescan task");
+
+    assert!(
+        registry.list().await.is_empty(),
+        "a stale process generation must not surface as an external session"
+    );
+    assert_eq!(
+        inspector.exit_watch_count(FOREIGN_AGENT_PID),
+        0,
+        "a stale process generation must not arm an exit watch"
+    );
+}
+
+#[tokio::test]
+async fn external_rescan_preserves_verified_entry_on_identity_inspection_failure() {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    inspector.set_descendants(1, vec![codex_fact(FOREIGN_AGENT_PID, 1)]);
+    inspector.set_cwd(
+        FOREIGN_AGENT_PID,
+        temp_dir("external-identity-inspection-failure"),
+    );
+    registry
+        .rescan_external_agents(&TranscriptIndex::default())
+        .await;
+    let verified = registry
+        .list()
+        .await
+        .into_iter()
+        .next()
+        .expect("verified external session");
+
+    inspector.fail_identity_with(FOREIGN_AGENT_PID, std::io::ErrorKind::Interrupted);
+    registry
+        .rescan_external_agents(&TranscriptIndex::default())
+        .await;
+
+    assert_eq!(registry.list().await, vec![verified]);
+    assert_eq!(
+        inspector.exit_watch_count(FOREIGN_AGENT_PID),
+        1,
+        "an inconclusive refresh must not replace the existing exit watch"
+    );
 }
 
 #[tokio::test]

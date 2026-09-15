@@ -1,6 +1,6 @@
 //! Defines validated worker runtime policy.
 
-// Rust guideline compliant 2026-08-04
+// Rust guideline compliant 2026-09-14
 
 use std::time::Duration;
 
@@ -22,6 +22,10 @@ pub(crate) const DEFAULT_DATA_TOKEN_TTL: Duration = Duration::from_secs(10);
 pub(crate) const DEFAULT_INPUT_DEDUP_ENTRIES: usize = 4_096;
 /// Default graceful stop window before hard termination.
 pub(crate) const DEFAULT_STOP_GRACE: Duration = Duration::from_millis(500);
+/// Default window for descendants to finish writing after the root exits.
+pub(crate) const DEFAULT_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default wait for a durable terminal commit before acknowledging stop.
+pub(crate) const DEFAULT_TERMINAL_COMMIT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default final-screen retention while the daemon is unavailable.
 pub(crate) const DEFAULT_TERMINAL_RETENTION: Duration = Duration::from_hours(24);
 /// Default maximum time occupied by one stalled observation request.
@@ -35,6 +39,12 @@ pub(crate) const DEFAULT_MAX_SNAPSHOT_ROWS: u16 = 512;
 pub(crate) const DEFAULT_MAX_SNAPSHOT_COLUMNS: u16 = 512;
 /// Default maximum serialized terminal-snapshot control response.
 pub(crate) const DEFAULT_MAX_SNAPSHOT_BYTES: usize = DEFAULT_CONTROL_LINE_BYTES;
+/// Retry cadence for durable launch claims while their hook lease remains valid.
+const DEFAULT_LAUNCH_CLAIM_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// Bounds deferred claims from concurrent provider descendants.
+const DEFAULT_PENDING_LAUNCH_CLAIMS: usize = 16;
+/// Hard cap for deferred launch-identity work and retained references.
+const MAX_PENDING_LAUNCH_CLAIMS: usize = 64;
 
 /// Hard cap preventing one worker from consuming excessive output memory.
 const MAX_HISTORY_BYTES: usize = 256 * 1024 * 1024;
@@ -107,6 +117,10 @@ pub struct WorkerConfig {
     pub input_dedup_entries: usize,
     /// Grace period between soft and hard stop.
     pub stop_grace: Duration,
+    /// Maximum natural PTY drain after the root process exits.
+    pub post_exit_drain_timeout: Duration,
+    /// Maximum wait for terminal journal persistence in a stop RPC.
+    pub terminal_commit_wait_timeout: Duration,
     /// Retention after terminal outcome when unacknowledged.
     pub terminal_retention: Duration,
     /// Maximum duration of one control-plane output wait.
@@ -117,6 +131,10 @@ pub struct WorkerConfig {
     pub max_snapshot_columns: u16,
     /// Maximum serialized terminal-snapshot control response bytes.
     pub max_snapshot_bytes: usize,
+    /// Interval between retries of unverified launch claims.
+    pub launch_claim_retry_interval: Duration,
+    /// Maximum retained unverified launch claims.
+    pub pending_launch_claims: usize,
 }
 
 impl WorkerConfig {
@@ -132,11 +150,15 @@ impl WorkerConfig {
             data_token_ttl: DEFAULT_DATA_TOKEN_TTL,
             input_dedup_entries: DEFAULT_INPUT_DEDUP_ENTRIES,
             stop_grace: DEFAULT_STOP_GRACE,
+            post_exit_drain_timeout: DEFAULT_POST_EXIT_DRAIN_TIMEOUT,
+            terminal_commit_wait_timeout: DEFAULT_TERMINAL_COMMIT_WAIT_TIMEOUT,
             terminal_retention: DEFAULT_TERMINAL_RETENTION,
             max_observation_wait: DEFAULT_MAX_OBSERVATION_WAIT,
             max_snapshot_rows: DEFAULT_MAX_SNAPSHOT_ROWS,
             max_snapshot_columns: DEFAULT_MAX_SNAPSHOT_COLUMNS,
             max_snapshot_bytes: DEFAULT_MAX_SNAPSHOT_BYTES,
+            launch_claim_retry_interval: DEFAULT_LAUNCH_CLAIM_RETRY_INTERVAL,
+            pending_launch_claims: DEFAULT_PENDING_LAUNCH_CLAIMS,
         }
     }
 
@@ -146,6 +168,15 @@ impl WorkerConfig {
     ///
     /// Returns [`ConfigError`] when a duration is zero or a bound is unsafe.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        validate_duration(
+            "launch_claim_retry_interval",
+            self.launch_claim_retry_interval,
+        )?;
+        validate_count(
+            "pending_launch_claims",
+            self.pending_launch_claims,
+            MAX_PENDING_LAUNCH_CLAIMS,
+        )?;
         validate_duration("initialize_deadline", self.initialize_deadline)?;
         validate_bytes("history_bytes", self.history_bytes, MAX_HISTORY_BYTES)?;
         validate_bytes(
@@ -170,6 +201,11 @@ impl WorkerConfig {
             MAX_INPUT_DEDUP_ENTRIES,
         )?;
         validate_duration("stop_grace", self.stop_grace)?;
+        validate_duration("post_exit_drain_timeout", self.post_exit_drain_timeout)?;
+        validate_duration(
+            "terminal_commit_wait_timeout",
+            self.terminal_commit_wait_timeout,
+        )?;
         validate_duration("terminal_retention", self.terminal_retention)?;
         validate_duration("max_observation_wait", self.max_observation_wait)?;
         if self.max_observation_wait > MAX_OBSERVATION_WAIT {
@@ -259,6 +295,36 @@ mod tests {
     }
 
     #[test]
+    fn zero_post_exit_drain_timeout_is_rejected() {
+        let config = WorkerConfig {
+            post_exit_drain_timeout: Duration::ZERO,
+            ..WorkerConfig::new()
+        };
+
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::Duration {
+                field: "post_exit_drain_timeout"
+            })
+        );
+    }
+
+    #[test]
+    fn zero_terminal_commit_wait_timeout_is_rejected() {
+        let config = WorkerConfig {
+            terminal_commit_wait_timeout: Duration::ZERO,
+            ..WorkerConfig::new()
+        };
+
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::Duration {
+                field: "terminal_commit_wait_timeout"
+            })
+        );
+    }
+
+    #[test]
     fn zero_memory_budget_is_rejected() {
         let config = WorkerConfig {
             subscriber_bytes: 0,
@@ -325,5 +391,31 @@ mod tests {
                 ..
             })
         ));
+    }
+    #[test]
+    fn launch_claim_work_is_nonzero_and_capacity_bounded() {
+        let zero_interval = WorkerConfig {
+            launch_claim_retry_interval: Duration::ZERO,
+            ..WorkerConfig::new()
+        };
+        assert!(matches!(
+            zero_interval.validate(),
+            Err(ConfigError::Duration {
+                field: "launch_claim_retry_interval"
+            })
+        ));
+        for capacity in [0, super::MAX_PENDING_LAUNCH_CLAIMS + 1] {
+            let invalid = WorkerConfig {
+                pending_launch_claims: capacity,
+                ..WorkerConfig::new()
+            };
+            assert!(matches!(
+                invalid.validate(),
+                Err(ConfigError::Count {
+                    field: "pending_launch_claims",
+                    ..
+                })
+            ));
+        }
     }
 }

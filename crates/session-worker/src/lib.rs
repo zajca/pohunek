@@ -8,12 +8,13 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-08-04
+// Rust guideline compliant 2026-09-14
 
 mod config;
 mod error;
 mod input;
 mod journal;
+mod launch;
 mod lease;
 mod output;
 mod pty;
@@ -28,7 +29,7 @@ pub use input::{InputError, InputFragment, InputPlan, WriteCoordinator};
 #[doc(inline)]
 pub use journal::{
     ActiveIdentity, ChildIdentity, Journal, JournalError, JournalRecord, LaunchIdentity,
-    ReleasedIdentity, RuntimeOutcome, RuntimePhase,
+    PendingLaunchClaim, ReleasedIdentity, RuntimeOutcome, RuntimePhase,
 };
 #[doc(inline)]
 pub use lease::{ControllerLease, LeaseError, LeaseOwner};

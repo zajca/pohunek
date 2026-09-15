@@ -1,6 +1,6 @@
 //! Persists the worker-owned runtime journal atomically.
 
-// Rust guideline compliant 2026-09-11
+// Rust guideline compliant 2026-09-14
 
 use std::fmt::{Debug, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 /// Worker journal schema understood by this crate.
-const JOURNAL_SCHEMA_VERSION: u32 = 1;
+const JOURNAL_SCHEMA_VERSION: u32 = 2;
 /// Owner-only directory permissions.
 const PRIVATE_DIR_MODE: u32 = 0o700;
 /// Owner-only journal permissions.
@@ -156,6 +156,26 @@ impl Debug for ActiveIdentity {
     }
 }
 
+/// Worker-owned launch claim awaiting a coherent process-tree observation.
+///
+/// Runtime, root and reporting-process generations are immutable, as is the
+/// first native reference reported by that process. The original hook expiry
+/// bounds retries independently of subsequent active reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingLaunchClaim {
+    /// Whether verification may still be retried. Rejected records fence later
+    /// reports from replacing the original native reference during this runtime.
+    pub retry_pending: bool,
+    /// Runtime generation that accepted this claim.
+    pub runtime_id: String,
+    /// Exact PTY root generation authorizing the claim.
+    pub root: ChildIdentity,
+    /// Unverified immutable launch reference; never exposed as verified state.
+    pub identity: LaunchIdentity,
+    /// Original hook claim's RFC 3339 expiry.
+    pub expires_at: String,
+}
+
 /// Durable ordering tombstone for an accepted active-identity release.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleasedIdentity {
@@ -241,6 +261,8 @@ pub struct JournalRecord {
     pub outcome: Option<RuntimeOutcome>,
     /// Immutable launch recovery identity.
     pub launch_identity: Option<LaunchIdentity>,
+    /// Deferred claims and rejection fences, not verified recovery identities.
+    pub pending_launch_claims: Vec<PendingLaunchClaim>,
     /// Latest sanitized active identity.
     pub active_identity: Option<ActiveIdentity>,
     /// Latest accepted release, distinguishing explicit release from no report.
@@ -278,6 +300,7 @@ impl Debug for JournalRecord {
             .field("phase", &self.phase)
             .field("outcome", &self.outcome)
             .field("launch_identity", &self.launch_identity)
+            .field("pending_launch_claims", &self.pending_launch_claims)
             .field("active_identity", &self.active_identity)
             .field("active_identity_release", &self.active_identity_release)
             .field("subagent_revision", &self.subagent_revision)
@@ -316,6 +339,7 @@ impl JournalRecord {
             phase: RuntimePhase::Bootstrap,
             outcome: None,
             launch_identity: None,
+            pending_launch_claims: Vec::new(),
             active_identity: None,
             active_identity_release: None,
             subagent_revision: 0,
@@ -556,6 +580,15 @@ mod tests {
             reference_kind: "thread_id".to_owned(),
             native_reference: secret.to_owned(),
         });
+        record
+            .pending_launch_claims
+            .push(super::PendingLaunchClaim {
+                retry_pending: true,
+                runtime_id: "runtime-1".to_owned(),
+                root: record.launch_identity.as_ref().unwrap().process.clone(),
+                identity: record.launch_identity.as_ref().unwrap().clone(),
+                expires_at: "2026-07-23T00:01:00Z".to_owned(),
+            });
         record.active_identity_release = Some(ReleasedIdentity {
             provider: "claude".to_owned(),
             process: ChildIdentity {

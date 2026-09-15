@@ -19,8 +19,6 @@ iced = { workspace = true, default-features = false, features = [
     "crisp",
     "web-colors",
     "thread-pool",
-    "linux-theme-detection",
-    "wayland",
 ] }
 pohunek-gui-core = { workspace = true }
 pohunek-paths = { workspace = true }
@@ -32,3 +30,9 @@ toml = { workspace = true }
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+iced = { workspace = true, default-features = false, features = [
+    "linux-theme-detection",
+    "wayland",
+] }

@@ -1,6 +1,6 @@
 //! Serves the private daemon-worker Unix protocol.
 
-// Rust guideline compliant 2026-09-11
+// Rust guideline compliant 2026-09-14
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -13,7 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use pohunek_platform::peer;
+use pohunek_platform::process::{
+    LinuxInspector, ProcessIdentity as OsProcessIdentity, ProcessInspector, StartIdentity,
+};
 use pohunek_worker_protocol as protocol;
 use protocol::{
     ActiveIdentityClaim, AttachStart, Capability, CloseReason, ControlCode, ControlError,
@@ -30,14 +33,17 @@ use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, watch, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, oneshot, watch, Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{event, Level};
 
 use crate::journal::{
-    ActiveIdentity, ChildIdentity, JournalRecord, LaunchIdentity, ReleasedIdentity, RuntimeOutcome,
-    RuntimePhase as JournalPhase, SubagentPhase as JournalSubagentPhase, SubagentRecord,
+    ActiveIdentity, ChildIdentity, JournalRecord, LaunchIdentity, PendingLaunchClaim,
+    ReleasedIdentity, RuntimeOutcome, RuntimePhase as JournalPhase,
+    SubagentPhase as JournalSubagentPhase, SubagentRecord,
 };
+use crate::launch::{self, LaunchClaimStatus};
+use crate::output::OutputCompletion;
 use crate::{
     Command, ControllerLease, Exit, InputFragment, InputPlan, Journal, LeaseError, LeaseOwner,
     OutputChunk, OutputEvent, ProcessIdentity, PtyError, PtyOwner, WorkerConfig, WorkerError,
@@ -49,6 +55,11 @@ const EVENT_BUFFER: usize = 256;
 const ACTIVE_SUBAGENT_CAPACITY: usize = 64;
 /// Recent terminal subagents retained for reconnecting clients.
 const TERMINAL_SUBAGENT_CAPACITY: usize = 32;
+/// Delay between terminal-journal retries after a transient storage failure.
+///
+/// A quarter second keeps the runtime publicly draining without either a busy
+/// loop or a long recovery delay once the journal becomes writable again.
+const TERMINAL_JOURNAL_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// Maximum accepted provider-native subagent identifier length.
 const MAX_SUBAGENT_ID_BYTES: usize = 256;
 /// Maximum accepted provider-defined subagent type length.
@@ -161,6 +172,7 @@ impl Server {
             started: Instant::now(),
             initialized_tx,
             lease_epoch_tx,
+            state_changed: Notify::new(),
             shutdown: CancellationToken::new(),
         });
         Ok(Self { listener, shared })
@@ -182,10 +194,20 @@ impl Server {
         let deadline = tokio::time::sleep(self.shared.config.initialize_deadline);
         tokio::pin!(deadline);
         let mut initialized = self.shared.initialized_tx.subscribe();
+        let mut launch_retry =
+            tokio::time::interval(self.shared.config.launch_claim_retry_interval);
+        launch_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
                 () = self.shared.shutdown.cancelled() => return Ok(()),
+                _ = launch_retry.tick() => {
+                    if let Err(error) = retry_launch_claims(&self.shared, verify_launch_claim).await {
+                        event!(name: "worker.launch_identity.retry.failed", Level::ERROR,
+                            error.type = "journal", error.message = %error,
+                            "launch identity retry commit failed: {{error.message}}");
+                    }
+                }
                 result = initialized.changed(), if !*initialized.borrow() => {
                     if result.is_err() {
                         return Err(WorkerError::Protocol(
@@ -246,19 +268,17 @@ struct Shared {
     started: Instant,
     initialized_tx: watch::Sender<bool>,
     lease_epoch_tx: watch::Sender<u64>,
+    state_changed: Notify,
     shutdown: CancellationToken,
 }
 
 impl Shared {
     async fn record_never_initialized(&self) -> Result<(), WorkerError> {
-        let record = {
-            let mut state = self.state.lock().await;
-            state.phase = WireRuntimePhase::Faulted;
-            state.journal.phase = JournalPhase::NeverInitialized;
-            state.journal.updated_at = timestamp();
-            state.journal.clone()
-        };
-        persist(self.journal.clone(), record).await
+        let mut state = self.state.lock().await;
+        state.phase = WireRuntimePhase::Faulted;
+        state.journal.phase = JournalPhase::NeverInitialized;
+        state.journal.updated_at = timestamp();
+        persist(self.journal.clone(), state.journal.clone()).await
     }
 
     fn emit(&self, kind: EventKind) {
@@ -453,7 +473,7 @@ impl Connection {
 }
 
 async fn serve_connection(shared: Arc<Shared>, mut stream: UnixStream) -> Result<(), WorkerError> {
-    verify_peer(&stream)?;
+    let peer = verify_peer(&stream)?;
     let mut prefix = [0_u8; 1];
     let read = stream
         .read_exact(&mut prefix)
@@ -464,7 +484,7 @@ async fn serve_connection(shared: Arc<Shared>, mut stream: UnixStream) -> Result
     }
     let prefixed = PrefixStream::new(prefix[0], stream);
     if prefix[0] == b'{' {
-        serve_json(shared, prefixed).await
+        serve_json(shared, prefixed, peer).await
     } else {
         serve_data(shared, prefixed).await
     }
@@ -473,12 +493,10 @@ async fn serve_connection(shared: Arc<Shared>, mut stream: UnixStream) -> Result
 async fn serve_json(
     shared: Arc<Shared>,
     stream: PrefixStream<UnixStream>,
+    peer: peer::Credentials,
 ) -> Result<(), WorkerError> {
-    let credentials = getsockopt(stream.inner(), PeerCredentials)
-        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
-    let peer_pid = u32::try_from(credentials.pid())
-        .map_err(|_range_error| WorkerError::Protocol("peer PID is invalid".to_owned()))?;
-    let peer_start = process_start(peer_pid)?;
+    let peer_pid = peer.pid;
+    let peer_start = process_start(peer.pid)?;
     let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = ControlReader::new(read_half);
     let mut writer = ControlWriter::new(write_half);
@@ -849,7 +867,7 @@ async fn initialize_request(
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
     let runtime_id = RuntimeId::new(runtime_value)
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
-    let starting = {
+    {
         let mut state = shared.state.lock().await;
         state.phase = WireRuntimePhase::Starting;
         state.initialize_transaction = Some(initialize.transaction_id.clone());
@@ -857,9 +875,8 @@ async fn initialize_request(
         state.journal.phase = JournalPhase::Starting;
         state.journal.runtime_id = Some(runtime_id.to_string());
         state.journal.updated_at = timestamp();
-        state.journal.clone()
+        persist_control(shared.journal.clone(), state.journal.clone()).await?;
     };
-    persist_control(shared.journal.clone(), starting).await?;
 
     let command = command_from_initialize(shared, &initialize, &runtime_id);
     let history_bytes = usize::try_from(initialize.limits.output_history_bytes())
@@ -883,7 +900,7 @@ async fn initialize_request(
         .map_err(|error| control_error(ControlCode::InvalidRequest, error, false))?;
     let pty = spawn_pty(command, &effective_config)?;
     let child_process = wire_identity(pty.identity())?;
-    let live = {
+    let live_commit = {
         let mut state = shared.state.lock().await;
         state.phase = WireRuntimePhase::Running;
         state.stop_grace = stop_grace;
@@ -896,9 +913,9 @@ async fn initialize_request(
         state.journal.rows = Some(initialize.dimensions.rows());
         state.journal.updated_at = timestamp();
         state.pty = Some(pty.clone());
-        state.journal.clone()
+        persist(shared.journal.clone(), state.journal.clone()).await
     };
-    if let Err(error) = persist(shared.journal.clone(), live).await {
+    if let Err(error) = live_commit {
         let _ = pty.stop("journal-failure", stop_grace).await;
         return Err(control_error(ControlCode::RuntimeFault, error, false));
     }
@@ -1233,20 +1250,98 @@ async fn stop_request(
     scope: &RuntimeScope,
     transaction_id: TransactionId,
 ) -> Result<ResponseKind, ControlError> {
-    let pty = scoped_pty(shared, connection, scope).await?;
-    let grace = {
+    validate_scope(shared, connection, scope).await?;
+    let preparation = {
         let mut state = shared.state.lock().await;
-        state.stop_requested = true;
-        state.phase = WireRuntimePhase::Stopping;
-        state.stop_grace
+        prepare_stop(&mut state)?
     };
-    let exit = pty
-        .stop(transaction_id.as_str(), grace)
+    let (pty, grace) = match preparation {
+        StopPreparation::AlreadyCommitted(exit) => {
+            return Ok(ResponseKind::Stopped { exit: Some(exit) });
+        }
+        StopPreparation::Begin { pty, grace } => (pty, grace),
+    };
+    pty.stop(transaction_id.as_str(), grace)
         .await
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
+    let committed = tokio::time::timeout(
+        shared.config.terminal_commit_wait_timeout,
+        wait_for_terminal_commit(shared),
+    )
+    .await
+    .map_err(|_elapsed| {
+        control_error_message(
+            ControlCode::RuntimeFault,
+            "terminal journal commit is still pending; retry stop",
+            true,
+        )
+    })??;
     Ok(ResponseKind::Stopped {
-        exit: Some(exit_status(&exit, true)),
+        exit: Some(committed),
     })
+}
+
+enum StopPreparation {
+    AlreadyCommitted(ExitStatus),
+    Begin { pty: PtyOwner, grace: Duration },
+}
+
+fn prepare_stop(state: &mut State) -> Result<StopPreparation, ControlError> {
+    if state.phase == WireRuntimePhase::Exited {
+        let exit = state.exit.clone().ok_or_else(|| {
+            control_error_message(
+                ControlCode::RuntimeFault,
+                "terminal journal commit has no exit status",
+                false,
+            )
+        })?;
+        return Ok(StopPreparation::AlreadyCommitted(exit));
+    }
+    if state.phase == WireRuntimePhase::Faulted {
+        return Err(control_error_message(
+            ControlCode::RuntimeFault,
+            "runtime faulted before its terminal journal commit",
+            false,
+        ));
+    }
+    let pty = state
+        .pty
+        .clone()
+        .ok_or_else(|| invalid_state("runtime has no PTY"))?;
+    state.stop_requested = true;
+    state.phase = WireRuntimePhase::Stopping;
+    Ok(StopPreparation::Begin {
+        pty,
+        grace: state.stop_grace,
+    })
+}
+
+async fn wait_for_terminal_commit(shared: &Shared) -> Result<ExitStatus, ControlError> {
+    loop {
+        let notified = shared.state_changed.notified();
+        let state = shared.state.lock().await;
+        match state.phase {
+            WireRuntimePhase::Exited => {
+                return state.exit.clone().ok_or_else(|| {
+                    control_error_message(
+                        ControlCode::RuntimeFault,
+                        "terminal journal commit has no exit status",
+                        false,
+                    )
+                });
+            }
+            WireRuntimePhase::Faulted => {
+                return Err(control_error_message(
+                    ControlCode::RuntimeFault,
+                    "runtime faulted before its terminal journal commit",
+                    false,
+                ));
+            }
+            _ => {}
+        }
+        drop(state);
+        notified.await;
+    }
 }
 
 async fn acknowledge_request(
@@ -1255,16 +1350,15 @@ async fn acknowledge_request(
     scope: &RuntimeScope,
 ) -> Result<ResponseKind, ControlError> {
     validate_scope(shared, connection, scope).await?;
-    let record = {
+    {
         let mut state = shared.state.lock().await;
         if state.phase != WireRuntimePhase::Exited {
             return Err(invalid_state("runtime is not terminal"));
         }
         state.journal.terminal_acknowledged = true;
         state.journal.updated_at = timestamp();
-        state.journal.clone()
+        persist_control(shared.journal.clone(), state.journal.clone()).await?;
     };
-    persist_control(shared.journal.clone(), record).await?;
     shared.shutdown.cancel();
     Ok(ResponseKind::TerminalAcknowledged)
 }
@@ -1373,119 +1467,293 @@ async fn inspect_snapshot(shared: &Shared, state: &State) -> Result<InspectSnaps
 }
 
 fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: RuntimeId) {
+    let (output_eof_tx, output_eof_rx) = oneshot::channel();
     let output_shared = Arc::clone(&shared);
     let output_pty = pty.clone();
     let output_runtime = runtime_id.clone();
     tokio::spawn(async move {
-        if let Ok(mut subscriber) = output_pty.subscribe_output(Some(0)) {
-            while let Some(event) = subscriber.recv().await {
-                match event {
-                    OutputEvent::Replay(_) | OutputEvent::TerminalSnapshot(_) => {}
-                    OutputEvent::Output(chunk) => {
-                        output_shared.emit(EventKind::OutputAdvanced {
-                            runtime_id: output_runtime.clone(),
-                            next_offset: chunk.offset.saturating_add(
-                                u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX),
-                            ),
-                        });
-                    }
-                    OutputEvent::Gap { watermark, .. } => {
-                        output_shared.emit(EventKind::TerminalChanged {
-                            runtime_id: output_runtime.clone(),
-                            watermark,
-                        });
-                    }
-                    OutputEvent::Exit { next_offset } => {
-                        let record = {
-                            let mut state = output_shared.state.lock().await;
-                            state.journal.next_output_offset = next_offset;
-                            state.journal.updated_at = timestamp();
-                            state.journal.clone()
-                        };
-                        if let Err(error) = persist(output_shared.journal.clone(), record).await {
-                            event!(
-                                name: "worker.journal.write.failed",
-                                Level::ERROR,
-                                error.type = "journal",
-                                error.message = %error,
-                                "worker journal write failed: {{error.message}}",
-                            );
-                        }
-                        break;
-                    }
+        let result = monitor_runtime_output(&output_shared, &output_pty, &output_runtime).await;
+        let _ = output_eof_tx.send(result);
+    });
+
+    tokio::spawn(coordinate_runtime_completion(
+        shared,
+        pty,
+        runtime_id,
+        output_eof_rx,
+    ));
+}
+
+async fn monitor_runtime_output(
+    shared: &Shared,
+    pty: &PtyOwner,
+    runtime_id: &RuntimeId,
+) -> Result<OutputCompletion, WorkerError> {
+    let mut subscriber = pty
+        .subscribe_output(Some(0))
+        .map_err(|error| WorkerError::Pty(PtyError::Output(error)))?;
+    loop {
+        match subscriber.recv().await {
+            Some(OutputEvent::Replay(_) | OutputEvent::TerminalSnapshot(_)) => {}
+            Some(OutputEvent::Output(chunk)) => {
+                shared.emit(EventKind::OutputAdvanced {
+                    runtime_id: runtime_id.clone(),
+                    next_offset: chunk
+                        .offset
+                        .saturating_add(u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX)),
+                });
+            }
+            Some(OutputEvent::Gap { watermark, .. }) => {
+                shared.emit(EventKind::TerminalChanged {
+                    runtime_id: runtime_id.clone(),
+                    watermark,
+                });
+            }
+            Some(OutputEvent::Exit { next_offset }) => {
+                let completion = pty.output_completion().ok_or_else(|| {
+                    WorkerError::Protocol(
+                        "PTY output closed without a completion record".to_owned(),
+                    )
+                })?;
+                if completion.next_offset() != next_offset {
+                    return Err(WorkerError::Protocol(
+                        "PTY output completion offset changed after closure".to_owned(),
+                    ));
+                }
+                return Ok(completion);
+            }
+            None => {
+                return Err(WorkerError::Protocol(
+                    "PTY output monitor closed before EOF".to_owned(),
+                ));
+            }
+        }
+    }
+}
+
+async fn coordinate_runtime_completion(
+    shared: Arc<Shared>,
+    pty: PtyOwner,
+    runtime_id: RuntimeId,
+    mut output_eof_rx: oneshot::Receiver<Result<OutputCompletion, WorkerError>>,
+) {
+    let exit = match wait_runtime_exit(&pty).await {
+        Ok(exit) => exit,
+        Err(error) => {
+            let _ = pty
+                .stop("root-observation-failure", shared.config.stop_grace)
+                .await;
+            mark_runtime_faulted(&shared, runtime_id, WorkerError::Pty(error)).await;
+            shared.shutdown.cancel();
+            return;
+        }
+    };
+    let (status, stopped_by_user) = {
+        let state = shared.state.lock().await;
+        (
+            exit_status(&exit, state.stop_requested),
+            state.stop_requested,
+        )
+    };
+    let exited_at = timestamp();
+    let completion = match wait_for_output_completion(&shared, &pty, &mut output_eof_rx).await {
+        Ok(completion) => completion,
+        Err(error) => {
+            mark_runtime_faulted(&shared, runtime_id, error).await;
+            shared.shutdown.cancel();
+            return;
+        }
+    };
+    let next_output_offset = match completion {
+        OutputCompletion::Eof { next_offset } => next_offset,
+        OutputCompletion::ForcedClosed { next_offset } => {
+            mark_runtime_faulted_at_offset(
+                &shared,
+                runtime_id,
+                WorkerError::Pty(PtyError::OutputForcedClosed),
+                Some(next_offset),
+            )
+            .await;
+            shared.shutdown.cancel();
+            return;
+        }
+    };
+    if let Err(error) = pty.finish_natural().await {
+        mark_runtime_faulted(&shared, runtime_id, WorkerError::Pty(error)).await;
+        shared.shutdown.cancel();
+        return;
+    }
+    let Some(retention) = retry_runtime_completion(
+        &shared,
+        &exit,
+        &status,
+        stopped_by_user,
+        &exited_at,
+        next_output_offset,
+    )
+    .await
+    else {
+        return;
+    };
+    shared.emit(EventKind::ChildExited {
+        runtime_id,
+        exit: status,
+    });
+    tokio::select! {
+        () = tokio::time::sleep(retention) => shared.shutdown.cancel(),
+        () = shared.shutdown.cancelled() => {}
+    }
+}
+
+async fn wait_for_output_completion(
+    shared: &Shared,
+    pty: &PtyOwner,
+    output_eof_rx: &mut oneshot::Receiver<Result<OutputCompletion, WorkerError>>,
+) -> Result<OutputCompletion, WorkerError> {
+    let completion =
+        match tokio::time::timeout(shared.config.post_exit_drain_timeout, output_eof_rx).await {
+            Ok(Ok(Ok(completion))) => completion,
+            Ok(Ok(Err(error))) => return Err(error),
+            Ok(Err(_closed)) => pty.output_completion().ok_or_else(|| {
+                WorkerError::Protocol("PTY output monitor stopped before EOF".to_owned())
+            })?,
+            Err(_elapsed) => {
+                event!(
+                    name: "worker.pty.drain.expired",
+                    Level::WARN,
+                    process.pid = pty.identity().pid,
+                    "PTY drain deadline expired; terminating the retained process group",
+                );
+                let grace = {
+                    let state = shared.state.lock().await;
+                    state.stop_grace
+                };
+                match pty.stop("natural-drain-timeout", grace).await {
+                    Ok(_) | Err(PtyError::OutputForcedClosed) => {}
+                    Err(error) => return Err(WorkerError::Pty(error)),
+                }
+                pty.output_completion().ok_or_else(|| {
+                    WorkerError::Protocol(
+                        "PTY cleanup returned without sealing output completion".to_owned(),
+                    )
+                })?
+            }
+        };
+    Ok(completion)
+}
+
+async fn retry_runtime_completion(
+    shared: &Shared,
+    exit: &Exit,
+    status: &ExitStatus,
+    stopped_by_user: bool,
+    exited_at: &str,
+    next_output_offset: u64,
+) -> Option<Duration> {
+    let mut terminal_commit_failed = false;
+    loop {
+        match commit_runtime_completion(
+            shared,
+            exit,
+            status,
+            stopped_by_user,
+            exited_at,
+            next_output_offset,
+        )
+        .await
+        {
+            Ok(retention) => {
+                if terminal_commit_failed {
+                    event!(
+                        name: "worker.terminal_commit.recovered",
+                        Level::INFO,
+                        "worker terminal journal commit recovered",
+                    );
+                }
+                return Some(retention);
+            }
+            Err(error) => {
+                if !terminal_commit_failed {
+                    event!(
+                        name: "worker.terminal_commit.retry",
+                        Level::WARN,
+                        error.type = "journal",
+                        error.message = %error,
+                        "worker terminal journal commit failed; retrying: {{error.message}}",
+                    );
+                    terminal_commit_failed = true;
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(TERMINAL_JOURNAL_RETRY_DELAY) => {}
+                    () = shared.shutdown.cancelled() => return None,
                 }
             }
         }
-    });
+    }
+}
 
-    tokio::spawn(async move {
-        let exit = match wait_runtime_exit(&pty).await {
-            Ok(exit) => exit,
-            Err(error) => {
-                mark_runtime_faulted(&shared, runtime_id, WorkerError::Pty(error)).await;
-                return;
-            }
-        };
-        let (status, retention, record) = {
-            let mut state = shared.state.lock().await;
-            let status = exit_status(&exit, state.stop_requested);
-            state.phase = WireRuntimePhase::Exited;
-            state.exit = Some(status.clone());
-            state.journal.phase = JournalPhase::Terminal;
-            mark_running_subagents_lost(&mut state.journal, status.exited_at_ms);
-            state.journal.outcome = Some(RuntimeOutcome {
-                exit_code: exit.exit_code,
-                signal: exit.signal.clone(),
-                success: exit.success,
-                exited_at: timestamp(),
-                reason: if state.stop_requested {
-                    "explicit_stop".to_owned()
-                } else {
-                    "natural_exit".to_owned()
-                },
-            });
-            state.journal.next_output_offset = pty.output().next_offset();
-            state.journal.updated_at = timestamp();
-            (status, state.terminal_retention, state.journal.clone())
-        };
-        if let Err(error) = persist(shared.journal.clone(), record).await {
-            event!(
-                name: "worker.journal.write.failed",
-                Level::ERROR,
-                error.type = "journal",
-                error.message = %error,
-                "worker terminal journal write failed: {{error.message}}",
-            );
-        }
-        shared.emit(EventKind::ChildExited {
-            runtime_id,
-            exit: status,
-        });
-        tokio::select! {
-            () = tokio::time::sleep(retention) => shared.shutdown.cancel(),
-            () = shared.shutdown.cancelled() => {}
-        }
+async fn commit_runtime_completion(
+    shared: &Shared,
+    exit: &Exit,
+    status: &ExitStatus,
+    stopped_by_user: bool,
+    exited_at: &str,
+    next_output_offset: u64,
+) -> Result<Duration, WorkerError> {
+    let mut state = shared.state.lock().await;
+    let mut journal = state.journal.clone();
+    journal.phase = JournalPhase::Terminal;
+    journal.pending_launch_claims.clear();
+    mark_running_subagents_lost(&mut journal, status.exited_at_ms);
+    journal.outcome = Some(RuntimeOutcome {
+        exit_code: exit.exit_code,
+        signal: exit.signal.clone(),
+        success: exit.success,
+        exited_at: exited_at.to_owned(),
+        reason: if stopped_by_user {
+            "explicit_stop".to_owned()
+        } else {
+            "natural_exit".to_owned()
+        },
     });
+    journal.next_output_offset = next_output_offset;
+    journal.updated_at = timestamp();
+    persist(shared.journal.clone(), journal.clone()).await?;
+    state.phase = WireRuntimePhase::Exited;
+    state.exit = Some(status.clone());
+    state.journal = journal;
+    shared.state_changed.notify_waiters();
+    Ok(state.terminal_retention)
 }
 
 async fn wait_runtime_exit(pty: &PtyOwner) -> Result<Exit, PtyError> {
-    let exit = pty.wait_exit().await;
-    // Child exit is authoritative even while descendants keep the slave PTY
-    // open, so observation waiters cannot depend on master EOF.
-    pty.output().mark_exit();
-    exit
+    pty.wait_exit().await
 }
 
 async fn mark_runtime_faulted(shared: &Shared, runtime_id: RuntimeId, error: WorkerError) {
-    let record = {
+    mark_runtime_faulted_at_offset(shared, runtime_id, error, None).await;
+}
+
+async fn mark_runtime_faulted_at_offset(
+    shared: &Shared,
+    runtime_id: RuntimeId,
+    error: WorkerError,
+    next_output_offset: Option<u64>,
+) {
+    let commit = {
         let mut state = shared.state.lock().await;
         state.phase = WireRuntimePhase::Faulted;
         state.journal.phase = JournalPhase::Faulted;
+        if let Some(next_output_offset) = next_output_offset {
+            state.journal.next_output_offset = next_output_offset;
+        }
+        state.journal.pending_launch_claims.clear();
         mark_running_subagents_lost(&mut state.journal, unix_ms());
         state.journal.updated_at = timestamp();
-        state.journal.clone()
+        persist(shared.journal.clone(), state.journal.clone()).await
     };
-    if let Err(persist_error) = persist(shared.journal.clone(), record).await {
+    shared.state_changed.notify_waiters();
+    if let Err(persist_error) = commit {
         event!(
             name: "worker.journal.write.failed",
             Level::ERROR,
@@ -1617,6 +1885,8 @@ async fn serve_data(
     let stream_id = header.stream_id;
     let runtime_id = header.runtime_id;
     let mut next_input_sequence = 1_u64;
+    let mut root_exit = pty.exit_receiver();
+    let mut pending_output_exit = None;
 
     loop {
         tokio::select! {
@@ -1634,20 +1904,47 @@ async fn serve_data(
                 ).await?;
                 return Ok(());
             }
-            output = subscriber.recv() => {
+            changed = root_exit.changed(), if pending_output_exit.is_some() => {
+                changed.map_err(|_closed| WorkerError::Pty(PtyError::ExitTimeout))?;
+                if root_exit.borrow().is_some() {
+                    let output = pending_output_exit
+                        .take()
+                        .expect("guarded pending PTY EOF");
+                    if *lease_epoch.borrow() != grant.lease_epoch {
+                        return Ok(());
+                    }
+                    write_runtime_output_event(
+                        &mut write_half,
+                        version,
+                        &stream_id,
+                        &runtime_id,
+                        shared.config.data_payload_bytes,
+                        output,
+                        pty.output_forced_closed(),
+                    ).await?;
+                }
+            }
+            output = subscriber.recv(), if pending_output_exit.is_none() => {
                 let Some(output) = output else {
                     return Ok(());
                 };
-                write_output_event(
+                if matches!(&output, OutputEvent::Exit { .. })
+                    && root_exit.borrow().is_none()
+                {
+                    pending_output_exit = Some(output);
+                    continue;
+                }
+                write_runtime_output_event(
                     &mut write_half,
                     version,
                     &stream_id,
                     &runtime_id,
                     shared.config.data_payload_bytes,
                     output,
+                    pty.output_forced_closed(),
                 ).await?;
             }
-            input = protocol::read_frame(&mut read_half), if mode == StreamMode::Attach => {
+            input = protocol::read_frame(&mut read_half) => {
                 let input = match input {
                     Ok(Some(input)) => input,
                     Ok(None) => return Ok(()),
@@ -1661,6 +1958,19 @@ async fn serve_data(
                         ).await;
                     }
                 };
+                if mode != StreamMode::Attach {
+                    return write_data_error(
+                        &mut write_half,
+                        version,
+                        &stream_id,
+                        &runtime_id,
+                        control_error_message(
+                            ControlCode::InvalidRequest,
+                            "output data stream received a client frame",
+                            false,
+                        ),
+                    ).await;
+                }
                 let (input_header, bytes) = input.into_parts();
                 let FrameKind::Input { write_id } = input_header.kind else {
                     return write_data_error(
@@ -2120,6 +2430,43 @@ where
     }
 }
 
+async fn write_runtime_output_event<W>(
+    writer: &mut W,
+    version: Version,
+    stream_id: &StreamId,
+    runtime_id: &RuntimeId,
+    payload_limit: usize,
+    output: OutputEvent,
+    forced_closed: bool,
+) -> Result<(), WorkerError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    if forced_closed && matches!(output, OutputEvent::Exit { .. }) {
+        return write_data_error(
+            writer,
+            version,
+            stream_id,
+            runtime_id,
+            control_error(
+                ControlCode::RuntimeFault,
+                PtyError::OutputForcedClosed,
+                false,
+            ),
+        )
+        .await;
+    }
+    write_output_event(
+        writer,
+        version,
+        stream_id,
+        runtime_id,
+        payload_limit,
+        output,
+    )
+    .await
+}
+
 async fn write_output_chunks<W>(
     writer: &mut W,
     version: Version,
@@ -2250,12 +2597,9 @@ enum HookRequest {
 struct HookResponse {
     ok: bool,
     launch_identity_accepted: bool,
+    launch_identity_status: LaunchClaimStatus,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "identity report and release share one validated response path"
-)]
 async fn serve_identity_hook<W>(
     shared: Arc<Shared>,
     writer: &mut ControlWriter<W>,
@@ -2264,8 +2608,25 @@ async fn serve_identity_hook<W>(
 where
     W: AsyncWrite + Unpin + Send,
 {
+    serve_identity_hook_with_probe(shared, writer, value, verify_launch_claim).await
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "identity report and release share one validated response path"
+)]
+async fn serve_identity_hook_with_probe<W>(
+    shared: Arc<Shared>,
+    writer: &mut ControlWriter<W>,
+    value: serde_json::Value,
+    mut verify: impl FnMut(&PendingLaunchClaim) -> Result<bool, WorkerError> + Send,
+) -> Result<(), WorkerError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
     let request: HookRequest =
         serde_json::from_value(value).map_err(|error| WorkerError::Protocol(error.to_string()))?;
+    let mut launch_identity_status = LaunchClaimStatus::NotApplicable;
     let (accepted, launch_identity_accepted, runtime_id, subagent_changed) = match request {
         HookRequest::IdentityReport {
             runtime_id,
@@ -2280,6 +2641,7 @@ where
             let mut state = shared.state.lock().await;
             let current_runtime = state.runtime_id.as_ref().map(ToString::to_string);
             if !known_identity_provider(&provider)
+                || state.phase != WireRuntimePhase::Running
                 || current_runtime.as_deref() != Some(runtime_id.as_str())
                 || !valid_identity_expiry(&expires_at)
             {
@@ -2305,54 +2667,54 @@ where
                         provider: provider.clone(),
                         process: process.clone(),
                         sequence,
-                        expires_at,
+                        expires_at: expires_at.clone(),
                         reference_kind: reference_kind.clone(),
                         native_reference: native_reference.clone(),
                     });
                     journal.active_identity_release = None;
-                    let mut launch_identity_accepted = false;
                     if let (Some(reference_kind), Some(native_reference), Some(launch_base)) = (
                         reference_kind,
                         native_reference,
                         state.launch_agent_base.as_ref(),
                     ) {
                         if &provider == launch_base {
-                            if let Some(designated) =
-                                designated_launch_process(root_identity.pid, launch_base)?
-                            {
-                                if designated.pid == pid
-                                    && designated.start_identity == start_identity
-                                {
-                                    match journal.launch_identity.as_ref() {
-                                        None => {
-                                            journal.launch_identity = Some(LaunchIdentity {
-                                                provider,
-                                                process,
-                                                reference_kind,
-                                                native_reference,
-                                            });
-                                            launch_identity_accepted = true;
-                                        }
-                                        Some(existing)
-                                            if existing.process.pid == pid
-                                                && existing.process.start_identity
-                                                    == start_identity.to_string()
-                                                && existing.reference_kind == reference_kind
-                                                && existing.native_reference
-                                                    == native_reference =>
-                                        {
-                                            launch_identity_accepted = true;
-                                        }
-                                        Some(_) => {}
+                            let claim = PendingLaunchClaim {
+                                retry_pending: true,
+                                runtime_id,
+                                root: journal_identity(&root_identity),
+                                identity: LaunchIdentity {
+                                    provider,
+                                    process,
+                                    reference_kind,
+                                    native_reference,
+                                },
+                                expires_at,
+                            };
+                            launch_identity_status = launch::submit(
+                                &mut journal,
+                                claim,
+                                shared.config.pending_launch_claims,
+                                |claim| {
+                                    let result = verify(claim);
+                                    if let Err(error) = &result {
+                                        event!(name: "worker.launch_identity.inspect.deferred", Level::WARN,
+                                            process.pid = pid, error.type = "process_observation", error.message = %error,
+                                            "launch identity verification deferred: {{error.message}}");
                                     }
-                                }
-                            }
+                                    result
+                                },
+                            )?;
                         }
                     }
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
-                    (true, launch_identity_accepted, current_runtime, false)
+                    (
+                        true,
+                        launch_identity_status == LaunchClaimStatus::Accepted,
+                        current_runtime,
+                        false,
+                    )
                 }
             }
         }
@@ -2513,6 +2875,7 @@ where
         .write(&HookResponse {
             ok: accepted,
             launch_identity_accepted,
+            launch_identity_status,
         })
         .await
         .map_err(|error| WorkerError::Protocol(error.to_string()))
@@ -2520,6 +2883,74 @@ where
 
 fn known_identity_provider(provider: &str) -> bool {
     matches!(provider, "shell" | "codex" | "claude" | "hermes")
+}
+
+fn verify_launch_claim(claim: &PendingLaunchClaim) -> Result<bool, WorkerError> {
+    let exact_identity = |process: &ChildIdentity| -> Result<OsProcessIdentity, WorkerError> {
+        Ok(OsProcessIdentity {
+            pid: process.pid,
+            start_identity: process
+                .start_identity
+                .parse::<StartIdentity>()
+                .map_err(|error| WorkerError::Protocol(error.to_string()))?,
+        })
+    };
+    let root = exact_identity(&claim.root)?;
+    let candidate = exact_identity(&claim.identity.process)?;
+    for expected in [root, candidate] {
+        match LinuxInspector.identity(expected.pid) {
+            Ok(Some(current)) if current == expected => {}
+            Ok(_) | Err(pohunek_platform::process::Error::Race { .. }) => return Ok(false),
+            Err(error) => return Err(WorkerError::Protocol(error.to_string())),
+        }
+    }
+    // This probe also rechecks root/candidate generations after executable and
+    // ancestry inspection. The stored PID alone never authorizes a retry.
+    let designated = designated_launch_process(root, &claim.identity.provider)?;
+    Ok(designated.is_some_and(|process| {
+        process.pid == candidate.pid
+            && process.start_identity.to_string() == candidate.start_identity.to_string()
+    }))
+}
+
+async fn retry_launch_claims(
+    shared: &Shared,
+    mut verify: impl FnMut(&PendingLaunchClaim) -> Result<bool, WorkerError>,
+) -> Result<(), WorkerError> {
+    let mut state = shared.state.lock().await;
+    if !state
+        .journal
+        .pending_launch_claims
+        .iter()
+        .any(|claim| claim.retry_pending)
+    {
+        return Ok(());
+    }
+    let running = state.phase == WireRuntimePhase::Running;
+    let mut journal = state.journal.clone();
+    let launch_was_accepted = journal.launch_identity.is_some();
+    let changed = launch::retry(&mut journal, time::OffsetDateTime::now_utc(), |claim| {
+        if running {
+            verify(claim)
+        } else {
+            Ok(false)
+        }
+    });
+    if changed {
+        let launch_became_accepted = !launch_was_accepted && journal.launch_identity.is_some();
+        journal.updated_at = timestamp();
+        // All journal writers share this lock: a stale output/terminal snapshot
+        // cannot overwrite ownership or a subsequently verified launch identity.
+        persist(shared.journal.clone(), journal.clone()).await?;
+        state.journal = journal;
+        if let (true, Some(runtime_id)) = (launch_became_accepted, state.runtime_id.clone()) {
+            shared.emit(EventKind::IdentityChanged { runtime_id });
+        }
+        event!(name: "worker.launch_identity.retry.resolved", Level::INFO,
+            launch.accepted = state.journal.launch_identity.is_some(),
+            "deferred launch identity verification updated");
+    }
+    Ok(())
 }
 
 fn event_visible_to_connection(event: &protocol::ControlEvent, connection: &Connection) -> bool {
@@ -3020,15 +3451,15 @@ async fn persist_control(journal: Journal, record: JournalRecord) -> Result<(), 
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))
 }
 
-fn verify_peer(stream: &UnixStream) -> Result<(), WorkerError> {
-    let credentials = getsockopt(stream, PeerCredentials)
-        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
-    if credentials.uid() != nix::unistd::Uid::effective().as_raw() {
+fn verify_peer(stream: &UnixStream) -> Result<peer::Credentials, WorkerError> {
+    let credentials =
+        peer::credentials(stream).map_err(|error| WorkerError::Protocol(error.to_string()))?;
+    if credentials.uid != nix::unistd::Uid::effective().as_raw() {
         return Err(WorkerError::Protocol(
             "worker peer UID does not match effective UID".to_owned(),
         ));
     }
-    Ok(())
+    Ok(credentials)
 }
 
 async fn prepare_socket(path: &Path) -> Result<(), WorkerError> {
@@ -3128,34 +3559,18 @@ fn unix_ms() -> u64 {
 }
 
 fn process_start(pid: u32) -> Result<u64, WorkerError> {
-    let stat_path = format!("/proc/{pid}/stat");
-    let stat = fs::read_to_string(&stat_path).map_err(|source| WorkerError::Filesystem {
-        path: PathBuf::from(&stat_path),
-        source,
-    })?;
-    parse_stat(&stat)
-        .map(|(_, start)| start)
-        .ok_or_else(|| WorkerError::Protocol("process stat is malformed".to_owned()))
+    LinuxInspector::new()
+        .identity(pid)
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?
+        .map(|identity| identity.start_identity.get())
+        .ok_or_else(|| WorkerError::Protocol("process no longer exists".to_owned()))
 }
 
 fn process_parent(pid: u32) -> Result<u32, WorkerError> {
-    let stat_path = format!("/proc/{pid}/stat");
-    let stat = fs::read_to_string(&stat_path).map_err(|source| WorkerError::Filesystem {
-        path: PathBuf::from(&stat_path),
-        source,
-    })?;
-    parse_stat(&stat)
-        .map(|(parent, _)| parent)
-        .ok_or_else(|| WorkerError::Protocol("process stat is malformed".to_owned()))
-}
-
-fn parse_stat(stat: &str) -> Option<(u32, u64)> {
-    let close = stat.rfind(')')?;
-    let mut fields = stat[close + 1..].split_whitespace();
-    let _state = fields.next()?;
-    let parent = fields.next()?.parse().ok()?;
-    let start_identity = fields.nth(17)?.parse().ok()?;
-    Some((parent, start_identity))
+    LinuxInspector::new()
+        .parent_pid(pid)
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?
+        .ok_or_else(|| WorkerError::Protocol("process no longer exists".to_owned()))
 }
 
 fn is_descendant(mut pid: u32, root: u32) -> Result<bool, WorkerError> {
@@ -3176,28 +3591,21 @@ fn is_descendant(mut pid: u32, root: u32) -> Result<bool, WorkerError> {
 }
 
 fn designated_launch_process(
-    root: u32,
+    root: OsProcessIdentity,
     provider: &str,
 ) -> Result<Option<WireProcessIdentity>, WorkerError> {
+    let inspector = LinuxInspector::new();
+    let mut processes = inspector
+        .descendant_identities(root)
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+    processes.push(root);
+    let provider = provider.to_ascii_lowercase();
     let mut candidates = Vec::new();
-    for entry in fs::read_dir("/proc").map_err(|source| WorkerError::Filesystem {
-        path: PathBuf::from("/proc"),
-        source,
-    })? {
-        let entry = entry.map_err(|source| WorkerError::Filesystem {
-            path: PathBuf::from("/proc"),
-            source,
-        })?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let Ok(pid) = name.parse::<u32>() else {
-            continue;
-        };
-        if !is_descendant(pid, root).unwrap_or(false) {
-            continue;
-        }
-        let Ok(executable) = fs::read_link(entry.path().join("exe")) else {
+    for process in processes {
+        let Some(executable) = inspector
+            .executable(process.pid)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?
+        else {
             continue;
         };
         let executable_name = executable
@@ -3205,18 +3613,59 @@ fn designated_launch_process(
             .and_then(std::ffi::OsStr::to_str)
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if !executable_name.contains(&provider.to_ascii_lowercase()) {
+        if !executable_name.contains(&provider) {
             continue;
         }
-        if let Ok(start_identity) = process_start(pid) {
-            candidates.push(WireProcessIdentity {
-                pid,
-                start_identity,
-            });
+        if inspector
+            .identity(process.pid)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?
+            != Some(process)
+        {
+            return Err(WorkerError::Protocol(
+                "launch candidate changed identity during inspection".to_owned(),
+            ));
         }
+        candidates.push(WireProcessIdentity {
+            pid: process.pid,
+            start_identity: process.start_identity.get(),
+        });
     }
     candidates.sort_by_key(|candidate| (candidate.start_identity, candidate.pid));
-    Ok(candidates.into_iter().next())
+    let Some(candidate) = candidates.into_iter().next() else {
+        return Ok(None);
+    };
+    let exact_candidate = OsProcessIdentity {
+        pid: candidate.pid,
+        start_identity: StartIdentity::new(candidate.start_identity),
+    };
+    if inspector
+        .identity(root.pid)
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?
+        != Some(root)
+        || inspector
+            .identity(candidate.pid)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?
+            != Some(exact_candidate)
+        || !is_descendant(candidate.pid, root.pid)?
+    {
+        return Err(WorkerError::Protocol(
+            "launch candidate changed ancestry during inspection".to_owned(),
+        ));
+    }
+    if inspector
+        .identity(root.pid)
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?
+        != Some(root)
+        || inspector
+            .identity(candidate.pid)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?
+            != Some(exact_candidate)
+    {
+        return Err(WorkerError::Protocol(
+            "launch candidate changed identity during ancestry inspection".to_owned(),
+        ));
+    }
+    Ok(Some(candidate))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -3237,10 +3686,6 @@ impl<S> PrefixStream<S> {
             prefix: Some(prefix),
             inner,
         }
-    }
-
-    fn inner(&self) -> &S {
-        &self.inner
     }
 }
 
@@ -3295,21 +3740,19 @@ mod tests {
     use super::{
         await_observation_page, capabilities, control_input_id, event_visible_to_connection,
         identity_sequence_is_fresh, known_identity_provider, mark_running_subagents_lost,
-        observation_timed_out, parse_stat, random_value, redeem_data_grant, signal_number,
-        start_subagent, stop_subagent, valid_identity_expiry, validate_attach_write_id,
-        validate_data_start, validate_observation_request, validate_terminal_snapshot_dimensions,
+        observation_timed_out, random_value, redeem_data_grant, signal_number, start_subagent,
+        stop_subagent, valid_identity_expiry, validate_attach_write_id, validate_data_start,
+        validate_observation_request, validate_terminal_snapshot_dimensions,
         validate_terminal_snapshot_response, wait_runtime_exit, write_data_error,
-        write_observation_page, write_output_chunks, write_terminal_chunks, Connection,
-        ControlInputId, DataGrant, ObservationGrant, ObservationWaitOutcome, PrefixStream,
-        TokenState, WireTerminalSnapshot,
+        write_observation_page, write_output_chunks, write_runtime_output_event,
+        write_terminal_chunks, Connection, ControlInputId, DataGrant, ObservationGrant,
+        ObservationWaitOutcome, PrefixStream, TokenState, WireTerminalSnapshot,
     };
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
     use pohunek_worker_protocol::{
         self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
-        ControlResponse, Cursor, DataToken, Dimensions, EventKind, FrameHeader, FrameKind, LeaseId,
-        RequestId, ResponseKind, RuntimeId, StreamId, StreamMode, Version, WriteId,
-        CURRENT_VERSION, MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
+        ControlResponse, Cursor, DataToken, Dimensions, EventKind, ExitStatus, FrameHeader,
+        FrameKind, LeaseId, RequestId, ResponseKind, RuntimeId, StreamId, StreamMode, Version,
+        WriteId, CURRENT_VERSION, MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::watch;
@@ -3320,6 +3763,233 @@ mod tests {
 
     /// Extra bytes force exactly one partial frame after a full wire payload.
     const OVERSIZED_PAYLOAD_EXTRA: usize = 257;
+
+    struct BarrierDirectory(std::path::PathBuf);
+
+    impl BarrierDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(random_value("output-barrier").unwrap());
+            std::fs::create_dir(&path).expect("create output barrier directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for BarrierDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn launch_claim_fixture() -> (super::Server, crate::PtyOwner, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(random_value("worker-claim").unwrap());
+        let config = crate::WorkerConfig::new();
+        let server = super::Server::bind(super::ServerArgs {
+            session_id: "s-112".into(),
+            worker_id: "worker-claim".into(),
+            socket_path: directory.join("worker.sock"),
+            journal_path: directory.join("journal.json"),
+            daemon_socket_path: directory.join("daemon.sock"),
+            config: config.clone(),
+        })
+        .await
+        .unwrap();
+        let pty = super::spawn_pty(
+            crate::Command {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "read -r line".into()],
+                env: Vec::new(),
+                cwd: directory.clone(),
+                cols: 80,
+                rows: 24,
+            },
+            &config,
+        )
+        .unwrap();
+        {
+            let mut state = server.shared.state.lock().await;
+            state.phase = super::WireRuntimePhase::Running;
+            state.runtime_id = Some(RuntimeId::new("runtime-claim").unwrap());
+            state.launch_agent_base = Some("claude".into());
+            state.pty = Some(pty.clone());
+            state.journal.phase = super::JournalPhase::Live;
+            state.journal.runtime_id = Some("runtime-claim".into());
+            state.journal.child = Some(super::journal_identity(pty.identity()));
+        };
+        (server, pty, directory)
+    }
+
+    fn launch_report(pty: &crate::PtyOwner, sequence: u64, reference: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "identity_report", "runtime_id": "runtime-claim", "provider": "claude",
+            "pid": pty.identity().pid,
+            "start_identity": pty.identity().start_identity.parse::<u64>().unwrap(),
+            "sequence": sequence,
+            "expires_at": (time::OffsetDateTime::now_utc() + time::Duration::seconds(30))
+                .format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "reference_kind": "id", "native_reference": reference,
+        })
+    }
+
+    #[tokio::test]
+    async fn deferred_launch_ack_owns_durable_original_claim_and_retry_commits_before_event() {
+        let (server, pty, directory) = launch_claim_fixture().await;
+        let mut bytes = Vec::new();
+        super::serve_identity_hook_with_probe(
+            std::sync::Arc::clone(&server.shared),
+            &mut super::ControlWriter::new(&mut bytes),
+            launch_report(&pty, 1, "original"),
+            |_| {
+                Err(crate::WorkerError::Protocol(
+                    "transient observation error".into(),
+                ))
+            },
+        )
+        .await
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            response,
+            serde_json::json!({"ok": true, "launch_identity_accepted": false, "launch_identity_status": "pending"})
+        );
+        let owned = server.shared.journal.load().unwrap();
+        assert_eq!(
+            owned.pending_launch_claims[0].identity.native_reference,
+            "original"
+        );
+        assert!(owned.launch_identity.is_none());
+
+        bytes.clear();
+        super::serve_identity_hook_with_probe(
+            std::sync::Arc::clone(&server.shared),
+            &mut super::ControlWriter::new(&mut bytes),
+            launch_report(&pty, 2, "continuation"),
+            |_| panic!("later report cannot replace pending claim"),
+        )
+        .await
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["launch_identity_status"], "rejected");
+        let mut events = server.shared.events.subscribe();
+        super::retry_launch_claims(&server.shared, |claim| {
+            assert_eq!(claim.identity.native_reference, "original");
+            Ok(true)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap().kind,
+            EventKind::IdentityChanged { .. }
+        ));
+        let committed = server.shared.journal.load().unwrap();
+        assert_eq!(
+            committed.launch_identity.unwrap().native_reference,
+            "original"
+        );
+        assert_eq!(
+            committed
+                .active_identity
+                .unwrap()
+                .native_reference
+                .as_deref(),
+            Some("continuation")
+        );
+        assert!(committed.pending_launch_claims.is_empty());
+        pty.stop("test-cleanup", server.shared.config.stop_grace)
+            .await
+            .unwrap();
+        drop(server);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn immediate_launch_rejection_commits_fence_before_acknowledgment() {
+        let (server, pty, directory) = launch_claim_fixture().await;
+        let mut bytes = Vec::new();
+        super::serve_identity_hook_with_probe(
+            std::sync::Arc::clone(&server.shared),
+            &mut super::ControlWriter::new(&mut bytes),
+            launch_report(&pty, 1, "original"),
+            |_| Ok(false),
+        )
+        .await
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            response,
+            serde_json::json!({"ok": true, "launch_identity_accepted": false, "launch_identity_status": "rejected"})
+        );
+        let committed = server.shared.journal.load().unwrap();
+        assert!(committed.launch_identity.is_none());
+        assert_eq!(committed.pending_launch_claims.len(), 1);
+        assert!(!committed.pending_launch_claims[0].retry_pending);
+        assert_eq!(
+            committed.pending_launch_claims[0].identity.native_reference,
+            "original"
+        );
+
+        bytes.clear();
+        super::serve_identity_hook_with_probe(
+            std::sync::Arc::clone(&server.shared),
+            &mut super::ControlWriter::new(&mut bytes),
+            launch_report(&pty, 2, "replacement"),
+            |_| panic!("rejection fence must not be reprobed"),
+        )
+        .await
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["launch_identity_status"], "rejected");
+        let committed = server.shared.journal.load().unwrap();
+        assert!(committed.launch_identity.is_none());
+        assert_eq!(
+            committed.pending_launch_claims[0].identity.native_reference,
+            "original"
+        );
+
+        pty.stop("test-cleanup", server.shared.config.stop_grace)
+            .await
+            .unwrap();
+        drop(server);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_pending_commit_never_acknowledges_or_changes_memory() {
+        let (server, pty, directory) = launch_claim_fixture().await;
+        std::fs::rename(
+            server.shared.journal.path(),
+            directory.join("original.json"),
+        )
+        .unwrap();
+        std::fs::create_dir(server.shared.journal.path()).unwrap();
+        let mut bytes = Vec::new();
+        let error = super::serve_identity_hook_with_probe(
+            std::sync::Arc::clone(&server.shared),
+            &mut super::ControlWriter::new(&mut bytes),
+            launch_report(&pty, 1, "original"),
+            |_| {
+                Err(crate::WorkerError::Protocol(
+                    "transient observation error".into(),
+                ))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, crate::WorkerError::Journal(_)));
+        assert!(bytes.is_empty());
+        let state = server.shared.state.lock().await;
+        assert!(state.journal.pending_launch_claims.is_empty());
+        assert!(state.journal.active_identity.is_none());
+        drop(state);
+        pty.stop("test-cleanup", server.shared.config.stop_grace)
+            .await
+            .unwrap();
+        drop(server);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn identity_provider_allowlist_is_exact() {
@@ -3502,15 +4172,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_exit_wakes_observation_while_a_descendant_holds_the_slave_pty() {
+    async fn root_exit_preserves_descendant_output_until_pty_eof() {
         let config = crate::WorkerConfig::new();
+        let barrier = BarrierDirectory::new();
+        let release = barrier.path().join("release");
         let pty = crate::PtyOwner::spawn(
             crate::Command {
                 program: "/bin/sh".to_owned(),
                 args: vec![
                     "-c".to_owned(),
-                    "(trap '' HUP; sleep 30) & printf 'descendant:%s\\n' \"$!\"; sleep 1"
-                        .to_owned(),
+                    concat!(
+                        "trap '' HUP; (",
+                        "while [ ! -e \"$1\" ] && [ -d \"$2\" ]; do sleep 0.01; done; ",
+                        "if [ -e \"$1\" ]; then printf 'late-descendant-output\\n'; fi) & ",
+                        "printf 'root-exited:%s\\n' \"$!\""
+                    )
+                    .to_owned(),
+                    "pohunek-descendant-output".to_owned(),
+                    release.to_string_lossy().into_owned(),
+                    barrier.path().to_string_lossy().into_owned(),
                 ],
                 env: Vec::new(),
                 cwd: std::env::temp_dir(),
@@ -3522,42 +4202,353 @@ mod tests {
             config.input_dedup_entries,
         )
         .expect("spawn PTY");
+        let mut subscriber = pty.subscribe_output(Some(0)).expect("subscribe output");
 
         tokio::time::timeout(Duration::from_secs(3), wait_runtime_exit(&pty))
             .await
             .expect("root process exit deadline")
             .expect("root process exit");
         let page = pty.output().observe(None, 1_024).expect("output page");
-        assert!(page.exited, "root exit must be authoritative for output");
-        let rendered = String::from_utf8_lossy(&page.bytes);
-        let descendant = rendered
-            .split_whitespace()
-            .find_map(|field| field.strip_prefix("descendant:"))
-            .and_then(|pid| pid.parse::<i32>().ok())
-            .expect("descendant PID in PTY output");
-        let descendant = Pid::from_raw(descendant);
-        assert!(
-            kill(descendant, None).is_ok(),
-            "descendant must still hold the slave PTY when the root exits"
-        );
-        let _ = kill(descendant, Signal::SIGKILL);
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            pty.stop("cleanup-descendant", Duration::from_millis(100)),
-        )
+        assert!(!page.exited, "root exit must not claim PTY EOF");
+        std::fs::write(&release, b"release").expect("release descendant output");
+
+        let (observed, final_offset) = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut observed = Vec::new();
+            loop {
+                match subscriber.recv().await.expect("output event before EOF") {
+                    crate::OutputEvent::Replay(chunk) | crate::OutputEvent::Output(chunk) => {
+                        observed.extend_from_slice(&chunk.bytes);
+                    }
+                    crate::OutputEvent::TerminalSnapshot(chunk) => {
+                        observed.extend_from_slice(&chunk.bytes);
+                    }
+                    crate::OutputEvent::Gap { .. } => observed.clear(),
+                    crate::OutputEvent::Exit { next_offset } => break (observed, next_offset),
+                }
+            }
+        })
         .await
-        .expect("descendant cleanup deadline")
-        .expect("descendant cleanup");
+        .expect("descendant output and EOF deadline");
+        assert!(
+            String::from_utf8_lossy(&observed).contains("late-descendant-output"),
+            "subscriber missed output produced after root exit"
+        );
+        assert_eq!(final_offset, pty.output().next_offset());
+        let page = pty
+            .output()
+            .observe(None, 1_024)
+            .expect("final output page");
+        assert!(page.exited, "reader EOF must close output");
+        assert_eq!(page.runtime_end_offset, final_offset);
     }
 
-    #[test]
-    fn proc_stat_parser_handles_spaces_and_parentheses_in_name() {
-        let mut fields = vec!["S".to_owned(), "10".to_owned()];
-        fields.extend((0..17).map(|value| value.to_string()));
-        fields.push("4242".to_owned());
-        let stat = format!("20 (name with ) parens) {}", fields.join(" "));
+    #[tokio::test]
+    async fn natural_exit_bounds_a_descendant_that_never_closes_the_pty() {
+        let directory = BarrierDirectory::new();
+        let config = crate::WorkerConfig {
+            post_exit_drain_timeout: Duration::from_millis(50),
+            stop_grace: Duration::from_millis(50),
+            ..crate::WorkerConfig::new()
+        };
+        let server = super::Server::bind(super::ServerArgs {
+            session_id: "s-113".to_owned(),
+            worker_id: "worker-bounded-drain".to_owned(),
+            socket_path: directory.path().join("worker.sock"),
+            journal_path: directory.path().join("journal.json"),
+            daemon_socket_path: directory.path().join("daemon.sock"),
+            config: config.clone(),
+        })
+        .await
+        .expect("bind worker");
+        let pty = super::spawn_pty(
+            crate::Command {
+                program: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    concat!(
+                        "trap '' HUP; ",
+                        "sh -c 'trap \"\" HUP TERM; while :; do sleep 1; done' & ",
+                        "printf 'root-exited\\n'"
+                    )
+                    .to_owned(),
+                ],
+                env: Vec::new(),
+                cwd: directory.path().to_path_buf(),
+                cols: 80,
+                rows: 24,
+            },
+            &config,
+        )
+        .expect("spawn PTY");
+        let runtime_id = RuntimeId::new("runtime-bounded-drain").expect("runtime id");
+        let mut state = server.shared.state.lock().await;
+        state.phase = super::WireRuntimePhase::Running;
+        state.runtime_id = Some(runtime_id.clone());
+        state.pty = Some(pty.clone());
+        state.stop_grace = config.stop_grace;
+        state.journal.phase = super::JournalPhase::Live;
+        state.journal.runtime_id = Some(runtime_id.as_str().to_owned());
+        state.journal.child = Some(super::journal_identity(pty.identity()));
+        drop(state);
+        super::spawn_runtime_monitors(
+            std::sync::Arc::clone(&server.shared),
+            pty.clone(),
+            runtime_id,
+        );
 
-        assert_eq!(parse_stat(&stat), Some((10, 4242)));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server.shared.state.lock().await.phase == super::WireRuntimePhase::Exited {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bounded natural drain completion");
+        let state = server.shared.state.lock().await;
+        assert_eq!(
+            state
+                .journal
+                .outcome
+                .as_ref()
+                .expect("terminal outcome")
+                .reason,
+            "natural_exit"
+        );
+        assert!(state.journal.next_output_offset > 0);
+        drop(state);
+        assert!(
+            super::process_start(pty.identity().pid).is_err(),
+            "root must be reaped after automatic cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_output_completion_does_not_wait_for_the_output_monitor() {
+        let directory = BarrierDirectory::new();
+        let ready = directory.path().join("held-monitor-ready");
+        let config = crate::WorkerConfig {
+            post_exit_drain_timeout: Duration::from_millis(50),
+            stop_grace: Duration::from_millis(50),
+            ..crate::WorkerConfig::new()
+        };
+        let server = super::Server::bind(super::ServerArgs {
+            session_id: "s-115".to_owned(),
+            worker_id: "worker-held-monitor".to_owned(),
+            socket_path: directory.path().join("worker.sock"),
+            journal_path: directory.path().join("journal.json"),
+            daemon_socket_path: directory.path().join("daemon.sock"),
+            config: config.clone(),
+        })
+        .await
+        .expect("bind worker");
+        let pty = super::spawn_pty(
+            crate::Command {
+                program: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    concat!(
+                        "trap '' HUP; ",
+                        "setsid sh -c 'trap \"\" HUP TERM; printf ready > \"$2\"; ",
+                        "while [ -d \"$1\" ]; do sleep 0.01; done' escaped \"$1\" \"$2\" & ",
+                        "while [ ! -e \"$2\" ]; do sleep 0.01; done; ",
+                        "printf 'root-exited\\n'"
+                    )
+                    .to_owned(),
+                    "pohunek-held-monitor".to_owned(),
+                    directory.path().to_string_lossy().into_owned(),
+                    ready.to_string_lossy().into_owned(),
+                ],
+                env: Vec::new(),
+                cwd: directory.path().to_path_buf(),
+                cols: 80,
+                rows: 24,
+            },
+            &config,
+        )
+        .expect("spawn PTY");
+        server.shared.state.lock().await.stop_grace = config.stop_grace;
+        tokio::time::timeout(Duration::from_secs(2), pty.wait_exit())
+            .await
+            .expect("root exit deadline")
+            .expect("root exit");
+
+        let (_output_eof_tx, mut output_eof_rx) = tokio::sync::oneshot::channel();
+        let completion = tokio::time::timeout(
+            Duration::from_secs(1),
+            super::wait_for_output_completion(&server.shared, &pty, &mut output_eof_rx),
+        )
+        .await
+        .expect("forced completion deadline")
+        .expect("forced completion");
+
+        assert!(matches!(
+            completion,
+            crate::output::OutputCompletion::ForcedClosed { next_offset }
+                if next_offset == pty.output().next_offset() && next_offset > 0
+        ));
+    }
+
+    #[tokio::test]
+    async fn escaped_pty_holder_faults_with_the_exact_final_output_offset() {
+        let directory = BarrierDirectory::new();
+        let ready = directory.path().join("escaped-ready");
+        let config = crate::WorkerConfig {
+            post_exit_drain_timeout: Duration::from_millis(50),
+            stop_grace: Duration::from_millis(50),
+            ..crate::WorkerConfig::new()
+        };
+        let server = super::Server::bind(super::ServerArgs {
+            session_id: "s-114".to_owned(),
+            worker_id: "worker-escaped-output".to_owned(),
+            socket_path: directory.path().join("worker.sock"),
+            journal_path: directory.path().join("journal.json"),
+            daemon_socket_path: directory.path().join("daemon.sock"),
+            config: config.clone(),
+        })
+        .await
+        .expect("bind worker");
+        let pty = super::spawn_pty(
+            crate::Command {
+                program: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    concat!(
+                        "trap '' HUP; ",
+                        "setsid sh -c 'trap \"\" HUP TERM; printf ready > \"$2\"; ",
+                        "while [ -d \"$1\" ]; do sleep 0.01; done' escaped \"$1\" \"$2\" & ",
+                        "while [ ! -e \"$2\" ]; do sleep 0.01; done; ",
+                        "printf 'root-exited\\n'"
+                    )
+                    .to_owned(),
+                    "pohunek-escaped-output".to_owned(),
+                    directory.path().to_string_lossy().into_owned(),
+                    ready.to_string_lossy().into_owned(),
+                ],
+                env: Vec::new(),
+                cwd: directory.path().to_path_buf(),
+                cols: 80,
+                rows: 24,
+            },
+            &config,
+        )
+        .expect("spawn PTY");
+        let runtime_id = RuntimeId::new("runtime-escaped-output").expect("runtime id");
+        let () = {
+            let mut state = server.shared.state.lock().await;
+            state.phase = super::WireRuntimePhase::Running;
+            state.runtime_id = Some(runtime_id.clone());
+            state.pty = Some(pty.clone());
+            state.stop_grace = config.stop_grace;
+            state.journal.phase = super::JournalPhase::Live;
+            state.journal.runtime_id = Some(runtime_id.as_str().to_owned());
+            state.journal.child = Some(super::journal_identity(pty.identity()));
+        };
+        super::spawn_runtime_monitors(
+            std::sync::Arc::clone(&server.shared),
+            pty.clone(),
+            runtime_id,
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server.shared.state.lock().await.phase == super::WireRuntimePhase::Faulted {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bounded forced-close fault");
+        let final_offset = pty.output().next_offset();
+        let journal = server.shared.journal.load().expect("load fault journal");
+        assert_eq!(journal.phase, super::JournalPhase::Faulted);
+        assert_eq!(journal.next_output_offset, final_offset);
+        assert!(final_offset > 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_commit_retries_before_publishing_exited_state() {
+        let (server, pty, directory) = launch_claim_fixture().await;
+        let journal_path = server.shared.journal.path().to_path_buf();
+        std::fs::remove_file(&journal_path).expect("remove writable journal fixture");
+        std::fs::create_dir(&journal_path).expect("block journal replacement with a directory");
+        let exit = crate::Exit {
+            exit_code: Some(0),
+            signal: None,
+            success: true,
+        };
+        let status = ExitStatus {
+            code: Some(0),
+            signal: None,
+            stopped_by_user: false,
+            exited_at_ms: 100,
+        };
+        let shared = std::sync::Arc::clone(&server.shared);
+        let completion = super::retry_runtime_completion(
+            &shared,
+            &exit,
+            &status,
+            false,
+            "2026-09-14T00:00:00Z",
+            42,
+        );
+        tokio::pin!(completion);
+        let terminal_confirmation = super::wait_for_terminal_commit(&shared);
+        tokio::pin!(terminal_confirmation);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut completion)
+                .await
+                .is_err(),
+            "failed terminal persistence must remain retryable"
+        );
+        assert_eq!(
+            server.shared.state.lock().await.phase,
+            super::WireRuntimePhase::Running,
+            "terminal state cannot be public before its journal commit"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut terminal_confirmation)
+                .await
+                .is_err(),
+            "stop confirmation cannot precede durable terminal state"
+        );
+
+        std::fs::remove_dir(&journal_path).expect("restore writable journal path");
+        let retention = tokio::time::timeout(Duration::from_secs(2), &mut completion)
+            .await
+            .expect("terminal commit retry deadline")
+            .expect("completion remains active until commit");
+        assert!(!retention.is_zero());
+        assert_eq!(
+            server.shared.state.lock().await.phase,
+            super::WireRuntimePhase::Exited
+        );
+        let journal = server.shared.journal.load().expect("load terminal journal");
+        assert_eq!(journal.phase, super::JournalPhase::Terminal);
+        assert_eq!(journal.next_output_offset, 42);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), &mut terminal_confirmation)
+                .await
+                .expect("terminal confirmation deadline")
+                .expect("terminal confirmation"),
+            status
+        );
+        let () = {
+            let mut state = server.shared.state.lock().await;
+            let retry = super::prepare_stop(&mut state).expect("prepare repeated stop");
+            let super::StopPreparation::AlreadyCommitted(retry_status) = retry else {
+                panic!("repeated stop must reuse the durable terminal commit");
+            };
+            assert_eq!(retry_status, status);
+            assert_eq!(state.phase, super::WireRuntimePhase::Exited);
+        };
+        pty.stop("test-cleanup", Duration::from_millis(100))
+            .await
+            .expect("stop fixture PTY");
+        drop(server);
+        std::fs::remove_dir_all(directory).expect("remove fixture directory");
     }
 
     #[test]
@@ -4146,6 +5137,36 @@ mod tests {
         assert_eq!(frame.header().stream_id, stream_id);
         assert_eq!(frame.header().runtime_id, runtime_id);
         assert_eq!(frame.header().kind, FrameKind::Error { error: expected });
+    }
+
+    #[tokio::test]
+    async fn forced_output_close_is_framed_as_a_runtime_fault() {
+        let stream_id = StreamId::new("forced-close").expect("stream id");
+        let runtime_id = RuntimeId::new("runtime-forced-close").expect("runtime id");
+        let (mut reader, mut writer) = tokio::io::duplex(4_096);
+
+        write_runtime_output_event(
+            &mut writer,
+            CURRENT_VERSION,
+            &stream_id,
+            &runtime_id,
+            1_024,
+            crate::OutputEvent::Exit { next_offset: 42 },
+            true,
+        )
+        .await
+        .expect("write forced-close fault");
+        let frame = protocol::read_frame(&mut reader)
+            .await
+            .expect("read forced-close frame")
+            .expect("forced-close frame");
+
+        let FrameKind::Error { error } = &frame.header().kind else {
+            panic!("forced close must not be framed as normal runtime exit");
+        };
+        assert_eq!(error.code, ControlCode::RuntimeFault);
+        assert!(!error.retryable);
+        assert!(error.message.contains("force-closed"));
     }
 
     #[tokio::test]

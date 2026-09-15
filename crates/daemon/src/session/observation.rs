@@ -340,10 +340,19 @@ impl SessionRegistry {
         id: &SessionId,
         observed: &ManagedSession,
     ) -> Result<(), ProtocolError> {
-        let current = self.managed_session(id).await?;
-        if current.worker_id != observed.worker_id
-            || current.runtime_id != observed.runtime_id
-            || current.runtime_generation != observed.runtime_generation
+        let sessions = self.inner.sessions.lock().await;
+        let Some(entry) = sessions.get(id) else {
+            return Err(ProtocolError::session_runtime_changed());
+        };
+        if !matches!(&entry.runtime, RuntimeHandle::Worker(_)) {
+            return Err(ProtocolError::session_runtime_changed());
+        }
+        let Some(runtime) = entry.info.runtime.as_ref() else {
+            return Err(ProtocolError::session_runtime_changed());
+        };
+        if runtime.worker_id.as_deref() != Some(observed.worker_id.as_str())
+            || runtime.runtime_id.as_deref() != Some(observed.runtime_id.as_str())
+            || runtime.runtime_generation != observed.runtime_generation
         {
             return Err(ProtocolError::session_runtime_changed());
         }

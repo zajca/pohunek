@@ -1,28 +1,33 @@
 //! Owns one PTY master and its managed process identity.
 
-// Rust guideline compliant 2026-08-09
+// Rust guideline compliant 2026-09-14
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::io::{self, Read};
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use nix::errno::Errno;
 use nix::sys::epoll::{self, EpollCreateFlags, EpollEvent, EpollFlags, EpollOp};
+use nix::sys::eventfd::{EfdFlags, EventFd};
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::{close, Pid};
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use pohunek_platform::process::{LinuxInspector, ProcessInspector};
+use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
 use rustix::fd::OwnedFd;
 use rustix::fs::{open, Mode, OFlags};
+use rustix::process::{waitid, Pid as RustixPid, WaitId, WaitIdOptions, WaitIdStatus};
 use rustix::termios::{tcflow, Action};
 use tokio::sync::{watch, Mutex as AsyncMutex};
 use tracing::{event, Level};
 
-use crate::{OutputHub, OutputSubscriber, RingError, WriteCoordinator};
+use crate::output::OutputCompletion;
+use crate::{OutputEvent, OutputHub, OutputSubscriber, RingError, WriteCoordinator};
 
 /// Blocking PTY read size.
 ///
@@ -41,6 +46,10 @@ const OUTPUT_DRAIN_BATCH_BYTES: usize = 256 * 1024;
 /// immediate readiness check.
 const EPOLL_WAIT_FOREVER_MS: isize = -1;
 const EPOLL_NO_WAIT_MS: isize = 0;
+/// Epoll token for PTY data readiness.
+const PTY_READY_TOKEN: u64 = 0;
+/// Epoll token for lifecycle-forced reader cancellation.
+const CANCEL_READY_TOKEN: u64 = 1;
 /// Maximum terminal grid cells accepted from one initialization.
 ///
 /// Four million cells accommodate unusually large terminals while preventing
@@ -173,6 +182,18 @@ pub enum PtyError {
     /// Process did not exit within both stop windows.
     #[error("timed out waiting for managed process exit")]
     ExitTimeout,
+    /// PTY output did not close after hard process-group termination.
+    #[error("PTY output remained open after hard process-group termination")]
+    OutputCloseTimeout,
+    /// PTY output was force-closed after its bounded cleanup deadline.
+    #[error("PTY output was force-closed after its cleanup deadline")]
+    OutputForcedClosed,
+    /// The root process could not be observed without releasing its PID anchor.
+    #[error("failed to observe the managed root process without reaping it: {message}")]
+    ChildObservation {
+        /// Sanitized operating-system failure.
+        message: String,
+    },
     /// Sending a process-group signal failed.
     #[error("failed to signal managed process group {process_group}: {source}")]
     Signal {
@@ -190,7 +211,7 @@ pub struct PtyOwner {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     reader_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     child_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
-    exit_rx: watch::Receiver<Option<Exit>>,
+    exit_rx: watch::Receiver<Option<RootObservation>>,
     output: OutputHub,
     output_order: Arc<Mutex<()>>,
     output_reader: Arc<Mutex<Box<dyn Read + Send>>>,
@@ -198,7 +219,121 @@ pub struct PtyOwner {
     tty_name: Arc<PathBuf>,
     input: WriteCoordinator,
     resize: Arc<AsyncMutex<ResizeState>>,
-    stop: Arc<AsyncMutex<Option<(String, Exit)>>>,
+    cleanup: Arc<AsyncMutex<CleanupState>>,
+    reap_tx: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CleanupState {
+    Active,
+    AuthorityReleased,
+    ForcedClosing,
+    OutputAuthorityReleased(OutputCompletion),
+    ForcedClosed,
+    ObservationAuthorityReleased(String),
+    ObservationFailed(String),
+    Finished(Exit),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RootObservation {
+    Exited(Exit),
+    Failed(String),
+}
+
+/// Owns a spawned child until construction commits it to the wait thread.
+struct SpawnGuard {
+    child: Option<Box<dyn PtyChild + Send + Sync>>,
+    process_group: Option<i32>,
+}
+
+/// Holds startup threads until every fallible ownership handoff succeeds.
+#[derive(Debug, Clone, Default)]
+struct StartupLatch {
+    inner: Arc<(Mutex<StartupState>, Condvar)>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum StartupState {
+    #[default]
+    Pending,
+    Committed,
+    Aborted,
+}
+
+impl StartupLatch {
+    fn wait(&self) -> bool {
+        let (state, changed) = &*self.inner;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *state == StartupState::Pending {
+            state = changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *state == StartupState::Committed
+    }
+
+    fn commit(&self) {
+        self.set(StartupState::Committed);
+    }
+
+    fn abort(&self) {
+        self.set(StartupState::Aborted);
+    }
+
+    fn set(&self, next: StartupState) {
+        let (state, changed) = &*self.inner;
+        *state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+        changed.notify_all();
+    }
+}
+
+impl Debug for SpawnGuard {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnGuard")
+            .field("has_child", &self.child.is_some())
+            .field("process_group", &self.process_group)
+            .finish()
+    }
+}
+
+impl SpawnGuard {
+    fn new(child: Box<dyn PtyChild + Send + Sync>) -> Self {
+        Self {
+            child: Some(child),
+            process_group: None,
+        }
+    }
+
+    fn set_process_group(&mut self, process_group: i32) {
+        self.process_group = Some(process_group);
+    }
+
+    fn wait(&mut self) -> io::Result<portable_pty::ExitStatus> {
+        let child = self.child.as_mut().expect("spawn guard owns child");
+        let result = child.wait();
+        if result.is_ok() {
+            self.child = None;
+        }
+        result
+    }
+}
+
+impl Drop for SpawnGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if let Some(process_group) = self.process_group {
+            let _ = killpg(Pid::from_raw(process_group), Signal::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 impl Debug for PtyOwner {
@@ -275,36 +410,7 @@ impl PtyOwner {
         }
         builder.cwd(&command.cwd);
 
-        let mut child = pair.slave.spawn_command(builder).map_err(|_source| {
-            let program = Path::new(&command.program);
-            PtyError::Spawn {
-                message: "process launch failed".to_owned(),
-                not_found: program.is_absolute() && !program.exists(),
-            }
-        })?;
-        let pid = child.process_id().ok_or(PtyError::MissingPid)?;
-        let process_group =
-            pair.master
-                .process_group_leader()
-                .unwrap_or(i32::try_from(pid).map_err(|_range_error| {
-                    PtyError::ProcessIdentity {
-                        pid,
-                        source: io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "PID exceeds pid_t range",
-                        ),
-                    }
-                })?);
-        let start_identity =
-            read_process_start(pid).map_err(|source| PtyError::ProcessIdentity { pid, source })?;
-        let identity = ProcessIdentity {
-            pid,
-            process_group,
-            start_identity,
-        };
         let tty_name = Arc::new(pair.master.tty_name().ok_or(PtyError::MissingTtyName)?);
-        drop(pair.slave);
-
         let master_fd = pair.master.as_raw_fd().ok_or(PtyError::MissingMasterFd)?;
         let output_readiness = Arc::new(OutputReadiness::new(master_fd)?);
         let output_reader = Arc::new(Mutex::new(
@@ -321,26 +427,67 @@ impl PtyOwner {
         let output = OutputHub::new(history_bytes, subscriber_bytes, command.rows, command.cols)?;
         let output_order = Arc::new(Mutex::new(()));
 
+        let child = pair.slave.spawn_command(builder).map_err(|_source| {
+            let program = Path::new(&command.program);
+            PtyError::Spawn {
+                message: "process launch failed".to_owned(),
+                not_found: program.is_absolute() && !program.exists(),
+            }
+        })?;
+        let mut child = SpawnGuard::new(child);
+        let pid = child
+            .child
+            .as_ref()
+            .and_then(|child| child.process_id())
+            .ok_or(PtyError::MissingPid)?;
+        let native_pid = i32::try_from(pid).map_err(|_range_error| PtyError::ProcessIdentity {
+            pid,
+            source: io::Error::new(io::ErrorKind::InvalidData, "PID exceeds pid_t range"),
+        })?;
+        child.set_process_group(native_pid);
+        // portable-pty creates the PTY root as a session and process-group
+        // leader. Unlike the terminal foreground group, this owned PGID stays
+        // bound to the unreaped root throughout construction rollback.
+        let process_group = native_pid;
+        let start_identity =
+            read_process_start(pid).map_err(|source| PtyError::ProcessIdentity { pid, source })?;
+        let identity = ProcessIdentity {
+            pid,
+            process_group,
+            start_identity,
+        };
+        drop(pair.slave);
+
         let reader_output = output.clone();
         let reader_output_order = Arc::clone(&output_order);
         let thread_output_reader = Arc::clone(&output_reader);
         let thread_output_readiness = Arc::clone(&output_readiness);
         let reader_pid = pid;
+        let startup = StartupLatch::default();
+        let reader_startup = startup.clone();
         let reader_thread = thread::Builder::new()
             .name(format!("pohunek-worker-pty-{pid}"))
             .spawn(move || {
+                if !reader_startup.wait() {
+                    reader_output.mark_exit();
+                    return;
+                }
                 let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
                 loop {
-                    if let Err(error) = wait_for_output(&*thread_output_readiness) {
-                        event!(
-                            name: "worker.pty.read.failed",
-                            Level::WARN,
-                            process.pid = reader_pid,
-                            error.type = "io",
-                            error.message = %error,
-                            "PTY readiness wait failed for {{process.pid}}: {{error.message}}",
-                        );
-                        break;
+                    match wait_for_output(&*thread_output_readiness) {
+                        Ok(OutputReadyState::Output) => {}
+                        Ok(OutputReadyState::Cancelled) => break,
+                        Err(error) => {
+                            event!(
+                                name: "worker.pty.read.failed",
+                                Level::WARN,
+                                process.pid = reader_pid,
+                                error.type = "io",
+                                error.message = %error,
+                                "PTY readiness wait failed for {{process.pid}}: {{error.message}}",
+                            );
+                            break;
+                        }
                     }
                     let _order = reader_output_order
                         .lock()
@@ -353,7 +500,7 @@ impl PtyOwner {
                         OUTPUT_DRAIN_BATCH_BYTES,
                     ) {
                         Ok(OutputReadState::Open | OutputReadState::BudgetExhausted) => {}
-                        Ok(OutputReadState::Eof) => break,
+                        Ok(OutputReadState::Eof | OutputReadState::Cancelled) => break,
                         Err(error) => {
                             event!(
                                 name: "worker.pty.read.failed",
@@ -372,38 +519,41 @@ impl PtyOwner {
             .map_err(PtyError::Io)?;
 
         let (exit_tx, exit_rx) = watch::channel(None);
+        let (reap_tx, reap_rx) = mpsc::channel();
+        let child_startup = startup.clone();
         let child_thread = thread::Builder::new()
             .name(format!("pohunek-worker-child-{pid}"))
             .spawn(move || {
-                let exit = match child.wait() {
-                    Ok(status) => Exit {
-                        exit_code: status
-                            .signal()
-                            .is_none()
-                            .then(|| i32::try_from(status.exit_code()).ok())
-                            .flatten(),
-                        signal: status.signal().map(str::to_owned),
-                        success: status.success(),
-                    },
+                if !child_startup.wait() {
+                    return;
+                }
+                let observation = match observe_child_exit(pid) {
+                    Ok(exit) => RootObservation::Exited(exit),
                     Err(error) => {
                         event!(
-                            name: "worker.child.wait.failed",
+                            name: "worker.child.observe.failed",
                             Level::ERROR,
                             process.pid = pid,
                             error.type = "io",
                             error.message = %error,
-                            "child wait failed for {{process.pid}}: {{error.message}}",
+                            "child non-reaping wait failed for {{process.pid}}: {{error.message}}",
                         );
-                        Exit {
-                            exit_code: None,
-                            signal: None,
-                            success: false,
-                        }
+                        RootObservation::Failed(error.to_string())
                     }
                 };
-                let _ = exit_tx.send(Some(exit));
-            })
-            .map_err(PtyError::Io)?;
+                let _ = exit_tx.send(Some(observation));
+                let _ = reap_rx.recv();
+                let _ = reap_child(&mut child, pid);
+            });
+        let child_thread = match child_thread {
+            Ok(child_thread) => child_thread,
+            Err(source) => {
+                startup.abort();
+                reader_thread.join().map_err(|_panic| PtyError::Task)?;
+                return Err(PtyError::Io(source));
+            }
+        };
+        startup.commit();
 
         Ok(Self {
             identity,
@@ -422,7 +572,8 @@ impl PtyOwner {
                 rows: command.rows,
                 sequences: HashMap::new(),
             })),
-            stop: Arc::new(AsyncMutex::new(None)),
+            cleanup: Arc::new(AsyncMutex::new(CleanupState::Active)),
+            reap_tx: Arc::new(Mutex::new(Some(reap_tx))),
         })
     }
 
@@ -615,31 +766,111 @@ impl PtyOwner {
     /// # Errors
     ///
     /// Returns [`PtyError`] for signal, identity, timeout, or join failures.
-    pub async fn stop(&self, stop_id: &str, grace: Duration) -> Result<Exit, PtyError> {
-        let mut stop = self.stop.lock().await;
-        if let Some((_, exit)) = stop.as_ref() {
-            return Ok(exit.clone());
-        }
-        let already_exited = self.exit_rx.borrow().clone();
-        if let Some(exit) = already_exited {
-            self.join_threads().await?;
-            *stop = Some((stop_id.to_owned(), exit.clone()));
-            return Ok(exit);
+    pub async fn stop(&self, _stop_id: &str, grace: Duration) -> Result<Exit, PtyError> {
+        let mut cleanup = self.cleanup.lock().await;
+        match &*cleanup {
+            CleanupState::Finished(exit) => return Ok(exit.clone()),
+            CleanupState::ForcedClosed => return Err(PtyError::OutputForcedClosed),
+            CleanupState::ForcedClosing => {
+                let completion = self.seal_and_release_output(&mut cleanup)?;
+                return self.finish_sealed_cleanup(&mut cleanup, completion).await;
+            }
+            CleanupState::OutputAuthorityReleased(completion) => {
+                let completion = *completion;
+                return self.finish_sealed_cleanup(&mut cleanup, completion).await;
+            }
+            CleanupState::ObservationAuthorityReleased(message) => {
+                let message = message.clone();
+                return self.finish_observation_failure(&mut cleanup, message);
+            }
+            CleanupState::ObservationFailed(message) => {
+                return Err(PtyError::ChildObservation {
+                    message: message.clone(),
+                });
+            }
+            CleanupState::AuthorityReleased => {
+                let exit = self.wait_exit().await?;
+                self.join_threads().await?;
+                *cleanup = CleanupState::Finished(exit.clone());
+                return Ok(exit);
+            }
+            CleanupState::Active => {}
         }
 
         self.signal_group(Signal::SIGTERM)?;
-        let exit = if let Ok(result) = tokio::time::timeout(grace, self.wait_exit()).await {
-            result?
-        } else {
-            if self.exit_rx.borrow().is_none() {
+        let graceful = tokio::time::timeout(grace, self.wait_root_and_output()).await;
+        let exit = match graceful {
+            Ok(Err(PtyError::ChildObservation { message })) => {
                 self.signal_group(Signal::SIGKILL)?;
+                self.force_output_close()?;
+                self.release_authority(
+                    &mut cleanup,
+                    CleanupState::ObservationAuthorityReleased(message.clone()),
+                )?;
+                return self.finish_observation_failure(&mut cleanup, message);
             }
-            tokio::time::timeout(grace, self.wait_exit())
-                .await
-                .map_err(|_elapsed| PtyError::ExitTimeout)??
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                self.signal_group(Signal::SIGKILL)?;
+                match tokio::time::timeout(grace, self.wait_root_and_output()).await {
+                    Ok(Err(PtyError::ChildObservation { message })) => {
+                        self.force_output_close()?;
+                        self.release_authority(
+                            &mut cleanup,
+                            CleanupState::ObservationAuthorityReleased(message.clone()),
+                        )?;
+                        return self.finish_observation_failure(&mut cleanup, message);
+                    }
+                    Ok(result) => result?,
+                    Err(_elapsed)
+                        if matches!(&*self.exit_rx.borrow(), Some(RootObservation::Exited(_))) =>
+                    {
+                        *cleanup = CleanupState::ForcedClosing;
+                        let completion = self.seal_and_release_output(&mut cleanup)?;
+                        return self.finish_sealed_cleanup(&mut cleanup, completion).await;
+                    }
+                    Err(_elapsed) => return Err(PtyError::ExitTimeout),
+                }
+            }
         };
+        self.release_authority(&mut cleanup, CleanupState::AuthorityReleased)?;
         self.join_threads().await?;
-        *stop = Some((stop_id.to_owned(), exit.clone()));
+        *cleanup = CleanupState::Finished(exit.clone());
+        Ok(exit)
+    }
+
+    /// Releases the process-group authority after a natural PTY EOF.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PtyError`] when the retained child threads cannot be joined.
+    pub(crate) async fn finish_natural(&self) -> Result<Exit, PtyError> {
+        let mut cleanup = self.cleanup.lock().await;
+        match &*cleanup {
+            CleanupState::Finished(exit) => return Ok(exit.clone()),
+            CleanupState::ForcedClosed => return Err(PtyError::OutputForcedClosed),
+            CleanupState::ForcedClosing => {
+                let completion = self.seal_and_release_output(&mut cleanup)?;
+                return self.finish_sealed_cleanup(&mut cleanup, completion).await;
+            }
+            CleanupState::OutputAuthorityReleased(completion) => {
+                let completion = *completion;
+                return self.finish_sealed_cleanup(&mut cleanup, completion).await;
+            }
+            CleanupState::ObservationAuthorityReleased(message)
+            | CleanupState::ObservationFailed(message) => {
+                return Err(PtyError::ChildObservation {
+                    message: message.clone(),
+                });
+            }
+            CleanupState::AuthorityReleased => {}
+            CleanupState::Active => {
+                self.release_authority(&mut cleanup, CleanupState::AuthorityReleased)?;
+            }
+        }
+        let exit = self.wait_exit().await?;
+        self.join_threads().await?;
+        *cleanup = CleanupState::Finished(exit.clone());
         Ok(exit)
     }
 
@@ -651,14 +882,120 @@ impl PtyOwner {
     pub async fn wait_exit(&self) -> Result<Exit, PtyError> {
         let mut receiver = self.exit_rx.clone();
         loop {
-            if let Some(exit) = receiver.borrow().clone() {
-                return Ok(exit);
+            if let Some(observation) = receiver.borrow().clone() {
+                return match observation {
+                    RootObservation::Exited(exit) => Ok(exit),
+                    RootObservation::Failed(message) => Err(PtyError::ChildObservation { message }),
+                };
             }
             receiver
                 .changed()
                 .await
                 .map_err(|_channel_closed| PtyError::ExitTimeout)?;
         }
+    }
+
+    /// Subscribes to the retained root-process outcome.
+    pub(crate) fn exit_receiver(&self) -> watch::Receiver<Option<RootObservation>> {
+        self.exit_rx.clone()
+    }
+
+    /// Returns whether the reader was closed by the lifecycle deadline.
+    pub(crate) fn output_forced_closed(&self) -> bool {
+        matches!(
+            self.output.completion(),
+            Some(OutputCompletion::ForcedClosed { .. })
+        )
+    }
+
+    /// Returns the immutable PTY output completion once sealed.
+    pub(crate) fn output_completion(&self) -> Option<OutputCompletion> {
+        self.output.completion()
+    }
+
+    async fn wait_root_and_output(&self) -> Result<Exit, PtyError> {
+        let (exit, ()) = tokio::try_join!(self.wait_exit(), self.wait_output_exit())?;
+        Ok(exit)
+    }
+
+    async fn wait_output_exit(&self) -> Result<(), PtyError> {
+        let mut subscriber = self.output.subscribe(None)?;
+        loop {
+            match subscriber.recv().await {
+                Some(OutputEvent::Exit { .. }) => return Ok(()),
+                Some(
+                    OutputEvent::Replay(_)
+                    | OutputEvent::Output(_)
+                    | OutputEvent::Gap { .. }
+                    | OutputEvent::TerminalSnapshot(_),
+                ) => {}
+                None => return Err(PtyError::OutputCloseTimeout),
+            }
+        }
+    }
+
+    fn force_output_close(&self) -> Result<OutputCompletion, PtyError> {
+        let completion = self.output.force_close();
+        self.output_readiness.cancel()?;
+        Ok(completion)
+    }
+
+    fn seal_and_release_output(
+        &self,
+        cleanup: &mut CleanupState,
+    ) -> Result<OutputCompletion, PtyError> {
+        let completion = self.force_output_close()?;
+        self.release_authority(cleanup, CleanupState::OutputAuthorityReleased(completion))?;
+        Ok(completion)
+    }
+
+    async fn finish_sealed_cleanup(
+        &self,
+        cleanup: &mut CleanupState,
+        completion: OutputCompletion,
+    ) -> Result<Exit, PtyError> {
+        match completion {
+            OutputCompletion::Eof { .. } => {
+                let exit = self.wait_exit().await?;
+                self.detach_threads()?;
+                *cleanup = CleanupState::Finished(exit.clone());
+                Ok(exit)
+            }
+            OutputCompletion::ForcedClosed { .. } => {
+                self.detach_threads()?;
+                *cleanup = CleanupState::ForcedClosed;
+                Err(PtyError::OutputForcedClosed)
+            }
+        }
+    }
+
+    fn finish_observation_failure(
+        &self,
+        cleanup: &mut CleanupState,
+        message: String,
+    ) -> Result<Exit, PtyError> {
+        self.detach_threads()?;
+        *cleanup = CleanupState::ObservationFailed(message.clone());
+        Err(PtyError::ChildObservation { message })
+    }
+
+    fn detach_threads(&self) -> Result<(), PtyError> {
+        drop(lock_result(&self.reader_thread)?.take());
+        drop(lock_result(&self.child_thread)?.take());
+        Ok(())
+    }
+
+    fn release_authority(
+        &self,
+        cleanup: &mut CleanupState,
+        released: CleanupState,
+    ) -> Result<(), PtyError> {
+        let sender = lock_result(&self.reap_tx)?.take();
+        *cleanup = released;
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
+        Ok(())
     }
 
     fn signal_group(&self, signal: Signal) -> Result<(), PtyError> {
@@ -744,11 +1081,19 @@ enum OutputReadState {
     Open,
     Eof,
     BudgetExhausted,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputReadyState {
+    Output,
+    Cancelled,
 }
 
 #[derive(Debug)]
 struct OutputReadiness {
     epoll_fd: RawFd,
+    cancel_fd: EventFd,
 }
 
 #[derive(Debug)]
@@ -803,9 +1148,11 @@ impl OutputReadiness {
     fn new(master_fd: RawFd) -> Result<Self, PtyError> {
         let epoll_fd =
             epoll::epoll_create1(EpollCreateFlags::EPOLL_CLOEXEC).map_err(errno_to_pty_error)?;
+        let cancel_fd = EventFd::from_flags(EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+            .map_err(errno_to_pty_error)?;
         let mut event = EpollEvent::new(
             EpollFlags::EPOLLIN | EpollFlags::EPOLLHUP | EpollFlags::EPOLLERR,
-            0,
+            PTY_READY_TOKEN,
         );
         if let Err(error) =
             epoll::epoll_ctl(epoll_fd, EpollOp::EpollCtlAdd, master_fd, Some(&mut event))
@@ -813,23 +1160,53 @@ impl OutputReadiness {
             let _ = close(epoll_fd);
             return Err(errno_to_pty_error(error));
         }
-        Ok(Self { epoll_fd })
+        let mut cancel_event = EpollEvent::new(EpollFlags::EPOLLIN, CANCEL_READY_TOKEN);
+        if let Err(error) = epoll::epoll_ctl(
+            epoll_fd,
+            EpollOp::EpollCtlAdd,
+            cancel_fd.as_raw_fd(),
+            Some(&mut cancel_event),
+        ) {
+            let _ = close(epoll_fd);
+            return Err(errno_to_pty_error(error));
+        }
+        Ok(Self {
+            epoll_fd,
+            cancel_fd,
+        })
     }
 
     #[expect(
         deprecated,
         reason = "portable-pty exposes only RawFd; nix's typed Epoll API requires AsFd"
     )]
-    fn is_ready(&self, timeout_ms: isize) -> Result<bool, PtyError> {
+    fn ready(&self, timeout_ms: isize) -> Result<Option<OutputReadyState>, PtyError> {
         loop {
-            let mut events = [EpollEvent::empty()];
+            let mut events = [EpollEvent::empty(), EpollEvent::empty()];
             match epoll::epoll_wait(self.epoll_fd, &mut events, timeout_ms) {
-                Ok(0) => return Ok(false),
-                Ok(_) => return Ok(true),
+                Ok(0) => return Ok(None),
+                Ok(count) => {
+                    let state = if events[..count]
+                        .iter()
+                        .any(|event| event.data() == CANCEL_READY_TOKEN)
+                    {
+                        OutputReadyState::Cancelled
+                    } else {
+                        OutputReadyState::Output
+                    };
+                    return Ok(Some(state));
+                }
                 Err(Errno::EINTR) => {}
                 Err(error) => return Err(errno_to_pty_error(error)),
             }
         }
+    }
+
+    fn cancel(&self) -> Result<(), PtyError> {
+        self.cancel_fd
+            .arm()
+            .map(|_written| ())
+            .map_err(errno_to_pty_error)
     }
 }
 
@@ -848,17 +1225,19 @@ fn rustix_errno_to_pty_error(error: rustix::io::Errno) -> PtyError {
 }
 
 trait OutputReady {
-    fn is_ready(&self, timeout_ms: isize) -> Result<bool, PtyError>;
+    fn ready(&self, timeout_ms: isize) -> Result<Option<OutputReadyState>, PtyError>;
 }
 
 impl OutputReady for OutputReadiness {
-    fn is_ready(&self, timeout_ms: isize) -> Result<bool, PtyError> {
-        Self::is_ready(self, timeout_ms)
+    fn ready(&self, timeout_ms: isize) -> Result<Option<OutputReadyState>, PtyError> {
+        Self::ready(self, timeout_ms)
     }
 }
 
-fn wait_for_output(readiness: &impl OutputReady) -> Result<(), PtyError> {
-    readiness.is_ready(EPOLL_WAIT_FOREVER_MS).map(|_ready| ())
+fn wait_for_output(readiness: &impl OutputReady) -> Result<OutputReadyState, PtyError> {
+    readiness
+        .ready(EPOLL_WAIT_FOREVER_MS)?
+        .ok_or_else(|| PtyError::Io(io::Error::other("blocking PTY readiness returned no event")))
 }
 
 fn drain_available_output<R>(
@@ -874,16 +1253,16 @@ where
     let mut drained = 0_usize;
     loop {
         if drained >= byte_budget {
-            return readiness.is_ready(EPOLL_NO_WAIT_MS).map(|ready| {
-                if ready {
-                    OutputReadState::BudgetExhausted
-                } else {
-                    OutputReadState::Open
-                }
+            return readiness.ready(EPOLL_NO_WAIT_MS).map(|ready| match ready {
+                Some(OutputReadyState::Output) => OutputReadState::BudgetExhausted,
+                Some(OutputReadyState::Cancelled) => OutputReadState::Cancelled,
+                None => OutputReadState::Open,
             });
         }
-        if !readiness.is_ready(EPOLL_NO_WAIT_MS)? {
-            return Ok(OutputReadState::Open);
+        match readiness.ready(EPOLL_NO_WAIT_MS)? {
+            Some(OutputReadyState::Output) => {}
+            Some(OutputReadyState::Cancelled) => return Ok(OutputReadState::Cancelled),
+            None => return Ok(OutputReadState::Open),
         }
         match lock_result(reader)?.read(buffer) {
             Ok(0) => return Ok(OutputReadState::Eof),
@@ -916,23 +1295,94 @@ where
                 "PTY closed before atomic resize or snapshot",
             )))
         }
+        OutputReadState::Cancelled => Err(PtyError::OutputForcedClosed),
         OutputReadState::BudgetExhausted => Err(PtyError::OutputDrainLimit),
     }
 }
 
+fn observe_child_exit(pid: u32) -> Result<Exit, io::Error> {
+    let native_pid = i32::try_from(pid)
+        .ok()
+        .and_then(RustixPid::from_raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid child PID"))?;
+    let status =
+        wait_for_child_status(native_pid, |pid, options| waitid(WaitId::Pid(pid), options))?;
+    if let Some(exit_code) = status.exit_status() {
+        return Ok(Exit {
+            exit_code: Some(exit_code),
+            signal: None,
+            success: exit_code == 0,
+        });
+    }
+    if let Some(signal_number) = status.terminating_signal() {
+        let signal = Signal::try_from(signal_number).map_or_else(
+            |_unknown| format!("signal-{signal_number}"),
+            |signal| signal.as_str().to_owned(),
+        );
+        return Ok(Exit {
+            exit_code: None,
+            signal: Some(signal),
+            success: false,
+        });
+    }
+    Err(io::Error::other(
+        "child observation returned a non-terminal status",
+    ))
+}
+
+fn wait_for_child_status(
+    native_pid: RustixPid,
+    mut wait: impl FnMut(RustixPid, WaitIdOptions) -> Result<Option<WaitIdStatus>, rustix::io::Errno>,
+) -> Result<WaitIdStatus, io::Error> {
+    loop {
+        match wait(native_pid, WaitIdOptions::EXITED | WaitIdOptions::NOWAIT) {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                return Err(io::Error::other(
+                    "blocking child observation returned no status",
+                ));
+            }
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) => return Err(io::Error::from(error)),
+        }
+    }
+}
+
+fn reap_child(child: &mut SpawnGuard, pid: u32) -> Exit {
+    match child.wait() {
+        Ok(status) => Exit {
+            exit_code: status
+                .signal()
+                .is_none()
+                .then(|| i32::try_from(status.exit_code()).ok())
+                .flatten(),
+            signal: status.signal().map(str::to_owned),
+            success: status.success(),
+        },
+        Err(error) => {
+            event!(
+                name: "worker.child.wait.failed",
+                Level::ERROR,
+                process.pid = pid,
+                error.type = "io",
+                error.message = %error,
+                "child wait failed for {{process.pid}}: {{error.message}}",
+            );
+            Exit {
+                exit_code: None,
+                signal: None,
+                success: false,
+            }
+        }
+    }
+}
+
 fn read_process_start(pid: u32) -> Result<String, io::Error> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let close = stat.rfind(')').ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "proc stat command field is unterminated",
-        )
-    })?;
-    let start_identity = stat[close + 1..]
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "proc stat has no start time"))?;
-    Ok(start_identity.to_owned())
+    LinuxInspector::new()
+        .identity(pid)
+        .map_err(io::Error::other)?
+        .map(|identity| identity.start_identity.to_string())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "process no longer exists"))
 }
 
 async fn join_thread(slot: &Arc<Mutex<Option<thread::JoinHandle<()>>>>) -> Result<(), PtyError> {
@@ -953,15 +1403,49 @@ fn lock_result<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, PtyE
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_resize_before_resume, drain_available_output, drain_snapshot_boundary, Command,
-        OutputReadState, OutputReady, PtyError, PtyOwner, ResizeCommit, ResizeState,
-        OUTPUT_DRAIN_BATCH_BYTES, READ_CHUNK_BYTES,
+        commit_resize_before_resume, drain_available_output, drain_snapshot_boundary,
+        read_process_start, wait_for_child_status, CleanupState, Command, OutputReadState,
+        OutputReady, OutputReadyState, PtyError, PtyOwner, ResizeCommit, ResizeState, SpawnGuard,
+        StartupLatch, OUTPUT_DRAIN_BATCH_BYTES, READ_CHUNK_BYTES,
     };
+    use crate::output::OutputCompletion;
     use crate::{InputFragment, InputPlan, OutputEvent, OutputHub, WorkerConfig};
+    use pohunek_platform::process::{LinuxInspector, ProcessInspector};
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::collections::{HashMap, VecDeque};
     use std::io::Cursor;
     use std::sync::Mutex;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    /// Bounds observation of the rollback fixture's signal-resistant descendant.
+    const ROLLBACK_CHILD_READY_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Avoids busy-spinning while the rollback fixture creates its descendant.
+    const ROLLBACK_CHILD_READY_POLL: Duration = Duration::from_millis(10);
+    /// Bounds delivery of the rollback kill to both exact process generations.
+    const ROLLBACK_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn non_reaping_wait_retries_interrupts_without_falling_back_to_reap() {
+        let pid = rustix::process::Pid::from_raw(1).expect("positive pid");
+        let mut calls = 0_u8;
+
+        let error = wait_for_child_status(pid, |_wait_id, options| {
+            assert!(options.contains(rustix::process::WaitIdOptions::NOWAIT));
+            calls = calls.saturating_add(1);
+            if calls == 1 {
+                Err(rustix::io::Errno::INTR)
+            } else {
+                Err(rustix::io::Errno::CHILD)
+            }
+        })
+        .expect_err("permanent observation failure");
+
+        assert_eq!(calls, 2);
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::CHILD.raw_os_error())
+        );
+    }
 
     fn shell(script: &str) -> Command {
         Command {
@@ -999,13 +1483,14 @@ mod tests {
     }
 
     impl OutputReady for TestReadiness {
-        fn is_ready(&self, _timeout_ms: isize) -> Result<bool, PtyError> {
+        fn ready(&self, _timeout_ms: isize) -> Result<Option<OutputReadyState>, PtyError> {
             Ok(self
                 .states
                 .lock()
                 .expect("test readiness lock")
                 .pop_front()
-                .unwrap_or(false))
+                .unwrap_or(false)
+                .then_some(OutputReadyState::Output))
         }
     }
 
@@ -1065,6 +1550,165 @@ mod tests {
                 .await
                 .expect("duplicate stop"),
             exit
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_terminates_descendants_after_root_exit_without_waiting_for_eof() {
+        let pty = spawn(shell(concat!(
+            "trap '' HUP; ",
+            "sh -c 'trap \"\" HUP TERM; while :; do sleep 1; done' & ",
+            "printf 'descendant:%s\\n' \"$!\""
+        )));
+        let mut output = pty.subscribe_output(Some(0)).expect("subscribe output");
+        let root_exit = tokio::time::timeout(Duration::from_secs(2), pty.wait_exit())
+            .await
+            .expect("root exit deadline")
+            .expect("root exit");
+        assert!(root_exit.success);
+        assert!(
+            !pty.output().observe(None, 1).expect("output page").exited,
+            "descendant must still hold the slave PTY after root exit"
+        );
+        assert_eq!(
+            read_process_start(pty.identity().pid).expect("unreaped root identity"),
+            pty.identity().start_identity,
+            "root must remain as the process-group authority during drain"
+        );
+
+        let started = Instant::now();
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(1),
+            pty.stop("stop-after-root-exit", Duration::from_millis(50)),
+        )
+        .await
+        .expect("bounded stop deadline")
+        .expect("stop descendant group");
+        assert_eq!(stopped, root_exit);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stop must not wait indefinitely for descendant-held PTY EOF"
+        );
+
+        loop {
+            match output.recv().await.expect("output closes after stop") {
+                OutputEvent::Exit { .. } => break,
+                OutputEvent::Replay(_)
+                | OutputEvent::Output(_)
+                | OutputEvent::Gap { .. }
+                | OutputEvent::TerminalSnapshot(_) => {}
+            }
+        }
+        assert!(pty.output().observe(None, 1).expect("output page").exited);
+        assert!(
+            read_process_start(pty.identity().pid).is_err(),
+            "root must be reaped after the last process-group signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_force_closes_output_retained_outside_the_owned_process_group() {
+        let barrier = tempfile::tempdir().expect("create escaped descendant barrier");
+        let ready = barrier.path().join("ready");
+        let pty = spawn(Command {
+            program: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                concat!(
+                    "trap '' HUP; ",
+                    "setsid sh -c 'trap \"\" HUP TERM; ",
+                    "printf ready > \"$2\"; ",
+                    "while [ -d \"$1\" ]; do sleep 0.01; done' escaped \"$1\" \"$2\" & ",
+                    "while [ ! -e \"$2\" ]; do sleep 0.01; done; ",
+                    "printf 'escaped:%s\\n' \"$!\""
+                )
+                .to_owned(),
+                "pohunek-escaped-output".to_owned(),
+                barrier.path().to_string_lossy().into_owned(),
+                ready.to_string_lossy().into_owned(),
+            ],
+            env: Vec::new(),
+            cwd: std::env::temp_dir(),
+            cols: 80,
+            rows: 24,
+        });
+        tokio::time::timeout(Duration::from_secs(2), pty.wait_exit())
+            .await
+            .expect("root exit deadline")
+            .expect("root exit");
+        assert!(!pty.output().observe(None, 1).expect("output page").exited);
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            pty.stop("stop-escaped-descendant", Duration::from_millis(50)),
+        )
+        .await
+        .expect("bounded forced-close deadline")
+        .expect_err("escaped PTY holder requires forced close");
+        assert!(matches!(error, PtyError::OutputForcedClosed));
+        assert!(matches!(
+            pty.stop("stop-escaped-descendant-again", Duration::from_millis(50))
+                .await,
+            Err(PtyError::OutputForcedClosed)
+        ));
+        assert!(pty.output_forced_closed());
+        assert!(pty.output().observe(None, 1).expect("output page").exited);
+        assert!(
+            read_process_start(pty.identity().pid).is_err(),
+            "root must be reaped after the final safe group signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn natural_eof_wins_a_concurrent_forced_cleanup() {
+        let barrier = tempfile::tempdir().expect("create EOF race barrier");
+        let ready = barrier.path().join("ready");
+        let pty = spawn(Command {
+            program: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                concat!(
+                    "trap '' HUP; ",
+                    "setsid sh -c 'trap \"\" HUP TERM; ",
+                    "printf ready > \"$2\"; ",
+                    "while [ -d \"$1\" ]; do sleep 0.01; done' escaped \"$1\" \"$2\" & ",
+                    "while [ ! -e \"$2\" ]; do sleep 0.01; done"
+                )
+                .to_owned(),
+                "pohunek-eof-race".to_owned(),
+                barrier.path().to_string_lossy().into_owned(),
+                ready.to_string_lossy().into_owned(),
+            ],
+            env: Vec::new(),
+            cwd: std::env::temp_dir(),
+            cols: 80,
+            rows: 24,
+        });
+        let root_exit = tokio::time::timeout(Duration::from_secs(2), pty.wait_exit())
+            .await
+            .expect("root exit deadline")
+            .expect("root exit");
+        pty.output().mark_exit();
+
+        let mut cleanup = pty.cleanup.lock().await;
+        *cleanup = CleanupState::ForcedClosing;
+        let completion = pty
+            .seal_and_release_output(&mut cleanup)
+            .expect("seal raced output");
+        assert!(matches!(completion, OutputCompletion::Eof { .. }));
+        let finished = pty
+            .finish_sealed_cleanup(&mut cleanup, completion)
+            .await
+            .expect("finish natural winner");
+        drop(cleanup);
+
+        assert_eq!(finished, root_exit);
+        assert!(!pty.output_forced_closed());
+        assert_eq!(
+            pty.stop("repeat-after-natural-winner", Duration::from_millis(50))
+                .await
+                .expect("repeat stop"),
+            root_exit
         );
     }
 
@@ -1270,5 +1914,80 @@ mod tests {
         let rendered = format!("{command:?}");
         assert!(rendered.contains("[REDACTED"));
         assert!(!rendered.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn spawn_guard_kills_the_uncommitted_process_group() {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("allocate rollback PTY");
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "trap '' HUP TERM; sleep 30 & wait"]);
+        let child = pair
+            .slave
+            .spawn_command(command)
+            .expect("spawn rollback fixture");
+        let pid = child.process_id().expect("fixture child PID");
+        let process_group = i32::try_from(pid).expect("PID fits pid_t");
+        let mut guard = SpawnGuard::new(child);
+        guard.set_process_group(process_group);
+        drop(pair.slave);
+
+        let inspector = LinuxInspector::new();
+        let root = inspector
+            .identity(pid)
+            .expect("inspect rollback root")
+            .expect("rollback root remains live");
+        let ready_deadline = Instant::now() + ROLLBACK_CHILD_READY_TIMEOUT;
+        let descendant = loop {
+            let descendants = inspector
+                .descendant_identities(root)
+                .expect("inspect rollback descendants");
+            if let Some(descendant) = descendants.into_iter().next() {
+                break descendant;
+            }
+            assert!(
+                Instant::now() < ready_deadline,
+                "rollback fixture did not create its descendant"
+            );
+            tokio::time::sleep(ROLLBACK_CHILD_READY_POLL).await;
+        };
+        assert_eq!(
+            inspector
+                .process(descendant.pid)
+                .expect("inspect rollback descendant")
+                .expect("rollback descendant remains live")
+                .pgid,
+            u32::try_from(process_group).expect("positive process group"),
+            "rollback descendant did not join the owned process group"
+        );
+        let root_exit = inspector.exit_watch(root).expect("watch rollback root");
+        let descendant_exit = inspector
+            .exit_watch(descendant)
+            .expect("watch rollback descendant");
+        drop(guard);
+
+        tokio::time::timeout(ROLLBACK_EXIT_TIMEOUT, async {
+            tokio::try_join!(root_exit.wait(), descendant_exit.wait())
+        })
+        .await
+        .expect("rollback did not terminate the exact process generations")
+        .expect("rollback exit watch failed");
+    }
+
+    #[test]
+    fn startup_abort_releases_reader_without_waiting_for_pty_eof() {
+        let startup = StartupLatch::default();
+        let waiter = startup.clone();
+        let reader = std::thread::spawn(move || waiter.wait());
+
+        startup.abort();
+
+        assert!(!reader.join().expect("startup waiter"));
     }
 }

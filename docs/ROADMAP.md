@@ -9,7 +9,7 @@ Status reflects the **code on `main`**. Where a phase/plan doc's own status
 header lags the code, the code wins and the lag is noted. Accepted future work
 is marked explicitly and must not be read as shipped functionality.
 
-Last reconciled: 2026-09-08.
+Last reconciled: 2026-09-13.
 
 ---
 
@@ -62,6 +62,27 @@ The accepted next product track is an **optional team relay**. It adds a
 host-initiated network path and multi-team authorization without replacing
 standalone or direct NetBird operation. It is tracked separately below because
 none of its runtime features are shipped yet.
+
+### Track M — Complete macOS host and client support
+
+The [accepted macOS RFC](design/macos-support-rfc.md) defines one complete
+release scope: native Apple Silicon and Intel hosts and clients, macOS 14.0
+minimum target, launchd-owned durable workers, real PTYs and agent integrations,
+native GUI, retained owner WebUI, direct overlay operation, installation,
+signing, and cross-stack acceptance.
+
+The shared platform foundation in #95 is complete: `crates/platform` owns
+portable process, peer, and supervisor contracts; shipped Linux consumers use
+the extracted implementations; target dependency graphs separate systemd,
+Secret Service, Keychain, and Linux-only Iced features; and native Darwin
+contract CI runs on both architectures. This does **not** advertise working
+macOS applications.
+
+Delivery remains ordered as #96 secure runtime/filesystem, #97 process/exit,
+#98 peer/agent identity, #99 PTY/attach, #100 launchd, #101 observation and
+agent integrations, #102 CLI/desktop integrations, #103 owner WebUI/overlay,
+#104 signed distribution, and #105 native release acceptance. Each merge is an
+engineering milestone; #105 is the support declaration gate.
 
 ### Track H — Hermes runtime and operator plugin
 
