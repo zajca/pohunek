@@ -3,25 +3,29 @@ name: pr-handoff
 description: >-
   Turn a finished, gate-green milestone branch into an unsigned commit, push
   it, and open a PR whose description is assembled from the milestone's audit
-  evidence. Use when the user says "udělej PR", "otevři PR pro tuhle větev",
-  "commit a push a vytvoř PR", "make a PR for this branch", "commit and open a
-  PR", or after a milestone-build harness run reports all DoD items met with
-  the gates green.
+  evidence. Use only on an explicit user request: "udělej PR", "otevři PR pro
+  tuhle větev", "commit a push a vytvoř PR", "make a PR for this branch",
+  "commit and open a PR".
 ---
 
 # pr-handoff — commit, push, open a PR
 
 Bridges the gap between "milestone implemented, gates green" (the `milestone`
 and `milestone-review` skills stop there) and a published pull request.
-Authorization semantics: a milestone-build harness run whose final audit
-reports every DoD item met with all gates green **pre-authorizes** this
-handoff — publishing is then part of the autonomous loop, no further ask. For
-any other branch, wait for the user to request it.
+Authorization semantics: publishing is always an explicit user decision. A
+milestone-build harness run whose final audit reports every DoD item met with
+all gates green supplies the evidence for the PR description, but it never
+triggers this handoff by itself: finish the run, report the result, and wait
+for the user to ask for the commit, push, and PR.
 
 ## Preconditions
 
-- The gates pass on the branch (run the `gates` skill first if unsure — never
-  push red).
+- The **full CI-mirror gate set** passes on the branch. For a harness
+  milestone that is the gate set in `.lh-harness/workflows/milestone-build.md`
+  (already run by the milestone's audit); for a plain branch, run that same
+  set by hand. The `gates` skill is a narrower subset — no Hermes
+  compatibility, web, or real-daemon gates — and is never sufficient on its
+  own to authorize a handoff.
 - You are on a milestone branch off `main`, not on `main` itself.
 - The milestone's verification evidence is available: gate results, DoD
   verdicts with `path:line` proof, test counts. From a harness run, take them

@@ -22,6 +22,9 @@ set -eu
 MANAGER_TIMEOUT=600
 AUDITOR_TIMEOUT=2400
 DEFAULT_MAX_ROUNDS=15
+# Upper bound mirrors the harness parser's --max-rounds range (1..1000);
+# anything above would create the worktree and then die at task parsing.
+MAX_ROUNDS_LIMIT=1000
 
 usage() {
     echo "usage: harness-milestone <slug> [--task FILE] [--max-rounds N]" >&2
@@ -67,9 +70,28 @@ worktrees=$(dirname "$repo")/pohunek-worktrees
 worktree="$worktrees/$slug"
 branch="zajca/$slug"
 
-# Known accepted trade-off (documented in PR #114): harness executors run
-# their model CLI unsandboxed on this host; the operator trades isolation
-# for autonomy.
+# The pinned version the gate loop was validated with: adapter behavior and
+# sandbox semantics differ between harness versions, and a mismatch must fail
+# the start instead of silently changing what the executors can do.
+HARNESS_VERSION=0.1.7
+case "$(lh-harness --version)" in
+    "lh-harness $HARNESS_VERSION") ;;
+    *)
+        echo "error: lh-harness $HARNESS_VERSION required, got: $(lh-harness --version)" >&2
+        exit 1
+        ;;
+esac
+
+# Real containment (container/VM or a dedicated account with only the target
+# worktree attached) is the proper isolation for autonomous executors. The
+# installed harness runs each model CLI unsandboxed on this host, so the
+# executor can read credentials and mutate other checkouts outside the
+# milestone worktree. Until real isolation exists, every start is an explicit
+# operator decision, never an implicit default.
+[ "${POHUNEK_HARNESS_ALLOW_UNSANDBOXED:-}" = "1" ] || {
+    echo "error: harness executors run unsandboxed on this host; set POHUNEK_HARNESS_ALLOW_UNSANDBOXED=1 to accept the trade-off, or run the harness inside real isolation (container/VM or a dedicated account)" >&2
+    exit 1
+}
 
 # A build tree can reach tens of GB: it must live on the big disk, never on
 # tmpfs (OOM kill) or under $HOME.
@@ -105,6 +127,7 @@ fi
 case "$max_rounds" in
     "" | *[!0-9]* | 0) usage ;;
 esac
+[ "$max_rounds" -le "$MAX_ROUNDS_LIMIT" ] || usage
 
 mkdir -p "$worktrees"
 if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
