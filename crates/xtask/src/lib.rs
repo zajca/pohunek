@@ -69,6 +69,7 @@ pub enum XtaskError {
     Io { path: PathBuf, source: io::Error },
     UnsupportedFileType(PathBuf),
     Json(serde_json::Error),
+    Yaml(serde_yaml::Error),
     InvalidPath(PathBuf),
 }
 
@@ -84,6 +85,7 @@ impl fmt::Display for XtaskError {
                 write!(f, "unsupported file type in `{}`", path.display())
             }
             Self::Json(error) => write!(f, "failed to serialize json: {error}"),
+            Self::Yaml(error) => write!(f, "failed to serialize yaml: {error}"),
             Self::InvalidPath(path) => write!(
                 f,
                 "path `{}` cannot be represented as a deterministic relative path",
@@ -99,6 +101,7 @@ impl Error for XtaskError {
             Self::BundleValidation(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             Self::Json(error) => Some(error),
+            Self::Yaml(error) => Some(error),
             Self::Usage(_) | Self::UnsupportedFileType(_) | Self::InvalidPath(_) => None,
         }
     }

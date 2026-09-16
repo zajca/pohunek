@@ -4,7 +4,7 @@
 //! keeping the render and parity check here makes source changes fail closed
 //! until the checked artifact is regenerated.
 
-// Rust guideline compliant 2026-09-15
+// Rust guideline compliant 2026-09-16
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -77,10 +77,10 @@ fn render(root: &Path) -> Result<Vec<u8>, XtaskError> {
 
     let mut output = String::from("---\n");
     output.push_str("name: ");
-    output.push_str(SKILL_NAME);
+    push_yaml_scalar(&mut output, SKILL_NAME)?;
     output.push('\n');
     output.push_str("description: ");
-    output.push_str(SKILL_DESCRIPTION);
+    push_yaml_scalar(&mut output, SKILL_DESCRIPTION)?;
     output.push_str("\n---\n\n");
     output.push_str(GENERATED_NOTICE);
     output.push('\n');
@@ -98,6 +98,20 @@ fn read_utf8(path: &Path) -> Result<String, XtaskError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// Appends `value` as the YAML scalar `serde_yaml` chooses for it. Quoted styles
+/// kick in whenever a plain scalar would be unsafe (a `: ` inside the
+/// description, for example), so the emitted frontmatter always parses.
+fn push_yaml_scalar(output: &mut String, value: &str) -> Result<(), XtaskError> {
+    let serialized = serde_yaml::to_string(value).map_err(XtaskError::Yaml)?;
+    let Some(scalar) = serialized.strip_suffix('\n') else {
+        return Err(XtaskError::Usage(format!(
+            "serde_yaml emitted an unexpected document for `{value}`"
+        )));
+    };
+    output.push_str(scalar);
+    Ok(())
 }
 
 fn strip_frontmatter(source: &str) -> Result<&str, XtaskError> {
@@ -182,6 +196,55 @@ mod tests {
         assert!(skill.contains(SOURCE_NOTICE));
         assert!(skill.ends_with("# Pohunek agent skill\n\nUse `pohunek doctor --json`.\n"));
         assert!(!skill.contains("type: Guide"));
+    }
+
+    #[test]
+    fn rendered_frontmatter_parses_with_expected_name_and_description() {
+        let root = temp_root();
+        write_source(&root.0, source());
+
+        let rendered = String::from_utf8(render(&root.0).expect("render skill"))
+            .expect("rendered skill is UTF-8");
+        let parsed = frontmatter_mapping(&rendered);
+        assert_eq!(
+            parsed.get(serde_yaml::Value::from("name")),
+            Some(&serde_yaml::Value::String(SKILL_NAME.into()))
+        );
+        assert_eq!(
+            parsed.get(serde_yaml::Value::from("description")),
+            Some(&serde_yaml::Value::String(SKILL_DESCRIPTION.into()))
+        );
+    }
+
+    #[test]
+    fn repo_rendered_frontmatter_parses_with_expected_name_and_description() {
+        let root = crate::repo_root();
+        let rendered = String::from_utf8(render(&root).expect("render repository skill"))
+            .expect("rendered skill is UTF-8");
+        let parsed = frontmatter_mapping(&rendered);
+        assert_eq!(
+            parsed.get(serde_yaml::Value::from("name")),
+            Some(&serde_yaml::Value::String(SKILL_NAME.into()))
+        );
+        assert_eq!(
+            parsed.get(serde_yaml::Value::from("description")),
+            Some(&serde_yaml::Value::String(SKILL_DESCRIPTION.into()))
+        );
+    }
+
+    fn frontmatter_mapping(rendered: &str) -> serde_yaml::Mapping {
+        let without_opener = rendered
+            .strip_prefix("---\n")
+            .expect("rendered skill must open its frontmatter");
+        let (frontmatter, _) = without_opener
+            .split_once("\n---\n")
+            .expect("rendered skill must close its frontmatter");
+        let value: serde_yaml::Value =
+            serde_yaml::from_str(frontmatter).expect("rendered frontmatter must be valid YAML");
+        value
+            .as_mapping()
+            .cloned()
+            .expect("rendered frontmatter must be a YAML mapping")
     }
 
     #[test]

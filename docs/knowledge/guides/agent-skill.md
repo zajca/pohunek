@@ -57,9 +57,11 @@ pohunek --host buildbox session list --json
 ## Safe targeting
 
 Resolve exact targets from list output before acting. Never guess or infer a
-session id, and never abbreviate one. A target is either a bare `session-id`
-for the implicit local host or a `<host>/<session-id>` pair; the host part of a
-qualified target overrides the global `--host` flag for that command.
+session id, and never abbreviate one. A target is either a bare `session-id` or
+a `<host>/<session-id>` pair. A bare `session-id` is not always local: it
+resolves against the host selected by the global `--host` flag, which only
+defaults to `local`. The host part of a qualified target overrides the global
+`--host` flag for that command.
 
 Confirm the exact target with `session inspect` before any action:
 
@@ -108,20 +110,30 @@ loop; each line is one event that names what changed.
 pohunek subscribe --json
 ```
 
-Polling with repeated `session list` calls wastes the daemon and misses
-transitions. A subscription is the correct way to observe session activity,
-notifications, and lifecycle changes as they happen.
+Polling with repeated `session list` calls wastes the daemon. But the stream is
+a hint, never the source of truth: it carries no initial snapshot, and under
+backpressure the daemon silently drops the oldest events and only logs a
+server-side warning — no gap marker reaches the client. A change between the
+last list and the subscription, or across a dropped event, can therefore go
+unseen, and a missed block, approval, or stop is exactly the kind of mistake
+this skill exists to prevent. Reconcile with `session list`, `session inspect`,
+and `notifications list` when you subscribe, after every reconnect, and
+periodically during long watches.
 
 ## Sending prompts and waiting
 
 Start a session with an explicit agent and project, or send text to an existing
 one. Keep untrusted or long text out of argv: prefer the stdin forms
 (`--input-stdin` on `session new`, `--stdin` on `session input`) whenever the
-text is not a fixed literal owned by the operator.
+text is not a fixed literal owned by the operator. Injected text reaches
+whatever the session runs: an agent profile or a shell. A `session new` that
+sends input must pin an explicit coding-agent profile (`--agent
+codex|claude|hermes`): the default `shell` agent would execute the text as
+shell commands.
 
 ```sh
 pohunek session new --agent codex --project <project> --branch <branch> --input <prompt> --json
-pohunek session new --input-stdin --json
+pohunek session new --agent codex --project <project> --input-stdin --json
 pohunek session input <target> --stdin --json
 pohunek session input <target> <message> --until idle --timeout 8000 --json
 pohunek session wait <target> --activity blocked --timeout-ms 8000 --json

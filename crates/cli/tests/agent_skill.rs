@@ -5,7 +5,7 @@
 //! every `pohunek ...` example inside the artifact must parse against the live
 //! clap tree.
 
-// Rust guideline compliant 2026-09-15
+// Rust guideline compliant 2026-09-16
 
 use std::process::Command;
 
@@ -198,6 +198,23 @@ fn embedded_artifact_examples_parse_through_the_live_clap_tree() {
                 err.kind().as_str().unwrap_or("unknown parse error")
             ),
         }
+    }
+}
+
+/// A `session new` example that injects text must pin an explicit agent
+/// profile: the default `shell` agent would execute injected stdin as shell
+/// commands, and the skill recommends the stdin form for untrusted text.
+#[test]
+fn session_new_input_examples_pin_an_explicit_agent() {
+    for example in collect_pohunek_examples(EMBEDDED_SKILL) {
+        if !(example.starts_with("pohunek session new") && example.contains("--input")) {
+            continue;
+        }
+        assert!(
+            example.contains("--agent"),
+            "example `{example}` sends input without an explicit --agent and would \
+             feed the default `shell` agent with untrusted text"
+        );
     }
 }
 
