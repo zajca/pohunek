@@ -361,7 +361,7 @@ fn safety_predicates_survive_remote_and_value_forms() {
     let Some(("new", args)) = session_args(&remote_form) else {
         panic!("the remote form must resolve the session new subcommand");
     };
-    assert!(args.contains_id("input"));
+    assert!(supplied_on_command_line(args, "input"));
     assert!(
         !pins_coding_agent(args),
         "no explicit coding agent was provided, so the remote form must fail the \
