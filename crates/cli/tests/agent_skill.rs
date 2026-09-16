@@ -268,6 +268,46 @@ fn discovery_reprobe_examples_pin_refresh() {
     }
 }
 
+/// `session new` examples must take `--branch`: without it the agent runs
+/// in-place in the project's main checkout, where it can collide with the
+/// owner's own edits or another session. In-place starts need explicit owner
+/// consent and are outside the skill's recommended flows.
+#[test]
+fn session_new_examples_get_dedicated_worktrees() {
+    for example in collect_pohunek_examples(EMBEDDED_SKILL) {
+        if example.starts_with("pohunek session new") {
+            assert!(
+                example.contains("--branch"),
+                "example `{example}` omits --branch and would run the agent \
+                 in-place in the project's main checkout"
+            );
+        }
+    }
+}
+
+/// Waited input (`--until`/`--timeout`) fails with
+/// `session_input_wait_unsupported` for the default coding agents: codex,
+/// claude, and hermes submit with a non-zero delay, and only zero-delay
+/// profiles such as `shell` support it. The artifact must explain the
+/// limitation and never recommend the waited form for a generic target.
+#[test]
+fn session_input_examples_avoid_waited_input_for_coding_agents() {
+    for example in collect_pohunek_examples(EMBEDDED_SKILL) {
+        if example.starts_with("pohunek session input") {
+            assert!(
+                !example.contains("--until"),
+                "example `{example}` uses waited input, which fails with \
+                 session_input_wait_unsupported for the default coding agents"
+            );
+        }
+    }
+    assert!(
+        EMBEDDED_SKILL.contains("session_input_wait_unsupported"),
+        "artifact must explain the waited-input limitation for non-zero-delay \
+         agent profiles"
+    );
+}
+
 /// Collects every `pohunek ...` example in the artifact: inline backticked
 /// spans anywhere plus bare command lines inside fenced code blocks. This
 /// mirrors the xtask `collect_pohunek_examples` scan without a regex

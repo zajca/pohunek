@@ -136,7 +136,10 @@ text is not a fixed literal owned by the operator. Injected text reaches
 whatever the session runs: an agent profile or a shell. A `session new` that
 sends input must pin an explicit coding-agent profile (`--agent
 codex|claude|hermes`): the default `shell` agent would execute the text as
-shell commands.
+shell commands. A `session new` without `--branch` runs in place: the agent
+works directly in the project's main checkout, where it can collide with the
+owner's own edits or another session. Start in-place sessions only on explicit
+owner consent; otherwise pass `--branch` and get a dedicated worktree.
 
 Before sending text to an existing session, inspect it and confirm its agent.
 Untrusted text goes only to an inspected coding-agent session. Never send it
@@ -147,10 +150,9 @@ argv; they do not make the content safe for the session that receives it.
 
 ```sh
 pohunek session new --agent codex --project <project> --branch <branch> --input <prompt> --json
-pohunek session new --agent codex --project <project> --input-stdin --json
+pohunek session new --agent codex --project <project> --branch <branch> --input-stdin --json
 pohunek session inspect <target> --json
 pohunek session input <coding-agent-target> --stdin --json
-pohunek session input <coding-agent-target> <message> --until idle --timeout 8000 --json
 pohunek session wait <target> --activity blocked --timeout-ms 8000 --json
 pohunek session wait <target> --state stopped --timeout-ms 8000 --json
 ```
@@ -161,6 +163,11 @@ terminal state, and success exactly as the command reports them. Do not retry
 input blindly after an ambiguous outcome: a timeout is not a delivery report,
 and a duplicate prompt can double-run work. `session wait` returns bounded
 settled-state waits; use it with `--activity` or `--state` instead of sleeping.
+The waited-input form of `session input` (`--until`/`--timeout`) fails with
+`session_input_wait_unsupported` for the default coding agents: codex, claude,
+and hermes submit with a non-zero delay, and only zero-delay profiles such as
+`shell` support it. Send input without a wait and observe the settle with
+`session wait` and `session screen` instead.
 
 ## Diffs and worktrees
 
