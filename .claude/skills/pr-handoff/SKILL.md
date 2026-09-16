@@ -3,20 +3,22 @@ name: pr-handoff
 description: >-
   Turn a finished, gate-green milestone branch into an unsigned commit, push
   it, and open a PR whose description is assembled from the milestone's audit
-  evidence. Use only on an explicit user request: "udělej PR", "otevři PR pro
-  tuhle větev", "commit a push a vytvoř PR", "make a PR for this branch",
-  "commit and open a PR".
+  evidence. Use when the user says "udělej PR", "otevři PR pro tuhle větev",
+  "commit a push a vytvoř PR", "make a PR for this branch", "commit and open a
+  PR", or after a milestone-build harness run reports all DoD items met with
+  the gates green.
 ---
 
 # pr-handoff — commit, push, open a PR
 
 Bridges the gap between "milestone implemented, gates green" (the `milestone`
 and `milestone-review` skills stop there) and a published pull request.
-Authorization semantics: publishing is always an explicit user decision. A
-milestone-build harness run whose final audit reports every DoD item met with
-all gates green supplies the evidence for the PR description, but it never
-triggers this handoff by itself: finish the run, report the result, and wait
-for the user to ask for the commit, push, and PR.
+Authorization semantics: a milestone-build harness run whose final audit
+reports every DoD item met with all gates green **pre-authorizes** this
+handoff — publishing is then part of the autonomous loop, no further ask.
+This intentionally supersedes the default "commit/push only when the user
+asks" for that one path (see AGENTS.md, "Accepted harness trade-offs"); for
+any other branch, wait for the user to request it.
 
 ## Preconditions
 
