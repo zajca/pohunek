@@ -228,7 +228,9 @@ fn input_examples_pin_coding_agent_targets() {
 
 /// `session rm` destroys the session's Pohunek-owned worktree with
 /// `git worktree remove --force`, so uncommitted changes vanish. The artifact
-/// must say so and require a diff plus separate owner confirmation first.
+/// must say so, treat `session diff` as incomplete (truncation omits files,
+/// ignored files are never listed), and require a diff plus separate owner
+/// confirmation first.
 #[test]
 fn session_rm_explanation_warns_about_worktree_destruction() {
     let explanation_start = EMBEDDED_SKILL
@@ -239,12 +241,30 @@ fn session_rm_explanation_warns_about_worktree_destruction() {
         "Pohunek-owned worktree",
         "git worktree remove --force",
         "session diff",
+        "ok.truncated",
+        "git-ignored",
     ] {
         assert!(
             explanation.contains(required),
             "the session rm explanation must warn about `{required}`: removing a \
              session irreversibly deletes uncommitted worktree changes"
         );
+    }
+}
+
+/// Discovery examples must re-probe explicitly: `host list` and
+/// `host discover` serve a TTL-fresh cache without `--refresh`, so a
+/// discovery that looks like a refresh can return the same stale list.
+#[test]
+fn discovery_reprobe_examples_pin_refresh() {
+    for example in collect_pohunek_examples(EMBEDDED_SKILL) {
+        if example.starts_with("pohunek host discover") {
+            assert!(
+                example.contains("--refresh"),
+                "example `{example}` promises a re-probe but serves the TTL-fresh \
+                 cache without --refresh"
+            );
+        }
     }
 }
 

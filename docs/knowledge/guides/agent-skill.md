@@ -40,8 +40,9 @@ pohunek doctor --json
 ```
 
 - `pohunek host list --json` enumerates known hosts with their
-  classification. `pohunek host discover --json` re-probes the overlay for
-  reachable peers when the cached list looks stale.
+  classification. Both commands serve a TTL-fresh cache and skip the network
+  probe by default; for an explicit re-probe run
+  `pohunek host discover --refresh --json`.
 - `pohunek session list --json` is the session inventory for the target host.
 - `pohunek doctor --json` reports local environment health: daemon
   reachability, socket and state directories, and required binaries. It checks
@@ -173,7 +174,9 @@ pohunek session diff <target> --json
 
 Worktrees can hold uncommitted work. Never mutate, reset, or remove a worktree
 without explicit user intent, even when the diff looks abandoned; report what
-you see and let the owner decide.
+you see and let the owner decide. Treat the diff as bounded evidence: when
+`ok.truncated` is `true` the remaining files are omitted, and git-ignored
+files are never listed even though removing the worktree deletes them too.
 
 ## Destructive operations
 
@@ -192,9 +195,14 @@ pohunek session fork <target> --name <fork-name> --json
 it is still live. It also removes the session's Pohunek-owned worktree with
 `git worktree remove --force`: any uncommitted changes in that worktree are
 destroyed irreversibly. Run `pohunek session diff <target> --json` before the
-removal and get the owner's explicit confirmation for deleting the worktree,
-separate from the remove intent. If an operation is denied, keep the typed
-error and report it; do not route around a guard.
+removal, but treat it as evidence, not a full inventory: the diff is capped at
+512 KiB, when `ok.truncated` is `true` the remaining files are omitted
+entirely, and git-ignored files never appear at all even though `--force`
+deletes them too. Stop on truncation and refuse the removal. Remove only after
+the owner's explicit confirmation for deleting the worktree, separate from the
+remove intent, and only with a complete inventory of what will be lost or a
+backup of the files the owner wants to keep. If an operation is denied, keep
+the typed error and report it; do not route around a guard.
 
 ## Blocked agents and approvals
 
