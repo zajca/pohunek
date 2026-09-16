@@ -168,6 +168,12 @@ where they are doing it, and when they need you.
   streams typed events over the same protocol. Session creation and input can
   read bounded UTF-8 payloads from stdin so prompts do not need to appear in
   argv, diagnostics, or logs.
+- **Bundled agent skill**: `pohunek agent-skill` prints the complete
+  agent-facing operating skill embedded in the binary — discovery, explicit
+  targeting, JSON state reads, subscriptions, send-and-wait flows, and the
+  safety boundaries — with `--json` emitting one envelope carrying the skill
+  text and its sha256. It is fully local: no daemon contact, no filesystem
+  reads, no network access; `--host` is accepted and ignored.
 - **Universal assistant**: `pohunek assistant "how do I …"` launches a capable
   agent session preloaded with an offline knowledge bundle about pohunek
   itself and a redacted live snapshot of your hosts — self-hosted support for
@@ -401,6 +407,7 @@ port is retained.
 | `pohunek setup [scripts\|config\|sway]` | Install launcher scripts, default config + prompt templates, sway keybindings. |
 | `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
 | `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot. |
+| `pohunek agent-skill` | Print the complete bundled agent skill; `--json` wraps the skill text and its `content_sha256` in the process envelope. Fully local — `--host` is accepted and ignored. |
 | `pohunek prompt render / link` | Render provider prompt templates and work-item link metadata (used by launchers). |
 
 ### Working across hosts

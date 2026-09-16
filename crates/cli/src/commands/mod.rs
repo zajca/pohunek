@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use crate::error::CliError;
 
+pub(crate) mod agent_skill;
 pub(crate) mod assistant;
 pub(crate) mod attach;
 pub(crate) mod daemon;

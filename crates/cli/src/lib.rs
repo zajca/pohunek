@@ -71,6 +71,17 @@ enum Commands {
         dynamic: bool,
     },
 
+    /// Print the complete bundled agent skill for coding agents.
+    ///
+    /// The skill bytes are embedded in this binary: printing them never
+    /// contacts a daemon, reads the filesystem, or touches the network, so
+    /// the global `--host` flag is accepted and deliberately ignored.
+    AgentSkill {
+        /// Emit one machine-readable JSON envelope instead of the skill text.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Check environment health (binaries, socket/state dir writability).
     Doctor {
         /// Emit machine-readable JSON instead of a table.
@@ -1292,7 +1303,7 @@ impl Commands {
             Commands::Assistant { action, args, .. } => {
                 action.as_ref().map_or(args.json, |a| a.parts().1.json)
             }
-            Commands::Subscribe { json } => *json,
+            Commands::Subscribe { json } | Commands::AgentSkill { json } => *json,
             Commands::Prompt { action } => action.wants_json(),
             Commands::Attach { .. } | Commands::Completions { .. } | Commands::Daemon { .. } => {
                 false
@@ -1306,6 +1317,7 @@ impl Commands {
             Commands::Relay { .. }
             | Commands::Attach { .. }
             | Commands::Completions { .. }
+            | Commands::AgentSkill { .. }
             | Commands::Doctor { .. }
             | Commands::Daemon { .. }
             | Commands::Health { .. }
@@ -1542,6 +1554,13 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         }
         Commands::Completions { shell, dynamic } => {
             completion::run(shell, dynamic)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::AgentSkill { json } => {
+            // Purely local and host-independent: the skill bytes are embedded at
+            // compile time, so the global `--host` flag is deliberately ignored
+            // and nothing is resolved from disk or the network.
+            commands::agent_skill::run(json)?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Doctor { json } => {

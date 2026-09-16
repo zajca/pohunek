@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod agent_skill;
 mod checks;
 mod eval;
 mod generators;
@@ -293,6 +294,13 @@ where
             }
         },
         TopCommand::Hermes { action } => run_hermes(action, &root),
+        TopCommand::AgentSkill { action } => match action {
+            AgentSkillAction::Generate => {
+                agent_skill::generate(&root)?;
+                println!("agent-skill generate ok: checked skill artifact updated");
+                Ok(())
+            }
+        },
     }
 }
 
@@ -368,6 +376,10 @@ enum TopCommand {
         #[command(subcommand)]
         action: HermesAction,
     },
+    AgentSkill {
+        #[command(subcommand)]
+        action: AgentSkillAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -409,6 +421,12 @@ enum HermesAction {
     GenerateSkill,
     /// Check that the checked Hermes skill is present and current.
     CheckSkill,
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentSkillAction {
+    /// Regenerate the checked agent skill from its knowledge source.
+    Generate,
 }
 
 fn repo_root() -> PathBuf {

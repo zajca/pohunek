@@ -4,6 +4,7 @@ use std::path::Path;
 use clap::error::ErrorKind;
 use regex::Regex;
 
+use crate::agent_skill;
 use crate::hermes_skill;
 use crate::{
     collect_files, create_dir_all, remove_dir_all, repo_root, validate_docs, BuildOptions,
@@ -51,6 +52,8 @@ pub(crate) fn check_docs(
     all_pass &= check_source_map_paths(source_dir, &repo);
     all_pass &= hermes_skill::check(&repo)?;
     all_pass &= check_generated_skill_documentation(&repo)?;
+    all_pass &= agent_skill::check(&repo)?;
+    all_pass &= check_agent_skill_commands(&repo)?;
     all_pass &= check_runbook_commands(source_dir)?;
     all_pass &= check_secret_scan(source_dir, output_root)?;
     all_pass &= check_release_extras(&repo);
@@ -208,6 +211,124 @@ fn missing_documented_paths(content: &str, repo: &Path) -> Vec<String> {
         })
         .filter(|candidate| !repo.join(candidate).exists())
         .collect()
+}
+
+/// Checks agent-skill source examples against the live CLI parser and the
+/// generated artifact for secret patterns and nonexistent backtick paths.
+///
+/// Every inline backticked or fenced `pohunek ...` example in the skill source
+/// must parse against the live clap tree, and the checked-in generated artifact
+/// must carry no secret-pattern hit and no backticked `crates/` or `docs/` path
+/// that does not exist. A missing artifact is reported by `agent_skill::check`,
+/// so the artifact scan is skipped here when it does not exist yet.
+fn check_agent_skill_commands(repo: &Path) -> Result<bool, XtaskError> {
+    let mut all_pass = true;
+
+    let source_path = repo.join(agent_skill::SOURCE_PATH);
+    match std::fs::read_to_string(&source_path) {
+        Ok(content) => {
+            let examples = collect_pohunek_examples(&content);
+            let failures: Vec<String> = examples
+                .iter()
+                .filter_map(|example| {
+                    parse_pohunek_command(example)
+                        .err()
+                        .map(|message| format!("command `{example}` failed to parse: {message}"))
+                })
+                .collect();
+            if failures.is_empty() {
+                println!(
+                    "[PASS] agent-skill-commands: {} example(s) parsed successfully",
+                    examples.len()
+                );
+            } else {
+                println!(
+                    "[FAIL] agent-skill-commands: {} example(s) failed to parse (checked {}):",
+                    failures.len(),
+                    examples.len()
+                );
+                for failure in &failures {
+                    println!("        {failure}");
+                }
+                all_pass = false;
+            }
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "[FAIL] agent-skill-commands: could not read {}: file not found",
+                source_path.display()
+            );
+            all_pass = false;
+        }
+        Err(source) => {
+            return Err(XtaskError::Io {
+                path: source_path,
+                source,
+            })
+        }
+    }
+
+    let Some(bytes) = agent_skill::read_checked(repo)? else {
+        // `agent_skill::check` reports the missing artifact and the remediation.
+        return Ok(all_pass);
+    };
+    let Ok(content) = std::str::from_utf8(&bytes) else {
+        println!("[FAIL] agent-skill-documentation: generated skill is not UTF-8");
+        return Ok(false);
+    };
+    let missing = missing_documented_paths(content, repo);
+    let secret_hits = secret_hits(content, agent_skill::GENERATED_PATH);
+    if missing.is_empty() && secret_hits.is_empty() {
+        println!("[PASS] agent-skill-documentation: backtick paths and secret scan passed");
+        return Ok(all_pass);
+    }
+    if !missing.is_empty() {
+        println!(
+            "[FAIL] agent-skill-documentation: {} missing backtick path(s):",
+            missing.len()
+        );
+        for path in missing {
+            println!("        {path}");
+        }
+    }
+    if !secret_hits.is_empty() {
+        println!(
+            "[FAIL] agent-skill-documentation: {} potential secret(s):",
+            secret_hits.len()
+        );
+        for hit in secret_hits {
+            println!("        {hit}");
+        }
+    }
+    Ok(false)
+}
+
+/// Collects every `pohunek ...` example in the skill source: inline backticked
+/// spans anywhere plus bare command lines inside fenced code blocks. Prose
+/// outside fences never becomes a candidate, so wrapped sentences starting
+/// with the binary name are not misread as commands.
+fn collect_pohunek_examples(content: &str) -> Vec<String> {
+    let backtick_cmd_re =
+        Regex::new(r"`(pohunek [^`]+)`").expect("valid agent-skill backtick command regex");
+    let fence_re = Regex::new(r"^(```|~~~)").expect("valid code fence regex");
+    let mut in_fence = false;
+    let mut examples = Vec::new();
+    for line in content.lines() {
+        if fence_re.is_match(line.trim_start()) {
+            in_fence = !in_fence;
+            continue;
+        }
+        for capture in backtick_cmd_re.captures_iter(line) {
+            examples.push(capture[1].to_string());
+        }
+        if in_fence {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("pohunek ") {
+                examples.push(trimmed.to_string());
+            }
+        }
+    }
+    examples
 }
 
 const REQUIRED_RELEASE_EXTRAS: [&str; 2] = ["README.md", "LICENSE"];
@@ -416,7 +537,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::{env, fs};
 
-    use super::{missing_release_extras, parse_pohunek_command, secret_hits};
+    use super::{
+        check_agent_skill_commands, collect_pohunek_examples, missing_release_extras,
+        parse_pohunek_command, secret_hits,
+    };
 
     fn temp_root(tag: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
@@ -427,6 +551,70 @@ mod tests {
             "pohunek-xtask-checks-{tag}-{nanos}-{}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn collect_pohunek_examples_covers_inline_spans_and_fenced_lines_only() {
+        const INLINE_COMMAND: &str = "pohunek doctor --json";
+        let content = format!(
+            "---\ntype: Guide\n---\n\nIntro with `{INLINE_COMMAND}` inline.\n\n```sh\npohunek host list --json\n# resolve first\npohunek session list --json\n```\n\nProse wrap: {INLINE_COMMAND} stays plain text and is not a candidate.\n\n```sh\npohunek made-up-command\n```\n"
+        );
+
+        let examples = collect_pohunek_examples(&content);
+
+        assert_eq!(
+            examples,
+            vec![
+                INLINE_COMMAND.to_owned(),
+                "pohunek host list --json".to_owned(),
+                "pohunek session list --json".to_owned(),
+                "pohunek made-up-command".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn check_agent_skill_commands_reports_example_and_artifact_drift() {
+        const SENTINEL: &str = "never-expose-this-secret-sentinel";
+        let root = temp_root("agent-skill");
+        fs::create_dir_all(&root).expect("create temp root");
+
+        assert!(
+            !check_agent_skill_commands(&root).expect("missing source is a failure, not an error")
+        );
+
+        let source_path = root.join(crate::agent_skill::SOURCE_PATH);
+        fs::create_dir_all(source_path.parent().expect("source parent")).expect("source parent");
+        fs::write(
+            &source_path,
+            "# skill\n\nRun `pohunek doctor --json` first.\n\n```sh\npohunek host list --json\n```\n",
+        )
+        .expect("write source");
+        assert!(check_agent_skill_commands(&root).expect("valid examples pass without artifact"));
+
+        fs::write(&source_path, "# skill\n\n`pohunek made-up-command`\n")
+            .expect("write unparsable source");
+        assert!(!check_agent_skill_commands(&root)
+            .expect("unparsable example is a failure, not an error"));
+
+        fs::write(
+            &source_path,
+            "# skill\n\nRun `pohunek doctor --json` first.\n",
+        )
+        .expect("write valid source");
+        let artifact_path = root.join(crate::agent_skill::GENERATED_PATH);
+        fs::create_dir_all(artifact_path.parent().expect("artifact parent"))
+            .expect("artifact parent");
+        fs::write(&artifact_path, "see `crates/does-not-exist.md`\n").expect("write artifact");
+        assert!(!check_agent_skill_commands(&root).expect("missing backtick path is a failure"));
+
+        fs::write(&artifact_path, format!("env\napi_key={SENTINEL}\n")).expect("write artifact");
+        assert!(!check_agent_skill_commands(&root).expect("secret hit is a failure"));
+
+        fs::write(&artifact_path, "clean generated body\n").expect("write clean artifact");
+        assert!(check_agent_skill_commands(&root).expect("clean artifact passes"));
+
+        fs::remove_dir_all(&root).expect("remove temp root");
     }
 
     #[test]

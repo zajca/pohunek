@@ -2,6 +2,15 @@
 
 ## Unreleased (2026-08-12)
 
+- Added the bundled agent-skill guide: safe agent CLI operation covering
+  discovery, explicit targeting, JSON state reads, event subscriptions,
+  send-and-wait flows, worktree diff inspection, destructive-op caution, and
+  owner-first approvals. The guide is the hand-authored source for the
+  checked-in CLI skill artifact guarded by xtask drift checks. The
+  `pohunek agent-skill` command prints that artifact verbatim, or with
+  `--json` as one envelope carrying the skill text and its `content_sha256`;
+  the command is fully local and the global `--host` flag is accepted and
+  ignored.
 - Documented the accepted complete macOS host/client contract and ordered
   #95-#105 delivery. Recorded the shipped shared-platform/Linux migration and
   native Darwin contract CI while keeping full macOS support explicitly

@@ -21,7 +21,14 @@ Start here:
   [remote hosts](guides/remote-hosts.md), [launcher](guides/launcher.md), and
   [GUI setup](guides/gui.md) cover common configuration paths. The
   [Hermes operator](guides/hermes-operator.md) documents the managed plugin,
-  policy, typed tools, lifecycle reporting, and recovery boundaries.
+  policy, typed tools, lifecycle reporting, and recovery boundaries. The
+  [Pohunek agent skill](guides/agent-skill.md) is the hand-authored source of
+  the bundled agent-facing CLI skill: safe discovery, explicit targeting, JSON
+  state reads, event subscriptions, send-and-wait flows, and owner-first
+  safety boundaries. `pohunek agent-skill` prints that bundled skill from the
+  binary: the skill text verbatim by default, or with `--json` one envelope
+  carrying the skill text and its `content_sha256`. The command is fully
+  local, so the global `--host` flag is accepted and ignored.
 - [Web control center](guides/web-control-center.md) covers the browser client,
   backend trust boundary, development stack, and TypeScript package surfaces.
 - [Debug daemon](runbooks/debug-daemon.md),
