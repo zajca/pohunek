@@ -1,0 +1,156 @@
+#!/bin/sh
+
+# Start a LongHorizon-Harness milestone run with the settings the pohunek gate
+# loop was validated with. The script owns every start-time decision that
+# killed or degraded the first trial runs: explicit role timeouts (workers do
+# not read this repo's config), a worktree on the big disk (never tmpfs or
+# $HOME), and a workspace root wide enough for the workbench to resume runs.
+#
+# Usage:
+#   scripts/harness-milestone <slug> [--task FILE] [--max-rounds N]
+#
+# <slug> names the branch `zajca/<slug>` and the worktree
+# /mnt/m2_4t/Code/me/pohunek-worktrees/<slug>. NEXT.md, the transient
+# uncommitted spec, is copied into the worktree when it exists.
+
+set -eu
+
+# The manager slices the NEXT.md DoD and analyses gate output; a full cold
+# analysis is rare, so 600 s is generous. The auditor runs the full gate set,
+# where workspace tests plus the release build can exceed ten minutes on a
+# cold cache; 2400 s keeps the loop from burning rounds on an auditor timeout.
+MANAGER_TIMEOUT=600
+AUDITOR_TIMEOUT=2400
+DEFAULT_MAX_ROUNDS=15
+# Upper bound mirrors the harness parser's --max-rounds range (1..1000);
+# anything above would create the worktree and then die at task parsing.
+MAX_ROUNDS_LIMIT=1000
+
+usage() {
+    echo "usage: harness-milestone <slug> [--task FILE] [--max-rounds N]" >&2
+    exit 2
+}
+
+[ $# -ge 1 ] || usage
+slug=$1
+shift
+case "$slug" in
+    *[!a-z0-9_-]* | "") usage ;;
+esac
+
+task=.lh-harness/workflows/milestone-build.md
+max_rounds=$DEFAULT_MAX_ROUNDS
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --task)
+            [ $# -ge 2 ] || usage
+            task=$2
+            shift 2
+            ;;
+        --max-rounds)
+            [ $# -ge 2 ] || usage
+            max_rounds=$2
+            shift 2
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+
+command -v lh-harness >/dev/null || {
+    echo "error: lh-harness is not on PATH" >&2
+    exit 1
+}
+
+# Derive the primary checkout, not the calling one: the script may run from a
+# linked worktree, and the worktrees root lives beside the primary checkout.
+repo=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+worktrees=$(dirname "$repo")/pohunek-worktrees
+worktree="$worktrees/$slug"
+branch="zajca/$slug"
+
+# The pinned version the gate loop was validated with: adapter behavior and
+# sandbox semantics differ between harness versions, and a mismatch must fail
+# the start instead of silently changing what the executors can do.
+HARNESS_VERSION=0.1.7
+case "$(lh-harness --version)" in
+    "lh-harness $HARNESS_VERSION") ;;
+    *)
+        echo "error: lh-harness $HARNESS_VERSION required, got: $(lh-harness --version)" >&2
+        exit 1
+        ;;
+esac
+
+# Real containment (container/VM or a dedicated account with only the target
+# worktree attached) is the proper isolation for autonomous executors. The
+# installed harness runs each model CLI unsandboxed on this host, so the
+# executor can read credentials and mutate other checkouts outside the
+# milestone worktree. Until real isolation exists, every start is an explicit
+# operator decision, never an implicit default.
+[ "${POHUNEK_HARNESS_ALLOW_UNSANDBOXED:-}" = "1" ] || {
+    echo "error: harness executors run unsandboxed on this host; set POHUNEK_HARNESS_ALLOW_UNSANDBOXED=1 to accept the trade-off, or run the harness inside real isolation (container/VM or a dedicated account)" >&2
+    exit 1
+}
+
+# A build tree can reach tens of GB: it must live on the big disk, never on
+# tmpfs (OOM kill) or under $HOME.
+case "$worktree" in
+    /tmp/* | "$HOME"/*)
+        echo "error: worktree parent must not be /tmp or \$HOME: $worktree" >&2
+        exit 1
+        ;;
+esac
+
+if [ -d "$worktree" ]; then
+    echo "error: worktree already exists: $worktree" >&2
+    exit 1
+fi
+
+# Validate every input before mutating git state: a rejected run must not
+# leave a stray worktree or branch behind.
+if [ "${task#/}" != "$task" ]; then
+    [ -f "$task" ] || {
+        echo "error: task file not found: $task" >&2
+        exit 1
+    }
+else
+    [ -f "$repo/$task" ] || {
+        echo "error: task file not found: $repo/$task" >&2
+        exit 1
+    }
+fi
+[ -f "$repo/NEXT.md" ] || {
+    echo "error: NEXT.md is missing at the repo root; there is no milestone spec to run against" >&2
+    exit 1
+}
+case "$max_rounds" in
+    "" | *[!0-9]* | 0) usage ;;
+esac
+[ "$max_rounds" -le "$MAX_ROUNDS_LIMIT" ] || usage
+
+mkdir -p "$worktrees"
+if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
+    git -C "$repo" worktree add "$worktree" "$branch"
+else
+    git -C "$repo" worktree add "$worktree" -b "$branch" main || {
+        git -C "$repo" branch -D "$branch" 2>/dev/null || true
+        echo "error: failed to create worktree $worktree" >&2
+        exit 1
+    }
+fi
+
+# NEXT.md is uncommitted by design, so a fresh worktree does not have it; the
+# run's contracts are written against the spec at the workspace root.
+if [ -f "$repo/NEXT.md" ]; then
+    cp "$repo/NEXT.md" "$worktree/NEXT.md"
+fi
+
+cd "$repo"
+exec lh-harness run \
+    --task "@$task" \
+    --workspace "$worktree" \
+    --run-id "ms-$slug-$(date -u +%Y%m%dT%H%M%SZ)" \
+    --max-rounds "$max_rounds" \
+    --manager-timeout "$MANAGER_TIMEOUT" \
+    --auditor-timeout "$AUDITOR_TIMEOUT"
