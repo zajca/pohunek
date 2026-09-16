@@ -85,11 +85,36 @@ if [ -d "$worktree" ]; then
     exit 1
 fi
 
+# Validate every input before mutating git state: a rejected run must not
+# leave a stray worktree or branch behind.
+if [ "${task#/}" != "$task" ]; then
+    [ -f "$task" ] || {
+        echo "error: task file not found: $task" >&2
+        exit 1
+    }
+else
+    [ -f "$repo/$task" ] || {
+        echo "error: task file not found: $repo/$task" >&2
+        exit 1
+    }
+fi
+[ -f "$repo/NEXT.md" ] || {
+    echo "error: NEXT.md is missing at the repo root; there is no milestone spec to run against" >&2
+    exit 1
+}
+case "$max_rounds" in
+    "" | *[!0-9]* | 0) usage ;;
+esac
+
 mkdir -p "$worktrees"
 if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
     git -C "$repo" worktree add "$worktree" "$branch"
 else
-    git -C "$repo" worktree add "$worktree" -b "$branch" main
+    git -C "$repo" worktree add "$worktree" -b "$branch" main || {
+        git -C "$repo" branch -D "$branch" 2>/dev/null || true
+        echo "error: failed to create worktree $worktree" >&2
+        exit 1
+    }
 fi
 
 # NEXT.md is uncommitted by design, so a fresh worktree does not have it; the

@@ -112,11 +112,13 @@ bunx playwright install --with-deps chromium   # once per fresh environment
 bun run test:e2e
 ```
 
-Real-daemon web suite (mandatory for done, from the worktree root after
-building the three binaries into the same `target/` as the gates above):
+Real-daemon web suite (mandatory for done; build the three binaries from the
+worktree root first, then run the suite from the worktree's `web/` directory
+where the workspace manifest and the `sdk/`/`backend/` paths live):
 
 ```bash
 cargo build -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli
+cd web
 POHUNEK_E2E=1 POHUNEK_DAEMON_BIN=<abs>/target/debug/pohunekd \
   POHUNEK_CLI_BIN=<abs>/target/debug/pohunek \
   POHUNEK_PYTHON_BIN=/usr/bin/python3 \
