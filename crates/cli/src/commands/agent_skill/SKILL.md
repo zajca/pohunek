@@ -151,6 +151,10 @@ to a `shell` session or a shell-based profile: the daemon types the text into
 that terminal and submits it, so multi-line input becomes shell commands
 running under the daemon owner's account. The stdin forms keep text out of
 argv; they do not make the content safe for the session that receives it.
+Never send text to a session whose inspected activity is `blocked`: codex and
+claude accept input while blocked, so the daemon would type into the open
+approval dialog. Surface the blocked session to the operator instead, as the
+approvals section below requires.
 
 ```sh
 pohunek session new --agent codex --project <project> --branch <branch> --input <prompt> --json
@@ -173,19 +177,23 @@ and a duplicate prompt can double-run work.
 `session wait` returns bounded settled-state waits; use it with `--activity`
 or `--state` instead of sleeping. But a state or activity predicate is a
 non-causal observation, not a delivery report: the daemon evaluates it against
-the session's current snapshot, so a wait for `blocked` can complete on the
-pre-send state before the new prompt is processed, and waiting on a single
-activity times out on a run that finishes normally into another state. Make
-the wait causal with a cursor. Before sending, capture the pre-send runtime
-and terminal revision from `session read --json` (`runtime_id`,
+the session's current snapshot, and no input-scoped activity cursor exists
+that would make it causal for one prompt. Two consequences: a `blocked` wait
+completes immediately on an already-blocked session even when the terminal
+only repainted, and a wait on a single activity times out on a run that
+finishes normally into another state. Order the observation instead of
+trusting the predicate. Before sending, capture the pre-send runtime and
+terminal revision from `session read --json` (`runtime_id`,
 `runtime_generation`, and `revision`). After sending, wait with
 `--after-terminal-watermark` plus the matching `--runtime-id` and
 `--runtime-generation`, passing the captured values exactly as the daemon
 reported them: it completes only once the terminal has repainted after the
-captured snapshot, so a pre-send `blocked` screen can no longer satisfy it.
-Confirm the new prompt is visible in the post-send `session screen`, and only
-then wait on `--activity blocked` or `--state stopped` for the settled
-outcome.
+captured snapshot. Then confirm the post-send `session screen` shows the new
+prompt consumed and the activity is `working` again. Only after that screen
+verification wait on `--activity blocked` or `--state stopped` for the
+settled outcome: the ordering is what makes the outcome attributable to the
+new prompt, not the predicate itself. Report a timeout as ambiguous and hand
+it to the operator.
 
 The waited-input form of `session input` (`--until`/`--timeout`) fails with
 `session_input_wait_unsupported` for the default coding agents: codex, claude,
@@ -224,8 +232,14 @@ pohunek session fork <target> --name <fork-name> --json
 `session rm` removes the logical session from the daemon and stops it first if
 it is still live. It also removes the session's Pohunek-owned worktree with
 `git worktree remove --force`: any uncommitted changes in that worktree are
-destroyed irreversibly. Run `pohunek session diff <target> --json` before the
-removal, but treat it as evidence, not a full inventory: the diff is capped at
+destroyed irreversibly. For a live session never diff and remove in one flow:
+the agent can write further changes after the diff, and `session rm` stops it
+and removes the worktree, so those later changes leave no trace. Order the
+flow: `pohunek session stop <target>` (an owner decision on its own) →
+verify the terminal state with `pohunek session inspect <target>` →
+`pohunek session diff <target>` as the evidence inventory → explicit owner
+confirmation → `pohunek session rm <target>`. But
+treat the diff as evidence, not a full inventory: the diff is capped at
 512 KiB, when `ok.truncated` is `true` the remaining files are omitted
 entirely, and git-ignored files never appear at all even though `--force`
 deletes them too. Stop on truncation and refuse the removal. Remove only after

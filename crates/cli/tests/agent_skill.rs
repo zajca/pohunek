@@ -7,6 +7,7 @@
 
 // Rust guideline compliant 2026-09-16
 
+use std::ffi::OsStr;
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
@@ -187,18 +188,44 @@ fn embedded_artifact_examples_parse_through_the_live_clap_tree() {
         "example extractor broke: only {found} examples in the artifact"
     );
     for example in &examples {
-        let tokens: Vec<&str> = example.split_whitespace().collect();
-        match pohunek_cli::command().try_get_matches_from(&tokens) {
-            Ok(_) => {}
-            Err(err)
-                if err.kind() == clap::error::ErrorKind::DisplayHelp
-                    || err.kind() == clap::error::ErrorKind::DisplayVersion => {}
-            Err(err) => panic!(
-                "artifact example `{example}` does not parse against the live clap tree: {}",
-                err.kind().as_str().unwrap_or("unknown parse error")
-            ),
-        }
+        parse_example(example.line, &example.command);
     }
+}
+
+/// Returns the `session <SUBCOMMAND>` matches when an example invokes one.
+fn session_args(matches: &clap::ArgMatches) -> Option<(&str, &clap::ArgMatches)> {
+    let (_, session) = matches
+        .subcommand()
+        .filter(|(name, _)| *name == "session")?;
+    session.subcommand()
+}
+
+/// True when parsed `session new` matches pin an explicit coding-agent
+/// profile: `--agent` supplied on the command line with a coding-agent value.
+/// The flag has a `shell` default, so presence in the matches alone also
+/// holds when the flag was never provided.
+fn pins_coding_agent(new_args: &clap::ArgMatches) -> bool {
+    new_args.value_source("agent") == Some(clap::parser::ValueSource::CommandLine)
+        && matches!(
+            new_args.get_one::<String>("agent").map(String::as_str),
+            Some("codex" | "claude" | "hermes")
+        )
+}
+
+/// True when parsed `session new` matches supply `--branch`, so the session
+/// gets a dedicated worktree instead of running in the main checkout.
+fn pins_dedicated_worktree(new_args: &clap::ArgMatches) -> bool {
+    new_args.contains_id("branch")
+}
+
+/// True when parsed `session input` matches target the inspected
+/// coding-agent placeholder exactly.
+fn targets_inspected_coding_agent(input_args: &clap::ArgMatches) -> bool {
+    let Some(values) = input_args.get_raw("target") else {
+        return false;
+    };
+    let raw: Vec<&OsStr> = values.collect();
+    raw == vec![OsStr::new("<coding-agent-target>")]
 }
 
 /// Input examples must never hand text to a shell: a `session new` that
@@ -209,19 +236,35 @@ fn embedded_artifact_examples_parse_through_the_live_clap_tree() {
 #[test]
 fn input_examples_pin_coding_agent_targets() {
     for example in collect_pohunek_examples(EMBEDDED_SKILL) {
-        if example.starts_with("pohunek session new") && example.contains("--input") {
-            assert!(
-                example.contains("--agent"),
-                "example `{example}` sends input without an explicit --agent and would \
-                 feed the default `shell` agent with untrusted text"
-            );
-        }
-        if example.starts_with("pohunek session input") {
-            assert!(
-                example.contains("<coding-agent-target>"),
-                "example `{example}` must target an inspected coding-agent session; \
-                 a shell session executes injected text as shell commands"
-            );
+        let Some(matches) = parse_example(example.line, &example.command) else {
+            continue;
+        };
+        let Some((subcommand, args)) = session_args(&matches) else {
+            continue;
+        };
+        match subcommand {
+            "new" => {
+                let sends_input = args.contains_id("input") || args.contains_id("input_stdin");
+                if sends_input {
+                    assert!(
+                        pins_coding_agent(args),
+                        "artifact example at line {} sends input without an explicit \
+                         coding-agent --agent and would feed the default `shell` agent \
+                         with untrusted text",
+                        example.line
+                    );
+                }
+            }
+            "input" => {
+                assert!(
+                    targets_inspected_coding_agent(args),
+                    "artifact example at line {} must target an inspected \
+                     coding-agent session; a shell session executes injected text as \
+                     shell commands",
+                    example.line
+                );
+            }
+            _ => {}
         }
     }
 }
@@ -258,13 +301,22 @@ fn session_rm_explanation_warns_about_worktree_destruction() {
 #[test]
 fn discovery_reprobe_examples_pin_refresh() {
     for example in collect_pohunek_examples(EMBEDDED_SKILL) {
-        if example.starts_with("pohunek host discover") {
-            assert!(
-                example.contains("--refresh"),
-                "example `{example}` promises a re-probe but serves the TTL-fresh \
-                 cache without --refresh"
-            );
-        }
+        let Some(matches) = parse_example(example.line, &example.command) else {
+            continue;
+        };
+        let Some(("discover", args)) = matches
+            .subcommand()
+            .filter(|(name, _)| *name == "host")
+            .and_then(|(_, host)| host.subcommand())
+        else {
+            continue;
+        };
+        assert!(
+            args.contains_id("refresh"),
+            "artifact example at line {} promises a re-probe but serves the \
+             TTL-fresh cache without --refresh",
+            example.line
+        );
     }
 }
 
@@ -275,14 +327,78 @@ fn discovery_reprobe_examples_pin_refresh() {
 #[test]
 fn session_new_examples_get_dedicated_worktrees() {
     for example in collect_pohunek_examples(EMBEDDED_SKILL) {
-        if example.starts_with("pohunek session new") {
-            assert!(
-                example.contains("--branch"),
-                "example `{example}` omits --branch and would run the agent \
-                 in-place in the project's main checkout"
-            );
-        }
+        let Some(matches) = parse_example(example.line, &example.command) else {
+            continue;
+        };
+        let Some(("new", args)) = session_args(&matches) else {
+            continue;
+        };
+        assert!(
+            pins_dedicated_worktree(args),
+            "artifact example at line {} omits --branch and would run the agent \
+             in-place in the project's main checkout",
+            example.line
+        );
     }
+}
+
+/// The safety predicates must evaluate the real clap matches, so a remote
+/// form (`--host` before the subcommand) cannot bypass them, and agent or
+/// branch text inside a flag value cannot fake a match.
+#[test]
+fn safety_predicates_survive_remote_and_value_forms() {
+    let remote_form = parse_example(0, "pohunek --host buildbox session new --input hi --json")
+        .expect("the remote form parses against the live clap tree");
+    let Some(("new", args)) = session_args(&remote_form) else {
+        panic!("the remote form must resolve the session new subcommand");
+    };
+    assert!(args.contains_id("input"));
+    assert!(
+        !pins_coding_agent(args),
+        "no explicit coding agent was provided, so the remote form must fail the \
+         agent check"
+    );
+    assert!(
+        !pins_dedicated_worktree(args),
+        "no --branch was provided, so the remote form must fail the worktree check"
+    );
+
+    let shell_agent = parse_example(0, "pohunek session new --agent shell --input hi --json")
+        .expect("the shell-agent form parses against the live clap tree");
+    let Some(("new", args)) = session_args(&shell_agent) else {
+        panic!("the shell-agent form must resolve the session new subcommand");
+    };
+    assert!(
+        !pins_coding_agent(args),
+        "--agent shell is not a coding agent"
+    );
+
+    let smuggled_value = parse_example(0, "pohunek session new --input=--agent --json")
+        .expect("the smuggled-value form parses against the live clap tree");
+    let Some(("new", args)) = session_args(&smuggled_value) else {
+        panic!("the smuggled-value form must resolve the session new subcommand");
+    };
+    assert!(
+        !pins_coding_agent(args),
+        "agent text inside a flag value must not satisfy the agent check"
+    );
+
+    let value_form = parse_example(
+        0,
+        "pohunek session new --agent=codex --branch=main --input=hi --json",
+    )
+    .expect("the flag=value form parses against the live clap tree");
+    let Some(("new", args)) = session_args(&value_form) else {
+        panic!("the flag=value form must resolve the session new subcommand");
+    };
+    assert!(
+        pins_coding_agent(args),
+        "the flag=value form must pin the coding agent"
+    );
+    assert!(
+        pins_dedicated_worktree(args),
+        "the flag=value form must pin the worktree branch"
+    );
 }
 
 /// Waited input (`--until`/`--timeout`) fails with
@@ -293,13 +409,18 @@ fn session_new_examples_get_dedicated_worktrees() {
 #[test]
 fn session_input_examples_avoid_waited_input_for_coding_agents() {
     for example in collect_pohunek_examples(EMBEDDED_SKILL) {
-        if example.starts_with("pohunek session input") {
-            assert!(
-                !example.contains("--until"),
-                "example `{example}` uses waited input, which fails with \
-                 session_input_wait_unsupported for the default coding agents"
-            );
-        }
+        let Some(matches) = parse_example(example.line, &example.command) else {
+            continue;
+        };
+        let Some(("input", args)) = session_args(&matches) else {
+            continue;
+        };
+        assert!(
+            !args.contains_id("wait_until"),
+            "artifact example at line {} uses waited input, which fails with \
+             session_input_wait_unsupported for the default coding agents",
+            example.line
+        );
     }
     assert!(
         EMBEDDED_SKILL.contains("session_input_wait_unsupported"),
@@ -328,10 +449,19 @@ fn observation_warnings_are_pinned_in_the_artifact() {
 /// spans anywhere plus bare command lines inside fenced code blocks. This
 /// mirrors the xtask `collect_pohunek_examples` scan without a regex
 /// dependency so the CLI suite stays independent of xtask.
-fn collect_pohunek_examples(content: &str) -> Vec<String> {
+///
+/// Each example carries its 1-based artifact line so failures can name the
+/// location without echoing command text, which may hold sensitive values.
+struct Example {
+    line: usize,
+    command: String,
+}
+
+fn collect_pohunek_examples(content: &str) -> Vec<Example> {
     let mut in_fence = false;
     let mut examples = Vec::new();
-    for line in content.lines() {
+    for (index, line) in content.lines().enumerate() {
+        let line_number = index + 1;
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_fence = !in_fence;
@@ -341,14 +471,42 @@ fn collect_pohunek_examples(content: &str) -> Vec<String> {
         while let Some(start) = rest.find("`pohunek ") {
             let span = &rest[start + "`".len()..];
             let Some(end) = span.find('`') else { break };
-            examples.push(span[..end].to_owned());
+            examples.push(Example {
+                line: line_number,
+                command: span[..end].to_owned(),
+            });
             rest = &span[end + "`".len()..];
         }
         if in_fence && trimmed.starts_with("pohunek ") {
-            examples.push(trimmed.to_owned());
+            examples.push(Example {
+                line: line_number,
+                command: trimmed.to_owned(),
+            });
         }
     }
     examples
+}
+
+/// Parses one artifact example against the live clap tree. Help and version
+/// displays yield `None`; any other parse failure panics with the source
+/// position and the clap error kind only, never the command text, which may
+/// hold sensitive values.
+fn parse_example(line: usize, example: &str) -> Option<clap::ArgMatches> {
+    let tokens: Vec<&str> = example.split_whitespace().collect();
+    match pohunek_cli::command().try_get_matches_from(&tokens) {
+        Ok(matches) => Some(matches),
+        Err(err)
+            if err.kind() == clap::error::ErrorKind::DisplayHelp
+                || err.kind() == clap::error::ErrorKind::DisplayVersion =>
+        {
+            None
+        }
+        Err(err) => panic!(
+            "agent-skill artifact line {line} does not parse against the live clap \
+             tree: {}",
+            err.kind().as_str().unwrap_or("unknown parse error")
+        ),
+    }
 }
 
 #[test]
@@ -362,14 +520,21 @@ fn example_collector_finds_inline_spans_and_fenced_lines() {
         "```\n",
         "tail mentioning `--host` only.\n",
     );
+    let examples = collect_pohunek_examples(content);
+    let commands: Vec<&str> = examples
+        .iter()
+        .map(|example| example.command.as_str())
+        .collect();
     assert_eq!(
-        collect_pohunek_examples(content),
+        commands,
         [
-            "pohunek doctor --json".to_owned(),
-            "pohunek host list --json".to_owned(),
-            "pohunek session list --json".to_owned()
+            "pohunek doctor --json",
+            "pohunek host list --json",
+            "pohunek session list --json"
         ]
     );
+    let lines: Vec<usize> = examples.iter().map(|example| example.line).collect();
+    assert_eq!(lines, [1, 3, 5]);
 }
 
 #[test]
