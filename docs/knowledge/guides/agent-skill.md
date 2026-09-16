@@ -43,9 +43,10 @@ pohunek doctor --json
   classification. `pohunek host discover --json` re-probes the overlay for
   reachable peers when the cached list looks stale.
 - `pohunek session list --json` is the session inventory for the target host.
-- `pohunek doctor --json` reports environment health: daemon reachability,
-  socket and state directories, and required binaries. Run it first when
-  something does not answer.
+- `pohunek doctor --json` reports local environment health: daemon
+  reachability, socket and state directories, and required binaries. It checks
+  the machine it runs on and ignores the global `--host` flag; run it first
+  when something on this machine does not answer.
 
 For any remote host, prefix the command with `--host` and the exact host name
 from the host list:
@@ -53,6 +54,11 @@ from the host list:
 ```sh
 pohunek --host buildbox session list --json
 ```
+
+A remote host has no remote `doctor`: diagnose its daemon with
+`pohunek --host buildbox health --json` (reachability, daemon and protocol
+versions) and its live capabilities with `pohunek --host buildbox host inspect
+buildbox --json`. A `--host doctor` still reports the local machine only.
 
 ## Safe targeting
 
@@ -131,11 +137,19 @@ sends input must pin an explicit coding-agent profile (`--agent
 codex|claude|hermes`): the default `shell` agent would execute the text as
 shell commands.
 
+Before sending text to an existing session, inspect it and confirm its agent.
+Untrusted text goes only to an inspected coding-agent session. Never send it
+to a `shell` session or a shell-based profile: the daemon types the text into
+that terminal and submits it, so multi-line input becomes shell commands
+running under the daemon owner's account. The stdin forms keep text out of
+argv; they do not make the content safe for the session that receives it.
+
 ```sh
 pohunek session new --agent codex --project <project> --branch <branch> --input <prompt> --json
 pohunek session new --agent codex --project <project> --input-stdin --json
-pohunek session input <target> --stdin --json
-pohunek session input <target> <message> --until idle --timeout 8000 --json
+pohunek session inspect <target> --json
+pohunek session input <coding-agent-target> --stdin --json
+pohunek session input <coding-agent-target> <message> --until idle --timeout 8000 --json
 pohunek session wait <target> --activity blocked --timeout-ms 8000 --json
 pohunek session wait <target> --state stopped --timeout-ms 8000 --json
 ```

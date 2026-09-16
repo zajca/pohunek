@@ -201,20 +201,28 @@ fn embedded_artifact_examples_parse_through_the_live_clap_tree() {
     }
 }
 
-/// A `session new` example that injects text must pin an explicit agent
-/// profile: the default `shell` agent would execute injected stdin as shell
-/// commands, and the skill recommends the stdin form for untrusted text.
+/// Input examples must never hand text to a shell: a `session new` that
+/// injects text must pin an explicit agent profile, and a `session input` must
+/// target the `<coding-agent-target>` placeholder an agent confirms with
+/// `session inspect` first. The default `shell` agent and an unverified target
+/// would execute injected text as shell commands.
 #[test]
-fn session_new_input_examples_pin_an_explicit_agent() {
+fn input_examples_pin_coding_agent_targets() {
     for example in collect_pohunek_examples(EMBEDDED_SKILL) {
-        if !(example.starts_with("pohunek session new") && example.contains("--input")) {
-            continue;
+        if example.starts_with("pohunek session new") && example.contains("--input") {
+            assert!(
+                example.contains("--agent"),
+                "example `{example}` sends input without an explicit --agent and would \
+                 feed the default `shell` agent with untrusted text"
+            );
         }
-        assert!(
-            example.contains("--agent"),
-            "example `{example}` sends input without an explicit --agent and would \
-             feed the default `shell` agent with untrusted text"
-        );
+        if example.starts_with("pohunek session input") {
+            assert!(
+                example.contains("<coding-agent-target>"),
+                "example `{example}` must target an inspected coding-agent session; \
+                 a shell session executes injected text as shell commands"
+            );
+        }
     }
 }
 
