@@ -226,6 +226,28 @@ fn input_examples_pin_coding_agent_targets() {
     }
 }
 
+/// `session rm` destroys the session's Pohunek-owned worktree with
+/// `git worktree remove --force`, so uncommitted changes vanish. The artifact
+/// must say so and require a diff plus separate owner confirmation first.
+#[test]
+fn session_rm_explanation_warns_about_worktree_destruction() {
+    let explanation_start = EMBEDDED_SKILL
+        .find("`session rm` removes the logical session")
+        .expect("artifact must explain what session rm does");
+    let explanation = &EMBEDDED_SKILL[explanation_start..];
+    for required in [
+        "Pohunek-owned worktree",
+        "git worktree remove --force",
+        "session diff",
+    ] {
+        assert!(
+            explanation.contains(required),
+            "the session rm explanation must warn about `{required}`: removing a \
+             session irreversibly deletes uncommitted worktree changes"
+        );
+    }
+}
+
 /// Collects every `pohunek ...` example in the artifact: inline backticked
 /// spans anywhere plus bare command lines inside fenced code blocks. This
 /// mirrors the xtask `collect_pohunek_examples` scan without a regex

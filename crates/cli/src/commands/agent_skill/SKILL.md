@@ -182,14 +182,19 @@ state. Use them only on explicit user intent, and confirm the exact target with
 `session inspect` immediately before acting:
 
 ```sh
-pohunek session stop <target> --json
+pohunek session diff <target> --json
 pohunek session rm <target> --json
+pohunek session stop <target> --json
 pohunek session fork <target> --name <fork-name> --json
 ```
 
 `session rm` removes the logical session from the daemon and stops it first if
-it is still live. If an operation is denied, keep the typed error and report it;
-do not route around a guard.
+it is still live. It also removes the session's Pohunek-owned worktree with
+`git worktree remove --force`: any uncommitted changes in that worktree are
+destroyed irreversibly. Run `pohunek session diff <target> --json` before the
+removal and get the owner's explicit confirmation for deleting the worktree,
+separate from the remove intent. If an operation is denied, keep the typed
+error and report it; do not route around a guard.
 
 ## Blocked agents and approvals
 
