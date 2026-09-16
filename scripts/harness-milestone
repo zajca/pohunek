@@ -60,10 +60,16 @@ command -v lh-harness >/dev/null || {
     exit 1
 }
 
-repo=$(git rev-parse --show-toplevel)
+# Derive the primary checkout, not the calling one: the script may run from a
+# linked worktree, and the worktrees root lives beside the primary checkout.
+repo=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 worktrees=$(dirname "$repo")/pohunek-worktrees
 worktree="$worktrees/$slug"
 branch="zajca/$slug"
+
+# Known accepted trade-off (documented in PR #114): harness executors run
+# their model CLI unsandboxed on this host; the operator trades isolation
+# for autonomy.
 
 # A build tree can reach tens of GB: it must live on the big disk, never on
 # tmpfs (OOM kill) or under $HOME.

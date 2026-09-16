@@ -88,6 +88,9 @@ spend an episode investigating it beyond that.
 
 ## Gate set (run from the worktree root, in this order)
 
+The full set mirrors CI exactly (see `AGENTS.md`). Run it in full, in this
+order, as the closing verification of the milestone:
+
 ```bash
 cargo fmt --all --check
 RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --all-features
@@ -95,9 +98,39 @@ cargo build -p pohunek-session-worker --bin pohunek-sessiond
 cargo test --workspace --all-features
 cargo build --workspace --release
 RUSTFLAGS="-D warnings" cargo xtask docs check
+cargo xtask hermes compatibility --pohunek-bin ABS
 ```
 
-- `cargo xtask docs check` runs under `-D warnings`; a warning is a failure.
+Web workspace gates (from the worktree's `web/`):
+
+```bash
+bun install --frozen-lockfile
+bun run typecheck
+bun run lint
+bun test
+bunx playwright install --with-deps chromium   # once per fresh environment
+bun run test:e2e
+```
+
+Real-daemon web suite (mandatory for done, from the worktree root after
+building the three binaries into the same `target/` as the gates above):
+
+```bash
+cargo build -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli
+POHUNEK_E2E=1 POHUNEK_DAEMON_BIN=<abs>/target/debug/pohunekd \
+  POHUNEK_CLI_BIN=<abs>/target/debug/pohunek \
+  POHUNEK_PYTHON_BIN=/usr/bin/python3 \
+  bun test sdk/test/e2e.test.ts backend/test/real-daemon.e2e.test.ts
+```
+
+- A gate is green only when its command exits 0. A milestone is never green
+  on a subset of this list: if a command genuinely cannot run in this
+  environment (for example a missing pinned Hermes executable), that is a
+  failed gate to report, never a silent skip.
+- When the change touches dependencies or feature flags, also run the extra
+  CI jobs: `cargo audit`,
+  `cargo hack --feature-powerset --workspace clippy --all-targets`,
+  `cargo udeps`.
 - While iterating, narrower loops are fine (`cargo test -p <crate>`,
   `cargo clippy -p <crate> --all-targets`), but a run is not done until the
   full set above passes in order.

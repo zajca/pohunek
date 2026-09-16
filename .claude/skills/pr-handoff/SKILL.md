@@ -12,8 +12,11 @@ description: >-
 # pr-handoff — commit, push, open a PR
 
 Bridges the gap between "milestone implemented, gates green" (the `milestone`
-and `milestone-review` skills stop there) and a published pull request. The
-commit and the PR are operator-authorized steps — run this only when asked.
+and `milestone-review` skills stop there) and a published pull request.
+Authorization semantics: a milestone-build harness run whose final audit
+reports every DoD item met with all gates green **pre-authorizes** this
+handoff — publishing is then part of the autonomous loop, no further ask. For
+any other branch, wait for the user to request it.
 
 ## Preconditions
 
@@ -48,9 +51,12 @@ commit and the PR are operator-authorized steps — run this only when asked.
      repeating by hand. This section mirrors the final audit report; do not
      invent or embellish results.
 
-5. **Open and verify.** `gh pr create --base main`, confirm the URL, then
-   check the initial CI status (`gh pr checks <n>`). Report the PR number,
-   URL, and CI state.
+5. **Open and verify.** `gh` in a non-interactive agent shell never prompts:
+   save the assembled title and body to a scratch file and pass them
+   explicitly — `gh pr create --base main --head <branch> --title "<title>"
+   --body-file <file>` (remove the scratch file afterwards). Confirm the URL,
+   then check the initial CI status (`gh pr checks <n>`). Report the PR
+   number, URL, and CI state.
 
 ## Constraints
 
