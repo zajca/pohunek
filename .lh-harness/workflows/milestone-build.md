@@ -98,7 +98,7 @@ cargo build -p pohunek-session-worker --bin pohunek-sessiond
 cargo test --workspace --all-features
 cargo build --workspace --release
 RUSTFLAGS="-D warnings" cargo xtask docs check
-cargo xtask hermes compatibility --pohunek-bin ABS
+cargo xtask hermes compatibility --pohunek-bin "$PWD/target/release/pohunek"
 ```
 
 Web workspace gates (from the worktree's `web/`):

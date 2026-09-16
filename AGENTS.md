@@ -280,6 +280,19 @@ PoC or imply that current direct-host execution is a hostile-workload sandbox.
   with output; never claim green without running it.
 - When a task spans 3+ steps, plan first and verify after each major step.
 
+## Accepted harness trade-offs (operator decisions)
+
+The milestone loop in `.lh-harness/workflows/` deliberately trades partial
+security for autonomy. These are recorded operator decisions, not oversights;
+do not re-report them as review findings:
+
+- A harness run whose final audit reports every DoD item met with the full
+  gate set green **pre-authorizes** the `pr-handoff` flow (commit, push,
+  open PR) without a further ask. This intentionally supersedes the default
+  "commit/push only when the user asks" for that one path.
+- Harness executors run their model CLI unsandboxed on the operator's host;
+  `--workspace` scopes the working directory, not file access.
+
 ## Pointers
 
 - `docs/architecture.md` — authoritative design and scope (read this first).
