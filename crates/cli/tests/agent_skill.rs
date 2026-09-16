@@ -308,6 +308,22 @@ fn session_input_examples_avoid_waited_input_for_coding_agents() {
     );
 }
 
+/// The two observation traps: `session read` currently serves every requested
+/// source from the visible screen (the fallback lands in `source_used`), and
+/// `session wait` evaluates the session's current snapshot, so it is not a
+/// delivery report for a prompt just sent.
+#[test]
+fn observation_warnings_are_pinned_in_the_artifact() {
+    for required in ["source_used", "non-causal observation"] {
+        assert!(
+            EMBEDDED_SKILL.contains(required),
+            "artifact must warn about `{required}`: a recent read may be the \
+             visible screen and session wait can return before the new prompt \
+             is processed"
+        );
+    }
+}
+
 /// Collects every `pohunek ...` example in the artifact: inline backticked
 /// spans anywhere plus bare command lines inside fenced code blocks. This
 /// mirrors the xtask `collect_pohunek_examples` scan without a regex

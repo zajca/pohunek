@@ -94,8 +94,12 @@ pohunek session detection <target> --json
 ```
 
 - `session screen` returns the current rendered terminal screen.
-- `session read` returns a bounded capture from a chosen source; `--lines`
-  bounds the result.
+- `session read` returns a bounded capture; `--lines` bounds the result. The
+  worker currently serves every requested source (`recent`,
+  `recent-unwrapped`, `detection`) from the visible screen and reports the
+  fallback in `source_used`: a `--source recent` read is not recent history.
+  Check `source_used` on every read and use `session output` for actually
+  retained output.
 - `session output` reads bounded retained output; carry the `runtime-id`,
   `runtime-generation`, and `after-offset` values exactly as the daemon last
   reported them. A `gap` in the result means retained history was evicted:
@@ -161,13 +165,21 @@ After sending, verify the effect with `session inspect` or `session screen`
 before concluding that anything happened. Distinguish no change, timeout,
 terminal state, and success exactly as the command reports them. Do not retry
 input blindly after an ambiguous outcome: a timeout is not a delivery report,
-and a duplicate prompt can double-run work. `session wait` returns bounded
-settled-state waits; use it with `--activity` or `--state` instead of sleeping.
+and a duplicate prompt can double-run work.
+
+`session wait` returns bounded settled-state waits; use it with `--activity`
+or `--state` instead of sleeping. But it is a non-causal observation, not a
+delivery report: it evaluates the session's current snapshot, so it can return
+before the new prompt is processed, and waiting for a single activity such as
+`blocked` times out on a run that finishes normally. Capture the pre-send
+state first (the current `session screen` or `session read` output), wait for
+a transition away from that captured state, and confirm the new prompt is
+visible in the post-send screen before treating delivery as real.
+
 The waited-input form of `session input` (`--until`/`--timeout`) fails with
 `session_input_wait_unsupported` for the default coding agents: codex, claude,
 and hermes submit with a non-zero delay, and only zero-delay profiles such as
-`shell` support it. Send input without a wait and observe the settle with
-`session wait` and `session screen` instead.
+`shell` support it.
 
 ## Diffs and worktrees
 
