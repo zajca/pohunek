@@ -58,8 +58,9 @@ pohunek --host buildbox session list --json
 
 A remote host has no remote `doctor`: diagnose its daemon with
 `pohunek --host buildbox health --json` (reachability, daemon and protocol
-versions) and its live capabilities with `pohunek --host buildbox host inspect
-buildbox --json`. A `--host doctor` still reports the local machine only.
+versions) and its live capabilities with
+`pohunek --host buildbox host inspect buildbox --json`. A `--host doctor`
+still reports the local machine only.
 
 ## Safe targeting
 
@@ -223,9 +224,9 @@ state. Use them only on explicit user intent, and confirm the exact target with
 `session inspect` immediately before acting:
 
 ```sh
+pohunek session stop <target> --json
 pohunek session diff <target> --json
 pohunek session rm <target> --json
-pohunek session stop <target> --json
 pohunek session fork <target> --name <fork-name> --json
 ```
 

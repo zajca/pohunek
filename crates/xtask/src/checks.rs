@@ -221,6 +221,11 @@ fn missing_documented_paths(content: &str, repo: &Path) -> Vec<String> {
 /// must carry no secret-pattern hit and no backticked `crates/` or `docs/` path
 /// that does not exist. A missing artifact is reported by `agent_skill::check`,
 /// so the artifact scan is skipped here when it does not exist yet.
+///
+/// The lower bound mirrors the CLI test suite's `MIN_EXPECTED_EXAMPLES`: a
+/// truncated or emptied skill source must fail this gate instead of passing it
+/// with zero checked examples.
+const MIN_AGENT_SKILL_EXAMPLES: usize = 20;
 fn check_agent_skill_commands(repo: &Path) -> Result<bool, XtaskError> {
     let mut all_pass = true;
 
@@ -228,6 +233,15 @@ fn check_agent_skill_commands(repo: &Path) -> Result<bool, XtaskError> {
     match std::fs::read_to_string(&source_path) {
         Ok(content) => {
             let examples = collect_pohunek_examples(&content);
+            if examples.len() < MIN_AGENT_SKILL_EXAMPLES {
+                println!(
+                    "[FAIL] agent-skill-commands: only {} example(s) collected (expected \
+                     at least {MIN_AGENT_SKILL_EXAMPLES}); a truncated or emptied source \
+                     must fail loudly instead of passing this gate vacuously",
+                    examples.len()
+                );
+                all_pass = false;
+            }
             let failures: Vec<String> = examples
                 .iter()
                 .filter_map(|example| {
@@ -241,12 +255,12 @@ fn check_agent_skill_commands(repo: &Path) -> Result<bool, XtaskError> {
                         })
                 })
                 .collect();
-            if failures.is_empty() {
+            if failures.is_empty() && examples.len() >= MIN_AGENT_SKILL_EXAMPLES {
                 println!(
                     "[PASS] agent-skill-commands: {} example(s) parsed successfully",
                     examples.len()
                 );
-            } else {
+            } else if !failures.is_empty() {
                 println!(
                     "[FAIL] agent-skill-commands: {} example(s) failed to parse (checked {}):",
                     failures.len(),
@@ -566,7 +580,7 @@ mod tests {
 
     use super::{
         check_agent_skill_commands, collect_pohunek_examples, missing_release_extras,
-        parse_failure_message, parse_pohunek_command, secret_hits,
+        parse_failure_message, parse_pohunek_command, secret_hits, MIN_AGENT_SKILL_EXAMPLES,
     };
 
     fn temp_root(tag: &str) -> std::path::PathBuf {
@@ -637,6 +651,21 @@ mod tests {
         );
     }
 
+    /// Writes a skill source carrying `valid` parseable examples plus the
+    /// given extra lines, sized above the example-count lower bound unless the
+    /// caller passes fewer.
+    fn write_skill_source(source_path: &std::path::Path, valid: usize, extra: &[&str]) {
+        let mut body = String::from("# skill\n\n");
+        for _ in 0..valid {
+            body.push_str("```sh\npohunek host list --json\n```\n\n");
+        }
+        for line in extra {
+            body.push_str(line);
+            body.push('\n');
+        }
+        fs::write(source_path, body).expect("write skill source");
+    }
+
     #[test]
     fn check_agent_skill_commands_reports_example_and_artifact_drift() {
         const SENTINEL: &str = "never-expose-this-secret-sentinel";
@@ -649,23 +678,22 @@ mod tests {
 
         let source_path = root.join(crate::agent_skill::SOURCE_PATH);
         fs::create_dir_all(source_path.parent().expect("source parent")).expect("source parent");
-        fs::write(
-            &source_path,
-            "# skill\n\nRun `pohunek doctor --json` first.\n\n```sh\npohunek host list --json\n```\n",
-        )
-        .expect("write source");
+        write_skill_source(&source_path, MIN_AGENT_SKILL_EXAMPLES, &[]);
         assert!(check_agent_skill_commands(&root).expect("valid examples pass without artifact"));
 
-        fs::write(&source_path, "# skill\n\n`pohunek made-up-command`\n")
-            .expect("write unparsable source");
+        write_skill_source(
+            &source_path,
+            MIN_AGENT_SKILL_EXAMPLES - 1,
+            &["Run `pohunek made-up-command` first."],
+        );
         assert!(!check_agent_skill_commands(&root)
             .expect("unparsable example is a failure, not an error"));
 
-        fs::write(
+        write_skill_source(
             &source_path,
-            "# skill\n\nRun `pohunek doctor --json` first.\n",
-        )
-        .expect("write valid source");
+            MIN_AGENT_SKILL_EXAMPLES - 1,
+            &["Run `pohunek doctor --json` first."],
+        );
         let artifact_path = root.join(crate::agent_skill::GENERATED_PATH);
         fs::create_dir_all(artifact_path.parent().expect("artifact parent"))
             .expect("artifact parent");
@@ -677,6 +705,10 @@ mod tests {
 
         fs::write(&artifact_path, "clean generated body\n").expect("write clean artifact");
         assert!(check_agent_skill_commands(&root).expect("clean artifact passes"));
+
+        write_skill_source(&source_path, MIN_AGENT_SKILL_EXAMPLES - 1, &[]);
+        assert!(!check_agent_skill_commands(&root)
+            .expect("an emptied or truncated source must not pass vacuously"));
 
         fs::remove_dir_all(&root).expect("remove temp root");
     }

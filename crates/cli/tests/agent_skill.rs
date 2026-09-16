@@ -215,7 +215,7 @@ fn pins_coding_agent(new_args: &clap::ArgMatches) -> bool {
 /// True when parsed `session new` matches supply `--branch`, so the session
 /// gets a dedicated worktree instead of running in the main checkout.
 fn pins_dedicated_worktree(new_args: &clap::ArgMatches) -> bool {
-    new_args.contains_id("branch")
+    supplied_on_command_line(new_args, "branch")
 }
 
 /// True when parsed `session input` matches target the inspected
@@ -226,6 +226,14 @@ fn targets_inspected_coding_agent(input_args: &clap::ArgMatches) -> bool {
     };
     let raw: Vec<&OsStr> = values.collect();
     raw == vec![OsStr::new("<coding-agent-target>")]
+}
+
+/// True when a flag was supplied on the command line. `contains_id` alone is
+/// unreliable for guarded flags: `ArgAction::SetTrue` carries an implicit
+/// `false` default, and any later `default_value` would silently weaken the
+/// guard, so every safety predicate asserts the command-line source instead.
+fn supplied_on_command_line(args: &clap::ArgMatches, id: &str) -> bool {
+    args.value_source(id) == Some(clap::parser::ValueSource::CommandLine)
 }
 
 /// Input examples must never hand text to a shell: a `session new` that
@@ -244,7 +252,8 @@ fn input_examples_pin_coding_agent_targets() {
         };
         match subcommand {
             "new" => {
-                let sends_input = args.contains_id("input") || args.contains_id("input_stdin");
+                let sends_input = supplied_on_command_line(args, "input")
+                    || supplied_on_command_line(args, "input_stdin");
                 if sends_input {
                     assert!(
                         pins_coding_agent(args),
@@ -312,7 +321,7 @@ fn discovery_reprobe_examples_pin_refresh() {
             continue;
         };
         assert!(
-            args.contains_id("refresh"),
+            supplied_on_command_line(args, "refresh"),
             "artifact example at line {} promises a re-probe but serves the \
              TTL-fresh cache without --refresh",
             example.line
@@ -416,7 +425,7 @@ fn session_input_examples_avoid_waited_input_for_coding_agents() {
             continue;
         };
         assert!(
-            !args.contains_id("wait_until"),
+            !supplied_on_command_line(args, "wait_until"),
             "artifact example at line {} uses waited input, which fails with \
              session_input_wait_unsupported for the default coding agents",
             example.line
