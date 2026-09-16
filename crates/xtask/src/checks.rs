@@ -231,9 +231,14 @@ fn check_agent_skill_commands(repo: &Path) -> Result<bool, XtaskError> {
             let failures: Vec<String> = examples
                 .iter()
                 .filter_map(|example| {
-                    parse_pohunek_command(example)
+                    parse_pohunek_command(&example.command)
                         .err()
-                        .map(|message| format!("command `{example}` failed to parse: {message}"))
+                        .map(|message| {
+                            parse_failure_message(
+                                &format!("{}:{}", agent_skill::SOURCE_PATH, example.line),
+                                &message,
+                            )
+                        })
                 })
                 .collect();
             if failures.is_empty() {
@@ -303,28 +308,50 @@ fn check_agent_skill_commands(repo: &Path) -> Result<bool, XtaskError> {
     Ok(false)
 }
 
+/// Renders one example parse failure for report output. Only the source
+/// position and the clap error kind are echoed: the command text may hold
+/// sensitive values and must never reach CI logs.
+fn parse_failure_message(location: &str, message: &str) -> String {
+    format!("{location}: example failed to parse: {message}")
+}
+
 /// Collects every `pohunek ...` example in the skill source: inline backticked
 /// spans anywhere plus bare command lines inside fenced code blocks. Prose
 /// outside fences never becomes a candidate, so wrapped sentences starting
 /// with the binary name are not misread as commands.
-fn collect_pohunek_examples(content: &str) -> Vec<String> {
+///
+/// Each example carries its 1-based source line so validation failures can be
+/// located without echoing command text, which may hold sensitive values.
+struct ExampleCommand {
+    line: usize,
+    command: String,
+}
+
+fn collect_pohunek_examples(content: &str) -> Vec<ExampleCommand> {
     let backtick_cmd_re =
         Regex::new(r"`(pohunek [^`]+)`").expect("valid agent-skill backtick command regex");
     let fence_re = Regex::new(r"^(```|~~~)").expect("valid code fence regex");
     let mut in_fence = false;
     let mut examples = Vec::new();
-    for line in content.lines() {
+    for (index, line) in content.lines().enumerate() {
+        let line_number = index + 1;
         if fence_re.is_match(line.trim_start()) {
             in_fence = !in_fence;
             continue;
         }
         for capture in backtick_cmd_re.captures_iter(line) {
-            examples.push(capture[1].to_string());
+            examples.push(ExampleCommand {
+                line: line_number,
+                command: capture[1].to_string(),
+            });
         }
         if in_fence {
             let trimmed = line.trim_start();
             if trimmed.starts_with("pohunek ") {
-                examples.push(trimmed.to_string());
+                examples.push(ExampleCommand {
+                    line: line_number,
+                    command: trimmed.to_string(),
+                });
             }
         }
     }
@@ -384,7 +411,7 @@ fn check_runbook_commands(source_dir: &Path) -> Result<bool, XtaskError> {
                 }
             };
 
-            for line in content.lines() {
+            for (index, line) in content.lines().enumerate() {
                 let mut candidates: Vec<String> = Vec::new();
                 for cap in backtick_cmd_re.captures_iter(line) {
                     candidates.push(cap[1].to_string());
@@ -410,9 +437,9 @@ fn check_runbook_commands(source_dir: &Path) -> Result<bool, XtaskError> {
                     }
                     runbook_checked += 1;
                     if let Err(message) = parse_pohunek_command(&cmd_str) {
-                        runbook_failures.push(format!(
-                            "{}: command `{cmd_str}` failed to parse: {message}",
-                            entry.source_path.display(),
+                        runbook_failures.push(parse_failure_message(
+                            &format!("{}:{}", entry.source_path.display(), index + 1),
+                            &message,
                         ));
                     }
                 }
@@ -539,7 +566,7 @@ mod tests {
 
     use super::{
         check_agent_skill_commands, collect_pohunek_examples, missing_release_extras,
-        parse_pohunek_command, secret_hits,
+        parse_failure_message, parse_pohunek_command, secret_hits,
     };
 
     fn temp_root(tag: &str) -> std::path::PathBuf {
@@ -563,13 +590,50 @@ mod tests {
         let examples = collect_pohunek_examples(&content);
 
         assert_eq!(
-            examples,
+            examples
+                .iter()
+                .map(|example| example.command.as_str())
+                .collect::<Vec<_>>(),
             vec![
-                INLINE_COMMAND.to_owned(),
-                "pohunek host list --json".to_owned(),
-                "pohunek session list --json".to_owned(),
-                "pohunek made-up-command".to_owned(),
+                INLINE_COMMAND,
+                "pohunek host list --json",
+                "pohunek session list --json",
+                "pohunek made-up-command",
             ]
+        );
+        assert_eq!(
+            examples
+                .iter()
+                .map(|example| example.line)
+                .collect::<Vec<_>>(),
+            vec![5, 8, 10, 16]
+        );
+    }
+
+    #[test]
+    fn parse_failure_message_never_includes_command_text() {
+        const SENTINEL: &str = "never-expose-this-secret-sentinel";
+
+        let message = parse_failure_message(
+            "docs/knowledge/guides/agent-skill.md:42",
+            "InvalidSubcommand",
+        );
+
+        assert!(
+            message.contains("agent-skill.md:42"),
+            "location is kept: {message}"
+        );
+        assert!(
+            message.contains("InvalidSubcommand"),
+            "parser error kind is kept: {message}"
+        );
+        assert!(
+            !message.contains(SENTINEL),
+            "command text is never echoed: {message}"
+        );
+        assert!(
+            !message.contains("pohunek"),
+            "command text is never echoed: {message}"
         );
     }
 

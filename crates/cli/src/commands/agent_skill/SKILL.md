@@ -156,7 +156,10 @@ argv; they do not make the content safe for the session that receives it.
 pohunek session new --agent codex --project <project> --branch <branch> --input <prompt> --json
 pohunek session new --agent codex --project <project> --branch <branch> --input-stdin --json
 pohunek session inspect <target> --json
+pohunek session read <target> --json
 pohunek session input <coding-agent-target> --stdin --json
+pohunek session wait <target> --runtime-id <runtime-id> --runtime-generation 1 --after-terminal-watermark 1 --timeout-ms 8000 --json
+pohunek session screen <target> --json
 pohunek session wait <target> --activity blocked --timeout-ms 8000 --json
 pohunek session wait <target> --state stopped --timeout-ms 8000 --json
 ```
@@ -168,13 +171,21 @@ input blindly after an ambiguous outcome: a timeout is not a delivery report,
 and a duplicate prompt can double-run work.
 
 `session wait` returns bounded settled-state waits; use it with `--activity`
-or `--state` instead of sleeping. But it is a non-causal observation, not a
-delivery report: it evaluates the session's current snapshot, so it can return
-before the new prompt is processed, and waiting for a single activity such as
-`blocked` times out on a run that finishes normally. Capture the pre-send
-state first (the current `session screen` or `session read` output), wait for
-a transition away from that captured state, and confirm the new prompt is
-visible in the post-send screen before treating delivery as real.
+or `--state` instead of sleeping. But a state or activity predicate is a
+non-causal observation, not a delivery report: the daemon evaluates it against
+the session's current snapshot, so a wait for `blocked` can complete on the
+pre-send state before the new prompt is processed, and waiting on a single
+activity times out on a run that finishes normally into another state. Make
+the wait causal with a cursor. Before sending, capture the pre-send runtime
+and terminal revision from `session read --json` (`runtime_id`,
+`runtime_generation`, and `revision`). After sending, wait with
+`--after-terminal-watermark` plus the matching `--runtime-id` and
+`--runtime-generation`, passing the captured values exactly as the daemon
+reported them: it completes only once the terminal has repainted after the
+captured snapshot, so a pre-send `blocked` screen can no longer satisfy it.
+Confirm the new prompt is visible in the post-send `session screen`, and only
+then wait on `--activity blocked` or `--state stopped` for the settled
+outcome.
 
 The waited-input form of `session input` (`--until`/`--timeout`) fails with
 `session_input_wait_unsupported` for the default coding agents: codex, claude,
