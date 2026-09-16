@@ -26,6 +26,11 @@ crates/relay-protocol/bindings/
 # Local agent memory written by Claude Code subagents (per-machine; not shared)
 /.claude/agent-memory
 
+# LongHorizon-Harness run state: per-run workspaces, logs, and control files
+# (per-machine; the committed part of .lh-harness is the workflow task files).
+/.lh-harness/runs/
+/.lh-harness/tmp/
+
 # Editor/OS noise
 .DS_Store
 *.swp
