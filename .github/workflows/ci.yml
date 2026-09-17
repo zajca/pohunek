@@ -58,11 +58,52 @@ jobs:
         run: cargo test --locked -p pohunek-platform
 
   test:
-    name: fmt + clippy + test + build
+    name: fmt + clippy + unit (fast feedback)
     runs-on: ubuntu-latest
-    env:
-      # Bound concurrent isolated PostgreSQL fixture pools.
-      RUST_TEST_THREADS: 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features
+
+      # Unit tests that need no external fixtures (some --lib tests spawn real
+      # PTYs/processes, the real session worker binary, or require the
+      # Postgres fixture URL, so exclude those packages here; the
+      # `integration` job runs them with the binary built and the Postgres
+      # service available).
+      - name: Unit tests (nextest --lib)
+        run: >
+          cargo nextest run --profile ci --all-features --lib
+          -E 'not package(pohunek-relay) and not package(pohunek-daemon) and not package(pohunek-session-worker)'
+
+      # Per-test timing evidence for the test-performance work (JUnit `time`
+      # attributes). Nextest writes the report under its own storage directory.
+      - name: Upload unit test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-junit-unit
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+
+  integration:
+    name: integration + release build
+    needs: [test]
+    runs-on: ubuntu-latest
     services:
       postgres:
         image: postgres:17-alpine
@@ -87,24 +128,40 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
 
       # The daemon socket tests spawn the real durable worker by path
-      # (`target/debug/pohunek-sessiond`). `cargo test` only builds the bin's
-      # test harness, never the runnable binary, so build it explicitly first.
+      # (`target/debug/pohunek-sessiond`). Nextest only builds test harnesses,
+      # never the runnable binary, so build it explicitly first.
       - name: Build session worker for daemon tests
         run: cargo build -p pohunek-session-worker --bin pohunek-sessiond
 
-      - name: Test
-        run: cargo test --workspace --all-features
+      - name: Integration tests (nextest, full suite)
+        # Lib tests re-run here too (seconds after compile); this keeps one
+        # command as the complete gate instead of fragile target filters.
+        # --test-threads 4 preserves the original RUST_TEST_THREADS=4 bound
+        # for PTY/Postgres fixture tests. Only the independently observed
+        # session-worker reap race retains a scoped retry.
+        run: cargo nextest run --profile ci --test-threads 4 --workspace --all-features
         env:
           # Resolved at step level: the `job` context is not available in
           # job-level `env`, where it makes the whole workflow invalid.
           POHUNEK_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}/pohunek_test
+
+      # Per-test timing evidence for the test-performance work (JUnit `time`
+      # attributes). Nextest writes the report under its own storage directory.
+      - name: Upload integration test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-junit-integration
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+
+      # Nextest does not execute rustdoc tests; preserve the cargo test gate.
+      - name: Documentation tests
+        run: cargo test --doc --workspace --all-features
 
       - name: Release build
         run: cargo build --workspace --release
@@ -195,14 +252,6 @@ jobs:
         with:
           bun-version: 1.3.11
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: web
-
       - name: Install web dependencies
         working-directory: web
         run: bun install --frozen-lockfile
@@ -219,17 +268,35 @@ jobs:
         working-directory: web
         run: bun test
 
+      # Build once, reuse for the Playwright e2e below. `bun run test:e2e`
+      # rebuilds the frontend itself, so invoke the Playwright CLI directly.
       - name: Build web control center
         working-directory: web
         run: bun run build:frontend
 
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-1.61.1
+          restore-keys: |
+            playwright-chromium-
+
       - name: Install Playwright Chromium
         working-directory: web
-        run: bunx playwright install --with-deps chromium
+        run: bunx playwright install --only-shell chromium
 
       - name: Test web control center
         working-directory: web
-        run: bun run test:e2e
+        run: bun ./node_modules/@playwright/test/cli.js test --config frontend/playwright.config.ts
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: web
 
       # The real daemon spawns `pohunek-sessiond` by path, and the Hermes plugin
       # e2e drives the real `pohunek` CLI, so all three binaries must be present.

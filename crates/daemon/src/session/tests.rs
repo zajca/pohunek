@@ -9773,10 +9773,14 @@ async fn exit_transition_retries_precommit_failure_before_single_event() {
             .state,
         SessionState::Running
     );
-    assert!(registry
-        .record_exit(&created.id, exit, false, Some(&expected), None)
-        .await
-        .expect("retry exit transition"));
+    assert_exit_transition_committed(
+        &registry,
+        &created.id,
+        exit,
+        &expected,
+        "retry exit transition",
+    )
+    .await;
     assert_eq!(
         next_runtime_event(&mut events).await,
         protocol::event::SESSION_UPDATED
@@ -9969,6 +9973,32 @@ async fn assert_lost_transition_applied(
         }
     }
     panic!("lost retry remained concurrently stale");
+}
+
+/// Commits an exit transition while a live worker task is running.
+///
+/// `record_exit` reports `Ok(false)` when a concurrent same-runtime snapshot
+/// commit lands between its durable read and its commit
+/// (`RuntimeTransitionOutcome::RetryableConcurrentChange`), which production
+/// callers retry. Mirrors `assert_reconnect_transition_applied`.
+async fn assert_exit_transition_committed(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    exit: RuntimeExit,
+    expected: &RuntimeWatchIdentity,
+    context: &str,
+) {
+    for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
+        match registry
+            .record_exit(id, exit, false, Some(expected), None)
+            .await
+        {
+            Ok(true) => return,
+            Ok(false) => tokio::task::yield_now().await,
+            Err(error) => panic!("{context}: unexpected exit error: {error}"),
+        }
+    }
+    panic!("{context}: exit transition remained concurrently stale");
 }
 
 async fn next_runtime_event(events: &mut tokio::sync::broadcast::Receiver<Event>) -> String {

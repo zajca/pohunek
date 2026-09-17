@@ -92,7 +92,8 @@ considering work done; they mirror CI exactly:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features   # must be clean under -D warnings
 cargo build -p pohunek-session-worker --bin pohunek-sessiond  # daemon tests spawn it by path
-cargo test --workspace --all-features
+cargo nextest run --profile ci --test-threads 4 --workspace --all-features
+cargo test --doc --workspace --all-features              # nextest excludes doctests
 cargo build --workspace --release                        # release profile must build
 cargo xtask docs check                                   # schema/drift/source-map/secrets/runbooks
 cargo xtask hermes compatibility --pohunek-bin ABS       # pinned, model-free Hermes CLI/golden gate
@@ -137,11 +138,12 @@ proxy compatibility; `POHUNEK_NODE_BIN` overrides a nonstandard Node path.
 A protocol change is not done until `cargo xtask ts check` passes; regenerate
 with `cargo xtask ts generate`.
 
-Useful narrower loops:
+Useful narrower loops (nextest profiles live in `.config/nextest.toml`):
 
 ```bash
-cargo test -p pohunek-gui-core                # one crate
-cargo test -p pohunek-cli some_test_name      # one test
+cargo t                                       # unit loop: --lib, workspace
+cargo t -p pohunek-gui-core                   # one crate (alias takes -p)
+cargo nextest run --profile local -p pohunek-cli some_test_name  # one test
 cargo clippy -p pohunek-daemon --all-targets  # lint one crate
 ```
 

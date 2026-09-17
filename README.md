@@ -783,9 +783,20 @@ CI treats warnings as errors. Run the full set before calling anything done:
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features
-cargo test --workspace --all-features
+cargo build -p pohunek-session-worker --bin pohunek-sessiond  # daemon tests spawn it by path
+cargo nextest run --profile ci --test-threads 4 --workspace --all-features
+cargo test --doc --workspace --all-features  # nextest excludes doctests
 cargo build --workspace --release
 cargo xtask docs check          # knowledge bundle: schema/drift/secrets/runbooks
+```
+
+Routine loops (cargo-nextest profiles live in `.config/nextest.toml`):
+
+```bash
+cargo t                        # unit loop: --lib across the workspace
+cargo t -p pohunek-gui-core    # one crate
+cargo ti                       # daemon/client/session-worker surface
+cargo tw                       # full suite, as CI runs it
 ```
 
 Web workspace:

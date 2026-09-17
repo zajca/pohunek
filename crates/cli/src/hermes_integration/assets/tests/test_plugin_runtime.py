@@ -34,13 +34,18 @@ from pohunek.redact import diagnostic
 from pohunek.tools import TOOL_SCHEMAS, Tools, _MAX_INPUT_BYTES, _input
 
 
+# Bulk pipe tests verify byte limits, not scheduler latency on shared runners.
+_BULK_COLLECTION_TIMEOUT_MS = 5_000
+
+
 def policy(
     cli: str = "/bin/true",
     mode: str = "full",
     max_output_bytes: int = 1024,
     max_screen_bytes: int = 1024,
+    tool_timeout_ms: int = 100,
 ) -> Policy:
-    return Policy(cli, 1, 3, mode, frozenset(("local",)), 100, 50, max_output_bytes, max_screen_bytes, 1)
+    return Policy(cli, 1, 3, mode, frozenset(("local",)), tool_timeout_ms, 50, max_output_bytes, max_screen_bytes, 1)
 
 
 class PolicyTests(unittest.TestCase):
@@ -123,20 +128,29 @@ class RunnerTests(unittest.TestCase):
             cap = _stdout_wire_cap(bounded)
             self.assertGreater(cap, 2 * 64 * 1024)
             exact_cli, _exact_pid = self._controlled_cli(root, b"x" * cap)
-            runner = CliRunner(policy(exact_cli, max_output_bytes=64, max_screen_bytes=32))
+            runner = CliRunner(policy(
+                exact_cli, max_output_bytes=64, max_screen_bytes=32,
+                tool_timeout_ms=_BULK_COLLECTION_TIMEOUT_MS,
+            ))
             process = subprocess.Popen(
                 [exact_cli], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=False, start_new_session=True,
             )
-            with mock.patch("pohunek.cli.os.read", wraps=os.read) as read:
-                stdout, stderr = runner._collect(process, b"")
-            self.assertEqual(stdout, b"x" * cap)
-            self.assertEqual(stderr, b"")
-            self.assertGreater(read.call_count, 2)
-            self.assertEqual(process.wait(timeout=1), 0)
+            try:
+                with mock.patch("pohunek.cli.os.read", wraps=os.read) as read:
+                    stdout, stderr = runner._collect(process, b"")
+                self.assertEqual(stdout, b"x" * cap)
+                self.assertEqual(stderr, b"")
+                self.assertGreater(read.call_count, 2)
+                self.assertEqual(process.wait(timeout=1), 0)
+            finally:
+                runner._terminate(process)
 
             over_cli, over_pid = self._controlled_cli(root, b"x" * (cap + 1), sleep_seconds=10)
-            over_runner = CliRunner(policy(over_cli, max_output_bytes=64, max_screen_bytes=32))
+            over_runner = CliRunner(policy(
+                over_cli, max_output_bytes=64, max_screen_bytes=32,
+                tool_timeout_ms=_BULK_COLLECTION_TIMEOUT_MS,
+            ))
             with self.assertRaises(CliError) as raised:
                 over_runner.run(Invocation(("ignored",)))
             self.assertEqual(raised.exception.code, "plugin_output_limit_exceeded")

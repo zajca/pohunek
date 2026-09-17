@@ -1,0 +1,28 @@
+[profile.default]
+# Nextest replaces the libtest RUST_TEST_THREADS knob with process-level
+# parallelism. Keep the default profile conservative; the ci/local profiles
+# below scale with available cores.
+test-threads = 4
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[profile.ci]
+# Fast job (fmt/clippy/unit) uses full cores. The integration job overrides
+# this on the command line (`--test-threads 4`) to preserve the original
+# RUST_TEST_THREADS=4 bound for PTY/Postgres fixture tests.
+test-threads = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 3 }
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"
+
+# This PTY root-reap race also occurs with cargo test on main. Keep its
+# temporary retry isolated; bulk Hermes pipe tests must pass without retries.
+[[profile.ci.overrides]]
+filter = "test(/stop_force_closes_output_retained_outside_the_owned_process_group/)"
+retries = 2
+
+[profile.local]
+# Local interactive loop: full core count, tighter slow-test signal.
+test-threads = "num-cpus"
+slow-timeout = { period = "30s" }

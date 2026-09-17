@@ -1,2 +1,9 @@
 [alias]
 xtask = "run -p xtask --"
+# Fast local loops (P0 test-performance): nextest profiles live in
+# `.config/nextest.toml`. `t` is the sub-minute unit loop (bare `nextest run`
+# defaults to the workspace; no --workspace flag so `-p` can be appended),
+# `ti` covers the daemon/client surface, `tw` is the full-suite local run.
+t = "nextest run --profile local --all-features --lib"
+ti = "nextest run --profile local -p pohunek-daemon -p pohunek-client -p pohunek-session-worker --all-features"
+tw = "nextest run --profile local --all-features"
