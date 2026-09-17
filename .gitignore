@@ -34,7 +34,3 @@ crates/relay-protocol/bindings/
 # Editor/OS noise
 .DS_Store
 *.swp
-
-# cargo-nextest JUnit report written by the `ci` profile (test-result evidence
-# uploaded by the workflow; never committed).
-/junit.xml
