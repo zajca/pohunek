@@ -7,15 +7,29 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 
 [profile.ci]
 # Fast job (fmt/clippy/unit) uses full cores. The integration job overrides
-# this on the command line (NEXTEST_TEST_THREADS=4) to preserve the original
+# this on the command line (`--test-threads 4`) to preserve the original
 # RUST_TEST_THREADS=4 bound for PTY/Postgres fixture tests.
 test-threads = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 3 }
 fail-fast = false
-retries = 2
 
 [profile.ci.junit]
 path = "junit.xml"
+
+# Both tests below are timing-sensitive under a loaded shared CI runner and
+# were observed flaking once the suite started running in parallel; retry them
+# rather than widening their internal deadlines, and keep the retry scoped so a
+# genuine regression anywhere else still fails the run.
+[[profile.ci.overrides]]
+# PTY root-reap deadline after the final process-group signal.
+filter = "test(/stop_force_closes_output_retained_outside_the_owned_process_group/)"
+retries = 2
+
+[[profile.ci.overrides]]
+# Embedded Hermes plugin suite drives real Python subprocesses with a plugin
+# timeout that the runner can exceed under parallel load.
+filter = "test(/embedded_plugin_runtime_suite_passes/)"
+retries = 2
 
 [profile.local]
 # Local interactive loop: full core count, tighter slow-test signal.

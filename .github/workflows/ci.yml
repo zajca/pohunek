@@ -90,6 +90,16 @@ jobs:
           cargo nextest run --profile ci --all-features --lib
           -E 'not package(pohunek-relay) and not package(pohunek-daemon) and not package(pohunek-session-worker)'
 
+      # Per-test timing evidence for the test-performance work (JUnit `time`
+      # attributes); the profile writes junit.xml at the workspace root.
+      - name: Upload unit test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-junit-unit
+          path: junit.xml
+          if-no-files-found: ignore
+
   integration:
     name: integration + release build
     needs: [test]
@@ -135,10 +145,19 @@ jobs:
         # flakes (session-worker reap, Hermes plugin timeout).
         run: cargo nextest run --profile ci --test-threads 4 --workspace --all-features
         env:
-        env:
           # Resolved at step level: the `job` context is not available in
           # job-level `env`, where it makes the whole workflow invalid.
           POHUNEK_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}/pohunek_test
+
+      # Per-test timing evidence for the test-performance work (JUnit `time`
+      # attributes); the profile writes junit.xml at the workspace root.
+      - name: Upload integration test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-junit-integration
+          path: junit.xml
+          if-no-files-found: ignore
 
       - name: Release build
         run: cargo build --workspace --release
