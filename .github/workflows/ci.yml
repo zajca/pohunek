@@ -80,10 +80,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features
 
-      # Unit tests only (lib targets): sub-minute fast feedback without the
-      # PTY/Postgres integration suites. The `integration` job runs the rest.
+      # Unit tests that need no external fixtures (some --lib tests spawn the
+      # real session worker binary or require the Postgres fixture URL, so
+      # exclude those crates here; the `integration` job runs them with the
+      # binary built and the Postgres service available).
       - name: Unit tests (nextest --lib)
-        run: cargo nextest run --profile ci --workspace --all-features --lib
+        run: >
+          cargo nextest run --profile ci --all-features --lib
+          -E 'not crate(pohunek-relay) and not crate(pohunek-daemon)'
 
   integration:
     name: integration + release build
