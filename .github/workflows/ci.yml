@@ -82,12 +82,12 @@ jobs:
 
       # Unit tests that need no external fixtures (some --lib tests spawn the
       # real session worker binary or require the Postgres fixture URL, so
-      # exclude those crates here; the `integration` job runs them with the
+      # exclude those packages here; the `integration` job runs them with the
       # binary built and the Postgres service available).
       - name: Unit tests (nextest --lib)
         run: >
           cargo nextest run --profile ci --all-features --lib
-          -E 'not crate(pohunek-relay) and not crate(pohunek-daemon)'
+          -E 'not package(pohunek-relay) and not package(pohunek-daemon)'
 
   integration:
     name: integration + release build
