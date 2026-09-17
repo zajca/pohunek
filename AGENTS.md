@@ -141,8 +141,8 @@ Useful narrower loops (nextest profiles live in `.config/nextest.toml`):
 
 ```bash
 cargo t                                       # unit loop: --lib, workspace
-cargo t -p pohunek-gui-core                   # one crate (--lib filter applies)
-cargo nextest run -p pohunek-cli some_test_name  # one test
+cargo t -p pohunek-gui-core                   # one crate (alias takes -p)
+cargo nextest run --profile local -p pohunek-cli some_test_name  # one test
 cargo clippy -p pohunek-daemon --all-targets  # lint one crate
 ```
 
