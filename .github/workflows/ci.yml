@@ -141,8 +141,8 @@ jobs:
         # Lib tests re-run here too (seconds after compile); this keeps one
         # command as the complete gate instead of fragile target filters.
         # --test-threads 4 preserves the original RUST_TEST_THREADS=4 bound
-        # for PTY/Postgres fixture tests; profile retries absorb known timing
-        # flakes (session-worker reap, Hermes plugin timeout).
+        # for PTY/Postgres fixture tests. Only the independently observed
+        # session-worker reap race retains a scoped retry.
         run: cargo nextest run --profile ci --test-threads 4 --workspace --all-features
         env:
           # Resolved at step level: the `job` context is not available in
@@ -158,6 +158,10 @@ jobs:
           name: nextest-junit-integration
           path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
+
+      # Nextest does not execute rustdoc tests; preserve the cargo test gate.
+      - name: Documentation tests
+        run: cargo test --doc --workspace --all-features
 
       - name: Release build
         run: cargo build --workspace --release

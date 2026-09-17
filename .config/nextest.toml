@@ -16,19 +16,10 @@ fail-fast = false
 [profile.ci.junit]
 path = "junit.xml"
 
-# Both tests below are timing-sensitive under a loaded shared CI runner and
-# were observed flaking once the suite started running in parallel; retry them
-# rather than widening their internal deadlines, and keep the retry scoped so a
-# genuine regression anywhere else still fails the run.
+# This PTY root-reap race also occurs with cargo test on main. Keep its
+# temporary retry isolated; bulk Hermes pipe tests must pass without retries.
 [[profile.ci.overrides]]
-# PTY root-reap deadline after the final process-group signal.
 filter = "test(/stop_force_closes_output_retained_outside_the_owned_process_group/)"
-retries = 2
-
-[[profile.ci.overrides]]
-# Embedded Hermes plugin suite drives real Python subprocesses with a plugin
-# timeout that the runner can exceed under parallel load.
-filter = "test(/embedded_plugin_runtime_suite_passes/)"
 retries = 2
 
 [profile.local]
