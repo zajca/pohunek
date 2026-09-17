@@ -4,6 +4,7 @@ use std::path::Path;
 use clap::error::ErrorKind;
 use regex::Regex;
 
+use crate::agent_skill;
 use crate::hermes_skill;
 use crate::{
     collect_files, create_dir_all, remove_dir_all, repo_root, validate_docs, BuildOptions,
@@ -51,6 +52,8 @@ pub(crate) fn check_docs(
     all_pass &= check_source_map_paths(source_dir, &repo);
     all_pass &= hermes_skill::check(&repo)?;
     all_pass &= check_generated_skill_documentation(&repo)?;
+    all_pass &= agent_skill::check(&repo)?;
+    all_pass &= check_agent_skill_commands(&repo)?;
     all_pass &= check_runbook_commands(source_dir)?;
     all_pass &= check_secret_scan(source_dir, output_root)?;
     all_pass &= check_release_extras(&repo);
@@ -210,6 +213,190 @@ fn missing_documented_paths(content: &str, repo: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Checks agent-skill source examples against the live CLI parser and the
+/// generated artifact for secret patterns and nonexistent backtick paths.
+///
+/// Every inline backticked or fenced `pohunek ...` example in the skill source
+/// must parse against the live clap tree, and the checked-in generated artifact
+/// must carry no secret-pattern hit and no backticked `crates/` or `docs/` path
+/// that does not exist. A missing artifact is reported by `agent_skill::check`,
+/// so the artifact scan is skipped here when it does not exist yet.
+///
+/// The lower bound mirrors the CLI test suite's `MIN_EXPECTED_EXAMPLES`: a
+/// truncated or emptied skill source must fail this gate instead of passing it
+/// with zero checked examples.
+const MIN_AGENT_SKILL_EXAMPLES: usize = 20;
+fn check_agent_skill_commands(repo: &Path) -> Result<bool, XtaskError> {
+    let mut all_pass = true;
+
+    let source_path = repo.join(agent_skill::SOURCE_PATH);
+    match std::fs::read_to_string(&source_path) {
+        Ok(content) => {
+            let examples = collect_pohunek_examples(&content);
+            if examples.len() < MIN_AGENT_SKILL_EXAMPLES {
+                println!(
+                    "[FAIL] agent-skill-commands: only {} example(s) collected (expected \
+                     at least {MIN_AGENT_SKILL_EXAMPLES}); a truncated or emptied source \
+                     must fail loudly instead of passing this gate vacuously",
+                    examples.len()
+                );
+                all_pass = false;
+            }
+            let failures: Vec<String> = examples
+                .iter()
+                .filter_map(|example| {
+                    parse_pohunek_command(&example.command)
+                        .err()
+                        .map(|message| {
+                            parse_failure_message(
+                                &format!("{}:{}", agent_skill::SOURCE_PATH, example.line),
+                                &message,
+                            )
+                        })
+                })
+                .collect();
+            if failures.is_empty() && examples.len() >= MIN_AGENT_SKILL_EXAMPLES {
+                println!(
+                    "[PASS] agent-skill-commands: {} example(s) parsed successfully",
+                    examples.len()
+                );
+            } else if !failures.is_empty() {
+                println!(
+                    "[FAIL] agent-skill-commands: {} example(s) failed to parse (checked {}):",
+                    failures.len(),
+                    examples.len()
+                );
+                for failure in &failures {
+                    println!("        {failure}");
+                }
+                all_pass = false;
+            }
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "[FAIL] agent-skill-commands: could not read {}: file not found",
+                source_path.display()
+            );
+            all_pass = false;
+        }
+        Err(source) => {
+            return Err(XtaskError::Io {
+                path: source_path,
+                source,
+            })
+        }
+    }
+
+    let Some(bytes) = agent_skill::read_checked(repo)? else {
+        // `agent_skill::check` reports the missing artifact and the remediation.
+        return Ok(all_pass);
+    };
+    let Ok(content) = std::str::from_utf8(&bytes) else {
+        println!("[FAIL] agent-skill-documentation: generated skill is not UTF-8");
+        return Ok(false);
+    };
+    let missing = missing_documented_paths(content, repo);
+    let secret_hits = secret_hits(content, agent_skill::GENERATED_PATH);
+    if missing.is_empty() && secret_hits.is_empty() {
+        println!("[PASS] agent-skill-documentation: backtick paths and secret scan passed");
+        return Ok(all_pass);
+    }
+    if !missing.is_empty() {
+        println!(
+            "[FAIL] agent-skill-documentation: {} missing backtick path(s):",
+            missing.len()
+        );
+        for path in missing {
+            println!("        {path}");
+        }
+    }
+    if !secret_hits.is_empty() {
+        println!(
+            "[FAIL] agent-skill-documentation: {} potential secret(s):",
+            secret_hits.len()
+        );
+        for hit in secret_hits {
+            println!("        {hit}");
+        }
+    }
+    Ok(false)
+}
+
+/// Renders one example parse failure for report output. Only the source
+/// position and the clap error kind are echoed: the command text may hold
+/// sensitive values and must never reach CI logs.
+fn parse_failure_message(location: &str, message: &str) -> String {
+    format!("{location}: example failed to parse: {message}")
+}
+
+/// Collects every `pohunek ...` example in the skill source: inline backticked
+/// spans plus bare command lines inside fenced code blocks. Prose outside
+/// fences never becomes a candidate, so wrapped sentences starting with the
+/// binary name are not misread as commands.
+///
+/// Outside a fence, a backticked span may wrap across lines; Markdown code
+/// spans cannot cross a blank line, and a fence always ends one, so the scan
+/// closes an open span there instead of absorbing the rest of the document.
+/// Each example carries the 1-based line where its span opened so validation
+/// failures can be located without echoing command text, which may hold
+/// sensitive values.
+struct ExampleCommand {
+    line: usize,
+    command: String,
+}
+
+fn collect_pohunek_examples(content: &str) -> Vec<ExampleCommand> {
+    let mut examples = Vec::new();
+    let mut in_fence = false;
+    let mut open_span: Option<(usize, String)> = None;
+    for (index, line) in content.lines().enumerate() {
+        let line_number = index + 1;
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            open_span = None;
+            continue;
+        }
+        if in_fence {
+            if trimmed.starts_with("pohunek ") {
+                examples.push(ExampleCommand {
+                    line: line_number,
+                    command: trimmed.to_owned(),
+                });
+            }
+            continue;
+        }
+        if trimmed.is_empty() {
+            open_span = None;
+            continue;
+        }
+        let mut rest = line;
+        let mut span = open_span.take();
+        while let Some(backtick) = rest.find('`') {
+            let before = &rest[..backtick];
+            rest = &rest[backtick + '`'.len_utf8()..];
+            match span.take() {
+                None => span = Some((line_number, String::new())),
+                Some((start_line, mut buffer)) => {
+                    buffer.push_str(before);
+                    if buffer.starts_with("pohunek ") {
+                        examples.push(ExampleCommand {
+                            line: start_line,
+                            command: buffer,
+                        });
+                    }
+                }
+            }
+        }
+        if let Some((_, buffer)) = span.as_mut() {
+            buffer.push_str(rest);
+            buffer.push(' ');
+        }
+        open_span = span;
+    }
+    examples
+}
+
 const REQUIRED_RELEASE_EXTRAS: [&str; 2] = ["README.md", "LICENSE"];
 
 fn check_release_extras(repo: &Path) -> bool {
@@ -263,7 +450,7 @@ fn check_runbook_commands(source_dir: &Path) -> Result<bool, XtaskError> {
                 }
             };
 
-            for line in content.lines() {
+            for (index, line) in content.lines().enumerate() {
                 let mut candidates: Vec<String> = Vec::new();
                 for cap in backtick_cmd_re.captures_iter(line) {
                     candidates.push(cap[1].to_string());
@@ -289,9 +476,9 @@ fn check_runbook_commands(source_dir: &Path) -> Result<bool, XtaskError> {
                     }
                     runbook_checked += 1;
                     if let Err(message) = parse_pohunek_command(&cmd_str) {
-                        runbook_failures.push(format!(
-                            "{}: command `{cmd_str}` failed to parse: {message}",
-                            entry.source_path.display(),
+                        runbook_failures.push(parse_failure_message(
+                            &format!("{}:{}", entry.source_path.display(), index + 1),
+                            &message,
                         ));
                     }
                 }
@@ -416,7 +603,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::{env, fs};
 
-    use super::{missing_release_extras, parse_pohunek_command, secret_hits};
+    use super::{
+        check_agent_skill_commands, collect_pohunek_examples, missing_release_extras,
+        parse_failure_message, parse_pohunek_command, secret_hits, MIN_AGENT_SKILL_EXAMPLES,
+    };
 
     fn temp_root(tag: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
@@ -427,6 +617,175 @@ mod tests {
             "pohunek-xtask-checks-{tag}-{nanos}-{}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn collect_pohunek_examples_covers_inline_spans_and_fenced_lines_only() {
+        const INLINE_COMMAND: &str = "pohunek doctor --json";
+        let content = format!(
+            "---\ntype: Guide\n---\n\nIntro with `{INLINE_COMMAND}` inline.\n\n```sh\npohunek host list --json\n# resolve first\npohunek session list --json\n```\n\nProse wrap: {INLINE_COMMAND} stays plain text and is not a candidate.\n\n```sh\npohunek made-up-command\n```\n"
+        );
+
+        let examples = collect_pohunek_examples(&content);
+
+        assert_eq!(
+            examples
+                .iter()
+                .map(|example| example.command.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                INLINE_COMMAND,
+                "pohunek host list --json",
+                "pohunek session list --json",
+                "pohunek made-up-command",
+            ]
+        );
+        assert_eq!(
+            examples
+                .iter()
+                .map(|example| example.line)
+                .collect::<Vec<_>>(),
+            vec![5, 8, 10, 16]
+        );
+    }
+
+    #[test]
+    fn collect_pohunek_examples_collects_inline_spans_across_lines() {
+        // A wrapped inline command is one example anchored at its opening
+        // line, so a multi-line command cannot bypass the parse gate.
+        let content = "Run `pohunek doctor\n--json` after startup.\n";
+
+        let examples = collect_pohunek_examples(content);
+
+        assert_eq!(
+            examples
+                .iter()
+                .map(|example| example.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pohunek doctor --json"]
+        );
+        assert_eq!(
+            examples
+                .iter()
+                .map(|example| example.line)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn collect_pohunek_examples_drops_spans_crossing_blank_lines_or_fences() {
+        let content = concat!(
+            "broken `pohunek doctor\n",
+            "\n",
+            "--json` span\n",
+            "broken `pohunek doctor\n",
+            "```sh\n",
+            "pohunek host list --json\n",
+            "```\n",
+            "--json` span\n",
+        );
+
+        let examples = collect_pohunek_examples(content);
+
+        // The blank line and the fence each end the broken span, so only the
+        // fenced bare line survives.
+        assert_eq!(
+            examples
+                .iter()
+                .map(|example| example.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pohunek host list --json"]
+        );
+    }
+
+    #[test]
+    fn parse_failure_message_never_includes_command_text() {
+        const SENTINEL: &str = "never-expose-this-secret-sentinel";
+
+        let message = parse_failure_message(
+            "docs/knowledge/guides/agent-skill.md:42",
+            "InvalidSubcommand",
+        );
+
+        assert!(
+            message.contains("agent-skill.md:42"),
+            "location is kept: {message}"
+        );
+        assert!(
+            message.contains("InvalidSubcommand"),
+            "parser error kind is kept: {message}"
+        );
+        assert!(
+            !message.contains(SENTINEL),
+            "command text is never echoed: {message}"
+        );
+        assert!(
+            !message.contains("pohunek"),
+            "command text is never echoed: {message}"
+        );
+    }
+
+    /// Writes a skill source carrying `valid` parseable examples plus the
+    /// given extra lines, sized above the example-count lower bound unless the
+    /// caller passes fewer.
+    fn write_skill_source(source_path: &std::path::Path, valid: usize, extra: &[&str]) {
+        let mut body = String::from("# skill\n\n");
+        for _ in 0..valid {
+            body.push_str("```sh\npohunek host list --json\n```\n\n");
+        }
+        for line in extra {
+            body.push_str(line);
+            body.push('\n');
+        }
+        fs::write(source_path, body).expect("write skill source");
+    }
+
+    #[test]
+    fn check_agent_skill_commands_reports_example_and_artifact_drift() {
+        const SENTINEL: &str = "never-expose-this-secret-sentinel";
+        let root = temp_root("agent-skill");
+        fs::create_dir_all(&root).expect("create temp root");
+
+        assert!(
+            !check_agent_skill_commands(&root).expect("missing source is a failure, not an error")
+        );
+
+        let source_path = root.join(crate::agent_skill::SOURCE_PATH);
+        fs::create_dir_all(source_path.parent().expect("source parent")).expect("source parent");
+        write_skill_source(&source_path, MIN_AGENT_SKILL_EXAMPLES, &[]);
+        assert!(check_agent_skill_commands(&root).expect("valid examples pass without artifact"));
+
+        write_skill_source(
+            &source_path,
+            MIN_AGENT_SKILL_EXAMPLES - 1,
+            &["Run `pohunek made-up-command` first."],
+        );
+        assert!(!check_agent_skill_commands(&root)
+            .expect("unparsable example is a failure, not an error"));
+
+        write_skill_source(
+            &source_path,
+            MIN_AGENT_SKILL_EXAMPLES - 1,
+            &["Run `pohunek doctor --json` first."],
+        );
+        let artifact_path = root.join(crate::agent_skill::GENERATED_PATH);
+        fs::create_dir_all(artifact_path.parent().expect("artifact parent"))
+            .expect("artifact parent");
+        fs::write(&artifact_path, "see `crates/does-not-exist.md`\n").expect("write artifact");
+        assert!(!check_agent_skill_commands(&root).expect("missing backtick path is a failure"));
+
+        fs::write(&artifact_path, format!("env\napi_key={SENTINEL}\n")).expect("write artifact");
+        assert!(!check_agent_skill_commands(&root).expect("secret hit is a failure"));
+
+        fs::write(&artifact_path, "clean generated body\n").expect("write clean artifact");
+        assert!(check_agent_skill_commands(&root).expect("clean artifact passes"));
+
+        write_skill_source(&source_path, MIN_AGENT_SKILL_EXAMPLES - 1, &[]);
+        assert!(!check_agent_skill_commands(&root)
+            .expect("an emptied or truncated source must not pass vacuously"));
+
+        fs::remove_dir_all(&root).expect("remove temp root");
     }
 
     #[test]

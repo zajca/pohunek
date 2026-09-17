@@ -18,6 +18,7 @@ Current CLI and command surface:
 - `crates/cli/src/main.rs`
 - `crates/cli/src/completion.rs`
 - `crates/cli/src/commands/mod.rs`
+- `crates/cli/src/commands/agent_skill.rs`
 - `crates/cli/src/commands/assistant/mod.rs`
 - `crates/cli/src/commands/assistant/bootstrap.rs`
 - `crates/cli/src/commands/doctor.rs`
@@ -38,6 +39,7 @@ Current CLI and command surface:
 - `crates/cli/src/paths.rs`
 - `crates/cli/src/error.rs`
 - `crates/cli/tests/notifications_clap.rs`
+- `crates/cli/tests/agent_skill.rs`
 - `crates/cli/tests/prompt_link.rs`
 - `crates/cli/tests/scripts.rs`
 - `crates/cli/tests/standalone_discovery.rs`
@@ -253,6 +255,12 @@ Hermes compatibility evidence:
 - `crates/xtask/src/hermes_mock.rs`
 - `crates/xtask/src/eval.rs`
 - `crates/xtask/src/hermes_skill.rs`
+
+Bundled agent skill:
+
+- `docs/knowledge/guides/agent-skill.md`
+- `crates/xtask/src/agent_skill.rs`
+- `crates/cli/src/commands/agent_skill/SKILL.md`
 
 Hermes operator plugin and managed lifecycle:
 

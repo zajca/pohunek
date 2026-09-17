@@ -41,7 +41,11 @@ base64 = "0.22"
 # explicitly opts into the minimal `std` and zeroization support it needs.
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std", "zeroize"] }
 getrandom = "0.2"
-cli = { package = "pohunek-cli", path = "crates/cli" }
+# xtask is the only crate that depends on the CLI library, and it must build
+# without the embedded skill artifact so the artifact generator stays runnable
+# while the artifact is missing or damaged; building pohunek-cli itself keeps
+# its default features.
+cli = { package = "pohunek-cli", path = "crates/cli", default-features = false }
 knowledge = { package = "pohunek-knowledge", path = "crates/knowledge" }
 pohunek-cli = { path = "crates/cli" }
 pohunek-client = { path = "crates/client" }

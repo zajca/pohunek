@@ -563,6 +563,10 @@ mod tests {
             assert!(script.contains(marker), "missing {marker:?} in {script}");
             assert!(script.contains("session"));
             assert!(script.contains(host_marker));
+            assert!(
+                script.contains("agent-skill"),
+                "static {shell:?} completion must cover the agent-skill command: {script}"
+            );
         }
     }
 
@@ -826,5 +830,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `agent-skill` is a static command with no dynamic completers; it must
+    /// still stay present in the dynamic completion tree so completions never
+    /// cover fewer commands than the parser accepts.
+    #[test]
+    fn dynamic_command_keeps_agent_skill_completable() {
+        let command = dynamic_command(CompletionContext::default());
+        command.clone().debug_assert();
+        assert!(
+            command.find_subcommand("agent-skill").is_some(),
+            "agent-skill must stay completable in dynamic completion mode"
+        );
     }
 }

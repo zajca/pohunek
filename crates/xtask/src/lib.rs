@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod agent_skill;
 mod checks;
 mod eval;
 mod generators;
@@ -68,6 +69,7 @@ pub enum XtaskError {
     Io { path: PathBuf, source: io::Error },
     UnsupportedFileType(PathBuf),
     Json(serde_json::Error),
+    Yaml(serde_yaml::Error),
     InvalidPath(PathBuf),
 }
 
@@ -83,6 +85,7 @@ impl fmt::Display for XtaskError {
                 write!(f, "unsupported file type in `{}`", path.display())
             }
             Self::Json(error) => write!(f, "failed to serialize json: {error}"),
+            Self::Yaml(error) => write!(f, "failed to serialize yaml: {error}"),
             Self::InvalidPath(path) => write!(
                 f,
                 "path `{}` cannot be represented as a deterministic relative path",
@@ -98,6 +101,7 @@ impl Error for XtaskError {
             Self::BundleValidation(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             Self::Json(error) => Some(error),
+            Self::Yaml(error) => Some(error),
             Self::Usage(_) | Self::UnsupportedFileType(_) | Self::InvalidPath(_) => None,
         }
     }
@@ -293,6 +297,13 @@ where
             }
         },
         TopCommand::Hermes { action } => run_hermes(action, &root),
+        TopCommand::AgentSkill { action } => match action {
+            AgentSkillAction::Generate => {
+                agent_skill::generate(&root)?;
+                println!("agent-skill generate ok: checked skill artifact updated");
+                Ok(())
+            }
+        },
     }
 }
 
@@ -368,6 +379,10 @@ enum TopCommand {
         #[command(subcommand)]
         action: HermesAction,
     },
+    AgentSkill {
+        #[command(subcommand)]
+        action: AgentSkillAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -409,6 +424,12 @@ enum HermesAction {
     GenerateSkill,
     /// Check that the checked Hermes skill is present and current.
     CheckSkill,
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentSkillAction {
+    /// Regenerate the checked agent skill from its knowledge source.
+    Generate,
 }
 
 fn repo_root() -> PathBuf {

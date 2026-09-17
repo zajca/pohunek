@@ -5,12 +5,12 @@ use knowledge::{
     CONCEPT_SCHEMA_VERSION,
 };
 
-// The committed bundle contains 23 frontmatter-backed concepts (including the
+// The committed bundle contains 24 frontmatter-backed concepts (including the
 // #81 host-governance concept, source map, and system prompt) plus the reserved
 // `index.md` and `log.md` files.
 // Keep this exact assertion so changing a checked Markdown file needs an intentional update.
-const COMMITTED_KNOWLEDGE_FILES: usize = 25;
-const COMMITTED_KNOWLEDGE_CONCEPTS: usize = 23;
+const COMMITTED_KNOWLEDGE_FILES: usize = 26;
+const COMMITTED_KNOWLEDGE_CONCEPTS: usize = 24;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

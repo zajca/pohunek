@@ -1306,6 +1306,34 @@ printf '%s' 'Redacted input.' | pohunek session input s-42 --stdin --json
 The resulting stdout remains exactly one JSON envelope. The input bytes do not
 appear in that envelope, diagnostics, or structured logs.
 
+## Agent Skill CLI
+
+`pohunek agent-skill` prints the complete bundled agent skill for coding
+agents. The skill bytes are embedded in the CLI binary at compile time, so one
+binary version always prints identical output. The command is a local CLI
+lifecycle, not a daemon public method: it never contacts a daemon, reads the
+filesystem, or touches the network.
+
+Default output is the embedded skill verbatim on stdout, ending with the
+artifact's single trailing newline; stderr stays silent. With `--json` the
+command emits exactly one pretty-printed CLI process envelope whose `ok`
+payload carries the skill text and its lowercase-hex sha256 content hash:
+
+```json
+{
+  "cli_version": "0.x.y",
+  "protocol": {"minimum": 3, "maximum": 3},
+  "ok": {
+    "skill": "<complete skill text>",
+    "content_sha256": "<64 lowercase hex characters>"
+  }
+}
+```
+
+The global `--host` flag is accepted and deliberately ignored. The skill is
+embedded locally, so no host is resolved, probed, or connected to, and local
+and remote invocations print the same document.
+
 ## Hermes Operator Plugin CLI
 
 The Hermes operator plugin is a local CLI lifecycle, not a daemon public method.
