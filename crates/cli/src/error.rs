@@ -107,6 +107,15 @@ pub(crate) enum CliError {
     #[error("input wait interrupted by process signal; delivery outcome is unknown")]
     InputWaitInterrupted,
 
+    /// The binary was built without the embedded agent skill. Only an explicit
+    /// no-default-features build reaches this; default and release builds
+    /// always embed the checked-in artifact.
+    #[cfg(not(feature = "embed-agent-skill"))]
+    #[error(
+        "the agent skill is not embedded in this build (missing the `embed-agent-skill` feature)"
+    )]
+    AgentSkillNotEmbedded,
+
     /// A remote `session new` named no target. No filesystem path crosses the
     /// wire to another host, so a remote session must be referenced by `--project`
     /// (or, for first-introduction, `--repo` with a path valid on that host). Fails
@@ -246,6 +255,13 @@ impl CliError {
                 "session_input_interrupted",
                 "input wait interrupted by process signal; delivery outcome is unknown".to_owned(),
                 None,
+            ),
+            #[cfg(not(feature = "embed-agent-skill"))]
+            CliError::AgentSkillNotEmbedded => ProtocolError::new(
+                ErrorClass::Configuration,
+                "agent_skill_not_embedded",
+                "the agent skill is not embedded in this build".to_owned(),
+                Some("build the CLI with default features (embed-agent-skill)".to_owned()),
             ),
             CliError::RemoteTargetRequired => ProtocolError::new(
                 ErrorClass::Configuration,

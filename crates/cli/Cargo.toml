@@ -10,6 +10,13 @@ description = "pohunek CLI: controls the host daemon over the local control prot
 name = "pohunek"
 path = "src/main.rs"
 
+[features]
+default = ["embed-agent-skill"]
+# xtask builds this crate without the feature so `cargo xtask agent-skill
+# generate` stays runnable even while the generated artifact itself is
+# missing or damaged; every binary build embeds the checked-in artifact.
+embed-agent-skill = []
+
 [dependencies]
 pohunek-relay-client.workspace = true
 pohunek-relay-protocol.workspace = true

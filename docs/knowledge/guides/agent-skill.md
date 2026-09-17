@@ -165,8 +165,7 @@ pohunek session read <target> --json
 pohunek session input <coding-agent-target> --stdin --json
 pohunek session wait <target> --runtime-id <runtime-id> --runtime-generation 1 --after-terminal-watermark 1 --timeout-ms 8000 --json
 pohunek session screen <target> --json
-pohunek session wait <target> --activity blocked --timeout-ms 8000 --json
-pohunek session wait <target> --state stopped --timeout-ms 8000 --json
+pohunek session wait <target> --activity idle --activity blocked --state done --state failed --state stopped --timeout-ms 8000 --json
 ```
 
 After sending, verify the effect with `session inspect` or `session screen`
@@ -179,22 +178,28 @@ and a duplicate prompt can double-run work.
 or `--state` instead of sleeping. But a state or activity predicate is a
 non-causal observation, not a delivery report: the daemon evaluates it against
 the session's current snapshot, and no input-scoped activity cursor exists
-that would make it causal for one prompt. Two consequences: a `blocked` wait
-completes immediately on an already-blocked session even when the terminal
-only repainted, and a wait on a single activity times out on a run that
-finishes normally into another state. Order the observation instead of
-trusting the predicate. Before sending, capture the pre-send runtime and
-terminal revision from `session read --json` (`runtime_id`,
-`runtime_generation`, and `revision`). After sending, wait with
-`--after-terminal-watermark` plus the matching `--runtime-id` and
+that would make it causal for one prompt. Two consequences: a predicate wait
+completes immediately on an already-matching session even when the terminal
+only repainted, and a wait that names one outcome times out on a run that
+settles into any other state — a coding agent that finishes normally reports
+`idle`, not `blocked`, and an exiting profile reports `done` or `failed`.
+Order the observation instead of trusting the predicate. Before sending,
+capture the pre-send runtime and terminal revision from `session read --json`
+(`runtime_id`, `runtime_generation`, and `revision`). After sending, wait
+with `--after-terminal-watermark` plus the matching `--runtime-id` and
 `--runtime-generation`, passing the captured values exactly as the daemon
 reported them: it completes only once the terminal has repainted after the
 captured snapshot. Then confirm the post-send `session screen` shows the new
 prompt consumed and the activity is `working` again. Only after that screen
-verification wait on `--activity blocked` or `--state stopped` for the
-settled outcome: the ordering is what makes the outcome attributable to the
-new prompt, not the predicate itself. Report a timeout as ambiguous and hand
-it to the operator.
+verification run one settled wait that names every normal outcome together —
+`--activity idle --activity blocked --state done --state failed --state
+stopped` — and branch on the reported `reason` plus the snapshot: an
+`activity_matched` wait with the snapshot activity `idle` means the prompt
+finished, `blocked` means an approval is pending and goes to the operator, a
+`state_matched` wait reports the terminal state, and `timeout` stays
+ambiguous. The ordering is what makes the outcome attributable to the new
+prompt, not the predicate itself. Report a timeout as ambiguous and hand it
+to the operator.
 
 The waited-input form of `session input` (`--until`/`--timeout`) fails with
 `session_input_wait_unsupported` for the default coding agents: codex, claude,

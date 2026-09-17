@@ -454,44 +454,135 @@ fn observation_warnings_are_pinned_in_the_artifact() {
     }
 }
 
+/// A settled wait that names one outcome times out on every other normal
+/// outcome: a coding agent that finishes a prompt reports `idle` while the
+/// session stays `running`, an approval reports `blocked`, and an exiting
+/// profile reports `done`, `failed`, or `stopped`. The artifact must
+/// recommend one combined wait covering all of them and checking the
+/// reported `reason`, so a successful prompt is never misreported as
+/// ambiguous.
+#[test]
+fn settled_wait_examples_cover_every_normal_outcome() {
+    let mut saw_settled_wait = false;
+    for example in collect_pohunek_examples(EMBEDDED_SKILL) {
+        let Some(matches) = parse_example(example.line, &example.command) else {
+            continue;
+        };
+        let Some(("wait", _)) = session_args(&matches) else {
+            continue;
+        };
+        let tokens: Vec<&str> = example.command.split_whitespace().collect();
+        let activities: Vec<&str> = flag_values(&tokens, "--activity");
+        let states: Vec<&str> = flag_values(&tokens, "--state");
+        if activities.is_empty() && states.is_empty() {
+            // Cursor-only repaint waits observe a repaint, not an outcome.
+            continue;
+        }
+        saw_settled_wait = true;
+        for outcome in ["idle", "blocked"] {
+            assert!(
+                activities.contains(&outcome),
+                "settled wait example at line {} omits --activity {outcome}; a \
+                 wait without it times out on that normal outcome and reports \
+                 an ambiguous result",
+                example.line
+            );
+        }
+        for outcome in ["done", "failed", "stopped"] {
+            assert!(
+                states.contains(&outcome),
+                "settled wait example at line {} omits --state {outcome}; a \
+                 wait without it times out on that normal outcome and reports \
+                 it as ambiguous",
+                example.line
+            );
+        }
+    }
+    assert!(
+        saw_settled_wait,
+        "artifact must contain a settled `session wait` example with predicates"
+    );
+    assert!(
+        EMBEDDED_SKILL.contains("`reason`"),
+        "artifact must direct the agent to branch on the wait `reason`; the \
+         snapshot alone does not distinguish a matched predicate from a timeout"
+    );
+}
+
+/// Returns every value supplied to one flag in a parsed example's token list.
+fn flag_values<'a>(tokens: &[&'a str], flag: &str) -> Vec<&'a str> {
+    tokens
+        .iter()
+        .zip(tokens.iter().skip(1))
+        .filter(|(token, _)| **token == flag)
+        .map(|(_, value)| *value)
+        .collect()
+}
+
 /// Collects every `pohunek ...` example in the artifact: inline backticked
-/// spans anywhere plus bare command lines inside fenced code blocks. This
-/// mirrors the xtask `collect_pohunek_examples` scan without a regex
-/// dependency so the CLI suite stays independent of xtask.
+/// spans plus bare command lines inside fenced code blocks. This mirrors the
+/// xtask `collect_pohunek_examples` scan without a regex dependency so the
+/// CLI suite stays independent of xtask.
 ///
-/// Each example carries its 1-based artifact line so failures can name the
-/// location without echoing command text, which may hold sensitive values.
+/// Outside a fence, a backticked span may wrap across lines; Markdown code
+/// spans cannot cross a blank line, and a fence always ends one, so the scan
+/// closes an open span there instead of absorbing the rest of the document.
+/// Each example carries the 1-based artifact line where its span opened so
+/// failures can name the location without echoing command text, which may
+/// hold sensitive values.
 struct Example {
     line: usize,
     command: String,
 }
 
 fn collect_pohunek_examples(content: &str) -> Vec<Example> {
-    let mut in_fence = false;
     let mut examples = Vec::new();
+    let mut in_fence = false;
+    let mut open_span: Option<(usize, String)> = None;
     for (index, line) in content.lines().enumerate() {
         let line_number = index + 1;
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_fence = !in_fence;
+            open_span = None;
+            continue;
+        }
+        if in_fence {
+            if trimmed.starts_with("pohunek ") {
+                examples.push(Example {
+                    line: line_number,
+                    command: trimmed.to_owned(),
+                });
+            }
+            continue;
+        }
+        if trimmed.is_empty() {
+            open_span = None;
             continue;
         }
         let mut rest = line;
-        while let Some(start) = rest.find("`pohunek ") {
-            let span = &rest[start + "`".len()..];
-            let Some(end) = span.find('`') else { break };
-            examples.push(Example {
-                line: line_number,
-                command: span[..end].to_owned(),
-            });
-            rest = &span[end + "`".len()..];
+        let mut span = open_span.take();
+        while let Some(backtick) = rest.find('`') {
+            let before = &rest[..backtick];
+            rest = &rest[backtick + '`'.len_utf8()..];
+            match span.take() {
+                None => span = Some((line_number, String::new())),
+                Some((start_line, mut buffer)) => {
+                    buffer.push_str(before);
+                    if buffer.starts_with("pohunek ") {
+                        examples.push(Example {
+                            line: start_line,
+                            command: buffer,
+                        });
+                    }
+                }
+            }
         }
-        if in_fence && trimmed.starts_with("pohunek ") {
-            examples.push(Example {
-                line: line_number,
-                command: trimmed.to_owned(),
-            });
+        if let Some((_, buffer)) = span.as_mut() {
+            buffer.push_str(rest);
+            buffer.push(' ');
         }
+        open_span = span;
     }
     examples
 }
@@ -552,4 +643,41 @@ fn example_collector_ignores_prose_and_unterminated_spans() {
     // with no closing backtick is not a complete example.
     let content = "pohunek in prose is not a command\n`pohunek unterminated\n";
     assert!(collect_pohunek_examples(content).is_empty());
+}
+
+#[test]
+fn example_collector_collects_inline_spans_across_lines() {
+    // A wrapped inline command is one example anchored at its opening line,
+    // so a multi-line command cannot bypass the parse gate.
+    let content = concat!("Run `pohunek doctor\n", "--json` after startup.\n",);
+    let examples = collect_pohunek_examples(content);
+    let commands: Vec<&str> = examples
+        .iter()
+        .map(|example| example.command.as_str())
+        .collect();
+    let lines: Vec<usize> = examples.iter().map(|example| example.line).collect();
+    assert_eq!(commands, ["pohunek doctor --json"]);
+    assert_eq!(lines, [1]);
+}
+
+#[test]
+fn example_collector_drops_spans_crossing_blank_lines_or_fences() {
+    let content = concat!(
+        "broken `pohunek doctor\n",
+        "\n",
+        "--json` span\n",
+        "broken `pohunek doctor\n",
+        "```sh\n",
+        "pohunek host list --json\n",
+        "```\n",
+        "--json` span\n",
+    );
+    let examples = collect_pohunek_examples(content);
+    let commands: Vec<&str> = examples
+        .iter()
+        .map(|example| example.command.as_str())
+        .collect();
+    // The blank line and the fence each end the broken span, so only the
+    // fenced bare line survives.
+    assert_eq!(commands, ["pohunek host list --json"]);
 }

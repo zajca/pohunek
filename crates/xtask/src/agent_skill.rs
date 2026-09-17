@@ -7,6 +7,7 @@
 // Rust guideline compliant 2026-09-16
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::{create_dir_all, XtaskError};
@@ -32,7 +33,28 @@ pub(crate) fn generate(root: &Path) -> Result<(), XtaskError> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
     }
-    fs::write(&path, bytes).map_err(|source| XtaskError::Io { path, source })
+    write_atomically(&path, &bytes)
+}
+
+/// Replaces `path` in one rename so a generate run can never leave a torn
+/// artifact behind: the CLI embeds these bytes with `include_str!`, which
+/// rejects invalid UTF-8, so a torn write would break every build whose
+/// remediation is this generator.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
+    let parent = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let mut temp = tempfile::NamedTempFile::new_in(&parent).map_err(|source| XtaskError::Io {
+        path: parent,
+        source,
+    })?;
+    temp.write_all(bytes).map_err(|source| XtaskError::Io {
+        path: temp.path().to_path_buf(),
+        source,
+    })?;
+    temp.persist(path).map_err(|error| XtaskError::Io {
+        path: path.to_path_buf(),
+        source: error.error,
+    })?;
+    Ok(())
 }
 
 /// Checks that the committed skill artifact is present and exactly current.

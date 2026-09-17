@@ -330,44 +330,69 @@ fn parse_failure_message(location: &str, message: &str) -> String {
 }
 
 /// Collects every `pohunek ...` example in the skill source: inline backticked
-/// spans anywhere plus bare command lines inside fenced code blocks. Prose
-/// outside fences never becomes a candidate, so wrapped sentences starting
-/// with the binary name are not misread as commands.
+/// spans plus bare command lines inside fenced code blocks. Prose outside
+/// fences never becomes a candidate, so wrapped sentences starting with the
+/// binary name are not misread as commands.
 ///
-/// Each example carries its 1-based source line so validation failures can be
-/// located without echoing command text, which may hold sensitive values.
+/// Outside a fence, a backticked span may wrap across lines; Markdown code
+/// spans cannot cross a blank line, and a fence always ends one, so the scan
+/// closes an open span there instead of absorbing the rest of the document.
+/// Each example carries the 1-based line where its span opened so validation
+/// failures can be located without echoing command text, which may hold
+/// sensitive values.
 struct ExampleCommand {
     line: usize,
     command: String,
 }
 
 fn collect_pohunek_examples(content: &str) -> Vec<ExampleCommand> {
-    let backtick_cmd_re =
-        Regex::new(r"`(pohunek [^`]+)`").expect("valid agent-skill backtick command regex");
-    let fence_re = Regex::new(r"^(```|~~~)").expect("valid code fence regex");
-    let mut in_fence = false;
     let mut examples = Vec::new();
+    let mut in_fence = false;
+    let mut open_span: Option<(usize, String)> = None;
     for (index, line) in content.lines().enumerate() {
         let line_number = index + 1;
-        if fence_re.is_match(line.trim_start()) {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_fence = !in_fence;
+            open_span = None;
             continue;
         }
-        for capture in backtick_cmd_re.captures_iter(line) {
-            examples.push(ExampleCommand {
-                line: line_number,
-                command: capture[1].to_string(),
-            });
-        }
         if in_fence {
-            let trimmed = line.trim_start();
             if trimmed.starts_with("pohunek ") {
                 examples.push(ExampleCommand {
                     line: line_number,
-                    command: trimmed.to_string(),
+                    command: trimmed.to_owned(),
                 });
             }
+            continue;
         }
+        if trimmed.is_empty() {
+            open_span = None;
+            continue;
+        }
+        let mut rest = line;
+        let mut span = open_span.take();
+        while let Some(backtick) = rest.find('`') {
+            let before = &rest[..backtick];
+            rest = &rest[backtick + '`'.len_utf8()..];
+            match span.take() {
+                None => span = Some((line_number, String::new())),
+                Some((start_line, mut buffer)) => {
+                    buffer.push_str(before);
+                    if buffer.starts_with("pohunek ") {
+                        examples.push(ExampleCommand {
+                            line: start_line,
+                            command: buffer,
+                        });
+                    }
+                }
+            }
+        }
+        if let Some((_, buffer)) = span.as_mut() {
+            buffer.push_str(rest);
+            buffer.push(' ');
+        }
+        open_span = span;
     }
     examples
 }
@@ -621,6 +646,56 @@ mod tests {
                 .map(|example| example.line)
                 .collect::<Vec<_>>(),
             vec![5, 8, 10, 16]
+        );
+    }
+
+    #[test]
+    fn collect_pohunek_examples_collects_inline_spans_across_lines() {
+        // A wrapped inline command is one example anchored at its opening
+        // line, so a multi-line command cannot bypass the parse gate.
+        let content = "Run `pohunek doctor\n--json` after startup.\n";
+
+        let examples = collect_pohunek_examples(content);
+
+        assert_eq!(
+            examples
+                .iter()
+                .map(|example| example.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pohunek doctor --json"]
+        );
+        assert_eq!(
+            examples
+                .iter()
+                .map(|example| example.line)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn collect_pohunek_examples_drops_spans_crossing_blank_lines_or_fences() {
+        let content = concat!(
+            "broken `pohunek doctor\n",
+            "\n",
+            "--json` span\n",
+            "broken `pohunek doctor\n",
+            "```sh\n",
+            "pohunek host list --json\n",
+            "```\n",
+            "--json` span\n",
+        );
+
+        let examples = collect_pohunek_examples(content);
+
+        // The blank line and the fence each end the broken span, so only the
+        // fenced bare line survives.
+        assert_eq!(
+            examples
+                .iter()
+                .map(|example| example.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pohunek host list --json"]
         );
     }
 
