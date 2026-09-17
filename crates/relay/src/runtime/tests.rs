@@ -3,6 +3,19 @@ use crate::lifecycle::BootstrapRequest;
 use sqlx::AssertSqlSafe;
 use std::os::unix::fs::PermissionsExt;
 
+/// CI runs four concurrent test threads against one shared PostgreSQL fixture,
+/// so a control roundtrip occasionally exceeds local-loopback latency. One
+/// second absorbs that jitter while renewal stays inside the lease lifetime.
+const TEST_CONTROL_PERIOD: Duration = Duration::from_secs(1);
+/// The observation window must cross the initial five-second lease deadline to
+/// prove the background renewal extended it.
+const TEST_OUTLIVE_WINDOW: Duration = Duration::from_secs(6);
+/// Bounds the occupied-pool observation without reaching the next control tick.
+const TEST_OCCUPIED_WINDOW: Duration = Duration::from_millis(350);
+/// Must exceed the control period so a slow roundtrip reports its own error
+/// instead of tripping the outer bound.
+const TEST_WATCH_BOUND: Duration = Duration::from_secs(3);
+
 #[derive(Debug)]
 struct Fixture {
     store: Store,
@@ -90,8 +103,8 @@ async fn background_renewal_outlives_initial_lease_and_clean_shutdown_restarts()
     let runtime = fixture.acquire().await;
     let authority = runtime.authority();
     tokio::select! {
-        result = renew(&authority, Duration::from_millis(100)) => panic!("renewal stopped: {result:?}"),
-        () = tokio::time::sleep(Duration::from_secs(6)) => (),
+        result = renew(&authority, TEST_CONTROL_PERIOD) => panic!("renewal stopped: {result:?}"),
+        () = tokio::time::sleep(TEST_OUTLIVE_WINDOW) => (),
     }
     authority
         .validate_fence()
@@ -125,13 +138,10 @@ async fn idle_fence_loss_closes_authority_and_preserves_dirty_latch() {
         .execute(fixture.store.pool())
         .await
         .expect("simulate replaced fence");
-    timeout(
-        Duration::from_secs(1),
-        watch(&authority, Duration::from_millis(100)),
-    )
-    .await
-    .expect("watch is bounded")
-    .expect_err("changed fence rejected");
+    timeout(TEST_WATCH_BOUND, watch(&authority, TEST_CONTROL_PERIOD))
+        .await
+        .expect("watch is bounded")
+        .expect_err("changed fence rejected");
     assert!(authority.is_closed());
     runtime
         .shutdown()
@@ -188,9 +198,9 @@ async fn occupied_application_pool_and_transaction_fence_do_not_starve_control()
     let request_b = Arc::clone(&authority);
     let request_b = tokio::spawn(async move { request_b.validate_fence().await });
     tokio::select! {
-        result = renew(&authority, Duration::from_millis(100)) => panic!("application work blocked renewal: {result:?}"),
-        result = watch(&authority, Duration::from_millis(100)) => panic!("application work blocked watchdog: {result:?}"),
-        () = tokio::time::sleep(Duration::from_millis(350)) => (),
+        result = renew(&authority, TEST_CONTROL_PERIOD) => panic!("application work blocked renewal: {result:?}"),
+        result = watch(&authority, TEST_CONTROL_PERIOD) => panic!("application work blocked watchdog: {result:?}"),
+        () = tokio::time::sleep(TEST_OCCUPIED_WINDOW) => (),
     }
     assert!(
         !request_a.is_finished(),
