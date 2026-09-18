@@ -1,14 +1,12 @@
+# Custom profile inheritance was introduced in this version.
+nextest-version = { required = "0.9.115" }
+
 [profile.default]
-# Nextest replaces the libtest RUST_TEST_THREADS knob with process-level
-# parallelism. Keep the default profile conservative; the ci/local profiles
-# below scale with available cores.
+# Process-level parallelism; keep full-suite and heavy local runs bounded.
 test-threads = 4
 slow-timeout = { period = "60s", terminate-after = 3 }
 
 [profile.ci]
-# Fast job (fmt/clippy/unit) uses full cores. The integration job overrides
-# this on the command line (`--test-threads 4`) to preserve the original
-# RUST_TEST_THREADS=4 bound for PTY/Postgres fixture tests.
 test-threads = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 3 }
 fail-fast = false
@@ -23,6 +21,31 @@ filter = "test(/stop_force_closes_output_retained_outside_the_owned_process_grou
 retries = 2
 
 [profile.local]
-# Local interactive loop: full core count, tighter slow-test signal.
+# Unfiltered full suite; unlike fast, this needs worker and database fixtures.
 test-threads = "num-cpus"
 slow-timeout = { period = "30s" }
+
+# Cost boundary shared by local aliases and scripts/test-partitions. Whole
+# fixture-owning modules stay heavy, including future tests added within them.
+# Ordinary file, mock-socket, and short CLI integration tests remain fast.
+[profile.fast]
+inherits = "ci"
+default-filter = '''
+not (
+  (package(=pohunek-daemon) and
+    (kind(test) or test(/^(api::handler::tests::|session::|runtime::client::|governance::owner_path_tests::|capabilities::|external::)/)))
+  or (package(=pohunek-session-worker) and test(/^(pty|server)::/))
+  or (package(=pohunek-relay) and
+    (kind(test) or test(/^(admission::|auth::service::|auth::parent_integrity_tests::|authorization::admin_tests::|lifecycle::|runtime::|server::credential_router_tests::|operator::)/)))
+  or (package(=pohunek-cli) and
+    (test(/^hermes_integration::/) or binary(/^hermes_/) or binary(=session_process_api)))
+  or (package(=pohunek-gui-core) and binary(=loopback))
+  or (package(=xtask) and (test(/^hermes(::|_mock::)/) or kind(test)))
+)
+'''
+
+[profile.heavy]
+inherits = "ci"
+test-threads = 4
+# The heavy filter is the exact complement of profile.fast, supplied by
+# scripts/test-partitions. Keep `ci` and `local` unfiltered full-suite profiles.

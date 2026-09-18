@@ -58,7 +58,7 @@ jobs:
         run: cargo test --locked -p pohunek-platform
 
   test:
-    name: fmt + clippy + unit (fast feedback)
+    name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,29 +80,39 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features
 
-      # Unit tests that need no external fixtures (some --lib tests spawn real
-      # PTYs/processes, the real session worker binary, or require the
-      # Postgres fixture URL, so exclude those packages here; the
-      # `integration` job runs them with the binary built and the Postgres
-      # service available).
-      - name: Unit tests (nextest --lib)
-        run: >
-          cargo nextest run --profile ci --all-features --lib
-          -E 'not package(pohunek-relay) and not package(pohunek-daemon) and not package(pohunek-session-worker)'
+  fast-tests:
+    name: tests (${{ matrix.shard }}, fast)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [unit, daemon, relay, cli]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tests-${{ matrix.shard }}
+      - uses: taiki-e/install-action@cargo-nextest
 
-      # Per-test timing evidence for the test-performance work (JUnit `time`
-      # attributes). Nextest writes the report under its own storage directory.
-      - name: Upload unit test report
+      - name: Check partition guard regressions
+        if: matrix.shard == 'unit'
+        run: python3 -m unittest discover -s scripts/tests -p 'test_partitions.py'
+
+      # No dependency on Clippy, PostgreSQL, PTYs, or the release build.
+      - name: Run fast shard
+        run: python3 scripts/test-partitions run "${{ matrix.shard }}"
+
+      - name: Upload shard timing report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nextest-junit-unit
+          name: nextest-junit-${{ matrix.shard }}
           path: target/nextest/ci/junit.xml
-          if-no-files-found: ignore
+          if-no-files-found: warn
 
   integration:
-    name: integration + release build
-    needs: [test]
+    name: tests (heavy, PTY + DB + Hermes)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -137,17 +147,15 @@ jobs:
       - name: Build session worker for daemon tests
         run: cargo build -p pohunek-session-worker --bin pohunek-sessiond
 
-      - name: Integration tests (nextest, full suite)
-        # Lib tests re-run here too (seconds after compile); this keeps one
-        # command as the complete gate instead of fragile target filters.
-        # --test-threads 4 preserves the original RUST_TEST_THREADS=4 bound
-        # for PTY/Postgres fixture tests. Only the independently observed
-        # session-worker reap race retains a scoped retry.
-        run: cargo nextest run --profile ci --test-threads 4 --workspace --all-features
+      - name: Verify exhaustive disjoint test partitions
+        run: python3 scripts/test-partitions check
+
+      - name: Heavy tests (bounded nextest concurrency)
+        run: python3 scripts/test-partitions run heavy
         env:
           # Resolved at step level: the `job` context is not available in
           # job-level `env`, where it makes the whole workflow invalid.
-          POHUNEK_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}/pohunek_test
+          POHUNEK_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/pohunek_test
 
       # Per-test timing evidence for the test-performance work (JUnit `time`
       # attributes). Nextest writes the report under its own storage directory.
@@ -155,9 +163,19 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nextest-junit-integration
-          path: target/nextest/ci/junit.xml
-          if-no-files-found: ignore
+          name: nextest-junit-heavy
+          path: target/nextest/heavy/junit.xml
+          if-no-files-found: warn
+
+  release-check:
+    name: doctests + release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-check
 
       # Nextest does not execute rustdoc tests; preserve the cargo test gate.
       - name: Documentation tests
