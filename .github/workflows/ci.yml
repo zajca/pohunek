@@ -273,6 +273,7 @@ jobs:
   hermes-compatibility:
     name: pinned Hermes compatibility (model-free)
     runs-on: ubuntu-latest
+    needs: build-bins
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -290,13 +291,10 @@ jobs:
           version: "0.9.28"
           enable-cache: true
 
+      # The compatibility gate itself is driven by `cargo xtask`, which is built
+      # from source in this job, so a toolchain is still required here.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: hermes-compatibility
 
       - name: Check fail-closed Hermes provisioning
         run: scripts/tests/provision-hermes-compat.sh
@@ -309,21 +307,58 @@ jobs:
           hermes_bin="$(scripts/provision-hermes-compat "$RUNNER_TEMP/hermes-compat")"
           printf 'bin=%s\n' "$hermes_bin" >> "$GITHUB_OUTPUT"
 
-      - name: Build Pohunek CLI for integration lifecycle checks
-        run: cargo build --locked -p pohunek-cli --bin pohunek
+      - name: Download built CLI
+        uses: actions/download-artifact@v4
+        with:
+          name: pohunek-bins
+          path: target/debug
 
       - name: Check pinned Hermes compatibility
         shell: bash
         run: |
           set -euo pipefail
+          chmod +x target/debug/pohunek
           pohunek_bin="$(realpath target/debug/pohunek)"
           cargo xtask hermes compatibility \
             --hermes-bin "${{ steps.hermes.outputs.bin }}" \
             --pohunek-bin "$pohunek_bin"
 
+  # Build the three runnable binaries exactly once. The web e2e and pinned
+  # Hermes jobs reuse this artifact instead of each rebuilding Rust, which used
+  # to cost a full duplicate build per job (issue #122).
+  build-bins:
+    name: build bins (pohunekd + pohunek-sessiond + pohunek)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: build-bins
+
+      # The real daemon spawns `pohunek-sessiond` by path, and the Hermes plugin
+      # e2e drives the real `pohunek` CLI, so all three binaries are needed.
+      - name: Build daemon, session worker, and CLI
+        run: cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli
+
+      - name: Upload built binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: pohunek-bins
+          path: |
+            target/debug/pohunekd
+            target/debug/pohunek-sessiond
+            target/debug/pohunek
+          if-no-files-found: error
+
   web:
     name: web SDK + control center
     runs-on: ubuntu-latest
+    needs: build-bins
     steps:
       - uses: actions/checkout@v4
 
@@ -380,8 +415,14 @@ jobs:
 
       # The real daemon spawns `pohunek-sessiond` by path, and the Hermes plugin
       # e2e drives the real `pohunek` CLI, so all three binaries must be present.
-      - name: Build daemon, session worker, and CLI for web e2e
-        run: cargo build -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli
+      - name: Download built binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: pohunek-bins
+          path: target/debug
+
+      - name: Restore executable bits on downloaded binaries
+        run: chmod +x target/debug/pohunekd target/debug/pohunek-sessiond target/debug/pohunek
 
       - name: SDK e2e against real daemon
         working-directory: web
