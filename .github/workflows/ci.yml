@@ -111,22 +111,38 @@ jobs:
           path: target/nextest/ci/junit.xml
           if-no-files-found: warn
 
-  integration:
-    name: tests (heavy, PTY + DB + Hermes)
+  # Determine which CI jobs the changed files require. Only the relay
+  # PostgreSQL fixture job is currently gated; everything else runs on every
+  # PR. The workflow file itself forces a relay run so filter edits are
+  # always validated.
+  changes:
+    name: required jobs (paths filter)
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_DB: pohunek_test
-          POSTGRES_HOST_AUTH_METHOD: trust
-        ports:
-          - 5432/tcp
-        options: >-
-          --health-cmd "pg_isready -U postgres -d pohunek_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
+    permissions:
+      pull-requests: read
+    outputs:
+      relay: ${{ steps.filter.outputs.relay }}
+    steps:
+      # Push events (after merge to main) resolve the filter with git commands
+      # against the previous commit, which needs more than a depth-1 checkout.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        with:
+          filters: |
+            relay:
+              - 'crates/relay/**'
+              - 'crates/relay-client/**'
+              - 'crates/relay-protocol/**'
+              - 'crates/relay/migrations/**'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+
+  integration:
+    name: tests (heavy, PTY + Hermes)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -152,10 +168,6 @@ jobs:
 
       - name: Heavy tests (bounded nextest concurrency)
         run: python3 scripts/test-partitions run heavy
-        env:
-          # Resolved at step level: the `job` context is not available in
-          # job-level `env`, where it makes the whole workflow invalid.
-          POHUNEK_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/pohunek_test
 
       # Per-test timing evidence for the test-performance work (JUnit `time`
       # attributes). Nextest writes the report under its own storage directory.
@@ -165,6 +177,56 @@ jobs:
         with:
           name: nextest-junit-heavy
           path: target/nextest/heavy/junit.xml
+          if-no-files-found: warn
+
+  # Relay heavy tests are the only PostgreSQL fixture consumers, so they get
+  # their own job whose Postgres service only starts when relay-relevant files
+  # changed (issue #121).
+  integration-relay:
+    name: tests (relay DB, PostgreSQL)
+    needs: changes
+    if: needs.changes.outputs.relay == 'true'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: pohunek_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U postgres -d pohunek_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: integration-relay
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+
+      - name: Relay database tests (bounded nextest concurrency)
+        run: python3 scripts/test-partitions run relay-db
+        env:
+          # Resolved at step level: the `job` context is not available in
+          # job-level `env`, where it makes the whole workflow invalid.
+          POHUNEK_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/pohunek_test
+
+      - name: Upload relay DB test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-junit-relay-db
+          path: target/nextest/relay-db/junit.xml
           if-no-files-found: warn
 
   release-check:
