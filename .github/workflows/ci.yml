@@ -19,6 +19,15 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Disable incremental compilation in CI: rust-cache strips incremental
+  # artifacts before persisting anyway, so producing them only wastes time.
+  # Kept explicit (issue #124) so every job benefits even before restore.
+  CARGO_INCREMENTAL: "0"
+  # NOTE (issue #124): SCCACHE_GHA_ENABLED/RUSTC_WRAPPER and the mold
+  # -C link-arg=-fuse-ld=mold RUSTFLAGS live in each Rust job's `env`, not
+  # here. Workflow-level RUSTC_WRAPPER would also wrap jobs that never run
+  # the sccache-action step (e.g. cargo-audit's `cargo install`), which fails
+  # with "could not execute process `sccache ...` (never executed)".
 
 jobs:
   platform-contracts:
@@ -33,9 +42,13 @@ jobs:
             arch: x86_64
     runs-on: ${{ matrix.runner }}
     env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
       # Compile against the oldest supported macOS SDK contract. Runtime
       # acceptance on macOS 14 remains an explicit release milestone.
       MACOSX_DEPLOYMENT_TARGET: "14.0"
+      # mold is Linux-only: keep the default linker on macOS runners.
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
 
@@ -46,10 +59,15 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # sccache runs on macOS too (content-keyed GHA backend); mold stays
+      # Linux-only via the job-level RUSTFLAGS override above.
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          key: platform-${{ matrix.arch }}
+          shared-key: ci-
 
       - name: Check shared platform contracts
         run: cargo check --locked -p pohunek-platform --all-targets
@@ -60,16 +78,28 @@ jobs:
   test:
     name: fmt + clippy
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@cargo-nextest
@@ -83,16 +113,28 @@ jobs:
   fast-tests:
     name: tests (${{ matrix.shard }}, fast)
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     strategy:
       fail-fast: false
       matrix:
         shard: [unit, daemon, relay, cli]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - uses: Swatinem/rust-cache@v2
         with:
-          key: tests-${{ matrix.shard }}
+          shared-key: ci-
       - uses: taiki-e/install-action@cargo-nextest
 
       - name: Check partition guard regressions
@@ -143,16 +185,28 @@ jobs:
   integration:
     name: tests (heavy, PTY + Hermes)
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@cargo-nextest
@@ -187,6 +241,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.relay == 'true'
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     services:
       postgres:
         image: postgres:17-alpine
@@ -203,13 +261,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          key: integration-relay
+          shared-key: ci-
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@cargo-nextest
@@ -232,12 +296,24 @@ jobs:
   release-check:
     name: doctests + release build
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-check
+          shared-key: ci-
 
       # Nextest does not execute rustdoc tests; preserve the cargo test gate.
       - name: Documentation tests
@@ -249,30 +325,44 @@ jobs:
   docs:
     name: docs check (schema + drift + source-map + runbooks + secrets + release extras)
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          key: docs
+          shared-key: ci-
 
       - name: docs check
         run: cargo xtask docs check
         env:
-          RUSTFLAGS: -D warnings
+          RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
 
       - name: TS binding drift
         run: cargo xtask ts check
         env:
-          RUSTFLAGS: -D warnings
+          RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
 
   hermes-compatibility:
     name: pinned Hermes compatibility (model-free)
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     needs: build-bins
     timeout-minutes: 30
     steps:
@@ -293,8 +383,19 @@ jobs:
 
       # The compatibility gate itself is driven by `cargo xtask`, which is built
       # from source in this job, so a toolchain is still required here.
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-
 
       - name: Check fail-closed Hermes provisioning
         run: scripts/tests/provision-hermes-compat.sh
@@ -329,16 +430,26 @@ jobs:
   build-bins:
     name: build bins (pohunekd + pohunek-sessiond + pohunek)
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          key: build-bins
+          shared-key: ci-
 
       # The real daemon spawns `pohunek-sessiond` by path, and the Hermes plugin
       # e2e drives the real `pohunek` CLI, so all three binaries are needed.
@@ -419,16 +530,10 @@ jobs:
         working-directory: web
         run: bun ./node_modules/@playwright/test/cli.js test --config frontend/playwright.config.ts
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: web
-
       # The real daemon spawns `pohunek-sessiond` by path, and the Hermes plugin
       # e2e drives the real `pohunek` CLI, so all three binaries must be present.
+      # They come from the build-bins artifact (issue #122): no Rust toolchain,
+      # sccache, or cargo cache is needed in this job.
       - name: Download built binaries
         uses: actions/download-artifact@v4
         with:
@@ -474,18 +579,28 @@ jobs:
   feature-matrix:
     name: cargo-hack (feature powerset)
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          key: feature-matrix
+          shared-key: ci-
 
       - name: Install cargo-hack
         uses: taiki-e/install-action@cargo-hack
@@ -499,16 +614,26 @@ jobs:
   udeps:
     name: cargo-udeps (unused dependencies)
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
 
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          key: udeps
+          shared-key: ci-
 
       - name: Install cargo-udeps
         uses: taiki-e/install-action@cargo-udeps
