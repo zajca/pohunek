@@ -19,6 +19,15 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # Disable incremental compilation: rust-cache strips incremental artifacts
+  # before persisting anyway (issue #124).
+  CARGO_INCREMENTAL: "0"
+  # NOTE (issue #124): SCCACHE_GHA_ENABLED/RUSTC_WRAPPER and the mold
+  # -C link-arg=-fuse-ld=mold RUSTFLAGS live in each Rust job's `env`, not
+  # here: workflow-level RUSTC_WRAPPER would also wrap steps that never run
+  # the sccache-action (e.g. audit-check's `cargo install`), which fails with
+  # "could not execute process `sccache ...` (never executed)".
 
 jobs:
   gate:
@@ -27,7 +36,9 @@ jobs:
     env:
       # Bound concurrent isolated PostgreSQL fixture pools.
       RUST_TEST_THREADS: 4
-      RUSTFLAGS: -D warnings
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     services:
       postgres:
         image: postgres:17-alpine
@@ -44,13 +55,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -80,17 +99,25 @@ jobs:
     name: docs check (deterministic build + secret scan)
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: -D warnings
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          key: docs
+          shared-key: ci-
 
       - name: docs check
         run: cargo xtask docs check
@@ -101,6 +128,10 @@ jobs:
   web-gate:
     name: web typecheck + lint + test + e2e
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
 
@@ -124,10 +155,16 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-web
+          shared-key: ci-
 
       - name: Install web dependencies
         working-directory: web
@@ -234,6 +271,10 @@ jobs:
     name: Build ${{ matrix.component }} for ${{ matrix.target }}
     needs: [gate, docs-gate, web-gate]
     runs-on: ${{ matrix.runner }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     permissions:
       contents: write
     strategy:
@@ -304,13 +345,24 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install mold linker
+        if: "!endsWith(matrix.target, '-musl')"
+        run: sudo apt-get update && sudo apt-get install -y mold
+
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}-${{ matrix.component }}
+          shared-key: ci-
 
       - name: Build release binaries
         shell: bash
+        env:
+          # musl targets link statically via the musl toolchain wrapper, which
+          # does not accept GNU ld replacement flags: keep mold GNU-only.
+          RUSTFLAGS: ${{ endsWith(matrix.target, '-musl') && '-D warnings' || '-D warnings -C link-arg=-fuse-ld=mold' }}
         run: |
           set -euo pipefail
           build_args=(--release --locked --target "${{ matrix.target }}")
