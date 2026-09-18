@@ -367,6 +367,18 @@ jobs:
         with:
           bun-version: 1.3.11
 
+      # `bun install` re-downloads every registry tarball without a cache.
+      # Reuse Bun's global package cache, keyed by web/bun.lock and the
+      # setup-bun bun-version pin above, so repeat runs install from disk
+      # instead of the network.
+      - name: Cache Bun packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-1.3.11-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            bun-${{ runner.os }}-1.3.11-
+
       - name: Install web dependencies
         working-directory: web
         run: bun install --frozen-lockfile
@@ -389,13 +401,15 @@ jobs:
         working-directory: web
         run: bun run build:frontend
 
+      # The lockfile pins the Playwright version, so its browser build is
+      # derived from web/bun.lock instead of a hand-maintained literal.
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-chromium-1.61.1
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('web/bun.lock') }}
           restore-keys: |
-            playwright-chromium-
+            playwright-chromium-${{ runner.os }}-
 
       - name: Install Playwright Chromium
         working-directory: web

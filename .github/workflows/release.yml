@@ -109,6 +109,18 @@ jobs:
         with:
           bun-version: 1.3.11
 
+      # `bun install` re-downloads every registry tarball without a cache.
+      # Reuse Bun's global package cache, keyed by web/bun.lock and the
+      # setup-bun bun-version pin above, so repeat runs install from disk
+      # instead of the network.
+      - name: Cache Bun packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-1.3.11-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            bun-${{ runner.os }}-1.3.11-
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -136,6 +148,14 @@ jobs:
       - name: Build web control center
         working-directory: web
         run: bun run build:frontend
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            playwright-chromium-${{ runner.os }}-
 
       - name: Install Playwright Chromium
         working-directory: web
@@ -179,6 +199,18 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.11
+
+      # `bun install` re-downloads every registry tarball without a cache.
+      # Reuse Bun's global package cache, keyed by web/bun.lock and the
+      # setup-bun bun-version pin above, so repeat runs install from disk
+      # instead of the network.
+      - name: Cache Bun packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-1.3.11-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            bun-${{ runner.os }}-1.3.11-
 
       - name: Install web dependencies
         working-directory: web
