@@ -13,7 +13,7 @@
   "scripts": {
     "dev": "bun run scripts/dev.ts",
     "build:frontend": "cd frontend && bun run build",
-    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p release/test/tsconfig.json && (cd shared && bun run typecheck) && (cd sdk && bun run typecheck) && (cd backend && bun run typecheck) && (cd testkit && bun run typecheck) && (cd client-core && bun run typecheck) && (cd frontend && bun run typecheck)",
+    "typecheck": "bun run scripts/typecheck.ts",
     "lint": "eslint \"**/*.{ts,svelte}\" --max-warnings=0",
     "test": "bun test",
     "test:e2e": "bun run build:frontend && bun ./node_modules/@playwright/test/cli.js test --config frontend/playwright.config.ts"
