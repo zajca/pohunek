@@ -797,7 +797,7 @@ cargo t                        # all fast unit + integration tests, no PTY/DB fi
 cargo t -p pohunek-gui-core     # fast tests in one crate
 cargo ti                       # fast daemon/client/session-worker surface
 cargo tw                       # unfiltered full suite, four test processes
-python3 scripts/test-partitions run cli    # exact CI shard (unit/daemon/relay/cli/heavy)
+python3 scripts/test-partitions run cli    # exact CI shard (unit/daemon/relay/cli/relay-db/heavy)
 python3 scripts/test-partitions check      # verify all tests belong to exactly one shard
 ```
 
@@ -809,9 +809,13 @@ PTY/worker lifecycle, PostgreSQL, Hermes subprocess suites, GUI daemon loopback,
 and nested Cargo integration checks. Fast includes short filesystem, mock-socket,
 and CLI integration tests; `--lib` alone is **not** a cost boundary.
 
-CI runs four fast matrix shards and a separate heavy job without waiting for
-Clippy or release builds. Heavy uses four test processes, the real worker binary,
-and `POHUNEK_RELAY_TEST_DATABASE_URL` pointing at a disposable PostgreSQL fixture.
+CI runs four fast matrix shards and separate heavy jobs without waiting for
+Clippy or release builds. Heavy uses four test processes and the real worker
+binary. Relay heavy tests (the only PostgreSQL fixture consumers) run in a
+dedicated `relay-db` job whose `POHUNEK_RELAY_TEST_DATABASE_URL` points at a
+disposable PostgreSQL service; a `paths-filter` job skips that job — including
+the Postgres service — when no relay-relevant file (`crates/relay*/**`,
+`migrations/**`, `Cargo.lock`, the CI workflow) changed. The full
 The full `ci`/`local` profiles remain unfiltered. Existing ignored tests retain
 their opt-in status. Each CI shard uploads a uniquely named JUnit artifact;
 sequential local fast shards overwrite `target/nextest/ci/junit.xml`, while heavy

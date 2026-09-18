@@ -15,7 +15,10 @@ ROOT = Path(__file__).resolve().parents[1]
 DAEMON = "package(=pohunek-daemon) or package(=pohunek-session-worker) or package(=pohunek-client)"
 RELAY = "package(=pohunek-relay) or package(=pohunek-relay-client) or package(=pohunek-relay-protocol)"
 CLI = "package(=pohunek-cli)"
-SHARDS = ("unit", "daemon", "relay", "cli", "heavy")
+# Relay heavy tests are the only consumers of the PostgreSQL fixture, so they
+# form their own shard: CI runs them in a job whose Postgres service is gated
+# by a paths filter on the relay crates.
+SHARDS = ("unit", "daemon", "relay", "cli", "relay-db", "heavy")
 
 
 def filters():
@@ -25,7 +28,8 @@ def filters():
     owners["unit"] = f"not (({DAEMON}) or ({RELAY}) or ({CLI}))"
     return {
         **{name: f"({fast}) and ({owner})" for name, owner in owners.items()},
-        "heavy": f"not ({fast})",
+        "relay-db": f"(not ({fast})) and ({RELAY})",
+        "heavy": f"(not ({fast})) and not ({RELAY})",
     }
 
 
@@ -87,7 +91,9 @@ def main():
     if args.action == "filter":
         print(expressions[args.shard])
         return
-    profile = "heavy" if args.shard == "heavy" else "ci"
+    # Heavy shards run bounded: heavy spawns real worker/PTY fixtures, and
+    # relay-db opens per-test database pools that exhaust the fixture limit.
+    profile = {"heavy": "heavy", "relay-db": "relay-db"}.get(args.shard, "ci")
     # CI uploads each job's report under its shard name. Local fast shard runs
     # share the ci report path; copy it before starting the next run if needed.
     command = [

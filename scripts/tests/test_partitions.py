@@ -60,13 +60,18 @@ class CoverageTests(unittest.TestCase):
             ("bin", "ignored"), ("bin", "selected"),
         })
 
-    def test_heavy_is_fast_complement(self):
+    def test_heavy_is_fast_complement_minus_relay_db(self):
+        import tomllib
+        with (Path(__file__).resolve().parents[2] / ".config/nextest.toml").open("rb") as config:
+            fast = tomllib.load(config)["profile"]["fast"]["default-filter"]
         expressions = partitions.filters()
         self.assertEqual(set(expressions), set(partitions.SHARDS))
-        self.assertTrue(expressions["heavy"].startswith("not ("))
-        fast = expressions["heavy"][5:-1]
         for name in ("unit", "daemon", "relay", "cli"):
-            self.assertTrue(expressions[name].startswith(f"({fast}) and ("))
+            self.assertIn(f"({fast}) and (", expressions[name])
+        # Relay heavy tests are the relay-db shard; heavy is the remaining
+        # fast-filter complement. Together they re-cover the full complement.
+        self.assertEqual(expressions["relay-db"], f"(not ({fast})) and ({partitions.RELAY})")
+        self.assertEqual(expressions["heavy"], f"(not ({fast})) and not ({partitions.RELAY})")
 
 
 if __name__ == "__main__":

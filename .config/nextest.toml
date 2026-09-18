@@ -49,3 +49,12 @@ inherits = "ci"
 test-threads = 4
 # The heavy filter is the exact complement of profile.fast, supplied by
 # scripts/test-partitions. Keep `ci` and `local` unfiltered full-suite profiles.
+
+[profile.relay-db]
+inherits = "ci"
+# Relay PostgreSQL tests each open dedicated schema-scoped pools; unbounded
+# num-cpus concurrency exhausts the fixture server's connection limit.
+test-threads = 4
+
+[profile.relay-db.junit]
+path = "junit.xml"

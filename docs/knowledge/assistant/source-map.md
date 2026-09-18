@@ -168,9 +168,11 @@ Release packaging and contributor verification:
 - `.config/nextest.toml` — shared fast cost boundary and bounded heavy profile.
 - `.cargo/config.toml` — `cargo t`/`cargo ti` select fast unit and integration
   tests; `cargo tw` keeps the full suite. Fast loops do not replace full gates.
-- `scripts/test-partitions` — disjoint unit/daemon/relay/cli/heavy CI shards and
-  exhaustive inventory check. Heavy is the exact complement of the fast filter;
-  it requires the real worker and disposable PostgreSQL fixture. The CI jobs
+- `scripts/test-partitions` — disjoint unit/daemon/relay/cli/relay-db/heavy CI
+  shards and exhaustive inventory check. Heavy is the exact complement of the
+  fast filter; relay heavy tests (`relay-db`, the only PostgreSQL fixture
+  consumers) run in a CI job gated by a paths filter on relay-relevant files,
+  so non-relay changes never start the Postgres service. The CI jobs
   run independently, retaining per-shard JUnit timing evidence. Cold compilation
   is separate from the approximately two-minute fast-feedback target.
 - `scripts/tests/test_partitions.py` — regression checks for coverage validation.
