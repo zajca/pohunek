@@ -138,11 +138,22 @@ proxy compatibility; `POHUNEK_NODE_BIN` overrides a nonstandard Node path.
 A protocol change is not done until `cargo xtask ts check` passes; regenerate
 with `cargo xtask ts generate`.
 
-Useful narrower loops (nextest profiles live in `.config/nextest.toml`):
+Useful narrower loops (nextest >= 0.9.115; profiles in `.config/nextest.toml`,
+shard helper requires Python >= 3.11). CI runs four fast matrix shards and one
+heavy job independently of lint/release jobs. The cost boundary is
+`profile.fast.default-filter`; update it when adding a PTY, DB, Hermes, or other
+costly fixture. The helper takes its exact complement for heavy and verifies
+all discovered tests, including ignored ones, are assigned exactly once. Heavy
+and full-suite runs need the worker binary and disposable PostgreSQL URL;
+`cargo t`/`cargo ti` do not. `cargo tw` remains unfiltered at four test processes.
+Do not treat a warm local timing as proof of the two-minute/90%-of-changes CI
+target; retain per-shard JUnit evidence and measure compilation separately.
 
 ```bash
-cargo t                                       # unit loop: --lib, workspace
-cargo t -p pohunek-gui-core                   # one crate (alias takes -p)
+cargo t                                       # cost-filtered fast unit + integration loop
+cargo t -p pohunek-gui-core                   # fast tests in one crate (alias takes -p)
+python3 scripts/test-partitions run cli       # exact CI shard: unit/daemon/relay/cli/heavy
+python3 scripts/test-partitions check         # exhaustive, disjoint nextest inventory check
 cargo nextest run --profile local -p pohunek-cli some_test_name  # one test
 cargo clippy -p pohunek-daemon --all-targets  # lint one crate
 ```

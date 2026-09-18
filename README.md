@@ -793,11 +793,35 @@ cargo xtask docs check          # knowledge bundle: schema/drift/secrets/runbook
 Routine loops (cargo-nextest profiles live in `.config/nextest.toml`):
 
 ```bash
-cargo t                        # unit loop: --lib across the workspace
-cargo t -p pohunek-gui-core    # one crate
-cargo ti                       # daemon/client/session-worker surface
-cargo tw                       # full suite, as CI runs it
+cargo t                        # all fast unit + integration tests, no PTY/DB fixtures
+cargo t -p pohunek-gui-core     # fast tests in one crate
+cargo ti                       # fast daemon/client/session-worker surface
+cargo tw                       # unfiltered full suite, four test processes
+python3 scripts/test-partitions run cli    # exact CI shard (unit/daemon/relay/cli/heavy)
+python3 scripts/test-partitions check      # verify all tests belong to exactly one shard
 ```
+
+Requires cargo-nextest >= 0.9.115 (profile inheritance) and Python >= 3.11
+for the shard helper. `profile.fast.default-filter` is the cost boundary;
+`scripts/test-partitions` subdivides it by package ownership, with an exact
+complement for heavy tests. Whole fixture-owning modules stay heavy: real
+PTY/worker lifecycle, PostgreSQL, Hermes subprocess suites, GUI daemon loopback,
+and nested Cargo integration checks. Fast includes short filesystem, mock-socket,
+and CLI integration tests; `--lib` alone is **not** a cost boundary.
+
+CI runs four fast matrix shards and a separate heavy job without waiting for
+Clippy or release builds. Heavy uses four test processes, the real worker binary,
+and `POHUNEK_RELAY_TEST_DATABASE_URL` pointing at a disposable PostgreSQL fixture.
+The full `ci`/`local` profiles remain unfiltered. Existing ignored tests retain
+their opt-in status. Each CI shard uploads a uniquely named JUnit artifact;
+sequential local fast shards overwrite `target/nextest/ci/junit.xml`, while heavy
+writes `target/nextest/heavy/junit.xml`.
+
+The target is fast feedback in about two minutes for routine changes, not a
+promise for cold builds or the complete required CI suite. Review JUnit execution
+times separately from compile/setup time; validating the 90%-of-changes target
+requires representative CI history. When adding a costly fixture, update the
+cost filter, run the partition coverage check, and measure the fast loop again.
 
 Web workspace:
 

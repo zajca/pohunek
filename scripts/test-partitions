@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Run disjoint nextest cost shards and verify coverage using nextest itself."""
+
+import argparse
+import collections
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tomllib
+
+ROOT = Path(__file__).resolve().parents[1]
+# Package ownership partitions the fast set. The complement catches new crates
+# and targets automatically; fixture ownership is in profile.fast's filter.
+DAEMON = "package(=pohunek-daemon) or package(=pohunek-session-worker) or package(=pohunek-client)"
+RELAY = "package(=pohunek-relay) or package(=pohunek-relay-client) or package(=pohunek-relay-protocol)"
+CLI = "package(=pohunek-cli)"
+SHARDS = ("unit", "daemon", "relay", "cli", "heavy")
+
+
+def filters():
+    with (ROOT / ".config/nextest.toml").open("rb") as config:
+        fast = tomllib.load(config)["profile"]["fast"]["default-filter"]
+    owners = {"daemon": DAEMON, "relay": RELAY, "cli": CLI}
+    owners["unit"] = f"not (({DAEMON}) or ({RELAY}) or ({CLI}))"
+    return {
+        **{name: f"({fast}) and ({owner})" for name, owner in owners.items()},
+        "heavy": f"not ({fast})",
+    }
+
+
+def selected_tests(document):
+    return {
+        (binary_id, name)
+        for binary_id, suite in document["rust-suites"].items()
+        for name, test in suite["testcases"].items()
+        if test["filter-match"]["status"] == "matches"
+    }
+
+
+def validate_coverage(universe, selections):
+    if not universe:
+        raise ValueError("empty workspace test inventory")
+    if set(selections) != set(SHARDS):
+        raise ValueError("unexpected shard names")
+    empty = [name for name, tests in selections.items() if not tests]
+    counts = collections.Counter(test for tests in selections.values() for test in tests)
+    missing = universe - counts.keys()
+    extra = counts.keys() - universe
+    overlap = {test for test, count in counts.items() if count != 1}
+    if empty or missing or extra or overlap:
+        raise ValueError(
+            f"partition coverage failed: empty={empty}, missing={sorted(missing)}, "
+            f"extra={sorted(extra)}, overlap={sorted(overlap)}"
+        )
+
+
+def inventory(expression=None):
+    command = [
+        "cargo", "nextest", "list", "--profile", "ci", "--workspace",
+        "--all-features", "--run-ignored", "all", "--message-format", "json",
+    ]
+    if expression is not None:
+        command.extend(["-E", expression])
+    result = subprocess.run(command, cwd=ROOT, check=True, stdout=subprocess.PIPE)
+    return selected_tests(json.loads(result.stdout))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("run", "check", "filter"))
+    parser.add_argument("shard", nargs="?", choices=SHARDS)
+    args = parser.parse_args()
+    expressions = filters()
+    if args.action == "check":
+        if args.shard is not None:
+            parser.error("check verifies all shards; do not specify one")
+        universe = inventory()
+        selections = {name: inventory(expressions[name]) for name in SHARDS}
+        validate_coverage(universe, selections)
+        for name, tests in selections.items():
+            print(f"{name}: {len(tests)} tests")
+        print(f"Coverage OK: {len(universe)} tests selected exactly once (including ignored tests)")
+        return
+    if args.shard is None:
+        parser.error("run and filter require a shard")
+    if args.action == "filter":
+        print(expressions[args.shard])
+        return
+    profile = "heavy" if args.shard == "heavy" else "ci"
+    # CI uploads each job's report under its shard name. Local fast shard runs
+    # share the ci report path; copy it before starting the next run if needed.
+    command = [
+        "cargo", "nextest", "run", "--profile", profile, "--workspace",
+        "--all-features", "-E", expressions[args.shard],
+    ]
+    sys.exit(subprocess.run(command, cwd=ROOT, check=False).returncode)
+
+
+if __name__ == "__main__":
+    main()
