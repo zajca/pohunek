@@ -99,10 +99,11 @@ cargo xtask docs check                                   # schema/drift/source-m
 cargo xtask hermes compatibility --pohunek-bin ABS       # pinned, model-free Hermes CLI/golden gate
 ```
 
-Shared platform contracts also run natively on Apple Silicon and Intel macOS
-CI with `MACOSX_DEPLOYMENT_TARGET=14.0`. This gate covers the portable library,
-not complete macOS host support; the ordered release scope is tracked by
-`docs/design/macos-support-rfc.md` and issues #96-#105.
+Shared platform contracts also run natively on Apple Silicon macOS CI with
+`MACOSX_DEPLOYMENT_TARGET=14.0`. Intel Macs are outside the current release
+scope. This gate covers the portable library, not complete macOS host support;
+the ordered release scope is tracked by `docs/design/macos-support-rfc.md` and
+issues #96-#105.
 
 Web workspace gates:
 

@@ -11,11 +11,13 @@ complete release includes the CLI, daemon, independent session workers, native
 Iced GUI, retained owner WebUI, Codex, Claude Code, the pinned Hermes runtime,
 and direct communication with Linux hosts over a configured overlay.
 
-The release targets native `aarch64-apple-darwin` and
-`x86_64-apple-darwin` artifacts without a Rosetta dependency. The proposed
-minimum is macOS 14.0. CI pins `MACOSX_DEPLOYMENT_TARGET=14.0`; this compile-time
-floor is not a substitute for the native minimum-OS acceptance gate in #105.
-Supported current versions must also be named and tested at release time.
+The release targets native `aarch64-apple-darwin` artifacts without a Rosetta
+dependency. Intel Macs and `x86_64-apple-darwin` artifacts are outside the
+current release scope; adding them requires a separate accepted scope and native
+acceptance evidence. The proposed minimum is macOS 14.0. CI pins
+`MACOSX_DEPLOYMENT_TARGET=14.0`; this compile-time floor is not a substitute for
+the native minimum-OS acceptance gate in #105. Supported current versions must
+also be named and tested at release time.
 
 Production services run as the logged-in owner through launchd user agents.
 Closing a terminal or locking the screen does not stop workers. Logout may end
@@ -126,9 +128,9 @@ Linux theme-detection features are Linux-only while the portable renderer stays
 available. File locking still uses reviewed OS primitives rather than a new
 cross-platform locking dependency.
 
-Native shared-contract CI runs on pinned Apple Silicon and Intel macOS runner
-labels, verifies `uname -m`, uses the locked graph, treats warnings as errors,
-and compiles/tests `pohunek-platform` with the macOS 14 deployment target. Full
+Native shared-contract CI runs on a pinned Apple Silicon macOS runner label,
+verifies `uname -m`, uses the locked graph, treats warnings as errors, and
+compiles/tests `pohunek-platform` with the macOS 14 deployment target. Full
 application and release gates are added with their real native backends; shared
 contract CI must not masquerade as complete host support.
 
@@ -147,7 +149,7 @@ contract CI must not masquerade as complete host support.
 9. #103 validates owner WebUI and direct-overlay workflows.
 10. #104 ships native installation, upgrades, signing, and notarized artifacts.
 11. #105 closes the release with native durability, security, minimum/current
-    OS, cross-architecture, and cross-stack acceptance.
+    OS, and cross-stack acceptance on Apple Silicon.
 
 These are engineering milestones within one complete release scope. No
 intermediate merge advertises partial macOS support as a reduced product.

@@ -66,17 +66,17 @@ none of its runtime features are shipped yet.
 ### Track M — Complete macOS host and client support
 
 The [accepted macOS RFC](design/macos-support-rfc.md) defines one complete
-release scope: native Apple Silicon and Intel hosts and clients, macOS 14.0
-minimum target, launchd-owned durable workers, real PTYs and agent integrations,
-native GUI, retained owner WebUI, direct overlay operation, installation,
-signing, and cross-stack acceptance.
+release scope: native Apple Silicon hosts and clients, macOS 14.0 minimum
+target, launchd-owned durable workers, real PTYs and agent integrations, native
+GUI, retained owner WebUI, direct overlay operation, installation, signing, and
+cross-stack acceptance. Intel Macs are outside this release scope.
 
 The shared platform foundation in #95 is complete: `crates/platform` owns
 portable process, peer, and supervisor contracts; shipped Linux consumers use
 the extracted implementations; target dependency graphs separate systemd,
 Secret Service, Keychain, and Linux-only Iced features; and native Darwin
-contract CI runs on both architectures. This does **not** advertise working
-macOS applications.
+contract CI runs on Apple Silicon. This does **not** advertise working macOS
+applications.
 
 Delivery remains ordered as #96 secure runtime/filesystem, #97 process/exit,
 #98 peer/agent identity, #99 PTY/attach, #100 launchd, #101 observation and

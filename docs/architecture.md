@@ -287,11 +287,11 @@ and retire operations. Linux implements that contract through systemd without
 exposing unit names, D-Bus paths, or raw `MainPID` semantics to session code.
 Worker readiness and authority still come from the private worker handshake.
 
-The shared contract crate compiles and tests natively on Apple Silicon and
-Intel Darwin with a macOS 14 deployment target. This is foundation evidence,
-not a claim that macOS host support ships: secure paths, native process and peer
-inspection, portable PTY I/O, launchd, clients, packaging, and full acceptance
-remain ordered work in #96-#105.
+The shared contract crate compiles and tests natively on Apple Silicon Darwin
+with a macOS 14 deployment target. Intel Macs are outside the current release
+scope. This is foundation evidence, not a claim that macOS host support ships:
+secure paths, native process and peer inspection, portable PTY I/O, launchd,
+clients, packaging, and full acceptance remain ordered work in #96-#105.
 
 The host daemon is the local control plane for one machine, written in Rust.
 
