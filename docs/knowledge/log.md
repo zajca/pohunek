@@ -11,10 +11,11 @@
   `--json` as one envelope carrying the skill text and its `content_sha256`;
   the command is fully local and the global `--host` flag is accepted and
   ignored.
-- Documented the accepted complete macOS host/client contract and ordered
-  #95-#105 delivery. Recorded the shipped shared-platform/Linux migration and
-  native Darwin contract CI while keeping full macOS support explicitly
-  unshipped until native release acceptance closes.
+- Documented the accepted complete macOS host/client contract and GitHub-owned
+  #94-#105 delivery tracking through the issue hierarchy, milestone, and
+  Project. Recorded the shipped shared-platform/Linux migration and native
+  Darwin contract CI while keeping full macOS support explicitly unshipped
+  until native release acceptance closes.
 - Documented the implemented reduced relay foundation: PostgreSQL fencing and
   recovery, protected initial Owner/service-account provisioning, generic OIDC
   browser and device authentication, bounded HTTPS account and credential

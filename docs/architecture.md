@@ -11,8 +11,10 @@ this document wins. Detailed relay decisions are authoritative in the
 [accepted team-relay RFC](design/team-relay-control-plane-rfc.md), tracked by
 [#56](https://github.com/zajca/pohunek/issues/56).
 The accepted complete macOS contract lives in the
-[macOS support RFC](design/macos-support-rfc.md), tracked by
-[#94](https://github.com/zajca/pohunek/issues/94).
+[macOS support RFC](design/macos-support-rfc.md). Its delivery source of truth is
+the issue hierarchy rooted at [#94](https://github.com/zajca/pohunek/issues/94),
+the [`Complete macOS support` milestone](https://github.com/zajca/pohunek/milestone/2),
+and the [macOS project](https://github.com/users/zajca/projects/4).
 
 Pohunek has two explicit trust domains:
 

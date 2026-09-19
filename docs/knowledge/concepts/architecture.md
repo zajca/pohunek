@@ -46,7 +46,9 @@ macOS host or client support is available. Intel Macs are outside the current
 release scope. Secure runtime paths, Darwin process and peer inspection,
 portable PTY readiness, launchd, client and WebUI integration, signed artifacts,
 and native acceptance remain explicitly deferred through issues #96-#105 under
-the accepted macOS RFC.
+the `Complete macOS support` milestone and macOS Project. The issue hierarchy,
+milestone, and Project own delivery scope, sequencing, and status; the accepted
+macOS RFC records design constraints rather than live tracking state.
 
 ## Owner paths and the accepted relay direction
 

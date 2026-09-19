@@ -3,6 +3,18 @@
 Status: accepted product contract; platform foundation implemented by #95;
 complete macOS support remains deferred through #96-#105.
 
+## Tracking authority
+
+This RFC records accepted product and architecture constraints. It is not the
+delivery tracker. The issue hierarchy rooted at
+[#94](https://github.com/zajca/pohunek/issues/94), the
+[`Complete macOS support` milestone](https://github.com/zajca/pohunek/milestone/2),
+and the [macOS project](https://github.com/users/zajca/projects/4) are the source
+of truth for implementation scope, dependencies, sequencing, and status. When
+tracking data differs from this document, GitHub tracking wins; changes to the
+product or architecture contract still require this RFC and canonical docs to
+be updated.
+
 ## Outcome and support contract
 
 Pohunek will support a Mac as a first-class owner host and client without
@@ -134,25 +146,14 @@ compiles/tests `pohunek-platform` with the macOS 14 deployment target. Full
 application and release gates are added with their real native backends; shared
 contract CI must not masquerade as complete host support.
 
-## Ordered delivery
+## Delivery model
 
-1. #95 defines shared contracts, migrates Linux behavior, isolates target
-   dependencies, and establishes native Darwin library CI.
-2. #96 adds secure macOS runtime paths and portable durable filesystem
-   operations.
-3. #97 implements native process inspection and race-safe exit observation.
-4. #98 preserves trusted Unix peer and agent identity.
-5. #99 makes worker PTY I/O and attach behavior portable.
-6. #100 adds launchd supervision for independent durable workers.
-7. #101 ports transcript observation and agent integration lifecycles.
-8. #102 adds CLI setup, desktop integrations, and actionable diagnostics.
-9. #103 validates owner WebUI and direct-overlay workflows.
-10. #104 ships native installation, upgrades, signing, and notarized artifacts.
-11. #105 closes the release with native durability, security, minimum/current
-    OS, and cross-stack acceptance on Apple Silicon.
-
-These are engineering milestones within one complete release scope. No
-intermediate merge advertises partial macOS support as a reduced product.
+The GitHub tracker orders the work from the completed shared platform foundation
+through secure paths, native process and peer identity, PTY portability,
+launchd, integrations, clients, distribution, and final native acceptance.
+These are work items within one complete release scope. No intermediate merge
+advertises partial macOS support as a reduced product, and #105 remains the
+release closure gate.
 
 ## Release acceptance
 

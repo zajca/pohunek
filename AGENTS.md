@@ -102,8 +102,11 @@ cargo xtask hermes compatibility --pohunek-bin ABS       # pinned, model-free He
 Shared platform contracts also run natively on Apple Silicon macOS CI with
 `MACOSX_DEPLOYMENT_TARGET=14.0`. Intel Macs are outside the current release
 scope. This gate covers the portable library, not complete macOS host support;
-the ordered release scope is tracked by `docs/design/macos-support-rfc.md` and
-issues #96-#105.
+delivery scope, order, and status are tracked by the
+[`Complete macOS support` milestone](https://github.com/zajca/pohunek/milestone/2),
+the [macOS project](https://github.com/users/zajca/projects/4), and the issue
+hierarchy rooted at #94. `docs/design/macos-support-rfc.md` records design
+constraints and rationale, not live delivery state.
 
 Web workspace gates:
 
