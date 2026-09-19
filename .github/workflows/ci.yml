@@ -7,6 +7,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  # Weekly sweep to catch regressions in jobs that are path-filtered out on
+  # normal PRs (issue #125). Runs at 05:00 UTC every Monday; `pull_request_target`
+  # is intentionally avoided to keep the default pull-request provenance model.
+  schedule:
+    - cron: '0 5 * * 1'
+
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
@@ -32,6 +39,10 @@ env:
 jobs:
   platform-contracts:
     name: platform contracts (${{ matrix.arch }})
+    # macOS runners are costly (issue #125): run only on schedule, push to main,
+    # or when platform/platform-graph inputs change via the paths filter.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || needs.changes.outputs.macos == 'true' }}
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
@@ -153,10 +164,12 @@ jobs:
           path: target/nextest/ci/junit.xml
           if-no-files-found: warn
 
-  # Determine which CI jobs the changed files require. Only the relay
-  # PostgreSQL fixture job is currently gated; everything else runs on every
-  # PR. The workflow file itself forces a relay run so filter edits are
-  # always validated.
+    # Determine which CI jobs the changed files require. Heavy non-default jobs
+  # (feature-powerset, unused-deps, macOS contracts, Hermes compatibility, and
+  # TS-binding drift) only run when their inputs change or on a schedule; the
+  # always-critical jobs (fmt, clippy, fast tests, heavy tests, release build,
+  # docs check, relay DB) still run on every push and PR. The workflow file
+  # itself forces a relay run so filter edits are always validated.
   changes:
     name: required jobs (paths filter)
     runs-on: ubuntu-latest
@@ -164,6 +177,11 @@ jobs:
       pull-requests: read
     outputs:
       relay: ${{ steps.filter.outputs.relay }}
+      feature_matrix: ${{ steps.filter.outputs.feature_matrix }}
+      udeps: ${{ steps.filter.outputs.udeps }}
+      macos: ${{ steps.filter.outputs.macos }}
+      hermes: ${{ steps.filter.outputs.hermes }}
+      docs_ts: ${{ steps.filter.outputs.docs_ts }}
     steps:
       # Push events (after merge to main) resolve the filter with git commands
       # against the previous commit, which needs more than a depth-1 checkout.
@@ -179,6 +197,52 @@ jobs:
               - 'crates/relay-client/**'
               - 'crates/relay-protocol/**'
               - 'crates/relay/migrations/**'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+            # cargo-hack feature-powerset is expensive (issue #125): run only
+            # on schedule or when the dependency graph or feature set changes.
+            feature_matrix:
+              - 'Cargo.toml'
+              - 'crates/**/Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+            # cargo-udeps needs the nightly toolchain and a full workspace
+            # dependency resolution (issue #125): schedule-only plus Cargo.toml,
+            # Cargo.lock changes, the workflow file, and the xtask inputs that
+            # configure the unused-dependency scan.
+            udeps:
+              - 'Cargo.toml'
+              - 'crates/**/Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+              - 'crates/xtask/src/checks.rs'
+              - 'crates/xtask/src/lib.rs'
+            # macOS platform contracts run on two runners (arm64 + x86_64)
+            # (issue #125): gate on the portable platform crate and the
+            # cross-platform dependency graph.
+            macos:
+              - 'crates/platform/**'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+            # Pinned Hermes compatibility provisioning + runtime check
+            # (issue #125): gate on the locked runtime metadata, the pinned
+            # CLI integration surface, the provisioner, and the xtask
+            # drivers that consume them.
+            hermes:
+              - 'compat/hermes/**'
+              - 'crates/cli/Cargo.toml'
+              - 'crates/cli/src/hermes_integration/**'
+              - 'crates/xtask/Cargo.toml'
+              - 'crates/xtask/src/hermes*.rs'
+              - 'scripts/provision-hermes-compat'
+              - '.github/workflows/ci.yml'
+            # Generated TS binding drift lives under a schedule or when the
+            # protocol surface or generation driver changes (issue #125).
+            docs_ts:
+              - 'crates/protocol/**'
+              - 'crates/xtask/src/ts.rs'
+              - 'crates/xtask/src/lib.rs'
+              - 'web/shared/src/generated/**'
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
 
@@ -322,9 +386,14 @@ jobs:
       - name: Release build
         run: cargo build --workspace --release
 
-  docs:
-    name: docs check (schema + drift + source-map + runbooks + secrets + release extras)
+  # TS-binding drift is gated by paths filter (issue #125); it only runs on
+  # schedule, push to main, or when the protocol/generation inputs change.
+  # It is kept as its own job so `docs check` always runs every PR.
+  ts-drift:
+    name: TS binding drift (xs check)
     runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || needs.changes.outputs.docs_ts == 'true' }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -346,11 +415,6 @@ jobs:
         with:
           shared-key: ci-
 
-      - name: docs check
-        run: cargo xtask docs check
-        env:
-          RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
-
       - name: TS binding drift
         run: cargo xtask ts check
         env:
@@ -359,11 +423,12 @@ jobs:
   hermes-compatibility:
     name: pinned Hermes compatibility (model-free)
     runs-on: ubuntu-latest
+    needs: [build-bins, changes]
+    if: ${{ needs.build-bins.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || needs.changes.outputs.hermes == 'true') }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
-    needs: build-bins
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -380,6 +445,16 @@ jobs:
         with:
           version: "0.9.28"
           enable-cache: true
+
+      # Cache the provisioned pinned Hermes runtime. The lock file is the
+      # only input that drives provisioning (see scripts/provision-hermes-compat);
+      # uv itself is already cached via `enable-cache` above, so this is just the
+      # resolved venv. Key on the lock + workflow so filter edits refresh it.
+      - name: Cache Hermes runtime
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/hermes-compat-cache
+          key: hermes-runtime-${{ runner.os }}-${{ hashFiles('compat/hermes/compatibility-lock.json') }}-${{ hashFiles('.github/workflows/ci.yml') }}
 
       # The compatibility gate itself is driven by `cargo xtask`, which is built
       # from source in this job, so a toolchain is still required here.
@@ -405,8 +480,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          hermes_bin="$(scripts/provision-hermes-compat "$RUNNER_TEMP/hermes-compat")"
+          cache_dir="${{ runner.temp }}/hermes-compat-cache"
+          install_dir="$RUNNER_TEMP/hermes-compat"
+          if [[ -d "$cache_dir" ]]; then
+            # Cache hit: restore the previously provisioned runtime.
+            rm -rf "$install_dir"
+            cp -a "$cache_dir" "$install_dir"
+            hermes_bin="$install_dir/bin/hermes"
+          else
+            hermes_bin="$(scripts/provision-hermes-compat "$install_dir")"
+            cp -a "$install_dir" "$cache_dir" 2>/dev/null || true
+          fi
           printf 'bin=%s\n' "$hermes_bin" >> "$GITHUB_OUTPUT"
+
+      - name: Persist Hermes runtime cache
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/hermes-compat-cache
+          key: hermes-runtime-${{ runner.os }}-${{ hashFiles('compat/hermes/compatibility-lock.json') }}-${{ hashFiles('.github/workflows/ci.yml') }}
 
       - name: Download built CLI
         uses: actions/download-artifact@v4
@@ -576,9 +668,32 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  docs:
+    name: docs check (schema + drift + source-map + runbooks + secrets + release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: docs
+
+      - name: docs check
+        run: cargo xtask docs check
+        env:
+          RUSTFLAGS: -D warnings
+
   feature-matrix:
     name: cargo-hack (feature powerset)
     runs-on: ubuntu-latest
+    # Expensive (issue #125): run only on schedule, push to main, or when the
+    # dependency graph / feature set / CI workflow changes.
+    needs: changes
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || needs.changes.outputs.feature_matrix == 'true' }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -614,6 +729,10 @@ jobs:
   udeps:
     name: cargo-udeps (unused dependencies)
     runs-on: ubuntu-latest
+    # Needs the nightly toolchain + full workspace resolution (issue #125):
+    # schedule-only, push to main, or when Cargo.toml / Cargo.lock / CI change.
+    needs: changes
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || needs.changes.outputs.udeps == 'true' }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
