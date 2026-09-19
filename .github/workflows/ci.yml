@@ -224,8 +224,12 @@ jobs:
               - 'crates/xtask/src/lib.rs'
             # macOS platform contracts run on two runners (arm64 + x86_64)
             # (issue #125): gate on the portable platform crate and the
-            # cross-platform dependency graph.
+            # cross-platform dependency graph. The root manifest is included
+            # because the platform crate inherits workspace package, dependency
+            # and lint settings from it — a workspace-level change can break
+            # only the macOS build without touching Cargo.lock.
             macos:
+              - 'Cargo.toml'
               - 'crates/platform/**'
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
@@ -235,13 +239,19 @@ jobs:
             # hermes_integration module), the xtask tree (its lib.rs owns the
             # `TopCommand::Hermes` dispatch that drives the harness), the
             # provisioner and its test, and the dependency graph the pinned
-            # run links against (portable-pty, vt100, clap, ...).
+            # run links against (portable-pty, vt100, clap, ...). The paths
+            # and protocol crates are included because `pohunek integration`
+            # resolves its install home via `pohunek_paths::state_home()` and
+            # negotiates via `pohunek_protocol` types
+            # (`SUPPORTED_PROTOCOL_VERSIONS`, `IntegrationRecovery`).
             hermes:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'compat/hermes/**'
               - 'crates/cli/Cargo.toml'
               - 'crates/cli/src/**'
+              - 'crates/paths/**'
+              - 'crates/protocol/**'
               - 'crates/xtask/Cargo.toml'
               - 'crates/xtask/src/**'
               - 'scripts/provision-hermes-compat'
