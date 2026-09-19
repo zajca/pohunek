@@ -200,21 +200,26 @@ jobs:
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
             # cargo-hack feature-powerset is expensive (issue #125): run only
-            # on schedule or when the dependency graph or feature set changes.
+            # on schedule or when the dependency graph, feature set, or any
+            # workspace Rust source changes — the powerset compiles feature
+            # branches of source code, not just manifests.
             feature_matrix:
               - 'Cargo.toml'
               - 'crates/**/Cargo.toml'
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
+              - 'crates/**/*.rs'
             # cargo-udeps needs the nightly toolchain and a full workspace
             # dependency resolution (issue #125): schedule-only plus Cargo.toml,
-            # Cargo.lock changes, the workflow file, and the xtask inputs that
-            # configure the unused-dependency scan.
+            # Cargo.lock changes, the workflow file, workspace Rust sources (an
+            # unused dependency usually appears by deleting its last use), and
+            # the xtask inputs that configure the unused-dependency scan.
             udeps:
               - 'Cargo.toml'
               - 'crates/**/Cargo.toml'
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
+              - 'crates/**/*.rs'
               - 'crates/xtask/src/checks.rs'
               - 'crates/xtask/src/lib.rs'
             # macOS platform contracts run on two runners (arm64 + x86_64)
@@ -225,16 +230,18 @@ jobs:
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
             # Pinned Hermes compatibility provisioning + runtime check
-            # (issue #125): gate on the locked runtime metadata, the pinned
-            # CLI integration surface, the provisioner, and the xtask
-            # drivers that consume them.
+            # (issue #125): gate on the locked runtime metadata, the full CLI
+            # surface (the gate drives the CLI parser/dispatch, not just the
+            # hermes_integration module), the provisioner and its test, and the
+            # xtask drivers that consume them.
             hermes:
               - 'compat/hermes/**'
               - 'crates/cli/Cargo.toml'
-              - 'crates/cli/src/hermes_integration/**'
+              - 'crates/cli/src/**'
               - 'crates/xtask/Cargo.toml'
               - 'crates/xtask/src/hermes*.rs'
               - 'scripts/provision-hermes-compat'
+              - 'scripts/tests/provision-hermes-compat.sh'
               - '.github/workflows/ci.yml'
             # Generated TS binding drift lives under a schedule or when the
             # protocol surface or generation driver changes (issue #125).
@@ -446,15 +453,21 @@ jobs:
           version: "0.9.28"
           enable-cache: true
 
-      # Cache the provisioned pinned Hermes runtime. The lock file is the
-      # only input that drives provisioning (see scripts/provision-hermes-compat);
-      # uv itself is already cached via `enable-cache` above, so this is just the
-      # resolved venv. Key on the lock + workflow so filter edits refresh it.
+      # Cache the provisioned pinned Hermes runtime. Inputs that drive
+      # provisioning: the lock file, the provisioner script, its test, and the
+      # workflow itself (see scripts/provision-hermes-compat); uv itself is
+      # already cached via `enable-cache` above, so this is just the resolved
+      # venv. Key on all of them so a provisioner change re-provisions.
       - name: Cache Hermes runtime
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/hermes-compat-cache
-          key: hermes-runtime-${{ runner.os }}-${{ hashFiles('compat/hermes/compatibility-lock.json') }}-${{ hashFiles('.github/workflows/ci.yml') }}
+          key: >-
+            hermes-runtime-${{ runner.os }}-
+            ${{ hashFiles('compat/hermes/compatibility-lock.json') }}-
+            ${{ hashFiles('scripts/provision-hermes-compat') }}-
+            ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
+            ${{ hashFiles('.github/workflows/ci.yml') }}
 
       # The compatibility gate itself is driven by `cargo xtask`, which is built
       # from source in this job, so a toolchain is still required here.
@@ -483,14 +496,18 @@ jobs:
           cache_dir="${{ runner.temp }}/hermes-compat-cache"
           install_dir="$RUNNER_TEMP/hermes-compat"
           if [[ -d "$cache_dir" ]]; then
-            # Cache hit: restore the previously provisioned runtime.
+            # Cache hit: restore the previously provisioned runtime. The
+            # provisioner emits the executable at `venv/bin/hermes` inside the
+            # install root; fail closed if the restored cache lacks it.
             rm -rf "$install_dir"
             cp -a "$cache_dir" "$install_dir"
-            hermes_bin="$install_dir/bin/hermes"
+            hermes_bin="$install_dir/venv/bin/hermes"
           else
             hermes_bin="$(scripts/provision-hermes-compat "$install_dir")"
             cp -a "$install_dir" "$cache_dir" 2>/dev/null || true
           fi
+          [[ -f "$hermes_bin" && -x "$hermes_bin" ]] \
+            || { echo "provisioned Hermes executable missing at $hermes_bin" >&2; exit 1; }
           printf 'bin=%s\n' "$hermes_bin" >> "$GITHUB_OUTPUT"
 
       - name: Persist Hermes runtime cache
@@ -498,7 +515,12 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/hermes-compat-cache
-          key: hermes-runtime-${{ runner.os }}-${{ hashFiles('compat/hermes/compatibility-lock.json') }}-${{ hashFiles('.github/workflows/ci.yml') }}
+          key: >-
+            hermes-runtime-${{ runner.os }}-
+            ${{ hashFiles('compat/hermes/compatibility-lock.json') }}-
+            ${{ hashFiles('scripts/provision-hermes-compat') }}-
+            ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
+            ${{ hashFiles('.github/workflows/ci.yml') }}
 
       - name: Download built CLI
         uses: actions/download-artifact@v4
