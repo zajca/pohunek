@@ -109,6 +109,14 @@ canonical_home=""
 if [[ -n "${HOME:-}" ]]; then
   canonical_home="$(canonicalize "$HOME" || true)"
 fi
+TARGET_ROOT="$canonical_root"
+
+# A missing root (fresh checkout, after `cargo clean`) is a clean no-op: there
+# is nothing to delete and nothing to verify.
+if [[ ! -d "$TARGET_ROOT" ]]; then
+  echo "target directory $TARGET_ROOT does not exist; nothing to sweep."
+  exit 0
+fi
 
 # Destructive guard: the sweep runs `rm -rf` below this root, so refuse
 # anything that is not recognisably a Cargo target directory. A typo such as
@@ -131,21 +139,33 @@ if [[ ! -e "$canonical_root/CACHEDIR.TAG" && ! -e "$canonical_root/.rustc_info.j
   echo "(missing CACHEDIR.TAG and .rustc_info.json sentinel)." >&2
   exit 1
 fi
-TARGET_ROOT="$canonical_root"
 
 # Directories the workspace itself owns: the default profiles, the
 # nextest/doc scratch areas, the manual eval transcripts (which may be
 # irreproducible), and standard Cargo outputs.
 KEEP=("debug" "release" "nextest" "tmp" "pohunek-docs" "pohunek-eval" "doc" "package")
-if [[ ! -d "$TARGET_ROOT" ]]; then
-  echo "target directory $TARGET_ROOT does not exist; nothing to sweep."
-  exit 0
-fi
 
-# True for cross-compile triple output (e.g. x86_64-unknown-linux-gnu),
-# which Cargo owns and the sweep must keep.
+# True for cross-compile triple output (e.g. x86_64-unknown-linux-gnu,
+# aarch64-apple-darwin, wasm32-wasip1), which Cargo owns and the sweep must
+# keep. The authoritative list comes from `rustc --print target-list`; the
+# token heuristic is additive, so it also covers custom JSON targets and
+# environments without rustc (skipping a candidate is safe, deleting it is not).
+KNOWN_TRIPLES=""
+load_known_triples() {
+  if [[ -n "$KNOWN_TRIPLES" ]]; then
+    return 0
+  fi
+  if command -v rustc >/dev/null 2>&1; then
+    KNOWN_TRIPLES="$(rustc --print target-list 2>/dev/null || true)"
+  fi
+}
 is_triple_dir() {
-  [[ "$1" =~ ^[a-z0-9_]+-unknown-.* ]]
+  local name="$1"
+  load_known_triples
+  if [[ -n "$KNOWN_TRIPLES" ]] && grep -qxF "$name" <<<"$KNOWN_TRIPLES"; then
+    return 0
+  fi
+  [[ "$name" =~ ^[a-z0-9_]+-.*(apple|darwin|pc|windows|wasm|wasi|unknown|linux|gnu|musl).*$ ]]
 }
 
 # True when the entry has the shape of a Cargo target directory: profile

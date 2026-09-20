@@ -102,6 +102,12 @@ Web control center client:
 - `web/frontend/src/lib/agent-presentation.ts`
 - `web/frontend/src/components/NewSessionDialog.svelte`
 - `web/scripts/dev.ts`
+- `web/scripts/typecheck.ts` — one-command typecheck: incremental `tsc -b` over
+  the composite source-only project graph (`shared`/`sdk`/`backend`/`testkit`/
+  `client-core`/tools) in `web/tsconfig.json`, then the standalone
+  `frontend`/`release-test` checks and the per-package `test/tsconfig.json`
+  projects; tests stay out of the composite graph because their sibling-package
+  imports resolve to `.ts` sources.
 - `docs/knowledge/guides/web-control-center.md`
 - `docs/design/track-b-web-control-center-plan-2026-07-22.md`
 - `docs/phases/04-browser-control-center.md`
@@ -176,6 +182,15 @@ Release packaging and contributor verification:
   run independently, retaining per-shard JUnit timing evidence. Cold compilation
   is separate from the approximately two-minute fast-feedback target.
 - `scripts/tests/test_partitions.py` — regression checks for coverage validation.
+- `scripts/cargo-sweep-targets` — retention cleanup for per-branch isolated
+  Cargo target dirs (`target/<name>`): canonicalizes and sentinel-verifies the
+  target root, deletes only entries with Cargo target shape whose newest nested
+  mtime exceeds the retention window, and keeps `debug`/`release`/`nextest`/
+  `tmp`/`pohunek-docs`/`pohunek-eval`/`doc`/`package` plus cross-compile
+  triples (`rustc --print target-list`).
+- `scripts/tests/test_cargo_sweep_targets.py` — regression checks for that
+  helper's destructive guards; the CI script-regression step runs
+  `python3 -m unittest discover -s scripts/tests -p 'test_*.py'`.
 - `.github/workflows/ci.yml`
 - `.github/workflows/release.yml`
 - `README.md`

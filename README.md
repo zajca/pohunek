@@ -835,12 +835,16 @@ bun install --frozen-lockfile
 bun run typecheck && bun run lint && bun test
 ```
 
-`bun run typecheck` is one command: `tsc -b` over the composite
+`bun run typecheck` is one command: `tsc -b` over the composite (source-only)
 `shared → sdk → backend/testkit → client-core/tools` graph (incremental via
-`.tsbuildinfo` in each `dist-types/`), then the standalone `frontend`
-(`svelte-check`) and `release-test` checks. Each package also supports
-`tsc -b` on its own (`cd web/sdk && bun run typecheck`).
-Per-package `dist-types/` output is git-ignored.
+`.tsbuildinfo` in each `dist-types/`), then the standalone checks — `frontend`
+(`svelte-check`), `release-test`, and the per-package `test/tsconfig.json`
+projects — run concurrently. Tests stay out of the composite graph because
+their imports of sibling packages resolve to `.ts` sources and would otherwise
+be pulled into non-referenced projects (and form reference cycles). Each
+package also supports `tsc -b` on its own (`cd web/sdk && bun run typecheck`,
+which also typechecks that package's tests). Per-package `dist-types/` output
+is git-ignored.
 
 Stale per-branch Cargo target isolation directories (`target/<name>` shaped
 like a Cargo target dir, untouched for 30+ days) are removed with:

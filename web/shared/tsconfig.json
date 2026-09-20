@@ -4,8 +4,9 @@
     "composite": true,
     "noEmit": false,
     "emitDeclarationOnly": true,
-    "outDir": "dist-types",
+    "declaration": true,
     "rootDir": "src",
+    "outDir": "dist-types",
     "tsBuildInfoFile": "dist-types/tsconfig.tsbuildinfo"
   },
   "include": [

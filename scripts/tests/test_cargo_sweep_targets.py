@@ -74,6 +74,9 @@ class SweepSafetyTests(unittest.TestCase):
             ("doc", {"shape": "debug"}),
             ("package", {"shape": "debug"}),
             ("x86_64-unknown-linux-gnu", {"shape": "debug"}),
+            ("aarch64-apple-darwin", {"shape": "debug"}),
+            ("x86_64-pc-windows-msvc", {"shape": "debug"}),
+            ("wasm32-wasip1", {"shape": "debug"}),
             ("stale-branch", {"shape": "debug"}),
         ])
         with tmp:
@@ -98,6 +101,27 @@ class SweepSafetyTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("skip (not a Cargo target directory)", result.stdout)
             self.assertIn("stale-branch", result.stdout)
+
+    def test_missing_target_dirs_report_nothing_to_sweep(self):
+        # A fresh checkout has no target/ at all: both the default target dir
+        # (repo/target) and an explicitly passed missing dir are clean no-ops,
+        # while the sentinel refusal stays for paths that do exist.
+        script = str(SCRIPT)
+        with tempfile.TemporaryDirectory() as fake_repo:
+            fake_scripts = Path(fake_repo) / "scripts"
+            fake_scripts.mkdir()
+            (fake_scripts / "cargo-sweep-targets").symlink_to(script)
+            missing_default = Path(fake_repo) / "target"
+            self.assertFalse(missing_default.exists())
+            default_run = subprocess.run(
+                ["bash", str(fake_scripts / "cargo-sweep-targets"), "--dry-run"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(default_run.returncode, 0, default_run.stderr)
+            self.assertIn("nothing to sweep", default_run.stdout)
+            explicit_run = run_sweep("--dry-run", target=missing_default)
+            self.assertEqual(explicit_run.returncode, 0, explicit_run.stderr)
+            self.assertIn("nothing to sweep", explicit_run.stdout)
 
     def test_nested_recency_keeps_active_target(self):
         tmp, root = make_target_root([("active-branch", {"shape": "debug"})])

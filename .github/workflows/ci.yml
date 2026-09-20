@@ -151,9 +151,9 @@ jobs:
           shared-key: ci-
       - uses: taiki-e/install-action@cargo-nextest
 
-      - name: Check partition guard regressions
+      - name: Check script regressions
         if: matrix.shard == 'unit'
-        run: python3 -m unittest discover -s scripts/tests -p 'test_partitions.py'
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
       # No dependency on Clippy, PostgreSQL, PTYs, or the release build.
       - name: Run fast shard

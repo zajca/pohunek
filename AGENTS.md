@@ -109,7 +109,7 @@ Web workspace gates:
 ```bash
 cd web
 bun install --frozen-lockfile
-bun run typecheck   # one command: tsc -b composite graph + frontend/release-test
+bun run typecheck   # one command: tsc -b source graph + test/frontend/release checks
 bun run lint
 bun test
 bunx playwright install --with-deps chromium  # prerequisite for browser e2e

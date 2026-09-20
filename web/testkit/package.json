@@ -17,6 +17,6 @@
   },
   "types": "./src/index.ts",
   "scripts": {
-    "typecheck": "tsc -b tsconfig.json"
+    "typecheck": "tsc -b tsconfig.json && tsc --noEmit -p test/tsconfig.json"
   }
 }
