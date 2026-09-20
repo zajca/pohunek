@@ -2435,8 +2435,8 @@ mod tests {
 
     #[test]
     fn absolute_tree_rejects_an_unsafe_application_owned_ancestor() {
-        let (temporary, _trusted) = trusted_root();
-        let ancestor = temporary.path().join("ancestor");
+        let (_temporary, trusted) = trusted_root();
+        let ancestor = trusted.path().join("ancestor");
         let leaf = ancestor.join("leaf");
         fs::create_dir(&ancestor).expect("create ancestor");
         fs::create_dir(&leaf).expect("create leaf");
@@ -2585,14 +2585,14 @@ mod tests {
 
     #[test]
     fn concurrent_no_replace_move_has_exactly_one_winner() {
-        let (temporary, _trusted) = trusted_root();
+        let (temporary, trusted) = trusted_root();
         for (name, bytes) in [("source-a", b"alpha"), ("source-b", b"bravo")] {
             fs::write(temporary.path().join(name), bytes).expect("write competing source");
         }
         let barrier = Arc::new(Barrier::new(2));
         let handles = ["source-a", "source-b"].map(|source| {
             let barrier = Arc::clone(&barrier);
-            let root = temporary.path().to_path_buf();
+            let root = trusted.path().to_path_buf();
             std::thread::spawn(move || {
                 let directory = TrustedDir::open_absolute(&root, DIRECTORY_MODE)
                     .expect("open competing directory descriptor");
