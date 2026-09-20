@@ -387,8 +387,9 @@ impl TrustedDir {
 
     /// Opens or creates and validates an absolute directory without following symlinks.
     ///
-    /// Missing path components are created with `mode`. Existing application-owned
-    /// ancestors must be private; system ancestors must be non-writable or sticky.
+    /// Missing path components and the final directory use exact `mode`. Existing
+    /// effective-user-owned ancestors must not be group/world-writable; system
+    /// ancestors must be non-writable or sticky.
     ///
     /// # Errors
     ///
@@ -1369,6 +1370,9 @@ fn validate_ancestor(
         fs::fstat(file).map_err(|source| io_error("inspect trusted ancestor", path, source))?;
     let mode = stat_mode(&stat);
     let owner = stat_uid(&stat);
+    if owner == system_uid && mode & 0o1000 != 0 {
+        return Ok(());
+    }
     if owner == effective_uid {
         if mode & 0o022 != 0 {
             return Err(FsError::UnsafeMode {
@@ -1379,8 +1383,7 @@ fn validate_ancestor(
         }
         return Ok(());
     }
-    let system_safe = owner == system_uid && (mode & 0o022 == 0 || mode & 0o1000 != 0);
-    if system_safe {
+    if owner == system_uid && mode & 0o022 == 0 {
         return Ok(());
     }
     Err(FsError::UnsafeOwner {
@@ -2890,8 +2893,14 @@ mod tests {
             1,
             "fixture must be foreign-owned"
         );
-        TrustedDir::open_absolute(&foreign, DIRECTORY_MODE)
-            .expect_err("foreign-owned private directory must be rejected");
+        assert!(matches!(
+            TrustedDir::open_absolute(&foreign, DIRECTORY_MODE),
+            Err(FsError::UnsafeOwner {
+                path,
+                actual: 1,
+                expected: 0
+            }) if path == foreign
+        ));
     }
 
     #[test]
