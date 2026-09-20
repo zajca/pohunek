@@ -2387,9 +2387,10 @@ mod tests {
 
     fn trusted_root() -> (tempfile::TempDir, TrustedDir) {
         let temporary = tempfile::tempdir().expect("create temporary directory");
-        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(DIRECTORY_MODE))
+        let canonical_path = fs::canonicalize(temporary.path()).expect("canonicalize test root");
+        fs::set_permissions(&canonical_path, fs::Permissions::from_mode(DIRECTORY_MODE))
             .expect("set temporary directory permissions");
-        let trusted = TrustedDir::open_absolute(temporary.path(), DIRECTORY_MODE)
+        let trusted = TrustedDir::open_absolute(&canonical_path, DIRECTORY_MODE)
             .expect("open trusted temporary directory");
         (temporary, trusted)
     }
@@ -2844,9 +2845,10 @@ mod tests {
     fn apfs_foreign_owned_private_directory_is_rejected() {
         assert_eq!(rustix::process::geteuid().as_raw(), 0, "test requires root");
         let temporary = tempfile::tempdir().expect("create APFS fixture");
-        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(DIRECTORY_MODE))
+        let canonical_path = fs::canonicalize(temporary.path()).expect("canonicalize APFS fixture");
+        fs::set_permissions(&canonical_path, fs::Permissions::from_mode(DIRECTORY_MODE))
             .expect("set fixture mode");
-        let foreign = temporary.path().join("foreign");
+        let foreign = canonical_path.join("foreign");
         fs::create_dir(&foreign).expect("create foreign directory");
         fs::set_permissions(&foreign, fs::Permissions::from_mode(DIRECTORY_MODE))
             .expect("set foreign mode");
