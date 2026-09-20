@@ -15,9 +15,11 @@ on:
     - cron: '0 5 * * 1'
 
 
-# Cancel superseded runs on the same ref to save CI minutes.
+# Cancel superseded runs on the same ref to save CI minutes. The event name is
+# part of the group so a manual (workflow_dispatch) full run never cancels an
+# in-progress push or weekly sweep on the same ref (and vice versa).
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 permissions:
@@ -39,9 +41,10 @@ env:
 jobs:
   platform-contracts:
     name: platform contracts (${{ matrix.arch }})
-    # macOS runners are costly (issue #125): run only on schedule, push to main,
-    # or when platform/platform-graph inputs change via the paths filter.
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || needs.changes.outputs.macos == 'true' }}
+    # macOS runners are costly (issue #125): run only on schedule, push to
+    # main, manual dispatch (always a full run), or when platform inputs
+    # change via the paths filter.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.macos == 'true' }}
     needs: changes
     strategy:
       fail-fast: false
@@ -223,8 +226,10 @@ jobs:
               - 'crates/xtask/src/checks.rs'
               - 'crates/xtask/src/lib.rs'
             # macOS platform contracts run on two runners (arm64 + x86_64)
-            # (issue #125): gate on the portable platform crate and the
-            # cross-platform dependency graph. The root manifest is included
+            # (issue #125): gate on the portable platform crate, the
+            # cross-platform dependency graph, and the Cargo configuration
+            # (.cargo/config.toml carries Apple-specific linker/target flags
+            # that can break only the macOS build). The root manifest is
             # because the platform crate inherits workspace package, dependency
             # and lint settings from it — a workspace-level change can break
             # only the macOS build without touching Cargo.lock.
@@ -232,6 +237,7 @@ jobs:
               - 'Cargo.toml'
               - 'crates/platform/**'
               - 'Cargo.lock'
+              - '.cargo/**'
               - '.github/workflows/ci.yml'
             # Pinned Hermes compatibility provisioning + runtime check
             # (issue #125): gate on the locked runtime metadata, the full CLI
@@ -266,8 +272,8 @@ jobs:
             docs_ts:
               - 'crates/protocol/**'
               - 'crates/relay-protocol/**'
-              - 'crates/xtask/src/ts.rs'
-              - 'crates/xtask/src/lib.rs'
+              - 'crates/xtask/Cargo.toml'
+              - 'crates/xtask/src/**'
               - 'web/shared/src/generated/**'
               - 'web/shared/src/relay-generated/**'
               - 'web/shared/fixtures/**'
@@ -327,11 +333,15 @@ jobs:
 
   # Relay heavy tests are the only PostgreSQL fixture consumers, so they get
   # their own job whose Postgres service only starts when relay-relevant files
-  # changed (issue #121).
+  # changed (issue #121) — except on the weekly sweep and manual dispatch,
+  # which are documented as full runs even when the paths filter is empty.
+  # Push to main stays filtered on purpose: the merged commit's relay files
+  # still trigger the job via fetch-depth-2 detection, while unrelated pushes
+  # never start the Postgres service.
   integration-relay:
     name: tests (relay DB, PostgreSQL)
     needs: changes
-    if: needs.changes.outputs.relay == 'true'
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.relay == 'true' }}
     runs-on: ubuntu-latest
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -415,13 +425,14 @@ jobs:
         run: cargo build --workspace --release
 
   # TS-binding drift is gated by paths filter (issue #125); it only runs on
-  # schedule, push to main, or when the protocol/generation inputs change.
+  # schedule, push to main, manual dispatch (always a full run), or when the
+  # protocol/generation inputs change.
   # It is kept as its own job so `docs check` always runs every PR.
   ts-drift:
     name: TS binding drift (xs check)
     runs-on: ubuntu-latest
     needs: changes
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || needs.changes.outputs.docs_ts == 'true' }}
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.docs_ts == 'true' }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -452,7 +463,7 @@ jobs:
     name: pinned Hermes compatibility (model-free)
     runs-on: ubuntu-latest
     needs: [build-bins, changes]
-    if: ${{ needs.build-bins.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || needs.changes.outputs.hermes == 'true') }}
+    if: ${{ needs.build-bins.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.hermes == 'true') }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -528,23 +539,19 @@ jobs:
             hermes_bin="$install_dir/venv/bin/hermes"
           else
             hermes_bin="$(scripts/provision-hermes-compat "$install_dir")"
-            cp -a "$install_dir" "$cache_dir" 2>/dev/null || true
+            # Stage the fresh runtime for caching. Copy errors fail the step
+            # (no `|| true`): a partial cache_dir under an immutable key
+            # would poison every later run until the key changes. The staged
+            # copy must contain the executable too — the post-check below only
+            # verifies install_dir, not the copy.
+            rm -rf "$cache_dir"
+            cp -a "$install_dir" "$cache_dir"
+            [[ -f "$cache_dir/venv/bin/hermes" && -x "$cache_dir/venv/bin/hermes" ]] \
+              || { echo "cached Hermes copy incomplete at $cache_dir/venv/bin/hermes" >&2; exit 1; }
           fi
           [[ -f "$hermes_bin" && -x "$hermes_bin" ]] \
             || { echo "provisioned Hermes executable missing at $hermes_bin" >&2; exit 1; }
           printf 'bin=%s\n' "$hermes_bin" >> "$GITHUB_OUTPUT"
-
-      - name: Persist Hermes runtime cache
-        if: success()
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ runner.temp }}/hermes-compat-cache
-          key: >-
-            hermes-runtime-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-
-            ${{ hashFiles('compat/hermes/compatibility-lock.json') }}-
-            ${{ hashFiles('scripts/provision-hermes-compat') }}-
-            ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
-            ${{ hashFiles('.github/workflows/ci.yml') }}
 
       - name: Download built CLI
         uses: actions/download-artifact@v4
@@ -561,6 +568,21 @@ jobs:
           cargo xtask hermes compatibility \
             --hermes-bin "${{ steps.hermes.outputs.bin }}" \
             --pohunek-bin "$pohunek_bin"
+
+      # Persist the staged runtime only after the compatibility gate passed:
+      # `if: success()` plus this position (after the check) means a broken
+      # or partial runtime is never uploaded under the immutable cache key.
+      - name: Persist Hermes runtime cache
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/hermes-compat-cache
+          key: >-
+            hermes-runtime-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-
+            ${{ hashFiles('compat/hermes/compatibility-lock.json') }}-
+            ${{ hashFiles('scripts/provision-hermes-compat') }}-
+            ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
+            ${{ hashFiles('.github/workflows/ci.yml') }}
 
   # Build the three runnable binaries exactly once. The web e2e and pinned
   # Hermes jobs reuse this artifact instead of each rebuilding Rust, which used
@@ -736,10 +758,11 @@ jobs:
   feature-matrix:
     name: cargo-hack (feature powerset)
     runs-on: ubuntu-latest
-    # Expensive (issue #125): run only on schedule, push to main, or when the
-    # dependency graph / feature set / CI workflow changes.
+    # Expensive (issue #125): run only on schedule, push to main, manual
+    # dispatch (always a full run), or when the dependency graph / feature
+    # set / CI workflow changes.
     needs: changes
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || needs.changes.outputs.feature_matrix == 'true' }}
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.feature_matrix == 'true' }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -776,9 +799,10 @@ jobs:
     name: cargo-udeps (unused dependencies)
     runs-on: ubuntu-latest
     # Needs the nightly toolchain + full workspace resolution (issue #125):
-    # schedule-only, push to main, or when Cargo.toml / Cargo.lock / CI change.
+    # schedule-only, push to main, manual dispatch (always a full run), or
+    # when Cargo.toml / Cargo.lock / CI change.
     needs: changes
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || needs.changes.outputs.udeps == 'true' }}
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.udeps == 'true' }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
