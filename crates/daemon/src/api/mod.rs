@@ -47,7 +47,7 @@ use tracing::{error, info, warn};
 use overlay::OverlayTransport;
 use pohunek_paths::{validate_socket_path, Platform, SocketKind};
 use pohunek_platform::filesystem::{
-    EntryIdentity, EntryKind, MoveOutcome, StageOutcome, TrustedDir,
+    EntryIdentity, EntryKind, FsError, MoveOutcome, StageOutcome, TrustedDir,
 };
 
 use crate::error::DaemonError;
@@ -85,6 +85,40 @@ pub struct ControlServer {
     socket_name: OsString,
     socket_identity: EntryIdentity,
     state: DaemonState,
+}
+
+struct PendingSocket<'a> {
+    directory: &'a TrustedDir,
+    name: OsString,
+    identity: EntryIdentity,
+    armed: bool,
+}
+
+impl<'a> PendingSocket<'a> {
+    fn new(directory: &'a TrustedDir, name: OsString, identity: EntryIdentity) -> Self {
+        Self {
+            directory,
+            name,
+            identity,
+            armed: true,
+        }
+    }
+
+    fn published_as(&mut self, name: &OsStr) {
+        self.name = name.to_os_string();
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingSocket<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = remove_expected_socket(self.directory, &self.name, self.identity);
+        }
+    }
 }
 
 impl ControlServer {
@@ -143,6 +177,7 @@ impl ControlServer {
             .map_err(DaemonError::Paths)?;
         let (bind_name, std_listener, socket_identity) =
             socket_dir.bind_unix_listener_staged(".s", SOCKET_MODE)?;
+        let mut pending = PendingSocket::new(&socket_dir, bind_name.clone(), socket_identity);
         let bind_path = dir.join(&bind_name);
         std_listener
             .set_nonblocking(true)
@@ -155,11 +190,15 @@ impl ControlServer {
                 path: bind_path.clone(),
                 source,
             })?;
-        match socket_dir.move_no_replace(&bind_name, &socket_dir, &socket_name)? {
-            MoveOutcome::Moved => {}
-            MoveOutcome::DestinationExists => {
+        match socket_dir.move_no_replace(&bind_name, &socket_dir, &socket_name) {
+            Ok(MoveOutcome::Moved) => pending.published_as(&socket_name),
+            Err(error @ FsError::CommittedDurabilityUncertain { .. }) => {
+                pending.published_as(&socket_name);
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+            Ok(MoveOutcome::DestinationExists) => {
                 drop(listener);
-                let _ = remove_expected_socket(&socket_dir, &bind_name, socket_identity);
                 return Err(DaemonError::Socket {
                     path: socket_path.to_path_buf(),
                     source: io::Error::new(
@@ -168,7 +207,7 @@ impl ControlServer {
                     ),
                 });
             }
-            _ => {
+            Ok(_) => {
                 return Err(DaemonError::Socket {
                     path: socket_path.to_path_buf(),
                     source: io::Error::new(
@@ -182,12 +221,13 @@ impl ControlServer {
             != Some(socket_identity)
         {
             drop(listener);
-            let _ = remove_expected_socket(&socket_dir, &socket_name, socket_identity);
             return Err(DaemonError::Socket {
                 path: socket_path.to_path_buf(),
                 source: io::Error::other("activated daemon socket identity changed"),
             });
         }
+        pending.disarm();
+        drop(pending);
 
         info!(socket = %socket_path.display(), "control socket bound");
         Ok(Self {
@@ -898,6 +938,48 @@ fn remove_expected_socket(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod pending_socket_tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
+
+    #[test]
+    fn pending_socket_guard_cleans_staged_and_published_names() {
+        let temporary = tempfile::tempdir().expect("create socket guard fixture");
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(DIR_MODE))
+            .expect("set private fixture mode");
+        let directory = TrustedDir::open_absolute(temporary.path(), DIR_MODE)
+            .expect("open socket guard fixture");
+
+        let (staged_name, listener, identity) = directory
+            .bind_unix_listener_staged(".s", SOCKET_MODE)
+            .expect("bind staged socket");
+        drop(listener);
+        drop(PendingSocket::new(
+            &directory,
+            staged_name.clone(),
+            identity,
+        ));
+        assert!(!temporary.path().join(&staged_name).exists());
+
+        let (staged_name, listener, identity) = directory
+            .bind_unix_listener_staged(".s", SOCKET_MODE)
+            .expect("bind second staged socket");
+        let mut pending = PendingSocket::new(&directory, staged_name.clone(), identity);
+        assert_eq!(
+            directory
+                .move_no_replace(&staged_name, &directory, "daemon.sock")
+                .expect("publish socket"),
+            MoveOutcome::Moved
+        );
+        pending.published_as(OsStr::new("daemon.sock"));
+        drop(listener);
+        drop(pending);
+        assert!(!temporary.path().join("daemon.sock").exists());
+    }
 }
 
 #[cfg(test)]

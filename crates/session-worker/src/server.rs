@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pohunek_paths::{validate_socket_path, Platform, SocketKind};
 use pohunek_platform::filesystem::{
-    AdvisoryLock, EntryIdentity, EntryKind, MoveOutcome, StageOutcome, TrustedDir,
+    AdvisoryLock, EntryIdentity, EntryKind, FsError, MoveOutcome, StageOutcome, TrustedDir,
 };
 use pohunek_platform::peer;
 use pohunek_platform::process::{
@@ -128,6 +128,79 @@ struct PreparedSocket {
     name: OsString,
 }
 
+struct PendingSocket<'a> {
+    directory: &'a TrustedDir,
+    name: OsString,
+    identity: EntryIdentity,
+    armed: bool,
+}
+
+impl<'a> PendingSocket<'a> {
+    fn new(directory: &'a TrustedDir, name: OsString, identity: EntryIdentity) -> Self {
+        Self {
+            directory,
+            name,
+            identity,
+            armed: true,
+        }
+    }
+
+    fn published_as(&mut self, name: &std::ffi::OsStr) {
+        self.name = name.to_os_string();
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingSocket<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(StageOutcome::Staged(entry)) =
+                self.directory
+                    .stage_random(&self.name, ".pohunek-worker-stale-", self.identity)
+            {
+                let _ = entry.remove();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pending_socket_tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
+
+    #[test]
+    fn pending_worker_socket_guard_follows_the_published_name() {
+        let temporary = tempfile::tempdir().expect("create worker socket guard fixture");
+        std::fs::set_permissions(
+            temporary.path(),
+            std::fs::Permissions::from_mode(SOCKET_DIRECTORY_MODE),
+        )
+        .expect("set private fixture mode");
+        let directory = TrustedDir::open_absolute(temporary.path(), SOCKET_DIRECTORY_MODE)
+            .expect("open worker socket guard fixture");
+        let (staged_name, listener, identity) = directory
+            .bind_unix_listener_staged(".s", SOCKET_MODE)
+            .expect("bind staged worker socket");
+        let mut pending = PendingSocket::new(&directory, staged_name.clone(), identity);
+        assert_eq!(
+            directory
+                .move_no_replace(&staged_name, &directory, "worker.sock")
+                .expect("publish worker socket"),
+            MoveOutcome::Moved
+        );
+        pending.published_as(std::ffi::OsStr::new("worker.sock"));
+        drop(listener);
+        drop(pending);
+
+        assert!(!temporary.path().join("worker.sock").exists());
+    }
+}
+
 impl Drop for SocketLease {
     fn drop(&mut self) {
         if let Ok(StageOutcome::Staged(entry)) =
@@ -169,6 +242,11 @@ impl Server {
         let (bind_name, std_listener, socket_identity) = prepared_socket
             .directory
             .bind_unix_listener_staged(".s", SOCKET_MODE)?;
+        let mut pending = PendingSocket::new(
+            &prepared_socket.directory,
+            bind_name.clone(),
+            socket_identity,
+        );
         let bind_path = prepared_socket.directory.path().join(&bind_name);
         std_listener
             .set_nonblocking(true)
@@ -185,17 +263,15 @@ impl Server {
             &bind_name,
             &prepared_socket.directory,
             &prepared_socket.name,
-        )? {
-            MoveOutcome::Moved => {}
-            MoveOutcome::DestinationExists => {
+        ) {
+            Ok(MoveOutcome::Moved) => pending.published_as(&prepared_socket.name),
+            Err(error @ FsError::CommittedDurabilityUncertain { .. }) => {
+                pending.published_as(&prepared_socket.name);
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+            Ok(MoveOutcome::DestinationExists) => {
                 drop(listener);
-                let cleanup = SocketLease {
-                    directory: prepared_socket.directory,
-                    _authority: prepared_socket.authority,
-                    name: bind_name,
-                    identity: socket_identity,
-                };
-                drop(cleanup);
                 return Err(WorkerError::Socket {
                     path: args.socket_path.clone(),
                     source: std::io::Error::new(
@@ -204,7 +280,7 @@ impl Server {
                     ),
                 });
             }
-            _ => {
+            Ok(_) => {
                 return Err(WorkerError::Filesystem {
                     path: args.socket_path.clone(),
                     source: std::io::Error::new(
@@ -221,18 +297,13 @@ impl Server {
         )? != Some(socket_identity)
         {
             drop(listener);
-            let cleanup = SocketLease {
-                directory: prepared_socket.directory,
-                _authority: prepared_socket.authority,
-                name: prepared_socket.name,
-                identity: socket_identity,
-            };
-            drop(cleanup);
             return Err(WorkerError::Filesystem {
                 path: args.socket_path.clone(),
                 source: std::io::Error::other("activated worker socket identity changed"),
             });
         }
+        pending.disarm();
+        drop(pending);
         let socket_lease = SocketLease {
             directory: prepared_socket.directory,
             _authority: prepared_socket.authority,

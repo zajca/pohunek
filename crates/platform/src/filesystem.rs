@@ -178,6 +178,12 @@ pub enum FsError {
         /// The required permission and special bits.
         expected: u32,
     },
+    /// A macOS extended ACL could grant access beyond the private mode bits.
+    #[error("trusted entry has a non-empty extended ACL: {path}", path = .path.display())]
+    UnsafeAcl {
+        /// The rejected entry.
+        path: PathBuf,
+    },
     /// An entry's link count could not establish the required binding.
     #[error("trusted entry has unsafe link count {actual}: {path}", path = .path.display())]
     UnsafeLinkCount {
@@ -206,6 +212,15 @@ pub enum FsError {
     RecoveryConflict {
         /// The occupied original path.
         path: PathBuf,
+    },
+    /// Staging committed and recovery could not restore the original name.
+    #[error("staged entry recovery is required at {path}: {source}", path = .path.display())]
+    StagedRecoveryRequired {
+        /// The last known path naming the staged entry.
+        path: PathBuf,
+        /// The failure that occurred after the staging rename committed.
+        #[source]
+        source: Box<FsError>,
     },
     /// A pathname stopped referring to the expected inode.
     #[error("trusted entry identity changed during operation: {path}", path = .path.display())]
@@ -801,15 +816,23 @@ impl TrustedDir {
         validate_mode(mode)?;
         let name = validate_component(name.as_ref())?;
         let path = self.path.join(name);
+        let expected = inspect_entry(&self.file, &path, name, EntryKind::RegularFile, Some(mode))?
+            .ok_or_else(|| FsError::Io {
+                operation: "inspect trusted file before opening",
+                path: path.clone(),
+                source: io::Error::new(io::ErrorKind::NotFound, "trusted file does not exist"),
+            })?;
         let fd = fs::openat(
             &self.file,
             name,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
             Mode::empty(),
         )
         .map_err(|source| io_error("open trusted file", &path, source))?;
         let mut file = File::from(fd);
-        validate_fd(&file, &path, EntryKind::RegularFile, Some(mode))?;
+        if validate_fd(&file, &path, EntryKind::RegularFile, Some(mode))? != expected {
+            return Err(FsError::IdentityChanged { path });
+        }
         let limit = u64::try_from(max_bytes)
             .unwrap_or(u64::MAX)
             .saturating_add(1);
@@ -917,7 +940,7 @@ impl TrustedDir {
             &destination_path,
             destination,
             EntryKind::RegularFile,
-            Some(mode),
+            None,
         )
         .map_err(AtomicReplaceError::BeforeCommit)?;
 
@@ -987,7 +1010,7 @@ impl TrustedDir {
                 &destination_path,
                 destination,
                 EntryKind::RegularFile,
-                Some(mode),
+                None,
             ) {
                 Ok(Some(actual)) if actual == expected => {
                     fs::renameat(&self.file, temporary, &self.file, destination).map_err(|source| {
@@ -1138,6 +1161,10 @@ impl TrustedDir {
     /// # Errors
     ///
     /// Returns [`FsError`] when inspection, movement, or recovery fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "staging keeps the namespace commit boundary and every recovery path contiguous"
+    )]
     pub fn stage(
         &self,
         source: impl AsRef<OsStr>,
@@ -1146,7 +1173,7 @@ impl TrustedDir {
     ) -> FsResult<StageOutcome> {
         let source = validate_component(source.as_ref())?;
         let staging = validate_component(staging.as_ref())?;
-        let Some(current) = inspect_entry(
+        let Some(current) = inspect_entry_generation(
             &self.file,
             &self.path.join(source),
             source,
@@ -1156,7 +1183,7 @@ impl TrustedDir {
         else {
             return Ok(StageOutcome::Missing);
         };
-        if current != expected {
+        if current.identity != expected {
             return Ok(StageOutcome::IdentityChanged);
         }
         let directory = self.file.try_clone().map_err(|source_error| {
@@ -1166,12 +1193,43 @@ impl TrustedDir {
                 source_error,
             )
         })?;
-        if self.move_no_replace(source, self, staging)? == MoveOutcome::DestinationExists {
-            return Ok(StageOutcome::DestinationExists);
-        }
         let staged_path = self.path.join(staging);
-        let staged =
-            inspect_entry_generation(&self.file, &staged_path, staging, expected.kind, None)?;
+        match self.move_no_replace(source, self, staging) {
+            Ok(MoveOutcome::Moved) => {}
+            Ok(MoveOutcome::DestinationExists) => return Ok(StageOutcome::DestinationExists),
+            Err(error @ FsError::CommittedDurabilityUncertain { .. }) => {
+                let staged = StagedEntry {
+                    directory,
+                    directory_path: self.path.clone(),
+                    name: staging.to_os_string(),
+                    identity: expected,
+                    generation: current,
+                    entry_directory: None,
+                };
+                return Err(recover_staging_failure(&staged, source, error));
+            }
+            Err(error) => return Err(error),
+        }
+        let staged = match inspect_entry_generation(
+            &self.file,
+            &staged_path,
+            staging,
+            expected.kind,
+            None,
+        ) {
+            Ok(staged) => staged,
+            Err(error) => {
+                let staged = StagedEntry {
+                    directory,
+                    directory_path: self.path.clone(),
+                    name: staging.to_os_string(),
+                    identity: expected,
+                    generation: current,
+                    entry_directory: None,
+                };
+                return Err(recover_staging_failure(&staged, source, error));
+            }
+        };
         if staged.map(|generation| generation.identity) != Some(expected) {
             match self.move_no_replace(staging, self, source)? {
                 MoveOutcome::Moved => return Ok(StageOutcome::IdentityChanged),
@@ -1183,15 +1241,52 @@ impl TrustedDir {
             }
         }
         let entry_directory = if expected.kind == EntryKind::Directory {
-            let descriptor = File::from(
-                open_directory_at(&self.file, staging)
-                    .map_err(|source| io_error("open staged directory", &staged_path, source))?,
-            );
-            if validate_fd_base(&descriptor, &staged_path, EntryKind::Directory)? != expected
-                || inspect_entry(&self.file, &staged_path, staging, expected.kind, None)?
-                    != Some(expected)
-            {
-                return Err(FsError::IdentityChanged { path: staged_path });
+            let descriptor = open_directory_at(&self.file, staging)
+                .map(File::from)
+                .map_err(|source| io_error("open staged directory", &staged_path, source));
+            let descriptor = match descriptor {
+                Ok(descriptor) => descriptor,
+                Err(error) => {
+                    let staged = StagedEntry {
+                        directory,
+                        directory_path: self.path.clone(),
+                        name: staging.to_os_string(),
+                        identity: expected,
+                        generation: staged.expect("validated staged generation exists"),
+                        entry_directory: None,
+                    };
+                    return Err(recover_staging_failure(&staged, source, error));
+                }
+            };
+            let validated = validate_fd_base(&descriptor, &staged_path, EntryKind::Directory)
+                .and_then(|identity| {
+                    if identity != expected {
+                        return Err(FsError::IdentityChanged {
+                            path: staged_path.clone(),
+                        });
+                    }
+                    inspect_entry(&self.file, &staged_path, staging, expected.kind, None).and_then(
+                        |current| {
+                            if current == Some(expected) {
+                                Ok(())
+                            } else {
+                                Err(FsError::IdentityChanged {
+                                    path: staged_path.clone(),
+                                })
+                            }
+                        },
+                    )
+                });
+            if let Err(error) = validated {
+                let staged = StagedEntry {
+                    directory,
+                    directory_path: self.path.clone(),
+                    name: staging.to_os_string(),
+                    identity: expected,
+                    generation: staged.expect("validated staged generation exists"),
+                    entry_directory: Some(descriptor),
+                };
+                return Err(recover_staging_failure(&staged, source, error));
             }
             Some(descriptor)
         } else {
@@ -1390,6 +1485,30 @@ impl TrustedDir {
                 "trusted directory staging collision budget exhausted",
             ),
         })
+    }
+}
+
+fn recover_staging_failure(staged: &StagedEntry, source: &OsStr, error: FsError) -> FsError {
+    let staged_path = staged.path();
+    match staged.restore(source) {
+        Ok(MoveOutcome::Moved) => error,
+        Ok(MoveOutcome::DestinationExists) => FsError::StagedRecoveryRequired {
+            path: staged_path,
+            source: Box::new(FsError::RecoveryConflict {
+                path: staged.directory_path.join(source),
+            }),
+        },
+        Err(recovery) => {
+            let path = match &recovery {
+                FsError::CommittedDurabilityUncertain { path, .. }
+                | FsError::StagedRecoveryRequired { path, .. } => path.clone(),
+                _ => staged_path,
+            };
+            FsError::StagedRecoveryRequired {
+                path,
+                source: Box::new(recovery),
+            }
+        }
     }
 }
 
@@ -2232,6 +2351,9 @@ fn inspect_entry_generation(
     kind: EntryKind,
     mode: Option<u32>,
 ) -> FsResult<Option<EntryGeneration>> {
+    if let Some(source) = injected_inspection_failure() {
+        return Err(io_error("inspect trusted entry generation", path, source));
+    }
     let stat = match fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) => stat,
         Err(rustix::io::Errno::NOENT) => return Ok(None),
@@ -2276,7 +2398,25 @@ fn validate_fd(
 ) -> FsResult<EntryIdentity> {
     let stat =
         fs::fstat(file).map_err(|source| io_error("inspect trusted descriptor", path, source))?;
-    validate_stat(&stat, path, kind, mode)
+    let identity = validate_stat(&stat, path, kind, mode)?;
+    #[cfg(target_os = "macos")]
+    validate_private_acl(file, path)?;
+    Ok(identity)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_private_acl(file: &File, path: &Path) -> FsResult<()> {
+    use std::os::fd::AsFd as _;
+
+    let acl = calcifer_macos_acl::read_acl(file.as_fd())
+        .map_err(|source| io_error("inspect trusted entry ACL", path, source))?;
+    if acl.is_empty() {
+        Ok(())
+    } else {
+        Err(FsError::UnsafeAcl {
+            path: path.to_path_buf(),
+        })
+    }
 }
 
 fn validate_fd_base(file: &File, path: &Path, kind: EntryKind) -> FsResult<EntryIdentity> {
@@ -2472,6 +2612,9 @@ std::thread_local! {
     static NEXT_MOVE_FAILURE: std::cell::RefCell<Option<io::ErrorKind>> = const {
         std::cell::RefCell::new(None)
     };
+    static NEXT_INSPECTION_FAILURE: std::cell::RefCell<Option<(usize, io::ErrorKind)>> = const {
+        std::cell::RefCell::new(None)
+    };
 }
 
 #[cfg(test)]
@@ -2481,6 +2624,27 @@ fn injected_move_failure() -> Option<io::Error> {
 
 #[cfg(not(test))]
 const fn injected_move_failure() -> Option<io::Error> {
+    None
+}
+
+#[cfg(test)]
+fn injected_inspection_failure() -> Option<io::Error> {
+    NEXT_INSPECTION_FAILURE.with(|slot| {
+        let mut pending = slot.borrow_mut();
+        let (remaining, kind) = pending.as_mut()?;
+        if *remaining == 0 {
+            let kind = *kind;
+            pending.take();
+            Some(io::Error::from(kind))
+        } else {
+            *remaining -= 1;
+            None
+        }
+    })
+}
+
+#[cfg(not(test))]
+const fn injected_inspection_failure() -> Option<io::Error> {
     None
 }
 
@@ -2658,7 +2822,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_replace_is_durable_and_rejects_untrusted_destination() {
+    fn atomic_replace_is_durable_and_repairs_destination_mode_drift() {
         let (temporary, trusted) = trusted_root();
         trusted
             .replace_file("record", ".record.tmp", b"first", FILE_MODE)
@@ -2678,16 +2842,28 @@ mod tests {
             FILE_MODE
         );
 
-        fs::set_permissions(
-            temporary.path().join("record"),
-            fs::Permissions::from_mode(0o644),
-        )
-        .expect("widen record mode");
-        assert!(matches!(
-            trusted.replace_file("record", ".record.bad", b"bad", FILE_MODE),
-            Err(AtomicReplaceError::BeforeCommit(FsError::UnsafeMode { .. }))
-        ));
-        assert!(!temporary.path().join(".record.bad").exists());
+        for (index, drifted_mode) in [0o600, 0o777, 0o4755].into_iter().enumerate() {
+            fs::set_permissions(
+                temporary.path().join("record"),
+                fs::Permissions::from_mode(drifted_mode),
+            )
+            .expect("drift record mode");
+            trusted
+                .replace_file(
+                    "record",
+                    format!(".record.repair-{index}"),
+                    b"repaired",
+                    FILE_MODE,
+                )
+                .expect("repair record mode during replacement");
+            assert_eq!(
+                fs::metadata(temporary.path().join("record"))
+                    .expect("inspect repaired record")
+                    .mode()
+                    & MODE_MASK,
+                FILE_MODE
+            );
+        }
     }
 
     #[test]
@@ -2735,6 +2911,44 @@ mod tests {
         trusted
             .read_file("record-link", FILE_MODE, 7)
             .expect_err("symlink read must fail closed");
+    }
+
+    #[test]
+    fn trusted_read_rejects_a_fifo_without_blocking_for_a_writer() {
+        let (temporary, trusted) = trusted_root();
+        let fifo = temporary.path().join("record-fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).expect("create FIFO fixture");
+
+        assert!(matches!(
+            trusted.read_file("record-fifo", FILE_MODE, 1),
+            Err(FsError::UnsafeType { .. })
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inherited_macos_acl_is_rejected_from_an_owner_private_directory() {
+        let temporary = tempfile::tempdir_in("/private/tmp").expect("create macOS fixture root");
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("set fixture root mode");
+        let status = std::process::Command::new("/bin/chmod")
+            .args([
+                "+a",
+                "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit",
+            ])
+            .arg(temporary.path())
+            .status()
+            .expect("run native ACL fixture command");
+        assert!(status.success(), "native ACL fixture command must succeed");
+        let child = temporary.path().join("inherited");
+        fs::create_dir(&child).expect("create ACL-inheriting child");
+        fs::set_permissions(&child, fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("retain private mode bits");
+
+        assert!(matches!(
+            TrustedDir::open_absolute(&child, DIRECTORY_MODE),
+            Err(FsError::UnsafeAcl { .. })
+        ));
     }
 
     #[test]
@@ -2794,6 +3008,62 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn staging_sync_failure_restores_the_original_source_name() {
+        let (temporary, trusted) = trusted_root();
+        let source = temporary.path().join("source");
+        fs::write(&source, b"source").expect("write source");
+        fs::set_permissions(&source, fs::Permissions::from_mode(FILE_MODE))
+            .expect("set source mode");
+        let identity = trusted
+            .entry_identity("source", EntryKind::RegularFile)
+            .expect("inspect source")
+            .expect("source exists");
+        NEXT_SYNC_FAILURE.with(|slot| {
+            *slot.borrow_mut() = Some((0, io::ErrorKind::StorageFull));
+        });
+
+        assert!(matches!(
+            trusted.stage_random("source", ".stage-", identity),
+            Err(FsError::CommittedDurabilityUncertain { .. })
+        ));
+        assert_eq!(fs::read(&source).expect("read restored source"), b"source");
+        assert!(temporary
+            .path()
+            .read_dir()
+            .expect("enumerate fixture")
+            .all(|entry| !entry
+                .expect("read fixture entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".stage-")));
+    }
+
+    #[test]
+    fn post_rename_staging_inspection_failure_restores_the_source() {
+        let (temporary, trusted) = trusted_root();
+        let source = temporary.path().join("source");
+        fs::write(&source, b"source").expect("write source");
+        fs::set_permissions(&source, fs::Permissions::from_mode(FILE_MODE))
+            .expect("set source mode");
+        let identity = trusted
+            .entry_identity("source", EntryKind::RegularFile)
+            .expect("inspect source")
+            .expect("source exists");
+        NEXT_INSPECTION_FAILURE.with(|slot| {
+            // The source inspection succeeds; the first staged-name inspection fails.
+            *slot.borrow_mut() = Some((1, io::ErrorKind::StorageFull));
+        });
+
+        assert!(matches!(
+            trusted.stage("source", ".source.staged", identity),
+            Err(FsError::Io { source, .. })
+                if source.kind() == io::ErrorKind::StorageFull
+        ));
+        assert_eq!(fs::read(&source).expect("read restored source"), b"source");
+        assert!(!temporary.path().join(".source.staged").exists());
     }
 
     #[cfg(target_os = "macos")]

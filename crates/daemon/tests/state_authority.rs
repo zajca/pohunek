@@ -168,3 +168,27 @@ async fn shared_data_rejects_second_daemon_with_a_different_state_root() {
     first.kill().await.expect("stop first daemon");
     let _ = first.wait().await;
 }
+
+#[tokio::test]
+async fn identical_runtime_and_data_base_starts_without_self_deadlock() {
+    let root = tempfile::Builder::new()
+        .prefix("pohunek-shared-runtime-data-")
+        .tempdir_in("/tmp")
+        .expect("create short test root");
+    let shared_home = root.path().join("shared");
+    let state_home = root.path().join("state");
+    let socket = shared_home.join("pohunek/daemon.sock");
+
+    let mut daemon = daemon_command(root.path(), &shared_home, &state_home, &shared_home)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon with a shared runtime and data base");
+    wait_until_ready(&mut daemon, &socket).await;
+    assert!(
+        UnixStream::connect(&socket).await.is_ok(),
+        "daemon with a shared runtime and data base must remain healthy"
+    );
+
+    daemon.kill().await.expect("stop daemon");
+    let _ = daemon.wait().await;
+}

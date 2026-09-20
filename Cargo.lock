@@ -646,6 +646,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "calcifer-macos-acl"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d623f1bbaccbe0d1c6a9e4d2366feef6e179ac4e235aa86342601caf29358df4"
+
+[[package]]
 name = "calloop"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4319,6 +4325,7 @@ name = "pohunek-platform"
 version = "0.31.6"
 dependencies = [
  "async-io",
+ "calcifer-macos-acl",
  "getrandom 0.2.17",
  "nix 0.29.0",
  "rustix 1.1.4",

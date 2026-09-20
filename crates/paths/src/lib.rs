@@ -535,6 +535,9 @@ pub fn require_env(key: &str) -> Result<String, PathError> {
 ///
 /// Returns [`PathError::MissingEnv`] when neither source resolves.
 pub fn xdg_or_home_relative(key: &str, home_relative: &[&str]) -> Result<PathBuf, PathError> {
+    if let Some(value) = std::env::var_os(key) {
+        return validate_env_path(key, &value);
+    }
     resolve_xdg_or_home(&PathEnv::capture(), key, home_relative)
 }
 
@@ -709,14 +712,16 @@ mod tests {
 
     // Keep synthetic runtime paths below the strictest supported Unix-socket limit.
     const TEST_BASE_ROOT: &str = "/tmp";
+    const CUSTOM_DATA_HOME: &str = "CUSTOM_DATA_HOME";
 
-    const VARS: [&str; 6] = [
+    const VARS: [&str; 7] = [
         XDG_RUNTIME_DIR,
         XDG_STATE_HOME,
         XDG_DATA_HOME,
         XDG_CONFIG_HOME,
         XDG_CACHE_HOME,
         HOME,
+        CUSTOM_DATA_HOME,
     ];
 
     struct EnvGuard {
@@ -828,6 +833,19 @@ mod tests {
             err,
             PathError::MissingEnv { var } if var == "XDG_CONFIG_HOME or HOME"
         ));
+    }
+
+    #[test]
+    fn xdg_or_home_relative_honors_an_arbitrary_environment_key() {
+        let _env = EnvGuard::acquire();
+        let custom = tmp_base("custom-data-home");
+        std::env::set_var(CUSTOM_DATA_HOME, &custom);
+
+        assert_eq!(
+            xdg_or_home_relative(CUSTOM_DATA_HOME, &["fallback"])
+                .expect("resolve custom environment key"),
+            custom
+        );
     }
 
     #[test]

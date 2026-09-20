@@ -4380,6 +4380,35 @@ mod tests {
             .any(|warning| warning.contains("mode 4755")));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn reinstall_repairs_managed_hook_permission_drift() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for (index, drifted_mode) in [0o600, 0o777, 0o4755].into_iter().enumerate() {
+            let codex = temp_dir(&format!("reinstall-hook-mode-{index}"));
+            install_codex(&codex).expect("install Codex fixture");
+            let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
+            fs::set_permissions(&hook_path, fs::Permissions::from_mode(drifted_mode))
+                .expect("drift managed hook permissions");
+
+            install_codex(&codex).expect("reinstall must repair managed hook permissions");
+
+            assert_eq!(
+                fs::metadata(&hook_path)
+                    .expect("inspect repaired hook")
+                    .permissions()
+                    .mode()
+                    & super::UNIX_MODE_MASK,
+                super::MANAGED_HOOK_MODE
+            );
+            assert_eq!(
+                fs::read(&hook_path).expect("read repaired hook"),
+                include_bytes!("assets/codex/pohunek-agent-state.sh")
+            );
+        }
+    }
+
     #[test]
     fn status_detects_broken_claude_registration() {
         let claude = temp_dir("status-claude-registration");

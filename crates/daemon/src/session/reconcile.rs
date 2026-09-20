@@ -436,7 +436,7 @@ impl SessionRegistry {
         Ok(())
     }
 
-    async fn discover_worker_journals(&self) -> HashMap<String, Vec<JournalEvidence>> {
+    async fn discover_worker_journals(&self) -> HashMap<String, WorkerJournalScan> {
         let Some(state_root) = self.inner.config.worker_state_root.clone() else {
             return HashMap::new();
         };
@@ -1956,11 +1956,21 @@ enum TerminalJournalClassification {
     Absent,
 }
 
+#[derive(Debug, Default)]
+struct WorkerJournalScan {
+    evidence: Vec<JournalEvidence>,
+    conflict: bool,
+}
+
 fn classify_terminal_journals(
-    journals: Vec<JournalEvidence>,
+    scan: WorkerJournalScan,
     record: &SessionRecord,
 ) -> TerminalJournalClassification {
-    let mut terminal = journals
+    if scan.conflict {
+        return TerminalJournalClassification::Conflict;
+    }
+    let mut terminal = scan
+        .evidence
         .into_iter()
         .filter(|journal| {
             journal.phase == JournalPhase::Terminal || journal.phase == JournalPhase::Faulted
@@ -1989,10 +1999,8 @@ fn classify_terminal_journals(
     }
 }
 
-fn scan_worker_journals(
-    state_root: &Path,
-) -> std::io::Result<HashMap<String, Vec<JournalEvidence>>> {
-    let mut journals = HashMap::<String, Vec<JournalEvidence>>::new();
+fn scan_worker_journals(state_root: &Path) -> std::io::Result<HashMap<String, WorkerJournalScan>> {
+    let mut journals = HashMap::<String, WorkerJournalScan>::new();
     let root_metadata = match std::fs::symlink_metadata(state_root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(journals),
@@ -2001,7 +2009,11 @@ fn scan_worker_journals(
     validate_discovery_path(state_root, &root_metadata, true)?;
     let root = TrustedDir::open_absolute(state_root, 0o700).map_err(std::io::Error::other)?;
     for session_name in root.entry_names().map_err(std::io::Error::other)? {
-        let Some(session_id) = session_name.to_str().map(ToOwned::to_owned) else {
+        let Some(session_id) = session_name
+            .to_str()
+            .filter(|name| pohunek_paths::valid_worker_session_id(name).is_some())
+            .map(ToOwned::to_owned)
+        else {
             continue;
         };
         let Ok(session_directory) = root.open_child(&session_name, 0o700) else {
@@ -2018,12 +2030,15 @@ fn scan_worker_journals(
             else {
                 continue;
             };
+            let scan = journals.entry(session_id.clone()).or_default();
             let Ok(bytes) =
                 session_directory.read_file(&journal_name, 0o600, MAX_WORKER_JOURNAL_BYTES)
             else {
+                scan.conflict = true;
                 continue;
             };
             let Ok(evidence) = serde_json::from_slice::<JournalEvidence>(&bytes) else {
+                scan.conflict = true;
                 continue;
             };
             if evidence.schema_version != WORKER_JOURNAL_SCHEMA_VERSION
@@ -2031,12 +2046,10 @@ fn scan_worker_journals(
                 || evidence.worker_id != journal_stem
                 || BootIdentity::parse(evidence.boot_identity.clone()).is_err()
             {
+                scan.conflict = true;
                 continue;
             }
-            journals
-                .entry(session_id.clone())
-                .or_default()
-                .push(evidence);
+            scan.evidence.push(evidence);
         }
     }
     Ok(journals)
@@ -2574,27 +2587,39 @@ mod tests {
         mismatch.worker_id = "different-worker".to_owned();
 
         assert!(matches!(
-            super::classify_terminal_journals(vec![mismatch], &record),
+            super::classify_terminal_journals(
+                super::WorkerJournalScan {
+                    evidence: vec![mismatch],
+                    conflict: false,
+                },
+                &record
+            ),
             super::TerminalJournalClassification::Conflict
         ));
         assert!(matches!(
-            super::classify_terminal_journals(vec![exact.clone(), exact], &record),
+            super::classify_terminal_journals(
+                super::WorkerJournalScan {
+                    evidence: vec![exact.clone(), exact],
+                    conflict: false,
+                },
+                &record
+            ),
             super::TerminalJournalClassification::Conflict
         ));
     }
 
     #[test]
-    fn journal_scan_ignores_temporary_malformed_and_identity_mismatched_files() {
+    fn journal_scan_marks_malformed_and_identity_mismatched_managed_files_as_conflicts() {
         let root = temp_root();
         let state_root = root.join("workers");
-        let session_dir = state_root.join("s-journal-scan");
+        let session_dir = state_root.join("s-91");
         std::fs::create_dir_all(&session_dir).expect("create journal directory");
         for path in [&state_root, &session_dir] {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
                 .expect("secure journal directory");
         }
         let mut journal = JournalRecord::bootstrap(
-            "s-journal-scan".to_owned(),
+            "s-91".to_owned(),
             "worker-valid".to_owned(),
             41,
             "410".to_owned(),
@@ -2621,10 +2646,21 @@ mod tests {
 
         let journals = super::scan_worker_journals(&state_root).expect("scan journals");
         let accepted = journals
-            .get("s-journal-scan")
+            .get("s-91")
             .expect("valid session journal accepted");
-        assert_eq!(accepted.len(), 1);
-        assert_eq!(accepted[0].worker_id, "worker-valid");
+        assert_eq!(accepted.evidence.len(), 1);
+        assert_eq!(accepted.evidence[0].worker_id, "worker-valid");
+        assert!(accepted.conflict);
+        assert!(matches!(
+            super::classify_terminal_journals(
+                super::WorkerJournalScan {
+                    evidence: accepted.evidence.clone(),
+                    conflict: accepted.conflict,
+                },
+                &identity_record()
+            ),
+            super::TerminalJournalClassification::Conflict
+        ));
     }
 
     #[test]
@@ -3667,6 +3703,60 @@ mod tests {
             .load_sessions()
             .expect("load compensated store")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn corrupted_expected_worker_journal_conflicts_and_blocks_resume() {
+        let root = temp_root();
+        let store_path = root.join("data/metadata.jsonl");
+        let state_root = root.join("state/workers");
+        let mut record = identity_record();
+        record.session_id = "s-206".to_owned();
+        record.info.id = SessionId("s-206".to_owned());
+        record.runtime.worker_id = Some("worker-corrupt".to_owned());
+        record.info.runtime.as_mut().expect("runtime").worker_id =
+            Some("worker-corrupt".to_owned());
+        record.recovery.as_mut().expect("recovery").session_id = "s-206".to_owned();
+        Store::new(store_path.clone())
+            .record_session(&record)
+            .expect("persist logical record");
+        let session_dir = state_root.join("s-206");
+        std::fs::create_dir_all(&session_dir).expect("create worker journal directory");
+        for path in [
+            state_root.parent().expect("state parent"),
+            state_root.as_path(),
+            session_dir.as_path(),
+        ] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .expect("set private journal directory mode");
+        }
+        let journal_path = session_dir.join("worker-corrupt.json");
+        std::fs::write(&journal_path, b"not json").expect("write corrupt worker journal");
+        std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o600))
+            .expect("set private journal mode");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            store_path: Some(store_path),
+            worker_runtime_root: Some(root.join("runtime/workers")),
+            worker_state_root: Some(state_root),
+            ..SessionRegistryConfig::default()
+        });
+
+        Box::pin(registry.reconcile_workers())
+            .await
+            .expect("reconcile corrupt journal");
+        let conflicted = registry
+            .inspect(&SessionId("s-206".to_owned()))
+            .await
+            .expect("inspect conflicted session");
+        assert_eq!(
+            conflicted.runtime.expect("runtime").state,
+            RuntimeState::Conflict
+        );
+        let error = registry
+            .resume(&SessionId("s-206".to_owned()))
+            .await
+            .expect_err("conflicted session cannot resume");
+        assert_eq!(error.code, "session_runtime_not_recoverable");
     }
 
     #[tokio::test]

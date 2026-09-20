@@ -163,6 +163,26 @@ pub(crate) fn install(
     install_with(control, request, &mut NativeFileOps)
 }
 
+/// Updates a policy derived from the current on-disk value under one lock.
+///
+/// # Errors
+///
+/// Returns [`Error`] when locking, policy loading, derivation, or installation fails.
+pub(crate) fn update(
+    control: &mut impl HermesControl,
+    target: &ResolvedTarget,
+    policy_path: &Path,
+    confirm_modified: bool,
+    derive: impl FnOnce(&Policy) -> Result<Policy, Error>,
+) -> Result<(LifecycleState, Policy), Error> {
+    let _lock = acquire_transaction_lock(policy_path)?;
+    let current = Policy::load_private(policy_path)?;
+    let policy = derive(&current)?;
+    let request = InstallRequest::new(target, policy_path, &policy, confirm_modified);
+    let state = install_with(control, &request, &mut NativeFileOps)?;
+    Ok((state, policy))
+}
+
 fn install_with(
     control: &mut impl HermesControl,
     request: &InstallRequest<'_>,
@@ -556,13 +576,8 @@ fn trusted_rename_no_replace_with(
         .ok_or(RenameFailure::BeforeCommit(Error::RecoveryRequired))?;
     let mut staged = match source_directory
         .stage_random(source_name, ".pohunek-hermes-move-", identity)
-        .map_err(|error| {
-            if matches!(error, FsError::CommittedDurabilityUncertain { .. }) {
-                RenameFailure::Committed(Error::RecoveryRequired)
-            } else {
-                RenameFailure::BeforeCommit(Error::RecoveryRequired)
-            }
-        })? {
+        .map_err(|_| RenameFailure::BeforeCommit(Error::RecoveryRequired))?
+    {
         StageOutcome::Staged(staged) => staged,
         StageOutcome::Missing | StageOutcome::IdentityChanged => {
             return Err(RenameFailure::BeforeCommit(Error::RecoveryRequired));
@@ -2666,5 +2681,85 @@ esac"#,
         ));
         drop(first);
         acquire_transaction_lock(&policy_path).expect("reacquire released lifecycle lock");
+    }
+
+    #[test]
+    fn concurrent_disjoint_updates_cannot_commit_from_the_same_policy_snapshot() {
+        let (_root, target, policy_path, policy) = setup("concurrent-update");
+        install(
+            &mut ControlledHermes::default(),
+            &InstallRequest::new(&target, &policy_path, &policy, false),
+        )
+        .expect("install initial policy");
+        let (loaded_tx, loaded_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+
+        std::thread::scope(|scope| {
+            let target_ref = &target;
+            let policy_path_ref = &policy_path;
+            let first = scope.spawn(move || {
+                update(
+                    &mut ControlledHermes::default(),
+                    target_ref,
+                    policy_path_ref,
+                    false,
+                    |existing| {
+                        loaded_tx.send(()).expect("signal locked policy load");
+                        release_rx.recv().expect("release first update");
+                        policy_with(existing, AccessMode::Full, existing.allowed_hosts())
+                    },
+                )
+            });
+            loaded_rx
+                .recv()
+                .expect("first update holds transaction lock");
+            assert!(matches!(
+                update(
+                    &mut ControlledHermes::default(),
+                    &target,
+                    &policy_path,
+                    false,
+                    |existing| policy_with(existing, existing.access_mode(), ["remote"]),
+                ),
+                Err(Error::TransactionBusy)
+            ));
+            release_tx.send(()).expect("release first update");
+            first
+                .join()
+                .expect("join first update")
+                .expect("first update");
+        });
+
+        update(
+            &mut ControlledHermes::default(),
+            &target,
+            &policy_path,
+            false,
+            |existing| policy_with(existing, existing.access_mode(), ["remote"]),
+        )
+        .expect("retry second update from committed snapshot");
+        let merged = Policy::load_private(&policy_path).expect("load merged policy");
+        assert_eq!(merged.access_mode(), AccessMode::Full);
+        assert_eq!(merged.allowed_hosts().collect::<Vec<_>>(), ["remote"]);
+    }
+
+    fn policy_with<'a>(
+        existing: &Policy,
+        access_mode: AccessMode,
+        allowed_hosts: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Policy, Error> {
+        Policy::new(PolicyInput {
+            pohunek_cli: existing.pohunek_cli().to_owned(),
+            protocol_min: existing.protocol_min(),
+            protocol_max: existing.protocol_max(),
+            access_mode,
+            allowed_hosts: allowed_hosts.into_iter().map(str::to_owned).collect(),
+            tool_timeout_ms: existing.tool_timeout_ms(),
+            request_timeout_ms: existing.request_timeout_ms(),
+            max_output_bytes: existing.max_output_bytes(),
+            max_screen_bytes: existing.max_screen_bytes(),
+            max_concurrency: existing.max_concurrency(),
+            wildcard_confirmation: WildcardConfirmation::new(false),
+        })
     }
 }

@@ -132,7 +132,14 @@ async fn run() -> Result<(), DaemonError> {
     // rejects duplicate use of this exact runtime namespace.
     ensure_private_dir(&paths.runtime_dir)?;
     ensure_private_dir(&paths.runtime_dir.join(WORKERS_SUBDIR))?;
-    let _lock = InstanceLock::acquire(&paths.lock)?;
+    let _runtime_authority = if paths.runtime_dir == paths.data_dir {
+        // The retained data authority already holds the shared directory inode.
+        // Reopening and flocking that inode would contend with this process's
+        // own lock even though the marker filenames differ.
+        None
+    } else {
+        Some(InstanceLock::acquire(&paths.lock)?)
+    };
 
     // 5. Initialize structured logging and durable worker state below B1's
     // owner-private application state directory.
