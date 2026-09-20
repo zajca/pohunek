@@ -1,10 +1,8 @@
-//! Single-instance lock.
+//! Daemon authority locks.
 //!
-//! Prevents two daemons from owning the same state directory (see
-//! `docs/architecture.md` "Concurrency and supervision": "a single-instance lock
-//! prevents two daemons owning the same state directory"). Implemented as an
-//! advisory `flock(LOCK_EX | LOCK_NB)` on a lock file held open for the daemon's
-//! lifetime.
+//! Prevents two daemons from owning the same runtime or durable data directory.
+//! Each authority is an advisory `flock(LOCK_EX | LOCK_NB)` on a lock file held
+//! open for the daemon's lifetime.
 //!
 //! flock is used (rather than a PID file with `O_EXCL`) because the lock is
 //! released automatically by the kernel when the holding process dies — even on
@@ -18,8 +16,8 @@ use pohunek_platform::filesystem::{AdvisoryLock, FsError, TrustedDir};
 
 use crate::error::DaemonError;
 
-/// An acquired single-instance lock. Drop releases it (the kernel also releases
-/// it on process exit).
+/// An acquired daemon authority lock. Drop releases it (the kernel also
+/// releases it on process exit).
 #[derive(Debug)]
 pub struct InstanceLock {
     // The retained directory and marker descriptors keep both advisory locks
@@ -29,7 +27,7 @@ pub struct InstanceLock {
 }
 
 impl InstanceLock {
-    /// Try to acquire the single-instance lock at `path`.
+    /// Try to acquire a daemon authority lock at `path`.
     ///
     /// The parent directory must already exist (the daemon creates it first).
     ///

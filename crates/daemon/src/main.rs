@@ -115,22 +115,26 @@ async fn run() -> Result<(), DaemonError> {
     // 1. Resolve all paths up front; fail fast on missing required env.
     let paths = Paths::resolve()?;
 
-    // 2. Acquire the durable host-state authority before mutating any runtime
-    // or data root. Two daemon processes can intentionally use different
-    // explicit runtime roots, so the runtime lock cannot arbitrate ownership of
-    // one shared durable state tree.
+    // 2. Acquire the durable data authority before opening any state service.
+    // State and data roots are configured independently, so each needs its own
+    // lifetime lock. Preparing the data root is safe before the lock because it
+    // creates only the owner-private directory that contains the lock itself.
+    ensure_private_dir(&paths.data_dir)?;
+    let _data_authority = InstanceLock::acquire(&paths.data_authority_lock_path())?;
+
+    // 3. Acquire the durable host-state authority. Two daemon processes can
+    // intentionally use different explicit runtime roots, so the runtime lock
+    // cannot arbitrate ownership of either durable tree.
     let governance = Arc::new(HostGovernanceService::open(paths.state_dir.clone()).await?);
 
-    // 3. Prepare owner-private runtime and data roots only after durable
-    // authority is held. The control server revalidates the runtime root on
-    // bind, while the instance lock rejects duplicate use of this exact runtime
-    // namespace.
+    // 4. Prepare the owner-private runtime root only after durable authority is
+    // held. The control server revalidates it on bind, while the runtime lock
+    // rejects duplicate use of this exact runtime namespace.
     ensure_private_dir(&paths.runtime_dir)?;
-    ensure_private_dir(&paths.data_dir)?;
     ensure_private_dir(&paths.runtime_dir.join(WORKERS_SUBDIR))?;
     let _lock = InstanceLock::acquire(&paths.lock)?;
 
-    // 4. Initialize structured logging and durable worker state below B1's
+    // 5. Initialize structured logging and durable worker state below B1's
     // owner-private application state directory.
     let _log_guard = logging::init(&paths.log_dir)?;
     ensure_private_dir(&paths.state_dir.join(WORKERS_SUBDIR))?;
@@ -142,7 +146,7 @@ async fn run() -> Result<(), DaemonError> {
     );
     info!(lock = %paths.lock.display(), "acquired single-instance lock");
 
-    // 5. Build the session registry with the hook-handshake socket path, the
+    // 6. Build the session registry with the hook-handshake socket path, the
     //    unified metadata store (logical sessions and related bindings), the
     //    worktrees root, and the event-log directory, so spawned agents can
     //    report native identity, logical sessions survive a restart, a
@@ -173,7 +177,7 @@ async fn run() -> Result<(), DaemonError> {
             source: std::io::Error::other(source),
         })?;
 
-    // 6. Start the append-only event log before anything emits, so worker
+    // 7. Start the append-only event log before anything emits, so worker
     //    reconciliation events are captured too. The log drains
     //    both session and notification control-plane events into one file.
     let event_logs = spawn_event_logs(

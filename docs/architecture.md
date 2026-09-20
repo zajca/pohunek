@@ -333,9 +333,11 @@ error rather than falling back to unsafe defaults.
 - `pohunekd.service` and worker units are siblings. Workers are grouped under
   `pohunek-sessions.slice`, use `Restart=no`, and have no `PartOf`, `BindsTo`,
   or other stop-propagation dependency on the daemon.
-- A stale public Unix socket is detected and replaced on daemon startup, and a
-  single-instance lock prevents two daemons controlling the same state
-  directory. The daemon sends systemd `READY=1` only after store load, worker
+- A stale public Unix socket is detected and replaced on daemon startup. The
+  daemon holds independent lifetime locks for its durable state and data roots,
+  plus a runtime-instance lock, so independently configured XDG roots cannot
+  let two daemons control the same persistent records. The daemon sends systemd
+  `READY=1` only after store load, worker
   discovery, reconciliation, and public socket bind.
 
 ## Durable Session Workers

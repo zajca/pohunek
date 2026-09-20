@@ -6,8 +6,6 @@ use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
-#[cfg(not(target_os = "linux"))]
-use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 
 // Rust guideline compliant 2026-09-20
@@ -658,11 +656,11 @@ impl TrustedDir {
     }
 
     /// Binds a Unix listener under a collision-resistant staging name with an
-    /// exact mode established at creation time.
+    /// exact mode established before publication.
     ///
-    /// The temporary process umask can only make unrelated concurrent creates
-    /// more restrictive. It is serialized for Pohunek callers and restored
-    /// before this method returns. No pathname-based chmod is performed.
+    /// The socket is created under a collision-resistant name in this verified
+    /// owner-private directory. Its identity is checked around mode setup and
+    /// again before the caller can publish it under a stable name.
     ///
     /// # Errors
     ///
@@ -692,7 +690,6 @@ impl TrustedDir {
                         .entry_identity(&name, EntryKind::Socket)?
                         .ok_or_else(|| FsError::IdentityChanged { path: path.clone() })?;
                     let mode_result = (|| {
-                        #[cfg(target_os = "linux")]
                         set_random_staging_mode_at(&self.file, &name, &path, identity, mode)?;
                         if self.entry_identity_with_mode(&name, EntryKind::Socket, mode)?
                             != Some(identity)
@@ -730,9 +727,9 @@ impl TrustedDir {
     ///
     /// The pathname identity is checked before and after the mode change, while
     /// the mutation itself is applied through a retained descriptor. Darwin does
-    /// not permit descriptor-bound chmod for pathname sockets, so socket callers
-    /// must use [`Self::bind_unix_listener_staged`] to establish the final mode at
-    /// creation time.
+    /// not permit opening pathname sockets for descriptor-bound chmod, so socket
+    /// callers use [`Self::bind_unix_listener_staged`] inside a verified private
+    /// directory instead.
     ///
     /// # Errors
     ///
@@ -1233,17 +1230,16 @@ impl TrustedDir {
             .map_err(|source| io_error("inspect filesystem root", Path::new("/"), source))?;
         let system_uid = stat_uid(&root_stat);
         let effective_uid = rustix::process::geteuid().as_raw();
-        let mut private_tree_started = false;
         if components.is_empty() {
             validate_fd(&directory.file, path, EntryKind::Directory, Some(mode))?;
             return Ok(directory);
         }
         let final_index = components.len() - 1;
         for (index, component) in components.into_iter().enumerate() {
-            let enforce_policy = private_tree_started || index == final_index;
+            let enforce_policy = index == final_index;
             directory = directory.open_child_inner(component, mode, create, enforce_policy)?;
-            if !private_tree_started && index != final_index {
-                private_tree_started = validate_ancestor(
+            if index != final_index {
+                validate_ancestor(
                     &directory.file,
                     &directory.path,
                     mode,
@@ -1368,7 +1364,7 @@ fn validate_ancestor(
     private_mode: u32,
     effective_uid: u32,
     system_uid: u32,
-) -> FsResult<bool> {
+) -> FsResult<()> {
     let stat =
         fs::fstat(file).map_err(|source| io_error("inspect trusted ancestor", path, source))?;
     let mode = stat_mode(&stat);
@@ -1381,11 +1377,11 @@ fn validate_ancestor(
                 expected: private_mode,
             });
         }
-        return Ok(mode == private_mode);
+        return Ok(());
     }
     let system_safe = owner == system_uid && (mode & 0o022 == 0 || mode & 0o1000 != 0);
     if system_safe {
-        return Ok(false);
+        return Ok(());
     }
     Err(FsError::UnsafeOwner {
         path: path.to_path_buf(),
@@ -1921,32 +1917,9 @@ fn bind_unix_listener_with_mode(
 #[cfg(not(target_os = "linux"))]
 fn bind_unix_listener_with_mode(
     path: &Path,
-    mode: u32,
+    _mode: u32,
 ) -> io::Result<std::os::unix::net::UnixListener> {
-    static UMASK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    struct UmaskGuard(Mode);
-
-    impl Drop for UmaskGuard {
-        fn drop(&mut self) {
-            rustix::process::umask(self.0);
-        }
-    }
-
-    let _lock = UMASK_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Reading umask is itself a mutation. Move first to the maximally
-    // restrictive mask so an unrelated concurrent create can only become more
-    // restrictive, then combine the caller's mask with the socket requirement.
-    let previous = rustix::process::umask(mode_from_raw(0o777));
-    let guard = UmaskGuard(previous);
-    let required = 0o777 & !mode;
-    rustix::process::umask(previous | mode_from_raw(required));
-    let result = std::os::unix::net::UnixListener::bind(path);
-    drop(guard);
-    result
+    std::os::unix::net::UnixListener::bind(path)
 }
 
 #[cfg(target_os = "linux")]
@@ -1958,6 +1931,34 @@ fn set_random_staging_mode_at(
     mode: u32,
 ) -> FsResult<()> {
     set_entry_mode_at(directory, name, path, expected, mode)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_random_staging_mode_at(
+    directory: &File,
+    name: &OsStr,
+    path: &Path,
+    expected: EntryIdentity,
+    mode: u32,
+) -> FsResult<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if inspect_entry(directory, path, name, EntryKind::Socket, None)? != Some(expected) {
+        return Err(FsError::IdentityChanged {
+            path: path.to_path_buf(),
+        });
+    }
+    // Darwin cannot open a pathname socket for fchmod. The random name lives
+    // inside a retained owner-private directory, and descriptor-relative
+    // identity checks fence the pathname mutation before atomic publication.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|source| io_error("set staged Unix socket mode", path, source))?;
+    if inspect_entry(directory, path, name, EntryKind::Socket, Some(mode))? != Some(expected) {
+        return Err(FsError::IdentityChanged {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -2440,7 +2441,8 @@ mod tests {
         let leaf = ancestor.join("leaf");
         fs::create_dir(&ancestor).expect("create ancestor");
         fs::create_dir(&leaf).expect("create leaf");
-        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o755)).expect("widen ancestor");
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o775))
+            .expect("make ancestor group-writable");
         fs::set_permissions(&leaf, fs::Permissions::from_mode(DIRECTORY_MODE))
             .expect("set private leaf");
 
@@ -2448,6 +2450,30 @@ mod tests {
             TrustedDir::open_absolute(&leaf, DIRECTORY_MODE),
             Err(FsError::UnsafeMode { path, .. }) if path == ancestor
         ));
+    }
+
+    #[test]
+    fn absolute_tree_accepts_safe_shared_intermediates_below_a_private_home() {
+        let (temporary, _trusted) = trusted_root();
+        let home = temporary.path().join("home");
+        let local = home.join(".local");
+        let share = local.join("share");
+        let application = share.join("pohunek");
+        fs::create_dir(&home).expect("create private home");
+        fs::create_dir(&local).expect("create shared local directory");
+        fs::create_dir(&share).expect("create shared data directory");
+        fs::create_dir(&application).expect("create private application directory");
+        fs::set_permissions(&home, fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("set private home mode");
+        fs::set_permissions(&local, fs::Permissions::from_mode(0o755))
+            .expect("set local directory mode");
+        fs::set_permissions(&share, fs::Permissions::from_mode(0o755))
+            .expect("set data directory mode");
+        fs::set_permissions(&application, fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("set private application mode");
+
+        TrustedDir::open_absolute(&application, DIRECTORY_MODE)
+            .expect("safe XDG intermediates below a private home are accepted");
     }
 
     #[test]
