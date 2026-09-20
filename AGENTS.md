@@ -118,7 +118,10 @@ bun run test:e2e
 
 Stale per-branch Cargo isolation dirs: `scripts/cargo-sweep-targets --dry-run`
 (preview) / `--days 30` (delete, 30-day retention; `--cron` prints the monthly
-line). `target/debug`, `target/release`, and nextest/doc scratch dirs are kept.
+line). `target/debug`, `target/release`, nextest/doc scratch dirs, manual
+`pohunek-eval` transcripts, and standard Cargo outputs (`doc`, `package`,
+cross-compile triples) are kept; only entries shaped like Cargo target dirs
+are deleted, and a non-target `--target-dir` refuses to run.
 
 The real-daemon web suite is opt-in locally and mandatory in CI after building
 `pohunekd`, `pohunek-sessiond`, and `pohunek` (the suite runs the daemon in

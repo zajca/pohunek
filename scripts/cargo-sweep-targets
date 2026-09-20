@@ -6,9 +6,12 @@
 # `rsa-policy` xtask fixture or a worktree-specific directory): those isolated
 # directories never get reused after the branch lands, so this script deletes
 # the ones whose content has not been touched for the retention window.
-# `target/debug`, `target/release`, and the nextest/doc support directories
-# are always kept. Run with `--dry-run` to preview, or install the cron line
-# printed by `--cron` to run it every 30 days.
+# Entries that do not look like Cargo target directories (no `debug/` or
+# `release/` profile output, no `CACHEDIR.TAG`/`rustc-info` sentinel) are never
+# deleted: that keeps `target/pohunek-eval` transcripts, `target/doc`,
+# `target/package`, and any other non-build output. Run with `--dry-run` to
+# preview, or install the cron line printed by `--cron` to run it every
+# 30 days.
 set -euo pipefail
 
 RETENTION_DAYS=30
@@ -32,13 +35,39 @@ cron_line() {
 }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Resolve a path to its canonical absolute form without requiring it to
+# exist. Prefers realpath/readlink -m, falls back to python3 (which covers
+# macOS, where neither flag is guaranteed to exist).
+canonicalize() {
+  local path="$1" out
+  if out="$(realpath -m "$path" 2>/dev/null)" && [[ -n "$out" ]]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  if out="$(readlink -m "$path" 2>/dev/null)" && [[ -n "$out" ]]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  python3 -c 'import os,sys; print(os.path.normpath(os.path.abspath(sys.argv[1])))' "$path"
+}
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target-dir)
+      if [[ $# -lt 2 || "$2" == -* ]]; then
+        echo "error: --target-dir requires a PATH value." >&2
+        usage >&2
+        exit 1
+      fi
       TARGET_ROOT="$2"
       shift 2
       ;;
     --days)
+      if [[ $# -lt 2 || "$2" == -* ]]; then
+        echo "error: --days requires a positive integer value." >&2
+        usage >&2
+        exit 1
+      fi
       RETENTION_DAYS="$2"
       shift 2
       ;;
@@ -62,22 +91,80 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if ! [[ "$RETENTION_DAYS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: --days must be a positive integer, got '$RETENTION_DAYS'." >&2
+  exit 1
+fi
+
 if [[ -z "$TARGET_ROOT" ]]; then
   TARGET_ROOT="$repo_root/target"
 fi
 
-# Directories the workspace itself owns: the default profiles plus the
-# nextest/doc scratch areas. Everything else directly under the target root
-# is a per-branch isolation directory eligible for retention cleanup.
-KEEP=("debug" "release" "nextest" "tmp" "pohunek-docs")
+canonical_root="$(canonicalize "$TARGET_ROOT")" || {
+  echo "refusing: cannot resolve target directory '$TARGET_ROOT'." >&2
+  exit 1
+}
+canonical_repo="$(canonicalize "$repo_root")"
+canonical_home=""
+if [[ -n "${HOME:-}" ]]; then
+  canonical_home="$(canonicalize "$HOME" || true)"
+fi
+
+# Destructive guard: the sweep runs `rm -rf` below this root, so refuse
+# anything that is not recognisably a Cargo target directory. A typo such as
+# `--target-dir "$PWD"` or the home directory must fail closed instead of
+# classifying source trees as sweep candidates.
+if [[ "$canonical_root" == "/" ]]; then
+  echo "refusing: target directory must not be the filesystem root." >&2
+  exit 1
+fi
+if [[ -n "$canonical_home" && "$canonical_root" == "$canonical_home" ]]; then
+  echo "refusing: target directory must not be the home directory." >&2
+  exit 1
+fi
+if [[ "$canonical_root" == "$canonical_repo" ]]; then
+  echo "refusing: target directory must not be the repository root." >&2
+  exit 1
+fi
+if [[ ! -e "$canonical_root/CACHEDIR.TAG" && ! -e "$canonical_root/.rustc_info.json" ]]; then
+  echo "refusing: '$TARGET_ROOT' does not look like a Cargo target directory" >&2
+  echo "(missing CACHEDIR.TAG and .rustc_info.json sentinel)." >&2
+  exit 1
+fi
+TARGET_ROOT="$canonical_root"
+
+# Directories the workspace itself owns: the default profiles, the
+# nextest/doc scratch areas, the manual eval transcripts (which may be
+# irreproducible), and standard Cargo outputs.
+KEEP=("debug" "release" "nextest" "tmp" "pohunek-docs" "pohunek-eval" "doc" "package")
 if [[ ! -d "$TARGET_ROOT" ]]; then
   echo "target directory $TARGET_ROOT does not exist; nothing to sweep."
   exit 0
 fi
 
+# True for cross-compile triple output (e.g. x86_64-unknown-linux-gnu),
+# which Cargo owns and the sweep must keep.
+is_triple_dir() {
+  [[ "$1" =~ ^[a-z0-9_]+-unknown-.* ]]
+}
+
+# True when the entry has the shape of a Cargo target directory: profile
+# output or a Cargo cache/rustc sentinel.
+is_cargo_target_shape() {
+  local entry="$1"
+  [[ -e "$entry/CACHEDIR.TAG" || -e "$entry/.rustc_info.json" || -d "$entry/debug" || -d "$entry/release" ]]
+}
+
 deleted=0
 for entry in "$TARGET_ROOT"/*; do
-  [[ -e "$entry" ]] || continue
+  [[ -e "$entry" || -L "$entry" ]] || continue
+  if [[ -L "$entry" ]]; then
+    echo "skip (symlink, not a real directory): $entry"
+    continue
+  fi
+  if [[ ! -d "$entry" ]]; then
+    continue
+  fi
   name="$(basename "$entry")"
   keep=0
   for kept in "${KEEP[@]}"; do
@@ -89,10 +176,18 @@ for entry in "$TARGET_ROOT"/*; do
   if [[ "$keep" -eq 1 ]]; then
     continue
   fi
-  if [[ ! -d "$entry" ]]; then
+  if is_triple_dir "$name"; then
+    echo "skip (cross-compile target output): $entry"
     continue
   fi
-  if find "$entry" -mindepth 0 -maxdepth 0 -mtime "-${RETENTION_DAYS}" | grep -q .; then
+  if ! is_cargo_target_shape "$entry"; then
+    echo "skip (not a Cargo target directory): $entry"
+    continue
+  fi
+  # Recency is the newest mtime anywhere under the entry: Cargo writes into
+  # nested profile output (e.g. <name>/debug/...) without touching the entry
+  # root, so checking only the root mtime would delete actively used targets.
+  if find "$entry" -mtime "-${RETENTION_DAYS}" -print -quit 2>/dev/null | grep -q .; then
     echo "keep (recent): $entry"
     continue
   fi
@@ -100,7 +195,7 @@ for entry in "$TARGET_ROOT"/*; do
     echo "would delete (stale >${RETENTION_DAYS}d): $entry"
   else
     echo "delete (stale >${RETENTION_DAYS}d): $entry"
-    rm -rf "$entry"
+    rm -rf -- "$entry"
     deleted=$((deleted + 1))
   fi
 done

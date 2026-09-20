@@ -842,13 +842,18 @@ bun run typecheck && bun run lint && bun test
 `tsc -b` on its own (`cd web/sdk && bun run typecheck`).
 Per-package `dist-types/` output is git-ignored.
 
-Stale per-branch Cargo target isolation directories (`target/<name>`,
-untouched for 30+ days) are removed with:
+Stale per-branch Cargo target isolation directories (`target/<name>` shaped
+like a Cargo target dir, untouched for 30+ days) are removed with:
 
 ```bash
 scripts/cargo-sweep-targets --dry-run   # preview
 scripts/cargo-sweep-targets --days 30   # delete; --cron prints a monthly line
 ```
+
+Only entries shaped like Cargo target dirs are deleted. `target/debug`,
+`target/release`, nextest/doc scratch dirs, manual `pohunek-eval`
+transcripts, `doc`/`package` output, and cross-compile triples are kept, and
+a `--target-dir` that is not a Cargo target dir refuses to run.
 
 A protocol change is not done until the generated TypeScript types match:
 
