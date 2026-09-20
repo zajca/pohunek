@@ -707,6 +707,9 @@ mod tests {
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    // Keep synthetic runtime paths below the strictest supported Unix-socket limit.
+    const TEST_BASE_ROOT: &str = "/tmp";
+
     const VARS: [&str; 6] = [
         XDG_RUNTIME_DIR,
         XDG_STATE_HOME,
@@ -746,7 +749,7 @@ mod tests {
     }
 
     fn tmp_base(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("pohunek-paths-{tag}-{}", std::process::id()))
+        Path::new(TEST_BASE_ROOT).join(format!("p-{}-{tag}", std::process::id()))
     }
 
     fn set_all_present(base: &Path) {
