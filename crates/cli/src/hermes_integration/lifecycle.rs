@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use nix::unistd::Uid;
 use pohunek_platform::filesystem::{
     AdvisoryLock, AtomicReplaceError, EntryKind, FsError, MoveOutcome, RemoveOutcome, StageOutcome,
-    TrustedDir,
+    StagedMoveError, TrustedDir,
 };
 
 use super::assets::{self, Asset, Ownership, MARKER_NAME};
@@ -454,6 +454,20 @@ impl FileOps for NativeFileOps {
 }
 
 fn trusted_rename_replacing_reservation(source: &Path, destination: &Path) -> RenameResult {
+    trusted_rename_replacing_reservation_with(source, destination, |path, is_directory| {
+        if is_directory {
+            trusted_remove_dir_all(path)
+        } else {
+            trusted_remove_file(path)
+        }
+    })
+}
+
+fn trusted_rename_replacing_reservation_with(
+    source: &Path,
+    destination: &Path,
+    remove_reservation: impl FnOnce(&Path, bool) -> Result<(), Error>,
+) -> RenameResult {
     if let Ok(metadata) = fs::symlink_metadata(destination) {
         let name = destination
             .file_name()
@@ -466,7 +480,7 @@ fn trusted_rename_replacing_reservation(source: &Path, destination: &Path) -> Re
         if !is_reservation || metadata.file_type().is_symlink() {
             return Err(RenameFailure::BeforeCommit(Error::Collision));
         }
-        let removal = if metadata.is_dir() {
+        let is_directory = if metadata.is_dir() {
             if fs::read_dir(destination)
                 .map_err(Error::from)
                 .map_err(RenameFailure::BeforeCommit)?
@@ -475,13 +489,14 @@ fn trusted_rename_replacing_reservation(source: &Path, destination: &Path) -> Re
             {
                 return Err(RenameFailure::BeforeCommit(Error::Collision));
             }
-            trusted_remove_dir_all(destination)
+            true
         } else if metadata.is_file() && metadata.len() == 0 {
-            trusted_remove_file(destination)
+            false
         } else {
             return Err(RenameFailure::BeforeCommit(Error::Collision));
         };
-        removal.map_err(|_| RenameFailure::Committed(Error::RecoveryRequired))?;
+        remove_reservation(destination, is_directory)
+            .map_err(|_| RenameFailure::BeforeCommit(Error::RecoveryRequired))?;
     }
     trusted_rename_no_replace(source, destination)
 }
@@ -530,7 +545,7 @@ fn trusted_rename_no_replace(source: &Path, destination: &Path) -> RenameResult 
         .entry_identity(source_name, kind)
         .map_err(|_| RenameFailure::BeforeCommit(Error::UnsafeTarget))?
         .ok_or(RenameFailure::BeforeCommit(Error::RecoveryRequired))?;
-    let staged = match source_directory
+    let mut staged = match source_directory
         .stage_random(source_name, ".pohunek-hermes-move-", identity)
         .map_err(|error| {
             if matches!(error, FsError::CommittedDurabilityUncertain { .. }) {
@@ -556,10 +571,19 @@ fn trusted_rename_no_replace(source: &Path, destination: &Path) -> RenameResult 
                 .map_err(|_| RenameFailure::Committed(Error::RecoveryRequired))?;
             Err(RenameFailure::BeforeCommit(Error::Collision))
         }
-        Err(_) => {
-            let _ = staged.restore(source_name);
+        Err(StagedMoveError::BeforeCommit(_)) => {
+            staged
+                .restore(source_name)
+                .map_err(|_| RenameFailure::BeforeCommit(Error::RecoveryRequired))?;
+            Err(RenameFailure::BeforeCommit(Error::RecoveryRequired))
+        }
+        Err(StagedMoveError::Committed { .. }) => {
             Err(RenameFailure::Committed(Error::RecoveryRequired))
         }
+        Err(StagedMoveError::RecoveryRequired { .. }) => {
+            Err(RenameFailure::BeforeCommit(Error::RecoveryRequired))
+        }
+        Err(_) => Err(RenameFailure::BeforeCommit(Error::RecoveryRequired)),
         Ok(_) => Err(RenameFailure::Committed(Error::RecoveryRequired)),
     }
 }
@@ -1998,6 +2022,67 @@ mod tests {
                 }))
             );
         }
+    }
+
+    #[test]
+    fn reservation_removal_failure_before_unlink_is_not_a_committed_move() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        fs::set_permissions(
+            root.path(),
+            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+        )
+        .expect("private temporary directory");
+        let source = root.path().join("source");
+        let destination = root.path().join(format!("{STAGE_PREFIX}reservation"));
+        fs::write(&source, b"source").expect("source file");
+        fs::write(&destination, b"").expect("reservation file");
+
+        let result = trusted_rename_replacing_reservation_with(
+            &source,
+            &destination,
+            |_path, _is_directory| {
+                Err(Error::Io {
+                    kind: std::io::ErrorKind::PermissionDenied,
+                })
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(RenameFailure::BeforeCommit(Error::RecoveryRequired))
+        );
+        assert_eq!(fs::read(&source).expect("preserved source"), b"source");
+        assert!(destination.exists());
+    }
+
+    #[test]
+    fn reservation_removal_failure_after_unlink_is_not_a_committed_move() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        fs::set_permissions(
+            root.path(),
+            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+        )
+        .expect("private temporary directory");
+        let source = root.path().join("source");
+        let destination = root.path().join(format!("{STAGE_PREFIX}reservation"));
+        fs::write(&source, b"source").expect("source file");
+        fs::write(&destination, b"").expect("reservation file");
+
+        let result = trusted_rename_replacing_reservation_with(
+            &source,
+            &destination,
+            |path, _is_directory| {
+                fs::remove_file(path)?;
+                Err(Error::RecoveryRequired)
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(RenameFailure::BeforeCommit(Error::RecoveryRequired))
+        );
+        assert_eq!(fs::read(&source).expect("preserved source"), b"source");
+        assert!(!destination.exists());
     }
 
     #[test]

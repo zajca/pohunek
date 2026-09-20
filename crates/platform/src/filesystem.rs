@@ -273,6 +273,33 @@ pub enum AtomicReplaceError {
     CommittedDurabilityUncertain(#[source] FsError),
 }
 
+/// A failure while moving an inode-bound staged entry.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum StagedMoveError {
+    /// The destination was unchanged and the entry was restored to its staging name.
+    #[error("staged move failed before commit: {0}")]
+    BeforeCommit(#[source] FsError),
+    /// The entry reached the destination, but final validation or durability failed.
+    #[error("staged move committed at {}: {source}", path.display())]
+    Committed {
+        /// The current path naming the moved entry.
+        path: PathBuf,
+        /// The failure observed after the namespace commit.
+        #[source]
+        source: FsError,
+    },
+    /// Recovery could not restore the entry to its tracked staging name.
+    #[error("staged move recovery failed with the entry at {}: {source}", path.display())]
+    RecoveryRequired {
+        /// The last known path naming the staged entry.
+        path: PathBuf,
+        /// The recovery failure.
+        #[source]
+        source: FsError,
+    },
+}
+
 /// A validated owner-private directory retained by descriptor.
 #[derive(Debug)]
 pub struct TrustedDir {
@@ -1060,6 +1087,13 @@ impl TrustedDir {
         let source = validate_component(source.as_ref())?;
         let destination = validate_component(destination.as_ref())?;
         let destination_path = destination_dir.path.join(destination);
+        if let Some(source) = injected_move_failure() {
+            return Err(io_error(
+                "move entry without replacement",
+                &destination_path,
+                source,
+            ));
+        }
         match fs::renameat_with(
             &self.file,
             source,
@@ -1627,56 +1661,113 @@ impl StagedEntry {
     ///
     /// # Errors
     ///
-    /// Returns [`FsError`] when identity validation, movement, or recovery fails.
+    /// Returns [`StagedMoveError`] with the namespace commit state when identity
+    /// validation, movement, durability, or recovery fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the staged-move commit and recovery states remain contiguous for auditability"
+    )]
     pub fn move_to(
-        &self,
+        &mut self,
         destination_dir: &TrustedDir,
         destination: impl AsRef<OsStr>,
-    ) -> FsResult<MoveOutcome> {
-        let destination = validate_component(destination.as_ref())?;
+    ) -> Result<MoveOutcome, StagedMoveError> {
+        let destination =
+            validate_component(destination.as_ref()).map_err(StagedMoveError::BeforeCommit)?;
         let source_dir = TrustedDir {
             path: self.directory_path.clone(),
-            file: self.directory.try_clone().map_err(|source| {
-                io_error(
-                    "duplicate staging directory descriptor",
-                    &self.directory_path,
-                    source,
-                )
-            })?,
+            file: self
+                .directory
+                .try_clone()
+                .map_err(|source| {
+                    io_error(
+                        "duplicate staging directory descriptor",
+                        &self.directory_path,
+                        source,
+                    )
+                })
+                .map_err(StagedMoveError::BeforeCommit)?,
         };
+        let original_name = self.name.clone();
         let staged_path = self.directory_path.join(&self.name);
-        let quarantine = move_to_random_quarantine(
+        let quarantine = rename_to_random_quarantine(
             &self.directory,
             &self.directory_path,
             &self.name,
             ".pohunek-move-",
-        )?
+        )
+        .map_err(StagedMoveError::BeforeCommit)?
         .ok_or_else(|| FsError::IdentityChanged {
             path: staged_path.clone(),
-        })?;
+        })
+        .map_err(StagedMoveError::BeforeCommit)?;
         let quarantine_path = self.directory_path.join(&quarantine);
-        if inspect_entry(
+        self.name.clone_from(&quarantine);
+        if let Err(source) = durable_sync(&self.directory) {
+            let error = FsError::CommittedDurabilityUncertain {
+                operation: "move entry to quarantine",
+                path: quarantine_path.clone(),
+                source,
+            };
+            return Err(self.restore_move_staging(&source_dir, original_name, error));
+        }
+        let current = inspect_entry(
             &self.directory,
             &quarantine_path,
             &quarantine,
             self.identity.kind,
             None,
-        )? != Some(self.identity)
-        {
-            match source_dir.move_no_replace(&quarantine, &source_dir, &self.name)? {
-                MoveOutcome::Moved => {}
+        );
+        let current = match current {
+            Ok(current) => current,
+            Err(error) => {
+                return Err(self.restore_move_staging(&source_dir, original_name, error));
+            }
+        };
+        if current != Some(self.identity) {
+            match source_dir
+                .move_no_replace(&self.name, &source_dir, &original_name)
+                .map_err(|source| StagedMoveError::RecoveryRequired {
+                    path: quarantine_path.clone(),
+                    source,
+                })? {
+                MoveOutcome::Moved => self.name = original_name,
                 MoveOutcome::DestinationExists => {
-                    return Err(FsError::RecoveryConflict { path: staged_path });
+                    return Err(StagedMoveError::RecoveryRequired {
+                        path: quarantine_path,
+                        source: FsError::RecoveryConflict { path: staged_path },
+                    });
                 }
             }
-            return Err(FsError::IdentityChanged { path: staged_path });
+            return Err(StagedMoveError::BeforeCommit(FsError::IdentityChanged {
+                path: staged_path,
+            }));
         }
-        let outcome = source_dir.move_no_replace(&quarantine, destination_dir, destination)?;
+        let outcome = match source_dir.move_no_replace(&self.name, destination_dir, destination) {
+            Ok(outcome) => outcome,
+            Err(source @ FsError::CommittedDurabilityUncertain { .. }) => {
+                return Err(StagedMoveError::Committed {
+                    path: destination_dir.path.join(destination),
+                    source,
+                });
+            }
+            Err(error) => {
+                return Err(self.restore_move_staging(&source_dir, original_name, error));
+            }
+        };
         if outcome == MoveOutcome::DestinationExists {
-            match source_dir.move_no_replace(&quarantine, &source_dir, &self.name)? {
-                MoveOutcome::Moved => {}
+            match source_dir
+                .move_no_replace(&self.name, &source_dir, &original_name)
+                .map_err(|source| StagedMoveError::RecoveryRequired {
+                    path: self.path(),
+                    source,
+                })? {
+                MoveOutcome::Moved => self.name = original_name,
                 MoveOutcome::DestinationExists => {
-                    return Err(FsError::RecoveryConflict { path: staged_path });
+                    return Err(StagedMoveError::RecoveryRequired {
+                        path: self.path(),
+                        source: FsError::RecoveryConflict { path: staged_path },
+                    });
                 }
             }
             return Ok(outcome);
@@ -1688,13 +1779,62 @@ impl StagedEntry {
             destination,
             self.identity.kind,
             None,
-        )? != Some(self.identity)
+        )
+        .map_err(|source| StagedMoveError::Committed {
+            path: destination_path.clone(),
+            source,
+        })? != Some(self.identity)
         {
-            return Err(FsError::IdentityChanged {
-                path: destination_path,
+            return Err(StagedMoveError::Committed {
+                path: destination_path.clone(),
+                source: FsError::IdentityChanged {
+                    path: destination_path,
+                },
             });
         }
         Ok(MoveOutcome::Moved)
+    }
+
+    fn restore_move_staging(
+        &mut self,
+        source_dir: &TrustedDir,
+        original_name: OsString,
+        original_error: FsError,
+    ) -> StagedMoveError {
+        let quarantine_path = self.path();
+        let staged_path = self.directory_path.join(&original_name);
+        match source_dir.move_no_replace(&self.name, source_dir, &original_name) {
+            Ok(MoveOutcome::Moved) => {
+                self.name = original_name;
+                StagedMoveError::BeforeCommit(original_error)
+            }
+            Ok(MoveOutcome::DestinationExists) => StagedMoveError::RecoveryRequired {
+                path: quarantine_path,
+                source: FsError::RecoveryConflict { path: staged_path },
+            },
+            Err(source @ FsError::CommittedDurabilityUncertain { .. }) => {
+                match inspect_entry(
+                    &source_dir.file,
+                    &staged_path,
+                    &original_name,
+                    self.identity.kind,
+                    None,
+                ) {
+                    Ok(Some(identity)) if identity == self.identity => {
+                        self.name = original_name;
+                        StagedMoveError::BeforeCommit(source)
+                    }
+                    _ => StagedMoveError::RecoveryRequired {
+                        path: quarantine_path,
+                        source,
+                    },
+                }
+            }
+            Err(source) => StagedMoveError::RecoveryRequired {
+                path: quarantine_path,
+                source,
+            },
+        }
     }
 }
 
@@ -1766,6 +1906,23 @@ fn move_to_random_quarantine(
     source_name: &OsStr,
     prefix: &str,
 ) -> FsResult<Option<OsString>> {
+    let quarantine = rename_to_random_quarantine(directory, directory_path, source_name, prefix)?;
+    if let Some(name) = quarantine.as_ref() {
+        durable_sync(directory).map_err(|source| FsError::CommittedDurabilityUncertain {
+            operation: "move entry to quarantine",
+            path: directory_path.join(name),
+            source,
+        })?;
+    }
+    Ok(quarantine)
+}
+
+fn rename_to_random_quarantine(
+    directory: &File,
+    directory_path: &Path,
+    source_name: &OsStr,
+    prefix: &str,
+) -> FsResult<Option<OsString>> {
     for _ in 0..STAGING_NAME_ATTEMPTS {
         let quarantine = random_staging_name(prefix)?;
         match fs::renameat_with(
@@ -1775,16 +1932,7 @@ fn move_to_random_quarantine(
             &quarantine,
             RenameFlags::NOREPLACE,
         ) {
-            Ok(()) => {
-                durable_sync(directory).map_err(|source| {
-                    FsError::CommittedDurabilityUncertain {
-                        operation: "move entry to quarantine",
-                        path: directory_path.join(&quarantine),
-                        source,
-                    }
-                })?;
-                return Ok(Some(quarantine));
-            }
+            Ok(()) => return Ok(Some(quarantine)),
             Err(rustix::io::Errno::NOENT) => return Ok(None),
             Err(rustix::io::Errno::EXIST) => {}
             Err(source) => {
@@ -2336,6 +2484,19 @@ std::thread_local! {
     static NEXT_SYNC_FAILURE: std::cell::RefCell<Option<(usize, io::ErrorKind)>> = const {
         std::cell::RefCell::new(None)
     };
+    static NEXT_MOVE_FAILURE: std::cell::RefCell<Option<io::ErrorKind>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn injected_move_failure() -> Option<io::Error> {
+    NEXT_MOVE_FAILURE.with(|slot| slot.borrow_mut().take().map(io::Error::from))
+}
+
+#[cfg(not(test))]
+const fn injected_move_failure() -> Option<io::Error> {
+    None
 }
 
 #[cfg(test)]
@@ -2703,6 +2864,85 @@ mod tests {
             fs::read(temporary.path().join(".source.staged")).expect("read replacement"),
             b"replacement"
         );
+    }
+
+    #[test]
+    fn staged_move_restores_its_tracked_name_after_pre_commit_failure() {
+        let (source_root, source_directory) = trusted_root();
+        let (destination_root, destination_directory) = trusted_root();
+        let source = source_root.path().join("source");
+        fs::write(&source, b"source").expect("write source");
+        fs::set_permissions(&source, fs::Permissions::from_mode(FILE_MODE))
+            .expect("set source mode");
+        let identity = source_directory
+            .entry_identity("source", EntryKind::RegularFile)
+            .expect("inspect source")
+            .expect("source exists");
+        let StageOutcome::Staged(mut staged) = source_directory
+            .stage("source", ".source.staged", identity)
+            .expect("stage source")
+        else {
+            panic!("source must be staged");
+        };
+        NEXT_MOVE_FAILURE.with(|slot| {
+            *slot.borrow_mut() = Some(io::ErrorKind::CrossesDevices);
+        });
+
+        assert!(matches!(
+            staged.move_to(&destination_directory, "destination"),
+            Err(StagedMoveError::BeforeCommit(FsError::Io { source, .. }))
+                if source.kind() == io::ErrorKind::CrossesDevices
+        ));
+        assert_eq!(
+            fs::read(staged.path()).expect("read restored staging entry"),
+            b"source"
+        );
+        assert!(!destination_root.path().join("destination").exists());
+        assert!(source_root
+            .path()
+            .read_dir()
+            .expect("enumerate source root")
+            .all(|entry| !entry
+                .expect("source entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".pohunek-move-")));
+    }
+
+    #[test]
+    fn staged_move_reports_the_destination_after_post_commit_failure() {
+        let (source_root, source_directory) = trusted_root();
+        let (destination_root, destination_directory) = trusted_root();
+        let source = source_root.path().join("source");
+        fs::write(&source, b"source").expect("write source");
+        fs::set_permissions(&source, fs::Permissions::from_mode(FILE_MODE))
+            .expect("set source mode");
+        let identity = source_directory
+            .entry_identity("source", EntryKind::RegularFile)
+            .expect("inspect source")
+            .expect("source exists");
+        let StageOutcome::Staged(mut staged) = source_directory
+            .stage("source", ".source.staged", identity)
+            .expect("stage source")
+        else {
+            panic!("source must be staged");
+        };
+        NEXT_SYNC_FAILURE.with(|slot| {
+            // Quarantine synchronization succeeds; source-directory
+            // synchronization after the destination rename fails.
+            *slot.borrow_mut() = Some((1, io::ErrorKind::StorageFull));
+        });
+        let destination = destination_root.path().join("destination");
+
+        assert!(matches!(
+            staged.move_to(&destination_directory, "destination"),
+            Err(StagedMoveError::Committed { path, .. }) if path == destination
+        ));
+        assert_eq!(
+            fs::read(&destination).expect("read committed entry"),
+            b"source"
+        );
+        assert!(!staged.path().exists());
     }
 
     #[test]
