@@ -2047,14 +2047,9 @@ mod tests {
 
     #[test]
     fn collision_restore_failure_does_not_record_parent_rename_as_committed() {
-        let root = tempfile::tempdir().expect("temporary directory");
-        fs::set_permissions(
-            root.path(),
-            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
-        )
-        .expect("private temporary directory");
-        let source = root.path().join("source");
-        let destination = root.path().join("destination");
+        let root = fixture("collision-restore-state");
+        let source = root.0.join("source");
+        let destination = root.0.join("destination");
         fs::write(&source, b"source").expect("source file");
         fs::set_permissions(&source, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
             .expect("private source");
