@@ -2912,7 +2912,7 @@ mod tests {
     #[test]
     fn staged_move_reports_the_destination_after_post_commit_failure() {
         let (source_root, source_directory) = trusted_root();
-        let (destination_root, destination_directory) = trusted_root();
+        let (_destination_root, destination_directory) = trusted_root();
         let source = source_root.path().join("source");
         fs::write(&source, b"source").expect("write source");
         fs::set_permissions(&source, fs::Permissions::from_mode(FILE_MODE))
@@ -2932,7 +2932,7 @@ mod tests {
             // synchronization after the destination rename fails.
             *slot.borrow_mut() = Some((1, io::ErrorKind::StorageFull));
         });
-        let destination = destination_root.path().join("destination");
+        let destination = destination_directory.path().join("destination");
 
         assert!(matches!(
             staged.move_to(&destination_directory, "destination"),
