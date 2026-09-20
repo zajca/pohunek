@@ -1,10 +1,22 @@
 {
   "extends": "../tsconfig.base.json",
   "compilerOptions": {
-    "rootDir": "."
+    "composite": true,
+    "noEmit": false,
+    "emitDeclarationOnly": true,
+    "outDir": "dist-types",
+    "tsBuildInfoFile": "dist-types/tsconfig.tsbuildinfo"
   },
   "include": [
     "src/**/*",
     "test/**/*"
+  ],
+  "references": [
+    {
+      "path": "../shared"
+    },
+    {
+      "path": "../sdk"
+    }
   ]
 }

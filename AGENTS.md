@@ -109,12 +109,16 @@ Web workspace gates:
 ```bash
 cd web
 bun install --frozen-lockfile
-bun run typecheck
+bun run typecheck   # one command: tsc -b composite graph + frontend/release-test
 bun run lint
 bun test
 bunx playwright install --with-deps chromium  # prerequisite for browser e2e
 bun run test:e2e
 ```
+
+Stale per-branch Cargo isolation dirs: `scripts/cargo-sweep-targets --dry-run`
+(preview) / `--days 30` (delete, 30-day retention; `--cron` prints the monthly
+line). `target/debug`, `target/release`, and nextest/doc scratch dirs are kept.
 
 The real-daemon web suite is opt-in locally and mandatory in CI after building
 `pohunekd`, `pohunek-sessiond`, and `pohunek` (the suite runs the daemon in

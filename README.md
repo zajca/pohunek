@@ -835,6 +835,21 @@ bun install --frozen-lockfile
 bun run typecheck && bun run lint && bun test
 ```
 
+`bun run typecheck` is one command: `tsc -b` over the composite
+`shared → sdk → backend/testkit → client-core/tools` graph (incremental via
+`.tsbuildinfo` in each `dist-types/`), then the standalone `frontend`
+(`svelte-check`) and `release-test` checks. Each package also supports
+`tsc -b` on its own (`cd web/sdk && bun run typecheck`).
+Per-package `dist-types/` output is git-ignored.
+
+Stale per-branch Cargo target isolation directories (`target/<name>`,
+untouched for 30+ days) are removed with:
+
+```bash
+scripts/cargo-sweep-targets --dry-run   # preview
+scripts/cargo-sweep-targets --days 30   # delete; --cron prints a monthly line
+```
+
 A protocol change is not done until the generated TypeScript types match:
 
 ```bash

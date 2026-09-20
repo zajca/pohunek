@@ -4,10 +4,14 @@
     "composite": true,
     "noEmit": false,
     "emitDeclarationOnly": true,
-    "outDir": "dist-types",
-    "tsBuildInfoFile": "dist-types/tsconfig.tsbuildinfo"
+    "outDir": "dist-types/tools",
+    "rootDir": ".",
+    "tsBuildInfoFile": "dist-types/tsconfig.tools.tsbuildinfo"
   },
-  "include": [],
+  "include": [
+    "release/smoke.ts",
+    "scripts/**/*.ts"
+  ],
   "references": [
     {
       "path": "./shared"
@@ -20,12 +24,6 @@
     },
     {
       "path": "./testkit"
-    },
-    {
-      "path": "./client-core"
-    },
-    {
-      "path": "./tsconfig.tools.json"
     }
   ]
 }

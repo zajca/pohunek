@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Remove stale per-branch Cargo target directories (issue #126).
+#
+# The default `target/` build output is shared. Per-branch isolation happens
+# only when `CARGO_TARGET_DIR` points at `target/<name>` (for example the
+# `rsa-policy` xtask fixture or a worktree-specific directory): those isolated
+# directories never get reused after the branch lands, so this script deletes
+# the ones whose content has not been touched for the retention window.
+# `target/debug`, `target/release`, and the nextest/doc support directories
+# are always kept. Run with `--dry-run` to preview, or install the cron line
+# printed by `--cron` to run it every 30 days.
+set -euo pipefail
+
+RETENTION_DAYS=30
+DRY_RUN=0
+TARGET_ROOT=""
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [--target-dir PATH] [--days N] [--dry-run] [--cron]
+
+  --target-dir PATH  Cargo target directory (default: <repo>/target)
+  --days N           delete per-branch dirs untouched for N days (default: 30)
+  --dry-run          print what would be deleted without deleting it
+  --cron             print the suggested cron line and exit
+EOF
+}
+
+cron_line() {
+  local repo="$1"
+  echo "0 6 1 * * CARGO_TARGET_DIR=$repo/target $repo/scripts/cargo-sweep-targets --days 30"
+}
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --target-dir)
+      TARGET_ROOT="$2"
+      shift 2
+      ;;
+    --days)
+      RETENTION_DAYS="$2"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --cron)
+      cron_line "$repo_root"
+      exit 0
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z "$TARGET_ROOT" ]]; then
+  TARGET_ROOT="$repo_root/target"
+fi
+
+# Directories the workspace itself owns: the default profiles plus the
+# nextest/doc scratch areas. Everything else directly under the target root
+# is a per-branch isolation directory eligible for retention cleanup.
+KEEP=("debug" "release" "nextest" "tmp" "pohunek-docs")
+if [[ ! -d "$TARGET_ROOT" ]]; then
+  echo "target directory $TARGET_ROOT does not exist; nothing to sweep."
+  exit 0
+fi
+
+deleted=0
+for entry in "$TARGET_ROOT"/*; do
+  [[ -e "$entry" ]] || continue
+  name="$(basename "$entry")"
+  keep=0
+  for kept in "${KEEP[@]}"; do
+    if [[ "$name" == "$kept" ]]; then
+      keep=1
+      break
+    fi
+  done
+  if [[ "$keep" -eq 1 ]]; then
+    continue
+  fi
+  if [[ ! -d "$entry" ]]; then
+    continue
+  fi
+  if find "$entry" -mindepth 0 -maxdepth 0 -mtime "-${RETENTION_DAYS}" | grep -q .; then
+    echo "keep (recent): $entry"
+    continue
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "would delete (stale >${RETENTION_DAYS}d): $entry"
+  else
+    echo "delete (stale >${RETENTION_DAYS}d): $entry"
+    rm -rf "$entry"
+    deleted=$((deleted + 1))
+  fi
+done
+echo "sweep done: $deleted directorie(s) removed (retention ${RETENTION_DAYS}d)."
