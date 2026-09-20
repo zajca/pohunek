@@ -2075,10 +2075,7 @@ esac"#,
             state = state.display(),
         );
         let hermes = write_executable(&binary_directory.join("hermes"), &hermes_body);
-        write_executable(
-            &binary_directory.join("python3"),
-            r#"exec /usr/bin/python3 "$@""#,
-        );
+        write_executable(&binary_directory.join("python3"), "exit 0");
 
         let mut runner = HermesRunner::new(&hermes).expect("runner");
         assert_eq!(
