@@ -40,12 +40,14 @@ block the caller's ordinary control connection.
 The shipped platform foundation centralizes target-neutral process identity,
 kernel Unix peer identity, and native service supervision contracts in
 `crates/platform`. Linux daemon and worker code use the real procfs, pidfd,
-peer-credential, and systemd backends. Native Apple Silicon CI compiles and tests
-the shared contract with a macOS 14 deployment target, but this does not mean
-macOS host or client support is available. Intel Macs are outside the current
-release scope. Secure runtime paths, Darwin process and peer inspection,
+peer-credential, and systemd backends. The shared secure-path contract preserves
+XDG config/data/state/cache precedence and adds a short, owner-private macOS
+runtime default without moving durable host identity. Native Apple Silicon CI
+compiles and tests these shared contracts with a macOS 14 deployment target, but
+this does not mean complete macOS host or client support is available. Intel
+Macs are outside the current release scope. Darwin process and peer inspection,
 portable PTY readiness, launchd, client and WebUI integration, signed artifacts,
-and native acceptance remain explicitly deferred through issues #96-#105 under
+and native acceptance remain explicitly deferred through issues #97-#105 under
 the `Complete macOS support` milestone and macOS Project. The issue hierarchy,
 milestone, and Project own delivery scope, sequencing, and status; the accepted
 macOS RFC records design constraints rather than live tracking state.

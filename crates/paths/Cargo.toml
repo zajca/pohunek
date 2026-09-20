@@ -11,7 +11,12 @@ name = "pohunek_paths"
 path = "src/lib.rs"
 
 [dependencies]
+nix = { workspace = true, features = ["user"] }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

@@ -3,7 +3,7 @@
 //! Codex and Claude hook installation remains a local daemon RPC. Hermes is an
 //! owner-local plugin lifecycle and deliberately never contacts the daemon.
 
-// Rust guideline compliant 2026-08-31
+// Rust guideline compliant 2026-09-19
 
 use std::env;
 use std::fmt::Write as _;
@@ -410,6 +410,7 @@ fn policy_path(
 ) -> Result<PathBuf, CliError> {
     let state_home = pohunek_paths::state_home().map_err(|error| match error {
         pohunek_paths::PathError::MissingEnv { var } => CliError::MissingEnv { var },
+        other => CliError::Paths(other),
     })?;
     policy::policy_path(&state_home.join(pohunek_paths::APP_DIR), target).map_err(hermes_error)
 }

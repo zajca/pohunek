@@ -2677,6 +2677,7 @@ fn temp_dir(tag: &str) -> PathBuf {
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).expect("create test dir");
+    make_owner_private(&dir);
     dir
 }
 

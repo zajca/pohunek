@@ -11,9 +11,10 @@
 //! a crash — so there is no stale-lock problem to recover from. A second daemon
 //! simply fails to acquire it.
 
-use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd;
+use std::io;
 use std::path::{Path, PathBuf};
+
+use pohunek_platform::filesystem::{AdvisoryLock, FsError, TrustedDir};
 
 use crate::error::DaemonError;
 
@@ -21,9 +22,9 @@ use crate::error::DaemonError;
 /// it on process exit).
 #[derive(Debug)]
 pub struct InstanceLock {
-    // The open file must be kept alive for the duration of the lock: closing the
-    // fd releases the flock. Held but not otherwise read.
-    _file: File,
+    // The retained directory and marker descriptors keep both advisory locks
+    // alive until this value is dropped.
+    _lock: AdvisoryLock,
     path: PathBuf,
 }
 
@@ -37,38 +38,33 @@ impl InstanceLock {
     /// - [`DaemonError::AlreadyRunning`] if another process holds the lock.
     /// - [`DaemonError::Lock`] for other I/O or syscall failures.
     pub fn acquire(path: &Path) -> Result<Self, DaemonError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|source| DaemonError::Lock {
+        let parent = path.parent().ok_or_else(|| DaemonError::Lock {
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidInput, "lock path has no parent"),
+        })?;
+        let name = path.file_name().ok_or_else(|| DaemonError::Lock {
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidInput, "lock path has no filename"),
+        })?;
+        let directory =
+            TrustedDir::open_absolute(parent, 0o700).map_err(|source| DaemonError::Lock {
                 path: path.to_path_buf(),
-                source,
+                source: io::Error::other(source),
+            })?;
+        let lock = directory
+            .acquire_lock(name, 0o600)
+            .map_err(|source| match source {
+                FsError::LockContended { .. } => DaemonError::AlreadyRunning {
+                    lock: path.to_path_buf(),
+                },
+                other => DaemonError::Lock {
+                    path: path.to_path_buf(),
+                    source: io::Error::other(other),
+                },
             })?;
 
-        // SAFETY: `file` owns a valid open fd for the duration of this call.
-        // flock with LOCK_NB never blocks; it returns EWOULDBLOCK if contended.
-        #[expect(unsafe_code, reason = "libc::flock FFI; SAFETY documented above")]
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            return match err.raw_os_error() {
-                Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
-                    Err(DaemonError::AlreadyRunning {
-                        lock: path.to_path_buf(),
-                    })
-                }
-                _ => Err(DaemonError::Lock {
-                    path: path.to_path_buf(),
-                    source: err,
-                }),
-            };
-        }
-
         Ok(Self {
-            _file: file,
+            _lock: lock,
             path: path.to_path_buf(),
         })
     }

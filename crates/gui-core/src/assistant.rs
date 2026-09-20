@@ -3,7 +3,7 @@
 //! The module contains client-side assistant orchestration used by both the CLI
 //! and native GUI. The daemon still sees ordinary protocol requests.
 
-// Rust guideline compliant 2026-07-01
+// Rust guideline compliant 2026-09-19
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -830,5 +830,6 @@ fn write_toc(prompt: &mut String, intent: Intent, concepts: &[ConceptMeta]) {
 fn path_error(err: pohunek_paths::PathError) -> CoreError {
     match err {
         pohunek_paths::PathError::MissingEnv { var } => CoreError::MissingEnv { var },
+        source => CoreError::Paths { source },
     }
 }

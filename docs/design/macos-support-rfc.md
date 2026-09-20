@@ -1,7 +1,8 @@
 # Complete macOS Host and Client Support RFC
 
-Status: accepted product contract; platform foundation implemented by #95;
-complete macOS support remains deferred through #96-#105.
+Status: accepted product contract; platform and secure-path foundations
+implemented by #95 and #96; complete macOS support remains deferred through
+#97-#105.
 
 ## Tracking authority
 
@@ -72,8 +73,8 @@ not require the optional team relay.
 Existing XDG config, data, state, and cache precedence remains consistent. A
 port must not relocate durable host identity or create a second `HostId`.
 
-Linux keeps its required runtime-directory contract. On macOS, when no valid
-explicit `XDG_RUNTIME_DIR` exists, the shared default is the short owner path
+Linux keeps its required runtime-directory contract. On macOS, when an explicit
+`XDG_RUNTIME_DIR` is absent, the shared default is the short owner path
 `/private/tmp/pohunek-<effective-uid>`; ambient `TMPDIR` does not select it. The
 implementation must validate the trusted parent and descriptor-relative owner,
 type, and mode of every pre-existing entry. It must reject unsafe symlinks or
@@ -81,12 +82,19 @@ foreign entries rather than repairing or deleting them. Private directories use
 mode `0700`, and private sockets/files use `0600` unless an established
 executable contract requires otherwise.
 
-All clients, workers, hooks, launchd jobs, and the Bun backend resolve the same
-runtime path. The complete encoded socket path must fit Darwin's Unix-socket
-limit before any mutation. Cross-process locks, descriptor-relative checks,
-atomic replacement, atomic no-replace installation, and file/directory sync
-retain their current security and durability meaning. An uncertain durability
-result remains an error.
+All clients, workers, hooks, launchd jobs, and the Bun backend must resolve the
+same runtime path. #96 provides the shared contract and fixtures; #103 owns the
+Bun consumer integration. The complete encoded socket path must fit Darwin's
+Unix-socket limit before any mutation.
+
+Durable replacement writes and synchronizes the temporary file before its
+atomic rename, then synchronizes the containing directory. Atomic no-replace
+installation commits only when the destination was absent at that instant and
+reports a collision distinctly. Failure to synchronize the directory after a
+rename is an uncertain committed result, not success; callers retain their
+existing fail-closed recovery behavior. Cross-process locks and
+descriptor-relative ownership, type, mode, no-follow, and inode checks retain
+the same meaning on Linux and APFS.
 
 ## Native identity, PTY, and supervision
 
@@ -142,14 +150,15 @@ cross-platform locking dependency.
 
 Native shared-contract CI runs on a pinned Apple Silicon macOS runner label,
 verifies `uname -m`, uses the locked graph, treats warnings as errors, and
-compiles/tests `pohunek-platform` with the macOS 14 deployment target. Full
-application and release gates are added with their real native backends; shared
-contract CI must not masquerade as complete host support.
+compiles/tests `pohunek-platform`, `pohunek-paths`, and the portable filesystem
+contract with the macOS 14 deployment target. Full application and release
+gates are added with their real native backends; shared contract CI must not
+masquerade as complete host support.
 
 ## Delivery model
 
-The GitHub tracker orders the work from the completed shared platform foundation
-through secure paths, native process and peer identity, PTY portability,
+The GitHub tracker orders the work from the completed shared platform and secure
+path foundations through native process and peer identity, PTY portability,
 launchd, integrations, clients, distribution, and final native acceptance.
 These are work items within one complete release scope. No intermediate merge
 advertises partial macOS support as a reduced product, and #105 remains the

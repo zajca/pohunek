@@ -135,6 +135,7 @@ impl Paths {
 fn path_error(err: pohunek_paths::PathError) -> DaemonError {
     match err {
         pohunek_paths::PathError::MissingEnv { var } => DaemonError::MissingEnv { var },
+        other => DaemonError::Paths(other),
     }
 }
 

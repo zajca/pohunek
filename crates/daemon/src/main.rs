@@ -115,24 +115,22 @@ async fn run() -> Result<(), DaemonError> {
     // 1. Resolve all paths up front; fail fast on missing required env.
     let paths = Paths::resolve()?;
 
-    // 2. Ensure the runtime dir exists (0700) before taking the lock in it.
-    //    The control server enforces the same on bind, but the lock lives there
-    //    too and is acquired first. The data dir holds logical session state.
-    //    Do not create the state app directory here: B1 owns its safe creation.
+    // 2. Acquire the durable host-state authority before mutating any runtime
+    // or data root. Two daemon processes can intentionally use different
+    // explicit runtime roots, so the runtime lock cannot arbitrate ownership of
+    // one shared durable state tree.
+    let governance = Arc::new(HostGovernanceService::open(paths.state_dir.clone()).await?);
+
+    // 3. Prepare owner-private runtime and data roots only after durable
+    // authority is held. The control server revalidates the runtime root on
+    // bind, while the instance lock rejects duplicate use of this exact runtime
+    // namespace.
     ensure_private_dir(&paths.runtime_dir)?;
     ensure_private_dir(&paths.data_dir)?;
     ensure_private_dir(&paths.runtime_dir.join(WORKERS_SUBDIR))?;
-
-    // 3. Single-instance lock: a second daemon refuses to start.
     let _lock = InstanceLock::acquire(&paths.lock)?;
 
-    // 4. Bootstrap stable host governance before session reconciliation or any
-    // listener can expose daemon readiness. This retains the owner-private
-    // cross-process host-state lock for the daemon lifetime and is the first
-    // creator and validator of the application state directory.
-    let governance = Arc::new(HostGovernanceService::open(paths.state_dir.clone()).await?);
-
-    // 5. Initialize structured logging and durable worker state below B1's
+    // 4. Initialize structured logging and durable worker state below B1's
     // owner-private application state directory.
     let _log_guard = logging::init(&paths.log_dir)?;
     ensure_private_dir(&paths.state_dir.join(WORKERS_SUBDIR))?;
@@ -144,7 +142,7 @@ async fn run() -> Result<(), DaemonError> {
     );
     info!(lock = %paths.lock.display(), "acquired single-instance lock");
 
-    // 6. Build the session registry with the hook-handshake socket path, the
+    // 5. Build the session registry with the hook-handshake socket path, the
     //    unified metadata store (logical sessions and related bindings), the
     //    worktrees root, and the event-log directory, so spawned agents can
     //    report native identity, logical sessions survive a restart, a
@@ -175,7 +173,7 @@ async fn run() -> Result<(), DaemonError> {
             source: std::io::Error::other(source),
         })?;
 
-    // 7. Start the append-only event log before anything emits, so worker
+    // 6. Start the append-only event log before anything emits, so worker
     //    reconciliation events are captured too. The log drains
     //    both session and notification control-plane events into one file.
     let event_logs = spawn_event_logs(
@@ -198,13 +196,13 @@ async fn run() -> Result<(), DaemonError> {
     );
     sessions.spawn_agent_state_hooks();
 
-    // 8. Adopt exact surviving worker runtimes before exposing the public API.
+    // 7. Adopt exact surviving worker runtimes before exposing the public API.
     //    Reconciliation never invokes provider-native resume.
     Box::pin(sessions.reconcile_workers())
         .await
         .map_err(DaemonError::Reconcile)?;
 
-    // 9. Bind the control socket (stale-socket recovery + 0600).
+    // 8. Bind the control socket (stale-socket recovery + 0600).
     let registry = netbird::configured_registry()?;
     let health = HealthInfo::new(DAEMON_VERSION);
     let discovery = DiscoveryCache::new(registry.clone());
@@ -682,18 +680,12 @@ enum RemoteBind {
 
 /// Create a directory (and parents) with mode 0700 if it does not exist.
 fn ensure_private_dir(dir: &std::path::Path) -> Result<(), DaemonError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::create_dir_all(dir).map_err(|source| DaemonError::Directory {
-        path: dir.to_path_buf(),
-        source,
-    })?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
-        DaemonError::Directory {
+    pohunek_platform::filesystem::TrustedDir::open_or_create_absolute(dir, 0o700)
+        .map(|_| ())
+        .map_err(|source| DaemonError::Directory {
             path: dir.to_path_buf(),
-            source,
-        }
-    })
+            source: std::io::Error::other(source),
+        })
 }
 
 /// Resolve when SIGINT or SIGTERM is received.

@@ -1,11 +1,11 @@
 //! Serves the private daemon-worker Unix protocol.
 
-// Rust guideline compliant 2026-09-14
+// Rust guideline compliant 2026-09-19
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,6 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use pohunek_paths::{validate_socket_path, Platform, SocketKind};
+use pohunek_platform::filesystem::{
+    AdvisoryLock, EntryIdentity, EntryKind, MoveOutcome, StageOutcome, TrustedDir,
+};
 use pohunek_platform::peer;
 use pohunek_platform::process::{
     LinuxInspector, ProcessIdentity as OsProcessIdentity, ProcessInspector, StartIdentity,
@@ -80,6 +84,9 @@ const WORKER_ONLY_ENV: [&str; 5] = [
     "POHUNEK_CONTROLLER_TOKEN",
     "POHUNEK_BOOTSTRAP_TOKEN",
 ];
+const SOCKET_DIRECTORY_MODE: u32 = 0o700;
+const SOCKET_MODE: u32 = 0o600;
+const SOCKET_LOCK_NAME: &str = ".worker.lock";
 
 /// Fully resolved worker server inputs.
 #[derive(Debug, Clone)]
@@ -102,7 +109,34 @@ pub struct ServerArgs {
 #[derive(Debug)]
 pub struct Server {
     listener: UnixListener,
+    _socket_lease: SocketLease,
     shared: Arc<Shared>,
+}
+
+#[derive(Debug)]
+struct SocketLease {
+    directory: TrustedDir,
+    _authority: AdvisoryLock,
+    name: OsString,
+    identity: EntryIdentity,
+}
+
+#[derive(Debug)]
+struct PreparedSocket {
+    directory: TrustedDir,
+    authority: AdvisoryLock,
+    name: OsString,
+}
+
+impl Drop for SocketLease {
+    fn drop(&mut self) {
+        if let Ok(StageOutcome::Staged(entry)) =
+            self.directory
+                .stage_random(&self.name, ".pohunek-worker-stale-", self.identity)
+        {
+            let _ = entry.remove();
+        }
+    }
 }
 
 impl Server {
@@ -111,8 +145,14 @@ impl Server {
     /// # Errors
     ///
     /// Returns [`WorkerError`] for invalid IDs, unsafe paths, or bind failure.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "validation, locked stale recovery, staged socket activation, and bootstrap journaling form one startup transaction"
+    )]
     pub async fn bind(args: ServerArgs) -> Result<Self, WorkerError> {
         args.config.validate()?;
+        let platform = Platform::current()?;
+        validate_socket_path(&args.daemon_socket_path, platform, SocketKind::Daemon)?;
         if pohunek_paths::valid_worker_session_id(&args.session_id).is_none() {
             return Err(WorkerError::InvalidSessionId(args.session_id));
         }
@@ -123,26 +163,94 @@ impl Server {
             .map_err(|error| WorkerError::Protocol(error.to_string()))?;
         let worker_id = WorkerId::new(&args.worker_id)
             .map_err(|error| WorkerError::Protocol(error.to_string()))?;
-        prepare_socket(&args.socket_path).await?;
-        let listener =
-            UnixListener::bind(&args.socket_path).map_err(|source| WorkerError::Socket {
-                path: args.socket_path.clone(),
+        let prepared_socket = prepare_socket(&args.socket_path, platform).await?;
+        let longest_bind_path = prepared_socket.directory.path().join(".s0000000000000000");
+        validate_socket_path(&longest_bind_path, platform, SocketKind::Worker)?;
+        let (bind_name, std_listener, socket_identity) = prepared_socket
+            .directory
+            .bind_unix_listener_staged(".s", SOCKET_MODE)?;
+        let bind_path = prepared_socket.directory.path().join(&bind_name);
+        std_listener
+            .set_nonblocking(true)
+            .map_err(|source| WorkerError::Socket {
+                path: bind_path.clone(),
                 source,
             })?;
-        fs::set_permissions(&args.socket_path, fs::Permissions::from_mode(0o600)).map_err(
-            |source| WorkerError::Socket {
-                path: args.socket_path.clone(),
+        let listener =
+            UnixListener::from_std(std_listener).map_err(|source| WorkerError::Socket {
+                path: bind_path.clone(),
                 source,
-            },
-        )?;
+            })?;
+        match prepared_socket.directory.move_no_replace(
+            &bind_name,
+            &prepared_socket.directory,
+            &prepared_socket.name,
+        )? {
+            MoveOutcome::Moved => {}
+            MoveOutcome::DestinationExists => {
+                drop(listener);
+                let cleanup = SocketLease {
+                    directory: prepared_socket.directory,
+                    _authority: prepared_socket.authority,
+                    name: bind_name,
+                    identity: socket_identity,
+                };
+                drop(cleanup);
+                return Err(WorkerError::Socket {
+                    path: args.socket_path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        "worker socket destination became occupied while binding",
+                    ),
+                });
+            }
+            _ => {
+                return Err(WorkerError::Filesystem {
+                    path: args.socket_path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "unsupported worker socket activation outcome",
+                    ),
+                });
+            }
+        }
+        if prepared_socket.directory.entry_identity_with_mode(
+            &prepared_socket.name,
+            EntryKind::Socket,
+            SOCKET_MODE,
+        )? != Some(socket_identity)
+        {
+            drop(listener);
+            let cleanup = SocketLease {
+                directory: prepared_socket.directory,
+                _authority: prepared_socket.authority,
+                name: prepared_socket.name,
+                identity: socket_identity,
+            };
+            drop(cleanup);
+            return Err(WorkerError::Filesystem {
+                path: args.socket_path.clone(),
+                source: std::io::Error::other("activated worker socket identity changed"),
+            });
+        }
+        let socket_lease = SocketLease {
+            directory: prepared_socket.directory,
+            _authority: prepared_socket.authority,
+            name: prepared_socket.name,
+            identity: socket_identity,
+        };
 
         let worker_start = process_start(std::process::id())?;
+        let boot_identity = LinuxInspector::new()
+            .boot_identity()
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?;
         let journal = Journal::new(&args.journal_path);
         let record = JournalRecord::bootstrap(
             args.session_id,
             args.worker_id,
             std::process::id(),
             worker_start.to_string(),
+            boot_identity.to_string(),
             (
                 u16::try_from(SUPPORTED_RANGE.minimum().get()).unwrap_or(u16::MAX),
                 u16::try_from(SUPPORTED_RANGE.maximum().get()).unwrap_or(u16::MAX),
@@ -175,7 +283,11 @@ impl Server {
             state_changed: Notify::new(),
             shutdown: CancellationToken::new(),
         });
-        Ok(Self { listener, shared })
+        Ok(Self {
+            listener,
+            _socket_lease: socket_lease,
+            shared,
+        })
     }
 
     /// Returns the bound worker socket path.
@@ -3439,10 +3551,27 @@ fn control_error_message(code: ControlCode, message: &str, retryable: bool) -> C
 }
 
 async fn persist(journal: Journal, record: JournalRecord) -> Result<(), WorkerError> {
-    tokio::task::spawn_blocking(move || journal.write(&record))
+    let result = tokio::task::spawn_blocking(move || journal.write(&record))
         .await
-        .map_err(|_join_error| WorkerError::Protocol("journal writer task failed".to_owned()))??;
-    Ok(())
+        .map_err(|_join_error| WorkerError::Protocol("journal writer task failed".to_owned()))?;
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.committed_durability_uncertain() => {
+            // The replacement is already authoritative in this process. Treating
+            // it as pre-commit would strand a live PTY in a journaled Live state
+            // without its monitors. Continue and surface the reduced crash
+            // durability explicitly; a later write retries the directory sync.
+            event!(
+                name: "worker.journal.durability.uncertain",
+                Level::ERROR,
+                error.type = "journal_durability",
+                error.message = %error,
+                "worker journal committed but durability is uncertain: {{error.message}}",
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn persist_control(journal: Journal, record: JournalRecord) -> Result<(), ControlError> {
@@ -3462,70 +3591,78 @@ fn verify_peer(stream: &UnixStream) -> Result<peer::Credentials, WorkerError> {
     Ok(credentials)
 }
 
-async fn prepare_socket(path: &Path) -> Result<(), WorkerError> {
+async fn prepare_socket(path: &Path, platform: Platform) -> Result<PreparedSocket, WorkerError> {
+    validate_socket_path(path, platform, SocketKind::Worker)?;
     let parent = path.parent().ok_or_else(|| WorkerError::Filesystem {
         path: path.to_path_buf(),
         source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "socket has no parent"),
     })?;
-    fs::create_dir_all(parent).map_err(|source| WorkerError::Filesystem {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|source| {
-        WorkerError::Filesystem {
-            path: parent.to_path_buf(),
-            source,
-        }
-    })?;
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
-                return Err(WorkerError::Filesystem {
+    let name = path
+        .file_name()
+        .ok_or_else(|| WorkerError::Filesystem {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "socket has no filename"),
+        })?
+        .to_os_string();
+    let directory = TrustedDir::open_or_create_absolute(parent, SOCKET_DIRECTORY_MODE)?;
+    let authority = directory.acquire_lock(SOCKET_LOCK_NAME, SOCKET_MODE)?;
+    if let Some(identity) =
+        directory.entry_identity_with_mode(&name, EntryKind::Socket, SOCKET_MODE)?
+    {
+        match UnixStream::connect(path).await {
+            Ok(_) => {
+                return Err(WorkerError::Socket {
                     path: path.to_path_buf(),
                     source: std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "worker socket path is not a real Unix socket",
+                        std::io::ErrorKind::AddrInUse,
+                        "worker socket already accepts connections",
                     ),
                 });
             }
-            match UnixStream::connect(path).await {
-                Ok(_) => {
-                    return Err(WorkerError::Socket {
-                        path: path.to_path_buf(),
-                        source: std::io::Error::new(
-                            std::io::ErrorKind::AddrInUse,
-                            "worker socket already accepts connections",
-                        ),
-                    });
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                    ) =>
-                {
-                    fs::remove_file(path).map_err(|source| WorkerError::Filesystem {
-                        path: path.to_path_buf(),
-                        source,
-                    })?;
-                }
-                Err(source) => {
-                    return Err(WorkerError::Socket {
-                        path: path.to_path_buf(),
-                        source,
-                    });
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                match directory.stage_random(&name, ".pohunek-worker-stale-", identity)? {
+                    StageOutcome::Staged(entry) => {
+                        let _ = entry.remove()?;
+                    }
+                    StageOutcome::Missing | StageOutcome::IdentityChanged => {}
+                    StageOutcome::DestinationExists => {
+                        return Err(WorkerError::Filesystem {
+                            path: path.to_path_buf(),
+                            source: std::io::Error::new(
+                                std::io::ErrorKind::AlreadyExists,
+                                "worker socket cleanup staging name already exists",
+                            ),
+                        });
+                    }
+                    _ => {
+                        return Err(WorkerError::Filesystem {
+                            path: path.to_path_buf(),
+                            source: std::io::Error::new(
+                                std::io::ErrorKind::Unsupported,
+                                "unsupported worker socket staging outcome",
+                            ),
+                        });
+                    }
                 }
             }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(WorkerError::Filesystem {
-                path: path.to_path_buf(),
-                source,
-            });
+            Err(source) => {
+                return Err(WorkerError::Socket {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
         }
     }
-    Ok(())
+    Ok(PreparedSocket {
+        directory,
+        authority,
+        name,
+    })
 }
 
 fn random_value(prefix: &str) -> Result<String, std::io::Error> {
@@ -3770,6 +3907,11 @@ mod tests {
         fn new() -> Self {
             let path = std::env::temp_dir().join(random_value("output-barrier").unwrap());
             std::fs::create_dir(&path).expect("create output barrier directory");
+            std::fs::set_permissions(
+                &path,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .expect("make output barrier directory private");
             Self(path)
         }
 
@@ -3782,6 +3924,54 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn retained_session_lock_rejects_a_second_worker_bind() {
+        let directory = BarrierDirectory::new();
+        let args = super::ServerArgs {
+            session_id: "s-112".to_owned(),
+            worker_id: "worker-lock".to_owned(),
+            socket_path: directory.path().join("worker.sock"),
+            journal_path: directory.path().join("journal.json"),
+            daemon_socket_path: directory.path().join("daemon.sock"),
+            config: crate::WorkerConfig::new(),
+        };
+        let first = super::Server::bind(args.clone())
+            .await
+            .expect("bind first worker");
+
+        assert!(matches!(
+            super::Server::bind(args).await,
+            Err(crate::WorkerError::TrustedFilesystem(
+                pohunek_platform::filesystem::FsError::LockContended { .. }
+            ))
+        ));
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn invalid_daemon_socket_override_fails_before_worker_mutation() {
+        let directory = BarrierDirectory::new();
+        let overlong = directory.path().join("d".repeat(256));
+        let worker_socket = directory.path().join("worker.sock");
+        let journal = directory.path().join("journal.json");
+
+        assert!(matches!(
+            super::Server::bind(super::ServerArgs {
+                session_id: "s-113".to_owned(),
+                worker_id: "worker-invalid-daemon-path".to_owned(),
+                socket_path: worker_socket.clone(),
+                journal_path: journal.clone(),
+                daemon_socket_path: overlong,
+                config: crate::WorkerConfig::new(),
+            })
+            .await,
+            Err(crate::WorkerError::Paths(_))
+        ));
+        assert!(!worker_socket.exists());
+        assert!(!journal.exists());
+        assert!(!directory.path().join(super::SOCKET_LOCK_NAME).exists());
     }
 
     async fn launch_claim_fixture() -> (super::Server, crate::PtyOwner, std::path::PathBuf) {
@@ -4036,6 +4226,7 @@ mod tests {
             "worker-identity".to_owned(),
             10,
             "100".to_owned(),
+            "boot-test".to_owned(),
             (80, 24),
             "2026-08-04T00:00:00Z".to_owned(),
         );
@@ -4061,6 +4252,7 @@ mod tests {
             "worker-subagents".to_owned(),
             10,
             "100".to_owned(),
+            "boot-test".to_owned(),
             (4, 5),
             "2026-09-11T00:00:00Z".to_owned(),
         );
@@ -4135,6 +4327,7 @@ mod tests {
             "worker-subagents".to_owned(),
             10,
             "100".to_owned(),
+            "boot-test".to_owned(),
             (4, 5),
             "2026-09-11T00:00:00Z".to_owned(),
         );

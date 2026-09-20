@@ -1,0 +1,145 @@
+{
+  "version": 1,
+  "session_id": "s-42",
+  "worker_id": "worker_fixture-1",
+  "assistant_id": "launch-1",
+  "cases": [
+    {
+      "name": "linux_explicit_overrides",
+      "platform": "linux",
+      "effective_uid": 1000,
+      "env": {
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+        "XDG_DATA_HOME": "/srv/pohunek data",
+        "XDG_STATE_HOME": "/srv/pohunek-state",
+        "XDG_CACHE_HOME": "/srv/cache-žluťoučký",
+        "XDG_CONFIG_HOME": "/srv/config",
+        "HOME": "/home/operator"
+      },
+      "expected": {
+        "runtime_dir": "/run/user/1000/pohunek",
+        "socket": "/run/user/1000/pohunek/daemon.sock",
+        "lock": "/run/user/1000/pohunek/daemon.lock",
+        "log_dir": "/srv/pohunek-state/pohunek/logs",
+        "state_dir": "/srv/pohunek-state/pohunek",
+        "data_dir": "/srv/pohunek data/pohunek",
+        "cache_dir": "/srv/cache-žluťoučký/pohunek",
+        "config_home": "/srv/config",
+        "config_dir": "/srv/config/pohunek",
+        "launcher_bin_dir": "/srv/pohunek data/pohunek/bin",
+        "sway_config_dir": "/srv/config/sway",
+        "assistant_bundle_cache_dir": "/srv/cache-žluťoučký/pohunek/knowledge",
+        "assistant_runtime_dir": "/run/user/1000/pohunek/assistant/launch-1",
+        "worker_runtime_root": "/run/user/1000/pohunek/workers",
+        "worker_state_root": "/srv/pohunek-state/pohunek/workers",
+        "worker_socket": "/run/user/1000/pohunek/workers/s-42/control.sock",
+        "worker_journal": "/srv/pohunek-state/pohunek/workers/s-42/worker_fixture-1.json",
+        "host_state_dir": "/srv/pohunek-state/pohunek/host",
+        "host_identity_path": "/srv/pohunek-state/pohunek/host/identity.json",
+        "host_approval_key_path": "/srv/pohunek-state/pohunek/host/approval.key",
+        "host_governance_path": "/srv/pohunek-state/pohunek/host/governance.json",
+        "host_state_lock_path": "/srv/pohunek-state/pohunek/host/state.lock"
+      }
+    },
+    {
+      "name": "macos_runtime_and_home_defaults",
+      "platform": "macos",
+      "effective_uid": 501,
+      "env": { "HOME": "/Users/Alice Name" },
+      "expected": {
+        "runtime_dir": "/private/tmp/pohunek-501",
+        "socket": "/private/tmp/pohunek-501/daemon.sock",
+        "lock": "/private/tmp/pohunek-501/daemon.lock",
+        "log_dir": "/Users/Alice Name/.local/state/pohunek/logs",
+        "state_dir": "/Users/Alice Name/.local/state/pohunek",
+        "data_dir": "/Users/Alice Name/.local/share/pohunek",
+        "cache_dir": "/Users/Alice Name/.cache/pohunek",
+        "config_home": "/Users/Alice Name/.config",
+        "config_dir": "/Users/Alice Name/.config/pohunek",
+        "launcher_bin_dir": "/Users/Alice Name/.local/share/pohunek/bin",
+        "sway_config_dir": "/Users/Alice Name/.config/sway",
+        "assistant_bundle_cache_dir": "/Users/Alice Name/.cache/pohunek/knowledge",
+        "assistant_runtime_dir": "/private/tmp/pohunek-501/assistant/launch-1",
+        "worker_runtime_root": "/private/tmp/pohunek-501/workers",
+        "worker_state_root": "/Users/Alice Name/.local/state/pohunek/workers",
+        "worker_socket": "/private/tmp/pohunek-501/workers/s-42/control.sock",
+        "worker_journal": "/Users/Alice Name/.local/state/pohunek/workers/s-42/worker_fixture-1.json",
+        "host_state_dir": "/Users/Alice Name/.local/state/pohunek/host",
+        "host_identity_path": "/Users/Alice Name/.local/state/pohunek/host/identity.json",
+        "host_approval_key_path": "/Users/Alice Name/.local/state/pohunek/host/approval.key",
+        "host_governance_path": "/Users/Alice Name/.local/state/pohunek/host/governance.json",
+        "host_state_lock_path": "/Users/Alice Name/.local/state/pohunek/host/state.lock"
+      }
+    },
+    {
+      "name": "macos_explicit_runtime_alternate_uid",
+      "platform": "macos",
+      "effective_uid": 4294967294,
+      "env": { "XDG_RUNTIME_DIR": "/Volumes/Runtime Disk/user", "HOME": "/Users/bob" },
+      "expected_runtime_dir": "/Volumes/Runtime Disk/user/pohunek"
+    },
+    {
+      "name": "macos_default_alternate_uid",
+      "platform": "macos",
+      "effective_uid": 4294967294,
+      "env": { "HOME": "/Users/bob" },
+      "expected_runtime_dir": "/private/tmp/pohunek-4294967294"
+    },
+    {
+      "name": "linux_missing_runtime",
+      "platform": "linux",
+      "effective_uid": 1000,
+      "env": { "HOME": "/home/operator" },
+      "error": { "variant": "missing_env", "var": "XDG_RUNTIME_DIR" }
+    },
+    {
+      "name": "missing_home_for_durable_defaults",
+      "platform": "macos",
+      "effective_uid": 501,
+      "env": {},
+      "error": { "variant": "missing_env", "var": "XDG_DATA_HOME or HOME" }
+    },
+    {
+      "name": "empty_explicit_runtime",
+      "platform": "macos",
+      "effective_uid": 501,
+      "env": { "XDG_RUNTIME_DIR": "", "HOME": "/Users/alice" },
+      "error": { "variant": "invalid_env", "var": "XDG_RUNTIME_DIR", "reason": "empty" }
+    },
+    {
+      "name": "empty_explicit_data_home",
+      "platform": "linux",
+      "effective_uid": 1000,
+      "env": { "XDG_RUNTIME_DIR": "/run/user/1000", "XDG_DATA_HOME": "", "HOME": "/home/operator" },
+      "error": { "variant": "invalid_env", "var": "XDG_DATA_HOME", "reason": "empty" }
+    },
+    {
+      "name": "relative_explicit_state_home",
+      "platform": "linux",
+      "effective_uid": 1000,
+      "env": { "XDG_RUNTIME_DIR": "/run/user/1000", "XDG_DATA_HOME": "/data", "XDG_STATE_HOME": "relative/state", "HOME": "/home/operator" },
+      "error": { "variant": "invalid_env", "var": "XDG_STATE_HOME", "reason": "not_absolute" }
+    },
+    {
+      "name": "relative_home",
+      "platform": "macos",
+      "effective_uid": 501,
+      "env": { "HOME": "Users/alice" },
+      "error": { "variant": "invalid_env", "var": "HOME", "reason": "not_absolute" }
+    },
+    {
+      "name": "parent_component_in_config_home",
+      "platform": "linux",
+      "effective_uid": 1000,
+      "env": {
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+        "XDG_DATA_HOME": "/data",
+        "XDG_STATE_HOME": "/state",
+        "XDG_CACHE_HOME": "/cache",
+        "XDG_CONFIG_HOME": "/config/../other",
+        "HOME": "/home/operator"
+      },
+      "error": { "variant": "invalid_env", "var": "XDG_CONFIG_HOME", "reason": "parent_component" }
+    }
+  ]
+}

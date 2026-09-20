@@ -24,9 +24,9 @@
 
 mod handler;
 
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::net::SocketAddr;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -45,6 +45,10 @@ use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 use tracing::{error, info, warn};
 
 use overlay::OverlayTransport;
+use pohunek_paths::{validate_socket_path, Platform, SocketKind};
+use pohunek_platform::filesystem::{
+    EntryIdentity, EntryKind, MoveOutcome, StageOutcome, TrustedDir,
+};
 
 use crate::error::DaemonError;
 use crate::governance::HostGovernanceService;
@@ -77,6 +81,9 @@ const SOCKET_MODE: u32 = 0o600;
 pub struct ControlServer {
     listener: UnixListener,
     socket_path: PathBuf,
+    socket_dir: TrustedDir,
+    socket_name: OsString,
+    socket_identity: EntryIdentity,
     state: DaemonState,
 }
 
@@ -110,6 +117,9 @@ impl ControlServer {
         socket_path: &Path,
         state: DaemonState,
     ) -> Result<Self, DaemonError> {
+        let platform = Platform::current().map_err(DaemonError::Paths)?;
+        validate_socket_path(socket_path, platform, SocketKind::Daemon)
+            .map_err(DaemonError::Paths)?;
         let dir = socket_path.parent().ok_or_else(|| DaemonError::Socket {
             path: socket_path.to_path_buf(),
             source: io::Error::new(
@@ -117,21 +127,75 @@ impl ControlServer {
                 "socket path has no parent directory",
             ),
         })?;
+        let socket_name = socket_path
+            .file_name()
+            .ok_or_else(|| DaemonError::Socket {
+                path: socket_path.to_path_buf(),
+                source: io::Error::new(io::ErrorKind::InvalidInput, "socket has no filename"),
+            })?
+            .to_os_string();
 
-        ensure_dir_mode(dir, DIR_MODE)?;
-        recover_stale_socket(socket_path).await?;
+        let socket_dir = TrustedDir::open_or_create_absolute(dir, DIR_MODE)?;
+        recover_stale_socket(&socket_dir, &socket_name, socket_path).await?;
 
-        let listener = UnixListener::bind(socket_path).map_err(|source| DaemonError::Socket {
-            path: socket_path.to_path_buf(),
-            source,
-        })?;
-
-        set_mode(socket_path, SOCKET_MODE)?;
+        let longest_bind_path = dir.join(".s0000000000000000");
+        validate_socket_path(&longest_bind_path, platform, SocketKind::Daemon)
+            .map_err(DaemonError::Paths)?;
+        let (bind_name, std_listener, socket_identity) =
+            socket_dir.bind_unix_listener_staged(".s", SOCKET_MODE)?;
+        let bind_path = dir.join(&bind_name);
+        std_listener
+            .set_nonblocking(true)
+            .map_err(|source| DaemonError::Socket {
+                path: bind_path.clone(),
+                source,
+            })?;
+        let listener =
+            UnixListener::from_std(std_listener).map_err(|source| DaemonError::Socket {
+                path: bind_path.clone(),
+                source,
+            })?;
+        match socket_dir.move_no_replace(&bind_name, &socket_dir, &socket_name)? {
+            MoveOutcome::Moved => {}
+            MoveOutcome::DestinationExists => {
+                drop(listener);
+                let _ = remove_expected_socket(&socket_dir, &bind_name, socket_identity);
+                return Err(DaemonError::Socket {
+                    path: socket_path.to_path_buf(),
+                    source: io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "daemon socket destination became occupied while binding",
+                    ),
+                });
+            }
+            _ => {
+                return Err(DaemonError::Socket {
+                    path: socket_path.to_path_buf(),
+                    source: io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "unsupported socket activation outcome",
+                    ),
+                });
+            }
+        }
+        if socket_dir.entry_identity_with_mode(&socket_name, EntryKind::Socket, SOCKET_MODE)?
+            != Some(socket_identity)
+        {
+            drop(listener);
+            let _ = remove_expected_socket(&socket_dir, &socket_name, socket_identity);
+            return Err(DaemonError::Socket {
+                path: socket_path.to_path_buf(),
+                source: io::Error::other("activated daemon socket identity changed"),
+            });
+        }
 
         info!(socket = %socket_path.display(), "control socket bound");
         Ok(Self {
             listener,
             socket_path: socket_path.to_path_buf(),
+            socket_dir,
+            socket_name,
+            socket_identity,
             state,
         })
     }
@@ -177,10 +241,10 @@ impl ControlServer {
         }
         // Best-effort cleanup so the next start does not need stale-socket
         // recovery. A failure here is non-fatal.
-        if let Err(err) = std::fs::remove_file(&self.socket_path) {
-            if err.kind() != io::ErrorKind::NotFound {
-                warn!(error = %err, socket = %self.socket_path.display(), "failed to remove socket on shutdown");
-            }
+        if let Err(err) =
+            remove_expected_socket(&self.socket_dir, &self.socket_name, self.socket_identity)
+        {
+            warn!(error = %err, socket = %self.socket_path.display(), "failed to remove socket on shutdown");
         }
     }
 }
@@ -769,51 +833,71 @@ fn codec_to_io(err: LinesCodecError) -> io::Error {
 /// daemon is there (the single-instance lock should normally prevent reaching
 /// here): return an error. If it exists but refuses connection, treat it as a
 /// stale socket from a previous run and remove it.
-async fn recover_stale_socket(path: &Path) -> Result<(), DaemonError> {
-    if !path.exists() {
+async fn recover_stale_socket(
+    directory: &TrustedDir,
+    name: &OsStr,
+    path: &Path,
+) -> Result<(), DaemonError> {
+    let Some(identity) =
+        directory.entry_identity_with_mode(name, EntryKind::Socket, SOCKET_MODE)?
+    else {
         return Ok(());
-    }
-    if UnixStream::connect(path).await.is_ok() {
-        // Something is alive on the socket. This is unexpected after the
-        // single-instance lock; fail clearly rather than clobbering it.
-        Err(DaemonError::Socket {
+    };
+    match UnixStream::connect(path).await {
+        Ok(_) => Err(DaemonError::Socket {
             path: path.to_path_buf(),
             source: io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "a live daemon is already listening on this socket",
             ),
-        })
-    } else {
-        warn!(socket = %path.display(), "removing stale socket from a previous run");
-        std::fs::remove_file(path).map_err(|source| DaemonError::Socket {
+        }),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            warn!(socket = %path.display(), "removing stale socket from a previous run");
+            remove_expected_socket(directory, name, identity)?;
+            Ok(())
+        }
+        Err(source) => Err(DaemonError::Socket {
             path: path.to_path_buf(),
             source,
-        })
+        }),
     }
 }
 
-/// Create `dir` (and parents) if missing and enforce `mode` on it.
-fn ensure_dir_mode(dir: &Path, mode: u32) -> Result<(), DaemonError> {
-    std::fs::create_dir_all(dir).map_err(|source| DaemonError::Directory {
-        path: dir.to_path_buf(),
-        source,
-    })?;
-    set_mode(dir, mode).map_err(|e| match e {
-        DaemonError::Socket { source, .. } => DaemonError::Directory {
-            path: dir.to_path_buf(),
-            source,
-        },
-        other => other,
-    })
-}
-
-/// Set a path's permission bits.
-fn set_mode(path: &Path, mode: u32) -> Result<(), DaemonError> {
-    let perms = std::fs::Permissions::from_mode(mode);
-    std::fs::set_permissions(path, perms).map_err(|source| DaemonError::Socket {
-        path: path.to_path_buf(),
-        source,
-    })
+fn remove_expected_socket(
+    directory: &TrustedDir,
+    name: &OsStr,
+    identity: EntryIdentity,
+) -> Result<(), DaemonError> {
+    match directory.stage_random(name, ".pohunek-socket-stale-", identity)? {
+        StageOutcome::Staged(entry) => {
+            let _ = entry.remove()?;
+        }
+        StageOutcome::Missing | StageOutcome::IdentityChanged => {}
+        StageOutcome::DestinationExists => {
+            return Err(DaemonError::Socket {
+                path: directory.path().to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "socket cleanup collision budget exhausted",
+                ),
+            });
+        }
+        _ => {
+            return Err(DaemonError::Socket {
+                path: directory.path().to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "unsupported socket staging outcome",
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

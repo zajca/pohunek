@@ -227,6 +227,12 @@ Daemon, sessions, integrations, and project state:
 - `crates/platform/src/process/`
 - `crates/platform/src/peer/`
 - `crates/platform/src/supervisor.rs`
+- `crates/paths/fixtures/runtime-paths.json`
+- `crates/daemon/src/host_state/`
+- `crates/daemon/src/store/mod.rs`
+- `crates/session-worker/src/journal.rs`
+- `crates/cli/src/hermes_integration/lifecycle.rs`
+- `web/backend/test/runtime-path-contract.test.ts`
 - `.github/workflows/ci.yml`
 
 - `crates/daemon/src/assistant.rs`

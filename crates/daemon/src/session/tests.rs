@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -1134,6 +1135,8 @@ fn temp_store_path(tag: &str) -> PathBuf {
         std::process::id(),
     ));
     std::fs::create_dir_all(&dir).expect("create temp dir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .expect("secure temp directory");
     dir.join("metadata.jsonl")
 }
 
@@ -1143,6 +1146,7 @@ fn temp_dir(tag: &str) -> PathBuf {
         .expect("store parent")
         .join("dir");
     fs::create_dir_all(&dir).expect("create temp dir");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("secure temp directory");
     dir
 }
 
@@ -1154,8 +1158,6 @@ fn write_host_hook(config_dir: &std::path::Path, event: &str, body: &str) {
 
 #[cfg(unix)]
 fn write_executable(path: &std::path::Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
     fs::write(path, body).expect("write executable");
     let mut perms = fs::metadata(path).expect("metadata").permissions();
     perms.set_mode(0o700);
@@ -5790,7 +5792,8 @@ async fn worker_metadata_cannot_recreate_a_removed_durable_record() {
     assert!(
         store
             .remove_session(&created.id.0)
-            .expect("remove durable session"),
+            .expect("remove durable session")
+            .into_value(),
         "test must remove the durable record"
     );
 

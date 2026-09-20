@@ -9,15 +9,21 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use super::{UnitTemplate, Units};
-use pohunek_platform::process::{LinuxInspector, ProcessInspector};
 pub use pohunek_platform::supervisor::{
     Error as WorkerLaunchError, Operation as WorkerLaunchFuture,
 };
 use pohunek_platform::supervisor::{ServiceId, ServiceObservation, ServiceState, Supervisor};
+use pohunek_platform::{
+    filesystem::TrustedDir,
+    process::{LinuxInspector, ProcessInspector},
+};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-// Rust guideline compliant 2026-09-14
+// Rust guideline compliant 2026-09-20
+
+/// Application directory inserted below each XDG base by `pohunek-paths`.
+const APPLICATION_DIRECTORY: &str = "pohunek";
 
 /// Daemon-facing durable worker supervisor.
 pub trait WorkerLauncher: Supervisor {}
@@ -100,13 +106,32 @@ impl SubprocessWorkerLauncher {
 impl SubprocessWorkerLauncher {
     fn activate<'a>(&'a self, id: &'a ServiceId, replace: bool) -> WorkerLaunchFuture<'a, ()> {
         Box::pin(async move {
-            prepare_private_directory(&self.environment.runtime_home)?;
-            prepare_private_directory(&self.environment.state_home)?;
-            prepare_private_directory(&self.environment.data_home)?;
-            prepare_private_directory(&self.environment.config_home)?;
-            prepare_private_directory(&self.environment.cache_home)?;
-            prepare_private_directory(&self.environment.runtime_home.join("pohunek/workers"))?;
-            prepare_private_directory(&self.environment.state_home.join("pohunek/workers"))?;
+            for base in [
+                &self.environment.runtime_home,
+                &self.environment.state_home,
+                &self.environment.data_home,
+                &self.environment.config_home,
+                &self.environment.cache_home,
+            ] {
+                // XDG bases are owner-managed and may legitimately be 0755.
+                // Creating the private application child also creates a missing
+                // base without ever repairing an existing entry.
+                prepare_private_directory(&base.join(APPLICATION_DIRECTORY))?;
+            }
+            prepare_private_directory(
+                &self
+                    .environment
+                    .runtime_home
+                    .join(APPLICATION_DIRECTORY)
+                    .join(pohunek_paths::WORKERS_SUBDIR),
+            )?;
+            prepare_private_directory(
+                &self
+                    .environment
+                    .state_home
+                    .join(APPLICATION_DIRECTORY)
+                    .join(pohunek_paths::WORKERS_SUBDIR),
+            )?;
 
             let mut children = self.children.lock().await;
             let previous_exited = children
@@ -248,12 +273,9 @@ fn inspect_child(
 }
 
 fn prepare_private_directory(path: &std::path::Path) -> Result<(), WorkerLaunchError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::create_dir_all(path)
-        .map_err(|source| operation("create_private_directory", source))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        .map_err(|source| operation("secure_private_directory", source))
+    TrustedDir::open_or_create_absolute(path, 0o700)
+        .map(|_| ())
+        .map_err(|source| operation("prepare_private_directory", source))
 }
 
 /// Production launcher backed by the native systemd user-manager API.
@@ -552,6 +574,7 @@ mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     use pohunek_platform::supervisor::{ServiceId, ServiceState, Supervisor};
@@ -579,6 +602,17 @@ mod tests {
         );
         let id = ServiceId::parse("s-42").expect("valid service id");
         launcher.start(&id).await.expect("first child starts");
+        for path in [
+            root.path().join("runtime/pohunek"),
+            root.path().join("state/pohunek"),
+        ] {
+            let mode = std::fs::metadata(&path)
+                .expect("application directory metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "{} must remain owner-private", path.display());
+        }
 
         let mut stopped = false;
         for _ in 0..CHILD_EXIT_ATTEMPTS {

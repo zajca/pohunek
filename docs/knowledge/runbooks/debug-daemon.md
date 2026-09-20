@@ -14,6 +14,15 @@ Use this runbook when commands report that the daemon is unreachable or unhealth
 
 1. Run `pohunek doctor --json` for local environment checks.
 2. Run `pohunek health --json` to query the local daemon.
+   If path resolution fails first, inspect `XDG_RUNTIME_DIR`. It must be an
+   absolute nonempty path when present. Linux requires it; macOS uses
+   `/private/tmp/pohunek-<effective-uid>` only when the variable is absent and
+   ignores `TMPDIR` for this decision. An overlong encoded daemon or worker
+   socket path is rejected before filesystem mutation.
+   If Pohunek reports an unsafe runtime root, inspect its owner, type, exact
+   private mode, and every application-owned component. Do not recursively
+   delete it or follow a symlink, and do not use broad `chmod` to make a foreign
+   entry pass validation.
 3. If health cannot connect, start the daemon with
    `pohunek daemon start --detach`.
 4. Run `pohunek health --json` again and inspect the reported socket, version,

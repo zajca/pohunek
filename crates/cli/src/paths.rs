@@ -109,6 +109,7 @@ impl Paths {
 fn path_error(err: pohunek_paths::PathError) -> CliError {
     match err {
         pohunek_paths::PathError::MissingEnv { var } => CliError::MissingEnv { var },
+        other => CliError::Paths(other),
     }
 }
 

@@ -70,6 +70,13 @@ replacement was renamed but cannot be proven durable, it treats the repository
 as unavailable until an explicit serialized reload; do not treat a reread as
 proof that the update is safe.
 
+The macOS runtime default under `/private/tmp` does not change this durable
+location and can never create a second HostId. Durable replacement synchronizes
+the temporary file before rename and the containing directory afterward. A
+post-rename directory-sync failure is an uncertain committed result, so the
+same fail-closed repository behavior applies on APFS. Runtime cleanup never
+removes the host directory or its records.
+
 Local unenrollment does not stop a PTY, remove the owner Unix socket, disable a
 direct NetBird/WireGuard owner route, or prevent the native GUI and transparent
 owner WebUI from continuing to inspect and operate their existing owner

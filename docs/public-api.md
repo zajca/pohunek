@@ -124,6 +124,24 @@ The daemon exposes the same protocol on two transports:
 | Local | Unix socket at the configured runtime path | Owner-only socket directory and mode |
 | Remote | One TCP listener per configured overlay, bound to that provider's validated local member address and port | Overlay reachability and provider policy; NetBird/WireGuard is the default production provider |
 
+The local runtime path is a shared host/client contract, not a wire-protocol
+field. A valid absolute `XDG_RUNTIME_DIR` resolves the application root to
+`$XDG_RUNTIME_DIR/pohunek` on Linux and macOS. Linux fails fast when it is
+absent. macOS instead uses `/private/tmp/pohunek-<effective-uid>` when the
+variable is absent; `TMPDIR` does not select this default. An explicit empty,
+relative, or otherwise malformed value is rejected rather than treated as
+absent. The root must be an effective-UID-owned real directory with exact mode
+`0700`; the daemon socket is `<runtime-root>/daemon.sock` with mode `0600`.
+Unsafe symlinks, foreign entries, wrong types or modes, and encoded socket paths
+that exceed the native Unix-socket limit are errors and are never repaired,
+deleted, or truncated implicitly.
+
+The Rust daemon, CLI, GUI, workers, and hooks use this shared resolver. The
+current Bun owner backend still requires either an explicit
+`POHUNEK_BACKEND_DAEMON_SOCKET` or `XDG_RUNTIME_DIR`; adopting the shared macOS
+default in that consumer is tracked by #103 and is not part of the protocol-v3
+contract change.
+
 The JSON control stream is newline-delimited UTF-8 JSON. One JSON value is sent
 per line. The current daemon and Rust SDK cap control lines at 1 MiB.
 

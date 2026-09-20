@@ -657,7 +657,9 @@ async function startDaemon(
     home: join(tempRoot, "home"),
     bin: join(tempRoot, "bin"),
   };
-  await Promise.all(Object.values(dirs).map((dir) => mkdir(dir, { recursive: true })));
+  await Promise.all(
+    Object.values(dirs).map((dir) => mkdir(dir, { recursive: true, mode: 0o700 })),
+  );
   await writeFile(
     join(dirs.bin, "netbird"),
     plugin === undefined ? NETBIRD_FIXTURE_SCRIPT : PLUGIN_NETBIRD_FIXTURE_SCRIPT,

@@ -4141,6 +4141,7 @@ dependencies = [
  "pohunek-netbird",
  "pohunek-overlay",
  "pohunek-paths",
+ "pohunek-platform",
  "pohunek-prompt",
  "pohunek-protocol",
  "pohunek-relay-client",
@@ -4307,6 +4308,9 @@ dependencies = [
 name = "pohunek-paths"
 version = "0.31.6"
 dependencies = [
+ "nix 0.29.0",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -4315,6 +4319,7 @@ name = "pohunek-platform"
 version = "0.31.6"
 dependencies = [
  "async-io",
+ "getrandom 0.2.17",
  "nix 0.29.0",
  "rustix 1.1.4",
  "tempfile",

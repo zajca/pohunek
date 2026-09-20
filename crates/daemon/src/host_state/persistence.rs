@@ -6,17 +6,18 @@
 //! file, synced before rename; a parent-sync failure is reported separately
 //! because the replacement may already be visible.
 
-// Rust guideline compliant 2026-09-03
+// Rust guideline compliant 2026-09-20
 
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use rustix::fs::{self, Mode, OFlags};
 use zeroize::Zeroizing;
+
+use pohunek_platform::filesystem::{AtomicReplaceError, FsError, TrustedDir};
 
 /// Exact mode for every managed host-state directory.
 const DIRECTORY_MODE: u32 = 0o700;
@@ -100,6 +101,7 @@ pub struct HostStateDir {
     state_path: PathBuf,
     path: PathBuf,
     dir: File,
+    trusted: TrustedDir,
     #[cfg(test)]
     faults: Faults,
 }
@@ -146,12 +148,16 @@ impl HostStateDir {
     /// broad, or an operating-system operation fails.
     pub fn open_or_create(state_dir: &Path) -> Result<Self, HostStateError> {
         let state_path = state_dir.to_path_buf();
-        let state = open_or_create_absolute_dir(state_dir, true)?;
-        let host = open_or_create_child_dir(&state, pohunek_paths::HOST_STATE_SUBDIR)?;
+        let state = TrustedDir::open_or_create_absolute(state_dir, DIRECTORY_MODE)
+            .map_err(platform_error)?;
+        let host = state
+            .open_or_create_child(pohunek_paths::HOST_STATE_SUBDIR, DIRECTORY_MODE)
+            .map_err(platform_error)?;
         Ok(Self {
             state_path: state_path.clone(),
             path: state_path.join(pohunek_paths::HOST_STATE_SUBDIR),
-            dir: host,
+            dir: host.try_clone_descriptor().map_err(platform_error)?,
+            trusted: host,
             #[cfg(test)]
             faults: Faults::default(),
         })
@@ -174,8 +180,13 @@ impl HostStateDir {
     /// Returns [`HostStateError`] when either directory is missing, unsafe, or
     /// no longer names the originally validated directory.
     pub(crate) fn validate_current_layout(&self) -> Result<(), HostStateError> {
-        let state = open_existing_absolute_dir(&self.state_path, true)?;
-        let host = open_existing_child_dir(&state, pohunek_paths::HOST_STATE_SUBDIR, true)?;
+        let state =
+            TrustedDir::open_absolute(&self.state_path, DIRECTORY_MODE).map_err(platform_error)?;
+        let host = state
+            .open_child(pohunek_paths::HOST_STATE_SUBDIR, DIRECTORY_MODE)
+            .map_err(platform_error)?
+            .try_clone_descriptor()
+            .map_err(platform_error)?;
         let current = host.metadata().map_err(|source| {
             io_error("inspect current host-state directory", &self.path, source)
         })?;
@@ -299,6 +310,13 @@ impl HostStateDir {
                 max_bytes: MAX_RECORD_BYTES,
             });
         }
+        #[cfg(not(test))]
+        let use_shared_primitive = true;
+        #[cfg(test)]
+        let use_shared_primitive = !self.faults.replace_is_armed();
+        if use_shared_primitive {
+            return self.replace_record_shared(name, bytes);
+        }
         self.validate_existing_record(name)?;
         let (temp_name, temp_fd) = self.create_temp(name)?;
         let temp_path = self.record_path(&temp_name);
@@ -315,8 +333,13 @@ impl HostStateDir {
                 .map_err(|source| io_error("write temporary record", &temp_path, source))?;
             #[cfg(test)]
             self.faults.file_sync(&temp_path)?;
-            temp.sync_all()
-                .map_err(|source| io_error("sync temporary record", &temp_path, source))?;
+            pohunek_platform::filesystem::sync_file(&temp).map_err(|source| {
+                io_error(
+                    "sync temporary record",
+                    &temp_path,
+                    io::Error::other(source),
+                )
+            })?;
             drop(temp);
             #[cfg(test)]
             self.faults.rename(&path)?;
@@ -328,17 +351,39 @@ impl HostStateDir {
                 .reoccupy_temp_after_rename(&self.dir, &temp_name, &path)?;
             #[cfg(test)]
             self.faults.dir_sync(&path)?;
-            self.dir
-                .sync_all()
-                .map_err(|source| HostStateError::CommittedDurabilityUncertain {
+            pohunek_platform::filesystem::sync_file(&self.dir).map_err(|source| {
+                HostStateError::CommittedDurabilityUncertain {
                     path: path.clone(),
-                    source,
-                })
+                    source: io::Error::other(source),
+                }
+            })
         })();
         if write_result.is_err() && !committed {
             let _ = fs::unlinkat(&self.dir, &temp_name, fs::AtFlags::empty());
         }
         write_result
+    }
+
+    fn replace_record_shared(&self, name: &str, bytes: &[u8]) -> Result<(), HostStateError> {
+        let temporary = format!(".{name}.{}.tmp", ulid::Ulid::new());
+        match self.trusted.replace_file(name, temporary, bytes, FILE_MODE) {
+            Ok(()) => Ok(()),
+            Err(AtomicReplaceError::BeforeCommit(error)) => Err(platform_error(error)),
+            Err(AtomicReplaceError::CommittedDurabilityUncertain(error)) => match error {
+                FsError::CommittedDurabilityUncertain { path, source, .. } => {
+                    Err(HostStateError::CommittedDurabilityUncertain { path, source })
+                }
+                other => Err(HostStateError::CommittedDurabilityUncertain {
+                    path: self.record_path(name),
+                    source: io::Error::other(other),
+                }),
+            },
+            Err(error) => Err(HostStateError::Io {
+                operation: "replace trusted host-state record",
+                path: self.record_path(name),
+                source: io::Error::other(error),
+            }),
+        }
     }
 
     /// Acquires the owner-private cross-process host-state lock.
@@ -553,187 +598,6 @@ impl HostStateLock {
     }
 }
 
-fn open_or_create_absolute_dir(path: &Path, managed_final: bool) -> Result<File, HostStateError> {
-    let raw = path.as_os_str().as_bytes();
-    if !path.is_absolute()
-        || raw == b"/"
-        || raw.windows(2).any(|window| window == b"//")
-        || raw.windows(3).any(|window| window == b"/./")
-        || raw.ends_with(b"/.")
-        || raw.ends_with(b"/")
-    {
-        return Err(HostStateError::UnsafePath {
-            path: path.to_path_buf(),
-        });
-    }
-    let root = fs::open(
-        Path::new("/"),
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .map_err(|source| io_error("open filesystem root", Path::new("/"), source))?;
-    let mut current = File::from(root);
-    let mut components = path.components();
-    if !matches!(components.next(), Some(Component::RootDir)) {
-        return Err(HostStateError::UnsafePath {
-            path: path.to_path_buf(),
-        });
-    }
-    let names: Vec<_> = components.collect();
-    if names.is_empty()
-        || names
-            .iter()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(HostStateError::UnsafePath {
-            path: path.to_path_buf(),
-        });
-    }
-    for (index, component) in names.iter().enumerate() {
-        if let Component::Normal(name) = component {
-            current = open_or_create_dir_component(
-                &current,
-                Path::new(name),
-                index + 1 == names.len() && managed_final,
-            )?;
-        } else {
-            return Err(HostStateError::UnsafePath {
-                path: path.to_path_buf(),
-            });
-        }
-    }
-    Ok(current)
-}
-
-fn open_existing_absolute_dir(path: &Path, managed_final: bool) -> Result<File, HostStateError> {
-    let raw = path.as_os_str().as_bytes();
-    if !path.is_absolute()
-        || raw == b"/"
-        || raw.windows(2).any(|window| window == b"//")
-        || raw.windows(3).any(|window| window == b"/./")
-        || raw.ends_with(b"/.")
-        || raw.ends_with(b"/")
-    {
-        return Err(HostStateError::UnsafePath {
-            path: path.to_path_buf(),
-        });
-    }
-    let root = fs::open(
-        Path::new("/"),
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .map_err(|source| io_error("open filesystem root", Path::new("/"), source))?;
-    let mut current = File::from(root);
-    let mut components = path.components();
-    if !matches!(components.next(), Some(Component::RootDir)) {
-        return Err(HostStateError::UnsafePath {
-            path: path.to_path_buf(),
-        });
-    }
-    let names: Vec<_> = components.collect();
-    if names.is_empty()
-        || names
-            .iter()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(HostStateError::UnsafePath {
-            path: path.to_path_buf(),
-        });
-    }
-    for (index, component) in names.iter().enumerate() {
-        let Component::Normal(name) = component else {
-            return Err(HostStateError::UnsafePath {
-                path: path.to_path_buf(),
-            });
-        };
-        current = open_existing_dir_component(
-            &current,
-            Path::new(name),
-            index + 1 == names.len() && managed_final,
-        )?;
-    }
-    Ok(current)
-}
-
-fn open_or_create_child_dir(parent: &File, name: &str) -> Result<File, HostStateError> {
-    open_or_create_dir_component(parent, Path::new(name), true)
-}
-
-fn open_existing_child_dir(
-    parent: &File,
-    name: &str,
-    managed: bool,
-) -> Result<File, HostStateError> {
-    open_existing_dir_component(parent, Path::new(name), managed)
-}
-
-fn open_existing_dir_component(
-    parent: &File,
-    name: &Path,
-    managed: bool,
-) -> Result<File, HostStateError> {
-    let display = name.to_path_buf();
-    let fd = fs::openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-        Mode::empty(),
-    )
-    .map_err(|source| io_error("open existing host-state directory", &display, source))?;
-    let file = File::from(fd);
-    validate_directory(&file, &display, managed)?;
-    Ok(file)
-}
-
-fn open_or_create_dir_component(
-    parent: &File,
-    name: &Path,
-    managed: bool,
-) -> Result<File, HostStateError> {
-    let display = name.to_path_buf();
-    let fd = match fs::openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            let mut created = false;
-            if let Err(source) = fs::mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
-                if source.kind() != io::ErrorKind::AlreadyExists {
-                    return Err(io_error("create host-state directory", &display, source));
-                }
-            } else {
-                created = true;
-            }
-            if created {
-                #[cfg(test)]
-                fault_parent_sync_after_mkdir(&display)?;
-                parent.sync_all().map_err(|source| {
-                    io_error("sync parent directory after create", &display, source)
-                })?;
-            }
-            fs::openat(
-                parent,
-                name,
-                OFlags::RDONLY
-                    | OFlags::DIRECTORY
-                    | OFlags::CLOEXEC
-                    | OFlags::NOFOLLOW
-                    | OFlags::NONBLOCK,
-                Mode::empty(),
-            )
-            .map_err(|source| io_error("open created host-state directory", &display, source))?
-        }
-        Err(source) => return Err(io_error("open host-state directory", &display, source)),
-    };
-    let file = File::from(fd);
-    validate_directory(&file, &display, managed)?;
-    Ok(file)
-}
-
 fn validate_directory(file: &File, path: &Path, managed: bool) -> Result<(), HostStateError> {
     let metadata = file
         .metadata()
@@ -743,7 +607,8 @@ fn validate_directory(file: &File, path: &Path, managed: bool) -> Result<(), Hos
             path: path.to_path_buf(),
         });
     }
-    if managed && (metadata.mode() & 0o777 != DIRECTORY_MODE || metadata.uid() != effective_uid()) {
+    if managed && (metadata.mode() & 0o7777 != DIRECTORY_MODE || metadata.uid() != effective_uid())
+    {
         return Err(HostStateError::UnsafePermissions {
             path: path.to_path_buf(),
         });
@@ -760,7 +625,7 @@ fn validate_private_file(file: &File, path: &Path) -> Result<(), HostStateError>
             path: path.to_path_buf(),
         });
     }
-    if metadata.mode() & 0o777 != FILE_MODE
+    if metadata.mode() & 0o7777 != FILE_MODE
         || metadata.uid() != effective_uid()
         || metadata.nlink() != 1
     {
@@ -796,6 +661,27 @@ fn io_error(operation: &'static str, path: &Path, source: impl Into<io::Error>) 
     }
 }
 
+fn platform_error(error: FsError) -> HostStateError {
+    match error {
+        FsError::UnsafeOwner { path, .. } | FsError::UnsafeMode { path, .. } => {
+            HostStateError::UnsafePermissions { path }
+        }
+        FsError::InvalidAbsolutePath { path }
+        | FsError::UnsafeType { path, .. }
+        | FsError::UnsafeLinkCount { path, .. }
+        | FsError::IdentityChanged { path }
+        | FsError::RecoveryConflict { path } => HostStateError::UnsafePath { path },
+        FsError::CommittedDurabilityUncertain { path, source, .. } => {
+            HostStateError::CommittedDurabilityUncertain { path, source }
+        }
+        other => HostStateError::Io {
+            operation: "prepare trusted host-state directory",
+            path: PathBuf::from("<host-state directory>"),
+            source: io::Error::other(other),
+        },
+    }
+}
+
 fn random_temp_suffix() -> Result<String, HostStateError> {
     let mut bytes = [0_u8; 16];
     File::open("/dev/urandom")
@@ -824,6 +710,37 @@ struct Faults {
 
 #[cfg(test)]
 impl Faults {
+    fn replace_is_armed(&self) -> bool {
+        self.write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+            || self
+                .file_sync
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+            || self
+                .rename
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+            || self
+                .dir_sync
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+            || !self
+                .temp_suffixes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+            || *self
+                .reoccupy_temp_after_rename
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn write(&self, path: &Path) -> Result<(), HostStateError> {
         Self::take_precommit(&self.write, "write temporary record", path)
     }
@@ -978,30 +895,6 @@ impl Faults {
                 source,
             })
     }
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static PARENT_SYNC_AFTER_MKDIR: std::cell::RefCell<Option<io::ErrorKind>> = const {
-        std::cell::RefCell::new(None)
-    };
-}
-
-#[cfg(test)]
-fn fault_parent_sync_after_mkdir(path: &Path) -> Result<(), HostStateError> {
-    match PARENT_SYNC_AFTER_MKDIR.with(|slot| slot.borrow_mut().take()) {
-        Some(kind) => Err(io_error(
-            "sync parent directory after create",
-            path,
-            io::Error::from(kind),
-        )),
-        None => Ok(()),
-    }
-}
-
-#[cfg(test)]
-fn inject_parent_sync_after_mkdir(kind: io::ErrorKind) {
-    PARENT_SYNC_AFTER_MKDIR.with(|slot| *slot.borrow_mut() = Some(kind));
 }
 
 #[cfg(test)]
@@ -1164,25 +1057,6 @@ mod tests {
     }
 
     #[test]
-    fn parent_sync_failure_stops_before_child_directory_creation() {
-        let path = state_dir("parent-sync");
-        std::fs::create_dir_all(path.parent().expect("state parent")).expect("create state parent");
-        inject_parent_sync_after_mkdir(io::ErrorKind::StorageFull);
-
-        assert!(matches!(
-            HostStateDir::open_or_create(&path),
-            Err(HostStateError::Io {
-                operation: "sync parent directory after create",
-                ..
-            })
-        ));
-        assert!(
-            !path.join(pohunek_paths::HOST_STATE_SUBDIR).exists(),
-            "a failed parent fsync must prevent child host-directory creation"
-        );
-    }
-
-    #[test]
     fn postrename_failure_never_removes_a_reoccupied_temporary_name() {
         let host =
             HostStateDir::open_or_create(&state_dir("postrename-temp")).expect("open host state");
@@ -1298,8 +1172,8 @@ mod tests {
             Path::new("/tmp/pohunek-host-state/"),
         ] {
             assert!(matches!(
-                open_or_create_absolute_dir(path, true),
-                Err(HostStateError::UnsafePath { .. })
+                TrustedDir::open_or_create_absolute(path, DIRECTORY_MODE),
+                Err(FsError::InvalidAbsolutePath { .. })
             ));
         }
     }

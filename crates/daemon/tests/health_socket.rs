@@ -235,6 +235,8 @@ async fn governance_service(socket: &Path) -> Arc<HostGovernanceService> {
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
@@ -244,6 +246,8 @@ fn temp_dir(tag: &str) -> PathBuf {
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).expect("create test socket dir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .expect("make test socket directory private");
     dir
 }
 
@@ -1675,6 +1679,11 @@ async fn stale_socket_is_recovered_on_bind() {
     let socket = temp_socket("stale");
     // Create a stale socket file with no listener behind it.
     let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind stale");
+    std::fs::set_permissions(
+        &socket,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .expect("make stale socket owner-private");
     drop(listener);
     assert!(socket.exists(), "stale socket file should exist");
     // See `wait_until_connect_refused`: give the kernel a moment to fully tear
@@ -1692,6 +1701,56 @@ async fn stale_socket_is_recovered_on_bind() {
 
     let _ = shutdown.send(());
     let _ = handle.await;
+}
+
+#[tokio::test]
+async fn hostile_socket_entry_is_rejected_without_mutation() {
+    let socket = temp_socket("hostile-socket-entry");
+    std::fs::write(&socket, b"owner data").expect("create hostile regular file");
+    std::fs::set_permissions(
+        &socket,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .expect("make hostile file private");
+
+    let error = ControlServer::bind(
+        &socket,
+        HealthInfo::new("0.0.0"),
+        governance_service(&socket).await,
+        support::overlay_registry(),
+    )
+    .await
+    .expect_err("regular file must not be treated as a stale socket");
+
+    assert!(error.to_string().contains("expected Socket"));
+    assert_eq!(
+        std::fs::read(&socket).expect("hostile entry remains"),
+        b"owner data"
+    );
+}
+
+#[tokio::test]
+async fn wrong_mode_stale_socket_is_rejected_without_removal() {
+    let socket = temp_socket("wrong-mode-stale-socket");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket");
+    std::fs::set_permissions(
+        &socket,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o660),
+    )
+    .expect("widen stale socket mode");
+    drop(listener);
+    wait_until_connect_refused(&socket).await;
+
+    ControlServer::bind(
+        &socket,
+        HealthInfo::new("0.0.0"),
+        governance_service(&socket).await,
+        support::overlay_registry(),
+    )
+    .await
+    .expect_err("wrong-mode stale socket must fail closed");
+
+    assert!(socket.exists(), "unsafe stale socket must remain untouched");
 }
 
 #[tokio::test]

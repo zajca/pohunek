@@ -5,6 +5,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use pohunek_platform::{filesystem::TrustedDir, process::BootIdentity};
 use pohunek_worker_protocol::{ControlCode, InspectSnapshot, ReleasedIdentityClaim, RuntimePhase};
 use protocol::{
     AgentActivity, AgentKind, RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus,
@@ -27,7 +28,12 @@ use crate::procwatch::ProcessInspector;
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-09-14
+// Rust guideline compliant 2026-09-19
+
+/// Maximum worker journal accepted during daemon reconciliation.
+const MAX_WORKER_JOURNAL_BYTES: usize = 1024 * 1024;
+/// Schema written by the current durable session worker.
+const WORKER_JOURNAL_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 struct DiscoveredWorker {
@@ -38,8 +44,10 @@ struct DiscoveredWorker {
 
 #[derive(Debug, Clone, Deserialize)]
 struct JournalEvidence {
+    schema_version: u32,
     session_id: String,
     worker_id: String,
+    boot_identity: String,
     runtime_id: Option<String>,
     child: Option<JournalChild>,
     cols: Option<u16>,
@@ -1991,44 +1999,40 @@ fn scan_worker_journals(
         Err(error) => return Err(error),
     };
     validate_discovery_path(state_root, &root_metadata, true)?;
-    for session_entry in std::fs::read_dir(state_root)? {
-        let session_entry = session_entry?;
-        if session_entry.file_type()?.is_symlink() || !session_entry.file_type()?.is_dir() {
-            continue;
-        }
-        let session_path = session_entry.path();
-        let session_metadata = session_entry.metadata()?;
-        if validate_discovery_path(&session_path, &session_metadata, true).is_err() {
-            continue;
-        }
-        let Some(session_id) = session_entry.file_name().to_str().map(ToOwned::to_owned) else {
+    let root = TrustedDir::open_absolute(state_root, 0o700).map_err(std::io::Error::other)?;
+    for session_name in root.entry_names().map_err(std::io::Error::other)? {
+        let Some(session_id) = session_name.to_str().map(ToOwned::to_owned) else {
             continue;
         };
-        for journal_entry in std::fs::read_dir(&session_path)? {
-            let journal_entry = journal_entry?;
-            let path = journal_entry.path();
-            let metadata = std::fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_symlink()
-                || !metadata.file_type().is_file()
-                || metadata.uid() != effective_uid()
-                || metadata.mode() & 0o077 != 0
+        let Ok(session_directory) = root.open_child(&session_name, 0o700) else {
+            continue;
+        };
+        for journal_name in session_directory
+            .entry_names()
+            .map_err(std::io::Error::other)?
+        {
+            let Some(journal_stem) = journal_name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+                .filter(|stem| pohunek_paths::valid_worker_id(stem).is_some())
+            else {
+                continue;
+            };
+            let Ok(bytes) =
+                session_directory.read_file(&journal_name, 0o600, MAX_WORKER_JOURNAL_BYTES)
+            else {
+                continue;
+            };
+            let Ok(evidence) = serde_json::from_slice::<JournalEvidence>(&bytes) else {
+                continue;
+            };
+            if evidence.schema_version != WORKER_JOURNAL_SCHEMA_VERSION
+                || evidence.session_id != session_id
+                || evidence.worker_id != journal_stem
+                || BootIdentity::parse(evidence.boot_identity.clone()).is_err()
             {
                 continue;
             }
-            let evidence = std::fs::read(&path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<JournalEvidence>(&bytes).ok())
-                .unwrap_or_else(|| JournalEvidence {
-                    session_id: session_id.clone(),
-                    worker_id: String::new(),
-                    runtime_id: None,
-                    child: None,
-                    cols: None,
-                    rows: None,
-                    phase: JournalPhase::Faulted,
-                    outcome: None,
-                    subagents: Vec::new(),
-                });
             journals
                 .entry(session_id.clone())
                 .or_default()
@@ -2232,7 +2236,17 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("ph-rec-{}-{nanos}", std::process::id()))
+        let root = std::env::temp_dir().join(format!("ph-rec-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create reconciliation root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("secure reconciliation root");
+        root
+    }
+
+    fn create_private_dir(path: &Path) {
+        std::fs::create_dir_all(path).expect("create private test directory");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("secure private test directory");
     }
 
     struct ReleaseFiles(Vec<PathBuf>);
@@ -2540,8 +2554,10 @@ mod tests {
     fn terminal_journal_identity_mismatch_and_duplicates_fail_closed() {
         let record = identity_record();
         let exact = super::JournalEvidence {
+            schema_version: super::WORKER_JOURNAL_SCHEMA_VERSION,
             session_id: record.session_id.clone(),
             worker_id: record.runtime.worker_id.clone().expect("worker id"),
+            boot_identity: "boot-test".to_owned(),
             runtime_id: record.runtime.runtime_id.clone(),
             child: Some(super::JournalChild { pid: 50 }),
             cols: Some(80),
@@ -2565,6 +2581,50 @@ mod tests {
             super::classify_terminal_journals(vec![exact.clone(), exact], &record),
             super::TerminalJournalClassification::Conflict
         ));
+    }
+
+    #[test]
+    fn journal_scan_ignores_temporary_malformed_and_identity_mismatched_files() {
+        let root = temp_root();
+        let state_root = root.join("workers");
+        let session_dir = state_root.join("s-journal-scan");
+        std::fs::create_dir_all(&session_dir).expect("create journal directory");
+        for path in [&state_root, &session_dir] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .expect("secure journal directory");
+        }
+        let mut journal = JournalRecord::bootstrap(
+            "s-journal-scan".to_owned(),
+            "worker-valid".to_owned(),
+            41,
+            "410".to_owned(),
+            "boot-test".to_owned(),
+            (1, 2),
+            "2026-09-20T00:00:00Z".to_owned(),
+        );
+        journal.phase = JournalRuntimePhase::Terminal;
+        Journal::new(session_dir.join("worker-valid.json"))
+            .write(&journal)
+            .expect("write valid journal");
+        let valid_bytes = std::fs::read(session_dir.join("worker-valid.json"))
+            .expect("read valid journal fixture");
+        for (name, bytes) in [
+            ("worker-valid.json.tmp", valid_bytes.as_slice()),
+            ("worker-malformed.json", b"not json".as_slice()),
+            ("worker-other.json", valid_bytes.as_slice()),
+        ] {
+            let path = session_dir.join(name);
+            std::fs::write(&path, bytes).expect("write ignored journal fixture");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("secure ignored journal fixture");
+        }
+
+        let journals = super::scan_worker_journals(&state_root).expect("scan journals");
+        let accepted = journals
+            .get("s-journal-scan")
+            .expect("valid session journal accepted");
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].worker_id, "worker-valid");
     }
 
     #[test]
@@ -3625,6 +3685,11 @@ mod tests {
             .expect("persist running logical record");
 
         std::fs::create_dir_all(&state_root).expect("create state root");
+        std::fs::set_permissions(
+            state_root.parent().expect("state parent"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("private state parent");
         std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o700))
             .expect("private state root");
         let mut journal = JournalRecord::bootstrap(
@@ -3632,6 +3697,7 @@ mod tests {
             "worker-terminal".to_owned(),
             41,
             "410".to_owned(),
+            "boot-test".to_owned(),
             (1, 2),
             "2026-07-23T00:00:00Z".to_owned(),
         );
@@ -4719,7 +4785,7 @@ mod tests {
     fn import_legacy_manifest_mixed_recoverable_and_unrecoverable() {
         let root = temp_root();
         let data_dir = root.join("data");
-        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        create_private_dir(&data_dir);
         let store_path = data_dir.join("metadata.jsonl");
         let store = Store::new(store_path.clone());
 
@@ -4829,7 +4895,7 @@ mod tests {
     fn import_archives_manifest_after_uncertain_post_rename_commit() {
         let root = temp_root();
         let data_dir = root.join("data");
-        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        create_private_dir(&data_dir);
         let store_path = data_dir.join("metadata.jsonl");
         let store = Store::new(store_path.clone());
         let fingerprint = store_fingerprint(&store_path);
@@ -4858,7 +4924,7 @@ mod tests {
     fn import_legacy_manifest_fingerprint_mismatch_fails_closed() {
         let root = temp_root();
         let data_dir = root.join("data");
-        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        create_private_dir(&data_dir);
         let store_path = data_dir.join("metadata.jsonl");
         let store = Store::new(store_path);
 
@@ -4882,7 +4948,7 @@ mod tests {
     fn import_legacy_manifest_live_loss_not_accepted_fails_closed() {
         let root = temp_root();
         let data_dir = root.join("data");
-        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        create_private_dir(&data_dir);
         let store_path = data_dir.join("metadata.jsonl");
         let store = Store::new(store_path.clone());
 
@@ -4904,7 +4970,7 @@ mod tests {
     fn import_legacy_manifest_live_classification_mismatch_fails_closed() {
         let root = temp_root();
         let data_dir = root.join("data");
-        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        create_private_dir(&data_dir);
         let store_path = data_dir.join("metadata.jsonl");
         let store = Store::new(store_path.clone());
 
@@ -4929,7 +4995,7 @@ mod tests {
     fn import_legacy_manifest_unsupported_schema_fails_closed() {
         let root = temp_root();
         let data_dir = root.join("data");
-        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        create_private_dir(&data_dir);
         let store_path = data_dir.join("metadata.jsonl");
         let store = Store::new(store_path.clone());
 
@@ -4956,7 +5022,7 @@ mod tests {
     fn import_legacy_manifest_already_migrated_is_idempotent() {
         let root = temp_root();
         let data_dir = root.join("data");
-        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        create_private_dir(&data_dir);
         let store_path = data_dir.join("metadata.jsonl");
         let store = Store::new(store_path.clone());
 

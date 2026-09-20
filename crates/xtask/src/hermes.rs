@@ -671,11 +671,13 @@ impl Isolation {
 /// parent nevertheless must be outside every Git workspace because Pohunek's
 /// production resolver intentionally treats Git ancestry as an unsafe target.
 fn production_integration_isolation() -> Result<Isolation, XtaskError> {
-    let mut candidates = Vec::new();
+    // Prefer the standard temporary root: the production filesystem contract
+    // accepts its sticky system ancestry, while a container-provided user
+    // runtime can itself sit below foreign-owned non-system mount ancestors.
+    let mut candidates = vec![std::env::temp_dir()];
     if let Some(runtime_directory) = std::env::var_os("XDG_RUNTIME_DIR") {
         candidates.push(PathBuf::from(runtime_directory));
     }
-    candidates.push(std::env::temp_dir());
     let parent = select_production_integration_temp_parent(candidates)?;
     Isolation::new_in("pohunek-production-plugin-", &parent)
 }
