@@ -239,17 +239,19 @@ jobs:
               - 'crates/**/*.rs'
               - 'crates/xtask/src/checks.rs'
               - 'crates/xtask/src/lib.rs'
-            # macOS platform contracts run on two runners (arm64 + x86_64)
-            # (issue #125): gate on the portable platform crate, the
-            # cross-platform dependency graph, and the Cargo configuration
-            # (.cargo/config.toml carries Apple-specific linker/target flags
-            # that can break only the macOS build). The root manifest is
-            # because the platform crate inherits workspace package, dependency
-            # and lint settings from it — a workspace-level change can break
-            # only the macOS build without touching Cargo.lock.
+            # macOS platform, path, and Hermes filesystem contracts run on the
+            # native arm64 runner (issues #96 and #125): gate on every crate
+            # exercised by the job, the cross-platform dependency graph, and
+            # the Cargo configuration (.cargo/config.toml carries Apple-specific
+            # linker/target flags that can break only the macOS build). The root
+            # manifest is included because these crates inherit workspace
+            # package, dependency, and lint settings from it.
             macos:
               - 'Cargo.toml'
               - 'crates/platform/**'
+              - 'crates/paths/**'
+              - 'crates/cli/Cargo.toml'
+              - 'crates/cli/src/**'
               - 'Cargo.lock'
               - '.cargo/**'
               - '.github/workflows/ci.yml'
