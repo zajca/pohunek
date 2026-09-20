@@ -2454,8 +2454,8 @@ mod tests {
 
     #[test]
     fn absolute_tree_accepts_safe_shared_intermediates_below_a_private_home() {
-        let (temporary, _trusted) = trusted_root();
-        let home = temporary.path().join("home");
+        let (_temporary, trusted) = trusted_root();
+        let home = trusted.path().join("home");
         let local = home.join(".local");
         let share = local.join("share");
         let application = share.join("pohunek");
