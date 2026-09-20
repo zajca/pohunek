@@ -16,6 +16,7 @@ web/logs/
 node_modules/
 web/node_modules/
 web/**/dist/
+web/**/dist-types/
 web/frontend/test-results/
 web/**/*.tsbuildinfo
 

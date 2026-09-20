@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# Remove stale per-branch Cargo target directories (issue #126).
+#
+# The default `target/` build output is shared. Per-branch isolation happens
+# only when `CARGO_TARGET_DIR` points at `target/<name>` (for example the
+# `rsa-policy` xtask fixture or a worktree-specific directory): those isolated
+# directories never get reused after the branch lands, so this script deletes
+# the ones whose content has not been touched for the retention window.
+# Entries that do not look like Cargo target directories (no `debug/` or
+# `release/` profile output, no `CACHEDIR.TAG`/`rustc-info` sentinel) are never
+# deleted: that keeps `target/pohunek-eval` transcripts, `target/doc`,
+# `target/package`, and any other non-build output. Run with `--dry-run` to
+# preview, or install the cron line printed by `--cron` to run it every
+# 30 days.
+set -euo pipefail
+
+RETENTION_DAYS=30
+DRY_RUN=0
+TARGET_ROOT=""
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [--target-dir PATH] [--days N] [--dry-run] [--cron]
+
+  --target-dir PATH  Cargo target directory (default: <repo>/target)
+  --days N           delete per-branch dirs untouched for N days (default: 30)
+  --dry-run          print what would be deleted without deleting it
+  --cron             print the suggested cron line and exit
+EOF
+}
+
+cron_line() {
+  local repo="$1"
+  echo "0 6 1 * * CARGO_TARGET_DIR=$repo/target $repo/scripts/cargo-sweep-targets --days 30"
+}
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Resolve a path to its canonical absolute form without requiring it to
+# exist. Prefers realpath/readlink -m, falls back to python3 (which covers
+# macOS, where neither flag is guaranteed to exist).
+canonicalize() {
+  local path="$1" out
+  if out="$(realpath -m "$path" 2>/dev/null)" && [[ -n "$out" ]]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  if out="$(readlink -m "$path" 2>/dev/null)" && [[ -n "$out" ]]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  python3 -c 'import os,sys; print(os.path.normpath(os.path.abspath(sys.argv[1])))' "$path"
+}
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --target-dir)
+      if [[ $# -lt 2 || "$2" == -* ]]; then
+        echo "error: --target-dir requires a PATH value." >&2
+        usage >&2
+        exit 1
+      fi
+      TARGET_ROOT="$2"
+      shift 2
+      ;;
+    --days)
+      if [[ $# -lt 2 || "$2" == -* ]]; then
+        echo "error: --days requires a positive integer value." >&2
+        usage >&2
+        exit 1
+      fi
+      RETENTION_DAYS="$2"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --cron)
+      cron_line "$repo_root"
+      exit 0
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if ! [[ "$RETENTION_DAYS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: --days must be a positive integer, got '$RETENTION_DAYS'." >&2
+  exit 1
+fi
+
+if [[ -z "$TARGET_ROOT" ]]; then
+  TARGET_ROOT="$repo_root/target"
+fi
+
+canonical_root="$(canonicalize "$TARGET_ROOT")" || {
+  echo "refusing: cannot resolve target directory '$TARGET_ROOT'." >&2
+  exit 1
+}
+canonical_repo="$(canonicalize "$repo_root")"
+canonical_home=""
+if [[ -n "${HOME:-}" ]]; then
+  canonical_home="$(canonicalize "$HOME" || true)"
+fi
+TARGET_ROOT="$canonical_root"
+
+# A missing root (fresh checkout, after `cargo clean`) is a clean no-op: there
+# is nothing to delete and nothing to verify.
+if [[ ! -d "$TARGET_ROOT" ]]; then
+  echo "target directory $TARGET_ROOT does not exist; nothing to sweep."
+  exit 0
+fi
+
+# Destructive guard: the sweep runs `rm -rf` below this root, so refuse
+# anything that is not recognisably a Cargo target directory. A typo such as
+# `--target-dir "$PWD"` or the home directory must fail closed instead of
+# classifying source trees as sweep candidates.
+if [[ "$canonical_root" == "/" ]]; then
+  echo "refusing: target directory must not be the filesystem root." >&2
+  exit 1
+fi
+if [[ -n "$canonical_home" && "$canonical_root" == "$canonical_home" ]]; then
+  echo "refusing: target directory must not be the home directory." >&2
+  exit 1
+fi
+if [[ "$canonical_root" == "$canonical_repo" ]]; then
+  echo "refusing: target directory must not be the repository root." >&2
+  exit 1
+fi
+if [[ ! -e "$canonical_root/CACHEDIR.TAG" && ! -e "$canonical_root/.rustc_info.json" ]]; then
+  echo "refusing: '$TARGET_ROOT' does not look like a Cargo target directory" >&2
+  echo "(missing CACHEDIR.TAG and .rustc_info.json sentinel)." >&2
+  exit 1
+fi
+
+# Directories the workspace itself owns: the default profiles, the
+# nextest/doc scratch areas, the manual eval transcripts (which may be
+# irreproducible), and standard Cargo outputs.
+KEEP=("debug" "release" "nextest" "tmp" "pohunek-docs" "pohunek-eval" "doc" "package")
+
+# True for cross-compile triple output (e.g. x86_64-unknown-linux-gnu,
+# aarch64-apple-darwin, wasm32-wasip1), which Cargo owns and the sweep must
+# keep. The authoritative list comes from `rustc --print target-list`; the
+# token heuristic is additive, so it also covers custom JSON targets and
+# environments without rustc (skipping a candidate is safe, deleting it is not).
+KNOWN_TRIPLES=""
+load_known_triples() {
+  if [[ -n "$KNOWN_TRIPLES" ]]; then
+    return 0
+  fi
+  if command -v rustc >/dev/null 2>&1; then
+    KNOWN_TRIPLES="$(rustc --print target-list 2>/dev/null || true)"
+  fi
+}
+is_triple_dir() {
+  local name="$1"
+  load_known_triples
+  if [[ -n "$KNOWN_TRIPLES" ]] && grep -qxF "$name" <<<"$KNOWN_TRIPLES"; then
+    return 0
+  fi
+  [[ "$name" =~ ^[a-z0-9_]+-.*(apple|darwin|pc|windows|wasm|wasi|unknown|linux|gnu|musl).*$ ]]
+}
+
+# True when the entry has the shape of a Cargo target directory: profile
+# output or a Cargo cache/rustc sentinel.
+is_cargo_target_shape() {
+  local entry="$1"
+  [[ -e "$entry/CACHEDIR.TAG" || -e "$entry/.rustc_info.json" || -d "$entry/debug" || -d "$entry/release" ]]
+}
+
+deleted=0
+for entry in "$TARGET_ROOT"/*; do
+  [[ -e "$entry" || -L "$entry" ]] || continue
+  if [[ -L "$entry" ]]; then
+    echo "skip (symlink, not a real directory): $entry"
+    continue
+  fi
+  if [[ ! -d "$entry" ]]; then
+    continue
+  fi
+  name="$(basename "$entry")"
+  keep=0
+  for kept in "${KEEP[@]}"; do
+    if [[ "$name" == "$kept" ]]; then
+      keep=1
+      break
+    fi
+  done
+  if [[ "$keep" -eq 1 ]]; then
+    continue
+  fi
+  if is_triple_dir "$name"; then
+    echo "skip (cross-compile target output): $entry"
+    continue
+  fi
+  if ! is_cargo_target_shape "$entry"; then
+    echo "skip (not a Cargo target directory): $entry"
+    continue
+  fi
+  # Recency is the newest mtime anywhere under the entry: Cargo writes into
+  # nested profile output (e.g. <name>/debug/...) without touching the entry
+  # root, so checking only the root mtime would delete actively used targets.
+  if find "$entry" -mtime "-${RETENTION_DAYS}" -print -quit 2>/dev/null | grep -q .; then
+    echo "keep (recent): $entry"
+    continue
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "would delete (stale >${RETENTION_DAYS}d): $entry"
+  else
+    echo "delete (stale >${RETENTION_DAYS}d): $entry"
+    rm -rf -- "$entry"
+    deleted=$((deleted + 1))
+  fi
+done
+echo "sweep done: $deleted directorie(s) removed (retention ${RETENTION_DAYS}d)."

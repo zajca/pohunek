@@ -1,11 +1,21 @@
-// Run every web workspace typecheck task in parallel.
+// Run the composite TypeScript build graph plus the standalone checks in one
+// command.
 //
-// The root `typecheck` script used to chain seven `tsc` / `svelte-check`
-// invocations with `&&`, so the wall time summed every package even though
-// the tasks are independent. This orchestrator keeps each package script as
-// the single source of truth and runs the tasks concurrently: the wall time
-// lands near the slowest task instead of their sum, and every failing task
-// is reported instead of stopping at the first one.
+// `tsc -b web/tsconfig.json` typechecks the shared/sdk/backend/testkit/
+// client-core/tools source graph incrementally: unchanged referenced projects
+// are reported "up to date" from their `.tsbuildinfo` instead of being
+// rechecked.
+//
+// Package tests stay out of that composite graph on purpose. Test files import
+// sibling packages (`@pohunek/backend`, `@pohunek/testkit`, ...) whose exports
+// resolve to `.ts` sources, so a composite project that includes `test/**/*`
+// silently compiles sources of non-referenced projects, and the resulting test
+// dependencies form cycles that project references cannot express. Each
+// package therefore carries a standalone `<pkg>/test/tsconfig.json`
+// (non-composite, noEmit) that this orchestrator runs after `tsc -b` finished,
+// in parallel with the frontend (`svelte-check`), its Playwright e2e project,
+// and the release installer fixture. Every failing task is reported instead of
+// stopping at the first one.
 
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
@@ -15,7 +25,7 @@ const WEB_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 // Spawn Bun by its own executable path so the orchestrator does not depend on
 // what `bun` resolves to on `PATH`.
 const BUN_EXECUTABLE = process.execPath;
-// Hoisted workspace TypeScript binary. The root tsc projects must not go
+// Hoisted workspace TypeScript binary. The composite build must not go
 // through `bun run typecheck`, which would recurse into this orchestrator.
 const TSC_EXECUTABLE = join(WEB_ROOT, "node_modules", "typescript", "bin", "tsc");
 const MS_PER_SECOND = 1000;
@@ -33,24 +43,29 @@ interface TypecheckResult {
   readonly output: string;
 }
 
-const PACKAGES = ["shared", "sdk", "backend", "testkit", "client-core", "frontend"] as const;
+const TEST_PROJECTS = ["sdk", "backend", "testkit", "client-core"] as const;
 
 const TASKS: readonly TypecheckTask[] = [
   {
-    name: "root",
+    name: "build",
     cwd: WEB_ROOT,
-    args: [TSC_EXECUTABLE, "--noEmit", "-p", "tsconfig.json"],
+    args: [TSC_EXECUTABLE, "-b", "tsconfig.json"],
   },
   {
     name: "release-test",
     cwd: WEB_ROOT,
     args: [TSC_EXECUTABLE, "--noEmit", "-p", "release/test/tsconfig.json"],
   },
-  ...PACKAGES.map(
+  {
+    name: "frontend",
+    cwd: join(WEB_ROOT, "frontend"),
+    args: ["run", "typecheck"],
+  },
+  ...TEST_PROJECTS.map(
     (name): TypecheckTask => ({
-      name,
+      name: `${name}-test`,
       cwd: join(WEB_ROOT, name),
-      args: ["run", "typecheck"],
+      args: [TSC_EXECUTABLE, "--noEmit", "-p", "test/tsconfig.json"],
     }),
   ),
 ];
@@ -89,7 +104,12 @@ function runTask(task: TypecheckTask): Promise<TypecheckResult> {
 }
 
 async function main(): Promise<void> {
-  const results = await Promise.all(TASKS.map(runTask));
+  // The standalone checks typecheck workspace sources, so they must observe the
+  // composite build's output state, not race it: run `tsc -b` to completion
+  // first, then fan out the remaining independent checks.
+  const build = await runTask(TASKS[0] as TypecheckTask);
+  const standalone = await Promise.all(TASKS.slice(1).map(runTask));
+  const results = [build, ...standalone];
   const failed = results.filter((result) => !result.ok);
   for (const result of results) {
     const seconds = (result.durationMs / MS_PER_SECOND).toFixed(1);
