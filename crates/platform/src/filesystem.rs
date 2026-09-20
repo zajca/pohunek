@@ -2771,9 +2771,9 @@ mod tests {
         let nested = tree.join("nested");
         let outside = temporary.path().join("outside");
         fs::create_dir(&tree).expect("create tree");
-        fs::create_dir(&nested).expect("create nested directory");
         fs::set_permissions(&tree, fs::Permissions::from_mode(DIRECTORY_MODE))
             .expect("set tree mode");
+        fs::create_dir(&nested).expect("create nested directory");
         fs::set_permissions(&nested, fs::Permissions::from_mode(DIRECTORY_MODE))
             .expect("set nested mode");
         fs::write(nested.join("record"), b"managed").expect("write nested record");
