@@ -503,6 +503,14 @@ fn trusted_rename_replacing_reservation_with(
 }
 
 fn trusted_rename_no_replace(source: &Path, destination: &Path) -> RenameResult {
+    trusted_rename_no_replace_with(source, destination, |_| Ok(()))
+}
+
+fn trusted_rename_no_replace_with(
+    source: &Path,
+    destination: &Path,
+    before_source_restore: impl FnOnce(&Path) -> Result<(), Error>,
+) -> RenameResult {
     if source.as_os_str().as_bytes().contains(&0) || destination.as_os_str().as_bytes().contains(&0)
     {
         return Err(RenameFailure::BeforeCommit(Error::Io {
@@ -567,8 +575,10 @@ fn trusted_rename_no_replace(source: &Path, destination: &Path) -> RenameResult 
     match staged.move_to(&destination_directory, destination_name) {
         Ok(MoveOutcome::Moved) => Ok(()),
         Ok(MoveOutcome::DestinationExists) => {
+            before_source_restore(source)
+                .map_err(|_| RenameFailure::BeforeCommit(Error::RecoveryRequired))?;
             restore_staged_source(&staged, source_name)
-                .map_err(|_| RenameFailure::Committed(Error::RecoveryRequired))?;
+                .map_err(|_| RenameFailure::BeforeCommit(Error::RecoveryRequired))?;
             Err(RenameFailure::BeforeCommit(Error::Collision))
         }
         Err(StagedMoveError::BeforeCommit(_)) => {
@@ -2033,6 +2043,45 @@ mod tests {
                 }))
             );
         }
+    }
+
+    #[test]
+    fn collision_restore_failure_does_not_record_parent_rename_as_committed() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        fs::set_permissions(
+            root.path(),
+            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+        )
+        .expect("private temporary directory");
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        fs::write(&source, b"source").expect("source file");
+        fs::set_permissions(&source, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+            .expect("private source");
+        fs::write(&destination, b"destination").expect("destination file");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+            .expect("private destination");
+
+        let result = trusted_rename_no_replace_with(&source, &destination, |original_source| {
+            fs::write(original_source, b"raced source")?;
+            fs::set_permissions(
+                original_source,
+                fs::Permissions::from_mode(PRIVATE_FILE_MODE),
+            )?;
+            Ok(())
+        });
+        let mut parent_rename_committed = false;
+
+        assert_eq!(
+            record_rename(result, &mut parent_rename_committed, true),
+            Err(Error::RecoveryRequired)
+        );
+        assert!(!parent_rename_committed);
+        assert_eq!(
+            fs::read(&destination).expect("preserved destination"),
+            b"destination"
+        );
+        assert_eq!(fs::read(&source).expect("raced source"), b"raced source");
     }
 
     #[test]
