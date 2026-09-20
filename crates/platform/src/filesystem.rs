@@ -2857,11 +2857,15 @@ mod tests {
             .status()
             .expect("run chown");
         assert!(status.success(), "chown foreign fixture");
-
-        assert!(matches!(
-            TrustedDir::open_absolute(&foreign, DIRECTORY_MODE),
-            Err(FsError::UnsafeOwner { .. })
-        ));
+        assert_eq!(
+            fs::symlink_metadata(&foreign)
+                .expect("inspect foreign fixture")
+                .uid(),
+            1,
+            "fixture must be foreign-owned"
+        );
+        TrustedDir::open_absolute(&foreign, DIRECTORY_MODE)
+            .expect_err("foreign-owned private directory must be rejected");
     }
 
     #[test]
