@@ -2508,6 +2508,9 @@ mod tests {
     const STATE_RELEASE_REQUEST_COUNT: usize = 1;
     /// Integration asset version expected after bounded in-memory state hooks ship.
     const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=6";
+    /// Writable inheritable ACL used to prove mode bits alone are insufficient on macOS.
+    #[cfg(target_os = "macos")]
+    const WRITABLE_INHERITABLE_ACL: &str = "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit";
     /// Action argument for state-hook `SessionStart` reporting.
     const STATE_SESSION_ACTION: &str = "session";
     /// Action argument for state-hook release reporting.
@@ -3860,6 +3863,24 @@ mod tests {
 
         assert_eq!(codex_error.code, "integration_path_untrusted");
         assert_eq!(tree_snapshot(&codex), codex_before);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn installer_rejects_an_extended_acl_on_the_owner_safe_trust_root() {
+        let codex = temp_dir("install-untrusted-codex-acl-parent");
+        let status = Command::new("/bin/chmod")
+            .args(["+a", WRITABLE_INHERITABLE_ACL])
+            .arg(&codex)
+            .status()
+            .expect("run native ACL fixture command");
+        assert!(status.success(), "native ACL fixture command must succeed");
+        let before = tree_snapshot(&codex);
+
+        let error = install_codex(&codex).expect_err("reject ACL-writable Codex config parent");
+
+        assert_eq!(error.code, "integration_path_untrusted");
+        assert_eq!(tree_snapshot(&codex), before);
     }
 
     #[cfg(unix)]

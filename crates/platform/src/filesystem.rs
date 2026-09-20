@@ -424,6 +424,7 @@ impl TrustedDir {
             });
         }
         validate_stat(&stat, &directory.path, EntryKind::Directory, None)?;
+        validate_private_acl(&directory.file, &directory.path)?;
         Ok(directory)
     }
 
@@ -467,6 +468,7 @@ impl TrustedDir {
             io_error("inspect owner-safe child directory", &child.path, source)
         })?;
         validate_stat(&stat, &child.path, EntryKind::Directory, None)?;
+        validate_private_acl(&child.file, &child.path)?;
         let actual = stat_mode(&stat);
         if actual & forbidden_mode_bits != 0 {
             return Err(FsError::UnsafeMode {
@@ -1524,6 +1526,7 @@ fn validate_ancestor(
     let mode = stat_mode(&stat);
     let owner = stat_uid(&stat);
     if owner == system_uid && mode & 0o1000 != 0 {
+        validate_private_acl(file, path)?;
         return Ok(());
     }
     if owner == effective_uid {
@@ -1534,9 +1537,11 @@ fn validate_ancestor(
                 expected: private_mode,
             });
         }
+        validate_private_acl(file, path)?;
         return Ok(());
     }
     if owner == system_uid && mode & 0o022 == 0 {
+        validate_private_acl(file, path)?;
         return Ok(());
     }
     Err(FsError::UnsafeOwner {
@@ -2419,6 +2424,15 @@ fn validate_private_acl(file: &File, path: &Path) -> FsResult<()> {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "keeps ACL validation call sites identical across supported Unix targets"
+)]
+fn validate_private_acl(_file: &File, _path: &Path) -> FsResult<()> {
+    Ok(())
+}
+
 fn validate_fd_base(file: &File, path: &Path, kind: EntryKind) -> FsResult<EntryIdentity> {
     let stat =
         fs::fstat(file).map_err(|source| io_error("inspect trusted descriptor", path, source))?;
@@ -2698,6 +2712,12 @@ mod tests {
 
     const DIRECTORY_MODE: u32 = 0o700;
     const FILE_MODE: u32 = 0o600;
+    #[cfg(target_os = "macos")]
+    const WRITABLE_ACL: &str =
+        "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity";
+    #[cfg(target_os = "macos")]
+    const WRITABLE_INHERITABLE_ACL: &str =
+        "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit";
 
     fn trusted_root() -> (tempfile::TempDir, TrustedDir) {
         let temporary = tempfile::tempdir().expect("create temporary directory");
@@ -2932,10 +2952,7 @@ mod tests {
         fs::set_permissions(temporary.path(), fs::Permissions::from_mode(DIRECTORY_MODE))
             .expect("set fixture root mode");
         let status = std::process::Command::new("/bin/chmod")
-            .args([
-                "+a",
-                "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit",
-            ])
+            .args(["+a", WRITABLE_INHERITABLE_ACL])
             .arg(temporary.path())
             .status()
             .expect("run native ACL fixture command");
@@ -2948,6 +2965,41 @@ mod tests {
         assert!(matches!(
             TrustedDir::open_absolute(&child, DIRECTORY_MODE),
             Err(FsError::UnsafeAcl { .. })
+        ));
+        assert!(matches!(
+            TrustedDir::open_absolute_owner_safe(&child, 0o022),
+            Err(FsError::UnsafeAcl { .. })
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn non_inherited_macos_acl_on_an_ancestor_is_rejected() {
+        let temporary = tempfile::tempdir_in("/private/tmp").expect("create macOS fixture root");
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("set fixture root mode");
+        let ancestor = temporary.path().join("ancestor");
+        let leaf = ancestor.join("leaf");
+        fs::create_dir(&ancestor).expect("create ACL-bearing ancestor");
+        fs::create_dir(&leaf).expect("create ACL-free leaf");
+        for path in [&ancestor, &leaf] {
+            fs::set_permissions(path, fs::Permissions::from_mode(DIRECTORY_MODE))
+                .expect("set private mode bits");
+        }
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", WRITABLE_ACL])
+            .arg(&ancestor)
+            .status()
+            .expect("run native ACL fixture command");
+        assert!(status.success(), "native ACL fixture command must succeed");
+
+        assert!(matches!(
+            TrustedDir::open_absolute(&leaf, DIRECTORY_MODE),
+            Err(FsError::UnsafeAcl { path }) if path == ancestor
+        ));
+        assert!(matches!(
+            TrustedDir::open_absolute_owner_safe(&leaf, 0o022),
+            Err(FsError::UnsafeAcl { path }) if path == ancestor
         ));
     }
 
