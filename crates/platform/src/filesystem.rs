@@ -56,6 +56,14 @@ pub struct EntryIdentity {
     kind: EntryKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EntryGeneration {
+    identity: EntryIdentity,
+    size: i128,
+    change_seconds: i128,
+    change_nanoseconds: i128,
+}
+
 impl EntryIdentity {
     /// Returns the device number containing this entry.
     #[must_use]
@@ -288,6 +296,7 @@ pub struct StagedEntry {
     directory_path: PathBuf,
     name: OsString,
     identity: EntryIdentity,
+    generation: EntryGeneration,
     entry_directory: Option<File>,
 }
 
@@ -487,11 +496,20 @@ impl TrustedDir {
                     return Ok(child);
                 }
                 MoveOutcome::DestinationExists => {
+                    let generation = require_entry_generation(
+                        &self.file,
+                        &staging_path,
+                        &staging,
+                        EntryKind::Directory,
+                        Some(mode),
+                        identity,
+                    )?;
                     let residue = StagedEntry {
                         directory: self.try_clone_descriptor()?,
                         directory_path: self.path.clone(),
                         name: staging,
                         identity,
+                        generation,
                         entry_directory: None,
                     };
                     let _ = residue.remove()?;
@@ -1120,8 +1138,9 @@ impl TrustedDir {
             return Ok(StageOutcome::DestinationExists);
         }
         let staged_path = self.path.join(staging);
-        let staged = inspect_entry(&self.file, &staged_path, staging, expected.kind, None)?;
-        if staged != Some(expected) {
+        let staged =
+            inspect_entry_generation(&self.file, &staged_path, staging, expected.kind, None)?;
+        if staged.map(|generation| generation.identity) != Some(expected) {
             match self.move_no_replace(staging, self, source)? {
                 MoveOutcome::Moved => return Ok(StageOutcome::IdentityChanged),
                 MoveOutcome::DestinationExists => {
@@ -1151,6 +1170,7 @@ impl TrustedDir {
             directory_path: self.path.clone(),
             name: staging.to_os_string(),
             identity: expected,
+            generation: staged.expect("validated staged generation exists"),
             entry_directory,
         }))
     }
@@ -1300,6 +1320,14 @@ impl TrustedDir {
                     return Ok(child);
                 }
                 MoveOutcome::DestinationExists => {
+                    let generation = require_entry_generation(
+                        &self.file,
+                        &staging_path,
+                        &staging,
+                        EntryKind::Directory,
+                        Some(mode),
+                        identity,
+                    )?;
                     let residue = StagedEntry {
                         directory: self.file.try_clone().map_err(|source| {
                             io_error("duplicate trusted directory descriptor", &self.path, source)
@@ -1307,6 +1335,7 @@ impl TrustedDir {
                         directory_path: self.path.clone(),
                         name: staging,
                         identity,
+                        generation,
                         entry_directory: None,
                     };
                     let _ = residue.remove()?;
@@ -1342,7 +1371,7 @@ fn validate_ancestor(
 ) -> FsResult<bool> {
     let stat =
         fs::fstat(file).map_err(|source| io_error("inspect trusted ancestor", path, source))?;
-    let mode = stat.st_mode & MODE_MASK;
+    let mode = stat_mode(&stat);
     let owner = stat_uid(&stat);
     if owner == effective_uid {
         if mode & 0o022 != 0 {
@@ -1378,7 +1407,8 @@ impl StagedEntry {
         self.identity
     }
 
-    /// Removes the staged entry only if its inode identity is unchanged.
+    /// Removes the staged entry only if its filesystem identity and generation
+    /// are unchanged.
     ///
     /// The caller must retain the lifecycle, daemon-instance, or worker
     /// authority that serialized the staging operation. Pohunek's owner-only
@@ -1390,6 +1420,20 @@ impl StagedEntry {
     /// Returns [`FsError`] when inspection, removal, or directory sync fails.
     pub fn remove(self) -> FsResult<RemoveOutcome> {
         let original_path = self.directory_path.join(&self.name);
+        let current = inspect_entry_generation(
+            &self.directory,
+            &original_path,
+            &self.name,
+            self.identity.kind,
+            None,
+        )?;
+        match current {
+            None => return Ok(RemoveOutcome::Missing),
+            Some(current) if current != self.generation => {
+                return Ok(RemoveOutcome::IdentityChanged);
+            }
+            Some(_) => {}
+        }
         let quarantine = move_to_random_quarantine(
             &self.directory,
             &self.directory_path,
@@ -2042,6 +2086,49 @@ fn inspect_entry(
         Err(source) => return Err(io_error("inspect trusted entry", path, source)),
     };
     validate_stat(&stat, path, kind, mode).map(Some)
+}
+
+fn inspect_entry_generation(
+    directory: &File,
+    path: &Path,
+    name: &OsStr,
+    kind: EntryKind,
+    mode: Option<u32>,
+) -> FsResult<Option<EntryGeneration>> {
+    let stat = match fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(source) => return Err(io_error("inspect trusted entry generation", path, source)),
+    };
+    let identity = validate_stat(&stat, path, kind, mode)?;
+    Ok(Some(EntryGeneration {
+        identity,
+        size: i128::from(stat.st_size),
+        change_seconds: i128::from(stat.st_ctime),
+        change_nanoseconds: i128::from(stat.st_ctime_nsec),
+    }))
+}
+
+fn require_entry_generation(
+    directory: &File,
+    path: &Path,
+    name: &OsStr,
+    kind: EntryKind,
+    mode: Option<u32>,
+    expected: EntryIdentity,
+) -> FsResult<EntryGeneration> {
+    let generation =
+        inspect_entry_generation(directory, path, name, kind, mode)?.ok_or_else(|| {
+            FsError::IdentityChanged {
+                path: path.to_path_buf(),
+            }
+        })?;
+    if generation.identity != expected {
+        return Err(FsError::IdentityChanged {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(generation)
 }
 
 fn validate_fd(
