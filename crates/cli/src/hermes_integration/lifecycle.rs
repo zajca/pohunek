@@ -24,6 +24,7 @@
 )]
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -32,7 +33,7 @@ use std::path::{Path, PathBuf};
 use nix::unistd::Uid;
 use pohunek_platform::filesystem::{
     AdvisoryLock, AtomicReplaceError, EntryKind, FsError, MoveOutcome, RemoveOutcome, StageOutcome,
-    StagedMoveError, TrustedDir,
+    StagedEntry, StagedMoveError, TrustedDir,
 };
 
 use super::assets::{self, Asset, Ownership, MARKER_NAME};
@@ -566,14 +567,12 @@ fn trusted_rename_no_replace(source: &Path, destination: &Path) -> RenameResult 
     match staged.move_to(&destination_directory, destination_name) {
         Ok(MoveOutcome::Moved) => Ok(()),
         Ok(MoveOutcome::DestinationExists) => {
-            staged
-                .restore(source_name)
+            restore_staged_source(&staged, source_name)
                 .map_err(|_| RenameFailure::Committed(Error::RecoveryRequired))?;
             Err(RenameFailure::BeforeCommit(Error::Collision))
         }
         Err(StagedMoveError::BeforeCommit(_)) => {
-            staged
-                .restore(source_name)
+            restore_staged_source(&staged, source_name)
                 .map_err(|_| RenameFailure::BeforeCommit(Error::RecoveryRequired))?;
             Err(RenameFailure::BeforeCommit(Error::RecoveryRequired))
         }
@@ -581,10 +580,22 @@ fn trusted_rename_no_replace(source: &Path, destination: &Path) -> RenameResult 
             Err(RenameFailure::Committed(Error::RecoveryRequired))
         }
         Err(StagedMoveError::RecoveryRequired { .. }) => {
+            restore_staged_source(&staged, source_name)
+                .map_err(|_| RenameFailure::BeforeCommit(Error::RecoveryRequired))?;
             Err(RenameFailure::BeforeCommit(Error::RecoveryRequired))
         }
         Err(_) => Err(RenameFailure::BeforeCommit(Error::RecoveryRequired)),
         Ok(_) => Err(RenameFailure::Committed(Error::RecoveryRequired)),
+    }
+}
+
+fn restore_staged_source(staged: &StagedEntry, source_name: &OsStr) -> Result<(), Error> {
+    match staged
+        .restore(source_name)
+        .map_err(|_| Error::RecoveryRequired)?
+    {
+        MoveOutcome::Moved => Ok(()),
+        _ => Err(Error::RecoveryRequired),
     }
 }
 

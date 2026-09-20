@@ -1663,10 +1663,6 @@ impl StagedEntry {
     ///
     /// Returns [`StagedMoveError`] with the namespace commit state when identity
     /// validation, movement, durability, or recovery fails.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the staged-move commit and recovery states remain contiguous for auditability"
-    )]
     pub fn move_to(
         &mut self,
         destination_dir: &TrustedDir,
@@ -1725,23 +1721,14 @@ impl StagedEntry {
             }
         };
         if current != Some(self.identity) {
-            match source_dir
-                .move_no_replace(&self.name, &source_dir, &original_name)
-                .map_err(|source| StagedMoveError::RecoveryRequired {
-                    path: quarantine_path.clone(),
-                    source,
-                })? {
-                MoveOutcome::Moved => self.name = original_name,
-                MoveOutcome::DestinationExists => {
-                    return Err(StagedMoveError::RecoveryRequired {
-                        path: quarantine_path,
-                        source: FsError::RecoveryConflict { path: staged_path },
-                    });
-                }
-            }
-            return Err(StagedMoveError::BeforeCommit(FsError::IdentityChanged {
-                path: staged_path,
-            }));
+            return Err(
+                match self.restore_tracked_name(&source_dir, original_name) {
+                    Ok(()) => StagedMoveError::BeforeCommit(FsError::IdentityChanged {
+                        path: staged_path,
+                    }),
+                    Err(error) => error,
+                },
+            );
         }
         let outcome = match source_dir.move_no_replace(&self.name, destination_dir, destination) {
             Ok(outcome) => outcome,
@@ -1756,20 +1743,7 @@ impl StagedEntry {
             }
         };
         if outcome == MoveOutcome::DestinationExists {
-            match source_dir
-                .move_no_replace(&self.name, &source_dir, &original_name)
-                .map_err(|source| StagedMoveError::RecoveryRequired {
-                    path: self.path(),
-                    source,
-                })? {
-                MoveOutcome::Moved => self.name = original_name,
-                MoveOutcome::DestinationExists => {
-                    return Err(StagedMoveError::RecoveryRequired {
-                        path: self.path(),
-                        source: FsError::RecoveryConflict { path: staged_path },
-                    });
-                }
-            }
+            self.restore_tracked_name(&source_dir, original_name)?;
             return Ok(outcome);
         }
         let destination_path = destination_dir.path.join(destination);
@@ -1795,45 +1769,56 @@ impl StagedEntry {
         Ok(MoveOutcome::Moved)
     }
 
+    fn restore_tracked_name(
+        &mut self,
+        source_dir: &TrustedDir,
+        original_name: OsString,
+    ) -> Result<(), StagedMoveError> {
+        let quarantine_path = self.path();
+        let staged_path = self.directory_path.join(&original_name);
+        match source_dir.move_no_replace(&self.name, source_dir, &original_name) {
+            Ok(MoveOutcome::Moved) => {
+                self.name = original_name;
+                Ok(())
+            }
+            Ok(MoveOutcome::DestinationExists) => Err(StagedMoveError::RecoveryRequired {
+                path: quarantine_path,
+                source: FsError::RecoveryConflict { path: staged_path },
+            }),
+            Err(source @ FsError::CommittedDurabilityUncertain { .. }) => {
+                self.name = original_name;
+                match inspect_entry(
+                    &source_dir.file,
+                    &staged_path,
+                    &self.name,
+                    self.identity.kind,
+                    None,
+                ) {
+                    Ok(Some(identity)) if identity == self.identity => {
+                        Err(StagedMoveError::BeforeCommit(source))
+                    }
+                    _ => Err(StagedMoveError::RecoveryRequired {
+                        path: staged_path,
+                        source,
+                    }),
+                }
+            }
+            Err(source) => Err(StagedMoveError::RecoveryRequired {
+                path: quarantine_path,
+                source,
+            }),
+        }
+    }
+
     fn restore_move_staging(
         &mut self,
         source_dir: &TrustedDir,
         original_name: OsString,
         original_error: FsError,
     ) -> StagedMoveError {
-        let quarantine_path = self.path();
-        let staged_path = self.directory_path.join(&original_name);
-        match source_dir.move_no_replace(&self.name, source_dir, &original_name) {
-            Ok(MoveOutcome::Moved) => {
-                self.name = original_name;
-                StagedMoveError::BeforeCommit(original_error)
-            }
-            Ok(MoveOutcome::DestinationExists) => StagedMoveError::RecoveryRequired {
-                path: quarantine_path,
-                source: FsError::RecoveryConflict { path: staged_path },
-            },
-            Err(source @ FsError::CommittedDurabilityUncertain { .. }) => {
-                match inspect_entry(
-                    &source_dir.file,
-                    &staged_path,
-                    &original_name,
-                    self.identity.kind,
-                    None,
-                ) {
-                    Ok(Some(identity)) if identity == self.identity => {
-                        self.name = original_name;
-                        StagedMoveError::BeforeCommit(source)
-                    }
-                    _ => StagedMoveError::RecoveryRequired {
-                        path: quarantine_path,
-                        source,
-                    },
-                }
-            }
-            Err(source) => StagedMoveError::RecoveryRequired {
-                path: quarantine_path,
-                source,
-            },
+        match self.restore_tracked_name(source_dir, original_name) {
+            Ok(()) => StagedMoveError::BeforeCommit(original_error),
+            Err(error) => error,
         }
     }
 }
@@ -2907,6 +2892,61 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .starts_with(".pohunek-move-")));
+    }
+
+    #[test]
+    fn staged_move_tracks_recovery_rename_after_destination_collision_sync_failure() {
+        let (source_root, source_directory) = trusted_root();
+        let (destination_root, destination_directory) = trusted_root();
+        let source = source_root.path().join("source");
+        let destination = destination_root.path().join("destination");
+        fs::write(&source, b"source").expect("write source");
+        fs::set_permissions(&source, fs::Permissions::from_mode(FILE_MODE))
+            .expect("set source mode");
+        fs::write(&destination, b"destination").expect("write destination");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(FILE_MODE))
+            .expect("set destination mode");
+        let identity = source_directory
+            .entry_identity("source", EntryKind::RegularFile)
+            .expect("inspect source")
+            .expect("source exists");
+        let StageOutcome::Staged(mut staged) = source_directory
+            .stage("source", ".source.staged", identity)
+            .expect("stage source")
+        else {
+            panic!("source must be staged");
+        };
+        NEXT_SYNC_FAILURE.with(|slot| {
+            // Quarantine synchronization succeeds; the destination collision
+            // performs no sync, then the recovery rename's second sync fails.
+            *slot.borrow_mut() = Some((1, io::ErrorKind::StorageFull));
+        });
+
+        assert!(matches!(
+            staged.move_to(&destination_directory, "destination"),
+            Err(StagedMoveError::BeforeCommit(
+                FsError::CommittedDurabilityUncertain { .. }
+            ))
+        ));
+        let staged_path = source_root
+            .path()
+            .canonicalize()
+            .expect("canonicalize source root")
+            .join(".source.staged");
+        assert_eq!(staged.path(), staged_path);
+        assert_eq!(
+            fs::read(&staged_path).expect("read staged source"),
+            b"source"
+        );
+        assert_eq!(
+            staged.restore("source").expect("restore original source"),
+            MoveOutcome::Moved
+        );
+        assert_eq!(fs::read(&source).expect("read restored source"), b"source");
+        assert_eq!(
+            fs::read(&destination).expect("read preserved destination"),
+            b"destination"
+        );
     }
 
     #[test]
