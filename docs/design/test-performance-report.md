@@ -27,17 +27,17 @@ scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 \
 
 | Window | Runs | p50 | p90 |
 | --- | --- | --- | --- |
-| Baseline (09-14..16) | 17 | **9m44s** | 12m20s |
-| Current (09-20..21) | 13 | **6m28s** | 11m42s |
+| Baseline (09-14..16) | 17 | **9m44s** | 11m37s |
+| Current (09-20..21) | 13 | **6m28s** | 11m39s |
 
-**Median workflow wall clock: −196 s (−34 %).** The current p90 (11m42s) is a
+**Median workflow wall clock: −196 s (−34 %).** The current p90 (11m39s) is a
 PR-only sample property, not a runner accident: by step timestamps, the two
 longest current-window PR runs waited on queued jobs, not slow execution —
-run `35496971392` (24m30s wall) started its last job (`tests (heavy, PTY +
-Hermes)`) 19m48s after the run began, and run `35516132376` (11m42s wall)
-started `tests (relay DB, PostgreSQL)` 6m42s in. GitHub schedules these jobs
+run `35496971392` (24m28s wall) started its last job (`tests (heavy, PTY +
+Hermes)`) 19m49s after the run began, and run `35516132376` (11m39s wall)
+started `tests (relay DB, PostgreSQL)` 6m40s in. GitHub schedules these jobs
 late on busy runners; excluding queue-heavy tail runs, the remaining 11 PR
-runs sit at 5m18s–7m18s wall.
+runs sit at 5m17s–7m18s wall.
 
 ## Job-level medians
 
@@ -197,7 +197,11 @@ seconds of test work inside 4–5 minutes of compilation).
 4. **Cache statistics are log-derived**, not first-class: sccache JSON lives
    in a post-step, and `gh run view --log` needs admin rights on this
    repository, so hit-ratio capture is opportunistic (the parsing itself is
-   unit-tested against recorded shapes).
-5. **Runner queueing tails the p90**: the current p90 (11m42s, PR-only) comes
+   unit-tested against recorded shapes). The parser attributes outcomes only
+   to their responsible steps — rust-cache markers to the `Cache cargo
+   build` step, the sccache JSON to the `Post Enable sccache` post-step — so
+   `actions/cache` steps (Bun packages, Playwright browsers) are never
+   misreported as rust-cache.
+5. **Runner queueing tails the p90**: the current p90 (11m39s, PR-only) comes
    from late-scheduled jobs (see the table note), not slow tests — the job
    walls themselves stay in the 4–7 minute band.
