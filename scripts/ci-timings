@@ -652,18 +652,27 @@ def wanted_attempts(latest, attempts):
     return sorted({1, latest})
 
 
-def list_documents(args, window=None):
-    """Fetch run documents, querying `gh run list` server-side.
+# What one fetch produced: the documents the current listing named, and
+# whether `gh run list` returned exactly `--limit` entries, which means the
+# server may have had more and the sample is a truncation, not a census.
+Fetch = collections.namedtuple("Fetch", ("documents", "truncated"))
 
-    The attempt-independent filters and the requested window are passed to
-    `gh`, so `--limit` counts matching runs instead of truncating the sample
-    before they apply; `filter_runs` then narrows to the exact window and
-    applies the conclusion filter to the selected attempts.
+
+def list_documents(args, window=None):
+    """Fetch the run documents the current `gh run list` names.
+
+    The on-disk snapshot accumulates every document ever fetched, but only
+    the ones this listing named are returned: a measurement must depend on
+    the query, not on which unrelated runs happen to sit in the local cache,
+    or the same command would report different medians on two machines.
     """
     cache_path = Path(args.cache)
-    documents = read_snapshot(cache_path) if cache_path.exists() else []
-    known = {document_key(document) for document in documents}
-    listed = gh_json(["run", "list", *list_arguments(args, window), "--json", LIST_FIELDS])
+    stored = read_snapshot(cache_path) if cache_path.exists() else []
+    by_key = {document_key(document): document for document in stored}
+    listed = gh_json(
+        ["run", "list", *list_arguments(args, window), "--json", LIST_FIELDS]
+    )
+    selected = {}
     fetched = 0
     for entry in listed:
         # An unfinished run has no completed job timestamps to measure.
@@ -673,18 +682,23 @@ def list_documents(args, window=None):
         latest = entry.get("attempt", 1) or 1
         view_command = ["run", "view", str(run_id), "--json", VIEW_FIELDS]
         for attempt in wanted_attempts(latest, args.attempts):
-            if (run_id, attempt) in known:
-                continue
-            document = gh_json(view_command + ["--attempt", str(attempt)])
-            key = document_key(document)
-            if key in known:
-                continue
-            known.add(key)
-            documents.append(document)
-            fetched += 1
+            document = by_key.get((run_id, attempt))
+            if document is None:
+                document = gh_json(view_command + ["--attempt", str(attempt)])
+                by_key[document_key(document)] = document
+                fetched += 1
+            selected[document_key(document)] = document
     if fetched:
-        write_snapshot(cache_path, documents)
-    return documents
+        write_snapshot(
+            cache_path, sorted(by_key.values(), key=document_key)
+        )
+    return Fetch(list(selected.values()), bool(args.limit) and len(listed) >= args.limit)
+
+
+# Run summaries for one window, plus whether `--limit` may have cut the
+# sample short. A truncated window still renders, so the flag is what keeps
+# a partial median from passing for a complete one.
+Loaded = collections.namedtuple("Loaded", ("runs", "truncated"))
 
 
 def load_run_summaries(args, window=None):
@@ -697,30 +711,55 @@ def load_run_summaries(args, window=None):
     before `workflowName` was requested are treated as unknown-workflow and
     kept, so old caches keep reproducing the report until refetched.
     """
-    documents = (
-        read_snapshot(args.input) if args.input else list_documents(args, window)
-    )
+    if args.input:
+        documents, truncated = read_snapshot(args.input), False
+    else:
+        documents, truncated = list_documents(args, window)
     summaries = []
     for document in documents:
         name = document.get("workflowName")
         if name is not None and name != "CI":
             continue
         summaries.append(summarize_run(document))
-    return summaries
+    return Loaded(summaries, truncated)
 
 
-def min_start_max_end_window(baseline, current):
-    """The bounding window covering two date-range tuples."""
-    return (min(baseline[0], current[0]), max(baseline[1], current[1]))
+def truncation_warning(label, window, limit):
+    """Warn that `--limit` may have cut a window's sample short.
+
+    `gh run list` returns the newest matching runs first, so a full result
+    means the window may hold older runs that never reached the medians --
+    a partial sample renders exactly like a complete one.
+    """
+    span = f"{window[0].date()}..{window[1].date()}"
+    return (
+        f"the {label} window {span} filled --limit {limit}, so it may be "
+        "missing older runs; raise --limit until the count stops growing"
+    )
 
 
-def load_run_log(run_id, log_cache):
-    """Return the raw log of a run, caching it for offline re-measurement."""
+def run_attempt_state(run_id):
+    """The attempt number and conclusion `gh` currently reports for a run."""
+    document = gh_json(
+        ["run", "view", str(run_id), "--json", "attempt,conclusion"]
+    )
+    return document.get("attempt", 1) or 1, document.get("conclusion")
+
+
+def load_run_log(run_id, log_cache, attempt=None):
+    """Return the raw log of a run, caching it for offline re-measurement.
+
+    A rerun keeps its run id, so the cache is keyed by attempt as well --
+    otherwise `cache --run` would keep reporting the superseded attempt's
+    hit/miss evidence. Only a finished run is cached: an in-progress run's
+    log is partial, and a partial log kept on disk never repairs itself.
+    """
     log_cache = Path(log_cache)
     if log_cache.exists():
         return log_cache.read_text()
     result = subprocess.run(
-        ["gh", "run", "view", str(run_id), "--log"],
+        ["gh", "run", "view", str(run_id), "--log"]
+        + (["--attempt", str(attempt)] if attempt else []),
         cwd=ROOT,
         check=True,
         stdout=subprocess.PIPE,
@@ -744,7 +783,10 @@ Reproducing the numbers in docs/design/test-performance-report.md:
 
 Fetched run metadata accumulates in target/ci-timings/ci-runs.json. Without
 --input every runs/compare invocation queries `gh` first; pass the snapshot as
---input to re-measure the same tables with no network calls.
+--input to re-measure the same tables with no network calls. A measurement
+covers exactly the runs its own query named, so a fuller cache never widens
+it; --limit applies per window, and a window that fills it is reported as
+possibly truncated.
 """
 
 
@@ -757,13 +799,15 @@ def add_selection_arguments(parser):
     parser.add_argument(
         "--cache",
         default=str(DEFAULT_CACHE),
-        help="snapshot file that fetched run documents accumulate into",
+        help="snapshot that fetched documents accumulate into; a measurement "
+        "uses only the runs its own query named",
     )
     parser.add_argument(
         "--limit",
         type=int,
         default=40,
-        help="how many recent runs to fetch from `gh run list`",
+        help="newest matching runs to fetch per window; a window that fills "
+        "it is reported as possibly truncated",
     )
     parser.add_argument("--event", help="filter by run event")
     parser.add_argument(
@@ -910,9 +954,15 @@ def selection_coverage_warning(args, window, loaded, selected):
 
 def command_runs(args):
     window = parse_window(args.window) if args.window else None
-    runs = load_run_summaries(args, window)
+    loaded = load_run_summaries(args, window)
+    runs = loaded.runs
     selected = select_runs(runs, args, window)
-    warning = selection_coverage_warning(args, window, runs, selected)
+    warnings = []
+    if loaded.truncated and window is not None:
+        warnings.append(truncation_warning("requested", window, args.limit))
+    coverage = selection_coverage_warning(args, window, runs, selected)
+    if coverage:
+        warnings.append(coverage)
     if args.json:
         print(
             json.dumps(
@@ -923,7 +973,7 @@ def command_runs(args):
         )
     else:
         print(render_runs_markdown(selected))
-    if warning:
+    for warning in warnings:
         print(f"warning: {warning}", file=sys.stderr)
     return 0
 
@@ -931,9 +981,13 @@ def command_runs(args):
 def command_compare(args):
     baseline_window = parse_window(args.baseline)
     current_window = parse_window(args.current)
-    runs = load_run_summaries(args, min_start_max_end_window(baseline_window, current_window))
-    baseline = select_runs(runs, args, baseline_window)
-    current = select_runs(runs, args, current_window)
+    # Each window is fetched under its own `--limit`; one combined span lets
+    # the newer days exhaust the limit and silently halve the baseline.
+    baseline_loaded = load_run_summaries(args, baseline_window)
+    current_loaded = load_run_summaries(args, current_window)
+    runs = baseline_loaded.runs + current_loaded.runs
+    baseline = select_runs(baseline_loaded.runs, args, baseline_window)
+    current = select_runs(current_loaded.runs, args, current_window)
     baseline_summary = window_summary(baseline)
     current_summary = window_summary(current)
     if not baseline_summary["runs"] or not current_summary["runs"]:
@@ -949,6 +1003,15 @@ def command_compare(args):
         raise ValueError(
             "both windows need at least one run; " + "; ".join(empty)
         )
+    for label, loaded_window, window in (
+        ("baseline", baseline_loaded, baseline_window),
+        ("current", current_loaded, current_window),
+    ):
+        if loaded_window.truncated:
+            print(
+                f"warning: {truncation_warning(label, window, args.limit)}",
+                file=sys.stderr,
+            )
     rows = compare_windows(baseline_summary, current_summary)
     if args.json:
         print(
@@ -1066,10 +1129,19 @@ def command_cache(args):
     if args.input:
         text = Path(args.input).read_text()
     elif args.run:
-        log_cache = Path(args.log_cache or f"target/ci-timings/run-{args.run}.log")
+        attempt, conclusion = run_attempt_state(args.run)
+        if not conclusion:
+            raise ValueError(
+                f"run {args.run} has not finished; its log is partial and the "
+                "cache evidence would be incomplete"
+            )
+        log_cache = Path(
+            args.log_cache
+            or f"target/ci-timings/run-{args.run}-attempt-{attempt}.log"
+        )
         if not log_cache.is_absolute():
             log_cache = ROOT / log_cache
-        text = load_run_log(args.run, log_cache)
+        text = load_run_log(args.run, log_cache, attempt)
     else:
         raise ValueError("pass --run <id> or --input <saved-log>")
     records = parse_cache_log(text)
@@ -1147,7 +1219,9 @@ def build_parser():
     cache.add_argument("--run", help="GitHub Actions run id to read the log of")
     cache.add_argument("--input", help="saved raw log file instead of --run")
     cache.add_argument(
-        "--log-cache", default=None, help="where to cache the downloaded run log"
+        "--log-cache", default=None,
+        help="where to cache the downloaded run log (default: keyed by run "
+        "and attempt, so a rerun does not read the superseded log)"
     )
     cache.add_argument("--json", action="store_true", help="emit JSON output")
     cache.set_defaults(handler=command_cache)

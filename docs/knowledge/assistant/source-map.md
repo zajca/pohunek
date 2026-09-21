@@ -188,9 +188,12 @@ Release packaging and contributor verification:
   data: per-job wall clock and workflow medians (`runs`, `compare`),
   per-shard nextest JUnit summaries (`junit`), and sccache/rust-cache
   cache-hit extraction (`cache`). A fetch accumulates run documents into
-  `target/ci-timings/ci-runs.json` (`--cache` writes elsewhere); `--input`
-  reads a snapshot instead and makes no network calls at all, which is how
-  the report is regenerated offline. The before/after report lives in
+  `target/ci-timings/ci-runs.json` (`--cache` writes elsewhere), but a
+  measurement covers only the runs its own query named, so a fuller snapshot
+  never changes a median; `--input` reads a snapshot instead and makes no
+  network calls at all, which is how the report is regenerated offline.
+  `--limit` applies per window and a filled window is flagged as possibly
+  truncated; run logs are cached per run *and* attempt. The before/after report lives in
   `docs/design/test-performance-report.md`.
 - `scripts/tests/test_ci_timings.py` — regression checks for the timing
   helper's parsing, medians, and markdown renderers.

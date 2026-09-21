@@ -198,7 +198,10 @@ bacon nextest-fast -- -p pohunek-gui-core  # narrow the loop to one crate
 Reproduce CI timing evidence from `gh` run data. Every fetch accumulates into
 the snapshot `target/ci-timings/ci-runs.json`; passing that file as `--input`
 re-measures from it with no network calls, while the plain commands always
-query `gh` first:
+query `gh` first. A measurement covers exactly the runs its own query named,
+so a fuller snapshot never widens it. `--limit` applies per window, and a
+window that fills it is reported as possibly truncated -- raise it until the
+run count stops growing:
 
 ```bash
 scripts/ci-timings runs --limit 60 --window 2026-09-14..2026-09-16 \

@@ -1,13 +1,17 @@
 """Regression checks for the CI timing/measurement helper (stdlib only)."""
 
 import argparse
+import contextlib
+import io
 import importlib.machinery
 import importlib.util
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "ci-timings"
+ROOT = Path(__file__).resolve().parents[2]
 LOADER = importlib.machinery.SourceFileLoader("ci_timings", str(SCRIPT))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 ci_timings = importlib.util.module_from_spec(SPEC)
@@ -1028,7 +1032,7 @@ class CacheTests(unittest.TestCase):
 
 
 class FetchTests(unittest.TestCase):
-    def _fetch(self, listed, attempts, cache_contents=None):
+    def _fetch(self, listed, attempts, cache_contents=None, limit=40):
         """Run `list_documents` against a stubbed `gh`, returning the calls."""
         calls = []
 
@@ -1057,12 +1061,12 @@ class FetchTests(unittest.TestCase):
                 if cache_contents is not None:
                     ci_timings.write_snapshot(cache, cache_contents)
                 args = argparse.Namespace(
-                    cache=str(cache), limit=40, event=None, branch=None,
+                    cache=str(cache), limit=limit, event=None, branch=None,
                     conclusion="success", attempts=attempts,
                 )
-                documents = ci_timings.list_documents(args)
+                fetch = ci_timings.list_documents(args)
                 stored = ci_timings.read_snapshot(cache) if cache.exists() else []
-            return documents, stored, calls
+            return fetch.documents, stored, calls, fetch.truncated
         finally:
             ci_timings.gh_json = original
 
@@ -1070,7 +1074,7 @@ class FetchTests(unittest.TestCase):
         # `gh run list` only ever describes attempt 3; attempt 2 exists only
         # if it is requested by number.
         listed = [{"databaseId": 77, "attempt": 3, "conclusion": "failure"}]
-        documents, stored, calls = self._fetch(listed, "all")
+        documents, stored, calls, _ = self._fetch(listed, "all")
         self.assertEqual(
             sorted(document["attempt"] for document in documents), [1, 2, 3]
         )
@@ -1082,7 +1086,7 @@ class FetchTests(unittest.TestCase):
 
     def test_fetch_first_attempt_keeps_the_original_run(self):
         listed = [{"databaseId": 77, "attempt": 2, "conclusion": "success"}]
-        documents, _, _ = self._fetch(listed, "first")
+        documents, _, _, _ = self._fetch(listed, "first")
         self.assertEqual(
             sorted(document["attempt"] for document in documents), [1, 2]
         )
@@ -1099,7 +1103,7 @@ class FetchTests(unittest.TestCase):
             "jobs": [],
         }
         listed = [{"databaseId": 77, "attempt": 2, "conclusion": "success"}]
-        _, stored, calls = self._fetch(listed, "first", cache_contents=[cached])
+        _, stored, calls, _ = self._fetch(listed, "first", cache_contents=[cached])
         self.assertEqual(len(stored), 2)
         self.assertEqual(
             [call[call.index("--attempt") + 1] for call in calls if call[1] == "view"],
@@ -1156,7 +1160,7 @@ class FetchTests(unittest.TestCase):
                     limit=40, event=None, branch=None, conclusion="success",
                     attempts="first",
                 )
-                summaries = ci_timings.load_run_summaries(args)
+                summaries = ci_timings.load_run_summaries(args).runs
                 selected = ci_timings.select_runs(summaries, args)
         finally:
             ci_timings.gh_json = original
@@ -1168,11 +1172,160 @@ class FetchTests(unittest.TestCase):
             [(27, 1, "success")],
         )
 
+    def test_fetch_ignores_unrelated_cached_runs(self):
+        """The sample follows the query, not the local cache's history.
+
+        A snapshot accumulates every run ever fetched. Returning all of it
+        would make the same command report different medians depending on
+        what someone fetched earlier on that machine.
+        """
+        stale = {
+            "databaseId": 99, "attempt": 1, "workflowName": "CI",
+            "conclusion": "success", "createdAt": "2026-01-01T10:00:00Z",
+            "startedAt": "2026-01-01T10:00:00Z",
+            "updatedAt": "2026-01-01T10:09:30Z", "jobs": [],
+        }
+        listed = [{"databaseId": 77, "attempt": 1, "conclusion": "success"}]
+        documents, stored, _, _ = self._fetch(
+            listed, "first", cache_contents=[stale]
+        )
+        self.assertEqual([d["databaseId"] for d in documents], [77])
+        # The unrelated run stays on disk for a later query that wants it.
+        self.assertEqual(
+            sorted(d["databaseId"] for d in stored), [77, 99]
+        )
+
+    def test_fetch_reuses_a_cached_document_without_refetching(self):
+        cached = {
+            "databaseId": 77, "attempt": 1, "workflowName": "CI",
+            "conclusion": "success", "createdAt": "2026-09-20T10:00:00Z",
+            "startedAt": "2026-09-20T10:00:00Z",
+            "updatedAt": "2026-09-20T10:09:30Z", "jobs": [],
+        }
+        listed = [{"databaseId": 77, "attempt": 1, "conclusion": "success"}]
+        documents, _, calls, _ = self._fetch(
+            listed, "first", cache_contents=[cached]
+        )
+        self.assertEqual([d["databaseId"] for d in documents], [77])
+        self.assertEqual([call for call in calls if call[1] == "view"], [])
+
+    def test_fetch_reports_a_listing_that_filled_the_limit(self):
+        # A full listing means `gh` may have had more, so the sample is a
+        # truncation rather than the whole window.
+        listed = [
+            {"databaseId": i, "attempt": 1, "conclusion": "success"}
+            for i in range(1, 4)
+        ]
+        self.assertTrue(self._fetch(listed, "first", limit=3)[3])
+        self.assertFalse(self._fetch(listed, "first", limit=4)[3])
+
     def test_fetch_skips_unfinished_runs(self):
         listed = [{"databaseId": 77, "attempt": 1, "conclusion": None}]
-        documents, _, calls = self._fetch(listed, "first")
+        documents, _, calls, _ = self._fetch(listed, "first")
         self.assertEqual(documents, [])
         self.assertEqual([call for call in calls if call[1] == "view"], [])
+
+
+class LogCacheTests(unittest.TestCase):
+    def test_log_cache_path_carries_the_attempt(self):
+        """A rerun keeps its run id, so the id alone is not a cache key.
+
+        Without the attempt, `cache --run` keeps reporting the superseded
+        attempt's hit/miss evidence after every rerun.
+        """
+        seen = []
+
+        def fake_run(command, **kwargs):
+            seen.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        original = ci_timings.subprocess.run
+        ci_timings.subprocess.run = fake_run
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                for attempt in (1, 2):
+                    path = Path(directory) / f"run-55-attempt-{attempt}.log"
+                    ci_timings.load_run_log(55, path, attempt)
+                    self.assertTrue(path.exists())
+        finally:
+            ci_timings.subprocess.run = original
+        self.assertEqual(
+            [command[command.index("--attempt") + 1] for command in seen],
+            ["1", "2"],
+        )
+
+    def test_log_cache_is_reused_without_calling_gh(self):
+        def fail(command, **kwargs):
+            raise AssertionError("gh must not be called for a cached log")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "run-55-attempt-1.log"
+            path.write_text("cached log")
+            original = ci_timings.subprocess.run
+            ci_timings.subprocess.run = fail
+            try:
+                self.assertEqual(
+                    ci_timings.load_run_log(55, path, 1), "cached log"
+                )
+            finally:
+                ci_timings.subprocess.run = original
+
+    def test_cache_command_default_path_separates_attempts(self):
+        """The default log path must distinguish a rerun from its original.
+
+        `command_cache` builds this path itself, so testing `load_run_log`
+        alone leaves the naming unguarded.
+        """
+        paths = []
+
+        def fake_load(run_id, log_cache, attempt=None):
+            paths.append((Path(log_cache).name, attempt))
+            return ""
+
+        originals = (ci_timings.gh_json, ci_timings.load_run_log)
+        ci_timings.load_run_log = fake_load
+        try:
+            for attempt in (1, 2):
+                ci_timings.gh_json = lambda arguments, attempt=attempt: {
+                    "attempt": attempt, "conclusion": "success",
+                }
+                args = argparse.Namespace(
+                    input=None, run=55, log_cache=None, json=True
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(ci_timings.command_cache(args), 0)
+        finally:
+            ci_timings.gh_json, ci_timings.load_run_log = originals
+        self.assertEqual(
+            paths,
+            [("run-55-attempt-1.log", 1), ("run-55-attempt-2.log", 2)],
+        )
+
+    def test_cache_command_refuses_an_unfinished_run(self):
+        # An in-progress run's log is partial, and a partial log written to
+        # the cache would never repair itself.
+        original = ci_timings.gh_json
+        ci_timings.gh_json = lambda arguments: {
+            "attempt": 1, "conclusion": None,
+        }
+        try:
+            args = argparse.Namespace(
+                input=None, run=55, log_cache=None, json=False
+            )
+            with self.assertRaisesRegex(ValueError, "has not finished"):
+                ci_timings.command_cache(args)
+        finally:
+            ci_timings.gh_json = original
+
+
+class TruncationTests(unittest.TestCase):
+    def test_truncation_warning_names_the_window_and_limit(self):
+        window = ci_timings.parse_window("2026-09-14..2026-09-16")
+        message = ci_timings.truncation_warning("baseline", window, 40)
+        self.assertIn("baseline", message)
+        self.assertIn("2026-09-14..2026-09-16", message)
+        self.assertIn("--limit 40", message)
+        self.assertIn("missing older runs", message)
 
 
 class SnapshotTests(unittest.TestCase):
