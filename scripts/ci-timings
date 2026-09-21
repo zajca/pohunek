@@ -68,13 +68,20 @@ def parse_timestamp(value):
 
 
 def format_seconds(seconds):
-    """Render a duration as `9s`, `1m23s`, or `1h02m`."""
+    """Render a duration as `9s`, `1m23s`, or `1h02m`.
+
+    Deltas are durations too, so the magnitude is scaled first and the sign
+    restored after: a 196 s improvement reads `-3m16s`, the same shape as
+    the `3m16s` regression it mirrors.
+    """
     total = int(round(seconds))
+    sign = "-" if total < 0 else ""
+    total = abs(total)
     if total >= 3600:
-        return f"{total // 3600}h{total % 3600 // 60:02d}m"
+        return f"{sign}{total // 3600}h{total % 3600 // 60:02d}m"
     if total >= 60:
-        return f"{total // 60}m{total % 60:02d}s"
-    return f"{total}s"
+        return f"{sign}{total // 60}m{total % 60:02d}s"
+    return f"{sign}{total}s"
 
 
 def format_percent(value):
@@ -221,18 +228,28 @@ def filter_runs(runs, window=None, event=None, conclusion=None, branch=None,
 
 
 def window_summary(runs):
-    """Per-job and workflow medians across a window of runs."""
+    """Per-job and workflow percentiles across a window of runs.
+
+    The workflow p90 is reported alongside the median because the report
+    quotes both, and a number the tool cannot print is a number no one can
+    check. `percentile` is nearest-rank, so p90 is an observed run's wall
+    clock, not an interpolation between two.
+    """
     jobs = {}
+    walls = [run["wall_seconds"] for run in runs]
     for run in runs:
         for name, seconds in run["jobs"].items():
             jobs.setdefault(name, []).append(seconds)
     return {
         "runs": len(runs),
-        "wall_seconds": statistics.median([run["wall_seconds"] for run in runs])
-        if runs
-        else None,
+        "wall_seconds": statistics.median(walls) if runs else None,
+        "wall_p90": percentile(walls, 0.90),
         "jobs": {
-            name: {"p50": statistics.median(values), "runs": len(values)}
+            name: {
+                "p50": statistics.median(values),
+                "p90": percentile(values, 0.90),
+                "runs": len(values),
+            }
             for name, values in jobs.items()
         },
     }
@@ -290,16 +307,20 @@ def render_runs_markdown(runs):
     if summary["runs"]:
         lines.append("")
         lines.append(
-            f"Median workflow wall clock over {summary['runs']} run(s): "
-            f"{format_seconds(summary['wall_seconds'])}"
+            f"Workflow wall clock over {summary['runs']} run(s): "
+            f"p50 {format_seconds(summary['wall_seconds'])}, "
+            f"p90 {format_seconds(summary['wall_p90'])}"
         )
         lines.append("")
-        lines.append("| Job | p50 | Runs |")
-        lines.append("| --- | --- | --- |")
+        lines.append("| Job | p50 | p90 | Runs |")
+        lines.append("| --- | --- | --- | --- |")
         for name, job in sorted(
             summary["jobs"].items(), key=lambda item: item[1]["p50"], reverse=True
         ):
-            lines.append(f"| {name} | {format_seconds(job['p50'])} | {job['runs']} |")
+            lines.append(
+                f"| {name} | {format_seconds(job['p50'])} | "
+                f"{format_seconds(job['p90'])} | {job['runs']} |"
+            )
     return "\n".join(lines)
 
 
@@ -310,10 +331,12 @@ def render_compare_markdown(baseline, current, rows):
         delta / baseline["wall_seconds"] * 100 if baseline["wall_seconds"] else None
     )
     lines = [
-        f"Baseline: {baseline['runs']} run(s), median workflow "
-        f"{format_seconds(baseline['wall_seconds'])}",
-        f"Current: {current['runs']} run(s), median workflow "
-        f"{format_seconds(current['wall_seconds'])}",
+        f"Baseline: {baseline['runs']} run(s), workflow p50 "
+        f"{format_seconds(baseline['wall_seconds'])}, p90 "
+        f"{format_seconds(baseline['wall_p90'])}",
+        f"Current: {current['runs']} run(s), workflow p50 "
+        f"{format_seconds(current['wall_seconds'])}, p90 "
+        f"{format_seconds(current['wall_p90'])}",
         "",
         "| Job | Before (p50) | After (p50) | Delta | Delta % | Runs (before/after) |",
         "| --- | --- | --- | --- | --- | --- |",
@@ -331,6 +354,14 @@ def render_compare_markdown(baseline, current, rows):
         f"| **workflow** | **{format_seconds(baseline['wall_seconds'])}** | "
         f"**{format_seconds(current['wall_seconds'])}** | **{format_seconds(delta)}** | "
         f"**{format_percent(percent)}** | "
+        f"**{baseline['runs']}/{current['runs']}** |"
+    )
+    p90_delta = current["wall_p90"] - baseline["wall_p90"]
+    lines.append(
+        f"| **workflow (p90)** | **{format_seconds(baseline['wall_p90'])}** | "
+        f"**{format_seconds(current['wall_p90'])}** | "
+        f"**{format_seconds(p90_delta)}** | "
+        f"**{format_percent(p90_delta / baseline['wall_p90'] * 100 if baseline['wall_p90'] else None)}** | "
         f"**{baseline['runs']}/{current['runs']}** |"
     )
     return "\n".join(lines)
@@ -1228,6 +1259,47 @@ def build_parser():
     return parser
 
 
+# Credential shapes that can appear in a `gh` diagnostic: its own token
+# formats, an Authorization header echoed from a failed request, and a token
+# carried in a URL query. Redacted before the message is printed, because a
+# secret that reaches a terminal or a CI log has to be rotated, not deleted.
+SECRET_PATTERNS = (
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{16,}"),
+    # `Authorization: Bearer <secret>` carries a scheme word before the
+    # value, so the scheme is consumed explicitly; without that the pattern
+    # would redact the word "Bearer" and print the secret after it.
+    re.compile(r"(?i)\bbearer\s+\S+"),
+    re.compile(r"(?i)\b(?:authorization|token)\b\s*[:=]\s*(?:bearer\s+)?\S+"),
+    re.compile(r"(?i)[?&](?:access_token|token)=[^&\s]+"),
+)
+
+
+def redact_secrets(text):
+    """Replace anything credential-shaped in `text` with a marker."""
+    for pattern in SECRET_PATTERNS:
+        text = pattern.sub("[redacted]", text)
+    return text
+
+
+def describe_error(error):
+    """One line for a failed command, keeping `gh`'s own diagnosis.
+
+    A `CalledProcessError` alone says only that the exit status was
+    non-zero; the reason -- expired auth, missing log scope, a rate limit,
+    no network -- is in the captured stderr, and without it the user has
+    nothing to act on.
+    """
+    detail = getattr(error, "stderr", None)
+    if not detail:
+        return str(error)
+    detail = redact_secrets(detail).strip()
+    if not detail:
+        return str(error)
+    first = detail.splitlines()[0]
+    return f"{error}: {first}"
+
+
 def main(argv=None):
     """Run one measurement mode and return the process exit code."""
     args = build_parser().parse_args(argv)
@@ -1239,7 +1311,7 @@ def main(argv=None):
         json.JSONDecodeError,
         subprocess.CalledProcessError,
     ) as error:
-        print(f"ci-timings: {error}", file=sys.stderr)
+        print(f"ci-timings: {describe_error(error)}", file=sys.stderr)
         return 1
 
 

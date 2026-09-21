@@ -103,6 +103,15 @@ def _selection(**overrides):
 
 
 class RunTimingTests(unittest.TestCase):
+    def test_format_seconds_scales_negative_values_too(self):
+        # A delta is a duration: an improvement must read like the
+        # regression it mirrors, not fall back to raw seconds.
+        self.assertEqual(ci_timings.format_seconds(-196), "-3m16s")
+        self.assertEqual(ci_timings.format_seconds(196), "3m16s")
+        self.assertEqual(ci_timings.format_seconds(-4000), "-1h06m")
+        self.assertEqual(ci_timings.format_seconds(-9), "-9s")
+        self.assertEqual(ci_timings.format_seconds(0), "0s")
+
     def test_format_seconds_scales(self):
         self.assertEqual(ci_timings.format_seconds(9.4), "9s")
         self.assertEqual(ci_timings.format_seconds(83), "1m23s")
@@ -679,6 +688,59 @@ class RunTimingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "START..END"):
             ci_timings.parse_window("2026-09-14")
 
+    def test_window_summary_reports_p90_beside_the_median(self):
+        # The report quotes a p90, so the tool has to be able to print one.
+        runs = [
+            _summary(databaseId=i, startedAt="2026-09-20T10:00:00Z",
+                     updatedAt=f"2026-09-20T10:0{i}:00Z")
+            for i in range(1, 6)
+        ]
+        summary = ci_timings.window_summary(runs)
+        walls = sorted(run["wall_seconds"] for run in runs)
+        self.assertEqual(summary["wall_p90"], ci_timings.percentile(walls, 0.90))
+        # Nearest-rank: the value is an observed run, not an interpolation.
+        self.assertIn(summary["wall_p90"], walls)
+        self.assertEqual(summary["wall_p90"], walls[-1])
+        rendered = ci_timings.render_runs_markdown(runs)
+        self.assertIn("p90", rendered)
+        self.assertIn(ci_timings.format_seconds(summary["wall_p90"]), rendered)
+
+    def test_window_summary_reports_p90_per_job(self):
+        # Job durations must spread, or p50 and p90 coincide and a wrong
+        # percentile would be invisible.
+        runs = []
+        for index, minutes in enumerate((1, 2, 3, 4, 9), start=1):
+            runs.append(ci_timings.summarize_run({
+                "databaseId": index,
+                "conclusion": "success", "event": "pull_request",
+                "headBranch": "topic", "displayTitle": "CI",
+                "createdAt": "2026-09-20T10:00:00Z",
+                "startedAt": "2026-09-20T10:00:00Z",
+                "updatedAt": "2026-09-20T10:10:00Z",
+                "jobs": [{
+                    "name": "fmt + clippy",
+                    "startedAt": "2026-09-20T10:00:00Z",
+                    "completedAt": f"2026-09-20T10:{minutes:02d}:00Z",
+                    "conclusion": "success",
+                }],
+            }))
+        job = ci_timings.window_summary(runs)["jobs"]["fmt + clippy"]
+        self.assertEqual(job["p50"], 180.0)
+        self.assertEqual(job["p90"], 540.0)
+        self.assertIn("9m00s", ci_timings.render_runs_markdown(runs))
+
+    def test_render_compare_markdown_includes_a_p90_row(self):
+        baseline = {"runs": 2, "wall_seconds": 584.0, "wall_p90": 697.0,
+                    "jobs": {}}
+        current = {"runs": 2, "wall_seconds": 388.0, "wall_p90": 699.0,
+                   "jobs": {}}
+        rendered = ci_timings.render_compare_markdown(baseline, current, [])
+        self.assertIn("**workflow (p90)**", rendered)
+        self.assertIn("**11m37s**", rendered)
+        self.assertIn("**11m39s**", rendered)
+        # The median row's improvement scales like a duration.
+        self.assertIn("**-3m16s**", rendered)
+
     def test_window_summary_medians_across_runs(self):
         first = _summary(databaseId=10)
         second = _summary(
@@ -765,6 +827,84 @@ class RunTimingTests(unittest.TestCase):
         )
         self.assertIn("| fmt + clippy | 3m19s | 3m19s | 0s | +0 % | 1/1 |", rendered)
 
+
+
+class ErrorReportingTests(unittest.TestCase):
+    def test_describe_error_keeps_the_gh_diagnosis(self):
+        # Without stderr the user sees only "non-zero exit status", which
+        # says nothing about expired auth, a missing scope, or a rate limit.
+        error = subprocess.CalledProcessError(
+            1, ["gh", "run", "list"],
+            stderr="gh: Requires authentication\nTry `gh auth login`\n",
+        )
+        message = ci_timings.describe_error(error)
+        self.assertIn("Requires authentication", message)
+        self.assertIn("exit status 1", message)
+
+    def test_describe_error_falls_back_without_stderr(self):
+        error = subprocess.CalledProcessError(1, ["gh", "run", "list"])
+        self.assertEqual(ci_timings.describe_error(error), str(error))
+        blank = subprocess.CalledProcessError(
+            1, ["gh", "run", "list"], stderr="   \n"
+        )
+        self.assertEqual(ci_timings.describe_error(blank), str(blank))
+        self.assertEqual(
+            ci_timings.describe_error(ValueError("plain")), "plain"
+        )
+
+    def test_describe_error_redacts_credentials(self):
+        """A secret printed to a terminal or CI log can only be rotated.
+
+        Each pattern is checked separately so a regression in one cannot
+        hide behind another still matching.
+        """
+        secrets = (
+            "ghp_" + "A" * 36,
+            "github_pat_" + "B" * 30,
+            # The scheme word sits between the key and the value here, and
+            # a pattern that stops at the first token redacts only "Bearer".
+            "Authorization: Bearer " + "C" * 40,
+            "https://api.github.com/x?access_token=" + "D" * 40,
+            "Bearer " + "E" * 40,
+            "token=" + "F" * 40,
+        )
+        runs = ["A" * 36, "B" * 30, "C" * 40, "D" * 40, "E" * 40, "F" * 40]
+        for secret in secrets:
+            with self.subTest(secret=secret[:12]):
+                error = subprocess.CalledProcessError(
+                    1, ["gh"], stderr=f"failed with {secret}"
+                )
+                message = ci_timings.describe_error(error)
+                self.assertIn("[redacted]", message)
+                for run in runs:
+                    self.assertNotIn(run, message)
+
+    def test_describe_error_keeps_credential_free_diagnostics(self):
+        # Redaction must not eat the reason: these words appear in ordinary
+        # gh messages that carry no secret.
+        error = subprocess.CalledProcessError(
+            1, ["gh"], stderr="gh: token expired, run gh auth login\n"
+        )
+        self.assertIn("token expired", ci_timings.describe_error(error))
+
+    def test_main_reports_the_underlying_gh_failure(self):
+        def failing(arguments):
+            raise subprocess.CalledProcessError(
+                1, ["gh", *arguments], stderr="gh: API rate limit exceeded\n"
+            )
+
+        original = ci_timings.gh_json
+        ci_timings.gh_json = failing
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(stderr):
+                code = ci_timings.main(
+                    ["runs", "--window", "2026-09-14..2026-09-16"]
+                )
+        finally:
+            ci_timings.gh_json = original
+        self.assertEqual(code, 1)
+        self.assertIn("API rate limit exceeded", stderr.getvalue())
 
 
 class JunitTests(unittest.TestCase):

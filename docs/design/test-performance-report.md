@@ -25,6 +25,10 @@ scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 \
 
 ## Workflow wall clock
 
+The command above prints both figures per window, and its table carries a
+`workflow (p90)` row beside the median one. Percentiles are nearest-rank, so
+each is an observed run's wall clock rather than an interpolation.
+
 | Window | Runs | p50 | p90 |
 | --- | --- | --- | --- |
 | Baseline (09-14..16) | 17 | **9m44s** | 11m37s |
