@@ -28,14 +28,16 @@ scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 \
 | Window | Runs | p50 | p90 |
 | --- | --- | --- | --- |
 | Baseline (09-14..16) | 17 | **9m44s** | 12m20s |
-| Current (09-20..21) | 13 | **6m28s** | (see limitations) |
+| Current (09-20..21) | 13 | **6m28s** | 11m42s |
 
-**Median workflow wall clock: −196 s (−34 %).** The current p90 is not
-comparable: one 09-20 run hit a GitHub-hosted-runner slowdown (a 1h44m push
-run with `doctests + release build` at 9m30s of documented step time inside a
-~40+ min queue/window) and one arm64 macOS runner stalled ~12 min, so the
-current window p90 (19m20s) reflects runner variance, not the pipeline
-change.
+**Median workflow wall clock: −196 s (−34 %).** The current p90 (11m42s) is a
+PR-only sample property, not a runner accident: by step timestamps, the two
+longest current-window PR runs waited on queued jobs, not slow execution —
+run `35496971392` (24m30s wall) started its last job (`tests (heavy, PTY +
+Hermes)`) 19m48s after the run began, and run `35516132376` (11m42s wall)
+started `tests (relay DB, PostgreSQL)` 6m42s in. GitHub schedules these jobs
+late on busy runners; excluding queue-heavy tail runs, the remaining 11 PR
+runs sit at 5m18s–7m18s wall.
 
 ## Job-level medians
 
@@ -150,8 +152,12 @@ per-test wall decomposition.*
 scripts/ci-timings cache --run 35534741514
 ```
 
-- `doctests + release build`: rust-cache **hit** ("Cache restored
-  successfully"); steps: Documentation tests 2m14s + Release build 4m34s.
+- `doctests + release build`: rust-cache **hit** (the "Cache restored
+  successfully" line from the step named "Cache cargo build", i.e.
+  `Swatinem/rust-cache` — detections were re-scoped to that step name after
+  finding that `actions/cache` steps like "Cache Bun packages" and "Cache
+  Playwright browsers" print the same marker); steps: Documentation tests
+  2m14s + Release build 4m34s.
   The sccache post-step prints the full JSON stats blob; on this run the
   job completed before the post step, so exact hit/miss counts were not
   captured here — the `cache` subcommand extracts
@@ -192,6 +198,6 @@ seconds of test work inside 4–5 minutes of compilation).
    in a post-step, and `gh run view --log` needs admin rights on this
    repository, so hit-ratio capture is opportunistic (the parsing itself is
    unit-tested against recorded shapes).
-5. **Runner variance**: the current window contains one 1h44m hosted-runner
-   outlier and one stalled arm64 leg, so current p90 is not a fair
-   comparison point (p50 is).
+5. **Runner queueing tails the p90**: the current p90 (11m42s, PR-only) comes
+   from late-scheduled jobs (see the table note), not slow tests — the job
+   walls themselves stay in the 4–7 minute band.

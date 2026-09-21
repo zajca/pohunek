@@ -1,5 +1,6 @@
 """Regression checks for the CI timing/measurement helper (stdlib only)."""
 
+import argparse
 import importlib.machinery
 import importlib.util
 from pathlib import Path
@@ -65,14 +66,20 @@ SCCACHE_JSON = (
 
 CACHE_LOG = "\n".join(
     [
-        "doctests + release build\tRun Swatinem/rust-cache@v2"
+        # Step names mirror the CI workflow: "Cache cargo build" is the
+        # Swatinem/rust-cache step, "Post Enable sccache" prints the sccache
+        # JSON. `actions/cache` steps ("Cache Bun packages", ...) must never
+        # count as rust-cache evidence.
+        "doctests + release build\tCache cargo build"
         "\t2026-09-21T05:18:03Z Cache restored successfully",
         "doctests + release build\tPost Enable sccache"
         "\t2026-09-21T05:22:56Z [command]/opt/sccache --show-stats --stats-format=json",
         "doctests + release build\tPost Enable sccache"
         f"\t2026-09-21T05:22:56Z {SCCACHE_JSON}",
-        "tests (unit, fast)\tRun Swatinem/rust-cache@v2"
+        "tests (unit, fast)\tCache cargo build"
         "\t2026-09-21T05:17:40Z Cache not found for keys: Linux-x64-gnu",
+        "web SDK + control center\tCache Bun packages"
+        "\t2026-09-21T05:17:40Z Cache restored successfully",
     ]
 )
 
@@ -153,6 +160,42 @@ class RunTimingTests(unittest.TestCase):
             branch="topic",
         )
         self.assertEqual([run["id"] for run in selected], [1])
+
+    def test_filter_runs_first_attempt_is_by_attempt_number(self):
+        # Attempts may arrive in either order (snapshot accumulation); the
+        # choice must follow the attempt value, not input position.
+        first = _summary(databaseId=22, startedAt="2026-09-20T10:00:00Z", attempt=1)
+        rerun = _summary(databaseId=22, startedAt="2026-09-20T15:00:00Z", attempt=2)
+        forward = ci_timings.filter_runs([first, rerun])
+        backward = ci_timings.filter_runs([rerun, first])
+        self.assertEqual([run["attempt"] for run in forward], [1])
+        self.assertEqual([run["attempt"] for run in backward], [1])
+
+    def test_document_key_and_workflow_filter(self):
+        self.assertEqual(
+            ci_timings.document_key({"databaseId": 23, "attempt": 2}), (23, 2)
+        )
+        self.assertEqual(
+            ci_timings.document_key({"databaseId": 23}), (23, 1)
+        )
+        release = {"databaseId": 23, "workflowName": "Release"}
+        ci_run = {"databaseId": 24, "workflowName": "CI"}
+        legacy = {"databaseId": 25}
+        kept = [
+            document for document in (release, ci_run, legacy)
+            if document.get("workflowName") in (None, "CI")
+        ]
+        self.assertEqual(
+            [document["databaseId"] for document in kept], [24, 25]
+        )
+
+    def test_list_arguments_scopes_to_ci_workflow(self):
+        arguments = ci_timings.list_arguments(
+            argparse.Namespace(limit=40, event="pull_request", branch=None),
+            None,
+        )
+        self.assertIn("--workflow", arguments)
+        self.assertIn("ci.yml", arguments)
 
     def test_parse_window_rejects_malformed_input(self):
         with self.assertRaisesRegex(ValueError, "START..END"):
@@ -375,6 +418,22 @@ class CacheTests(unittest.TestCase):
         )
         self.assertIn("| doctests + release build | 1015 | 660 | 286 | 70 % | hit |", rendered)
         self.assertIn("| tests (unit, fast) | n/a | n/a | n/a | n/a | miss |", rendered)
+
+    def test_parse_cache_log_ignores_unrelated_cache_steps(self):
+        # "Cache restored successfully" from an `actions/cache` step (Bun,
+        # Playwright) must not fabricate a rust-cache record; nor may an
+        # sccache-looking line outside the post-step.
+        records = {record["job"]: record for record in ci_timings.parse_cache_log(CACHE_LOG)}
+        self.assertNotIn("web SDK + control center", records)
+        unrelated = "\n".join(
+            [
+                "tests (cli, fast)\tRun fast shard"
+                f"\t2026-09-21T05:20:00Z some output {{\"stats\": 1}}",
+                "tests (cli, fast)\tCache Bun packages"
+                "\t2026-09-21T05:17:40Z Cache restored successfully",
+            ]
+        )
+        self.assertEqual(ci_timings.parse_cache_log(unrelated), [])
 
 
 class SnapshotTests(unittest.TestCase):

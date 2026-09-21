@@ -41,13 +41,16 @@ REPORT_CURRENT = "2026-09-20..2026-09-21"
 # `Swatinem/rust-cache` step-log markers for a restored versus a missed cache.
 RUST_CACHE_HIT = "Cache restored successfully"
 RUST_CACHE_MISS = ("Cache not found", "Failed to restore")
+# Fields requested from `gh run list` and `gh run view --json`. The list
+# fields carry workflowName so a shared on-disk cache can be filtered back
+# to the CI workflow even when it accumulates documents from other fetches.
 LIST_FIELDS = (
     "databaseId,conclusion,createdAt,updatedAt,event,headBranch,displayTitle,"
-    "attempt,startedAt"
+    "attempt,startedAt,workflowName"
 )
 VIEW_FIELDS = (
     "databaseId,name,displayTitle,event,conclusion,createdAt,updatedAt,"
-    "startedAt,attempt,headBranch,jobs"
+    "startedAt,attempt,headBranch,workflowName,jobs"
 )
 
 
@@ -137,27 +140,33 @@ def filter_runs(runs, window=None, event=None, conclusion=None, branch=None,
 
     `attempts` controls rerun handling: `first` keeps only the first attempt
     of each run (reruns would distort medians and outliers), `all` keeps every
-    attempt.
+    attempt. The `first` choice is by lowest attempt number, never by input
+    order: snapshots accumulate documents across fetches, so the same run's
+    attempts may arrive in either position.
     """
-    seen_attempts = set()
-    selected = []
+    earliest = {}
     for run in runs:
         started = run["created_at"]
         if window is not None:
             start, end = window
             if not start <= started < end + datetime.timedelta(days=1):
                 continue
-        if attempts == "first":
-            if run["id"] in seen_attempts:
-                continue
-            seen_attempts.add(run["id"])
         if event is not None and run.get("event") != event:
             continue
         if conclusion is not None and run.get("conclusion") != conclusion:
             continue
         if branch is not None and run.get("branch") != branch:
             continue
-        selected.append(run)
+        if attempts == "first":
+            attempt = run.get("attempt", 1) or 1
+            known = earliest.get(run["id"])
+            known_attempt = (known.get("attempt", 1) or 1) if known else None
+            if known_attempt is not None and known_attempt <= attempt:
+                continue
+            earliest[run["id"]] = run
+        else:
+            earliest.setdefault((run["id"], run.get("attempt", 1) or 1), run)
+    selected = list(earliest.values())
     return sorted(selected, key=lambda run: run["created_at"])
 
 
@@ -363,8 +372,24 @@ def parse_junit(paths, top=5):
     }
 
 
+# The `Swatinem/rust-cache@v2` step in ci.yml is always named "Cache cargo
+# build"; matching by step name keeps `actions/cache` steps (e.g. "Cache Bun
+# packages", "Cache Playwright browsers") out of the rust-cache evidence.
+# The sccache statistics blob is printed by the post-step of "Enable sccache"
+# (`sccache-action` `--show-stats --stats-format=json`); only that step's
+# lines may set the sccache entry. Lines that match neither kind leave no
+# trace: no fabricated records.
+RUST_CACHE_STEP = "Cache cargo build"
+SCCACHE_STEP = "Post Enable sccache"
 def parse_cache_log(text):
-    """Extract per-job sccache statistics and rust-cache restore outcomes."""
+    """Extract per-job sccache statistics and rust-cache restore outcomes.
+
+    Only lines from the responsible steps count: rust-cache outcomes from
+    the step named exactly ``RUST_CACHE_STEP`` (Swatinem/rust-cache), and the
+    sccache JSON blob from ``SCCACHE_STEP`` (the sccache post-step). All
+    other lines (including `actions/cache` steps for Bun/Playwright and the
+    cache-save upload steps) are ignored.
+    """
     jobs = {}
     for line in text.splitlines():
         parts = line.split("\t", 2)
@@ -372,6 +397,16 @@ def parse_cache_log(text):
             continue
         job, step = parts[0], parts[1]
         message = parts[2] if len(parts) > 2 else ""
+        if '"stats":' in message:
+            if step != SCCACHE_STEP:
+                continue
+        elif RUST_CACHE_HIT in message or any(
+            marker in message for marker in RUST_CACHE_MISS
+        ):
+            if step != RUST_CACHE_STEP:
+                continue
+        else:
+            continue
         record = jobs.setdefault(job, {"job": job, "sccache": None, "rust_cache": None})
         if '"stats":' in message:
             payload = message[message.index("{") :]
@@ -482,6 +517,16 @@ def read_snapshot(path):
     return documents
 
 
+def document_key(document):
+    """Cache key for one stored run document: `(databaseId, attempt)`.
+
+    Reruns of the same run share a `databaseId`, and `gh run list` returns
+    only the latest attempt, so keying by id alone silently swaps which
+    attempt a `--attempts all` comparison measures.
+    """
+    return (document["databaseId"], document.get("attempt", 1) or 1)
+
+
 def write_snapshot(path, documents):
     """Write a run snapshot, accumulating runs for offline re-measurement."""
     path = Path(path)
@@ -498,6 +543,7 @@ def list_arguments(args, window=None):
     applies the remaining filters (`gh run list` has no `--conclusion` flag).
     """
     arguments = []
+    arguments += ["--workflow", WORKFLOW]
     if args.limit:
         arguments += ["--limit", str(args.limit)]
     if args.event:
@@ -521,28 +567,57 @@ def list_documents(args, window=None):
     """
     cache_path = Path(args.cache)
     documents = read_snapshot(cache_path) if cache_path.exists() else []
-    known = {document["databaseId"] for document in documents}
+    known = {document_key(document) for document in documents}
     listed = gh_json(["run", "list", *list_arguments(args, window), "--json", LIST_FIELDS])
     fetched = 0
     for entry in listed:
         # An unfinished run has no completed job timestamps to measure.
-        if not entry.get("conclusion") or entry["databaseId"] in known:
+        if not entry.get("conclusion"):
             continue
-        documents.append(
-            gh_json(["run", "view", str(entry["databaseId"]), "--json", VIEW_FIELDS])
+        attempt = entry.get("attempt", 1) or 1
+        view_command = ["run", "view", str(entry["databaseId"]), "--json", VIEW_FIELDS]
+        first = (
+            gh_json(view_command + ["--attempt", "1"])
+            if attempt > 1 and not any(
+                key == (entry["databaseId"], 1) for key in known
+            )
+            else None
         )
-        fetched += 1
+        current = gh_json(
+            view_command + (["--attempt", str(attempt)] if attempt > 1 else [])
+        )
+        for document in ([first] if first else []) + [current]:
+            key = document_key(document)
+            if key in known:
+                continue
+            known.add(key)
+            documents.append(document)
+            fetched += 1
     if fetched:
         write_snapshot(cache_path, documents)
     return documents
 
 
 def load_run_summaries(args, window=None):
-    """Summaries from a snapshot, or from a fresh window-bounded fetch."""
+    """Summaries from a snapshot, or from a fresh window-bounded fetch.
+
+    `runs`/`compare` measure the CI workflow only. The fetch passes
+    `--workflow ci.yml` to `gh`, and snapshots are filtered back by the
+    stored `workflowName`, because tag Release runs also complete `CI`-named
+    jobs but must never enter these medians. Snapshot documents written
+    before `workflowName` was requested are treated as unknown-workflow and
+    kept, so old caches keep reproducing the report until refetched.
+    """
     documents = (
         read_snapshot(args.input) if args.input else list_documents(args, window)
     )
-    return [summarize_run(document) for document in documents]
+    summaries = []
+    for document in documents:
+        name = document.get("workflowName")
+        if name is not None and name != "CI":
+            continue
+        summaries.append(summarize_run(document))
+    return summaries
 
 
 def min_start_max_end_window(baseline, current):
