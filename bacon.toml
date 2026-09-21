@@ -1,0 +1,39 @@
+#:schema https://dystroy.org/bacon/.bacon.schema.json
+#
+# Watcher configuration for the narrow local loops documented in AGENTS.md
+# (issue #127). Bacon is an optional developer tool: no CI gate and no
+# `cargo xtask` target depends on this file, and every job below only re-runs a
+# command that is already documented and usable on its own.
+#
+#   cargo install --locked bacon
+#   bacon                                         # fast unit + integration loop
+#   bacon clippy-fast                             # the CI lint gate
+#   bacon nextest-fast -- -p pohunek-gui-core      # narrow to one crate
+#   bacon nextest-fast -- some_test_name           # narrow to one test
+#
+# Bacon re-runs the active job when watched sources change, so the fast loops
+# stay inside the two-minute feedback target instead of re-running the full
+# workspace suite.
+
+default_job = "nextest-fast"
+
+# `fast` is the cost boundary from .config/nextest.toml: the `ci` profile plus
+# the filter that keeps PTY, PostgreSQL, and Hermes fixtures out of the loop.
+# `--hide-progress-bar` and `--failure-output final` keep the captured output
+# stable for bacon's analyzer and for copying into a report.
+[jobs.nextest-fast]
+command = [
+    "cargo", "nextest", "run",
+    "--profile", "fast",
+    "--all-features",
+    "--hide-progress-bar",
+    "--failure-output", "final",
+]
+need_stdout = true
+analyzer = "nextest"
+
+# The CI lint gate itself: workspace, all targets, all features. Warnings are
+# errors in CI through RUSTFLAGS; locally bacon displays them as they appear.
+[jobs.clippy-fast]
+command = ["cargo", "clippy", "--workspace", "--all-targets", "--all-features"]
+need_stdout = false

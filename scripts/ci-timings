@@ -1,0 +1,685 @@
+#!/usr/bin/env python3
+"""Reproduce the test-performance baseline from CI and local artifacts.
+
+Implements the measurement half of issue #127 (epic #115): per-job workflow
+wall clock, JUnit execution times, and sccache/rust-cache cache-hit evidence.
+
+Every number printed by this tool comes from one of three sources:
+
+* `runs` / `compare` -- GitHub Actions run and job metadata (`gh`), which is
+  per-job wall clock, not test execution time. Wall clock includes checkout,
+  toolchain setup, cache restore, compilation, and the tests themselves.
+* `junit` -- nextest JUnit XML (`target/nextest/<profile>/junit.xml` or an
+  uploaded CI artifact). JUnit has test execution time only; compilation and
+  setup are deliberately *not* part of it.
+* `cache` -- the raw run log, which contains the sccache JSON statistics
+  printed by the post-run `sccache-action` step and the `Swatinem/rust-cache`
+  restore outcome lines.
+
+`--cache` keeps fetched run metadata on disk so the tables in
+`docs/design/test-performance-report.md` can be regenerated offline.
+"""
+
+import argparse
+import datetime
+import json
+from pathlib import Path
+import re
+import statistics
+import subprocess
+import sys
+import xml.etree.ElementTree as ElementTree
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW = "ci.yml"
+DEFAULT_CACHE = ROOT / "target/ci-timings/ci-runs.json"
+# Windows behind the report tables, so the numbers in
+# docs/design/test-performance-report.md stay reproducible.
+REPORT_BASELINE = "2026-09-14..2026-09-17"
+REPORT_CURRENT = "2026-09-20..2026-09-21"
+# `Swatinem/rust-cache` step-log markers for a restored versus a missed cache.
+RUST_CACHE_HIT = "Cache restored successfully"
+RUST_CACHE_MISS = ("Cache not found", "Failed to restore")
+LIST_FIELDS = (
+    "databaseId,conclusion,createdAt,updatedAt,event,headBranch,displayTitle"
+)
+VIEW_FIELDS = (
+    "databaseId,name,displayTitle,event,conclusion,createdAt,updatedAt,headBranch,jobs"
+)
+
+
+def parse_timestamp(value):
+    """Parse a GitHub Actions ISO-8601 timestamp (UTC, trailing `Z`)."""
+    if not value:
+        return None
+    return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def format_seconds(seconds):
+    """Render a duration as `9s`, `1m23s`, or `1h02m`."""
+    total = int(round(seconds))
+    if total >= 3600:
+        return f"{total // 3600}h{total % 3600 // 60:02d}m"
+    if total >= 60:
+        return f"{total // 60}m{total % 60:02d}s"
+    return f"{total}s"
+
+
+def format_percent(value):
+    """Render a signed percentage, or `n/a` when there is no comparison."""
+    return "n/a" if value is None else f"{value:+.0f} %"
+
+
+def job_seconds(document):
+    """Map job name to wall-clock seconds for every finished job."""
+    durations = {}
+    for job in document.get("jobs") or []:
+        start = parse_timestamp(job.get("startedAt"))
+        end = parse_timestamp(job.get("completedAt"))
+        if start is None or end is None:
+            continue
+        durations[job["name"]] = (end - start).total_seconds()
+    return durations
+
+
+def summarize_run(document):
+    """Normalize one `gh run view --json` document into a run summary."""
+    created = parse_timestamp(document.get("createdAt"))
+    updated = parse_timestamp(document.get("updatedAt"))
+    if created is None or updated is None:
+        raise ValueError(f"run {document.get('databaseId')} has no timestamps")
+    return {
+        "id": document["databaseId"],
+        "created_at": created,
+        "updated_at": updated,
+        "wall_seconds": (updated - created).total_seconds(),
+        "conclusion": document.get("conclusion"),
+        "event": document.get("event"),
+        "branch": document.get("headBranch"),
+        "title": document.get("displayTitle"),
+        "jobs": job_seconds(document),
+    }
+
+
+
+def parse_date(value):
+    """Parse a `YYYY-MM-DD` date as a UTC midnight datetime."""
+    return datetime.datetime.strptime(value, "%Y-%m-%d").replace(
+        tzinfo=datetime.timezone.utc
+    )
+
+
+def parse_window(value):
+    """Parse an inclusive `START..END` window of `YYYY-MM-DD` dates."""
+    parts = value.split("..")
+    if len(parts) != 2:
+        raise ValueError(f"window must be START..END, got {value!r}")
+    return parse_date(parts[0]), parse_date(parts[1])
+
+
+def filter_runs(runs, window=None, event=None, conclusion=None, branch=None):
+    """Select run summaries by window (inclusive dates) and run metadata."""
+    selected = []
+    for run in runs:
+        created = run["created_at"]
+        if window is not None:
+            start, end = window
+            if not start <= created < end + datetime.timedelta(days=1):
+                continue
+        if event is not None and run.get("event") != event:
+            continue
+        if conclusion is not None and run.get("conclusion") != conclusion:
+            continue
+        if branch is not None and run.get("branch") != branch:
+            continue
+        selected.append(run)
+    return sorted(selected, key=lambda run: run["created_at"])
+
+
+def window_summary(runs):
+    """Per-job and workflow medians across a window of runs."""
+    jobs = {}
+    for run in runs:
+        for name, seconds in run["jobs"].items():
+            jobs.setdefault(name, []).append(seconds)
+    return {
+        "runs": len(runs),
+        "wall_seconds": statistics.median([run["wall_seconds"] for run in runs])
+        if runs
+        else None,
+        "jobs": {
+            name: {"p50": statistics.median(values), "runs": len(values)}
+            for name, values in jobs.items()
+        },
+    }
+
+
+def compare_windows(baseline, current):
+    """Compare two window summaries per job, largest baseline first."""
+    rows = []
+    for name, before in baseline["jobs"].items():
+        after = current["jobs"].get(name)
+        delta = after["p50"] - before["p50"] if after else None
+        rows.append(
+            {
+                "job": name,
+                "before": before["p50"],
+                "after": after["p50"] if after else None,
+                "before_runs": before["runs"],
+                "after_runs": after["runs"] if after else 0,
+                "delta": delta,
+                "percent": delta / before["p50"] * 100
+                if delta is not None and before["p50"]
+                else None,
+            }
+        )
+    rows.sort(key=lambda row: row["before"], reverse=True)
+    return rows
+
+
+def render_runs_markdown(runs):
+    """Render one row per run plus the per-job median table."""
+    lines = [
+        "| Run | Date | Event | Branch | Conclusion | Wall clock |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for run in runs:
+        lines.append(
+            f"| {run['id']} | {run['created_at'].date()} | {run['event']} | "
+            f"{run['branch']} | {run['conclusion']} | "
+            f"{format_seconds(run['wall_seconds'])} |"
+        )
+    summary = window_summary(runs)
+    if summary["runs"]:
+        lines.append("")
+        lines.append(
+            f"Median workflow wall clock over {summary['runs']} run(s): "
+            f"{format_seconds(summary['wall_seconds'])}"
+        )
+        lines.append("")
+        lines.append("| Job | p50 | Runs |")
+        lines.append("| --- | --- | --- |")
+        for name, job in sorted(
+            summary["jobs"].items(), key=lambda item: item[1]["p50"], reverse=True
+        ):
+            lines.append(f"| {name} | {format_seconds(job['p50'])} | {job['runs']} |")
+    return "\n".join(lines)
+
+
+def render_compare_markdown(baseline, current, rows):
+    """Render the before/after table used by the report."""
+    delta = current["wall_seconds"] - baseline["wall_seconds"]
+    percent = (
+        delta / baseline["wall_seconds"] * 100 if baseline["wall_seconds"] else None
+    )
+    lines = [
+        f"Baseline: {baseline['runs']} run(s), median workflow "
+        f"{format_seconds(baseline['wall_seconds'])}",
+        f"Current: {current['runs']} run(s), median workflow "
+        f"{format_seconds(current['wall_seconds'])}",
+        "",
+        "| Job | Before (p50) | After (p50) | Delta | Delta % | Runs (before/after) |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for row in rows:
+        after = "n/a" if row["after"] is None else format_seconds(row["after"])
+        row_delta = "n/a" if row["delta"] is None else format_seconds(row["delta"])
+        lines.append(
+            f"| {row['job']} | {format_seconds(row['before'])} | {after} | "
+            f"{row_delta} | {format_percent(row['percent'])} | "
+            f"{row['before_runs']}/{row['after_runs']} |"
+        )
+    lines.append(
+        f"| **workflow** | **{format_seconds(baseline['wall_seconds'])}** | "
+        f"**{format_seconds(current['wall_seconds'])}** | **{format_seconds(delta)}** | "
+        f"**{format_percent(percent)}** | "
+        f"**{baseline['runs']}/{current['runs']}** |"
+    )
+    return "\n".join(lines)
+
+
+def percentile(values, fraction):
+    """Nearest-rank percentile over an unsorted list of numbers."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round(fraction * len(ordered))) - 1))
+    return ordered[index]
+
+
+def parse_junit(paths, top=5):
+    """Summarise nextest JUnit XML files into counts and execution times."""
+    suites = []
+    slowest = []
+    times = []
+    failures = 0
+    errors = 0
+    skipped = 0
+    for path in paths:
+        root = ElementTree.parse(path).getroot()
+        nodes = [root] if root.tag == "testsuite" else list(root)
+        for node in nodes:
+            if node.tag != "testsuite":
+                continue
+            cases = node.findall("testcase")
+            suite_seconds = float(node.get("time") or 0.0)
+            suites.append(
+                {
+                    "name": node.get("name") or path.name,
+                    "tests": int(node.get("tests") or len(cases)),
+                    "failures": int(node.get("failures") or 0),
+                    "errors": int(node.get("errors") or 0),
+                    "skipped": int(node.get("skipped") or 0),
+                    "seconds": suite_seconds,
+                }
+            )
+            failures += suites[-1]["failures"]
+            errors += suites[-1]["errors"]
+            skipped += suites[-1]["skipped"]
+            for case in cases:
+                seconds = float(case.get("time") or 0.0)
+                times.append(seconds)
+                slowest.append((case.get("name") or "?", seconds))
+    slowest.sort(key=lambda item: item[1], reverse=True)
+    return {
+        "suites": suites,
+        "cases": len(times),
+        "failures": failures,
+        "errors": errors,
+        "skipped": skipped,
+        "seconds": sum(times),
+        "p50": statistics.median(times) if times else None,
+        "p95": percentile(times, 0.95),
+        "slowest": slowest[:top],
+    }
+
+
+def parse_cache_log(text):
+    """Extract per-job sccache statistics and rust-cache restore outcomes."""
+    jobs = {}
+    for line in text.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) < 2:
+            continue
+        job, step = parts[0], parts[1]
+        message = parts[2] if len(parts) > 2 else ""
+        record = jobs.setdefault(job, {"job": job, "sccache": None, "rust_cache": None})
+        if '"stats":' in message:
+            payload = message[message.index("{") :]
+            stats, _ = json.JSONDecoder().raw_decode(payload)
+            values = stats.get("stats", {})
+            hits = sum(values.get("cache_hits", {}).get("counts", {}).values())
+            misses = sum(values.get("cache_misses", {}).get("counts", {}).values())
+            record["sccache"] = {
+                "requests": values.get("compile_requests"),
+                "executed": values.get("requests_executed"),
+                "hits": hits,
+                "misses": misses,
+                "write_errors": values.get("cache_write_errors"),
+                "compile_fails": values.get("compile_fails"),
+                "location": stats.get("cache_location"),
+            }
+        elif RUST_CACHE_HIT in message:
+            record["rust_cache"] = "hit"
+        elif any(marker in message for marker in RUST_CACHE_MISS):
+            record["rust_cache"] = "miss"
+    return list(jobs.values())
+
+
+def render_junit_markdown(summary, label, job_seconds=None):
+    """Render the JUnit execution-time table and its overhead note."""
+    lines = [
+        f"{label}: {summary['cases']} test(s), {summary['failures']} failure(s), "
+        f"{summary['errors']} error(s), {summary['skipped']} skipped",
+        f"Execution time: total {format_seconds(summary['seconds'])}, "
+        f"p50 {format_seconds(summary['p50'])}, p95 {format_seconds(summary['p95'])}",
+    ]
+    if job_seconds is not None:
+        overhead = job_seconds - summary["seconds"]
+        share = summary["seconds"] / job_seconds * 100 if job_seconds else 0
+        lines.append(
+            f"Job wall clock {format_seconds(job_seconds)}: test execution is "
+            f"{share:.0f} % of it; the remaining {format_seconds(overhead)} is "
+            "checkout, toolchain, cache restore, and compilation (not in JUnit)."
+        )
+    lines.append("")
+    lines.append("| Suite | Tests | Seconds |")
+    lines.append("| --- | --- | --- |")
+    for suite in sorted(summary["suites"], key=lambda item: item["seconds"], reverse=True):
+        lines.append(f"| {suite['name']} | {suite['tests']} | {suite['seconds']:.1f} |")
+    lines.append("")
+    lines.append("| Slowest test | Seconds |")
+    lines.append("| --- | --- |")
+    for name, seconds in summary["slowest"]:
+        lines.append(f"| {name} | {seconds:.1f} |")
+    return "\n".join(lines)
+
+
+def render_cache_markdown(records):
+    """Render per-job sccache hit/miss and rust-cache restore evidence."""
+    lines = [
+        "| Job | sccache requests | Hits | Misses | Hit ratio | rust-cache restore |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for record in sorted(records, key=lambda item: item["job"]):
+        stats = record["sccache"]
+        if stats is None:
+            lines.append(
+                f"| {record['job']} | n/a | n/a | n/a | n/a | "
+                f"{record['rust_cache'] or 'n/a'} |"
+            )
+            continue
+        total = stats["hits"] + stats["misses"]
+        ratio = f"{stats['hits'] / total * 100:.0f} %" if total else "n/a"
+        lines.append(
+            f"| {record['job']} | {stats['executed']} | {stats['hits']} | "
+            f"{stats['misses']} | {ratio} | {record['rust_cache'] or 'n/a'} |"
+        )
+    return "\n".join(lines)
+
+
+def gh_json(arguments):
+    """Run `gh` with `--json` output and decode the result."""
+    result = subprocess.run(
+        ["gh", *arguments],
+        cwd=ROOT,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return json.loads(result.stdout)
+
+
+def read_snapshot(path):
+    """Read a run snapshot: a JSON list of `gh run view` documents."""
+    documents = json.loads(Path(path).read_text())
+    if not isinstance(documents, list):
+        raise ValueError(f"{path} must hold a JSON list of run documents")
+    return documents
+
+
+def write_snapshot(path, documents):
+    """Write a run snapshot, accumulating runs for offline re-measurement."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(documents, indent=1, sort_keys=True) + "\n")
+
+
+def load_run_summaries(args):
+    """Load run summaries from a snapshot, or fetch the missing ones via `gh`."""
+    if args.input:
+        return [summarize_run(document) for document in read_snapshot(args.input)]
+    cache_path = Path(args.cache)
+    documents = read_snapshot(cache_path) if cache_path.exists() else []
+    known = {document["databaseId"] for document in documents}
+    listed = gh_json(
+        [
+            "run", "list", "--workflow", WORKFLOW, "--limit", str(args.limit),
+            "--json", LIST_FIELDS,
+        ]
+    )
+    fetched = 0
+    for entry in listed:
+        # An unfinished run has no completed job timestamps to measure.
+        if not entry.get("conclusion") or entry["databaseId"] in known:
+            continue
+        documents.append(
+            gh_json(
+                [
+                    "run", "view", str(entry["databaseId"]), "--json", VIEW_FIELDS,
+                ]
+            )
+        )
+        fetched += 1
+    if fetched:
+        write_snapshot(cache_path, documents)
+    return [summarize_run(document) for document in documents]
+
+
+def load_run_log(run_id, log_cache):
+    """Return the raw log of a run, caching it for offline re-measurement."""
+    log_cache = Path(log_cache)
+    if log_cache.exists():
+        return log_cache.read_text()
+    result = subprocess.run(
+        ["gh", "run", "view", str(run_id), "--log"],
+        cwd=ROOT,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    log_cache.parent.mkdir(parents=True, exist_ok=True)
+    log_cache.write_text(result.stdout)
+    return result.stdout
+
+
+EPILOG = """\
+Reproducing the numbers in docs/design/test-performance-report.md:
+
+  scripts/ci-timings compare \\
+      --baseline 2026-09-14..2026-09-17 --current 2026-09-20..2026-09-21 \\
+      --event pull_request --conclusion success --runs
+  scripts/ci-timings junit --label "tests (unit, fast)" --job-seconds 226 \\
+      junit-unit.xml
+  scripts/ci-timings cache --run 35564038269
+
+Run metadata is cached under target/ci-timings/, so repeating a command needs
+no network; pass that file to --input to measure offline.
+"""
+
+
+def add_selection_arguments(parser):
+    """Add the run-selection flags shared by `runs` and `compare`."""
+    parser.add_argument(
+        "--input",
+        help="run snapshot JSON (a list of `gh run view --json` documents)",
+    )
+    parser.add_argument(
+        "--cache",
+        default=str(DEFAULT_CACHE),
+        help="snapshot file that fetched run documents accumulate into",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=40,
+        help="how many recent runs to fetch from `gh run list`",
+    )
+    parser.add_argument("--event", help="filter by run event")
+    parser.add_argument("--conclusion", help="filter by run conclusion")
+    parser.add_argument("--branch", help="filter by head branch")
+    parser.add_argument("--json", action="store_true", help="emit JSON output")
+
+
+def select_runs(runs, args, window=None):
+    """Apply the shared selection flags, defaulting to the newest `--limit`."""
+    selected = filter_runs(
+        runs,
+        window=window,
+        event=args.event,
+        conclusion=args.conclusion,
+        branch=args.branch,
+    )
+    if window is None:
+        return sorted(selected, key=lambda run: run["created_at"], reverse=True)[
+            : args.limit
+        ]
+    return selected
+
+
+def command_runs(args):
+    runs = load_run_summaries(args)
+    window = parse_window(args.window) if args.window else None
+    selected = select_runs(runs, args, window)
+    if args.json:
+        print(
+            json.dumps(
+                {"runs": selected, "summary": window_summary(selected)},
+                default=json_default,
+                indent=1,
+            )
+        )
+    else:
+        print(render_runs_markdown(selected))
+    return 0
+
+
+def command_compare(args):
+    runs = load_run_summaries(args)
+    baseline = select_runs(runs, args, parse_window(args.baseline))
+    current = select_runs(runs, args, parse_window(args.current))
+    baseline_summary = window_summary(baseline)
+    current_summary = window_summary(current)
+    if not baseline_summary["runs"] or not current_summary["runs"]:
+        raise ValueError(
+            "both windows need at least one run; widen --limit or relax the filters"
+        )
+    rows = compare_windows(baseline_summary, current_summary)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "baseline": {"window": args.baseline, "summary": baseline_summary},
+                    "current": {"window": args.current, "summary": current_summary},
+                    "rows": rows,
+                },
+                default=json_default,
+                indent=1,
+            )
+        )
+        return 0
+    print(render_compare_markdown(baseline_summary, current_summary, rows))
+    if args.runs:
+        print("")
+        print(f"### Baseline runs ({args.baseline})")
+        print("")
+        print(render_runs_markdown(baseline))
+        print("")
+        print(f"### Current runs ({args.current})")
+        print("")
+        print(render_runs_markdown(current))
+    return 0
+
+
+
+def json_default(value):
+    """Serialize datetimes in `--json` output."""
+    if isinstance(value, datetime.datetime):
+        return value.isoformat()
+    raise TypeError(f"cannot serialize {type(value).__name__}")
+
+
+def command_junit(args):
+    paths = [Path(path) for path in args.paths]
+    missing = [str(path) for path in paths if not path.exists()]
+    if missing:
+        raise ValueError(f"missing JUnit file(s): {', '.join(missing)}")
+    summary = parse_junit(paths, top=args.top)
+    if args.json:
+        print(json.dumps(summary, indent=1))
+    else:
+        print(render_junit_markdown(summary, args.label, job_seconds=args.job_seconds))
+    return 0
+
+
+def command_cache(args):
+    if args.input and args.run:
+        raise ValueError("pass either --run or --input, not both")
+    if args.input:
+        text = Path(args.input).read_text()
+    elif args.run:
+        log_cache = Path(args.log_cache or f"target/ci-timings/run-{args.run}.log")
+        if not log_cache.is_absolute():
+            log_cache = ROOT / log_cache
+        text = load_run_log(args.run, log_cache)
+    else:
+        raise ValueError("pass --run <id> or --input <saved-log>")
+    records = parse_cache_log(text)
+    if args.json:
+        print(json.dumps(records, indent=1))
+    else:
+        print(render_cache_markdown(records))
+    return 0
+
+
+def build_parser():
+    """Build the parser for the `runs`, `compare`, `junit`, and `cache` modes."""
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    runs = subparsers.add_parser("runs", help="per-run and per-job wall clock")
+    add_selection_arguments(runs)
+    runs.add_argument(
+        "--window",
+        default=None,
+        help="inclusive START..END window of YYYY-MM-DD dates (default: newest runs)",
+    )
+    runs.set_defaults(handler=command_runs)
+
+    compare = subparsers.add_parser(
+        "compare", help="before/after per-job medians for two windows"
+    )
+    add_selection_arguments(compare)
+    compare.add_argument(
+        "--baseline", default=REPORT_BASELINE, help="inclusive baseline START..END window"
+    )
+    compare.add_argument(
+        "--current", default=REPORT_CURRENT, help="inclusive current START..END window"
+    )
+    compare.add_argument(
+        "--runs", action="store_true", help="also print the per-run evidence tables"
+    )
+    compare.set_defaults(handler=command_compare)
+
+    junit = subparsers.add_parser(
+        "junit", help="JUnit execution-time summary (no compile/setup time)"
+    )
+    junit.add_argument("paths", nargs="+", help="JUnit XML file(s)")
+    junit.add_argument("--label", default="JUnit", help="label for the summary header")
+    junit.add_argument("--top", type=int, default=5, help="slowest tests to list")
+    junit.add_argument(
+        "--job-seconds",
+        type=float,
+        default=None,
+        help="CI job wall clock, to separate test execution from compile/setup",
+    )
+    junit.add_argument("--json", action="store_true", help="emit JSON output")
+    junit.set_defaults(handler=command_junit)
+
+    cache = subparsers.add_parser(
+        "cache", help="sccache and rust-cache hit evidence from a run log"
+    )
+    cache.add_argument("--run", help="GitHub Actions run id to read the log of")
+    cache.add_argument("--input", help="saved raw log file instead of --run")
+    cache.add_argument(
+        "--log-cache", default=None, help="where to cache the downloaded run log"
+    )
+    cache.add_argument("--json", action="store_true", help="emit JSON output")
+    cache.set_defaults(handler=command_cache)
+    return parser
+
+
+def main(argv=None):
+    """Run one measurement mode and return the process exit code."""
+    args = build_parser().parse_args(argv)
+    try:
+        return args.handler(args)
+    except (
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+        subprocess.CalledProcessError,
+    ) as error:
+        print(f"ci-timings: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
