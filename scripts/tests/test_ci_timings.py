@@ -100,6 +100,24 @@ class RunTimingTests(unittest.TestCase):
         self.assertEqual(seconds["fmt + clippy"], 199.0)
         self.assertNotIn("cargo-udeps (unused dependencies)", seconds)
 
+    def test_job_seconds_skips_skipped_and_zero_time_jobs(self):
+        # Conditionally skipped jobs must not count as 0 s runs: `gh`
+        # serializes their missing timestamps as null or the Go zero time,
+        # which would drag medians down while inflating run counts.
+        zero = {
+            "name": "tests (relay DB, PostgreSQL)",
+            "startedAt": "0001-01-01T00:00:00Z",
+            "completedAt": "0001-01-01T00:00:00Z",
+            "conclusion": "skipped",
+        }
+        skewed = {
+            "name": "TS binding drift (xs check)",
+            "startedAt": "2026-09-20T10:00:00Z",
+            "completedAt": "2026-09-20T10:00:00Z",
+            "conclusion": "success",
+        }
+        self.assertEqual(ci_timings.job_seconds({"jobs": [zero, skewed]}), {})
+
     def test_summarize_run_wall_clock(self):
         summary = ci_timings.summarize_run(RUN)
         self.assertEqual(summary["id"], 1)
@@ -110,10 +128,11 @@ class RunTimingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no timestamps"):
             ci_timings.summarize_run({"databaseId": 7})
 
-    def test_summarize_run_wall_clock_uses_started_at(self):
+    def test_summarize_run_separates_created_and_started(self):
         # A rerun keeps createdAt at the original attempt; wall clock must
         # measure the actual execution from startedAt, not the gap between
-        # attempts.
+        # attempts, while windows keep matching on creation time (the
+        # server-side `--created` semantics).
         summary = _summary(
             createdAt="2026-09-20T09:00:00Z",
             startedAt="2026-09-20T10:00:00Z",
@@ -121,9 +140,43 @@ class RunTimingTests(unittest.TestCase):
         )
         self.assertEqual(summary["wall_seconds"], 570.0)
         self.assertEqual(summary["created_at"], ci_timings.parse_timestamp(
+            "2026-09-20T09:00:00Z"
+        ))
+        self.assertEqual(summary["started_at"], ci_timings.parse_timestamp(
             "2026-09-20T10:00:00Z"
         ))
         self.assertEqual(summary["attempt"], 1)
+
+    def test_filter_runs_windows_follow_created_not_started(self):
+        queued = _summary(
+            databaseId=25,
+            createdAt="2026-09-19T23:50:00Z",
+            startedAt="2026-09-20T00:10:00Z",
+        )
+        window = ci_timings.parse_window("2026-09-20..2026-09-21")
+        self.assertEqual(ci_timings.filter_runs([queued], window=window), [])
+
+    def test_filter_runs_conclusion_applies_to_grouped_first_attempt(self):
+        # A failed first attempt must stay excluded even when its rerun
+        # succeeded: grouping precedes the conclusion filter.
+        failed = _summary(
+            databaseId=26, attempt=1, conclusion="failure",
+            startedAt="2026-09-20T10:00:00Z",
+        )
+        rerun = _summary(
+            databaseId=26, attempt=2, conclusion="success",
+            startedAt="2026-09-20T15:00:00Z",
+        )
+        selected = ci_timings.filter_runs(
+            [failed, rerun], conclusion="success"
+        )
+        self.assertEqual(selected, [])
+        everything = ci_timings.filter_runs(
+            [failed, rerun], conclusion="success", attempts="all"
+        )
+        self.assertEqual(
+            [(run["id"], run["attempt"]) for run in everything], [(26, 2)]
+        )
 
     def test_filter_runs_default_keeps_only_first_attempts(self):
         first = _summary(databaseId=20, startedAt="2026-09-20T10:00:00Z")
@@ -191,11 +244,21 @@ class RunTimingTests(unittest.TestCase):
 
     def test_list_arguments_scopes_to_ci_workflow(self):
         arguments = ci_timings.list_arguments(
-            argparse.Namespace(limit=40, event="pull_request", branch=None),
+            argparse.Namespace(limit=40, event="pull_request", branch=None,
+                               conclusion=None),
             None,
         )
         self.assertIn("--workflow", arguments)
         self.assertIn("ci.yml", arguments)
+
+    def test_list_arguments_passes_conclusion_as_status(self):
+        arguments = ci_timings.list_arguments(
+            argparse.Namespace(limit=40, event=None, branch=None,
+                               conclusion="success"),
+            None,
+        )
+        self.assertIn("--status", arguments)
+        self.assertIn("success", arguments)
 
     def test_parse_window_rejects_malformed_input(self):
         with self.assertRaisesRegex(ValueError, "START..END"):
@@ -416,8 +479,36 @@ class CacheTests(unittest.TestCase):
         rendered = ci_timings.render_cache_markdown(
             ci_timings.parse_cache_log(CACHE_LOG)
         )
-        self.assertIn("| doctests + release build | 1015 | 660 | 286 | 70 % | hit |", rendered)
-        self.assertIn("| tests (unit, fast) | n/a | n/a | n/a | n/a | miss |", rendered)
+        self.assertIn(
+            "| doctests + release build | 1015 | 660 | 286 | 0 | 70 % | hit |",
+            rendered,
+        )
+        self.assertIn(
+            "| tests (unit, fast) | n/a | n/a | n/a | n/a | n/a | miss |",
+            rendered,
+        )
+
+    def test_parse_cache_log_counts_cache_errors(self):
+        # Backend lookup errors dilute the hit ratio: the same blob with
+        # half its lookups failing must not read as highly cached.
+        errored = CACHE_LOG.replace(
+            '"cache_misses":{"counts":{"Rust":286}}',
+            '"cache_misses":{"counts":{"Rust":286}},'
+            '"cache_errors":{"counts":{"Timeout":946}}',
+        )
+        records = {
+            record["job"]: record for record in ci_timings.parse_cache_log(errored)
+        }
+        release = records["doctests + release build"]
+        self.assertEqual(release["sccache"]["errors"], 946)
+        self.assertAlmostEqual(release["sccache"]["hit_ratio"], 660 / 1892)
+        rendered = ci_timings.render_cache_markdown(
+            ci_timings.parse_cache_log(errored)
+        )
+        self.assertIn(
+            "| doctests + release build | 1015 | 660 | 286 | 946 | 35 % | hit |",
+            rendered,
+        )
 
     def test_parse_cache_log_ignores_unrelated_cache_steps(self):
         # "Cache restored successfully" from an `actions/cache` step (Bun,

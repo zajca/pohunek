@@ -77,23 +77,38 @@ def format_percent(value):
 
 
 def job_seconds(document):
-    """Map job name to wall-clock seconds for every finished job."""
+    """Map job name to wall-clock seconds for every finished job.
+
+    Conditionally skipped jobs carry no meaningful duration: their timestamps
+    are absent (`null`) or the Go zero time (`0001-01-01T00:00:00Z`), which
+    would otherwise count as a 0 s run and drag medians down while inflating
+    run counts. Both are excluded alongside any non-positive duration.
+    """
     durations = {}
     for job in document.get("jobs") or []:
+        if (job.get("conclusion") or "") == "skipped":
+            continue
         start = parse_timestamp(job.get("startedAt"))
         end = parse_timestamp(job.get("completedAt"))
         if start is None or end is None:
             continue
-        durations[job["name"]] = (end - start).total_seconds()
+        if start.year <= 1 or end.year <= 1:
+            continue
+        seconds = (end - start).total_seconds()
+        if seconds <= 0:
+            continue
+        durations[job["name"]] = seconds
     return durations
 
 
 def summarize_run(document):
     """Normalize one `gh run view --json` document into a run summary.
 
-    Wall clock measures the actual execution (`startedAt` to `updatedAt`),
-    not queue time between rerun attempts: `createdAt` stays at the original
-    attempt, so reruns would otherwise appear as hour-long runs.
+    `created_at` keeps the run's creation time and selects date windows, so it
+    matches the server-side `--created` filter semantics. Wall clock measures
+    the actual execution (`started_at` to `updated_at`), not queue time
+    between rerun attempts: `createdAt` stays at the original attempt, so
+    reruns would otherwise appear as hour-long runs.
     """
     started = parse_timestamp(document.get("startedAt"))
     created = parse_timestamp(document.get("createdAt"))
@@ -105,7 +120,8 @@ def summarize_run(document):
         started = created
     return {
         "id": document["databaseId"],
-        "created_at": started,
+        "created_at": created,
+        "started_at": started,
         "updated_at": updated,
         "wall_seconds": (updated - started).total_seconds(),
         # Attempts above one are reruns; keep them out of the aggregates.
@@ -138,18 +154,31 @@ def filter_runs(runs, window=None, event=None, conclusion=None, branch=None,
                 attempts="first"):
     """Select run summaries by window (inclusive dates) and run metadata.
 
-    `attempts` controls rerun handling: `first` keeps only the first attempt
-    of each run (reruns would distort medians and outliers), `all` keeps every
-    attempt. The `first` choice is by lowest attempt number, never by input
-    order: snapshots accumulate documents across fetches, so the same run's
-    attempts may arrive in either position.
+    Attempt grouping happens before any metadata filter: with the default
+    `first`, a failed first attempt is never discarded so that its run's
+    successful rerun can masquerade as the representative. The lowest attempt
+    number wins the run, then the winner must pass the conclusion/event/branch
+    filters. With `all`, every attempt is kept as its own sample.
     """
-    earliest = {}
+    by_id = {}
     for run in runs:
-        started = run["created_at"]
+        attempt = run.get("attempt", 1) or 1
+        known = by_id.get(run["id"], [])
+        known.append((attempt, run))
+        by_id[run["id"]] = known
+    candidates = []
+    for run_id, group in by_id.items():
+        ordered = sorted(group, key=lambda pair: pair[0])
+        if attempts == "first":
+            candidates.append(ordered[0][1])
+        else:
+            candidates.extend(run for _, run in ordered)
+    selected = []
+    for run in candidates:
+        when = run["created_at"]
         if window is not None:
             start, end = window
-            if not start <= started < end + datetime.timedelta(days=1):
+            if when is None or not start <= when < end + datetime.timedelta(days=1):
                 continue
         if event is not None and run.get("event") != event:
             continue
@@ -157,17 +186,11 @@ def filter_runs(runs, window=None, event=None, conclusion=None, branch=None,
             continue
         if branch is not None and run.get("branch") != branch:
             continue
-        if attempts == "first":
-            attempt = run.get("attempt", 1) or 1
-            known = earliest.get(run["id"])
-            known_attempt = (known.get("attempt", 1) or 1) if known else None
-            if known_attempt is not None and known_attempt <= attempt:
-                continue
-            earliest[run["id"]] = run
-        else:
-            earliest.setdefault((run["id"], run.get("attempt", 1) or 1), run)
-    selected = list(earliest.values())
-    return sorted(selected, key=lambda run: run["created_at"])
+        selected.append(run)
+    fallback = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    return sorted(
+        selected, key=lambda run: run["created_at"] if run["created_at"] else fallback
+    )
 
 
 def window_summary(runs):
@@ -414,11 +437,15 @@ def parse_cache_log(text):
             values = stats.get("stats", {})
             hits = sum(values.get("cache_hits", {}).get("counts", {}).values())
             misses = sum(values.get("cache_misses", {}).get("counts", {}).values())
+            errors = sum(values.get("cache_errors", {}).get("counts", {}).values())
+            total = hits + misses + errors
             record["sccache"] = {
                 "requests": values.get("compile_requests"),
                 "executed": values.get("requests_executed"),
                 "hits": hits,
                 "misses": misses,
+                "errors": errors,
+                "hit_ratio": hits / total if total else None,
                 "write_errors": values.get("cache_write_errors"),
                 "compile_fails": values.get("compile_fails"),
                 "location": stats.get("cache_location"),
@@ -474,24 +501,33 @@ def render_junit_markdown(summary, label, job_seconds=None, step_seconds=None,
 
 
 def render_cache_markdown(records):
-    """Render per-job sccache hit/miss and rust-cache restore evidence."""
+    """Render per-job sccache hit/miss and rust-cache restore evidence.
+
+    The hit ratio divides by lookups, including backend cache errors: a job
+    that hits whenever the backend answers but fails half its lookups must
+    not read as highly cached.
+    """
     lines = [
-        "| Job | sccache requests | Hits | Misses | Hit ratio | rust-cache restore |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| Job | sccache requests | Hits | Misses | Errors | Hit ratio | rust-cache restore |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for record in sorted(records, key=lambda item: item["job"]):
         stats = record["sccache"]
         if stats is None:
             lines.append(
-                f"| {record['job']} | n/a | n/a | n/a | n/a | "
+                f"| {record['job']} | n/a | n/a | n/a | n/a | n/a | "
                 f"{record['rust_cache'] or 'n/a'} |"
             )
             continue
-        total = stats["hits"] + stats["misses"]
-        ratio = f"{stats['hits'] / total * 100:.0f} %" if total else "n/a"
+        ratio = (
+            f"{stats['hit_ratio'] * 100:.0f} %"
+            if stats["hit_ratio"] is not None
+            else "n/a"
+        )
         lines.append(
             f"| {record['job']} | {stats['executed']} | {stats['hits']} | "
-            f"{stats['misses']} | {ratio} | {record['rust_cache'] or 'n/a'} |"
+            f"{stats['misses']} | {stats['errors']} | {ratio} | "
+            f"{record['rust_cache'] or 'n/a'} |"
         )
     return "\n".join(lines)
 
@@ -540,7 +576,9 @@ def list_arguments(args, window=None):
     The supported filters and the requested window are applied server-side,
     so `--limit` counts matching runs instead of truncating the sample before
     the filters apply; `filter_runs` then narrows to the exact window and
-    applies the remaining filters (`gh run list` has no `--conclusion` flag).
+    applies the remaining filters. `--conclusion` maps to `gh --status`,
+    which accepts conclusions (`success`, `failure`, ...) as well as states;
+    the local conclusion filter stays in place for snapshots.
     """
     arguments = []
     arguments += ["--workflow", WORKFLOW]
@@ -548,6 +586,8 @@ def list_arguments(args, window=None):
         arguments += ["--limit", str(args.limit)]
     if args.event:
         arguments += ["--event", args.event]
+    if args.conclusion:
+        arguments += ["--status", args.conclusion]
     if args.branch:
         arguments += ["--branch", args.branch]
     if window is not None:
@@ -676,7 +716,11 @@ def add_selection_arguments(parser):
         help="how many recent runs to fetch from `gh run list`",
     )
     parser.add_argument("--event", help="filter by run event")
-    parser.add_argument("--conclusion", help="filter by run conclusion")
+    parser.add_argument(
+        "--conclusion",
+        choices=("success", "failure", "cancelled", "skipped"),
+        help="filter by run conclusion (also passed to `gh run list --status`)",
+    )
     parser.add_argument("--branch", help="filter by head branch")
     parser.add_argument(
         "--attempts",
@@ -698,9 +742,12 @@ def select_runs(runs, args, window=None):
         attempts=args.attempts,
     )
     if window is None:
-        return sorted(selected, key=lambda run: run["created_at"], reverse=True)[
-            : args.limit
-        ]
+        fallback = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+        return sorted(
+            selected,
+            key=lambda run: run["created_at"] if run["created_at"] else fallback,
+            reverse=True,
+        )[: args.limit]
     return selected
 
 
@@ -850,7 +897,15 @@ def command_junit(args):
             document, label=args.label, requested=args.job
         )
     if args.json:
-        print(json.dumps(summary, indent=1))
+        payload = dict(summary)
+        if matched_job is not None:
+            payload["job"] = {
+                "run": args.run,
+                "name": matched_job,
+                "wall_seconds": job_wall,
+                "step_seconds": step_seconds,
+            }
+        print(json.dumps(payload, indent=1))
     else:
         print(
             render_junit_markdown(

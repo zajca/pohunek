@@ -161,8 +161,9 @@ scripts/ci-timings cache --run 35534741514
   The sccache post-step prints the full JSON stats blob; on this run the
   job completed before the post step, so exact hit/miss counts were not
   captured here — the `cache` subcommand extracts
-  `cache_hits.counts`/`cache_misses.counts` whenever the blob is present
-  (tested shape: 1248 requests / 1207 hits / 41 misses ≈ 97 % hit rate).
+  `cache_hits.counts`/`cache_misses.counts`/`cache_errors.counts` whenever
+  the blob is present (tested shape: 1248 requests / 1207 hits / 41 misses /
+  0 errors ≈ 97 % of lookups; backend errors dilute the ratio by design).
 - Fast shards and heavy: rust-cache **hit** on all inspected jobs.
 
 Log-derived cache statistics are best-effort: the sccache JSON only appears
