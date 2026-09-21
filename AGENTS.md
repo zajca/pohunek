@@ -203,7 +203,9 @@ scripts/ci-timings runs --limit 60 --window 2026-09-14..2026-09-16 \
     --event pull_request --conclusion success      # fetch + snapshot + per-run table
 scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 \
     --current 2026-09-20..2026-09-21 --event pull_request --conclusion success
-scripts/ci-timings junit --label "tests (unit, fast)" --job-seconds 300 junit-unit.xml
+scripts/ci-timings junit --label "tests (unit, fast)" --run RUN_ID junit-unit.xml
+                                  # or: --job-seconds N to supply the job wall
+                                  # by hand; --job NAME picks the paired CI job
 scripts/ci-timings cache --run RUN_ID             # sccache JSON + rust-cache hits per job
 ```
 

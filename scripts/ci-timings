@@ -23,6 +23,7 @@ Every number printed by this tool comes from one of three sources:
 import argparse
 import datetime
 import json
+import math
 from pathlib import Path
 import re
 import statistics
@@ -35,16 +36,18 @@ WORKFLOW = "ci.yml"
 DEFAULT_CACHE = ROOT / "target/ci-timings/ci-runs.json"
 # Windows behind the report tables, so the numbers in
 # docs/design/test-performance-report.md stay reproducible.
-REPORT_BASELINE = "2026-09-14..2026-09-17"
+REPORT_BASELINE = "2026-09-14..2026-09-16"
 REPORT_CURRENT = "2026-09-20..2026-09-21"
 # `Swatinem/rust-cache` step-log markers for a restored versus a missed cache.
 RUST_CACHE_HIT = "Cache restored successfully"
 RUST_CACHE_MISS = ("Cache not found", "Failed to restore")
 LIST_FIELDS = (
-    "databaseId,conclusion,createdAt,updatedAt,event,headBranch,displayTitle"
+    "databaseId,conclusion,createdAt,updatedAt,event,headBranch,displayTitle,"
+    "attempt,startedAt"
 )
 VIEW_FIELDS = (
-    "databaseId,name,displayTitle,event,conclusion,createdAt,updatedAt,headBranch,jobs"
+    "databaseId,name,displayTitle,event,conclusion,createdAt,updatedAt,"
+    "startedAt,attempt,headBranch,jobs"
 )
 
 
@@ -83,16 +86,27 @@ def job_seconds(document):
 
 
 def summarize_run(document):
-    """Normalize one `gh run view --json` document into a run summary."""
+    """Normalize one `gh run view --json` document into a run summary.
+
+    Wall clock measures the actual execution (`startedAt` to `updatedAt`),
+    not queue time between rerun attempts: `createdAt` stays at the original
+    attempt, so reruns would otherwise appear as hour-long runs.
+    """
+    started = parse_timestamp(document.get("startedAt"))
     created = parse_timestamp(document.get("createdAt"))
     updated = parse_timestamp(document.get("updatedAt"))
-    if created is None or updated is None:
+    if updated is None or (started is None and created is None):
         raise ValueError(f"run {document.get('databaseId')} has no timestamps")
+    if started is None:
+        # Older snapshots predate the startedAt field.
+        started = created
     return {
         "id": document["databaseId"],
-        "created_at": created,
+        "created_at": started,
         "updated_at": updated,
-        "wall_seconds": (updated - created).total_seconds(),
+        "wall_seconds": (updated - started).total_seconds(),
+        # Attempts above one are reruns; keep them out of the aggregates.
+        "attempt": document.get("attempt") or 1,
         "conclusion": document.get("conclusion"),
         "event": document.get("event"),
         "branch": document.get("headBranch"),
@@ -117,15 +131,26 @@ def parse_window(value):
     return parse_date(parts[0]), parse_date(parts[1])
 
 
-def filter_runs(runs, window=None, event=None, conclusion=None, branch=None):
-    """Select run summaries by window (inclusive dates) and run metadata."""
+def filter_runs(runs, window=None, event=None, conclusion=None, branch=None,
+                attempts="first"):
+    """Select run summaries by window (inclusive dates) and run metadata.
+
+    `attempts` controls rerun handling: `first` keeps only the first attempt
+    of each run (reruns would distort medians and outliers), `all` keeps every
+    attempt.
+    """
+    seen_attempts = set()
     selected = []
     for run in runs:
-        created = run["created_at"]
+        started = run["created_at"]
         if window is not None:
             start, end = window
-            if not start <= created < end + datetime.timedelta(days=1):
+            if not start <= started < end + datetime.timedelta(days=1):
                 continue
+        if attempts == "first":
+            if run["id"] in seen_attempts:
+                continue
+            seen_attempts.add(run["id"])
         if event is not None and run.get("event") != event:
             continue
         if conclusion is not None and run.get("conclusion") != conclusion:
@@ -155,17 +180,23 @@ def window_summary(runs):
 
 
 def compare_windows(baseline, current):
-    """Compare two window summaries per job, largest baseline first."""
+    """Compare two window summaries per job, largest baseline first.
+
+    Jobs that exist in only one window still get a row with `n/a` on the
+    missing side, so newly added or removed shards stay visible.
+    """
+    names = set(baseline["jobs"]) | set(current["jobs"])
     rows = []
-    for name, before in baseline["jobs"].items():
+    for name in names:
+        before = baseline["jobs"].get(name)
         after = current["jobs"].get(name)
-        delta = after["p50"] - before["p50"] if after else None
+        delta = after["p50"] - before["p50"] if after and before else None
         rows.append(
             {
                 "job": name,
-                "before": before["p50"],
+                "before": before["p50"] if before else None,
                 "after": after["p50"] if after else None,
-                "before_runs": before["runs"],
+                "before_runs": before["runs"] if before else 0,
                 "after_runs": after["runs"] if after else 0,
                 "delta": delta,
                 "percent": delta / before["p50"] * 100
@@ -173,7 +204,13 @@ def compare_windows(baseline, current):
                 else None,
             }
         )
-    rows.sort(key=lambda row: row["before"], reverse=True)
+    rows.sort(
+        key=lambda row: (
+            row["before"] if row["before"] is not None else -1.0,
+            row["after"] if row["after"] is not None else -1.0,
+        ),
+        reverse=True,
+    )
     return rows
 
 
@@ -184,9 +221,10 @@ def render_runs_markdown(runs):
         "| --- | --- | --- | --- | --- | --- |",
     ]
     for run in runs:
+        rerun = f" (attempt {run['attempt']})" if run["attempt"] > 1 else ""
         lines.append(
             f"| {run['id']} | {run['created_at'].date()} | {run['event']} | "
-            f"{run['branch']} | {run['conclusion']} | "
+            f"{run['branch']}{rerun} | {run['conclusion']} | "
             f"{format_seconds(run['wall_seconds'])} |"
         )
     summary = window_summary(runs)
@@ -222,10 +260,11 @@ def render_compare_markdown(baseline, current, rows):
         "| --- | --- | --- | --- | --- | --- |",
     ]
     for row in rows:
+        before = "n/a" if row["before"] is None else format_seconds(row["before"])
         after = "n/a" if row["after"] is None else format_seconds(row["after"])
         row_delta = "n/a" if row["delta"] is None else format_seconds(row["delta"])
         lines.append(
-            f"| {row['job']} | {format_seconds(row['before'])} | {after} | "
+            f"| {row['job']} | {before} | {after} | "
             f"{row_delta} | {format_percent(row['percent'])} | "
             f"{row['before_runs']}/{row['after_runs']} |"
         )
@@ -238,12 +277,42 @@ def render_compare_markdown(baseline, current, rows):
     return "\n".join(lines)
 
 
+def junit_step_seconds(document,
+                       step_patterns=("Run fast shard",
+                                      "bounded nextest concurrency",
+                                      "Documentation tests")):
+    """Map job name to the elapsed seconds of its test-execution step.
+
+    nextest runs tests in parallel, so the *sum* of JUnit testcase times is
+    not wall-clock time; only the CI step's own start/end timestamps give a
+    comparable test share. Patterns match the workflow's test steps by exact
+    substring ("Run fast shard", the bounded-concurrency heavy/relay-db
+    steps, "Documentation tests"); install steps that merely mention nextest
+    never match. Jobs without a matching step map to None.
+    """
+    durations = {}
+    for job in document.get("jobs") or []:
+        elapsed = None
+        for step in job.get("steps") or []:
+            name = step.get("name") or ""
+            if not any(pattern in name for pattern in step_patterns):
+                continue
+            start = parse_timestamp(step.get("startedAt"))
+            end = parse_timestamp(step.get("completedAt"))
+            if start is None or end is None:
+                continue
+            elapsed = (end - start).total_seconds()
+            break
+        durations[job["name"]] = elapsed
+    return durations
+
+
 def percentile(values, fraction):
     """Nearest-rank percentile over an unsorted list of numbers."""
     if not values:
         return None
     ordered = sorted(values)
-    index = min(len(ordered) - 1, max(0, int(round(fraction * len(ordered))) - 1))
+    index = min(len(ordered) - 1, max(0, math.ceil(fraction * len(ordered))) - 1)
     return ordered[index]
 
 
@@ -326,21 +395,35 @@ def parse_cache_log(text):
     return list(jobs.values())
 
 
-def render_junit_markdown(summary, label, job_seconds=None):
+def render_junit_markdown(summary, label, job_seconds=None, step_seconds=None,
+                          job_name=None):
     """Render the JUnit execution-time table and its overhead note."""
+    p50 = "n/a" if summary["p50"] is None else format_seconds(summary["p50"])
+    p95 = "n/a" if summary["p95"] is None else format_seconds(summary["p95"])
     lines = [
         f"{label}: {summary['cases']} test(s), {summary['failures']} failure(s), "
         f"{summary['errors']} error(s), {summary['skipped']} skipped",
         f"Execution time: total {format_seconds(summary['seconds'])}, "
-        f"p50 {format_seconds(summary['p50'])}, p95 {format_seconds(summary['p95'])}",
+        f"p50 {p50}, p95 {p95}",
     ]
     if job_seconds is not None:
-        overhead = job_seconds - summary["seconds"]
-        share = summary["seconds"] / job_seconds * 100 if job_seconds else 0
+        source = f" (CI job {job_name!r})" if job_name else ""
         lines.append(
-            f"Job wall clock {format_seconds(job_seconds)}: test execution is "
-            f"{share:.0f} % of it; the remaining {format_seconds(overhead)} is "
-            "checkout, toolchain, cache restore, and compilation (not in JUnit)."
+            f"Job wall clock {format_seconds(job_seconds)}{source}: checkout, "
+            "toolchain, cache restore, and compilation dominate it (JUnit test "
+            "cases run in parallel, so their summed time is not a wall-clock "
+            "share)."
+        )
+    if step_seconds is not None:
+        share = (
+            f" ({step_seconds / job_seconds * 100:.0f} % of the job wall clock)"
+            if job_seconds
+            else ""
+        )
+        lines.append(
+            f"Test step elapsed {format_seconds(step_seconds)}{share}; "
+            "the step includes compilation, the JUnit total bounds test wall "
+            "time from above (not in JUnit)."
         )
     lines.append("")
     lines.append("| Suite | Tests | Seconds |")
@@ -406,35 +489,65 @@ def write_snapshot(path, documents):
     path.write_text(json.dumps(documents, indent=1, sort_keys=True) + "\n")
 
 
-def load_run_summaries(args):
-    """Load run summaries from a snapshot, or fetch the missing ones via `gh`."""
-    if args.input:
-        return [summarize_run(document) for document in read_snapshot(args.input)]
+def list_arguments(args, window=None):
+    """Build the `gh run list` arguments for a fetch.
+
+    The supported filters and the requested window are applied server-side,
+    so `--limit` counts matching runs instead of truncating the sample before
+    the filters apply; `filter_runs` then narrows to the exact window and
+    applies the remaining filters (`gh run list` has no `--conclusion` flag).
+    """
+    arguments = []
+    if args.limit:
+        arguments += ["--limit", str(args.limit)]
+    if args.event:
+        arguments += ["--event", args.event]
+    if args.branch:
+        arguments += ["--branch", args.branch]
+    if window is not None:
+        created = (
+            f"{window[0].date().isoformat()}..{window[1].date().isoformat()}"
+        )
+        arguments += ["--created", created]
+    return arguments
+
+
+def list_documents(args, window=None):
+    """Fetch run documents, querying `gh run list` server-side.
+
+    The selection filters and the requested window are passed to `gh`, so
+    `--limit` counts matching runs instead of truncating the sample before
+    the filters apply; `filter_runs` then narrows to the exact window again.
+    """
     cache_path = Path(args.cache)
     documents = read_snapshot(cache_path) if cache_path.exists() else []
     known = {document["databaseId"] for document in documents}
-    listed = gh_json(
-        [
-            "run", "list", "--workflow", WORKFLOW, "--limit", str(args.limit),
-            "--json", LIST_FIELDS,
-        ]
-    )
+    listed = gh_json(["run", "list", *list_arguments(args, window), "--json", LIST_FIELDS])
     fetched = 0
     for entry in listed:
         # An unfinished run has no completed job timestamps to measure.
         if not entry.get("conclusion") or entry["databaseId"] in known:
             continue
         documents.append(
-            gh_json(
-                [
-                    "run", "view", str(entry["databaseId"]), "--json", VIEW_FIELDS,
-                ]
-            )
+            gh_json(["run", "view", str(entry["databaseId"]), "--json", VIEW_FIELDS])
         )
         fetched += 1
     if fetched:
         write_snapshot(cache_path, documents)
+    return documents
+
+
+def load_run_summaries(args, window=None):
+    """Summaries from a snapshot, or from a fresh window-bounded fetch."""
+    documents = (
+        read_snapshot(args.input) if args.input else list_documents(args, window)
+    )
     return [summarize_run(document) for document in documents]
+
+
+def min_start_max_end_window(baseline, current):
+    """The bounding window covering two date-range tuples."""
+    return (min(baseline[0], current[0]), max(baseline[1], current[1]))
 
 
 def load_run_log(run_id, log_cache):
@@ -459,9 +572,9 @@ EPILOG = """\
 Reproducing the numbers in docs/design/test-performance-report.md:
 
   scripts/ci-timings compare \\
-      --baseline 2026-09-14..2026-09-17 --current 2026-09-20..2026-09-21 \\
+      --baseline 2026-09-14..2026-09-16 --current 2026-09-20..2026-09-21 \\
       --event pull_request --conclusion success --runs
-  scripts/ci-timings junit --label "tests (unit, fast)" --job-seconds 226 \\
+  scripts/ci-timings junit --label "tests (unit, fast)" --run RUN_ID \
       junit-unit.xml
   scripts/ci-timings cache --run 35564038269
 
@@ -490,6 +603,12 @@ def add_selection_arguments(parser):
     parser.add_argument("--event", help="filter by run event")
     parser.add_argument("--conclusion", help="filter by run conclusion")
     parser.add_argument("--branch", help="filter by head branch")
+    parser.add_argument(
+        "--attempts",
+        choices=("first", "all"),
+        default="first",
+        help="keep only first attempts (default) or every rerun attempt",
+    )
     parser.add_argument("--json", action="store_true", help="emit JSON output")
 
 
@@ -501,6 +620,7 @@ def select_runs(runs, args, window=None):
         event=args.event,
         conclusion=args.conclusion,
         branch=args.branch,
+        attempts=args.attempts,
     )
     if window is None:
         return sorted(selected, key=lambda run: run["created_at"], reverse=True)[
@@ -509,10 +629,36 @@ def select_runs(runs, args, window=None):
     return selected
 
 
+def selection_coverage_warning(args, windows, runs):
+    """Return a warning string when fetched data cannot cover the windows.
+
+    Only meaningful for fresh fetches: snapshots hold what was cached when
+    they were written, so their coverage cannot be repaired by refetching.
+    """
+    if args.input:
+        return None
+    if not windows:
+        return None
+    start = min(window[0] for window in windows)
+    end = max(window[1] for window in windows) + datetime.timedelta(days=1)
+    inside = [
+        run for run in runs if start <= run["created_at"] < end
+    ]
+    if inside:
+        return None
+    span = f"{start.date()}..{end.date()}"
+    return (
+        f"no fetched run falls inside the requested window(s) {span}; "
+        "the local snapshot is older than them -- rerun without --input (and "
+        "check --limit) so the windows can be fetched, then repeat this command"
+    )
+
+
 def command_runs(args):
-    runs = load_run_summaries(args)
     window = parse_window(args.window) if args.window else None
+    runs = load_run_summaries(args, window)
     selected = select_runs(runs, args, window)
+    warning = selection_coverage_warning(args, [window] if window else [], selected)
     if args.json:
         print(
             json.dumps(
@@ -523,13 +669,17 @@ def command_runs(args):
         )
     else:
         print(render_runs_markdown(selected))
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
     return 0
 
 
 def command_compare(args):
-    runs = load_run_summaries(args)
-    baseline = select_runs(runs, args, parse_window(args.baseline))
-    current = select_runs(runs, args, parse_window(args.current))
+    baseline_window = parse_window(args.baseline)
+    current_window = parse_window(args.current)
+    runs = load_run_summaries(args, min_start_max_end_window(baseline_window, current_window))
+    baseline = select_runs(runs, args, baseline_window)
+    current = select_runs(runs, args, current_window)
     baseline_summary = window_summary(baseline)
     current_summary = window_summary(current)
     if not baseline_summary["runs"] or not current_summary["runs"]:
@@ -550,6 +700,11 @@ def command_compare(args):
             )
         )
         return 0
+    warning = selection_coverage_warning(
+        args, [baseline_window, current_window], baseline + current
+    )
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
     print(render_compare_markdown(baseline_summary, current_summary, rows))
     if args.runs:
         print("")
@@ -571,16 +726,63 @@ def json_default(value):
     raise TypeError(f"cannot serialize {type(value).__name__}")
 
 
+def select_junit_job(document, label=None, requested=None):
+    """Pick the job whose test step pairs with the given JUnit artifact.
+
+    Preference order: the explicitly requested job name, then a job whose
+    name equals the artifact label, then the first job (alphabetically) that
+    has a test-step duration. Raises when nothing matches.
+    """
+    step_durations = junit_step_seconds(document)
+    walls = job_seconds(document)
+    candidates = [
+        (name, walls.get(name), step_durations[name])
+        for name in sorted(step_durations)
+        if step_durations[name] is not None
+    ]
+    if not candidates:
+        raise ValueError("no job in this run has a test-execution step")
+    if requested is not None:
+        for name, wall, step in candidates:
+            if name == requested:
+                return name, wall, step
+        available = ", ".join(name for name, _, _ in candidates)
+        raise ValueError(
+            f"job {requested!r} not found or has no test step; available: {available}"
+        )
+    if label is not None:
+        for name, wall, step in candidates:
+            if name == label:
+                return name, wall, step
+    name, wall, step = candidates[0]
+    return name, wall, step
+
+
 def command_junit(args):
     paths = [Path(path) for path in args.paths]
     missing = [str(path) for path in paths if not path.exists()]
     if missing:
         raise ValueError(f"missing JUnit file(s): {', '.join(missing)}")
     summary = parse_junit(paths, top=args.top)
+    job_wall = args.job_seconds
+    step_seconds = None
+    matched_job = None
+    if args.run:
+        if job_wall is not None:
+            raise ValueError("pass either --run or --job-seconds, not both")
+        document = gh_json(["run", "view", str(args.run), "--json", VIEW_FIELDS])
+        matched_job, job_wall, step_seconds = select_junit_job(
+            document, label=args.label, requested=args.job
+        )
     if args.json:
         print(json.dumps(summary, indent=1))
     else:
-        print(render_junit_markdown(summary, args.label, job_seconds=args.job_seconds))
+        print(
+            render_junit_markdown(
+                summary, args.label, job_seconds=job_wall,
+                step_seconds=step_seconds, job_name=matched_job,
+            )
+        )
     return 0
 
 
@@ -648,6 +850,18 @@ def build_parser():
         type=float,
         default=None,
         help="CI job wall clock, to separate test execution from compile/setup",
+    )
+    junit.add_argument(
+        "--run",
+        type=int,
+        default=None,
+        help="GitHub Actions run id: take job wall clock and the test-step "
+        "elapsed time from its metadata instead of --job-seconds",
+    )
+    junit.add_argument(
+        "--job",
+        help="with --run: name of the CI job to pair the artifact with "
+        "(default: label match, then the first job with a test step)",
     )
     junit.add_argument("--json", action="store_true", help="emit JSON output")
     junit.set_defaults(handler=command_junit)

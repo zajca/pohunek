@@ -32,8 +32,11 @@ command = [
 need_stdout = true
 analyzer = "nextest"
 
-# The CI lint gate itself: workspace, all targets, all features. Warnings are
-# errors in CI through RUSTFLAGS; locally bacon displays them as they appear.
+# The CI lint gate itself: workspace, all targets, all features. `-D warnings`
+# matches the CI RUSTFLAGS so a locally green run cannot fail in CI.
 [jobs.clippy-fast]
-command = ["cargo", "clippy", "--workspace", "--all-targets", "--all-features"]
+command = [
+    "cargo", "clippy", "--workspace", "--all-targets", "--all-features",
+    "--", "-D", "warnings",
+]
 need_stdout = false

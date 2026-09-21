@@ -85,7 +85,7 @@ CI already uploads per-shard JUnit artifacts; nothing aggregates them, so
 
 ```bash
 gh run download 35534741514 -n nextest-junit-unit -D /tmp/junit-unit
-scripts/ci-timings junit --label "tests (unit, fast)" --job-seconds 300 \
+scripts/ci-timings junit --label "tests (unit, fast)" --run 35534741514 \
     /tmp/junit-unit/junit.xml
 ```
 
@@ -98,11 +98,51 @@ scripts/ci-timings junit --label "tests (unit, fast)" --job-seconds 300 \
 | tests (relay DB, PostgreSQL) | 133 | 0 | 4m05s | 6m28s | 63 % |
 | tests (heavy, PTY + Hermes) | 685 | 0 | 4m02s | 5m56s | 68 % |
 
-This is the report's core structural finding: the four fast shards are now
-**compile-dominated** (test execution ≤ 16 % of job wall time), so further
-fast-shard wins require build-time work (sccache/mold, shard packaging),
-not test pruning. The PostgreSQL and heavy shards are the only genuinely
-test-time-dominated jobs.
+This was the report's original structural claim: the four fast shards are
+**compile-dominated**, so further fast-shard wins require build-time work
+(sccache/mold, shard packaging), not test pruning. The PostgreSQL and heavy
+shards were called the only genuinely test-time-dominated jobs — the
+methodology note below re-measures that claim with step timestamps and
+sharps it (the fast shards are even more compile-dominated than stated; the
+heavy job is not test-dominated after all).
+
+**Methodology note (added after review):** the "Test share" column above was
+computed as JUnit Σ test time ÷ job wall time. That ratio is methodologically
+wrong — nextest runs test cases in parallel, so the *sum* of testcase times
+is neither a wall-clock share nor decomposable against the job clock. The
+corrected measure is the **elapsed time of the CI test step itself**
+(`scripts/ci-timings junit --run <id>`, step start/end timestamps). Measured
+on this same run:
+
+| Job | JUnit Σ test time | Test step elapsed | Job wall |
+| --- | --- | --- | --- |
+| tests (unit, fast) | 13s | 4m18s | 5m00s |
+| tests (cli, fast) | 7s | 4m27s | 5m06s |
+| tests (daemon, fast) | 32s | 4m41s | 5m18s |
+| tests (relay, fast) | 46s | 4m24s | 4m58s |
+| tests (relay DB, PostgreSQL) | 4m05s | 5m33s | 6m28s |
+| tests (heavy, PTY + Hermes) | 4m02s | 1m14s | 5m56s |
+
+Reading it honestly:
+
+- The fast-shard "Run fast shard" step wraps `cargo nextest run`, so it
+  includes compilation. Test wall time is bounded above by the JUnit Σ
+  (parallelism can only shrink it), i.e. **≤ 7–46 s inside 4.2–4.7-minute
+  steps**: the fast shards are compile-dominated by a wide margin — a
+  *stronger* version of the original claim, now proven instead of estimated.
+- **Heavy flips:** its test step is only 1m14s of a 5m56s job wall (Σ 4m02s
+  across bounded 4-way concurrency), so the heavy job is dominated by setup
+  and compilation too, not test execution; the tests themselves are heavily
+  parallel, not long.
+- **Relay DB stays indeterminate:** Σ 4m05s inside a 5m33s step bounds test
+  wall time between Σ/4 ≈ 1m01s and 4m05s, so it may or may not be
+  test-dominated; PostgreSQL-bound tests are the plausible slow tail either
+  way.
+
+The workflow-level verdict (−34 % median) is unaffected; the structural
+conclusion sharpens to: *every shard's job wall is setup/compile-dominated;
+only relay-db has a plausibly test-dominated step, and proving that needs
+per-test wall decomposition.*
 
 ## Cache evidence (same run, step-level timing via the GitHub API)
 
@@ -129,8 +169,9 @@ sccache hit ratios as opportunistic.
 **Target met at the workflow level: −34 % median (target −30–65 %), with the
 old critical-path job (9m39s monolithic build+test) eliminated.** The
 improvement sits inside the target band but at its shallow end; the deep end
-of the band would require attacking shared compile time (the four fast
-shards each pay 4–5 minutes of compilation for minutes of tests).
+of the band would require attacking shared compile time (every shard's job
+wall is setup/compile-dominated; the fast shards' test steps add up to
+seconds of test work inside 4–5 minutes of compilation).
 
 ## Limitations
 
@@ -142,9 +183,11 @@ shards each pay 4–5 minutes of compilation for minutes of tests).
    run data only), but the two-minute/90 %-of-changes CI target is *not*
    re-verified here; retaining per-shard JUnit evidence in CI remains a
    separate concern.
-3. **JUnit Σ test time excludes compilation** by definition; the
-   "test share" column divides it by job wall time, so it under-measures
-   work hidden inside the compile phase.
+3. **JUnit Σ test time excludes compilation** by definition; and because
+   nextest runs cases in parallel, that sum is *not* a wall-clock share of
+   the job — the correct test-share measure is the CI test step's elapsed
+   time (`scripts/ci-timings junit --run <id>`), see the methodology note
+   in the JUnit section.
 4. **Cache statistics are log-derived**, not first-class: sccache JSON lives
    in a post-step, and `gh run view --log` needs admin rights on this
    repository, so hit-ratio capture is opportunistic (the parsing itself is

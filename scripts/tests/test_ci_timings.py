@@ -103,6 +103,35 @@ class RunTimingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no timestamps"):
             ci_timings.summarize_run({"databaseId": 7})
 
+    def test_summarize_run_wall_clock_uses_started_at(self):
+        # A rerun keeps createdAt at the original attempt; wall clock must
+        # measure the actual execution from startedAt, not the gap between
+        # attempts.
+        summary = _summary(
+            createdAt="2026-09-20T09:00:00Z",
+            startedAt="2026-09-20T10:00:00Z",
+            updatedAt="2026-09-20T10:09:30Z",
+        )
+        self.assertEqual(summary["wall_seconds"], 570.0)
+        self.assertEqual(summary["created_at"], ci_timings.parse_timestamp(
+            "2026-09-20T10:00:00Z"
+        ))
+        self.assertEqual(summary["attempt"], 1)
+
+    def test_filter_runs_default_keeps_only_first_attempts(self):
+        first = _summary(databaseId=20, startedAt="2026-09-20T10:00:00Z")
+        rerun = _summary(
+            databaseId=20,
+            startedAt="2026-09-20T15:00:00Z",
+            attempt=2,
+            conclusion="success",
+        )
+        other = _summary(databaseId=21, startedAt="2026-09-20T16:00:00Z")
+        selected = ci_timings.filter_runs([rerun, other, first])
+        self.assertEqual([run["id"] for run in selected], [20, 21])
+        everything = ci_timings.filter_runs([rerun, other, first], attempts="all")
+        self.assertEqual([run["id"] for run in everything], [20, 20, 21])
+
     def test_filter_runs_window_is_inclusive_and_sorted(self):
         older = _summary(databaseId=2, createdAt="2026-09-14T09:00:00Z")
         newer = _summary(databaseId=3, createdAt="2026-09-21T00:00:00Z")
@@ -176,6 +205,34 @@ class RunTimingTests(unittest.TestCase):
         self.assertIsNone(unit["after"])
         self.assertIsNone(unit["percent"])
 
+    def test_compare_windows_includes_current_only_jobs(self):
+        baseline = ci_timings.window_summary([_summary()])
+        current = ci_timings.window_summary(
+            [
+                _summary(
+                    databaseId=13,
+                    jobs=[
+                        {
+                            "name": "tests (new-shard, fast)",
+                            "startedAt": "2026-09-20T10:00:05Z",
+                            "completedAt": "2026-09-20T10:02:05Z",
+                            "conclusion": "success",
+                        }
+                    ],
+                )
+            ]
+        )
+        rows = ci_timings.compare_windows(baseline, current)
+        added = next(row for row in rows if row["job"] == "tests (new-shard, fast)")
+        self.assertIsNone(added["before"])
+        self.assertEqual(added["after"], 120.0)
+        self.assertEqual(added["after_runs"], 1)
+        self.assertIsNone(added["delta"])
+        self.assertIsNone(added["percent"])
+        # Rendered output shows the new job with `n/a` on the baseline side.
+        rendered = ci_timings.render_compare_markdown(baseline, current, rows)
+        self.assertIn("| tests (new-shard, fast) | n/a | 2m00s | n/a | n/a | 0/1 |", rendered)
+
     def test_render_compare_markdown_includes_workflow_row(self):
         baseline = ci_timings.window_summary([_summary()])
         current = ci_timings.window_summary([_summary(databaseId=13)])
@@ -208,20 +265,94 @@ class JunitTests(unittest.TestCase):
         self.assertEqual(ci_timings.percentile([5.0], 0.95), 5.0)
         self.assertEqual(ci_timings.percentile([1.0, 2.0, 3.0, 4.0], 0.5), 2.0)
 
+    def test_percentile_nearest_rank_ceil_boundary(self):
+        # Nearest rank: p95 of 11 values is the 11th value (ceil(0.95*11)=11),
+        # not the 10th, which the previous round()-based index returned.
+        values = [float(value) for value in range(1, 12)]
+        self.assertEqual(ci_timings.percentile(values, 0.95), 11.0)
+        self.assertEqual(ci_timings.percentile([1.0, 2.0], 0.5), 1.0)
+
     def test_render_junit_markdown_separates_compile_time(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "junit.xml"
             path.write_text(JUNIT)
             summary = ci_timings.parse_junit([path])
         rendered = ci_timings.render_junit_markdown(
-            summary, "tests (unit, fast)", job_seconds=226.0
+            summary, "tests (unit, fast)", job_seconds=300.0,
+            step_seconds=258.0,
         )
         self.assertIn("tests (unit, fast): 3 test(s)", rendered)
-        self.assertIn("test execution is 6 % of it", rendered)
+        self.assertIn("Test step elapsed 4m18s (86 % of the job wall clock)", rendered)
+        self.assertIn("their summed time is not a wall-clock share", rendered)
         self.assertIn("| cli::parse | 1 | 11.0 |", rendered)
+
+    def test_render_junit_markdown_handles_empty_artifact(self):
+        # A valid JUnit artifact without test cases yields p50/p95 of None;
+        # the renderer must print `n/a` instead of raising TypeError.
+        rendered = ci_timings.render_junit_markdown(
+            {"suites": [], "cases": 0, "failures": 0, "errors": 0, "skipped": 0,
+             "seconds": 0.0, "p50": None, "p95": None, "slowest": []},
+            "tests (empty)",
+        )
+        self.assertIn("tests (empty): 0 test(s)", rendered)
+        self.assertIn("p50 n/a, p95 n/a", rendered)
+
+    def test_select_junit_job_prefers_label_then_explicit(self):
+        document = {
+            "jobs": [
+                {"name": "doctests + release build", "steps": [
+                    {"name": "Documentation tests",
+                     "startedAt": "2026-09-20T10:00:00Z",
+                     "completedAt": "2026-09-20T10:02:00Z"},
+                ]},
+                {"name": "tests (unit, fast)", "steps": [
+                    {"name": "Run fast shard",
+                     "startedAt": "2026-09-20T10:00:00Z",
+                     "completedAt": "2026-09-20T10:04:18Z"},
+                ]},
+            ]
+        }
+        name, wall, step = ci_timings.select_junit_job(
+            document, label="tests (unit, fast)"
+        )
+        self.assertEqual((name, step), ("tests (unit, fast)", 258.0))
+        self.assertIsNone(wall)  # job wall needs job start/end; absent → None
+        name, _, _ = ci_timings.select_junit_job(
+            document, label="tests (unit, fast)", requested="doctests + release build"
+        )
+        self.assertEqual(name, "doctests + release build")
+        with self.assertRaisesRegex(ValueError, "not found"):
+            ci_timings.select_junit_job(document, requested="nope")
 
 
 class CacheTests(unittest.TestCase):
+    def test_junit_step_seconds_matches_exact_step_names(self):
+        # Only the test-execution step counts; a step whose name merely
+        # contains "nextest" (e.g. "Install cargo-nextest") must not match.
+        document = {
+            "jobs": [
+                {
+                    "name": "tests (unit, fast)",
+                    "steps": [
+                        {
+                            "name": "Install cargo-nextest",
+                            "startedAt": "2026-09-20T10:00:00Z",
+                            "completedAt": "2026-09-20T10:00:10Z",
+                        },
+                        {
+                            "name": "Run fast shard",
+                            "startedAt": "2026-09-20T10:01:00Z",
+                            "completedAt": "2026-09-20T10:05:18Z",
+                        },
+                    ],
+                },
+                {"name": "docs check", "steps": []},
+            ]
+        }
+        durations = ci_timings.junit_step_seconds(document)
+        self.assertIsNone(durations["docs check"])
+        self.assertEqual(durations["tests (unit, fast)"], 4.0 * 60 + 18)
+
     def test_parse_cache_log_extracts_sccache_json(self):
         records = {record["job"]: record for record in ci_timings.parse_cache_log(CACHE_LOG)}
         release = records["doctests + release build"]
