@@ -148,7 +148,11 @@ realDaemonTest(
     const prerequisites = await pluginPrerequisites();
     await withTimeout(
       withPluginDaemon(prerequisites, async (daemon) => {
-        await runHermesPluginScenario(daemon);
+        try {
+          await runHermesPluginScenario(daemon);
+        } catch (error: unknown) {
+          throw addDaemonContext(error, daemon);
+        }
       }),
       PLUGIN_E2E_TIMEOUT_MS,
       `Hermes plugin real-daemon e2e did not finish within ${PLUGIN_E2E_TIMEOUT_MS}ms`,
