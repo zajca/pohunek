@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
-// Rust guideline compliant 2026-09-20
+// Rust guideline compliant 2026-09-21
 
 /// Permission and special-mode bits reported by `stat`.
 const MODE_MASK: u32 = 0o7777;
@@ -179,7 +179,7 @@ pub enum FsError {
         expected: u32,
     },
     /// A macOS extended ACL could grant access beyond the private mode bits.
-    #[error("trusted entry has a non-empty extended ACL: {path}", path = .path.display())]
+    #[error("trusted entry has an unsafe extended ACL: {path}", path = .path.display())]
     UnsafeAcl {
         /// The rejected entry.
         path: PathBuf,
@@ -2415,13 +2415,25 @@ fn validate_private_acl(file: &File, path: &Path) -> FsResult<()> {
 
     let acl = calcifer_macos_acl::read_acl(file.as_fd())
         .map_err(|source| io_error("inspect trusted entry ACL", path, source))?;
-    if acl.is_empty() {
+    if acl_is_deny_only(&acl) {
         Ok(())
     } else {
         Err(FsError::UnsafeAcl {
             path: path.to_path_buf(),
         })
     }
+}
+
+#[cfg(target_os = "macos")]
+fn acl_is_deny_only(acl: &calcifer_macos_acl::Acl) -> bool {
+    // macOS commonly puts `everyone deny delete` on home directories. A
+    // deny-only ACL cannot grant access beyond the mode bits, unlike allow or
+    // unknown entries, which remain rejected fail-closed.
+    acl.flags == 0
+        && acl
+            .entries
+            .iter()
+            .all(|entry| entry.tag == calcifer_macos_acl::TAG_DENY)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2716,6 +2728,8 @@ mod tests {
     const WRITABLE_ACL: &str =
         "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity";
     #[cfg(target_os = "macos")]
+    const DENY_ONLY_ACL: &str = "everyone deny delete";
+    #[cfg(target_os = "macos")]
     const WRITABLE_INHERITABLE_ACL: &str =
         "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit";
 
@@ -2970,6 +2984,87 @@ mod tests {
             TrustedDir::open_absolute_owner_safe(&child, 0o022),
             Err(FsError::UnsafeAcl { .. })
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn deny_only_macos_acl_on_an_ancestor_is_accepted() {
+        let temporary = tempfile::tempdir_in("/private/tmp").expect("create macOS fixture root");
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("set fixture root mode");
+        let ancestor = temporary.path().join("ancestor");
+        let leaf = ancestor.join("leaf");
+        fs::create_dir(&ancestor).expect("create ACL-bearing ancestor");
+        fs::create_dir(&leaf).expect("create leaf");
+        for path in [&ancestor, &leaf] {
+            fs::set_permissions(path, fs::Permissions::from_mode(DIRECTORY_MODE))
+                .expect("set private mode bits");
+        }
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", DENY_ONLY_ACL])
+            .arg(&ancestor)
+            .status()
+            .expect("run native ACL fixture command");
+        assert!(status.success(), "native ACL fixture command must succeed");
+
+        TrustedDir::open_absolute(&leaf, DIRECTORY_MODE)
+            .expect("deny-only ancestor ACL must be accepted");
+        TrustedDir::open_absolute_owner_safe(&leaf, 0o022)
+            .expect("deny-only owner-safe ancestor ACL must be accepted");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn deny_only_macos_acl_on_a_final_directory_is_accepted() {
+        let temporary = tempfile::tempdir_in("/private/tmp").expect("create macOS fixture root");
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("set fixture root mode");
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", DENY_ONLY_ACL])
+            .arg(temporary.path())
+            .status()
+            .expect("run native ACL fixture command");
+        assert!(status.success(), "native ACL fixture command must succeed");
+
+        TrustedDir::open_absolute(temporary.path(), DIRECTORY_MODE)
+            .expect("deny-only final ACL must be accepted");
+        TrustedDir::open_absolute_owner_safe(temporary.path(), 0o022)
+            .expect("deny-only owner-safe final ACL must be accepted");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_acl_policy_accepts_only_deny_entries_without_acl_flags() {
+        use calcifer_macos_acl::{Acl, Entry, TAG_ALLOW, TAG_DENY};
+
+        let deny = Entry {
+            tag: TAG_DENY,
+            flags: 0,
+            permissions: 0,
+        };
+        assert!(acl_is_deny_only(&Acl::default()));
+        assert!(acl_is_deny_only(&Acl {
+            flags: 0,
+            entries: vec![deny],
+        }));
+        assert!(!acl_is_deny_only(&Acl {
+            flags: 0,
+            entries: vec![Entry {
+                tag: TAG_ALLOW,
+                ..deny
+            }],
+        }));
+        assert!(!acl_is_deny_only(&Acl {
+            flags: 0,
+            entries: vec![Entry {
+                tag: u32::MAX,
+                ..deny
+            }],
+        }));
+        assert!(!acl_is_deny_only(&Acl {
+            flags: 1,
+            entries: vec![deny],
+        }));
     }
 
     #[cfg(target_os = "macos")]
