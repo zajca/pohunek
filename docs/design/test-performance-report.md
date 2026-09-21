@@ -56,9 +56,9 @@ Jobs only in the current matrix (fast shards + release build; 13/13 runs each):
 | tests (cli, fast) | 3m52s |
 | tests (unit, fast) | 4m07s |
 | fmt + clippy | 1m18s |
-| build bins | 1m41s |
+| build bins (pohunekd + pohunek-sessiond + pohunek) | 1m41s |
 | TS binding drift (xs check) | 2m07s |
-| docs check | 32s |
+| docs check (schema + drift + source-map + runbooks + secrets + release) | 32s |
 
 Jobs present in both windows (p50, before → after):
 
@@ -91,60 +91,42 @@ scripts/ci-timings junit --label "tests (unit, fast)" --run 35534741514 \
     /tmp/junit-unit/junit.xml
 ```
 
-| Shard | Cases | Failures | Σ test time | Job wall | Test share |
+| Shard | Cases | Failures | Σ test time | Test step elapsed | Job wall |
 | --- | --- | --- | --- | --- | --- |
-| tests (unit, fast) | 867 | 0 | 13s | 5m00s | 4 % |
-| tests (cli, fast) | 445 | 0 | 7s | 5m06s | 2 % |
-| tests (daemon, fast) | 673 | 0 | 32s | 5m18s | 10 % |
-| tests (relay, fast) | 126 | 0 | 46s | 4m58s | 16 % |
-| tests (relay DB, PostgreSQL) | 133 | 0 | 4m05s | 6m28s | 63 % |
-| tests (heavy, PTY + Hermes) | 685 | 0 | 4m02s | 5m56s | 68 % |
+| tests (unit, fast) | 867 | 0 | 13s | 4m18s | 5m00s |
+| tests (cli, fast) | 445 | 0 | 7s | 4m27s | 5m06s |
+| tests (daemon, fast) | 673 | 0 | 32s | 4m41s | 5m18s |
+| tests (relay, fast) | 126 | 0 | 46s | 4m24s | 4m58s |
+| tests (relay DB, PostgreSQL) | 133 | 0 | 4m05s | 5m33s | 6m28s |
+| tests (heavy, PTY + Hermes) | 685 | 0 | 4m02s | 1m14s | 5m56s |
 
-This was the report's original structural claim: the four fast shards are
-**compile-dominated**, so further fast-shard wins require build-time work
-(sccache/mold, shard packaging), not test pruning. The PostgreSQL and heavy
-shards were called the only genuinely test-time-dominated jobs — the
-methodology note below re-measures that claim with step timestamps and
-sharps it (the fast shards are even more compile-dominated than stated; the
-heavy job is not test-dominated after all).
+**Σ test time is not a share of the job wall.** nextest runs test cases in
+parallel, so the sum of testcase times is neither a wall-clock quantity nor
+decomposable against the job clock — dividing it by the job wall can even
+exceed 100 %. The comparable measure is the **elapsed time of the CI test
+step itself**, from the step's own start/end timestamps
+(`scripts/ci-timings junit --run <id>`), which is the "Test step elapsed"
+column. Σ test time stays in the table because it bounds test wall time from
+above: parallelism can only shrink it.
 
-**Methodology note (added after review):** the "Test share" column above was
-computed as JUnit Σ test time ÷ job wall time. That ratio is methodologically
-wrong — nextest runs test cases in parallel, so the *sum* of testcase times
-is neither a wall-clock share nor decomposable against the job clock. The
-corrected measure is the **elapsed time of the CI test step itself**
-(`scripts/ci-timings junit --run <id>`, step start/end timestamps). Measured
-on this same run:
+Reading the two columns together:
 
-| Job | JUnit Σ test time | Test step elapsed | Job wall |
-| --- | --- | --- | --- |
-| tests (unit, fast) | 13s | 4m18s | 5m00s |
-| tests (cli, fast) | 7s | 4m27s | 5m06s |
-| tests (daemon, fast) | 32s | 4m41s | 5m18s |
-| tests (relay, fast) | 46s | 4m24s | 4m58s |
-| tests (relay DB, PostgreSQL) | 4m05s | 5m33s | 6m28s |
-| tests (heavy, PTY + Hermes) | 4m02s | 1m14s | 5m56s |
+- **The four fast shards are compile-dominated by a wide margin.** Their
+  "Run fast shard" step wraps `cargo nextest run`, so it includes
+  compilation, and test wall time is at most the Σ — 7–46 s inside
+  4.3–4.7-minute steps. Further fast-shard wins require build-time work
+  (sccache/mold, shard packaging), not test pruning.
+- **Heavy is not test-dominated either.** Its test step is 1m14s of a 5m56s
+  job wall (Σ 4m02s across bounded 4-way concurrency), so setup and
+  compilation dominate; the tests themselves are heavily parallel, not long.
+- **Relay DB is indeterminate.** Σ 4m05s inside a 5m33s step bounds test wall
+  time between Σ/4 ≈ 1m01s and 4m05s, so it may or may not be test-dominated;
+  PostgreSQL-bound tests are the plausible slow tail either way.
 
-Reading it honestly:
-
-- The fast-shard "Run fast shard" step wraps `cargo nextest run`, so it
-  includes compilation. Test wall time is bounded above by the JUnit Σ
-  (parallelism can only shrink it), i.e. **≤ 7–46 s inside 4.2–4.7-minute
-  steps**: the fast shards are compile-dominated by a wide margin — a
-  *stronger* version of the original claim, now proven instead of estimated.
-- **Heavy flips:** its test step is only 1m14s of a 5m56s job wall (Σ 4m02s
-  across bounded 4-way concurrency), so the heavy job is dominated by setup
-  and compilation too, not test execution; the tests themselves are heavily
-  parallel, not long.
-- **Relay DB stays indeterminate:** Σ 4m05s inside a 5m33s step bounds test
-  wall time between Σ/4 ≈ 1m01s and 4m05s, so it may or may not be
-  test-dominated; PostgreSQL-bound tests are the plausible slow tail either
-  way.
-
-The workflow-level verdict (−34 % median) is unaffected; the structural
-conclusion sharpens to: *every shard's job wall is setup/compile-dominated;
-only relay-db has a plausibly test-dominated step, and proving that needs
-per-test wall decomposition.*
+Structurally: *every shard's job wall is setup/compile-dominated; only
+relay-db has a plausibly test-dominated step, and proving that needs per-test
+wall decomposition.* This does not affect the workflow-level verdict
+(−34 % median).
 
 ## Cache evidence (same run, step-level timing via the GitHub API)
 
@@ -153,11 +135,11 @@ scripts/ci-timings cache --run 35534741514
 ```
 
 - `doctests + release build`: rust-cache **hit** (the "Cache restored
-  successfully" line from the step named "Cache cargo build", i.e.
-  `Swatinem/rust-cache` — detections were re-scoped to that step name after
-  finding that `actions/cache` steps like "Cache Bun packages" and "Cache
-  Playwright browsers" print the same marker); steps: Documentation tests
-  2m14s + Release build 4m34s.
+  successfully" line from a `Swatinem/rust-cache` step — the parser accepts
+  only that action's steps, by the workflow's "Cache cargo build" name or by
+  the action reference an unnamed step logs under, because `actions/cache`
+  steps such as "Cache Bun packages" and "Cache Playwright browsers" print
+  the same marker); steps: Documentation tests 2m14s + Release build 4m34s.
   The sccache post-step prints the full JSON stats blob; on this run the
   job completed before the post step, so exact hit/miss counts were not
   captured here — the `cache` subcommand extracts
@@ -165,6 +147,10 @@ scripts/ci-timings cache --run 35534741514
   the blob is present (tested shape: 1248 requests / 1207 hits / 41 misses /
   0 errors ≈ 97 % of lookups; backend errors dilute the ratio by design).
 - Fast shards and heavy: rust-cache **hit** on all inspected jobs.
+- A restore that starts and then fails ("Failed to restore") is reported as
+  `error`, not `miss`: it says the cache backend or the extraction broke, not
+  that the entry was absent, and folding it into `miss` would understate how
+  effective the cache is.
 
 Log-derived cache statistics are best-effort: the sccache JSON only appears
 in the post-step log, and run-log download requires repository admin, so the
@@ -199,8 +185,8 @@ seconds of test work inside 4–5 minutes of compilation).
    in a post-step, and `gh run view --log` needs admin rights on this
    repository, so hit-ratio capture is opportunistic (the parsing itself is
    unit-tested against recorded shapes). The parser attributes outcomes only
-   to their responsible steps — rust-cache markers to the `Cache cargo
-   build` step, the sccache JSON to the `Post Enable sccache` post-step — so
+   to their responsible steps — rust-cache markers to `Swatinem/rust-cache`
+   steps, the sccache JSON to the `Post Enable sccache` post-step — so
    `actions/cache` steps (Bun packages, Playwright browsers) are never
    misreported as rust-cache.
 5. **Runner queueing tails the p90**: the current p90 (11m39s, PR-only) comes

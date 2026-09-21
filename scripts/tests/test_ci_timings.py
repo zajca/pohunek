@@ -89,6 +89,15 @@ def _summary(**overrides):
     return ci_timings.summarize_run(dict(RUN, **overrides))
 
 
+def _selection(**overrides):
+    """Selection args carrying every field the diagnosis reads."""
+    defaults = {
+        "input": None, "conclusion": None, "event": None, "branch": None,
+        "attempts": "first",
+    }
+    return argparse.Namespace(**{**defaults, **overrides})
+
+
 class RunTimingTests(unittest.TestCase):
     def test_format_seconds_scales(self):
         self.assertEqual(ci_timings.format_seconds(9.4), "9s")
@@ -100,23 +109,79 @@ class RunTimingTests(unittest.TestCase):
         self.assertEqual(seconds["fmt + clippy"], 199.0)
         self.assertNotIn("cargo-udeps (unused dependencies)", seconds)
 
-    def test_job_seconds_skips_skipped_and_zero_time_jobs(self):
-        # Conditionally skipped jobs must not count as 0 s runs: `gh`
-        # serializes their missing timestamps as null or the Go zero time,
-        # which would drag medians down while inflating run counts.
-        zero = {
+    def test_job_seconds_skips_skipped_jobs_with_real_timestamps(self):
+        # A conditionally skipped job can still carry usable timestamps, so
+        # the conclusion is what disqualifies it -- counting it would add a
+        # run that never ran.
+        skipped = {
             "name": "tests (relay DB, PostgreSQL)",
-            "startedAt": "0001-01-01T00:00:00Z",
-            "completedAt": "0001-01-01T00:00:00Z",
+            "startedAt": "2026-09-20T10:00:00Z",
+            "completedAt": "2026-09-20T10:04:00Z",
             "conclusion": "skipped",
         }
-        skewed = {
+        self.assertEqual(ci_timings.job_seconds({"jobs": [skipped]}), {})
+
+    def test_job_seconds_skips_a_half_finished_job(self):
+        # A job still running when the run was read has a start but no
+        # completion; `gh` serializes that as null rather than the Go zero
+        # time, and it carries no duration to measure.
+        unfinished = {
+            "name": "tests (heavy, PTY + Hermes)",
+            "startedAt": "2026-09-20T10:00:00Z",
+            "completedAt": None,
+            "conclusion": "success",
+        }
+        self.assertEqual(ci_timings.job_seconds({"jobs": [unfinished]}), {})
+
+    def test_job_seconds_skips_the_go_zero_timestamp(self):
+        # `gh` serializes a missing time as Go's zero `time.Time`, not null.
+        # Paired with a real completion that parses into a ~2000-year
+        # duration, which would dominate every median it entered.
+        zero_start = {
             "name": "TS binding drift (xs check)",
+            "startedAt": "0001-01-01T00:00:00Z",
+            "completedAt": "2026-09-20T10:04:00Z",
+            "conclusion": "success",
+        }
+        self.assertEqual(ci_timings.job_seconds({"jobs": [zero_start]}), {})
+
+    def test_job_seconds_skips_zero_length_jobs(self):
+        instant = {
+            "name": "fmt + clippy",
             "startedAt": "2026-09-20T10:00:00Z",
             "completedAt": "2026-09-20T10:00:00Z",
             "conclusion": "success",
         }
-        self.assertEqual(ci_timings.job_seconds({"jobs": [zero, skewed]}), {})
+        self.assertEqual(ci_timings.job_seconds({"jobs": [instant]}), {})
+
+    def test_runs_in_window_spans_the_whole_last_day(self):
+        # The window is inclusive of its end date, so a run late on that day
+        # belongs to it; the diagnosis and filter_runs must agree on this or
+        # they report different populations for the same request.
+        window = ci_timings.parse_window("2026-09-14..2026-09-16")
+        last_day = _summary(
+            createdAt="2026-09-16T23:59:59Z", startedAt="2026-09-16T23:59:59Z"
+        )
+        next_day = _summary(
+            createdAt="2026-09-17T00:00:00Z", startedAt="2026-09-17T00:00:00Z"
+        )
+        first_day = _summary(
+            createdAt="2026-09-14T00:00:00Z", startedAt="2026-09-14T00:00:00Z"
+        )
+        self.assertEqual(
+            ci_timings.runs_in_window([last_day, next_day, first_day], window),
+            [last_day, first_day],
+        )
+        # The same boundary, through the real selection path.
+        self.assertEqual(
+            [run["created_at"] for run in ci_timings.filter_runs(
+                [last_day], window=window
+            )],
+            [last_day["created_at"]],
+        )
+        self.assertEqual(
+            ci_timings.filter_runs([next_day], window=window), []
+        )
 
     def test_summarize_run_wall_clock(self):
         summary = ci_timings.summarize_run(RUN)
@@ -176,6 +241,25 @@ class RunTimingTests(unittest.TestCase):
         )
         self.assertEqual(
             [(run["id"], run["attempt"]) for run in everything], [(26, 2)]
+        )
+
+    def test_filter_runs_keeps_run_whose_rerun_failed(self):
+        # The scenario a server-side `gh run list --status success` would
+        # lose: `gh run list` reports only attempt 2's failure, so the run
+        # would never be fetched, yet attempt 1 is a genuine success sample.
+        succeeded = _summary(
+            databaseId=27, attempt=1, conclusion="success",
+            startedAt="2026-09-20T10:00:00Z",
+        )
+        rerun = _summary(
+            databaseId=27, attempt=2, conclusion="failure",
+            startedAt="2026-09-20T15:00:00Z",
+        )
+        selected = ci_timings.filter_runs(
+            [succeeded, rerun], conclusion="success"
+        )
+        self.assertEqual(
+            [(run["id"], run["attempt"]) for run in selected], [(27, 1)]
         )
 
     def test_filter_runs_default_keeps_only_first_attempts(self):
@@ -251,14 +335,341 @@ class RunTimingTests(unittest.TestCase):
         self.assertIn("--workflow", arguments)
         self.assertIn("ci.yml", arguments)
 
-    def test_list_arguments_passes_conclusion_as_status(self):
+    def test_list_arguments_keeps_conclusion_client_side(self):
+        # `gh run list` reports the latest attempt's conclusion, so a
+        # server-side --status would drop a run whose first attempt succeeded
+        # and whose rerun failed before an attempt is even selected.
         arguments = ci_timings.list_arguments(
             argparse.Namespace(limit=40, event=None, branch=None,
                                conclusion="success"),
             None,
         )
-        self.assertIn("--status", arguments)
-        self.assertIn("success", arguments)
+        self.assertNotIn("--status", arguments)
+        self.assertNotIn("success", arguments)
+
+    def test_list_arguments_passes_window_and_branch(self):
+        arguments = ci_timings.list_arguments(
+            argparse.Namespace(limit=40, event=None, branch="main",
+                               conclusion=None),
+            ci_timings.parse_window("2026-09-14..2026-09-16"),
+        )
+        self.assertIn("--branch", arguments)
+        self.assertIn("main", arguments)
+        self.assertIn("--created", arguments)
+        self.assertIn("2026-09-14..2026-09-16", arguments)
+
+    def test_wanted_attempts_covers_every_rerun(self):
+        # `all` must reach intermediate attempts that `gh run list` never
+        # exposes; `first` needs attempt 1 plus the latest one it described.
+        self.assertEqual(ci_timings.wanted_attempts(3, "all"), [1, 2, 3])
+        self.assertEqual(ci_timings.wanted_attempts(3, "first"), [1, 3])
+        self.assertEqual(ci_timings.wanted_attempts(1, "all"), [1])
+        self.assertEqual(ci_timings.wanted_attempts(1, "first"), [1])
+        self.assertEqual(ci_timings.wanted_attempts(None, "first"), [1])
+
+    def test_empty_window_diagnosis_names_the_filter_that_excluded_runs(self):
+        # The case that makes guessing unsafe: the window IS covered, so
+        # telling the user to widen the fetch or drop --input would send them
+        # away from the filter actually responsible.
+        window = ci_timings.parse_window("2026-09-14..2026-09-16")
+        covered = _summary(
+            conclusion="failure",
+            createdAt="2026-09-15T10:00:00Z",
+            startedAt="2026-09-15T10:00:00Z",
+        )
+        for source in (None, "snapshot.json"):
+            message = ci_timings.empty_window_diagnosis(
+                _selection(input=source, conclusion="success", event=None, branch=None),
+                [covered],
+                window,
+            ).message
+            self.assertIn("1 run(s) fall inside it", message)
+            self.assertIn("--conclusion success", message)
+            self.assertNotIn("--limit", message)
+            self.assertNotIn("drop --input", message)
+
+    def test_empty_window_diagnosis_names_only_blocking_filters(self):
+        # The fixture run is a successful `pull_request` on `topic`, so only
+        # --conclusion rejects it; naming the matching --event would send the
+        # user after a flag that excluded nothing.
+        window = ci_timings.parse_window("2026-09-14..2026-09-16")
+        covered = _summary(
+            createdAt="2026-09-15T10:00:00Z", startedAt="2026-09-15T10:00:00Z"
+        )
+        message = ci_timings.empty_window_diagnosis(
+            _selection(input=None, conclusion="failure", event="pull_request", branch="topic"),
+            [covered],
+            window,
+        ).message
+        self.assertIn("--conclusion failure", message)
+        self.assertNotIn("--event", message)
+        self.assertNotIn("--branch", message)
+
+    def test_empty_window_diagnosis_lists_every_blocking_filter(self):
+        window = ci_timings.parse_window("2026-09-14..2026-09-16")
+        covered = _summary(
+            createdAt="2026-09-15T10:00:00Z", startedAt="2026-09-15T10:00:00Z"
+        )
+        message = ci_timings.empty_window_diagnosis(
+            _selection(input=None, conclusion="failure", event="push", branch="main"),
+            [covered],
+            window,
+        ).message
+        for expected in ("--conclusion failure", "--event push", "--branch main"):
+            self.assertIn(expected, message)
+
+    def test_empty_window_diagnosis_judges_filters_against_candidates(self):
+        """A sibling attempt must not be blamed for emptying the window.
+
+        `wanted_attempts("first")` always loads attempt 1 beside the latest,
+        and reruns share their run's creation time, so both siblings sit in
+        the window. Only attempt 1 is a candidate under `--attempts first`;
+        counting attempt 2's mismatch would misreport what happened.
+        """
+        window = ci_timings.parse_window("2026-09-14..2026-09-16")
+        def attempt(number, conclusion):
+            return _summary(
+                databaseId=60, attempt=number, conclusion=conclusion,
+                createdAt="2026-09-15T10:00:00Z",
+                startedAt="2026-09-15T10:00:00Z",
+            )
+        loaded = [attempt(1, "failure"), attempt(2, "success")]
+        message = ci_timings.empty_window_diagnosis(
+            _selection(conclusion="success"), loaded, window
+        ).message
+        # One candidate, not two: attempt 2 never reaches the filter stage.
+        self.assertIn("1 run(s) fall inside it", message)
+        self.assertIn("--conclusion success", message)
+        # The narrower fix the user actually wants is named too.
+        self.assertIn("--attempts all", message)
+        self.assertEqual(
+            [(run["id"], run["attempt"]) for run in ci_timings.filter_runs(
+                loaded, window=window, conclusion="success", attempts="all"
+            )],
+            [(60, 2)],
+        )
+
+    def test_empty_window_diagnosis_ignores_a_non_candidate_mismatch(self):
+        # Attempt 2 ran on another branch, but it is not a candidate under
+        # --attempts first, so its --branch mismatch did not empty the
+        # window and naming --branch would send the user after the wrong flag.
+        window = ci_timings.parse_window("2026-09-14..2026-09-16")
+        loaded = [
+            _summary(databaseId=63, attempt=1, conclusion="failure",
+                     headBranch="main", createdAt="2026-09-15T10:00:00Z",
+                     startedAt="2026-09-15T10:00:00Z"),
+            _summary(databaseId=63, attempt=2, conclusion="failure",
+                     headBranch="other", createdAt="2026-09-15T10:00:00Z",
+                     startedAt="2026-09-15T10:00:00Z"),
+        ]
+        message = ci_timings.empty_window_diagnosis(
+            _selection(conclusion="success", branch="main"), loaded, window
+        ).message
+        self.assertIn("--conclusion success", message)
+        self.assertNotIn("--branch", message)
+
+    def test_empty_window_diagnosis_blames_filters_failed_by_any_candidate(self):
+        """Two candidates, each failing a different filter, must name both.
+
+        A filter blocks when it rejects *any* candidate, not only when it
+        rejects every one. With one candidate the two readings agree, so
+        this needs a heterogeneous set: judging "every" here would report no
+        blocking filter at all and fall through to blaming attempt grouping,
+        which has nothing to do with it -- there are no reruns in sight.
+        """
+        window = ci_timings.parse_window("2026-09-14..2026-09-16")
+
+        def run(**overrides):
+            return _summary(
+                createdAt="2026-09-15T10:00:00Z",
+                startedAt="2026-09-15T10:00:00Z",
+                **overrides,
+            )
+
+        loaded = [
+            run(databaseId=80, conclusion="success", event="push"),
+            run(databaseId=81, conclusion="failure", event="pull_request"),
+        ]
+        args = _selection(conclusion="success", event="pull_request")
+        # Neither run passes both filters, so the window is genuinely empty.
+        self.assertEqual(
+            ci_timings.filter_runs(
+                loaded, window=window, conclusion="success",
+                event="pull_request",
+            ),
+            [],
+        )
+        message = ci_timings.empty_window_diagnosis(args, loaded, window).message
+        self.assertIn("--conclusion success", message)
+        self.assertIn("--event pull_request", message)
+        self.assertNotIn("--attempts", message)
+        self.assertIn("2 run(s) fall inside it", message)
+
+    def test_empty_window_diagnosis_omits_rescue_note_without_a_rescuer(self):
+        # Both attempts failed, so --attempts all would not help and must
+        # not be suggested.
+        window = ci_timings.parse_window("2026-09-14..2026-09-16")
+        def attempt(number):
+            return _summary(
+                databaseId=61, attempt=number, conclusion="failure",
+                createdAt="2026-09-15T10:00:00Z",
+                startedAt="2026-09-15T10:00:00Z",
+            )
+        message = ci_timings.empty_window_diagnosis(
+            _selection(conclusion="success"),
+            [attempt(1), attempt(2)],
+            window,
+        ).message
+        self.assertIn("--conclusion success", message)
+        self.assertNotIn("--attempts all", message)
+
+    def test_select_attempts_backs_both_filtering_and_diagnosis(self):
+        # One helper, so the diagnosis can never reason about a candidate set
+        # that differs from the one filter_runs uses.
+        def attempt(number):
+            return _summary(databaseId=62, attempt=number,
+                            startedAt="2026-09-15T10:00:00Z")
+        runs = [attempt(3), attempt(1), attempt(2)]
+        self.assertEqual(
+            [run["attempt"] for run in ci_timings.select_attempts(runs, "first")],
+            [1],
+        )
+        self.assertEqual(
+            sorted(run["attempt"]
+                   for run in ci_timings.select_attempts(runs, "all")),
+            [1, 2, 3],
+        )
+
+    def test_empty_window_diagnosis_rejects_an_impossible_state(self):
+        """Every candidate passing every filter contradicts an empty selection.
+
+        `candidates` is `filter_runs`' own post-window pool, so this state
+        means the two have drifted apart. That is a bug in the tool, not a
+        user error, and must not be dressed up as advice.
+        """
+        window = ci_timings.parse_window("2026-09-14..2026-09-16")
+        covered = _summary(
+            createdAt="2026-09-15T10:00:00Z", startedAt="2026-09-15T10:00:00Z"
+        )
+        # The real pipeline selects this run, so no diagnosis is ever asked for.
+        self.assertTrue(ci_timings.filter_runs([covered], window=window))
+        with self.assertRaisesRegex(RuntimeError, "invariant violated"):
+            ci_timings.empty_window_diagnosis(_selection(), [covered], window)
+
+    def test_empty_window_diagnosis_explains_every_reachable_empty_window(self):
+        """Tie the diagnosis to the pipeline and to the branch it reports.
+
+        Testing the diagnosis in isolation is what let a branch survive on a
+        premise the real pipeline contradicts, so every case asserts that
+        `filter_runs` really is empty before asking for a diagnosis. The
+        branch each case claims is then compared against the tag the
+        function itself returns, so a case cannot look covered while
+        exercising a different branch: a wrong label fails its own case, and
+        the closing set comparison catches a branch no case reaches at all.
+        """
+        window = ci_timings.parse_window("2026-09-14..2026-09-16")
+
+        def run(**overrides):
+            return _summary(
+                createdAt="2026-09-15T10:00:00Z",
+                startedAt="2026-09-15T10:00:00Z",
+                **overrides,
+            )
+
+        outside = _summary(
+            createdAt="2026-09-21T10:00:00Z", startedAt="2026-09-21T10:00:00Z"
+        )
+        cases = {
+            "uncovered, nothing in range": (
+                _selection(), [outside], "no run was fetched for it",
+                "uncovered-fetch",
+            ),
+            "uncovered, nothing loaded at all": (
+                _selection(), [], "no run was fetched for it",
+                "uncovered-fetch",
+            ),
+            "uncovered, snapshot": (
+                _selection(input="snapshot.json"), [outside],
+                "the snapshot given to --input holds no run in it",
+                "uncovered-snapshot",
+            ),
+            "conclusion excludes": (
+                _selection(conclusion="failure"), [run()],
+                "none passed --conclusion failure", "blocking",
+            ),
+            "branch excludes": (
+                _selection(branch="other"), [run()],
+                "none passed --branch other", "blocking",
+            ),
+            "event excludes": (
+                _selection(event="push"), [run()],
+                "none passed --event push", "blocking",
+            ),
+            # Both attempts share createdAt, so both are in the window and
+            # attempt 1 is a candidate: this reaches the blocking branch with
+            # attempt 2 as the rescuable sibling.
+            "rerun blocked with a rescuable sibling": (
+                _selection(conclusion="success"),
+                [run(databaseId=70, attempt=1, conclusion="failure"),
+                 run(databaseId=70, attempt=2, conclusion="success")],
+                "so --attempts all would match", "blocking-with-rescue",
+            ),
+            # A stitched-together snapshot can hold attempts with different
+            # creation times; then --attempts first picks a candidate that
+            # falls outside the window and hides the sibling inside it.
+            "attempt selection misses the window": (
+                _selection(),
+                [_summary(databaseId=71, attempt=1,
+                          createdAt="2026-09-21T10:00:00Z",
+                          startedAt="2026-09-21T10:00:00Z"),
+                 run(databaseId=71, attempt=2)],
+                "kept no attempt of theirs inside it; pass --attempts all "
+                "to count the attempts that do",
+                "no-candidates",
+            ),
+        }
+        reached = set()
+        for label, (args, loaded, expected, branch) in cases.items():
+            with self.subTest(case=label):
+                selected = ci_timings.filter_runs(
+                    loaded, window=window, event=args.event,
+                    conclusion=args.conclusion, branch=args.branch,
+                    attempts=args.attempts,
+                )
+                self.assertEqual(selected, [], "case must be genuinely empty")
+                diagnosis = ci_timings.empty_window_diagnosis(
+                    args, loaded, window
+                )
+                self.assertIn(expected, diagnosis.message)
+                # The tag comes from the function's own control flow, so a
+                # mislabelled case fails here instead of passing quietly.
+                self.assertEqual(diagnosis.branch, branch)
+                reached.add(diagnosis.branch)
+        # Every branch reachable with a non-empty selection is represented;
+        # the invariant branch is unreachable here by construction and has
+        # its own test.
+        self.assertEqual(
+            reached,
+            {"uncovered-fetch", "uncovered-snapshot", "blocking",
+             "blocking-with-rescue", "no-candidates"},
+        )
+
+    def test_selection_coverage_warning_reports_uncovered_windows(self):
+        window = ci_timings.parse_window("2026-09-14..2026-09-16")
+        args = _selection(input=None, conclusion=None, event=None, branch=None)
+        message = ci_timings.selection_coverage_warning(args, window, [], [])
+        self.assertIn("2026-09-14..2026-09-16", message)
+        covered = _summary(
+            createdAt="2026-09-15T10:00:00Z", startedAt="2026-09-15T10:00:00Z"
+        )
+        self.assertIsNone(
+            ci_timings.selection_coverage_warning(
+                args, window, [covered], [covered]
+            )
+        )
+        self.assertIsNone(
+            ci_timings.selection_coverage_warning(args, None, [], [])
+        )
 
     def test_parse_window_rejects_malformed_input(self):
         with self.assertRaisesRegex(ValueError, "START..END"):
@@ -430,6 +841,66 @@ class JunitTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not found"):
             ci_timings.select_junit_job(document, requested="nope")
 
+    def test_select_junit_job_prefers_label_over_ambiguity(self):
+        # Several test-bearing jobs are fine as long as --label names one of
+        # them: --job is only required when nothing matches.
+        document = {
+            "jobs": [
+                {"name": "tests (unit, fast)", "steps": [
+                    {"name": "Run fast shard",
+                     "startedAt": "2026-09-20T10:00:00Z",
+                     "completedAt": "2026-09-20T10:04:18Z"},
+                ]},
+                {"name": "tests (cli, fast)", "steps": [
+                    {"name": "Run fast shard",
+                     "startedAt": "2026-09-20T10:00:00Z",
+                     "completedAt": "2026-09-20T10:03:00Z"},
+                ]},
+            ]
+        }
+        name, _, _ = ci_timings.select_junit_job(
+            document, label="tests (unit, fast)"
+        )
+        self.assertEqual(name, "tests (unit, fast)")
+
+    def test_select_junit_job_refuses_to_guess_between_jobs(self):
+        # The default label is "JUnit", which matches no job: guessing would
+        # pair the artifact with an unrelated shard and report false numbers.
+        document = {
+            "jobs": [
+                {"name": "doctests + release build", "steps": [
+                    {"name": "Documentation tests",
+                     "startedAt": "2026-09-20T10:00:00Z",
+                     "completedAt": "2026-09-20T10:02:00Z"},
+                ]},
+                {"name": "tests (unit, fast)", "steps": [
+                    {"name": "Run fast shard",
+                     "startedAt": "2026-09-20T10:00:00Z",
+                     "completedAt": "2026-09-20T10:04:18Z"},
+                ]},
+            ]
+        }
+        with self.assertRaisesRegex(ValueError, "pass --job"):
+            ci_timings.select_junit_job(document, label="JUnit")
+
+    def test_select_junit_job_auto_selects_single_candidate(self):
+        document = {
+            "jobs": [
+                {"name": "tests (unit, fast)", "steps": [
+                    {"name": "Run fast shard",
+                     "startedAt": "2026-09-20T10:00:00Z",
+                     "completedAt": "2026-09-20T10:04:18Z"},
+                ]},
+                {"name": "fmt + clippy", "steps": [
+                    {"name": "Clippy",
+                     "startedAt": "2026-09-20T10:00:00Z",
+                     "completedAt": "2026-09-20T10:03:00Z"},
+                ]},
+            ]
+        }
+        name, _, step = ci_timings.select_junit_job(document, label="JUnit")
+        self.assertEqual((name, step), ("tests (unit, fast)", 258.0))
+
 
 class CacheTests(unittest.TestCase):
     def test_junit_step_seconds_matches_exact_step_names(self):
@@ -510,6 +981,35 @@ class CacheTests(unittest.TestCase):
             rendered,
         )
 
+    def test_parse_cache_log_separates_restore_errors_from_misses(self):
+        # "Failed to restore" is a backend/extraction failure, not evidence
+        # that the entry was absent: reporting it as a miss would make the
+        # cache look ineffective when it is the restore that broke.
+        log = "\n".join(
+            [
+                "tests (heavy)\tCache cargo build"
+                "\t2026-09-21T05:17:40Z Failed to restore: archive extraction failed",
+                "tests (cli, fast)\tCache cargo build"
+                "\t2026-09-21T05:17:40Z Cache not found for keys: Linux-x64-gnu",
+            ]
+        )
+        records = {record["job"]: record for record in ci_timings.parse_cache_log(log)}
+        self.assertEqual(records["tests (heavy)"]["rust_cache"], "error")
+        self.assertEqual(records["tests (cli, fast)"]["rust_cache"], "miss")
+
+    def test_parse_cache_log_accepts_unnamed_rust_cache_step(self):
+        # A workflow step left unnamed is logged under its action reference;
+        # its hit evidence must not be discarded.
+        log = (
+            "tests (unit, fast)\tRun Swatinem/rust-cache@v2"
+            "\t2026-09-21T05:17:40Z Cache restored successfully"
+        )
+        records = ci_timings.parse_cache_log(log)
+        self.assertEqual(
+            [(record["job"], record["rust_cache"]) for record in records],
+            [("tests (unit, fast)", "hit")],
+        )
+
     def test_parse_cache_log_ignores_unrelated_cache_steps(self):
         # "Cache restored successfully" from an `actions/cache` step (Bun,
         # Playwright) must not fabricate a rust-cache record; nor may an
@@ -527,6 +1027,154 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(ci_timings.parse_cache_log(unrelated), [])
 
 
+class FetchTests(unittest.TestCase):
+    def _fetch(self, listed, attempts, cache_contents=None):
+        """Run `list_documents` against a stubbed `gh`, returning the calls."""
+        calls = []
+
+        def fake_gh_json(arguments):
+            calls.append(arguments)
+            if arguments[1] == "list":
+                return listed
+            run_id = int(arguments[2])
+            attempt = int(arguments[arguments.index("--attempt") + 1])
+            return {
+                "databaseId": run_id,
+                "attempt": attempt,
+                "workflowName": "CI",
+                "conclusion": "success",
+                "createdAt": "2026-09-20T10:00:00Z",
+                "startedAt": "2026-09-20T10:00:00Z",
+                "updatedAt": "2026-09-20T10:09:30Z",
+                "jobs": [],
+            }
+
+        original = ci_timings.gh_json
+        ci_timings.gh_json = fake_gh_json
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                cache = Path(directory) / "ci-runs.json"
+                if cache_contents is not None:
+                    ci_timings.write_snapshot(cache, cache_contents)
+                args = argparse.Namespace(
+                    cache=str(cache), limit=40, event=None, branch=None,
+                    conclusion="success", attempts=attempts,
+                )
+                documents = ci_timings.list_documents(args)
+                stored = ci_timings.read_snapshot(cache) if cache.exists() else []
+            return documents, stored, calls
+        finally:
+            ci_timings.gh_json = original
+
+    def test_fetch_all_attempts_reaches_intermediate_reruns(self):
+        # `gh run list` only ever describes attempt 3; attempt 2 exists only
+        # if it is requested by number.
+        listed = [{"databaseId": 77, "attempt": 3, "conclusion": "failure"}]
+        documents, stored, calls = self._fetch(listed, "all")
+        self.assertEqual(
+            sorted(document["attempt"] for document in documents), [1, 2, 3]
+        )
+        self.assertEqual(len(stored), 3)
+        self.assertEqual(
+            [call[call.index("--attempt") + 1] for call in calls if call[1] == "view"],
+            ["1", "2", "3"],
+        )
+
+    def test_fetch_first_attempt_keeps_the_original_run(self):
+        listed = [{"databaseId": 77, "attempt": 2, "conclusion": "success"}]
+        documents, _, _ = self._fetch(listed, "first")
+        self.assertEqual(
+            sorted(document["attempt"] for document in documents), [1, 2]
+        )
+
+    def test_fetch_skips_attempts_already_cached(self):
+        cached = {
+            "databaseId": 77,
+            "attempt": 1,
+            "workflowName": "CI",
+            "conclusion": "failure",
+            "createdAt": "2026-09-20T10:00:00Z",
+            "startedAt": "2026-09-20T10:00:00Z",
+            "updatedAt": "2026-09-20T10:09:30Z",
+            "jobs": [],
+        }
+        listed = [{"databaseId": 77, "attempt": 2, "conclusion": "success"}]
+        _, stored, calls = self._fetch(listed, "first", cache_contents=[cached])
+        self.assertEqual(len(stored), 2)
+        self.assertEqual(
+            [call[call.index("--attempt") + 1] for call in calls if call[1] == "view"],
+            ["2"],
+        )
+
+    def test_fetch_then_filter_recovers_a_run_whose_rerun_failed(self):
+        """The whole finding-3 pipeline: listing shows only the failed rerun.
+
+        `gh run list` reports attempt 2's `failure`, so a server-side
+        `--status success` would drop the run outright. Fetching both
+        attempts and applying the conclusion locally keeps attempt 1.
+        """
+        conclusions = {1: "success", 2: "failure"}
+        calls = []
+
+        def fake_gh_json(arguments):
+            calls.append(arguments)
+            if arguments[1] == "list":
+                # `gh run list` describes the latest attempt only, and honors
+                # --status against it. Modelling that is what makes this test
+                # fail if --conclusion is ever pushed server-side again.
+                listed = {"databaseId": 27, "attempt": 2, "conclusion": "failure"}
+                if "--status" in arguments:
+                    wanted = arguments[arguments.index("--status") + 1]
+                    if listed["conclusion"] != wanted:
+                        return []
+                return [listed]
+            attempt = int(arguments[arguments.index("--attempt") + 1])
+            return {
+                "databaseId": 27,
+                "attempt": attempt,
+                "workflowName": "CI",
+                "conclusion": conclusions[attempt],
+                "createdAt": "2026-09-20T10:00:00Z",
+                "startedAt": "2026-09-20T10:00:00Z",
+                "updatedAt": "2026-09-20T10:09:30Z",
+                "jobs": [
+                    {
+                        "name": "tests (unit, fast)",
+                        "startedAt": "2026-09-20T10:00:06Z",
+                        "completedAt": "2026-09-20T10:03:52Z",
+                        "conclusion": conclusions[attempt],
+                    },
+                ],
+            }
+
+        original = ci_timings.gh_json
+        ci_timings.gh_json = fake_gh_json
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                args = argparse.Namespace(
+                    input=None, cache=str(Path(directory) / "ci-runs.json"),
+                    limit=40, event=None, branch=None, conclusion="success",
+                    attempts="first",
+                )
+                summaries = ci_timings.load_run_summaries(args)
+                selected = ci_timings.select_runs(summaries, args)
+        finally:
+            ci_timings.gh_json = original
+
+        listing = [call for call in calls if call[1] == "list"][0]
+        self.assertNotIn("--status", listing)
+        self.assertEqual(
+            [(run["id"], run["attempt"], run["conclusion"]) for run in selected],
+            [(27, 1, "success")],
+        )
+
+    def test_fetch_skips_unfinished_runs(self):
+        listed = [{"databaseId": 77, "attempt": 1, "conclusion": None}]
+        documents, _, calls = self._fetch(listed, "first")
+        self.assertEqual(documents, [])
+        self.assertEqual([call for call in calls if call[1] == "view"], [])
+
+
 class SnapshotTests(unittest.TestCase):
     def test_snapshot_roundtrip_and_rejection(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -536,4 +1184,3 @@ class SnapshotTests(unittest.TestCase):
             path.write_text('{"runs": []}')
             with self.assertRaisesRegex(ValueError, "JSON list"):
                 ci_timings.read_snapshot(path)
-

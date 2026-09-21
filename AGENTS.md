@@ -195,14 +195,19 @@ bacon clippy-fast          # CI lint command
 bacon nextest-fast -- -p pohunek-gui-core  # narrow the loop to one crate
 ```
 
-Reproduce CI timing evidence from `gh` run data (offline after the first fetch;
-snapshot in `target/ci-timings/ci-runs.json`):
+Reproduce CI timing evidence from `gh` run data. Every fetch accumulates into
+the snapshot `target/ci-timings/ci-runs.json`; passing that file as `--input`
+re-measures from it with no network calls, while the plain commands always
+query `gh` first:
 
 ```bash
 scripts/ci-timings runs --limit 60 --window 2026-09-14..2026-09-16 \
     --event pull_request --conclusion success      # fetch + snapshot + per-run table
 scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 \
     --current 2026-09-20..2026-09-21 --event pull_request --conclusion success
+scripts/ci-timings compare --input target/ci-timings/ci-runs.json \
+    --baseline 2026-09-14..2026-09-16 --current 2026-09-20..2026-09-21 \
+    --event pull_request --conclusion success      # same tables, no network
 scripts/ci-timings junit --label "tests (unit, fast)" --run RUN_ID junit-unit.xml
                                   # or: --job-seconds N to supply the job wall
                                   # by hand; --job NAME picks the paired CI job

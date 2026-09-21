@@ -146,7 +146,8 @@ jobs:
       - name: Enable sccache
         uses: mozilla-actions/sccache-action@v0.0.11
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-
       - uses: taiki-e/install-action@cargo-nextest
@@ -413,7 +414,8 @@ jobs:
       - name: Enable sccache
         uses: mozilla-actions/sccache-action@v0.0.11
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-
 

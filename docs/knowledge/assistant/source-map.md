@@ -187,9 +187,10 @@ Release packaging and contributor verification:
 - `scripts/ci-timings` — reproduction of CI timing evidence from `gh` run
   data: per-job wall clock and workflow medians (`runs`, `compare`),
   per-shard nextest JUnit summaries (`junit`), and sccache/rust-cache
-  cache-hit extraction (`cache`). Caches fetched runs in
-  `target/ci-timings/ci-runs.json` (`--input`/`--cache` to point elsewhere);
-  the before/after report lives in
+  cache-hit extraction (`cache`). A fetch accumulates run documents into
+  `target/ci-timings/ci-runs.json` (`--cache` writes elsewhere); `--input`
+  reads a snapshot instead and makes no network calls at all, which is how
+  the report is regenerated offline. The before/after report lives in
   `docs/design/test-performance-report.md`.
 - `scripts/tests/test_ci_timings.py` — regression checks for the timing
   helper's parsing, medians, and markdown renderers.
