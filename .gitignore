@@ -11,6 +11,7 @@ web/logs/
 
 # Local tool/runtime caches (per-machine; not shared)
 /.cache
+__pycache__/
 
 # TypeScript/Bun workspace artifacts. `bun.lock` is intentionally committed.
 node_modules/

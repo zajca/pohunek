@@ -182,6 +182,21 @@ Release packaging and contributor verification:
   run independently, retaining per-shard JUnit timing evidence. Cold compilation
   is separate from the approximately two-minute fast-feedback target.
 - `scripts/tests/test_partitions.py` — regression checks for coverage validation.
+- `bacon.toml` — optional watcher jobs for the documented fast loops
+  (`nextest-fast` on the `fast` profile, `clippy-fast`); no gate depends on it.
+- `scripts/ci-timings` — reproduction of CI timing evidence from `gh` run
+  data: per-job wall clock and workflow medians (`runs`, `compare`),
+  per-shard nextest JUnit summaries (`junit`), and sccache/rust-cache
+  cache-hit extraction (`cache`). A fetch accumulates run documents into
+  `target/ci-timings/ci-runs.json` (`--cache` writes elsewhere), but a
+  measurement covers only the runs its own query named, so a fuller snapshot
+  never changes a median; `--input` reads a snapshot instead and makes no
+  network calls at all, which is how the report is regenerated offline.
+  `--limit` applies per window and a filled window is flagged as possibly
+  truncated; run logs are cached per run *and* attempt. The before/after report lives in
+  `docs/design/test-performance-report.md`.
+- `scripts/tests/test_ci_timings.py` — regression checks for the timing
+  helper's parsing, medians, and markdown renderers.
 - `scripts/cargo-sweep-targets` — retention cleanup for per-branch isolated
   Cargo target dirs (`target/<name>`): canonicalizes and sentinel-verifies the
   target root, deletes only entries with Cargo target shape whose newest nested

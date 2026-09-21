@@ -790,15 +790,20 @@ cargo build --workspace --release
 cargo xtask docs check          # knowledge bundle: schema/drift/secrets/runbooks
 ```
 
-Routine loops (cargo-nextest profiles live in `.config/nextest.toml`):
+Routine loops (cargo-nextest profiles live in `.config/nextest.toml`; see
+`AGENTS.md` "Fast loops" for web, watcher, and CI-timing variants):
 
 ```bash
 cargo t                        # all fast unit + integration tests, no PTY/DB fixtures
 cargo t -p pohunek-gui-core     # fast tests in one crate
 cargo ti                       # fast daemon/client/session-worker surface
 cargo tw                       # unfiltered full suite, four test processes
+bun test sdk/test/config.test.ts -t "one case"  # one web test file, name pattern (from web/)
+bacon                          # watcher: profile-fast nextest loop (bacon.toml)
 python3 scripts/test-partitions run cli    # exact CI shard (unit/daemon/relay/cli/relay-db/heavy)
 python3 scripts/test-partitions check      # verify all tests belong to exactly one shard
+scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 --current 2026-09-20..2026-09-21 \
+    --event pull_request --conclusion success   # reproduce CI timing evidence
 ```
 
 Requires cargo-nextest >= 0.9.115 (profile inheritance) and Python >= 3.11

@@ -145,7 +145,16 @@ proxy compatibility; `POHUNEK_NODE_BIN` overrides a nonstandard Node path.
 A protocol change is not done until `cargo xtask ts check` passes; regenerate
 with `cargo xtask ts generate`.
 
-Useful narrower loops (nextest >= 0.9.115; profiles in `.config/nextest.toml`,
+## Fast loops
+
+Start from a fast loop, not from the full gate set; run the full gates once
+before declaring work done. A warm local timing is not CI evidence: per-shard
+JUnit artifacts and `scripts/ci-timings` (which also derives job wall clock,
+JUnit execution time, and sccache/rust-cache hit rates from `gh` run data) are
+the measurement path behind
+`docs/design/test-performance-report.md`.
+
+The loop cost boundary (nextest >= 0.9.115; profiles in `.config/nextest.toml`,
 shard helper requires Python >= 3.11). CI runs four fast matrix shards and one
 heavy job independently of lint/release jobs. The cost boundary is
 `profile.fast.default-filter`; update it when adding a PTY, DB, Hermes, or other
@@ -156,16 +165,56 @@ all discovered tests, including ignored ones, are assigned exactly once. The
 `cargo tw` remains unfiltered at four test processes. In CI, the Postgres-backed
 relay job is gated by a paths filter and does not run (its PostgreSQL service
 never starts) for non-relay changes.
-Do not treat a warm local timing as proof of the two-minute/90%-of-changes CI
-target; retain per-shard JUnit evidence and measure compilation separately.
+
+Rust:
 
 ```bash
 cargo t                                       # cost-filtered fast unit + integration loop
 cargo t -p pohunek-gui-core                   # fast tests in one crate (alias takes -p)
-python3 scripts/test-partitions run cli       # exact CI shard: unit/daemon/relay/cli/relay-db/heavy
-python3 scripts/test-partitions check         # exhaustive, disjoint nextest inventory check
 cargo nextest run --profile local -p pohunek-cli some_test_name  # one test
 cargo clippy -p pohunek-daemon --all-targets  # lint one crate
+python3 scripts/test-partitions run cli       # exact CI shard: unit/daemon/relay/cli/relay-db/heavy
+python3 scripts/test-partitions check         # exhaustive, disjoint nextest inventory check
+```
+
+Web (run inside `web/`):
+
+```bash
+bun test backend/test/real-daemon.e2e.test.ts    # one test file
+bun test -t "notifications"                      # only tests matching the name pattern
+bun test sdk/test/config.test.ts -t "one case"   # file plus name pattern
+cd sdk && bun run typecheck                      # one package's tsc -b graph
+```
+
+Watcher (`bacon.toml` at the repo root; optional tool, no gate depends on it —
+install with `cargo install --locked bacon`):
+
+```bash
+bacon                      # default job `nextest-fast`: profile-fast nextest loop
+bacon clippy-fast          # CI lint command
+bacon nextest-fast -- -p pohunek-gui-core  # narrow the loop to one crate
+```
+
+Reproduce CI timing evidence from `gh` run data. Every fetch accumulates into
+the snapshot `target/ci-timings/ci-runs.json`; passing that file as `--input`
+re-measures from it with no network calls, while the plain commands always
+query `gh` first. A measurement covers exactly the runs its own query named,
+so a fuller snapshot never widens it. `--limit` applies per window, and a
+window that fills it is reported as possibly truncated -- raise it until the
+run count stops growing:
+
+```bash
+scripts/ci-timings runs --limit 60 --window 2026-09-14..2026-09-16 \
+    --event pull_request --conclusion success      # fetch + snapshot + per-run table
+scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 \
+    --current 2026-09-20..2026-09-21 --event pull_request --conclusion success
+scripts/ci-timings compare --input target/ci-timings/ci-runs.json \
+    --baseline 2026-09-14..2026-09-16 --current 2026-09-20..2026-09-21 \
+    --event pull_request --conclusion success      # same tables, no network
+scripts/ci-timings junit --label "tests (unit, fast)" --run RUN_ID junit-unit.xml
+                                  # or: --job-seconds N to supply the job wall
+                                  # by hand; --job NAME picks the paired CI job
+scripts/ci-timings cache --run RUN_ID             # sccache JSON + rust-cache hits per job
 ```
 
 Hermes M3 supports only the pinned local interactive Hermes Agent `0.20.0`
