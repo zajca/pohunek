@@ -110,6 +110,13 @@ link transaction for the account, and advances both the account-link generation
 and the principal generation in the same transaction as the audit record; an
 audit or database failure fails closed and closes active access rather than
 acknowledging an authority change. An account never removes its last identity.
+
+An unlink removes that identity's authority over the account; it is not a ban on
+the identity. The issuer and subject can authenticate again afterwards, and
+teamless authentication provisions a brand-new principal with no membership, so
+the returning identity authorizes no team resource and has no path back to the
+account it was removed from. Barring an identity from the relay is a separate
+administrative decision, not a consequence of unlinking.
 Restore quarantine cancels every pending link transaction and blocks link
 changes while the recovery generation is stale.
 

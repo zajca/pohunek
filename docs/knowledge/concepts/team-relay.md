@@ -136,6 +136,11 @@ Safety rules a user should know:
 - Unlinking signs out that identity everywhere at once. Any CLI credential or
   browser session obtained through it stops working immediately, so keep a
   working second identity before removing one.
+- Unlinking is not a ban. It removes that identity's authority over the account,
+  but the same issuer and subject can sign in again and gets a brand-new
+  principal with no team, so it authorizes nothing and cannot reach the account
+  it left. Barring an identity from the relay is a separate administrative
+  decision.
 - A cancelled, expired or completed transaction is terminal. Nothing revives it:
   not a retry, not a restore, not a cached provider session, not provider profile
   data.

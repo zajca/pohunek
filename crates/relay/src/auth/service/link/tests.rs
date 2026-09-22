@@ -486,8 +486,11 @@ async fn link_start_binds_the_channel_to_the_callers_proof() {
 
 /// One account holds at most one provable transaction, and a repeated retry
 /// coordinate is refused rather than re-arming or minting a second proof.
+///
+/// These calls are sequential. The genuine race is
+/// [`racing_starts_open_exactly_one_transaction`].
 #[tokio::test]
-async fn concurrent_and_replayed_starts_cannot_mint_a_second_transaction() {
+async fn sequential_repeat_starts_cannot_mint_a_second_transaction() {
     let (store, schema, pool) = fixture().await;
     let (authority, _directory) = authority(store.clone()).await;
     let service = service(&store, authority);
@@ -2230,4 +2233,139 @@ async fn database_triggers_refuse_provenance_rewrites_and_generation_rewinds() {
         Some("23514")
     );
     cleanup(&pool, &schema).await;
+}
+
+/// Unlink removes an identity's authority; it is not a ban. The same issuer and
+/// subject can authenticate again, and lands on a brand-new principal with no
+/// team, not on the account it was removed from.
+#[tokio::test]
+async fn an_unlinked_identity_authenticates_again_as_a_new_teamless_principal() {
+    let (store, schema, pool) = fixture().await;
+    let (authority, _directory) = authority(store.clone()).await;
+    let service = service(&store, authority);
+    let oidc = OidcClient::test_client();
+    let account = seed_account(&store, &service, "ban-owner").await;
+    let open = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
+        .await
+        .expect("open a device transaction");
+    let linked = service
+        .commit_link_once(
+            &oidc,
+            commit_for(&open, 1),
+            &proven("ban-target"),
+            Some(account.bearer),
+        )
+        .await
+        .expect("link the identity that will be removed");
+    service
+        .unlink_identity(
+            account.bearer,
+            linked.identity.identity_id,
+            UnlinkIdentityRequest {
+                idempotency: idempotency(),
+            },
+        )
+        .await
+        .expect("remove the linked identity");
+
+    // The login path resolves the same coordinate after removal.
+    let mut transaction = store
+        .begin_serializable()
+        .await
+        .expect("begin a login transaction");
+    let resolved = crate::auth::service::canonical_human_principal(
+        &mut transaction,
+        TEST_ISSUER,
+        "ban-target",
+    )
+    .await
+    .expect("resolve the removed coordinate");
+    transaction.commit().await.expect("commit the login");
+
+    assert_ne!(
+        resolved.principal_id, account.principal_id,
+        "the removed identity does not come back to the account it left"
+    );
+    assert_ne!(
+        resolved.identity_id, linked.identity.identity_id,
+        "a new identity row is minted rather than the removed one revived"
+    );
+    let kind: String = sqlx::query_scalar("SELECT kind FROM principals WHERE id = $1")
+        .bind(resolved.principal_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("read the new principal kind");
+    assert_eq!(kind, "human");
+    let memberships: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM memberships WHERE principal_id = $1")
+            .bind(resolved.principal_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("count the new principal's memberships");
+    assert_eq!(
+        memberships, 0,
+        "the new principal holds no team, so it authorizes no team resource"
+    );
+    // The account it left keeps only its own original identity.
+    assert_eq!(identity_count(&store, account.principal_id).await, 1);
+    cleanup(&pool, &schema).await;
+}
+
+/// Two starts that genuinely race for one account produce exactly one
+/// transaction. `PostgreSQL` chooses which unique index reports first, so the
+/// loser's refusal is asserted as a set rather than one variant.
+#[tokio::test]
+async fn racing_starts_open_exactly_one_transaction() {
+    for shared_key in [false, true] {
+        let (store, schema, pool) = fixture().await;
+        let (authority, _directory) = authority(store.clone()).await;
+        let service = service(&store, authority);
+        let oidc = OidcClient::test_client();
+        let account = seed_account(&store, &service, "racing").await;
+        let first = link_request();
+        let second = if shared_key {
+            // The same retry key: `single_pending_idx` and the idempotency-key
+            // index can both be the one violated.
+            first.clone()
+        } else {
+            link_request()
+        };
+
+        let (left, right) = tokio::join!(
+            service.begin_browser_link(&oidc, account.browser, first),
+            service.begin_browser_link(&oidc, account.browser, second),
+        );
+
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM account_link_transactions WHERE principal_id = $1 AND state = 'pending'",
+        )
+        .bind(account.principal_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("count pending transactions");
+        assert!(
+            pending <= 1,
+            "a race never leaves two provable transactions (shared_key={shared_key})"
+        );
+        let winners = usize::from(left.is_ok()) + usize::from(right.is_ok());
+        assert!(
+            winners <= 1,
+            "at most one start succeeds (shared_key={shared_key})"
+        );
+        for outcome in [left, right] {
+            if let Err(error) = outcome {
+                assert!(
+                    matches!(
+                        error,
+                        AuthError::LinkPending
+                            | AuthError::IdempotencyConflict
+                            | AuthError::Retryable
+                            | AuthError::Durable
+                    ),
+                    "unexpected refusal for the losing start: {error:?} (shared_key={shared_key})"
+                );
+            }
+        }
+        cleanup(&pool, &schema).await;
+    }
 }
