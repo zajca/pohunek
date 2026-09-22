@@ -1,6 +1,6 @@
 //! Serves the private daemon-worker Unix protocol.
 
-// Rust guideline compliant 2026-09-19
+// Rust guideline compliant 2026-09-22
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -17,7 +17,6 @@ use pohunek_paths::{validate_socket_path, Platform, SocketKind};
 use pohunek_platform::filesystem::{
     AdvisoryLock, EntryIdentity, EntryKind, FsError, MoveOutcome, StageOutcome, TrustedDir,
 };
-use pohunek_platform::peer;
 use pohunek_platform::process::{
     HostInspector, ProcessIdentity as OsProcessIdentity, ProcessInspector, StartIdentity,
 };
@@ -41,6 +40,7 @@ use tokio::sync::{broadcast, oneshot, watch, Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{event, Level};
 
+use crate::identity::{PeerContext, RejectReason};
 use crate::journal::{
     ActiveIdentity, ChildIdentity, JournalRecord, LaunchIdentity, PendingLaunchClaim,
     ReleasedIdentity, RuntimeOutcome, RuntimePhase as JournalPhase,
@@ -560,6 +560,18 @@ impl TokenState {
         Ok(())
     }
 
+    /// Returns the lease owner a live grant was minted for, without using it.
+    ///
+    /// The redeeming peer is checked against this before [`TokenState::redeem`]
+    /// runs, because `redeem` removes the grant whatever its validation says. A
+    /// foreign redemption attempt must not burn a legitimate token.
+    fn grant_owner(&mut self, token: &DataToken, now_ms: u64) -> Option<LeaseOwner> {
+        self.purge_expired(now_ms);
+        self.grants
+            .get(token)
+            .map(|grant| grant.lease_owner.clone())
+    }
+
     fn redeem(
         &mut self,
         token: &DataToken,
@@ -630,8 +642,7 @@ struct ObservationGrant {
 
 #[derive(Debug)]
 struct Connection {
-    peer_pid: u32,
-    peer_start: u64,
+    peer: Arc<PeerContext>,
     daemon_id: Option<DaemonId>,
     selected_version: Option<Version>,
     capabilities: Vec<Capability>,
@@ -641,10 +652,9 @@ struct Connection {
 }
 
 impl Connection {
-    fn new(peer_pid: u32, peer_start: u64) -> Self {
+    fn new(peer: Arc<PeerContext>) -> Self {
         Self {
-            peer_pid,
-            peer_start,
+            peer,
             daemon_id: None,
             selected_version: None,
             capabilities: Vec::new(),
@@ -656,7 +666,9 @@ impl Connection {
 }
 
 async fn serve_connection(shared: Arc<Shared>, mut stream: UnixStream) -> Result<(), WorkerError> {
-    let peer = verify_peer(&stream)?;
+    // The peer is bound before the classifier byte is read, so no request shape
+    // can be parsed from an unattested connection.
+    let peer = Arc::new(PeerContext::capture(&stream)?);
     let mut prefix = [0_u8; 1];
     let read = stream
         .read_exact(&mut prefix)
@@ -669,17 +681,15 @@ async fn serve_connection(shared: Arc<Shared>, mut stream: UnixStream) -> Result
     if prefix[0] == b'{' {
         serve_json(shared, prefixed, peer).await
     } else {
-        serve_data(shared, prefixed).await
+        serve_data(shared, prefixed, peer).await
     }
 }
 
 async fn serve_json(
     shared: Arc<Shared>,
     stream: PrefixStream<UnixStream>,
-    peer: peer::Credentials,
+    peer: Arc<PeerContext>,
 ) -> Result<(), WorkerError> {
-    let peer_pid = peer.pid;
-    let peer_start = process_start(peer.pid)?;
     let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = ControlReader::new(read_half);
     let mut writer = ControlWriter::new(write_half);
@@ -693,20 +703,12 @@ async fn serve_json(
 
     match serde_json::from_value::<ControlMessage>(first.clone()) {
         Ok(ControlMessage::Request(request)) => {
-            serve_control(
-                Arc::clone(&shared),
-                &mut reader,
-                &mut writer,
-                request,
-                peer_pid,
-                peer_start,
-            )
-            .await
+            serve_control(Arc::clone(&shared), &mut reader, &mut writer, request, peer).await
         }
         Ok(_) => Err(WorkerError::Protocol(
             "first control message must be a request".to_owned(),
         )),
-        Err(_) => serve_identity_hook(shared, &mut writer, first).await,
+        Err(_) => serve_identity_hook(shared, &mut writer, first, &peer).await,
     }
 }
 
@@ -715,14 +717,13 @@ async fn serve_control<R, W>(
     reader: &mut ControlReader<R>,
     writer: &mut ControlWriter<W>,
     first: ControlRequest,
-    peer_pid: u32,
-    peer_start: u64,
+    peer: Arc<PeerContext>,
 ) -> Result<(), WorkerError>
 where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
-    let mut connection = Connection::new(peer_pid, peer_start);
+    let mut connection = Connection::new(peer);
     let result = run_control_connection(&shared, reader, writer, first, &mut connection).await;
     // Release the controller lease whenever the control connection ends, for
     // ANY reason: clean EOF, a protocol error, or a failed event write to a
@@ -970,14 +971,33 @@ fn acquire_request(
             false,
         ));
     }
+    // The lease is the worker's strongest grant, so the kernel answer is read
+    // again here rather than trusted from accept time.
+    let peer = connection
+        .peer
+        .reverify()
+        .map(|()| connection.peer.identity())
+        .map_err(|reason| {
+            reject_identity(
+                shared,
+                "acquire_controller",
+                reason,
+                connection.peer.as_ref(),
+            );
+            control_error_message(
+                ControlCode::IdentityMismatch,
+                "peer identity is no longer the one that connected",
+                false,
+            )
+        })?;
     let lease_value = random_value("lease")
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
     let lease_id = LeaseId::new(lease_value)
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
     let owner = LeaseOwner {
         daemon_id: daemon_id.to_string(),
-        peer_pid: connection.peer_pid,
-        peer_start_identity: connection.peer_start.to_string(),
+        peer_pid: peer.pid,
+        peer_start_identity: peer.start_identity.to_string(),
     };
     shared
         .lease
@@ -1958,6 +1978,7 @@ async fn mark_runtime_faulted_at_offset(
 async fn serve_data(
     shared: Arc<Shared>,
     stream: PrefixStream<UnixStream>,
+    peer: Arc<PeerContext>,
 ) -> Result<(), WorkerError> {
     let (mut read_half, mut write_half) = tokio::io::split(stream);
     // Register before redemption so a lease release in the handoff window is
@@ -1995,7 +2016,13 @@ async fn serve_data(
         mode,
         after_offset,
         attach.as_ref(),
-    )?;
+        &peer,
+    )
+    .inspect_err(|error| {
+        if let WorkerError::PeerIdentity { reason } = error {
+            reject_identity(&shared, "redeem_data_token", *reason, &peer);
+        }
+    })?;
     if *lease_epoch.borrow() != grant.lease_epoch {
         return Err(WorkerError::Protocol(
             "data token lease generation changed during redemption".to_owned(),
@@ -2247,8 +2274,25 @@ fn redeem_data_grant(
     mode: StreamMode,
     after_offset: Option<u64>,
     attach: Option<&AttachStart>,
+    peer: &PeerContext,
 ) -> Result<DataGrant, WorkerError> {
     let mut tokens = lock(tokens);
+    // Checked before `redeem`, which consumes the grant regardless of its
+    // validation result: a foreign attempt must not burn a legitimate token.
+    if let Some(owner) = tokens.grant_owner(token, now_ms) {
+        peer.reverify()
+            .and_then(|()| {
+                let identity = peer.identity();
+                if owner.peer_pid == identity.pid
+                    && owner.peer_start_identity == identity.start_identity.to_string()
+                {
+                    Ok(())
+                } else {
+                    Err(RejectReason::LeaseOwnerMismatch)
+                }
+            })
+            .map_err(|reason| WorkerError::PeerIdentity { reason })?;
+    }
     tokens.redeem(token, now_ms, |grant| {
         lease
             .validate(&grant.lease_owner, grant.lease_id.as_str())
@@ -2787,11 +2831,12 @@ async fn serve_identity_hook<W>(
     shared: Arc<Shared>,
     writer: &mut ControlWriter<W>,
     value: serde_json::Value,
+    peer: &PeerContext,
 ) -> Result<(), WorkerError>
 where
     W: AsyncWrite + Unpin + Send,
 {
-    serve_identity_hook_with_probe(shared, writer, value, verify_launch_claim).await
+    serve_identity_hook_with_probe(shared, writer, value, peer, verify_launch_claim).await
 }
 
 #[expect(
@@ -2802,6 +2847,7 @@ async fn serve_identity_hook_with_probe<W>(
     shared: Arc<Shared>,
     writer: &mut ControlWriter<W>,
     value: serde_json::Value,
+    peer: &PeerContext,
     mut verify: impl FnMut(&PendingLaunchClaim) -> Result<bool, WorkerError> + Send,
 ) -> Result<(), WorkerError>
 where
@@ -2823,20 +2869,39 @@ where
         } => {
             let mut state = shared.state.lock().await;
             let current_runtime = state.runtime_id.as_ref().map(ToString::to_string);
-            if !known_identity_provider(&provider)
-                || state.phase != WireRuntimePhase::Running
-                || current_runtime.as_deref() != Some(runtime_id.as_str())
-                || !valid_identity_expiry(&expires_at)
-            {
+            let inadmissible = hook_claim_admissible(
+                known_identity_provider(&provider),
+                current_runtime.as_deref() == Some(runtime_id.as_str()),
+                state.phase == WireRuntimePhase::Running,
+            )
+            .or_else(|| {
+                (!valid_identity_expiry(&expires_at)).then_some(RejectReason::ClaimExpired)
+            });
+            if let Some(reason) = inadmissible {
+                reject_identity(&shared, "identity_report", reason, peer);
                 (false, false, current_runtime, false)
             } else {
                 let pty = state.pty.as_ref().ok_or_else(|| {
                     WorkerError::Protocol("runtime is not initialized".to_owned())
                 })?;
                 let root_identity = pty.identity().clone();
-                let process_valid =
-                    validate_hook_process(pid, start_identity, root_identity.pid).is_ok();
+                let process_valid = hook_claim_valid(
+                    &shared,
+                    "identity_report",
+                    peer,
+                    pid,
+                    start_identity,
+                    root_identity.pid,
+                );
                 let sequence_valid = identity_sequence_is_fresh(&state.journal, sequence);
+                if !sequence_valid {
+                    reject_identity(
+                        &shared,
+                        "identity_report",
+                        RejectReason::SequenceStale,
+                        peer,
+                    );
+                }
                 if !process_valid || !sequence_valid {
                     (false, false, current_runtime, false)
                 } else {
@@ -2910,16 +2975,26 @@ where
         } => {
             let mut state = shared.state.lock().await;
             let current_runtime = state.runtime_id.as_ref().map(ToString::to_string);
-            if !known_identity_provider(&provider)
-                || current_runtime.as_deref() != Some(runtime_id.as_str())
-            {
+            let inadmissible = hook_claim_admissible(
+                known_identity_provider(&provider),
+                current_runtime.as_deref() == Some(runtime_id.as_str()),
+                true,
+            );
+            if let Some(reason) = inadmissible {
+                reject_identity(&shared, "identity_release", reason, peer);
                 (false, false, current_runtime, false)
             } else {
                 let pty = state.pty.as_ref().ok_or_else(|| {
                     WorkerError::Protocol("runtime is not initialized".to_owned())
                 })?;
-                let process_valid =
-                    validate_hook_process(pid, start_identity, pty.identity().pid).is_ok();
+                let process_valid = hook_claim_valid(
+                    &shared,
+                    "identity_release",
+                    peer,
+                    pid,
+                    start_identity,
+                    pty.identity().pid,
+                );
                 let released_process = if process_valid {
                     state
                         .journal
@@ -2970,18 +3045,34 @@ where
             let occurred_at_ms = unix_ms();
             let mut state = shared.state.lock().await;
             let current_runtime = state.runtime_id.as_ref().map(ToString::to_string);
-            let valid = known_subagent_provider(&provider)
-                && current_runtime.as_deref() == Some(runtime_id.as_str())
-                && state.phase == WireRuntimePhase::Running
-                && valid_subagent_text(&subagent_id, MAX_SUBAGENT_ID_BYTES)
-                && parent_id
-                    .as_deref()
-                    .is_none_or(|value| valid_subagent_text(value, MAX_SUBAGENT_ID_BYTES))
-                && agent_type
-                    .as_deref()
-                    .is_none_or(|value| valid_subagent_text(value, MAX_SUBAGENT_TYPE_BYTES));
+            let inadmissible = hook_claim_admissible(
+                known_subagent_provider(&provider),
+                current_runtime.as_deref() == Some(runtime_id.as_str()),
+                state.phase == WireRuntimePhase::Running,
+            )
+            .or_else(|| {
+                let text_valid = valid_subagent_text(&subagent_id, MAX_SUBAGENT_ID_BYTES)
+                    && parent_id
+                        .as_deref()
+                        .is_none_or(|value| valid_subagent_text(value, MAX_SUBAGENT_ID_BYTES))
+                    && agent_type
+                        .as_deref()
+                        .is_none_or(|value| valid_subagent_text(value, MAX_SUBAGENT_TYPE_BYTES));
+                (!text_valid).then_some(RejectReason::SubagentClaimInvalid)
+            });
+            if let Some(reason) = inadmissible {
+                reject_identity(&shared, "subagent_start", reason, peer);
+            }
+            let valid = inadmissible.is_none();
             let process_valid = state.pty.as_ref().is_some_and(|pty| {
-                validate_hook_process(pid, start_identity, pty.identity().pid).is_ok()
+                hook_claim_valid(
+                    &shared,
+                    "subagent_start",
+                    peer,
+                    pid,
+                    start_identity,
+                    pty.identity().pid,
+                )
             });
             if !valid || !process_valid {
                 (false, false, current_runtime, false)
@@ -3016,13 +3107,29 @@ where
             let occurred_at_ms = unix_ms();
             let mut state = shared.state.lock().await;
             let current_runtime = state.runtime_id.as_ref().map(ToString::to_string);
-            let valid = known_subagent_provider(&provider)
-                && current_runtime.as_deref() == Some(runtime_id.as_str())
-                && state.phase == WireRuntimePhase::Running
-                && valid_subagent_text(&subagent_id, MAX_SUBAGENT_ID_BYTES)
-                && outcome.is_none_or(|phase| phase != JournalSubagentPhase::Running);
+            let inadmissible = hook_claim_admissible(
+                known_subagent_provider(&provider),
+                current_runtime.as_deref() == Some(runtime_id.as_str()),
+                state.phase == WireRuntimePhase::Running,
+            )
+            .or_else(|| {
+                let text_valid = valid_subagent_text(&subagent_id, MAX_SUBAGENT_ID_BYTES)
+                    && outcome.is_none_or(|phase| phase != JournalSubagentPhase::Running);
+                (!text_valid).then_some(RejectReason::SubagentClaimInvalid)
+            });
+            if let Some(reason) = inadmissible {
+                reject_identity(&shared, "subagent_stop", reason, peer);
+            }
+            let valid = inadmissible.is_none();
             let process_valid = state.pty.as_ref().is_some_and(|pty| {
-                validate_hook_process(pid, start_identity, pty.identity().pid).is_ok()
+                hook_claim_valid(
+                    &shared,
+                    "subagent_stop",
+                    peer,
+                    pid,
+                    start_identity,
+                    pty.identity().pid,
+                )
             });
             if !valid || !process_valid {
                 (false, false, current_runtime, false)
@@ -3309,6 +3416,98 @@ fn validate_hook_process(pid: u32, start_identity: u64, root_pid: u32) -> Result
         ));
     }
     Ok(())
+}
+
+/// Returns whether the connecting peer may speak for the reported process.
+///
+/// A report is accepted only from the subject itself or from a process it
+/// spawned, which is the shape every shipped hook already has: Codex and Claude
+/// run their hook as a child of the agent whose id they report, and the pinned
+/// Hermes plugin reports from the agent process. Binding a claim to the process
+/// that vouches for it keeps an unrelated command in the same terminal from
+/// rewriting another process's identity, which matters because the PTY root's
+/// environment carries the runtime id and the private socket path to everything
+/// the operator runs.
+///
+/// The ancestry walk reads live parent links, so the relationship holds only
+/// while the chain is alive. A reporter whose intermediate parent has exited is
+/// reparented out of the subject's subtree and is rejected, which is the
+/// conservative direction and stays distinguishable through its own reason code.
+///
+/// The stricter `peer == subject` binding belongs to the explicit in-process
+/// identity mode in <https://github.com/zajca/pohunek/issues/52>, which can
+/// demand it on a wire shape of its own without breaking child hooks.
+fn peer_vouches_for(peer: &PeerContext, subject: u32) -> Result<bool, WorkerError> {
+    let peer_pid = peer.identity().pid;
+    if peer_pid == subject {
+        return Ok(true);
+    }
+    is_descendant(peer_pid, subject)
+}
+
+/// Returns why a hook claim is inadmissible before its process is inspected.
+///
+/// Provider, runtime generation, and runtime phase are the rules every hook
+/// variant shares. Reporting them as distinct codes is what lets an operator
+/// tell a stale hook from a rejected one; before this they were indistinguishable
+/// from a hook that never ran.
+fn hook_claim_admissible(
+    provider_known: bool,
+    runtime_matches: bool,
+    phase_running: bool,
+) -> Option<RejectReason> {
+    if !provider_known {
+        return Some(RejectReason::ProviderNotAllowed);
+    }
+    if !runtime_matches {
+        return Some(RejectReason::RuntimeMismatch);
+    }
+    if !phase_running {
+        return Some(RejectReason::PhaseNotRunning);
+    }
+    None
+}
+
+/// Validates one hook claim end to end and records why it was rejected.
+///
+/// Combines the peer binding with the existing reported-process rules so every
+/// hook variant applies both, and emits exactly one payload-free event naming
+/// the stable reason.
+fn hook_claim_valid(
+    shared: &Shared,
+    operation: &'static str,
+    peer: &PeerContext,
+    pid: u32,
+    start_identity: u64,
+    root_pid: u32,
+) -> bool {
+    if let Err(reason) = authorize_hook_report(peer, pid) {
+        reject_identity(shared, operation, reason, peer);
+        return false;
+    }
+    if validate_hook_process(pid, start_identity, root_pid).is_err() {
+        reject_identity(
+            shared,
+            operation,
+            RejectReason::ReportedProcessInvalid,
+            peer,
+        );
+        return false;
+    }
+    true
+}
+
+/// Rejects a hook whose peer cannot be bound to the process it reports.
+///
+/// Runs before any journal mutation, and re-reads the kernel answer first so a
+/// peer that changed since the connection was accepted cannot slip through.
+fn authorize_hook_report(peer: &PeerContext, subject: u32) -> Result<(), RejectReason> {
+    peer.reverify()?;
+    if peer_vouches_for(peer, subject).map_err(|_error| RejectReason::ReportedProcessInvalid)? {
+        Ok(())
+    } else {
+        Err(RejectReason::PeerOutsideSubject)
+    }
 }
 
 async fn scoped_pty(
@@ -3651,15 +3850,29 @@ async fn persist_control(journal: Journal, record: JournalRecord) -> Result<(), 
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))
 }
 
-fn verify_peer(stream: &UnixStream) -> Result<peer::Credentials, WorkerError> {
-    let credentials =
-        peer::credentials(stream).map_err(|error| WorkerError::Protocol(error.to_string()))?;
-    if credentials.uid != nix::unistd::Uid::effective().as_raw() {
-        return Err(WorkerError::Protocol(
-            "worker peer UID does not match effective UID".to_owned(),
-        ));
-    }
-    Ok(credentials)
+/// Records one rejected private identity claim without any payload.
+///
+/// Only the worker and session identifiers, the operation, the stable reason
+/// code, the kernel-attested peer id, and the kernel interface that attested it
+/// are emitted. The caller-supplied process id, native references, tokens, and
+/// protocol frames never reach a log.
+fn reject_identity(
+    shared: &Shared,
+    operation: &'static str,
+    reason: RejectReason,
+    peer: &PeerContext,
+) {
+    event!(
+        name: "worker.identity.rejected",
+        Level::WARN,
+        worker.id = %shared.worker_id,
+        session.id = %shared.session_id,
+        identity.operation = operation,
+        identity.reason = reason.code(),
+        peer.pid = peer.identity().pid,
+        peer.provenance = %peer.provenance(),
+        "private identity claim rejected: {{identity.reason}}",
+    );
 }
 
 async fn prepare_socket(path: &Path, platform: Platform) -> Result<PreparedSocket, WorkerError> {
@@ -4083,6 +4296,19 @@ mod tests {
         (server, pty, directory)
     }
 
+    /// Builds a peer context standing in for the reported process itself.
+    ///
+    /// These tests drive the hook handler directly rather than over a socket,
+    /// so they supply the identity the kernel would have attested.
+    fn subject_peer(pty: &crate::PtyOwner) -> crate::identity::PeerContext {
+        crate::identity::PeerContext::for_test(pohunek_platform::process::ProcessIdentity {
+            pid: pty.identity().pid,
+            start_identity: pohunek_platform::process::StartIdentity::new(
+                pty.identity().start_identity.parse::<u64>().unwrap(),
+            ),
+        })
+    }
+
     fn launch_report(pty: &crate::PtyOwner, sequence: u64, reference: &str) -> serde_json::Value {
         serde_json::json!({
             "type": "identity_report", "runtime_id": "runtime-claim", "provider": "claude",
@@ -4103,6 +4329,7 @@ mod tests {
             std::sync::Arc::clone(&server.shared),
             &mut super::ControlWriter::new(&mut bytes),
             launch_report(&pty, 1, "original"),
+            &subject_peer(&pty),
             |_| {
                 Err(crate::WorkerError::Protocol(
                     "transient observation error".into(),
@@ -4128,6 +4355,7 @@ mod tests {
             std::sync::Arc::clone(&server.shared),
             &mut super::ControlWriter::new(&mut bytes),
             launch_report(&pty, 2, "continuation"),
+            &subject_peer(&pty),
             |_| panic!("later report cannot replace pending claim"),
         )
         .await
@@ -4166,6 +4394,45 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A peer that no longer exists leaves the journal untouched.
+    ///
+    /// `reverify` distinguishes a vanished peer from a substituted one, and the
+    /// hook path must reject before it writes: proving the return value alone
+    /// would say nothing about whether durable state moved.
+    #[tokio::test]
+    async fn a_vanished_peer_is_rejected_without_touching_the_journal() {
+        let (server, pty, directory) = launch_claim_fixture().await;
+        let before = server.shared.state.lock().await.journal.clone();
+        // A start identity the live process cannot have makes the recheck fail
+        // exactly as an exited-and-reused process id would.
+        let vanished = crate::identity::PeerContext::for_test_live(
+            pohunek_platform::process::ProcessIdentity {
+                pid: std::process::id(),
+                start_identity: pohunek_platform::process::StartIdentity::new(u64::MAX),
+            },
+        );
+        let mut bytes = Vec::new();
+        super::serve_identity_hook_with_probe(
+            std::sync::Arc::clone(&server.shared),
+            &mut super::ControlWriter::new(&mut bytes),
+            launch_report(&pty, 1, "vanished-peer"),
+            &vanished,
+            |_| panic!("a rejected peer must never reach launch verification"),
+        )
+        .await
+        .expect("hook answers a rejected claim");
+
+        let response: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("decode hook response");
+        assert_eq!(response["ok"], serde_json::Value::Bool(false));
+        assert_eq!(
+            server.shared.state.lock().await.journal,
+            before,
+            "a rejected claim must not move durable state"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[tokio::test]
     async fn immediate_launch_rejection_commits_fence_before_acknowledgment() {
         let (server, pty, directory) = launch_claim_fixture().await;
@@ -4174,6 +4441,7 @@ mod tests {
             std::sync::Arc::clone(&server.shared),
             &mut super::ControlWriter::new(&mut bytes),
             launch_report(&pty, 1, "original"),
+            &subject_peer(&pty),
             |_| Ok(false),
         )
         .await
@@ -4197,6 +4465,7 @@ mod tests {
             std::sync::Arc::clone(&server.shared),
             &mut super::ControlWriter::new(&mut bytes),
             launch_report(&pty, 2, "replacement"),
+            &subject_peer(&pty),
             |_| panic!("rejection fence must not be reprobed"),
         )
         .await
@@ -4231,6 +4500,7 @@ mod tests {
             std::sync::Arc::clone(&server.shared),
             &mut super::ControlWriter::new(&mut bytes),
             launch_report(&pty, 1, "original"),
+            &subject_peer(&pty),
             |_| {
                 Err(crate::WorkerError::Protocol(
                     "transient observation error".into(),
@@ -4870,7 +5140,12 @@ mod tests {
         let attach = AttachStart {
             dimensions: Some(Dimensions::new(120, 40).expect("dimensions")),
         };
-        let mut current = Connection::new(1, 1);
+        let mut current = Connection::new(std::sync::Arc::new(
+            crate::identity::PeerContext::for_test(pohunek_platform::process::ProcessIdentity {
+                pid: std::process::id(),
+                start_identity: pohunek_platform::process::StartIdentity::new(1),
+            }),
+        ));
         current.selected_version = Some(CURRENT_VERSION);
         current.capabilities.push(Capability::AttachSnapshot);
         validate_data_start(&current, StreamMode::Attach, None, Some(&attach))
@@ -4881,7 +5156,12 @@ mod tests {
             .expect_err("missing capability");
         assert_eq!(unsupported.code, ControlCode::InvalidRequest);
 
-        let mut previous = Connection::new(1, 1);
+        let mut previous = Connection::new(std::sync::Arc::new(
+            crate::identity::PeerContext::for_test(pohunek_platform::process::ProcessIdentity {
+                pid: std::process::id(),
+                start_identity: pohunek_platform::process::StartIdentity::new(1),
+            }),
+        ));
         previous.selected_version = Some(PREVIOUS_VERSION);
         previous.capabilities.push(Capability::AttachSnapshot);
         validate_data_start(&previous, StreamMode::Attach, None, Some(&attach))
@@ -4908,10 +5188,20 @@ mod tests {
                 runtime_id: RuntimeId::new("runtime-1").expect("runtime id"),
             },
         };
-        let mut previous = Connection::new(1, 1);
+        let mut previous = Connection::new(std::sync::Arc::new(
+            crate::identity::PeerContext::for_test(pohunek_platform::process::ProcessIdentity {
+                pid: std::process::id(),
+                start_identity: pohunek_platform::process::StartIdentity::new(1),
+            }),
+        ));
         previous.selected_version = Some(PREVIOUS_VERSION);
         previous.capabilities = capabilities(PREVIOUS_VERSION);
-        let mut current = Connection::new(1, 1);
+        let mut current = Connection::new(std::sync::Arc::new(
+            crate::identity::PeerContext::for_test(pohunek_platform::process::ProcessIdentity {
+                pid: std::process::id(),
+                start_identity: pohunek_platform::process::StartIdentity::new(1),
+            }),
+        ));
         current.selected_version = Some(CURRENT_VERSION);
         current.capabilities = capabilities(CURRENT_VERSION);
 
@@ -4940,6 +5230,22 @@ mod tests {
         }
     }
 
+    /// Builds the peer context a lease owner describes.
+    ///
+    /// Data redemption compares the redeeming peer against the owner the grant
+    /// was minted for, so a token test needs the matching kernel identity.
+    fn owner_peer(owner: &crate::LeaseOwner) -> crate::identity::PeerContext {
+        crate::identity::PeerContext::for_test(pohunek_platform::process::ProcessIdentity {
+            pid: owner.peer_pid,
+            start_identity: pohunek_platform::process::StartIdentity::new(
+                owner
+                    .peer_start_identity
+                    .parse()
+                    .expect("decimal start identity"),
+            ),
+        })
+    }
+
     fn insert_grant(tokens: &mut TokenState, token: DataToken, grant: DataGrant) {
         tokens.insert(token, grant, 0).expect("insert token");
     }
@@ -4958,13 +5264,98 @@ mod tests {
         }
     }
 
+    /// A data grant is redeemable only by the process that acquired the lease.
+    ///
+    /// The grant is minted for one kernel-attested peer; a different process —
+    /// and a reused process id with a different start identity — must both be
+    /// refused, and the refusal must leave the one-use token intact so a
+    /// foreign attempt cannot burn a legitimate grant.
+    #[test]
+    fn data_token_redemption_is_bound_to_the_lease_owning_peer() {
+        let leases = crate::ControllerLease::new();
+        let owner = crate::LeaseOwner {
+            daemon_id: "daemon-bound".to_owned(),
+            peer_pid: 4_242,
+            peer_start_identity: "7100".to_owned(),
+        };
+        let lease_id = LeaseId::new("lease-bound").expect("lease id");
+        leases
+            .acquire(owner.clone(), lease_id.to_string())
+            .expect("owner lease");
+        let grant = data_grant(owner.clone(), lease_id, 0, CURRENT_VERSION);
+        let token = DataToken::new("token-bound").expect("token");
+        let header = open_header(&grant, token.clone(), CURRENT_VERSION);
+        let tokens = std::sync::Mutex::new(TokenState::new());
+        insert_grant(
+            &mut tokens.lock().expect("token lock"),
+            token.clone(),
+            grant,
+        );
+
+        let foreign = crate::LeaseOwner {
+            peer_pid: owner.peer_pid + 1,
+            ..owner.clone()
+        };
+        let reused_pid = crate::LeaseOwner {
+            peer_start_identity: "7101".to_owned(),
+            ..owner.clone()
+        };
+        for (label, impostor) in [
+            ("a different process", foreign),
+            ("a reused id", reused_pid),
+        ] {
+            let error = redeem_data_grant(
+                &tokens,
+                &leases,
+                0,
+                1,
+                &token,
+                &header,
+                StreamMode::Detector,
+                None,
+                None,
+                &owner_peer(&impostor),
+            )
+            .expect_err(label);
+            assert!(
+                matches!(
+                    error,
+                    super::WorkerError::PeerIdentity {
+                        reason: super::RejectReason::LeaseOwnerMismatch
+                    }
+                ),
+                "{label} must be refused as a lease-owner mismatch, got {error:?}"
+            );
+            assert_eq!(
+                tokens.lock().expect("token lock").len(),
+                1,
+                "{label} must not consume the grant"
+            );
+        }
+
+        redeem_data_grant(
+            &tokens,
+            &leases,
+            0,
+            1,
+            &token,
+            &header,
+            StreamMode::Detector,
+            None,
+            None,
+            &owner_peer(&owner),
+        )
+        .expect("the lease owner still redeems its own grant");
+        assert_eq!(tokens.lock().expect("token lock").len(), 0);
+    }
+
     #[test]
     fn data_token_redemption_rejects_a_released_lease_generation() {
         let leases = crate::ControllerLease::new();
         let first_owner = crate::LeaseOwner {
             daemon_id: "daemon-first".to_owned(),
             peer_pid: 10,
-            peer_start_identity: "start-first".to_owned(),
+            peer_start_identity: "7001".to_owned(),
         };
         let first_lease = LeaseId::new("lease-first").expect("lease id");
         leases
@@ -4984,7 +5375,7 @@ mod tests {
         let next_owner = crate::LeaseOwner {
             daemon_id: "daemon-next".to_owned(),
             peer_pid: 11,
-            peer_start_identity: "start-next".to_owned(),
+            peer_start_identity: "7002".to_owned(),
         };
         let next_lease = LeaseId::new("lease-next").expect("lease id");
         leases
@@ -5000,6 +5391,7 @@ mod tests {
             StreamMode::Detector,
             None,
             None,
+            &owner_peer(&first_owner),
         )
         .expect_err("stale lease token");
         assert_eq!(tokens.lock().expect("token lock").len(), 0);
@@ -5010,7 +5402,7 @@ mod tests {
         let owner = crate::LeaseOwner {
             daemon_id: "daemon-capacity".to_owned(),
             peer_pid: 13,
-            peer_start_identity: "start-capacity".to_owned(),
+            peer_start_identity: "7003".to_owned(),
         };
         let lease_id = LeaseId::new("lease-capacity").expect("lease id");
         let mut abandoned = data_grant(owner.clone(), lease_id.clone(), 0, CURRENT_VERSION);
@@ -5044,13 +5436,13 @@ mod tests {
         let owner = crate::LeaseOwner {
             daemon_id: "daemon-current".to_owned(),
             peer_pid: 12,
-            peer_start_identity: "start-current".to_owned(),
+            peer_start_identity: "7004".to_owned(),
         };
         let lease_id = LeaseId::new("lease-current").expect("lease id");
         leases
             .acquire(owner.clone(), lease_id.to_string())
             .expect("current lease");
-        let current = data_grant(owner, lease_id, 0, CURRENT_VERSION);
+        let current = data_grant(owner.clone(), lease_id, 0, CURRENT_VERSION);
         let current_token = DataToken::new("token-current").expect("token");
         let wrong_version = open_header(&current, current_token.clone(), PREVIOUS_VERSION);
         let tokens = std::sync::Mutex::new(TokenState::new());
@@ -5069,6 +5461,7 @@ mod tests {
             StreamMode::Detector,
             None,
             None,
+            &owner_peer(&owner),
         )
         .expect_err("v3 header for v4 grant");
         assert_eq!(tokens.lock().expect("token lock").len(), 0);
@@ -5090,6 +5483,7 @@ mod tests {
             StreamMode::Detector,
             None,
             None,
+            &owner_peer(&owner),
         )
         .expect("matching token");
         redeem_data_grant(
@@ -5102,6 +5496,7 @@ mod tests {
             StreamMode::Detector,
             None,
             None,
+            &owner_peer(&owner),
         )
         .expect_err("one-shot token reuse");
         let unknown = DataToken::new("token-unknown").expect("token");
@@ -5116,6 +5511,7 @@ mod tests {
             StreamMode::Detector,
             None,
             None,
+            &owner_peer(&owner),
         )
         .expect_err("unknown token");
     }

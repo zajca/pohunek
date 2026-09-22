@@ -2350,6 +2350,147 @@ mod tests {
         }
     }
 
+    /// In-PTY identity reporter used by the worker-identity fixtures.
+    ///
+    /// The worker accepts a hook report only from the reported process or one
+    /// of its descendants, so a report cannot come from the test process. This
+    /// runs inside the managed PTY, publishes its own process id, and forwards
+    /// request files verbatim to the private worker socket. Callers that want a
+    /// self-report use the published id; callers that report the PTY root rely
+    /// on this process being a descendant of it.
+    ///
+    /// Requests and responses are published through a temporary file plus a
+    /// rename so neither side can observe a partial file.
+    const IDENTITY_REPORTER: &str = r#"import json
+import os
+import socket
+import sys
+import time
+
+pid_path, inbox = sys.argv[1], sys.argv[2]
+endpoint = os.environ["POHUNEK_WORKER_SOCKET_PATH"]
+os.makedirs(inbox, exist_ok=True)
+
+
+def publish(path, payload):
+    staged = path + ".staged"
+    with open(staged, "wb") as handle:
+        handle.write(payload)
+    os.replace(staged, path)
+
+
+publish(pid_path, str(os.getpid()).encode())
+
+# Exit as soon as the launching process is gone, so the reporter never holds the
+# PTY open past the lifetime of the tree it belongs to.
+parent = os.getppid()
+
+while os.getppid() == parent:
+    for name in sorted(os.listdir(inbox)):
+        if not name.endswith(".req"):
+            continue
+        request_path = os.path.join(inbox, name)
+        try:
+            with open(request_path, "rb") as handle:
+                payload = handle.read()
+        except OSError:
+            continue
+        try:
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(2.0)
+            client.connect(endpoint)
+            client.sendall(payload.rstrip() + b"\n")
+            answer = client.recv(4096).splitlines()[0]
+            client.close()
+        except Exception as error:
+            answer = json.dumps({"ok": False, "error": str(error)}).encode()
+        publish(request_path[:-4] + ".res", answer)
+        os.remove(request_path)
+    time.sleep(0.02)
+"#;
+
+    /// Handle to one in-PTY reporter: its published id and its request inbox.
+    #[derive(Debug, Clone)]
+    struct Reporter {
+        pid_path: std::path::PathBuf,
+        inbox: std::path::PathBuf,
+    }
+
+    impl Reporter {
+        /// Returns the shell fragment that starts this reporter in the PTY.
+        fn launch(&self, script: &Path) -> String {
+            format!(
+                "python3 {} {} {} &",
+                script.display(),
+                self.pid_path.display(),
+                self.inbox.display()
+            )
+        }
+    }
+
+    /// Writes the reporter script and declares one reporter per name.
+    fn identity_reporters(root: &Path, names: &[&str]) -> (std::path::PathBuf, Vec<Reporter>) {
+        let script = root.join("identity_reporter.py");
+        std::fs::write(&script, IDENTITY_REPORTER).expect("write identity reporter");
+        let reporters = names
+            .iter()
+            .map(|name| Reporter {
+                pid_path: root.join(format!("{name}.pid")),
+                inbox: root.join(format!("{name}-inbox")),
+            })
+            .collect();
+        (script, reporters)
+    }
+
+    /// Sends one hook request from inside the managed PTY and returns its `ok`.
+    ///
+    /// Mirrors [`send_identity_hook`]'s contract so a call site only changes
+    /// transport, never its assertion.
+    async fn send_identity_hook_from(reporter: &Reporter, request: serde_json::Value) -> bool {
+        static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let sequence = NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = reporter.inbox.join(format!("{sequence:06}"));
+        let request_path = base.with_extension("req");
+        let response_path = base.with_extension("res");
+        let staged = base.with_extension("req.staged");
+        let mut encoded = serde_json::to_vec(&request).expect("encode hook");
+        encoded.push(b'\n');
+        wait_for_directory(&reporter.inbox).await;
+        std::fs::write(&staged, &encoded).expect("stage hook request");
+        std::fs::rename(&staged, &request_path).expect("publish hook request");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(answer) = std::fs::read(&response_path) {
+                return serde_json::from_slice::<serde_json::Value>(&answer)
+                    .expect("decode hook response")
+                    .get("ok")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "in-PTY reporter did not answer {}",
+                request_path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Waits until the reporter has created its inbox directory.
+    async fn wait_for_directory(path: &Path) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !path.is_dir() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "in-PTY reporter never created {}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     async fn send_identity_hook(socket: &Path, request: serde_json::Value) -> bool {
         let stream = UnixStream::connect(socket).await.expect("connect hook");
         let (reader, mut writer) = stream.into_split();
@@ -2751,9 +2892,9 @@ mod tests {
         let runtime_root = root.join("runtime/workers");
         let session_id = "s-209";
         let worker_id = "worker-startup-identity-retry";
-        let (controller, runtime_id, child_pid, server_task) =
-            spawn_initialized_worker(&root, &runtime_root, session_id, worker_id).await;
-        let socket = controller.socket_path().to_path_buf();
+        let (controller, runtime_id, child_pid, server_task, reporter) =
+            spawn_initialized_worker_with_reporter(&root, &runtime_root, session_id, worker_id)
+                .await;
         let child = controller
             .inspect()
             .await
@@ -2764,8 +2905,8 @@ mod tests {
             .format(&Rfc3339)
             .expect("format identity expiry");
         assert!(
-            send_identity_hook(
-                &socket,
+            send_identity_hook_from(
+                &reporter,
                 serde_json::json!({
                     "type": "identity_report",
                     "runtime_id": runtime_id.as_str(),
@@ -2779,7 +2920,7 @@ mod tests {
                 }),
             )
             .await,
-            "worker accepts the active identity fixture"
+            "worker accepts a report from inside the managed PTY"
         );
         assert!(
             controller
@@ -2880,6 +3021,91 @@ mod tests {
         server_task.abort();
     }
 
+    /// The worker binds a hook report to the process it names.
+    ///
+    /// A report is accepted from the subject itself and from a process it
+    /// spawned — the shapes the pinned Hermes plugin and the Codex/Claude child
+    /// hooks actually have — and rejected from a same-session sibling or from a
+    /// process outside the managed PTY entirely. The `POHUNEK_*` environment the
+    /// worker injects into the PTY root makes the sibling case reachable by any
+    /// command the operator runs in that terminal, which is why it is covered
+    /// here and not only in theory.
+    #[tokio::test]
+    async fn identity_reports_are_bound_to_the_process_they_name() {
+        let root = temp_root();
+        let runtime_root = root.join("runtime/workers");
+        let session_id = "s-211";
+        let worker_id = "worker-identity-subject-binding";
+        let (controller, runtime_id, _child_pid, server_task, reporters) =
+            spawn_initialized_worker_with_reporters(
+                &root,
+                &runtime_root,
+                session_id,
+                worker_id,
+                &["first", "second"],
+            )
+            .await;
+        let socket = controller.socket_path().to_path_buf();
+        let child = controller
+            .inspect()
+            .await
+            .expect("inspect initialized worker")
+            .child_process
+            .expect("worker child identity");
+        let first = reporters[0].clone();
+        let second = reporters[1].clone();
+        let second_pid = wait_for_pid_file(&second.pid_path).await;
+        let second_start = process_start_identity(second_pid);
+
+        let report = |pid: u32, start_identity: u64, sequence: u64| {
+            let expires_at = (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+                .format(&Rfc3339)
+                .expect("format identity expiry");
+            serde_json::json!({
+                "type": "identity_report",
+                "runtime_id": runtime_id.as_str(),
+                "provider": "claude",
+                "pid": pid,
+                "start_identity": start_identity,
+                "sequence": sequence,
+                "expires_at": expires_at,
+                "reference_kind": "id",
+                "native_reference": "subject-binding"
+            })
+        };
+
+        assert!(
+            !send_identity_hook(&socket, report(child.pid, child.start_identity, 1)).await,
+            "a process outside the managed PTY cannot report an identity in it"
+        );
+        assert!(
+            !send_identity_hook_from(&first, report(second_pid, second_start, 2)).await,
+            "a same-session sibling cannot report another process's identity"
+        );
+        assert!(
+            send_identity_hook_from(&second, report(second_pid, second_start, 3)).await,
+            "a process may report its own identity"
+        );
+        assert!(
+            send_identity_hook_from(&first, report(child.pid, child.start_identity, 4)).await,
+            "a child hook may report the agent that spawned it"
+        );
+
+        assert_eq!(
+            controller
+                .inspect()
+                .await
+                .expect("inspect reported identity")
+                .active_identity
+                .map(|identity| identity.process.pid),
+            Some(child.pid),
+            "only the accepted reports may reach the journal"
+        );
+
+        drop(controller);
+        server_task.abort();
+    }
+
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
@@ -2894,15 +3120,18 @@ mod tests {
         let root_exited = root.join("root-exited");
         let descendant_release = root.join("descendant-release");
         let _release_files = ReleaseFiles(vec![root_release.clone(), descendant_release.clone()]);
+        let (script, mut reporters) = identity_reporters(&root, &["agent"]);
+        let reporter = reporters.pop().expect("one reporter");
         let command = format!(
             concat!(
-                "trap '' HUP; root_pid=$$; (",
+                "trap '' HUP; root_pid=$$; {} (",
                 "while [ \"$(sed -n 's/^.*) \\([^ ]\\).*/\\1/p' \"/proc/$root_pid/stat\" 2>/dev/null)\" != Z ]; do sleep 0.01; done; ",
                 "printf exited > '{}'; ",
                 "while [ ! -e '{}' ]; do sleep 0.01; done; ",
                 "printf 'late-restart-output\\n') & ",
                 "while [ ! -e '{}' ]; do sleep 0.01; done"
             ),
+            reporter.launch(&script),
             root_exited.display(),
             descendant_release.display(),
             root_release.display(),
@@ -2916,7 +3145,7 @@ mod tests {
                 command,
             )
             .await;
-        let socket = controller.socket_path().to_path_buf();
+        wait_for_directory(&reporter.inbox).await;
         let child = controller
             .inspect()
             .await
@@ -2927,8 +3156,8 @@ mod tests {
             .format(&Rfc3339)
             .expect("format identity expiry");
         assert!(
-            send_identity_hook(
-                &socket,
+            send_identity_hook_from(
+                &reporter,
                 serde_json::json!({
                     "type": "identity_report",
                     "runtime_id": runtime_id.as_str(),
@@ -2942,7 +3171,7 @@ mod tests {
                 }),
             )
             .await,
-            "worker accepts the durable native identity fixture"
+            "worker accepts the durable native identity fixture from inside the PTY"
         );
 
         let mut record = identity_record();
@@ -3106,8 +3335,19 @@ mod tests {
             .expect("first controller");
         let wire_worker_id = first_controller.worker_id().await;
         let wire_session_id = WorkerSessionId::new(session_id).expect("session id");
-        let released_pid_path = root.join("released.pid");
-        let reassert_pid_path = root.join("reassert.pid");
+        // The nested agents report their own identity, exactly as a real nested
+        // agent's in-process hook would, so each one is its own reporter rather
+        // than a `sleep` that could never have spoken for itself.
+        let (reporter_script, reporters) = identity_reporters(&root, &["released", "reassert"]);
+        let released = reporters[0].clone();
+        let reassert = reporters[1].clone();
+        let nested_command = format!(
+            "{} {} printf ready; while :; do sleep 1; done",
+            released.launch(&reporter_script),
+            reassert.launch(&reporter_script),
+        );
+        let released_pid_path = released.pid_path.clone();
+        let reassert_pid_path = reassert.pid_path.clone();
         let runtime_id = first_controller
             .initialize(Initialize {
                 session_id: wire_session_id,
@@ -3119,11 +3359,7 @@ mod tests {
                     reference_kind: Some("id".to_owned()),
                 },
                 executable: PathBuf::from("/bin/sh"),
-                arguments: vec![
-                    "-c".to_owned(),
-                    "sleep 30 & echo $! > released.pid; sleep 30 & echo $! > reassert.pid; printf ready; while :; do sleep 1; done"
-                        .to_owned(),
-                ],
+                arguments: vec!["-c".to_owned(), nested_command.clone()],
                 cwd: root.clone(),
                 dimensions: Dimensions::new(80, 24).expect("dimensions"),
                 environment: SecretEnv::new(BTreeMap::new()).expect("environment"),
@@ -3145,8 +3381,8 @@ mod tests {
             .format(&Rfc3339)
             .expect("format private claim expiry");
         assert!(
-            send_identity_hook(
-                &socket,
+            send_identity_hook_from(
+                &released,
                 serde_json::json!({
                     "type": "identity_report",
                     "runtime_id": runtime_id.as_str(),
@@ -3162,8 +3398,8 @@ mod tests {
             .await
         );
         assert!(
-            send_identity_hook(
-                &socket,
+            send_identity_hook_from(
+                &released,
                 serde_json::json!({
                     "type": "identity_release",
                     "runtime_id": runtime_id.as_str(),
@@ -3351,11 +3587,11 @@ mod tests {
             })
         };
         assert!(
-            !send_identity_hook(&socket, reassert_request(8)).await,
+            !send_identity_hook_from(&reassert, reassert_request(8)).await,
             "release sequence must reject a late report after restart"
         );
         assert!(
-            send_identity_hook(&socket, reassert_request(9)).await,
+            send_identity_hook_from(&reassert, reassert_request(9)).await,
             "higher sequence may reassert after restart"
         );
         let stale_native_report = SessionReportNativeIdParams::new(
@@ -4191,6 +4427,72 @@ mod tests {
             "sleep 30".to_owned(),
         )
         .await
+    }
+
+    /// Starts a worker whose PTY also runs an in-tree identity reporter.
+    ///
+    /// The PTY command is compound on purpose: `sh` execs a single simple
+    /// command, so `sh -c "sleep 30"` leaves a PTY root that can never spawn a
+    /// hook client. Keeping the shell alive makes the reporter a descendant of
+    /// the root, which is what lets it report the root's identity.
+    async fn spawn_initialized_worker_with_reporter(
+        root: &std::path::Path,
+        runtime_root: &std::path::Path,
+        session_id: &str,
+        worker_id: &str,
+    ) -> (
+        crate::runtime::Worker,
+        RuntimeId,
+        u32,
+        tokio::task::JoinHandle<()>,
+        Reporter,
+    ) {
+        let (controller, runtime_id, child_pid, task, mut reporters) =
+            spawn_initialized_worker_with_reporters(
+                root,
+                runtime_root,
+                session_id,
+                worker_id,
+                &["agent"],
+            )
+            .await;
+        let reporter = reporters.pop().expect("one reporter");
+        (controller, runtime_id, child_pid, task, reporter)
+    }
+
+    /// Starts a worker whose PTY runs one in-tree reporter per requested name.
+    async fn spawn_initialized_worker_with_reporters(
+        root: &std::path::Path,
+        runtime_root: &std::path::Path,
+        session_id: &str,
+        worker_id: &str,
+        names: &[&str],
+    ) -> (
+        crate::runtime::Worker,
+        RuntimeId,
+        u32,
+        tokio::task::JoinHandle<()>,
+        Vec<Reporter>,
+    ) {
+        let (script, reporters) = identity_reporters(root, names);
+        let mut command = String::new();
+        for reporter in &reporters {
+            command.push_str(&reporter.launch(&script));
+            command.push(' ');
+        }
+        command.push_str("printf ready; while :; do sleep 1; done");
+        let (controller, runtime_id, child_pid, task) = spawn_initialized_worker_with_command(
+            root,
+            runtime_root,
+            session_id,
+            worker_id,
+            command,
+        )
+        .await;
+        for reporter in &reporters {
+            wait_for_directory(&reporter.inbox).await;
+        }
+        (controller, runtime_id, child_pid, task, reporters)
     }
 
     async fn spawn_initialized_worker_with_command(

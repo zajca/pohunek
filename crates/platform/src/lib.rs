@@ -4,10 +4,11 @@
 //! and session worker. It deliberately excludes session policy, provider
 //! interpretation, public wire types, GUI state, and supervisor policy.
 
-// The Darwin process backend wraps `libproc`, `sysctl`, and kqueue calls that
-// have no safe equivalent; it opts back in with a localized
-// `#[expect(unsafe_code)]` and documents the invariant each block relies on.
-// Every other target stays free of unsafe code.
+// The Darwin process and peer backends wrap `libproc`, `sysctl`, kqueue, and
+// the `LOCAL_PEERCRED`/`LOCAL_PEERPID` socket options, which have no safe
+// equivalent; each opts back in with a localized `#[expect(unsafe_code)]` and
+// documents the invariant every block relies on. Every other target stays free
+// of unsafe code.
 #![cfg_attr(not(target_os = "macos"), forbid(unsafe_code))]
 #![cfg_attr(target_os = "macos", deny(unsafe_code))]
 

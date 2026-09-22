@@ -80,8 +80,11 @@ jobs:
 
       # Covers the Darwin process backend: same-user facts, descendants, cwd,
       # executable identity, controlling-terminal foreground groups, ownership
-      # markers, and the kqueue `NOTE_EXIT` watch. Those paths exist only on a
-      # native runner, so this step is the only gate that executes them.
+      # markers, and the kqueue `NOTE_EXIT` watch. It also covers the Darwin
+      # peer backend: `LOCAL_PEERCRED` for the owner, `LOCAL_PEERPID` for the
+      # process id, and the `last_pid` drift that `Binding::revalidate` must
+      # reject. Those paths exist only on a native runner, so this step is the
+      # only gate that executes them.
       - name: Test shared platform contracts
         run: cargo test --locked -p pohunek-platform
 
@@ -97,9 +100,15 @@ jobs:
       - name: Test shared path contracts
         run: cargo test --locked -p pohunek-paths
 
+      # The private daemon-to-worker protocol carries no target-specific code,
+      # and the peer identity work in issue #98 must keep it that way: a check
+      # here fails the moment a platform assumption leaks into the wire crate.
+      - name: Check private worker protocol
+        run: cargo check --locked -p pohunek-worker-protocol --all-targets
+
       # The complete daemon/worker macOS build remains sequenced behind the
-      # native peer-identity and PTY work in issues #98-#99. Exercise the
-      # issue-#96 Hermes filesystem lifecycle natively in the meantime.
+      # portable PTY work in issue #99. Exercise the issue-#96 Hermes
+      # filesystem lifecycle natively in the meantime.
       - name: Check Hermes filesystem lifecycle
         run: cargo check --locked -p pohunek-cli --lib
 
@@ -243,9 +252,9 @@ jobs:
               - 'crates/**/*.rs'
               - 'crates/xtask/src/checks.rs'
               - 'crates/xtask/src/lib.rs'
-            # macOS platform, path, and Hermes filesystem contracts run on the
-            # native arm64 runner (issues #96, #97, and #125): gate on every crate
-            # exercised by the job, the cross-platform dependency graph, and
+            # macOS platform, path, private-protocol, and Hermes filesystem
+            # contracts run on the native arm64 runner (issues #96, #97, #98,
+            # and #125): gate on every crate exercised by the job, the cross-platform dependency graph, and
             # the Cargo configuration (.cargo/config.toml carries Apple-specific
             # linker/target flags that can break only the macOS build). The root
             # manifest is included because these crates inherit workspace
@@ -254,6 +263,7 @@ jobs:
               - 'Cargo.toml'
               - 'crates/platform/**'
               - 'crates/paths/**'
+              - 'crates/worker-protocol/**'
               - 'crates/cli/Cargo.toml'
               - 'crates/cli/src/**'
               - 'Cargo.lock'

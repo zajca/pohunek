@@ -17,7 +17,7 @@
 //! values, prompt/input bytes, terminal bytes, data tokens, controller
 //! tokens, or native reference values").
 
-// Rust guideline compliant 2026-07-24
+// Rust guideline compliant 2026-09-22
 
 mod support;
 
@@ -37,7 +37,7 @@ use protocol::{
 };
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio_util::codec::{Framed, LinesCodec};
@@ -48,6 +48,7 @@ use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::procwatch::{HostInspector, ProcessInspector};
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
+use pohunek_paths::WORKER_SOCKET_NAME;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -226,6 +227,39 @@ fn collect_dir_bytes(dir: &Path) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Sends one identity-hook request to a live worker's private socket.
+///
+/// The worker binds a private report to the process it names, and this test
+/// process is unrelated to the managed runtime, so the report is expected to be
+/// rejected. Returns the worker's `ok` answer.
+async fn send_worker_identity_hook(
+    runtime_root: &Path,
+    session_id: &str,
+    request: serde_json::Value,
+) -> bool {
+    let socket = runtime_root.join(session_id).join(WORKER_SOCKET_NAME);
+    let stream = tokio::net::UnixStream::connect(&socket)
+        .await
+        .expect("connect worker hook socket");
+    let (reader, mut writer) = stream.into_split();
+    let mut encoded = serde_json::to_vec(&request).expect("encode hook request");
+    encoded.push(b'\n');
+    writer
+        .write_all(&encoded)
+        .await
+        .expect("write hook request");
+    let mut answer = String::new();
+    tokio::io::BufReader::new(reader)
+        .read_line(&mut answer)
+        .await
+        .expect("read hook response");
+    serde_json::from_str::<serde_json::Value>(&answer)
+        .expect("decode hook response")
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Polls `collect_dir_bytes(dir)` until it contains `marker`, so the scan
@@ -718,6 +752,9 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     const ENV_VALUE: &str = "SENTINEL_ENV_9f3a";
     const OUTPUT: &str = "SENTINEL_OUTPUT_9f3a";
     const HOOK: &str = "SENTINEL_HOOK_9f3a";
+    // Carried by a report the worker must reject on peer identity, so it may
+    // not reach any artifact, including the rejection event itself.
+    const REJECTED_HOOK: &str = "SENTINEL_REJECTED_HOOK_4c71";
 
     let root = temp_dir("privacy-sentinel");
     let data_dir = root.join("data");
@@ -872,6 +909,33 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
             .expect("report-native-id result");
     assert!(reported.recorded, "the sentinel native id must be recorded");
 
+    // A rejected private identity report must not leak either. This test
+    // process is neither the reported runtime process nor a descendant of it,
+    // so the worker rejects the claim on its kernel peer identity and logs a
+    // reason code; the native reference it carried must reach no artifact.
+    let rejected = send_worker_identity_hook(
+        &worker_home.join("runtime/pohunek/workers"),
+        &created.id.0,
+        serde_json::json!({
+            "type": "identity_report",
+            "runtime_id": runtime_id,
+            "provider": "claude",
+            "pid": created.pid,
+            "start_identity": process_start_identity(created.pid).get(),
+            "sequence": 2,
+            "expires_at": (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+                .format(&Rfc3339)
+                .expect("format rejected identity expiry"),
+            "reference_kind": "id",
+            "native_reference": REJECTED_HOOK,
+        }),
+    )
+    .await;
+    assert!(
+        !rejected,
+        "the worker must reject an identity report from outside the reported process"
+    );
+
     let stop_req = Request::make(
         "privacy-sentinel-stop",
         method::SESSION_STOP,
@@ -911,6 +975,10 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
         (PROMPT, "the initial prompt/input bytes"),
         (OUTPUT, "raw terminal output bytes"),
         (ENV_VALUE, "the profile environment value"),
+        (
+            REJECTED_HOOK,
+            "the native reference from a rejected identity report",
+        ),
     ];
     for (artifact_name, bytes) in artifacts {
         let text = String::from_utf8_lossy(bytes);
@@ -944,6 +1012,14 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
         HOOK,
         "the reported native id",
         &["logical store", "event log"],
+    );
+
+    // The rejection must be the peer-binding one, so the sentinel assertion
+    // above is not passing merely because some earlier rule fired first.
+    let worker_log_text = String::from_utf8_lossy(&worker_log_bytes);
+    assert!(
+        worker_log_text.contains("peer_outside_subject"),
+        "the worker must record why it rejected the report: {worker_log_text}"
     );
 
     // A safe identifier (the session id) legitimately appears everywhere.
