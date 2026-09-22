@@ -37,7 +37,7 @@ use tokio_util::codec::{Framed, LinesCodec};
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::error::DaemonError;
 use pohunek_daemon::governance::HostGovernanceService;
-use pohunek_daemon::procwatch::LinuxInspector;
+use pohunek_daemon::procwatch::HostInspector;
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 
@@ -137,7 +137,7 @@ async fn spawn_dual_servers(
             worker_binary(),
             worker_environment,
         )),
-        Arc::new(LinuxInspector::new()),
+        Arc::new(HostInspector::new()),
     );
     let state = DaemonState::new(
         HealthInfo::new(version),

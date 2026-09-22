@@ -1,5 +1,7 @@
 //! Native systemd user-manager client for worker units.
 
+// Control groups are a Linux kernel facility, so this supervisor names the
+// Linux backend directly instead of the portable host inspector.
 use pohunek_platform::process::{LinuxInspector, ProcessInspector};
 use pohunek_platform::supervisor::{
     Error as SupervisorError, ServiceId, ServiceObservation, ServiceState,
@@ -7,7 +9,7 @@ use pohunek_platform::supervisor::{
 use zbus::proxy::CacheProperties;
 use zbus::zvariant::OwnedObjectPath;
 
-// Rust guideline compliant 2026-09-14
+// Rust guideline compliant 2026-09-22
 
 const SYSTEMD_DESTINATION: &str = "org.freedesktop.systemd1";
 const SYSTEMD_MANAGER_PATH: &str = "/org/freedesktop/systemd1";

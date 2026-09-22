@@ -2238,6 +2238,10 @@ fn prepare_random_staging_directory_mode(
 }
 
 #[cfg(not(target_os = "linux"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the signature matches the Linux implementation, which can fail"
+)]
 fn prepare_random_staging_directory_mode(
     _directory: &File,
     _name: &OsStr,

@@ -359,7 +359,11 @@ synthetic ids such as `ext-12345`, carry `external: true`, and appear in
 no pohunek-owned PTY: attach, input, resize, stop, remove, rename, metadata, and
 resume operations are rejected with `session_external_read_only`. The observer
 removes the entry when the external process exits, including `kill -9` via the
-pidfd-backed exit path.
+event-driven native exit watch: a pidfd on Linux and a kqueue `NOTE_EXIT`
+registration on macOS. Both re-verify the exact process identity after arming
+the watch, so a reused process id never completes a watch for the process it
+replaced, and a registration failure is reported as a failure rather than as an
+exit.
 
 Detach and client restarts do not stop a session because its worker owns the
 PTY. A daemon restart, daemon `SIGKILL`, or daemon binary upgrade closes client

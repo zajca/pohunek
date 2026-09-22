@@ -11,19 +11,23 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+async-io.workspace = true
 getrandom.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-async-io.workspace = true
 nix = { workspace = true, features = ["socket"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 calcifer-macos-acl.workspace = true
+libc.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
-nix.workspace = true
+nix = { workspace = true, features = ["signal"] }
 tempfile.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+portable-pty.workspace = true
 
 [lints]
 workspace = true

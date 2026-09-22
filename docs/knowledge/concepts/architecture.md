@@ -39,16 +39,43 @@ block the caller's ordinary control connection.
 
 The shipped platform foundation centralizes target-neutral process identity,
 kernel Unix peer identity, and native service supervision contracts in
-`crates/platform`. Linux daemon and worker code use the real procfs, pidfd,
-peer-credential, and systemd backends. The shared secure-path contract preserves
-XDG config/data/state/cache precedence and adds a short, owner-private macOS
-runtime default without moving durable host identity. Native Apple Silicon CI
-compiles and tests these shared contracts with a macOS 14 deployment target, but
-this does not mean complete macOS host or client support is available. Intel
-Macs are outside the current release scope. Darwin process and peer inspection,
-portable PTY readiness, launchd, client and WebUI integration, signed artifacts,
-and native acceptance remain explicitly deferred through issues #97-#105 under
-the `Complete macOS support` milestone and macOS Project. The issue hierarchy,
+`crates/platform`. Every process-identity consumer in the daemon and the worker
+resolves one host inspector from those contracts rather than parsing operating
+system records on its own. Linux uses the real procfs, pidfd, peer-credential,
+and systemd backends; Darwin uses `libproc` process records, `sysctl`
+`KERN_PROCARGS2` argument regions, and a kqueue `EVFILT_PROC`/`NOTE_EXIT` exit
+watch. Both backends read the same facts: process, parent, and process-group
+ids, an opaque same-boot start identity, the controlling-terminal foreground
+process group, the executable path, the working directory, and only the
+allowlisted `POHUNEK` ownership markers. Argument and environment regions stay
+separate, so an environment value is never argument evidence and an argument is
+never an ownership marker. An observation that fails is an explicit typed
+failure, never a healthy absence, and never authorizes a mutation.
+
+Darwin adds a privilege boundary Linux does not have: the kernel serves most
+process records only to the owner of the target process and refuses everyone
+else, so ownership is settled first through the short process record, the one
+record it serves for every process id. A process owned by another user is
+therefore outside the same-user contract and reported as absent, while a
+privileged fact refused for a process the caller does own stays a denial. Three
+facts need a privilege pohunek does not ask for and so are unavailable on macOS:
+the working directory of another user's process, that process's argument vector,
+and the environment of a code-signing-restricted process, whose environment
+region the kernel omits even for the owner. A process whose environment cannot be
+read reports no ownership markers, which keeps it observable rather than
+adoptable. An argument vector is an optional fact for the same reason: a process
+that has not finished its `exec`, or whose address space is being replaced or
+torn down while the kernel copies it out, is reported without a command line
+rather than failing the inventory it appears in. The shared
+secure-path contract preserves XDG config/data/state/cache precedence and adds a
+short, owner-private macOS runtime default without moving durable host identity.
+Native Apple Silicon CI compiles and tests these shared contracts with a macOS
+14 deployment target, but this does not mean complete macOS host or client
+support is available. Intel Macs are outside the current release scope. Darwin
+peer inspection, portable PTY readiness, launchd, client and WebUI integration,
+signed artifacts, and native acceptance remain explicitly deferred through
+issues #98-#105 under the `Complete macOS support` milestone and macOS
+Project. The issue hierarchy,
 milestone, and Project own delivery scope, sequencing, and status; the accepted
 macOS RFC records design constraints rather than live tracking state.
 

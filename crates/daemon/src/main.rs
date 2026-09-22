@@ -355,7 +355,7 @@ fn build_session_registry(
         WorkerLauncherMode::Subprocess => Ok(SessionRegistry::new_with_launcher_and_inspector(
             config,
             subprocess_worker_launcher(paths)?,
-            Arc::new(pohunek_daemon::procwatch::LinuxInspector::new()),
+            Arc::new(pohunek_daemon::procwatch::HostInspector::new()),
         )),
     }
 }

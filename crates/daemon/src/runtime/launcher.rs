@@ -15,7 +15,7 @@ pub use pohunek_platform::supervisor::{
 use pohunek_platform::supervisor::{ServiceId, ServiceObservation, ServiceState, Supervisor};
 use pohunek_platform::{
     filesystem::TrustedDir,
-    process::{LinuxInspector, ProcessInspector},
+    process::{HostInspector, ProcessInspector},
 };
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -255,7 +255,7 @@ fn inspect_child(
         None
     } else {
         match pid {
-            Some(pid) => LinuxInspector::new()
+            Some(pid) => HostInspector::new()
                 .identity(pid)
                 .map_err(|source| operation("inspect_process_identity", source))?,
             None => None,

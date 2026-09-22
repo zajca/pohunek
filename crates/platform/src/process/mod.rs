@@ -5,7 +5,7 @@
 //! for equality only; they are not portable timestamps. Persisted callers that
 //! cross a reboot boundary must additionally bind records to a [`BootIdentity`].
 
-// Rust guideline compliant 2026-09-14
+// Rust guideline compliant 2026-09-22
 
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
@@ -19,6 +19,35 @@ mod linux;
 #[cfg(target_os = "linux")]
 #[doc(inline)]
 pub use linux::LinuxInspector;
+
+// The pure kernel-layout decoding is built on every host so its region
+// separation, bounds, and integer conversions are covered by the ordinary
+// workspace test gate instead of only by the macOS runner.
+#[cfg(all(unix, any(target_os = "macos", test)))]
+mod darwin_layout;
+
+#[cfg(target_os = "macos")]
+mod darwin;
+
+#[cfg(target_os = "macos")]
+#[doc(inline)]
+pub use darwin::DarwinInspector;
+
+/// Process inspector backing this host.
+///
+/// Daemon, worker, and client code name this alias instead of a concrete
+/// backend, so exactly one implementation answers every process-identity
+/// question on a given target.
+#[cfg(target_os = "linux")]
+pub type HostInspector = LinuxInspector;
+
+/// Process inspector backing this host.
+///
+/// Daemon, worker, and client code name this alias instead of a concrete
+/// backend, so exactly one implementation answers every process-identity
+/// question on a given target.
+#[cfg(target_os = "macos")]
+pub type HostInspector = DarwinInspector;
 
 /// Operating-system process identifier.
 pub type Pid = u32;
@@ -346,6 +375,17 @@ pub trait ProcessInspector: Debug + Send + Sync + 'static {
     /// Returns typed process inspection failures.
     fn cwd(&self, pid: Pid) -> Result<PathBuf, Error>;
 
+    /// Returns the executable path of one same-user process, or `None` if it exited.
+    ///
+    /// The path is instantaneous evidence: a process can `exec` a different
+    /// image at any time, so callers that act on it must recheck the process
+    /// identity afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed process inspection failures.
+    fn executable(&self, pid: Pid) -> Result<Option<PathBuf>, Error>;
+
     /// Arms an exit watch for one exact process identity.
     ///
     /// Implementations must not require an active async runtime while arming
@@ -373,8 +413,165 @@ pub trait ProcessInspector: Debug + Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-    use super::{BootIdentity, Error, StartIdentity};
+    use super::{
+        BootIdentity, Error, ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity,
+        ProcessInspector, StartIdentity,
+    };
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::str::FromStr;
+
+    /// Inspector whose per-call identity answers are supplied by the test.
+    ///
+    /// Substituting a start identity between calls reproduces PID reuse without
+    /// depending on a real operating-system race.
+    #[derive(Debug)]
+    struct ScriptedInspector {
+        identities: std::sync::Mutex<VecDeque<Option<ProcessIdentity>>>,
+        descendants: Vec<ProcessFact>,
+    }
+
+    impl ScriptedInspector {
+        fn new(
+            identities: impl IntoIterator<Item = Option<ProcessIdentity>>,
+            descendants: Vec<ProcessFact>,
+        ) -> Self {
+            Self {
+                identities: std::sync::Mutex::new(identities.into_iter().collect()),
+                descendants,
+            }
+        }
+    }
+
+    impl ProcessInspector for ScriptedInspector {
+        fn identity(&self, _pid: Pid) -> Result<Option<ProcessIdentity>, Error> {
+            Ok(self
+                .identities
+                .lock()
+                .expect("scripted identities are not poisoned")
+                .pop_front()
+                .flatten())
+        }
+
+        fn parent_pid(&self, _pid: Pid) -> Result<Option<Pid>, Error> {
+            Ok(None)
+        }
+
+        fn process(&self, _pid: Pid) -> Result<Option<ProcessFact>, Error> {
+            Ok(None)
+        }
+
+        fn same_user_processes(&self) -> Result<Vec<ProcessFact>, Error> {
+            Ok(self.descendants.clone())
+        }
+
+        fn descendants(&self, _root: Pid) -> Result<Vec<ProcessFact>, Error> {
+            Ok(self.descendants.clone())
+        }
+
+        fn cwd(&self, _pid: Pid) -> Result<PathBuf, Error> {
+            Err(Error::Unavailable {
+                operation: "scripted_cwd",
+            })
+        }
+
+        fn executable(&self, _pid: Pid) -> Result<Option<PathBuf>, Error> {
+            Ok(None)
+        }
+
+        fn exit_watch(&self, _identity: ProcessIdentity) -> Result<ExitWatch, Error> {
+            Err(Error::Unavailable {
+                operation: "scripted_exit_watch",
+            })
+        }
+
+        fn ownership_markers(&self, _pid: Pid) -> Result<OwnershipMarkers, Error> {
+            Ok(OwnershipMarkers::default())
+        }
+
+        fn foreground_process_group(&self, _root_pid: Pid) -> Result<Option<Pid>, Error> {
+            Ok(None)
+        }
+    }
+
+    fn identity(pid: Pid, start: u64) -> ProcessIdentity {
+        ProcessIdentity {
+            pid,
+            start_identity: StartIdentity::new(start),
+        }
+    }
+
+    fn fact(pid: Pid, start: u64) -> ProcessFact {
+        ProcessFact {
+            pid,
+            pgid: pid,
+            ppid: 1,
+            start_identity: StartIdentity::new(start),
+            comm: "agent".to_owned(),
+            cmdline: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn liveness_rejects_a_substituted_start_identity() {
+        let expected = identity(4_242, 100);
+        let inspector = ScriptedInspector::new([Some(identity(4_242, 101))], Vec::new());
+
+        assert!(!inspector.is_running(expected).expect("scripted liveness"));
+    }
+
+    #[test]
+    fn descendant_identities_reject_a_root_substituted_before_the_scan() {
+        let expected = identity(4_242, 100);
+        let inspector =
+            ScriptedInspector::new([Some(identity(4_242, 101))], vec![fact(4_243, 200)]);
+
+        assert!(matches!(
+            inspector.descendant_identities(expected),
+            Err(Error::Race { .. })
+        ));
+    }
+
+    #[test]
+    fn descendant_identities_reject_a_root_substituted_after_the_scan() {
+        let expected = identity(4_242, 100);
+        let inspector = ScriptedInspector::new(
+            [Some(expected), Some(identity(4_242, 101))],
+            vec![fact(4_243, 200)],
+        );
+
+        assert!(matches!(
+            inspector.descendant_identities(expected),
+            Err(Error::Race { .. })
+        ));
+    }
+
+    #[test]
+    fn descendant_identities_accept_a_stable_root() {
+        let expected = identity(4_242, 100);
+        let inspector =
+            ScriptedInspector::new([Some(expected), Some(expected)], vec![fact(4_243, 200)]);
+
+        assert_eq!(
+            inspector
+                .descendant_identities(expected)
+                .expect("stable root"),
+            vec![identity(4_243, 200)]
+        );
+    }
+
+    #[test]
+    fn a_disappeared_root_is_a_race_not_a_healthy_absence() {
+        let expected = identity(4_242, 100);
+        let inspector = ScriptedInspector::new([None], vec![fact(4_243, 200)]);
+
+        assert!(matches!(
+            inspector.descendant_identities(expected),
+            Err(Error::Race { .. })
+        ));
+        let inspector = ScriptedInspector::new([None], Vec::new());
+        assert!(!inspector.is_running(expected).expect("scripted liveness"));
+    }
 
     #[test]
     fn start_identity_roundtrips_full_wire_range() {

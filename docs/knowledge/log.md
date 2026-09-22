@@ -12,6 +12,22 @@
   reason, `worktrees_cleaned` counts only checkouts confirmed gone with a
   surviving checkout reported as `worktrees_failed`, and
   `session retention sweep` exits non-zero on a partial failure.
+- Documented the native Darwin process backend and the single shared host
+  inspector: `libproc` process records, `sysctl` `KERN_PROCARGS2` argument and
+  environment regions parsed separately, bounded allocations and traversal,
+  checked kernel start-identity encoding interpreted identically by daemon and
+  worker, controlling-terminal foreground groups resolved without assuming the
+  group equals the root process, and an event-driven kqueue `NOTE_EXIT` exit
+  watch that re-verifies process identity after registration. Complete macOS
+  host, WebUI, packaging, and release support remains deferred through #98-#105.
+- Documented the Darwin process-inspection privilege boundary: ownership decided
+  by the unprivileged short process record, another user's process reported as
+  absent while a refused fact about an owned process stays a denial, and the
+  three facts macOS withholds without a privilege pohunek does not request
+  (a foreign process's working directory and argument vector, and a
+  code-signing-restricted process's environment). An argument vector an `exec`
+  or an exit withholds leaves that one process without a command line instead of
+  failing the inventory it appears in.
 - Documented the shared secure runtime-path and portable filesystem foundation:
   preserved XDG durable locations, the owner-private macOS runtime default,
   fail-closed path validation, byte-bounded Unix sockets, atomic no-replace
