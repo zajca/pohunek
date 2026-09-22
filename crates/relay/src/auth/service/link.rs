@@ -725,16 +725,28 @@ impl AuthService {
             Err(error) => return Err(self.deny(actor, UNLINK_ACTION, denied, error).await),
         };
         let digest = request_digest(&self.digest_key, &(identity_id, request))?;
-        if exact_receipt(
+        let receipt = exact_receipt(
             &mut transaction,
             context,
             UNLINK_ACTION,
             request.idempotency.idempotency_key,
             &digest,
         )
-        .await?
-        .is_some()
-        {
+        .await;
+        let receipt = match receipt {
+            Ok(receipt) => receipt,
+            // A retry key reused for a different request is a refused authority
+            // change rather than an infrastructure failure, so it is recorded
+            // against the identity it named. Other failures are not decisions.
+            Err(AuthError::IdempotencyConflict) => {
+                drop(transaction);
+                return Err(self
+                    .deny(actor, UNLINK_ACTION, denied, AuthError::IdempotencyConflict)
+                    .await);
+            }
+            Err(error) => return Err(error),
+        };
+        if receipt.is_some() {
             let replay = removed_identity(&mut transaction, context.principal_id(), identity_id)
                 .await?
                 .ok_or(AuthError::Durable)?;

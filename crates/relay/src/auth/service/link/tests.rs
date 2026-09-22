@@ -1855,6 +1855,53 @@ async fn every_refused_transition_records_an_attributable_denial() {
     )
     .await;
 
+    // A retry key reused for a different unlink is a refused authority change
+    // and is recorded against the identity the caller named.
+    let linked = open_link(&service, &store, owner.bearer, AccountLinkChannel::Device)
+        .await
+        .expect("open a transaction to link a second identity");
+    let second = service
+        .commit_link_once(
+            &oidc,
+            commit_for(&linked, 1),
+            &proven("denial-second-identity"),
+            Some(owner.bearer),
+        )
+        .await
+        .expect("link a second identity");
+    let reused = idempotency();
+    service
+        .unlink_identity(
+            owner.bearer,
+            second.identity.identity_id,
+            UnlinkIdentityRequest {
+                idempotency: reused,
+            },
+        )
+        .await
+        .expect("remove the second identity");
+    assert!(matches!(
+        service
+            .unlink_identity(
+                owner.bearer,
+                owner.identity_id,
+                UnlinkIdentityRequest {
+                    idempotency: reused
+                },
+            )
+            .await,
+        Err(AuthError::IdempotencyConflict)
+    ));
+    assert_denied(
+        &store,
+        UNLINK_ACTION,
+        "idempotency_conflict",
+        owner.principal_id,
+        "oidc_identity",
+        &owner.identity_id.to_string(),
+    )
+    .await;
+
     // Recovery quarantine is recorded even though the relay is no longer normal.
     sqlx::query(
         "UPDATE relay_identity SET recovery_generation = recovery_generation + 1 WHERE relay_id = 'test-relay'",
