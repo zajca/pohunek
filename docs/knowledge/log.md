@@ -6,6 +6,12 @@
   policy, the separate terminal and lost TTLs, `session policy get`/`set`,
   `session retention sweep --dry-run`/`--apply`, and the eligibility rules that
   keep external, conflicting, incompatible and in-TTL sessions untouched.
+- Documented the sweep's unsaved-work hold and its truthful counters: a matched
+  session whose owned worktree has uncommitted, untracked or unpushed work — or
+  a state git cannot report — is held rather than removed and carries a `hold`
+  reason, `worktrees_cleaned` counts only checkouts confirmed gone with a
+  surviving checkout reported as `worktrees_failed`, and
+  `session retention sweep` exits non-zero on a partial failure.
 - Documented the shared secure runtime-path and portable filesystem foundation:
   preserved XDG durable locations, the owner-private macOS runtime default,
   fail-closed path validation, byte-bounded Unix sockets, atomic no-replace

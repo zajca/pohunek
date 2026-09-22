@@ -328,6 +328,25 @@ logs. It never selects an `external` session or one in `conflict` or
 or inside its TTL. Anything the sweep cannot classify is kept: an ambiguous
 record is never a removal candidate.
 
+Because the sweep is unattended and worktree removal is forced, a session whose
+age matched the policy is still **held** when its pohunek-owned worktree holds
+work: an uncommitted change to a tracked file, an untracked file, commits
+contained in no other branch, remote branch or tag, or a checkout whose state git
+cannot report at all. A held session is reported with a `hold` reason
+(`worktree_uncommitted`, `worktree_untracked`, `worktree_unpushed`,
+`worktree_unknown`), counted in `held` rather than `eligible`, and logged — its
+worktree stays on disk. Ignored files are not a hold, since they are ignored on
+purpose and regenerated. `session rm` is unaffected: an explicit operator removal
+still removes a dirty worktree, which is how a held session is cleaned up once
+the operator has looked at it.
+
+The sweep's counters are exact. `worktrees_cleaned` counts only checkouts
+confirmed gone from disk; when `git worktree remove` fails the session record is
+still evicted, and the leftover directory is reported as `worktrees_failed` and
+logged instead of counted as cleaned. `pohunek session retention sweep` exits
+non-zero when the sweep reports a failed removal or a leftover worktree, so a
+cron job or health check sees a partial failure without parsing the output.
+
 External observer mode is opt-in with `POHUNEK_OBSERVE_EXTERNAL_AGENTS=1` (or
 `SessionRegistryConfig.observe_external_agents = true`) and defaults off because
 it watches provider transcript trees under the operator's Claude/Codex homes.
