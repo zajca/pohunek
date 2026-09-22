@@ -122,8 +122,11 @@ across `fork`/`exec` or passed over `SCM_RIGHTS` changes the reported peer.
 Services therefore capture the peer before parsing a request and re-read the
 kernel answer before every decision that grants authority; a drift is a typed
 rejection. Because a connection outlives the moment it was authorized, that
-means every request on a leased control connection and every frame of a live
-attach stream, not only the exchange that granted the lease. A peer that exited
+means every request on a leased control connection, every frame of a live data
+stream including the deferred page an observation stream releases after its
+wait, and a timed re-check while a leased connection is silent — an exclusive
+lease held by a descriptor inherited from an exited daemon would otherwise block
+recovery. A peer that exited
 without being reaped is not live either: a zombie keeps its process id and
 start identity, so liveness is asked of the process record rather than inferred
 from identity alone. An in-place `exec` stays indistinguishable, because it preserves both

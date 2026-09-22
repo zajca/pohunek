@@ -21,10 +21,16 @@
 //!
 //! "Each authority decision" is meant literally, because a connection outlives
 //! the moment it was authorized: every control request is re-checked, not only
-//! the one that acquires the lease, and an attach data stream is re-checked in
-//! both directions for as long as it runs. Checking once would leave a
-//! descriptor handed on afterwards still issuing input and still receiving PTY
-//! bytes under the original peer's authority.
+//! the one that acquires the lease, and a data stream is re-checked in both
+//! directions for as long as it runs — including an observation stream that
+//! sends nothing until its wait ends. Checking once would leave a descriptor
+//! handed on afterwards still issuing input and still receiving PTY bytes under
+//! the original peer's authority.
+//!
+//! Silence counts too. A leased connection that stops speaking is re-checked on
+//! a timer, because the lease is exclusive: a descriptor inherited from a
+//! daemon that has since exited would otherwise hold it until the process dies,
+//! and a replacement daemon would keep being told the controller is busy.
 //!
 //! One thing this cannot observe is an `exec` in place. `execve` keeps both the
 //! process id and the kernel start time, on Linux and Darwin alike, so a peer

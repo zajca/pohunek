@@ -53,6 +53,14 @@ use crate::{
     OutputChunk, OutputEvent, ProcessIdentity, PtyError, PtyOwner, WorkerConfig, WorkerError,
 };
 
+/// How long an idle leased control connection may go unverified.
+///
+/// The lease is exclusive, so a peer that stops speaking must still be proved
+/// to exist: otherwise a descriptor inherited from an exited daemon holds the
+/// lease indefinitely. The interval trades a periodic pair of cheap kernel
+/// lookups against how long a replacement daemon can be blocked.
+const LEASE_PEER_RECHECK: Duration = Duration::from_secs(5);
+
 /// Number of worker events buffered per control connection.
 const EVENT_BUFFER: usize = 256;
 /// Maximum simultaneously running subagents accepted from provider hooks.
@@ -774,6 +782,7 @@ where
                             if !event_visible_to_connection(&event, connection) {
                                 continue;
                             }
+                            authorize_control_request(shared, connection)?;
                             writer.write(&ControlMessage::Event(event)).await
                                 .map_err(|error| WorkerError::Protocol(error.to_string()))?;
                             continue;
@@ -781,6 +790,15 @@ where
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => None,
                     }
+                }
+                () = tokio::time::sleep(LEASE_PEER_RECHECK) => {
+                    // A handed-off descriptor can simply go quiet: no request,
+                    // no event, no EOF. Without this the lease would be held
+                    // until the process exits, and a replacement daemon would
+                    // keep getting `ControllerBusy` from a peer that no longer
+                    // exists.
+                    authorize_control_request(shared, connection)?;
+                    continue;
                 }
             }
         } else {
@@ -2036,6 +2054,8 @@ async fn serve_data(
             observation,
             grant.lease_epoch,
             &mut lease_epoch,
+            &peer,
+            &grant.lease_owner,
         )
         .await;
     }
@@ -2323,6 +2343,8 @@ async fn serve_observation_data<R, W>(
     observation: ObservationGrant,
     expected_lease_epoch: u64,
     lease_epoch: &mut watch::Receiver<u64>,
+    peer: &PeerContext,
+    owner: &LeaseOwner,
 ) -> Result<(), WorkerError>
 where
     R: AsyncRead + Unpin + Send,
@@ -2370,6 +2392,10 @@ where
             .await;
         }
     };
+
+    // The wait above can last seconds, so the peer that redeemed the token is
+    // proved again before any PTY history leaves the worker.
+    authorize_data_frame(shared, peer, owner)?;
 
     if *lease_epoch.borrow() != expected_lease_epoch {
         return write_data_frame(
@@ -5356,6 +5382,69 @@ mod tests {
                 }
             ),
             "expected a lease-owner mismatch, got {error:?}"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An observation stream proves its peer again after it stops waiting.
+    ///
+    /// The wait can last seconds, so a descriptor handed on in the meantime
+    /// would otherwise receive a page of PTY history on the strength of the
+    /// redemption that happened before it.
+    #[tokio::test]
+    async fn a_waiting_observation_reauthorizes_before_releasing_output() {
+        let owner = crate::LeaseOwner {
+            daemon_id: "daemon-observe".to_owned(),
+            peer_pid: std::process::id(),
+            peer_start_identity: "7300".to_owned(),
+        };
+        let (server, pty, directory) = launch_claim_fixture().await;
+        let output = crate::OutputHub::new(64, 64, 2, 10).expect("output hub");
+        output
+            .push(b"must-not-cross-a-handoff")
+            .expect("retained output");
+        let (_lease_tx, mut lease_rx) = watch::channel(0_u64);
+        let (mut reader, _writer) = tokio::io::duplex(64);
+        let mut written = Vec::new();
+
+        // A peer whose kernel identity no longer matches the grant owner is the
+        // descriptor-handoff shape.
+        let drifted = crate::LeaseOwner {
+            peer_start_identity: "7301".to_owned(),
+            ..owner.clone()
+        };
+        let error = super::serve_observation_data(
+            &server.shared,
+            &pty,
+            &mut reader,
+            &mut written,
+            CURRENT_VERSION,
+            &StreamId::new("stream-observe").expect("stream id"),
+            &RuntimeId::new("runtime-claim").expect("runtime id"),
+            Some(0),
+            ObservationGrant {
+                max_bytes: 64,
+                wait: Duration::from_millis(10),
+            },
+            0,
+            &mut lease_rx,
+            &owner_peer(&drifted),
+            &owner,
+        )
+        .await
+        .expect_err("a drifted peer must not receive terminal history");
+        assert!(
+            matches!(
+                error,
+                super::WorkerError::PeerIdentity {
+                    reason: super::RejectReason::LeaseOwnerMismatch
+                }
+            ),
+            "expected a lease-owner mismatch, got {error:?}"
+        );
+        assert!(
+            written.is_empty(),
+            "no PTY history may reach a peer that changed"
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
