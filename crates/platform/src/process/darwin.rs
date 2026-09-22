@@ -1025,7 +1025,7 @@ mod native {
 
 #[cfg(test)]
 mod tests {
-    use super::{DarwinInspector, Error, ProcessInspector};
+    use super::{DarwinInspector, Error, ExitWatch, ProcessInspector};
     use crate::process::{Pid, ProcessIdentity, StartIdentity};
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
@@ -1063,7 +1063,16 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = self.0.kill();
-            let _ = self.0.wait();
+            // Reaping is bounded for the same reason the pseudoterminal fixture
+            // bounds it: a child that never reports its exit would otherwise
+            // stall every test that spawned one, with no diagnosis.
+            let deadline = Instant::now() + REAP_TIMEOUT;
+            while Instant::now() < deadline {
+                if matches!(self.0.try_wait(), Ok(Some(_status)) | Err(_unreapable)) {
+                    return;
+                }
+                std::thread::sleep(OBSERVE_POLL);
+            }
         }
     }
 
@@ -1144,6 +1153,17 @@ mod tests {
         receiver
             .recv_timeout(OBSERVE_TIMEOUT)
             .unwrap_or_else(|_elapsed| panic!("{what} never answered"))
+    }
+
+    /// Awaits one exit watch under an explicit deadline.
+    ///
+    /// An event-driven watch that never completes is a defect to be reported,
+    /// not a reason for the suite to wait forever.
+    async fn await_exit(what: &str, watch: ExitWatch) {
+        tokio::time::timeout(OBSERVE_TIMEOUT, watch.wait())
+            .await
+            .unwrap_or_else(|_elapsed| panic!("timed out waiting for {what}"))
+            .unwrap_or_else(|error| panic!("unexpected watch failure for {what}: {error}"));
     }
 
     /// Polls until `probe` yields a value or the observation window elapses.
@@ -1554,7 +1574,7 @@ mod tests {
         let watch = inspector.exit_watch(identity).expect("arm the exit watch");
         fixture.0.kill().expect("kill the fixture");
 
-        watch.wait().await.expect("observe the fixture exit");
+        await_exit("the fixture exit", watch).await;
         assert!(!inspector.is_running(identity).expect("inspect liveness"));
     }
 
@@ -1570,8 +1590,8 @@ mod tests {
             .expect("arm the second watch");
         fixture.0.kill().expect("kill the fixture");
 
-        first.wait().await.expect("first watch completes");
-        second.wait().await.expect("second watch completes");
+        await_exit("the first watch", first).await;
+        await_exit("the second watch", second).await;
     }
 
     #[tokio::test]
@@ -1626,7 +1646,7 @@ mod tests {
             match inspector.exit_watch(identity) {
                 Ok(watch) => {
                     armed += 1;
-                    watch.wait().await.expect("observe the churn exit");
+                    await_exit("the churn exit", watch).await;
                     assert_ne!(
                         inspector.identity(pid).expect("reinspect identity"),
                         Some(identity),
@@ -1662,7 +1682,7 @@ mod tests {
 
         fixture.0.kill().expect("kill the fixture");
         for watch in watches {
-            watch.wait().await.expect("an idle watch completes");
+            await_exit("an idle watch", watch).await;
         }
     }
 
