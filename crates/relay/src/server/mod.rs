@@ -19,9 +19,11 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use relay_protocol::{
-    ApiError, ApiErrorBody, CreateServiceAccountRequest, CredentialId, DeviceCredential,
-    DeviceLoginStart, DevicePollResult, LoginId, PageRequest, RevokeCredentialRequest,
-    RotateCredentialRequest, Secret, TeamId,
+    AccountLinkBrowserStart, AccountLinkDeviceStart, AccountLinkPollRequest, AccountLinkPollResult,
+    AccountLinkRequest, ApiError, ApiErrorBody, CancelAccountLinkRequest,
+    CreateServiceAccountRequest, CredentialId, DeviceCredential, DeviceLoginStart,
+    DevicePollResult, LoginId, PageRequest, RevokeCredentialRequest, RotateCredentialRequest,
+    Secret, TeamId, UnlinkIdentityRequest,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -29,8 +31,9 @@ use uuid::Uuid;
 use crate::{
     admission::Authority,
     auth::{
-        AuthError, AuthService, BrowserCallback, BrowserCallbackOutcome, BrowserCookie,
-        DevicePollSecret, LoginBindingCookie, OidcCallbackCode, OidcClient, RelayBearerCredential,
+        AuthError, AuthService, BrowserCallback, BrowserCallbackOutcome, BrowserCallbackResult,
+        BrowserCookie, DevicePollSecret, LoginBindingCookie, OidcCallbackCode, OidcClient,
+        RelayBearerCredential,
     },
     config::Config,
     store::{Store, StoreError},
@@ -92,6 +95,18 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/auth/device/start", post(device_start))
         .route("/v1/auth/device/poll", post(device_poll))
         .route("/v1/account", get(account))
+        .route(
+            "/v1/account/links",
+            get(list_account_links),
+        )
+        .route("/v1/account/links/browser/start", post(browser_link_start))
+        .route("/v1/account/links/device/start", post(device_link_start))
+        .route("/v1/account/links/device/poll", post(device_link_poll))
+        .route("/v1/account/links/{link_id}/cancel", post(cancel_account_link))
+        .route(
+            "/v1/account/identities/{identity_id}/unlink",
+            post(unlink_identity),
+        )
         .route("/v1/account/credentials", get(list_credentials))
         .route(
             "/v1/account/credentials/{credential_id}/rotate",
@@ -196,16 +211,28 @@ async fn browser_callback(
         (None, Some(_)) => BrowserCallbackOutcome::ProviderDenied,
         _ => BrowserCallbackOutcome::Invalid,
     };
-    let session = state
+    // An account-link callback must also present its current browser session.
+    // A login callback has none yet, so an absent or stale cookie is not an
+    // error here: the durable transaction decides which proof is required.
+    let session = match cookie(&headers, SESSION_COOKIE) {
+        Ok(Some(value)) => state
+            .auth
+            .authenticate_browser(BrowserCookie::new(value))
+            .await
+            .ok(),
+        Ok(None) | Err(_) => None,
+    };
+    let completed = state
         .auth
-        .complete_browser_login(
+        .complete_browser_callback(
             &state.oidc,
             BrowserCallback::new(query.state, query.iss, query.session_state, outcome),
             LoginBindingCookie::new(binding),
+            session,
         )
         .await;
-    let session = match session {
-        Ok(session) => session,
+    let completed = match completed {
+        Ok(completed) => completed,
         Err(error) => return callback_failure_response(&error),
     };
     let target = state
@@ -214,14 +241,16 @@ async fn browser_callback(
         .join("account/ready")
         .map_err(|_error| ApiFailure::invalid())?;
     let mut response = Redirect::temporary(target.as_str()).into_response();
-    response.headers_mut().append(
-        header::SET_COOKIE,
-        protected_cookie(SESSION_COOKIE, session.cookie(), true)?,
-    );
-    response.headers_mut().append(
-        header::SET_COOKIE,
-        protected_cookie(CSRF_COOKIE, session.csrf(), false)?,
-    );
+    if let BrowserCallbackResult::Session(session) = completed {
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            protected_cookie(SESSION_COOKIE, session.cookie(), true)?,
+        );
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            protected_cookie(CSRF_COOKIE, session.csrf(), false)?,
+        );
+    }
     response
         .headers_mut()
         .append(header::SET_COOKIE, cleared_cookie(LOGIN_COOKIE, true)?);
@@ -375,6 +404,171 @@ async fn account(
             state
                 .auth
                 .account(actor)
+                .await
+                .map_err(|error| ApiFailure::auth(&error))?,
+        )
+        .into_response(),
+    ))
+}
+
+async fn browser_link_start(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<AccountLinkRequest>,
+) -> Result<Response, ApiFailure> {
+    gate(&state)?;
+    let actor = authenticated(&state, &headers, true).await?;
+    let start = state
+        .auth
+        .begin_browser_link(&state.oidc, actor, request)
+        .await
+        .map_err(|error| ApiFailure::auth(&error))?;
+    let mut response = Json(AccountLinkBrowserStart {
+        link: start.record.clone(),
+        authorization_url: start.authorization_url.to_string(),
+    })
+    .into_response();
+    // The provider URL alone cannot complete the link: the callback must return
+    // this one-use host-only binding cookie as well.
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        protected_cookie(LOGIN_COOKIE, start.binding(), true)?,
+    );
+    Ok(no_store(response))
+}
+
+async fn device_link_start(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<AccountLinkRequest>,
+) -> Result<Response, ApiFailure> {
+    gate(&state)?;
+    let actor = authenticated(&state, &headers, true).await?;
+    let start = state
+        .auth
+        .begin_device_link(&state.oidc, actor, request)
+        .await
+        .map_err(|error| ApiFailure::auth(&error))?;
+    let seconds = i64::try_from(start.authorization.expires_in.as_secs())
+        .map_err(|_error| ApiFailure::invalid())?;
+    Ok(no_store(
+        Json(AccountLinkDeviceStart {
+            link: start.record.clone(),
+            authorization: relay_protocol::LinkDeviceAuthorization {
+                verification_uri: start.authorization.verification_uri.to_string(),
+                verification_uri_complete: start
+                    .authorization
+                    .verification_uri_complete
+                    .as_ref()
+                    .map(ToString::to_string),
+                user_code: start.authorization.user_code.clone(),
+                expires_at: time::OffsetDateTime::now_utc() + time::Duration::seconds(seconds),
+                interval_seconds: u32::try_from(start.authorization.interval.as_secs())
+                    .map_err(|_error| ApiFailure::invalid())?,
+                poll_secret: Secret::new(start.poll_secret().to_owned()),
+            },
+        })
+        .into_response(),
+    ))
+}
+
+async fn device_link_poll(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<AccountLinkPollRequest>,
+) -> Result<Response, ApiFailure> {
+    gate(&state)?;
+    let actor = authenticated(&state, &headers, true).await?;
+    let secret = required_header(&headers, DEVICE_SECRET_HEADER)?;
+    let result = match state
+        .auth
+        .poll_device_link(
+            &state.oidc,
+            actor,
+            request.link_id,
+            DevicePollSecret::new(secret),
+        )
+        .await
+    {
+        Ok(linked) => AccountLinkPollResult::Complete {
+            link: linked.record,
+            identity: linked.identity,
+        },
+        Err(AuthError::DevicePending {
+            retry_after_seconds,
+        }) => AccountLinkPollResult::Pending {
+            retry_after_seconds,
+        },
+        Err(
+            AuthError::DeviceSlowDown {
+                retry_after_seconds,
+            }
+            | AuthError::DeviceBusy {
+                retry_after_seconds,
+            },
+        ) => AccountLinkPollResult::SlowDown {
+            retry_after_seconds,
+        },
+        Err(AuthError::DeviceDenied) => AccountLinkPollResult::Denied,
+        Err(AuthError::DeviceExpired | AuthError::LinkExpired) => AccountLinkPollResult::Expired,
+        Err(AuthError::LinkCancelled) => AccountLinkPollResult::Cancelled,
+        Err(error) => return Err(ApiFailure::auth(&error)),
+    };
+    Ok(no_store(Json(result).into_response()))
+}
+
+async fn list_account_links(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    axum::extract::Query(page): axum::extract::Query<PageRequest>,
+) -> Result<Response, ApiFailure> {
+    gate(&state)?;
+    let actor = authenticated(&state, &headers, false).await?;
+    Ok(no_store(
+        Json(
+            state
+                .auth
+                .list_account_links(actor, page)
+                .await
+                .map_err(|error| ApiFailure::auth(&error))?,
+        )
+        .into_response(),
+    ))
+}
+
+async fn cancel_account_link(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    axum::extract::Path(link_id): axum::extract::Path<Uuid>,
+    Json(request): Json<CancelAccountLinkRequest>,
+) -> Result<Response, ApiFailure> {
+    gate(&state)?;
+    let actor = authenticated(&state, &headers, true).await?;
+    Ok(no_store(
+        Json(
+            state
+                .auth
+                .cancel_account_link(actor, link_id, request)
+                .await
+                .map_err(|error| ApiFailure::auth(&error))?,
+        )
+        .into_response(),
+    ))
+}
+
+async fn unlink_identity(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    axum::extract::Path(identity_id): axum::extract::Path<Uuid>,
+    Json(request): Json<UnlinkIdentityRequest>,
+) -> Result<Response, ApiFailure> {
+    gate(&state)?;
+    let actor = authenticated(&state, &headers, true).await?;
+    Ok(no_store(
+        Json(
+            state
+                .auth
+                .unlink_identity(actor, identity_id, request)
                 .await
                 .map_err(|error| ApiFailure::auth(&error))?,
         )
@@ -704,14 +898,40 @@ impl ApiFailure {
             code: "unavailable",
         }
     }
+    fn forbidden() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden",
+        }
+    }
+    fn not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+        }
+    }
+    const fn conflict(code: &'static str) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code,
+        }
+    }
     fn auth(error: &AuthError) -> Self {
         match error {
             AuthError::CredentialInvalid | AuthError::CsrfInvalid | AuthError::OriginInvalid => {
                 Self::unauthenticated()
             }
-            AuthError::Capacity | AuthError::Durable | AuthError::IssuerUnavailable => {
-                Self::unavailable()
-            }
+            // `Retryable` is an internal SERIALIZABLE-conflict signal. It is meant
+            // to be consumed by a retry loop, but any path that leaks it must
+            // still tell the client the attempt is worth retrying rather than
+            // malformed, so it is explicit here instead of falling through.
+            AuthError::Capacity
+            | AuthError::Durable
+            | AuthError::Retryable
+            | AuthError::IssuerUnavailable
+            // Recovery quarantine is a temporary refusal to change authority, so
+            // it reads as unavailable rather than as a client error.
+            | AuthError::LinkQuarantined => Self::unavailable(),
             AuthError::IdempotencyConflict => Self {
                 status: StatusCode::CONFLICT,
                 code: "state_conflict",
@@ -724,6 +944,19 @@ impl ApiFailure {
                 status: StatusCode::BAD_REQUEST,
                 code: "rotation_rejected",
             },
+            AuthError::LinkUnsupportedActor | AuthError::LinkCrossPrincipal => Self::forbidden(),
+            AuthError::LinkNotFound | AuthError::IdentityNotFound => Self::not_found(),
+            AuthError::LinkExpired => Self {
+                status: StatusCode::GONE,
+                code: "link_expired",
+            },
+            AuthError::LinkPending => Self::conflict("link_pending"),
+            AuthError::LinkCancelled => Self::conflict("link_cancelled"),
+            AuthError::LinkReplayed => Self::conflict("link_replayed"),
+            AuthError::LinkStale => Self::conflict("state_conflict"),
+            AuthError::LinkSelf => Self::conflict("link_self"),
+            AuthError::LinkCollision => Self::conflict("link_collision"),
+            AuthError::UnlinkLastIdentity => Self::conflict("last_identity"),
             _ => Self::invalid(),
         }
     }
@@ -1124,6 +1357,175 @@ mod credential_router_tests {
         assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
         auth_tests::cleanup(&bootstrap, &schema).await;
     }
+
+    /// Every link route sits behind one authentication boundary: a bearer
+    /// caller may not also present a cookie or `Origin`, an unauthenticated
+    /// caller is refused, and a browser mutation needs its exact `Origin` and
+    /// CSRF header before the linking lifecycle sees the request.
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The route-level authentication boundary is one end-to-end HTTP sequence."
+    )]
+    async fn link_routes_reject_mixed_and_unauthenticated_callers() {
+        let (store, schema, bootstrap) = auth_tests::fixture().await;
+        let (authority, _directory) = auth_tests::authority(store.clone()).await;
+        let digest_key = DigestKey::new("test".to_owned(), b"ephemeral-test-key".to_vec());
+        let auth = AuthService::new(
+            store.clone(),
+            digest_key.clone(),
+            2,
+            router_auth_limits(),
+            LoginPolicy::AnyAuthenticatedSubject,
+            Arc::clone(&authority),
+        );
+        let principal_id = Uuid::now_v7();
+        let identity_id = Uuid::now_v7();
+        let credential_id = Uuid::now_v7();
+        let secret = "link-router-secret";
+        sqlx::query(
+            "INSERT INTO principals (id,kind,state,generation) VALUES ($1,'human','active',1)",
+        )
+        .bind(principal_id)
+        .execute(store.pool())
+        .await
+        .expect("seed principal");
+        sqlx::query("INSERT INTO oidc_identities (identity_id,issuer,subject,principal_id,link_generation) VALUES ($1,'issuer','link-router-owner',$2,1)")
+            .bind(identity_id)
+            .bind(principal_id)
+            .execute(store.pool())
+            .await
+            .expect("seed identity");
+        sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,expires_at) VALUES ($1,$2,$3,$4,$5,'test','human',1,$1,1,clock_timestamp()+interval '1 hour')")
+            .bind(credential_id)
+            .bind(credential_id.to_string())
+            .bind(digest_key.digest(secret).as_slice())
+            .bind(principal_id)
+            .bind(identity_id)
+            .execute(store.pool())
+            .await
+            .expect("seed bearer");
+        let state = ServerState::new(
+            config(),
+            store.clone(),
+            auth,
+            OidcClient::test_client(),
+            authority,
+        );
+        let app = router(state);
+        let bearer = format!("Bearer {credential_id}.{secret}");
+        let body = json!({
+            "idempotency":{"correlation_id":Uuid::now_v7(),"idempotency_key":Uuid::now_v7()},
+        });
+        for uri in [
+            "/v1/account/links/browser/start",
+            "/v1/account/links/device/start",
+        ] {
+            let mixed = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, &bearer)
+                        .header(header::COOKIE, "__Host-pohunek-relay-session=x")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .expect("mixed link request"),
+                )
+                .await
+                .expect("router response");
+            assert_eq!(mixed.status(), StatusCode::BAD_REQUEST);
+            let anonymous = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .expect("anonymous link request"),
+                )
+                .await
+                .expect("router response");
+            assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // A browser mutation without its exact Origin and CSRF header never
+        // reaches the linking lifecycle.
+        let no_csrf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/account/links/browser/start")
+                    .header(header::COOKIE, "__Host-pohunek-relay-session=x")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .expect("cookie-only link request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(no_csrf.status(), StatusCode::BAD_REQUEST);
+
+        // A bearer caller reaches the lifecycle, which owns the channel rule.
+        let wrong_channel = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/account/links/browser/start")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .expect("bearer browser-start request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(wrong_channel.status(), StatusCode::BAD_REQUEST);
+        let wrong_channel_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(wrong_channel.into_body(), 64 * 1024)
+                .await
+                .expect("wrong channel body"),
+        )
+        .expect("wrong channel JSON");
+        assert_eq!(wrong_channel_json["error"]["code"], "invalid_request");
+
+        let page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/account/links?limit=0")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(axum::body::Body::empty())
+                    .expect("invalid link page request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(page.status(), StatusCode::BAD_REQUEST);
+
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/account/links?limit=1")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(axum::body::Body::empty())
+                    .expect("link page request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(listed.status(), StatusCode::OK);
+        assert_eq!(
+            listed
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "a link response is never cached"
+        );
+        auth_tests::cleanup(&bootstrap, &schema).await;
+    }
 }
 impl IntoResponse for ApiFailure {
     fn into_response(self) -> Response {
@@ -1214,6 +1616,19 @@ mod tests {
             HeaderValue::from_static("__Host-pohunek-relay-login=second"),
         );
         cookie(&separate_headers, LOGIN_COOKIE).unwrap_err();
+    }
+
+    /// A leaked retry signal must read as retryable, not as a malformed request.
+    #[test]
+    fn a_retry_signal_maps_to_unavailable_rather_than_invalid() {
+        let retryable = super::ApiFailure::auth(&AuthError::Retryable);
+        assert_eq!(retryable.status, super::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retryable.code, super::ApiFailure::unavailable().code);
+        // The catch-all remains 400 for genuinely malformed input.
+        assert_eq!(
+            super::ApiFailure::auth(&AuthError::Malformed).status,
+            super::StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]

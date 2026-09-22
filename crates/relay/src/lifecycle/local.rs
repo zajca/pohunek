@@ -396,8 +396,8 @@ impl Lifecycle {
         self.require_no_live_lease(&mut tx, expected_relay_id)
             .await?;
         // This takes `SHARE ROW EXCLUSIVE` locks before the database-derived
-        // digest. A pending migration therefore cannot be resumed from a
-        // swapped authority state before SQLx receives any DDL.
+        // digests, so the authority state hashed below cannot change under this
+        // transaction before SQLx receives any DDL.
         locked_tables(&mut tx).await?;
         let observed = self
             .store
@@ -409,6 +409,11 @@ impl Lifecycle {
             .migration_authority_digest_in_transaction(&mut tx)
             .await
             .map_err(|error| migration_store_error(&error))?;
+        let projection_digest = self
+            .store
+            .migration_projection_digest_in_transaction(&mut tx)
+            .await
+            .map_err(|error| migration_store_error(&error))?;
         let active = if checkpoint.active_run {
             let WitnessEvent::Migration {
                 base_migration_count,
@@ -416,6 +421,7 @@ impl Lifecycle {
                 target_migration_count,
                 target_plan_digest,
                 authority_digest: expected_authority,
+                authority_projection_digest: expected_projection,
             } = &checkpoint.event
             else {
                 return Err(LifecycleError::InvalidState);
@@ -428,9 +434,16 @@ impl Lifecycle {
                 || observed.count() < *base_migration_count
                 || observed.count() > *target_migration_count
                 || observed.count() > target.count()
-                || authority_digest != *expected_authority
+                // The projected digest selects each table's base column list, so
+                // it survives a plan step that adds a column and binds the
+                // authority rows at every point in the plan.
+                || projection_digest != *expected_projection
+                // The whole-row digest additionally binds columns the projection
+                // omits, but only while the base schema is intact: once a step
+                // has added a column it is no longer reproducible.
                 || (observed.count() == *base_migration_count
-                    && observed.digest() != *base_plan_digest)
+                    && (observed.digest() != *base_plan_digest
+                        || authority_digest != *expected_authority))
             {
                 return Err(LifecycleError::InvalidState);
             }
@@ -449,6 +462,7 @@ impl Lifecycle {
                     target_migration_count: target.count(),
                     target_plan_digest: target.digest(),
                     authority_digest,
+                    authority_projection_digest: projection_digest,
                 },
             )?
         };
@@ -461,11 +475,27 @@ impl Lifecycle {
             .migrate()
             .await
             .map_err(|_error| LifecycleError::Durable)?;
+        #[cfg(test)]
+        if let Some(statement) = self.applied_hook.lock().await.clone() {
+            // A hook that cannot run is a broken test, not a lifecycle failure,
+            // so it surfaces here instead of being reported as unavailable state.
+            sqlx::raw_sql(AssertSqlSafe(statement))
+                .execute(self.store.pool())
+                .await
+                .expect("applied-plan hook statement");
+        }
         let mut tx = self.begin().await?;
-        self.store
-            .lock_relay_identity_in_transaction(&mut tx, expected_relay_id)
-            .await
-            .map_err(|_error| LifecycleError::InvalidState)?;
+        // The relay holds no lock while SQLx applies the plan on another pooled
+        // connection, so this re-verifies the authority itself and not only the
+        // schema version: the exact relay identity at the signed recovery
+        // generation, the exact target prefix, and the projected authority digest
+        // the pre-DDL phase signed. A row inserted, edited, or removed in any
+        // projected table during that window fails here.
+        let generation: Option<i64> = sqlx::query_scalar("SELECT recovery_generation FROM relay_identity WHERE relay_id=$1 AND state='normal' AND recovery_generation=$2 FOR UPDATE")
+            .bind(expected_relay_id).bind(active.recovery_generation).fetch_optional(&mut *tx).await.map_err(|_error| LifecycleError::Durable)?;
+        if generation.is_none() || self.witness.latest()?.as_ref() != Some(&active) {
+            return Err(LifecycleError::ManifestMismatch);
+        }
         self.require_no_live_lease(&mut tx, expected_relay_id)
             .await?;
         locked_tables(&mut tx).await?;
@@ -474,14 +504,19 @@ impl Lifecycle {
             .migration_prefix_in_transaction(&mut tx)
             .await
             .map_err(|error| migration_store_error(&error))?;
-        let authority_digest = self
+        let applied_projection = self
             .store
-            .migration_authority_digest_in_transaction(&mut tx)
+            .migration_projection_digest_in_transaction(&mut tx)
             .await
             .map_err(|error| migration_store_error(&error))?;
-        if observed != target
-            || !matches!(&active.event, WitnessEvent::Migration { authority_digest: expected, .. } if authority_digest == *expected)
-        {
+        let WitnessEvent::Migration {
+            authority_projection_digest: signed_projection,
+            ..
+        } = &active.event
+        else {
+            return Err(LifecycleError::InvalidState);
+        };
+        if observed != target || applied_projection != *signed_projection {
             return Err(LifecycleError::ManifestMismatch);
         }
         tx.commit()

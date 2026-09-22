@@ -14,6 +14,7 @@ mod auth;
 mod error;
 mod evidence;
 mod id;
+mod link;
 mod management;
 mod revision;
 
@@ -34,6 +35,11 @@ pub use evidence::{
     SignedEvidence, EVIDENCE_SCHEMA_VERSION,
 };
 pub use id::{CredentialId, PrincipalId, RelayId, TeamId};
+pub use link::{
+    AccountLinkBrowserStart, AccountLinkChannel, AccountLinkDeviceStart, AccountLinkPage,
+    AccountLinkPollRequest, AccountLinkPollResult, AccountLinkRecord, AccountLinkState,
+    CancelAccountLinkRequest, IdentityRemoved, LinkDeviceAuthorization, UnlinkIdentityRequest,
+};
 pub use management::{
     CreateGrantRequest, CreateGroupRequest, CreateRoleRequest, CreateTeamRequest, GrantSubject,
     Idempotency, MemberChangeRequest, MemberRecord, MembershipPage, MutationReceipt, Page,

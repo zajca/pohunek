@@ -327,10 +327,9 @@ live blocker graph:
 
 - **Application auth in the shipped mesh-local Bun backend** — intentionally
   absent under the owner-path NetBird/filesystem trust boundary. The separate
-  relay foundation now provides generic OIDC and credential lifecycle; its
-  account linking, complete team administration, and session ACLs remain
-  [#107](https://github.com/zajca/pohunek/issues/107),
-  [#108](https://github.com/zajca/pohunek/issues/108), and
+  relay foundation now provides generic OIDC, credential lifecycle, and account
+  linking; its complete team administration and session ACLs remain
+  [#108](https://github.com/zajca/pohunek/issues/108) and
   [#83](https://github.com/zajca/pohunek/issues/83).
 - **In-tree provider adapters in the chassis** — never; providers stay shell-out
   (`gh`) / GraphQL (Linear) in the clients.

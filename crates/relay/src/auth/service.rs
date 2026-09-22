@@ -2,6 +2,8 @@
 
 // Rust guideline compliant 2026-09-08
 
+pub(crate) mod link;
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex as StdMutex},
@@ -26,7 +28,7 @@ use crate::{
 };
 
 use super::{
-    oidc::{OidcClient, OidcDeviceAuthorization},
+    oidc::{OidcClient, OidcDeviceAuthorization, OidcIdentity},
     pending::{PendingDeviceCode, PendingDeviceCodes, PendingTransactions},
     AuthError, BrowserCallback, BrowserCallbackOutcome, BrowserCookie, DevicePollSecret, DigestKey,
     LoginBindingCookie, RelayBearerCredential,
@@ -165,6 +167,99 @@ struct PendingBrowserLogin {
 impl PendingBrowserLogin {
     fn expired(&self, now: Instant) -> bool {
         self.expires_at <= now
+    }
+}
+
+/// Holds one durably consumed callback and its transient PKCE material.
+///
+/// The capacity guard keeps the shared pending-transaction unit reserved until
+/// the provider exchange and the durable effect of this callback are finished.
+struct ConsumedCallback {
+    login_id: Uuid,
+    link_id: Option<Uuid>,
+    account_link_generation: i64,
+    recovery_generation: i64,
+    verifier: Zeroizing<String>,
+    nonce: Zeroizing<String>,
+    _capacity_guard: super::pending::PendingTransactionGuard,
+}
+
+impl ConsumedCallback {
+    const fn audit_action(&self) -> &'static str {
+        if self.link_id.is_some() {
+            "auth.link.callback"
+        } else {
+            "auth.browser.callback"
+        }
+    }
+}
+
+impl std::fmt::Debug for ConsumedCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsumedCallback")
+            .field("login_id", &self.login_id)
+            .field("link_id", &self.link_id)
+            .field("redacted", &true)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Reports which durable action one browser callback completed.
+#[derive(Debug)]
+pub enum BrowserCallbackResult {
+    /// A login callback issued a new browser session.
+    Session(IssuedBrowserSession),
+    /// An account-link callback linked a proven second identity.
+    Link(Box<relay_protocol::AccountLinkRecord>),
+}
+
+/// Binds one device poll to the exact durable action it may complete.
+#[derive(Debug, Clone, Copy)]
+struct DeviceTransaction {
+    action: &'static str,
+    link_id: Option<Uuid>,
+    account_link_generation: i64,
+    audit_action: &'static str,
+}
+
+impl DeviceTransaction {
+    /// Describes an anonymous device login, which never carries a link.
+    const fn login() -> Self {
+        Self {
+            action: "login",
+            link_id: None,
+            // A login transaction predates any account, so it pins the initial
+            // generation rather than an account's current one.
+            account_link_generation: 1,
+            audit_action: "auth.device.poll",
+        }
+    }
+
+    /// Describes an account-link device transaction bound to its account generation.
+    const fn account_link(link_id: Uuid, account_link_generation: i64) -> Self {
+        Self {
+            action: "account_link",
+            link_id: Some(link_id),
+            account_link_generation,
+            audit_action: "auth.link.poll",
+        }
+    }
+}
+
+/// Carries one successful device poll to its action-specific commit.
+struct DevicePollClaim {
+    recovery_generation: i64,
+    poll_interval_seconds: u32,
+    poll_lease_token: [u8; RANDOM_SECRET_BYTES],
+    identity: OidcIdentity,
+}
+
+impl std::fmt::Debug for DevicePollClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DevicePollClaim")
+            .field("recovery_generation", &self.recovery_generation)
+            .field("redacted", &true)
+            .finish_non_exhaustive()
     }
 }
 
@@ -443,7 +538,7 @@ impl AuthService {
         self.commit_current(transaction).await?;
         let expires_at = Instant::now() + authorization.expires_in;
         if let Err(error) = reservation.commit(login_id, expires_at) {
-            self.reject_device_login(login_id, "cancelled", None)
+            self.reject_device_login(login_id, "cancelled", None, "auth.device.poll")
                 .await?;
             return Err(error);
         }
@@ -452,7 +547,7 @@ impl AuthService {
             .insert(login_id, PendingDeviceCode::new(authorization.clone()))
         {
             self.pending_transactions.release(login_id);
-            self.reject_device_login(login_id, "cancelled", None)
+            self.reject_device_login(login_id, "cancelled", None, "auth.device.poll")
                 .await?;
             return Err(error);
         }
@@ -463,17 +558,102 @@ impl AuthService {
         })
     }
 
-    /// Consumes a callback exactly once before exchanging its authorization code.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "The browser callback must retain its security checks and durable transitions in review order."
-    )]
+    /// Completes one browser callback as either a login or an account link.
+    ///
+    /// The durable row decides which action the callback may complete, so both
+    /// paths share the same one-use consumption, binding, and provider checks.
+    /// `session` carries the browser session the request presented; an account
+    /// link requires it and a login ignores it.
+    pub async fn complete_browser_callback(
+        &self,
+        oidc: &OidcClient,
+        callback: BrowserCallback,
+        binding: LoginBindingCookie,
+        session: Option<AuthenticatedActor>,
+    ) -> Result<BrowserCallbackResult, AuthError> {
+        let consumed = self
+            .consume_browser_callback(oidc, &callback, &binding)
+            .await?;
+        let audit_action = consumed.audit_action();
+        let BrowserCallbackOutcome::Code(code) = callback.outcome else {
+            return Err(AuthError::OidcInvalid);
+        };
+        let Ok(identity) = oidc
+            .exchange_browser_code(code.expose().to_owned(), consumed.verifier, consumed.nonce)
+            .await
+        else {
+            self.audit_rejection(audit_action, "browser_login", "provider_invalid")
+                .await?;
+            return Err(AuthError::OidcInvalid);
+        };
+        if identity.issuer != oidc.issuer() {
+            self.audit_rejection(audit_action, "browser_login", "issuer_invalid")
+                .await?;
+            return Err(AuthError::OidcInvalid);
+        }
+        match consumed.link_id {
+            None => self
+                .issue_browser_session(
+                    identity.issuer,
+                    identity.subject,
+                    oidc.client_id().to_owned(),
+                    oidc.redirect_uri()
+                        .ok_or(AuthError::OidcInvalid)?
+                        .to_owned(),
+                    consumed.login_id,
+                    consumed.recovery_generation,
+                )
+                .await
+                .map(BrowserCallbackResult::Session),
+            Some(link_id) => self
+                .commit_browser_link(
+                    oidc,
+                    link::BrowserLinkBinding {
+                        link_id,
+                        login_id: consumed.login_id,
+                        recovery_generation: consumed.recovery_generation,
+                        account_link_generation: consumed.account_link_generation,
+                    },
+                    &identity,
+                    session,
+                )
+                .await
+                .map(Box::new)
+                .map(BrowserCallbackResult::Link),
+        }
+    }
+
+    /// Completes one browser login callback.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::OidcInvalid`] when the callback is not a current
+    /// login transaction, including when it belongs to an account link.
     pub async fn complete_browser_login(
         &self,
         oidc: &OidcClient,
         callback: BrowserCallback,
         binding: LoginBindingCookie,
     ) -> Result<IssuedBrowserSession, AuthError> {
+        match self
+            .complete_browser_callback(oidc, callback, binding, None)
+            .await?
+        {
+            BrowserCallbackResult::Session(session) => Ok(session),
+            BrowserCallbackResult::Link(_) => Err(AuthError::OidcInvalid),
+        }
+    }
+
+    /// Consumes one callback row exactly once and validates its bindings.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The browser callback must retain its security checks and durable transitions in review order."
+    )]
+    async fn consume_browser_callback(
+        &self,
+        oidc: &OidcClient,
+        callback: &BrowserCallback,
+        binding: &LoginBindingCookie,
+    ) -> Result<ConsumedCallback, AuthError> {
         let mut transaction = self
             .store
             .begin_serializable()
@@ -486,8 +666,7 @@ impl AuthService {
         let row = sqlx::query(
             "UPDATE browser_logins b SET consumed_at = clock_timestamp(), outcome = 'failed' \
              FROM relay_identity r WHERE b.state_digest = $1 AND b.login_binding_digest = $2 \
-             AND b.issuer = $3 AND b.client_id = $4 AND b.audience = $4 AND b.redirect_uri = $5 AND b.action = 'login' \
-             AND b.link_id IS NULL AND b.account_link_generation = 1 \
+             AND b.issuer = $3 AND b.client_id = $4 AND b.audience = $4 AND b.redirect_uri = $5 \
              AND b.consumed_at IS NULL AND b.expires_at > clock_timestamp() AND b.recovery_generation = r.recovery_generation AND r.state = 'normal' \
              RETURNING b.login_id, b.nonce_digest, b.pkce_verifier_digest, b.issuer, b.client_id, b.audience, b.redirect_uri, b.action, b.link_id, b.account_link_generation, b.recovery_generation",
         ).bind(self.digest_key.digest(&callback.state).as_slice()).bind(self.digest_key.digest(binding.expose()).as_slice())
@@ -507,16 +686,26 @@ impl AuthService {
             return Err(AuthError::OidcInvalid);
         };
         let login_id: Uuid = row.get("login_id");
-        let _capacity_guard = self.pending_transactions.claim(login_id)?;
+        let link_id: Option<Uuid> = row.get("link_id");
+        let action: String = row.get("action");
+        let audit_action = if link_id.is_some() {
+            "auth.link.callback"
+        } else {
+            "auth.browser.callback"
+        };
+        let capacity_guard = self.pending_transactions.claim(login_id)?;
         let pending = self.remove_pending_browser_login(login_id);
-        if row.get::<String, _>("issuer") != oidc.issuer()
+        let action_is_coherent = match action.as_str() {
+            "login" => link_id.is_none() && row.get::<i64, _>("account_link_generation") == 1,
+            "account_link" => link_id.is_some(),
+            _ => false,
+        };
+        if !action_is_coherent
+            || row.get::<String, _>("issuer") != oidc.issuer()
             || row.get::<String, _>("client_id") != oidc.client_id()
             || row.get::<String, _>("audience") != oidc.client_id()
             || row.get::<String, _>("redirect_uri")
                 != oidc.redirect_uri().ok_or(AuthError::OidcInvalid)?
-            || row.get::<String, _>("action") != "login"
-            || row.get::<Option<Uuid>, _>("link_id").is_some()
-            || row.get::<i64, _>("account_link_generation") != 1
             || callback
                 .issuer
                 .as_deref()
@@ -528,7 +717,7 @@ impl AuthService {
         {
             audit_auth(
                 &mut transaction,
-                "auth.browser.callback",
+                audit_action,
                 "deny",
                 "browser_login",
                 "callback_invalid",
@@ -541,7 +730,7 @@ impl AuthService {
         let Some(pending) = pending else {
             audit_auth(
                 &mut transaction,
-                "auth.browser.callback",
+                audit_action,
                 "deny",
                 "browser_login",
                 "verifier_missing",
@@ -560,7 +749,7 @@ impl AuthService {
         ) {
             audit_auth(
                 &mut transaction,
-                "auth.browser.callback",
+                audit_action,
                 "deny",
                 "browser_login",
                 "binding_invalid",
@@ -572,7 +761,7 @@ impl AuthService {
         }
         audit_auth(
             &mut transaction,
-            "auth.browser.callback",
+            audit_action,
             "changed",
             "browser_login",
             "consumed",
@@ -580,51 +769,64 @@ impl AuthService {
         )
         .await?;
         self.commit_current(transaction).await?;
-        let BrowserCallbackOutcome::Code(code) = callback.outcome else {
-            return Err(AuthError::OidcInvalid);
-        };
-        let Ok(identity) = oidc
-            .exchange_browser_code(code.expose().to_owned(), pending.verifier, pending.nonce)
-            .await
-        else {
-            self.audit_rejection("auth.browser.callback", "browser_login", "provider_invalid")
-                .await?;
-            return Err(AuthError::OidcInvalid);
-        };
-        if identity.issuer != oidc.issuer() {
-            self.audit_rejection("auth.browser.callback", "browser_login", "issuer_invalid")
-                .await?;
-            return Err(AuthError::OidcInvalid);
-        }
-        let recovery_generation: i64 = row.get("recovery_generation");
-        self.issue_browser_session(
-            identity.issuer,
-            identity.subject,
-            oidc.client_id().to_owned(),
-            oidc.redirect_uri()
-                .ok_or(AuthError::OidcInvalid)?
-                .to_owned(),
+        Ok(ConsumedCallback {
             login_id,
-            recovery_generation,
-        )
-        .await
+            link_id,
+            account_link_generation: row.get("account_link_generation"),
+            recovery_generation: row.get("recovery_generation"),
+            verifier: pending.verifier,
+            nonce: pending.nonce,
+            _capacity_guard: capacity_guard,
+        })
     }
 
     /// Owns one due device poll, exchanges it once, and delivers a relay credential once.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "The device poll claim, provider exchange, and terminal transition are one reviewed sequence."
-    )]
     pub async fn poll_device_login(
         &self,
         oidc: &OidcClient,
         login_id: Uuid,
         secret: DevicePollSecret,
     ) -> Result<super::IssuedCredential, AuthError> {
+        let claim = self
+            .claim_and_poll_device(oidc, login_id, &secret, DeviceTransaction::login())
+            .await?;
+        let issued = self
+            .issue_human_credential(
+                claim.identity.subject,
+                DeviceIssueBinding {
+                    issuer: claim.identity.issuer,
+                    client_id: oidc.client_id().to_owned(),
+                    login_id,
+                    recovery_generation: claim.recovery_generation,
+                    poll_interval_seconds: claim.poll_interval_seconds,
+                    poll_lease_token: claim.poll_lease_token,
+                },
+            )
+            .await;
+        self.pending_transactions.release(login_id);
+        issued
+    }
+
+    /// Claims one due device poll for its exact action and exchanges it once.
+    ///
+    /// Login and account linking share this claim, possession, lease, and
+    /// provider-validation sequence; neither path may weaken it.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The device poll claim, provider exchange, and terminal transition are one reviewed sequence."
+    )]
+    async fn claim_and_poll_device(
+        &self,
+        oidc: &OidcClient,
+        login_id: Uuid,
+        secret: &DevicePollSecret,
+        transaction_kind: DeviceTransaction,
+    ) -> Result<DevicePollClaim, AuthError> {
+        let audit_action = transaction_kind.audit_action;
         let row = sqlx::query("SELECT poll_secret_digest, issuer, client_id, audience, action, link_id, account_link_generation, recovery_generation, poll_interval_seconds FROM device_logins WHERE login_id = $1 AND consumed_at IS NULL AND expires_at > clock_timestamp()")
             .bind(login_id).fetch_optional(self.store.pool()).await.map_err(database_error)?;
         let Some(row) = row else {
-            self.audit_rejection("auth.device.poll", "device_login", "expired")
+            self.audit_rejection(audit_action, "device_login", "expired")
                 .await?;
             return Err(AuthError::DeviceExpired);
         };
@@ -633,18 +835,20 @@ impl AuthService {
             secret.expose(),
             row.get::<Vec<u8>, _>("poll_secret_digest").as_slice(),
         ) {
-            self.audit_rejection("auth.device.poll", "device_login", "possession_invalid")
+            self.audit_rejection(audit_action, "device_login", "possession_invalid")
                 .await?;
             return Err(AuthError::CredentialInvalid);
         }
         if row.get::<String, _>("issuer") != oidc.issuer()
             || row.get::<String, _>("client_id") != oidc.client_id()
             || row.get::<String, _>("audience") != oidc.client_id()
-            || row.get::<String, _>("action") != "login"
-            || row.get::<Option<Uuid>, _>("link_id").is_some()
-            || row.get::<i64, _>("account_link_generation") != 1
+            || row.get::<String, _>("action") != transaction_kind.action
+            || row.get::<Option<Uuid>, _>("link_id") != transaction_kind.link_id
+            || row.get::<i64, _>("account_link_generation")
+                != transaction_kind.account_link_generation
         {
-            self.reject_device_login(login_id, "failed", None).await?;
+            self.reject_device_login(login_id, "failed", None, audit_action)
+                .await?;
             return Err(AuthError::OidcInvalid);
         }
         let poll_lease_token = random_token()?;
@@ -657,14 +861,16 @@ impl AuthService {
             .verify_fence_in_transaction(&mut claim_transaction)
             .await
             .map_err(|_error| AuthError::Durable)?;
-        let claimed = sqlx::query("UPDATE device_logins d SET poll_lease_until = clock_timestamp() + $2::interval, poll_lease_token = $3 FROM relay_identity r WHERE d.login_id = $1 AND d.issuer = $4 AND d.client_id = $5 AND d.audience = $5 AND d.action = 'login' AND d.link_id IS NULL AND d.account_link_generation = 1 AND d.consumed_at IS NULL AND d.expires_at > clock_timestamp() AND d.next_poll_at <= clock_timestamp() AND (d.poll_lease_until IS NULL OR d.poll_lease_until < clock_timestamp()) AND d.recovery_generation = r.recovery_generation AND r.state = 'normal' RETURNING d.recovery_generation")
-            .bind(login_id).bind(interval(self.limits.device_poll_lease)).bind(poll_lease_token.as_slice()).bind(oidc.issuer()).bind(oidc.client_id()).fetch_optional(&mut *claim_transaction).await.map_err(database_error)?.ok_or(AuthError::DeviceBusy { retry_after_seconds: poll_interval_seconds })?;
+        let claimed = sqlx::query("UPDATE device_logins d SET poll_lease_until = clock_timestamp() + $2::interval, poll_lease_token = $3 FROM relay_identity r WHERE d.login_id = $1 AND d.issuer = $4 AND d.client_id = $5 AND d.audience = $5 AND d.action = $6 AND d.link_id IS NOT DISTINCT FROM $7 AND d.account_link_generation = $8 AND d.consumed_at IS NULL AND d.expires_at > clock_timestamp() AND d.next_poll_at <= clock_timestamp() AND (d.poll_lease_until IS NULL OR d.poll_lease_until < clock_timestamp()) AND d.recovery_generation = r.recovery_generation AND r.state = 'normal' RETURNING d.recovery_generation")
+            .bind(login_id).bind(interval(self.limits.device_poll_lease)).bind(poll_lease_token.as_slice()).bind(oidc.issuer()).bind(oidc.client_id())
+            .bind(transaction_kind.action).bind(transaction_kind.link_id).bind(transaction_kind.account_link_generation)
+            .fetch_optional(&mut *claim_transaction).await.map_err(database_error)?.ok_or(AuthError::DeviceBusy { retry_after_seconds: poll_interval_seconds })?;
         self.commit_current(claim_transaction).await?;
         let recovery_generation: i64 = claimed.get("recovery_generation");
         let pending = self.pending_device_codes.take(login_id);
         let Some(pending) = pending else {
             let result = self
-                .reject_device_login(login_id, "expired", Some(&poll_lease_token))
+                .reject_device_login(login_id, "expired", Some(&poll_lease_token), audit_action)
                 .await;
             self.pending_transactions.release(login_id);
             result?;
@@ -736,31 +942,22 @@ impl AuthService {
                     AuthError::DeviceExpired => "expired",
                     _ => "failed",
                 };
-                self.reject_device_login(login_id, outcome, Some(&poll_lease_token))
+                self.reject_device_login(login_id, outcome, Some(&poll_lease_token), audit_action)
                     .await?;
                 return Err(error);
             }
         };
         if identity.issuer != oidc.issuer() {
-            self.reject_device_login(login_id, "failed", Some(&poll_lease_token))
+            self.reject_device_login(login_id, "failed", Some(&poll_lease_token), audit_action)
                 .await?;
             return Err(AuthError::OidcInvalid);
         }
-        let issued = self
-            .issue_human_credential(
-                identity.subject,
-                DeviceIssueBinding {
-                    issuer: identity.issuer,
-                    client_id: oidc.client_id().to_owned(),
-                    login_id,
-                    recovery_generation,
-                    poll_interval_seconds,
-                    poll_lease_token,
-                },
-            )
-            .await;
-        self.pending_transactions.release(login_id);
-        issued
+        Ok(DevicePollClaim {
+            recovery_generation,
+            poll_interval_seconds,
+            poll_lease_token,
+            identity,
+        })
     }
 
     /// Authenticates one opaque browser session cookie.
@@ -1824,6 +2021,13 @@ impl AuthService {
             .await
             .map_err(|_error| AuthError::Durable)?;
         sqlx::query(
+            "UPDATE account_link_transactions SET state = 'expired', completed_at = clock_timestamp(), \
+             revision = revision + 1 WHERE state = 'pending' AND expires_at <= clock_timestamp()",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        sqlx::query(
             "UPDATE browser_logins SET consumed_at = clock_timestamp(), outcome = 'expired' \
              WHERE consumed_at IS NULL AND expires_at <= clock_timestamp()",
         )
@@ -1848,6 +2052,7 @@ impl AuthService {
         login_id: Uuid,
         outcome: &'static str,
         poll_lease_token: Option<&[u8; RANDOM_SECRET_BYTES]>,
+        audit_action: &'static str,
     ) -> Result<(), AuthError> {
         let mut transaction = self
             .store
@@ -1873,7 +2078,7 @@ impl AuthService {
         }
         audit_auth(
             &mut transaction,
-            "auth.device.poll",
+            audit_action,
             "deny",
             "device_login",
             outcome,
@@ -2827,10 +3032,11 @@ pub(crate) mod tests {
             .await
             .expect("create isolated schema");
         sqlx::raw_sql(AssertSqlSafe(format!(
-            "SET search_path TO {schema};{};{};{}",
+            "SET search_path TO {schema};{};{};{};{}",
             include_str!("../../migrations/0001_relay_foundation.sql"),
             include_str!("../../migrations/0002_auth.sql"),
-            include_str!("../../migrations/0003_evidence_v1.sql")
+            include_str!("../../migrations/0003_evidence_v1.sql"),
+            include_str!("../../migrations/0004_account_linking.sql")
         )))
         .execute(bootstrap.pool())
         .await

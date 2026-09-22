@@ -3,12 +3,17 @@
 use super::*;
 use axum::{extract::State, routing::get, Json, Router};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+/// Subject the issuer asserts unless a test changes it.
+const FIXTURE_SUBJECT: &str = "fixture-subject";
+/// Device code the fixture issuer hands out.
+const FIXTURE_DEVICE_CODE: &str = "fixture-device-code";
+
 use std::{
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tokio::{
     io::AsyncReadExt,
@@ -28,6 +33,11 @@ struct Ingress {
     token_release: Arc<Notify>,
     token_requests: Arc<AtomicUsize>,
     token_nonce: Arc<Mutex<Option<String>>>,
+    /// Subject the issuer asserts next; a link needs one the account lacks.
+    token_subject: Arc<Mutex<String>>,
+    /// While false the device endpoint never answers, which is what the capacity
+    /// tests need. A flow that must complete sets it.
+    device_answers: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -38,11 +48,17 @@ struct IssuerState {
     token_release: Arc<Notify>,
     token_requests: Arc<AtomicUsize>,
     token_nonce: Arc<Mutex<Option<String>>>,
+    token_subject: Arc<Mutex<String>>,
+    device_answers: Arc<AtomicBool>,
     signing_key: PathBuf,
     issuer: String,
 }
 
 impl Ingress {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The issuer, its TLS, its routes, and the relay config it serves are one fixture."
+    )]
     async fn new() -> Self {
         let fixture = Fixture::new().await;
         let directory = fixture.directory.path();
@@ -77,6 +93,8 @@ impl Ingress {
         let token_release = Arc::new(Notify::new());
         let token_requests = Arc::new(AtomicUsize::new(0));
         let token_nonce = Arc::new(Mutex::new(None));
+        let token_subject = Arc::new(Mutex::new(FIXTURE_SUBJECT.to_owned()));
+        let device_answers = Arc::new(AtomicBool::new(false));
         let app = Router::new()
             .route(
                 "/issuer/.well-known/openid-configuration",
@@ -98,6 +116,8 @@ impl Ingress {
                 token_release: Arc::clone(&token_release),
                 token_requests: Arc::clone(&token_requests),
                 token_nonce: Arc::clone(&token_nonce),
+                token_subject: Arc::clone(&token_subject),
+                device_answers: Arc::clone(&device_answers),
                 signing_key,
                 issuer: issuer.clone(),
             });
@@ -138,6 +158,8 @@ impl Ingress {
             token_release,
             token_requests,
             token_nonce,
+            token_subject,
+            device_answers,
         }
     }
 
@@ -182,23 +204,36 @@ fn private_file(path: &Path, bytes: &[u8]) {
 async fn held_device(State(state): State<IssuerState>) -> Json<serde_json::Value> {
     state.requests.fetch_add(1, Ordering::Relaxed);
     state.entered.notify_one();
-    std::future::pending().await
+    if !state.device_answers.load(Ordering::Relaxed) {
+        // Holding the request is what the capacity tests measure: the flow must
+        // occupy its slot while the issuer has not answered.
+        std::future::pending::<()>().await;
+    }
+    Json(serde_json::json!({
+        "device_code": FIXTURE_DEVICE_CODE,
+        "user_code": "FIXT-CODE",
+        "verification_uri": format!("{}/activate", state.issuer),
+        "expires_in": 300,
+        "interval": 1,
+    }))
 }
 
 async fn held_token(State(state): State<IssuerState>) -> Json<serde_json::Value> {
     state.token_requests.fetch_add(1, Ordering::Relaxed);
     state.token_entered.notify_one();
     state.token_release.notified().await;
-    let nonce = state
-        .token_nonce
+    // A device grant carries no nonce, so the claim is emitted only when a
+    // browser flow recorded one.
+    let nonce = state.token_nonce.lock().expect("token nonce lock").clone();
+    let subject = state
+        .token_subject
         .lock()
-        .expect("token nonce lock")
-        .clone()
-        .expect("callback nonce");
+        .expect("token subject lock")
+        .clone();
     Json(serde_json::json!({
         "access_token": "fixture-access-token",
         "token_type": "Bearer",
-        "id_token": signed_id_token(&state.signing_key, &state.issuer, &nonce),
+        "id_token": signed_id_token(&state.signing_key, &state.issuer, nonce.as_deref(), &subject),
     }))
 }
 
@@ -731,20 +766,20 @@ fn issuer_jwks(key: &Path) -> serde_json::Value {
     })
 }
 
-fn signed_id_token(key: &Path, issuer: &str, nonce: &str) -> String {
+fn signed_id_token(key: &Path, issuer: &str, nonce: Option<&str>, subject: &str) -> String {
     let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","kid":"fixture","typ":"JWT"}"#);
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    let payload = URL_SAFE_NO_PAD.encode(
-        serde_json::json!({
-            "iss": issuer,
-            "sub": "fixture-subject",
-            "aud": "fixture",
-            "exp": now + 60,
-            "iat": now,
-            "nonce": nonce,
-        })
-        .to_string(),
-    );
+    let mut claims = serde_json::json!({
+        "iss": issuer,
+        "sub": subject,
+        "aud": "fixture",
+        "exp": now + 60,
+        "iat": now,
+    });
+    if let Some(nonce) = nonce {
+        claims["nonce"] = serde_json::Value::String(nonce.to_owned());
+    }
+    let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
     let input = format!("{header}.{payload}");
     let directory = key.parent().expect("issuer key parent");
     let input_file = directory.join("issuer-token-input");
@@ -840,4 +875,347 @@ fn configuration(
         .expect("valid test evidence knobs"),
         login_policy: crate::config::LoginPolicy::AnyAuthenticatedSubject,
     }
+}
+
+impl Ingress {
+    /// Asserts the issuer subject the next token exchange will carry.
+    fn assert_subject(&self, subject: &str) {
+        subject.clone_into(&mut self.token_subject.lock().expect("token subject lock"));
+    }
+
+    /// Scrapes `state` and `nonce` out of the relay's own authorization redirect
+    /// and arms the issuer with that nonce, then returns the state and the
+    /// one-use binding cookie the callback must return.
+    fn bind_authorization(&self, response: &reqwest::Response) -> (String, String) {
+        let authorization = url::Url::parse(
+            response
+                .headers()
+                .get("location")
+                .expect("authorization redirect")
+                .to_str()
+                .expect("ASCII redirect"),
+        )
+        .expect("valid authorization URL");
+        let mut query = authorization.query_pairs();
+        let state = query
+            .clone()
+            .find_map(|(key, value)| (key == "state").then_some(value.into_owned()))
+            .expect("opaque state");
+        let nonce = query
+            .find_map(|(key, value)| (key == "nonce").then_some(value.into_owned()))
+            .expect("opaque nonce");
+        *self.token_nonce.lock().expect("token nonce lock") = Some(nonce);
+        (state, cookie_pair(response, "__Host-pohunek-relay-login"))
+    }
+}
+
+/// Returns one `name=value` pair from a response's `Set-Cookie` headers.
+fn cookie_pair(response: &reqwest::Response, name: &str) -> String {
+    response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.split(';').next())
+        .find(|pair| pair.starts_with(&format!("{name}=")))
+        .unwrap_or_else(|| panic!("response carries a {name} cookie"))
+        .to_owned()
+}
+
+/// Completes one browser login and returns its session and CSRF cookie pairs.
+async fn browser_login(ingress: &Ingress, running: &Running) -> (String, String) {
+    ingress.assert_subject(FIXTURE_SUBJECT);
+    let start = ingress
+        .client
+        .post(running.url("/v1/auth/browser/start"))
+        .header("origin", "https://localhost:9443")
+        .send()
+        .await
+        .expect("start a browser login");
+    assert_eq!(start.status(), reqwest::StatusCode::SEE_OTHER);
+    let (state, login_cookie) = ingress.bind_authorization(&start);
+    ingress.token_release.notify_one();
+    let callback = ingress
+        .client
+        .get(running.url(&format!(
+            "/v1/auth/oidc/callback?code=fixture-code&state={state}"
+        )))
+        .header("cookie", login_cookie)
+        .send()
+        .await
+        .expect("complete the browser login");
+    assert_eq!(callback.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+    (
+        cookie_pair(&callback, "__Host-pohunek-relay-session"),
+        cookie_pair(&callback, "__Host-pohunek-relay-csrf"),
+    )
+}
+
+/// Drives a browser account link from start to completion against the fixture
+/// issuer, proving the wiring between the callback consumption and the link
+/// commit rather than calling the commit directly.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Login, link start, callback, and the durable effects are one end-to-end flow."
+)]
+async fn browser_link_proves_a_second_identity_end_to_end() {
+    let mut ingress = Ingress::new().await;
+    ingress.config.auth.pending_transactions = 2;
+    let running = ingress.start().await;
+    let (session, csrf) = browser_login(&ingress, &running).await;
+    let csrf_value = csrf.split_once('=').expect("csrf cookie pair").1.to_owned();
+
+    // A second, distinct identity is what the link must prove.
+    ingress.assert_subject("linked-subject");
+    let start = ingress
+        .client
+        .post(running.url("/v1/account/links/browser/start"))
+        .header("origin", "https://localhost:9443")
+        .header("cookie", format!("{session}; {csrf}"))
+        .header("x-pohunek-csrf", &csrf_value)
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({
+                "idempotency": {
+                    "correlation_id": Uuid::now_v7(),
+                    "idempotency_key": Uuid::now_v7(),
+                },
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("start a browser link");
+    assert_eq!(start.status(), reqwest::StatusCode::OK);
+    let link_cookie = cookie_pair(&start, "__Host-pohunek-relay-login");
+    let started: serde_json::Value = start.json().await.expect("link start body");
+    let link_id = started["link"]["link_id"]
+        .as_str()
+        .expect("link id")
+        .to_owned();
+    assert_eq!(started["link"]["state"], "pending");
+    let authorization = url::Url::parse(
+        started["authorization_url"]
+            .as_str()
+            .expect("authorization url"),
+    )
+    .expect("valid authorization URL");
+    let mut query = authorization.query_pairs();
+    let state = query
+        .clone()
+        .find_map(|(key, value)| (key == "state").then_some(value.into_owned()))
+        .expect("link state");
+    let nonce = query
+        .find_map(|(key, value)| (key == "nonce").then_some(value.into_owned()))
+        .expect("link nonce");
+    *ingress.token_nonce.lock().expect("token nonce lock") = Some(nonce);
+
+    // The callback must present the one-use link cookie and the caller's current
+    // session; the provider redirect alone cannot complete the link.
+    ingress.token_release.notify_one();
+    let callback = ingress
+        .client
+        .get(running.url(&format!(
+            "/v1/auth/oidc/callback?code=fixture-code&state={state}"
+        )))
+        .header("cookie", format!("{link_cookie}; {session}"))
+        .send()
+        .await
+        .expect("complete the browser link callback");
+    assert_eq!(callback.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+    assert!(
+        callback
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .all(|value| !value.starts_with("__Host-pohunek-relay-session=")),
+        "completing a link issues no new session"
+    );
+
+    let store = ingress.fixture.store.clone();
+    let linked: (uuid::Uuid, String) = sqlx::query_as(
+        "SELECT principal_id, subject FROM oidc_identities WHERE subject = 'linked-subject' AND removed_at IS NULL",
+    )
+    .fetch_one(store.pool())
+    .await
+    .expect("the proven identity is linked");
+    let owner: uuid::Uuid = sqlx::query_scalar(
+        "SELECT principal_id FROM oidc_identities WHERE subject = $1 AND removed_at IS NULL",
+    )
+    .bind(FIXTURE_SUBJECT)
+    .fetch_one(store.pool())
+    .await
+    .expect("the signed-in account");
+    assert_eq!(
+        linked.0, owner,
+        "the second identity joins the account that proved the link"
+    );
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM account_link_transactions WHERE link_id = $1::uuid")
+            .bind(&link_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("read the completed transaction");
+    assert_eq!(state, "completed");
+    let generation: i64 =
+        sqlx::query_scalar("SELECT account_link_generation FROM principals WHERE id = $1")
+            .bind(owner)
+            .fetch_one(store.pool())
+            .await
+            .expect("read the advanced generation");
+    assert_eq!(
+        generation, 2,
+        "a proven link advances the account generation"
+    );
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE action = 'auth.link.complete' AND decision = 'changed'",
+    )
+    .fetch_one(store.pool())
+    .await
+    .expect("read the completion audit");
+    assert_eq!(audited, 1);
+    running.shutdown().await.expect("clean runtime shutdown");
+    ingress.cleanup().await;
+}
+
+/// Completes one device login against the fixture issuer and returns the bearer
+/// credential it issued.
+async fn device_login(ingress: &Ingress, running: &Running) -> String {
+    ingress.assert_subject(FIXTURE_SUBJECT);
+    *ingress.token_nonce.lock().expect("token nonce lock") = None;
+    let start = ingress
+        .client
+        .post(running.url("/v1/auth/device/start"))
+        .send()
+        .await
+        .expect("start a device login");
+    assert_eq!(start.status(), reqwest::StatusCode::OK);
+    let started: serde_json::Value = start.json().await.expect("device start body");
+    let login_id = started["login_id"].as_str().expect("login id").to_owned();
+    let poll_secret = started["poll_secret"]
+        .as_str()
+        .expect("poll secret")
+        .to_owned();
+    assert_eq!(started["user_code"], "FIXT-CODE");
+    ingress.token_release.notify_one();
+    let poll = ingress
+        .client
+        .post(running.url("/v1/auth/device/poll"))
+        .header("x-pohunek-device-secret", poll_secret)
+        .header("content-type", "application/json")
+        .body(serde_json::json!({ "login_id": login_id }).to_string())
+        .send()
+        .await
+        .expect("poll the device login");
+    assert_eq!(poll.status(), reqwest::StatusCode::OK);
+    let polled: serde_json::Value = poll.json().await.expect("device poll body");
+    assert_eq!(polled["status"], "complete", "device login completes");
+    let credential = &polled["credential"];
+    format!(
+        "{}.{}",
+        credential["credential_id"].as_str().expect("credential id"),
+        credential["secret"].as_str().expect("credential secret"),
+    )
+}
+
+/// Drives a device account link from start to completion against the fixture
+/// issuer, so the wiring through `claim_and_poll_device` into the link commit is
+/// covered rather than the commit being called directly.
+#[tokio::test]
+async fn device_link_proves_a_second_identity_end_to_end() {
+    let mut ingress = Ingress::new().await;
+    ingress.config.auth.pending_transactions = 2;
+    // The fixture issuer answers its device endpoint for this flow instead of
+    // holding the request open the way the capacity tests need.
+    ingress.device_answers.store(true, Ordering::Relaxed);
+    let running = ingress.start().await;
+    let bearer = device_login(&ingress, &running).await;
+
+    ingress.assert_subject("device-linked-subject");
+    let start = ingress
+        .client
+        .post(running.url("/v1/account/links/device/start"))
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({
+                "idempotency": {
+                    "correlation_id": Uuid::now_v7(),
+                    "idempotency_key": Uuid::now_v7(),
+                },
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("start a device link");
+    assert_eq!(start.status(), reqwest::StatusCode::OK);
+    let started: serde_json::Value = start.json().await.expect("device link start body");
+    let link_id = started["link"]["link_id"]
+        .as_str()
+        .expect("link id")
+        .to_owned();
+    assert_eq!(started["link"]["state"], "pending");
+    assert_eq!(started["link"]["channel"], "device");
+    let poll_secret = started["authorization"]["poll_secret"]
+        .as_str()
+        .expect("link poll secret")
+        .to_owned();
+
+    ingress.token_release.notify_one();
+    let poll = ingress
+        .client
+        .post(running.url("/v1/account/links/device/poll"))
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("x-pohunek-device-secret", &poll_secret)
+        .header("content-type", "application/json")
+        .body(serde_json::json!({ "link_id": link_id }).to_string())
+        .send()
+        .await
+        .expect("poll the device link");
+    assert_eq!(poll.status(), reqwest::StatusCode::OK);
+    let polled: serde_json::Value = poll.json().await.expect("device link poll body");
+    assert_eq!(polled["status"], "complete", "device link completes");
+    assert_eq!(polled["identity"]["subject"], "device-linked-subject");
+
+    let store = ingress.fixture.store.clone();
+    let owner: uuid::Uuid = sqlx::query_scalar(
+        "SELECT principal_id FROM oidc_identities WHERE subject = $1 AND removed_at IS NULL",
+    )
+    .bind(FIXTURE_SUBJECT)
+    .fetch_one(store.pool())
+    .await
+    .expect("the signed-in account");
+    let linked: uuid::Uuid = sqlx::query_scalar(
+        "SELECT principal_id FROM oidc_identities WHERE subject = 'device-linked-subject' AND removed_at IS NULL",
+    )
+    .fetch_one(store.pool())
+    .await
+    .expect("the proven identity is linked");
+    assert_eq!(linked, owner);
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM account_link_transactions WHERE link_id = $1::uuid")
+            .bind(&link_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("read the completed transaction");
+    assert_eq!(state, "completed");
+    // The proof is one-use: the same poll secret cannot complete a second time.
+    let replay = ingress
+        .client
+        .post(running.url("/v1/account/links/device/poll"))
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("x-pohunek-device-secret", &poll_secret)
+        .header("content-type", "application/json")
+        .body(serde_json::json!({ "link_id": link_id }).to_string())
+        .send()
+        .await
+        .expect("replay the device link poll");
+    assert_eq!(replay.status(), reqwest::StatusCode::CONFLICT);
+    let replayed: serde_json::Value = replay.json().await.expect("replay body");
+    assert_eq!(replayed["error"]["code"], "link_replayed");
+    running.shutdown().await.expect("clean runtime shutdown");
+    ingress.cleanup().await;
 }

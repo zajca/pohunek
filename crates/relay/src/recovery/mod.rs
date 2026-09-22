@@ -131,7 +131,10 @@ pub enum WitnessEvent {
         base_plan_digest: [u8; 32],
         target_migration_count: u16,
         target_plan_digest: [u8; 32],
+        /// Whole-row digest of the authority tables at the base schema.
         authority_digest: [u8; 32],
+        /// Column-projected authority digest, reproducible after the plan runs.
+        authority_projection_digest: [u8; 32],
     },
     /// Initial explicit team ownership and service credential provisioning.
     Provision {
