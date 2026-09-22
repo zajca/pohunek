@@ -533,6 +533,20 @@ mod tests {
     }
 
     #[test]
+    fn non_utf8_kernel_path_survives_decoding() {
+        // Darwin filesystems reject an invalid UTF-8 filename with `EILSEQ`, so
+        // this is the only place the working-directory decoder can be held to a
+        // byte sequence the kernel could still hand over.
+        let raw = b"/Users/owner/agent-\xC3\x28";
+        let mut field = raw.to_vec();
+        field.resize(64, 0);
+
+        let decoded = decode_kernel_path(&field).expect("terminated path");
+
+        assert_eq!(decoded.as_os_str(), OsStr::from_bytes(raw));
+    }
+
+    #[test]
     fn descendant_traversal_bounds_depth_and_cycles() {
         let deep: Vec<(Pid, Pid)> = (1..=200).map(|pid| (pid + 1, pid)).collect();
         let index = children_by_parent(&deep);

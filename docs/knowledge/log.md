@@ -20,6 +20,12 @@
   group equals the root process, and an event-driven kqueue `NOTE_EXIT` exit
   watch that re-verifies process identity after registration. Complete macOS
   host, WebUI, packaging, and release support remains deferred through #98-#105.
+- Documented the Darwin process-inspection privilege boundary: ownership decided
+  by the unprivileged short process record, another user's process reported as
+  absent while a refused fact about an owned process stays a denial, and the
+  three facts macOS withholds without a privilege pohunek does not request
+  (a foreign process's working directory and argument vector, and a
+  code-signing-restricted process's environment).
 - Documented the shared secure runtime-path and portable filesystem foundation:
   preserved XDG durable locations, the owner-private macOS runtime default,
   fail-closed path validation, byte-bounded Unix sockets, atomic no-replace

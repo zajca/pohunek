@@ -3,6 +3,13 @@
 //! Every fact comes from a kernel interface available to an unprivileged
 //! same-user process. The inspector never shells out and never retains raw
 //! argument or environment buffers beyond the decoding step.
+//!
+//! Darwin serves most process records only for the caller's own processes and
+//! answers `EPERM` for anyone else's, so ownership is settled first through the
+//! short BSD record, which the kernel serves regardless of who owns the target.
+//! A privileged fact about a foreign process stays unreadable without the
+//! `PRIV_GLOBAL_PROC_INFO` privilege that only root holds, and such a refusal is
+//! reported as a denial rather than as absence.
 
 // Rust guideline compliant 2026-09-22
 
@@ -223,6 +230,32 @@ struct BsdFact {
     terminal_group: u32,
     start_identity: StartIdentity,
     is_zombie: bool,
+    is_exiting: bool,
+}
+
+/// Owner of one process id as reported by an unprivileged kernel read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ownership {
+    /// The process belongs to the calling effective user.
+    SameUser,
+    /// The process exists and belongs to another user.
+    OtherUser,
+    /// The process id no longer names a process the kernel will report.
+    Gone,
+}
+
+/// Resolves who owns a process id without reading any privileged record.
+///
+/// Darwin serves the short BSD record regardless of who owns the target, so it
+/// decides ownership before a call the kernel would refuse for a process the
+/// caller does not own.
+fn read_ownership(pid: Pid, euid: u32, operation: &'static str) -> Result<Ownership, Error> {
+    match native::owner_info(native_pid(pid, operation)?) {
+        Ok(info) if info.pid == pid && info.uid == euid => Ok(Ownership::SameUser),
+        Ok(_) => Ok(Ownership::OtherUser),
+        Err(error) if is_process_race(&error) => Ok(Ownership::Gone),
+        Err(source) => Err(Error::from_io(operation, source)),
+    }
 }
 
 /// Reads the BSD record of one same-user process.
@@ -230,9 +263,22 @@ struct BsdFact {
 /// Returns `None` for a process that exited or is owned by another user, which
 /// preserves the same-user filter every caller depends on.
 fn read_bsd_fact(pid: Pid, euid: u32, operation: &'static str) -> Result<Option<BsdFact>, Error> {
+    if read_ownership(pid, euid, operation)? != Ownership::SameUser {
+        return Ok(None);
+    }
     let raw = match native::bsd_info(native_pid(pid, operation)?) {
         Ok(raw) => raw,
         Err(error) if is_process_race(&error) => return Ok(None),
+        Err(error) if is_permission_denied(&error) => {
+            // The kernel served this process id a moment ago, so a refusal now
+            // means the process changed credentials or vanished. Ownership
+            // separates that from a denial on a process the caller still owns,
+            // which stays an explicit failure instead of an absence.
+            return match read_ownership(pid, euid, operation)? {
+                Ownership::SameUser => Err(Error::from_io(operation, error)),
+                Ownership::OtherUser | Ownership::Gone => Ok(None),
+            };
+        }
         Err(source) => return Err(Error::from_io(operation, source)),
     };
     if raw.uid != euid || raw.pid != pid {
@@ -247,6 +293,7 @@ fn read_bsd_fact(pid: Pid, euid: u32, operation: &'static str) -> Result<Option<
         start_identity: encode_start_identity(raw.start_seconds, raw.start_microseconds)
             .map_err(|error| layout_error(operation, error))?,
         is_zombie: raw.is_zombie,
+        is_exiting: raw.is_exiting,
     }))
 }
 
@@ -307,27 +354,28 @@ fn read_process_fact(
 
 /// Reads and decodes the `KERN_PROCARGS2` regions of one same-user process.
 ///
-/// Returns `None` when the process exited or is a zombie, which keeps no
-/// argument region. Darwin reports both a vanished process and an unreadable
-/// argument region as `EINVAL`, so the ambiguity is resolved against the
-/// process record rather than reported as an absence of arguments.
+/// Returns `None` for a process that keeps no argument region: one that exited,
+/// one retained as a zombie, and one already inside `exit`. Darwin reports both
+/// a vanished process and an unreadable argument region as `EINVAL`, so the
+/// ambiguity is resolved against the process record rather than reported as an
+/// absence of arguments.
 fn read_arguments(
     pid: Pid,
     euid: u32,
     fact: &BsdFact,
     operation: &'static str,
 ) -> Result<Option<super::darwin_layout::NativeArguments>, Error> {
-    if fact.is_zombie {
+    if fact.is_zombie || fact.is_exiting {
         return Ok(None);
     }
     let buffer = match native::process_arguments(native_pid(pid, operation)?) {
         Ok(buffer) => buffer,
         Err(error) if is_process_race(&error) => return Ok(None),
         Err(error) if is_ambiguous_argument_error(&error) => {
-            return if read_bsd_fact(pid, euid, operation)?.is_none() {
-                Ok(None)
-            } else {
-                Err(Error::InvalidData { operation })
+            return match read_bsd_fact(pid, euid, operation)? {
+                None => Ok(None),
+                Some(current) if current.is_zombie || current.is_exiting => Ok(None),
+                Some(_) => Err(Error::InvalidData { operation }),
             };
         }
         Err(source) => return Err(Error::from_io(operation, source)),
@@ -365,6 +413,11 @@ fn is_process_race(error: &io::Error) -> bool {
 /// Returns whether `sysctl` reported the argument region ambiguously.
 fn is_ambiguous_argument_error(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::EINVAL)
+}
+
+/// Returns whether the kernel refused to serve the record at all.
+fn is_permission_denied(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied
 }
 
 /// Classifies a process observation failure without exposing kernel buffers.
@@ -415,8 +468,20 @@ mod native {
     /// `PROC_ALL_PIDS` from `<sys/proc_info.h>`, which `libc` does not export.
     const PROC_ALL_PIDS: u32 = 1;
 
-    /// Width of the `proc_bsdinfo::pbi_comm` kernel command-name field.
+    /// `PROC_FLAG_INEXIT` from `<sys/proc_info.h>`, which `libc` does not export.
+    ///
+    /// The kernel sets this flag once a process enters `exit`, at which point it
+    /// has already released the memory that holds its argument region.
+    const PROC_FLAG_INEXIT: u32 = 4;
+
+    /// Width of the kernel `pbi_comm` and `pbsi_comm` command-name fields.
     const COMMAND_NAME_BYTES: usize = 16;
+
+    /// `PROC_PIDT_SHORTBSDINFO` from `<sys/proc_info.h>`, unexported by `libc`.
+    const PROC_PIDT_SHORTBSDINFO: libc::c_int = 13;
+
+    /// Width of `struct proc_bsdshortinfo`, which the kernel writes in full.
+    const SHORT_RECORD_BYTES: usize = 64;
 
     /// Caps the process table read in one inventory pass.
     ///
@@ -452,7 +517,42 @@ mod native {
         pub(super) start_seconds: u64,
         pub(super) start_microseconds: u64,
         pub(super) is_zombie: bool,
+        pub(super) is_exiting: bool,
     }
+
+    /// Short kernel record that identifies a process without any privilege.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct RawOwnerInfo {
+        pub(super) pid: Pid,
+        pub(super) uid: u32,
+    }
+
+    /// `struct proc_bsdshortinfo` from `<sys/proc_info.h>`, unexported by `libc`.
+    ///
+    /// The declaration mirrors the kernel field order and widths so the compiler
+    /// computes the offsets. Fields the inspector does not read keep their
+    /// kernel names behind an underscore because they carry the layout.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ProcBsdShortInfo {
+        pbsi_pid: u32,
+        _pbsi_ppid: u32,
+        _pbsi_pgid: u32,
+        _pbsi_status: u32,
+        _pbsi_comm: [libc::c_char; COMMAND_NAME_BYTES],
+        _pbsi_flags: u32,
+        pbsi_uid: libc::uid_t,
+        _pbsi_gid: libc::gid_t,
+        _pbsi_ruid: libc::uid_t,
+        _pbsi_rgid: libc::gid_t,
+        _pbsi_svuid: libc::uid_t,
+        _pbsi_svgid: libc::gid_t,
+        _pbsi_rfu: u32,
+    }
+
+    // A transcription slip in the mirrored record must fail the build rather
+    // than read a field from the wrong offset.
+    const _: () = assert!(size_of::<ProcBsdShortInfo>() == SHORT_RECORD_BYTES);
 
     /// Outcome of draining one kqueue after a readiness notification.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -468,7 +568,52 @@ mod native {
         rustix::process::geteuid().as_raw()
     }
 
+    /// Reads the short BSD process record for one process id.
+    ///
+    /// The kernel serves `PROC_PIDT_SHORTBSDINFO` regardless of who owns the
+    /// target process, which is what makes it usable as an ownership probe.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error, or `InvalidData` when the kernel
+    /// wrote fewer bytes than the structure it documents.
+    pub(super) fn owner_info(pid: i32) -> io::Result<RawOwnerInfo> {
+        let size = buffer_length(size_of::<ProcBsdShortInfo>())?;
+        let mut info = MaybeUninit::<ProcBsdShortInfo>::zeroed();
+        // SAFETY: `proc_pidinfo` writes at most `size` bytes, and `info` is a
+        // live, correctly aligned allocation of exactly `size` bytes.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDT_SHORTBSDINFO,
+                0,
+                info.as_mut_ptr().cast::<libc::c_void>(),
+                size,
+            )
+        };
+        if written <= 0 {
+            return Err(last_os_error());
+        }
+        if written != size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "short process record is shorter than the kernel structure",
+            ));
+        }
+        // SAFETY: the kernel wrote the whole record, and the structure is plain
+        // integer and character data, so every byte pattern it can write is a
+        // valid value.
+        let info = unsafe { info.assume_init() };
+        Ok(RawOwnerInfo {
+            pid: info.pbsi_pid,
+            uid: info.pbsi_uid,
+        })
+    }
+
     /// Reads the BSD process record for one process id.
+    ///
+    /// The kernel serves `PROC_PIDTBSDINFO` only for the caller's own processes
+    /// and answers `EPERM` for anyone else's.
     ///
     /// # Errors
     ///
@@ -512,6 +657,7 @@ mod native {
             start_seconds: info.pbi_start_tvsec,
             start_microseconds: info.pbi_start_tvusec,
             is_zombie: info.pbi_status == libc::SZOMB,
+            is_exiting: info.pbi_flags & PROC_FLAG_INEXIT != 0,
         })
     }
 
@@ -1014,6 +1160,53 @@ mod tests {
     }
 
     #[test]
+    fn another_users_process_is_absent_or_denied_but_never_guessed() {
+        /// `launchd` holds process id 1 and always runs as root.
+        const ROOT_OWNED_PID: Pid = 1;
+
+        let inspector = DarwinInspector::new();
+        assert_ne!(
+            super::native::effective_uid(),
+            0,
+            "a root caller reads every process and cannot observe the same-user filter"
+        );
+
+        assert!(
+            inspector
+                .identity(ROOT_OWNED_PID)
+                .expect("inspect a root-owned identity")
+                .is_none(),
+            "a process owned by another user is outside the same-user contract"
+        );
+        assert!(inspector
+            .process(ROOT_OWNED_PID)
+            .expect("inspect a root-owned process")
+            .is_none());
+        assert!(inspector
+            .parent_pid(ROOT_OWNED_PID)
+            .expect("inspect a root-owned parent")
+            .is_none());
+        assert!(inspector
+            .executable(ROOT_OWNED_PID)
+            .expect("inspect a root-owned executable")
+            .is_none());
+        assert!(
+            !inspector
+                .ownership_markers(ROOT_OWNED_PID)
+                .expect("inspect root-owned markers")
+                .is_marked(),
+            "markers are never read from a process outside the same-user contract"
+        );
+        assert!(
+            matches!(
+                inspector.cwd(ROOT_OWNED_PID),
+                Err(Error::PermissionDenied { .. })
+            ),
+            "a privileged fact must be reported as a denial, never as absence or a race"
+        );
+    }
+
+    #[test]
     fn descendants_follow_a_spawned_subtree() {
         let inspector = DarwinInspector::new();
         let fixture = spawn_shell("sleep 60 & wait", &[], None);
@@ -1084,17 +1277,31 @@ mod tests {
     }
 
     #[test]
-    fn cwd_preserves_non_utf8_directory_bytes() {
+    fn cwd_preserves_exact_directory_bytes() {
         let inspector = DarwinInspector::new();
         let parent = tempfile::tempdir().expect("create a parent directory");
         let parent = parent
             .path()
             .canonicalize()
             .expect("canonicalize the parent directory");
-        let mut name = b"agent-".to_vec();
-        name.extend_from_slice(&[0xC3, 0x28]);
-        let expected = parent.join(PathBuf::from(OsString::from_vec(name)));
-        std::fs::create_dir(&expected).expect("create a non-UTF-8 directory");
+
+        // Darwin filesystems validate filename bytes and reject an invalid
+        // UTF-8 sequence with `EILSEQ`, so no such directory can exist to be
+        // observed end to end. The kernel still hands out raw path bytes, and
+        // `darwin_layout::tests::non_utf8_kernel_path_survives_decoding` pins
+        // the decoder against bytes the filesystem refuses to store.
+        let mut refused = b"agent-".to_vec();
+        refused.extend_from_slice(&[0xC3, 0x28]);
+        std::fs::create_dir(parent.join(PathBuf::from(OsString::from_vec(refused))))
+            .expect_err("a non-UTF-8 directory name must stay uncreatable on this filesystem");
+
+        // U+0416 CYRILLIC CAPITAL LETTER ZHE has no canonical decomposition, so
+        // the stored name is byte-identical under every normalization rule a
+        // Darwin filesystem applies.
+        let expected = parent.join(PathBuf::from(OsString::from_vec(
+            b"agent-\xD0\x96".to_vec(),
+        )));
+        std::fs::create_dir(&expected).expect("create a multi-byte directory");
         let fixture = spawn_shell(
             "trap '' TERM; while :; do sleep 1; done",
             &[],
@@ -1102,8 +1309,12 @@ mod tests {
         );
         let pid = fixture.pid();
 
-        let observed = wait_for("the non-UTF-8 working directory", || {
-            inspector.cwd(pid).ok()
+        let observed = wait_for("the multi-byte working directory", || {
+            match inspector.cwd(pid) {
+                Ok(path) => Some(path),
+                Err(Error::Race { .. }) => None,
+                Err(error) => panic!("unexpected cwd failure: {error}"),
+            }
         });
 
         assert_eq!(observed, expected);
