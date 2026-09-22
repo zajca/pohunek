@@ -1068,20 +1068,41 @@ mod tests {
     }
 
     /// Kills and reaps a pseudoterminal shell even when an assertion fails.
-    struct PtyFixture(Box<dyn portable_pty::Child + Send + Sync>);
+    struct PtyFixture {
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        pid: Pid,
+    }
+
+    impl PtyFixture {
+        /// Kills the shell and reports whether it became reapable in time.
+        ///
+        /// The signal is sent directly because the pseudoterminal crate's own
+        /// kill sends `SIGHUP` first and leaves an interactive shell deciding
+        /// what to do with its jobs.
+        fn reap(&mut self) -> bool {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(
+                    i32::try_from(self.pid).expect("a shell pid fits a pid"),
+                ),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            let deadline = Instant::now() + REAP_TIMEOUT;
+            while Instant::now() < deadline {
+                match self.child.try_wait() {
+                    Ok(Some(_status)) => return true,
+                    Ok(None) => std::thread::sleep(OBSERVE_POLL),
+                    Err(_unreapable) => return false,
+                }
+            }
+            false
+        }
+    }
 
     impl Drop for PtyFixture {
         fn drop(&mut self) {
-            let _ = self.0.kill();
-            // A child that does not become reapable must not stall the suite;
-            // the CI job terminates whatever is left when it ends.
-            let deadline = Instant::now() + REAP_TIMEOUT;
-            while Instant::now() < deadline {
-                if matches!(self.0.try_wait(), Ok(Some(_)) | Err(_)) {
-                    return;
-                }
-                std::thread::sleep(OBSERVE_POLL);
-            }
+            // A shell that never becomes reapable must not stall the suite; the
+            // CI job terminates whatever is left when it ends.
+            let _ = self.reap();
         }
     }
 
@@ -1679,7 +1700,10 @@ mod tests {
         command.env("PS1", "READY>");
         let child = pair.slave.spawn_command(command).expect("spawn the shell");
         let shell_pid = child.process_id().expect("shell process id");
-        let shell = PtyFixture(child);
+        let shell = PtyFixture {
+            child,
+            pid: shell_pid,
+        };
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -1801,6 +1825,19 @@ mod tests {
 
         // A killed shell that never becomes reapable would otherwise stall the
         // suite with no diagnosis, so the reap is observed like any other phase.
-        observe("the killed shell to be reaped", move || drop(shell));
+        assert!(
+            observe("the killed shell to be reaped", move || {
+                let mut shell = shell;
+                shell.reap()
+            }),
+            "a killed pseudoterminal shell must become reapable"
+        );
+        assert!(
+            !observe("the reaped shell liveness", move || {
+                inspector.is_running(root)
+            })
+            .expect("inspect the reaped shell"),
+            "a reaped shell identity is no longer running"
+        );
     }
 }
