@@ -20,6 +20,7 @@ use crate::{
         service::tests::{authority, cleanup, fixture, limits},
         BrowserCookie, DigestKey, RelayBearerCredential,
     },
+    auth::{BrowserCallback, BrowserCallbackOutcome, LoginBindingCookie, OidcCallbackCode},
     config::LoginPolicy,
     store::Store,
 };
@@ -268,6 +269,18 @@ async fn audited(store: &Store, action: &str, decision: &str) -> i64 {
         .fetch_one(store.pool())
         .await
         .expect("read audit count")
+}
+
+/// Closes one transaction directly so the next case can open its own.
+async fn close_link(store: &Store, link_id: Uuid) {
+    sqlx::query(
+        "UPDATE account_link_transactions SET state = 'cancelled', completed_at = now(), \
+         revision = revision + 1 WHERE link_id = $1 AND state = 'pending'",
+    )
+    .bind(link_id)
+    .execute(store.pool())
+    .await
+    .expect("close the transaction");
 }
 
 /// Reads the attribution of the newest denial row for one action and outcome.
@@ -1864,5 +1877,302 @@ async fn every_refused_transition_records_an_attributable_denial() {
         &none,
     )
     .await;
+    cleanup(&pool, &schema).await;
+}
+
+/// Seeds one bound browser callback row for an existing link transaction.
+async fn insert_link_callback(
+    store: &Store,
+    service: &AuthService,
+    link_id: Uuid,
+    account_link_generation: i64,
+    state: &str,
+    binding: &str,
+    nonce: &str,
+    verifier: &str,
+) -> Uuid {
+    let login_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO browser_logins (login_id,state_digest,nonce_digest,pkce_verifier_digest,login_binding_digest,issuer,client_id,audience,redirect_uri,action,link_id,account_link_generation,recovery_generation,expires_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$7,'https://relay.example/callback','account_link',$8,$9,1,now()+interval '1 hour')",
+    )
+    .bind(login_id)
+    .bind(service.digest_key.digest(state).as_slice())
+    .bind(service.digest_key.digest(nonce).as_slice())
+    .bind(service.digest_key.digest(verifier).as_slice())
+    .bind(service.digest_key.digest(binding).as_slice())
+    .bind(TEST_ISSUER)
+    .bind(TEST_CLIENT)
+    .bind(link_id)
+    .bind(account_link_generation)
+    .execute(store.pool())
+    .await
+    .expect("seed a bound link callback");
+    login_id
+}
+
+/// A link callback is consumed exactly once and every wrong coordinate is
+/// refused and audited before any provider exchange is attempted.
+#[tokio::test]
+async fn link_callbacks_consume_once_and_audit_every_denial_class() {
+    let (store, schema, pool) = fixture().await;
+    let (authority, _directory) = authority(store.clone()).await;
+    let service = service(&store, authority);
+    let oidc = OidcClient::test_client();
+    let account = seed_account(&store, &service, "callback-owner").await;
+    let open = open_link(
+        &service,
+        &store,
+        account.browser,
+        AccountLinkChannel::Browser,
+    )
+    .await
+    .expect("open a browser transaction");
+
+    // Each case leaves the transaction pending and records its own outcome.
+    for (state, binding, outcome, expected) in [
+        (
+            "wrong-state",
+            "link-binding",
+            "rejected",
+            AuthError::OidcInvalid,
+        ),
+        (
+            "link-state",
+            "wrong-binding",
+            "rejected",
+            AuthError::OidcInvalid,
+        ),
+    ] {
+        let login_id = insert_link_callback(
+            &store,
+            &service,
+            open.record.link_id,
+            open.record.account_link_generation,
+            "link-state",
+            "link-binding",
+            "link-nonce",
+            "link-verifier",
+        )
+        .await;
+        service
+            .pending_browser_logins
+            .lock()
+            .expect("pending browser map")
+            .insert(
+                login_id,
+                PendingBrowserLogin {
+                    verifier: Zeroizing::new("link-verifier".to_owned()),
+                    nonce: Zeroizing::new("link-nonce".to_owned()),
+                    expires_at: Instant::now() + Duration::from_mins(1),
+                },
+            );
+        let result = service
+            .complete_browser_callback(
+                &oidc,
+                BrowserCallback::new(
+                    state.to_owned(),
+                    None,
+                    None,
+                    BrowserCallbackOutcome::Code(OidcCallbackCode::new("fixture-code".to_owned())),
+                ),
+                LoginBindingCookie::new(binding.to_owned()),
+                Some(account.browser),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ref error) if std::mem::discriminant(error) == std::mem::discriminant(&expected)),
+            "callback with state {state} and binding {binding} must be refused"
+        );
+        // A callback whose consumption finds no row cannot be attributed to a
+        // link or a login without telling the caller which exists, so it is
+        // audited under the login action. That is the absence of an oracle, not
+        // a missing record.
+        assert!(
+            audited(&store, "auth.browser.callback", "deny").await >= 1,
+            "a refused callback is audited with outcome {outcome}"
+        );
+        assert_eq!(link_state(&store, open.record.link_id).await, "pending");
+        sqlx::query("DELETE FROM browser_logins WHERE login_id = $1")
+            .bind(login_id)
+            .execute(store.pool())
+            .await
+            .expect("clear the refused callback row");
+    }
+
+    // The database, not application code, keeps the two callback kinds apart: an
+    // account-link row must name a transaction and a login row must not.
+    for (action, link) in [("account_link", None), ("login", Some(open.record.link_id))] {
+        let error = sqlx::query(
+            "INSERT INTO browser_logins (login_id,state_digest,nonce_digest,pkce_verifier_digest,login_binding_digest,issuer,client_id,audience,redirect_uri,action,link_id,account_link_generation,recovery_generation,expires_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$7,'https://relay.example/callback',$8,$9,1,1,now()+interval '1 hour')",
+        )
+        .bind(Uuid::now_v7())
+        .bind(service.digest_key.digest(&format!("state-{action}")).as_slice())
+        .bind(service.digest_key.digest("incoherent-nonce").as_slice())
+        .bind(service.digest_key.digest("incoherent-verifier").as_slice())
+        .bind(service.digest_key.digest(&format!("binding-{action}")).as_slice())
+        .bind(TEST_ISSUER)
+        .bind(TEST_CLIENT)
+        .bind(action)
+        .bind(link)
+        .execute(store.pool())
+        .await
+        .expect_err("an incoherent callback kind is refused");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("23514"),
+            "a {action} row with link {link:?} is refused by the database"
+        );
+    }
+    cleanup(&pool, &schema).await;
+}
+
+/// The poll path refuses a cancelled, expired or superseded transaction.
+#[tokio::test]
+async fn device_poll_refuses_cancelled_expired_and_superseded_transactions() {
+    let (store, schema, pool) = fixture().await;
+    let (authority, _directory) = authority(store.clone()).await;
+    let service = service(&store, authority);
+    let oidc = OidcClient::test_client();
+    let account = seed_account(&store, &service, "poll-states").await;
+
+    let cancelled = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
+        .await
+        .expect("open a transaction to cancel");
+    service
+        .cancel_account_link(
+            account.bearer,
+            cancelled.record.link_id,
+            CancelAccountLinkRequest {
+                idempotency: idempotency(),
+            },
+        )
+        .await
+        .expect("cancel the transaction");
+    assert!(matches!(
+        service
+            .poll_device_link(
+                &oidc,
+                account.bearer,
+                cancelled.record.link_id,
+                DevicePollSecret::new(cancelled.possession.clone()),
+            )
+            .await,
+        Err(AuthError::LinkCancelled)
+    ));
+
+    // An account-link generation that moved on after the transaction opened
+    // supersedes it, so its own possession secret no longer proves anything.
+    let superseded = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
+        .await
+        .expect("open a transaction to supersede");
+    sqlx::query(
+        "UPDATE principals SET account_link_generation = account_link_generation + 1 WHERE id = $1",
+    )
+    .bind(account.principal_id)
+    .execute(store.pool())
+    .await
+    .expect("advance the account link generation");
+    assert!(matches!(
+        service
+            .poll_device_link(
+                &oidc,
+                account.bearer,
+                superseded.record.link_id,
+                DevicePollSecret::new(superseded.possession.clone()),
+            )
+            .await,
+        Err(AuthError::LinkStale)
+    ));
+    close_link(&store, superseded.record.link_id).await;
+
+    let expired = insert_expired_link(&store, &service, account.bearer).await;
+    assert!(matches!(
+        service
+            .poll_device_link(
+                &oidc,
+                account.bearer,
+                expired.record.link_id,
+                DevicePollSecret::new(expired.possession.clone()),
+            )
+            .await,
+        Err(AuthError::LinkExpired)
+    ));
+    assert_eq!(identity_count(&store, account.principal_id).await, 1);
+    cleanup(&pool, &schema).await;
+}
+
+/// The database refuses to rewrite link provenance or rewind a generation, so
+/// the durable guarantees do not depend on application code alone.
+#[tokio::test]
+async fn database_triggers_refuse_provenance_rewrites_and_generation_rewinds() {
+    let (store, schema, pool) = fixture().await;
+    let (authority, _directory) = authority(store.clone()).await;
+    let service = service(&store, authority);
+    let account = seed_account(&store, &service, "trigger-owner").await;
+    let open = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
+        .await
+        .expect("open a device transaction");
+
+    // Every provenance column is immutable once the transaction exists.
+    for column in [
+        "channel = 'browser'",
+        "issuer = 'https://other.example'",
+        "audience = 'other-audience'",
+        "expires_at = now() + interval '2 hours'",
+        "account_link_generation = account_link_generation + 1",
+    ] {
+        let error = sqlx::query(AssertSqlSafe(format!(
+            "UPDATE account_link_transactions SET {column} WHERE link_id = $1"
+        )))
+        .bind(open.record.link_id)
+        .execute(store.pool())
+        .await
+        .expect_err("link provenance is immutable");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("23514"),
+            "rewriting {column} is refused by the provenance trigger"
+        );
+    }
+
+    // A state change must advance the revision.
+    let error = sqlx::query(
+        "UPDATE account_link_transactions SET state = 'cancelled', completed_at = now() WHERE link_id = $1",
+    )
+    .bind(open.record.link_id)
+    .execute(store.pool())
+    .await
+    .expect_err("a transition must advance the revision");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("23514")
+    );
+
+    // The account-link generation is monotonic.
+    let error = sqlx::query(
+        "UPDATE principals SET account_link_generation = account_link_generation - 1 WHERE id = $1",
+    )
+    .bind(account.principal_id)
+    .execute(store.pool())
+    .await
+    .expect_err("the account link generation cannot move backwards");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("23514")
+    );
     cleanup(&pool, &schema).await;
 }
