@@ -174,11 +174,12 @@ impl SessionRegistry {
         })
         .await
         {
-            Ok(Ok(removed)) => {
-                if removed > 0 {
+            Ok(Ok(cleanup)) => {
+                if cleanup.attempted() > 0 {
                     debug!(
                         session_id = %id.0,
-                        removed,
+                        removed = cleanup.removed,
+                        failed = cleanup.failed,
                         "rolled back worktree after a failed launch"
                     );
                 }

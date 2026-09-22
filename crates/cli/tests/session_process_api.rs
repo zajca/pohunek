@@ -41,6 +41,8 @@ enum Scenario {
     SlowInput,
     WaitTimeout,
     OutputLogSafety,
+    RetentionSweepClean,
+    RetentionSweepPartialFailure,
 }
 
 const OUTPUT_LOG_LINE_ONE: &str = "OUTPUT_SENTINEL_DELTA_\"quoted\"_41f62a";
@@ -461,9 +463,27 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
             result
         }
         protocol::method::SESSION_INPUT => json!({"accepted": true}),
+        protocol::method::SESSION_RETENTION_SWEEP => retention_sweep(scenario),
         method => panic!("unexpected fixture method: {method}"),
     };
     Response::ok(PROTOCOL_VERSION, request.id(), ok).expect("valid success response")
+}
+
+/// A sweep result whose only difference between scenarios is whether it reports a
+/// partial failure, which is what the exit status has to reflect.
+fn retention_sweep(scenario: Scenario) -> Value {
+    let partial = matches!(scenario, Scenario::RetentionSweepPartialFailure);
+    json!({
+        "dry_run": false,
+        "examined": 3,
+        "eligible": 1,
+        "held": 1,
+        "removed": 1,
+        "worktrees_cleaned": if partial { 0 } else { 1 },
+        "worktrees_failed": if partial { 1 } else { 0 },
+        "failed": u32::from(partial),
+        "sessions": []
+    })
 }
 
 fn governance_inspect_response(request: &Request, scenario: Scenario) -> Option<Response> {
@@ -1281,4 +1301,38 @@ int connect(int fd, const struct sockaddr *address, socklen_t length) {
         utf8(&compiled.stderr)
     );
     (library, capture)
+}
+
+#[test]
+fn session_retention_sweep_exits_zero_when_nothing_failed() {
+    let home = TestHome::new();
+    let fixture = FixtureDaemon::start(&home.socket(), Scenario::RetentionSweepClean);
+    let (output, requests) = run(&home, fixture, &["session", "retention", "sweep", "--apply"]);
+
+    assert!(
+        output.status.success(),
+        "a sweep with no failure exits zero: {}",
+        utf8(&output.stderr)
+    );
+    assert_eq!(
+        requests.last().expect("sweep request").method(),
+        protocol::method::SESSION_RETENTION_SWEEP
+    );
+}
+
+#[test]
+fn session_retention_sweep_exits_nonzero_on_a_partial_failure() {
+    let home = TestHome::new();
+    let fixture = FixtureDaemon::start(&home.socket(), Scenario::RetentionSweepPartialFailure);
+    let (output, _requests) = run(&home, fixture, &["session", "retention", "sweep", "--apply"]);
+
+    assert!(
+        !output.status.success(),
+        "a cron job must see a partial failure in the exit status: {}",
+        utf8(&output.stdout)
+    );
+    // The counters still reach stdout so the operator learns what went wrong.
+    let stdout = utf8(&output.stdout);
+    assert!(stdout.contains("failed=1"), "{stdout}");
+    assert!(stdout.contains("worktrees_failed=1"), "{stdout}");
 }

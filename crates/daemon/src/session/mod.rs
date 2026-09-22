@@ -55,7 +55,8 @@ use crate::store::{
 };
 use crate::time::now_rfc3339;
 use crate::worktree::{
-    canonical_or_original, run_hook, HookContext, HookEvent, WorktreeManager, WorktreeRequest,
+    canonical_or_original, run_hook, HookContext, HookEvent, WorktreeCleanup, WorktreeManager,
+    WorktreeRequest,
 };
 
 mod attach;
@@ -947,18 +948,24 @@ impl SessionRegistry {
         })
     }
 
+    /// Clean the worktrees owned by `id`, returning the setup warnings and how
+    /// many checkouts are really gone.
+    ///
+    /// A `git worktree remove` failure is non-fatal, so the count is what
+    /// [`SessionRegistry::remove`] reports rather than the number of bindings it
+    /// processed.
     async fn cleanup_owned_worktrees_for_removal(
         &self,
         id: &SessionId,
-    ) -> Result<Vec<SessionWarning>, ProtocolError> {
+    ) -> Result<(Vec<SessionWarning>, WorktreeCleanup), ProtocolError> {
         let Some(worktree) = self.inner.worktree.clone() else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), WorktreeCleanup::default()));
         };
         let session_id = id.0.clone();
         tokio::task::spawn_blocking(move || {
             let mut warnings = Vec::new();
-            worktree.cleanup_session(&session_id, &mut warnings)?;
-            Ok(warnings)
+            let cleanup = worktree.cleanup_session(&session_id, &mut warnings)?;
+            Ok((warnings, cleanup))
         })
         .await
         .map_err(|_join_error| {
@@ -2621,6 +2628,11 @@ impl SessionRegistry {
     /// `session_removed` event is emitted with the final snapshot so subscribed
     /// clients drop their view of the session.
     ///
+    /// Worktree cleanup is best-effort: a checkout that could not be deleted is
+    /// counted in [`SessionRemoveResult::worktrees_failed`] instead of failing
+    /// the removal, so a caller reporting cleaned worktrees can tell the two
+    /// apart.
+    ///
     /// # Errors
     ///
     /// Returns `session_not_found` when no session has the given id, and
@@ -2664,13 +2676,24 @@ impl SessionRegistry {
             false
         };
 
-        let cleanup_warnings = self.cleanup_owned_worktrees_for_removal(id).await?;
+        let (cleanup_warnings, cleanup) = self.cleanup_owned_worktrees_for_removal(id).await?;
         if !cleanup_warnings.is_empty() {
             let mut sessions = self.inner.sessions.lock().await;
             if let Some(entry) = sessions.get_mut(id) {
                 entry.info.warnings.extend(cleanup_warnings);
             }
         }
+        // The entry is about to leave the map and its warnings with it, so a
+        // checkout that survived is reported on the result as well.
+        if cleanup.failed > 0 {
+            warn!(
+                session_id = %id.0,
+                worktrees_failed = cleanup.failed,
+                "session removal left an owned worktree on disk"
+            );
+        }
+        let worktrees_removed = u32::try_from(cleanup.removed).unwrap_or(u32::MAX);
+        let worktrees_failed = u32::try_from(cleanup.failed).unwrap_or(u32::MAX);
 
         // The PTY has stopped above, so cleanup removes the accumulated family.
         // A retained terminal worker may still emit a final control diagnostic,
@@ -2686,6 +2709,8 @@ impl SessionRegistry {
                     return Ok(SessionRemoveResult {
                         removed: false,
                         stopped,
+                        worktrees_removed,
+                        worktrees_failed,
                     })
                 }
             }
@@ -2700,6 +2725,8 @@ impl SessionRegistry {
         Ok(SessionRemoveResult {
             removed: true,
             stopped,
+            worktrees_removed,
+            worktrees_failed,
         })
     }
 

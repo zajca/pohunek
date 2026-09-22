@@ -39,7 +39,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use protocol::{ErrorClass, ProtocolError, SessionWarning, SessionWarningKind};
+use protocol::{
+    ErrorClass, ProtocolError, SessionRetentionHold, SessionWarning, SessionWarningKind,
+};
 use tracing::{debug, warn};
 
 use crate::store::{Store, StoreMutation, WorktreeBinding, WorktreeStatus};
@@ -131,6 +133,46 @@ pub struct ProjectPrune {
     pub removed: usize,
     /// Canonical paths of owned worktrees skipped (a live session was using them).
     pub skipped: Vec<PathBuf>,
+}
+
+/// How many owned worktrees a cleanup actually deleted.
+///
+/// `git worktree remove` failures are non-fatal by design (the binding is
+/// dropped regardless), so a caller that reports cleanup counts needs the split
+/// between the checkouts that are gone and the ones that may still be on disk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorktreeCleanup {
+    /// Owned worktrees whose `git worktree remove` succeeded.
+    pub removed: usize,
+    /// Owned worktrees whose `git worktree remove` failed.
+    pub failed: usize,
+}
+
+impl WorktreeCleanup {
+    /// Returns how many bindings the cleanup processed.
+    #[must_use]
+    pub const fn attempted(self) -> usize {
+        self.removed + self.failed
+    }
+}
+
+/// Whether removing a pohunek-owned worktree would destroy work.
+///
+/// Answered for the unattended retention sweep only; an operator-driven
+/// `session rm` removes regardless. Anything git cannot establish is reported as
+/// a hold, so an unreadable checkout is kept rather than deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeWork {
+    /// Removal destroys nothing: no uncommitted or untracked files, and the
+    /// checked-out commits are contained in another ref.
+    Saved,
+    /// Removal would destroy work, or the checkout could not be inspected.
+    Held {
+        /// The rule that keeps the worktree.
+        hold: SessionRetentionHold,
+        /// What git reported, for the operator-facing log line.
+        detail: String,
+    },
 }
 
 /// Binds and cleans up per-session worktrees under a single root directory.
@@ -491,11 +533,13 @@ impl WorktreeManager {
 
     /// Remove every worktree owned by `session_id` (cleanup). Refuses to touch a
     /// tree the daemon does not own: only paths recorded in the binding store
-    /// are removed, then their bindings are dropped. Returns the number of
-    /// worktrees removed.
+    /// are removed, then their bindings are dropped. Returns how many checkouts
+    /// are gone and how many `git worktree remove` calls failed.
     ///
     /// Best-effort by design — a `git worktree remove` failure is logged and the
     /// binding is still dropped so a half-removed tree does not wedge cleanup.
+    /// It is reported in [`WorktreeCleanup::failed`] so a caller that counts
+    /// cleaned worktrees cannot claim a checkout that is still on disk.
     ///
     /// # Errors
     ///
@@ -505,12 +549,12 @@ impl WorktreeManager {
         &self,
         session_id: &str,
         warnings: &mut Vec<SessionWarning>,
-    ) -> Result<usize, ProtocolError> {
+    ) -> Result<WorktreeCleanup, ProtocolError> {
         let bindings = self
             .store
             .load_worktrees()
             .map_err(|err| store_error("read worktree binding store", &err))?;
-        let mut removed = 0;
+        let mut cleanup = WorktreeCleanup::default();
         for binding in bindings
             .into_iter()
             .filter(|binding| binding.session_id == session_id)
@@ -521,23 +565,61 @@ impl WorktreeManager {
             // unifying them would change the emitted output. The per-call-site
             // closure keeps the exact `warn!` invocation verbatim while the shared
             // hook bracketing lives in `cleanup_one_worktree`.
-            self.cleanup_one_worktree(&binding, warnings, |message| {
+            if self.cleanup_one_worktree(&binding, warnings, |message| {
                 warn!(
                     session_id = %session_id,
                     path = %binding.path.display(),
                     error = %message,
                     "git worktree remove failed during cleanup; dropping binding anyway"
                 );
-            });
-            removed += 1;
+            }) {
+                cleanup.removed += 1;
+            } else {
+                cleanup.failed += 1;
+            }
         }
-        if removed > 0 {
+        if cleanup.attempted() > 0 {
             self.store
                 .remove_worktree_session(session_id)
                 .map(StoreMutation::into_value)
                 .map_err(|err| store_error("drop worktree bindings", &err))?;
         }
-        Ok(removed)
+        Ok(cleanup)
+    }
+
+    /// Reports whether removing the worktrees owned by `session_id` would
+    /// destroy work, for the unattended retention sweep.
+    ///
+    /// The binding store is the ownership proof, exactly as in
+    /// [`Self::cleanup_session`]: a session with no binding has nothing the
+    /// sweep would delete, so it is [`WorktreeWork::Saved`]. Every other answer
+    /// fails closed — a binding-store read failure, an unreadable checkout or an
+    /// unexpected git failure is reported as
+    /// [`SessionRetentionHold::WorktreeUnknown`], never as removable.
+    ///
+    /// Ignored files are deliberately not a hold: they are ignored on purpose
+    /// and are regenerated, so counting them would pin every worktree forever.
+    #[must_use]
+    pub fn unsaved_work(&self, session_id: &str) -> WorktreeWork {
+        let bindings = match self.store.load_worktrees() {
+            Ok(bindings) => bindings,
+            Err(err) => {
+                return WorktreeWork::Held {
+                    hold: SessionRetentionHold::WorktreeUnknown,
+                    detail: format!("worktree binding store is unreadable: {err}"),
+                }
+            }
+        };
+        for binding in bindings
+            .into_iter()
+            .filter(|binding| binding.session_id == session_id)
+        {
+            match worktree_unsaved_work(&binding.path) {
+                WorktreeWork::Saved => {}
+                held @ WorktreeWork::Held { .. } => return held,
+            }
+        }
+        WorktreeWork::Saved
     }
 
     /// Remove the worktrees pohunek created for `project_id` (`project rm
@@ -581,7 +663,9 @@ impl WorktreeManager {
             // See `cleanup_session`: the differing `warn!` (project_id field + its
             // own message) stays verbatim at this call site; the shared hook
             // bracketing + `worktree_remove` live in `cleanup_one_worktree`.
-            self.cleanup_one_worktree(&binding, warnings, |message| {
+            // `project rm` reports the bindings it pruned, and a remove failure is
+            // already logged by the closure below.
+            let _removed = self.cleanup_one_worktree(&binding, warnings, |message| {
                 warn!(
                     project_id = %project_id,
                     path = %binding.path.display(),
@@ -631,7 +715,9 @@ impl WorktreeManager {
         else {
             return Ok(false);
         };
-        self.cleanup_one_worktree(&binding, warnings, |message| {
+        // A remove failure is logged by the closure and the binding is dropped
+        // regardless, so `Ok(true)` keeps meaning "this path was owned".
+        let _removed = self.cleanup_one_worktree(&binding, warnings, |message| {
             warn!(
                 path = %binding.path.display(),
                 error = %message,
@@ -656,12 +742,15 @@ impl WorktreeManager {
     /// both at the macro call site, so unifying them would change emitted output.
     /// `on_remove_error` therefore carries each caller's exact `warn!` verbatim and
     /// is invoked only on a remove failure.
+    ///
+    /// Returns whether `git worktree remove` succeeded, so a caller can report
+    /// the checkouts that are really gone rather than the bindings it processed.
     fn cleanup_one_worktree(
         &self,
         binding: &WorktreeBinding,
         warnings: &mut Vec<SessionWarning>,
         on_remove_error: impl FnOnce(&str),
-    ) {
+    ) -> bool {
         // pre-remove fires IN the worktree while it still exists.
         if binding.path.is_dir() {
             self.run_remove_hook(
@@ -673,9 +762,13 @@ impl WorktreeManager {
             );
         }
         // The binding is the ownership proof; only an owned worktree is removed.
-        if let Err(message) = worktree_remove(&binding.repository, &binding.path) {
-            on_remove_error(&message);
-        }
+        let removed = match worktree_remove(&binding.repository, &binding.path) {
+            Ok(()) => true,
+            Err(message) => {
+                on_remove_error(&message);
+                false
+            }
+        };
         // post-remove fires IN the repository (the worktree is gone). If the
         // repository itself is gone, skip with a warning rather than spawn in a
         // non-existent cwd.
@@ -696,6 +789,7 @@ impl WorktreeManager {
                 ),
             ));
         }
+        removed
     }
 
     /// Prune a stale git admin entry and remove any leftover directory so a
@@ -1116,6 +1210,115 @@ fn worktree_remove(repo: &Path, path: &Path) -> Result<(), String> {
 /// `git worktree prune` — drop admin entries for vanished worktrees.
 fn worktree_prune(repo: &Path) -> Result<(), String> {
     git_run(repo, &["worktree", "prune"]).map(|_| ())
+}
+
+/// Reports whether removing the checkout at `path` would destroy work.
+///
+/// [`worktree_remove`] deletes the working directory but not the branch, so a
+/// commit survives as long as some ref still contains it. The destructive cases
+/// are therefore an uncommitted change to a tracked file, an untracked file, and
+/// a commit no other ref contains. Every git failure is a
+/// [`SessionRetentionHold::WorktreeUnknown`] hold: an unattended caller must not
+/// delete a checkout it could not read.
+fn worktree_unsaved_work(path: &Path) -> WorktreeWork {
+    if !path.is_dir() {
+        // Nothing is on disk to lose; removal only prunes git's admin entry.
+        return WorktreeWork::Saved;
+    }
+    // Ignored files are excluded on purpose (see `WorktreeManager::unsaved_work`).
+    match git_capture(path, &["status", "--porcelain", "--untracked-files=normal"]) {
+        Ok(status) => {
+            if let Some((hold, detail)) = status_hold(&status) {
+                return WorktreeWork::Held { hold, detail };
+            }
+        }
+        Err(message) => {
+            return WorktreeWork::Held {
+                hold: SessionRetentionHold::WorktreeUnknown,
+                detail: format!("git status failed in {}: {message}", path.display()),
+            }
+        }
+    }
+    unpushed_hold(path)
+}
+
+/// Returns the hold implied by `git status --porcelain` output, if any.
+///
+/// An uncommitted change to a tracked file outranks an untracked file: both keep
+/// the worktree, and the more serious one is the better log line.
+fn status_hold(status: &str) -> Option<(SessionRetentionHold, String)> {
+    let mut untracked = None;
+    for line in status.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(file) = line.strip_prefix("?? ") {
+            untracked = untracked.or_else(|| Some(file.to_owned()));
+        } else {
+            return Some((
+                SessionRetentionHold::WorktreeUncommitted,
+                format!("uncommitted change: {line}"),
+            ));
+        }
+    }
+    untracked.map(|file| {
+        (
+            SessionRetentionHold::WorktreeUntracked,
+            format!("untracked file: {file}"),
+        )
+    })
+}
+
+/// Returns a hold when the checkout's commits are contained in no other ref.
+///
+/// The worktree's own branch is excluded from the search: it is the ref the
+/// removal leaves behind, so it cannot prove the commits exist anywhere else.
+fn unpushed_hold(path: &Path) -> WorktreeWork {
+    let head = match git_capture(path, &["rev-parse", "--verify", "HEAD"]) {
+        Ok(head) => head,
+        Err(message) => {
+            return WorktreeWork::Held {
+                hold: SessionRetentionHold::WorktreeUnknown,
+                detail: format!("git rev-parse failed in {}: {message}", path.display()),
+            }
+        }
+    };
+    // A detached HEAD has no own branch, which only widens the search.
+    let own_branch = git_capture(path, &["symbolic-ref", "--quiet", "HEAD"]).ok();
+    let containing = match git_capture(
+        path,
+        &[
+            "for-each-ref",
+            "--contains",
+            &head,
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ],
+    ) {
+        Ok(refs) => refs,
+        Err(message) => {
+            return WorktreeWork::Held {
+                hold: SessionRetentionHold::WorktreeUnknown,
+                detail: format!("git for-each-ref failed in {}: {message}", path.display()),
+            }
+        }
+    };
+    let contained_elsewhere = containing
+        .lines()
+        .map(str::trim)
+        .filter(|refname| !refname.is_empty())
+        .any(|refname| Some(refname) != own_branch.as_deref());
+    if contained_elsewhere {
+        WorktreeWork::Saved
+    } else {
+        WorktreeWork::Held {
+            hold: SessionRetentionHold::WorktreeUnpushed,
+            detail: format!("commit {head} is contained in no other branch, remote or tag"),
+        }
+    }
 }
 
 /// Outcome of supervising a setup script to (possibly forced) completion.

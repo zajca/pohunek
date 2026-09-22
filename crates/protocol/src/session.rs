@@ -2681,6 +2681,12 @@ pub struct SessionRemoveResult {
     pub removed: bool,
     /// Whether a still-live session was stopped as part of this removal.
     pub stopped: bool,
+    /// Pohunek-owned worktrees whose checkout this removal deleted.
+    pub worktrees_removed: u32,
+    /// Pohunek-owned worktrees whose checkout could not be deleted. Their
+    /// binding is dropped either way, so the leftover directory is no longer
+    /// tracked and needs manual cleanup.
+    pub worktrees_failed: u32,
 }
 
 /// Default interval between daemon-owned session retention sweeps.
@@ -2788,7 +2794,43 @@ impl SessionRetentionReason {
     }
 }
 
-/// One session selected by a retention sweep.
+/// Why a retention sweep refused a session whose age already matched the policy.
+///
+/// A sweep is unattended, so it removes a pohunek-owned worktree only when it
+/// can prove the checkout holds nothing that removal would destroy. Every hold
+/// below keeps the session and its worktree until an operator removes them
+/// deliberately with `session rm`, which is unaffected by these rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionRetentionHold.ts"))]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRetentionHold {
+    /// The owned worktree has uncommitted changes to tracked files.
+    WorktreeUncommitted,
+    /// The owned worktree has untracked files.
+    WorktreeUntracked,
+    /// The owned worktree's commits are contained in no other branch, remote
+    /// branch or tag.
+    WorktreeUnpushed,
+    /// The owned worktree's state could not be determined, so the sweep fails
+    /// closed and keeps it.
+    WorktreeUnknown,
+}
+
+impl SessionRetentionHold {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WorktreeUncommitted => "worktree_uncommitted",
+            Self::WorktreeUntracked => "worktree_untracked",
+            Self::WorktreeUnpushed => "worktree_unpushed",
+            Self::WorktreeUnknown => "worktree_unknown",
+        }
+    }
+}
+
+/// One session a retention sweep matched, whether it removed it or held it back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionRetentionCandidate.ts"))]
@@ -2804,8 +2846,14 @@ pub struct SessionRetentionCandidate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub worktree_path: Option<PathBuf>,
+    /// Why the sweep kept this session although its age matched the policy.
+    /// `None` for a session the sweep is free to remove.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub hold: Option<SessionRetentionHold>,
     /// Whether this sweep actually removed the session. Always `false` for a
-    /// dry run, and `false` for a candidate the sweep's removal cap deferred.
+    /// dry run, for a held candidate, and for a candidate the sweep's removal
+    /// cap deferred.
     pub removed: bool,
 }
 
@@ -2832,15 +2880,23 @@ pub struct SessionRetentionResult {
     pub dry_run: bool,
     /// Sessions the sweep considered, including the ones it kept.
     pub examined: u32,
-    /// Sessions that matched the policy, before the removal cap applied.
+    /// Sessions that matched the policy and are safe to remove, before the
+    /// removal cap applied.
     pub eligible: u32,
+    /// Sessions whose age matched the policy but whose owned worktree holds
+    /// work, or could not be inspected. Counted separately from
+    /// [`Self::eligible`] because the sweep never removes them.
+    pub held: u32,
     /// Sessions the sweep actually removed.
     pub removed: u32,
-    /// Removed sessions that held a pohunek-owned worktree.
+    /// Pohunek-owned worktrees this sweep confirmed gone from disk.
     pub worktrees_cleaned: u32,
+    /// Owned worktrees whose checkout survived the removal and may still be on
+    /// disk. The session record is gone, so the leftover needs manual cleanup.
+    pub worktrees_failed: u32,
     /// Selected sessions whose removal returned an error and were left in place.
     pub failed: u32,
-    /// Per-session detail for every selected session.
+    /// Per-session detail for every matched session, held ones included.
     pub sessions: Vec<SessionRetentionCandidate>,
 }
 

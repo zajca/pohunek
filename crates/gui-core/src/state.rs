@@ -3155,6 +3155,8 @@ mod tests {
             result: SessionRemoveResult {
                 removed: true,
                 stopped: true,
+                worktrees_removed: 0,
+                worktrees_failed: 0,
             },
         });
 
@@ -3315,6 +3317,8 @@ mod tests {
             result: SessionRemoveResult {
                 removed: false,
                 stopped: false,
+                worktrees_removed: 0,
+                worktrees_failed: 0,
             },
         });
 

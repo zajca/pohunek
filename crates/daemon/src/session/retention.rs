@@ -11,21 +11,23 @@
 use std::{
     io,
     path::{Path, PathBuf},
-    sync::{PoisonError, RwLock},
+    sync::{Arc, PoisonError, RwLock},
     time::Duration,
 };
 
 use pohunek_platform::filesystem::{AtomicReplaceError, FsError, TrustedDir};
 use protocol::{
     ErrorClass, ProtocolError, RuntimeState, SessionInfo, SessionRetentionCandidate,
-    SessionRetentionParams, SessionRetentionPolicy, SessionRetentionReason, SessionRetentionResult,
+    SessionRetentionHold, SessionRetentionParams, SessionRetentionPolicy, SessionRetentionReason,
+    SessionRetentionResult,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::SessionRegistry;
+use crate::worktree::WorktreeWork;
 
 /// File name of the durable session policy below the daemon data directory.
 pub const POLICY_FILE_NAME: &str = "session-policy.json";
@@ -185,25 +187,42 @@ impl SessionRegistry {
         let sessions = self.list_raw().await;
         let examined = u32::try_from(sessions.len()).unwrap_or(u32::MAX);
         let mut candidates = select_candidates(&sessions, &policy, now);
-        let eligible = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
+        self.apply_worktree_holds(&mut candidates).await;
+        let held = count(candidates.iter().filter(|candidate| candidate.hold.is_some()));
+        let eligible = count(candidates.iter().filter(|candidate| candidate.hold.is_none()));
         let budget = removal_budget(&policy, params.limit);
 
         let mut removed = 0_u32;
         let mut worktrees_cleaned = 0_u32;
+        let mut worktrees_failed = 0_u32;
         let mut failed = 0_u32;
         if !params.dry_run {
-            for candidate in candidates.iter_mut().take(budget) {
+            for candidate in candidates
+                .iter_mut()
+                .filter(|candidate| candidate.hold.is_none())
+                .take(budget)
+            {
                 match self.remove(&candidate.session_id).await {
-                    Ok(result) if result.removed => {
-                        candidate.removed = true;
-                        removed = removed.saturating_add(1);
-                        if candidate.worktree_path.is_some() {
-                            worktrees_cleaned = worktrees_cleaned.saturating_add(1);
+                    // The removal reports the checkouts it really deleted, so a
+                    // `git worktree remove` failure cannot inflate the count.
+                    Ok(result) => {
+                        worktrees_cleaned =
+                            worktrees_cleaned.saturating_add(result.worktrees_removed);
+                        worktrees_failed = worktrees_failed.saturating_add(result.worktrees_failed);
+                        if result.worktrees_failed > 0 {
+                            warn!(
+                                session_id = %candidate.session_id.0,
+                                session.worktrees_failed = result.worktrees_failed,
+                                "session retention removed a session but left its worktree on disk"
+                            );
                         }
+                        if result.removed {
+                            candidate.removed = true;
+                            removed = removed.saturating_add(1);
+                        }
+                        // Otherwise a concurrent remove already evicted this
+                        // session; it is gone either way.
                     }
-                    // A concurrent remove already evicted this session; it is
-                    // gone either way and is not this sweep's work to report.
-                    Ok(_) => {}
                     Err(error) => {
                         failed = failed.saturating_add(1);
                         warn!(
@@ -221,11 +240,51 @@ impl SessionRegistry {
             dry_run: params.dry_run,
             examined,
             eligible,
+            held,
             removed,
             worktrees_cleaned,
+            worktrees_failed,
             failed,
             sessions: candidates,
         })
+    }
+
+    /// Marks every candidate the sweep must not remove because its owned
+    /// worktree holds work, or because that worktree could not be inspected.
+    ///
+    /// An automatic sweep is unattended and `git worktree remove --force`
+    /// deletes the checkout without asking, so a selected session only stays
+    /// removable while its worktree is provably empty of work. `session rm` is an
+    /// explicit operator action and is deliberately not subject to this rule.
+    async fn apply_worktree_holds(&self, candidates: &mut [SessionRetentionCandidate]) {
+        let Some(worktree) = self.inner.worktree.clone() else {
+            return;
+        };
+        for candidate in candidates
+            .iter_mut()
+            .filter(|candidate| candidate.worktree_path.is_some())
+        {
+            let manager = Arc::clone(&worktree);
+            let session_id = candidate.session_id.0.clone();
+            let work = match tokio::task::spawn_blocking(move || manager.unsaved_work(&session_id))
+                .await
+            {
+                Ok(work) => work,
+                Err(_join) => WorktreeWork::Held {
+                    hold: SessionRetentionHold::WorktreeUnknown,
+                    detail: "worktree inspection task panicked".to_owned(),
+                },
+            };
+            if let WorktreeWork::Held { hold, detail } = work {
+                candidate.hold = Some(hold);
+                info!(
+                    session_id = %candidate.session_id.0,
+                    session.hold = hold.as_str(),
+                    detail = %detail,
+                    "session retention kept a session whose worktree holds work"
+                );
+            }
+        }
     }
 }
 
@@ -250,37 +309,19 @@ impl SessionRetentionTask {
         let handle = tokio::spawn(async move {
             loop {
                 if sessions.retention_policy().enabled {
-                    match sessions
-                        .sweep_retention(&SessionRetentionParams::default())
-                        .await
-                    {
-                        Ok(result) => {
-                            // Every sweep leaves evidence for backtesting; only a
-                            // sweep that changed something is worth INFO.
-                            if result.removed > 0 || result.failed > 0 {
-                                info!(
-                                    session.pruned = result.removed,
-                                    session.worktrees_cleaned = result.worktrees_cleaned,
-                                    session.eligible = result.eligible,
-                                    session.examined = result.examined,
-                                    session.failed = result.failed,
-                                    "completed automatic session retention"
-                                );
-                            } else {
-                                debug!(
-                                    session.pruned = result.removed,
-                                    session.worktrees_cleaned = result.worktrees_cleaned,
-                                    session.eligible = result.eligible,
-                                    session.examined = result.examined,
-                                    session.failed = result.failed,
-                                    "completed automatic session retention"
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            warn!(error = %error, "automatic session retention failed");
-                        }
-                    }
+                    // The sweep runs in its own task so a panic anywhere in the
+                    // removal chain arrives here as a `JoinError` instead of
+                    // unwinding this loop and killing automatic retention until
+                    // the next daemon restart.
+                    let registry = sessions.clone();
+                    report_sweep(
+                        tokio::spawn(async move {
+                            registry
+                                .sweep_retention(&SessionRetentionParams::default())
+                                .await
+                        })
+                        .await,
+                    );
                 }
 
                 let interval =
@@ -305,6 +346,48 @@ impl SessionRetentionTask {
             Err(_) => {
                 warn!("session retention task did not finish within the shutdown timeout");
             }
+        }
+    }
+}
+
+/// Logs the outcome of one automatic sweep, including a panicked one.
+///
+/// Returns normally for every outcome: the caller is a background loop whose next
+/// tick must still run, so nothing here may propagate.
+fn report_sweep(outcome: Result<Result<SessionRetentionResult, ProtocolError>, JoinError>) {
+    match outcome {
+        Ok(Ok(result)) => {
+            // Every sweep leaves evidence for backtesting; only a sweep that
+            // changed something is worth INFO.
+            if result.removed > 0 || result.failed > 0 || result.worktrees_failed > 0 {
+                info!(
+                    session.pruned = result.removed,
+                    session.worktrees_cleaned = result.worktrees_cleaned,
+                    session.worktrees_failed = result.worktrees_failed,
+                    session.eligible = result.eligible,
+                    session.held = result.held,
+                    session.examined = result.examined,
+                    session.failed = result.failed,
+                    "completed automatic session retention"
+                );
+            } else {
+                debug!(
+                    session.pruned = result.removed,
+                    session.worktrees_cleaned = result.worktrees_cleaned,
+                    session.worktrees_failed = result.worktrees_failed,
+                    session.eligible = result.eligible,
+                    session.held = result.held,
+                    session.examined = result.examined,
+                    session.failed = result.failed,
+                    "completed automatic session retention"
+                );
+            }
+        }
+        Ok(Err(error)) => {
+            warn!(error = %error, "automatic session retention failed");
+        }
+        Err(error) => {
+            warn!(error = %error, "automatic session retention task panicked");
         }
     }
 }
@@ -358,8 +441,16 @@ fn candidate_for(
         reason,
         age_secs,
         worktree_path: session.worktree_path.clone(),
+        // Filled in by `apply_worktree_holds`, which needs blocking git access
+        // this pure selection deliberately has no part in.
+        hold: None,
         removed: false,
     })
+}
+
+/// Counts an iterator into one of the sweep result's `u32` counters.
+fn count<T>(items: impl Iterator<Item = T>) -> u32 {
+    u32::try_from(items.count()).unwrap_or(u32::MAX)
 }
 
 /// Returns the rule that applies to `session` and the timestamp it ages from.
@@ -552,9 +643,11 @@ mod tests {
     };
     use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 
+    use tokio::task::JoinError;
+
     use super::{
-        read_policy, removal_budget, select_candidates, validate_policy, write_policy,
-        POLICY_FILE_NAME,
+        invalid_policy, read_policy, removal_budget, report_sweep, select_candidates,
+        validate_policy, write_policy, POLICY_FILE_NAME,
     };
 
     /// The policy store requires an owner-private directory, so fixtures create one.
@@ -841,5 +934,24 @@ mod tests {
         std::fs::write(&path, b"{ not json").expect("write corrupt policy");
 
         read_policy(&path).expect_err("a corrupt policy file must not parse");
+    }
+
+    /// A sweep that panics must not take the background loop with it: the loop
+    /// awaits the sweep as its own task and hands the `JoinError` to
+    /// `report_sweep`, which has to return normally so the next tick still runs.
+    #[tokio::test]
+    async fn a_panicking_sweep_is_reported_without_unwinding_the_caller() {
+        let outcome = tokio::spawn(async { panic!("sweep exploded") }).await;
+        assert!(
+            outcome.as_ref().err().is_some_and(JoinError::is_panic),
+            "the fixture must produce a real panic JoinError"
+        );
+
+        report_sweep(outcome);
+    }
+
+    #[tokio::test]
+    async fn a_failed_sweep_is_reported_without_unwinding_the_caller() {
+        report_sweep(Ok(Err(invalid_policy("sweep refused".to_owned()))));
     }
 }

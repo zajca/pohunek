@@ -1696,6 +1696,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         }
         Commands::Session { action } => {
             let paths = Paths::resolve()?;
+            // A retention sweep can complete with a partial failure, which only a
+            // non-zero status makes visible to a cron job or health check.
+            let mut exit = ExitCode::SUCCESS;
             match action {
                 SessionAction::New {
                     agent,
@@ -1987,7 +1990,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                         json,
                     } => {
                         let host = effective_host(&global_host, None);
-                        commands::session::run_retention_sweep(
+                        if !commands::session::run_retention_sweep(
                             &host,
                             &paths,
                             commands::session::SweepArgs {
@@ -1997,11 +2000,14 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                             },
                             json,
                         )
-                        .await?;
+                        .await?
+                        {
+                            exit = ExitCode::FAILURE;
+                        }
                     }
                 },
             }
-            Ok(ExitCode::SUCCESS)
+            Ok(exit)
         }
         Commands::Subscribe { .. } => {
             // `json` is intentionally not read here: the daemon's event stream is
