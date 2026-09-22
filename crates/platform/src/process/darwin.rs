@@ -1068,7 +1068,7 @@ mod tests {
             // stall every test that spawned one, with no diagnosis.
             let deadline = Instant::now() + REAP_TIMEOUT;
             while Instant::now() < deadline {
-                if matches!(self.0.try_wait(), Ok(Some(_status)) | Err(_unreapable)) {
+                if matches!(self.0.try_wait(), Ok(Some(_)) | Err(_)) {
                     return;
                 }
                 std::thread::sleep(OBSERVE_POLL);
