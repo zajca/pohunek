@@ -1350,6 +1350,171 @@ mod credential_router_tests {
         assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
         auth_tests::cleanup(&bootstrap, &schema).await;
     }
+
+    /// Every link route sits behind one authentication boundary: a bearer
+    /// caller may not also present a cookie or `Origin`, an unauthenticated
+    /// caller is refused, and a browser mutation needs its exact `Origin` and
+    /// CSRF header before the linking lifecycle sees the request.
+    #[tokio::test]
+    async fn link_routes_reject_mixed_and_unauthenticated_callers() {
+        let (store, schema, bootstrap) = auth_tests::fixture().await;
+        let (authority, _directory) = auth_tests::authority(store.clone()).await;
+        let digest_key = DigestKey::new("test".to_owned(), b"ephemeral-test-key".to_vec());
+        let auth = AuthService::new(
+            store.clone(),
+            digest_key.clone(),
+            2,
+            router_auth_limits(),
+            LoginPolicy::AnyAuthenticatedSubject,
+            Arc::clone(&authority),
+        );
+        let principal_id = Uuid::now_v7();
+        let identity_id = Uuid::now_v7();
+        let credential_id = Uuid::now_v7();
+        let secret = "link-router-secret";
+        sqlx::query(
+            "INSERT INTO principals (id,kind,state,generation) VALUES ($1,'human','active',1)",
+        )
+        .bind(principal_id)
+        .execute(store.pool())
+        .await
+        .expect("seed principal");
+        sqlx::query("INSERT INTO oidc_identities (identity_id,issuer,subject,principal_id,link_generation) VALUES ($1,'issuer','link-router-owner',$2,1)")
+            .bind(identity_id)
+            .bind(principal_id)
+            .execute(store.pool())
+            .await
+            .expect("seed identity");
+        sqlx::query("INSERT INTO relay_credentials (credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,recovery_generation,expires_at) VALUES ($1,$2,$3,$4,$5,'test','human',1,$1,1,clock_timestamp()+interval '1 hour')")
+            .bind(credential_id)
+            .bind(credential_id.to_string())
+            .bind(digest_key.digest(secret).as_slice())
+            .bind(principal_id)
+            .bind(identity_id)
+            .execute(store.pool())
+            .await
+            .expect("seed bearer");
+        let state = ServerState::new(
+            config(),
+            store.clone(),
+            auth,
+            OidcClient::test_client(),
+            authority,
+        );
+        let app = router(state);
+        let bearer = format!("Bearer {credential_id}.{secret}");
+        let body = json!({
+            "idempotency":{"correlation_id":Uuid::now_v7(),"idempotency_key":Uuid::now_v7()},
+        });
+        for uri in [
+            "/v1/account/links/browser/start",
+            "/v1/account/links/device/start",
+        ] {
+            let mixed = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, &bearer)
+                        .header(header::COOKIE, "__Host-pohunek-relay-session=x")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .expect("mixed link request"),
+                )
+                .await
+                .expect("router response");
+            assert_eq!(mixed.status(), StatusCode::BAD_REQUEST);
+            let anonymous = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .expect("anonymous link request"),
+                )
+                .await
+                .expect("router response");
+            assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // A browser mutation without its exact Origin and CSRF header never
+        // reaches the linking lifecycle.
+        let no_csrf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/account/links/browser/start")
+                    .header(header::COOKIE, "__Host-pohunek-relay-session=x")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .expect("cookie-only link request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(no_csrf.status(), StatusCode::BAD_REQUEST);
+
+        // A bearer caller reaches the lifecycle, which owns the channel rule.
+        let wrong_channel = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/account/links/browser/start")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .expect("bearer browser-start request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(wrong_channel.status(), StatusCode::BAD_REQUEST);
+        let wrong_channel_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(wrong_channel.into_body(), 64 * 1024)
+                .await
+                .expect("wrong channel body"),
+        )
+        .expect("wrong channel JSON");
+        assert_eq!(wrong_channel_json["error"]["code"], "invalid_request");
+
+        let page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/account/links?limit=0")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(axum::body::Body::empty())
+                    .expect("invalid link page request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(page.status(), StatusCode::BAD_REQUEST);
+
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/account/links?limit=1")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(axum::body::Body::empty())
+                    .expect("link page request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(listed.status(), StatusCode::OK);
+        assert_eq!(
+            listed
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "a link response is never cached"
+        );
+        auth_tests::cleanup(&bootstrap, &schema).await;
+    }
 }
 impl IntoResponse for ApiFailure {
     fn into_response(self) -> Response {
