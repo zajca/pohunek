@@ -1615,7 +1615,9 @@ async fn audit_link_denial(
     .bind(outcome)
     .execute(&mut **transaction)
     .await
-    .map_err(retryable_database_error)?;
+    // A denial has nothing to retry productively, and `Retryable` is an
+    // internal signal that must not reach the caller, so this fails closed.
+    .map_err(|_error| AuthError::Durable)?;
     if inserted.rows_affected() != 1 {
         return Err(AuthError::Durable);
     }

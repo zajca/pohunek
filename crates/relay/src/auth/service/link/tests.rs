@@ -1880,17 +1880,25 @@ async fn every_refused_transition_records_an_attributable_denial() {
     cleanup(&pool, &schema).await;
 }
 
+/// Opaque values a seeded link callback is bound to.
+const CALLBACK_STATE: &str = "link-state";
+const CALLBACK_BINDING: &str = "link-binding";
+const CALLBACK_NONCE: &str = "link-nonce";
+const CALLBACK_VERIFIER: &str = "link-verifier";
+
 /// Seeds one bound browser callback row for an existing link transaction.
 async fn insert_link_callback(
     store: &Store,
     service: &AuthService,
     link_id: Uuid,
     account_link_generation: i64,
-    state: &str,
-    binding: &str,
-    nonce: &str,
-    verifier: &str,
 ) -> Uuid {
+    let (state, binding, nonce, verifier) = (
+        CALLBACK_STATE,
+        CALLBACK_BINDING,
+        CALLBACK_NONCE,
+        CALLBACK_VERIFIER,
+    );
     let login_id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO browser_logins (login_id,state_digest,nonce_digest,pkce_verifier_digest,login_binding_digest,issuer,client_id,audience,redirect_uri,action,link_id,account_link_generation,recovery_generation,expires_at) \
@@ -1914,6 +1922,10 @@ async fn insert_link_callback(
 /// A link callback is consumed exactly once and every wrong coordinate is
 /// refused and audited before any provider exchange is attempted.
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Each refused callback class and the database floor that separates the kinds are one sequence."
+)]
 async fn link_callbacks_consume_once_and_audit_every_denial_class() {
     let (store, schema, pool) = fixture().await;
     let (authority, _directory) = authority(store.clone()).await;
@@ -1949,10 +1961,6 @@ async fn link_callbacks_consume_once_and_audit_every_denial_class() {
             &service,
             open.record.link_id,
             open.record.account_link_generation,
-            "link-state",
-            "link-binding",
-            "link-nonce",
-            "link-verifier",
         )
         .await;
         service
@@ -1962,8 +1970,8 @@ async fn link_callbacks_consume_once_and_audit_every_denial_class() {
             .insert(
                 login_id,
                 PendingBrowserLogin {
-                    verifier: Zeroizing::new("link-verifier".to_owned()),
-                    nonce: Zeroizing::new("link-nonce".to_owned()),
+                    verifier: Zeroizing::new(CALLBACK_VERIFIER.to_owned()),
+                    nonce: Zeroizing::new(CALLBACK_NONCE.to_owned()),
                     expires_at: Instant::now() + Duration::from_mins(1),
                 },
             );
