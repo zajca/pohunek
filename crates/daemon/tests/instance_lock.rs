@@ -7,17 +7,18 @@
 
 use pohunek_daemon::error::DaemonError;
 use pohunek_daemon::lock::InstanceLock;
+use std::os::unix::fs::PermissionsExt as _;
 
 fn temp_lock(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    p.push(format!(
-        "pohunek-test-{tag}-{}-{nanos}.lock",
-        std::process::id()
-    ));
-    p
+    p.push(format!("pohunek-test-{tag}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir(&p).expect("create owner-private lock directory");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
+        .expect("set owner-private lock directory mode");
+    p.join("daemon.lock")
 }
 
 #[test]
@@ -39,4 +40,5 @@ fn second_acquire_is_refused_while_held() {
     drop(third);
 
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir(path.parent().expect("lock has a parent"));
 }

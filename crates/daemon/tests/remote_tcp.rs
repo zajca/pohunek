@@ -14,6 +14,7 @@
 mod support;
 
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,6 +71,8 @@ fn temp_dir(tag: &str) -> PathBuf {
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).expect("create test dir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .expect("make test directory private");
     dir
 }
 

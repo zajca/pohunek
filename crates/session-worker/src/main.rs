@@ -1,6 +1,6 @@
 //! Runs one durable pohunek session worker.
 
-// Rust guideline compliant 2026-07-23
+// Rust guideline compliant 2026-09-19
 
 use std::fmt::Write as _;
 use std::fs;
@@ -9,7 +9,7 @@ use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use pohunek_paths::BasePaths;
+use pohunek_paths::{validate_socket_path, BasePaths, Platform, SocketKind};
 use pohunek_session_worker::{Server, ServerArgs, WorkerConfig, WorkerError};
 use tracing::{event, Level};
 use tracing_subscriber::prelude::*;
@@ -44,10 +44,17 @@ async fn run() -> Result<(), WorkerError> {
     };
     let socket_path = paths
         .worker_socket(&cli.session_id)
+        .map_err(WorkerError::Paths)?
         .ok_or_else(|| WorkerError::InvalidSessionId(cli.session_id.clone()))?;
     let journal_path = paths
         .worker_journal(&cli.session_id, &worker_id)
         .ok_or_else(|| WorkerError::InvalidWorkerId(worker_id.clone()))?;
+    let daemon_socket_path = cli.daemon_socket_path.unwrap_or(paths.socket);
+    validate_socket_path(
+        &daemon_socket_path,
+        Platform::current()?,
+        SocketKind::Daemon,
+    )?;
     let _log_guard = init_logging(&paths.log_dir, &cli.session_id)?;
 
     let server = Server::bind(ServerArgs {
@@ -55,7 +62,7 @@ async fn run() -> Result<(), WorkerError> {
         worker_id: worker_id.clone(),
         socket_path,
         journal_path,
-        daemon_socket_path: cli.daemon_socket_path.unwrap_or(paths.socket),
+        daemon_socket_path,
         config: WorkerConfig::new(),
     })
     .await?;

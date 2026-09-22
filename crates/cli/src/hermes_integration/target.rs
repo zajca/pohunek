@@ -236,7 +236,7 @@ fn has_git_workspace_ancestor(path: &Path) -> Result<bool, Error> {
 pub(crate) fn isolated_test_temp_root() -> PathBuf {
     let standard = std::env::temp_dir();
     if !has_git_workspace_ancestor(&standard).unwrap_or(true) {
-        return standard;
+        return fs::canonicalize(&standard).expect("canonical temporary root");
     }
     // `/var/tmp` is the standard persistent Unix temporary root and keeps
     // custom-target fixtures outside an ambient repository rooted at `/tmp`.
@@ -245,7 +245,7 @@ pub(crate) fn isolated_test_temp_root() -> PathBuf {
         !has_git_workspace_ancestor(&fallback).unwrap_or(true),
         "no temporary root outside a Git workspace"
     );
-    fallback
+    fs::canonicalize(fallback).expect("canonical fallback temporary root")
 }
 
 fn canonical_existing_dir(path: &Path, uid: u32) -> Result<PathBuf, Error> {

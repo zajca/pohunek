@@ -1,22 +1,25 @@
 //! Persists the worker-owned runtime journal atomically.
 
-// Rust guideline compliant 2026-09-14
+// Rust guideline compliant 2026-09-20
 
 use std::fmt::{Debug, Formatter};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use pohunek_platform::filesystem::{AtomicReplaceError, TrustedDir};
 use serde::{Deserialize, Serialize};
 
 /// Worker journal schema understood by this crate.
-const JOURNAL_SCHEMA_VERSION: u32 = 2;
+const JOURNAL_SCHEMA_VERSION: u32 = 3;
 /// Owner-only directory permissions.
 const PRIVATE_DIR_MODE: u32 = 0o700;
 /// Owner-only journal permissions.
 const PRIVATE_FILE_MODE: u32 = 0o600;
+/// Maximum serialized journal size accepted from disk.
+///
+/// Runtime journals contain bounded session metadata; one MiB leaves ample
+/// schema growth room while preventing unbounded allocation from a replaced file.
+const MAX_JOURNAL_BYTES: usize = 1024 * 1024;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -56,6 +59,23 @@ pub enum JournalError {
     /// Journal serialization failed.
     #[error("worker journal serialization failed: {0}")]
     Serialize(serde_json::Error),
+    /// A trusted descriptor-relative filesystem operation failed.
+    #[error("trusted worker journal operation failed: {0}")]
+    TrustedFilesystem(#[from] pohunek_platform::filesystem::FsError),
+    /// Atomic journal replacement failed before or after its commit point.
+    #[error("atomic worker journal replacement failed: {0}")]
+    AtomicReplace(#[from] AtomicReplaceError),
+}
+
+impl JournalError {
+    /// Reports whether the journal rename committed before durability failed.
+    #[must_use]
+    pub fn committed_durability_uncertain(&self) -> bool {
+        matches!(
+            self,
+            Self::AtomicReplace(AtomicReplaceError::CommittedDurabilityUncertain(_))
+        )
+    }
 }
 
 /// Durable worker runtime phase.
@@ -247,6 +267,8 @@ pub struct JournalRecord {
     pub worker_pid: u32,
     /// Worker process start identity.
     pub worker_start_identity: String,
+    /// Operating-system boot identity that scopes process start identities.
+    pub boot_identity: String,
     /// Managed PTY root identity.
     pub child: Option<ChildIdentity>,
     /// PTY creation timestamp.
@@ -293,6 +315,7 @@ impl Debug for JournalRecord {
             .field("protocol_maximum", &self.protocol_maximum)
             .field("worker_pid", &self.worker_pid)
             .field("worker_start_identity", &self.worker_start_identity)
+            .field("boot_identity", &self.boot_identity)
             .field("child", &self.child)
             .field("pty_created_at", &self.pty_created_at)
             .field("cols", &self.cols)
@@ -320,6 +343,7 @@ impl JournalRecord {
         worker_id: String,
         process_id: u32,
         worker_start_identity: String,
+        boot_identity: String,
         protocol_range: (u16, u16),
         updated_at: String,
     ) -> Self {
@@ -332,6 +356,7 @@ impl JournalRecord {
             protocol_maximum: protocol_range.1,
             worker_pid: process_id,
             worker_start_identity,
+            boot_identity,
             child: None,
             pty_created_at: None,
             cols: None,
@@ -387,48 +412,22 @@ impl Journal {
             .ok_or_else(|| JournalError::MissingParent {
                 path: self.path.clone(),
             })?;
-        ensure_private_dir(parent)?;
-        reject_symlink(&self.path)?;
+        let directory = TrustedDir::open_or_create_absolute(parent, PRIVATE_DIR_MODE)?;
 
-        let bytes = serde_json::to_vec_pretty(record).map_err(JournalError::Serialize)?;
+        let mut bytes = serde_json::to_vec_pretty(record).map_err(JournalError::Serialize)?;
+        bytes.push(b'\n');
         let temp = temp_path(&self.path);
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(PRIVATE_FILE_MODE)
-                .open(&temp)
-                .map_err(|source| JournalError::Io {
-                    path: temp.clone(),
-                    source,
-                })?;
-            file.write_all(&bytes).map_err(|source| JournalError::Io {
-                path: temp.clone(),
-                source,
-            })?;
-            file.write_all(b"\n").map_err(|source| JournalError::Io {
-                path: temp.clone(),
-                source,
-            })?;
-            file.sync_all().map_err(|source| JournalError::Io {
-                path: temp.clone(),
-                source,
-            })?;
-            fs::rename(&temp, &self.path).map_err(|source| JournalError::Io {
+        let destination = self
+            .path
+            .file_name()
+            .ok_or_else(|| JournalError::MissingParent {
                 path: self.path.clone(),
-                source,
             })?;
-            File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|source| JournalError::Io {
-                    path: parent.to_path_buf(),
-                    source,
-                })
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp);
-        }
-        result
+        let temporary = temp
+            .file_name()
+            .ok_or_else(|| JournalError::MissingParent { path: temp.clone() })?;
+        directory.replace_file(destination, temporary, &bytes, PRIVATE_FILE_MODE)?;
+        Ok(())
     }
 
     /// Loads and validates the current journal.
@@ -437,97 +436,25 @@ impl Journal {
     ///
     /// Returns [`JournalError`] for unsafe paths, I/O, or malformed JSON.
     pub fn load(&self) -> Result<JournalRecord, JournalError> {
-        reject_symlink(&self.path)?;
-        let metadata = fs::metadata(&self.path).map_err(|source| JournalError::Io {
-            path: self.path.clone(),
-            source,
-        })?;
-        validate_private_file(&self.path, &metadata)?;
-        let mut bytes = Vec::new();
-        File::open(&self.path)
-            .and_then(|mut file| file.read_to_end(&mut bytes))
-            .map_err(|source| JournalError::Io {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| JournalError::MissingParent {
                 path: self.path.clone(),
-                source,
             })?;
+        let name = self
+            .path
+            .file_name()
+            .ok_or_else(|| JournalError::MissingParent {
+                path: self.path.clone(),
+            })?;
+        let directory = TrustedDir::open_absolute(parent, PRIVATE_DIR_MODE)?;
+        let bytes = directory.read_file(name, PRIVATE_FILE_MODE, MAX_JOURNAL_BYTES)?;
         serde_json::from_slice(&bytes).map_err(|source| JournalError::Corrupt {
             path: self.path.clone(),
             source,
         })
     }
-}
-
-fn ensure_private_dir(path: &Path) -> Result<(), JournalError> {
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(JournalError::UnsafePath {
-                path: path.to_path_buf(),
-                reason: "expected a real directory",
-            });
-        }
-        validate_owner_mode(path, &metadata, PRIVATE_DIR_MODE)?;
-        return Ok(());
-    }
-    fs::create_dir_all(path).map_err(|source| JournalError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIR_MODE)).map_err(|source| {
-        JournalError::Io {
-            path: path.to_path_buf(),
-            source,
-        }
-    })?;
-    let metadata = fs::symlink_metadata(path).map_err(|source| JournalError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    validate_owner_mode(path, &metadata, PRIVATE_DIR_MODE)
-}
-
-fn reject_symlink(path: &Path) -> Result<(), JournalError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(JournalError::UnsafePath {
-            path: path.to_path_buf(),
-            reason: "symlinks are not accepted",
-        }),
-        Ok(_) => Ok(()),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(JournalError::Io {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
-fn validate_private_file(path: &Path, metadata: &fs::Metadata) -> Result<(), JournalError> {
-    if !metadata.is_file() {
-        return Err(JournalError::UnsafePath {
-            path: path.to_path_buf(),
-            reason: "expected a regular file",
-        });
-    }
-    validate_owner_mode(path, metadata, PRIVATE_FILE_MODE)
-}
-
-fn validate_owner_mode(
-    path: &Path,
-    metadata: &fs::Metadata,
-    expected_mode: u32,
-) -> Result<(), JournalError> {
-    if metadata.uid() != nix::unistd::Uid::effective().as_raw() {
-        return Err(JournalError::UnsafePath {
-            path: path.to_path_buf(),
-            reason: "path is not owned by the effective user",
-        });
-    }
-    if metadata.mode() & 0o777 != expected_mode {
-        return Err(JournalError::UnsafePath {
-            path: path.to_path_buf(),
-            reason: "path permissions are not owner-private",
-        });
-    }
-    Ok(())
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -541,6 +468,8 @@ fn temp_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use pohunek_platform::filesystem::AtomicReplaceError;
+
     use super::{
         Journal, JournalError, JournalRecord, LaunchIdentity, ReleasedIdentity, SubagentPhase,
         SubagentRecord,
@@ -567,6 +496,7 @@ mod tests {
             "worker-1".to_owned(),
             10,
             "start-1".to_owned(),
+            "boot-test".to_owned(),
             (1, 2),
             "2026-07-23T00:00:00Z".to_owned(),
         );
@@ -675,7 +605,9 @@ mod tests {
 
         assert!(matches!(
             Journal::new(&path).write(&record("secret")),
-            Err(JournalError::UnsafePath { .. })
+            Err(JournalError::AtomicReplace(
+                AtomicReplaceError::BeforeCommit(_)
+            ))
         ));
         fs::remove_dir_all(root).expect("cleanup");
     }

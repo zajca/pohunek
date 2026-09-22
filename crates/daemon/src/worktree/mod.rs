@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use protocol::{ErrorClass, ProtocolError, SessionWarning, SessionWarningKind};
 use tracing::{debug, warn};
 
-use crate::store::{Store, WorktreeBinding, WorktreeStatus};
+use crate::store::{Store, StoreMutation, WorktreeBinding, WorktreeStatus};
 use crate::time::now_rfc3339;
 
 /// Relative path of the optional per-repository setup script, run inside a
@@ -388,21 +388,24 @@ impl WorktreeManager {
             created_at: now.clone(),
             updated_at: now,
         };
-        self.store.record_worktree(&binding).map_err(|err| {
-            // The worktree directory and branch checkout already exist. If the
-            // binding cannot be persisted we would orphan them: with no binding
-            // the ownership gate can never reclaim the tree, and the branch stays
-            // checked out, blocking the next `session.new` on it with
-            // `worktree_branch_in_use`. Roll the checkout back before erroring.
-            if let Err(message) = worktree_remove(&repository, &path) {
-                warn!(
-                    path = %path.display(),
-                    error = %message,
-                    "failed to remove worktree after a failed binding persist"
-                );
-            }
-            store_error("persist worktree binding", &err)
-        })?;
+        self.store
+            .record_worktree(&binding)
+            .map(StoreMutation::into_value)
+            .map_err(|err| {
+                // The worktree directory and branch checkout already exist. If the
+                // binding cannot be persisted we would orphan them: with no binding
+                // the ownership gate can never reclaim the tree, and the branch stays
+                // checked out, blocking the next `session.new` on it with
+                // `worktree_branch_in_use`. Roll the checkout back before erroring.
+                if let Err(message) = worktree_remove(&repository, &path) {
+                    warn!(
+                        path = %path.display(),
+                        error = %message,
+                        "failed to remove worktree after a failed binding persist"
+                    );
+                }
+                store_error("persist worktree binding", &err)
+            })?;
 
         Ok(WorktreeBound {
             path,
@@ -531,6 +534,7 @@ impl WorktreeManager {
         if removed > 0 {
             self.store
                 .remove_worktree_session(session_id)
+                .map(StoreMutation::into_value)
                 .map_err(|err| store_error("drop worktree bindings", &err))?;
         }
         Ok(removed)
@@ -593,6 +597,7 @@ impl WorktreeManager {
         for session_id in &removed_sessions {
             self.store
                 .remove_worktree_session(session_id)
+                .map(StoreMutation::into_value)
                 .map_err(|err| store_error("drop worktree bindings", &err))?;
         }
         Ok(prune)
@@ -635,6 +640,7 @@ impl WorktreeManager {
         });
         self.store
             .remove_worktree_session(&binding.session_id)
+            .map(StoreMutation::into_value)
             .map_err(|err| store_error("drop worktree binding", &err))?;
         Ok(true)
     }

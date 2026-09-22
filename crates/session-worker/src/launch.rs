@@ -1,6 +1,6 @@
 //! Owns deferred launch claims until verification or bounded rejection.
 
-// Rust guideline compliant 2026-09-14
+// Rust guideline compliant 2026-09-19
 
 use serde::Serialize;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -134,6 +134,7 @@ mod tests {
             "worker-1".into(),
             1,
             "1".into(),
+            "boot-test".into(),
             (1, 1),
             "now".into(),
         );

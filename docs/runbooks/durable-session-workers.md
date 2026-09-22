@@ -74,8 +74,10 @@ systemctl --user show \
 ```
 
 The worker socket is under
-`$XDG_RUNTIME_DIR/pohunek/workers/<session-id>/control.sock`. The journal is
-under
+`<runtime-root>/workers/<session-id>/control.sock`. A valid explicit
+`XDG_RUNTIME_DIR` selects its `pohunek` child; Linux requires that variable,
+while macOS without it uses `/private/tmp/pohunek-<effective-uid>`. The journal
+is under
 `${XDG_STATE_HOME:-$HOME/.local/state}/pohunek/workers/<session-id>/<worker-id>.json`.
 Do not remove either path while a unit is active. A failed connection does not
 prove that unlinking the socket is safe.

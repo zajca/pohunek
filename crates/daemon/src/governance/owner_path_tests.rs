@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -183,6 +184,8 @@ async fn start_servers(condition: GovernanceCondition) -> Servers {
         .prefix("po-")
         .tempdir()
         .expect("create isolated owner-path root");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("secure isolated owner-path root");
     let socket = root.path().join("daemon.sock");
     let governance = Arc::new(
         HostGovernanceService::open(root.path().join("host-state"))

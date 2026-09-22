@@ -223,7 +223,9 @@ async function startDaemon(): Promise<DaemonHarness> {
     config: join(tempRoot, "config"),
     home: join(tempRoot, "home"),
   };
-  await Promise.all(Object.values(dirs).map((dir) => mkdir(dir, { recursive: true })));
+  await Promise.all(
+    Object.values(dirs).map((dir) => mkdir(dir, { recursive: true, mode: 0o700 })),
+  );
 
   const daemonBin = daemonBinaryPath();
   const worker = await startDurableWorkerFixture({ daemonBin });

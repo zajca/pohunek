@@ -2,6 +2,11 @@
 
 ## Unreleased (2026-08-12)
 
+- Documented the shared secure runtime-path and portable filesystem foundation:
+  preserved XDG durable locations, the owner-private macOS runtime default,
+  fail-closed path validation, byte-bounded Unix sockets, atomic no-replace
+  installation, and explicit uncertain-durability handling. Complete macOS
+  host, WebUI, packaging, and release support remains deferred through #97-#105.
 - Added the bundled agent-skill guide: safe agent CLI operation covering
   discovery, explicit targeting, JSON state reads, event subscriptions,
   send-and-wait flows, worktree diff inspection, destructive-op caution, and
@@ -11,10 +16,11 @@
   `--json` as one envelope carrying the skill text and its `content_sha256`;
   the command is fully local and the global `--host` flag is accepted and
   ignored.
-- Documented the accepted complete macOS host/client contract and ordered
-  #95-#105 delivery. Recorded the shipped shared-platform/Linux migration and
-  native Darwin contract CI while keeping full macOS support explicitly
-  unshipped until native release acceptance closes.
+- Documented the accepted complete macOS host/client contract and GitHub-owned
+  #94-#105 delivery tracking through the issue hierarchy, milestone, and
+  Project. Recorded the shipped shared-platform/Linux migration and native
+  Darwin contract CI while keeping full macOS support explicitly unshipped
+  until native release acceptance closes.
 - Documented the implemented reduced relay foundation: PostgreSQL fencing and
   recovery, protected initial Owner/service-account provisioning, generic OIDC
   browser and device authentication, bounded HTTPS account and credential

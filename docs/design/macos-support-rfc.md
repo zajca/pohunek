@@ -1,7 +1,20 @@
 # Complete macOS Host and Client Support RFC
 
-Status: accepted product contract; platform foundation implemented by #95;
-complete macOS support remains deferred through #96-#105.
+Status: accepted product contract; platform and secure-path foundations
+implemented by #95 and #96; complete macOS support remains deferred through
+#97-#105.
+
+## Tracking authority
+
+This RFC records accepted product and architecture constraints. It is not the
+delivery tracker. The issue hierarchy rooted at
+[#94](https://github.com/zajca/pohunek/issues/94), the
+[`Complete macOS support` milestone](https://github.com/zajca/pohunek/milestone/2),
+and the [macOS project](https://github.com/users/zajca/projects/4) are the source
+of truth for implementation scope, dependencies, sequencing, and status. When
+tracking data differs from this document, GitHub tracking wins; changes to the
+product or architecture contract still require this RFC and canonical docs to
+be updated.
 
 ## Outcome and support contract
 
@@ -11,11 +24,13 @@ complete release includes the CLI, daemon, independent session workers, native
 Iced GUI, retained owner WebUI, Codex, Claude Code, the pinned Hermes runtime,
 and direct communication with Linux hosts over a configured overlay.
 
-The release targets native `aarch64-apple-darwin` and
-`x86_64-apple-darwin` artifacts without a Rosetta dependency. The proposed
-minimum is macOS 14.0. CI pins `MACOSX_DEPLOYMENT_TARGET=14.0`; this compile-time
-floor is not a substitute for the native minimum-OS acceptance gate in #105.
-Supported current versions must also be named and tested at release time.
+The release targets native `aarch64-apple-darwin` artifacts without a Rosetta
+dependency. Intel Macs and `x86_64-apple-darwin` artifacts are outside the
+current release scope; adding them requires a separate accepted scope and native
+acceptance evidence. The proposed minimum is macOS 14.0. CI pins
+`MACOSX_DEPLOYMENT_TARGET=14.0`; this compile-time floor is not a substitute for
+the native minimum-OS acceptance gate in #105. Supported current versions must
+also be named and tested at release time.
 
 Production services run as the logged-in owner through launchd user agents.
 Closing a terminal or locking the screen does not stop workers. Logout may end
@@ -58,8 +73,8 @@ not require the optional team relay.
 Existing XDG config, data, state, and cache precedence remains consistent. A
 port must not relocate durable host identity or create a second `HostId`.
 
-Linux keeps its required runtime-directory contract. On macOS, when no valid
-explicit `XDG_RUNTIME_DIR` exists, the shared default is the short owner path
+Linux keeps its required runtime-directory contract. On macOS, when an explicit
+`XDG_RUNTIME_DIR` is absent, the shared default is the short owner path
 `/private/tmp/pohunek-<effective-uid>`; ambient `TMPDIR` does not select it. The
 implementation must validate the trusted parent and descriptor-relative owner,
 type, and mode of every pre-existing entry. It must reject unsafe symlinks or
@@ -67,12 +82,19 @@ foreign entries rather than repairing or deleting them. Private directories use
 mode `0700`, and private sockets/files use `0600` unless an established
 executable contract requires otherwise.
 
-All clients, workers, hooks, launchd jobs, and the Bun backend resolve the same
-runtime path. The complete encoded socket path must fit Darwin's Unix-socket
-limit before any mutation. Cross-process locks, descriptor-relative checks,
-atomic replacement, atomic no-replace installation, and file/directory sync
-retain their current security and durability meaning. An uncertain durability
-result remains an error.
+All clients, workers, hooks, launchd jobs, and the Bun backend must resolve the
+same runtime path. #96 provides the shared contract and fixtures; #103 owns the
+Bun consumer integration. The complete encoded socket path must fit Darwin's
+Unix-socket limit before any mutation.
+
+Durable replacement writes and synchronizes the temporary file before its
+atomic rename, then synchronizes the containing directory. Atomic no-replace
+installation commits only when the destination was absent at that instant and
+reports a collision distinctly. Failure to synchronize the directory after a
+rename is an uncertain committed result, not success; callers retain their
+existing fail-closed recovery behavior. Cross-process locks and
+descriptor-relative ownership, type, mode, no-follow, and inode checks retain
+the same meaning on Linux and APFS.
 
 ## Native identity, PTY, and supervision
 
@@ -126,31 +148,21 @@ Linux theme-detection features are Linux-only while the portable renderer stays
 available. File locking still uses reviewed OS primitives rather than a new
 cross-platform locking dependency.
 
-Native shared-contract CI runs on pinned Apple Silicon and Intel macOS runner
-labels, verifies `uname -m`, uses the locked graph, treats warnings as errors,
-and compiles/tests `pohunek-platform` with the macOS 14 deployment target. Full
-application and release gates are added with their real native backends; shared
-contract CI must not masquerade as complete host support.
+Native shared-contract CI runs on a pinned Apple Silicon macOS runner label,
+verifies `uname -m`, uses the locked graph, treats warnings as errors, and
+compiles/tests `pohunek-platform`, `pohunek-paths`, and the portable filesystem
+contract with the macOS 14 deployment target. Full application and release
+gates are added with their real native backends; shared contract CI must not
+masquerade as complete host support.
 
-## Ordered delivery
+## Delivery model
 
-1. #95 defines shared contracts, migrates Linux behavior, isolates target
-   dependencies, and establishes native Darwin library CI.
-2. #96 adds secure macOS runtime paths and portable durable filesystem
-   operations.
-3. #97 implements native process inspection and race-safe exit observation.
-4. #98 preserves trusted Unix peer and agent identity.
-5. #99 makes worker PTY I/O and attach behavior portable.
-6. #100 adds launchd supervision for independent durable workers.
-7. #101 ports transcript observation and agent integration lifecycles.
-8. #102 adds CLI setup, desktop integrations, and actionable diagnostics.
-9. #103 validates owner WebUI and direct-overlay workflows.
-10. #104 ships native installation, upgrades, signing, and notarized artifacts.
-11. #105 closes the release with native durability, security, minimum/current
-    OS, cross-architecture, and cross-stack acceptance.
-
-These are engineering milestones within one complete release scope. No
-intermediate merge advertises partial macOS support as a reduced product.
+The GitHub tracker orders the work from the completed shared platform and secure
+path foundations through native process and peer identity, PTY portability,
+launchd, integrations, clients, distribution, and final native acceptance.
+These are work items within one complete release scope. No intermediate merge
+advertises partial macOS support as a reduced product, and #105 remains the
+release closure gate.
 
 ## Release acceptance
 

@@ -150,6 +150,8 @@ impl RawGuiConfig {
 pub(crate) enum ConfigError {
     #[error("missing environment variable `{var}`")]
     MissingEnv { var: String },
+    #[error("invalid application path configuration: {source}")]
+    Paths { source: pohunek_paths::PathError },
     #[error("failed to read `{}`: {source}", path.display())]
     Read {
         path: PathBuf,
@@ -237,6 +239,7 @@ fn config_dir() -> Result<PathBuf, ConfigError> {
 fn config_path_error(err: pohunek_paths::PathError) -> ConfigError {
     match err {
         pohunek_paths::PathError::MissingEnv { var } => ConfigError::MissingEnv { var },
+        source => ConfigError::Paths { source },
     }
 }
 

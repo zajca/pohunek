@@ -1,15 +1,16 @@
 # Pohunek — Roadmap
 
-Consolidated, top-level roadmap for the whole project. This is the **index and
-sequencing** source of truth; the per-phase design docs under
-[`docs/phases/`](phases/) and [`docs/design/`](design/) remain the source of truth
-for *what* and *why* inside each track.
+Consolidated, top-level roadmap for the whole project. This is a repository
+snapshot and index. For active GitHub-planned initiatives, issue hierarchy,
+milestones, and Projects are the source of truth for delivery scope, sequencing,
+and status. The per-phase documents under [`docs/phases/`](phases/) and
+[`docs/design/`](design/) record product and architecture rationale.
 
 Status reflects the **code on `main`**. Where a phase/plan doc's own status
 header lags the code, the code wins and the lag is noted. Accepted future work
 is marked explicitly and must not be read as shipped functionality.
 
-Last reconciled: 2026-09-13.
+Last reconciled: 2026-09-19.
 
 ---
 
@@ -65,24 +66,25 @@ none of its runtime features are shipped yet.
 
 ### Track M — Complete macOS host and client support
 
-The [accepted macOS RFC](design/macos-support-rfc.md) defines one complete
-release scope: native Apple Silicon and Intel hosts and clients, macOS 14.0
-minimum target, launchd-owned durable workers, real PTYs and agent integrations,
-native GUI, retained owner WebUI, direct overlay operation, installation,
-signing, and cross-stack acceptance.
+The [macOS project](https://github.com/users/zajca/projects/4),
+[`Complete macOS support` milestone](https://github.com/zajca/pohunek/milestone/2),
+and issue hierarchy rooted at [#94](https://github.com/zajca/pohunek/issues/94)
+own delivery scope, sequencing, and status. The
+[accepted macOS RFC](design/macos-support-rfc.md) records the design constraints:
+native Apple Silicon hosts and clients, macOS 14.0 minimum target,
+launchd-owned durable workers, real PTYs and agent integrations, native GUI,
+retained owner WebUI, direct overlay operation, installation, signing, and
+cross-stack acceptance. Intel Macs are outside this release scope.
 
 The shared platform foundation in #95 is complete: `crates/platform` owns
 portable process, peer, and supervisor contracts; shipped Linux consumers use
 the extracted implementations; target dependency graphs separate systemd,
 Secret Service, Keychain, and Linux-only Iced features; and native Darwin
-contract CI runs on both architectures. This does **not** advertise working
-macOS applications.
+contract CI runs on Apple Silicon. This does **not** advertise working macOS
+applications.
 
-Delivery remains ordered as #96 secure runtime/filesystem, #97 process/exit,
-#98 peer/agent identity, #99 PTY/attach, #100 launchd, #101 observation and
-agent integrations, #102 CLI/desktop integrations, #103 owner WebUI/overlay,
-#104 signed distribution, and #105 native release acceptance. Each merge is an
-engineering milestone; #105 is the support declaration gate.
+The live delivery order and dependencies are maintained in GitHub rather than
+duplicated here. #105 remains the support declaration gate.
 
 ### Track H — Hermes runtime and operator plugin
 

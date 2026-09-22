@@ -34,6 +34,10 @@ pub(crate) enum CliError {
         var: String,
     },
 
+    /// A configured application path violates the shared platform contract.
+    #[error("invalid application path configuration: {0}")]
+    Paths(#[source] pohunek_paths::PathError),
+
     /// The daemon socket could not be reached (likely not running).
     ///
     /// The recovery hint ("start the daemon …") is surfaced uniformly through
@@ -209,6 +213,15 @@ impl CliError {
                 format!("required environment variable {var} is not set (no safe default exists)"),
                 None,
             ),
+            CliError::Paths(error) => ProtocolError::new(
+                ErrorClass::Configuration,
+                "paths_unavailable",
+                error.to_string(),
+                Some(
+                    "use absolute owner-controlled XDG paths or remove the invalid override"
+                        .to_owned(),
+                ),
+            ),
             CliError::DaemonUnreachable { socket, source } => ProtocolError::new(
                 ErrorClass::Daemon,
                 "daemon_unreachable",
@@ -359,7 +372,8 @@ fn hermes_error_class(error: &crate::hermes_integration::error::Error) -> ErrorC
         | Error::InvalidHermesState
         | Error::StagedValidation
         | Error::InstalledProbe
-        | Error::RecoveryRequired => ErrorClass::Runtime,
+        | Error::RecoveryRequired
+        | Error::TransactionBusy => ErrorClass::Runtime,
     }
 }
 
@@ -392,6 +406,7 @@ fn hermes_error_code(error: &crate::hermes_integration::error::Error) -> &'stati
         Error::StagedValidation => "hermes_staged_validation_failed",
         Error::InstalledProbe => "hermes_installed_probe_failed",
         Error::RecoveryRequired => "hermes_recovery_required",
+        Error::TransactionBusy => "hermes_transaction_busy",
     }
 }
 

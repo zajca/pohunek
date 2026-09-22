@@ -23,6 +23,20 @@ Start with structured inspection:
    null enrollment, owner, owner revision, and quarantine fields; it still has
    a public approval-key reference.
 
+Pohunek resolves one owner-private application runtime root for the daemon and
+worker sockets. A valid absolute `XDG_RUNTIME_DIR` selects its `pohunek` child on
+Linux and macOS. Linux requires that variable. On macOS, when it is absent, the
+root is `/private/tmp/pohunek-<effective-uid>`; `TMPDIR` is not consulted. An
+explicit empty or relative value is a configuration error, not a request for the
+macOS default. Do not repair a rejected root with broad `chmod` or recursive
+deletion: Pohunek fails closed on symlinks, foreign ownership, wrong types, and
+incorrect private modes.
+
+Only live runtime sockets and locks use that root. Config, data, state, logs,
+worker journals, the stable HostId, approval key, and governance records retain
+their XDG or home-relative durable locations. Runtime cleanup must never remove
+those durable records.
+
 On a worker-aware Linux installation, the daemon archive installs three
 systemd user units: `pohunekd.service`, the
 `pohunek-session@.service` template, and `pohunek-sessions.slice`. The daemon

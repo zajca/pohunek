@@ -194,7 +194,7 @@ where they are doing it, and when they need you.
   CLI / GUI (local)                   CLI / GUI (remote)
        |                                   |
        | Unix socket                       | TCP over NetBird/WireGuard
-       | ($XDG_RUNTIME_DIR, mode 0600)     | (daemon binds ONLY to the 100.x iface)
+       | (resolved private runtime root)   | (daemon binds ONLY to the 100.x iface)
        v                                   v
  +-----------------------------------------------------------+
  |                    host daemon (pohunekd)                  |
@@ -646,13 +646,24 @@ entirely through this surface.
 
 Connecting and listing sessions is the same call in both SDKs:
 
+First-party Rust components resolve the platform runtime path centrally. Custom
+SDK clients should receive the exact local socket endpoint from configuration;
+the examples use `POHUNEK_SOCKET` rather than reconstructing a Linux-only path.
+With an explicit `XDG_RUNTIME_DIR`, Pohunek uses its `pohunek` child on Linux and
+macOS. Linux requires that variable, while macOS without it uses
+`/private/tmp/pohunek-<effective-uid>` and ignores `TMPDIR` for this decision.
+The current Bun owner backend does not derive that macOS default yet; until the
+#103 integration, configure its exact socket explicitly or provide
+`XDG_RUNTIME_DIR`.
+
 ```rust
 // Rust — `pohunek-client`
 use pohunek_client::{protocol::method::SessionList, Client};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let sock = format!("{}/pohunek/daemon.sock", std::env::var("XDG_RUNTIME_DIR")?);
+    let sock = std::env::var_os("POHUNEK_SOCKET")
+        .ok_or_else(|| anyhow::anyhow!("set POHUNEK_SOCKET to the daemon socket path"))?;
     // Local daemon over its owner-only Unix socket.
     let mut client = Client::connect_local(&sock).await?;
     // ...or a remote host over the NetBird/WireGuard mesh:
@@ -670,7 +681,8 @@ async fn main() -> anyhow::Result<()> {
 // TypeScript — `@pohunek/sdk`
 import { connectLocal } from "@pohunek/sdk";
 
-const sock = `${process.env.XDG_RUNTIME_DIR}/pohunek/daemon.sock`;
+const sock = process.env.POHUNEK_SOCKET;
+if (!sock) throw new Error("set POHUNEK_SOCKET to the daemon socket path");
 const client = await connectLocal(sock);
 
 const sessions = await client.call("session.list", {});
@@ -698,7 +710,8 @@ use serde_json::Value;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let sock = format!("{}/pohunek/daemon.sock", std::env::var("XDG_RUNTIME_DIR")?);
+    let sock = std::env::var_os("POHUNEK_SOCKET")
+        .ok_or_else(|| anyhow::anyhow!("set POHUNEK_SOCKET to the daemon socket path"))?;
     let client = Client::connect_local(&sock).await?;
 
     let request = Request::new(next_request_id(method::SUBSCRIBE), method::SUBSCRIBE, Value::Null);

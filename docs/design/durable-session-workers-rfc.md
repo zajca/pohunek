@@ -537,7 +537,7 @@ session data, and attach bookkeeping. Every direct call from the public API to
 `crates/paths` becomes the single source of these paths:
 
 ```text
-$XDG_RUNTIME_DIR/pohunek/
+<runtime-root>/
   daemon.sock
   daemon.lock
   workers/
@@ -555,6 +555,11 @@ $XDG_DATA_HOME/pohunek/
   worktrees/
   events/
 ```
+
+A valid explicit `XDG_RUNTIME_DIR` resolves `<runtime-root>` to its `pohunek`
+child on Linux and macOS. Linux requires that variable; macOS without it uses
+`/private/tmp/pohunek-<effective-uid>` and does not derive the root from
+`TMPDIR`. The state tree remains durable and separate from this runtime root.
 
 Modes are:
 

@@ -507,9 +507,14 @@ and reused across sessions; only the snapshot is per-session.
 
 ```text
 $XDG_CACHE_HOME/pohunek/knowledge/<version-hash>/   shared bundle (extract once)
-$XDG_RUNTIME_DIR/pohunek/assistant/<session-id>/
+<runtime-root>/assistant/<session-id>/
   snapshot.json                                     per-session redacted snapshot
 ```
+
+The shared runtime resolver supplies `<runtime-root>`: an explicit
+`$XDG_RUNTIME_DIR/pohunek` on both supported Unix platforms, or the short
+`/private/tmp/pohunek-<effective-uid>` default when `XDG_RUNTIME_DIR` is absent
+on macOS. The durable shared cache remains outside that ephemeral root.
 
 The host that owns the session owns materialization: the CLI for local sessions,
 the daemon for remote ones (via the materialize capability). If the shared

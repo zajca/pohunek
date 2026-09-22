@@ -28,6 +28,7 @@ _GAP_COMPLETE_MARKER = "pohunek-hermes-gap-output-complete"
 _GAP_OUTPUT_BYTES = 11_000_000
 _MAX_RETRIES = 200
 _RETRY_DELAY_SECONDS = 0.05
+_TERMINAL_STATES = frozenset({"done", "failed", "stopped"})
 
 
 class FixtureError(RuntimeError):
@@ -112,11 +113,36 @@ def runtime_from(session: Any) -> tuple[str, str]:
     return runtime_id, generation
 
 
+def lifecycle_diagnostic(session: Any) -> str:
+    """Describe one session's lifecycle metadata without exposing its payload."""
+    if not isinstance(session, dict):
+        return "state=unknown"
+    return (
+        f"state={session.get('state')} exit_code={session.get('exit_code')} "
+        f"state_source={session.get('state_source')}"
+    )
+
+
+def require_live(handlers: dict[str, Any], session_id: str, context: str) -> str:
+    """Require one live session and return its diagnostic for a later assertion."""
+    session = invoke(handlers, "pohunek_session_get", {"session": session_id})
+    if not isinstance(session, dict) or session.get("id") != session_id:
+        raise FixtureError(f"{context} session result is invalid")
+    diagnostic = lifecycle_diagnostic(session)
+    if session.get("state") in _TERMINAL_STATES:
+        raise FixtureError(f"{context} session is already terminal ({diagnostic})")
+    return diagnostic
+
+
 def inspect_until_live(handlers: dict[str, Any], session_id: str) -> tuple[dict[str, Any], str, str]:
     """Wait only for the worker's bounded startup transition."""
     for _ in range(_MAX_RETRIES):
         session = invoke(handlers, "pohunek_session_get", {"session": session_id})
         if isinstance(session, dict):
+            if session.get("state") in _TERMINAL_STATES:
+                raise FixtureError(
+                    f"session is terminal while a live runtime is required ({lifecycle_diagnostic(session)})"
+                )
             try:
                 runtime_id, generation = runtime_from(session)
             except FixtureError:
@@ -142,7 +168,7 @@ def inspect_until_terminal(handlers: dict[str, Any], session_id: str) -> dict[st
     """Wait for the controlled initial Hermes process to exit naturally."""
     for _ in range(_MAX_RETRIES):
         session = invoke(handlers, "pohunek_session_get", {"session": session_id})
-        if isinstance(session, dict) and session.get("state") in {"done", "failed", "stopped"}:
+        if isinstance(session, dict) and session.get("state") in _TERMINAL_STATES:
             if session.get("native_session_id") != _NATIVE_REFERENCE:
                 raise FixtureError("terminal Hermes session lost its native reference")
             runtime_from(session)
@@ -424,9 +450,10 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         raise FixtureError("diff result shape is invalid")
 
     assert_origin_denials(plugin, policy, session_id)
+    live_before_stop = require_live(handlers, session_id, "shell")
     stopped = invoke(handlers, "pohunek_session_stop", {"session": session_id})
     if not isinstance(stopped, dict) or stopped.get("stopped") is not True:
-        raise FixtureError("stop result is invalid")
+        raise FixtureError(f"stop result is invalid (before stop: {live_before_stop})")
     removed = invoke(handlers, "pohunek_session_remove", {"session": session_id})
     if not isinstance(removed, dict) or removed.get("removed") is not True:
         raise FixtureError("remove result is invalid")
@@ -463,9 +490,12 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
     })
     require_wait(stale, hermes_id, "runtime_changed")
     require_session_result(resumed_session, hermes_id, "Hermes runtime recovery")
+    hermes_live_before_stop = require_live(handlers, hermes_id, "resumed Hermes")
     final_hermes_stop = invoke(handlers, "pohunek_session_stop", {"session": hermes_id})
     if not isinstance(final_hermes_stop, dict) or final_hermes_stop.get("stopped") is not True:
-        raise FixtureError("resumed Hermes stop result is invalid")
+        raise FixtureError(
+            f"resumed Hermes stop result is invalid (before stop: {hermes_live_before_stop})"
+        )
     invoke(handlers, "pohunek_session_remove", {"session": hermes_id})
 
     return {

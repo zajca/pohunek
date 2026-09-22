@@ -10,12 +10,19 @@ description = "Shared operating-system contracts for Pohunek host processes."
 thiserror.workspace = true
 tokio.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+getrandom.workspace = true
+rustix = { workspace = true, features = ["fs", "process"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 async-io.workspace = true
 nix = { workspace = true, features = ["socket"] }
-rustix = { workspace = true, features = ["process"] }
 
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
+calcifer-macos-acl.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+nix.workspace = true
 tempfile.workspace = true
 
 [lints]

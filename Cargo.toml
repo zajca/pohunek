@@ -94,6 +94,7 @@ clap_complete = { version = "4", features = ["unstable-dynamic"] }
 libc = "0.2"
 nix = { version = "0.29", features = ["fs", "user"] }
 rustix = { version = "1", features = ["fs"] }
+calcifer-macos-acl = "0.1"
 # RFC3339 timestamps for session metadata (milestone 3). Formatting only.
 time = { version = "0.3", features = ["formatting"] }
 vt100 = "0.16.2"

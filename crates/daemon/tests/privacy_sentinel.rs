@@ -71,6 +71,8 @@ fn temp_dir(tag: &str) -> PathBuf {
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).expect("create test dir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .expect("make test directory private");
     dir
 }
 
@@ -732,6 +734,9 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     let events_dir = data_dir.join("events");
     let agents_dir = root.join("agents");
     let daemon_log_dir = root.join("daemon-logs");
+    std::fs::create_dir_all(&data_dir).expect("create data dir");
+    std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("make data directory private");
     std::fs::create_dir_all(&agents_dir).expect("create agents dir");
 
     // Stub sentinel agent: prints a terminal-output sentinel unrelated to any

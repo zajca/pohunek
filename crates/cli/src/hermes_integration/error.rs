@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-08-06
+// Rust guideline compliant 2026-09-19
 
 use std::io::ErrorKind;
 
@@ -83,6 +83,9 @@ pub(crate) enum Error {
     /// A filesystem transaction could not be restored safely.
     #[error("Hermes lifecycle recovery is required")]
     RecoveryRequired,
+    /// Another process currently owns the Hermes lifecycle transaction lock.
+    #[error("another Hermes lifecycle transaction is already running")]
+    TransactionBusy,
 }
 
 impl Error {
@@ -133,6 +136,7 @@ impl Error {
             Self::RecoveryRequired => {
                 "preserve the reported managed recovery directory and run Hermes doctor"
             }
+            Self::TransactionBusy => "wait for the active Hermes lifecycle action and retry",
         }
     }
 }

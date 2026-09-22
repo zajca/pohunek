@@ -43,11 +43,15 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
+#[cfg(test)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use pohunek_platform::filesystem::{AtomicReplaceError, FsError, TrustedDir};
 use protocol::{AgentKind, ProjectSource, RuntimeState, SessionInfo};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -57,6 +61,10 @@ use crate::project::detect::project_id;
 
 #[cfg(unix)]
 const OWNER_PRIVATE_FILE_MODE: u32 = 0o600;
+const OWNER_PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+/// Upper bound for the line-oriented daemon metadata store.
+const MAX_METADATA_STORE_BYTES: usize = 16 * 1024 * 1024;
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// One session's native resume and fork recovery binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -546,10 +554,43 @@ enum MetadataWriteOutcome {
 }
 
 impl MetadataWriteOutcome {
-    fn require_synced(self) -> io::Result<()> {
+    fn with_value<T>(self, value: T) -> StoreMutation<T> {
         match self {
-            Self::Synced => Ok(()),
-            Self::CommittedDurabilityUncertain(error) => Err(error),
+            Self::Synced => StoreMutation::Synced(value),
+            Self::CommittedDurabilityUncertain(error) => {
+                warn!(
+                    error = %error,
+                    "metadata store mutation committed but durability is uncertain"
+                );
+                StoreMutation::CommittedDurabilityUncertain {
+                    value,
+                    error: error.to_string(),
+                }
+            }
+        }
+    }
+}
+
+/// Result of a metadata mutation whose rename may precede directory-sync failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreMutation<T> {
+    /// The namespace mutation and its directory synchronization completed.
+    Synced(T),
+    /// The new authoritative contents are visible, but crash durability is uncertain.
+    CommittedDurabilityUncertain {
+        /// Value produced by the committed mutation.
+        value: T,
+        /// Sanitized description of the failed durability step.
+        error: String,
+    },
+}
+
+impl<T> StoreMutation<T> {
+    /// Returns the committed value regardless of the final durability outcome.
+    #[must_use]
+    pub fn into_value(self) -> T {
+        match self {
+            Self::Synced(value) | Self::CommittedDurabilityUncertain { value, .. } => value,
         }
     }
 }
@@ -718,7 +759,7 @@ impl Store {
     }
 
     /// Removes one logical session and preserves every other record kind.
-    pub fn remove_session(&self, session_id: &str) -> io::Result<bool> {
+    pub fn remove_session(&self, session_id: &str) -> io::Result<StoreMutation<bool>> {
         let _guard = self
             .write_lock
             .lock()
@@ -728,15 +769,16 @@ impl Store {
         sessions.retain(|record| record.session_id != session_id);
         let removed = before != sessions.len();
         if removed {
-            self.write_all(&resume, &worktrees, &projects, &sessions)?
-                .require_synced()?;
+            return Ok(self
+                .write_all(&resume, &worktrees, &projects, &sessions)?
+                .with_value(true));
         }
-        Ok(removed)
+        Ok(StoreMutation::Synced(false))
     }
 
     /// Upsert a resume binding (keyed by `session_id`), preserving every worktree
     /// record, and rewrite the file atomically.
-    pub fn record_resume(&self, binding: &ResumeBinding) -> io::Result<()> {
+    pub fn record_resume(&self, binding: &ResumeBinding) -> io::Result<StoreMutation<()>> {
         let _guard = self
             .write_lock
             .lock()
@@ -766,13 +808,14 @@ impl Store {
         } else {
             resume.push(replacement);
         }
-        self.write_all(&resume, &worktrees, &projects, &sessions)?
-            .require_synced()
+        Ok(self
+            .write_all(&resume, &worktrees, &projects, &sessions)?
+            .with_value(()))
     }
 
     /// Remove a resume binding by session id, preserving every worktree record. A
     /// missing entry is a no-op.
-    pub fn remove_resume(&self, session_id: &str) -> io::Result<()> {
+    pub fn remove_resume(&self, session_id: &str) -> io::Result<StoreMutation<()>> {
         let _guard = self
             .write_lock
             .lock()
@@ -781,10 +824,11 @@ impl Store {
         let before = resume.len();
         resume.retain(|binding| binding.session_id != session_id);
         if resume.len() == before {
-            return Ok(());
+            return Ok(StoreMutation::Synced(()));
         }
-        self.write_all(&resume, &worktrees, &projects, &sessions)?
-            .require_synced()
+        Ok(self
+            .write_all(&resume, &worktrees, &projects, &sessions)?
+            .with_value(()))
     }
 
     /// Find the active worktree binding for a `(session_id, repository,
@@ -820,7 +864,7 @@ impl Store {
     /// branch_slug)`), preserving every resume record, and rewrite the file
     /// atomically. The triple key keeps two branches of one `(session,
     /// repository)` pair from collapsing onto a single row.
-    pub fn record_worktree(&self, binding: &WorktreeBinding) -> io::Result<()> {
+    pub fn record_worktree(&self, binding: &WorktreeBinding) -> io::Result<StoreMutation<()>> {
         let _guard = self
             .write_lock
             .lock()
@@ -835,13 +879,14 @@ impl Store {
         } else {
             worktrees.push(binding.clone());
         }
-        self.write_all(&resume, &worktrees, &projects, &sessions)?
-            .require_synced()
+        Ok(self
+            .write_all(&resume, &worktrees, &projects, &sessions)?
+            .with_value(()))
     }
 
     /// Remove every worktree binding owned by `session_id`, preserving every
     /// resume record. Returns the number removed (`0` is a no-op success).
-    pub fn remove_worktree_session(&self, session_id: &str) -> io::Result<usize> {
+    pub fn remove_worktree_session(&self, session_id: &str) -> io::Result<StoreMutation<usize>> {
         let _guard = self
             .write_lock
             .lock()
@@ -851,10 +896,11 @@ impl Store {
         worktrees.retain(|binding| binding.session_id != session_id);
         let removed = before - worktrees.len();
         if removed > 0 {
-            self.write_all(&resume, &worktrees, &projects, &sessions)?
-                .require_synced()?;
+            return Ok(self
+                .write_all(&resume, &worktrees, &projects, &sessions)?
+                .with_value(removed));
         }
-        Ok(removed)
+        Ok(StoreMutation::Synced(0))
     }
 
     /// Atomically read-modify-write the project keyed by canonical
@@ -875,7 +921,7 @@ impl Store {
         &self,
         git_common_dir: &Path,
         mutate: F,
-    ) -> io::Result<Option<ProjectRecord>>
+    ) -> io::Result<StoreMutation<Option<ProjectRecord>>>
     where
         F: FnOnce(Option<ProjectRecord>) -> Option<ProjectRecord>,
     {
@@ -889,15 +935,15 @@ impl Store {
             .position(|existing| existing.git_common_dir == git_common_dir);
         let current = pos.map(|index| projects[index].clone());
         let Some(updated) = mutate(current) else {
-            return Ok(None);
+            return Ok(StoreMutation::Synced(None));
         };
         match pos {
             Some(index) => projects[index] = updated.clone(),
             None => projects.push(updated.clone()),
         }
-        self.write_all(&resume, &worktrees, &projects, &sessions)?
-            .require_synced()?;
-        Ok(Some(updated))
+        Ok(self
+            .write_all(&resume, &worktrees, &projects, &sessions)?
+            .with_value(Some(updated)))
     }
 
     /// Upsert a project record (keyed by canonical `git_common_dir`), preserving
@@ -911,7 +957,7 @@ impl Store {
     /// Prefer [`Self::mutate_project`] when the new value depends on the current
     /// record (read-modify-write); this whole-record overwrite is for callers that
     /// already hold the complete intended record.
-    pub fn record_project(&self, record: &ProjectRecord) -> io::Result<()> {
+    pub fn record_project(&self, record: &ProjectRecord) -> io::Result<StoreMutation<()>> {
         let _guard = self
             .write_lock
             .lock()
@@ -925,15 +971,16 @@ impl Store {
         } else {
             projects.push(record.clone());
         }
-        self.write_all(&resume, &worktrees, &projects, &sessions)?
-            .require_synced()
+        Ok(self
+            .write_all(&resume, &worktrees, &projects, &sessions)?
+            .with_value(()))
     }
 
     /// Remove the project keyed by `git_common_dir`, preserving every resume and
     /// worktree record. Returns whether a record was removed (`false` is a no-op
     /// success). Only forgets the record; it never touches the on-disk repository
     /// or its worktrees.
-    pub fn remove_project(&self, git_common_dir: &Path) -> io::Result<bool> {
+    pub fn remove_project(&self, git_common_dir: &Path) -> io::Result<StoreMutation<bool>> {
         let _guard = self
             .write_lock
             .lock()
@@ -943,10 +990,11 @@ impl Store {
         projects.retain(|project| project.git_common_dir != git_common_dir);
         let removed = projects.len() != before;
         if removed {
-            self.write_all(&resume, &worktrees, &projects, &sessions)?
-                .require_synced()?;
+            return Ok(self
+                .write_all(&resume, &worktrees, &projects, &sessions)?
+                .with_value(true));
         }
-        Ok(removed)
+        Ok(StoreMutation::Synced(false))
     }
 
     /// Resolve a `<id|label>` reference to a project (design Decision 2):
@@ -973,14 +1021,28 @@ impl Store {
     /// malformed lines are skipped (a corrupt line must not block loading the
     /// rest).
     fn read_all(&self) -> io::Result<StoreRecords> {
-        reject_symlink(&self.path)?;
-        let content = match fs::read_to_string(&self.path) {
-            Ok(content) => content,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()))
-            }
-            Err(err) => return Err(err),
-        };
+        let parent = parent_directory(&self.path);
+        if !parent.exists() {
+            return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+        }
+        let directory = TrustedDir::open_absolute(parent, OWNER_PRIVATE_DIRECTORY_MODE)
+            .map_err(fs_error_to_io)?;
+        let name = self.path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "metadata store has no filename",
+            )
+        })?;
+        let bytes =
+            match directory.read_file(name, OWNER_PRIVATE_FILE_MODE, MAX_METADATA_STORE_BYTES) {
+                Ok(bytes) => bytes,
+                Err(error) if error.io_kind() == Some(io::ErrorKind::NotFound) => {
+                    return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()))
+                }
+                Err(error) => return Err(fs_error_to_io(error)),
+            };
+        let content = String::from_utf8(bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let mut resume = Vec::new();
         let mut worktrees = Vec::new();
         let mut projects = Vec::new();
@@ -1032,7 +1094,8 @@ impl Store {
             ));
         }
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
+            TrustedDir::open_or_create_absolute(parent, OWNER_PRIVATE_DIRECTORY_MODE)
+                .map_err(fs_error_to_io)?;
         }
         let mut body = String::new();
         for binding in resume {
@@ -1047,6 +1110,14 @@ impl Store {
         for record in sessions {
             append_line(&mut body, &Record::Session(Box::new(record.clone())))?;
         }
+        if body.len() > MAX_METADATA_STORE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "metadata store exceeds the {MAX_METADATA_STORE_BYTES}-byte durable read limit"
+                ),
+            ));
+        }
 
         let tmp = self.temp_path();
         #[cfg(test)]
@@ -1055,12 +1126,37 @@ impl Store {
         if should_fail {
             return Err(io::Error::other("injected pre-rename write failure"));
         }
-        if let Err(error) = write_owner_private(&tmp, body.as_bytes())
-            .and_then(|()| reject_symlink(&self.path))
-            .and_then(|()| fs::rename(&tmp, &self.path))
-        {
-            let _ = fs::remove_file(&tmp);
-            return Err(error);
+        let parent = parent_directory(&self.path);
+        let directory = TrustedDir::open_absolute(parent, OWNER_PRIVATE_DIRECTORY_MODE)
+            .map_err(fs_error_to_io)?;
+        let destination = self.path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "metadata store has no filename",
+            )
+        })?;
+        let temporary = tmp.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "metadata temporary has no filename",
+            )
+        })?;
+        match directory.replace_file(
+            destination,
+            temporary,
+            body.as_bytes(),
+            OWNER_PRIVATE_FILE_MODE,
+        ) {
+            Ok(()) => {}
+            Err(AtomicReplaceError::BeforeCommit(error)) => {
+                return Err(fs_error_to_io(error));
+            }
+            Err(AtomicReplaceError::CommittedDurabilityUncertain(error)) => {
+                return Ok(MetadataWriteOutcome::CommittedDurabilityUncertain(
+                    io::Error::other(error),
+                ));
+            }
+            Err(error) => return Err(io::Error::other(error)),
         }
         #[cfg(test)]
         if self
@@ -1083,11 +1179,32 @@ impl Store {
             .file_name()
             .map_or_else(|| "metadata.jsonl".into(), std::ffi::OsStr::to_os_string);
         name.push(format!(".tmp.{}", std::process::id()));
+        name.push(format!(
+            ".{}",
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         match self.path.parent() {
             Some(parent) => parent.join(name),
             None => PathBuf::from(name),
         }
     }
+}
+
+fn fs_error_to_io(error: FsError) -> io::Error {
+    let kind = match &error {
+        FsError::InvalidAbsolutePath { .. }
+        | FsError::InvalidComponent { .. }
+        | FsError::InvalidMode { .. }
+        | FsError::UnsafeType { .. }
+        | FsError::UnsafeOwner { .. }
+        | FsError::UnsafeMode { .. }
+        | FsError::UnsafeLinkCount { .. }
+        | FsError::IdentityChanged { .. } => io::ErrorKind::InvalidInput,
+        FsError::FileTooLarge { .. } => io::ErrorKind::InvalidData,
+        _ if error.raw_os_error() == Some(libc::ELOOP) => io::ErrorKind::InvalidInput,
+        _ => error.io_kind().unwrap_or(io::ErrorKind::Other),
+    };
+    io::Error::new(kind, error)
 }
 
 pub(crate) fn preserve_newer_native_identity(
@@ -1220,17 +1337,19 @@ fn append_line(body: &mut String, record: &Record) -> io::Result<()> {
 }
 
 /// Write a file with owner-only permissions (`0600`).
+#[cfg(test)]
 fn write_owner_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = owner_private_replace_options().open(path)?;
     set_owner_private_file_permissions(path)?;
     file.write_all(bytes)?;
-    file.sync_all()
+    pohunek_platform::filesystem::sync_file(&file).map_err(io::Error::other)
 }
 
 /// Persist the directory entry created by the atomic rename.
 #[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> io::Result<()> {
-    fs::File::open(parent_directory(path))?.sync_all()
+    let directory = fs::File::open(parent_directory(path))?;
+    pohunek_platform::filesystem::sync_file(&directory).map_err(io::Error::other)
 }
 
 /// Directory handles are not portably openable outside Unix.
@@ -1245,6 +1364,7 @@ fn parent_directory(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
+#[cfg(test)]
 fn owner_private_replace_options() -> fs::OpenOptions {
     let mut options = fs::OpenOptions::new();
     options.create(true).write(true).truncate(true);
@@ -1258,19 +1378,8 @@ fn owner_private_replace_options() -> fs::OpenOptions {
     options
 }
 
-fn reject_symlink(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("refusing symlink metadata-store path: {}", path.display()),
-        )),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
 #[cfg(unix)]
+#[cfg(test)]
 fn set_owner_private_file_permissions(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1278,6 +1387,7 @@ fn set_owner_private_file_permissions(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[cfg(test)]
 fn set_owner_private_file_permissions(_path: &Path) -> io::Result<()> {
     Ok(())
 }
@@ -1293,7 +1403,7 @@ mod tests {
 
     use super::{
         ForkMode, ProjectRecord, ProjectResolution, ResumeBinding, ResumeMode, SessionRefKind,
-        Store, StoredInputRules, WorktreeBinding, WorktreeStatus,
+        Store, StoreMutation, StoredInputRules, WorktreeBinding, WorktreeStatus,
     };
 
     fn temp_store_path(tag: &str) -> PathBuf {
@@ -1306,7 +1416,21 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
+        fs::set_permissions(
+            &dir,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .expect("make temp dir private");
         dir.join("metadata.jsonl")
+    }
+
+    fn write_private(path: &Path, bytes: impl AsRef<[u8]>) {
+        fs::write(path, bytes).expect("write private fixture");
+        fs::set_permissions(
+            path,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .expect("make fixture file private");
     }
 
     fn resume(session_id: &str, native: &str) -> ResumeBinding {
@@ -1474,7 +1598,7 @@ mod tests {
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"native-old"}"#,
             "\n"
         );
-        fs::write(store.path(), legacy).expect("write legacy line");
+        write_private(store.path(), legacy);
         let loaded = store.load_resume().expect("load legacy");
         assert_eq!(loaded.len(), 1);
         let b = &loaded[0];
@@ -1504,7 +1628,7 @@ mod tests {
             r#""cwd":"/w","cols":100,"rows":30,"native_session_id":"native-claude"}"#,
             "\n"
         );
-        fs::write(store.path(), legacy).expect("write legacy lines");
+        write_private(store.path(), legacy);
 
         let loaded = store.load_resume().expect("load legacy lines");
 
@@ -1534,15 +1658,14 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(!path.exists(), "rejected record must not create the store");
 
-        fs::write(
+        write_private(
             &path,
             concat!(
                 r#"{"kind":"resume","session_id":"s-future","agent":"future-agent",#,
                 r#""agent_base":"future-agent","cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),
-        )
-        .expect("write future record");
+        );
         assert!(
             store.load_resume().expect("load future record").is_empty(),
             "unsupported persisted record must be ignored"
@@ -1573,9 +1696,28 @@ mod tests {
             .expect("present");
         assert_eq!(for_session.session_id, "s-1");
 
-        let removed = store.remove_worktree_session("s-1").expect("remove");
+        let removed = store
+            .remove_worktree_session("s-1")
+            .expect("remove")
+            .into_value();
         assert_eq!(removed, 2);
         assert!(store.load_worktrees().expect("load").is_empty());
+    }
+
+    #[test]
+    fn worktree_write_preserves_the_committed_uncertain_outcome() {
+        let store = Store::new(temp_store_path("worktree-committed-uncertain"));
+        let binding = worktree("s-1", "x");
+        store.fail_next_parent_sync_after_rename();
+
+        assert!(matches!(
+            store.record_worktree(&binding).expect("committed write"),
+            StoreMutation::CommittedDurabilityUncertain { value: (), .. }
+        ));
+        assert_eq!(
+            store.load_worktrees().expect("load committed binding"),
+            vec![binding]
+        );
     }
 
     #[test]
@@ -1709,7 +1851,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn store_rejects_symlink_temporary_file_without_touching_referent() {
+    fn store_ignores_stale_symlink_temporary_file_without_touching_referent() {
         use std::os::unix::fs::symlink;
 
         let path = temp_store_path("symlink-temp");
@@ -1720,10 +1862,10 @@ mod tests {
 
         store
             .record_resume(&resume("s-1", "native-1"))
-            .expect_err("temporary symlink must be rejected");
+            .expect("fresh unique temporary name avoids stale symlink");
 
         assert_eq!(fs::read(referent).expect("read referent"), b"keep");
-        assert!(!path.exists(), "failed write must not create the store");
+        assert!(path.exists(), "safe write creates the store");
     }
 
     // --- projects (milestone: projects M2) -----------------------------------
@@ -1769,6 +1911,7 @@ mod tests {
                 Some(project("/code/ui/.git", "/code/ui", None))
             })
             .expect("mutate")
+            .into_value()
             .expect("a record was written");
         assert_eq!(created.git_common_dir, PathBuf::from("/code/ui/.git"));
         assert_eq!(store.load_projects().expect("p").len(), 1);
@@ -1805,6 +1948,7 @@ mod tests {
                 Some(record)
             })
             .expect("edit B")
+            .into_value()
             .expect("written");
 
         assert_eq!(after.custom_name.as_deref(), Some("dashboard"));
@@ -1827,7 +1971,8 @@ mod tests {
         // `None`); nothing is written and the result is `None`.
         let result = store
             .mutate_project(Path::new("/code/ui/.git"), |_existing| None)
-            .expect("mutate present");
+            .expect("mutate present")
+            .into_value();
         assert!(result.is_none(), "declined ⇒ no record returned");
         let loaded = store.load_projects().expect("p");
         assert_eq!(loaded.len(), 1);
@@ -1842,7 +1987,8 @@ mod tests {
                     record
                 })
             })
-            .expect("mutate absent");
+            .expect("mutate absent")
+            .into_value();
         assert!(missing.is_none(), "absent + update-only ⇒ None");
         assert_eq!(store.load_projects().expect("p").len(), 1, "nothing added");
     }
@@ -1911,7 +2057,7 @@ mod tests {
             r#""created_at":"2026-06-19T00:00:00Z","updated_at":"2026-06-19T00:00:00Z"}"#,
             "\n"
         );
-        fs::write(store.path(), legacy).expect("write legacy line");
+        write_private(store.path(), legacy);
         let loaded = store.load_worktrees().expect("load legacy");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].session_id, "s-2");
@@ -1979,7 +2125,8 @@ mod tests {
         assert!(
             store
                 .remove_project(&PathBuf::from("/code/ui/.git"))
-                .expect("remove"),
+                .expect("remove")
+                .into_value(),
             "removed an existing project"
         );
         assert!(store.load_projects().expect("p").is_empty());
@@ -1991,7 +2138,8 @@ mod tests {
         assert!(
             !store
                 .remove_project(&PathBuf::from("/code/ui/.git"))
-                .expect("remove missing"),
+                .expect("remove missing")
+                .into_value(),
             "removing an absent project is a no-op false"
         );
     }
@@ -2012,7 +2160,7 @@ mod tests {
             serde_json::to_string(&super::Record::Resume(resume("s-1", "native-1")))
                 .expect("resume json"),
         );
-        fs::write(store.path(), body).expect("write store");
+        write_private(store.path(), body);
 
         assert_eq!(
             store.load_projects().expect("p").len(),

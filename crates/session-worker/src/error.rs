@@ -1,6 +1,6 @@
 //! Defines the worker's top-level typed error.
 
-// Rust guideline compliant 2026-07-23
+// Rust guideline compliant 2026-09-19
 
 use std::path::PathBuf;
 
@@ -15,6 +15,9 @@ pub enum WorkerError {
     /// XDG path resolution failed.
     #[error("failed to resolve worker paths: {0}")]
     Paths(#[from] pohunek_paths::PathError),
+    /// A trusted descriptor-relative filesystem operation failed.
+    #[error("trusted filesystem operation failed: {0}")]
+    TrustedFilesystem(#[from] pohunek_platform::filesystem::FsError),
     /// A session identifier is unsafe.
     #[error("invalid managed session id `{0}`")]
     InvalidSessionId(String),

@@ -975,7 +975,7 @@ mod tests {
 
     #[tokio::test]
     async fn assistant_materialize_uses_unique_snapshot_paths_per_request() {
-        let _env = EnvGuard::set_all("assistant-materialize-unique-rpc");
+        let _env = EnvGuard::set_all("asst-unique-rpc");
         let state = daemon_state(
             HealthInfo::new("test"),
             SessionRegistry::new(SessionRegistryConfig::default()),

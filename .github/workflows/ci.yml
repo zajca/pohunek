@@ -40,21 +40,13 @@ env:
 
 jobs:
   platform-contracts:
-    name: platform contracts (${{ matrix.arch }})
+    name: platform contracts (arm64)
     # macOS runners are costly (issue #125): run only on schedule, push to
     # main, manual dispatch (always a full run), or when platform inputs
     # change via the paths filter.
     if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.macos == 'true' }}
     needs: changes
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            arch: arm64
-          - runner: macos-15-intel
-            arch: x86_64
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-15
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -68,7 +60,7 @@ jobs:
 
       - name: Verify native runner architecture
         shell: bash
-        run: test "$(uname -m)" = "${{ matrix.arch }}"
+        run: test "$(uname -m)" = "arm64"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -88,6 +80,27 @@ jobs:
 
       - name: Test shared platform contracts
         run: cargo test --locked -p pohunek-platform
+
+      - name: Test APFS foreign-owner rejection
+        run: sudo env PATH="$PATH" RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo" CARGO_TARGET_DIR=/tmp/pohunek-platform-root-target TMPDIR=/tmp MACOSX_DEPLOYMENT_TARGET=14.0 RUSTFLAGS='-D warnings' cargo test --locked -p pohunek-platform filesystem::tests::apfs_foreign_owned_private_directory_is_rejected -- --ignored --exact
+
+      - name: Verify native APFS test volume
+        run: diskutil info / | grep -q 'Type (Bundle):.*apfs'
+
+      - name: Check shared path contracts
+        run: cargo check --locked -p pohunek-paths --all-targets
+
+      - name: Test shared path contracts
+        run: cargo test --locked -p pohunek-paths
+
+      # The complete daemon/worker macOS build remains sequenced behind the
+      # native process, peer-identity, and PTY work in issues #97-#99. Exercise
+      # the issue-#96 Hermes filesystem lifecycle natively in the meantime.
+      - name: Check Hermes filesystem lifecycle
+        run: cargo check --locked -p pohunek-cli --lib
+
+      - name: Test Hermes filesystem lifecycle
+        run: cargo test --locked -p pohunek-cli --lib hermes_integration::lifecycle::tests
 
   test:
     name: fmt + clippy
@@ -226,17 +239,19 @@ jobs:
               - 'crates/**/*.rs'
               - 'crates/xtask/src/checks.rs'
               - 'crates/xtask/src/lib.rs'
-            # macOS platform contracts run on two runners (arm64 + x86_64)
-            # (issue #125): gate on the portable platform crate, the
-            # cross-platform dependency graph, and the Cargo configuration
-            # (.cargo/config.toml carries Apple-specific linker/target flags
-            # that can break only the macOS build). The root manifest is
-            # because the platform crate inherits workspace package, dependency
-            # and lint settings from it — a workspace-level change can break
-            # only the macOS build without touching Cargo.lock.
+            # macOS platform, path, and Hermes filesystem contracts run on the
+            # native arm64 runner (issues #96 and #125): gate on every crate
+            # exercised by the job, the cross-platform dependency graph, and
+            # the Cargo configuration (.cargo/config.toml carries Apple-specific
+            # linker/target flags that can break only the macOS build). The root
+            # manifest is included because these crates inherit workspace
+            # package, dependency, and lint settings from it.
             macos:
               - 'Cargo.toml'
               - 'crates/platform/**'
+              - 'crates/paths/**'
+              - 'crates/cli/Cargo.toml'
+              - 'crates/cli/src/**'
               - 'Cargo.lock'
               - '.cargo/**'
               - '.github/workflows/ci.yml'

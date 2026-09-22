@@ -21,6 +21,14 @@ pub enum DaemonError {
         var: String,
     },
 
+    /// A configured application path violates the shared platform contract.
+    #[error("invalid application path configuration: {0}")]
+    Paths(#[source] pohunek_paths::PathError),
+
+    /// A trusted descriptor-relative filesystem operation failed.
+    #[error("trusted filesystem operation failed: {0}")]
+    TrustedFilesystem(#[from] pohunek_platform::filesystem::FsError),
+
     /// An environment variable was present but not one of the accepted values.
     #[error("environment variable {var} has invalid value {value:?}; expected {expected}")]
     InvalidEnv {

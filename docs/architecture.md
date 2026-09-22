@@ -11,8 +11,10 @@ this document wins. Detailed relay decisions are authoritative in the
 [accepted team-relay RFC](design/team-relay-control-plane-rfc.md), tracked by
 [#56](https://github.com/zajca/pohunek/issues/56).
 The accepted complete macOS contract lives in the
-[macOS support RFC](design/macos-support-rfc.md), tracked by
-[#94](https://github.com/zajca/pohunek/issues/94).
+[macOS support RFC](design/macos-support-rfc.md). Its delivery source of truth is
+the issue hierarchy rooted at [#94](https://github.com/zajca/pohunek/issues/94),
+the [`Complete macOS support` milestone](https://github.com/zajca/pohunek/milestone/2),
+and the [macOS project](https://github.com/users/zajca/projects/4).
 
 Pohunek has two explicit trust domains:
 
@@ -47,7 +49,7 @@ The following invariants span both domains:
 |---|---|---|
 | Standalone Unix-socket owner operation | Shipped in public protocol v3 | Existing daemon, CLI, SDK, and GUI |
 | Direct configured-overlay operation, including NetBird | Shipped in public protocol v3 | Existing daemon and clients; generic overlay work completed in [#69](https://github.com/zajca/pohunek/issues/69) |
-| Shared Linux/macOS platform contracts and native Darwin library CI | Shipped foundation; Linux backends are active, while complete macOS host/client support remains deferred | [#95](https://github.com/zajca/pohunek/issues/95); remaining delivery [#96](https://github.com/zajca/pohunek/issues/96)-[#105](https://github.com/zajca/pohunek/issues/105) |
+| Shared Linux/macOS platform, secure path, and portable filesystem contracts with native Darwin CI | Shipped foundation; Linux backends are active, while complete macOS host/client support remains deferred | [#95](https://github.com/zajca/pohunek/issues/95)-[#96](https://github.com/zajca/pohunek/issues/96); remaining delivery [#97](https://github.com/zajca/pohunek/issues/97)-[#105](https://github.com/zajca/pohunek/issues/105) |
 | Local/direct-overlay transparent Bun browser backend | Shipped and retained owner-path client transport | Existing `web/backend`; team web mode is separate work in [#86](https://github.com/zajca/pohunek/issues/86) |
 | Stable host identity, one exact principal-or-team owner, checked revisions, local lifecycle, and safe v3 inspection | Shipped host-local foundation; no relay API or mutation surface | [#81](https://github.com/zajca/pohunek/issues/81) |
 | Rust relay foundation: PostgreSQL, lease fencing, recovery quarantine, protected initial Owner/service-account provisioning, generic OIDC, HTTPS auth/account/credential operations, and native credential CLI | Implemented reduced foundation; no host link, routing, attach, account linking, or team administration API | [#85](https://github.com/zajca/pohunek/issues/85); follow-up [#107](https://github.com/zajca/pohunek/issues/107), [#108](https://github.com/zajca/pohunek/issues/108), [#92](https://github.com/zajca/pohunek/issues/92), and [#86](https://github.com/zajca/pohunek/issues/86) |
@@ -108,7 +110,7 @@ The following invariants span both domains:
   CLI (local)                         CLI (remote)
        |                                   |
        | Unix socket                       | TCP over NetBird/WireGuard
-       | ($XDG_RUNTIME_DIR, mode 0600)     | (daemon binds ONLY to 100.x iface)
+       | (resolved private runtime root)   | (daemon binds ONLY to 100.x iface)
        v                                   v
  +-----------------------------------------------------------+
  |               host control plane (pohunekd)               |
@@ -287,11 +289,12 @@ and retire operations. Linux implements that contract through systemd without
 exposing unit names, D-Bus paths, or raw `MainPID` semantics to session code.
 Worker readiness and authority still come from the private worker handshake.
 
-The shared contract crate compiles and tests natively on Apple Silicon and
-Intel Darwin with a macOS 14 deployment target. This is foundation evidence,
-not a claim that macOS host support ships: secure paths, native process and peer
-inspection, portable PTY I/O, launchd, clients, packaging, and full acceptance
-remain ordered work in #96-#105.
+The shared contract crate compiles and tests natively on Apple Silicon Darwin
+with a macOS 14 deployment target. Intel Macs are outside the current release
+scope. The secure runtime-path and portable filesystem contract also runs
+natively on APFS. This is foundation evidence, not a claim that macOS host
+support ships: native process and peer inspection, portable PTY I/O, launchd,
+clients, packaging, and full acceptance remain ordered work in #97-#105.
 
 The host daemon is the local control plane for one machine, written in Rust.
 
@@ -330,9 +333,11 @@ error rather than falling back to unsafe defaults.
 - `pohunekd.service` and worker units are siblings. Workers are grouped under
   `pohunek-sessions.slice`, use `Restart=no`, and have no `PartOf`, `BindsTo`,
   or other stop-propagation dependency on the daemon.
-- A stale public Unix socket is detected and replaced on daemon startup, and a
-  single-instance lock prevents two daemons controlling the same state
-  directory. The daemon sends systemd `READY=1` only after store load, worker
+- A stale public Unix socket is detected and replaced on daemon startup. The
+  daemon holds independent lifetime locks for its durable state and data roots,
+  plus a runtime-instance lock, so independently configured XDG roots cannot
+  let two daemons control the same persistent records. The daemon sends systemd
+  `READY=1` only after store load, worker
   discovery, reconciliation, and public socket bind.
 
 ## Durable Session Workers
@@ -399,9 +404,12 @@ fresh interactive input.
 Public protocol v3 currently exposes one logical owner protocol over two
 transport classes:
 
-- **Local:** Unix domain socket at `$XDG_RUNTIME_DIR/pohunek/daemon.sock`
-  (directory mode `0700`, socket mode `0600`). This is the only access control
-  needed for the owner path: the socket is owner-private.
+- **Local:** Unix domain socket at `<runtime-root>/daemon.sock`. A valid explicit
+  `XDG_RUNTIME_DIR` selects `$XDG_RUNTIME_DIR/pohunek` on Linux and macOS. Linux
+  requires that variable; macOS without it uses
+  `/private/tmp/pohunek-<effective-uid>` and never selects a root from `TMPDIR`.
+  The application directory is mode `0700` and the socket is mode `0600`. The
+  validated owner-private root and socket are the access-control boundary.
 - **Remote:** one TCP listener per configured overlay, bound **only** to the
   provider's validated current local member address and per-overlay port, never
   `0.0.0.0`. Reachability and authentication are provided by that overlay;
@@ -822,14 +830,24 @@ Runtime state under the user data directory:
   worktrees/               # managed git worktrees
 ```
 
-Ephemeral owner-private sockets under the user runtime directory:
+Ephemeral owner-private sockets live under one resolved application runtime
+root. A valid explicit `XDG_RUNTIME_DIR` resolves to
+`$XDG_RUNTIME_DIR/pohunek`; Linux requires it, while macOS without it uses
+`/private/tmp/pohunek-<effective-uid>`. An empty, relative, or otherwise invalid
+explicit value is an error, and ambient `TMPDIR` never selects the macOS
+default.
 
 ```text
-$XDG_RUNTIME_DIR/pohunek/
+<runtime-root>/
   daemon.sock
   daemon.lock
   workers/<session-id>/control.sock
 ```
+
+The resolver validates the complete encoded daemon and worker socket paths,
+including the native terminator, before mutating the filesystem. It rejects an
+overlong path rather than truncating it. Runtime cleanup never removes durable
+session, host identity, approval-key, or governance state.
 
 Structured logs under the user state directory:
 

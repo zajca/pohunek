@@ -23,6 +23,8 @@ pub enum CoreError {
     Prompt(#[from] PromptError),
     #[error("missing environment variable `{var}`")]
     MissingEnv { var: String },
+    #[error("invalid application path configuration: {source}")]
+    Paths { source: pohunek_paths::PathError },
     #[error("remote assistant launch on `{host}` requires a project or repo target")]
     RemoteAssistantTargetRequired { host: String },
     #[error("degraded assistant launch is not supported for remote host `{host}`")]

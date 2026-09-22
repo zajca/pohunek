@@ -242,26 +242,30 @@ esac"#,
     let status_json = parse_ok(&run(&fixture, &status_json_arguments));
     assert_eq!(status_json["modified"], false);
 
-    let policy_path = fs::read_dir(fixture.root.join("state/pohunek/policies/hermes"))
+    let policy_paths = fs::read_dir(fixture.root.join("state/pohunek/policies/hermes"))
         .expect("read policy directory")
-        .next()
-        .expect("installed policy entry")
-        .expect("read policy entry")
-        .path();
-    let policy_bytes = fs::read(&policy_path).expect("read installed policy");
-    fs::remove_file(&policy_path).expect("remove policy for status check");
+        .map(|entry| entry.expect("read policy entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(policy_paths.len(), 1, "exactly one installed policy");
+    let policy_path = &policy_paths[0];
+    let policy_bytes = fs::read(policy_path).expect("read installed policy");
+    fs::remove_file(policy_path).expect("remove policy for status check");
     assert_eq!(
         parse_error(&run(&fixture, &status_json_arguments))["code"],
         "hermes_io_failed"
     );
-    fs::write(&policy_path, b"{invalid-policy").expect("write corrupt policy");
-    set_mode(&policy_path, 0o600);
+    fs::write(policy_path, b"{invalid-policy").expect("write corrupt policy");
+    set_mode(policy_path, 0o600);
     assert_eq!(
         parse_error(&run(&fixture, &status_json_arguments))["code"],
         "hermes_invalid_policy"
     );
-    fs::write(&policy_path, policy_bytes).expect("restore installed policy");
-    set_mode(&policy_path, 0o600);
+    fs::write(policy_path, policy_bytes).expect("restore installed policy");
+    set_mode(policy_path, 0o600);
 
     let update = parse_ok(&run(
         &fixture,

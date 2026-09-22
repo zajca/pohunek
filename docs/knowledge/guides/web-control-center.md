@@ -112,6 +112,12 @@ wildcard binds are rejected. Use the supplied
 `POHUNEK_BACKEND_BIND_HOST` and `POHUNEK_BACKEND_PORT`; it can override the
 local daemon socket with `POHUNEK_BACKEND_DAEMON_SOCKET`.
 
+The Rust host components share a macOS runtime default, but the current Bun
+backend has not adopted that default yet. It still requires either
+`POHUNEK_BACKEND_DAEMON_SOCKET` or `XDG_RUNTIME_DIR`. Native macOS owner-WebUI
+integration, including consumption of the shared path fixtures, is tracked by
+#103; do not treat the secure-path foundation alone as a supported macOS WebUI.
+
 For a released Linux x86_64 deployment, download the
 `pohunek-web-*-linux-x86_64.tar.gz` release asset, unpack it, and run its
 `install.sh`. The archive contains a standalone backend executable with Bun

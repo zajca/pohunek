@@ -3,7 +3,7 @@
 //! Codex and Claude hook installation remains a local daemon RPC. Hermes is an
 //! owner-local plugin lifecycle and deliberately never contacts the daemon.
 
-// Rust guideline compliant 2026-08-31
+// Rust guideline compliant 2026-09-19
 
 use std::env;
 use std::fmt::Write as _;
@@ -309,11 +309,12 @@ pub(crate) fn run_hermes(
             result(action, &target, lifecycle, None, Some(report))
         }
         HermesAction::Update => {
-            let existing = Policy::load_private(&policy_path).map_err(hermes_error)?;
-            let policy = update_policy(options, &existing)?;
-            let lifecycle = lifecycle::install(
+            let (lifecycle, policy) = lifecycle::update(
                 &mut runner,
-                &InstallRequest::new(&target, &policy_path, &policy, options.confirm_modified),
+                &target,
+                &policy_path,
+                options.confirm_modified,
+                |existing| update_policy(options, existing),
             )
             .map_err(hermes_error)?;
             result(action, &target, lifecycle, Some(&policy), None)
@@ -410,6 +411,7 @@ fn policy_path(
 ) -> Result<PathBuf, CliError> {
     let state_home = pohunek_paths::state_home().map_err(|error| match error {
         pohunek_paths::PathError::MissingEnv { var } => CliError::MissingEnv { var },
+        other => CliError::Paths(other),
     })?;
     policy::policy_path(&state_home.join(pohunek_paths::APP_DIR), target).map_err(hermes_error)
 }
@@ -454,9 +456,10 @@ fn install_policy(options: &HermesOptions) -> Result<Policy, CliError> {
         options.confirm_wildcard,
         None,
     )
+    .map_err(hermes_error)
 }
 
-fn update_policy(options: &HermesOptions, existing: &Policy) -> Result<Policy, CliError> {
+fn update_policy(options: &HermesOptions, existing: &Policy) -> Result<Policy, HermesError> {
     let access_mode = options
         .access_mode
         .map_or_else(|| existing.access_mode(), Into::into);
@@ -483,21 +486,19 @@ fn new_policy(
     allowed_hosts: Vec<String>,
     confirm_wildcard: bool,
     existing: Option<&Policy>,
-) -> Result<Policy, CliError> {
+) -> Result<Policy, HermesError> {
     let pohunek_cli = match (options.pohunek_bin.clone(), existing) {
         (Some(path), _) => path,
         (None, Some(policy)) => policy.pohunek_cli().to_owned(),
-        (None, None) => env::current_exe()
-            .map_err(HermesError::from)
-            .map_err(hermes_error)?,
+        (None, None) => env::current_exe().map_err(HermesError::from)?,
     };
     // Policies always use this binary's range so updates repair drift that
     // `assets/pohunek/cli.py::_validate_envelope` rejects as `pohunek_cli_incompatible`.
     let versions = protocol::SUPPORTED_PROTOCOL_VERSIONS;
-    let protocol_min = i32::try_from(versions.minimum().get())
-        .map_err(|_error| hermes_error(HermesError::InvalidPolicy))?;
-    let protocol_max = i32::try_from(versions.maximum().get())
-        .map_err(|_error| hermes_error(HermesError::InvalidPolicy))?;
+    let protocol_min =
+        i32::try_from(versions.minimum().get()).map_err(|_error| HermesError::InvalidPolicy)?;
+    let protocol_max =
+        i32::try_from(versions.maximum().get()).map_err(|_error| HermesError::InvalidPolicy)?;
     if existing.is_some_and(|policy| {
         policy.protocol_min() != protocol_min || policy.protocol_max() != protocol_max
     }) {
@@ -536,7 +537,6 @@ fn new_policy(
             .unwrap_or(MAX_CONCURRENCY),
         wildcard_confirmation: WildcardConfirmation::new(confirm_wildcard),
     })
-    .map_err(hermes_error)
 }
 
 fn hermes_error(error: HermesError) -> CliError {

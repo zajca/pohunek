@@ -25,7 +25,11 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nix::unistd::{eaccess, AccessFlags, Uid};
+#[cfg(not(target_os = "linux"))]
+use nix::unistd::access;
+#[cfg(target_os = "linux")]
+use nix::unistd::eaccess;
+use nix::unistd::{AccessFlags, Uid};
 use serde::{Deserialize, Serialize};
 
 use super::error::Error;
@@ -1067,7 +1071,7 @@ fn validate_runtime(path: &Path, uid: u32) -> Result<(), Error> {
     if !metadata.is_file()
         || (metadata.uid() != root_uid && metadata.uid() != uid)
         || metadata.permissions().mode() & UNSAFE_WRITE_BITS != 0
-        || eaccess(path, AccessFlags::X_OK).is_err()
+        || !is_effectively_executable(path)
     {
         return Err(Error::InvalidHermesRuntime);
     }
@@ -1114,7 +1118,7 @@ fn validate_executable(path: &Path) -> Result<PathBuf, Error> {
     if !metadata.is_file()
         || metadata.uid() != Uid::effective().as_raw()
         || metadata.permissions().mode() & UNSAFE_WRITE_BITS != 0
-        || eaccess(&canonical, AccessFlags::X_OK).is_err()
+        || !is_effectively_executable(&canonical)
     {
         return Err(Error::InvalidHermesExecutable);
     }
@@ -1137,6 +1141,16 @@ fn reject_symlink_components(path: &Path) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn is_effectively_executable(path: &Path) -> bool {
+    eaccess(path, AccessFlags::X_OK).is_ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_effectively_executable(path: &Path) -> bool {
+    Uid::current() == Uid::effective() && access(path, AccessFlags::X_OK).is_ok()
 }
 
 fn configure_target(command: &mut Command, target: &ResolvedTarget) {
@@ -1207,11 +1221,15 @@ fn configure_child(command: &mut Command, fallback_fd_limit: libc::c_int) {
     reason = "raw close_range and close calls are required inside pre_exec"
 )]
 fn close_inherited_fds(fallback_fd_limit: libc::c_int) {
-    let first = FIRST_INHERITED_FD as libc::c_uint;
-    // SAFETY: close_range receives scalar descriptor bounds and no pointers.
-    let result = unsafe { libc::syscall(libc::SYS_close_range, first, libc::c_uint::MAX, 0_u32) };
-    if result == 0 {
-        return;
+    #[cfg(target_os = "linux")]
+    {
+        let first = FIRST_INHERITED_FD as libc::c_uint;
+        // SAFETY: close_range receives scalar descriptor bounds and no pointers.
+        let result =
+            unsafe { libc::syscall(libc::SYS_close_range, first, libc::c_uint::MAX, 0_u32) };
+        if result == 0 {
+            return;
+        }
     }
     for descriptor in FIRST_INHERITED_FD..fallback_fd_limit {
         // SAFETY: close accepts any integer descriptor. EBADF and EINTR are

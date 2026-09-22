@@ -4,7 +4,7 @@
 //! this module. This module never launches Hermes; `HermesControl` is the
 //! narrow boundary the fixed runner implements later.
 
-// Rust guideline compliant 2026-08-12
+// Rust guideline compliant 2026-09-20
 
 #![expect(
     clippy::map_err_ignore,
@@ -24,16 +24,17 @@
 )]
 
 use std::collections::BTreeSet;
-use std::ffi::CString;
+use std::ffi::OsStr;
 use std::fs;
-use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{
-    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
-};
-use std::path::{Component, Path, PathBuf};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::path::{Path, PathBuf};
 
 use nix::unistd::Uid;
+use pohunek_platform::filesystem::{
+    AdvisoryLock, AtomicReplaceError, EntryKind, FsError, MoveOutcome, RemoveOutcome, StageOutcome,
+    StagedEntry, StagedMoveError, TrustedDir,
+};
 
 use super::assets::{self, Asset, Ownership, MARKER_NAME};
 use super::error::Error;
@@ -58,6 +59,10 @@ const POLICY_STAGE_PREFIX: &str = ".pohunek-policy-stage-";
 const POLICY_BACKUP_PREFIX: &str = ".pohunek-policy-backup-";
 /// Status checks inspect only a bounded number of exact Pohunek transaction siblings.
 const MAX_STALE_SIBLINGS: usize = 32;
+/// Upper bound for one owner file preserved across a plugin update.
+const MAX_UNMANAGED_ASSET_BYTES: usize = 16 * 1024 * 1024;
+/// Canonical marker serializing one profile's plugin and external policy lifecycle.
+const TRANSACTION_LOCK_NAME: &str = ".pohunek-lifecycle.lock";
 
 /// Fixed Hermes operations needed by the filesystem lifecycle.
 ///
@@ -154,7 +159,28 @@ pub(crate) fn install(
     control: &mut impl HermesControl,
     request: &InstallRequest<'_>,
 ) -> Result<LifecycleState, Error> {
+    let _lock = acquire_transaction_lock(request.policy_path)?;
     install_with(control, request, &mut NativeFileOps)
+}
+
+/// Updates a policy derived from the current on-disk value under one lock.
+///
+/// # Errors
+///
+/// Returns [`Error`] when locking, policy loading, derivation, or installation fails.
+pub(crate) fn update(
+    control: &mut impl HermesControl,
+    target: &ResolvedTarget,
+    policy_path: &Path,
+    confirm_modified: bool,
+    derive: impl FnOnce(&Policy) -> Result<Policy, Error>,
+) -> Result<(LifecycleState, Policy), Error> {
+    let _lock = acquire_transaction_lock(policy_path)?;
+    let current = Policy::load_private(policy_path)?;
+    let policy = derive(&current)?;
+    let request = InstallRequest::new(target, policy_path, &policy, confirm_modified);
+    let state = install_with(control, &request, &mut NativeFileOps)?;
+    Ok((state, policy))
 }
 
 fn install_with(
@@ -278,7 +304,23 @@ pub(crate) fn uninstall(
     control: &mut impl HermesControl,
     request: &UninstallRequest<'_>,
 ) -> Result<LifecycleState, Error> {
+    let _lock = acquire_transaction_lock(request.policy_path)?;
     uninstall_with(control, request, &mut NativeFileOps)
+}
+
+fn acquire_transaction_lock(policy_path: &Path) -> Result<AdvisoryLock, Error> {
+    let parent = policy_path.parent().ok_or(Error::UnsafePolicyPath)?;
+    ensure_private_parent(parent)?;
+    let directory = TrustedDir::open_absolute(parent, PRIVATE_DIRECTORY_MODE)
+        .map_err(|_| Error::UnsafePolicyPath)?;
+    directory
+        .acquire_lock(TRANSACTION_LOCK_NAME, PRIVATE_FILE_MODE)
+        .map_err(|error| match error {
+            FsError::LockContended { .. } => Error::TransactionBusy,
+            _ => Error::Io {
+                kind: std::io::ErrorKind::Other,
+            },
+        })
 }
 
 fn uninstall_with(
@@ -378,10 +420,30 @@ struct Installed {
 trait FileOps {
     fn write_new(&mut self, path: &Path, bytes: &[u8]) -> Result<(), Error>;
     fn write_reserved(&mut self, path: &Path, bytes: &[u8]) -> Result<(), Error>;
-    fn rename(&mut self, source: &Path, destination: &Path) -> Result<(), Error>;
-    fn rename_no_replace(&mut self, source: &Path, destination: &Path) -> Result<(), Error>;
+    fn rename(&mut self, source: &Path, destination: &Path) -> RenameResult;
+    fn rename_no_replace(&mut self, source: &Path, destination: &Path) -> RenameResult;
     fn remove_file(&mut self, path: &Path) -> Result<(), Error>;
     fn remove_dir_all(&mut self, path: &Path) -> Result<(), Error>;
+}
+
+type RenameResult = Result<(), RenameFailure>;
+
+#[derive(Debug, PartialEq, Eq)]
+enum RenameFailure {
+    BeforeCommit(Error),
+    Committed(Error),
+}
+
+impl RenameFailure {
+    fn error(self) -> Error {
+        match self {
+            Self::BeforeCommit(error) | Self::Committed(error) => error,
+        }
+    }
+
+    fn committed(&self) -> bool {
+        matches!(self, Self::Committed(_))
+    }
 }
 
 struct NativeFileOps;
@@ -395,20 +457,212 @@ impl FileOps for NativeFileOps {
         write_reserved_private_file(path, bytes)
     }
 
-    fn rename(&mut self, source: &Path, destination: &Path) -> Result<(), Error> {
-        fs::rename(source, destination).map_err(Into::into)
+    fn rename(&mut self, source: &Path, destination: &Path) -> RenameResult {
+        trusted_rename_replacing_reservation(source, destination)
     }
 
-    fn rename_no_replace(&mut self, source: &Path, destination: &Path) -> Result<(), Error> {
-        rename_no_replace(source, destination)
+    fn rename_no_replace(&mut self, source: &Path, destination: &Path) -> RenameResult {
+        trusted_rename_no_replace(source, destination)
     }
 
     fn remove_file(&mut self, path: &Path) -> Result<(), Error> {
-        fs::remove_file(path).map_err(Into::into)
+        trusted_remove_file(path)
     }
 
     fn remove_dir_all(&mut self, path: &Path) -> Result<(), Error> {
-        fs::remove_dir_all(path).map_err(Into::into)
+        trusted_remove_dir_all(path)
+    }
+}
+
+fn trusted_rename_replacing_reservation(source: &Path, destination: &Path) -> RenameResult {
+    trusted_rename_replacing_reservation_with(source, destination, |path, is_directory| {
+        if is_directory {
+            trusted_remove_dir_all(path)
+        } else {
+            trusted_remove_file(path)
+        }
+    })
+}
+
+fn trusted_rename_replacing_reservation_with(
+    source: &Path,
+    destination: &Path,
+    remove_reservation: impl FnOnce(&Path, bool) -> Result<(), Error>,
+) -> RenameResult {
+    if let Ok(metadata) = fs::symlink_metadata(destination) {
+        let name = destination
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or(RenameFailure::BeforeCommit(Error::Collision))?;
+        let is_reservation = name.starts_with(STAGE_PREFIX)
+            || name.starts_with(BACKUP_PREFIX)
+            || name.starts_with(POLICY_STAGE_PREFIX)
+            || name.starts_with(POLICY_BACKUP_PREFIX);
+        if !is_reservation || metadata.file_type().is_symlink() {
+            return Err(RenameFailure::BeforeCommit(Error::Collision));
+        }
+        let is_directory = if metadata.is_dir() {
+            if fs::read_dir(destination)
+                .map_err(Error::from)
+                .map_err(RenameFailure::BeforeCommit)?
+                .next()
+                .is_some()
+            {
+                return Err(RenameFailure::BeforeCommit(Error::Collision));
+            }
+            true
+        } else if metadata.is_file() && metadata.len() == 0 {
+            false
+        } else {
+            return Err(RenameFailure::BeforeCommit(Error::Collision));
+        };
+        remove_reservation(destination, is_directory)
+            .map_err(|_| RenameFailure::BeforeCommit(Error::RecoveryRequired))?;
+    }
+    trusted_rename_no_replace(source, destination)
+}
+
+fn trusted_rename_no_replace(source: &Path, destination: &Path) -> RenameResult {
+    trusted_rename_no_replace_with(source, destination, |_| Ok(()))
+}
+
+fn trusted_rename_no_replace_with(
+    source: &Path,
+    destination: &Path,
+    before_source_restore: impl FnOnce(&Path) -> Result<(), Error>,
+) -> RenameResult {
+    if source.as_os_str().as_bytes().contains(&0) || destination.as_os_str().as_bytes().contains(&0)
+    {
+        return Err(RenameFailure::BeforeCommit(Error::Io {
+            kind: std::io::ErrorKind::InvalidInput,
+        }));
+    }
+    let source_parent = source
+        .parent()
+        .ok_or(Error::RecoveryRequired)
+        .map_err(RenameFailure::BeforeCommit)?;
+    let destination_parent = destination
+        .parent()
+        .ok_or(Error::RecoveryRequired)
+        .map_err(RenameFailure::BeforeCommit)?;
+    let source_name = source
+        .file_name()
+        .ok_or(Error::RecoveryRequired)
+        .map_err(RenameFailure::BeforeCommit)?;
+    let destination_name = destination
+        .file_name()
+        .ok_or(Error::RecoveryRequired)
+        .map_err(RenameFailure::BeforeCommit)?;
+    let source_directory = TrustedDir::open_absolute(source_parent, PRIVATE_DIRECTORY_MODE)
+        .map_err(|_| RenameFailure::BeforeCommit(Error::UnsafeTarget))?;
+    let destination_directory =
+        TrustedDir::open_absolute(destination_parent, PRIVATE_DIRECTORY_MODE)
+            .map_err(|_| RenameFailure::BeforeCommit(Error::UnsafeTarget))?;
+    let metadata = fs::symlink_metadata(source)
+        .map_err(Error::from)
+        .map_err(RenameFailure::BeforeCommit)?;
+    let kind = if metadata.file_type().is_symlink() {
+        return Err(RenameFailure::BeforeCommit(Error::UnsafeTarget));
+    } else if metadata.is_dir() {
+        EntryKind::Directory
+    } else if metadata.is_file() {
+        EntryKind::RegularFile
+    } else {
+        return Err(RenameFailure::BeforeCommit(Error::UnsafeTarget));
+    };
+    let identity = source_directory
+        .entry_identity(source_name, kind)
+        .map_err(|_| RenameFailure::BeforeCommit(Error::UnsafeTarget))?
+        .ok_or(RenameFailure::BeforeCommit(Error::RecoveryRequired))?;
+    let mut staged = match source_directory
+        .stage_random(source_name, ".pohunek-hermes-move-", identity)
+        .map_err(|_| RenameFailure::BeforeCommit(Error::RecoveryRequired))?
+    {
+        StageOutcome::Staged(staged) => staged,
+        StageOutcome::Missing | StageOutcome::IdentityChanged => {
+            return Err(RenameFailure::BeforeCommit(Error::RecoveryRequired));
+        }
+        StageOutcome::DestinationExists => {
+            return Err(RenameFailure::BeforeCommit(Error::Collision));
+        }
+        _ => return Err(RenameFailure::BeforeCommit(Error::RecoveryRequired)),
+    };
+    match staged.move_to(&destination_directory, destination_name) {
+        Ok(MoveOutcome::Moved) => Ok(()),
+        Ok(MoveOutcome::DestinationExists) => {
+            before_source_restore(source)
+                .map_err(|_| RenameFailure::BeforeCommit(Error::RecoveryRequired))?;
+            restore_staged_source(&staged, source_name)
+                .map_err(|_| RenameFailure::BeforeCommit(Error::RecoveryRequired))?;
+            Err(RenameFailure::BeforeCommit(Error::Collision))
+        }
+        Err(StagedMoveError::BeforeCommit(_)) => {
+            restore_staged_source(&staged, source_name)
+                .map_err(|_| RenameFailure::BeforeCommit(Error::RecoveryRequired))?;
+            Err(RenameFailure::BeforeCommit(Error::RecoveryRequired))
+        }
+        Err(StagedMoveError::Committed { .. }) => {
+            Err(RenameFailure::Committed(Error::RecoveryRequired))
+        }
+        Err(StagedMoveError::RecoveryRequired { .. }) => {
+            restore_staged_source(&staged, source_name)
+                .map_err(|_| RenameFailure::BeforeCommit(Error::RecoveryRequired))?;
+            Err(RenameFailure::BeforeCommit(Error::RecoveryRequired))
+        }
+        Err(_) => Err(RenameFailure::BeforeCommit(Error::RecoveryRequired)),
+        Ok(_) => Err(RenameFailure::Committed(Error::RecoveryRequired)),
+    }
+}
+
+fn restore_staged_source(staged: &StagedEntry, source_name: &OsStr) -> Result<(), Error> {
+    match staged
+        .restore(source_name)
+        .map_err(|_| Error::RecoveryRequired)?
+    {
+        MoveOutcome::Moved => Ok(()),
+        _ => Err(Error::RecoveryRequired),
+    }
+}
+
+fn trusted_remove_file(path: &Path) -> Result<(), Error> {
+    let parent = path.parent().ok_or(Error::RecoveryRequired)?;
+    let name = path.file_name().ok_or(Error::RecoveryRequired)?;
+    let directory = TrustedDir::open_absolute(parent, PRIVATE_DIRECTORY_MODE)
+        .map_err(|_| Error::UnsafeTarget)?;
+    let identity = directory
+        .entry_identity(name, EntryKind::RegularFile)
+        .map_err(|_| Error::UnsafeTarget)?
+        .ok_or(Error::RecoveryRequired)?;
+    let StageOutcome::Staged(staged) = directory
+        .stage_random(name, ".pohunek-hermes-remove-", identity)
+        .map_err(|_| Error::RecoveryRequired)?
+    else {
+        return Err(Error::RecoveryRequired);
+    };
+    match staged.remove().map_err(|_| Error::RecoveryRequired)? {
+        RemoveOutcome::Removed => Ok(()),
+        _ => Err(Error::RecoveryRequired),
+    }
+}
+
+fn trusted_remove_dir_all(path: &Path) -> Result<(), Error> {
+    let parent = path.parent().ok_or(Error::RecoveryRequired)?;
+    let name = path.file_name().ok_or(Error::RecoveryRequired)?;
+    let directory = TrustedDir::open_absolute(parent, PRIVATE_DIRECTORY_MODE)
+        .map_err(|_| Error::UnsafeTarget)?;
+    let identity = directory
+        .entry_identity(name, EntryKind::Directory)
+        .map_err(|_| Error::UnsafeTarget)?
+        .ok_or(Error::RecoveryRequired)?;
+    let StageOutcome::Staged(staged) = directory
+        .stage_random(name, ".pohunek-hermes-tree-", identity)
+        .map_err(|_| Error::RecoveryRequired)?
+    else {
+        return Err(Error::RecoveryRequired);
+    };
+    match staged.remove_tree().map_err(|_| Error::RecoveryRequired)? {
+        RemoveOutcome::Removed => Ok(()),
+        _ => Err(Error::RecoveryRequired),
     }
 }
 
@@ -521,18 +775,19 @@ fn copy_unmanaged_entries(root: &Path, stage: &Path, ownership: &Ownership) -> R
         let parent = destination.parent().ok_or(Error::UnsafeTarget)?;
         ensure_private_tree(stage, parent)?;
         let metadata = fs::metadata(&source)?;
-        if metadata.uid() != Uid::effective().as_raw() {
+        let mode = metadata.permissions().mode() & 0o7777;
+        if metadata.uid() != Uid::effective().as_raw() || mode & UNSAFE_PRIVATE_BITS != 0 {
             return Err(Error::UnsafePermissions);
         }
-        let mut input = fs::File::open(source)?;
-        let mut output = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(PRIVATE_FILE_MODE)
-            .open(&destination)?;
-        std::io::copy(&mut input, &mut output)?;
-        output.sync_all()?;
-        fs::set_permissions(&destination, metadata.permissions())?;
+        let source_parent = source.parent().ok_or(Error::UnsafeTarget)?;
+        let source_name = source.file_name().ok_or(Error::UnsafeTarget)?;
+        let bytes = TrustedDir::open_absolute(source_parent, PRIVATE_DIRECTORY_MODE)
+            .and_then(|directory| directory.read_file(source_name, mode, MAX_UNMANAGED_ASSET_BYTES))
+            .map_err(|_| Error::UnsafeTarget)?;
+        let destination_name = destination.file_name().ok_or(Error::InvalidAsset)?;
+        TrustedDir::open_absolute(parent, PRIVATE_DIRECTORY_MODE)
+            .and_then(|directory| directory.create_file(destination_name, &bytes, mode))
+            .map_err(|_| Error::RecoveryRequired)?;
     }
     Ok(())
 }
@@ -627,22 +882,34 @@ impl<'a> InstallTransaction<'a> {
     fn activate(&mut self, replacing: bool, files: &mut impl FileOps) -> Result<(), Error> {
         if replacing {
             let backup = self.plugin_backup.as_deref().ok_or(Error::Collision)?;
-            files.rename(self.target.plugin_root(), backup)?;
-            self.old_plugin_moved = true;
+            record_rename(
+                files.rename(self.target.plugin_root(), backup),
+                &mut self.old_plugin_moved,
+                true,
+            )?;
             if path_exists(self.policy_path)? {
-                files.rename(
-                    self.policy_path,
-                    self.policy_backup.as_deref().ok_or(Error::Collision)?,
+                record_rename(
+                    files.rename(
+                        self.policy_path,
+                        self.policy_backup.as_deref().ok_or(Error::Collision)?,
+                    ),
+                    &mut self.old_policy_moved,
+                    true,
                 )?;
-                self.old_policy_moved = true;
             }
         } else if path_exists(self.target.plugin_root())? || path_exists(self.policy_path)? {
             return Err(Error::Collision);
         }
-        files.rename_no_replace(&self.stage_policy, self.policy_path)?;
-        self.new_policy_moved = true;
-        files.rename_no_replace(&self.stage_plugin, self.target.plugin_root())?;
-        self.new_plugin_moved = true;
+        record_rename(
+            files.rename_no_replace(&self.stage_policy, self.policy_path),
+            &mut self.new_policy_moved,
+            true,
+        )?;
+        record_rename(
+            files.rename_no_replace(&self.stage_plugin, self.target.plugin_root()),
+            &mut self.new_plugin_moved,
+            true,
+        )?;
         Ok(())
     }
 
@@ -695,33 +962,45 @@ impl<'a> InstallTransaction<'a> {
             if !matches_ownership(self.target.plugin_root(), &self.desired)? {
                 return Err(Error::RecoveryRequired);
             }
-            files.rename(self.target.plugin_root(), &self.stage_plugin)?;
-            self.new_plugin_moved = false;
+            record_rename(
+                files.rename(self.target.plugin_root(), &self.stage_plugin),
+                &mut self.new_plugin_moved,
+                false,
+            )?;
         }
         if self.new_policy_moved {
             if fs::read(self.policy_path)? != self.policy_bytes {
                 return Err(Error::RecoveryRequired);
             }
-            files.rename(self.policy_path, &self.stage_policy)?;
-            self.new_policy_moved = false;
+            record_rename(
+                files.rename(self.policy_path, &self.stage_policy),
+                &mut self.new_policy_moved,
+                false,
+            )?;
         }
         if self.old_policy_moved {
-            files.rename(
-                self.policy_backup
-                    .as_deref()
-                    .ok_or(Error::RecoveryRequired)?,
-                self.policy_path,
+            record_rename(
+                files.rename(
+                    self.policy_backup
+                        .as_deref()
+                        .ok_or(Error::RecoveryRequired)?,
+                    self.policy_path,
+                ),
+                &mut self.old_policy_moved,
+                false,
             )?;
-            self.old_policy_moved = false;
         }
         if self.old_plugin_moved {
-            files.rename(
-                self.plugin_backup
-                    .as_deref()
-                    .ok_or(Error::RecoveryRequired)?,
-                self.target.plugin_root(),
+            record_rename(
+                files.rename(
+                    self.plugin_backup
+                        .as_deref()
+                        .ok_or(Error::RecoveryRequired)?,
+                    self.target.plugin_root(),
+                ),
+                &mut self.old_plugin_moved,
+                false,
             )?;
-            self.old_plugin_moved = false;
         }
         remove_current_stage(&self.stage_plugin);
         remove_owned_file(&self.stage_policy);
@@ -738,37 +1017,21 @@ impl<'a> InstallTransaction<'a> {
     }
 }
 
-#[expect(
-    unsafe_code,
-    reason = "renameat2 is the Linux kernel boundary for atomic no-replace moves"
-)]
-fn rename_no_replace(source: &Path, destination: &Path) -> Result<(), Error> {
-    let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| Error::Io {
-        kind: std::io::ErrorKind::InvalidInput,
-    })?;
-    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| Error::Io {
-        kind: std::io::ErrorKind::InvalidInput,
-    })?;
-    // SAFETY: both path pointers reference owned NUL-terminated strings for the
-    // duration of the call; directory descriptors and flags are scalar values.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            destination.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result == 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::EEXIST) {
-        Err(Error::Collision)
-    } else {
-        Err(Error::Io { kind: error.kind() })
+fn record_rename(
+    result: RenameResult,
+    state: &mut bool,
+    committed_state: bool,
+) -> Result<(), Error> {
+    match result {
+        Ok(()) => {
+            *state = committed_state;
+            Ok(())
+        }
+        Err(error) if error.committed() => {
+            *state = committed_state;
+            Err(error.error())
+        }
+        Err(error) => Err(error.error()),
     }
 }
 
@@ -813,13 +1076,20 @@ fn move_managed_to_trash(
         if let Err(error) = ensure_private_tree(trash, parent) {
             return Err(MoveFailure { error, moves });
         }
-        if let Err(error) = files.rename(&source, &destination) {
-            return Err(MoveFailure { error, moves });
-        }
-        moves.push(MoveRecord {
+        let move_record = MoveRecord {
             source,
             destination,
-        });
+        };
+        if let Err(error) = files.rename(&move_record.source, &move_record.destination) {
+            if error.committed() {
+                moves.push(move_record);
+            }
+            return Err(MoveFailure {
+                error: error.error(),
+                moves,
+            });
+        }
+        moves.push(move_record);
     }
     let marker = root.join(MARKER_NAME);
     let marker_destination = trash.join("plugin").join(MARKER_NAME);
@@ -832,21 +1102,35 @@ fn move_managed_to_trash(
     if let Err(error) = ensure_private_tree(trash, marker_parent) {
         return Err(MoveFailure { error, moves });
     }
-    if let Err(error) = files.rename(&marker, &marker_destination) {
-        return Err(MoveFailure { error, moves });
-    }
-    moves.push(MoveRecord {
+    let marker_move = MoveRecord {
         source: marker,
         destination: marker_destination,
-    });
-    let policy_destination = trash.join("policy");
-    if let Err(error) = files.rename(policy_path, &policy_destination) {
-        return Err(MoveFailure { error, moves });
+    };
+    if let Err(error) = files.rename(&marker_move.source, &marker_move.destination) {
+        if error.committed() {
+            moves.push(marker_move);
+        }
+        return Err(MoveFailure {
+            error: error.error(),
+            moves,
+        });
     }
-    moves.push(MoveRecord {
+    moves.push(marker_move);
+    let policy_destination = trash.join("policy");
+    let policy_move = MoveRecord {
         source: policy_path.to_owned(),
         destination: policy_destination,
-    });
+    };
+    if let Err(error) = files.rename(&policy_move.source, &policy_move.destination) {
+        if error.committed() {
+            moves.push(policy_move);
+        }
+        return Err(MoveFailure {
+            error: error.error(),
+            moves,
+        });
+    }
+    moves.push(policy_move);
     if let Err(error) = remove_empty_managed_directories(root) {
         return Err(MoveFailure { error, moves });
     }
@@ -858,6 +1142,7 @@ fn restore_moves(
     moves: &[MoveRecord],
     trash: &Path,
 ) -> Result<(), Error> {
+    let mut durability_uncertain = false;
     for move_record in moves.iter().rev() {
         let parent = move_record.source.parent().ok_or(Error::RecoveryRequired)?;
         if !parent.exists() {
@@ -866,10 +1151,18 @@ fn restore_moves(
         if !path_exists(&move_record.destination)? {
             return Err(Error::RecoveryRequired);
         }
-        files.rename_no_replace(&move_record.destination, &move_record.source)?;
+        match files.rename_no_replace(&move_record.destination, &move_record.source) {
+            Ok(()) => {}
+            Err(error) if error.committed() => durability_uncertain = true,
+            Err(error) => return Err(error.error()),
+        }
     }
     files.remove_dir_all(trash)?;
-    Ok(())
+    if durability_uncertain {
+        Err(Error::RecoveryRequired)
+    } else {
+        Ok(())
+    }
 }
 
 fn remove_empty_managed_directories(root: &Path) -> Result<(), Error> {
@@ -972,55 +1265,18 @@ fn ensure_private_parent(path: &Path) -> Result<(), Error> {
     if !path.is_absolute() {
         return Err(Error::UnsafePolicyPath);
     }
-    let existing = nearest_existing(path)?;
-    validate_private_directory(&existing)?;
-    let tail = path
-        .strip_prefix(&existing)
-        .map_err(|_| Error::UnsafePolicyPath)?;
-    let mut current = existing;
-    for component in tail.components() {
-        let Component::Normal(component) = component else {
-            return Err(Error::UnsafePolicyPath);
-        };
-        current.push(component);
-        create_or_validate_private_directory(&current)?;
-    }
-    Ok(())
+    TrustedDir::open_or_create_absolute(path, PRIVATE_DIRECTORY_MODE)
+        .map(|_| ())
+        .map_err(|_| Error::UnsafePolicyPath)
 }
 
 fn ensure_private_tree(base: &Path, leaf: &Path) -> Result<(), Error> {
     if !leaf.starts_with(base) {
         return Err(Error::UnsafeTarget);
     }
-    if !path_exists(base)? {
-        ensure_private_parent(base)?;
-    }
-    validate_private_directory(base)?;
-    let tail = leaf.strip_prefix(base).map_err(|_| Error::UnsafeTarget)?;
-    let mut current = base.to_owned();
-    for component in tail.components() {
-        let Component::Normal(component) = component else {
-            return Err(Error::UnsafeTarget);
-        };
-        current.push(component);
-        create_or_validate_private_directory(&current)?;
-    }
-    Ok(())
-}
-
-fn create_or_validate_private_directory(path: &Path) -> Result<(), Error> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::UnsafeTarget),
-        Ok(_) => validate_private_directory(path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::DirBuilder::new()
-                .mode(PRIVATE_DIRECTORY_MODE)
-                .create(path)?;
-            fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))?;
-            validate_private_directory(path)
-        }
-        Err(error) => Err(error.into()),
-    }
+    TrustedDir::open_or_create_absolute(leaf, PRIVATE_DIRECTORY_MODE)
+        .map(|_| ())
+        .map_err(|_| Error::UnsafeTarget)
 }
 
 fn validate_private_directory(path: &Path) -> Result<(), Error> {
@@ -1048,76 +1304,55 @@ fn validate_private_file(path: &Path, error: Error) -> Result<(), Error> {
 }
 
 fn create_private_sibling(parent: &Path, prefix: &str) -> Result<PathBuf, Error> {
-    for attempt in 0..SIBLING_NAME_ATTEMPTS {
-        let path = parent.join(format!("{prefix}{}-{attempt}", std::process::id()));
-        match fs::DirBuilder::new()
-            .mode(PRIVATE_DIRECTORY_MODE)
-            .create(&path)
-        {
-            Ok(()) => {
-                fs::set_permissions(&path, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))?;
-                return Ok(path);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
+    let directory = TrustedDir::open_absolute(parent, PRIVATE_DIRECTORY_MODE)
+        .map_err(|_| Error::UnsafeTarget)?;
+    for _ in 0..SIBLING_NAME_ATTEMPTS {
+        let name = format!("{prefix}{}", uuid::Uuid::now_v7());
+        match directory.create_child_exclusive(&name, PRIVATE_DIRECTORY_MODE) {
+            Ok(_) => return Ok(parent.join(name)),
+            Err(error) if error.io_kind() == Some(std::io::ErrorKind::AlreadyExists) => {}
+            Err(_) => return Err(Error::RecoveryRequired),
         }
     }
     Err(Error::Collision)
 }
 
 fn create_private_file_sibling(parent: &Path, prefix: &str) -> Result<PathBuf, Error> {
-    for attempt in 0..SIBLING_NAME_ATTEMPTS {
-        let path = parent.join(format!("{prefix}{}-{attempt}", std::process::id()));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(PRIVATE_FILE_MODE)
-            .open(&path)
-        {
-            Ok(_file) => return Ok(path),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
+    let directory = TrustedDir::open_absolute(parent, PRIVATE_DIRECTORY_MODE)
+        .map_err(|_| Error::UnsafePolicyPath)?;
+    for _ in 0..SIBLING_NAME_ATTEMPTS {
+        let name = format!("{prefix}{}", uuid::Uuid::now_v7());
+        match directory.create_file(&name, &[], PRIVATE_FILE_MODE) {
+            Ok(_) => return Ok(parent.join(name)),
+            Err(error) if error.io_kind() == Some(std::io::ErrorKind::AlreadyExists) => {}
+            Err(_) => return Err(Error::RecoveryRequired),
         }
     }
     Err(Error::Collision)
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(PRIVATE_FILE_MODE)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
-    Ok(())
+    let parent = path.parent().ok_or(Error::UnsafeTarget)?;
+    let name = path.file_name().ok_or(Error::InvalidAsset)?;
+    TrustedDir::open_absolute(parent, PRIVATE_DIRECTORY_MODE)
+        .and_then(|directory| directory.create_file(name, bytes, PRIVATE_FILE_MODE))
+        .map(|_| ())
+        .map_err(|_| Error::RecoveryRequired)
 }
 
 fn write_reserved_private_file(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
-    Ok(())
-}
-
-fn nearest_existing(path: &Path) -> Result<PathBuf, Error> {
-    let mut current = path;
-    loop {
-        match fs::symlink_metadata(current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(Error::UnsafePolicyPath)
-            }
-            Ok(_) => return Ok(current.to_owned()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                current = current.parent().ok_or(Error::UnsafePolicyPath)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
+    let parent = path.parent().ok_or(Error::UnsafePolicyPath)?;
+    let name = path.file_name().ok_or(Error::UnsafePolicyPath)?;
+    let temporary = format!(".pohunek-policy-write-{}", uuid::Uuid::now_v7());
+    match TrustedDir::open_absolute(parent, PRIVATE_DIRECTORY_MODE)
+        .map_err(|_| Error::UnsafePolicyPath)?
+        .replace_file(name, temporary, bytes, PRIVATE_FILE_MODE)
+    {
+        Ok(()) => Ok(()),
+        Err(AtomicReplaceError::BeforeCommit(_)) => Err(Error::Io {
+            kind: std::io::ErrorKind::Other,
+        }),
+        Err(_) => Err(Error::RecoveryRequired),
     }
 }
 
@@ -1144,7 +1379,7 @@ fn path_exists(path: &Path) -> Result<bool, Error> {
 }
 
 fn remove_owned_directory(path: &Path) {
-    let _ = fs::remove_dir_all(path);
+    let _ = trusted_remove_dir_all(path);
 }
 
 fn remove_current_stage(path: &Path) {
@@ -1152,12 +1387,12 @@ fn remove_current_stage(path: &Path) {
         .file_name()
         .is_some_and(|name| name.to_string_lossy().starts_with(STAGE_PREFIX));
     if current && validate_private_directory(path).is_ok() {
-        let _ = fs::remove_dir_all(path);
+        let _ = trusted_remove_dir_all(path);
     }
 }
 
 fn remove_owned_file(path: &Path) {
-    let _ = fs::remove_file(path);
+    let _ = trusted_remove_file(path);
 }
 
 #[cfg(test)]
@@ -1344,13 +1579,13 @@ mod tests {
             self.native.write_reserved(path, bytes)
         }
 
-        fn rename(&mut self, source: &Path, destination: &Path) -> Result<(), Error> {
-            self.before()?;
+        fn rename(&mut self, source: &Path, destination: &Path) -> RenameResult {
+            self.before().map_err(RenameFailure::BeforeCommit)?;
             self.native.rename(source, destination)
         }
 
-        fn rename_no_replace(&mut self, source: &Path, destination: &Path) -> Result<(), Error> {
-            self.before()?;
+        fn rename_no_replace(&mut self, source: &Path, destination: &Path) -> RenameResult {
+            self.before().map_err(RenameFailure::BeforeCommit)?;
             self.native.rename_no_replace(source, destination)
         }
 
@@ -1380,20 +1615,68 @@ mod tests {
             self.native.write_reserved(path, bytes)
         }
 
-        fn rename(&mut self, source: &Path, destination: &Path) -> Result<(), Error> {
+        fn rename(&mut self, source: &Path, destination: &Path) -> RenameResult {
             self.native.rename(source, destination)
         }
 
-        fn rename_no_replace(&mut self, source: &Path, destination: &Path) -> Result<(), Error> {
+        fn rename_no_replace(&mut self, source: &Path, destination: &Path) -> RenameResult {
             self.no_replace_calls += 1;
             if self.no_replace_calls == 2 {
-                fs::create_dir(&self.collision_path).map_err(Error::from)?;
+                fs::create_dir(&self.collision_path)
+                    .map_err(Error::from)
+                    .map_err(RenameFailure::BeforeCommit)?;
                 fs::set_permissions(
                     &self.collision_path,
                     fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
-                )?;
+                )
+                .map_err(Error::from)
+                .map_err(RenameFailure::BeforeCommit)?;
             }
             self.native.rename_no_replace(source, destination)
+        }
+
+        fn remove_file(&mut self, path: &Path) -> Result<(), Error> {
+            self.native.remove_file(path)
+        }
+
+        fn remove_dir_all(&mut self, path: &Path) -> Result<(), Error> {
+            self.native.remove_dir_all(path)
+        }
+    }
+
+    struct PostCommitRenameFailureFileOps {
+        native: NativeFileOps,
+        fail_at: usize,
+        rename_calls: usize,
+    }
+
+    impl FileOps for PostCommitRenameFailureFileOps {
+        fn write_new(&mut self, path: &Path, bytes: &[u8]) -> Result<(), Error> {
+            self.native.write_new(path, bytes)
+        }
+
+        fn write_reserved(&mut self, path: &Path, bytes: &[u8]) -> Result<(), Error> {
+            self.native.write_reserved(path, bytes)
+        }
+
+        fn rename(&mut self, source: &Path, destination: &Path) -> RenameResult {
+            self.rename_calls += 1;
+            self.native.rename(source, destination)?;
+            if self.rename_calls == self.fail_at {
+                Err(RenameFailure::Committed(Error::RecoveryRequired))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn rename_no_replace(&mut self, source: &Path, destination: &Path) -> RenameResult {
+            self.rename_calls += 1;
+            self.native.rename_no_replace(source, destination)?;
+            if self.rename_calls == self.fail_at {
+                Err(RenameFailure::Committed(Error::RecoveryRequired))
+            } else {
+                Ok(())
+            }
         }
 
         fn remove_file(&mut self, path: &Path) -> Result<(), Error> {
@@ -1740,18 +2023,136 @@ mod tests {
     }
 
     #[test]
+    fn committed_activation_failure_is_rolled_back_from_recorded_namespace_state() {
+        let (_root, target, policy_path, policy) = setup("committed-activation-failure");
+        let mut files = PostCommitRenameFailureFileOps {
+            native: NativeFileOps,
+            fail_at: 1,
+            rename_calls: 0,
+        };
+        let mut hermes = ControlledHermes::default();
+
+        assert_eq!(
+            install_with(
+                &mut hermes,
+                &InstallRequest::new(&target, &policy_path, &policy, false),
+                &mut files,
+            ),
+            Err(Error::RecoveryRequired)
+        );
+        assert!(!target.plugin_root().exists());
+        assert!(!policy_path.exists());
+        assert!(!hermes.enabled);
+    }
+
+    #[test]
     fn rename_no_replace_rejects_interior_nul_paths() {
         let invalid = Path::new(std::ffi::OsStr::from_bytes(b"invalid\0path"));
         let valid = Path::new("valid");
 
         for (source, destination) in [(invalid, valid), (valid, invalid)] {
             assert_eq!(
-                rename_no_replace(source, destination),
-                Err(Error::Io {
+                trusted_rename_no_replace(source, destination),
+                Err(RenameFailure::BeforeCommit(Error::Io {
                     kind: std::io::ErrorKind::InvalidInput,
-                })
+                }))
             );
         }
+    }
+
+    #[test]
+    fn collision_restore_failure_does_not_record_parent_rename_as_committed() {
+        let root = fixture("collision-restore-state");
+        let source = root.0.join("source");
+        let destination = root.0.join("destination");
+        fs::write(&source, b"source").expect("source file");
+        fs::set_permissions(&source, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+            .expect("private source");
+        fs::write(&destination, b"destination").expect("destination file");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+            .expect("private destination");
+
+        let result = trusted_rename_no_replace_with(&source, &destination, |original_source| {
+            fs::write(original_source, b"raced source")?;
+            fs::set_permissions(
+                original_source,
+                fs::Permissions::from_mode(PRIVATE_FILE_MODE),
+            )?;
+            Ok(())
+        });
+        let mut parent_rename_committed = false;
+
+        assert_eq!(
+            record_rename(result, &mut parent_rename_committed, true),
+            Err(Error::RecoveryRequired)
+        );
+        assert!(!parent_rename_committed);
+        assert_eq!(
+            fs::read(&destination).expect("preserved destination"),
+            b"destination"
+        );
+        assert_eq!(fs::read(&source).expect("raced source"), b"raced source");
+    }
+
+    #[test]
+    fn reservation_removal_failure_before_unlink_is_not_a_committed_move() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        fs::set_permissions(
+            root.path(),
+            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+        )
+        .expect("private temporary directory");
+        let source = root.path().join("source");
+        let destination = root.path().join(format!("{STAGE_PREFIX}reservation"));
+        fs::write(&source, b"source").expect("source file");
+        fs::write(&destination, b"").expect("reservation file");
+
+        let result = trusted_rename_replacing_reservation_with(
+            &source,
+            &destination,
+            |_path, _is_directory| {
+                Err(Error::Io {
+                    kind: std::io::ErrorKind::PermissionDenied,
+                })
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(RenameFailure::BeforeCommit(Error::RecoveryRequired))
+        );
+        assert_eq!(fs::read(&source).expect("preserved source"), b"source");
+        assert!(destination.exists());
+    }
+
+    #[test]
+    fn reservation_removal_failure_after_unlink_is_not_a_committed_move() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        fs::set_permissions(
+            root.path(),
+            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+        )
+        .expect("private temporary directory");
+        let source = root.path().join("source");
+        let destination = root.path().join(format!("{STAGE_PREFIX}reservation"));
+        fs::write(&source, b"source").expect("source file");
+        fs::write(&destination, b"").expect("reservation file");
+
+        let result = trusted_rename_replacing_reservation_with(
+            &source,
+            &destination,
+            |path, _is_directory| {
+                fs::remove_file(path)?;
+                Err(Error::RecoveryRequired)
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(RenameFailure::BeforeCommit(Error::RecoveryRequired))
+        );
+        assert_eq!(fs::read(&source).expect("preserved source"), b"source");
+        assert!(!destination.exists());
     }
 
     #[test]
@@ -1829,10 +2230,7 @@ esac"#,
             state = state.display(),
         );
         let hermes = write_executable(&binary_directory.join("hermes"), &hermes_body);
-        write_executable(
-            &binary_directory.join("python3"),
-            r#"exec /usr/bin/python3 "$@""#,
-        );
+        write_executable(&binary_directory.join("python3"), "exit 0");
 
         let mut runner = HermesRunner::new(&hermes).expect("runner");
         assert_eq!(
@@ -1969,7 +2367,7 @@ esac"#,
     }
 
     #[test]
-    fn exhausted_private_backup_names_leave_the_original_update_state_unchanged() {
+    fn predictable_backup_names_cannot_block_or_redirect_an_update() {
         let (_root, target, policy_path, policy) = setup("backup-exhaustion");
         let mut hermes = ControlledHermes::default();
         install(
@@ -1986,19 +2384,22 @@ esac"#,
             fs::set_permissions(&path, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
                 .expect("private backup reservation");
         }
-        assert_eq!(
-            install(
-                &mut hermes,
-                &InstallRequest::new(&target, &policy_path, &policy, false),
-            ),
-            Err(Error::Collision)
-        );
+        install(
+            &mut hermes,
+            &InstallRequest::new(&target, &policy_path, &policy, false),
+        )
+        .expect("random transaction name bypasses predictable reservations");
         assert_eq!(
             fs::read(target.plugin_root().join("tools.py")).expect("tool"),
             original_tool
         );
         assert_eq!(fs::read(&policy_path).expect("policy"), original_policy);
         assert!(hermes.enabled);
+        for attempt in 0..SIBLING_NAME_ATTEMPTS {
+            assert!(parent
+                .join(format!("{BACKUP_PREFIX}{}-{attempt}", std::process::id()))
+                .is_dir());
+        }
     }
 
     #[test]
@@ -2268,5 +2669,97 @@ esac"#,
             Err(Error::UnsafePolicyPath)
         );
         assert_eq!(assets.len(), 8);
+    }
+
+    #[test]
+    fn transaction_lock_rejects_overlapping_lifecycle() {
+        let (_root, _target, policy_path, _policy) = setup("transaction-lock");
+        let first = acquire_transaction_lock(&policy_path).expect("acquire lifecycle lock");
+        assert!(matches!(
+            acquire_transaction_lock(&policy_path),
+            Err(Error::TransactionBusy)
+        ));
+        drop(first);
+        acquire_transaction_lock(&policy_path).expect("reacquire released lifecycle lock");
+    }
+
+    #[test]
+    fn concurrent_disjoint_updates_cannot_commit_from_the_same_policy_snapshot() {
+        let (_root, target, policy_path, policy) = setup("concurrent-update");
+        install(
+            &mut ControlledHermes::default(),
+            &InstallRequest::new(&target, &policy_path, &policy, false),
+        )
+        .expect("install initial policy");
+        let (loaded_tx, loaded_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+
+        std::thread::scope(|scope| {
+            let target_ref = &target;
+            let policy_path_ref = &policy_path;
+            let first = scope.spawn(move || {
+                update(
+                    &mut ControlledHermes::default(),
+                    target_ref,
+                    policy_path_ref,
+                    false,
+                    |existing| {
+                        loaded_tx.send(()).expect("signal locked policy load");
+                        release_rx.recv().expect("release first update");
+                        policy_with(existing, AccessMode::Full, existing.allowed_hosts())
+                    },
+                )
+            });
+            loaded_rx
+                .recv()
+                .expect("first update holds transaction lock");
+            assert!(matches!(
+                update(
+                    &mut ControlledHermes::default(),
+                    &target,
+                    &policy_path,
+                    false,
+                    |existing| policy_with(existing, existing.access_mode(), ["remote"]),
+                ),
+                Err(Error::TransactionBusy)
+            ));
+            release_tx.send(()).expect("release first update");
+            first
+                .join()
+                .expect("join first update")
+                .expect("first update");
+        });
+
+        update(
+            &mut ControlledHermes::default(),
+            &target,
+            &policy_path,
+            false,
+            |existing| policy_with(existing, existing.access_mode(), ["remote"]),
+        )
+        .expect("retry second update from committed snapshot");
+        let merged = Policy::load_private(&policy_path).expect("load merged policy");
+        assert_eq!(merged.access_mode(), AccessMode::Full);
+        assert_eq!(merged.allowed_hosts().collect::<Vec<_>>(), ["remote"]);
+    }
+
+    fn policy_with<'a>(
+        existing: &Policy,
+        access_mode: AccessMode,
+        allowed_hosts: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Policy, Error> {
+        Policy::new(PolicyInput {
+            pohunek_cli: existing.pohunek_cli().to_owned(),
+            protocol_min: existing.protocol_min(),
+            protocol_max: existing.protocol_max(),
+            access_mode,
+            allowed_hosts: allowed_hosts.into_iter().map(str::to_owned).collect(),
+            tool_timeout_ms: existing.tool_timeout_ms(),
+            request_timeout_ms: existing.request_timeout_ms(),
+            max_output_bytes: existing.max_output_bytes(),
+            max_screen_bytes: existing.max_screen_bytes(),
+            max_concurrency: existing.max_concurrency(),
+            wildcard_confirmation: WildcardConfirmation::new(false),
+        })
     }
 }

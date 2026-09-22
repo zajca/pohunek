@@ -6,8 +6,10 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-09-13
+// Rust guideline compliant 2026-09-19
 
+#[cfg(unix)]
+pub mod filesystem;
 pub mod peer;
 pub mod process;
 pub mod supervisor;

@@ -27,7 +27,7 @@ use protocol::{
     ProtocolError,
 };
 
-use crate::store::{ProjectRecord, ProjectResolution, Store, WorktreeStatus};
+use crate::store::{ProjectRecord, ProjectResolution, Store, StoreMutation, WorktreeStatus};
 use crate::time::now_rfc3339;
 use crate::worktree::canonical_or_original;
 
@@ -150,6 +150,7 @@ impl ProjectManager {
                 Some(record)
             })
             .map_err(store_error)?
+            .into_value()
             .expect("upsert closure always returns Some, so a record is written");
         Ok(record)
     }
@@ -172,6 +173,7 @@ impl ProjectManager {
                     record
                 })
             })
+            .map(StoreMutation::into_value)
             .map_err(store_error)
     }
 
@@ -236,6 +238,7 @@ impl ProjectManager {
                 })
             })
             .map_err(store_error)?
+            .into_value()
             // The project resolved a moment ago; only a racing `project rm` could
             // have removed it before the locked write. Surface that as not-found.
             .map(|record| to_info(&record))
@@ -249,6 +252,7 @@ impl ProjectManager {
         let record = self.resolve(reference)?;
         self.store
             .remove_project(&record.git_common_dir)
+            .map(StoreMutation::into_value)
             .map_err(store_error)
     }
 
@@ -508,6 +512,7 @@ pub fn detect_at(path: &Path) -> Result<Option<DetectedProject>, ProtocolError> 
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
@@ -526,6 +531,8 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("pohunek-pm-{tag}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("secure temp directory");
         dir
     }
 

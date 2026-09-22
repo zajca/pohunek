@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -29,6 +30,7 @@ fn unique_dir(tag: &str) -> PathBuf {
         .as_nanos();
     let dir = std::env::temp_dir().join(format!("pohunek-wt-{tag}-{}-{nanos}", std::process::id()));
     fs::create_dir_all(&dir).expect("create temp dir");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("secure temp directory");
     dir
 }
 
@@ -868,7 +870,7 @@ fn binding_persist_failure_rolls_back_the_worktree() {
     let probe = store_dir.join(".probe");
     if fs::write(&probe, b"x").is_ok() {
         let _ = fs::remove_file(&probe);
-        let _ = fs::set_permissions(&store_dir, fs::Permissions::from_mode(0o755));
+        let _ = fs::set_permissions(&store_dir, fs::Permissions::from_mode(0o700));
         eprintln!(
             "skipping binding_persist_failure_rolls_back_the_worktree: perms not enforced (root?)"
         );
@@ -878,7 +880,7 @@ fn binding_persist_failure_rolls_back_the_worktree() {
     let result = mgr.bind(&request("s-1", &repo, "feat/x"));
 
     // Restore perms first so the temp dir is cleanable regardless of the outcome.
-    fs::set_permissions(&store_dir, fs::Permissions::from_mode(0o755))
+    fs::set_permissions(&store_dir, fs::Permissions::from_mode(0o700))
         .expect("restore store dir perms");
 
     let err = result.expect_err("bind must fail when the binding cannot be persisted");
