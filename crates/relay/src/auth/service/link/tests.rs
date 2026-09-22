@@ -270,6 +270,51 @@ async fn audited(store: &Store, action: &str, decision: &str) -> i64 {
         .expect("read audit count")
 }
 
+/// Reads the attribution of the newest denial row for one action and outcome.
+async fn denial(
+    store: &Store,
+    action: &str,
+    outcome: &str,
+) -> Option<(Option<Uuid>, String, String, String)> {
+    sqlx::query(
+        "SELECT actor_principal_id, actor_kind, parameter_code, parameter_value \
+         FROM audit_events WHERE action = $1 AND decision = 'deny' AND outcome = $2 \
+         ORDER BY occurred_at DESC LIMIT 1",
+    )
+    .bind(action)
+    .bind(outcome)
+    .fetch_optional(store.pool())
+    .await
+    .expect("read denial audit")
+    .map(|row| {
+        (
+            row.get("actor_principal_id"),
+            row.get("actor_kind"),
+            row.get("parameter_code"),
+            row.get("parameter_value"),
+        )
+    })
+}
+
+/// Asserts one denial is durably recorded and attributable to this account.
+async fn assert_denied(
+    store: &Store,
+    action: &str,
+    outcome: &str,
+    principal_id: Uuid,
+    parameter_code: &str,
+    target: &str,
+) {
+    let row = denial(store, action, outcome).await;
+    let Some((actor, kind, code, value)) = row else {
+        panic!("no {action} denial recorded for {outcome}");
+    };
+    assert_eq!(actor, Some(principal_id), "{outcome} names its principal");
+    assert_eq!(kind, "human", "{outcome} names the actor kind");
+    assert_eq!(code, parameter_code, "{outcome} names its resource kind");
+    assert_eq!(value, target, "{outcome} names its target coordinate");
+}
+
 /// Installs a trigger that fails every audit insert for one action.
 async fn reject_audit(store: &Store, action: &str) {
     let name = action.replace('.', "_");
@@ -1564,5 +1609,260 @@ async fn link_transactions_expire_on_the_configured_bound() {
         trailing < Duration::from_secs(1),
         "the stored window {window:?} must be the configured {configured:?}"
     );
+    cleanup(&pool, &schema).await;
+}
+
+/// Every refused transition leaves an attributable denial record, so a refusal
+/// is usable evidence rather than a silent return.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "The denial record for each refusal class must stay adjacent to the refusal that produced it."
+)]
+async fn every_refused_transition_records_an_attributable_denial() {
+    let (store, schema, pool) = fixture().await;
+    let (authority, _directory) = authority(store.clone()).await;
+    let service = service(&store, authority);
+    let oidc = OidcClient::test_client();
+    let owner = seed_account(&store, &service, "denial-owner").await;
+    let stranger = seed_account(&store, &service, "denial-stranger").await;
+    let none = "none".to_owned();
+
+    // Start refusals, before any transaction exists.
+    assert!(matches!(
+        service
+            .begin_browser_link(&oidc, owner.bearer, link_request())
+            .await,
+        Err(AuthError::LinkChannelMismatch)
+    ));
+    assert_denied(
+        &store,
+        LINK_BEGIN_ACTION,
+        "channel_mismatch",
+        owner.principal_id,
+        "account_link",
+        &none,
+    )
+    .await;
+
+    let service_actor = seed_service_actor(&store, &service).await;
+    assert!(matches!(
+        open_link(&service, &store, service_actor, AccountLinkChannel::Device).await,
+        Err(AuthError::LinkUnsupportedActor)
+    ));
+
+    let open = open_link(&service, &store, owner.bearer, AccountLinkChannel::Device)
+        .await
+        .expect("open a device transaction");
+    let target = open.record.link_id.to_string();
+
+    // A second start meets the one-pending index.
+    assert!(matches!(
+        service
+            .begin_browser_link(&oidc, owner.browser, link_request())
+            .await,
+        Err(AuthError::LinkPending)
+    ));
+    assert_denied(
+        &store,
+        LINK_BEGIN_ACTION,
+        "already_pending",
+        owner.principal_id,
+        "account_link",
+        &none,
+    )
+    .await;
+
+    // Poll refusals.
+    assert!(matches!(
+        service
+            .poll_device_link(
+                &oidc,
+                owner.bearer,
+                open.record.link_id,
+                DevicePollSecret::new("wrong-secret".to_owned()),
+            )
+            .await,
+        Err(AuthError::CredentialInvalid)
+    ));
+    assert_denied(
+        &store,
+        LINK_POLL_ACTION,
+        "possession_invalid",
+        owner.principal_id,
+        "account_link",
+        &target,
+    )
+    .await;
+    assert!(matches!(
+        service
+            .poll_device_link(
+                &oidc,
+                stranger.bearer,
+                open.record.link_id,
+                DevicePollSecret::new(open.possession.clone()),
+            )
+            .await,
+        Err(AuthError::LinkCrossPrincipal)
+    ));
+    assert_denied(
+        &store,
+        LINK_POLL_ACTION,
+        "cross_principal",
+        stranger.principal_id,
+        "account_link",
+        &target,
+    )
+    .await;
+    assert!(matches!(
+        service
+            .poll_device_link(
+                &oidc,
+                owner.browser,
+                open.record.link_id,
+                DevicePollSecret::new(open.possession.clone()),
+            )
+            .await,
+        Err(AuthError::LinkChannelMismatch)
+    ));
+
+    // Completion refusals keep their narrower causes apart in the record even
+    // though they share one typed error.
+    assert!(matches!(
+        service
+            .commit_link_once(
+                &oidc,
+                commit_for(&open, 2),
+                &proven("denial-stale"),
+                Some(owner.bearer),
+            )
+            .await,
+        Err(AuthError::LinkStale)
+    ));
+    assert_denied(
+        &store,
+        LINK_COMPLETE_ACTION,
+        "generation_stale",
+        owner.principal_id,
+        "account_link",
+        &target,
+    )
+    .await;
+    assert!(matches!(
+        service
+            .commit_link_once(
+                &oidc,
+                commit_for(&open, 1),
+                &OidcIdentity {
+                    issuer: "https://other-issuer.example".to_owned(),
+                    subject: "denial-foreign".to_owned(),
+                },
+                Some(owner.bearer),
+            )
+            .await,
+        Err(AuthError::LinkStale)
+    ));
+    assert_denied(
+        &store,
+        LINK_COMPLETE_ACTION,
+        "binding_mismatch",
+        owner.principal_id,
+        "account_link",
+        &target,
+    )
+    .await;
+
+    // A self-link denial names the account and the transaction it refused.
+    assert!(matches!(
+        service
+            .commit_link_once(
+                &oidc,
+                commit_for(&open, 1),
+                &proven("denial-owner"),
+                Some(owner.bearer),
+            )
+            .await,
+        Err(AuthError::LinkSelf)
+    ));
+    assert_denied(
+        &store,
+        LINK_COMPLETE_ACTION,
+        "self_link",
+        owner.principal_id,
+        "account_link",
+        &target,
+    )
+    .await;
+
+    // A cancel refusal names the coordinate the caller asked for, even when no
+    // such transaction exists.
+    let unknown = Uuid::now_v7();
+    assert!(matches!(
+        service
+            .cancel_account_link(
+                owner.bearer,
+                unknown,
+                CancelAccountLinkRequest {
+                    idempotency: idempotency()
+                },
+            )
+            .await,
+        Err(AuthError::LinkNotFound)
+    ));
+    assert_denied(
+        &store,
+        LINK_CANCEL_ACTION,
+        "not_found",
+        owner.principal_id,
+        "account_link",
+        &unknown.to_string(),
+    )
+    .await;
+
+    // Unlink refusals name the identity, not the transaction.
+    assert!(matches!(
+        service
+            .unlink_identity(
+                owner.bearer,
+                owner.identity_id,
+                UnlinkIdentityRequest {
+                    idempotency: idempotency()
+                },
+            )
+            .await,
+        Err(AuthError::UnlinkLastIdentity)
+    ));
+    assert_denied(
+        &store,
+        UNLINK_ACTION,
+        "last_identity",
+        owner.principal_id,
+        "oidc_identity",
+        &owner.identity_id.to_string(),
+    )
+    .await;
+
+    // Recovery quarantine is recorded even though the relay is no longer normal.
+    sqlx::query(
+        "UPDATE relay_identity SET recovery_generation = recovery_generation + 1 WHERE relay_id = 'test-relay'",
+    )
+    .execute(store.pool())
+    .await
+    .expect("advance the recovery generation");
+    assert!(matches!(
+        service
+            .begin_browser_link(&oidc, owner.browser, link_request())
+            .await,
+        Err(AuthError::LinkQuarantined)
+    ));
+    assert_denied(
+        &store,
+        LINK_BEGIN_ACTION,
+        "recovery_quarantine",
+        owner.principal_id,
+        "account_link",
+        &none,
+    )
+    .await;
     cleanup(&pool, &schema).await;
 }
