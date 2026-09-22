@@ -25,7 +25,9 @@
   absent while a refused fact about an owned process stays a denial, and the
   three facts macOS withholds without a privilege pohunek does not request
   (a foreign process's working directory and argument vector, and a
-  code-signing-restricted process's environment).
+  code-signing-restricted process's environment). An argument vector an `exec`
+  or an exit withholds leaves that one process without a command line instead of
+  failing the inventory it appears in.
 - Documented the shared secure runtime-path and portable filesystem foundation:
   preserved XDG durable locations, the owner-private macOS runtime default,
   fail-closed path validation, byte-bounded Unix sockets, atomic no-replace

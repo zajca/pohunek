@@ -354,12 +354,13 @@ fn read_process_fact(
 
 /// Reads and decodes the `KERN_PROCARGS2` regions of one same-user process.
 ///
-/// Returns `None` for a process that holds no argument region: one that exited,
-/// one retained as a zombie, one already inside `exit`, and one that has forked
-/// but not yet published the region its `exec` will write. The caller has
-/// established ownership, so the region being absent is the only thing `EINVAL`
-/// can report, and whether the process itself exists stays a question for the
-/// process record.
+/// Returns `None` for a process whose argument region cannot be observed right
+/// now: one that exited, one retained as a zombie, one already inside `exit`,
+/// one that has forked but not yet published the region its `exec` will write,
+/// and one whose address space is being replaced or torn down while the kernel
+/// copies it out. The caller has established ownership, so an absent region is
+/// the only thing `EINVAL` can report, and whether the process itself exists
+/// stays a question for the process record, never for this read.
 fn read_arguments(
     pid: Pid,
     fact: &BsdFact,
@@ -372,6 +373,7 @@ fn read_arguments(
         Ok(buffer) => buffer,
         Err(error) if is_process_race(&error) => return Ok(None),
         Err(error) if is_missing_argument_region(&error) => return Ok(None),
+        Err(error) if is_uncopyable_argument_region(&error) => return Ok(None),
         Err(source) => return Err(Error::from_io(operation, source)),
     };
     parse_process_arguments(&buffer)
@@ -410,6 +412,16 @@ fn is_process_race(error: &io::Error) -> bool {
 /// it on exit, and answers `EINVAL` whenever the region is not there.
 fn is_missing_argument_region(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::EINVAL)
+}
+
+/// Returns whether `sysctl` could not copy the argument region out.
+///
+/// Darwin answers `EIO` only when copying the target's address space fails,
+/// which is what happens while an `exec` replaces that space or an exit tears it
+/// down. It reports nothing about the process, so the record stays the authority
+/// on whether it exists.
+fn is_uncopyable_argument_region(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EIO)
 }
 
 /// Returns whether the kernel refused to serve the record at all.

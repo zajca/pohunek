@@ -63,7 +63,10 @@ the working directory of another user's process, that process's argument vector,
 and the environment of a code-signing-restricted process, whose environment
 region the kernel omits even for the owner. A process whose environment cannot be
 read reports no ownership markers, which keeps it observable rather than
-adoptable. The shared
+adoptable. An argument vector is an optional fact for the same reason: a process
+that has not finished its `exec`, or whose address space is being replaced or
+torn down while the kernel copies it out, is reported without a command line
+rather than failing the inventory it appears in. The shared
 secure-path contract preserves XDG config/data/state/cache precedence and adds a
 short, owner-private macOS runtime default without moving durable host identity.
 Native Apple Silicon CI compiles and tests these shared contracts with a macOS
