@@ -921,9 +921,17 @@ impl ApiFailure {
             AuthError::CredentialInvalid | AuthError::CsrfInvalid | AuthError::OriginInvalid => {
                 Self::unauthenticated()
             }
-            AuthError::Capacity | AuthError::Durable | AuthError::IssuerUnavailable => {
-                Self::unavailable()
-            }
+            // `Retryable` is an internal SERIALIZABLE-conflict signal. It is meant
+            // to be consumed by a retry loop, but any path that leaks it must
+            // still tell the client the attempt is worth retrying rather than
+            // malformed, so it is explicit here instead of falling through.
+            AuthError::Capacity
+            | AuthError::Durable
+            | AuthError::Retryable
+            | AuthError::IssuerUnavailable
+            // Recovery quarantine is a temporary refusal to change authority, so
+            // it reads as unavailable rather than as a client error.
+            | AuthError::LinkQuarantined => Self::unavailable(),
             AuthError::IdempotencyConflict => Self {
                 status: StatusCode::CONFLICT,
                 code: "state_conflict",
@@ -936,7 +944,6 @@ impl ApiFailure {
                 status: StatusCode::BAD_REQUEST,
                 code: "rotation_rejected",
             },
-            AuthError::LinkQuarantined => Self::unavailable(),
             AuthError::LinkUnsupportedActor | AuthError::LinkCrossPrincipal => Self::forbidden(),
             AuthError::LinkNotFound | AuthError::IdentityNotFound => Self::not_found(),
             AuthError::LinkExpired => Self {
@@ -1609,6 +1616,19 @@ mod tests {
             HeaderValue::from_static("__Host-pohunek-relay-login=second"),
         );
         cookie(&separate_headers, LOGIN_COOKIE).unwrap_err();
+    }
+
+    /// A leaked retry signal must read as retryable, not as a malformed request.
+    #[test]
+    fn a_retry_signal_maps_to_unavailable_rather_than_invalid() {
+        let retryable = super::ApiFailure::auth(&AuthError::Retryable);
+        assert_eq!(retryable.status, super::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retryable.code, super::ApiFailure::unavailable().code);
+        // The catch-all remains 400 for genuinely malformed input.
+        assert_eq!(
+            super::ApiFailure::auth(&AuthError::Malformed).status,
+            super::StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]
