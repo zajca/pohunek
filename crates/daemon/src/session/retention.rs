@@ -68,6 +68,15 @@ const MIN_TTL_SECS: u32 = 3_600;
 /// produce a control line above the protocol's framing limit.
 const MAX_REPORTED_CANDIDATES: usize = 200;
 
+/// Maximum worktree safety probes one sweep performs.
+///
+/// Each probe runs up to three bounded `git` commands against one checkout, so an
+/// unbounded count would let a host with hundreds of stale worktrees hold the
+/// sweep lock far longer than the shutdown budget. It is comfortably above the
+/// default per-sweep removal cap, and a candidate past it is held as unknown
+/// rather than removed, so the bound only delays cleanup to the next sweep.
+pub(super) const MAX_WORKTREE_PROBES_PER_SWEEP: usize = 64;
+
 /// Maximum time to wait for a running sweep during daemon shutdown.
 ///
 /// A sweep performs bounded local filesystem work per session. Five seconds
@@ -264,14 +273,29 @@ impl SessionRegistry {
     /// deletes the checkout without asking, so a selected session only stays
     /// removable while its worktree is provably empty of work. `session rm` is an
     /// explicit operator action and is deliberately not subject to this rule.
-    async fn apply_worktree_holds(&self, candidates: &mut [SessionRetentionCandidate]) {
+    ///
+    /// At most [`MAX_WORKTREE_PROBES_PER_SWEEP`] checkouts are inspected per
+    /// sweep; anything left over is held as unknown.
+    pub(super) async fn apply_worktree_holds(&self, candidates: &mut [SessionRetentionCandidate]) {
         let Some(worktree) = self.inner.worktree.clone() else {
             return;
         };
+        let mut probes = 0_usize;
         for candidate in candidates
             .iter_mut()
             .filter(|candidate| candidate.worktree_path.is_some())
         {
+            if probes >= MAX_WORKTREE_PROBES_PER_SWEEP {
+                // Unprobed means unproven, which means kept. Candidates are
+                // ordered oldest first, so the next sweep starts with these.
+                candidate.hold = Some(SessionRetentionHold::WorktreeUnknown);
+                debug!(
+                    session_id = %candidate.session_id.0,
+                    "session retention kept a session it had no probe budget left to inspect"
+                );
+                continue;
+            }
+            probes += 1;
             let manager = Arc::clone(&worktree);
             let session_id = candidate.session_id.0.clone();
             let work = match tokio::task::spawn_blocking(move || manager.unsaved_work(&session_id))

@@ -12770,3 +12770,39 @@ async fn concurrent_sweeps_are_serialised_by_the_sweep_lock() {
     );
     assert!(session_ids(&registry).await.is_empty());
 }
+
+#[tokio::test]
+async fn the_worktree_probe_budget_holds_every_candidate_it_could_not_inspect() {
+    let (registry, _data_dir, _worktree_root) = retention_registry("sweep-probe-budget");
+    // One candidate past the per-sweep probe budget. The paths need not exist:
+    // what is pinned is that an uninspected candidate is held, not removed.
+    let budget = super::retention::MAX_WORKTREE_PROBES_PER_SWEEP;
+    let mut candidates = (0..=budget)
+        .map(|index| protocol::SessionRetentionCandidate {
+            session_id: SessionId(format!("s-probe-{index}")),
+            reason: protocol::SessionRetentionReason::Terminal,
+            age_secs: 7_200,
+            worktree_path: Some(PathBuf::from(format!(
+                "/nonexistent/worktrees/s-probe-{index}"
+            ))),
+            hold: None,
+            removed: false,
+        })
+        .collect::<Vec<_>>();
+
+    registry.apply_worktree_holds(&mut candidates).await;
+
+    let held = candidates
+        .iter()
+        .filter(|candidate| candidate.hold.is_some())
+        .count();
+    assert_eq!(
+        held, 1,
+        "only the candidate past the budget is held: {candidates:?}"
+    );
+    assert_eq!(
+        candidates[budget].hold,
+        Some(protocol::SessionRetentionHold::WorktreeUnknown),
+        "an uninspected candidate is unproven, so it is kept"
+    );
+}

@@ -336,7 +336,9 @@ cannot report at all. A held session is reported with a `hold` reason
 (`worktree_uncommitted`, `worktree_untracked`, `worktree_unpushed`,
 `worktree_unknown`), counted in `held` rather than `eligible`, and logged — its
 worktree stays on disk. Ignored files are not a hold, since they are ignored on
-purpose and regenerated. `session rm` is unaffected: an explicit operator removal
+purpose and regenerated. One sweep inspects at most 64 checkouts; a matched
+session past that bound is held as `worktree_unknown` and inspected by the next
+sweep, because an uninspected checkout is an unproven one. `session rm` is unaffected: an explicit operator removal
 still removes a dirty worktree, which is how a held session is cleaned up once
 the operator has looked at it.
 
