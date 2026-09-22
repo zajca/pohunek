@@ -104,10 +104,61 @@ markers, and bounded inventory. Exit observation uses kqueue process events with
 registration/recheck logic that rejects exit and PID-reuse races.
 
 Unix peer credentials come from the accepted socket before request dispatch.
-Darwin uses `LOCAL_PEERCRED` and `LOCAL_PEERPID`, or an equally strong supported
-kernel API. Same-owner checks, process-start checks, launch ancestry, frozen
-provider binding, lease, sequence, expiry, and immutable identity rules remain
-unchanged. Request fields and UID alone cannot establish a PID-bound claim.
+Darwin uses `LOCAL_PEERCRED` for the owner and `LOCAL_PEERPID` for the process
+id. Same-owner checks, process-start checks, launch ancestry, frozen provider
+binding, lease, sequence, expiry, and immutable identity rules remain unchanged.
+Request fields and UID alone cannot establish a PID-bound claim, and a peer the
+kernel cannot attest is an explicit rejection rather than a downgrade.
+
+Peer identity has two halves with different guarantees, and the contract names
+them separately. The owner is **connection-time** identity: both kernels freeze
+it when the connection is established, Linux in the socket's `SO_PEERCRED`
+record and Darwin by copying the connecting process's credentials into the
+accepted socket inside `unp_connect`. The process id is **inspection-time**
+identity: Linux freezes it with the rest of `SO_PEERCRED`, but Darwin serves
+`LOCAL_PEERPID` from the peer socket's `last_pid`, which the kernel re-stamps
+whenever a different process operates on that socket, so a descriptor inherited
+across `fork`/`exec` or passed over `SCM_RIGHTS` changes the reported peer.
+Services therefore capture the peer before parsing a request and re-read the
+kernel answer before every decision that grants authority; a drift is a typed
+rejection. Because a connection outlives the moment it was authorized, that
+means every request on a leased control connection, every frame of a live data
+stream including the deferred page an observation stream releases after its
+wait, and a timed re-check while a leased connection is silent — an exclusive
+lease held by a descriptor inherited from an exited daemon would otherwise block
+recovery. A peer that exited
+without being reaped is not live either: a zombie keeps its process id and
+start identity, so liveness is asked of the process record rather than inferred
+from identity alone. An in-place `exec` stays indistinguishable, because it preserves both
+the process id and the kernel start time, and executable identity remains the
+launch-claim path's concern rather than the transport's.
+
+`LOCAL_PEERTOKEN` was evaluated as the stronger alternative and rejected. The
+kernel resolves it through the same `last_pid`, so it does not detect a
+descriptor hand-off either; `audit_token_t` is absent from `libc`, its field
+layout is undocumented, and `libbsm` has been deprecated since macOS 11. The
+shared process start identity already supplies process-reuse protection on both
+targets.
+
+A private identity report is accepted only from the process it names or from a
+descendant of it. That is the shape every shipped hook already has — Codex and
+Claude run their hook as a child of the agent whose id they report, and the
+pinned Hermes plugin reports from the agent process — and it keeps an unrelated
+command in the same terminal from rewriting another process's identity, which
+matters because the PTY root's environment carries the runtime id and the
+private socket path. The stricter `peer == subject` binding belongs to the
+explicit in-process identity mode in
+[#52](https://github.com/zajca/pohunek/issues/52), which can require it on a
+wire shape of its own without breaking child hooks. Note that #98's test list
+also asks for "a child claiming a parent PID" to be rejected while its required
+behavior asks for existing child hooks to keep working; those cannot both hold
+for the shipped integrations, and this RFC records the reading that preserves
+them.
+
+The public `session.report_native_id` fallback, which a hook uses when the
+private worker socket is unreachable, carries no kernel peer binding. It keeps
+its existing runtime, ordering, expiry, and provider rules, and hardening it is
+separate work.
 
 The daemon and every worker are separate sibling launchd jobs in the owner's
 login domain. Worker definitions are private, explicitly registered, and do not

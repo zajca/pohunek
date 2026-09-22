@@ -280,8 +280,17 @@ owns this recovery contract.
 `crates/platform` defines the narrow operating-system contracts shared by the
 daemon and session worker. Process facts use a PID plus opaque same-boot start
 identity, with a separate boot identity where persistence crosses reboots.
-Kernel peer credentials are captured in the platform backend while
-authorization policy stays with the accepting service.
+Kernel peer identity is captured in the platform backend while authorization
+policy stays with the accepting service. It has two halves: the peer's owner is
+connection-time identity that both kernels freeze when the connection is
+established, while the peer process id is inspection-time identity, because
+Darwin serves it from the peer socket's last operating process rather than from
+a connect-time snapshot. A service therefore captures the peer before parsing a
+request and re-reads the kernel answer before each decision that grants
+authority, so a descriptor handed to another process is rejected rather than
+inherited. A peer the kernel cannot attest, or one without a process id, is an
+explicit rejection; neither a request field nor the owner alone can stand in for
+one.
 
 Native service supervision exposes validated logical IDs, portable states, and
 stable process identities through start, bounded discovery, inspect, replace,
@@ -292,9 +301,10 @@ Worker readiness and authority still come from the private worker handshake.
 The shared contract crate compiles and tests natively on Apple Silicon Darwin
 with a macOS 14 deployment target. Intel Macs are outside the current release
 scope. The secure runtime-path and portable filesystem contract also runs
-natively on APFS. This is foundation evidence, not a claim that macOS host
-support ships: native process and peer inspection, portable PTY I/O, launchd,
-clients, packaging, and full acceptance remain ordered work in #97-#105.
+natively on APFS, and native process and peer inspection are in place. This is
+foundation evidence, not a claim that macOS host support ships: portable PTY
+I/O, launchd, clients, packaging, and full acceptance remain ordered work in
+#99-#105.
 
 The host daemon is the local control plane for one machine, written in Rust.
 
@@ -527,8 +537,14 @@ Hooks have two separate roles:
   validates process ancestry and accepts this binding only for the designated
   immutable launch agent; it journals the accepted value before forwarding it
   to the daemon. This keeps recovery tied to the original launch identity and
-  retains the claim across daemon outage. If the private endpoint cannot be
-  reached, the hook uses the local public daemon as a hardened fallback. That
+  retains the claim across daemon outage. Every private report is additionally
+  bound to its reporter: the worker accepts it only from the process it names or
+  from a descendant of that process, using kernel peer identity the caller
+  cannot supply. That is the shape the shipped hooks already have, and it stops
+  an unrelated command in the same terminal from rewriting another process's
+  identity. If the private endpoint cannot be reached, the hook uses the local
+  public daemon as a hardened fallback; that path has no kernel peer binding and
+  relies on its runtime, ordering, expiry, and provider rules alone. That
   report carries the exact runtime id, PID plus kernel start identity, a
   monotonic sequence, and a short RFC 3339 expiry. The daemon rejects stale
   runtime/session/provider identity, PID reuse, expired claims, and duplicate or

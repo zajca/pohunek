@@ -8,10 +8,11 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-09-14
+// Rust guideline compliant 2026-09-22
 
 mod config;
 mod error;
+mod identity;
 mod input;
 mod journal;
 mod launch;
@@ -24,6 +25,8 @@ mod server;
 pub use config::{ConfigError, WorkerConfig};
 #[doc(inline)]
 pub use error::WorkerError;
+#[doc(inline)]
+pub use identity::RejectReason;
 #[doc(inline)]
 pub use input::{InputError, InputFragment, InputPlan, WriteCoordinator};
 #[doc(inline)]

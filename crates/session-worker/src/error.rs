@@ -1,9 +1,10 @@
 //! Defines the worker's top-level typed error.
 
-// Rust guideline compliant 2026-09-19
+// Rust guideline compliant 2026-09-22
 
 use std::path::PathBuf;
 
+use crate::identity::RejectReason;
 use crate::{ConfigError, JournalError, PtyError};
 
 /// Failure while starting or serving one worker.
@@ -52,6 +53,12 @@ pub enum WorkerError {
     /// Private protocol handling failed.
     #[error("worker protocol failed: {0}")]
     Protocol(String),
+    /// The connecting peer could not be bound to a trusted process identity.
+    #[error("worker peer identity rejected: {reason}")]
+    PeerIdentity {
+        /// Stable, payload-free rejection code.
+        reason: RejectReason,
+    },
     /// No valid controller initialized the worker in time.
     #[error("worker initialization deadline elapsed")]
     InitializeTimeout,

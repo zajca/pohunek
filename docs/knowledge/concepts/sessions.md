@@ -389,7 +389,11 @@ process, so a nested different or same-provider agent cannot overwrite the
 parent session's recovery reference. Managed children inherit the stable
 `POHUNEK_SESSION_ID`, `POHUNEK_WORKER_ID`,
 `POHUNEK_WORKER_SOCKET_PATH`, and worker hook protocol version. Identity hooks
-prefer the worker endpoint so accepted state survives daemon outage. Nested
+prefer the worker endpoint so accepted state survives daemon outage. The worker
+binds every private report to the process that sends it: the connecting peer,
+taken from the kernel and never from the request, must be the reported process
+itself or a descendant of it. The shipped hooks already have that shape, and a
+same-session sibling reporting another process is rejected. Nested
 active-agent reports remain runtime evidence only: they can expose the active
 agent and active native metadata while that process runs, but never populate or
 replace `native_session_id` / `native_session_path` for the parent session.
@@ -401,7 +405,8 @@ persisted session and recovery binding; it does not replace an already captured
 native reference with an empty worker field.
 If the owner-private worker identity claim cannot be delivered, the shipped
 hook falls back to the local public daemon with the exact runtime id, PID and
-kernel start identity, a monotonic sequence, and a short expiry. Stale runtime,
+kernel start identity, a monotonic sequence, and a short expiry. That public
+path carries no kernel peer binding, so it rests on those rules alone. Stale runtime,
 PID reuse, wrong provider/session, expiry, and duplicate or reordered reports
 are rejected. The public path is fallback; the private worker claim remains
 preferred because it survives daemon outage.

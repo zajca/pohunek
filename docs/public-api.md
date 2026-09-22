@@ -307,7 +307,11 @@ including observation, remain available. The lifecycle reports
 `session.report_agent`, `session.release_agent`, and `session.report_native_id`
 are explicitly allowed because hooks must report their own session; the public
 native-id report is the necessary local fallback when the owner-private worker
-claim cannot be delivered. This is a narrow server-side confused-deputy guard
+claim cannot be delivered. The owner-private worker claim is additionally bound
+to kernel peer identity — the worker accepts a report only from the process it
+names or from a descendant of that process, and never from a request field —
+while this public fallback has no peer binding and rests on its runtime,
+ordering, expiry, and provider rules alone. This is a narrow server-side confused-deputy guard
 inside the existing single-operator trust boundary, not per-session
 authentication or a broader mutation policy.
 

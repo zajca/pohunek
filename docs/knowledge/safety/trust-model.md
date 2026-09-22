@@ -61,6 +61,23 @@ The assistant must:
   Never proxy a worker endpoint over NetBird, unlink a failed socket without
   proving unit inactivity and exact identity, or edit worker/runtime ids by
   hand.
+- Treat kernel peer identity as the only source of a caller's process identity
+  on the private worker paths. It is read from the accepted socket on both
+  Linux and macOS before a request is parsed, and re-read before each decision
+  that grants authority — every request on a leased control connection and
+  every frame of a live attach stream, because a connection outlives the moment
+  it was authorized. A peer that exited without being reaped does not count as
+  live. A request field never supplies it, the owner alone
+  never authorizes a claim that needs a process id, and a peer the kernel
+  cannot attest — including one with no process id — is rejected rather than
+  downgraded. A private identity report is accepted only from the process it
+  names or from a descendant of that process; a sibling in the same session is
+  not enough. This binds a report to its reporter, not to the account: an
+  owner-private socket is still not a sandbox against arbitrary commands run
+  under the same Unix account, and in a shell session most of what the operator
+  runs is inside the managed process tree by construction. The public
+  `session.report_native_id` fallback has no peer binding at all and relies on
+  its runtime, ordering, expiry, and provider rules.
 - Never copy worker journal or structured-log diagnostics into shared reports
   without review. Journals intentionally omit prompt, input, terminal, and
   environment bytes; preserve that boundary when adding diagnostics.
