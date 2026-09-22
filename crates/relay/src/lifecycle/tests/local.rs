@@ -10,7 +10,9 @@ fn reopened(store: &Store, directory: &std::path::Path) -> Lifecycle {
     Lifecycle::new(store.clone(), Arc::new(witness))
 }
 
-async fn migration_coordinates(store: &Store) -> (crate::store::MigrationPrefix, [u8; 32]) {
+async fn migration_coordinates(
+    store: &Store,
+) -> (crate::store::MigrationPrefix, [u8; 32], [u8; 32]) {
     let mut tx = store
         .begin_serializable()
         .await
@@ -26,17 +28,21 @@ async fn migration_coordinates(store: &Store) -> (crate::store::MigrationPrefix,
         .migration_authority_digest_in_transaction(&mut tx)
         .await
         .expect("SQL-side authority digest");
+    let projection = store
+        .migration_projection_digest_in_transaction(&mut tx)
+        .await
+        .expect("SQL-side projected authority digest");
     tx.commit()
         .await
         .expect("commit migration coordinate snapshot");
-    (prefix, authority)
+    (prefix, authority, projection)
 }
 
 async fn migration_coordinates_with_session_defaults(
     store: &Store,
     time_zone: &str,
     bytea_output: &str,
-) -> (crate::store::MigrationPrefix, [u8; 32]) {
+) -> (crate::store::MigrationPrefix, [u8; 32], [u8; 32]) {
     let mut tx = store
         .begin_serializable()
         .await
@@ -64,13 +70,18 @@ async fn migration_coordinates_with_session_defaults(
         .migration_authority_digest_in_transaction(&mut tx)
         .await
         .expect("digest");
+    let projection = store
+        .migration_projection_digest_in_transaction(&mut tx)
+        .await
+        .expect("projected digest");
     tx.commit().await.expect("commit digest snapshot");
-    (prefix, digest)
+    (prefix, digest, projection)
 }
 
 fn migration_event(
     base: crate::store::MigrationPrefix,
     authority_digest: [u8; 32],
+    authority_projection_digest: [u8; 32],
 ) -> WitnessEvent {
     let target = Store::migration_target_prefix().expect("embedded migration target");
     WitnessEvent::Migration {
@@ -79,6 +90,7 @@ fn migration_event(
         target_migration_count: target.count(),
         target_plan_digest: target.digest(),
         authority_digest,
+        authority_projection_digest,
     }
 }
 
@@ -339,13 +351,13 @@ async fn migration_restarts_from_exact_foundation_prefix_and_repairs_publication
         .latest()
         .expect("witness")
         .expect("clean foundation");
-    let (base, authority_digest) = migration_coordinates(&store).await;
+    let (base, authority_digest, projection_digest) = migration_coordinates(&store).await;
     let pending = witness
         .begin_local(
             Some(&clean),
             "relay-test",
             1,
-            migration_event(base, authority_digest),
+            migration_event(base, authority_digest, projection_digest),
         )
         .expect("process crashes after exact pre-DDL latch");
     assert!(pending.active_run);
@@ -383,7 +395,7 @@ async fn migration_restarts_from_exact_foundation_prefix_and_repairs_publication
         .expect("repair postcommit migration publication");
     let clean = witness.latest().expect("witness").expect("clean");
     witness.set_failpoint(None);
-    let (base, authority_digest) = migration_coordinates(&store).await;
+    let (base, authority_digest, projection_digest) = migration_coordinates(&store).await;
     let mut different = Store::migration_plan_digest();
     different[0] ^= 1;
     let pending = witness
@@ -397,6 +409,7 @@ async fn migration_restarts_from_exact_foundation_prefix_and_repairs_publication
                 target_migration_count: Store::migration_target_prefix().expect("target").count(),
                 target_plan_digest: different,
                 authority_digest,
+                authority_projection_digest: projection_digest,
             },
         )
         .expect("different binary plan");
@@ -417,13 +430,13 @@ async fn migration_rejects_swapped_authority_before_auth_ddl() {
         .latest()
         .expect("witness")
         .expect("clean foundation");
-    let (base, authority_digest) = migration_coordinates(&store).await;
+    let (base, authority_digest, projection_digest) = migration_coordinates(&store).await;
     witness
         .begin_local(
             Some(&clean),
             "relay-test",
             1,
-            migration_event(base, authority_digest),
+            migration_event(base, authority_digest, projection_digest),
         )
         .expect("persist migration latch before process loss");
     sqlx::query("INSERT INTO principals (id,kind,state,generation) VALUES ($1,'human','active',1)")
@@ -465,19 +478,20 @@ async fn migration_hash_is_stable_across_session_rendering_defaults() {
         .bind(audit).execute(store.pool()).await.expect("seed audit receipt parent");
     sqlx::query("INSERT INTO mutation_receipts (actor_principal_id,action,idempotency_key,request_digest,audit_id,outcome_code) VALUES ($1,'migration.digest',$2,decode(repeat('ab',32),'hex'),$3,'committed')")
         .bind(principal).bind(Uuid::now_v7()).bind(audit).execute(store.pool()).await.expect("seed bytea row");
-    let (prague_prefix, prague_digest) =
+    let (prague_prefix, prague_digest, prague_projection) =
         migration_coordinates_with_session_defaults(&store, "Europe/Prague", "escape").await;
-    let (utc_prefix, utc_digest) =
+    let (utc_prefix, utc_digest, utc_projection) =
         migration_coordinates_with_session_defaults(&store, "UTC", "hex").await;
     assert_eq!(prague_prefix, utc_prefix);
     assert_eq!(prague_digest, utc_digest);
+    assert_eq!(prague_projection, utc_projection);
     let clean = witness.latest().expect("witness").expect("clean");
     witness
         .begin_local(
             Some(&clean),
             "relay-test",
             1,
-            migration_event(prague_prefix, prague_digest),
+            migration_event(prague_prefix, prague_digest, prague_projection),
         )
         .expect("pending migration");
     reopened(&store, directory.path())
@@ -498,7 +512,7 @@ async fn migration_resumes_a_plan_that_reshaped_populated_authority_rows() {
         .execute(store.pool())
         .await
         .expect("seed a populated authority table");
-    let (base, authority_digest) = migration_coordinates(&store).await;
+    let (base, authority_digest, projection_digest) = migration_coordinates(&store).await;
     let clean = witness
         .latest()
         .expect("witness")
@@ -508,7 +522,7 @@ async fn migration_resumes_a_plan_that_reshaped_populated_authority_rows() {
             Some(&clean),
             "relay-test",
             1,
-            migration_event(base, authority_digest),
+            migration_event(base, authority_digest, projection_digest),
         )
         .expect("persist migration latch before process loss");
     let target = Store::migration_target_prefix().expect("embedded target");
@@ -545,6 +559,52 @@ async fn migration_resumes_a_plan_that_reshaped_populated_authority_rows() {
     cleanup(&pool, &schema).await;
 }
 
+/// The relay holds no lock while SQLx applies the plan on another pooled
+/// connection, so the projected authority digest is re-verified afterwards.
+/// Authority written inside that exact window is refused rather than adopted.
+#[tokio::test]
+async fn migration_refuses_authority_written_while_the_plan_was_applied() {
+    for tamper in [
+        // A rogue principal inserted into a table that already existed.
+        "INSERT INTO principals (id,kind,state,generation) VALUES ('01a0c7e2-0000-7000-8000-00000000beef','human','active',1)",
+        // An existing authority row edited in place.
+        "UPDATE principals SET state='deprovisioned'",
+        // A rogue team, which is where memberships and grants hang.
+        "INSERT INTO teams (team_id,display_name,state,policy_generation,revision) VALUES ('01a0c7e2-0000-7000-8000-0000000000cc','rogue','active',1,1)",
+        // A rogue identity that would log in as the seeded account, inserted
+        // into a table the plan itself created. The projection requires such a
+        // table to still be empty when it first appears.
+        "INSERT INTO oidc_identities (identity_id,issuer,subject,principal_id,link_generation) SELECT '01a0c7e2-0000-7000-8000-0000000000aa','https://rogue.test','rogue',id,1 FROM principals LIMIT 1",
+    ] {
+        let (store, schema, pool, witness, directory) = foundation_fixture().await;
+        let principal = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO principals (id,kind,state,generation) VALUES ($1,'human','active',1)",
+        )
+        .bind(principal)
+        .execute(store.pool())
+        .await
+        .expect("seed a populated authority table");
+        let clean = witness.latest().expect("witness").expect("clean foundation");
+        let lifecycle = reopened(&store, directory.path());
+        lifecycle.set_applied_hook(tamper).await;
+        assert!(
+            matches!(
+                lifecycle.migrate_local("relay-test").await,
+                Err(LifecycleError::ManifestMismatch)
+            ),
+            "tampering must be refused: {tamper}"
+        );
+        // The latch stays active and unreviewed, so the operator decides rather
+        // than the relay silently adopting the tampered authority.
+        let latest = witness.latest().expect("witness").expect("latch");
+        assert!(latest.active_run);
+        assert_ne!(latest, clean);
+        assert!(matches!(&latest.event, WitnessEvent::Migration { .. }));
+        cleanup(&pool, &schema).await;
+    }
+}
+
 #[tokio::test]
 async fn migration_rejects_a_signed_target_plan_mismatch_before_ddl() {
     let (store, schema, pool, witness, directory) = foundation_fixture().await;
@@ -552,7 +612,7 @@ async fn migration_rejects_a_signed_target_plan_mismatch_before_ddl() {
         .latest()
         .expect("witness")
         .expect("clean foundation");
-    let (base, authority_digest) = migration_coordinates(&store).await;
+    let (base, authority_digest, projection_digest) = migration_coordinates(&store).await;
     let target = Store::migration_target_prefix().expect("embedded target");
     let mut wrong_target = target.digest();
     wrong_target[0] ^= 1;
@@ -567,6 +627,7 @@ async fn migration_rejects_a_signed_target_plan_mismatch_before_ddl() {
                 target_migration_count: target.count(),
                 target_plan_digest: wrong_target,
                 authority_digest,
+                authority_projection_digest: projection_digest,
             },
         )
         .expect("persist mismatched plan latch");

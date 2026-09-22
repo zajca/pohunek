@@ -27,6 +27,50 @@ const MAX_MIGRATION_TABLES: usize = 128;
 const MIGRATION_PREFIX_DOMAIN: &[u8] = b"pohunek.relay.migration-prefix.v1\0";
 /// Binds SQL-side row digests to the local additive migration invariant.
 const MIGRATION_AUTHORITY_DOMAIN: &[u8] = b"pohunek.relay.migration-authority.v1\0";
+/// Domain separator for the column-projected authority digest.
+const MIGRATION_PROJECTION_DOMAIN: &[u8] = b"pohunek.relay.migration-projection.v1\0";
+
+/// Authority tables and the exact columns the projected digest binds.
+///
+/// Each column list is the one the migration that created the table declared,
+/// so a later plan step that adds a column does not change the projection. That
+/// is what makes this digest reproducible on both sides of a migration, unlike
+/// the whole-row digest, which only holds while the base schema is intact.
+///
+/// A table absent from the schema hashes identically to a table with no rows.
+/// A plan step therefore may create a table, which starts empty, but nothing may
+/// insert into it before the migration completes.
+///
+/// A plan that must rewrite a projected value is refused by this binding. Such a
+/// change has to ship as a schema-only migration followed by an audited
+/// application mutation, because only the application path records who changed
+/// authority and why.
+const AUTHORITY_PROJECTION: &[(&str, &str)] = &[
+    ("account_link_transactions", "link_id,principal_id,source_identity_id,account_link_generation,recovery_generation,created_at,expires_at,completed_at"),
+    ("admission_rule_versions", "admission_rule_id,revision,team_id,provider,method,match_value,state,created_at"),
+    ("admission_rules", "admission_rule_id,team_id,provider,method,match_value,state,current_revision,created_at,updated_at"),
+    ("audit_events", "audit_id,occurred_at,actor_principal_id,actor_kind,team_id,action,decision,policy_generation,recovery_generation,parameter_code,parameter_value,outcome"),
+    ("browser_sessions", "session_id,cookie_digest,csrf_digest,principal_id,identity_id,digest_key_id,session_generation,recovery_generation,expires_at,idle_deadline,revoked_at"),
+    ("cancellation_outbox", "revocation_id,scope_kind,scope_id,team_id,committed_at,delivered_at"),
+    ("custom_role_permissions", "team_id,role_id,permission"),
+    ("custom_roles", "team_id,role_id,display_name,state,revision,created_at"),
+    ("evidence_results", "evidence_id,challenge_id,principal_id,team_id,admission_rule_id,admission_rule_revision,account_link_generation,recovery_generation,outcome,checked_at,expires_at"),
+    ("grants", "team_id,grant_id,subject_kind,subject_id,resource_kind,resource_id,permission,state,revision,created_at"),
+    ("group_members", "team_id,group_id,principal_id,revision,created_at"),
+    ("groups", "team_id,group_id,display_name,state,revision,created_at"),
+    ("host_ownership_references", "host_id,relay_id,owner_principal_id,owner_team_id,owner_revision,state,created_at"),
+    ("membership_custom_roles", "team_id,principal_id,role_id"),
+    ("memberships", "membership_id,team_id,principal_id,builtin_role,state,revision,local_deny_generation,created_at,removed_at"),
+    ("mutation_receipts", "actor_principal_id,action,idempotency_key,request_digest,audit_id,outcome_code,result_id,result_revision,created_at"),
+    ("oidc_identities", "identity_id,issuer,subject,principal_id,link_generation,created_at,removed_at"),
+    ("principals", "id,kind,state,generation,created_at,deprovisioned_at"),
+    ("relay_credentials", "credential_id,public_id,secret_digest,principal_id,identity_id,digest_key_id,credential_kind,credential_generation,rotation_family_id,predecessor_credential_id,recovery_generation,issued_at,expires_at,rotation_overlap_ends_at,revoked_at"),
+    ("relay_identity", "relay_id,recovery_generation,state,revision"),
+    ("restore_reviews", "review_id,relay_id,witness_generation,manifest_digest,decided_by_principal_id,action,audit_id,decided_at"),
+    ("revocations", "revocation_id,scope_kind,scope_id,team_id,policy_generation,recovery_generation,reason_code,committed_at"),
+    ("service_accounts", "principal_id,team_id,display_name,created_at,deprovisioned_at"),
+    ("teams", "team_id,display_name,state,policy_generation,revision,created_at,updated_at"),
+];
 
 /// Holds `PostgreSQL` state for one relay process.
 #[derive(Debug, Clone)]
@@ -342,6 +386,67 @@ impl Store {
                 continue;
             };
             update_digest_field(&mut digest, table.as_bytes());
+            let row_digest = hex::decode(row_digest).map_err(|_error| StoreError::StaleState)?;
+            update_digest_field(&mut digest, &row_digest);
+        }
+        Ok(digest.finalize().into())
+    }
+
+    /// Hashes the authority tables through a fixed column projection.
+    ///
+    /// Callers lock every table first. Unlike
+    /// [`Store::migration_authority_digest_in_transaction`], this selects a named
+    /// column list per table rather than the whole row, so adding a column leaves
+    /// the digest unchanged. That makes it verifiable on both sides of a
+    /// migration and closes the window in which the relay holds no lock while
+    /// SQLx applies the plan on another connection.
+    ///
+    /// See [`AUTHORITY_PROJECTION`] for the bound tables and columns, how an
+    /// absent table is treated, and which plans this binding refuses.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Database`] when a projection cannot be read.
+    pub(crate) async fn migration_projection_digest_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<[u8; 32], StoreError> {
+        // Pin the same session forms the whole-row digest pins, so a role or
+        // default change cannot alter the rendering between the two phases.
+        for statement in [
+            "SET LOCAL TimeZone='UTC'",
+            "SET LOCAL DateStyle='ISO, YMD'",
+            "SET LOCAL bytea_output='hex'",
+        ] {
+            sqlx::query(statement)
+                .execute(&mut **tx)
+                .await
+                .map_err(StoreError::Database)?;
+        }
+        let mut digest = Sha256::new();
+        digest.update(MIGRATION_PROJECTION_DOMAIN);
+        for (table, columns) in AUTHORITY_PROJECTION {
+            let present: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                .bind(*table)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(StoreError::Database)?;
+            update_digest_field(&mut digest, table.as_bytes());
+            if !present {
+                continue;
+            }
+            let statement = format!(
+                "SELECT encode(sha256(convert_to(string_agg(octet_length(convert_to(row_json,'UTF8'))::text || ':' || row_json,E'\\n' ORDER BY row_json COLLATE \"C\"),'UTF8')),'hex') FROM (SELECT to_jsonb(projected)::text AS row_json FROM (SELECT {columns} FROM {}) AS projected) AS canonical_rows",
+                quote_identifier(table),
+            );
+            let row_digest: Option<String> = sqlx::query_scalar(AssertSqlSafe(statement))
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(StoreError::Database)?;
+            // An empty table yields NULL, exactly like an absent one, so a plan
+            // may create a table but may not populate it before completing.
+            let Some(row_digest) = row_digest else {
+                continue;
+            };
             let row_digest = hex::decode(row_digest).map_err(|_error| StoreError::StaleState)?;
             update_digest_field(&mut digest, &row_digest);
         }

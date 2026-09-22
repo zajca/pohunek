@@ -320,6 +320,10 @@ impl ManifestField {
 pub struct Lifecycle {
     store: Store,
     witness: Arc<WitnessStore>,
+    /// Runs after the plan is applied and before the post-DDL recheck, so a test
+    /// can write authority in the window where the relay holds no lock.
+    #[cfg(test)]
+    applied_hook: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 /// Reports a fail-closed lifecycle transition failure.
@@ -339,7 +343,18 @@ impl Lifecycle {
     /// Creates a lifecycle service from process-owned durable dependencies.
     #[must_use]
     pub fn new(store: Store, witness: Arc<WitnessStore>) -> Self {
-        Self { store, witness }
+        Self {
+            store,
+            witness,
+            #[cfg(test)]
+            applied_hook: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Arms one statement to run in the unlocked window after the plan applies.
+    #[cfg(all(test, feature = "postgres-tests"))]
+    pub(crate) async fn set_applied_hook(&self, statement: &str) {
+        *self.applied_hook.lock().await = Some(statement.to_owned());
     }
 
     /// Derives a complete semantic authority manifest under a serializable snapshot.
