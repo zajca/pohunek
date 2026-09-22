@@ -5604,8 +5604,13 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
         "transcript_path": "/must/not/cross.jsonl",
         "prompt": "must not cross the hook boundary"
     });
+    // Every assertion after the hook lands requires the session's root process
+    // to still be running, so the fixture has to outlive the longest run the
+    // harness permits: nextest terminates a test after three sixty-second slow
+    // periods. A thirty-second shell made those assertions depend instead on how
+    // loaded the machine is.
     let command = format!(
-        "printf '%s' '{}' | sh '{}' subagent-start; sleep 30",
+        "printf '%s' '{}' | sh '{}' subagent-start; sleep 300",
         payload,
         hook_path.display()
     );
@@ -5672,6 +5677,23 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
         .await
         .expect("inspect after reconnect");
     assert_eq!(snapshot.subagents.len(), 1, "worker journal retained child");
+    // The apply validates the snapshot's identity claims against the live root
+    // process and permanently discards them when it is gone, so a fixture that
+    // did not survive this far reports itself instead of arriving as a discarded
+    // snapshot with no stated cause.
+    let root = snapshot
+        .child_process
+        .as_ref()
+        .expect("snapshot reports its root process");
+    assert!(
+        crate::procwatch::HostInspector::new()
+            .is_running(ProcessIdentity {
+                pid: root.pid,
+                start_identity: StartIdentity::new(root.start_identity),
+            })
+            .expect("inspect the fixture root process"),
+        "the fixture shell must still run when the reconnected snapshot is applied"
+    );
     assert_eq!(
         registry
             .apply_worker_metadata_snapshot(&created.id, &snapshot)
