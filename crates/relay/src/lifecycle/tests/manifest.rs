@@ -50,6 +50,11 @@ async fn durable_quarantine_and_manifest_bind_service_and_credential_authority()
     let session = Uuid::now_v7();
     sqlx::query("INSERT INTO browser_sessions (session_id,cookie_digest,csrf_digest,principal_id,identity_id,digest_key_id,session_generation,recovery_generation,expires_at,idle_deadline) VALUES ($1,$2,$3,$4,$5,'test',1,1,clock_timestamp()+interval '1 hour',clock_timestamp()+interval '30 minutes')")
         .bind(session).bind(vec![13_u8;32]).bind(vec![14_u8;32]).bind(principal).bind(identity).execute(store.pool()).await.expect("browser session");
+    let pending_link = Uuid::now_v7();
+    sqlx::query("INSERT INTO account_link_transactions (link_id,principal_id,source_identity_id,channel,source_authentication_id,source_authentication_generation,issuer,client_id,audience,possession_digest,digest_key_id,state,revision,correlation_id,idempotency_key,account_link_generation,recovery_generation,expires_at) VALUES ($1,$2,$3,'device',$4,1,'https://issuer.test','client','client',$5,'test','pending',1,$6,$7,1,1,clock_timestamp()+interval '1 hour')")
+        .bind(pending_link).bind(principal).bind(identity).bind(credential).bind(vec![15_u8;32])
+        .bind(Uuid::now_v7()).bind(Uuid::now_v7())
+        .execute(store.pool()).await.expect("pending account link");
     let before = lifecycle
         .snapshot_authority_manifest()
         .await
@@ -72,6 +77,15 @@ async fn durable_quarantine_and_manifest_bind_service_and_credential_authority()
         .quarantine_pending()
         .await
         .expect("quarantine without pre-restore process state");
+    // A restore cannot leave a provable link transaction behind for the new
+    // recovery generation to complete.
+    let link_after_restore: String =
+        sqlx::query_scalar("SELECT state FROM account_link_transactions WHERE link_id = $1")
+            .bind(pending_link)
+            .fetch_one(store.pool())
+            .await
+            .expect("read the link state after quarantine");
+    assert_eq!(link_after_restore, "cancelled");
     let reviewed = lifecycle
         .snapshot_authority_manifest()
         .await
