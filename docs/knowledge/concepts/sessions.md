@@ -296,6 +296,38 @@ record and diagnostic `loss_reason`. After preserving diagnostic evidence, the
 operator can remove a degraded logical record with `session rm`; this does not
 stop or signal an unavailable or ambiguous worker.
 
+## Retention
+
+A host that runs agents for weeks accumulates logical records for sessions that
+can never be attached again, and those records keep owning their worktrees. The
+daemon therefore runs a retention sweep that ages unavailable sessions out.
+
+The policy lives at `<data_dir>/session-policy.json` and is read with
+`pohunek session policy get` (add `--json` for the machine-readable shape) and
+changed with `pohunek session policy set`, which accepts `--enabled` /
+`--disabled`, `--sweep-interval-secs`, `--terminal-ttl-secs`,
+`--lost-ttl-secs` and `--max-removals-per-sweep`. Unspecified fields keep their
+current value, and the running sweep task picks the new policy up on its next
+cycle, so no daemon restart is needed.
+
+The shipped default is deliberately conservative: sweeps are **disabled**, and
+once enabled they run every 6 hours, keep a terminal (`stopped`/`done`/`failed`)
+session for 30 days, keep a session whose runtime is `lost` for 90 days, and
+remove at most 25 sessions per sweep. The `lost` grace period is the longer one
+because such a session may still be recoverable with `session resume`.
+
+`pohunek session retention sweep --dry-run` reports exactly what the current
+policy selects without touching anything; `--apply` removes the selection, and
+`--limit` lowers the cap for that one sweep. A manual sweep works whether or not
+automatic sweeps are enabled and never exceeds the policy's own cap.
+
+A sweep removes through the same path as `session rm`, so it stops a runtime
+that is still live, cleans pohunek-owned worktrees, and deletes the session's
+logs. It never selects an `external` session or one in `conflict` or
+`incompatible` runtime state, and it never selects a session that is still live
+or inside its TTL. Anything the sweep cannot classify is kept: an ambiguous
+record is never a removal candidate.
+
 External observer mode is opt-in with `POHUNEK_OBSERVE_EXTERNAL_AGENTS=1` (or
 `SessionRegistryConfig.observe_external_agents = true`) and defaults off because
 it watches provider transcript trees under the operator's Claude/Codex homes.

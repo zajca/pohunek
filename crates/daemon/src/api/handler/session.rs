@@ -9,8 +9,9 @@ use protocol::{
     ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams,
     SessionDetectionParams, SessionDiffParams, SessionForkParams, SessionForkResult, SessionId,
     SessionInputParams, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
-    SessionReadParams, SessionReleaseAgentParams, SessionRenameParams, SessionReportAgentParams,
-    SessionReportNativeIdParams, SessionResizeParams, SessionResumeResult, SessionScreenParams,
+    SessionPolicyParams, SessionPolicyResult, SessionReadParams, SessionReleaseAgentParams,
+    SessionRenameParams, SessionReportAgentParams, SessionReportNativeIdParams,
+    SessionResizeParams, SessionResumeResult, SessionRetentionParams, SessionScreenParams,
     SessionSetMetadataParams, SessionWaitParams,
 };
 
@@ -126,6 +127,52 @@ pub(super) async fn handle_session_remove(
         Err(err) => return error_value(request, err),
     };
     match sessions.remove(&id).await {
+        Ok(result) => ok_value(request, &result),
+        Err(err) => error_value(request, err),
+    }
+}
+
+/// `session.policy.get`: return the current session retention policy.
+pub(super) fn handle_session_policy_get(request: &Request, sessions: &SessionRegistry) -> Response {
+    if !request.params().is_null() {
+        return error_value(
+            request,
+            ProtocolError::bad_request("session.policy.get does not accept params"),
+        );
+    }
+    ok_value(
+        request,
+        &SessionPolicyResult {
+            retention: sessions.retention_policy(),
+        },
+    )
+}
+
+/// `session.policy.set`: persist a replacement session retention policy.
+pub(super) async fn handle_session_policy_set(
+    request: &Request,
+    sessions: &SessionRegistry,
+) -> Response {
+    let params = match parse_params::<SessionPolicyParams>(request) {
+        Ok(params) => params,
+        Err(err) => return error_value(request, err),
+    };
+    match sessions.set_retention_policy(params.retention).await {
+        Ok(retention) => ok_value(request, &SessionPolicyResult { retention }),
+        Err(err) => error_value(request, err),
+    }
+}
+
+/// `session.retention.sweep`: run one retention sweep now.
+pub(super) async fn handle_session_retention_sweep(
+    request: &Request,
+    sessions: &SessionRegistry,
+) -> Response {
+    let params = match parse_optional_params::<SessionRetentionParams>(request) {
+        Ok(params) => params,
+        Err(err) => return error_value(request, err),
+    };
+    match sessions.sweep_retention(&params).await {
         Ok(result) => ok_value(request, &result),
         Err(err) => error_value(request, err),
     }

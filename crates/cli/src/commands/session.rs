@@ -20,12 +20,13 @@ use protocol::{
     method, AgentActivity, CwdSource, ForkCwdMode, OutputOffset, RuntimeGeneration,
     SessionDetectionParams, SessionDetectionResult, SessionDiffParams, SessionForkParams,
     SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
-    SessionListFilter, SessionListParams, SessionNewParams, SessionOutputParams, SessionReadFormat,
-    SessionReadParams, SessionReadResult, SessionReadSource, SessionRemoveResult,
-    SessionRenameParams, SessionResizeParams, SessionRuntimeIdentity, SessionScreenParams,
-    SessionSetMetadataParams, SessionState, SessionStopResult, SessionWaitParams,
-    SessionWarningKind, StateSource, SubagentLifecycle, TerminalWatermark, MAX_SESSION_INPUT_BYTES,
-    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
+    SessionListFilter, SessionListParams, SessionNewParams, SessionOutputParams,
+    SessionPolicyParams, SessionReadFormat, SessionReadParams, SessionReadResult,
+    SessionReadSource, SessionRemoveResult, SessionRenameParams, SessionResizeParams,
+    SessionRetentionParams, SessionRetentionPolicy, SessionRetentionResult, SessionRuntimeIdentity,
+    SessionScreenParams, SessionSetMetadataParams, SessionState, SessionStopResult,
+    SessionWaitParams, SessionWarningKind, StateSource, SubagentLifecycle, TerminalWatermark,
+    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
 };
 
 use crate::client::Client;
@@ -1118,6 +1119,204 @@ pub(crate) async fn run_diff(
         print!("{}", result.diff);
     }
     Ok(())
+}
+
+/// Fields accepted by `session policy set`.
+///
+/// Every field is optional so an update is a read-modify-write of exactly the
+/// fields the operator named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PolicyArgs {
+    /// Enable automatic retention sweeps.
+    pub(crate) enabled: bool,
+    /// Disable automatic retention sweeps.
+    pub(crate) disabled: bool,
+    /// Seconds between automatic sweeps.
+    pub(crate) sweep_interval_secs: Option<u32>,
+    /// Seconds a terminal session is kept.
+    pub(crate) terminal_ttl_secs: Option<u32>,
+    /// Seconds a session whose runtime is lost is kept.
+    pub(crate) lost_ttl_secs: Option<u32>,
+    /// Maximum sessions one sweep may remove.
+    pub(crate) max_removals_per_sweep: Option<u32>,
+}
+
+/// Arguments accepted by `session retention sweep`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SweepArgs {
+    /// Report the selection without removing anything.
+    pub(crate) dry_run: bool,
+    /// Remove the selected sessions.
+    pub(crate) apply: bool,
+    /// Maximum sessions to remove.
+    pub(crate) limit: Option<u32>,
+}
+
+/// Run `session policy get` against the daemon for `host`.
+///
+/// # Errors
+///
+/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
+/// resolved, the daemon rejects the request, or the payload does not match the
+/// contract.
+pub(crate) async fn run_policy_get(host: &str, paths: &Paths, json: bool) -> Result<(), CliError> {
+    let mut client = Client::connect(host, paths).await?;
+    let result = client.call::<method::SessionPolicyGet>(()).await?;
+
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_policy_human(host, &result.retention));
+    }
+    Ok(())
+}
+
+/// Run `session policy set` against the daemon for `host`.
+///
+/// The current policy is read first so unnamed fields keep their value, which
+/// also means the daemon validates exactly the policy it will store.
+///
+/// # Errors
+///
+/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
+/// resolved, the daemon rejects the policy, or the payload does not match the
+/// contract.
+pub(crate) async fn run_policy_set(
+    host: &str,
+    paths: &Paths,
+    args: PolicyArgs,
+    json: bool,
+) -> Result<(), CliError> {
+    let mut client = Client::connect(host, paths).await?;
+    let current = client.call::<method::SessionPolicyGet>(()).await?.retention;
+    let result = client
+        .call::<method::SessionPolicySet>(SessionPolicyParams {
+            retention: apply_policy_args(current, args),
+        })
+        .await?;
+
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_policy_human(host, &result.retention));
+    }
+    Ok(())
+}
+
+/// Run `session retention sweep` against the daemon for `host`.
+///
+/// # Errors
+///
+/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
+/// resolved, the daemon rejects the request, or the payload does not match the
+/// contract.
+pub(crate) async fn run_retention_sweep(
+    host: &str,
+    paths: &Paths,
+    args: SweepArgs,
+    json: bool,
+) -> Result<(), CliError> {
+    let mut client = Client::connect(host, paths).await?;
+    let result = client
+        .call::<method::SessionRetentionSweep>(sweep_params(args))
+        .await?;
+
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_sweep_human(host, &result));
+    }
+    Ok(())
+}
+
+/// Returns `current` with the fields named by `args` replaced.
+fn apply_policy_args(current: SessionRetentionPolicy, args: PolicyArgs) -> SessionRetentionPolicy {
+    let enabled = if args.enabled {
+        true
+    } else if args.disabled {
+        false
+    } else {
+        current.enabled
+    };
+    SessionRetentionPolicy {
+        enabled,
+        sweep_interval_secs: args
+            .sweep_interval_secs
+            .unwrap_or(current.sweep_interval_secs),
+        terminal_ttl_secs: args.terminal_ttl_secs.unwrap_or(current.terminal_ttl_secs),
+        lost_ttl_secs: args.lost_ttl_secs.unwrap_or(current.lost_ttl_secs),
+        max_removals_per_sweep: args
+            .max_removals_per_sweep
+            .unwrap_or(current.max_removals_per_sweep),
+    }
+}
+
+/// Builds the sweep params. `--apply` is the absence of `--dry-run`; clap
+/// requires exactly one of the two so the destructive mode is never implicit.
+fn sweep_params(args: SweepArgs) -> SessionRetentionParams {
+    SessionRetentionParams {
+        dry_run: args.dry_run || !args.apply,
+        limit: args.limit,
+    }
+}
+
+fn render_policy_human(host: &str, policy: &SessionRetentionPolicy) -> String {
+    let mut output = format!("host {host} session retention policy\n");
+    let _ = writeln!(
+        output,
+        "  automatic sweeps: {}",
+        if policy.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    let _ = writeln!(
+        output,
+        "  sweep_interval_secs: {}",
+        policy.sweep_interval_secs
+    );
+    let _ = writeln!(output, "  terminal_ttl_secs: {}", policy.terminal_ttl_secs);
+    let _ = writeln!(output, "  lost_ttl_secs: {}", policy.lost_ttl_secs);
+    let _ = writeln!(
+        output,
+        "  max_removals_per_sweep: {}",
+        policy.max_removals_per_sweep
+    );
+    output
+}
+
+fn render_sweep_human(host: &str, result: &SessionRetentionResult) -> String {
+    let action = if result.dry_run { "matched" } else { "removed" };
+    let count = if result.dry_run {
+        result.eligible
+    } else {
+        result.removed
+    };
+    let mut output = format!(
+        "host {host} session retention {action} {count} of {} session(s)\n",
+        result.examined
+    );
+    let _ = writeln!(
+        output,
+        "  eligible={} removed={} worktrees_cleaned={} failed={}",
+        result.eligible, result.removed, result.worktrees_cleaned, result.failed
+    );
+    for candidate in &result.sessions {
+        let worktree = candidate
+            .worktree_path
+            .as_ref()
+            .map_or_else(|| "-".to_owned(), |path| path.display().to_string());
+        let _ = writeln!(
+            output,
+            "  {} reason={} age_secs={} removed={} worktree={worktree}",
+            candidate.session_id.0,
+            candidate.reason.as_str(),
+            candidate.age_secs,
+            candidate.removed
+        );
+    }
+    output
 }
 
 fn new_params(args: &NewArgs) -> Result<SessionNewParams, CliError> {

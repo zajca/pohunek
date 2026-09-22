@@ -2472,6 +2472,56 @@ pub struct SessionInfo {
     pub exit_code: Option<i32>,
 }
 
+impl SessionInfo {
+    /// Whether `session.stop` can still act on this session.
+    ///
+    /// An external observe-only entry has no PTY to stop, a terminal session has
+    /// already stopped, and a runtime that is neither connected nor on its way
+    /// back cannot be asked to shut one down. A session with no runtime at all
+    /// predates worker-backed runtimes and is treated as stoppable.
+    #[must_use]
+    pub fn can_stop(&self) -> bool {
+        if self.external == Some(true) || self.state.is_terminal() {
+            return false;
+        }
+        self.runtime.as_ref().is_none_or(|runtime| {
+            matches!(
+                runtime.state,
+                RuntimeState::Live | RuntimeState::Starting | RuntimeState::Reconnecting
+            )
+        })
+    }
+
+    /// Whether `session.remove` can evict this session.
+    ///
+    /// Removal is refused for an external entry the daemon does not own, and for
+    /// a [`RuntimeState::Conflict`] or [`RuntimeState::Incompatible`] runtime,
+    /// where the identity backing the session is unresolved and evicting the
+    /// record would strand a live PTY. Everything else is removable once it is
+    /// terminal, still stoppable, or lost. This is the single eligibility rule
+    /// shared by the GUI's affordances and the daemon's retention sweep.
+    #[must_use]
+    pub fn can_remove(&self) -> bool {
+        if self.external == Some(true) {
+            return false;
+        }
+        if self.runtime.as_ref().is_some_and(|runtime| {
+            matches!(
+                runtime.state,
+                RuntimeState::Conflict | RuntimeState::Incompatible
+            )
+        }) {
+            return false;
+        }
+        self.state.is_terminal()
+            || self.can_stop()
+            || self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.state == RuntimeState::Lost)
+    }
+}
+
 /// Payload shared by session lifecycle events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -2631,6 +2681,187 @@ pub struct SessionRemoveResult {
     pub removed: bool,
     /// Whether a still-live session was stopped as part of this removal.
     pub stopped: bool,
+}
+
+/// Default interval between daemon-owned session retention sweeps.
+///
+/// Six hours matches the notification retention cadence. Unrecoverable sessions
+/// accumulate slowly, so a tighter interval would only add daemon wakeups
+/// without pruning anything sooner in practice.
+const DEFAULT_SESSION_SWEEP_INTERVAL_SECS: u32 = 21_600;
+
+/// Default age after which a terminal session becomes eligible for removal.
+///
+/// Thirty days keeps a finished session listable well past the review window it
+/// belongs to. A sweep is destructive — it also deletes the session's logs and
+/// any pohunek-owned worktree bound to it — so the default deliberately errs
+/// toward keeping the record.
+const DEFAULT_SESSION_TERMINAL_TTL_SECS: u32 = 2_592_000;
+
+/// Default age after which a session with a lost runtime becomes eligible.
+///
+/// Ninety days is three times the terminal grace because a lost runtime is not
+/// a finished session: it can still be relaunched with `session resume`, so its
+/// record must outlive a long absence from the host.
+const DEFAULT_SESSION_LOST_TTL_SECS: u32 = 7_776_000;
+
+/// Default upper bound on removals performed by a single sweep.
+///
+/// Caps the blast radius of a mistaken policy: a wrong TTL prunes at most this
+/// many sessions per interval, leaving the operator time to notice and correct
+/// it. The next sweep continues where this one stopped.
+const DEFAULT_SESSION_MAX_REMOVALS_PER_SWEEP: u32 = 25;
+
+/// Automatic retention settings for unrecoverable logical sessions.
+///
+/// A sweep is destructive: it evicts the logical record, deletes the session's
+/// logs, and cleans the pohunek-owned worktree bound to it. Automatic sweeps are
+/// therefore opt-in via [`Self::enabled`], and the shipped TTLs are generous so
+/// that turning them on cannot surprise an operator who still has a stale
+/// session parked on a review worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionRetentionPolicy.ts"))]
+#[serde(deny_unknown_fields)]
+pub struct SessionRetentionPolicy {
+    /// Whether the daemon performs automatic retention sweeps.
+    ///
+    /// `false` leaves the sweep task running but idle; an explicit
+    /// `session.retention.sweep` still applies the TTLs below, because that is
+    /// an operator-triggered action rather than an unattended one.
+    pub enabled: bool,
+    /// Interval between daemon-owned retention sweeps.
+    pub sweep_interval_secs: u32,
+    /// Age after which a terminal session is removed.
+    pub terminal_ttl_secs: u32,
+    /// Age after which a session whose runtime is `lost` is removed.
+    ///
+    /// Separate from [`Self::terminal_ttl_secs`] and expected to be longer: a
+    /// lost session is not finished, only unreachable, and may still be
+    /// resumable.
+    pub lost_ttl_secs: u32,
+    /// Upper bound on sessions removed by one sweep.
+    pub max_removals_per_sweep: u32,
+}
+
+impl Default for SessionRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sweep_interval_secs: DEFAULT_SESSION_SWEEP_INTERVAL_SECS,
+            terminal_ttl_secs: DEFAULT_SESSION_TERMINAL_TTL_SECS,
+            lost_ttl_secs: DEFAULT_SESSION_LOST_TTL_SECS,
+            max_removals_per_sweep: DEFAULT_SESSION_MAX_REMOVALS_PER_SWEEP,
+        }
+    }
+}
+
+/// Why a retention sweep selected a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionRetentionReason.ts"))]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRetentionReason {
+    /// The session reached a terminal lifecycle state.
+    Terminal,
+    /// The session's PTY runtime was lost and never recovered.
+    Lost,
+}
+
+impl SessionRetentionReason {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Lost => "lost",
+        }
+    }
+
+    /// Returns the policy TTL that applies to this reason.
+    #[must_use]
+    pub const fn ttl_secs(self, policy: &SessionRetentionPolicy) -> u32 {
+        match self {
+            Self::Terminal => policy.terminal_ttl_secs,
+            Self::Lost => policy.lost_ttl_secs,
+        }
+    }
+}
+
+/// One session selected by a retention sweep.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionRetentionCandidate.ts"))]
+pub struct SessionRetentionCandidate {
+    /// Selected session.
+    pub session_id: SessionId,
+    /// Rule that selected it.
+    pub reason: SessionRetentionReason,
+    /// Age in seconds at selection time, measured from the timestamp the rule
+    /// used (the session's last update, or the runtime's last connection).
+    pub age_secs: u64,
+    /// Pohunek-owned worktree the removal cleans, when the session bound one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub worktree_path: Option<PathBuf>,
+    /// Whether this sweep actually removed the session. Always `false` for a
+    /// dry run, and `false` for a candidate the sweep's removal cap deferred.
+    pub removed: bool,
+}
+
+/// Parameters for `session.retention.sweep`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionRetentionParams.ts"))]
+pub struct SessionRetentionParams {
+    /// Whether to report the selection without removing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Maximum removals for this sweep, capped by the policy's own limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub limit: Option<u32>,
+}
+
+/// Result returned by `session.retention.sweep`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionRetentionResult.ts"))]
+pub struct SessionRetentionResult {
+    /// Whether the sweep only reported its selection.
+    pub dry_run: bool,
+    /// Sessions the sweep considered, including the ones it kept.
+    pub examined: u32,
+    /// Sessions that matched the policy, before the removal cap applied.
+    pub eligible: u32,
+    /// Sessions the sweep actually removed.
+    pub removed: u32,
+    /// Removed sessions that held a pohunek-owned worktree.
+    pub worktrees_cleaned: u32,
+    /// Selected sessions whose removal returned an error and were left in place.
+    pub failed: u32,
+    /// Per-session detail for every selected session.
+    pub sessions: Vec<SessionRetentionCandidate>,
+}
+
+/// Parameters for `session.policy.set`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionPolicyParams.ts"))]
+#[serde(deny_unknown_fields)]
+pub struct SessionPolicyParams {
+    /// Replacement session retention policy.
+    pub retention: SessionRetentionPolicy,
+}
+
+/// Result returned by `session.policy.get` and `session.policy.set`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionPolicyResult.ts"))]
+#[serde(deny_unknown_fields)]
+pub struct SessionPolicyResult {
+    /// Current session retention policy.
+    pub retention: SessionRetentionPolicy,
 }
 
 /// Result returned by `session.resize`.

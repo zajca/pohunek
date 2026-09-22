@@ -113,6 +113,10 @@ pub enum DaemonError {
     #[error("session worker reconciliation failed: {0}")]
     Reconcile(#[source] protocol::ProtocolError),
 
+    /// The durable session retention policy could not be loaded.
+    #[error("session retention policy could not be loaded: {0}")]
+    RetentionPolicy(#[source] protocol::ProtocolError),
+
     /// Owner-private host governance could not start safely.
     #[error("host governance startup failed: {0}")]
     Governance(#[from] crate::governance::HostGovernanceError),

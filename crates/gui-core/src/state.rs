@@ -2483,36 +2483,19 @@ fn session_can_resume(session: &SessionInfo) -> bool {
                 .is_some_and(|value| !value.is_empty()))
 }
 
+/// Stop affordance for one session row.
+///
+/// The rule lives on [`SessionInfo`] so the GUI and the daemon's retention
+/// sweep cannot drift apart.
 fn session_can_stop(session: &SessionInfo) -> bool {
-    if session.external == Some(true) || session.state.is_terminal() {
-        return false;
-    }
-    session.runtime.as_ref().is_none_or(|runtime| {
-        matches!(
-            runtime.state,
-            RuntimeState::Live | RuntimeState::Starting | RuntimeState::Reconnecting
-        )
-    })
+    session.can_stop()
 }
 
+/// Remove affordance for one session row.
+///
+/// Shares [`SessionInfo::can_remove`] with the daemon's retention sweep.
 fn session_can_remove(session: &SessionInfo) -> bool {
-    if session.external == Some(true) {
-        return false;
-    }
-    if session.runtime.as_ref().is_some_and(|runtime| {
-        matches!(
-            runtime.state,
-            RuntimeState::Conflict | RuntimeState::Incompatible
-        )
-    }) {
-        return false;
-    }
-    session.state.is_terminal()
-        || session_can_stop(session)
-        || session
-            .runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.state == RuntimeState::Lost)
+    session.can_remove()
 }
 
 fn session_group(session: &SessionInfo, access: SessionAccess, needs_you: bool) -> SessionGroup {

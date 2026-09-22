@@ -69,9 +69,11 @@ mod procwatch;
 mod read;
 mod reconcile;
 mod resume;
+mod retention;
 mod target;
 
 pub use attach::{RedeemedAttach, RedeemedRuntime};
+pub use retention::{SessionRetentionTask, POLICY_FILE_NAME as RETENTION_POLICY_NAME};
 
 pub(crate) use observation::{observation_worker_error, runtime_identity};
 
@@ -302,6 +304,10 @@ pub struct SessionRegistryConfig {
     /// Directory for the append-only event log (`<data_dir>/events`). `None`
     /// disables event logging. Started via [`SessionRegistry::spawn_event_log`].
     pub event_log_dir: Option<PathBuf>,
+    /// Durable session policy document (`<data_dir>/session-policy.json`).
+    /// `None` keeps the retention policy in memory only, which is what unit
+    /// tests that never persist a policy use.
+    pub retention_policy_path: Option<PathBuf>,
     /// Directory containing bounded structured logs. When set, removing a
     /// stopped session also removes its owner-private worker log family.
     pub log_dir: Option<PathBuf>,
@@ -363,6 +369,7 @@ impl Default for SessionRegistryConfig {
             worktree_root: None,
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
             event_log_dir: None,
+            retention_policy_path: None,
             log_dir: None,
             config_dir: None,
             agents_dir: None,
@@ -458,6 +465,8 @@ struct SessionRegistryInner {
     procwatch_seq: AtomicU64,
     /// Read-only external agent sessions observed outside pohunek-owned PTYs.
     external: ExternalSessions,
+    /// Automatic session retention policy and its sweep serialization point.
+    retention: retention::RetentionState,
     #[cfg(test)]
     external_association_block: std::sync::Mutex<Option<Arc<ExternalAssociationBlock>>>,
 }
@@ -1126,6 +1135,7 @@ impl SessionRegistry {
         // Host agent profiles resolve the free-string `agent` name; built from the
         // configured agents dir (a bare base kind still resolves when it is unset).
         let profiles = ProfileRegistry::new(config.agents_dir.clone());
+        let retention = retention::RetentionState::new(config.retention_policy_path.clone());
         let registry = Self {
             inner: Arc::new(SessionRegistryInner {
                 sessions: Mutex::new(HashMap::new()),
@@ -1157,6 +1167,7 @@ impl SessionRegistry {
                 inspector,
                 procwatch_seq: AtomicU64::new(current_time_millis()),
                 external: external.clone(),
+                retention,
                 #[cfg(test)]
                 external_association_block: std::sync::Mutex::new(None),
             }),

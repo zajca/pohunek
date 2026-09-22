@@ -1275,6 +1275,96 @@ enum SessionAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Read or update the session retention policy.
+    Policy {
+        #[command(subcommand)]
+        action: SessionPolicyAction,
+    },
+
+    /// Run session retention maintenance.
+    Retention {
+        #[command(subcommand)]
+        action: SessionRetentionAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionPolicyAction {
+    /// Show the session retention policy.
+    Get {
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Update one or more session retention policy fields.
+    ///
+    /// Unspecified fields keep their current value. The daemon applies the new
+    /// policy on its next sweep; no restart is needed.
+    #[command(group(
+        clap::ArgGroup::new("session_policy_field")
+            .required(true)
+            .multiple(true)
+            .args([
+                "enabled",
+                "disabled",
+                "sweep_interval_secs",
+                "terminal_ttl_secs",
+                "lost_ttl_secs",
+                "max_removals_per_sweep",
+            ])
+    ))]
+    Set {
+        /// Enable automatic retention sweeps.
+        #[arg(long, conflicts_with = "disabled")]
+        enabled: bool,
+        /// Disable automatic retention sweeps.
+        #[arg(long)]
+        disabled: bool,
+        /// Seconds between automatic sweeps.
+        #[arg(long, value_name = "SECONDS")]
+        sweep_interval_secs: Option<u32>,
+        /// Seconds a terminal (stopped/done/failed) session is kept.
+        #[arg(long, value_name = "SECONDS")]
+        terminal_ttl_secs: Option<u32>,
+        /// Seconds a session whose runtime is lost is kept.
+        #[arg(long, value_name = "SECONDS")]
+        lost_ttl_secs: Option<u32>,
+        /// Maximum sessions one sweep may remove.
+        #[arg(long, value_name = "COUNT")]
+        max_removals_per_sweep: Option<u32>,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionRetentionAction {
+    /// Run one retention sweep now, applying the current policy TTLs.
+    ///
+    /// A manual sweep works whether or not automatic sweeps are enabled, and
+    /// never exceeds the policy's own per-sweep removal cap.
+    #[command(group(
+        clap::ArgGroup::new("session_retention_mode")
+            .required(true)
+            .args(["dry_run", "apply"])
+    ))]
+    Sweep {
+        /// Report the sessions the policy selects without removing them.
+        #[arg(long, group = "session_retention_mode")]
+        dry_run: bool,
+        /// Remove the selected sessions, including their owned worktrees.
+        #[arg(long, group = "session_retention_mode")]
+        apply: bool,
+        /// Maximum sessions to remove, capped by the policy limit.
+        #[arg(long, value_name = "COUNT")]
+        limit: Option<u32>,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl Commands {
@@ -1459,6 +1549,24 @@ impl SessionAction {
             | SessionAction::RuntimeInventory { json }
             | SessionAction::Rename { json, .. }
             | SessionAction::Diff { json, .. } => *json,
+            SessionAction::Policy { action } => action.wants_json(),
+            SessionAction::Retention { action } => action.wants_json(),
+        }
+    }
+}
+
+impl SessionPolicyAction {
+    fn wants_json(&self) -> bool {
+        match self {
+            SessionPolicyAction::Get { json } | SessionPolicyAction::Set { json, .. } => *json,
+        }
+    }
+}
+
+impl SessionRetentionAction {
+    fn wants_json(&self) -> bool {
+        match self {
+            SessionRetentionAction::Sweep { json, .. } => *json,
         }
     }
 }
@@ -1840,6 +1948,58 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     let target = commands::session::resolve_target(&host, &paths, &target).await?;
                     commands::session::run_diff(&host, &paths, &target, base, json).await?;
                 }
+                SessionAction::Policy { action } => match action {
+                    SessionPolicyAction::Get { json } => {
+                        let host = effective_host(&global_host, None);
+                        commands::session::run_policy_get(&host, &paths, json).await?;
+                    }
+                    SessionPolicyAction::Set {
+                        enabled,
+                        disabled,
+                        sweep_interval_secs,
+                        terminal_ttl_secs,
+                        lost_ttl_secs,
+                        max_removals_per_sweep,
+                        json,
+                    } => {
+                        let host = effective_host(&global_host, None);
+                        commands::session::run_policy_set(
+                            &host,
+                            &paths,
+                            commands::session::PolicyArgs {
+                                enabled,
+                                disabled,
+                                sweep_interval_secs,
+                                terminal_ttl_secs,
+                                lost_ttl_secs,
+                                max_removals_per_sweep,
+                            },
+                            json,
+                        )
+                        .await?;
+                    }
+                },
+                SessionAction::Retention { action } => match action {
+                    SessionRetentionAction::Sweep {
+                        dry_run,
+                        apply,
+                        limit,
+                        json,
+                    } => {
+                        let host = effective_host(&global_host, None);
+                        commands::session::run_retention_sweep(
+                            &host,
+                            &paths,
+                            commands::session::SweepArgs {
+                                dry_run,
+                                apply,
+                                limit,
+                            },
+                            json,
+                        )
+                        .await?;
+                    }
+                },
             }
             Ok(ExitCode::SUCCESS)
         }
