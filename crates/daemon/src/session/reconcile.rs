@@ -28,7 +28,7 @@ use crate::procwatch::ProcessInspector;
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-09-19
+// Rust guideline compliant 2026-09-22
 
 /// Maximum worker journal accepted during daemon reconciliation.
 const MAX_WORKER_JOURNAL_BYTES: usize = 1024 * 1024;
@@ -1414,7 +1414,7 @@ fn apply_identity_projection(
     true
 }
 
-fn worker_metadata_record_is_current(
+pub(super) fn worker_metadata_record_is_current(
     record: &SessionRecord,
     worker_id: &str,
     runtime_id: Option<&str>,

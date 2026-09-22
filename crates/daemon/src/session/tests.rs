@@ -5672,6 +5672,13 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
         .await
         .expect("inspect after reconnect");
     assert_eq!(snapshot.subagents.len(), 1, "worker journal retained child");
+    // The apply accepts a snapshot only while the durable record still names the
+    // reconnected worker runtime as live. The worker task that is still running
+    // commits its own snapshots, so that record can be momentarily stale between
+    // this test's durable write and its apply. Waiting for the documented
+    // precondition removes the race without weakening what the apply is asked
+    // to prove, and a precondition that never holds says so.
+    wait_for_current_worker_metadata_record(&registry, &store, &created.id, &snapshot).await;
     assert_eq!(
         registry
             .apply_worker_metadata_snapshot(&created.id, &snapshot)
@@ -5701,6 +5708,59 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
     assert!(!serialized.contains("prompt"));
 
     let _ = registry.stop(&created.id).await;
+}
+
+/// Waits until both records name the snapshot's worker runtime as live.
+///
+/// Applying worker metadata requires the in-memory and the durable record to be
+/// current, and a worker task that is still running commits its own snapshots,
+/// so either can be momentarily stale right after a test writes one of its own.
+/// Naming whichever record stayed stale keeps a discarded snapshot from being
+/// the only thing a failure reports.
+async fn wait_for_current_worker_metadata_record(
+    registry: &SessionRegistry,
+    store: &crate::store::Store,
+    id: &SessionId,
+    snapshot: &pohunek_worker_protocol::InspectSnapshot,
+) {
+    let worker_id = snapshot.worker_id.to_string();
+    let runtime_id = snapshot.runtime_id.as_ref().map(ToString::to_string);
+    let is_current = |record: &crate::store::SessionRecord| {
+        super::reconcile::worker_metadata_record_is_current(
+            record,
+            &worker_id,
+            runtime_id.as_deref(),
+        )
+    };
+    let mut memory_current = false;
+    let mut durable_current = false;
+    for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
+        memory_current = {
+            let sessions = registry.inner.sessions.lock().await;
+            let entry = sessions.get(id).expect("live session entry");
+            is_current(&SessionRegistry::session_record(
+                id,
+                entry,
+                entry.desired_state,
+                None,
+            ))
+        };
+        durable_current = store
+            .load_sessions()
+            .expect("load durable sessions")
+            .pop()
+            .is_some_and(|record| is_current(&record));
+        if memory_current && durable_current {
+            return;
+        }
+        // `worker_metadata_record_is_current` is a plain bool with no retryable
+        // signal, so this waits on the committing task's wall-clock progress
+        // rather than on a scheduler turn the way `yield_now()` siblings do.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "worker runtime never settled as live (memory: {memory_current}, durable: {durable_current})"
+    );
 }
 
 fn worker_subagent_snapshot(id: &str) -> pohunek_worker_protocol::SubagentSnapshot {
