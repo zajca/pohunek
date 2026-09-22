@@ -1506,7 +1506,7 @@ impl ProcessInspector for MockInspector {
             .cloned();
         match fact {
             Some(fact) => Ok(Some(fact)),
-            None => crate::procwatch::LinuxInspector::new().process(pid),
+            None => crate::procwatch::HostInspector::new().process(pid),
         }
     }
 
@@ -1555,6 +1555,10 @@ impl ProcessInspector for MockInspector {
         cwd.ok_or(crate::procwatch::Error::Race {
             operation: "mock_cwd",
         })
+    }
+
+    fn executable(&self, pid: Pid) -> Result<Option<PathBuf>, crate::procwatch::Error> {
+        crate::procwatch::HostInspector::new().executable(pid)
     }
 
     fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, crate::procwatch::Error> {

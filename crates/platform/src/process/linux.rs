@@ -1,6 +1,6 @@
 //! Linux `/proc` and pidfd process inspection.
 
-// Rust guideline compliant 2026-09-14
+// Rust guideline compliant 2026-09-22
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
@@ -51,23 +51,6 @@ impl LinuxInspector {
     #[must_use]
     pub fn new() -> Self {
         Self
-    }
-
-    /// Returns the executable path for one same-user process.
-    ///
-    /// # Errors
-    ///
-    /// Returns typed process inspection failures.
-    pub fn executable(&self, pid: Pid) -> Result<Option<PathBuf>, Error> {
-        let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
-        if !same_user(pid, euid) {
-            return Ok(None);
-        }
-        match fs::read_link(proc_path(pid).join("exe")) {
-            Ok(path) => Ok(Some(path)),
-            Err(error) if is_process_race(&error) => Ok(None),
-            Err(source) => Err(Error::from_io("read_executable", source)),
-        }
     }
 
     /// Returns the current opaque Linux boot identity.
@@ -167,6 +150,18 @@ impl ProcessInspector for LinuxInspector {
     fn cwd(&self, pid: Pid) -> Result<PathBuf, Error> {
         fs::read_link(proc_path(pid).join("cwd"))
             .map_err(|source| process_error("read_cwd", source))
+    }
+
+    fn executable(&self, pid: Pid) -> Result<Option<PathBuf>, Error> {
+        let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
+        if !same_user(pid, euid) {
+            return Ok(None);
+        }
+        match fs::read_link(proc_path(pid).join("exe")) {
+            Ok(path) => Ok(Some(path)),
+            Err(error) if is_process_race(&error) => Ok(None),
+            Err(source) => Err(Error::from_io("read_executable", source)),
+        }
     }
 
     fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, Error> {

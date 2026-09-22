@@ -45,7 +45,7 @@ use tokio_util::codec::{Framed, LinesCodec};
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo};
 use pohunek_daemon::events::{spawn_drain, EventLog};
 use pohunek_daemon::governance::HostGovernanceService;
-use pohunek_daemon::procwatch::LinuxInspector;
+use pohunek_daemon::procwatch::{HostInspector, ProcessInspector};
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 
@@ -153,20 +153,11 @@ fn ok_payload(response: Response) -> serde_json::Value {
 }
 
 fn process_start_identity(pid: u32) -> ProcessStartIdentity {
-    let stat =
-        std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read child process identity");
-    let fields = stat
-        .rsplit_once(") ")
-        .expect("process stat contains command terminator")
-        .1
-        .split_ascii_whitespace()
-        .collect::<Vec<_>>();
-    let start_identity = fields
-        .get(19)
-        .expect("process stat contains start identity")
-        .parse()
-        .expect("process start identity is numeric");
-    ProcessStartIdentity::new(start_identity)
+    let identity = HostInspector::new()
+        .identity(pid)
+        .expect("inspect child process identity")
+        .expect("child process is live");
+    ProcessStartIdentity::new(identity.start_identity.get())
 }
 
 /// Open a raw attach stream: a fresh connection carrying only the attach
@@ -299,7 +290,7 @@ async fn spawn_worker_backed_server(
     let registry = SessionRegistry::new_with_launcher_and_inspector(
         config,
         launcher,
-        Arc::new(LinuxInspector::new()),
+        Arc::new(HostInspector::new()),
     );
     if let Some(event_log_dir) = event_log_dir {
         let log = Arc::new(EventLog::open(&event_log_dir).expect("event log opens"));

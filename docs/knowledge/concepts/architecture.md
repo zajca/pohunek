@@ -39,16 +39,27 @@ block the caller's ordinary control connection.
 
 The shipped platform foundation centralizes target-neutral process identity,
 kernel Unix peer identity, and native service supervision contracts in
-`crates/platform`. Linux daemon and worker code use the real procfs, pidfd,
-peer-credential, and systemd backends. The shared secure-path contract preserves
-XDG config/data/state/cache precedence and adds a short, owner-private macOS
-runtime default without moving durable host identity. Native Apple Silicon CI
-compiles and tests these shared contracts with a macOS 14 deployment target, but
-this does not mean complete macOS host or client support is available. Intel
-Macs are outside the current release scope. Darwin process and peer inspection,
-portable PTY readiness, launchd, client and WebUI integration, signed artifacts,
-and native acceptance remain explicitly deferred through issues #97-#105 under
-the `Complete macOS support` milestone and macOS Project. The issue hierarchy,
+`crates/platform`. Every process-identity consumer in the daemon and the worker
+resolves one host inspector from those contracts rather than parsing operating
+system records on its own. Linux uses the real procfs, pidfd, peer-credential,
+and systemd backends; Darwin uses `libproc` process records, `sysctl`
+`KERN_PROCARGS2` argument regions, and a kqueue `EVFILT_PROC`/`NOTE_EXIT` exit
+watch. Both backends read the same facts: process, parent, and process-group
+ids, an opaque same-boot start identity, the controlling-terminal foreground
+process group, the executable path, the working directory, and only the
+allowlisted `POHUNEK` ownership markers. Argument and environment regions stay
+separate, so an environment value is never argument evidence and an argument is
+never an ownership marker. An observation that fails is an explicit typed
+failure, never a healthy absence, and never authorizes a mutation. The shared
+secure-path contract preserves XDG config/data/state/cache precedence and adds a
+short, owner-private macOS runtime default without moving durable host identity.
+Native Apple Silicon CI compiles and tests these shared contracts with a macOS
+14 deployment target, but this does not mean complete macOS host or client
+support is available. Intel Macs are outside the current release scope. Darwin
+peer inspection, portable PTY readiness, launchd, client and WebUI integration,
+signed artifacts, and native acceptance remain explicitly deferred through
+issues #98-#105 under the `Complete macOS support` milestone and macOS
+Project. The issue hierarchy,
 milestone, and Project own delivery scope, sequencing, and status; the accepted
 macOS RFC records design constraints rather than live tracking state.
 

@@ -15,7 +15,7 @@ use pohunek_client::Client;
 use pohunek_daemon::api::{DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::notifications::NotificationService;
-use pohunek_daemon::procwatch::LinuxInspector;
+use pohunek_daemon::procwatch::{HostInspector, ProcessInspector};
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_daemon::store::Store;
@@ -49,10 +49,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-
-// Linux `/proc/<pid>/stat` field 22 is the process start identity; after
-// removing pid and the parenthesized command it is item 19 in the remainder.
-const PROC_STAT_START_FIELD_AFTER_COMMAND: usize = 19;
 
 // Keeps a test report live long enough for local scheduling without making it
 // effectively unbounded.
@@ -2153,7 +2149,7 @@ fn worker_backed_registry(mut config: SessionRegistryConfig) -> SessionRegistry 
     SessionRegistry::new_with_launcher_and_inspector(
         config,
         launcher,
-        Arc::new(LinuxInspector::new()),
+        Arc::new(HostInspector::new()),
     )
 }
 
@@ -2556,16 +2552,11 @@ async fn report_native_id(host: &HostConfig, id: &SessionId, agent: &str, native
 }
 
 fn process_start_identity(pid: u32) -> ProcessStartIdentity {
-    let stat =
-        std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read managed process stat");
-    let command_end = stat.rfind(')').expect("process stat command is terminated");
-    let start_identity = stat[command_end + 1..]
-        .split_whitespace()
-        .nth(PROC_STAT_START_FIELD_AFTER_COMMAND)
-        .expect("process stat has start identity")
-        .parse::<u64>()
-        .expect("process start identity is numeric");
-    ProcessStartIdentity::new(start_identity)
+    let identity = HostInspector::new()
+        .identity(pid)
+        .expect("inspect managed process identity")
+        .expect("managed process is live");
+    ProcessStartIdentity::new(identity.start_identity.get())
 }
 
 async fn wait_for_native_id_tcp(host: &HostConfig, id: &SessionId, native_id: &str) -> SessionInfo {

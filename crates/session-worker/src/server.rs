@@ -19,7 +19,7 @@ use pohunek_platform::filesystem::{
 };
 use pohunek_platform::peer;
 use pohunek_platform::process::{
-    LinuxInspector, ProcessIdentity as OsProcessIdentity, ProcessInspector, StartIdentity,
+    HostInspector, ProcessIdentity as OsProcessIdentity, ProcessInspector, StartIdentity,
 };
 use pohunek_worker_protocol as protocol;
 use protocol::{
@@ -312,7 +312,7 @@ impl Server {
         };
 
         let worker_start = process_start(std::process::id())?;
-        let boot_identity = LinuxInspector::new()
+        let boot_identity = HostInspector::new()
             .boot_identity()
             .map_err(|error| WorkerError::Protocol(error.to_string()))?;
         let journal = Journal::new(&args.journal_path);
@@ -3081,7 +3081,7 @@ fn verify_launch_claim(claim: &PendingLaunchClaim) -> Result<bool, WorkerError> 
     let root = exact_identity(&claim.root)?;
     let candidate = exact_identity(&claim.identity.process)?;
     for expected in [root, candidate] {
-        match LinuxInspector.identity(expected.pid) {
+        match HostInspector::new().identity(expected.pid) {
             Ok(Some(current)) if current == expected => {}
             Ok(_) | Err(pohunek_platform::process::Error::Race { .. }) => return Ok(false),
             Err(error) => return Err(WorkerError::Protocol(error.to_string())),
@@ -3767,7 +3767,7 @@ fn unix_ms() -> u64 {
 }
 
 fn process_start(pid: u32) -> Result<u64, WorkerError> {
-    LinuxInspector::new()
+    HostInspector::new()
         .identity(pid)
         .map_err(|error| WorkerError::Protocol(error.to_string()))?
         .map(|identity| identity.start_identity.get())
@@ -3775,7 +3775,7 @@ fn process_start(pid: u32) -> Result<u64, WorkerError> {
 }
 
 fn process_parent(pid: u32) -> Result<u32, WorkerError> {
-    LinuxInspector::new()
+    HostInspector::new()
         .parent_pid(pid)
         .map_err(|error| WorkerError::Protocol(error.to_string()))?
         .ok_or_else(|| WorkerError::Protocol("process no longer exists".to_owned()))
@@ -3802,7 +3802,7 @@ fn designated_launch_process(
     root: OsProcessIdentity,
     provider: &str,
 ) -> Result<Option<WireProcessIdentity>, WorkerError> {
-    let inspector = LinuxInspector::new();
+    let inspector = HostInspector::new();
     let mut processes = inspector
         .descendant_identities(root)
         .map_err(|error| WorkerError::Protocol(error.to_string()))?;

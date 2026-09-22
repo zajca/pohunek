@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use pohunek_daemon::procwatch::{LinuxInspector, ProcessInspector};
+use pohunek_daemon::procwatch::{HostInspector, ProcessInspector};
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use protocol::{
@@ -140,7 +140,7 @@ fn worker_backed_registry(mut config: SessionRegistryConfig) -> SessionRegistry 
     SessionRegistry::new_with_launcher_and_inspector(
         config,
         launcher,
-        Arc::new(LinuxInspector::new()),
+        Arc::new(HostInspector::new()),
     )
 }
 
@@ -166,7 +166,7 @@ fn worker_binary() -> PathBuf {
 
 #[tokio::test]
 async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
-    if !pidfd_is_available() {
+    if !native_exit_watch_is_available() {
         return;
     }
 
@@ -205,7 +205,7 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
             .expect("create shell session")
     };
     let child_pid = wait_for_pid_file(&pid_file).await;
-    let inspector = LinuxInspector::new();
+    let inspector = HostInspector::new();
     let child = inspector
         .process(child_pid)
         .expect("inspect fake agent")
@@ -281,7 +281,7 @@ async fn procwatch_updates_cwd_after_shell_cd() {
     reason = "the end-to-end external-session contract is clearer in one lifecycle test"
 )]
 async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
-    if !pidfd_is_available() {
+    if !native_exit_watch_is_available() {
         return;
     }
 
@@ -390,8 +390,8 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
     let _ = child.wait();
 }
 
-fn pidfd_is_available() -> bool {
-    let inspector = LinuxInspector::new();
+fn native_exit_watch_is_available() -> bool {
+    let inspector = HostInspector::new();
     let identity = inspector
         .identity(std::process::id())
         .expect("inspect test process")
@@ -399,7 +399,7 @@ fn pidfd_is_available() -> bool {
     match inspector.exit_watch(identity) {
         Ok(_) => true,
         Err(pohunek_daemon::procwatch::Error::Unavailable { .. }) => false,
-        Err(err) => panic!("pidfd_open failed unexpectedly: {err}"),
+        Err(err) => panic!("native exit watch failed unexpectedly: {err}"),
     }
 }
 

@@ -2235,7 +2235,7 @@ mod tests {
     };
     use crate::agent::{ForkMode, InputRules, ResumeMode, SessionRefKind};
     use crate::procwatch::{
-        ExitWatch, LinuxInspector, OwnershipMarkers, Pid, ProcessFact,
+        ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessFact,
         ProcessIdentity as OsProcessIdentity, ProcessInspector,
     };
     use crate::session::SessionRegistryConfig;
@@ -2276,7 +2276,7 @@ mod tests {
     struct RetryInspector {
         fail_descendants: AtomicBool,
         descendant_calls: AtomicUsize,
-        inner: LinuxInspector,
+        inner: HostInspector,
     }
 
     impl RetryInspector {
@@ -2325,6 +2325,10 @@ mod tests {
 
         fn cwd(&self, pid: Pid) -> Result<PathBuf, crate::procwatch::Error> {
             self.inner.cwd(pid)
+        }
+
+        fn executable(&self, pid: Pid) -> Result<Option<PathBuf>, crate::procwatch::Error> {
+            self.inner.executable(pid)
         }
 
         fn exit_watch(
@@ -2376,15 +2380,12 @@ mod tests {
     }
 
     fn process_start_identity(pid: u32) -> u64 {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read proc stat");
-        stat.rsplit_once(')')
-            .expect("proc stat command")
-            .1
-            .split_whitespace()
-            .nth(19)
-            .expect("proc stat start identity")
-            .parse()
-            .expect("numeric start identity")
+        HostInspector::new()
+            .identity(pid)
+            .expect("inspect process identity")
+            .expect("process is live")
+            .start_identity
+            .get()
     }
 
     #[test]

@@ -31,7 +31,7 @@ use super::{
     LocalGovernanceConfirmation, RelayProjection,
 };
 use crate::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
-use crate::procwatch::LinuxInspector;
+use crate::procwatch::HostInspector;
 use crate::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use crate::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 
@@ -326,7 +326,7 @@ fn worker_backed_registry(socket: &Path, root: &Path) -> SessionRegistry {
     SessionRegistry::new_with_launcher_and_inspector(
         config,
         Arc::new(SubprocessWorkerLauncher::new(worker_binary(), environment)),
-        Arc::new(LinuxInspector::new()),
+        Arc::new(HostInspector::new()),
     )
 }
 

@@ -4,9 +4,14 @@
 //! and session worker. It deliberately excludes session policy, provider
 //! interpretation, public wire types, GUI state, and supervisor policy.
 
-#![forbid(unsafe_code)]
+// The Darwin process backend wraps `libproc`, `sysctl`, and kqueue calls that
+// have no safe equivalent; it opts back in with a localized
+// `#[expect(unsafe_code)]` and documents the invariant each block relies on.
+// Every other target stays free of unsafe code.
+#![cfg_attr(not(target_os = "macos"), forbid(unsafe_code))]
+#![cfg_attr(target_os = "macos", deny(unsafe_code))]
 
-// Rust guideline compliant 2026-09-19
+// Rust guideline compliant 2026-09-22
 
 #[cfg(unix)]
 pub mod filesystem;

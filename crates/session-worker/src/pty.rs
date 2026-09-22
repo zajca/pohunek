@@ -17,7 +17,7 @@ use nix::sys::epoll::{self, EpollCreateFlags, EpollEvent, EpollFlags, EpollOp};
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::{close, Pid};
-use pohunek_platform::process::{LinuxInspector, ProcessInspector};
+use pohunek_platform::process::{HostInspector, ProcessInspector};
 use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
 use rustix::fd::OwnedFd;
 use rustix::fs::{open, Mode, OFlags};
@@ -1378,7 +1378,7 @@ fn reap_child(child: &mut SpawnGuard, pid: u32) -> Exit {
 }
 
 fn read_process_start(pid: u32) -> Result<String, io::Error> {
-    LinuxInspector::new()
+    HostInspector::new()
         .identity(pid)
         .map_err(io::Error::other)?
         .map(|identity| identity.start_identity.to_string())
@@ -1410,7 +1410,7 @@ mod tests {
     };
     use crate::output::OutputCompletion;
     use crate::{InputFragment, InputPlan, OutputEvent, OutputHub, WorkerConfig};
-    use pohunek_platform::process::{LinuxInspector, ProcessInspector};
+    use pohunek_platform::process::{HostInspector, ProcessInspector};
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::collections::{HashMap, VecDeque};
     use std::io::Cursor;
@@ -1938,7 +1938,7 @@ mod tests {
         guard.set_process_group(process_group);
         drop(pair.slave);
 
-        let inspector = LinuxInspector::new();
+        let inspector = HostInspector::new();
         let root = inspector
             .identity(pid)
             .expect("inspect rollback root")

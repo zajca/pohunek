@@ -78,6 +78,10 @@ jobs:
       - name: Check shared platform contracts
         run: cargo check --locked -p pohunek-platform --all-targets
 
+      # Covers the Darwin process backend: same-user facts, descendants, cwd,
+      # executable identity, controlling-terminal foreground groups, ownership
+      # markers, and the kqueue `NOTE_EXIT` watch. Those paths exist only on a
+      # native runner, so this step is the only gate that executes them.
       - name: Test shared platform contracts
         run: cargo test --locked -p pohunek-platform
 
@@ -94,8 +98,8 @@ jobs:
         run: cargo test --locked -p pohunek-paths
 
       # The complete daemon/worker macOS build remains sequenced behind the
-      # native process, peer-identity, and PTY work in issues #97-#99. Exercise
-      # the issue-#96 Hermes filesystem lifecycle natively in the meantime.
+      # native peer-identity and PTY work in issues #98-#99. Exercise the
+      # issue-#96 Hermes filesystem lifecycle natively in the meantime.
       - name: Check Hermes filesystem lifecycle
         run: cargo check --locked -p pohunek-cli --lib
 
@@ -240,7 +244,7 @@ jobs:
               - 'crates/xtask/src/checks.rs'
               - 'crates/xtask/src/lib.rs'
             # macOS platform, path, and Hermes filesystem contracts run on the
-            # native arm64 runner (issues #96 and #125): gate on every crate
+            # native arm64 runner (issues #96, #97, and #125): gate on every crate
             # exercised by the job, the cross-platform dependency graph, and
             # the Cargo configuration (.cargo/config.toml carries Apple-specific
             # linker/target flags that can break only the macOS build). The root

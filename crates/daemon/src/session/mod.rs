@@ -1030,7 +1030,7 @@ impl SessionRegistry {
             Self::new_with_launcher_and_inspector(
                 config,
                 launcher,
-                Arc::new(crate::procwatch::LinuxInspector::new()),
+                Arc::new(crate::procwatch::HostInspector::new()),
             )
         }
         #[cfg(not(test))]
@@ -1041,7 +1041,7 @@ impl SessionRegistry {
             Self::new_with_launcher_and_inspector(
                 config,
                 launcher,
-                Arc::new(crate::procwatch::LinuxInspector::new()),
+                Arc::new(crate::procwatch::HostInspector::new()),
             )
         }
     }
@@ -1066,13 +1066,13 @@ impl SessionRegistry {
         Ok(Self::new_with_launcher_and_inspector(
             config,
             launcher,
-            Arc::new(crate::procwatch::LinuxInspector::new()),
+            Arc::new(crate::procwatch::HostInspector::new()),
         ))
     }
 
     /// Create a registry with an injected process inspector.
     ///
-    /// Production uses [`crate::procwatch::LinuxInspector`]. Tests use this to
+    /// Production uses [`crate::procwatch::HostInspector`]. Tests use this to
     /// drive process facts and exit events deterministically without touching the
     /// host process table.
     #[must_use]
