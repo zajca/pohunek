@@ -24,8 +24,9 @@ pub use oidc::{OidcClient, OidcClientConfig, OidcDeviceAuthorization, OidcIdenti
 
 #[doc(inline)]
 pub use service::{
-    AuthLimits, AuthService, AuthenticatedActor, BrowserLoginStart, DeviceLoginStart,
-    IssuedBrowserSession,
+    link::{BrowserLinkStart, DeviceLinkStart, LinkedIdentity},
+    AuthLimits, AuthService, AuthenticatedActor, BrowserCallbackResult, BrowserLoginStart,
+    DeviceLoginStart, IssuedBrowserSession,
 };
 
 use std::fmt::{Debug, Formatter};
@@ -86,6 +87,48 @@ pub enum AuthError {
     /// A credential rotation conflicts with the current configured policy.
     #[error("credential rotation request is rejected by policy")]
     RotationRejected,
+    /// The caller has no stable OIDC identity that can prove an account link.
+    #[error("account linking requires an authenticated human identity")]
+    LinkUnsupportedActor,
+    /// A browser transaction was presented to a bearer caller, or the reverse.
+    #[error("account link transaction requires its original authentication channel")]
+    LinkChannelMismatch,
+    /// The account already has an open link transaction.
+    #[error("account already has a pending link transaction")]
+    LinkPending,
+    /// No link transaction matches the requested coordinate.
+    #[error("account link transaction was not found")]
+    LinkNotFound,
+    /// The link transaction passed its bounded expiry.
+    #[error("account link transaction expired")]
+    LinkExpired,
+    /// The link transaction was cancelled before it could be proven.
+    #[error("account link transaction was cancelled")]
+    LinkCancelled,
+    /// A link coordinate no longer matches current durable authority.
+    #[error("account link transaction is no longer current")]
+    LinkStale,
+    /// A completion attempt did not come from the initiating principal.
+    #[error("account link completion does not match its initiating account")]
+    LinkCrossPrincipal,
+    /// The transaction, callback, or identity proof was already consumed.
+    #[error("account link transaction was already completed")]
+    LinkReplayed,
+    /// The proven identity is already linked to this account.
+    #[error("account link target is already linked to this account")]
+    LinkSelf,
+    /// The proven identity is already linked to another account.
+    #[error("account link target identity belongs to another account")]
+    LinkCollision,
+    /// Recovery quarantine forbids changing account authority.
+    #[error("relay recovery quarantine forbids account link changes")]
+    LinkQuarantined,
+    /// Removing this identity would leave the account unable to authenticate.
+    #[error("account must retain at least one linked identity")]
+    UnlinkLastIdentity,
+    /// No active linked identity matches the requested coordinate.
+    #[error("linked identity was not found")]
+    IdentityNotFound,
 }
 
 /// Identifies an opaque browser session cookie.
