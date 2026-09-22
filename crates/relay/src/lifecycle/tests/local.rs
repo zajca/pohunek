@@ -499,7 +499,10 @@ async fn migration_resumes_a_plan_that_reshaped_populated_authority_rows() {
         .await
         .expect("seed a populated authority table");
     let (base, authority_digest) = migration_coordinates(&store).await;
-    let clean = witness.latest().expect("witness").expect("clean foundation");
+    let clean = witness
+        .latest()
+        .expect("witness")
+        .expect("clean foundation");
     witness
         .begin_local(
             Some(&clean),

@@ -21,9 +21,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use relay_protocol::{
     AccountLinkBrowserStart, AccountLinkDeviceStart, AccountLinkPollRequest, AccountLinkPollResult,
     AccountLinkRequest, ApiError, ApiErrorBody, CancelAccountLinkRequest,
-    CreateServiceAccountRequest, CredentialId, DeviceCredential, DeviceLoginStart, DevicePollResult,
-    LoginId, PageRequest, RevokeCredentialRequest, RotateCredentialRequest, Secret, TeamId,
-    UnlinkIdentityRequest,
+    CreateServiceAccountRequest, CredentialId, DeviceCredential, DeviceLoginStart,
+    DevicePollResult, LoginId, PageRequest, RevokeCredentialRequest, RotateCredentialRequest,
+    Secret, TeamId, UnlinkIdentityRequest,
 };
 use serde::Deserialize;
 use uuid::Uuid;

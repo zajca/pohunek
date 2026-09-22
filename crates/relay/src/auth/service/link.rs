@@ -36,6 +36,9 @@ use super::{
     IDENTITY_ISSUE_MAX_ATTEMPTS, RANDOM_SECRET_BYTES,
 };
 
+#[cfg(test)]
+mod tests;
+
 /// Bounds a link status page so one account cannot request unbounded history.
 const MAX_LINK_PAGE: u16 = 128;
 /// Audited action for starting a link transaction.
@@ -372,7 +375,9 @@ impl AuthService {
             .await?;
         if !self.digest_key.matches(
             secret.expose(),
-            possession_digest(&mut transaction, link_id).await?.as_slice(),
+            possession_digest(&mut transaction, link_id)
+                .await?
+                .as_slice(),
         ) {
             audit_auth(
                 &mut transaction,
@@ -537,7 +542,8 @@ impl AuthService {
         .map_err(database_error)?
         .ok_or(AuthError::LinkStale)?;
         let cancelled = link_record(&cancelled)?;
-        self.supersede_link_logins(&mut transaction, link_id).await?;
+        self.supersede_link_logins(&mut transaction, link_id)
+            .await?;
         audit_actor_mutation(
             &mut transaction,
             actor.actor(),
@@ -659,7 +665,8 @@ impl AuthService {
         .await
         .map_err(retryable_database_error)?;
         for link_id in stale {
-            self.supersede_link_logins(&mut transaction, link_id).await?;
+            self.supersede_link_logins(&mut transaction, link_id)
+                .await?;
         }
         let advanced = sqlx::query_scalar::<_, i64>(
             "UPDATE principals SET account_link_generation = account_link_generation + 1, \
@@ -721,7 +728,8 @@ impl AuthService {
             account_link_generation: advanced,
             revoked_credentials: u32::try_from(revoked_credentials)
                 .map_err(|_error| AuthError::Durable)?,
-            revoked_sessions: u32::try_from(revoked_sessions).map_err(|_error| AuthError::Durable)?,
+            revoked_sessions: u32::try_from(revoked_sessions)
+                .map_err(|_error| AuthError::Durable)?,
         })
     }
 
@@ -774,7 +782,10 @@ impl AuthService {
         .ok_or(AuthError::CredentialInvalid)?;
         // Only a human or infrastructure principal has OIDC identities; a
         // service account never links one.
-        if !matches!(row.get::<String, _>("kind").as_str(), "human" | "infrastructure") {
+        if !matches!(
+            row.get::<String, _>("kind").as_str(),
+            "human" | "infrastructure"
+        ) {
             return Err(AuthError::LinkUnsupportedActor);
         }
         let present = sqlx::query_scalar::<_, Uuid>(
@@ -865,7 +876,10 @@ impl AuthService {
             .bind(insert.recovery_generation)
             .fetch_optional(&mut **transaction)
             .await;
-        link_record(&row.map_err(link_database_error)?.ok_or(AuthError::LinkStale)?)
+        link_record(
+            &row.map_err(link_database_error)?
+                .ok_or(AuthError::LinkStale)?,
+        )
     }
 
     /// Closes any unconsumed provider row bound to one link transaction.
@@ -926,7 +940,8 @@ impl AuthService {
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
-        self.supersede_link_logins(&mut transaction, link_id).await?;
+        self.supersede_link_logins(&mut transaction, link_id)
+            .await?;
         audit_auth(
             &mut transaction,
             LINK_BEGIN_ACTION,
@@ -984,7 +999,8 @@ impl AuthService {
                 != context.authentication_generation()
             || actor.identity_id() != Some(row.get("source_identity_id"))
             || row.get::<i64, _>("recovery_generation") != context.recovery_generation()
-            || row.get::<i64, _>("account_link_generation") != row.get::<i64, _>("current_generation")
+            || row.get::<i64, _>("account_link_generation")
+                != row.get::<i64, _>("current_generation")
         {
             return Err(AuthError::LinkStale);
         }

@@ -146,9 +146,16 @@ pub struct AccountLinkPollRequest {
 #[cfg_attr(feature = "ts", ts(export))]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AccountLinkPollResult {
-    Pending { retry_after_seconds: u32 },
-    SlowDown { retry_after_seconds: u32 },
-    Complete { link: AccountLinkRecord, identity: IdentityRecord },
+    Pending {
+        retry_after_seconds: u32,
+    },
+    SlowDown {
+        retry_after_seconds: u32,
+    },
+    Complete {
+        link: AccountLinkRecord,
+        identity: IdentityRecord,
+    },
     Denied,
     Expired,
     Cancelled,
