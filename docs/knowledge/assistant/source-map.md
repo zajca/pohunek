@@ -115,9 +115,9 @@ Web control center client:
 Implemented reduced relay foundation and deferred team-relay architecture:
 PostgreSQL fencing and recovery, protected stopped-lifecycle provisioning,
 generic OIDC browser/device authentication, bounded HTTPS account and credential
-lifecycle, and native relay CLI are implemented. Host links, routing, attach,
-account linking, team administration, provider verification, and team clients
-remain deferred:
+lifecycle, provider-neutral account linking, and native relay CLI are
+implemented. Host links, routing, attach, team administration, provider
+verification, and team clients remain deferred:
 
 - `docs/design/team-relay-control-plane-rfc.md`
 - `docs/architecture.md`
@@ -128,7 +128,21 @@ remain deferred:
 - `docs/knowledge/guides/remote-hosts.md`
 - `docs/knowledge/guides/web-control-center.md`
 - `crates/relay-protocol/src/`
+- `crates/relay-protocol/src/link.rs` — typed account-link contracts: channel,
+  state, safe revisioned record and page, browser/device start, poll request and
+  result, cancel and unlink requests, and the identity-removal result. No type
+  here carries a provider profile attribute.
 - `crates/relay/migrations/`
+- `crates/relay/migrations/0004_account_linking.sql` — the durable account-link
+  guarantees: monotonic `principals.account_link_generation`, active
+  `(issuer, subject)` uniqueness for identities that are not removed, link-once
+  identity provenance, one pending transaction per account, one unconsumed
+  provider row per transaction, immutable transaction provenance, and
+  terminal-state transition enforcement.
+- `crates/relay/src/auth/service/link.rs` — the account-link lifecycle: browser
+  and device start, device poll, browser-callback commit, status page, cancel,
+  and unlink, with the current-actor, generation, possession, collision, and
+  audit checks each transition makes.
 - `crates/relay/src/operator.rs`
 - `crates/relay/src/lifecycle.rs`
 - `crates/relay/src/lifecycle/local.rs`

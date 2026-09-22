@@ -28,6 +28,15 @@
   code-signing-restricted process's environment). An argument vector an `exec`
   or an exit withholds leaves that one process without a command line instead of
   failing the inventory it appears in.
+- Documented the implemented provider-neutral relay account linking: identity is
+  exactly issuer plus immutable subject, provider profile attributes never link
+  accounts, both the current relay actor and the new identity prove themselves in
+  one audited transaction completable only through its own browser or device
+  channel, and a link or unlink takes effect on current credentials and sessions
+  immediately. Recorded the HTTPS start/poll/status/cancel/unlink surface with no
+  CLI subcommand, the durable PostgreSQL guarantees, and the user-facing safety
+  rules. Kept host links, routing, attach, team administration, provider
+  verification, and team clients explicitly deferred.
 - Documented the shared secure runtime-path and portable filesystem foundation:
   preserved XDG durable locations, the owner-private macOS runtime default,
   fail-closed path validation, byte-bounded Unix sockets, atomic no-replace

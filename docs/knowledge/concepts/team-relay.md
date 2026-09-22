@@ -12,12 +12,13 @@ intents: [setup, project, update, debug, help]
 Status: the reduced relay foundation is implemented. It has PostgreSQL-backed
 lease fencing and recovery, protected stopped-lifecycle initial Owner and
 service-account provisioning, generic OIDC browser and device login, bounded
-HTTPS account and credential lifecycle, and a native HTTPS/keyring CLI. It has
-no host link, team client or WebUI, routing, attach path, host enrollment,
-account linking, or complete team-administration API. Current Pohunek releases
-otherwise use public protocol v3 through an owner-only Unix socket or a direct
-configured overlay such as NetBird. The shipped Bun web backend is a transparent
-mesh-local browser transport, not the team relay described here.
+HTTPS account and credential lifecycle, provider-neutral account linking, and a
+native HTTPS/keyring CLI. It has no host link, team client or WebUI, routing,
+attach path, host enrollment, or complete team-administration API. Current
+Pohunek releases otherwise use public protocol v3 through an owner-only Unix
+socket or a direct configured overlay such as NetBird. The shipped Bun web
+backend is a transparent mesh-local browser transport, not the team relay
+described here.
 
 ## Local foundation provisioning
 
@@ -83,11 +84,66 @@ URLs, routine output, or logs. A keyring write failure attempts compensating
 revocation.
 
 This generic OIDC implementation contains no Keycloak-specific provider or
-social-account verification. Account linking is deferred to
-[#107](https://github.com/zajca/pohunek/issues/107), complete team
-administration to [#108](https://github.com/zajca/pohunek/issues/108), and
-Keycloak-brokered Google/GitHub verification to
+social-account verification. Complete team administration is deferred to
+[#108](https://github.com/zajca/pohunek/issues/108) and Keycloak-brokered
+Google/GitHub verification to
 [#92](https://github.com/zajca/pohunek/issues/92).
+
+## Account linking
+
+An account can hold more than one OIDC identity so the same person reaches the
+same relay account through different providers. A relay identity is exactly the
+issuer plus the immutable subject. Email address, display name, Google `hd`,
+GitHub login and every other provider profile attribute are attributes of an
+identity, never a key: two accounts with the same email address stay two
+accounts, and no profile data can merge them.
+
+Linking is an explicit authenticated transaction, not a lookup. Both sides prove
+themselves: the caller must be a current relay actor with a stable OIDC identity,
+and the new identity must be proven through the same Authorization Code with PKCE
+or device authorization rules that a login uses. A service account has no OIDC
+identity and cannot link one. The transaction is completable only through the
+channel that opened it: a browser transaction by the same browser session through
+the registered callback, a device transaction by the same bearer credential
+through its bounded poll. An account has at most one open link transaction, and
+each one expires.
+
+The relay serves linking over HTTPS as start, poll, status, cancel and unlink
+operations on the account's own links. There is no `pohunek relay` subcommand for
+it, and no team WebUI. Safe status reads report the transaction's channel, state,
+revision, source and linked identity coordinates, account-link generation, and
+timestamps. One-use possession material is delivered once to the caller and kept
+only as a keyed digest, so a lost value cannot be re-read and a transaction
+cannot be re-armed; the caller cancels it and starts a new one.
+
+Every link and unlink takes effect on current authority immediately. Completing a
+link advances the account's account-link generation. That generation is the
+coordinate every sensitive decision re-checks, so an in-flight transaction bound
+to the previous value is no longer usable and must be started
+again. An unlink removes the identity, revokes the credentials and browser sessions
+that came from it, cancels the account's pending link transactions, and advances
+the account generation in the same audited transaction. An account cannot remove
+its last identity, because it would then be unable to authenticate at all;
+removing the final identity means deprovisioning the principal.
+
+Safety rules a user should know:
+
+- A link changes who can sign in as the account. Only link an identity you
+  control yourself, at a provider you trust for that account.
+- An identity already linked to another account is refused rather than moved. A
+  collision means someone else's account holds that identity; resolve the
+  ownership question instead of retrying.
+- Unlinking signs out that identity everywhere at once. Any CLI credential or
+  browser session obtained through it stops working immediately, so keep a
+  working second identity before removing one.
+- A cancelled, expired or completed transaction is terminal. Nothing revives it:
+  not a retry, not a restore, not a cached provider session, not provider profile
+  data.
+- Recovery quarantine blocks link changes and cancels pending transactions. Wait
+  until the relay leaves quarantine rather than retrying against a stale
+  recovery generation.
+- Never paste a link's one-use possession value into a chat, an issue, a log or a
+  URL. It proves possession on its own for as long as the transaction is open.
 
 ## Topology and connection direction
 

@@ -36,14 +36,100 @@ and unchanged.
 PostgreSQL. It is not a `pohunekd` protocol-v3 endpoint and it does not add a
 host link, routing, attach, or team WebUI. The implemented bounded surface
 includes liveness/readiness, generic OIDC browser Authorization Code with PKCE
-and device authorization, account and credential lifecycle, and service-account
-credential lifecycle. It also has protected stopped-lifecycle `migrate`,
-`bootstrap`, `provision`, and recovery commands.
+and device authorization, account and credential lifecycle, account linking, and
+service-account credential lifecycle. It also has protected stopped-lifecycle
+`migrate`, `bootstrap`, `provision`, and recovery commands.
 
 The native `pohunek relay` commands use a separate HTTPS-only client and the OS
 keyring for `login`, `status`, `logout`, credential `rotate`, and interrupted
 rotation recovery. They bind a credential to one exact HTTPS origin. This is a
-foundation surface, not a complete team-management or host-control API.
+foundation surface, not a complete team-management or host-control API. The
+account-linking routes below have no `pohunek relay` subcommand; they are
+HTTPS-only.
+
+### Relay account-linking surface
+
+Account linking proves control of one additional stable OIDC identity and
+attaches it to an existing relay account. A relay identity is exactly the issuer
+plus the immutable subject. Email, display name, Google `hd`, GitHub login, and
+every other provider profile attribute are attributes, never linking inputs, and
+matching email strings never link accounts.
+
+Wire types are exported by `crates/relay-protocol`, and JSON field names are the
+Serde field names of those structs. Every route is served with `no-store`, sits
+behind the existing relay authentication boundary, and accepts either a browser
+session cookie or a bearer credential in one request, never both. A browser
+mutation additionally requires the exact configured `Origin` and an
+`x-pohunek-csrf` header matching the CSRF cookie.
+
+| Route | Request | `200` response | Notes |
+|---|---|---|---|
+| `POST /v1/account/links/browser/start` | `AccountLinkRequest` | `AccountLinkBrowserStart` | Browser session only; a bearer caller is rejected. Returns `{link, authorization_url}` and sets the one-use host-only `__Host-pohunek-relay-login` binding cookie, so the authorization URL alone cannot complete the transaction. |
+| `POST /v1/account/links/device/start` | `AccountLinkRequest` | `AccountLinkDeviceStart` | Bearer credential only; a browser caller is rejected. Returns `{link, authorization}` where `authorization` carries the RFC 8628 `verification_uri`, optional `verification_uri_complete`, `user_code`, `expires_at`, `interval_seconds`, and the one-use `poll_secret`. The poll value is delivered once and is stored only as a keyed digest. |
+| `POST /v1/account/links/device/poll` | `AccountLinkPollRequest` plus the `x-pohunek-device-secret` header | `AccountLinkPollResult` | Polled by `link_id` by the same bearer credential that started the transaction; the possession value travels in the header, never in the URL. The `status` tag is `pending` or `slow_down` with `retry_after_seconds`, `complete` with `{link, identity}`, `denied`, `expired`, or `cancelled`. |
+| `GET /v1/account/links` | `PageRequest` query (`after`, `limit`) | `AccountLinkPage` | Read-only history for the calling account only, ordered by `link_id` ascending, with `next_cursor` for continuation. `limit` above 128 is rejected. No CSRF is required. |
+| `POST /v1/account/links/{link_id}/cancel` | `CancelAccountLinkRequest` | `AccountLinkRecord` | Cancels one pending transaction owned by this account and closes its unconsumed provider row. An already cancelled transaction returns its current record, so a retry after a lost response is safe. |
+| `POST /v1/account/identities/{identity_id}/unlink` | `UnlinkIdentityRequest` | `IdentityRemoved` | Removes one active linked identity and returns `{identity_id, principal_id, removed_at, account_link_generation, revoked_credentials, revoked_sessions}`. An exact retry of the same `idempotency` coordinate returns the committed result instead of removing a second identity. |
+
+`AccountLinkRecord` is the safe revisioned view of one transaction: `link_id`,
+`principal_id`, `channel` (`browser` or `device`), `state` (`pending`,
+`completed`, `cancelled`, `expired`, or `failed`), `source_identity_id`,
+`linked_identity_id`, `revision`, `account_link_generation`, `created_at`,
+`expires_at`, and `completed_at`. Possession digests, provider tokens, and
+verifier material never appear in it, and `IdentityRecord` carries only
+`identity_id`, `issuer`, and `subject`.
+
+A browser link completes through the existing `GET /v1/auth/oidc/callback`. That
+callback must present both the one-use login binding cookie and the caller's
+current session cookie; it consumes the `BrowserLogin` row before code exchange,
+redirects to `account/ready`, and issues no new session cookie for a link. A
+device link completes on the poll that returns `complete`. Both channels use the
+same PKCE and device validation rules as login, and a transaction is completable
+only through the channel that created it.
+
+Every transaction is bound at creation to the initiating principal, the source
+identity, the exact authentication row and its generation, the issuer, client
+and audience, a keyed digest of its one-use possession value, the digest key id,
+the account-link generation, the recovery generation, and a bounded expiry. A
+completion re-checks all of those against current durable state, so a rotated or
+revoked source credential, a replaced browser session, an advanced account-link
+generation, a changed recovery generation, or a cross-principal caller fails the
+transaction instead of linking.
+
+PostgreSQL holds the durable guarantees rather than application code alone: one
+pending transaction per account, one created identity per completed transaction,
+uniqueness of `(issuer, subject)` across identities that are not removed,
+monotonic `account_link_generation`, immutable transaction provenance, and a
+terminal state that cannot be revived or rewritten without advancing `revision`.
+A removed identity keeps its row so credential and browser-session provenance
+stays resolvable.
+
+A completed link advances the account's `account_link_generation`. An unlink
+revokes that identity's credentials and browser sessions, cancels every pending
+link transaction for the account, and advances both the account-link generation
+and the principal generation in the same transaction as the audit record; an
+audit or database failure fails closed and closes active access rather than
+acknowledging an authority change. An account never removes its last identity.
+Restore quarantine cancels every pending link transaction and blocks link
+changes while the recovery generation is stale.
+
+Failures use the relay's HTTP error contract with a stable `code`:
+
+| Status | `code` | Cause |
+|---|---|---|
+| `400` | `invalid_request` | A transaction presented through the wrong channel, `Authorization` mixed with a cookie or `Origin`, a malformed body, or a page limit above the bound. |
+| `401` | `authentication_required` | No current credential or session, a failed CSRF or `Origin` check, or a poll possession value that does not match the transaction. |
+| `403` | `forbidden` | An actor with no stable OIDC identity, such as a service account, or a completion that does not match the initiating account. |
+| `404` | `not_found` | No link transaction or active identity with that coordinate belongs to this account. |
+| `409` | `link_pending` | The account already has an open link transaction. |
+| `409` | `link_replayed` | The transaction, callback, or identity proof was already consumed. |
+| `409` | `link_cancelled` | The transaction was cancelled before it could be proven. |
+| `409` | `link_self` | The proven identity is already linked to this account. |
+| `409` | `link_collision` | The proven identity belongs to another account. |
+| `409` | `last_identity` | Removing the identity would leave the account unable to authenticate. |
+| `409` | `state_conflict` | A link coordinate is no longer current, or a retry coordinate conflicts with a different request. |
+| `410` | `link_expired` | The transaction passed its bounded expiry. |
+| `503` | `unavailable` | Recovery quarantine, a durable failure, or a configured issuer with no usable device endpoint. |
 
 ### Deferred optional team relay
 

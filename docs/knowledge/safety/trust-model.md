@@ -102,13 +102,27 @@ boundaries in [secrets](secrets.md) and [repo `.pohunek/`](repo-pohunek.md).
 The [optional team relay](../concepts/team-relay.md) has an implemented reduced
 foundation: PostgreSQL-backed fencing and recovery, protected local
 provisioning, generic OIDC authentication, bounded HTTPS account and credential
-lifecycle, and a native HTTPS/keyring CLI. Do not invent host-link, routing,
-attach, team-administration, account-linking, provider-verification, or team
-browser commands, configuration keys, protocol fields, or recovery steps.
+lifecycle, provider-neutral account linking, and a native HTTPS/keyring CLI. Do
+not invent host-link, routing, attach, team-administration,
+provider-verification, or team browser commands, configuration keys, protocol
+fields, or recovery steps.
 Current protocol-v3 local, overlay, and Bun browser paths remain one owner trust
 domain and remain supported alongside the foundation. The relay has no local
 mode. Owner and team browser surfaces must not exchange credentials, state, or
 silently fall back between their explicit origins and API adapters.
+
+[Account linking](../concepts/team-relay.md) is an authority change, so treat it
+with the same care as a credential. A relay identity is exactly the issuer plus
+the immutable subject; never treat an email address, display name, or any other
+provider profile attribute as proof that two accounts are the same person. A
+link requires both the current relay actor and the new identity to prove
+themselves in one audited transaction, and it is completable only through the
+channel that opened it. A link or unlink takes effect on current credentials and
+browser sessions immediately: an unlink revokes everything derived from the
+removed identity and cannot be undone by retry, restore, or cached provider
+state. An account always keeps at least one identity. Linking is an HTTPS-only
+relay surface with no CLI subcommand, so do not invent one; and never repeat a
+link transaction's one-use possession value in output, a log, an issue, or a URL.
 
 The implemented foundation authenticates generic OIDC subjects and credentials;
 future relay work must preserve these independent authorization responsibilities:
