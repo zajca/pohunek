@@ -1356,6 +1356,10 @@ mod credential_router_tests {
     /// caller is refused, and a browser mutation needs its exact `Origin` and
     /// CSRF header before the linking lifecycle sees the request.
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The route-level authentication boundary is one end-to-end HTTP sequence."
+    )]
     async fn link_routes_reject_mixed_and_unauthenticated_callers() {
         let (store, schema, bootstrap) = auth_tests::fixture().await;
         let (authority, _directory) = auth_tests::authority(store.clone()).await;
