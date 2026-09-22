@@ -801,6 +801,7 @@ where
         let Some(request) = request else {
             return Ok(());
         };
+        authorize_control_request(shared, connection)?;
         let release = matches!(request.kind, RequestKind::ReleaseController { .. });
         let response = handle_request(shared, connection, request).await;
         writer
@@ -971,25 +972,9 @@ fn acquire_request(
             false,
         ));
     }
-    // The lease is the worker's strongest grant, so the kernel answer is read
-    // again here rather than trusted from accept time.
-    let peer = connection
-        .peer
-        .reverify()
-        .map(|()| connection.peer.identity())
-        .map_err(|reason| {
-            reject_identity(
-                shared,
-                "acquire_controller",
-                reason,
-                connection.peer.as_ref(),
-            );
-            control_error_message(
-                ControlCode::IdentityMismatch,
-                "peer identity is no longer the one that connected",
-                false,
-            )
-        })?;
+    // `authorize_control_request` re-read the kernel for this request already,
+    // so the identity it attested is the one the lease is minted for.
+    let peer = connection.peer.identity();
     let lease_value = random_value("lease")
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
     let lease_id = LeaseId::new(lease_value)
@@ -2123,6 +2108,7 @@ async fn serve_data(
                     if *lease_epoch.borrow() != grant.lease_epoch {
                         return Ok(());
                     }
+                    authorize_data_frame(&shared, &peer, &grant.lease_owner)?;
                     write_runtime_output_event(
                         &mut write_half,
                         version,
@@ -2144,6 +2130,7 @@ async fn serve_data(
                     pending_output_exit = Some(output);
                     continue;
                 }
+                authorize_data_frame(&shared, &peer, &grant.lease_owner)?;
                 write_runtime_output_event(
                     &mut write_half,
                     version,
@@ -2168,6 +2155,7 @@ async fn serve_data(
                         ).await;
                     }
                 };
+                authorize_data_frame(&shared, &peer, &grant.lease_owner)?;
                 if mode != StreamMode::Attach {
                     return write_data_error(
                         &mut write_half,
@@ -3445,6 +3433,62 @@ fn peer_vouches_for(peer: &PeerContext, subject: u32) -> Result<bool, WorkerErro
     is_descendant(peer_pid, subject)
 }
 
+/// Re-reads the kernel peer before one control request is dispatched.
+///
+/// Capture runs once per connection, so checking only at acquisition would let a
+/// descriptor handed to another process keep issuing input, resize, stop, and
+/// data-stream requests under the original peer's authority. Once a lease
+/// exists the peer must also still be its owner, which is what stops an
+/// inherited connection from holding a lease the real controller needs back.
+///
+/// Failing here ends the connection rather than answering an error, so the
+/// caller releases the lease and a replacement daemon can recover.
+fn authorize_control_request(shared: &Shared, connection: &Connection) -> Result<(), WorkerError> {
+    let peer = connection.peer.as_ref();
+    let drift = peer.reverify().err().or_else(|| {
+        let identity = peer.identity();
+        connection.owner.as_ref().and_then(|owner| {
+            (owner.peer_pid != identity.pid
+                || owner.peer_start_identity != identity.start_identity.to_string())
+            .then_some(RejectReason::LeaseOwnerMismatch)
+        })
+    });
+    match drift {
+        Some(reason) => {
+            reject_identity(shared, "control_request", reason, peer);
+            Err(WorkerError::PeerIdentity { reason })
+        }
+        None => Ok(()),
+    }
+}
+
+/// Re-reads the kernel peer while one data stream is still being served.
+///
+/// Redemption authorizes the stream once, but an attach stream then lives as
+/// long as the lease. Without this, a descriptor handed to another process
+/// after redemption could keep injecting input and keep receiving PTY bytes.
+/// The check runs in both directions and fails the stream closed, which is why
+/// it costs a kernel round trip per frame rather than a cached comparison.
+fn authorize_data_frame(
+    shared: &Shared,
+    peer: &PeerContext,
+    owner: &LeaseOwner,
+) -> Result<(), WorkerError> {
+    let drift = peer.reverify().err().or_else(|| {
+        let identity = peer.identity();
+        (owner.peer_pid != identity.pid
+            || owner.peer_start_identity != identity.start_identity.to_string())
+        .then_some(RejectReason::LeaseOwnerMismatch)
+    });
+    match drift {
+        Some(reason) => {
+            reject_identity(shared, "data_frame", reason, peer);
+            Err(WorkerError::PeerIdentity { reason })
+        }
+        None => Ok(()),
+    }
+}
+
 /// Returns why a hook claim is inadmissible before its process is inspected.
 ///
 /// Provider, runtime generation, and runtime phase are the rules every hook
@@ -4159,15 +4203,15 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        await_observation_page, capabilities, control_input_id, event_visible_to_connection,
-        identity_sequence_is_fresh, known_identity_provider, mark_running_subagents_lost,
-        observation_timed_out, random_value, redeem_data_grant, signal_number, start_subagent,
-        stop_subagent, valid_identity_expiry, validate_attach_write_id, validate_data_start,
-        validate_observation_request, validate_terminal_snapshot_dimensions,
-        validate_terminal_snapshot_response, wait_runtime_exit, write_data_error,
-        write_observation_page, write_output_chunks, write_runtime_output_event,
-        write_terminal_chunks, Connection, ControlInputId, DataGrant, ObservationGrant,
-        ObservationWaitOutcome, PrefixStream, TokenState, WireTerminalSnapshot,
+        authorize_control_request, await_observation_page, capabilities, control_input_id,
+        event_visible_to_connection, identity_sequence_is_fresh, known_identity_provider,
+        mark_running_subagents_lost, observation_timed_out, random_value, redeem_data_grant,
+        signal_number, start_subagent, stop_subagent, valid_identity_expiry,
+        validate_attach_write_id, validate_data_start, validate_observation_request,
+        validate_terminal_snapshot_dimensions, validate_terminal_snapshot_response,
+        wait_runtime_exit, write_data_error, write_observation_page, write_output_chunks,
+        write_runtime_output_event, write_terminal_chunks, Connection, ControlInputId, DataGrant,
+        ObservationGrant, ObservationWaitOutcome, PrefixStream, TokenState, WireTerminalSnapshot,
     };
     use pohunek_worker_protocol::{
         self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
@@ -5270,6 +5314,52 @@ mod tests {
     /// and a reused process id with a different start identity — must both be
     /// refused, and the refusal must leave the one-use token intact so a
     /// foreign attempt cannot burn a legitimate grant.
+    /// A leased connection is re-checked on every request, not only at acquire.
+    ///
+    /// The lease caches the owner it was granted to, so without a fresh kernel
+    /// read a descriptor handed to another process would keep issuing
+    /// privileged requests — and keep holding a lease the real controller needs
+    /// back. Failing here ends the connection, which releases it.
+    #[tokio::test]
+    async fn a_leased_connection_is_reauthorized_on_every_request() {
+        let owner = crate::LeaseOwner {
+            daemon_id: "daemon-reauth".to_owned(),
+            peer_pid: std::process::id(),
+            peer_start_identity: "7200".to_owned(),
+        };
+        let shared = launch_claim_fixture().await;
+        let (server, _pty, directory) = shared;
+
+        let mut connection = Connection::new(std::sync::Arc::new(owner_peer(&owner)));
+        connection.owner = Some(owner.clone());
+        connection.lease_id = Some(LeaseId::new("lease-reauth").expect("lease id"));
+        authorize_control_request(&server.shared, &connection)
+            .expect("the owning peer stays authorized");
+
+        // A peer whose kernel identity no longer matches the lease owner is the
+        // descriptor-handoff shape; it must not be able to keep issuing work.
+        let drifted = crate::LeaseOwner {
+            peer_pid: owner.peer_pid,
+            peer_start_identity: "7201".to_owned(),
+            ..owner.clone()
+        };
+        let mut hijacked = Connection::new(std::sync::Arc::new(owner_peer(&drifted)));
+        hijacked.owner = Some(owner);
+        hijacked.lease_id = connection.lease_id.clone();
+        let error = authorize_control_request(&server.shared, &hijacked)
+            .expect_err("a drifted peer must lose the lease");
+        assert!(
+            matches!(
+                error,
+                super::WorkerError::PeerIdentity {
+                    reason: super::RejectReason::LeaseOwnerMismatch
+                }
+            ),
+            "expected a lease-owner mismatch, got {error:?}"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn data_token_redemption_is_bound_to_the_lease_owning_peer() {
         let leases = crate::ControllerLease::new();

@@ -121,7 +121,12 @@ whenever a different process operates on that socket, so a descriptor inherited
 across `fork`/`exec` or passed over `SCM_RIGHTS` changes the reported peer.
 Services therefore capture the peer before parsing a request and re-read the
 kernel answer before every decision that grants authority; a drift is a typed
-rejection. An in-place `exec` stays indistinguishable, because it preserves both
+rejection. Because a connection outlives the moment it was authorized, that
+means every request on a leased control connection and every frame of a live
+attach stream, not only the exchange that granted the lease. A peer that exited
+without being reaped is not live either: a zombie keeps its process id and
+start identity, so liveness is asked of the process record rather than inferred
+from identity alone. An in-place `exec` stays indistinguishable, because it preserves both
 the process id and the kernel start time, and executable identity remains the
 launch-claim path's concern rather than the transport's.
 

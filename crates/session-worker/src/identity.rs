@@ -19,6 +19,13 @@
 //! Darwin can report a different peer after a descriptor hand-off, and either
 //! kernel can be describing a process that has since exited or been replaced.
 //!
+//! "Each authority decision" is meant literally, because a connection outlives
+//! the moment it was authorized: every control request is re-checked, not only
+//! the one that acquires the lease, and an attach data stream is re-checked in
+//! both directions for as long as it runs. Checking once would leave a
+//! descriptor handed on afterwards still issuing input and still receiving PTY
+//! bytes under the original peer's authority.
+//!
 //! One thing this cannot observe is an `exec` in place. `execve` keeps both the
 //! process id and the kernel start time, on Linux and Darwin alike, so a peer
 //! that replaces its own image without exiting keeps the identity it captured.
@@ -142,7 +149,7 @@ impl PeerContext {
                 reason: RejectReason::PeerForeignOwner,
             });
         }
-        let identity = process_identity(snapshot.pid).ok_or(WorkerError::PeerIdentity {
+        let identity = live_identity(snapshot.pid).ok_or(WorkerError::PeerIdentity {
             reason: RejectReason::PeerExited,
         })?;
         Ok(Self {
@@ -186,7 +193,7 @@ impl PeerContext {
             peer::Error::Changed => RejectReason::PeerChanged,
             other => reason(&other),
         })?;
-        if !self.recheck_process || process_identity(self.identity.pid) == Some(self.identity) {
+        if !self.recheck_process || live_identity(self.identity.pid) == Some(self.identity) {
             Ok(())
         } else {
             Err(RejectReason::PeerExited)
@@ -234,12 +241,20 @@ const fn owner_matches(peer_uid: u32, worker_uid: u32) -> bool {
     peer_uid == worker_uid
 }
 
-/// Reads the PID-reuse-safe identity of one process, or `None` if it is gone.
+/// Reads the identity of one *running* process, or `None` if it cannot vouch.
+///
+/// The liveness check matters as much as the identity: a zombie keeps its
+/// process id and start identity, so comparing those alone would accept a
+/// connector that exited without being reaped after handing its descriptor to
+/// another process. `is_running` is the contract that excludes that state on
+/// both targets.
 ///
 /// An observation failure is treated as absence on purpose: the caller must not
 /// act on a process the worker cannot currently see.
-fn process_identity(pid: u32) -> Option<OsProcessIdentity> {
-    HostInspector::new().identity(pid).ok().flatten()
+fn live_identity(pid: u32) -> Option<OsProcessIdentity> {
+    let inspector = HostInspector::new();
+    let identity = inspector.identity(pid).ok().flatten()?;
+    inspector.is_running(identity).ok()?.then_some(identity)
 }
 
 /// Classifies a peer lookup failure into a rejection reason.
@@ -316,6 +331,50 @@ mod tests {
         let context = PeerContext::capture(&accepted).expect("capture peer");
         assert_eq!(context.identity().pid, std::process::id());
         context.reverify().expect("peer identity is unchanged");
+    }
+
+    /// A peer that exited without being reaped must not keep vouching.
+    ///
+    /// A zombie keeps its process id and start identity, so comparing those
+    /// alone would accept a connector that exited after handing its descriptor
+    /// on — on Linux the socket record still names it.
+    #[test]
+    fn a_zombie_peer_is_not_live() {
+        use pohunek_platform::process::{HostInspector, ProcessInspector};
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn a process that exits immediately");
+        let pid = child.id();
+        let inspector = HostInspector::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let zombie = loop {
+            // The child is unreaped here on purpose: `wait` is only called once
+            // the assertions below are done with the zombie.
+            if let Ok(Some(identity)) = inspector.identity(pid) {
+                if inspector.is_running(identity).is_ok_and(|running| !running) {
+                    break identity;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never became an unreaped zombie"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        assert_eq!(
+            inspector.identity(pid).expect("inspect the zombie"),
+            Some(zombie),
+            "a zombie still reports its identity, which is what makes this trap real"
+        );
+        assert_eq!(
+            super::live_identity(pid),
+            None,
+            "a zombie must not be treated as a live peer"
+        );
+        child.wait().expect("reap the zombie");
     }
 
     #[test]

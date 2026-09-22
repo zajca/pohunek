@@ -64,7 +64,10 @@ The assistant must:
 - Treat kernel peer identity as the only source of a caller's process identity
   on the private worker paths. It is read from the accepted socket on both
   Linux and macOS before a request is parsed, and re-read before each decision
-  that grants authority. A request field never supplies it, the owner alone
+  that grants authority — every request on a leased control connection and
+  every frame of a live attach stream, because a connection outlives the moment
+  it was authorized. A peer that exited without being reaped does not count as
+  live. A request field never supplies it, the owner alone
   never authorizes a claim that needs a process id, and a peer the kernel
   cannot attest — including one with no process id — is rejected rather than
   downgraded. A private identity report is accepted only from the process it
