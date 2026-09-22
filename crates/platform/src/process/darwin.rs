@@ -201,7 +201,7 @@ impl ProcessInspector for DarwinInspector {
         let Some(fact) = read_bsd_fact(pid, euid, OPERATION)? else {
             return Ok(OwnershipMarkers::default());
         };
-        match read_arguments(pid, euid, &fact, OPERATION)? {
+        match read_arguments(pid, &fact, OPERATION)? {
             Some(arguments) => Ok(arguments.markers),
             None => Ok(OwnershipMarkers::default()),
         }
@@ -333,7 +333,7 @@ fn read_process_fact(
     let Some(initial) = read_bsd_fact(pid, euid, operation)? else {
         return Ok(None);
     };
-    let cmdline = read_arguments(pid, euid, &initial, operation)?
+    let cmdline = read_arguments(pid, &initial, operation)?
         .map(|arguments| arguments.argv)
         .unwrap_or_default();
     let Some(current) = read_bsd_fact(pid, euid, operation)? else {
@@ -354,14 +354,14 @@ fn read_process_fact(
 
 /// Reads and decodes the `KERN_PROCARGS2` regions of one same-user process.
 ///
-/// Returns `None` for a process that keeps no argument region: one that exited,
-/// one retained as a zombie, and one already inside `exit`. Darwin reports both
-/// a vanished process and an unreadable argument region as `EINVAL`, so the
-/// ambiguity is resolved against the process record rather than reported as an
-/// absence of arguments.
+/// Returns `None` for a process that holds no argument region: one that exited,
+/// one retained as a zombie, one already inside `exit`, and one that has forked
+/// but not yet published the region its `exec` will write. The caller has
+/// established ownership, so the region being absent is the only thing `EINVAL`
+/// can report, and whether the process itself exists stays a question for the
+/// process record.
 fn read_arguments(
     pid: Pid,
-    euid: u32,
     fact: &BsdFact,
     operation: &'static str,
 ) -> Result<Option<super::darwin_layout::NativeArguments>, Error> {
@@ -371,13 +371,7 @@ fn read_arguments(
     let buffer = match native::process_arguments(native_pid(pid, operation)?) {
         Ok(buffer) => buffer,
         Err(error) if is_process_race(&error) => return Ok(None),
-        Err(error) if is_ambiguous_argument_error(&error) => {
-            return match read_bsd_fact(pid, euid, operation)? {
-                None => Ok(None),
-                Some(current) if current.is_zombie || current.is_exiting => Ok(None),
-                Some(_) => Err(Error::InvalidData { operation }),
-            };
-        }
+        Err(error) if is_missing_argument_region(&error) => return Ok(None),
         Err(source) => return Err(Error::from_io(operation, source)),
     };
     parse_process_arguments(&buffer)
@@ -410,8 +404,11 @@ fn is_process_race(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::ESRCH) || error.kind() == io::ErrorKind::NotFound
 }
 
-/// Returns whether `sysctl` reported the argument region ambiguously.
-fn is_ambiguous_argument_error(error: &io::Error) -> bool {
+/// Returns whether `sysctl` reported that no argument region exists.
+///
+/// Darwin writes a process's argument region at the end of `exec` and releases
+/// it on exit, and answers `EINVAL` whenever the region is not there.
+fn is_missing_argument_region(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::EINVAL)
 }
 
@@ -1065,6 +1062,16 @@ mod tests {
         }
     }
 
+    /// Kills and reaps a pseudoterminal shell even when an assertion fails.
+    struct PtyFixture(Box<dyn portable_pty::Child + Send + Sync>);
+
+    impl Drop for PtyFixture {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     /// Spawns a shell that stays alive until it is killed.
     fn spawn_idle_shell() -> Fixture {
         spawn_shell("trap '' TERM; while :; do sleep 1; done", &[], None)
@@ -1089,6 +1096,20 @@ mod tests {
             command.current_dir(directory);
         }
         Fixture(command.spawn().expect("spawn shell fixture"))
+    }
+
+    /// Runs one observation on a helper thread and bounds how long it may take.
+    ///
+    /// A kernel call that never returns then fails this test with the phase that
+    /// stalled, instead of stalling the whole suite until CI cancels the job.
+    fn observe<T: Send + 'static>(what: &str, probe: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(probe());
+        });
+        receiver
+            .recv_timeout(OBSERVE_TIMEOUT)
+            .unwrap_or_else(|_elapsed| panic!("{what} never answered"))
     }
 
     /// Polls until `probe` yields a value or the observation window elapses.
@@ -1157,6 +1178,28 @@ mod tests {
             "launchd is owned by root and must be filtered out"
         );
         assert!(table.iter().any(|fact| fact.pid == std::process::id()));
+    }
+
+    #[test]
+    fn the_process_table_survives_concurrent_spawn_churn() {
+        let inspector = DarwinInspector::new();
+        let resident = spawn_idle_shell();
+        let resident_pid = live_identity(inspector, resident.pid()).pid;
+
+        // A process caught between its fork and the end of its exec holds no
+        // argument region yet. That is a fact about that one process and must
+        // neither fail the inventory nor drop a process that is plainly live.
+        for _ in 0..CHURN_ROUNDS {
+            let mut churn = spawn_shell("exit 0", &[], None);
+            let table = inspector
+                .same_user_processes()
+                .expect("inspect the process table during churn");
+            assert!(
+                table.iter().any(|fact| fact.pid == resident_pid),
+                "a live same-user process must stay in every inventory snapshot"
+            );
+            churn.0.wait().expect("reap the churn fixture");
+        }
     }
 
     #[test]
@@ -1621,8 +1664,9 @@ mod tests {
         let mut command = CommandBuilder::new("/bin/bash");
         command.args(["--norc", "--noprofile", "-i"]);
         command.env("PS1", "READY>");
-        let mut child = pair.slave.spawn_command(command).expect("spawn the shell");
+        let child = pair.slave.spawn_command(command).expect("spawn the shell");
         let shell_pid = child.process_id().expect("shell process id");
+        let _shell = PtyFixture(child);
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -1630,26 +1674,27 @@ mod tests {
         let mut writer = pair.master.take_writer().expect("take the terminal writer");
         drop(pair.slave);
 
-        let ready = std::thread::spawn(move || {
+        let (prompt, prompt_seen) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
             let mut seen = Vec::new();
             let mut byte = [0_u8; 1];
             while reader.read(&mut byte).is_ok_and(|read| read == 1) {
                 seen.push(byte[0]);
                 if seen.ends_with(b"READY>") {
-                    return true;
+                    let _ = prompt.send(());
+                    return;
                 }
             }
-            false
         });
-        assert!(
-            ready.join().expect("terminal reader thread"),
-            "the interactive shell never printed its prompt"
-        );
+        prompt_seen
+            .recv_timeout(OBSERVE_TIMEOUT)
+            .expect("the interactive shell never printed its prompt");
 
         assert_eq!(
-            inspector
-                .foreground_process_group(shell_pid)
-                .expect("inspect the shell foreground group"),
+            observe("the idle shell foreground group", move || {
+                inspector.foreground_process_group(shell_pid)
+            })
+            .expect("inspect the shell foreground group"),
             Some(shell_pid),
             "an idle job-control shell owns its own terminal"
         );
@@ -1659,54 +1704,75 @@ mod tests {
         std::io::Write::flush(&mut writer).expect("flush the terminal writer");
 
         let foreground = wait_for("the shell to hand the terminal to a job", || {
-            inspector
-                .foreground_process_group(shell_pid)
-                .expect("inspect the foreground group")
-                .filter(|group| *group != shell_pid)
+            observe("the foreground group of a running job", move || {
+                inspector.foreground_process_group(shell_pid)
+            })
+            .expect("inspect the foreground group")
+            .filter(|group| *group != shell_pid)
         });
         let root = live_identity(inspector, shell_pid);
-        let members: Vec<_> = inspector
-            .descendants(root.pid)
-            .expect("inspect the shell descendants")
-            .into_iter()
-            .filter(|fact| fact.pgid == foreground)
-            .collect();
+        let members: Vec<_> = observe("the descendants of a running job", move || {
+            inspector.descendants(root.pid)
+        })
+        .expect("inspect the shell descendants")
+        .into_iter()
+        .filter(|fact| fact.pgid == foreground)
+        .collect();
         assert!(
             !members.is_empty(),
             "the foreground group must resolve to real members"
         );
         assert!(
-            inspector
-                .descendants(root.pid)
-                .expect("inspect the shell descendants")
-                .iter()
-                .any(|fact| fact.pgid != foreground),
+            observe("the process groups of a running job", move || {
+                inspector.descendants(root.pid)
+            })
+            .expect("inspect the shell descendants")
+            .iter()
+            .any(|fact| fact.pgid != foreground),
             "the background sibling keeps its own process group"
         );
 
+        let member_pid = members.first().expect("a foreground group member").pid;
         nix::sys::signal::killpg(
             nix::unistd::Pid::from_raw(i32::try_from(foreground).expect("group fits a pid")),
             nix::sys::signal::Signal::SIGTSTP,
         )
         .expect("stop the foreground job");
 
+        // The record and the argument region of a stopped process are read
+        // through different kernel interfaces, so they are observed separately.
+        assert!(
+            observe("the identity of a stopped process", move || {
+                inspector.identity(member_pid)
+            })
+            .expect("inspect a stopped process identity")
+            .is_some(),
+            "a stopped process keeps its identity while it holds its process id"
+        );
+        assert!(
+            observe("the facts of a stopped process", move || {
+                inspector.process(member_pid)
+            })
+            .expect("inspect a stopped process")
+            .is_some(),
+            "a stopped process stays observable while it holds its process id"
+        );
         let reclaimed = wait_for("the shell to reclaim the terminal", || {
-            inspector
-                .foreground_process_group(shell_pid)
-                .expect("inspect the foreground group")
-                .filter(|group| *group == shell_pid)
+            observe("the foreground group of a stopped job", move || {
+                inspector.foreground_process_group(shell_pid)
+            })
+            .expect("inspect the foreground group")
+            .filter(|group| *group == shell_pid)
         });
         assert_eq!(reclaimed, shell_pid);
         assert!(
-            inspector
-                .descendants(root.pid)
-                .expect("inspect the shell descendants")
-                .iter()
-                .any(|fact| fact.pgid == foreground),
+            observe("the descendants of a stopped job", move || {
+                inspector.descendants(root.pid)
+            })
+            .expect("inspect the shell descendants")
+            .iter()
+            .any(|fact| fact.pgid == foreground),
             "a stopped foreground job stays observable without owning the terminal"
         );
-
-        let _ = child.kill();
-        let _ = child.wait();
     }
 }
