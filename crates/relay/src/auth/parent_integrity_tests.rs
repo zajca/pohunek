@@ -36,6 +36,26 @@ async fn insert_identity(store: &Store, identity_id: Uuid, principal_id: Uuid, s
         .expect("seed OIDC identity");
 }
 
+/// Inserts a complete pending link transaction so a rejection can only come
+/// from the parent references under test, never from an unset required column.
+async fn insert_pending_link(
+    store: &Store,
+    principal_id: Uuid,
+    source_identity_id: Uuid,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO account_link_transactions (link_id,principal_id,source_identity_id,channel,source_authentication_id,source_authentication_generation,issuer,client_id,audience,possession_digest,digest_key_id,state,revision,account_link_generation,recovery_generation,expires_at,correlation_id,idempotency_key) VALUES ($1,$2,$3,'device',$4,1,'issuer','client','audience',decode(repeat('ab',32),'hex'),'test-key','pending',1,1,1,clock_timestamp()+interval '1 hour',$5,$6)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(principal_id)
+    .bind(source_identity_id)
+    .bind(Uuid::now_v7())
+    .bind(Uuid::now_v7())
+    .bind(Uuid::now_v7())
+    .execute(store.pool())
+    .await
+}
+
 async fn insert_team(store: &Store, team_id: Uuid, name: &str) {
     sqlx::query("INSERT INTO teams (team_id,display_name,state,policy_generation,revision) VALUES ($1,$2,'active',1,1)")
         .bind(team_id)
@@ -268,18 +288,20 @@ async fn postgres_auth_parents_reject_invalid_identity_and_link_coordinates() {
         .execute(store.pool())
         .await
         .expect_err("principal kind is immutable after creation");
-    sqlx::query("INSERT INTO account_link_transactions (link_id,principal_id,source_identity_id,account_link_generation,recovery_generation,expires_at) VALUES ($1,$2,$3,1,1,clock_timestamp()+interval '1 hour')")
-        .bind(Uuid::now_v7())
-        .bind(human_principal_id)
-        .bind(other_human_identity_id)
-        .execute(store.pool())
+    let foreign_source = insert_pending_link(&store, human_principal_id, other_human_identity_id)
         .await
         .expect_err("link source identity must belong to its principal");
-    sqlx::query("INSERT INTO account_link_transactions (link_id,principal_id,source_identity_id,account_link_generation,recovery_generation,expires_at) VALUES ($1,$2,$3,1,1,clock_timestamp()+interval '1 hour')")
-        .bind(Uuid::now_v7())
-        .bind(human_principal_id)
-        .bind(human_identity_id)
-        .execute(store.pool())
+    assert_eq!(
+        foreign_source
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        // The composite (source_identity_id, principal_id) parent must be what
+        // rejects this row, not a missing column on the newer link schema.
+        Some("23503"),
+        "foreign source identity must fail the composite parent reference"
+    );
+    insert_pending_link(&store, human_principal_id, human_identity_id)
         .await
         .expect("matching account-link source identity is valid");
     let identity_principals: i64 = sqlx::query_scalar(

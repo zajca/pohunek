@@ -487,6 +487,61 @@ async fn migration_hash_is_stable_across_session_rendering_defaults() {
     cleanup(&pool, &schema).await;
 }
 
+/// A plan step that adds a column to a populated table changes every whole-row
+/// authority digest, so a crash inside the plan must still resume from the
+/// checksum-validated prefix instead of latching on an unreproducible digest.
+#[tokio::test]
+async fn migration_resumes_a_plan_that_reshaped_populated_authority_rows() {
+    let (store, schema, pool, witness, directory) = foundation_fixture().await;
+    sqlx::query("INSERT INTO principals (id,kind,state,generation) VALUES ($1,'human','active',1)")
+        .bind(Uuid::now_v7())
+        .execute(store.pool())
+        .await
+        .expect("seed a populated authority table");
+    let (base, authority_digest) = migration_coordinates(&store).await;
+    let clean = witness.latest().expect("witness").expect("clean foundation");
+    witness
+        .begin_local(
+            Some(&clean),
+            "relay-test",
+            1,
+            migration_event(base, authority_digest),
+        )
+        .expect("persist migration latch before process loss");
+    let target = Store::migration_target_prefix().expect("embedded target");
+    store
+        .migrate_to_for_test(i64::from(target.count()))
+        .await
+        .expect("apply the whole signed plan before the process is lost");
+    let reshaped = {
+        let mut tx = store
+            .begin_serializable()
+            .await
+            .expect("begin reshaped snapshot");
+        locked_tables(&mut tx).await.expect("lock tables");
+        let digest = store
+            .migration_authority_digest_in_transaction(&mut tx)
+            .await
+            .expect("post-plan authority digest");
+        tx.commit().await.expect("commit reshaped snapshot");
+        digest
+    };
+    assert_ne!(
+        reshaped, authority_digest,
+        "the plan must actually reshape the seeded authority rows"
+    );
+    reopened(&store, directory.path())
+        .migrate_local("relay-test")
+        .await
+        .expect("resume the exact signed plan after authority rows were reshaped");
+    let latest = witness
+        .latest()
+        .expect("witness")
+        .expect("completed migration");
+    assert!(!latest.active_run);
+    cleanup(&pool, &schema).await;
+}
+
 #[tokio::test]
 async fn migration_rejects_a_signed_target_plan_mismatch_before_ddl() {
     let (store, schema, pool, witness, directory) = foundation_fixture().await;

@@ -428,9 +428,15 @@ impl Lifecycle {
                 || observed.count() < *base_migration_count
                 || observed.count() > *target_migration_count
                 || observed.count() > target.count()
-                || authority_digest != *expected_authority
+                // The signed authority digest hashes whole rows, so a plan step
+                // that adds a column to a populated table changes it. It is
+                // reproducible only while the base schema is still intact. Past
+                // that point the checksum-validated migration prefix, the locked
+                // relay identity, and the recovery generation are the binding a
+                // swapped authority state cannot satisfy.
                 || (observed.count() == *base_migration_count
-                    && observed.digest() != *base_plan_digest)
+                    && (observed.digest() != *base_plan_digest
+                        || authority_digest != *expected_authority))
             {
                 return Err(LifecycleError::InvalidState);
             }
@@ -462,10 +468,15 @@ impl Lifecycle {
             .await
             .map_err(|_error| LifecycleError::Durable)?;
         let mut tx = self.begin().await?;
-        self.store
-            .lock_relay_identity_in_transaction(&mut tx, expected_relay_id)
-            .await
-            .map_err(|_error| LifecycleError::InvalidState)?;
+        // The applied plan reshapes rows, so the post-DDL binding is the exact
+        // relay identity at the signed recovery generation rather than a repeat
+        // of the pre-DDL authority digest. A restored or swapped authority state
+        // cannot present this identity row at this generation in 'normal' state.
+        let generation: Option<i64> = sqlx::query_scalar("SELECT recovery_generation FROM relay_identity WHERE relay_id=$1 AND state='normal' AND recovery_generation=$2 FOR UPDATE")
+            .bind(expected_relay_id).bind(active.recovery_generation).fetch_optional(&mut *tx).await.map_err(|_error| LifecycleError::Durable)?;
+        if generation.is_none() || self.witness.latest()?.as_ref() != Some(&active) {
+            return Err(LifecycleError::ManifestMismatch);
+        }
         self.require_no_live_lease(&mut tx, expected_relay_id)
             .await?;
         locked_tables(&mut tx).await?;
@@ -474,14 +485,7 @@ impl Lifecycle {
             .migration_prefix_in_transaction(&mut tx)
             .await
             .map_err(|error| migration_store_error(&error))?;
-        let authority_digest = self
-            .store
-            .migration_authority_digest_in_transaction(&mut tx)
-            .await
-            .map_err(|error| migration_store_error(&error))?;
-        if observed != target
-            || !matches!(&active.event, WitnessEvent::Migration { authority_digest: expected, .. } if authority_digest == *expected)
-        {
+        if observed != target {
             return Err(LifecycleError::ManifestMismatch);
         }
         tx.commit()
