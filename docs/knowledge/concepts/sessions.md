@@ -296,6 +296,59 @@ record and diagnostic `loss_reason`. After preserving diagnostic evidence, the
 operator can remove a degraded logical record with `session rm`; this does not
 stop or signal an unavailable or ambiguous worker.
 
+## Retention
+
+A host that runs agents for weeks accumulates logical records for sessions that
+can never be attached again, and those records keep owning their worktrees. The
+daemon therefore runs a retention sweep that ages unavailable sessions out.
+
+The policy lives at `<data_dir>/session-policy.json` and is read with
+`pohunek session policy get` (add `--json` for the machine-readable shape) and
+changed with `pohunek session policy set`, which accepts `--enabled` /
+`--disabled`, `--sweep-interval-secs`, `--terminal-ttl-secs`,
+`--lost-ttl-secs` and `--max-removals-per-sweep`. Unspecified fields keep their
+current value, and the running sweep task picks the new policy up on its next
+cycle, so no daemon restart is needed.
+
+The shipped default is deliberately conservative: sweeps are **disabled**, and
+once enabled they run every 6 hours, keep a terminal (`stopped`/`done`/`failed`)
+session for 30 days, keep a session whose runtime is `lost` for 90 days, and
+remove at most 25 sessions per sweep. The `lost` grace period is the longer one
+because such a session may still be recoverable with `session resume`.
+
+`pohunek session retention sweep --dry-run` reports exactly what the current
+policy selects without touching anything; `--apply` removes the selection, and
+`--limit` lowers the cap for that one sweep. A manual sweep works whether or not
+automatic sweeps are enabled and never exceeds the policy's own cap.
+
+A sweep removes through the same path as `session rm`, so it stops a runtime
+that is still live, cleans pohunek-owned worktrees, and deletes the session's
+logs. It never selects an `external` session or one in `conflict` or
+`incompatible` runtime state, and it never selects a session that is still live
+or inside its TTL. Anything the sweep cannot classify is kept: an ambiguous
+record is never a removal candidate.
+
+Because the sweep is unattended and worktree removal is forced, a session whose
+age matched the policy is still **held** when its pohunek-owned worktree holds
+work: an uncommitted change to a tracked file, an untracked file, commits
+contained in no other branch, remote branch or tag, or a checkout whose state git
+cannot report at all. A held session is reported with a `hold` reason
+(`worktree_uncommitted`, `worktree_untracked`, `worktree_unpushed`,
+`worktree_unknown`), counted in `held` rather than `eligible`, and logged — its
+worktree stays on disk. Ignored files are not a hold, since they are ignored on
+purpose and regenerated. One sweep inspects at most 64 checkouts; a matched
+session past that bound is held as `worktree_unknown` and inspected by the next
+sweep, because an uninspected checkout is an unproven one. `session rm` is unaffected: an explicit operator removal
+still removes a dirty worktree, which is how a held session is cleaned up once
+the operator has looked at it.
+
+The sweep's counters are exact. `worktrees_cleaned` counts only checkouts
+confirmed gone from disk; when `git worktree remove` fails the session record is
+still evicted, and the leftover directory is reported as `worktrees_failed` and
+logged instead of counted as cleaned. `pohunek session retention sweep` exits
+non-zero when the sweep reports a failed removal or a leftover worktree, so a
+cron job or health check sees a partial failure without parsing the output.
+
 External observer mode is opt-in with `POHUNEK_OBSERVE_EXTERNAL_AGENTS=1` (or
 `SessionRegistryConfig.observe_external_agents = true`) and defaults off because
 it watches provider transcript trees under the operator's Claude/Codex homes.

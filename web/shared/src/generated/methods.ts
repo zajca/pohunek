@@ -60,6 +60,8 @@ import type {
   SessionNewResult,
   SessionOutputParams,
   SessionOutputResult,
+  SessionPolicyParams,
+  SessionPolicyResult,
   SessionReadParams,
   SessionReadResult,
   SessionReleaseAgentParams,
@@ -74,6 +76,8 @@ import type {
   SessionResizeParams,
   SessionResizeResult,
   SessionResumeResult,
+  SessionRetentionParams,
+  SessionRetentionResult,
   SessionScreenParams,
   SessionScreenResult,
   SessionSetMetadataParams,
@@ -119,6 +123,8 @@ export interface Methods {
   "session.list": { params: SessionListParams; output: SessionInfo[] };
   "session.new": { params: SessionNewParams; output: SessionNewResult };
   "session.output": { params: SessionOutputParams; output: SessionOutputResult };
+  "session.policy.get": { params: null; output: SessionPolicyResult };
+  "session.policy.set": { params: SessionPolicyParams; output: SessionPolicyResult };
   "session.read": { params: SessionReadParams; output: SessionReadResult };
   "session.release_agent": { params: SessionReleaseAgentParams; output: SessionReleaseAgentResult };
   "session.remove": { params: SessionId; output: SessionRemoveResult };
@@ -127,6 +133,7 @@ export interface Methods {
   "session.report_native_id": { params: SessionReportNativeIdParams; output: SessionReportNativeIdResult };
   "session.resize": { params: SessionResizeParams; output: SessionResizeResult };
   "session.resume": { params: SessionId; output: SessionResumeResult };
+  "session.retention.sweep": { params: SessionRetentionParams; output: SessionRetentionResult };
   "session.runtime_inventory": { params: null; output: RuntimeInventoryResult };
   "session.screen": { params: SessionScreenParams; output: SessionScreenResult };
   "session.set_metadata": { params: SessionSetMetadataParams; output: SessionSetMetadataResult };

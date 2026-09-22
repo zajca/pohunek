@@ -24,10 +24,11 @@ use crate::{
     SessionDetectionResult, SessionDiffParams, SessionDiffResult, SessionForkParams,
     SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
     SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
-    SessionOutputResult, SessionReadParams, SessionReadResult, SessionReleaseAgentParams,
-    SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeResult,
+    SessionOutputResult, SessionPolicyParams, SessionPolicyResult, SessionReadParams,
+    SessionReadResult, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionRenameParams, SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionResumeResult, SessionRetentionParams, SessionRetentionResult,
     SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
     SessionStopResult, SessionWaitParams, SessionWaitResult, WorktreeRemoveParams,
     WorktreeRemoveResult,
@@ -357,6 +358,33 @@ method_table!(
     SessionDiffResult,
     "SessionDiffParams",
     "SessionDiffResult";
+
+    /// Read the session retention policy.
+    SessionPolicyGet,
+    SESSION_POLICY_GET,
+    "session.policy.get",
+    (),
+    SessionPolicyResult,
+    "null",
+    "SessionPolicyResult";
+
+    /// Replace the session retention policy.
+    SessionPolicySet,
+    SESSION_POLICY_SET,
+    "session.policy.set",
+    SessionPolicyParams,
+    SessionPolicyResult,
+    "SessionPolicyParams",
+    "SessionPolicyResult";
+
+    /// Run one session retention sweep.
+    SessionRetentionSweep,
+    SESSION_RETENTION_SWEEP,
+    "session.retention.sweep",
+    SessionRetentionParams,
+    SessionRetentionResult,
+    "SessionRetentionParams",
+    "SessionRetentionResult";
 
     /// Install per-agent native-session capture hooks.
     IntegrationInstall,

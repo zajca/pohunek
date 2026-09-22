@@ -17,9 +17,9 @@ use protocol::{
     SessionDetectionParams, SessionForkParams, SessionId, SessionInfo, SessionNativeRecoveredEvent,
     SessionNewParams, SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadSource,
     SessionReleaseAgentParams, SessionReportAgentParams, SessionReportNativeIdParams,
-    SessionRuntime, SessionRuntimeIdentity, SessionState, SessionWaitParams, SessionWaitReason,
-    StateSource, SubagentInfo, SubagentLifecycle, SubagentRevision, TerminalWatermark,
-    MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
+    SessionRetentionPolicy, SessionRuntime, SessionRuntimeIdentity, SessionState,
+    SessionWaitParams, SessionWaitReason, StateSource, SubagentInfo, SubagentLifecycle,
+    SubagentRevision, TerminalWatermark, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
 };
 
 use crate::agent::LaunchCommand;
@@ -12451,4 +12451,358 @@ async fn session_diff_registry_end_to_end_reflects_worktree_changes_against_the_
     assert!(!result.truncated);
     assert!(result.diff.contains("README.md"));
     assert!(result.diff.contains("+changed in the worktree"));
+}
+
+// --- retention sweep (end to end) -----------------------------------------
+
+/// A registry whose sessions exit immediately, with the metadata store and
+/// worktree binding enabled so a sweep exercises the real removal path.
+fn retention_registry(tag: &str) -> (SessionRegistry, PathBuf, PathBuf) {
+    let store = temp_store_path(tag);
+    let data_dir = store.parent().expect("store parent").to_path_buf();
+    let worktree_root = data_dir.join("worktrees");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "true"]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store),
+        worktree_root: Some(worktree_root.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    (registry, data_dir, worktree_root)
+}
+
+/// The shortest policy the validator accepts, so a backdated session ages out
+/// without the tests having to simulate a month of wall-clock time.
+fn sweep_policy() -> SessionRetentionPolicy {
+    SessionRetentionPolicy {
+        enabled: true,
+        sweep_interval_secs: 60,
+        terminal_ttl_secs: 3_600,
+        lost_ttl_secs: 3_600,
+        max_removals_per_sweep: 25,
+    }
+}
+
+/// Age well past [`sweep_policy`]'s TTLs.
+fn past_ttl() -> time::Duration {
+    time::Duration::hours(2)
+}
+
+fn backdated_stamp(age: time::Duration) -> String {
+    (OffsetDateTime::now_utc() - age)
+        .format(&Rfc3339)
+        .expect("format backdated timestamp")
+}
+
+/// Create a session that exits on its own, optionally on its own worktree.
+async fn exited_session(registry: &SessionRegistry, repo: Option<&PathBuf>) -> SessionInfo {
+    let create = match repo {
+        Some(repo) => SessionNewParams {
+            cwd: None,
+            repo: Some(repo.clone()),
+            branch: Some(format!("feat/{}", uuid_like())),
+            ..params()
+        },
+        None => params(),
+    };
+    let created = registry.create(create).await.expect("create session");
+    registry
+        .wait_for_exit(&created.id, Duration::from_secs(10))
+        .await
+        .expect("session exits")
+}
+
+/// Distinct branch names so two sessions can share one repository.
+fn uuid_like() -> String {
+    format!("x{}", TEMP_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Backdate a terminal session so the terminal TTL selects it.
+async fn age_terminal(registry: &SessionRegistry, id: &SessionId, age: time::Duration) {
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(id).expect("session entry");
+    entry.info.updated_at = backdated_stamp(age);
+}
+
+/// Turn an exited session into a backdated `running` + `lost` one, the state a
+/// session is left in when its worker disappears.
+async fn age_lost(registry: &SessionRegistry, id: &SessionId, age: time::Duration) {
+    let stamp = backdated_stamp(age);
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(id).expect("session entry");
+    entry.info.state = SessionState::Running;
+    entry.info.updated_at = stamp.clone();
+    // The runtime's identity and generation are what the store's staleness guard
+    // compares, so a lost runtime keeps the ones the worker was launched with.
+    let runtime = entry
+        .info
+        .runtime
+        .as_mut()
+        .expect("a worker-backed session has a runtime");
+    runtime.state = RuntimeState::Lost;
+    runtime.last_connected_at = Some(stamp);
+    runtime.loss_reason = Some("worker_unavailable".to_owned());
+    entry.runtime = RuntimeHandle::Unavailable(RuntimeState::Lost);
+}
+
+async fn session_ids(registry: &SessionRegistry) -> Vec<String> {
+    registry
+        .list()
+        .await
+        .into_iter()
+        .map(|info| info.id.0)
+        .collect()
+}
+
+#[tokio::test]
+async fn retention_sweep_removes_terminal_and_lost_sessions_and_keeps_an_in_ttl_one() {
+    let (registry, _data_dir, _worktree_root) = retention_registry("sweep-e2e");
+    let repo = init_git_repo("sweep-e2e");
+    registry
+        .set_retention_policy(sweep_policy())
+        .await
+        .expect("apply policy");
+
+    let terminal = exited_session(&registry, None).await;
+    age_terminal(&registry, &terminal.id, past_ttl()).await;
+    let lost = exited_session(&registry, Some(&repo)).await;
+    let lost_worktree = lost.worktree_path.clone().expect("lost session worktree");
+    assert!(
+        lost_worktree.is_dir(),
+        "the worktree exists before the sweep"
+    );
+    age_lost(&registry, &lost.id, past_ttl()).await;
+    let fresh = exited_session(&registry, None).await;
+
+    let result = registry
+        .sweep_retention(&protocol::SessionRetentionParams::default())
+        .await
+        .expect("sweep");
+
+    assert_eq!(result.examined, 3, "{result:?}");
+    assert_eq!(result.eligible, 2, "{result:?}");
+    assert_eq!(result.held, 0, "{result:?}");
+    assert_eq!(result.removed, 2, "{result:?}");
+    assert_eq!(result.failed, 0, "{result:?}");
+    assert_eq!(result.worktrees_cleaned, 1, "{result:?}");
+    assert_eq!(result.worktrees_failed, 0, "{result:?}");
+    assert!(
+        result.sessions.iter().all(|candidate| candidate.removed),
+        "every reported candidate was removed: {result:?}"
+    );
+    // DoD: the lost session's worktree is gone from disk, not merely reported.
+    assert!(
+        !lost_worktree.exists(),
+        "the lost session's worktree must be gone: {}",
+        lost_worktree.display()
+    );
+    assert_eq!(
+        session_ids(&registry).await,
+        vec![fresh.id.0.clone()],
+        "only the in-TTL session survives"
+    );
+}
+
+#[tokio::test]
+async fn retention_sweep_keeps_a_session_whose_worktree_has_uncommitted_work() {
+    let (registry, _data_dir, _worktree_root) = retention_registry("sweep-dirty");
+    let repo = init_git_repo("sweep-dirty");
+    registry
+        .set_retention_policy(sweep_policy())
+        .await
+        .expect("apply policy");
+
+    let session = exited_session(&registry, Some(&repo)).await;
+    let worktree = session.worktree_path.clone().expect("session worktree");
+    fs::write(
+        worktree.join("README.md"),
+        "work the agent did not commit\n",
+    )
+    .expect("dirty the worktree");
+    age_lost(&registry, &session.id, past_ttl()).await;
+
+    let result = registry
+        .sweep_retention(&protocol::SessionRetentionParams::default())
+        .await
+        .expect("sweep");
+
+    assert_eq!(result.eligible, 0, "{result:?}");
+    assert_eq!(result.held, 1, "{result:?}");
+    assert_eq!(result.removed, 0, "{result:?}");
+    assert_eq!(result.worktrees_cleaned, 0, "{result:?}");
+    assert_eq!(
+        result.sessions.first().and_then(|candidate| candidate.hold),
+        Some(protocol::SessionRetentionHold::WorktreeUncommitted),
+        "{result:?}"
+    );
+    assert!(worktree.is_dir(), "the dirty worktree stays on disk");
+    assert_eq!(session_ids(&registry).await, vec![session.id.0.clone()]);
+}
+
+#[tokio::test]
+async fn retention_sweep_stops_at_the_removal_budget() {
+    let (registry, _data_dir, _worktree_root) = retention_registry("sweep-budget");
+    registry
+        .set_retention_policy(sweep_policy())
+        .await
+        .expect("apply policy");
+
+    for _ in 0..2 {
+        let session = exited_session(&registry, None).await;
+        age_terminal(&registry, &session.id, past_ttl()).await;
+    }
+
+    let result = registry
+        .sweep_retention(&protocol::SessionRetentionParams {
+            dry_run: false,
+            limit: Some(1),
+        })
+        .await
+        .expect("sweep");
+
+    assert_eq!(result.eligible, 2, "{result:?}");
+    assert_eq!(result.removed, 1, "{result:?}");
+    assert_eq!(
+        session_ids(&registry).await.len(),
+        1,
+        "the budget leaves the rest for the next sweep"
+    );
+}
+
+#[tokio::test]
+async fn retention_sweep_counts_a_removal_it_could_not_complete() {
+    let (registry, data_dir, _worktree_root) = retention_registry("sweep-failed");
+    registry
+        .set_retention_policy(sweep_policy())
+        .await
+        .expect("apply policy");
+    let session = exited_session(&registry, None).await;
+    age_terminal(&registry, &session.id, past_ttl()).await;
+
+    // Removal persists a record before it evicts the entry, so a data directory
+    // it cannot write makes the real removal fail.
+    fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o500))
+        .expect("make the data directory read-only");
+    let result = registry
+        .sweep_retention(&protocol::SessionRetentionParams::default())
+        .await
+        .expect("sweep");
+    fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700))
+        .expect("restore the data directory");
+
+    assert_eq!(result.eligible, 1, "{result:?}");
+    assert_eq!(result.removed, 0, "{result:?}");
+    assert_eq!(result.failed, 1, "{result:?}");
+    assert_eq!(
+        session_ids(&registry).await,
+        vec![session.id.0.clone()],
+        "a failed removal leaves the session in place"
+    );
+}
+
+#[tokio::test]
+async fn retention_sweep_reports_a_worktree_it_could_not_delete() {
+    let (registry, _data_dir, worktree_root) = retention_registry("sweep-debris");
+    let repo = init_git_repo("sweep-debris");
+    registry
+        .set_retention_policy(sweep_policy())
+        .await
+        .expect("apply policy");
+    let session = exited_session(&registry, Some(&repo)).await;
+    let worktree = session.worktree_path.clone().expect("session worktree");
+    age_terminal(&registry, &session.id, past_ttl()).await;
+
+    // `git worktree remove` has to unlink the checkout's directory entry, which
+    // a read-only worktree root refuses while still allowing the safety probe to
+    // read the checkout.
+    fs::set_permissions(&worktree_root, fs::Permissions::from_mode(0o500))
+        .expect("make the worktree root read-only");
+    let result = registry
+        .sweep_retention(&protocol::SessionRetentionParams::default())
+        .await
+        .expect("sweep");
+    fs::set_permissions(&worktree_root, fs::Permissions::from_mode(0o700))
+        .expect("restore the worktree root");
+
+    assert_eq!(result.removed, 1, "{result:?}");
+    assert_eq!(
+        result.worktrees_cleaned, 0,
+        "a checkout still on disk is never counted as cleaned: {result:?}"
+    );
+    assert_eq!(result.worktrees_failed, 1, "{result:?}");
+    assert!(
+        worktree.exists(),
+        "the debris this sweep reported is really there: {}",
+        worktree.display()
+    );
+}
+
+#[tokio::test]
+async fn concurrent_sweeps_are_serialised_by_the_sweep_lock() {
+    let (registry, _data_dir, _worktree_root) = retention_registry("sweep-lock");
+    registry
+        .set_retention_policy(sweep_policy())
+        .await
+        .expect("apply policy");
+    for _ in 0..2 {
+        let session = exited_session(&registry, None).await;
+        age_terminal(&registry, &session.id, past_ttl()).await;
+    }
+
+    let sweep_params = protocol::SessionRetentionParams::default();
+    let (first, second) = tokio::join!(
+        registry.sweep_retention(&sweep_params),
+        registry.sweep_retention(&sweep_params)
+    );
+    let first = first.expect("first sweep");
+    let second = second.expect("second sweep");
+
+    let mut eligible = [first.eligible, second.eligible];
+    eligible.sort_unstable();
+    assert_eq!(
+        eligible, [0, 2],
+        "the second sweep starts after the first finished, so it selects nothing: {first:?} {second:?}"
+    );
+    assert_eq!(
+        first.removed + second.removed,
+        2,
+        "each session is removed exactly once: {first:?} {second:?}"
+    );
+    assert!(session_ids(&registry).await.is_empty());
+}
+
+#[tokio::test]
+async fn the_worktree_probe_budget_holds_every_candidate_it_could_not_inspect() {
+    let (registry, _data_dir, _worktree_root) = retention_registry("sweep-probe-budget");
+    // One candidate past the per-sweep probe budget. The paths need not exist:
+    // what is pinned is that an uninspected candidate is held, not removed.
+    let budget = super::retention::MAX_WORKTREE_PROBES_PER_SWEEP;
+    let mut candidates = (0..=budget)
+        .map(|index| protocol::SessionRetentionCandidate {
+            session_id: SessionId(format!("s-probe-{index}")),
+            reason: protocol::SessionRetentionReason::Terminal,
+            age_secs: 7_200,
+            worktree_path: Some(PathBuf::from(format!(
+                "/nonexistent/worktrees/s-probe-{index}"
+            ))),
+            hold: None,
+            removed: false,
+        })
+        .collect::<Vec<_>>();
+
+    registry.apply_worktree_holds(&mut candidates).await;
+
+    let held = candidates
+        .iter()
+        .filter(|candidate| candidate.hold.is_some())
+        .count();
+    assert_eq!(
+        held, 1,
+        "only the candidate past the budget is held: {candidates:?}"
+    );
+    assert_eq!(
+        candidates[budget].hold,
+        Some(protocol::SessionRetentionHold::WorktreeUnknown),
+        "an uninspected candidate is unproven, so it is kept"
+    );
 }

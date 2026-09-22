@@ -20,12 +20,13 @@ use protocol::{
     method, AgentActivity, CwdSource, ForkCwdMode, OutputOffset, RuntimeGeneration,
     SessionDetectionParams, SessionDetectionResult, SessionDiffParams, SessionForkParams,
     SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
-    SessionListFilter, SessionListParams, SessionNewParams, SessionOutputParams, SessionReadFormat,
-    SessionReadParams, SessionReadResult, SessionReadSource, SessionRemoveResult,
-    SessionRenameParams, SessionResizeParams, SessionRuntimeIdentity, SessionScreenParams,
-    SessionSetMetadataParams, SessionState, SessionStopResult, SessionWaitParams,
-    SessionWarningKind, StateSource, SubagentLifecycle, TerminalWatermark, MAX_SESSION_INPUT_BYTES,
-    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
+    SessionListFilter, SessionListParams, SessionNewParams, SessionOutputParams,
+    SessionPolicyParams, SessionReadFormat, SessionReadParams, SessionReadResult,
+    SessionReadSource, SessionRemoveResult, SessionRenameParams, SessionResizeParams,
+    SessionRetentionParams, SessionRetentionPolicy, SessionRetentionResult, SessionRuntimeIdentity,
+    SessionScreenParams, SessionSetMetadataParams, SessionState, SessionStopResult,
+    SessionWaitParams, SessionWarningKind, StateSource, SubagentLifecycle, TerminalWatermark,
+    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
 };
 
 use crate::client::Client;
@@ -1120,6 +1121,225 @@ pub(crate) async fn run_diff(
     Ok(())
 }
 
+/// Fields accepted by `session policy set`.
+///
+/// Every field is optional so an update is a read-modify-write of exactly the
+/// fields the operator named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PolicyArgs {
+    /// Enable automatic retention sweeps.
+    pub(crate) enabled: bool,
+    /// Disable automatic retention sweeps.
+    pub(crate) disabled: bool,
+    /// Seconds between automatic sweeps.
+    pub(crate) sweep_interval_secs: Option<u32>,
+    /// Seconds a terminal session is kept.
+    pub(crate) terminal_ttl_secs: Option<u32>,
+    /// Seconds a session whose runtime is lost is kept.
+    pub(crate) lost_ttl_secs: Option<u32>,
+    /// Maximum sessions one sweep may remove.
+    pub(crate) max_removals_per_sweep: Option<u32>,
+}
+
+/// Arguments accepted by `session retention sweep`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SweepArgs {
+    /// Report the selection without removing anything.
+    pub(crate) dry_run: bool,
+    /// Remove the selected sessions.
+    pub(crate) apply: bool,
+    /// Maximum sessions to remove.
+    pub(crate) limit: Option<u32>,
+}
+
+/// Run `session policy get` against the daemon for `host`.
+///
+/// # Errors
+///
+/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
+/// resolved, the daemon rejects the request, or the payload does not match the
+/// contract.
+pub(crate) async fn run_policy_get(host: &str, paths: &Paths, json: bool) -> Result<(), CliError> {
+    let mut client = Client::connect(host, paths).await?;
+    let result = client.call::<method::SessionPolicyGet>(()).await?;
+
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_policy_human(host, &result.retention));
+    }
+    Ok(())
+}
+
+/// Run `session policy set` against the daemon for `host`.
+///
+/// The current policy is read first so unnamed fields keep their value, which
+/// also means the daemon validates exactly the policy it will store.
+///
+/// # Errors
+///
+/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
+/// resolved, the daemon rejects the policy, or the payload does not match the
+/// contract.
+pub(crate) async fn run_policy_set(
+    host: &str,
+    paths: &Paths,
+    args: PolicyArgs,
+    json: bool,
+) -> Result<(), CliError> {
+    let mut client = Client::connect(host, paths).await?;
+    let current = client.call::<method::SessionPolicyGet>(()).await?.retention;
+    let result = client
+        .call::<method::SessionPolicySet>(SessionPolicyParams {
+            retention: apply_policy_args(current, args),
+        })
+        .await?;
+
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_policy_human(host, &result.retention));
+    }
+    Ok(())
+}
+
+/// Run `session retention sweep` against the daemon for `host`.
+///
+/// Returns whether the sweep completed without any partial failure, so the
+/// caller can turn a partial failure into a non-zero exit status for cron jobs
+/// and health checks that only inspect it.
+///
+/// # Errors
+///
+/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
+/// resolved, the daemon rejects the request, or the payload does not match the
+/// contract.
+pub(crate) async fn run_retention_sweep(
+    host: &str,
+    paths: &Paths,
+    args: SweepArgs,
+    json: bool,
+) -> Result<bool, CliError> {
+    let mut client = Client::connect(host, paths).await?;
+    let result = client
+        .call::<method::SessionRetentionSweep>(sweep_params(args))
+        .await?;
+
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_sweep_human(host, &result));
+    }
+    Ok(sweep_succeeded(&result))
+}
+
+/// Returns whether a sweep did everything it set out to do.
+///
+/// A session it could not remove and a worktree it could not delete are both
+/// partial failures the caller must be able to see without parsing the output. A
+/// held session is not: keeping work is the sweep behaving correctly.
+fn sweep_succeeded(result: &SessionRetentionResult) -> bool {
+    result.failed == 0 && result.worktrees_failed == 0
+}
+
+/// Returns `current` with the fields named by `args` replaced.
+fn apply_policy_args(current: SessionRetentionPolicy, args: PolicyArgs) -> SessionRetentionPolicy {
+    let enabled = if args.enabled {
+        true
+    } else if args.disabled {
+        false
+    } else {
+        current.enabled
+    };
+    SessionRetentionPolicy {
+        enabled,
+        sweep_interval_secs: args
+            .sweep_interval_secs
+            .unwrap_or(current.sweep_interval_secs),
+        terminal_ttl_secs: args.terminal_ttl_secs.unwrap_or(current.terminal_ttl_secs),
+        lost_ttl_secs: args.lost_ttl_secs.unwrap_or(current.lost_ttl_secs),
+        max_removals_per_sweep: args
+            .max_removals_per_sweep
+            .unwrap_or(current.max_removals_per_sweep),
+    }
+}
+
+/// Builds the sweep params. `--apply` is the absence of `--dry-run`; clap
+/// requires exactly one of the two so the destructive mode is never implicit.
+fn sweep_params(args: SweepArgs) -> SessionRetentionParams {
+    SessionRetentionParams {
+        dry_run: args.dry_run || !args.apply,
+        limit: args.limit,
+    }
+}
+
+fn render_policy_human(host: &str, policy: &SessionRetentionPolicy) -> String {
+    let mut output = format!("host {host} session retention policy\n");
+    let _ = writeln!(
+        output,
+        "  automatic sweeps: {}",
+        if policy.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    let _ = writeln!(
+        output,
+        "  sweep_interval_secs: {}",
+        policy.sweep_interval_secs
+    );
+    let _ = writeln!(output, "  terminal_ttl_secs: {}", policy.terminal_ttl_secs);
+    let _ = writeln!(output, "  lost_ttl_secs: {}", policy.lost_ttl_secs);
+    let _ = writeln!(
+        output,
+        "  max_removals_per_sweep: {}",
+        policy.max_removals_per_sweep
+    );
+    output
+}
+
+fn render_sweep_human(host: &str, result: &SessionRetentionResult) -> String {
+    let action = if result.dry_run { "matched" } else { "removed" };
+    let count = if result.dry_run {
+        result.eligible
+    } else {
+        result.removed
+    };
+    let mut output = format!(
+        "host {host} session retention {action} {count} of {} session(s)\n",
+        result.examined
+    );
+    let _ = writeln!(
+        output,
+        "  eligible={} held={} removed={} worktrees_cleaned={} worktrees_failed={} failed={}",
+        result.eligible,
+        result.held,
+        result.removed,
+        result.worktrees_cleaned,
+        result.worktrees_failed,
+        result.failed
+    );
+    for candidate in &result.sessions {
+        let worktree = candidate
+            .worktree_path
+            .as_ref()
+            .map_or_else(|| "-".to_owned(), |path| path.display().to_string());
+        let hold = candidate
+            .hold
+            .map_or("-", protocol::SessionRetentionHold::as_str);
+        let _ = writeln!(
+            output,
+            "  {} reason={} age_secs={} hold={hold} removed={} worktree={worktree}",
+            candidate.session_id.0,
+            candidate.reason.as_str(),
+            candidate.age_secs,
+            candidate.removed
+        );
+    }
+    output
+}
+
 fn new_params(args: &NewArgs) -> Result<SessionNewParams, CliError> {
     Ok(SessionNewParams {
         agent: args.agent.clone(),
@@ -1635,10 +1855,20 @@ fn render_stop_human(session_id: &str, result: &SessionStopResult) -> String {
 }
 
 fn render_remove_human(session_id: &str, result: &SessionRemoveResult) -> String {
-    format!(
+    let mut output = format!(
         "session {session_id}: removed={} stopped={}\n",
         result.removed, result.stopped
-    )
+    );
+    // Worktree cleanup is best-effort inside the daemon, so a leftover checkout
+    // is only visible if it is printed here.
+    if result.worktrees_removed > 0 || result.worktrees_failed > 0 {
+        let _ = writeln!(
+            output,
+            "  worktrees: removed={} failed={}",
+            result.worktrees_removed, result.worktrees_failed
+        );
+    }
+    output
 }
 
 fn render_input_human(session_id: &str, result: &SessionInputResult) -> String {
@@ -2997,10 +3227,87 @@ mod tests {
             &SessionRemoveResult {
                 removed: true,
                 stopped: true,
+                worktrees_removed: 0,
+                worktrees_failed: 0,
             },
         );
 
         assert_eq!(output, "session s-42: removed=true stopped=true\n");
+    }
+
+    #[test]
+    fn renders_remove_result_worktree_cleanup_failure() {
+        let output = render_remove_human(
+            "s-42",
+            &SessionRemoveResult {
+                removed: true,
+                stopped: false,
+                worktrees_removed: 1,
+                worktrees_failed: 2,
+            },
+        );
+
+        assert_eq!(
+            output,
+            "session s-42: removed=true stopped=false\n  worktrees: removed=1 failed=2\n"
+        );
+    }
+
+    /// A sweep result with the given failure counters and nothing else set.
+    fn sweep_result(failed: u32, worktrees_failed: u32) -> SessionRetentionResult {
+        SessionRetentionResult {
+            dry_run: false,
+            examined: 4,
+            eligible: 2,
+            held: 1,
+            removed: 2,
+            worktrees_cleaned: 1,
+            worktrees_failed,
+            failed,
+            sessions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_clean_sweep_succeeds() {
+        assert!(sweep_succeeded(&sweep_result(0, 0)));
+    }
+
+    #[test]
+    fn a_sweep_with_a_failed_removal_or_leftover_worktree_does_not_succeed() {
+        assert!(
+            !sweep_succeeded(&sweep_result(1, 0)),
+            "a session it could not remove is a partial failure"
+        );
+        assert!(
+            !sweep_succeeded(&sweep_result(0, 1)),
+            "a worktree it could not delete is a partial failure"
+        );
+    }
+
+    #[test]
+    fn renders_sweep_result_with_holds_and_failure_counters() {
+        let mut result = sweep_result(1, 2);
+        result.sessions.push(protocol::SessionRetentionCandidate {
+            session_id: protocol::SessionId("s-42".to_owned()),
+            reason: protocol::SessionRetentionReason::Lost,
+            age_secs: 90,
+            worktree_path: Some(std::path::PathBuf::from("/data/worktrees/s-42")),
+            hold: Some(protocol::SessionRetentionHold::WorktreeUncommitted),
+            removed: false,
+        });
+
+        let output = render_sweep_human("local", &result);
+
+        assert_eq!(
+            output,
+            concat!(
+                "host local session retention removed 2 of 4 session(s)\n",
+                "  eligible=2 held=1 removed=2 worktrees_cleaned=1 worktrees_failed=2 failed=1\n",
+                "  s-42 reason=lost age_secs=90 hold=worktree_uncommitted removed=false",
+                " worktree=/data/worktrees/s-42\n"
+            )
+        );
     }
 
     #[test]

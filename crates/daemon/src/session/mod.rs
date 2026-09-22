@@ -55,7 +55,8 @@ use crate::store::{
 };
 use crate::time::now_rfc3339;
 use crate::worktree::{
-    canonical_or_original, run_hook, HookContext, HookEvent, WorktreeManager, WorktreeRequest,
+    canonical_or_original, run_hook, HookContext, HookEvent, WorktreeCleanup, WorktreeManager,
+    WorktreeRequest,
 };
 
 mod attach;
@@ -69,9 +70,11 @@ mod procwatch;
 mod read;
 mod reconcile;
 mod resume;
+mod retention;
 mod target;
 
 pub use attach::{RedeemedAttach, RedeemedRuntime};
+pub use retention::{SessionRetentionTask, POLICY_FILE_NAME as RETENTION_POLICY_NAME};
 
 pub(crate) use observation::{observation_worker_error, runtime_identity};
 
@@ -302,6 +305,10 @@ pub struct SessionRegistryConfig {
     /// Directory for the append-only event log (`<data_dir>/events`). `None`
     /// disables event logging. Started via [`SessionRegistry::spawn_event_log`].
     pub event_log_dir: Option<PathBuf>,
+    /// Durable session policy document (`<data_dir>/session-policy.json`).
+    /// `None` keeps the retention policy in memory only, which is what unit
+    /// tests that never persist a policy use.
+    pub retention_policy_path: Option<PathBuf>,
     /// Directory containing bounded structured logs. When set, removing a
     /// stopped session also removes its owner-private worker log family.
     pub log_dir: Option<PathBuf>,
@@ -363,6 +370,7 @@ impl Default for SessionRegistryConfig {
             worktree_root: None,
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
             event_log_dir: None,
+            retention_policy_path: None,
             log_dir: None,
             config_dir: None,
             agents_dir: None,
@@ -458,6 +466,8 @@ struct SessionRegistryInner {
     procwatch_seq: AtomicU64,
     /// Read-only external agent sessions observed outside pohunek-owned PTYs.
     external: ExternalSessions,
+    /// Automatic session retention policy and its sweep serialization point.
+    retention: retention::RetentionState,
     #[cfg(test)]
     external_association_block: std::sync::Mutex<Option<Arc<ExternalAssociationBlock>>>,
 }
@@ -938,18 +948,24 @@ impl SessionRegistry {
         })
     }
 
+    /// Clean the worktrees owned by `id`, returning the setup warnings and how
+    /// many checkouts are really gone.
+    ///
+    /// A `git worktree remove` failure is non-fatal, so the count is what
+    /// [`SessionRegistry::remove`] reports rather than the number of bindings it
+    /// processed.
     async fn cleanup_owned_worktrees_for_removal(
         &self,
         id: &SessionId,
-    ) -> Result<Vec<SessionWarning>, ProtocolError> {
+    ) -> Result<(Vec<SessionWarning>, WorktreeCleanup), ProtocolError> {
         let Some(worktree) = self.inner.worktree.clone() else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), WorktreeCleanup::default()));
         };
         let session_id = id.0.clone();
         tokio::task::spawn_blocking(move || {
             let mut warnings = Vec::new();
-            worktree.cleanup_session(&session_id, &mut warnings)?;
-            Ok(warnings)
+            let cleanup = worktree.cleanup_session(&session_id, &mut warnings)?;
+            Ok((warnings, cleanup))
         })
         .await
         .map_err(|_join_error| {
@@ -1126,6 +1142,7 @@ impl SessionRegistry {
         // Host agent profiles resolve the free-string `agent` name; built from the
         // configured agents dir (a bare base kind still resolves when it is unset).
         let profiles = ProfileRegistry::new(config.agents_dir.clone());
+        let retention = retention::RetentionState::new(config.retention_policy_path.clone());
         let registry = Self {
             inner: Arc::new(SessionRegistryInner {
                 sessions: Mutex::new(HashMap::new()),
@@ -1157,6 +1174,7 @@ impl SessionRegistry {
                 inspector,
                 procwatch_seq: AtomicU64::new(current_time_millis()),
                 external: external.clone(),
+                retention,
                 #[cfg(test)]
                 external_association_block: std::sync::Mutex::new(None),
             }),
@@ -2610,6 +2628,11 @@ impl SessionRegistry {
     /// `session_removed` event is emitted with the final snapshot so subscribed
     /// clients drop their view of the session.
     ///
+    /// Worktree cleanup is best-effort: a checkout that could not be deleted is
+    /// counted in [`SessionRemoveResult::worktrees_failed`] instead of failing
+    /// the removal, so a caller reporting cleaned worktrees can tell the two
+    /// apart.
+    ///
     /// # Errors
     ///
     /// Returns `session_not_found` when no session has the given id, and
@@ -2653,13 +2676,24 @@ impl SessionRegistry {
             false
         };
 
-        let cleanup_warnings = self.cleanup_owned_worktrees_for_removal(id).await?;
+        let (cleanup_warnings, cleanup) = self.cleanup_owned_worktrees_for_removal(id).await?;
         if !cleanup_warnings.is_empty() {
             let mut sessions = self.inner.sessions.lock().await;
             if let Some(entry) = sessions.get_mut(id) {
                 entry.info.warnings.extend(cleanup_warnings);
             }
         }
+        // The entry is about to leave the map and its warnings with it, so a
+        // checkout that survived is reported on the result as well.
+        if cleanup.failed > 0 {
+            warn!(
+                session_id = %id.0,
+                worktrees_failed = cleanup.failed,
+                "session removal left an owned worktree on disk"
+            );
+        }
+        let worktrees_removed = u32::try_from(cleanup.removed).unwrap_or(u32::MAX);
+        let worktrees_failed = u32::try_from(cleanup.failed).unwrap_or(u32::MAX);
 
         // The PTY has stopped above, so cleanup removes the accumulated family.
         // A retained terminal worker may still emit a final control diagnostic,
@@ -2675,6 +2709,8 @@ impl SessionRegistry {
                     return Ok(SessionRemoveResult {
                         removed: false,
                         stopped,
+                        worktrees_removed,
+                        worktrees_failed,
                     })
                 }
             }
@@ -2689,6 +2725,8 @@ impl SessionRegistry {
         Ok(SessionRemoveResult {
             removed: true,
             stopped,
+            worktrees_removed,
+            worktrees_failed,
         })
     }
 

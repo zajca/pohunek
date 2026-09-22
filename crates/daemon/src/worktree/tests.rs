@@ -11,11 +11,11 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use protocol::SessionWarningKind;
+use protocol::{SessionRetentionHold, SessionWarningKind};
 
 use super::{
     branch_slug, hook_env, is_valid_worktree, run_output_bounded, HookContext, HookEvent,
-    WorktreeManager, WorktreeRequest,
+    WorktreeCleanup, WorktreeManager, WorktreeRequest, WorktreeWork,
 };
 use crate::store::{Store, WorktreeStatus};
 
@@ -908,7 +908,7 @@ fn cleanup_session_removes_only_owned_worktrees() {
     let none = mgr
         .cleanup_session("s-unknown", &mut Vec::new())
         .expect("cleanup unknown");
-    assert_eq!(none, 0);
+    assert_eq!(none, WorktreeCleanup::default());
     assert!(
         bound.path.exists(),
         "an unowned session must not touch our tree"
@@ -918,7 +918,13 @@ fn cleanup_session_removes_only_owned_worktrees() {
     let removed = mgr
         .cleanup_session("s-1", &mut Vec::new())
         .expect("cleanup owned");
-    assert_eq!(removed, 1);
+    assert_eq!(
+        removed,
+        WorktreeCleanup {
+            removed: 1,
+            failed: 0
+        }
+    );
     assert!(!bound.path.exists(), "owned worktree directory removed");
     assert!(
         mgr.store()
@@ -1246,7 +1252,13 @@ fn remove_hooks_fire_on_cleanup_with_post_remove_in_repository() {
 
     let mut warnings = Vec::new();
     let removed = mgr.cleanup_session("s-1", &mut warnings).expect("cleanup");
-    assert_eq!(removed, 1);
+    assert_eq!(
+        removed,
+        WorktreeCleanup {
+            removed: 1,
+            failed: 0
+        }
+    );
     assert!(warnings.is_empty(), "passing remove hooks warn nothing");
     assert_eq!(
         fs::read_to_string(repo.join("pre-remove-agent"))
@@ -1271,7 +1283,15 @@ fn post_remove_skips_with_warning_when_repository_is_gone() {
     let mut warnings = Vec::new();
     let removed = mgr.cleanup_session("s-1", &mut warnings).expect("cleanup");
 
-    assert_eq!(removed, 1);
+    // The repository is gone, so `git worktree remove` cannot run: the binding is
+    // dropped anyway and the failure is reported rather than counted as cleaned.
+    assert_eq!(
+        removed,
+        WorktreeCleanup {
+            removed: 0,
+            failed: 1
+        }
+    );
     let warning = warnings
         .iter()
         .find(|warning| warning.kind == SessionWarningKind::Hook)
@@ -1313,4 +1333,132 @@ fn host_global_and_in_repo_post_create_run_host_global_first() {
         vec!["host", "repo"],
         "host-global hook runs before the in-repo hook"
     );
+}
+
+// --- retention safety probe -----------------------------------------------
+
+/// Asserts `unsaved_work` holds the session for exactly `expected`.
+fn assert_held(mgr: &WorktreeManager, session: &str, expected: SessionRetentionHold) {
+    match mgr.unsaved_work(session) {
+        WorktreeWork::Held { hold, detail } => {
+            assert_eq!(hold, expected, "detail: {detail}");
+            assert!(!detail.is_empty(), "a hold always explains itself");
+        }
+        WorktreeWork::Saved => panic!("expected a {expected:?} hold, got Saved"),
+    }
+}
+
+#[test]
+fn unsaved_work_clears_a_clean_owned_worktree() {
+    let mgr = manager("unsaved-clean");
+    let repo = init_repo("unsaved-clean-repo");
+    mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+
+    assert_eq!(
+        mgr.unsaved_work("s-1"),
+        WorktreeWork::Saved,
+        "a freshly bound worktree branched off main holds nothing"
+    );
+}
+
+#[test]
+fn unsaved_work_clears_a_session_with_no_binding() {
+    let mgr = manager("unsaved-unbound");
+
+    assert_eq!(
+        mgr.unsaved_work("s-unknown"),
+        WorktreeWork::Saved,
+        "a session with no owned worktree has nothing to lose"
+    );
+}
+
+#[test]
+fn unsaved_work_holds_a_worktree_with_an_uncommitted_change() {
+    let mgr = manager("unsaved-dirty");
+    let repo = init_repo("unsaved-dirty-repo");
+    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    fs::write(bound.path.join("README.md"), "edited by the agent\n").expect("dirty a tracked file");
+
+    assert_held(&mgr, "s-1", SessionRetentionHold::WorktreeUncommitted);
+}
+
+#[test]
+fn unsaved_work_holds_a_worktree_with_an_untracked_file() {
+    let mgr = manager("unsaved-untracked");
+    let repo = init_repo("unsaved-untracked-repo");
+    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    fs::write(bound.path.join("notes.md"), "scratch work\n").expect("add an untracked file");
+
+    assert_held(&mgr, "s-1", SessionRetentionHold::WorktreeUntracked);
+}
+
+#[test]
+fn unsaved_work_holds_a_worktree_whose_commit_is_in_no_other_ref() {
+    let mgr = manager("unsaved-unpushed");
+    let repo = init_repo("unsaved-unpushed-repo");
+    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    fs::write(bound.path.join("README.md"), "committed only here\n").expect("edit tracked file");
+    git_in(&bound.path, &["add", "."]);
+    git_in(&bound.path, &["commit", "-q", "-m", "work in progress"]);
+
+    assert_held(&mgr, "s-1", SessionRetentionHold::WorktreeUnpushed);
+}
+
+#[test]
+fn unsaved_work_clears_a_commit_another_ref_still_contains() {
+    let mgr = manager("unsaved-pushed");
+    let repo = init_repo("unsaved-pushed-repo");
+    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    fs::write(bound.path.join("README.md"), "committed and shared\n").expect("edit tracked file");
+    git_in(&bound.path, &["add", "."]);
+    git_in(&bound.path, &["commit", "-q", "-m", "shared work"]);
+    // A second ref on the same commit stands in for a pushed branch: the commit
+    // survives the checkout's removal either way.
+    git_in(&bound.path, &["branch", "review/feat-x"]);
+
+    assert_eq!(mgr.unsaved_work("s-1"), WorktreeWork::Saved);
+}
+
+#[test]
+fn unsaved_work_holds_a_worktree_git_cannot_read() {
+    let mgr = manager("unsaved-unreadable");
+    let repo = init_repo("unsaved-unreadable-repo");
+    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    // The `.git` file is what makes the directory a worktree; without it git
+    // cannot report anything about the checkout that is still on disk.
+    fs::remove_file(bound.path.join(".git")).expect("drop the worktree gitdir link");
+
+    assert_held(&mgr, "s-1", SessionRetentionHold::WorktreeUnknown);
+}
+
+#[test]
+fn unsaved_work_clears_a_binding_whose_checkout_is_already_gone() {
+    let mgr = manager("unsaved-vanished");
+    let repo = init_repo("unsaved-vanished-repo");
+    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    fs::remove_dir_all(&bound.path).expect("delete the checkout behind git's back");
+
+    assert_eq!(
+        mgr.unsaved_work("s-1"),
+        WorktreeWork::Saved,
+        "nothing is on disk, so removal destroys nothing"
+    );
+}
+
+#[test]
+fn status_hold_ranks_an_uncommitted_change_above_an_untracked_file() {
+    let hold = super::status_hold("?? notes.md\n M README.md\n").expect("a hold");
+
+    assert_eq!(hold.0, SessionRetentionHold::WorktreeUncommitted);
+    assert!(
+        hold.1.contains("README.md"),
+        "detail names the file: {}",
+        hold.1
+    );
+}
+
+#[test]
+fn status_hold_accepts_clean_status_output() {
+    assert!(super::status_hold("").is_none());
+    assert!(super::status_hold("\n").is_none());
 }

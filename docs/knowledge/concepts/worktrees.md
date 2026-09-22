@@ -25,6 +25,16 @@ Removing a project record never deletes the main repository. The project remove
 command has a separate `--prune-worktrees` option for worktrees Pohunek created;
 it does not remove unrelated worktrees.
 
+A pohunek-owned worktree is removed with `git worktree remove --force`, which
+deletes the checkout but leaves the branch and its commits in the repository.
+`pohunek session rm` does that unconditionally, since it is an explicit operator
+action. The automatic session retention sweep does not: it keeps any session
+whose owned worktree has uncommitted or untracked changes, commits contained in
+no other ref, or a state git cannot report (see the Sessions concept's Retention
+section). Cleanup is best-effort, so a checkout whose removal failed is reported
+rather than silently counted as cleaned, and the leftover directory needs manual
+cleanup.
+
 Assistant guidance should preserve this boundary: verify which checkout or
 worktree is active before editing, avoid deleting user-managed worktrees, and
 prefer explicit project or repository targeting for project work.

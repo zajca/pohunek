@@ -34,7 +34,9 @@ use pohunek_daemon::runtime::{
     SubprocessWorkerEnvironment, SubprocessWorkerLauncher, UnitTemplate, WorkerLauncher,
     DEFAULT_WORKER_UNIT_TEMPLATE,
 };
-use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
+use pohunek_daemon::session::{
+    SessionRegistry, SessionRegistryConfig, SessionRetentionTask, RETENTION_POLICY_NAME,
+};
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
 
 /// File name of the unified logical-session metadata store under the data dir.
@@ -164,6 +166,7 @@ async fn run() -> Result<(), DaemonError> {
         store_path: Some(paths.data_dir.join(STORE_NAME)),
         worktree_root: Some(paths.data_dir.join(WORKTREES_SUBDIR)),
         event_log_dir: Some(paths.data_dir.join(EVENTS_SUBDIR)),
+        retention_policy_path: Some(paths.data_dir.join(RETENTION_POLICY_NAME)),
         log_dir: Some(paths.log_dir.clone()),
         // Slice 0 owns this line: B3 (host-global hooks) and C1 (agent profiles)
         // read it through SessionRegistry::config_dir() / derive off it — they must
@@ -178,6 +181,20 @@ async fn run() -> Result<(), DaemonError> {
         ..SessionRegistryConfig::default()
     };
     let sessions = build_session_registry(config, &paths)?;
+    // Load the durable retention policy before anything can sweep: a corrupt or
+    // unsafely-permissioned document must fail startup rather than silently
+    // revert to the shipped default.
+    let retention_policy = sessions
+        .load_retention_policy()
+        .await
+        .map_err(DaemonError::RetentionPolicy)?;
+    info!(
+        session.retention_enabled = retention_policy.enabled,
+        session.retention_sweep_interval_secs = retention_policy.sweep_interval_secs,
+        session.retention_terminal_ttl_secs = retention_policy.terminal_ttl_secs,
+        session.retention_lost_ttl_secs = retention_policy.lost_ttl_secs,
+        "loaded session retention policy"
+    );
     let notifications =
         NotificationService::open(&paths.data_dir).map_err(|source| DaemonError::Directory {
             path: paths.data_dir.join(NOTIFICATIONS_SUBDIR),
@@ -193,6 +210,7 @@ async fn run() -> Result<(), DaemonError> {
         &notifications,
     )?;
     let notification_retention = NotificationRetentionTask::spawn(notifications.clone());
+    let session_retention = SessionRetentionTask::spawn(sessions.clone());
     // Spawn the debounce coordinator: it owns the lifecycle of session-scoped
     // agent_blocked/approval_required and turn_completed notifications, holding
     // them for the policy debounce window so transient signals never surface.
@@ -269,6 +287,7 @@ async fn run() -> Result<(), DaemonError> {
     //     Stop the projector before the coordinator so any last defers/resolves
     //     it drains are still accepted, then drop the coordinator's pending
     //     (in-memory, deliberately not persisted).
+    session_retention.shutdown().await;
     notification_retention.shutdown().await;
     notification_projector.shutdown().await;
     attention_task.shutdown().await;
