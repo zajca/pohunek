@@ -19,4 +19,14 @@ export type SessionRemoveResult = {
    * Whether a still-live session was stopped as part of this removal.
    */
   stopped: boolean;
+  /**
+   * Pohunek-owned worktrees whose checkout this removal deleted.
+   */
+  worktrees_removed: number;
+  /**
+   * Pohunek-owned worktrees whose checkout could not be deleted. Their
+   * binding is dropped either way, so the leftover directory is no longer
+   * tracked and needs manual cleanup.
+   */
+  worktrees_failed: number;
 };
