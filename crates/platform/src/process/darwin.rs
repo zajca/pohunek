@@ -1037,6 +1037,11 @@ mod tests {
     const OBSERVE_TIMEOUT: Duration = Duration::from_secs(10);
     /// Spacing between polls while waiting for an observable state change.
     const OBSERVE_POLL: Duration = Duration::from_millis(20);
+    /// Bounds how long a killed pseudoterminal shell may take to become reapable.
+    ///
+    /// Shorter than the observation window so the fixture always answers before
+    /// the caller that waits on it gives up.
+    const REAP_TIMEOUT: Duration = Duration::from_secs(2);
     /// Proves a watch on a live process stays pending without busy polling.
     const IDLE_WATCH_WINDOW: Duration = Duration::from_millis(250);
     /// Number of concurrent idle watches armed on one live process.
@@ -1068,7 +1073,15 @@ mod tests {
     impl Drop for PtyFixture {
         fn drop(&mut self) {
             let _ = self.0.kill();
-            let _ = self.0.wait();
+            // A child that does not become reapable must not stall the suite;
+            // the CI job terminates whatever is left when it ends.
+            let deadline = Instant::now() + REAP_TIMEOUT;
+            while Instant::now() < deadline {
+                if matches!(self.0.try_wait(), Ok(Some(_)) | Err(_)) {
+                    return;
+                }
+                std::thread::sleep(OBSERVE_POLL);
+            }
         }
     }
 
@@ -1666,7 +1679,7 @@ mod tests {
         command.env("PS1", "READY>");
         let child = pair.slave.spawn_command(command).expect("spawn the shell");
         let shell_pid = child.process_id().expect("shell process id");
-        let _shell = PtyFixture(child);
+        let shell = PtyFixture(child);
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -1710,7 +1723,10 @@ mod tests {
             .expect("inspect the foreground group")
             .filter(|group| *group != shell_pid)
         });
-        let root = live_identity(inspector, shell_pid);
+        let root = wait_for("the shell to become observable", || {
+            observe("the shell identity", move || inspector.identity(shell_pid))
+                .expect("inspect the shell identity")
+        });
         let members: Vec<_> = observe("the descendants of a running job", move || {
             inspector.descendants(root.pid)
         })
@@ -1733,6 +1749,14 @@ mod tests {
         );
 
         let member_pid = members.first().expect("a foreground group member").pid;
+        // Signalling the observer's own process group would stop this test
+        // process instead of the job, so the resolved group is checked first.
+        let own_group = u32::try_from(rustix::process::getpgrp().as_raw_nonzero().get())
+            .expect("a process group fits an unsigned process id");
+        assert_ne!(
+            foreground, own_group,
+            "a shell terminal foreground group must never resolve to the observer's own group"
+        );
         nix::sys::signal::killpg(
             nix::unistd::Pid::from_raw(i32::try_from(foreground).expect("group fits a pid")),
             nix::sys::signal::Signal::SIGTSTP,
@@ -1774,5 +1798,9 @@ mod tests {
             .any(|fact| fact.pgid == foreground),
             "a stopped foreground job stays observable without owning the terminal"
         );
+
+        // A killed shell that never becomes reapable would otherwise stall the
+        // suite with no diagnosis, so the reap is observed like any other phase.
+        observe("the killed shell to be reaped", move || drop(shell));
     }
 }
