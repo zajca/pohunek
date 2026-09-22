@@ -152,6 +152,10 @@ impl AuthService {
     /// Returns [`AuthError::LinkChannelMismatch`] for a bearer caller,
     /// [`AuthError::LinkPending`] when another transaction is already open, and
     /// [`AuthError::LinkQuarantined`] while the relay is in recovery quarantine.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The transaction binding, its provider row, and the cleanup each refusal owes must stay visibly adjacent."
+    )]
     pub async fn begin_browser_link(
         &self,
         oidc: &OidcClient,
@@ -311,6 +315,10 @@ impl AuthService {
     /// Returns [`AuthError::LinkChannelMismatch`] for a browser caller and
     /// [`AuthError::IssuerUnavailable`] when the configured issuer has no usable
     /// device endpoint.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The transaction binding, its provider row, and the cleanup each refusal owes must stay visibly adjacent."
+    )]
     pub async fn begin_device_link(
         &self,
         oidc: &OidcClient,
