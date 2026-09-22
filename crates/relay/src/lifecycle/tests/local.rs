@@ -559,7 +559,7 @@ async fn migration_resumes_a_plan_that_reshaped_populated_authority_rows() {
     cleanup(&pool, &schema).await;
 }
 
-/// The relay holds no lock while SQLx applies the plan on another pooled
+/// The relay holds no lock while `SQLx` applies the plan on another pooled
 /// connection, so the projected authority digest is re-verified afterwards.
 /// Authority written inside that exact window is refused rather than adopted.
 #[tokio::test]

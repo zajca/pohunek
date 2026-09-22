@@ -399,7 +399,7 @@ impl Store {
     /// column list per table rather than the whole row, so adding a column leaves
     /// the digest unchanged. That makes it verifiable on both sides of a
     /// migration and closes the window in which the relay holds no lock while
-    /// SQLx applies the plan on another connection.
+    /// `SQLx` applies the plan on another connection.
     ///
     /// See [`AUTHORITY_PROJECTION`] for the bound tables and columns, how an
     /// absent table is treated, and which plans this binding refuses.
