@@ -7,10 +7,17 @@
 //! different process operates on that socket, so the process id is
 //! inspection-time identity and callers must re-read it before acting.
 //!
-//! The kernel fills the peer record only where it set `UNP_HAVEPC`: the
-//! accepted side of a listener, and both ends of a `socketpair`. The connecting
-//! side of a real `connect` answers `ENOTCONN` even while fully connected, so
-//! that errno means "this socket carries no peer record", not "not connected".
+//! The two options have different preconditions, and the difference shows up as
+//! `ENOTCONN` in two unrelated situations. `LOCAL_PEERCRED` answers whenever the
+//! kernel set `UNP_HAVEPC`, which `unp_connect` does for *both* ends — the
+//! accepted socket receives the connecting process's credentials, and the
+//! connecting socket receives the listener's, cached by `unp_listen`. That
+//! record is a copy, so it survives the peer closing. `LOCAL_PEERPID` instead
+//! requires a live `unp_conn`, so it answers `ENOTCONN` once the peer
+//! disconnects. A caller therefore cannot read a peer id from a connection the
+//! other side has already dropped: on this target a closed peer is reported as
+//! unavailable rather than as an exited process. Both are rejections, so the
+//! difference is one of diagnosis, not of trust.
 //!
 //! `LOCAL_PEERTOKEN` was evaluated and rejected. The kernel resolves it through
 //! the same `last_pid`, so it does not detect a descriptor hand-off either;

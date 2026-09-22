@@ -128,9 +128,12 @@ impl Binding {
     ///
     /// Call this on the socket returned by `accept`, before reading any request
     /// byte, so the snapshot describes the process that connected. Only an
-    /// accepted socket carries a peer: Linux answers for a listening socket
-    /// with the *listener's own* credentials and for an unconnected socket with
-    /// a zero process id, and Darwin refuses the connecting side outright.
+    /// accepted socket names the right process: a listening socket answers with
+    /// the *listener's own* credentials, an unconnected Linux socket answers
+    /// with a zero process id, and the connecting side of a Darwin connection
+    /// answers with the listener's credentials rather than refusing. None of
+    /// those is an error, which is exactly why the caller has to pick the right
+    /// socket.
     ///
     /// # Errors
     ///
@@ -220,12 +223,23 @@ mod tests {
         let binding = Binding::capture(&accepted).expect("capture peer");
         assert_eq!(binding.snapshot().pid, std::process::id());
         binding.revalidate().expect("peer identity is unchanged");
+
+        // What a closed peer means is the one place the two kernels disagree,
+        // and both answers reject rather than silently pass.
         drop(client);
-        // A closed peer leaves the kernel record intact. Liveness is a process
-        // question, not a socket question, so the binding still matches.
-        binding
-            .revalidate()
-            .expect("credentials survive peer close");
+        let after_close = binding.revalidate();
+        if cfg!(target_os = "macos") {
+            // `LOCAL_PEERPID` needs a live connection, so the peer id stops
+            // being readable once the other side drops.
+            assert!(
+                matches!(after_close, Err(Error::Unavailable)),
+                "a dropped peer must stop being attestable, got {after_close:?}"
+            );
+        } else {
+            // `SO_PEERCRED` answers from a record the kernel keeps, so the
+            // socket still names the same peer; liveness is a process question.
+            after_close.expect("credentials survive peer close");
+        }
     }
 
     #[test]
@@ -270,20 +284,25 @@ mod tests {
         assert_eq!(reported.pid, std::process::id());
     }
 
-    /// Darwin fills the peer record only on the accepting side, so the
-    /// connecting side of a real listener stays unattested.
+    /// Darwin attests the connecting side too, with the *listener's* identity.
+    ///
+    /// `unp_connect` copies the listener's cached credentials into the
+    /// connecting socket, so this side answers successfully while naming a
+    /// process that never connected. That is the concrete reason
+    /// [`Binding::capture`] is documented as accept-only: a caller cannot rely
+    /// on the wrong socket failing to tell them apart.
     #[cfg(target_os = "macos")]
     #[test]
-    fn connecting_side_has_no_peer_record() {
+    fn connecting_side_is_attested_too() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("peer.sock");
         let listener = UnixListener::bind(&path).expect("bind peer socket");
         let client = UnixStream::connect(&path).expect("connect peer socket");
-        let (_accepted, _address) = listener.accept().expect("accept peer socket");
-        let error = credentials(&client).expect_err("connecting side is unattested");
-        assert!(
-            matches!(error, Error::Unavailable),
-            "expected an explicit unavailable rejection, got {error:?}"
-        );
+        let (accepted, _address) = listener.accept().expect("accept peer socket");
+
+        let from_client = credentials(&client).expect("connecting side is attested");
+        let from_accepted = credentials(&accepted).expect("accepted side is attested");
+        assert_eq!(from_client.pid, std::process::id());
+        assert_eq!(from_accepted.pid, std::process::id());
     }
 }
