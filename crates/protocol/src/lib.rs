@@ -119,11 +119,11 @@ pub use session::{
     SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
     SessionResizeParams, SessionResizeResult, SessionResumeResult, SessionRetentionCandidate,
     SessionRetentionHold, SessionRetentionParams, SessionRetentionPolicy, SessionRetentionReason,
-    SessionRetentionResult, SessionRuntime, SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
-    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
-    SubagentInfo, SubagentLifecycle, SubagentStateEvent, TerminalCursor, TerminalDimensions,
-    TerminalDimensionsError,
+    SessionRetentionResult, SessionRuntime, SessionRuntimeIdentity, SessionScreenParams,
+    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
+    SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning,
+    SessionWarningKind, SubagentInfo, SubagentLifecycle, SubagentStateEvent, TerminalCursor,
+    TerminalDimensions, TerminalDimensionsError,
 };
 #[doc(inline)]
 pub use version::{

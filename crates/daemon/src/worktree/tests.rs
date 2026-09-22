@@ -1450,7 +1450,11 @@ fn status_hold_ranks_an_uncommitted_change_above_an_untracked_file() {
     let hold = super::status_hold("?? notes.md\n M README.md\n").expect("a hold");
 
     assert_eq!(hold.0, SessionRetentionHold::WorktreeUncommitted);
-    assert!(hold.1.contains("README.md"), "detail names the file: {}", hold.1);
+    assert!(
+        hold.1.contains("README.md"),
+        "detail names the file: {}",
+        hold.1
+    );
 }
 
 #[test]

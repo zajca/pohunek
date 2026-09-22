@@ -188,8 +188,16 @@ impl SessionRegistry {
         let examined = u32::try_from(sessions.len()).unwrap_or(u32::MAX);
         let mut candidates = select_candidates(&sessions, &policy, now);
         self.apply_worktree_holds(&mut candidates).await;
-        let held = count(candidates.iter().filter(|candidate| candidate.hold.is_some()));
-        let eligible = count(candidates.iter().filter(|candidate| candidate.hold.is_none()));
+        let held = count(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.hold.is_some()),
+        );
+        let eligible = count(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.hold.is_none()),
+        );
         let budget = removal_budget(&policy, params.limit);
 
         let mut removed = 0_u32;

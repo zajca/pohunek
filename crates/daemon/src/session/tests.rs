@@ -18,9 +18,8 @@ use protocol::{
     SessionNewParams, SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadSource,
     SessionReleaseAgentParams, SessionReportAgentParams, SessionReportNativeIdParams,
     SessionRetentionPolicy, SessionRuntime, SessionRuntimeIdentity, SessionState,
-    SessionWaitParams, SessionWaitReason,
-    StateSource, SubagentInfo, SubagentLifecycle, SubagentRevision, TerminalWatermark,
-    MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
+    SessionWaitParams, SessionWaitReason, StateSource, SubagentInfo, SubagentLifecycle,
+    SubagentRevision, TerminalWatermark, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
 };
 
 use crate::agent::LaunchCommand;
@@ -12460,10 +12459,7 @@ async fn session_diff_registry_end_to_end_reflects_worktree_changes_against_the_
 /// worktree binding enabled so a sweep exercises the real removal path.
 fn retention_registry(tag: &str) -> (SessionRegistry, PathBuf, PathBuf) {
     let store = temp_store_path(tag);
-    let data_dir = store
-        .parent()
-        .expect("store parent")
-        .to_path_buf();
+    let data_dir = store.parent().expect("store parent").to_path_buf();
     let worktree_root = data_dir.join("worktrees");
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "true"]),
@@ -12571,7 +12567,10 @@ async fn retention_sweep_removes_terminal_and_lost_sessions_and_keeps_an_in_ttl_
     age_terminal(&registry, &terminal.id, past_ttl()).await;
     let lost = exited_session(&registry, Some(&repo)).await;
     let lost_worktree = lost.worktree_path.clone().expect("lost session worktree");
-    assert!(lost_worktree.is_dir(), "the worktree exists before the sweep");
+    assert!(
+        lost_worktree.is_dir(),
+        "the worktree exists before the sweep"
+    );
     age_lost(&registry, &lost.id, past_ttl()).await;
     let fresh = exited_session(&registry, None).await;
 
@@ -12615,8 +12614,11 @@ async fn retention_sweep_keeps_a_session_whose_worktree_has_uncommitted_work() {
 
     let session = exited_session(&registry, Some(&repo)).await;
     let worktree = session.worktree_path.clone().expect("session worktree");
-    fs::write(worktree.join("README.md"), "work the agent did not commit\n")
-        .expect("dirty the worktree");
+    fs::write(
+        worktree.join("README.md"),
+        "work the agent did not commit\n",
+    )
+    .expect("dirty the worktree");
     age_lost(&registry, &session.id, past_ttl()).await;
 
     let result = registry

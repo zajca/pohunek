@@ -479,8 +479,8 @@ fn retention_sweep(scenario: Scenario) -> Value {
         "eligible": 1,
         "held": 1,
         "removed": 1,
-        "worktrees_cleaned": if partial { 0 } else { 1 },
-        "worktrees_failed": if partial { 1 } else { 0 },
+        "worktrees_cleaned": u32::from(!partial),
+        "worktrees_failed": u32::from(partial),
         "failed": u32::from(partial),
         "sessions": []
     })
@@ -1307,7 +1307,11 @@ int connect(int fd, const struct sockaddr *address, socklen_t length) {
 fn session_retention_sweep_exits_zero_when_nothing_failed() {
     let home = TestHome::new();
     let fixture = FixtureDaemon::start(&home.socket(), Scenario::RetentionSweepClean);
-    let (output, requests) = run(&home, fixture, &["session", "retention", "sweep", "--apply"]);
+    let (output, requests) = run(
+        &home,
+        fixture,
+        &["session", "retention", "sweep", "--apply"],
+    );
 
     assert!(
         output.status.success(),
@@ -1324,7 +1328,11 @@ fn session_retention_sweep_exits_zero_when_nothing_failed() {
 fn session_retention_sweep_exits_nonzero_on_a_partial_failure() {
     let home = TestHome::new();
     let fixture = FixtureDaemon::start(&home.socket(), Scenario::RetentionSweepPartialFailure);
-    let (output, _requests) = run(&home, fixture, &["session", "retention", "sweep", "--apply"]);
+    let (output, _requests) = run(
+        &home,
+        fixture,
+        &["session", "retention", "sweep", "--apply"],
+    );
 
     assert!(
         !output.status.success(),
