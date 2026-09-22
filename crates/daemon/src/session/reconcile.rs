@@ -1414,7 +1414,7 @@ fn apply_identity_projection(
     true
 }
 
-fn worker_metadata_record_is_current(
+pub(super) fn worker_metadata_record_is_current(
     record: &SessionRecord,
     worker_id: &str,
     runtime_id: Option<&str>,

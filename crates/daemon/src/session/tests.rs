@@ -5604,13 +5604,8 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
         "transcript_path": "/must/not/cross.jsonl",
         "prompt": "must not cross the hook boundary"
     });
-    // Every assertion after the hook lands requires the session's root process
-    // to still be running, so the fixture has to outlive the longest run the
-    // harness permits: nextest terminates a test after three sixty-second slow
-    // periods. A thirty-second shell made those assertions depend instead on how
-    // loaded the machine is.
     let command = format!(
-        "printf '%s' '{}' | sh '{}' subagent-start; sleep 300",
+        "printf '%s' '{}' | sh '{}' subagent-start; sleep 30",
         payload,
         hook_path.display()
     );
@@ -5677,23 +5672,13 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
         .await
         .expect("inspect after reconnect");
     assert_eq!(snapshot.subagents.len(), 1, "worker journal retained child");
-    // The apply validates the snapshot's identity claims against the live root
-    // process and permanently discards them when it is gone, so a fixture that
-    // did not survive this far reports itself instead of arriving as a discarded
-    // snapshot with no stated cause.
-    let root = snapshot
-        .child_process
-        .as_ref()
-        .expect("snapshot reports its root process");
-    assert!(
-        crate::procwatch::HostInspector::new()
-            .is_running(ProcessIdentity {
-                pid: root.pid,
-                start_identity: StartIdentity::new(root.start_identity),
-            })
-            .expect("inspect the fixture root process"),
-        "the fixture shell must still run when the reconnected snapshot is applied"
-    );
+    // The apply accepts a snapshot only while the durable record still names the
+    // reconnected worker runtime as live. The worker task that is still running
+    // commits its own snapshots, so that record can be momentarily stale between
+    // this test's durable write and its apply. Waiting for the documented
+    // precondition removes the race without weakening what the apply is asked
+    // to prove, and a precondition that never holds says so.
+    wait_for_current_worker_metadata_record(&registry, &store, &created.id, &snapshot).await;
     assert_eq!(
         registry
             .apply_worker_metadata_snapshot(&created.id, &snapshot)
@@ -5723,6 +5708,56 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
     assert!(!serialized.contains("prompt"));
 
     let _ = registry.stop(&created.id).await;
+}
+
+/// Waits until both records name the snapshot's worker runtime as live.
+///
+/// Applying worker metadata requires the in-memory and the durable record to be
+/// current, and a worker task that is still running commits its own snapshots,
+/// so either can be momentarily stale right after a test writes one of its own.
+/// Naming whichever record stayed stale keeps a discarded snapshot from being
+/// the only thing a failure reports.
+async fn wait_for_current_worker_metadata_record(
+    registry: &SessionRegistry,
+    store: &crate::store::Store,
+    id: &SessionId,
+    snapshot: &pohunek_worker_protocol::InspectSnapshot,
+) {
+    let worker_id = snapshot.worker_id.to_string();
+    let runtime_id = snapshot.runtime_id.as_ref().map(ToString::to_string);
+    let is_current = |record: &crate::store::SessionRecord| {
+        super::reconcile::worker_metadata_record_is_current(
+            record,
+            &worker_id,
+            runtime_id.as_deref(),
+        )
+    };
+    let mut memory_current = false;
+    let mut durable_current = false;
+    for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
+        memory_current = {
+            let sessions = registry.inner.sessions.lock().await;
+            let entry = sessions.get(id).expect("live session entry");
+            is_current(&SessionRegistry::session_record(
+                id,
+                entry,
+                entry.desired_state,
+                None,
+            ))
+        };
+        durable_current = store
+            .load_sessions()
+            .expect("load durable sessions")
+            .pop()
+            .is_some_and(|record| is_current(&record));
+        if memory_current && durable_current {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "worker runtime never settled as live (memory: {memory_current}, durable: {durable_current})"
+    );
 }
 
 fn worker_subagent_snapshot(id: &str) -> pohunek_worker_protocol::SubagentSnapshot {
