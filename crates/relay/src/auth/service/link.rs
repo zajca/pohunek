@@ -30,10 +30,10 @@ use crate::{
 };
 
 use super::{
-    audit_actor_mutation, audit_auth, database_error, exact_receipt, insert_receipt, interval,
-    page_limit, random_secret, request_digest, retryable_database_error, AuthService,
-    DeviceTransaction, PendingBrowserLogin, IDENTITY_ADVISORY_LOCK_SEED,
-    IDENTITY_ISSUE_MAX_ATTEMPTS, RANDOM_SECRET_BYTES,
+    audit_actor_mutation, database_error, exact_receipt, insert_receipt, interval, page_limit,
+    random_secret, request_digest, retryable_database_error, AuthService, DeviceTransaction,
+    PendingBrowserLogin, IDENTITY_ADVISORY_LOCK_SEED, IDENTITY_ISSUE_MAX_ATTEMPTS,
+    RANDOM_SECRET_BYTES,
 };
 
 #[cfg(test)]
@@ -49,6 +49,8 @@ const LINK_COMPLETE_ACTION: &str = "auth.link.complete";
 const LINK_CANCEL_ACTION: &str = "auth.link.cancel";
 /// Audited action for removing a linked identity.
 const UNLINK_ACTION: &str = "auth.identity.unlink";
+/// Audited action for polling a device link transaction.
+const LINK_POLL_ACTION: &str = "auth.link.poll";
 /// `PostgreSQL` unique-violation code used to classify link collisions.
 const UNIQUE_VIOLATION: &str = "23505";
 
@@ -156,28 +158,53 @@ impl AuthService {
         actor: AuthenticatedActor,
         request: AccountLinkRequest,
     ) -> Result<BrowserLinkStart, AuthError> {
+        let denied = LinkTarget::Transaction(None);
         if actor.actor().binding() != AuthenticationBinding::BrowserSession {
-            return Err(AuthError::LinkChannelMismatch);
+            return Err(self
+                .deny(
+                    actor,
+                    LINK_BEGIN_ACTION,
+                    denied,
+                    AuthError::LinkChannelMismatch,
+                )
+                .await);
         }
         self.prune_expired_pending().await?;
-        let reservation = self.pending_transactions.reserve()?;
+        let reservation = match self.pending_transactions.reserve() {
+            Ok(reservation) => reservation,
+            Err(error) => return Err(self.deny(actor, LINK_BEGIN_ACTION, denied, error).await),
+        };
         let authorization = oidc.begin_browser();
         let redirect_uri = oidc.redirect_uri().ok_or(AuthError::OidcInvalid)?;
         let binding = random_secret()?;
         let login_id = Uuid::now_v7();
-        let mut transaction = self.begin_link_transaction(actor).await?;
-        let (source_identity_id, account_link_generation, recovery_generation) =
-            self.link_source(&mut transaction, actor).await?;
+        let mut transaction = match self.begin_link_transaction(actor).await {
+            Ok(transaction) => transaction,
+            Err(error) => return Err(self.deny(actor, LINK_BEGIN_ACTION, denied, error).await),
+        };
+        let source = match self.link_source(&mut transaction, actor).await {
+            Ok(source) => source,
+            Err(error) => {
+                drop(transaction);
+                return Err(self.deny(actor, LINK_BEGIN_ACTION, denied, error).await);
+            }
+        };
+        let (source_identity_id, account_link_generation, recovery_generation) = source;
         // A retried start never mints a second provable transaction: the
         // duplicate is refused so the caller cancels before starting again.
-        self.reject_duplicate_link(
-            &mut transaction,
-            actor,
-            &request,
-            AccountLinkChannel::Browser,
-        )
-        .await?;
-        let record = self
+        if let Err(error) = self
+            .reject_duplicate_link(
+                &mut transaction,
+                actor,
+                &request,
+                AccountLinkChannel::Browser,
+            )
+            .await
+        {
+            drop(transaction);
+            return Err(self.deny(actor, LINK_BEGIN_ACTION, denied, error).await);
+        }
+        let opened = self
             .open_link_transaction(
                 &mut transaction,
                 LinkInsert {
@@ -193,7 +220,14 @@ impl AuthService {
                     idempotency: request.idempotency,
                 },
             )
-            .await?;
+            .await;
+        let record = match opened {
+            Ok(record) => record,
+            Err(error) => {
+                drop(transaction);
+                return Err(self.deny(actor, LINK_BEGIN_ACTION, denied, error).await);
+            }
+        };
         let link_id = record.link_id;
         let inserted = sqlx::query(
             "INSERT INTO browser_logins (login_id, state_digest, nonce_digest, pkce_verifier_digest, login_binding_digest, issuer, client_id, audience, redirect_uri, action, link_id, account_link_generation, recovery_generation, expires_at) \
@@ -216,7 +250,10 @@ impl AuthService {
         .await
         .map_err(link_database_error)?;
         if inserted.rows_affected() != 1 {
-            return Err(AuthError::LinkStale);
+            drop(transaction);
+            return Err(self
+                .deny(actor, LINK_BEGIN_ACTION, denied, AuthError::LinkStale)
+                .await);
         }
         audit_actor_mutation(
             &mut transaction,
@@ -231,18 +268,36 @@ impl AuthService {
         .await?;
         self.commit_current(transaction).await?;
         let expires_at = Instant::now() + self.limits.login_lifetime;
-        reservation.commit(login_id, expires_at)?;
-        self.pending_browser_logins
-            .lock()
-            .map_err(|_error| AuthError::Durable)?
-            .insert(
-                login_id,
-                PendingBrowserLogin {
-                    verifier: authorization.verifier,
-                    nonce: authorization.nonce,
-                    expires_at,
-                },
-            );
+        // The transaction and its provider row are already durable. Either
+        // remaining step can fail, and the verifier and nonce live only in
+        // process memory, so a failure here must close the transaction instead
+        // of leaving an unprovable one that blocks every later start until it
+        // expires.
+        if let Err(error) = reservation.commit(login_id, expires_at) {
+            self.cancel_link_after_start(actor, link_id, login_id)
+                .await?;
+            return Err(error);
+        }
+        let pending = PendingBrowserLogin {
+            verifier: authorization.verifier,
+            nonce: authorization.nonce,
+            expires_at,
+        };
+        // The guard is released before the cleanup await so this future stays
+        // `Send`.
+        let stored = match self.pending_browser_logins.lock() {
+            Ok(mut logins) => {
+                logins.insert(login_id, pending);
+                true
+            }
+            Err(_poisoned) => false,
+        };
+        if !stored {
+            self.pending_transactions.release(login_id);
+            self.cancel_link_after_start(actor, link_id, login_id)
+                .await?;
+            return Err(AuthError::Durable);
+        }
         Ok(BrowserLinkStart {
             record,
             authorization_url: authorization.url,
@@ -262,27 +317,52 @@ impl AuthService {
         actor: AuthenticatedActor,
         request: AccountLinkRequest,
     ) -> Result<DeviceLinkStart, AuthError> {
+        let denied = LinkTarget::Transaction(None);
         if actor.actor().binding() != AuthenticationBinding::Credential {
-            return Err(AuthError::LinkChannelMismatch);
+            return Err(self
+                .deny(
+                    actor,
+                    LINK_BEGIN_ACTION,
+                    denied,
+                    AuthError::LinkChannelMismatch,
+                )
+                .await);
         }
         self.prune_expired_pending().await?;
-        let reservation = self.pending_transactions.reserve()?;
+        let reservation = match self.pending_transactions.reserve() {
+            Ok(reservation) => reservation,
+            Err(error) => return Err(self.deny(actor, LINK_BEGIN_ACTION, denied, error).await),
+        };
         let authorization = oidc.begin_device().await?;
         let poll_secret = random_secret()?;
         let login_id = Uuid::now_v7();
-        let mut transaction = self.begin_link_transaction(actor).await?;
-        let (source_identity_id, account_link_generation, recovery_generation) =
-            self.link_source(&mut transaction, actor).await?;
+        let mut transaction = match self.begin_link_transaction(actor).await {
+            Ok(transaction) => transaction,
+            Err(error) => return Err(self.deny(actor, LINK_BEGIN_ACTION, denied, error).await),
+        };
+        let source = match self.link_source(&mut transaction, actor).await {
+            Ok(source) => source,
+            Err(error) => {
+                drop(transaction);
+                return Err(self.deny(actor, LINK_BEGIN_ACTION, denied, error).await);
+            }
+        };
+        let (source_identity_id, account_link_generation, recovery_generation) = source;
         // A retried start never mints a second provable transaction: the
         // duplicate is refused so the caller cancels before starting again.
-        self.reject_duplicate_link(
-            &mut transaction,
-            actor,
-            &request,
-            AccountLinkChannel::Device,
-        )
-        .await?;
-        let record = self
+        if let Err(error) = self
+            .reject_duplicate_link(
+                &mut transaction,
+                actor,
+                &request,
+                AccountLinkChannel::Device,
+            )
+            .await
+        {
+            drop(transaction);
+            return Err(self.deny(actor, LINK_BEGIN_ACTION, denied, error).await);
+        }
+        let opened = self
             .open_link_transaction(
                 &mut transaction,
                 LinkInsert {
@@ -298,7 +378,14 @@ impl AuthService {
                     idempotency: request.idempotency,
                 },
             )
-            .await?;
+            .await;
+        let record = match opened {
+            Ok(record) => record,
+            Err(error) => {
+                drop(transaction);
+                return Err(self.deny(actor, LINK_BEGIN_ACTION, denied, error).await);
+            }
+        };
         let link_id = record.link_id;
         let inserted = sqlx::query(
             "INSERT INTO device_logins (login_id, device_code_digest, poll_secret_digest, issuer, client_id, audience, action, link_id, account_link_generation, recovery_generation, expires_at, poll_interval_seconds, next_poll_at) \
@@ -319,7 +406,10 @@ impl AuthService {
         .await
         .map_err(link_database_error)?;
         if inserted.rows_affected() != 1 {
-            return Err(AuthError::LinkStale);
+            drop(transaction);
+            return Err(self
+                .deny(actor, LINK_BEGIN_ACTION, denied, AuthError::LinkStale)
+                .await);
         }
         audit_actor_mutation(
             &mut transaction,
@@ -335,7 +425,8 @@ impl AuthService {
         self.commit_current(transaction).await?;
         let expires_at = Instant::now() + authorization.expires_in;
         if let Err(error) = reservation.commit(login_id, expires_at) {
-            self.cancel_link_after_start(link_id, login_id).await?;
+            self.cancel_link_after_start(actor, link_id, login_id)
+                .await?;
             return Err(error);
         }
         if let Err(error) = self
@@ -343,7 +434,8 @@ impl AuthService {
             .insert(login_id, PendingDeviceCode::new(authorization.clone()))
         {
             self.pending_transactions.release(login_id);
-            self.cancel_link_after_start(link_id, login_id).await?;
+            self.cancel_link_after_start(actor, link_id, login_id)
+                .await?;
             return Err(error);
         }
         Ok(DeviceLinkStart {
@@ -366,30 +458,47 @@ impl AuthService {
         link_id: Uuid,
         secret: DevicePollSecret,
     ) -> Result<LinkedIdentity, AuthError> {
+        let denied = LinkTarget::Transaction(Some(link_id));
         if actor.actor().binding() != AuthenticationBinding::Credential {
-            return Err(AuthError::LinkChannelMismatch);
+            return Err(self
+                .deny(
+                    actor,
+                    LINK_POLL_ACTION,
+                    denied,
+                    AuthError::LinkChannelMismatch,
+                )
+                .await);
         }
-        let mut transaction = self.begin_link_transaction(actor).await?;
-        let pending = self
+        let mut transaction = match self.begin_link_transaction(actor).await {
+            Ok(transaction) => transaction,
+            Err(error) => return Err(self.deny(actor, LINK_POLL_ACTION, denied, error).await),
+        };
+        let pending = match self
             .locked_pending_link(&mut transaction, actor, link_id, AccountLinkChannel::Device)
-            .await?;
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                drop(transaction);
+                return Err(self.deny(actor, LINK_POLL_ACTION, denied, error).await);
+            }
+        };
         if !self.digest_key.matches(
             secret.expose(),
             possession_digest(&mut transaction, link_id)
                 .await?
                 .as_slice(),
         ) {
-            audit_auth(
-                &mut transaction,
-                "auth.link.poll",
-                "deny",
-                "account_link",
-                "possession_invalid",
-                Some(pending.recovery_generation),
-            )
-            .await?;
-            self.commit_current(transaction).await?;
-            return Err(AuthError::CredentialInvalid);
+            drop(transaction);
+            return Err(self
+                .deny_with_outcome(
+                    actor,
+                    LINK_POLL_ACTION,
+                    denied,
+                    "possession_invalid",
+                    AuthError::CredentialInvalid,
+                )
+                .await);
         }
         let login_id = sqlx::query_scalar::<_, Uuid>(
             "SELECT login_id FROM device_logins WHERE link_id = $1 AND action = 'account_link' \
@@ -400,7 +509,11 @@ impl AuthService {
         .await
         .map_err(database_error)?;
         self.commit_current(transaction).await?;
-        let login_id = login_id.ok_or(AuthError::LinkExpired)?;
+        let Some(login_id) = login_id else {
+            return Err(self
+                .deny(actor, LINK_POLL_ACTION, denied, AuthError::LinkExpired)
+                .await);
+        };
         let claim = self
             .claim_and_poll_device(
                 oidc,
@@ -506,8 +619,12 @@ impl AuthService {
         link_id: Uuid,
         request: CancelAccountLinkRequest,
     ) -> Result<AccountLinkRecord, AuthError> {
-        let mut transaction = self.begin_link_transaction(actor).await?;
-        let current = sqlx::query(
+        let denied = LinkTarget::Transaction(Some(link_id));
+        let mut transaction = match self.begin_link_transaction(actor).await {
+            Ok(transaction) => transaction,
+            Err(error) => return Err(self.deny(actor, LINK_CANCEL_ACTION, denied, error).await),
+        };
+        let found = sqlx::query(
             "SELECT link_id, principal_id, channel, state, source_identity_id, linked_identity_id, \
              revision, account_link_generation, created_at, expires_at, completed_at \
              FROM account_link_transactions WHERE link_id = $1 AND principal_id = $2 FOR UPDATE",
@@ -516,18 +633,27 @@ impl AuthService {
         .bind(actor.actor().principal_id())
         .fetch_optional(&mut *transaction)
         .await
-        .map_err(database_error)?
-        .ok_or(AuthError::LinkNotFound)?;
+        .map_err(database_error)?;
+        let Some(current) = found else {
+            drop(transaction);
+            return Err(self
+                .deny(actor, LINK_CANCEL_ACTION, denied, AuthError::LinkNotFound)
+                .await);
+        };
         let current = link_record(&current)?;
-        match current.state {
-            AccountLinkState::Completed => return Err(AuthError::LinkReplayed),
+        let refused = match current.state {
+            AccountLinkState::Completed => Some(AuthError::LinkReplayed),
             AccountLinkState::Cancelled => {
                 self.commit_current(transaction).await?;
                 return Ok(current);
             }
-            AccountLinkState::Expired => return Err(AuthError::LinkExpired),
-            AccountLinkState::Failed => return Err(AuthError::LinkStale),
-            AccountLinkState::Pending => {}
+            AccountLinkState::Expired => Some(AuthError::LinkExpired),
+            AccountLinkState::Failed => Some(AuthError::LinkStale),
+            AccountLinkState::Pending => None,
+        };
+        if let Some(error) = refused {
+            drop(transaction);
+            return Err(self.deny(actor, LINK_CANCEL_ACTION, denied, error).await);
         }
         let cancelled = sqlx::query(
             "UPDATE account_link_transactions SET state = 'cancelled', completed_at = clock_timestamp(), \
@@ -539,8 +665,13 @@ impl AuthService {
         .bind(actor.actor().principal_id())
         .fetch_optional(&mut *transaction)
         .await
-        .map_err(database_error)?
-        .ok_or(AuthError::LinkStale)?;
+        .map_err(database_error)?;
+        let Some(cancelled) = cancelled else {
+            drop(transaction);
+            return Err(self
+                .deny(actor, LINK_CANCEL_ACTION, denied, AuthError::LinkStale)
+                .await);
+        };
         let cancelled = link_record(&cancelled)?;
         self.supersede_link_logins(&mut transaction, link_id)
             .await?;
@@ -580,7 +711,11 @@ impl AuthService {
         request: UnlinkIdentityRequest,
     ) -> Result<IdentityRemoved, AuthError> {
         let context = actor.actor();
-        let mut transaction = self.begin_link_transaction(actor).await?;
+        let denied = LinkTarget::Identity(identity_id);
+        let mut transaction = match self.begin_link_transaction(actor).await {
+            Ok(transaction) => transaction,
+            Err(error) => return Err(self.deny(actor, UNLINK_ACTION, denied, error).await),
+        };
         let digest = request_digest(&self.digest_key, &(identity_id, request))?;
         if exact_receipt(
             &mut transaction,
@@ -607,8 +742,13 @@ impl AuthService {
         .bind(context.principal_id())
         .fetch_optional(&mut *transaction)
         .await
-        .map_err(retryable_database_error)?
-        .ok_or(AuthError::CredentialInvalid)?;
+        .map_err(retryable_database_error)?;
+        let Some(generation) = generation else {
+            drop(transaction);
+            return Err(self
+                .deny(actor, UNLINK_ACTION, denied, AuthError::CredentialInvalid)
+                .await);
+        };
         let active: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM oidc_identities WHERE principal_id = $1 AND removed_at IS NULL",
         )
@@ -619,7 +759,10 @@ impl AuthService {
         // An account with no identity could never authenticate again, so its
         // last identity is removed only by deprovisioning the principal.
         if active <= 1 {
-            return Err(AuthError::UnlinkLastIdentity);
+            drop(transaction);
+            return Err(self
+                .deny(actor, UNLINK_ACTION, denied, AuthError::UnlinkLastIdentity)
+                .await);
         }
         let removed = sqlx::query(
             "UPDATE oidc_identities SET removed_at = clock_timestamp(), \
@@ -630,8 +773,13 @@ impl AuthService {
         .bind(context.principal_id())
         .fetch_optional(&mut *transaction)
         .await
-        .map_err(retryable_database_error)?
-        .ok_or(AuthError::IdentityNotFound)?;
+        .map_err(retryable_database_error)?;
+        let Some(removed) = removed else {
+            drop(transaction);
+            return Err(self
+                .deny(actor, UNLINK_ACTION, denied, AuthError::IdentityNotFound)
+                .await);
+        };
         let removed_at: time::OffsetDateTime = removed.get("removed_at");
         let revoked_credentials = sqlx::query(
             "UPDATE relay_credentials SET revoked_at = clock_timestamp(), \
@@ -677,8 +825,15 @@ impl AuthService {
         .bind(generation)
         .fetch_optional(&mut *transaction)
         .await
-        .map_err(retryable_database_error)?
-        .ok_or(AuthError::LinkStale)?;
+        .map_err(retryable_database_error)?;
+        let Some(advanced) = advanced else {
+            // The removal and its revocations roll back with this transaction,
+            // so the denial is recorded on its own.
+            drop(transaction);
+            return Err(self
+                .deny(actor, UNLINK_ACTION, denied, AuthError::LinkStale)
+                .await);
+        };
         let audit_id = match audit_actor_mutation(
             &mut transaction,
             context,
@@ -731,6 +886,51 @@ impl AuthService {
             revoked_sessions: u32::try_from(revoked_sessions)
                 .map_err(|_error| AuthError::Durable)?,
         })
+    }
+
+    /// Records one attributable denied link transition in its own transaction.
+    ///
+    /// A refused attempt changes nothing else, so the audit is its only durable
+    /// effect and must not roll back with the work it refused. Callers drop
+    /// their own transaction first, so no partial write is ever committed
+    /// alongside the denial. The returned error is the caller's original
+    /// refusal unless the audit itself could not be written, which fails closed.
+    async fn deny(
+        &self,
+        actor: AuthenticatedActor,
+        action: &'static str,
+        target: LinkTarget,
+        error: AuthError,
+    ) -> AuthError {
+        let outcome = denial_outcome(&error);
+        self.deny_with_outcome(actor, action, target, outcome, error)
+            .await
+    }
+
+    /// Records one denied link transition under an explicit outcome code.
+    ///
+    /// Used where the cause is narrower than the typed error can express, such
+    /// as a failed possession check that surfaces as an invalid credential.
+    async fn deny_with_outcome(
+        &self,
+        actor: AuthenticatedActor,
+        action: &'static str,
+        target: LinkTarget,
+        outcome: &'static str,
+        error: AuthError,
+    ) -> AuthError {
+        let Ok(mut transaction) = self.store.begin_serializable().await else {
+            return AuthError::Durable;
+        };
+        if let Err(durable) =
+            audit_link_denial(&mut transaction, actor.actor(), action, target, outcome).await
+        {
+            return durable;
+        }
+        match transaction.commit().await {
+            Ok(()) => error,
+            Err(_error) => AuthError::Durable,
+        }
     }
 
     /// Opens a fence-verified transaction with a current, non-quarantined actor.
@@ -919,6 +1119,7 @@ impl AuthService {
     /// Cancels a started link whose process-local admission could not complete.
     async fn cancel_link_after_start(
         &self,
+        actor: AuthenticatedActor,
         link_id: Uuid,
         login_id: Uuid,
     ) -> Result<(), AuthError> {
@@ -942,13 +1143,12 @@ impl AuthService {
         .map_err(database_error)?;
         self.supersede_link_logins(&mut transaction, link_id)
             .await?;
-        audit_auth(
+        audit_link_denial(
             &mut transaction,
+            actor.actor(),
             LINK_BEGIN_ACTION,
-            "deny",
-            "account_link",
-            "cancelled",
-            None,
+            LinkTarget::Transaction(Some(link_id)),
+            "start_incomplete",
         )
         .await?;
         self.commit_current(transaction).await?;
@@ -1046,17 +1246,44 @@ impl AuthService {
             AccountLinkChannel::Browser => AuthenticationBinding::BrowserSession,
             AccountLinkChannel::Device => AuthenticationBinding::Credential,
         };
+        let denied = LinkTarget::Transaction(Some(commit.link_id));
         if actor.actor().binding() != expected_binding {
-            return Err(AuthError::LinkChannelMismatch);
+            return Err(self
+                .deny(
+                    actor,
+                    LINK_COMPLETE_ACTION,
+                    denied,
+                    AuthError::LinkChannelMismatch,
+                )
+                .await);
         }
-        let mut transaction = self.begin_link_transaction(actor).await?;
-        let pending = self
+        let mut transaction = match self.begin_link_transaction(actor).await {
+            Ok(transaction) => transaction,
+            Err(error) => return Err(self.deny(actor, LINK_COMPLETE_ACTION, denied, error).await),
+        };
+        let pending = match self
             .locked_pending_link(&mut transaction, actor, commit.link_id, commit.channel)
-            .await?;
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                drop(transaction);
+                return Err(self.deny(actor, LINK_COMPLETE_ACTION, denied, error).await);
+            }
+        };
         if pending.recovery_generation != commit.recovery_generation
             || pending.account_link_generation != commit.account_link_generation
         {
-            return Err(AuthError::LinkStale);
+            drop(transaction);
+            return Err(self
+                .deny_with_outcome(
+                    actor,
+                    LINK_COMPLETE_ACTION,
+                    denied,
+                    "generation_stale",
+                    AuthError::LinkStale,
+                )
+                .await);
         }
         let bound = sqlx::query_scalar::<_, Uuid>(
             "SELECT link_id FROM account_link_transactions WHERE link_id = $1 AND issuer = $2 \
@@ -1070,13 +1297,31 @@ impl AuthService {
         .await
         .map_err(retryable_database_error)?;
         if bound.is_none() {
-            return Err(AuthError::LinkStale);
+            drop(transaction);
+            return Err(self
+                .deny_with_outcome(
+                    actor,
+                    LINK_COMPLETE_ACTION,
+                    denied,
+                    "binding_mismatch",
+                    AuthError::LinkStale,
+                )
+                .await);
         }
         if !self
             .consume_link_login(&mut transaction, commit, pending)
             .await?
         {
-            return Err(AuthError::LinkStale);
+            drop(transaction);
+            return Err(self
+                .deny_with_outcome(
+                    actor,
+                    LINK_COMPLETE_ACTION,
+                    denied,
+                    "proof_unconsumable",
+                    AuthError::LinkStale,
+                )
+                .await);
         }
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
             .bind(format!("{}\u{1f}{}", identity.issuer, identity.subject))
@@ -1099,7 +1344,8 @@ impl AuthService {
             } else {
                 ("collision", AuthError::LinkCollision)
             };
-            self.fail_link(&mut transaction, pending, outcome).await?;
+            self.fail_link(&mut transaction, actor, pending, outcome)
+                .await?;
             self.commit_current(transaction).await?;
             return Err(error);
         }
@@ -1126,7 +1372,16 @@ impl AuthService {
         .await
         .map_err(retryable_database_error)?;
         if advanced.is_none() {
-            return Err(AuthError::LinkStale);
+            drop(transaction);
+            return Err(self
+                .deny_with_outcome(
+                    actor,
+                    LINK_COMPLETE_ACTION,
+                    denied,
+                    "generation_advance_lost",
+                    AuthError::LinkStale,
+                )
+                .await);
         }
         let completed = sqlx::query(
             "UPDATE account_link_transactions SET state = 'completed', \
@@ -1141,8 +1396,19 @@ impl AuthService {
         .bind(pending.revision)
         .fetch_optional(&mut *transaction)
         .await
-        .map_err(retryable_database_error)?
-        .ok_or(AuthError::LinkStale)?;
+        .map_err(retryable_database_error)?;
+        let Some(completed) = completed else {
+            drop(transaction);
+            return Err(self
+                .deny_with_outcome(
+                    actor,
+                    LINK_COMPLETE_ACTION,
+                    denied,
+                    "completion_lost",
+                    AuthError::LinkStale,
+                )
+                .await);
+        };
         let record = link_record(&completed)?;
         let idempotency = link_idempotency(&mut transaction, commit.link_id).await?;
         audit_actor_mutation(
@@ -1153,7 +1419,7 @@ impl AuthService {
             identity_id,
             None,
             idempotency,
-            database_error,
+            retryable_database_error,
         )
         .await?;
         self.commit_current(transaction).await?;
@@ -1215,6 +1481,7 @@ impl AuthService {
     async fn fail_link(
         &self,
         transaction: &mut Transaction<'_, Postgres>,
+        actor: AuthenticatedActor,
         pending: PendingLink,
         outcome: &'static str,
     ) -> Result<(), AuthError> {
@@ -1228,13 +1495,12 @@ impl AuthService {
         .execute(&mut **transaction)
         .await
         .map_err(retryable_database_error)?;
-        audit_auth(
+        audit_link_denial(
             transaction,
+            actor.actor(),
             LINK_COMPLETE_ACTION,
-            "deny",
-            "account_link",
+            LinkTarget::Transaction(Some(pending.link_id)),
             outcome,
-            Some(pending.recovery_generation),
         )
         .await
     }
@@ -1253,6 +1519,99 @@ struct LinkInsert<'value> {
     issuer: &'value str,
     client_id: &'value str,
     idempotency: Idempotency,
+}
+
+/// Names the durable resource a denied link transition was aimed at.
+#[derive(Debug, Clone, Copy)]
+enum LinkTarget {
+    /// A link transaction coordinate, or none when the denial precedes one.
+    Transaction(Option<Uuid>),
+    /// A linked identity coordinate.
+    Identity(Uuid),
+}
+
+impl LinkTarget {
+    const fn parameter_code(self) -> &'static str {
+        match self {
+            Self::Transaction(_) => "account_link",
+            Self::Identity(_) => "oidc_identity",
+        }
+    }
+
+    fn parameter_value(self) -> String {
+        match self {
+            Self::Transaction(Some(id)) | Self::Identity(id) => id.to_string(),
+            // A denial that never reached a transaction still records the
+            // attempt; only its target coordinate is absent.
+            Self::Transaction(None) => "none".to_owned(),
+        }
+    }
+}
+
+/// Returns the safe, distinct outcome code for one denied link transition.
+///
+/// Several denials share a typed error because the public contract is coarser
+/// than the cause. The audit record is the evidence surface, so it keeps the
+/// causes apart.
+const fn denial_outcome(error: &AuthError) -> &'static str {
+    match error {
+        AuthError::LinkChannelMismatch => "channel_mismatch",
+        AuthError::LinkQuarantined => "recovery_quarantine",
+        AuthError::LinkUnsupportedActor => "unsupported_actor",
+        AuthError::LinkPending => "already_pending",
+        AuthError::LinkReplayed => "replayed",
+        AuthError::LinkCancelled => "cancelled",
+        AuthError::LinkExpired => "expired",
+        AuthError::LinkNotFound => "not_found",
+        AuthError::LinkCrossPrincipal => "cross_principal",
+        AuthError::LinkSelf => "self_link",
+        AuthError::LinkCollision => "collision",
+        AuthError::LinkStale => "stale",
+        AuthError::IdempotencyConflict => "idempotency_conflict",
+        AuthError::UnlinkLastIdentity => "last_identity",
+        AuthError::IdentityNotFound => "identity_not_found",
+        AuthError::CredentialInvalid => "actor_invalid",
+        AuthError::Capacity => "capacity",
+        _ => "denied",
+    }
+}
+
+/// Records one attributable denied link transition.
+///
+/// Unlike an allowed transition this carries no idempotency key, because a
+/// denial is not a retryable effect. It deliberately does not require the relay
+/// to be in `normal` state, so a recovery-quarantine denial is still recorded.
+///
+/// # Errors
+/// Returns [`AuthError::Durable`] when the row cannot be written, so a denial
+/// that cannot be evidenced fails closed rather than being silently dropped.
+async fn audit_link_denial(
+    transaction: &mut Transaction<'_, Postgres>,
+    actor: crate::store::ActorContext,
+    action: &'static str,
+    target: LinkTarget,
+    outcome: &'static str,
+) -> Result<(), AuthError> {
+    let inserted = sqlx::query(
+        "INSERT INTO audit_events (audit_id, actor_principal_id, actor_kind, team_id, action, decision, policy_generation, recovery_generation, correlation_id, parameter_code, parameter_value, outcome) \
+         SELECT $1, $2, $3, NULL, $4, 'deny', r.revision, r.recovery_generation, $5, $6, $7, $8 \
+         FROM relay_identity r",
+    )
+    .bind(Uuid::now_v7())
+    .bind(actor.principal_id())
+    .bind(crate::store::actor_kind_name(actor.kind()))
+    .bind(action)
+    .bind(Uuid::now_v7())
+    .bind(target.parameter_code())
+    .bind(target.parameter_value())
+    .bind(outcome)
+    .execute(&mut **transaction)
+    .await
+    .map_err(retryable_database_error)?;
+    if inserted.rows_affected() != 1 {
+        return Err(AuthError::Durable);
+    }
+    Ok(())
 }
 
 /// Returns the durable name of one possession channel.
