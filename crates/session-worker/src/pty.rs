@@ -18,7 +18,6 @@ use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterP
 use rustix::event::{poll, PollFd, PollFlags};
 use rustix::fd::{BorrowedFd, OwnedFd};
 use rustix::fs::{open, Mode, OFlags};
-use rustix::pipe::{pipe_with, PipeFlags};
 use rustix::process::{waitid, Pid as RustixPid, WaitId, WaitIdOptions, WaitIdStatus};
 use rustix::termios::{tcflow, Action};
 use tokio::sync::{watch, Mutex as AsyncMutex};
@@ -1172,10 +1171,16 @@ impl OutputReadiness {
     /// cancellation pipe cannot be created.
     fn new(master: BorrowedFd<'_>) -> Result<Self, PtyError> {
         let master = master.try_clone_to_owned().map_err(PtyError::Io)?;
-        // Non-blocking so arming an already full pipe cannot stall the caller,
-        // close-on-exec so a PTY child never inherits the cancellation channel.
-        let (cancel_reader, cancel_writer) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)
-            .map_err(rustix_errno_to_pty_error)?;
+        // `std::io::pipe` marks both ends close-on-exec: atomically through
+        // `pipe2` on Linux, and right after `pipe` on Darwin, which has no
+        // `pipe2`. PTY children additionally close every inherited descriptor
+        // above stderr before `exec`, so that window cannot leak into them.
+        let (cancel_reader, cancel_writer) = std::io::pipe().map_err(PtyError::Io)?;
+        let cancel_reader = OwnedFd::from(cancel_reader);
+        let cancel_writer = OwnedFd::from(cancel_writer);
+        // Non-blocking so arming an already full pipe cannot stall the caller.
+        // The read end is never read, so its blocking mode does not matter.
+        rustix::io::ioctl_fionbio(&cancel_writer, true).map_err(rustix_errno_to_pty_error)?;
         Ok(Self {
             master,
             cancel_reader,
@@ -1912,6 +1917,31 @@ mod tests {
                 .expect("wait beside output"),
             Some(OutputReadyState::Cancelled),
             "re-arming is harmless and the latch still beats pending output"
+        );
+    }
+
+    /// Arming past the pipe's capacity neither blocks nor fails.
+    ///
+    /// Every forced-close path arms the latch, and a caller must never stall
+    /// there. The write end is non-blocking and a full pipe already carries
+    /// the cancellation, so `AGAIN` counts as armed.
+    #[test]
+    fn arming_a_full_cancellation_pipe_does_not_block() {
+        use std::os::fd::AsFd as _;
+
+        /// Well past any pipe buffer on Linux (64 KiB) or Darwin (up to 64 KiB).
+        const ARMINGS: usize = 256 * 1024;
+
+        let (master, _peer) = std::os::unix::net::UnixStream::pair().expect("readiness fixture");
+        let readiness = super::OutputReadiness::new(master.as_fd()).expect("readiness");
+        for arming in 0..ARMINGS {
+            readiness
+                .cancel()
+                .unwrap_or_else(|error| panic!("arming {arming} failed: {error}"));
+        }
+        assert_eq!(
+            readiness.ready(super::NO_WAIT_MS).expect("armed wait"),
+            Some(OutputReadyState::Cancelled)
         );
     }
 
