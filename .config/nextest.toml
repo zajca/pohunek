@@ -14,12 +14,6 @@ fail-fast = false
 [profile.ci.junit]
 path = "junit.xml"
 
-# This PTY root-reap race also occurs with cargo test on main. Keep its
-# temporary retry isolated; bulk Hermes pipe tests must pass without retries.
-[[profile.ci.overrides]]
-filter = "test(/stop_force_closes_output_retained_outside_the_owned_process_group/)"
-retries = 2
-
 [profile.local]
 # Unfiltered full suite; unlike fast, this needs worker and database fixtures.
 test-threads = "num-cpus"

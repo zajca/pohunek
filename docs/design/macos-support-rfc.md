@@ -171,8 +171,10 @@ uncertain commit cannot create a duplicate generation.
 PTY work retains `portable-pty` and the existing attach protocol. Readiness is
 one `poll(2)` implementation shared by both targets rather than a backend per
 kernel, so the ordinary Linux gate exercises the same code the macOS runner
-does and the two cannot drift apart. Cancellation is a self-pipe, drained on
-wake so one arming cannot satisfy two waits.
+does and the two cannot drift apart. Cancellation is a self-pipe that is never
+drained: once armed it stays readable, so the reader thread and every later
+resize or attach snapshot all observe a forced output close rather than only the
+first waiter.
 
 Readiness classification is deliberate rather than inherited: cancellation wins
 over output, a hangup arriving together with buffered bytes still delivers

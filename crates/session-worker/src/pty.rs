@@ -1,11 +1,10 @@
 //! Owns one PTY master and its managed process identity.
 
-// Rust guideline compliant 2026-09-14
+// Rust guideline compliant 2026-09-23
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::io::{self, Read};
-use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -49,12 +48,6 @@ const NO_WAIT_MS: isize = 0;
 const MASTER_SLOT: usize = 0;
 /// Position of the cancellation pipe in the readiness set.
 const CANCEL_SLOT: usize = 1;
-/// Bytes drained from the cancel pipe per wake.
-///
-/// One armed cancellation writes a single byte, and repeated arming before a
-/// wake collapses into the same drained state, so a small buffer empties the
-/// pipe in one read under any arming pattern the worker can produce.
-const CANCEL_DRAIN_BYTES: usize = 64;
 /// Maximum terminal grid cells accepted from one initialization.
 ///
 /// Four million cells accommodate unusually large terminals while preventing
@@ -416,8 +409,7 @@ impl PtyOwner {
         builder.cwd(&command.cwd);
 
         let tty_name = Arc::new(pair.master.tty_name().ok_or(PtyError::MissingTtyName)?);
-        let master_fd = pair.master.as_raw_fd().ok_or(PtyError::MissingMasterFd)?;
-        let output_readiness = Arc::new(OutputReadiness::new(master_fd)?);
+        let output_readiness = Arc::new(OutputReadiness::new(borrow_master(&*pair.master)?)?);
         let output_reader = Arc::new(Mutex::new(
             pair.master
                 .try_clone_reader()
@@ -962,12 +954,12 @@ impl PtyOwner {
         match completion {
             OutputCompletion::Eof { .. } => {
                 let exit = self.wait_exit().await?;
-                self.detach_threads()?;
+                self.reap_and_detach_reader().await?;
                 *cleanup = CleanupState::Finished(exit.clone());
                 Ok(exit)
             }
             OutputCompletion::ForcedClosed { .. } => {
-                self.detach_threads()?;
+                self.reap_and_detach_reader().await?;
                 *cleanup = CleanupState::ForcedClosed;
                 Err(PtyError::OutputForcedClosed)
             }
@@ -982,6 +974,19 @@ impl PtyOwner {
         self.detach_threads()?;
         *cleanup = CleanupState::ObservationFailed(message.clone());
         Err(PtyError::ChildObservation { message })
+    }
+
+    /// Waits for the root to be reaped, then lets the reader go.
+    ///
+    /// Sealed cleanup starts only after the root was observed exiting and the
+    /// process-group authority was released, so the reaper has nothing left but
+    /// collecting an exited child and the join is bounded. It makes a returned
+    /// cleanup mean a reaped root. The reader may still be serving a PTY that a
+    /// process outside the group holds open, so it is not waited for.
+    async fn reap_and_detach_reader(&self) -> Result<(), PtyError> {
+        join_thread(&self.child_thread).await?;
+        drop(lock_result(&self.reader_thread)?.take());
+        Ok(())
     }
 
     fn detach_threads(&self) -> Result<(), PtyError> {
@@ -1095,12 +1100,22 @@ enum OutputReadyState {
     Cancelled,
 }
 
+/// Waits for PTY output or for a forced close, whichever comes first.
+///
+/// Cancellation is a latch: once armed it is never consumed, so every later
+/// wait from every holder reports it. The reader thread, `resize` and
+/// `attach_snapshot` share one instance, and the latter two learn about a
+/// forced close only through it — a signal consumed by the first waiter would
+/// let them report success on a PTY whose output is already closed.
 #[derive(Debug)]
 struct OutputReadiness {
-    master_fd: RawFd,
-    /// Read end of the cancellation self-pipe, watched alongside the master.
+    /// Duplicate of the PTY master, owned so every wait polls a descriptor this
+    /// struct itself keeps open.
+    master: OwnedFd,
+    /// Read end of the cancellation self-pipe, watched alongside the master and
+    /// never read, which is what keeps an armed cancellation readable.
     cancel_reader: OwnedFd,
-    /// Write end; one byte wakes a blocked reader.
+    /// Write end; one byte arms the cancellation for good.
     cancel_writer: OwnedFd,
 }
 
@@ -1149,53 +1164,40 @@ impl Drop for OutputPause {
 }
 
 impl OutputReadiness {
-    fn new(master_fd: RawFd) -> Result<Self, PtyError> {
-        // Non-blocking so draining never stalls the reader, close-on-exec so a
-        // PTY child never inherits the worker's cancellation channel.
+    /// Builds a readiness over its own duplicate of `master`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PtyError`] when the master cannot be duplicated or the
+    /// cancellation pipe cannot be created.
+    fn new(master: BorrowedFd<'_>) -> Result<Self, PtyError> {
+        let master = master.try_clone_to_owned().map_err(PtyError::Io)?;
+        // Non-blocking so arming an already full pipe cannot stall the caller,
+        // close-on-exec so a PTY child never inherits the cancellation channel.
         let (cancel_reader, cancel_writer) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)
             .map_err(rustix_errno_to_pty_error)?;
         Ok(Self {
-            master_fd,
+            master,
             cancel_reader,
             cancel_writer,
         })
     }
 
-    /// Borrows the PTY master for one readiness wait.
-    ///
-    /// `portable-pty` hands out the master only as a raw descriptor
-    /// (`MasterPty::as_raw_fd`), while every safe `poll` wrapper takes a
-    /// `BorrowedFd`, so the conversion happens here and nowhere else.
-    #[expect(
-        unsafe_code,
-        reason = "portable-pty exposes the PTY master only as a RawFd; every safe poll wrapper needs a BorrowedFd"
-    )]
-    fn master(&self) -> BorrowedFd<'_> {
-        // SAFETY: `PtyOwner` holds the `PtyPair` that owns this descriptor for
-        // as long as it holds this `OutputReadiness`, so the descriptor is open
-        // for the whole borrow and is not closed by anything else meanwhile.
-        unsafe { BorrowedFd::borrow_raw(self.master_fd) }
-    }
-
     fn ready(&self, timeout_ms: isize) -> Result<Option<OutputReadyState>, PtyError> {
         let timeout = readiness_timeout(timeout_ms)?;
         loop {
-            let master = self.master();
             let watched = PollFlags::IN | PollFlags::HUP | PollFlags::ERR;
             let mut fds = [
-                PollFd::new(&master, watched),
+                PollFd::new(&self.master, watched),
                 PollFd::new(&self.cancel_reader, watched),
             ];
             match poll(&mut fds, timeout.as_ref()) {
                 Ok(0) => return Ok(None),
                 Ok(_woken) => {
-                    let state =
+                    if let Some(state) =
                         classify_readiness(fds[MASTER_SLOT].revents(), fds[CANCEL_SLOT].revents())
-                            .map_err(readiness_fault_to_pty_error)?;
-                    if state == Some(OutputReadyState::Cancelled) {
-                        self.drain_cancel()?;
-                    }
-                    if let Some(state) = state {
+                            .map_err(readiness_fault_to_pty_error)?
+                    {
                         return Ok(Some(state));
                     }
                 }
@@ -1205,22 +1207,7 @@ impl OutputReadiness {
         }
     }
 
-    /// Empties the cancel pipe so one arming cannot wake two waits.
-    fn drain_cancel(&self) -> Result<(), PtyError> {
-        let mut scratch = [0_u8; CANCEL_DRAIN_BYTES];
-        loop {
-            match rustix::io::read(&self.cancel_reader, &mut scratch) {
-                // A short read empties the pipe; `AGAIN` says it was already
-                // empty. Both mean the same thing to the caller.
-                Ok(read) if read < scratch.len() => return Ok(()),
-                Ok(_full) => {}
-                Err(rustix::io::Errno::INTR) => {}
-                Err(rustix::io::Errno::AGAIN) => return Ok(()),
-                Err(error) => return Err(rustix_errno_to_pty_error(error)),
-            }
-        }
-    }
-
+    /// Arms the cancellation latch; arming it again changes nothing.
     fn cancel(&self) -> Result<(), PtyError> {
         loop {
             match rustix::io::write(&self.cancel_writer, &[1_u8]) {
@@ -1233,6 +1220,31 @@ impl OutputReadiness {
             }
         }
     }
+}
+
+/// Borrows the descriptor `portable-pty` exposes for a PTY master.
+///
+/// `MasterPty` hands out the master only as a raw descriptor, while duplicating
+/// it safely needs a `BorrowedFd`, so the conversion happens here and nowhere
+/// else. The borrow is tied to `master`, which owns the descriptor.
+///
+/// # Errors
+///
+/// Returns [`PtyError::MissingMasterFd`] when the master exposes no descriptor.
+#[expect(
+    unsafe_code,
+    reason = "portable-pty exposes the PTY master only as a RawFd; duplicating it safely needs a BorrowedFd"
+)]
+fn borrow_master(master: &dyn MasterPty) -> Result<BorrowedFd<'_>, PtyError> {
+    let raw = master
+        .as_raw_fd()
+        .filter(|raw| *raw >= 0)
+        .ok_or(PtyError::MissingMasterFd)?;
+    // SAFETY: `as_raw_fd` returns the descriptor the master owns and closes only
+    // when it is dropped. The returned borrow lives no longer than `&master`, so
+    // the master cannot be dropped, and the descriptor cannot close, while it
+    // exists. The filter above rules out the `-1` sentinel `borrow_raw` forbids.
+    Ok(unsafe { BorrowedFd::borrow_raw(raw) })
 }
 
 /// Converts the shared millisecond convention to a `poll` timeout.
@@ -1860,40 +1872,138 @@ mod tests {
         }
     }
 
-    /// One arming wakes exactly one wait.
+    /// Cancellation is a latch that every later wait observes.
     ///
-    /// Without draining, the pipe would stay readable and every later wait
-    /// would report a cancellation nobody asked for.
+    /// The reader thread, `resize` and `attach_snapshot` share one readiness,
+    /// so the first waiter must not consume the signal the others rely on.
     #[test]
-    fn a_drained_cancellation_does_not_wake_the_next_wait() {
-        use std::os::fd::AsRawFd;
+    fn cancellation_stays_armed_for_every_later_wait() {
+        use std::io::Write as _;
+        use std::os::fd::AsFd as _;
 
-        let (master, _peer) = std::os::unix::net::UnixStream::pair().expect("readiness fixture");
-        let readiness = super::OutputReadiness::new(master.as_raw_fd()).expect("readiness");
+        let (master, mut peer) = std::os::unix::net::UnixStream::pair().expect("readiness fixture");
+        let readiness = super::OutputReadiness::new(master.as_fd()).expect("readiness");
+        assert_eq!(
+            readiness.ready(super::NO_WAIT_MS).expect("unarmed wait"),
+            None,
+            "a quiet, unarmed readiness times out"
+        );
 
         readiness.cancel().expect("arm cancellation");
-        assert_eq!(
-            readiness.ready(super::NO_WAIT_MS).expect("first wait"),
-            Some(super::OutputReadyState::Cancelled)
-        );
-        assert_eq!(
-            readiness.ready(super::NO_WAIT_MS).expect("second wait"),
-            None,
-            "the armed byte must have been consumed by the first wait"
-        );
-
-        for _ in 0..3 {
-            readiness.cancel().expect("re-arm cancellation");
+        for wait in 0..3 {
+            assert_eq!(
+                readiness.ready(super::NO_WAIT_MS).expect("armed wait"),
+                Some(OutputReadyState::Cancelled),
+                "wait {wait} after arming must still see the cancellation"
+            );
         }
         assert_eq!(
-            readiness.ready(super::NO_WAIT_MS).expect("third wait"),
-            Some(super::OutputReadyState::Cancelled)
+            super::wait_for_output(&readiness).expect("blocking wait"),
+            OutputReadyState::Cancelled,
+            "a blocking wait must return at once on an armed latch"
         );
+
+        peer.write_all(b"late output")
+            .expect("write fixture output");
+        readiness.cancel().expect("re-arm cancellation");
         assert_eq!(
-            readiness.ready(super::NO_WAIT_MS).expect("fourth wait"),
-            None,
-            "repeated arming must not queue extra wakes"
+            readiness
+                .ready(super::NO_WAIT_MS)
+                .expect("wait beside output"),
+            Some(OutputReadyState::Cancelled),
+            "re-arming is harmless and the latch still beats pending output"
         );
+    }
+
+    /// The readiness keeps its own close-on-exec descriptors open.
+    ///
+    /// Waiting must not depend on whoever handed the master in, so closing
+    /// the original leaves the readiness polling a live descriptor. None of
+    /// its descriptors may leak into a PTY child.
+    #[test]
+    fn readiness_outlives_the_descriptor_it_was_built_from() {
+        use rustix::io::{fcntl_getfd, FdFlags};
+        use std::io::Write as _;
+        use std::os::fd::AsFd as _;
+
+        let (master, mut peer) = std::os::unix::net::UnixStream::pair().expect("readiness fixture");
+        let readiness = super::OutputReadiness::new(master.as_fd()).expect("readiness");
+        drop(master);
+
+        for (descriptor, what) in [
+            (&readiness.master, "master duplicate"),
+            (&readiness.cancel_reader, "cancel pipe read end"),
+            (&readiness.cancel_writer, "cancel pipe write end"),
+        ] {
+            assert!(
+                fcntl_getfd(descriptor)
+                    .expect("descriptor flags")
+                    .contains(FdFlags::CLOEXEC),
+                "the {what} must be close-on-exec"
+            );
+        }
+
+        assert_eq!(
+            readiness.ready(super::NO_WAIT_MS).expect("quiet wait"),
+            None,
+            "the duplicate is open and quiet, not reported as invalid"
+        );
+        peer.write_all(b"output")
+            .expect("the duplicate keeps the fixture connected");
+        assert_eq!(
+            readiness.ready(super::NO_WAIT_MS).expect("readable wait"),
+            Some(OutputReadyState::Output)
+        );
+    }
+
+    /// A forced close fails every snapshot-boundary operation after it.
+    ///
+    /// The reader thread is joined first, so it has already woken on the
+    /// cancellation before `resize` and `attach_snapshot` consult the same
+    /// readiness. Neither may report success on a force-closed PTY.
+    #[tokio::test]
+    async fn forced_close_fails_resize_and_snapshot_after_the_reader_has_woken() {
+        let pty = spawn(shell("sleep 30"));
+        pty.force_output_close().expect("force output close");
+
+        let reader = pty
+            .reader_thread
+            .lock()
+            .expect("reader thread lock")
+            .take()
+            .expect("reader thread handle");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || reader.join()),
+        )
+        .await
+        .expect("reader exit deadline")
+        .expect("reader join task")
+        .expect("reader thread must exit cleanly");
+
+        assert!(matches!(
+            pty.resize("attach-1", 1, 100, 40).await,
+            Err(PtyError::OutputForcedClosed)
+        ));
+        assert!(matches!(
+            pty.attach_snapshot(Some((100, 40))).await,
+            Err(PtyError::OutputForcedClosed)
+        ));
+        assert!(matches!(
+            pty.attach_snapshot(None).await,
+            Err(PtyError::OutputForcedClosed)
+        ));
+        assert_eq!(
+            pty.dimensions().await,
+            (80, 24),
+            "a refused resize must not commit its dimensions"
+        );
+
+        let exit = pty
+            .stop("cleanup", Duration::from_millis(200))
+            .await
+            .expect("stop still reaps the root after a forced output close");
+        assert!(!exit.success, "the root was signalled, not left to finish");
     }
 
     #[tokio::test]
