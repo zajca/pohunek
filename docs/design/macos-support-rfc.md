@@ -176,6 +176,19 @@ drained: once armed it stays readable, so the reader thread and every later
 resize or attach snapshot all observe a forced output close rather than only the
 first waiter.
 
+The PTY root is its session's leader, and when it exits XNU drains the
+controlling terminal, hangs up its foreground group and revokes every open
+reference to it (`proc_exit`). On Darwin, then, descendants lose the terminal
+the moment the root exits: output ends after the root's trailing bytes, and a
+descendant that ignores the hangup keeps running detached. That is the standing
+a Linux process has once it closes its terminal, so the post-exit drain window,
+which exists for descendants still holding the PTY, only ever engages on Linux.
+`tcflow` output suspension on the terminal device works natively, so the
+snapshot quiescence barrier is the same on both targets. The Darwin process
+backend reports an exited but unreaped process with its identity, as procfs
+does, which is what lets a stop prove the retained root still owns its process
+group before signalling it.
+
 Readiness classification is deliberate rather than inherited: cancellation wins
 over output, a hangup arriving together with buffered bytes still delivers
 those bytes, hangup and error send the caller to read — which is where end of

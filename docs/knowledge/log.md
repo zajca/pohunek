@@ -7,6 +7,8 @@
   Darwin, with the worker's complete test suite running on native macOS CI.
   Darwin kernel peer identity is recorded as in place; launchd, clients,
   packaging, and native acceptance remain deferred through #100-#105.
+- Documented that both process backends keep reporting an exited but unreaped
+  process with its identity, marked as no longer running.
 - Documented automatic session retention: the conservative opt-in default
   policy, the separate terminal and lost TTLs, `session policy get`/`set`,
   `session retention sweep --dry-run`/`--apply`, and the eligibility rules that

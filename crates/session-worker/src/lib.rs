@@ -24,6 +24,8 @@ mod lease;
 mod output;
 mod pty;
 mod server;
+#[cfg(test)]
+mod test_support;
 
 #[doc(inline)]
 pub use config::{ConfigError, WorkerConfig};

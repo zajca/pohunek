@@ -1511,11 +1511,10 @@ fn lock_result<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, PtyE
 mod tests {
     use super::{
         commit_resize_before_resume, drain_available_output, drain_snapshot_boundary,
-        read_process_start, wait_for_child_status, CleanupState, Command, OutputReadState,
-        OutputReady, OutputReadyState, PtyError, PtyOwner, ResizeCommit, ResizeState, SpawnGuard,
-        StartupLatch, OUTPUT_DRAIN_BATCH_BYTES, READ_CHUNK_BYTES,
+        read_process_start, wait_for_child_status, Command, OutputReadState, OutputReady,
+        OutputReadyState, PtyError, PtyOwner, ResizeCommit, ResizeState, SpawnGuard, StartupLatch,
+        OUTPUT_DRAIN_BATCH_BYTES, READ_CHUNK_BYTES,
     };
-    use crate::output::OutputCompletion;
     use crate::{InputFragment, InputPlan, OutputEvent, OutputHub, WorkerConfig};
     use pohunek_platform::process::{HostInspector, ProcessInspector};
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -1660,6 +1659,107 @@ mod tests {
         );
     }
 
+    /// Darwin ends the PTY for every descendant once the root exits.
+    ///
+    /// XNU's `proc_exit` drains the controlling terminal, hangs up its
+    /// foreground group and revokes every open reference to it when the session
+    /// leader exits. The root's trailing output still arrives before EOF, a
+    /// descendant that ignores the hangup keeps running, and the unreaped root
+    /// stays observable, so `stop` can still prove the group is the root's and
+    /// terminate what is left of it.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn root_exit_revokes_the_terminal_and_stop_still_ends_the_group() {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid as NixPid;
+
+        /// Kills the fixture descendant if an assertion fails before `stop`.
+        struct Descendant(NixPid);
+
+        impl Drop for Descendant {
+            fn drop(&mut self) {
+                let _ = kill(self.0, Signal::SIGKILL);
+            }
+        }
+
+        let pty = spawn(shell(concat!(
+            "trap '' HUP; ",
+            "sh -c 'trap \"\" HUP; while :; do sleep 1; done' & ",
+            "printf 'descendant:%s\\n' \"$!\"; ",
+            "printf 'root-final\\n'"
+        )));
+        let mut output = pty.subscribe_output(Some(0)).expect("subscribe output");
+        let root_exit = tokio::time::timeout(Duration::from_secs(2), pty.wait_exit())
+            .await
+            .expect("root exit deadline")
+            .expect("root exit");
+
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut observed = Vec::new();
+            loop {
+                match output.recv().await.expect("output event before EOF") {
+                    OutputEvent::Replay(chunk) | OutputEvent::Output(chunk) => {
+                        observed.extend_from_slice(&chunk.bytes);
+                    }
+                    OutputEvent::TerminalSnapshot(chunk) => {
+                        observed.extend_from_slice(&chunk.bytes);
+                    }
+                    OutputEvent::Gap { .. } => observed.clear(),
+                    OutputEvent::Exit { .. } => break observed,
+                }
+            }
+        })
+        .await
+        .expect("the revoked terminal must reach EOF without waiting for the descendant");
+        let text = String::from_utf8_lossy(&observed);
+        assert!(
+            text.contains("root-final"),
+            "the root's trailing output must precede EOF: {text:?}"
+        );
+        let descendant = text
+            .split("descendant:")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|pid| pid.parse::<i32>().ok())
+            .map(NixPid::from_raw)
+            .map(Descendant)
+            .expect("fixture reports its descendant");
+        assert!(
+            kill(descendant.0, None).is_ok(),
+            "a descendant that ignores the hangup outlives the revoked terminal"
+        );
+        assert_eq!(
+            read_process_start(pty.identity().pid).expect("unreaped root identity"),
+            pty.identity().start_identity,
+            "the unreaped root must stay observable as the group authority"
+        );
+
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(2),
+            pty.stop("stop-after-revoke", Duration::from_millis(200)),
+        )
+        .await
+        .expect("bounded stop deadline")
+        .expect("stop the remaining group");
+        assert_eq!(stopped, root_exit);
+        assert!(
+            read_process_start(pty.identity().pid).is_err(),
+            "root must be reaped after stop"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while kill(descendant.0, None).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "stop must terminate the descendant left in the root's group"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    // Needs a descendant that keeps the PTY open after the root exits. Darwin
+    // revokes the controlling terminal from every holder when the session
+    // leader exits, so this scenario exists only on Linux.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stop_terminates_descendants_after_root_exit_without_waiting_for_eof() {
         let pty = spawn(shell(concat!(
@@ -1713,6 +1813,10 @@ mod tests {
         );
     }
 
+    // Needs a descendant that keeps the PTY open after the root exits. Darwin
+    // revokes the controlling terminal from every holder when the session
+    // leader exits, so this scenario exists only on Linux.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stop_force_closes_output_retained_outside_the_owned_process_group() {
         let barrier = tempfile::tempdir().expect("create escaped descendant barrier");
@@ -1766,8 +1870,15 @@ mod tests {
         );
     }
 
+    // Needs a descendant that keeps the PTY open after the root exits. Darwin
+    // revokes the controlling terminal from every holder when the session
+    // leader exits, so this scenario exists only on Linux.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn natural_eof_wins_a_concurrent_forced_cleanup() {
+        use super::CleanupState;
+        use crate::output::OutputCompletion;
+
         let barrier = tempfile::tempdir().expect("create EOF race barrier");
         let ready = barrier.path().join("ready");
         let pty = spawn(Command {

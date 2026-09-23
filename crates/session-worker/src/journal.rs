@@ -484,7 +484,7 @@ mod tests {
 
     fn test_dir(tag: &str) -> PathBuf {
         let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
+        crate::test_support::temp_root().join(format!(
             "pohunek-session-worker-{tag}-{}-{sequence}",
             std::process::id()
         ))
