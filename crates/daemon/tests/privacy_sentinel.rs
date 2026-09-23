@@ -949,7 +949,9 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     // down; the session id is always present (a safe identifier), so it also
     // doubles as a readiness marker against the worker's own async writers.
     let journal_bytes = wait_for_dir_containing(&worker_state_root, created.id.0.as_bytes()).await;
-    let worker_log_bytes = wait_for_dir_containing(&worker_log_dir, created.id.0.as_bytes()).await;
+    // The session id reaches the worker log at bootstrap, long before the
+    // rejection, so the log waits on the rejection's reason code instead.
+    let worker_log_bytes = wait_for_dir_containing(&worker_log_dir, b"peer_outside_subject").await;
     let event_log_bytes = wait_for_dir_containing(&events_dir, created.id.0.as_bytes()).await;
 
     let _ = shutdown.send(());

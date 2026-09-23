@@ -1780,6 +1780,38 @@ mod tests {
         assert_eq!(store.load_worktrees().expect("worktree").len(), 1);
     }
 
+    /// Every write renames a new file over the store while another handle on
+    /// the same path polls it, as a second process or a test observer does.
+    /// A load must return one whole version, never fail on the replaced file.
+    #[test]
+    fn loads_survive_a_concurrent_writer_on_another_handle() {
+        // Enough rewrites that the reader lands inside the window between
+        // inspecting the old file and the rename replacing it.
+        const REWRITES: usize = 400;
+        let path = temp_store_path("concurrent-read");
+        let writer = Store::new(path.clone());
+        let reader = Store::new(path);
+        writer
+            .record_resume(&resume("s-1", "native-1"))
+            .expect("seed resume");
+        std::thread::scope(|scope| {
+            let writing = scope.spawn(|| {
+                for round in 0..REWRITES {
+                    writer
+                        .record_resume(&resume("s-1", &format!("native-{round}")))
+                        .expect("rewrite resume");
+                }
+            });
+            while !writing.is_finished() {
+                let bindings = reader
+                    .load_resume()
+                    .expect("a load racing a rewrite must still succeed");
+                assert_eq!(bindings.len(), 1, "each load sees one whole version");
+            }
+            writing.join().expect("writer thread completes");
+        });
+    }
+
     #[cfg(unix)]
     #[test]
     fn store_file_is_owner_private() {
