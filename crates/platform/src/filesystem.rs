@@ -3164,7 +3164,7 @@ mod tests {
         during_read(ReadStage::BeforeOpen, move || {
             nix::unistd::mkfifo(
                 &root.join(".record.fifo"),
-                nix::sys::stat::Mode::from_bits_truncate(FILE_MODE),
+                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
             )
             .expect("stage FIFO");
             fs::rename(root.join(".record.fifo"), root.join("record"))
