@@ -5,22 +5,21 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use nix::errno::Errno;
-use nix::sys::epoll::{self, EpollCreateFlags, EpollEvent, EpollFlags, EpollOp};
-use nix::sys::eventfd::{EfdFlags, EventFd};
 use nix::sys::signal::{killpg, Signal};
-use nix::unistd::{close, Pid};
+use nix::unistd::Pid;
 use pohunek_platform::process::{HostInspector, ProcessInspector};
 use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
-use rustix::fd::OwnedFd;
+use rustix::event::{poll, PollFd, PollFlags};
+use rustix::fd::{BorrowedFd, OwnedFd};
 use rustix::fs::{open, Mode, OFlags};
+use rustix::pipe::{pipe_with, PipeFlags};
 use rustix::process::{waitid, Pid as RustixPid, WaitId, WaitIdOptions, WaitIdStatus};
 use rustix::termios::{tcflow, Action};
 use tokio::sync::{watch, Mutex as AsyncMutex};
@@ -40,16 +39,22 @@ const READ_CHUNK_BYTES: usize = 8 * 1024;
 /// under an unbounded producer such as `yes`. This bounds one holder's work,
 /// but does not guarantee which waiting operation acquires the gate next.
 const OUTPUT_DRAIN_BATCH_BYTES: usize = 256 * 1024;
-/// Blocking and non-blocking epoll timeout values.
+/// Blocking and non-blocking readiness timeouts.
 ///
-/// The raw epoll API uses negative one for an indefinite wait and zero for an
-/// immediate readiness check.
-const EPOLL_WAIT_FOREVER_MS: isize = -1;
-const EPOLL_NO_WAIT_MS: isize = 0;
-/// Epoll token for PTY data readiness.
-const PTY_READY_TOKEN: u64 = 0;
-/// Epoll token for lifecycle-forced reader cancellation.
-const CANCEL_READY_TOKEN: u64 = 1;
+/// Negative one waits indefinitely and zero checks without blocking, which is
+/// the convention `poll(2)` uses directly.
+const WAIT_FOREVER_MS: isize = -1;
+const NO_WAIT_MS: isize = 0;
+/// Position of the PTY master in the readiness set.
+const MASTER_SLOT: usize = 0;
+/// Position of the cancellation pipe in the readiness set.
+const CANCEL_SLOT: usize = 1;
+/// Bytes drained from the cancel pipe per wake.
+///
+/// One armed cancellation writes a single byte, and repeated arming before a
+/// wake collapses into the same drained state, so a small buffer empties the
+/// pipe in one read under any arming pattern the worker can produce.
+const CANCEL_DRAIN_BYTES: usize = 64;
 /// Maximum terminal grid cells accepted from one initialization.
 ///
 /// Four million cells accommodate unusually large terminals while preventing
@@ -1092,8 +1097,11 @@ enum OutputReadyState {
 
 #[derive(Debug)]
 struct OutputReadiness {
-    epoll_fd: RawFd,
-    cancel_fd: EventFd,
+    master_fd: RawFd,
+    /// Read end of the cancellation self-pipe, watched alongside the master.
+    cancel_reader: OwnedFd,
+    /// Write end; one byte wakes a blocked reader.
+    cancel_writer: OwnedFd,
 }
 
 #[derive(Debug)]
@@ -1141,87 +1149,169 @@ impl Drop for OutputPause {
 }
 
 impl OutputReadiness {
-    #[expect(
-        deprecated,
-        reason = "portable-pty exposes only RawFd; nix's typed Epoll API requires AsFd"
-    )]
     fn new(master_fd: RawFd) -> Result<Self, PtyError> {
-        let epoll_fd =
-            epoll::epoll_create1(EpollCreateFlags::EPOLL_CLOEXEC).map_err(errno_to_pty_error)?;
-        let cancel_fd = EventFd::from_flags(EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
-            .map_err(errno_to_pty_error)?;
-        let mut event = EpollEvent::new(
-            EpollFlags::EPOLLIN | EpollFlags::EPOLLHUP | EpollFlags::EPOLLERR,
-            PTY_READY_TOKEN,
-        );
-        if let Err(error) =
-            epoll::epoll_ctl(epoll_fd, EpollOp::EpollCtlAdd, master_fd, Some(&mut event))
-        {
-            let _ = close(epoll_fd);
-            return Err(errno_to_pty_error(error));
-        }
-        let mut cancel_event = EpollEvent::new(EpollFlags::EPOLLIN, CANCEL_READY_TOKEN);
-        if let Err(error) = epoll::epoll_ctl(
-            epoll_fd,
-            EpollOp::EpollCtlAdd,
-            cancel_fd.as_raw_fd(),
-            Some(&mut cancel_event),
-        ) {
-            let _ = close(epoll_fd);
-            return Err(errno_to_pty_error(error));
-        }
+        // Non-blocking so draining never stalls the reader, close-on-exec so a
+        // PTY child never inherits the worker's cancellation channel.
+        let (cancel_reader, cancel_writer) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)
+            .map_err(rustix_errno_to_pty_error)?;
         Ok(Self {
-            epoll_fd,
-            cancel_fd,
+            master_fd,
+            cancel_reader,
+            cancel_writer,
         })
     }
 
+    /// Borrows the PTY master for one readiness wait.
+    ///
+    /// `portable-pty` hands out the master only as a raw descriptor
+    /// (`MasterPty::as_raw_fd`), while every safe `poll` wrapper takes a
+    /// `BorrowedFd`, so the conversion happens here and nowhere else.
     #[expect(
-        deprecated,
-        reason = "portable-pty exposes only RawFd; nix's typed Epoll API requires AsFd"
+        unsafe_code,
+        reason = "portable-pty exposes the PTY master only as a RawFd; every safe poll wrapper needs a BorrowedFd"
     )]
+    fn master(&self) -> BorrowedFd<'_> {
+        // SAFETY: `PtyOwner` holds the `PtyPair` that owns this descriptor for
+        // as long as it holds this `OutputReadiness`, so the descriptor is open
+        // for the whole borrow and is not closed by anything else meanwhile.
+        unsafe { BorrowedFd::borrow_raw(self.master_fd) }
+    }
+
     fn ready(&self, timeout_ms: isize) -> Result<Option<OutputReadyState>, PtyError> {
+        let timeout = readiness_timeout(timeout_ms)?;
         loop {
-            let mut events = [EpollEvent::empty(), EpollEvent::empty()];
-            match epoll::epoll_wait(self.epoll_fd, &mut events, timeout_ms) {
+            let master = self.master();
+            let watched = PollFlags::IN | PollFlags::HUP | PollFlags::ERR;
+            let mut fds = [
+                PollFd::new(&master, watched),
+                PollFd::new(&self.cancel_reader, watched),
+            ];
+            match poll(&mut fds, timeout.as_ref()) {
                 Ok(0) => return Ok(None),
-                Ok(count) => {
-                    let state = if events[..count]
-                        .iter()
-                        .any(|event| event.data() == CANCEL_READY_TOKEN)
-                    {
-                        OutputReadyState::Cancelled
-                    } else {
-                        OutputReadyState::Output
-                    };
-                    return Ok(Some(state));
+                Ok(_woken) => {
+                    let state =
+                        classify_readiness(fds[MASTER_SLOT].revents(), fds[CANCEL_SLOT].revents())
+                            .map_err(readiness_fault_to_pty_error)?;
+                    if state == Some(OutputReadyState::Cancelled) {
+                        self.drain_cancel()?;
+                    }
+                    if let Some(state) = state {
+                        return Ok(Some(state));
+                    }
                 }
-                Err(Errno::EINTR) => {}
-                Err(error) => return Err(errno_to_pty_error(error)),
+                Err(rustix::io::Errno::INTR) => {}
+                Err(error) => return Err(rustix_errno_to_pty_error(error)),
+            }
+        }
+    }
+
+    /// Empties the cancel pipe so one arming cannot wake two waits.
+    fn drain_cancel(&self) -> Result<(), PtyError> {
+        let mut scratch = [0_u8; CANCEL_DRAIN_BYTES];
+        loop {
+            match rustix::io::read(&self.cancel_reader, &mut scratch) {
+                // A short read empties the pipe; `AGAIN` says it was already
+                // empty. Both mean the same thing to the caller.
+                Ok(read) if read < scratch.len() => return Ok(()),
+                Ok(_full) => {}
+                Err(rustix::io::Errno::INTR) => {}
+                Err(rustix::io::Errno::AGAIN) => return Ok(()),
+                Err(error) => return Err(rustix_errno_to_pty_error(error)),
             }
         }
     }
 
     fn cancel(&self) -> Result<(), PtyError> {
-        self.cancel_fd
-            .arm()
-            .map(|_written| ())
-            .map_err(errno_to_pty_error)
+        loop {
+            match rustix::io::write(&self.cancel_writer, &[1_u8]) {
+                Ok(_written) => return Ok(()),
+                Err(rustix::io::Errno::INTR) => {}
+                // A full pipe already carries an unconsumed cancellation, which
+                // is exactly the state arming wants to reach.
+                Err(rustix::io::Errno::AGAIN) => return Ok(()),
+                Err(error) => return Err(rustix_errno_to_pty_error(error)),
+            }
+        }
     }
 }
 
-impl Drop for OutputReadiness {
-    fn drop(&mut self) {
-        let _ = close(self.epoll_fd);
+/// Converts the shared millisecond convention to a `poll` timeout.
+///
+/// A negative value means "wait indefinitely", which `poll` expresses as an
+/// absent timespec rather than a negative number.
+///
+/// # Errors
+///
+/// Returns [`PtyError`] when a non-negative value does not fit the native
+/// timespec, which a caller could only produce by asking for an absurd wait.
+fn readiness_timeout(timeout_ms: isize) -> Result<Option<rustix::event::Timespec>, PtyError> {
+    /// Milliseconds per second, for splitting the caller's value.
+    const MILLIS_PER_SECOND: i64 = 1_000;
+    /// Nanoseconds per millisecond, for the sub-second remainder.
+    const NANOS_PER_MILLI: i64 = 1_000_000;
+
+    if timeout_ms < 0 {
+        return Ok(None);
     }
+    let millis = i64::try_from(timeout_ms)
+        .map_err(|_range| PtyError::Io(io::Error::from(io::ErrorKind::InvalidInput)))?;
+    let nanoseconds = i32::try_from((millis % MILLIS_PER_SECOND) * NANOS_PER_MILLI)
+        .map_err(|_range| PtyError::Io(io::Error::from(io::ErrorKind::InvalidInput)))?;
+    Ok(Some(rustix::event::Timespec {
+        tv_sec: millis / MILLIS_PER_SECOND,
+        tv_nsec: nanoseconds.into(),
+    }))
 }
 
-fn errno_to_pty_error(error: Errno) -> PtyError {
-    PtyError::Io(io::Error::from_raw_os_error(error as i32))
+/// Maps a rejected readiness classification onto the worker's typed error.
+fn readiness_fault_to_pty_error(fault: ReadinessFault) -> PtyError {
+    match fault {
+        ReadinessFault::InvalidDescriptor => PtyError::Io(io::Error::from_raw_os_error(
+            rustix::io::Errno::BADF.raw_os_error(),
+        )),
+    }
 }
 
 fn rustix_errno_to_pty_error(error: rustix::io::Errno) -> PtyError {
     PtyError::Io(io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+/// Why a readiness wake could not be classified.
+///
+/// Separate from [`PtyError`] so the classification stays a pure function with
+/// no I/O vocabulary, testable on any host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessFault {
+    /// The kernel reported a descriptor that is not open.
+    ///
+    /// `poll` keeps answering this for a closed descriptor, so treating it as
+    /// "nothing happened" would spin instead of failing.
+    InvalidDescriptor,
+}
+
+/// Classifies one `poll` wake over the PTY master and the cancel pipe.
+///
+/// Cancellation wins over output: a caller that asked to stop must not be made
+/// to drain first. Hangup and error on the master are deliberately reported as
+/// output, because the read that follows is what turns them into EOF or a typed
+/// I/O failure — and a hangup arriving together with buffered bytes must still
+/// deliver those bytes.
+///
+/// `None` means the wait timed out with nothing ready.
+fn classify_readiness(
+    master: PollFlags,
+    cancel: PollFlags,
+) -> Result<Option<OutputReadyState>, ReadinessFault> {
+    if master.contains(PollFlags::NVAL) || cancel.contains(PollFlags::NVAL) {
+        return Err(ReadinessFault::InvalidDescriptor);
+    }
+    if cancel.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
+        return Ok(Some(OutputReadyState::Cancelled));
+    }
+    if master.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
+        return Ok(Some(OutputReadyState::Output));
+    }
+    Ok(None)
 }
 
 trait OutputReady {
@@ -1236,7 +1326,7 @@ impl OutputReady for OutputReadiness {
 
 fn wait_for_output(readiness: &impl OutputReady) -> Result<OutputReadyState, PtyError> {
     readiness
-        .ready(EPOLL_WAIT_FOREVER_MS)?
+        .ready(WAIT_FOREVER_MS)?
         .ok_or_else(|| PtyError::Io(io::Error::other("blocking PTY readiness returned no event")))
 }
 
@@ -1253,13 +1343,13 @@ where
     let mut drained = 0_usize;
     loop {
         if drained >= byte_budget {
-            return readiness.ready(EPOLL_NO_WAIT_MS).map(|ready| match ready {
+            return readiness.ready(NO_WAIT_MS).map(|ready| match ready {
                 Some(OutputReadyState::Output) => OutputReadState::BudgetExhausted,
                 Some(OutputReadyState::Cancelled) => OutputReadState::Cancelled,
                 None => OutputReadState::Open,
             });
         }
-        match readiness.ready(EPOLL_NO_WAIT_MS)? {
+        match readiness.ready(NO_WAIT_MS)? {
             Some(OutputReadyState::Output) => {}
             Some(OutputReadyState::Cancelled) => return Ok(OutputReadState::Cancelled),
             None => return Ok(OutputReadState::Open),
@@ -1709,6 +1799,100 @@ mod tests {
                 .await
                 .expect("repeat stop"),
             root_exit
+        );
+    }
+
+    /// Cancellation wins over output, and hangup still delivers buffered bytes.
+    ///
+    /// The hangup rule is the one that matters: a child that writes and exits
+    /// wakes with `IN | HUP` together, and reporting that as end-of-stream
+    /// would drop its final output.
+    #[test]
+    fn readiness_classification_covers_every_documented_wake() {
+        use super::{classify_readiness, OutputReadyState, PollFlags, ReadinessFault};
+
+        let quiet = PollFlags::empty();
+        assert_eq!(classify_readiness(quiet, quiet), Ok(None), "timeout");
+        assert_eq!(
+            classify_readiness(PollFlags::IN, quiet),
+            Ok(Some(OutputReadyState::Output)),
+            "readable master"
+        );
+        assert_eq!(
+            classify_readiness(PollFlags::HUP, quiet),
+            Ok(Some(OutputReadyState::Output)),
+            "hangup still sends the caller to read, which is where EOF is seen"
+        );
+        assert_eq!(
+            classify_readiness(PollFlags::IN | PollFlags::HUP, quiet),
+            Ok(Some(OutputReadyState::Output)),
+            "hangup arriving with buffered bytes must still drain them"
+        );
+        assert_eq!(
+            classify_readiness(PollFlags::ERR, quiet),
+            Ok(Some(OutputReadyState::Output)),
+            "error readiness is surfaced by the read, not swallowed here"
+        );
+        assert_eq!(
+            classify_readiness(quiet, PollFlags::IN),
+            Ok(Some(OutputReadyState::Cancelled)),
+            "cancellation"
+        );
+        assert_eq!(
+            classify_readiness(PollFlags::IN, PollFlags::IN),
+            Ok(Some(OutputReadyState::Cancelled)),
+            "a caller that asked to stop must not be made to drain first"
+        );
+        for (master, cancel, what) in [
+            (PollFlags::NVAL, quiet, "master"),
+            (quiet, PollFlags::NVAL, "cancel pipe"),
+            (
+                PollFlags::IN,
+                PollFlags::NVAL,
+                "cancel pipe beside a readable master",
+            ),
+        ] {
+            assert_eq!(
+                classify_readiness(master, cancel),
+                Err(ReadinessFault::InvalidDescriptor),
+                "a closed {what} must fail rather than spin"
+            );
+        }
+    }
+
+    /// One arming wakes exactly one wait.
+    ///
+    /// Without draining, the pipe would stay readable and every later wait
+    /// would report a cancellation nobody asked for.
+    #[test]
+    fn a_drained_cancellation_does_not_wake_the_next_wait() {
+        use std::os::fd::AsRawFd;
+
+        let (master, _peer) = std::os::unix::net::UnixStream::pair().expect("readiness fixture");
+        let readiness = super::OutputReadiness::new(master.as_raw_fd()).expect("readiness");
+
+        readiness.cancel().expect("arm cancellation");
+        assert_eq!(
+            readiness.ready(super::NO_WAIT_MS).expect("first wait"),
+            Some(super::OutputReadyState::Cancelled)
+        );
+        assert_eq!(
+            readiness.ready(super::NO_WAIT_MS).expect("second wait"),
+            None,
+            "the armed byte must have been consumed by the first wait"
+        );
+
+        for _ in 0..3 {
+            readiness.cancel().expect("re-arm cancellation");
+        }
+        assert_eq!(
+            readiness.ready(super::NO_WAIT_MS).expect("third wait"),
+            Some(super::OutputReadyState::Cancelled)
+        );
+        assert_eq!(
+            readiness.ready(super::NO_WAIT_MS).expect("fourth wait"),
+            None,
+            "repeated arming must not queue extra wakes"
         );
     }
 

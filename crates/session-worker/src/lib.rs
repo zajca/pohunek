@@ -6,7 +6,11 @@
 //! directly; [`Server`] exposes the private owner-only Unix protocol used by
 //! `pohunekd`.
 
-#![forbid(unsafe_code)]
+// `portable-pty` exposes the PTY master only as a raw descriptor, while every
+// safe `poll` wrapper needs a `BorrowedFd`. One helper in `pty` opts back in
+// with a localized `#[expect(unsafe_code)]` and documents the invariant it
+// relies on; the rest of the crate stays free of unsafe code.
+#![deny(unsafe_code)]
 
 // Rust guideline compliant 2026-09-22
 

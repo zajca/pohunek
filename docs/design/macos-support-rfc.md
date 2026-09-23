@@ -168,9 +168,19 @@ preserve the live worker PID, child identity, PTY, and output drain. Failed or
 cancelled supervisor operations reconcile observed state before retrying so an
 uncertain commit cannot create a duplicate generation.
 
-PTY work retains `portable-pty` and the existing attach protocol while replacing
-epoll-only readiness. Output quiescence, bounded backpressure, replay ordering,
-read-after-exit drain, input deduplication, and resize ordering are invariants.
+PTY work retains `portable-pty` and the existing attach protocol. Readiness is
+one `poll(2)` implementation shared by both targets rather than a backend per
+kernel, so the ordinary Linux gate exercises the same code the macOS runner
+does and the two cannot drift apart. Cancellation is a self-pipe, drained on
+wake so one arming cannot satisfy two waits.
+
+Readiness classification is deliberate rather than inherited: cancellation wins
+over output, a hangup arriving together with buffered bytes still delivers
+those bytes, hangup and error send the caller to read — which is where end of
+stream and I/O failures are surfaced — and a descriptor the kernel reports as
+invalid is a typed failure instead of a wake that would repeat forever. Output
+quiescence, bounded backpressure, replay ordering, read-after-exit drain, input
+deduplication, and resize ordering are invariants.
 The subprocess launcher remains an integration harness, never production
 durability.
 
