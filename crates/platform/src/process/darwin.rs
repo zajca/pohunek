@@ -77,7 +77,10 @@ impl ProcessInspector for DarwinInspector {
         let Some(fact) = read_bsd_fact(identity.pid, native::effective_uid(), OPERATION)? else {
             return Ok(false);
         };
-        Ok(fact.start_identity == identity.start_identity && !fact.is_zombie)
+        // A process inside `exit` never runs user code again, yet it can stay
+        // there without becoming a zombie for as long as the kernel waits to
+        // drain its controlling terminal.
+        Ok(fact.start_identity == identity.start_identity && !fact.is_zombie && !fact.is_exiting)
     }
 
     fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, Error> {
@@ -1710,10 +1713,9 @@ mod tests {
                 Ok(watch) => {
                     armed += 1;
                     await_exit("the churn exit", watch).await;
-                    assert_ne!(
-                        inspector.identity(pid).expect("reinspect identity"),
-                        Some(identity),
-                        "a completed watch means the exact identity is gone"
+                    assert!(
+                        !inspector.is_running(identity).expect("reinspect liveness"),
+                        "a completed watch means the exact identity no longer runs"
                     );
                 }
                 Err(Error::Race { .. }) => {}
