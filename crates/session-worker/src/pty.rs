@@ -1026,10 +1026,12 @@ impl PtyOwner {
         match killpg(Pid::from_raw(self.identity.process_group), signal) {
             Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
             // XNU leaves zombies out when it signals a group and answers EPERM
-            // when nothing else was signalled (`killpg1` in
-            // `bsd/kern/kern_sig.c`), where Linux counts the zombie as
-            // signalled. Once the verified root has exited, EPERM therefore
-            // means nothing signallable is left in its group.
+            // when it signalled no member (`killpg1` in `bsd/kern/kern_sig.c`),
+            // where Linux counts the exited root as signalled and succeeds.
+            // Every live member this worker may signal is signalled either
+            // way, so once the verified root has exited, EPERM means no such
+            // member is left. A member owned by another user stays unsignalled
+            // on both kernels; Linux reports that as success too.
             Err(nix::errno::Errno::EPERM)
                 if cfg!(target_os = "macos")
                     && !root_is_running(self.identity.pid).map_err(|source| {
