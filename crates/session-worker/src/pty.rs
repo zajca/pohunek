@@ -93,7 +93,7 @@ pub struct ProcessIdentity {
     pub pid: u32,
     /// PTY process-group leader.
     pub process_group: i32,
-    /// Linux `/proc` start-time field.
+    /// Opaque same-boot start identity reported by the platform inspector.
     pub start_identity: String,
 }
 
@@ -1025,6 +1025,22 @@ impl PtyOwner {
         }
         match killpg(Pid::from_raw(self.identity.process_group), signal) {
             Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            // XNU leaves zombies out when it signals a group and answers EPERM
+            // when nothing else was signalled (`killpg1` in
+            // `bsd/kern/kern_sig.c`), where Linux counts the zombie as
+            // signalled. Once the verified root has exited, EPERM therefore
+            // means nothing signallable is left in its group.
+            Err(nix::errno::Errno::EPERM)
+                if cfg!(target_os = "macos")
+                    && !root_is_running(self.identity.pid).map_err(|source| {
+                        PtyError::ProcessIdentity {
+                            pid: self.identity.pid,
+                            source,
+                        }
+                    })? =>
+            {
+                Ok(())
+            }
             Err(source) => Err(PtyError::Signal {
                 process_group: self.identity.process_group,
                 source,
@@ -1481,6 +1497,18 @@ fn reap_child(child: &mut SpawnGuard, pid: u32) -> Exit {
                 success: false,
             }
         }
+    }
+}
+
+/// Returns whether the process currently behind `pid` is still executing.
+///
+/// Callers verify the start identity first; the PTY root stays unreaped until
+/// cleanup, so its id cannot name another process in between.
+fn root_is_running(pid: u32) -> Result<bool, io::Error> {
+    let inspector = HostInspector::new();
+    match inspector.identity(pid).map_err(io::Error::other)? {
+        Some(identity) => inspector.is_running(identity).map_err(io::Error::other),
+        None => Ok(false),
     }
 }
 
