@@ -47,7 +47,9 @@ and systemd backends; Darwin uses `libproc` process records, `sysctl`
 watch. Both backends read the same facts: process, parent, and process-group
 ids, an opaque same-boot start identity, the controlling-terminal foreground
 process group, the executable path, the working directory, and only the
-allowlisted `POHUNEK` ownership markers. Argument and environment regions stay
+allowlisted `POHUNEK` ownership markers. A process that has exited but is not
+yet reaped keeps its identity on both backends and is reported as no longer
+running. Argument and environment regions stay
 separate, so an environment value is never argument evidence and an argument is
 never an ownership marker. An observation that fails is an explicit typed
 failure, never a healthy absence, and never authorizes a mutation.
@@ -72,10 +74,12 @@ short, owner-private macOS runtime default without moving durable host identity.
 Native Apple Silicon CI compiles and tests these shared contracts with a macOS
 14 deployment target, but this does not mean complete macOS host or client
 support is available. Intel Macs are outside the current release scope. Darwin
-peer inspection, portable PTY readiness, launchd, client and WebUI integration,
-signed artifacts, and native acceptance remain explicitly deferred through
-issues #98-#105 under the `Complete macOS support` milestone and macOS
-Project. The issue hierarchy,
+kernel peer identity and the session worker's portable PTY readiness are in
+place: the worker waits for PTY output with one `poll(2)` implementation shared
+by both targets, and its complete test suite runs natively. launchd, client and
+WebUI integration, signed artifacts, and native acceptance remain explicitly
+deferred through issues #100-#105 under the `Complete macOS support` milestone
+and macOS Project. The issue hierarchy,
 milestone, and Project own delivery scope, sequencing, and status; the accepted
 macOS RFC records design constraints rather than live tracking state.
 

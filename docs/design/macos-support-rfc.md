@@ -168,9 +168,34 @@ preserve the live worker PID, child identity, PTY, and output drain. Failed or
 cancelled supervisor operations reconcile observed state before retrying so an
 uncertain commit cannot create a duplicate generation.
 
-PTY work retains `portable-pty` and the existing attach protocol while replacing
-epoll-only readiness. Output quiescence, bounded backpressure, replay ordering,
-read-after-exit drain, input deduplication, and resize ordering are invariants.
+PTY work retains `portable-pty` and the existing attach protocol. Readiness is
+one `poll(2)` implementation shared by both targets rather than a backend per
+kernel, so the ordinary Linux gate exercises the same code the macOS runner
+does and the two cannot drift apart. Cancellation is a self-pipe that is never
+drained: once armed it stays readable, so the reader thread and every later
+resize or attach snapshot all observe a forced output close rather than only the
+first waiter.
+
+The PTY root is its session's leader, and when it exits XNU drains the
+controlling terminal, hangs up its foreground group and revokes every open
+reference to it (`proc_exit`). On Darwin, then, descendants lose the terminal
+the moment the root exits: output ends after the root's trailing bytes, and a
+descendant that ignores the hangup keeps running detached. That is the standing
+a Linux process has once it closes its terminal, so the post-exit drain window,
+which exists for descendants still holding the PTY, only ever engages on Linux.
+`tcflow` output suspension on the terminal device works natively, so the
+snapshot quiescence barrier is the same on both targets. The Darwin process
+backend reports an exited but unreaped process with its identity, as procfs
+does, which is what lets a stop prove the retained root still owns its process
+group before signalling it.
+
+Readiness classification is deliberate rather than inherited: cancellation wins
+over output, a hangup arriving together with buffered bytes still delivers
+those bytes, hangup and error send the caller to read — which is where end of
+stream and I/O failures are surfaced — and a descriptor the kernel reports as
+invalid is a typed failure instead of a wake that would repeat forever. Output
+quiescence, bounded backpressure, replay ordering, read-after-exit drain, input
+deduplication, and resize ordering are invariants.
 The subprocess launcher remains an integration harness, never production
 durability.
 

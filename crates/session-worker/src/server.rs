@@ -183,7 +183,8 @@ mod pending_socket_tests {
 
     #[test]
     fn pending_worker_socket_guard_follows_the_published_name() {
-        let temporary = tempfile::tempdir().expect("create worker socket guard fixture");
+        let temporary = tempfile::tempdir_in(crate::test_support::temp_root())
+            .expect("create worker socket guard fixture");
         std::fs::set_permissions(
             temporary.path(),
             std::fs::Permissions::from_mode(SOCKET_DIRECTORY_MODE),
@@ -4235,9 +4236,9 @@ mod tests {
         signal_number, start_subagent, stop_subagent, valid_identity_expiry,
         validate_attach_write_id, validate_data_start, validate_observation_request,
         validate_terminal_snapshot_dimensions, validate_terminal_snapshot_response,
-        wait_runtime_exit, write_data_error, write_observation_page, write_output_chunks,
-        write_runtime_output_event, write_terminal_chunks, Connection, ControlInputId, DataGrant,
-        ObservationGrant, ObservationWaitOutcome, PrefixStream, TokenState, WireTerminalSnapshot,
+        write_data_error, write_observation_page, write_output_chunks, write_runtime_output_event,
+        write_terminal_chunks, Connection, ControlInputId, DataGrant, ObservationGrant,
+        ObservationWaitOutcome, PrefixStream, TokenState, WireTerminalSnapshot,
     };
     use pohunek_worker_protocol::{
         self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
@@ -4259,7 +4260,8 @@ mod tests {
 
     impl BarrierDirectory {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(random_value("output-barrier").unwrap());
+            let path =
+                crate::test_support::temp_root().join(random_value("output-barrier").unwrap());
             std::fs::create_dir(&path).expect("create output barrier directory");
             std::fs::set_permissions(
                 &path,
@@ -4329,7 +4331,8 @@ mod tests {
     }
 
     async fn launch_claim_fixture() -> (super::Server, crate::PtyOwner, std::path::PathBuf) {
-        let directory = std::env::temp_dir().join(random_value("worker-claim").unwrap());
+        let directory =
+            crate::test_support::temp_root().join(random_value("worker-claim").unwrap());
         let config = crate::WorkerConfig::new();
         let server = super::Server::bind(super::ServerArgs {
             session_id: "s-112".into(),
@@ -4775,6 +4778,10 @@ mod tests {
         assert_eq!(journal.subagents[0].sequence, 20);
     }
 
+    // Needs a descendant that keeps the PTY open after the root exits. Darwin
+    // revokes the controlling terminal from every holder when the session
+    // leader exits, so this scenario exists only on Linux.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn root_exit_preserves_descendant_output_until_pty_eof() {
         let config = crate::WorkerConfig::new();
@@ -4808,7 +4815,7 @@ mod tests {
         .expect("spawn PTY");
         let mut subscriber = pty.subscribe_output(Some(0)).expect("subscribe output");
 
-        tokio::time::timeout(Duration::from_secs(3), wait_runtime_exit(&pty))
+        tokio::time::timeout(Duration::from_secs(3), super::wait_runtime_exit(&pty))
             .await
             .expect("root process exit deadline")
             .expect("root process exit");
@@ -4846,6 +4853,10 @@ mod tests {
         assert_eq!(page.runtime_end_offset, final_offset);
     }
 
+    // Needs a descendant that keeps the PTY open after the root exits. Darwin
+    // revokes the controlling terminal from every holder when the session
+    // leader exits, so this scenario exists only on Linux.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn natural_exit_bounds_a_descendant_that_never_closes_the_pty() {
         let directory = BarrierDirectory::new();
@@ -4928,6 +4939,10 @@ mod tests {
         );
     }
 
+    // Needs a descendant that keeps the PTY open after the root exits. Darwin
+    // revokes the controlling terminal from every holder when the session
+    // leader exits, so this scenario exists only on Linux.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn forced_output_completion_does_not_wait_for_the_output_monitor() {
         let directory = BarrierDirectory::new();
@@ -4994,6 +5009,10 @@ mod tests {
         ));
     }
 
+    // Needs a descendant that keeps the PTY open after the root exits. Darwin
+    // revokes the controlling terminal from every holder when the session
+    // leader exits, so this scenario exists only on Linux.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn escaped_pty_holder_faults_with_the_exact_final_output_offset() {
         let directory = BarrierDirectory::new();

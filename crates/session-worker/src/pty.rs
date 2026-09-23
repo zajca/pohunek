@@ -1,25 +1,22 @@
 //! Owns one PTY master and its managed process identity.
 
-// Rust guideline compliant 2026-09-14
+// Rust guideline compliant 2026-09-23
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use nix::errno::Errno;
-use nix::sys::epoll::{self, EpollCreateFlags, EpollEvent, EpollFlags, EpollOp};
-use nix::sys::eventfd::{EfdFlags, EventFd};
 use nix::sys::signal::{killpg, Signal};
-use nix::unistd::{close, Pid};
+use nix::unistd::Pid;
 use pohunek_platform::process::{HostInspector, ProcessInspector};
 use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
-use rustix::fd::OwnedFd;
+use rustix::event::{poll, PollFd, PollFlags};
+use rustix::fd::{BorrowedFd, OwnedFd};
 use rustix::fs::{open, Mode, OFlags};
 use rustix::process::{waitid, Pid as RustixPid, WaitId, WaitIdOptions, WaitIdStatus};
 use rustix::termios::{tcflow, Action};
@@ -40,16 +37,16 @@ const READ_CHUNK_BYTES: usize = 8 * 1024;
 /// under an unbounded producer such as `yes`. This bounds one holder's work,
 /// but does not guarantee which waiting operation acquires the gate next.
 const OUTPUT_DRAIN_BATCH_BYTES: usize = 256 * 1024;
-/// Blocking and non-blocking epoll timeout values.
+/// Blocking and non-blocking readiness timeouts.
 ///
-/// The raw epoll API uses negative one for an indefinite wait and zero for an
-/// immediate readiness check.
-const EPOLL_WAIT_FOREVER_MS: isize = -1;
-const EPOLL_NO_WAIT_MS: isize = 0;
-/// Epoll token for PTY data readiness.
-const PTY_READY_TOKEN: u64 = 0;
-/// Epoll token for lifecycle-forced reader cancellation.
-const CANCEL_READY_TOKEN: u64 = 1;
+/// Negative one waits indefinitely and zero checks without blocking, which is
+/// the convention `poll(2)` uses directly.
+const WAIT_FOREVER_MS: isize = -1;
+const NO_WAIT_MS: isize = 0;
+/// Position of the PTY master in the readiness set.
+const MASTER_SLOT: usize = 0;
+/// Position of the cancellation pipe in the readiness set.
+const CANCEL_SLOT: usize = 1;
 /// Maximum terminal grid cells accepted from one initialization.
 ///
 /// Four million cells accommodate unusually large terminals while preventing
@@ -96,7 +93,7 @@ pub struct ProcessIdentity {
     pub pid: u32,
     /// PTY process-group leader.
     pub process_group: i32,
-    /// Linux `/proc` start-time field.
+    /// Opaque same-boot start identity reported by the platform inspector.
     pub start_identity: String,
 }
 
@@ -411,8 +408,7 @@ impl PtyOwner {
         builder.cwd(&command.cwd);
 
         let tty_name = Arc::new(pair.master.tty_name().ok_or(PtyError::MissingTtyName)?);
-        let master_fd = pair.master.as_raw_fd().ok_or(PtyError::MissingMasterFd)?;
-        let output_readiness = Arc::new(OutputReadiness::new(master_fd)?);
+        let output_readiness = Arc::new(OutputReadiness::new(borrow_master(&*pair.master)?)?);
         let output_reader = Arc::new(Mutex::new(
             pair.master
                 .try_clone_reader()
@@ -957,12 +953,12 @@ impl PtyOwner {
         match completion {
             OutputCompletion::Eof { .. } => {
                 let exit = self.wait_exit().await?;
-                self.detach_threads()?;
+                self.reap_and_detach_reader().await?;
                 *cleanup = CleanupState::Finished(exit.clone());
                 Ok(exit)
             }
             OutputCompletion::ForcedClosed { .. } => {
-                self.detach_threads()?;
+                self.reap_and_detach_reader().await?;
                 *cleanup = CleanupState::ForcedClosed;
                 Err(PtyError::OutputForcedClosed)
             }
@@ -977,6 +973,19 @@ impl PtyOwner {
         self.detach_threads()?;
         *cleanup = CleanupState::ObservationFailed(message.clone());
         Err(PtyError::ChildObservation { message })
+    }
+
+    /// Waits for the root to be reaped, then lets the reader go.
+    ///
+    /// Sealed cleanup starts only after the root was observed exiting and the
+    /// process-group authority was released, so the reaper has nothing left but
+    /// collecting an exited child and the join is bounded. It makes a returned
+    /// cleanup mean a reaped root. The reader may still be serving a PTY that a
+    /// process outside the group holds open, so it is not waited for.
+    async fn reap_and_detach_reader(&self) -> Result<(), PtyError> {
+        join_thread(&self.child_thread).await?;
+        drop(lock_result(&self.reader_thread)?.take());
+        Ok(())
     }
 
     fn detach_threads(&self) -> Result<(), PtyError> {
@@ -1016,6 +1025,24 @@ impl PtyOwner {
         }
         match killpg(Pid::from_raw(self.identity.process_group), signal) {
             Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            // XNU leaves zombies out when it signals a group and answers EPERM
+            // when it signalled no member (`killpg1` in `bsd/kern/kern_sig.c`),
+            // where Linux counts the exited root as signalled and succeeds.
+            // Every live member this worker may signal is signalled either
+            // way, so once the verified root has exited, EPERM means no such
+            // member is left. A member owned by another user stays unsignalled
+            // on both kernels; Linux reports that as success too.
+            Err(nix::errno::Errno::EPERM)
+                if cfg!(target_os = "macos")
+                    && !root_is_running(self.identity.pid).map_err(|source| {
+                        PtyError::ProcessIdentity {
+                            pid: self.identity.pid,
+                            source,
+                        }
+                    })? =>
+            {
+                Ok(())
+            }
             Err(source) => Err(PtyError::Signal {
                 process_group: self.identity.process_group,
                 source,
@@ -1090,10 +1117,23 @@ enum OutputReadyState {
     Cancelled,
 }
 
+/// Waits for PTY output or for a forced close, whichever comes first.
+///
+/// Cancellation is a latch: once armed it is never consumed, so every later
+/// wait from every holder reports it. The reader thread, `resize` and
+/// `attach_snapshot` share one instance, and the latter two learn about a
+/// forced close only through it — a signal consumed by the first waiter would
+/// let them report success on a PTY whose output is already closed.
 #[derive(Debug)]
 struct OutputReadiness {
-    epoll_fd: RawFd,
-    cancel_fd: EventFd,
+    /// Duplicate of the PTY master, owned so every wait polls a descriptor this
+    /// struct itself keeps open.
+    master: OwnedFd,
+    /// Read end of the cancellation self-pipe, watched alongside the master and
+    /// never read, which is what keeps an armed cancellation readable.
+    cancel_reader: OwnedFd,
+    /// Write end; one byte arms the cancellation for good.
+    cancel_writer: OwnedFd,
 }
 
 #[derive(Debug)]
@@ -1141,87 +1181,172 @@ impl Drop for OutputPause {
 }
 
 impl OutputReadiness {
-    #[expect(
-        deprecated,
-        reason = "portable-pty exposes only RawFd; nix's typed Epoll API requires AsFd"
-    )]
-    fn new(master_fd: RawFd) -> Result<Self, PtyError> {
-        let epoll_fd =
-            epoll::epoll_create1(EpollCreateFlags::EPOLL_CLOEXEC).map_err(errno_to_pty_error)?;
-        let cancel_fd = EventFd::from_flags(EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
-            .map_err(errno_to_pty_error)?;
-        let mut event = EpollEvent::new(
-            EpollFlags::EPOLLIN | EpollFlags::EPOLLHUP | EpollFlags::EPOLLERR,
-            PTY_READY_TOKEN,
-        );
-        if let Err(error) =
-            epoll::epoll_ctl(epoll_fd, EpollOp::EpollCtlAdd, master_fd, Some(&mut event))
-        {
-            let _ = close(epoll_fd);
-            return Err(errno_to_pty_error(error));
-        }
-        let mut cancel_event = EpollEvent::new(EpollFlags::EPOLLIN, CANCEL_READY_TOKEN);
-        if let Err(error) = epoll::epoll_ctl(
-            epoll_fd,
-            EpollOp::EpollCtlAdd,
-            cancel_fd.as_raw_fd(),
-            Some(&mut cancel_event),
-        ) {
-            let _ = close(epoll_fd);
-            return Err(errno_to_pty_error(error));
-        }
+    /// Builds a readiness over its own duplicate of `master`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PtyError`] when the master cannot be duplicated or the
+    /// cancellation pipe cannot be created.
+    fn new(master: BorrowedFd<'_>) -> Result<Self, PtyError> {
+        let master = master.try_clone_to_owned().map_err(PtyError::Io)?;
+        // `std::io::pipe` marks both ends close-on-exec: atomically through
+        // `pipe2` on Linux, and right after `pipe` on Darwin, which has no
+        // `pipe2`. PTY children additionally close every inherited descriptor
+        // above stderr before `exec`, so that window cannot leak into them.
+        let (cancel_reader, cancel_writer) = std::io::pipe().map_err(PtyError::Io)?;
+        let cancel_reader = OwnedFd::from(cancel_reader);
+        let cancel_writer = OwnedFd::from(cancel_writer);
+        // Non-blocking so arming an already full pipe cannot stall the caller.
+        // The read end is never read, so its blocking mode does not matter.
+        rustix::io::ioctl_fionbio(&cancel_writer, true).map_err(rustix_errno_to_pty_error)?;
         Ok(Self {
-            epoll_fd,
-            cancel_fd,
+            master,
+            cancel_reader,
+            cancel_writer,
         })
     }
 
-    #[expect(
-        deprecated,
-        reason = "portable-pty exposes only RawFd; nix's typed Epoll API requires AsFd"
-    )]
     fn ready(&self, timeout_ms: isize) -> Result<Option<OutputReadyState>, PtyError> {
+        let timeout = readiness_timeout(timeout_ms)?;
         loop {
-            let mut events = [EpollEvent::empty(), EpollEvent::empty()];
-            match epoll::epoll_wait(self.epoll_fd, &mut events, timeout_ms) {
+            let watched = PollFlags::IN | PollFlags::HUP | PollFlags::ERR;
+            let mut fds = [
+                PollFd::new(&self.master, watched),
+                PollFd::new(&self.cancel_reader, watched),
+            ];
+            match poll(&mut fds, timeout.as_ref()) {
                 Ok(0) => return Ok(None),
-                Ok(count) => {
-                    let state = if events[..count]
-                        .iter()
-                        .any(|event| event.data() == CANCEL_READY_TOKEN)
+                Ok(_woken) => {
+                    if let Some(state) =
+                        classify_readiness(fds[MASTER_SLOT].revents(), fds[CANCEL_SLOT].revents())
+                            .map_err(readiness_fault_to_pty_error)?
                     {
-                        OutputReadyState::Cancelled
-                    } else {
-                        OutputReadyState::Output
-                    };
-                    return Ok(Some(state));
+                        return Ok(Some(state));
+                    }
                 }
-                Err(Errno::EINTR) => {}
-                Err(error) => return Err(errno_to_pty_error(error)),
+                Err(rustix::io::Errno::INTR) => {}
+                Err(error) => return Err(rustix_errno_to_pty_error(error)),
             }
         }
     }
 
+    /// Arms the cancellation latch; arming it again changes nothing.
     fn cancel(&self) -> Result<(), PtyError> {
-        self.cancel_fd
-            .arm()
-            .map(|_written| ())
-            .map_err(errno_to_pty_error)
+        loop {
+            match rustix::io::write(&self.cancel_writer, &[1_u8]) {
+                Ok(_written) => return Ok(()),
+                Err(rustix::io::Errno::INTR) => {}
+                // A full pipe already carries an unconsumed cancellation, which
+                // is exactly the state arming wants to reach.
+                Err(rustix::io::Errno::AGAIN) => return Ok(()),
+                Err(error) => return Err(rustix_errno_to_pty_error(error)),
+            }
+        }
     }
 }
 
-impl Drop for OutputReadiness {
-    fn drop(&mut self) {
-        let _ = close(self.epoll_fd);
-    }
+/// Borrows the descriptor `portable-pty` exposes for a PTY master.
+///
+/// `MasterPty` hands out the master only as a raw descriptor, while duplicating
+/// it safely needs a `BorrowedFd`, so the conversion happens here and nowhere
+/// else. The borrow is tied to `master`, which owns the descriptor.
+///
+/// # Errors
+///
+/// Returns [`PtyError::MissingMasterFd`] when the master exposes no descriptor.
+#[expect(
+    unsafe_code,
+    reason = "portable-pty exposes the PTY master only as a RawFd; duplicating it safely needs a BorrowedFd"
+)]
+fn borrow_master(master: &dyn MasterPty) -> Result<BorrowedFd<'_>, PtyError> {
+    let raw = master
+        .as_raw_fd()
+        .filter(|raw| *raw >= 0)
+        .ok_or(PtyError::MissingMasterFd)?;
+    // SAFETY: `as_raw_fd` returns the descriptor the master owns and closes only
+    // when it is dropped. The returned borrow lives no longer than `&master`, so
+    // the master cannot be dropped, and the descriptor cannot close, while it
+    // exists. The filter above rules out the `-1` sentinel `borrow_raw` forbids.
+    Ok(unsafe { BorrowedFd::borrow_raw(raw) })
 }
 
-fn errno_to_pty_error(error: Errno) -> PtyError {
-    PtyError::Io(io::Error::from_raw_os_error(error as i32))
+/// Converts the shared millisecond convention to a `poll` timeout.
+///
+/// A negative value means "wait indefinitely", which `poll` expresses as an
+/// absent timespec rather than a negative number.
+///
+/// # Errors
+///
+/// Returns [`PtyError`] when a non-negative value does not fit the native
+/// timespec, which a caller could only produce by asking for an absurd wait.
+fn readiness_timeout(timeout_ms: isize) -> Result<Option<rustix::event::Timespec>, PtyError> {
+    /// Milliseconds per second, for splitting the caller's value.
+    const MILLIS_PER_SECOND: i64 = 1_000;
+    /// Nanoseconds per millisecond, for the sub-second remainder.
+    const NANOS_PER_MILLI: i64 = 1_000_000;
+
+    if timeout_ms < 0 {
+        return Ok(None);
+    }
+    let millis = i64::try_from(timeout_ms)
+        .map_err(|_range| PtyError::Io(io::Error::from(io::ErrorKind::InvalidInput)))?;
+    let nanoseconds = i32::try_from((millis % MILLIS_PER_SECOND) * NANOS_PER_MILLI)
+        .map_err(|_range| PtyError::Io(io::Error::from(io::ErrorKind::InvalidInput)))?;
+    Ok(Some(rustix::event::Timespec {
+        tv_sec: millis / MILLIS_PER_SECOND,
+        tv_nsec: nanoseconds.into(),
+    }))
+}
+
+/// Maps a rejected readiness classification onto the worker's typed error.
+fn readiness_fault_to_pty_error(fault: ReadinessFault) -> PtyError {
+    match fault {
+        ReadinessFault::InvalidDescriptor => PtyError::Io(io::Error::from_raw_os_error(
+            rustix::io::Errno::BADF.raw_os_error(),
+        )),
+    }
 }
 
 fn rustix_errno_to_pty_error(error: rustix::io::Errno) -> PtyError {
     PtyError::Io(io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+/// Why a readiness wake could not be classified.
+///
+/// Separate from [`PtyError`] so the classification stays a pure function with
+/// no I/O vocabulary, testable on any host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessFault {
+    /// The kernel reported a descriptor that is not open.
+    ///
+    /// `poll` keeps answering this for a closed descriptor, so treating it as
+    /// "nothing happened" would spin instead of failing.
+    InvalidDescriptor,
+}
+
+/// Classifies one `poll` wake over the PTY master and the cancel pipe.
+///
+/// Cancellation wins over output: a caller that asked to stop must not be made
+/// to drain first. Hangup and error on the master are deliberately reported as
+/// output, because the read that follows is what turns them into EOF or a typed
+/// I/O failure — and a hangup arriving together with buffered bytes must still
+/// deliver those bytes.
+///
+/// `None` means the wait timed out with nothing ready.
+fn classify_readiness(
+    master: PollFlags,
+    cancel: PollFlags,
+) -> Result<Option<OutputReadyState>, ReadinessFault> {
+    if master.contains(PollFlags::NVAL) || cancel.contains(PollFlags::NVAL) {
+        return Err(ReadinessFault::InvalidDescriptor);
+    }
+    if cancel.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
+        return Ok(Some(OutputReadyState::Cancelled));
+    }
+    if master.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
+        return Ok(Some(OutputReadyState::Output));
+    }
+    Ok(None)
 }
 
 trait OutputReady {
@@ -1236,7 +1361,7 @@ impl OutputReady for OutputReadiness {
 
 fn wait_for_output(readiness: &impl OutputReady) -> Result<OutputReadyState, PtyError> {
     readiness
-        .ready(EPOLL_WAIT_FOREVER_MS)?
+        .ready(WAIT_FOREVER_MS)?
         .ok_or_else(|| PtyError::Io(io::Error::other("blocking PTY readiness returned no event")))
 }
 
@@ -1253,13 +1378,13 @@ where
     let mut drained = 0_usize;
     loop {
         if drained >= byte_budget {
-            return readiness.ready(EPOLL_NO_WAIT_MS).map(|ready| match ready {
+            return readiness.ready(NO_WAIT_MS).map(|ready| match ready {
                 Some(OutputReadyState::Output) => OutputReadState::BudgetExhausted,
                 Some(OutputReadyState::Cancelled) => OutputReadState::Cancelled,
                 None => OutputReadState::Open,
             });
         }
-        match readiness.ready(EPOLL_NO_WAIT_MS)? {
+        match readiness.ready(NO_WAIT_MS)? {
             Some(OutputReadyState::Output) => {}
             Some(OutputReadyState::Cancelled) => return Ok(OutputReadState::Cancelled),
             None => return Ok(OutputReadState::Open),
@@ -1377,6 +1502,18 @@ fn reap_child(child: &mut SpawnGuard, pid: u32) -> Exit {
     }
 }
 
+/// Returns whether the process currently behind `pid` is still executing.
+///
+/// Callers verify the start identity first; the PTY root stays unreaped until
+/// cleanup, so its id cannot name another process in between.
+fn root_is_running(pid: u32) -> Result<bool, io::Error> {
+    let inspector = HostInspector::new();
+    match inspector.identity(pid).map_err(io::Error::other)? {
+        Some(identity) => inspector.is_running(identity).map_err(io::Error::other),
+        None => Ok(false),
+    }
+}
+
 fn read_process_start(pid: u32) -> Result<String, io::Error> {
     HostInspector::new()
         .identity(pid)
@@ -1404,11 +1541,10 @@ fn lock_result<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, PtyE
 mod tests {
     use super::{
         commit_resize_before_resume, drain_available_output, drain_snapshot_boundary,
-        read_process_start, wait_for_child_status, CleanupState, Command, OutputReadState,
-        OutputReady, OutputReadyState, PtyError, PtyOwner, ResizeCommit, ResizeState, SpawnGuard,
-        StartupLatch, OUTPUT_DRAIN_BATCH_BYTES, READ_CHUNK_BYTES,
+        read_process_start, wait_for_child_status, Command, OutputReadState, OutputReady,
+        OutputReadyState, PtyError, PtyOwner, ResizeCommit, ResizeState, SpawnGuard, StartupLatch,
+        OUTPUT_DRAIN_BATCH_BYTES, READ_CHUNK_BYTES,
     };
-    use crate::output::OutputCompletion;
     use crate::{InputFragment, InputPlan, OutputEvent, OutputHub, WorkerConfig};
     use pohunek_platform::process::{HostInspector, ProcessInspector};
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -1553,6 +1689,107 @@ mod tests {
         );
     }
 
+    /// Darwin ends the PTY for every descendant once the root exits.
+    ///
+    /// XNU's `proc_exit` drains the controlling terminal, hangs up its
+    /// foreground group and revokes every open reference to it when the session
+    /// leader exits. The root's trailing output still arrives before EOF, a
+    /// descendant that ignores the hangup keeps running, and the unreaped root
+    /// stays observable, so `stop` can still prove the group is the root's and
+    /// terminate what is left of it.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn root_exit_revokes_the_terminal_and_stop_still_ends_the_group() {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid as NixPid;
+
+        /// Kills the fixture descendant if an assertion fails before `stop`.
+        struct Descendant(NixPid);
+
+        impl Drop for Descendant {
+            fn drop(&mut self) {
+                let _ = kill(self.0, Signal::SIGKILL);
+            }
+        }
+
+        let pty = spawn(shell(concat!(
+            "trap '' HUP; ",
+            "sh -c 'trap \"\" HUP; while :; do sleep 1; done' & ",
+            "printf 'descendant:%s\\n' \"$!\"; ",
+            "printf 'root-final\\n'"
+        )));
+        let mut output = pty.subscribe_output(Some(0)).expect("subscribe output");
+        let root_exit = tokio::time::timeout(Duration::from_secs(2), pty.wait_exit())
+            .await
+            .expect("root exit deadline")
+            .expect("root exit");
+
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut observed = Vec::new();
+            loop {
+                match output.recv().await.expect("output event before EOF") {
+                    OutputEvent::Replay(chunk) | OutputEvent::Output(chunk) => {
+                        observed.extend_from_slice(&chunk.bytes);
+                    }
+                    OutputEvent::TerminalSnapshot(chunk) => {
+                        observed.extend_from_slice(&chunk.bytes);
+                    }
+                    OutputEvent::Gap { .. } => observed.clear(),
+                    OutputEvent::Exit { .. } => break observed,
+                }
+            }
+        })
+        .await
+        .expect("the revoked terminal must reach EOF without waiting for the descendant");
+        let text = String::from_utf8_lossy(&observed);
+        assert!(
+            text.contains("root-final"),
+            "the root's trailing output must precede EOF: {text:?}"
+        );
+        let descendant = text
+            .split("descendant:")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|pid| pid.parse::<i32>().ok())
+            .map(NixPid::from_raw)
+            .map(Descendant)
+            .expect("fixture reports its descendant");
+        assert!(
+            kill(descendant.0, None).is_ok(),
+            "a descendant that ignores the hangup outlives the revoked terminal"
+        );
+        assert_eq!(
+            read_process_start(pty.identity().pid).expect("unreaped root identity"),
+            pty.identity().start_identity,
+            "the unreaped root must stay observable as the group authority"
+        );
+
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(2),
+            pty.stop("stop-after-revoke", Duration::from_millis(200)),
+        )
+        .await
+        .expect("bounded stop deadline")
+        .expect("stop the remaining group");
+        assert_eq!(stopped, root_exit);
+        assert!(
+            read_process_start(pty.identity().pid).is_err(),
+            "root must be reaped after stop"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while kill(descendant.0, None).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "stop must terminate the descendant left in the root's group"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    // Needs a descendant that keeps the PTY open after the root exits. Darwin
+    // revokes the controlling terminal from every holder when the session
+    // leader exits, so this scenario exists only on Linux.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stop_terminates_descendants_after_root_exit_without_waiting_for_eof() {
         let pty = spawn(shell(concat!(
@@ -1606,6 +1843,10 @@ mod tests {
         );
     }
 
+    // Needs a descendant that keeps the PTY open after the root exits. Darwin
+    // revokes the controlling terminal from every holder when the session
+    // leader exits, so this scenario exists only on Linux.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stop_force_closes_output_retained_outside_the_owned_process_group() {
         let barrier = tempfile::tempdir().expect("create escaped descendant barrier");
@@ -1659,8 +1900,15 @@ mod tests {
         );
     }
 
+    // Needs a descendant that keeps the PTY open after the root exits. Darwin
+    // revokes the controlling terminal from every holder when the session
+    // leader exits, so this scenario exists only on Linux.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn natural_eof_wins_a_concurrent_forced_cleanup() {
+        use super::CleanupState;
+        use crate::output::OutputCompletion;
+
         let barrier = tempfile::tempdir().expect("create EOF race barrier");
         let ready = barrier.path().join("ready");
         let pty = spawn(Command {
@@ -1710,6 +1958,223 @@ mod tests {
                 .expect("repeat stop"),
             root_exit
         );
+    }
+
+    /// Cancellation wins over output, and hangup still delivers buffered bytes.
+    ///
+    /// The hangup rule is the one that matters: a child that writes and exits
+    /// wakes with `IN | HUP` together, and reporting that as end-of-stream
+    /// would drop its final output.
+    #[test]
+    fn readiness_classification_covers_every_documented_wake() {
+        use super::{classify_readiness, OutputReadyState, PollFlags, ReadinessFault};
+
+        let quiet = PollFlags::empty();
+        assert_eq!(classify_readiness(quiet, quiet), Ok(None), "timeout");
+        assert_eq!(
+            classify_readiness(PollFlags::IN, quiet),
+            Ok(Some(OutputReadyState::Output)),
+            "readable master"
+        );
+        assert_eq!(
+            classify_readiness(PollFlags::HUP, quiet),
+            Ok(Some(OutputReadyState::Output)),
+            "hangup still sends the caller to read, which is where EOF is seen"
+        );
+        assert_eq!(
+            classify_readiness(PollFlags::IN | PollFlags::HUP, quiet),
+            Ok(Some(OutputReadyState::Output)),
+            "hangup arriving with buffered bytes must still drain them"
+        );
+        assert_eq!(
+            classify_readiness(PollFlags::ERR, quiet),
+            Ok(Some(OutputReadyState::Output)),
+            "error readiness is surfaced by the read, not swallowed here"
+        );
+        assert_eq!(
+            classify_readiness(quiet, PollFlags::IN),
+            Ok(Some(OutputReadyState::Cancelled)),
+            "cancellation"
+        );
+        assert_eq!(
+            classify_readiness(PollFlags::IN, PollFlags::IN),
+            Ok(Some(OutputReadyState::Cancelled)),
+            "a caller that asked to stop must not be made to drain first"
+        );
+        for (master, cancel, what) in [
+            (PollFlags::NVAL, quiet, "master"),
+            (quiet, PollFlags::NVAL, "cancel pipe"),
+            (
+                PollFlags::IN,
+                PollFlags::NVAL,
+                "cancel pipe beside a readable master",
+            ),
+        ] {
+            assert_eq!(
+                classify_readiness(master, cancel),
+                Err(ReadinessFault::InvalidDescriptor),
+                "a closed {what} must fail rather than spin"
+            );
+        }
+    }
+
+    /// Cancellation is a latch that every later wait observes.
+    ///
+    /// The reader thread, `resize` and `attach_snapshot` share one readiness,
+    /// so the first waiter must not consume the signal the others rely on.
+    #[test]
+    fn cancellation_stays_armed_for_every_later_wait() {
+        use std::io::Write as _;
+        use std::os::fd::AsFd as _;
+
+        let (master, mut peer) = std::os::unix::net::UnixStream::pair().expect("readiness fixture");
+        let readiness = super::OutputReadiness::new(master.as_fd()).expect("readiness");
+        assert_eq!(
+            readiness.ready(super::NO_WAIT_MS).expect("unarmed wait"),
+            None,
+            "a quiet, unarmed readiness times out"
+        );
+
+        readiness.cancel().expect("arm cancellation");
+        for wait in 0..3 {
+            assert_eq!(
+                readiness.ready(super::NO_WAIT_MS).expect("armed wait"),
+                Some(OutputReadyState::Cancelled),
+                "wait {wait} after arming must still see the cancellation"
+            );
+        }
+        assert_eq!(
+            super::wait_for_output(&readiness).expect("blocking wait"),
+            OutputReadyState::Cancelled,
+            "a blocking wait must return at once on an armed latch"
+        );
+
+        peer.write_all(b"late output")
+            .expect("write fixture output");
+        readiness.cancel().expect("re-arm cancellation");
+        assert_eq!(
+            readiness
+                .ready(super::NO_WAIT_MS)
+                .expect("wait beside output"),
+            Some(OutputReadyState::Cancelled),
+            "re-arming is harmless and the latch still beats pending output"
+        );
+    }
+
+    /// Arming past the pipe's capacity neither blocks nor fails.
+    ///
+    /// Every forced-close path arms the latch, and a caller must never stall
+    /// there. The write end is non-blocking and a full pipe already carries
+    /// the cancellation, so `AGAIN` counts as armed.
+    #[test]
+    fn arming_a_full_cancellation_pipe_does_not_block() {
+        use std::os::fd::AsFd as _;
+
+        /// Well past any pipe buffer on Linux (64 KiB) or Darwin (up to 64 KiB).
+        const ARMINGS: usize = 256 * 1024;
+
+        let (master, _peer) = std::os::unix::net::UnixStream::pair().expect("readiness fixture");
+        let readiness = super::OutputReadiness::new(master.as_fd()).expect("readiness");
+        for arming in 0..ARMINGS {
+            readiness
+                .cancel()
+                .unwrap_or_else(|error| panic!("arming {arming} failed: {error}"));
+        }
+        assert_eq!(
+            readiness.ready(super::NO_WAIT_MS).expect("armed wait"),
+            Some(OutputReadyState::Cancelled)
+        );
+    }
+
+    /// The readiness keeps its own close-on-exec descriptors open.
+    ///
+    /// Waiting must not depend on whoever handed the master in, so closing
+    /// the original leaves the readiness polling a live descriptor. None of
+    /// its descriptors may leak into a PTY child.
+    #[test]
+    fn readiness_outlives_the_descriptor_it_was_built_from() {
+        use rustix::io::{fcntl_getfd, FdFlags};
+        use std::io::Write as _;
+        use std::os::fd::AsFd as _;
+
+        let (master, mut peer) = std::os::unix::net::UnixStream::pair().expect("readiness fixture");
+        let readiness = super::OutputReadiness::new(master.as_fd()).expect("readiness");
+        drop(master);
+
+        for (descriptor, what) in [
+            (&readiness.master, "master duplicate"),
+            (&readiness.cancel_reader, "cancel pipe read end"),
+            (&readiness.cancel_writer, "cancel pipe write end"),
+        ] {
+            assert!(
+                fcntl_getfd(descriptor)
+                    .expect("descriptor flags")
+                    .contains(FdFlags::CLOEXEC),
+                "the {what} must be close-on-exec"
+            );
+        }
+
+        assert_eq!(
+            readiness.ready(super::NO_WAIT_MS).expect("quiet wait"),
+            None,
+            "the duplicate is open and quiet, not reported as invalid"
+        );
+        peer.write_all(b"output")
+            .expect("the duplicate keeps the fixture connected");
+        assert_eq!(
+            readiness.ready(super::NO_WAIT_MS).expect("readable wait"),
+            Some(OutputReadyState::Output)
+        );
+    }
+
+    /// A forced close fails every snapshot-boundary operation after it.
+    ///
+    /// The reader thread is joined first, so it has already woken on the
+    /// cancellation before `resize` and `attach_snapshot` consult the same
+    /// readiness. Neither may report success on a force-closed PTY.
+    #[tokio::test]
+    async fn forced_close_fails_resize_and_snapshot_after_the_reader_has_woken() {
+        let pty = spawn(shell("sleep 30"));
+        pty.force_output_close().expect("force output close");
+
+        let reader = pty
+            .reader_thread
+            .lock()
+            .expect("reader thread lock")
+            .take()
+            .expect("reader thread handle");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || reader.join()),
+        )
+        .await
+        .expect("reader exit deadline")
+        .expect("reader join task")
+        .expect("reader thread must exit cleanly");
+
+        assert!(matches!(
+            pty.resize("attach-1", 1, 100, 40).await,
+            Err(PtyError::OutputForcedClosed)
+        ));
+        assert!(matches!(
+            pty.attach_snapshot(Some((100, 40))).await,
+            Err(PtyError::OutputForcedClosed)
+        ));
+        assert!(matches!(
+            pty.attach_snapshot(None).await,
+            Err(PtyError::OutputForcedClosed)
+        ));
+        assert_eq!(
+            pty.dimensions().await,
+            (80, 24),
+            "a refused resize must not commit its dimensions"
+        );
+
+        let exit = pty
+            .stop("cleanup", Duration::from_millis(200))
+            .await
+            .expect("stop still reaps the root after a forced output close");
+        assert!(!exit.success, "the root was signalled, not left to finish");
     }
 
     #[tokio::test]

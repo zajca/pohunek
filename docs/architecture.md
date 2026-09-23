@@ -301,10 +301,13 @@ Worker readiness and authority still come from the private worker handshake.
 The shared contract crate compiles and tests natively on Apple Silicon Darwin
 with a macOS 14 deployment target. Intel Macs are outside the current release
 scope. The secure runtime-path and portable filesystem contract also runs
-natively on APFS, and native process and peer inspection are in place. This is
-foundation evidence, not a claim that macOS host support ships: portable PTY
-I/O, launchd, clients, packaging, and full acceptance remain ordered work in
-#99-#105.
+natively on APFS, and native process and peer inspection are in place. The
+session worker's PTY I/O is portable: output readiness is one `poll(2)`
+implementation shared by both targets, and the worker's complete test suite,
+including idle-CPU and descriptor-release evidence, runs on the native runner.
+This is foundation evidence, not a claim that macOS host support ships:
+launchd, clients, packaging, and full acceptance remain ordered work in
+#100-#105.
 
 The host daemon is the local control plane for one machine, written in Rust.
 

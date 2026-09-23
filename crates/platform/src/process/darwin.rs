@@ -11,7 +11,7 @@
 //! `PRIV_GLOBAL_PROC_INFO` privilege that only root holds, and such a refusal is
 //! reported as a denial rather than as absence.
 
-// Rust guideline compliant 2026-09-22
+// Rust guideline compliant 2026-09-23
 
 use std::io;
 use std::os::fd::AsFd;
@@ -77,7 +77,10 @@ impl ProcessInspector for DarwinInspector {
         let Some(fact) = read_bsd_fact(identity.pid, native::effective_uid(), OPERATION)? else {
             return Ok(false);
         };
-        Ok(fact.start_identity == identity.start_identity && !fact.is_zombie)
+        // A process inside `exit` never runs user code again, yet it can stay
+        // there without becoming a zombie for as long as the kernel waits to
+        // drain its controlling terminal.
+        Ok(fact.start_identity == identity.start_identity && !fact.is_zombie && !fact.is_exiting)
     }
 
     fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, Error> {
@@ -507,6 +510,16 @@ mod native {
     /// `kern.argmax`, whose documented maximum is 1 MiB.
     const MAX_ARGUMENT_BUFFER_BYTES: usize = 1024 * 1024;
 
+    /// `proc_pidinfo` argument asking for exited-but-unreaped processes too.
+    ///
+    /// For the BSD record flavors XNU looks a process id up among zombies only
+    /// when this argument is non-zero (`bsd/kern/proc_info.c`, `proc_pidinfo`);
+    /// with zero an unreaped child answers `ESRCH`. Procfs lists a zombie until
+    /// it is reaped, so this keeps both backends reporting the same identity
+    /// for it, with `SZOMB` marking it as no longer running. A parent that
+    /// holds its exited child unreaped to pin a process group relies on that.
+    const INCLUDE_ZOMBIES: u64 = 1;
+
     /// Caps kqueue events drained in one pass.
     ///
     /// One filter is registered per watch, so a small buffer always drains the
@@ -595,7 +608,7 @@ mod native {
             libc::proc_pidinfo(
                 pid,
                 PROC_PIDT_SHORTBSDINFO,
-                0,
+                INCLUDE_ZOMBIES,
                 info.as_mut_ptr().cast::<libc::c_void>(),
                 size,
             )
@@ -637,7 +650,7 @@ mod native {
             libc::proc_pidinfo(
                 pid,
                 libc::PROC_PIDTBSDINFO,
-                0,
+                INCLUDE_ZOMBIES,
                 info.as_mut_ptr().cast::<libc::c_void>(),
                 size,
             )
@@ -1359,6 +1372,47 @@ mod tests {
         ));
     }
 
+    /// An unreaped child keeps its identity but is no longer running.
+    ///
+    /// A parent holding its exited child unreaped pins that child's process
+    /// group; a caller can only prove the group is still that child's if the
+    /// zombie stays observable, as it does under Linux procfs.
+    #[test]
+    fn an_unreaped_zombie_keeps_its_identity_but_is_not_running() {
+        use rustix::process::{waitid, Pid as RustixPid, WaitId, WaitIdOptions};
+
+        let inspector = DarwinInspector::new();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn a process that exits immediately");
+        let pid = child.id();
+        let live = wait_for("the child identity", || {
+            inspector.identity(pid).ok().flatten()
+        });
+
+        let native_pid =
+            RustixPid::from_raw(i32::try_from(pid).expect("pid fits pid_t")).expect("positive pid");
+        waitid(
+            WaitId::Pid(native_pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+        )
+        .expect("wait for exit without reaping");
+
+        assert_eq!(
+            inspector.identity(pid).expect("inspect the zombie"),
+            Some(live),
+            "an unreaped zombie keeps the identity it had while running"
+        );
+        assert!(!inspector.is_running(live).expect("zombie liveness"));
+        child.wait().expect("reap the zombie");
+        assert_ne!(
+            inspector.identity(pid).expect("inspect the reaped id"),
+            Some(live),
+            "a reaped process no longer has an identity"
+        );
+    }
+
     #[test]
     fn cwd_reports_the_child_working_directory() {
         let inspector = DarwinInspector::new();
@@ -1659,10 +1713,9 @@ mod tests {
                 Ok(watch) => {
                     armed += 1;
                     await_exit("the churn exit", watch).await;
-                    assert_ne!(
-                        inspector.identity(pid).expect("reinspect identity"),
-                        Some(identity),
-                        "a completed watch means the exact identity is gone"
+                    assert!(
+                        !inspector.is_running(identity).expect("reinspect liveness"),
+                        "a completed watch means the exact identity no longer runs"
                     );
                 }
                 Err(Error::Race { .. }) => {}
