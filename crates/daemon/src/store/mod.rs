@@ -20,7 +20,7 @@
 //!
 //! Each line is a tagged [`Record`] (`{"kind":"resume", ...}` /
 //! `{"kind":"worktree", ...}` / `{"kind":"project", ...}`). Every mutation
-//! re-reads the whole file under the write lock, edits the relevant record kind,
+//! re-reads the whole file under the store lock, edits the relevant record kind,
 //! and rewrites **all** records, preserving the other kinds untouched. The file
 //! is small (one line per resumable session, per bound worktree, and per known
 //! project) so a full rewrite per mutation is cheap. No daemon-derived secrets
@@ -48,7 +48,7 @@ use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use pohunek_platform::filesystem::{AtomicReplaceError, FsError, TrustedDir};
@@ -597,13 +597,18 @@ impl<T> StoreMutation<T> {
 
 /// File-backed unified metadata store.
 ///
-/// A single internal lock is the **one writer-serialization point** for the
-/// file; every mutating method rewrites the whole file under it via one atomic
-/// temp+rename, so the two record kinds stay mutually consistent.
+/// A single internal lock serializes every access to the file: each mutating
+/// method rewrites the whole file under it via one atomic temp+rename, so the
+/// record kinds stay mutually consistent, and each load reads under it too.
 #[derive(Debug)]
 pub struct Store {
     path: PathBuf,
-    write_lock: Mutex<()>,
+    /// Held for every read and every read-modify-write of the file.
+    ///
+    /// Reads need it as much as writes: a writer's `rename` unlinks the inode a
+    /// concurrent reader may have just opened, and the trusted read rejects an
+    /// open file with no remaining links rather than return it.
+    lock: Mutex<()>,
     #[cfg(test)]
     fail_parent_sync_after_rename: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -616,7 +621,7 @@ impl Store {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
-            write_lock: Mutex::new(()),
+            lock: Mutex::new(()),
             #[cfg(test)]
             fail_parent_sync_after_rename: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -672,30 +677,42 @@ impl Store {
 
     /// All resume bindings. A missing file yields an empty list.
     pub fn load_resume(&self) -> io::Result<Vec<ResumeBinding>> {
-        Ok(self.read_all()?.0)
+        Ok(self.snapshot()?.0)
     }
 
     /// All worktree bindings. A missing file yields an empty list.
     pub fn load_worktrees(&self) -> io::Result<Vec<WorktreeBinding>> {
-        Ok(self.read_all()?.1)
+        Ok(self.snapshot()?.1)
     }
 
     /// All project records. A missing file yields an empty list.
     pub fn load_projects(&self) -> io::Result<Vec<ProjectRecord>> {
-        Ok(self.read_all()?.2)
+        Ok(self.snapshot()?.2)
     }
 
     /// Loads every durable logical session.
     pub fn load_sessions(&self) -> io::Result<Vec<SessionRecord>> {
-        Ok(self.read_all()?.3)
+        Ok(self.snapshot()?.3)
+    }
+
+    /// Acquires the store lock.
+    ///
+    /// A poisoned lock is still taken: every write commits through one atomic
+    /// rename, so a panic while it was held cannot leave the file half-written.
+    fn guard(&self) -> MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Reads every record under the store lock, so no writer can replace the
+    /// file between opening it and validating the open descriptor.
+    fn snapshot(&self) -> io::Result<StoreRecords> {
+        let _guard = self.guard();
+        self.read_all()
     }
 
     /// Upserts one logical session and preserves every other record kind.
     pub fn record_session(&self, record: &SessionRecord) -> io::Result<SessionWriteOutcome> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self.guard();
         let (resume, worktrees, projects, mut sessions) = self.read_all()?;
         if let Some(existing) = sessions
             .iter_mut()
@@ -728,10 +745,7 @@ impl Store {
         expected: &SessionRecord,
         record: &SessionRecord,
     ) -> io::Result<SessionWriteOutcome> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self.guard();
         let (resume, worktrees, projects, mut sessions) = self.read_all()?;
         let Some(existing) = sessions
             .iter_mut()
@@ -760,10 +774,7 @@ impl Store {
 
     /// Removes one logical session and preserves every other record kind.
     pub fn remove_session(&self, session_id: &str) -> io::Result<StoreMutation<bool>> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self.guard();
         let (resume, worktrees, projects, mut sessions) = self.read_all()?;
         let before = sessions.len();
         sessions.retain(|record| record.session_id != session_id);
@@ -779,10 +790,7 @@ impl Store {
     /// Upsert a resume binding (keyed by `session_id`), preserving every worktree
     /// record, and rewrite the file atomically.
     pub fn record_resume(&self, binding: &ResumeBinding) -> io::Result<StoreMutation<()>> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self.guard();
         let (mut resume, worktrees, projects, sessions) = self.read_all()?;
         let mut replacement = binding.clone();
         if let Some(authoritative) = sessions
@@ -816,10 +824,7 @@ impl Store {
     /// Remove a resume binding by session id, preserving every worktree record. A
     /// missing entry is a no-op.
     pub fn remove_resume(&self, session_id: &str) -> io::Result<StoreMutation<()>> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self.guard();
         let (mut resume, worktrees, projects, sessions) = self.read_all()?;
         let before = resume.len();
         resume.retain(|binding| binding.session_id != session_id);
@@ -865,10 +870,7 @@ impl Store {
     /// atomically. The triple key keeps two branches of one `(session,
     /// repository)` pair from collapsing onto a single row.
     pub fn record_worktree(&self, binding: &WorktreeBinding) -> io::Result<StoreMutation<()>> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self.guard();
         let (resume, mut worktrees, projects, sessions) = self.read_all()?;
         if let Some(existing) = worktrees.iter_mut().find(|existing| {
             existing.session_id == binding.session_id
@@ -887,10 +889,7 @@ impl Store {
     /// Remove every worktree binding owned by `session_id`, preserving every
     /// resume record. Returns the number removed (`0` is a no-op success).
     pub fn remove_worktree_session(&self, session_id: &str) -> io::Result<StoreMutation<usize>> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self.guard();
         let (resume, mut worktrees, projects, sessions) = self.read_all()?;
         let before = worktrees.len();
         worktrees.retain(|binding| binding.session_id != session_id);
@@ -904,7 +903,7 @@ impl Store {
     }
 
     /// Atomically read-modify-write the project keyed by canonical
-    /// `git_common_dir`, **entirely under the store write lock** so a concurrent
+    /// `git_common_dir`, **entirely under the store lock** so a concurrent
     /// edit cannot be clobbered by a stale snapshot. This is the safe alternative
     /// to the `load_projects()` → mutate a detached copy → `record_project()`
     /// pattern, which reads outside the lock and so races: two callers can each
@@ -925,10 +924,7 @@ impl Store {
     where
         F: FnOnce(Option<ProjectRecord>) -> Option<ProjectRecord>,
     {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self.guard();
         let (resume, worktrees, mut projects, sessions) = self.read_all()?;
         let pos = projects
             .iter()
@@ -958,10 +954,7 @@ impl Store {
     /// record (read-modify-write); this whole-record overwrite is for callers that
     /// already hold the complete intended record.
     pub fn record_project(&self, record: &ProjectRecord) -> io::Result<StoreMutation<()>> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self.guard();
         let (resume, worktrees, mut projects, sessions) = self.read_all()?;
         if let Some(existing) = projects
             .iter_mut()
@@ -981,10 +974,7 @@ impl Store {
     /// success). Only forgets the record; it never touches the on-disk repository
     /// or its worktrees.
     pub fn remove_project(&self, git_common_dir: &Path) -> io::Result<StoreMutation<bool>> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self.guard();
         let (resume, worktrees, mut projects, sessions) = self.read_all()?;
         let before = projects.len();
         projects.retain(|project| project.git_common_dir != git_common_dir);
@@ -1017,9 +1007,9 @@ impl Store {
         })
     }
 
-    /// Read and partition every record. A missing file yields three empty lists;
+    /// Read and partition every record. A missing file yields empty lists;
     /// malformed lines are skipped (a corrupt line must not block loading the
-    /// rest).
+    /// rest). The caller must hold the store lock.
     fn read_all(&self) -> io::Result<StoreRecords> {
         let parent = parent_directory(&self.path);
         if !parent.exists() {
@@ -1397,6 +1387,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use protocol::{AgentActivity, AgentKind, ProjectSource};
@@ -1780,6 +1771,37 @@ mod tests {
         assert_eq!(store.load_worktrees().expect("worktree").len(), 1);
     }
 
+    /// Every write renames a new file over the store while readers poll it, as
+    /// the session registry does when a caller waits for a binding to change.
+    /// A read must see one whole version of the file, never the replaced inode.
+    #[test]
+    fn loads_never_observe_a_file_replaced_by_a_concurrent_write() {
+        // Enough rewrites that an unserialized reader lands inside the window
+        // between opening the old file and the rename unlinking it.
+        const REWRITES: usize = 400;
+        let store = Store::new(temp_store_path("concurrent-read"));
+        store
+            .record_resume(&resume("s-1", "native-1"))
+            .expect("seed resume");
+        let writing = AtomicBool::new(true);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for round in 0..REWRITES {
+                    store
+                        .record_resume(&resume("s-1", &format!("native-{round}")))
+                        .expect("rewrite resume");
+                }
+                writing.store(false, Ordering::SeqCst);
+            });
+            while writing.load(Ordering::SeqCst) {
+                let bindings = store
+                    .load_resume()
+                    .expect("a load racing a rewrite must still succeed");
+                assert_eq!(bindings.len(), 1, "each load sees one whole version");
+            }
+        });
+    }
+
     #[cfg(unix)]
     #[test]
     fn store_file_is_owner_private() {
@@ -1923,7 +1945,7 @@ mod tests {
     #[test]
     fn mutate_project_passes_current_record_and_merges_edits() {
         // This is the fix for the metadata-clobber race: each edit reads the
-        // freshest record *under the write lock* and mutates only its own field,
+        // freshest record *under the store lock* and mutates only its own field,
         // so a later edit cannot revert an earlier one from a stale snapshot.
         let store = Store::new(temp_store_path("mutate-merge"));
         store
