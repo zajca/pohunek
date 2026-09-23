@@ -28,7 +28,7 @@ default-filter = '''
 not (
   (package(=pohunek-daemon) and
     (kind(test) or test(/^(api::handler::tests::|session::|runtime::client::|governance::owner_path_tests::|capabilities::|external::)/)))
-  or (package(=pohunek-session-worker) and test(/^(pty|server)::/))
+  or (package(=pohunek-session-worker) and (kind(test) or test(/^(pty|server)::/)))
   or (package(=pohunek-relay) and
     (kind(test) or test(/^(admission::|auth::service::|auth::parent_integrity_tests::|authorization::admin_tests::|lifecycle::|runtime::|server::credential_router_tests::|operator::)/)))
   or (package(=pohunek-cli) and

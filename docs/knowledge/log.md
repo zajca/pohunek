@@ -2,6 +2,11 @@
 
 ## Unreleased (2026-08-12)
 
+- Documented portable PTY readiness in the session worker: one `poll(2)`
+  implementation over the PTY master and a cancellation self-pipe on Linux and
+  Darwin, with the worker's complete test suite running on native macOS CI.
+  Darwin kernel peer identity is recorded as in place; launchd, clients,
+  packaging, and native acceptance remain deferred through #100-#105.
 - Documented automatic session retention: the conservative opt-in default
   policy, the separate terminal and lost TTLs, `session policy get`/`set`,
   `session retention sweep --dry-run`/`--apply`, and the eligibility rules that

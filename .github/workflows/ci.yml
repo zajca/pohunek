@@ -116,6 +116,11 @@ jobs:
       - name: Test session worker
         run: cargo test --locked -p pohunek-session-worker
 
+      # Prints the idle CPU and descriptor counts the resource test asserts on,
+      # so the native measurements are readable from the job log.
+      - name: Measure session worker resources
+        run: cargo test --locked -p pohunek-session-worker --test resources -- --nocapture
+
       # Exercise the issue-#96 Hermes filesystem lifecycle natively as well.
       - name: Check Hermes filesystem lifecycle
         run: cargo check --locked -p pohunek-cli --lib
