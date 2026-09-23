@@ -47,7 +47,9 @@ and systemd backends; Darwin uses `libproc` process records, `sysctl`
 watch. Both backends read the same facts: process, parent, and process-group
 ids, an opaque same-boot start identity, the controlling-terminal foreground
 process group, the executable path, the working directory, and only the
-allowlisted `POHUNEK` ownership markers. Argument and environment regions stay
+allowlisted `POHUNEK` ownership markers. A process that has exited but is not
+yet reaped keeps its identity on both backends and is reported as no longer
+running. Argument and environment regions stay
 separate, so an environment value is never argument evidence and an argument is
 never an ownership marker. An observation that fails is an explicit typed
 failure, never a healthy absence, and never authorizes a mutation.

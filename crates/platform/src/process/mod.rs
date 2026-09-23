@@ -290,6 +290,9 @@ impl ExitWatch {
 pub trait ProcessInspector: Debug + Send + Sync + 'static {
     /// Returns the PID-reuse-safe identity without reading unrelated facts.
     ///
+    /// An exited process its parent has not reaped yet keeps its identity, and
+    /// [`ProcessInspector::is_running`] reports it as not running.
+    ///
     /// # Errors
     ///
     /// Returns typed failures when the minimal platform process record cannot be inspected.
