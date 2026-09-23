@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
-// Rust guideline compliant 2026-09-21
+// Rust guideline compliant 2026-09-23
 
 /// Permission and special-mode bits reported by `stat`.
 const MODE_MASK: u32 = 0o7777;
@@ -16,6 +16,33 @@ const MODE_MASK: u32 = 0o7777;
 const STAGING_NAME_ATTEMPTS: usize = 16;
 /// Random bytes encoded in internal staging names.
 const STAGING_RANDOM_BYTES: usize = 8;
+/// Attempts [`TrustedDir::read_file`] makes while the file keeps being replaced.
+///
+/// A replacement only fails an attempt when its rename lands inside the few
+/// syscalls from looking the name up to validating the opened file, so one
+/// retry almost always suffices. The bound keeps a writer that replaces the file
+/// continuously from holding a reader in the loop; exhausting it returns the
+/// last replacement error.
+const READ_REPLACED_ATTEMPTS: usize = 8;
+
+/// Outcome of one [`TrustedDir::read_file`] attempt.
+#[derive(Debug)]
+enum ReadAttempt {
+    /// The validated contents of the file that was inspected.
+    Read(Vec<u8>),
+    /// `name` was renamed over between its lookup and validation.
+    Replaced(FsError),
+}
+
+/// Points inside one [`TrustedDir::read_file`] attempt where tests replace the
+/// file, to hit the rename windows deterministically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadStage {
+    /// After the name is inspected, before it is opened.
+    BeforeOpen,
+    /// After the name is opened, before the descriptor is validated.
+    BeforeValidate,
+}
 
 /// A filesystem operation result.
 pub type FsResult<T> = Result<T, FsError>;
@@ -806,9 +833,15 @@ impl TrustedDir {
     /// The open is no-follow, the descriptor is validated before reading, and
     /// `max_bytes` bounds memory use even if the file changes during the read.
     ///
+    /// A writer that atomically renames a new file over `name` while the read
+    /// is in flight does not fail it: the read starts again against the new
+    /// file and validates it from scratch, a bounded number of times.
+    ///
     /// # Errors
     ///
     /// Returns [`FsError`] when the entry is unsafe, too large, or cannot be read.
+    /// Returns [`FsError::IdentityChanged`] or [`FsError::UnsafeLinkCount`] when
+    /// `name` was replaced during every attempt.
     pub fn read_file(
         &self,
         name: impl AsRef<OsStr>,
@@ -818,22 +851,70 @@ impl TrustedDir {
         validate_mode(mode)?;
         let name = validate_component(name.as_ref())?;
         let path = self.path.join(name);
-        let expected = inspect_entry(&self.file, &path, name, EntryKind::RegularFile, Some(mode))?
-            .ok_or_else(|| FsError::Io {
-                operation: "inspect trusted file before opening",
-                path: path.clone(),
-                source: io::Error::new(io::ErrorKind::NotFound, "trusted file does not exist"),
-            })?;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match self.read_file_once(name, &path, mode, max_bytes)? {
+                ReadAttempt::Read(bytes) => return Ok(bytes),
+                ReadAttempt::Replaced(error) if attempts >= READ_REPLACED_ATTEMPTS => {
+                    return Err(error);
+                }
+                ReadAttempt::Replaced(_) => {}
+            }
+        }
+    }
+
+    /// Reads `name` once, reporting a concurrent replacement separately from
+    /// a real failure so [`Self::read_file`] can start over.
+    fn read_file_once(
+        &self,
+        name: &OsStr,
+        path: &Path,
+        mode: u32,
+        max_bytes: usize,
+    ) -> FsResult<ReadAttempt> {
+        let expected =
+            match inspect_entry(&self.file, path, name, EntryKind::RegularFile, Some(mode)) {
+                Ok(Some(identity)) => identity,
+                Ok(None) => {
+                    return Err(FsError::Io {
+                        operation: "inspect trusted file before opening",
+                        path: path.to_path_buf(),
+                        source: io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "trusted file does not exist",
+                        ),
+                    });
+                }
+                // A rename can unlink the looked-up inode before the stat reads it.
+                Err(error @ FsError::UnsafeLinkCount { actual: 0, .. }) => {
+                    return Ok(ReadAttempt::Replaced(error));
+                }
+                Err(error) => return Err(error),
+            };
+        run_read_interleave(ReadStage::BeforeOpen);
         let fd = fs::openat(
             &self.file,
             name,
             OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
             Mode::empty(),
         )
-        .map_err(|source| io_error("open trusted file", &path, source))?;
+        .map_err(|source| io_error("open trusted file", path, source))?;
         let mut file = File::from(fd);
-        if validate_fd(&file, &path, EntryKind::RegularFile, Some(mode))? != expected {
-            return Err(FsError::IdentityChanged { path });
+        run_read_interleave(ReadStage::BeforeValidate);
+        match validate_fd(&file, path, EntryKind::RegularFile, Some(mode)) {
+            Ok(identity) if identity == expected => {}
+            // The name now points at a newer file than the one inspected.
+            Ok(_) => {
+                return Ok(ReadAttempt::Replaced(FsError::IdentityChanged {
+                    path: path.to_path_buf(),
+                }));
+            }
+            // The opened file lost its only name to a rename after the open.
+            Err(error @ FsError::UnsafeLinkCount { actual: 0, .. }) => {
+                return Ok(ReadAttempt::Replaced(error));
+            }
+            Err(error) => return Err(error),
         }
         let limit = u64::try_from(max_bytes)
             .unwrap_or(u64::MAX)
@@ -842,11 +923,14 @@ impl TrustedDir {
         std::io::Read::by_ref(&mut file)
             .take(limit)
             .read_to_end(&mut bytes)
-            .map_err(|source| io_error("read trusted file", &path, source))?;
+            .map_err(|source| io_error("read trusted file", path, source))?;
         if bytes.len() > max_bytes {
-            return Err(FsError::FileTooLarge { path, max_bytes });
+            return Err(FsError::FileTooLarge {
+                path: path.to_path_buf(),
+                max_bytes,
+            });
         }
-        Ok(bytes)
+        Ok(ReadAttempt::Read(bytes))
     }
 
     /// Creates, writes, and durably synchronizes one regular file exclusively.
@@ -2699,6 +2783,35 @@ const fn injected_sync_failure() -> Option<io::Error> {
     None
 }
 
+/// An action a test runs when a read reaches the given stage.
+#[cfg(test)]
+type ReadInterleave = (ReadStage, Box<dyn FnOnce()>);
+
+#[cfg(test)]
+std::thread_local! {
+    static READ_INTERLEAVES: std::cell::RefCell<std::collections::VecDeque<ReadInterleave>> =
+        std::cell::RefCell::new(std::collections::VecDeque::new());
+}
+
+/// Runs the next queued test action if it is waiting for `stage`.
+#[cfg(test)]
+fn run_read_interleave(stage: ReadStage) {
+    let action = READ_INTERLEAVES.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        if queue.front().is_some_and(|(waiting, _)| *waiting == stage) {
+            queue.pop_front().map(|(_, action)| action)
+        } else {
+            None
+        }
+    });
+    if let Some(action) = action {
+        action();
+    }
+}
+
+#[cfg(not(test))]
+const fn run_read_interleave(_stage: ReadStage) {}
+
 fn io_error(operation: &'static str, path: &Path, source: impl Into<io::Error>) -> FsError {
     FsError::Io {
         operation,
@@ -2960,6 +3073,131 @@ mod tests {
         assert!(matches!(
             trusted.read_file("record-fifo", FILE_MODE, 1),
             Err(FsError::UnsafeType { .. })
+        ));
+    }
+
+    fn write_private(path: &Path, contents: &[u8]) {
+        fs::write(path, contents).expect("write private fixture");
+        fs::set_permissions(path, fs::Permissions::from_mode(FILE_MODE))
+            .expect("set private fixture mode");
+    }
+
+    /// Queues an atomic replacement of `root/name`, the way store writers
+    /// commit, to run when a read reaches `stage`.
+    fn replace_during_read(stage: ReadStage, root: &Path, name: &str, contents: &'static [u8]) {
+        let staged = root.join(format!(".{name}.next"));
+        let target = root.join(name);
+        READ_INTERLEAVES.with(|queue| {
+            queue.borrow_mut().push_back((
+                stage,
+                Box::new(move || {
+                    write_private(&staged, contents);
+                    fs::rename(&staged, &target).expect("rename replacement over record");
+                }),
+            ));
+        });
+    }
+
+    fn pending_read_interleaves() -> usize {
+        READ_INTERLEAVES.with(|queue| queue.borrow().len())
+    }
+
+    #[test]
+    fn read_restarts_when_the_file_is_replaced_before_it_is_opened() {
+        let (temporary, trusted) = trusted_root();
+        write_private(&temporary.path().join("record"), b"old");
+        replace_during_read(ReadStage::BeforeOpen, temporary.path(), "record", b"new");
+
+        assert_eq!(
+            trusted
+                .read_file("record", FILE_MODE, 3)
+                .expect("a replaced file is read again"),
+            b"new"
+        );
+        assert_eq!(pending_read_interleaves(), 0);
+    }
+
+    #[test]
+    fn read_restarts_when_the_opened_file_is_replaced_before_validation() {
+        let (temporary, trusted) = trusted_root();
+        write_private(&temporary.path().join("record"), b"old");
+        replace_during_read(
+            ReadStage::BeforeValidate,
+            temporary.path(),
+            "record",
+            b"new",
+        );
+
+        assert_eq!(
+            trusted
+                .read_file("record", FILE_MODE, 3)
+                .expect("an unlinked open file is read again by name"),
+            b"new"
+        );
+        assert_eq!(pending_read_interleaves(), 0);
+    }
+
+    #[test]
+    fn read_fails_closed_when_every_attempt_is_replaced() {
+        let (temporary, trusted) = trusted_root();
+        write_private(&temporary.path().join("record"), b"old");
+        for _ in 0..READ_REPLACED_ATTEMPTS {
+            replace_during_read(
+                ReadStage::BeforeValidate,
+                temporary.path(),
+                "record",
+                b"new",
+            );
+        }
+
+        assert!(matches!(
+            trusted.read_file("record", FILE_MODE, 3),
+            Err(FsError::UnsafeLinkCount { actual: 0, .. })
+        ));
+        assert_eq!(
+            pending_read_interleaves(),
+            0,
+            "each attempt consumed exactly one replacement"
+        );
+    }
+
+    #[test]
+    fn read_retry_does_not_follow_a_symlink_renamed_over_the_file() {
+        let (temporary, trusted) = trusted_root();
+        let root = temporary.path().to_path_buf();
+        write_private(&root.join("record"), b"old");
+        write_private(&root.join("elsewhere"), b"leak");
+        READ_INTERLEAVES.with(|queue| {
+            queue.borrow_mut().push_back((
+                ReadStage::BeforeValidate,
+                Box::new(move || {
+                    std::os::unix::fs::symlink("elsewhere", root.join(".record.link"))
+                        .expect("stage symlink");
+                    fs::rename(root.join(".record.link"), root.join("record"))
+                        .expect("rename symlink over record");
+                }),
+            ));
+        });
+
+        assert!(matches!(
+            trusted.read_file("record", FILE_MODE, 4),
+            Err(FsError::UnsafeType { .. })
+        ));
+    }
+
+    #[test]
+    fn read_rejects_a_hard_linked_file_without_retrying() {
+        let (temporary, trusted) = trusted_root();
+        write_private(&temporary.path().join("record"), b"old");
+        fs::hard_link(
+            temporary.path().join("record"),
+            temporary.path().join("second"),
+        )
+        .expect("create second link");
+
+        assert!(matches!(
+            trusted.read_file("record", FILE_MODE, 3),
+            Err(FsError::UnsafeLinkCount { actual: 2, .. })
         ));
     }
 
