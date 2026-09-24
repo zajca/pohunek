@@ -814,6 +814,10 @@ impl SessionRegistry {
     }
 
     /// Deletes the record of a create that never produced a usable runtime.
+    ///
+    /// A create left `runtime_supervision_unavailable` is already listed while
+    /// its supervision retry settles it, so that entry leaves the registry
+    /// with the record and subscribers see it removed.
     async fn compensate_abandoned_create(&self, id: &SessionId) {
         if let Err(error) = self.delete_session_record(id).await {
             tracing::warn!(
@@ -821,6 +825,11 @@ impl SessionRegistry {
                 error = %error,
                 "failed to compensate abandoned preparing session"
             );
+            return;
+        }
+        let removed = self.inner.sessions.lock().await.remove(id);
+        if let Some(entry) = removed {
+            self.emit(event::SESSION_REMOVED, &entry.info);
         }
     }
 
@@ -6545,6 +6554,67 @@ while os.getppid() == parent:
                 .load_sessions()
                 .expect("load store")
                 .is_empty());
+        }
+
+        #[tokio::test]
+        async fn abandoned_create_settled_by_a_retry_leaves_the_registry() {
+            let fixture = fixture(Arc::new(HostInspector::new()));
+            let mut record = persist_record(&fixture.root, "s-316", None);
+            record.runtime.worker_id = None;
+            record.transaction = Some(crate::store::SessionTransaction {
+                id: "create-s-316".to_owned(),
+                kind: crate::store::TransactionKind::Create,
+                phase: "preparing".to_owned(),
+                previous_worker_id: None,
+                previous_runtime_id: None,
+            });
+            Store::new(fixture.root.join("data/metadata.jsonl"))
+                .record_session(&record)
+                .expect("persist preparing record");
+            let id = service_id("s-316", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), JobScript::Unavailable);
+            fixture.supervisor.fail_discovery();
+            let mut events = fixture.registry.subscribe();
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let runtime = runtime_of(&fixture.registry, "s-316").await;
+            assert_eq!(runtime.state, RuntimeState::Reconnecting);
+            assert_eq!(
+                runtime.loss_reason.as_deref(),
+                Some(SUPERVISION_UNAVAILABLE)
+            );
+
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            while fixture
+                .registry
+                .inspect(&SessionId("s-316".to_owned()))
+                .await
+                .is_ok()
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the settled create is still listed"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(fixture.supervisor.retired(), vec![id]);
+            assert!(Store::new(fixture.root.join("data/metadata.jsonl"))
+                .load_sessions()
+                .expect("load store")
+                .is_empty());
+            let mut removed = false;
+            while let Ok(event) = events.try_recv() {
+                removed |= event.event() == protocol::event::SESSION_REMOVED
+                    && event.payload()["session"]["id"].as_str() == Some("s-316");
+            }
+            assert!(removed, "subscribers see the settled create removed");
         }
 
         #[tokio::test]

@@ -121,15 +121,16 @@ impl Staged {
 /// Copies the three binaries from `from` into a staging directory and probes them.
 ///
 /// Every staged copy must answer `--version` with its own name and
-/// `version`. The probe runs the copy, never the source, so what is verified
-/// is exactly what gets installed.
+/// `reported`, which is the version being installed except under the
+/// `test-util` version override. The probe runs the copy, never the source,
+/// so what is verified is exactly what gets installed.
 ///
 /// # Errors
 ///
 /// Returns [`Error::StagedBinary`] for a missing source,
 /// [`Error::VersionProbe`] or [`Error::VersionMismatch`] for a failed probe,
 /// and filesystem errors for unsafe directories.
-pub async fn stage(layout: &InstallLayout, from: &Path, version: &str) -> Result<Staged, Error> {
+pub async fn stage(layout: &InstallLayout, from: &Path, reported: &str) -> Result<Staged, Error> {
     let versions = open_owner_dir(&layout.versions_dir(), PUBLIC_MODE)?;
     sweep(&versions)?;
     let name = format!(
@@ -147,7 +148,7 @@ pub async fn stage(layout: &InstallLayout, from: &Path, version: &str) -> Result
         name,
         path: staging.path().to_path_buf(),
     };
-    let result = fill(&staging, from, version).await;
+    let result = fill(&staging, from, reported).await;
     if let Err(error) = result {
         // The staging directory is private scratch; removing it cannot
         // affect an installation, and the next run sweeps it otherwise.

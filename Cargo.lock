@@ -4158,6 +4158,7 @@ dependencies = [
  "keyring",
  "libc",
  "nix 0.29.0",
+ "pohunek-cli",
  "pohunek-client",
  "pohunek-gui-core",
  "pohunek-hostcheck",

@@ -108,6 +108,8 @@ pub struct Engine<'a> {
     stop_timeout: Duration,
     #[cfg(test)]
     interrupt_after: Option<Step>,
+    #[cfg(feature = "test-util")]
+    reported_version: Option<String>,
 }
 
 impl<'a> Engine<'a> {
@@ -123,7 +125,35 @@ impl<'a> Engine<'a> {
             stop_timeout: settings::SESSION_STOP_TIMEOUT,
             #[cfg(test)]
             interrupt_after: None,
+            #[cfg(feature = "test-util")]
+            reported_version: None,
         }
+    }
+
+    /// Accepts staged binaries, and the daemon they run, reporting
+    /// `reported` while installing them under the version directory the
+    /// caller names.
+    ///
+    /// Test-only: one build has one version, so an upgrade between two
+    /// version directories with live workers is exercised by installing the
+    /// same build twice under different directory names. Everything else
+    /// (staging, journal, `service.toml`, daemon replacement, and version GC)
+    /// runs unchanged. The previous daemon reports the same version, so the
+    /// caller must observe the daemon's restart itself.
+    #[cfg(feature = "test-util")]
+    #[must_use]
+    pub fn with_reported_version(mut self, reported: impl Into<String>) -> Self {
+        self.reported_version = Some(reported.into());
+        self
+    }
+
+    /// Version the staged binaries must report when installing `version`.
+    fn reported<'v>(&'v self, version: &'v str) -> &'v str {
+        #[cfg(feature = "test-util")]
+        if let Some(reported) = &self.reported_version {
+            return reported;
+        }
+        version
     }
 
     /// Installs `version` from the binaries in `from` below `prefix`.
@@ -174,7 +204,7 @@ impl<'a> Engine<'a> {
             }
         }
         let config = initial_config(self.context, prefix, version)?;
-        let staged = layout::stage(&layout, from, version).await?;
+        let staged = layout::stage(&layout, from, self.reported(version)).await?;
         let resumed = resume.is_some();
         let mut record = if let Some(record) = resume {
             record
@@ -232,7 +262,7 @@ impl<'a> Engine<'a> {
         })?;
         let layout = config.layout().clone();
         layout::check_trusted(layout.prefix())?;
-        let staged = layout::stage(&layout, from, version).await?;
+        let staged = layout::stage(&layout, from, self.reported(version)).await?;
         let resumed = resume.is_some();
         let from_version = resume
             .as_ref()
@@ -661,7 +691,7 @@ impl<'a> Engine<'a> {
         let deadline = Instant::now() + self.ready_timeout;
         loop {
             let mut last = match self.backend.control().health().await {
-                Ok(health) if health.daemon_version == version => return Ok(()),
+                Ok(health) if health.daemon_version == self.reported(version) => return Ok(()),
                 Ok(health) => Some(format!("daemon reports version {}", health.daemon_version)),
                 Err(error) => Some(error.to_string()),
             };
