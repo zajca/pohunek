@@ -4484,6 +4484,7 @@ dependencies = [
  "pohunek-logging",
  "pohunek-paths",
  "pohunek-platform",
+ "pohunek-service-config",
  "pohunek-terminal",
  "pohunek-worker-protocol",
  "portable-pty",

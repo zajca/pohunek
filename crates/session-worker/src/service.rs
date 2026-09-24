@@ -1,187 +1,342 @@
-//! Verifies the service configuration file a supervised worker starts with.
+//! Loads and verifies the service configuration a supervised worker starts with.
 //!
 //! A worker started by systemd or launchd receives `--service-config <path>`
-//! naming the installation's `service.toml`. The worker refuses to start when
-//! that file is not a trustworthy owner-private regular file, so a broken
-//! installation fails before the worker binds its socket. Typed parsing of the
-//! file's contents belongs to the `pohunek-service-config` crate.
+//! naming the installation's `service.toml`. Before binding its socket the
+//! worker parses that file with [`ServiceConfig::load`], which also enforces
+//! the owner-private `0600` trust rules, and then proves that the file belongs
+//! to this installation and this binary:
+//!
+//! - [`ServiceConfig::verify_installation`] compares the recorded user and
+//!   canonical state and runtime roots with the worker's own, so a file written
+//!   for another user or installation is refused;
+//! - the running executable must be the session worker of *some* version
+//!   directory below the recorded prefix. It is deliberately not required to be
+//!   the active version: an upgrade rewrites `active_version` while live
+//!   workers keep running, and until the daemon restarts it may still start
+//!   generations from the version it runs.
 
 // Rust guideline compliant 2026-09-24
 
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-/// Permission bit that lets the owner read a file.
-const OWNER_READ: u32 = 0o400;
-/// Permission bits that let anyone but the owner modify a file.
-const NON_OWNER_WRITE: u32 = 0o022;
-/// Permission bits carried by `st_mode`, excluding the file type.
-const PERMISSION_BITS: u32 = 0o7777;
+use pohunek_paths::BasePaths;
+use pohunek_service_config::{ConfigError, ServiceConfig};
 
-/// Reports why a service configuration file cannot be trusted.
+/// Reports why a worker refuses its service configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceConfigError {
-    /// The path is relative.
-    #[error("service configuration path {} must be absolute", path.display())]
-    NotAbsolute {
-        /// Rejected path.
-        path: PathBuf,
+    /// The file is untrusted, unreadable, malformed, or records another installation.
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    /// The running worker is not an installed session worker of this prefix.
+    #[error(
+        "worker executable {} is not a session worker below {} of the service configuration",
+        executable.display(),
+        versions_dir.display()
+    )]
+    ForeignExecutable {
+        /// Canonical path of the running executable.
+        executable: PathBuf,
+        /// Recorded `<prefix>/libexec/pohunek` directory.
+        versions_dir: PathBuf,
     },
-    /// The path could not be inspected, including when it does not exist.
-    #[error("service configuration {} is not accessible: {source}", path.display())]
-    Inaccessible {
-        /// Inspected path.
+    /// A path needed for the executable comparison could not be resolved.
+    #[error("cannot resolve {} for the service configuration check: {source}", path.display())]
+    Resolve {
+        /// Path that failed to resolve.
         path: PathBuf,
         /// Underlying I/O error.
         source: std::io::Error,
     },
-    /// The path names a symlink, directory, or other non-regular file.
-    #[error("service configuration {} is not a regular file", path.display())]
-    NotRegularFile {
-        /// Inspected path.
-        path: PathBuf,
-    },
-    /// Another user owns the file.
-    #[error(
-        "service configuration {} is owned by uid {owner}, expected {expected}",
-        path.display()
-    )]
-    ForeignOwner {
-        /// Inspected path.
-        path: PathBuf,
-        /// Observed owner.
-        owner: u32,
-        /// Effective user of this worker.
-        expected: u32,
-    },
-    /// The owner cannot read the file, or other users can modify it.
-    #[error(
-        "service configuration {} has mode {mode:04o}; it must be owner-readable \
-         and not group- or world-writable",
-        path.display()
-    )]
-    UnsafeMode {
-        /// Inspected path.
-        path: PathBuf,
-        /// Observed permission bits.
-        mode: u32,
-    },
 }
 
-/// Verifies that `path` is an owner-private service configuration file.
+/// Loads `path` and verifies it describes this installation and executable.
 ///
-/// The file must be an absolute, regular, non-symlink file owned by the
-/// worker's effective user, readable by that owner, and not writable by group
-/// or others.
+/// `uid` is the worker's effective user, `paths` its resolved application
+/// directories, and `executable` the running worker binary.
 ///
 /// # Errors
 ///
-/// Returns [`ServiceConfigError`] naming the first violated requirement.
-pub fn load_service_config(path: &Path) -> Result<(), ServiceConfigError> {
-    if !path.is_absolute() {
-        return Err(ServiceConfigError::NotAbsolute {
-            path: path.to_path_buf(),
-        });
-    }
-    let metadata =
-        std::fs::symlink_metadata(path).map_err(|source| ServiceConfigError::Inaccessible {
-            path: path.to_path_buf(),
+/// Returns [`ServiceConfigError::Config`] for every [`ServiceConfig::load`]
+/// and [`ServiceConfig::verify_installation`] failure (missing, untrusted,
+/// invalid, or foreign file), [`ServiceConfigError::ForeignExecutable`] when
+/// `executable` is not `<prefix>/libexec/pohunek/<version>/pohunek-sessiond`,
+/// and [`ServiceConfigError::Resolve`] when that comparison cannot resolve a
+/// path.
+pub fn load_service_config(
+    path: &Path,
+    uid: u32,
+    paths: &BasePaths,
+    executable: &Path,
+) -> Result<ServiceConfig, ServiceConfigError> {
+    let config = ServiceConfig::load(path)?;
+    config.verify_installation(uid, &paths.state_dir, &paths.runtime_dir)?;
+    verify_executable(&config, executable)?;
+    Ok(config)
+}
+
+/// Requires `executable` to be the worker binary of a recorded version directory.
+fn verify_executable(config: &ServiceConfig, executable: &Path) -> Result<(), ServiceConfigError> {
+    let executable = canonicalize(executable)?;
+    let versions_dir = config.layout().versions_dir();
+    let foreign = || ServiceConfigError::ForeignExecutable {
+        executable: executable.clone(),
+        versions_dir: versions_dir.clone(),
+    };
+    let version = executable
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .ok_or_else(foreign)?;
+    let expected = config
+        .layout()
+        .worker_executable(version)
+        .ok_or_else(foreign)?;
+    // The recorded prefix may traverse symlinks (for example a relocated
+    // home); compare resolved paths so only the real file identity matters.
+    match std::fs::canonicalize(&expected) {
+        Ok(expected) if expected == executable => Ok(()),
+        Ok(_) => Err(foreign()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(foreign()),
+        Err(source) => Err(ServiceConfigError::Resolve {
+            path: expected,
             source,
-        })?;
-    if !metadata.file_type().is_file() {
-        return Err(ServiceConfigError::NotRegularFile {
-            path: path.to_path_buf(),
-        });
+        }),
     }
-    let expected = rustix::process::geteuid().as_raw();
-    if metadata.uid() != expected {
-        return Err(ServiceConfigError::ForeignOwner {
-            path: path.to_path_buf(),
-            owner: metadata.uid(),
-            expected,
-        });
-    }
-    let mode = metadata.mode() & PERMISSION_BITS;
-    if mode & OWNER_READ == 0 || mode & NON_OWNER_WRITE != 0 {
-        return Err(ServiceConfigError::UnsafeMode {
-            path: path.to_path_buf(),
-            mode,
-        });
-    }
-    Ok(())
+}
+
+fn canonicalize(path: &Path) -> Result<PathBuf, ServiceConfigError> {
+    std::fs::canonicalize(path).map_err(|source| ServiceConfigError::Resolve {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    use pohunek_paths::{PathEnv, Platform};
+    use pohunek_service_config::{ConfigSpec, Deadlines};
 
     use super::*;
 
-    fn config_file(mode: u32) -> (tempfile::TempDir, PathBuf) {
-        let root = tempfile::tempdir().expect("create temporary directory");
-        let path = root.path().join("service.toml");
-        fs::write(&path, b"schema_version = 1\n").expect("write service configuration");
-        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("chmod");
-        (root, path)
+    const VERSION: &str = "1.2.3";
+    const OLD_VERSION: &str = "1.2.2";
+
+    struct Installation {
+        _root: tempfile::TempDir,
+        paths: BasePaths,
+        config_path: PathBuf,
+        prefix: PathBuf,
+        uid: u32,
     }
 
-    #[test]
-    fn an_owner_private_regular_file_is_accepted() {
-        for mode in [0o600, 0o400, 0o644] {
-            let (_root, path) = config_file(mode);
-            load_service_config(&path).expect("owner-private configuration");
+    fn private_dir(path: &Path) {
+        fs::create_dir_all(path).expect("create directory");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+
+    fn install_worker(prefix: &Path, version: &str) -> PathBuf {
+        let executable = prefix
+            .join("libexec/pohunek")
+            .join(version)
+            .join("pohunek-sessiond");
+        fs::create_dir_all(executable.parent().expect("version dir")).expect("version dir");
+        fs::write(&executable, b"#!/bin/sh\n").expect("write worker");
+        executable
+    }
+
+    fn installation() -> Installation {
+        let root = tempfile::tempdir_in(crate::test_support::temp_root()).expect("root");
+        let base = fs::canonicalize(root.path()).expect("canonical root");
+        let env = |name: &str| {
+            let path = base.join(name);
+            private_dir(&path);
+            Some(path.into_os_string())
+        };
+        let paths = BasePaths::resolve_for(
+            Platform::current().expect("platform"),
+            rustix::process::geteuid().as_raw(),
+            &PathEnv {
+                xdg_runtime_dir: env("run"),
+                xdg_data_home: env("data"),
+                xdg_state_home: env("state"),
+                xdg_cache_home: env("cache"),
+                xdg_config_home: env("config"),
+                home: env("home"),
+            },
+        )
+        .expect("resolve paths");
+        for path in [&paths.runtime_dir, &paths.state_dir, &paths.config_dir] {
+            private_dir(path);
+        }
+        let prefix = base.join("prefix");
+        let uid = rustix::process::geteuid().as_raw();
+        let deadline = Duration::from_secs(1);
+        let config = ServiceConfig::new(ConfigSpec {
+            prefix: prefix.clone(),
+            active_version: VERSION.to_owned(),
+            uid,
+            state_root: fs::canonicalize(&paths.state_dir).expect("state root"),
+            runtime_root: fs::canonicalize(&paths.runtime_dir).expect("runtime root"),
+            deadlines: Deadlines {
+                worker_connect: deadline,
+                worker_initialize: deadline,
+                launchctl_command: deadline,
+                worker_exit_timeout: deadline,
+                daemon_exit_timeout: deadline,
+                daemon_restart_throttle: deadline,
+            },
+            environment_allowlist: vec!["PATH".to_owned(), "LC_*".to_owned()],
+            sweep_grace: deadline,
+            open_files: 8192,
+        })
+        .expect("valid configuration");
+        let config_path = pohunek_service_config::file_path(&paths);
+        config.write(&config_path).expect("write configuration");
+        Installation {
+            _root: root,
+            paths,
+            config_path,
+            prefix,
+            uid,
+        }
+    }
+
+    impl Installation {
+        fn load(&self, executable: &Path) -> Result<ServiceConfig, ServiceConfigError> {
+            load_service_config(&self.config_path, self.uid, &self.paths, executable)
+        }
+
+        fn overwrite(&self, contents: &str) {
+            fs::write(&self.config_path, contents).expect("overwrite configuration");
         }
     }
 
     #[test]
-    fn a_relative_path_is_rejected() {
-        assert!(matches!(
-            load_service_config(Path::new("service.toml")),
-            Err(ServiceConfigError::NotAbsolute { .. })
-        ));
+    fn a_valid_configuration_for_this_installation_is_accepted() {
+        let installation = installation();
+        let executable = install_worker(&installation.prefix, VERSION);
+
+        let config = installation.load(&executable).expect("valid configuration");
+
+        assert_eq!(config.active_version(), VERSION);
+        assert_eq!(config.environment_allowlist(), ["PATH", "LC_*"]);
     }
 
     #[test]
-    fn a_missing_file_is_rejected() {
-        let root = tempfile::tempdir().expect("create temporary directory");
+    fn a_worker_of_a_previous_version_is_accepted_after_upgrade() {
+        let installation = installation();
+        let executable = install_worker(&installation.prefix, OLD_VERSION);
 
-        let error = load_service_config(&root.path().join("service.toml"))
-            .expect_err("missing file must fail");
-
-        assert!(matches!(
-            error,
-            ServiceConfigError::Inaccessible { ref source, .. }
-                if source.kind() == std::io::ErrorKind::NotFound
-        ));
+        installation
+            .load(&executable)
+            .expect("installed previous version");
     }
 
     #[test]
-    fn directories_and_symlinks_are_rejected() {
-        let (root, path) = config_file(0o600);
-        let link = root.path().join("link.toml");
-        symlink(&path, &link).expect("create symlink");
+    fn truncated_or_invalid_toml_is_refused() {
+        let installation = installation();
+        let executable = install_worker(&installation.prefix, VERSION);
+        let valid = fs::read_to_string(&installation.config_path).expect("read configuration");
 
-        assert!(matches!(
-            load_service_config(root.path()),
-            Err(ServiceConfigError::NotRegularFile { .. })
-        ));
-        assert!(matches!(
-            load_service_config(&link),
-            Err(ServiceConfigError::NotRegularFile { .. })
-        ));
-    }
-
-    #[test]
-    fn unreadable_or_shared_writable_files_are_rejected() {
-        for mode in [0o200, 0o000, 0o620, 0o602, 0o666] {
-            let (_root, path) = config_file(mode);
+        for contents in [
+            &valid[..valid.len() / 2],
+            "",
+            "schema_version = 1\nprefix = [",
+            "not toml at all",
+        ] {
+            installation.overwrite(contents);
             assert!(
                 matches!(
-                    load_service_config(&path),
-                    Err(ServiceConfigError::UnsafeMode { mode: observed, .. }) if observed == mode
+                    installation.load(&executable),
+                    Err(ServiceConfigError::Config(ConfigError::Parse { .. }))
                 ),
-                "mode {mode:04o} must be rejected"
+                "{contents:?} must be refused"
+            );
+        }
+        installation.overwrite(&format!("{valid}\nunknown_key = 1\n"));
+        assert!(matches!(
+            installation.load(&executable),
+            Err(ServiceConfigError::Config(ConfigError::Parse { .. }))
+        ));
+    }
+
+    #[test]
+    fn a_missing_or_untrusted_file_is_refused() {
+        let installation = installation();
+        let executable = install_worker(&installation.prefix, VERSION);
+
+        fs::set_permissions(&installation.config_path, fs::Permissions::from_mode(0o644))
+            .expect("chmod");
+        assert!(matches!(
+            installation.load(&executable),
+            Err(ServiceConfigError::Config(ConfigError::Untrusted { .. }))
+        ));
+
+        fs::remove_file(&installation.config_path).expect("remove configuration");
+        assert!(matches!(
+            installation.load(&executable),
+            Err(ServiceConfigError::Config(ConfigError::Io { .. }))
+        ));
+    }
+
+    #[test]
+    fn a_configuration_of_another_installation_is_refused() {
+        let installation = installation();
+        let executable = install_worker(&installation.prefix, VERSION);
+        let other = self::installation();
+
+        assert!(matches!(
+            load_service_config(
+                &installation.config_path,
+                installation.uid,
+                &other.paths,
+                &executable,
+            ),
+            Err(ServiceConfigError::Config(
+                ConfigError::NamespaceMismatch { .. }
+            ))
+        ));
+        assert!(matches!(
+            load_service_config(
+                &installation.config_path,
+                installation.uid.wrapping_add(1),
+                &installation.paths,
+                &executable,
+            ),
+            Err(ServiceConfigError::Config(
+                ConfigError::NamespaceMismatch { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn an_executable_outside_the_recorded_layout_is_refused() {
+        let installation = installation();
+        install_worker(&installation.prefix, VERSION);
+        let stray = installation.prefix.join("pohunek-sessiond");
+        fs::write(&stray, b"#!/bin/sh\n").expect("write stray worker");
+        let renamed = installation
+            .prefix
+            .join("libexec/pohunek")
+            .join(VERSION)
+            .join("pohunekd");
+        fs::write(&renamed, b"#!/bin/sh\n").expect("write misnamed worker");
+        let elsewhere = tempfile::tempdir_in(crate::test_support::temp_root()).expect("dir");
+        let foreign = install_worker(elsewhere.path(), VERSION);
+
+        for executable in [&stray, &renamed, &foreign] {
+            assert!(
+                matches!(
+                    installation.load(executable),
+                    Err(ServiceConfigError::ForeignExecutable { .. })
+                ),
+                "{} must be refused",
+                executable.display()
             );
         }
     }

@@ -57,6 +57,14 @@ pub const SUPERVISION_AMBIGUOUS: &str = "runtime_supervision_ambiguous";
 /// executable than the durable record; the runtime is `Conflict`.
 pub const IDENTITY_MISMATCH: &str = "runtime_identity_mismatch";
 
+/// Error code for a new generation whose worker negotiated an outdated protocol.
+///
+/// New generations must carry the base-environment contract
+/// ([`pohunek_worker_protocol::BASE_ENVIRONMENT_VERSION`]); a worker that
+/// cannot would give its agent the service manager's environment. Such a
+/// generation is never initialized and is retired by exact generation.
+pub const WORKER_PROTOCOL_OUTDATED: &str = "worker_protocol_outdated";
+
 /// Worker socket negotiation bound of the dev/test subprocess contract.
 ///
 /// Mirrors the `worker_connect_ms` value `pohunek service install` writes; a
@@ -536,15 +544,46 @@ impl Lifecycle<'_> {
     /// Registers `generation` and returns its authenticated worker.
     ///
     /// Commit points 2 and 3: the job is started, then the worker is accepted
-    /// only when its journal names exactly this generation. On failure the job
-    /// is reconciled as described in the module documentation, so an `Err`
-    /// never leaves an untracked live job behind unless it is
-    /// [`LaunchFailure::Unavailable`].
+    /// only when its journal names exactly this generation and it negotiated
+    /// at least [`pohunek_worker_protocol::BASE_ENVIRONMENT_VERSION`]. On
+    /// failure the job is reconciled as described in the module
+    /// documentation, so an `Err` never leaves an untracked live job behind
+    /// unless it is [`LaunchFailure::Unavailable`]. Reconnecting to an already
+    /// running generation does not go through here, so a live version-five
+    /// worker kept across an upgrade stays adoptable.
     ///
     /// # Errors
     ///
-    /// Returns [`LaunchFailure`] classifying what is left of the generation.
+    /// Returns [`LaunchFailure`] classifying what is left of the generation;
+    /// a worker below the base-environment protocol is never initialized and
+    /// is abandoned with [`WORKER_PROTOCOL_OUTDATED`].
     pub async fn launch(&self, generation: &Generation) -> Result<Worker, LaunchFailure> {
+        let worker = self.start_and_connect(generation).await?;
+        let version = worker.selected_version().await;
+        if version < pohunek_worker_protocol::BASE_ENVIRONMENT_VERSION {
+            tracing::warn!(
+                session_id = generation.session_id(),
+                worker.generation = generation.generation(),
+                worker.protocol = %version,
+                "new worker generation negotiated an outdated protocol; retiring it"
+            );
+            drop(worker);
+            let cause = lifecycle_error(
+                WORKER_PROTOCOL_OUTDATED,
+                format!(
+                    "worker generation {} negotiated protocol {version}; new generations \
+                     require {}",
+                    generation.service_id(),
+                    pohunek_worker_protocol::BASE_ENVIRONMENT_VERSION
+                ),
+            );
+            return Err(self.abandon(generation, cause).await);
+        }
+        Ok(worker)
+    }
+
+    /// Commit points 2 and 3 without the protocol check of [`Self::launch`].
+    async fn start_and_connect(&self, generation: &Generation) -> Result<Worker, LaunchFailure> {
         let definition = job_definition(self.config, generation).map_err(|error| {
             LaunchFailure::Cleaned(lifecycle_error(
                 "worker_definition_invalid",

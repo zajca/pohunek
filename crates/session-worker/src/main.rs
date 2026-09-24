@@ -64,10 +64,17 @@ fn print_version() -> ExitCode {
 
 async fn run() -> Result<(), WorkerError> {
     let cli = Cli::parse(std::env::args().skip(1))?;
-    if let Some(service_config) = &cli.service_config {
-        load_service_config(service_config)?;
-    }
     let paths = BasePaths::resolve()?;
+    if let Some(service_config) = &cli.service_config {
+        let executable =
+            std::env::current_exe().map_err(|source| WorkerError::Executable { source })?;
+        load_service_config(
+            service_config,
+            rustix::process::geteuid().as_raw(),
+            &paths,
+            &executable,
+        )?;
+    }
     let worker_id = match cli.worker_id {
         Some(worker_id) => worker_id,
         None => generate_worker_id()?,

@@ -343,6 +343,11 @@ impl Worker {
         self.inner.lock().await.worker_id.clone()
     }
 
+    /// Returns the private protocol version negotiated for this connection.
+    pub async fn selected_version(&self) -> Version {
+        self.inner.lock().await.selected_version
+    }
+
     /// Returns the current runtime identity.
     pub async fn runtime_id(&self) -> Option<RuntimeId> {
         self.inner.lock().await.runtime_id.clone()

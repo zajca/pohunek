@@ -1244,3 +1244,152 @@ async fn one_session_is_serialized_and_different_sessions_are_not() {
     drop((second, other));
     assert_eq!(locks.tracked(), 0, "released sessions leave no lock entry");
 }
+
+/// Serves one controller connection as a worker that only speaks version five.
+///
+/// Returns the request kinds received after the controller lease, so a test
+/// can prove the daemon never sent `Initialize`.
+fn serve_version_five_worker(
+    socket: &Path,
+    session_id: &str,
+    worker_id: &str,
+) -> tokio::task::JoinHandle<Vec<String>> {
+    use pohunek_worker_protocol::{
+        Capability, ControlMessage, ControlReader, ControlResponse, ControlWriter, LeaseChallenge,
+        LeaseId, ProcessIdentity as WireProcess, RequestKind, ResponseKind, RuntimePhase,
+        SessionId, Version, VersionRange, WorkerId,
+    };
+
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(socket.parent().expect("socket directory"))
+        .expect("create socket directory");
+    let listener = tokio::net::UnixListener::bind(socket).expect("bind fake worker");
+    let session_id = SessionId::new(session_id).expect("session id");
+    let worker_id = WorkerId::new(worker_id).expect("worker id");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept controller");
+        let (read_half, write_half) = stream.into_split();
+        let mut reader = ControlReader::new(read_half);
+        let mut writer = ControlWriter::new(write_half);
+        let five = Version::new(5).expect("version five");
+        let mut after_lease = Vec::new();
+        while let Some(message) = reader
+            .read::<ControlMessage>()
+            .await
+            .expect("read control message")
+        {
+            let ControlMessage::Request(request) = message else {
+                panic!("daemon sent a non-request message");
+            };
+            let kind = match request.kind {
+                RequestKind::Negotiate { .. } => ResponseKind::Negotiated {
+                    selected_version: five,
+                    supported_range: VersionRange::new(Version::new(4).expect("v4"), five)
+                        .expect("range"),
+                    session_id: session_id.clone(),
+                    worker_id: worker_id.clone(),
+                    runtime_id: None,
+                    worker_process: WireProcess {
+                        pid: std::process::id(),
+                        start_identity: 1,
+                    },
+                    phase: RuntimePhase::Uninitialized,
+                    capabilities: vec![Capability::AtomicReplay],
+                    challenge: LeaseChallenge::new("challenge-v5").expect("challenge"),
+                },
+                RequestKind::AcquireController { .. } => ResponseKind::ControllerAcquired {
+                    lease_id: LeaseId::new("lease-v5").expect("lease"),
+                    capabilities: Vec::new(),
+                },
+                other => {
+                    after_lease.push(format!("{other:?}"));
+                    continue;
+                }
+            };
+            writer
+                .write(&ControlMessage::Response(ControlResponse {
+                    request_id: request.request_id,
+                    kind,
+                }))
+                .await
+                .expect("write response");
+            writer.flush().await.expect("flush response");
+        }
+        after_lease
+    })
+}
+
+#[tokio::test]
+async fn a_new_generation_below_the_base_environment_protocol_is_retired_uninitialized() {
+    let harness = Harness::scripted(GENEROUS, INITIALIZE);
+    let generation = harness.generation("s-1");
+    harness.write_journal(
+        "s-1",
+        "worker-v5",
+        &journal(
+            "s-1",
+            "worker-v5",
+            generation.generation(),
+            "bootstrap",
+            std::process::id(),
+        ),
+    );
+    let fake = serve_version_five_worker(
+        &harness
+            .runtime_root
+            .join("s-1")
+            .join(pohunek_paths::WORKER_SOCKET_NAME),
+        "s-1",
+        "worker-v5",
+    );
+
+    let failure = harness
+        .lifecycle()
+        .launch(&generation)
+        .await
+        .expect_err("a version-five worker must not start a new generation");
+
+    assert!(
+        matches!(&failure, LaunchFailure::Cleaned(error) if error.code == WORKER_PROTOCOL_OUTDATED),
+        "{failure:?}"
+    );
+    assert_eq!(
+        harness.supervisor.calls(),
+        [
+            Call::Start(generation.service_id()),
+            Call::Retire(generation.service_id()),
+        ]
+    );
+    let after_lease = tokio::time::timeout(GENEROUS, fake)
+        .await
+        .expect("controller connection closed")
+        .expect("fake worker task");
+    assert!(
+        after_lease.is_empty(),
+        "no request may follow the lease, got {after_lease:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_live_version_five_worker_stays_adoptable_by_reconnection() {
+    let harness = Harness::scripted(GENEROUS, INITIALIZE);
+    let socket = harness
+        .runtime_root
+        .join("s-1")
+        .join(pohunek_paths::WORKER_SOCKET_NAME);
+    let fake = serve_version_five_worker(&socket, "s-1", "worker-v5");
+
+    // Reconciliation reconnects through the worker client directly, never
+    // through `Lifecycle::launch`, so the version floor does not apply.
+    let worker = Worker::connect_discovered(&socket, "daemon-after-upgrade")
+        .await
+        .expect("reconnect to a live version-five worker");
+
+    assert_eq!(
+        worker.selected_version().await,
+        pohunek_worker_protocol::Version::new(5).expect("version five")
+    );
+    drop(worker);
+    fake.await.expect("fake worker task");
+}
