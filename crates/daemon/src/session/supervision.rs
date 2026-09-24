@@ -192,9 +192,12 @@ pub(super) enum Unreachable {
     Ended {
         /// Whether the generation's worker had journaled at all; a journaled
         /// worker that is gone crashed, while a missing journal means it
-        /// never started.
+        /// never started. Callers pass no journal only after a successful
+        /// scan found none for the generation.
         journaled: bool,
-        /// Runtime whose marked processes may have survived the worker.
+        /// Runtime whose marked processes may have survived the worker; set
+        /// only when `journaled`, since only the journal's PID check proves
+        /// which runtime died.
         runtime_id: Option<String>,
     },
 }

@@ -55,7 +55,8 @@ Interpret runtime states as follows:
   generation's leftover processes. `runtime_lost_cleanup_unconfirmed` means the
   same, but the sweep could not confirm that every marked process ended;
   inspect `ps` for processes of that session before recovering it. A lost
-  session without a journal for its generation reports `worker_unavailable`.
+  session without a journal for its generation reports `worker_unavailable`;
+  its job is retired, but no process is swept, so check `ps` for leftovers.
   The same classification runs when a worker dies while the daemon is running:
   a proven crash is reported `lost` immediately, and a worker that stays
   unreachable is classified after the worker connect deadline (`conflict`
@@ -64,7 +65,8 @@ Interpret runtime states as follows:
   unlink, or kill either candidate automatically. Preserve the job, journal,
   and socket evidence for diagnosis. `runtime_supervision_ambiguous` means the
   native job is present but its worker socket does not answer and its journal is
-  not terminal. It is not permanent: the daemon re-checks it in the background
+  not terminal, or that its journals or worker socket directory could not be
+  read at all. It is not permanent: the daemon re-checks it in the background
   (after 1 s, doubling to at most 60 s) without killing anything, adopts the
   worker when it answers again, and reports `lost` with `runtime_lost` once the
   job ends and the journaled worker process is gone. A create that was pending
