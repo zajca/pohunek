@@ -17,6 +17,11 @@ use std::time::Duration;
 
 use crate::process::ProcessIdentity;
 
+// The launchd module is also built for tests on every host so its
+// target-neutral `launchctl` runner and plist rendering are covered by the
+// ordinary test gate; the backends inside it exist only on macOS.
+#[cfg(any(target_os = "macos", test))]
+pub mod launchd;
 pub mod namespace;
 #[cfg(target_os = "linux")]
 pub mod systemd;
