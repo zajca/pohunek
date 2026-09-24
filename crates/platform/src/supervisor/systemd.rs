@@ -384,6 +384,24 @@ impl SystemdDaemon {
         }
     }
 
+    /// Enables the daemon unit for login; enabling an enabled unit is a no-op.
+    ///
+    /// The unit is enabled persistently (`runtime = false`) so the symlink
+    /// survives reboot, and with `force = true` so a conflicting symlink is
+    /// replaced rather than failing the call.
+    async fn enable(
+        &self,
+        manager: &zbus::Proxy<'_>,
+        name: &str,
+        operation: &'static str,
+    ) -> Result<(), Error> {
+        let _changes: (bool, Vec<(String, String, String)>) = manager
+            .call("EnableUnitFiles", &(vec![name], false, true))
+            .await
+            .map_err(|source| unit_error(operation, &self.id, source))?;
+        Ok(())
+    }
+
     fn write_units(&self, daemon_unit: &str, create: bool) -> Result<(), Error> {
         let Some(directory) = open_unit_dir(&self.unit_dir, create)? else {
             return Err(Error::NotFound(self.id.clone()));
@@ -410,10 +428,7 @@ impl DaemonSupervisor for SystemdDaemon {
             self.write_units(&unit, true)?;
             self.bus.reload(OPERATION).await?;
             let manager = self.bus.manager(OPERATION).await?;
-            let _changes: (bool, Vec<(String, String, String)>) = manager
-                .call("EnableUnitFiles", &(vec![name.as_str()], false, true))
-                .await
-                .map_err(|source| unit_error(OPERATION, &self.id, source))?;
+            self.enable(&manager, &name, OPERATION).await?;
             let _job: OwnedObjectPath = manager
                 .call("StartUnit", &(name.as_str(), START_MODE))
                 .await
@@ -440,6 +455,9 @@ impl DaemonSupervisor for SystemdDaemon {
             self.write_units(&unit, false)?;
             self.bus.reload(OPERATION).await?;
             let manager = self.bus.manager(OPERATION).await?;
+            // A resumed install reaches `replace` with the unit file written
+            // but possibly never enabled, so enabling is part of the contract.
+            self.enable(&manager, &name, OPERATION).await?;
             let _job: OwnedObjectPath = manager
                 .call("RestartUnit", &(name.as_str(), RESTART_MODE))
                 .await
@@ -581,7 +599,8 @@ impl Bus {
     ///
     /// Unit state, main PID, and control group are read twice around the
     /// process checks; any change, a reused PID, or a main process outside the
-    /// unit's control group is a [`Error::Race`]. A starting unit whose main
+    /// unit's control group is a [`Error::Race`]. A failed command read is
+    /// also a race when the unit changed meanwhile. A starting unit whose main
     /// process does not run `ExecStart` yet is observed without a process.
     async fn observe(&self, name: &str, id: &ServiceId) -> Result<ServiceObservation, Error> {
         const OPERATION: &str = "inspect";
@@ -609,11 +628,21 @@ impl Bus {
             let in_control_group = inspector
                 .is_in_control_group(before.main_pid, &before.control_group)
                 .map_err(|source| process_error("inspect_process_control_group", source))?;
-            let live = read_live_command(
+            let live = match read_live_command(
                 inspector,
                 identity_before,
                 before.active_state == "activating",
-            )?;
+            ) {
+                Ok(live) => live,
+                Err(error) => {
+                    // The snapshot's properties are read one call at a time,
+                    // so a restart can pair a stale `ActiveState` with the
+                    // next fork's `MainPID`; a changed unit makes it a race.
+                    let after = read_snapshot(&unit, &service, "reinspect_snapshot").await?;
+                    validate_stable_observation(&before, &after)?;
+                    return Err(error);
+                }
+            };
             let after = read_snapshot(&unit, &service, "reinspect_snapshot").await?;
             let identity_after = inspector
                 .identity(before.main_pid)

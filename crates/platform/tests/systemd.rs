@@ -709,11 +709,7 @@ async fn daemon_unit_installs_replaces_inspects_and_uninstalls() {
     .await;
     assert_eq!(first.id.as_str(), daemon_unit);
     assert_eq!(first.definition, Some(definition.facts()));
-    let enabled = Command::new("systemctl")
-        .args(["--user", "is-enabled", &daemon_unit])
-        .output()
-        .expect("run systemctl is-enabled");
-    assert_eq!(String::from_utf8_lossy(&enabled.stdout).trim(), "enabled");
+    assert_eq!(unit_file_state(&daemon_unit), "enabled");
     let accounting = show(&slice, &["MemoryAccounting", "TasksAccounting"]);
     for key in ["MemoryAccounting", "TasksAccounting"] {
         assert_eq!(
@@ -746,6 +742,67 @@ async fn daemon_unit_installs_replaces_inspects_and_uninstalls() {
     assert!(!unit_dir.join(&daemon_unit).exists());
     assert!(!unit_dir.join(&slice).exists());
     daemon.uninstall().await.expect("uninstall is idempotent");
+}
+
+/// Returns `systemctl --user is-enabled` for one unit, such as `enabled`.
+fn unit_file_state(unit: &str) -> String {
+    let output = Command::new("systemctl")
+        .args(["--user", "is-enabled", unit])
+        .output()
+        .expect("run systemctl is-enabled");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn replace_enables_a_written_but_disabled_daemon_unit() {
+    require_e2e();
+    let mut installation = Installation::new();
+    let unit_dir = user_unit_dir();
+    let daemon_unit = installation.namespace.daemon_unit();
+    installation.cleanup.unit_dir = Some((
+        unit_dir.clone(),
+        vec![daemon_unit.clone(), installation.namespace.sessions_slice()],
+    ));
+    let mut spec = fixture_spec(installation.root.path(), "ready");
+    spec.restart = RestartPolicy::OnFailure {
+        throttle: Duration::from_secs(1),
+    };
+    let definition = JobDefinition::new(spec).expect("valid definition");
+    let daemon = SystemdDaemon::connect(installation.namespace.clone(), unit_dir, CALL_TIMEOUT)
+        .await
+        .expect("connect to the systemd user manager");
+    daemon.install(&definition).await.expect("install daemon");
+    wait_for_daemon(&daemon, |observation| {
+        observation.state == ServiceState::Running
+    })
+    .await;
+
+    // An install interrupted between writing the unit and enabling it leaves
+    // exactly this state: the unit file present but not enabled for login.
+    let disabled = Command::new("systemctl")
+        .args(["--user", "disable", &daemon_unit])
+        .output()
+        .expect("run systemctl disable");
+    assert!(
+        disabled.status.success(),
+        "systemctl disable {daemon_unit} failed: {}",
+        String::from_utf8_lossy(&disabled.stderr)
+    );
+    assert_eq!(unit_file_state(&daemon_unit), "disabled");
+
+    daemon.replace(&definition).await.expect("replace daemon");
+    assert_eq!(unit_file_state(&daemon_unit), "enabled");
+    wait_for_daemon(&daemon, |observation| {
+        observation.state == ServiceState::Running
+    })
+    .await;
+    assert_eq!(
+        show(&daemon_unit, &["ActiveState"])["ActiveState"],
+        "active"
+    );
+
+    daemon.uninstall().await.expect("uninstall daemon");
 }
 
 async fn wait_for_daemon(

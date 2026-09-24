@@ -429,7 +429,12 @@ pub trait DaemonSupervisor: std::fmt::Debug + Send + Sync {
     /// Fails with [`Error::AlreadyRegistered`] when a daemon job is loaded.
     fn install<'a>(&'a self, definition: &'a JobDefinition) -> Operation<'a, ()>;
 
-    /// Rewrites the daemon definition and restarts only the daemon job.
+    /// Rewrites the daemon definition, enables it for login, and restarts
+    /// only the daemon job.
+    ///
+    /// Enabling is idempotent and always performed, so `replace` also
+    /// completes an install interrupted after the definition was written.
+    /// Fails with [`Error::NotFound`] when no daemon definition exists.
     fn replace<'a>(&'a self, definition: &'a JobDefinition) -> Operation<'a, ()>;
 
     /// Inspects the daemon job; an absent job is [`Error::NotFound`].
