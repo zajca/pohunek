@@ -1351,6 +1351,18 @@ struct ForegroundBlock {
 }
 
 impl MockInspector {
+    /// Returns the scripted fact for `pid`, if any test registered one.
+    fn fact(&self, pid: Pid) -> Option<ProcessFact> {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .descendants
+            .values()
+            .flatten()
+            .find(|fact| fact.pid == pid)
+            .cloned()
+    }
+
     fn set_descendants(&self, root: Pid, facts: Vec<ProcessFact>) {
         let mut inner = self.inner.lock().expect("mock inspector lock");
         for fact in &facts {
@@ -1538,8 +1550,15 @@ impl ProcessInspector for MockInspector {
         {
             return Ok(identity);
         }
-        self.process(pid)
-            .map(|fact| fact.map(|fact| fact.identity()))
+        match self.fact(pid) {
+            Some(fact) => Ok(Some(fact.identity())),
+            // A real process (the session root) is identified the way the
+            // production liveness checks do it: from the kernel process record
+            // alone. A full `process` read also parses the argument region,
+            // which Darwin can serve malformed while the root is still inside
+            // its `sh` -> `bash` -> command exec chain right after launch.
+            None => crate::procwatch::HostInspector::new().identity(pid),
+        }
     }
 
     fn is_running(&self, identity: ProcessIdentity) -> Result<bool, crate::procwatch::Error> {
@@ -1560,16 +1579,7 @@ impl ProcessInspector for MockInspector {
     }
 
     fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, crate::procwatch::Error> {
-        let fact = self
-            .inner
-            .lock()
-            .expect("mock inspector lock")
-            .descendants
-            .values()
-            .flatten()
-            .find(|fact| fact.pid == pid)
-            .cloned();
-        match fact {
+        match self.fact(pid) {
             Some(fact) => Ok(Some(fact)),
             None => crate::procwatch::HostInspector::new().process(pid),
         }
