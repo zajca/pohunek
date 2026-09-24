@@ -362,20 +362,25 @@ impl Supervisor for LaunchdSupervisor {
         Box::pin(self.start_worker(id, definition))
     }
 
+    /// Returns [`Discovery::observations`] and logs a warning per
+    /// [`Discovery::rejected`] file name.
     fn discover(&self) -> Operation<'_, Vec<ServiceObservation>> {
         Box::pin(async move {
-            self.discover_definitions()
-                .await
-                .map(|discovery| discovery.observations)
+            let discovery = self.discover_definitions().await?;
+            super::super::warn_rejected("launchd", &discovery.rejected);
+            Ok(discovery.observations)
         })
     }
 
     /// Combines `print` presence, the private definition, and process facts.
     ///
     /// A loaded job with a matching process is [`ServiceState::Running`]; a
-    /// loaded job without one is [`ServiceState::Stopped`], because launchd
-    /// keeps a `RunAtLoad` job without `KeepAlive` loaded after its process
-    /// exits and exposes no further state without parsing `print` output.
+    /// loaded job without one is [`ServiceState::Unknown`] with no process.
+    /// launchd keeps a `RunAtLoad` job without `KeepAlive` loaded after its
+    /// process exits and exposes no further state without parsing `print`
+    /// output, so that one observation covers a job not spawned yet, a
+    /// process that does not match the definition, and an exited process.
+    /// It is never proof that the job ended; see the module documentation.
     fn inspect<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, ServiceObservation> {
         Box::pin(self.inspect_worker(id))
     }
@@ -791,10 +796,11 @@ impl Jobs {
         }
         Ok(ServiceObservation {
             id: id.clone(),
+            // A loaded label without a matching process is not proven ended.
             state: if process.is_some() {
                 ServiceState::Running
             } else {
-                ServiceState::Stopped
+                ServiceState::Unknown
             },
             process,
             definition: Some(stored.facts),

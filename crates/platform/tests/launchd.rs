@@ -26,6 +26,8 @@ use pohunek_platform::supervisor::{
     ServiceObservation, ServiceState, Supervisor as _, WorkerKey,
 };
 
+mod support;
+
 /// Deadline of one `launchctl` command; generous for loaded CI runners.
 const COMMAND_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -43,6 +45,13 @@ const ABSENT_UID: u32 = 4_000_000;
 
 /// Worker that runs until launchd stops it.
 const SLEEPING_WORKER: &str = "/bin/sleep 600 & wait";
+
+/// Worker whose process exits on its own shortly after it starts.
+///
+/// Three seconds leave the 100 ms observation poll ample time to see it run.
+/// The background job keeps `bash` itself as the main process; a lone simple
+/// command would be `exec`ed and no longer match the definition's executable.
+const EXITING_WORKER: &str = "/bin/sleep 3 & wait";
 
 /// Worker that ignores `SIGTERM` and keeps a child in its process group.
 const STUBBORN_WORKER: &str = "trap '' TERM; /bin/sleep 600 & wait";
@@ -315,6 +324,40 @@ async fn start_inspect_and_retire_one_worker() {
 }
 
 #[tokio::test]
+async fn an_exited_worker_stays_loaded_without_a_process_and_is_never_proven_ended() {
+    let fixture = Fixture::new();
+    let key = key("s-1002", "abcd2346");
+    let id = key.service_id();
+    let definition = fixture.worker(&key, EXITING_WORKER, Duration::from_secs(5));
+
+    fixture
+        .supervisor
+        .start(&id, &definition)
+        .await
+        .expect("worker starts");
+    wait_for(|| fixture.supervisor.inspect(&id), running).await;
+    let observation = wait_for(
+        || fixture.supervisor.inspect(&id),
+        |observation| observation.process.is_none(),
+    )
+    .await;
+
+    // launchd keeps the label loaded after the process exits and does not
+    // say so; a loaded label without a process is never `Stopped`.
+    assert_eq!(observation.state, ServiceState::Unknown);
+    assert_eq!(observation.definition, Some(definition.facts()));
+    fixture
+        .supervisor
+        .retire(&id)
+        .await
+        .expect("worker retires");
+    assert!(matches!(
+        fixture.supervisor.inspect(&id).await,
+        Err(Error::NotFound(missing)) if missing == id
+    ));
+}
+
+#[tokio::test]
 async fn discovery_ignores_foreign_other_namespace_and_malformed_definitions() {
     let mut fixture = Fixture::new();
     let own = key("s-2001", "efgh2345");
@@ -365,14 +408,17 @@ async fn discovery_ignores_foreign_other_namespace_and_malformed_definitions() {
     let mut expected = vec![format!("{malformed}.plist"), format!("{mismatched}.plist")];
     expected.sort();
     assert_eq!(rejected, expected);
+    let captured = support::LogCapture::default();
+    let observations = {
+        let _capture = captured.install();
+        fixture.supervisor.discover().await.expect("discovery")
+    };
+    assert_eq!(observations.len(), 1);
+    let mut warned = captured.rejected_entries();
+    warned.sort();
     assert_eq!(
-        fixture
-            .supervisor
-            .discover()
-            .await
-            .expect("discovery")
-            .len(),
-        1
+        warned, expected,
+        "the trait discovery warns about every rejected definition"
     );
 
     // Foreign jobs stay loaded; discovery never touches them.

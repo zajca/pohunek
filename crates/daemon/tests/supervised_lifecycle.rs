@@ -83,6 +83,10 @@ const RUNNING_JOB: &str = "sleep 600 & wait";
 /// Script of a stand-in job that has already ended.
 const ENDED_JOB: &str = "exit 3";
 
+/// Worker initialization deadline of the stale-job test; well inside the
+/// suite's wait bound, and long enough for a real worker to journal.
+const STALE_JOB_INITIALIZE: Duration = Duration::from_secs(5);
+
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(
     target_os = "linux",
@@ -300,7 +304,14 @@ async fn late_worker_is_retired_and_every_path_converges_to_one_generation() {
     ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"
 )]
 async fn foreign_malformed_stale_and_incompatible_inputs_fail_closed() {
-    let mut fixture = Installation::new(Settings::default()).await;
+    // launchd keeps an exited job loaded without a process, which proves
+    // nothing; the daemon retires such an unjournaled stale job only after
+    // `worker_initialize`, so it is kept short here.
+    let mut fixture = Installation::new(Settings {
+        worker_initialize: STALE_JOB_INITIALIZE,
+        ..Settings::default()
+    })
+    .await;
     let namespace = fixture.namespace();
 
     // A live and an ended job of generations no record names.

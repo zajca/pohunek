@@ -284,8 +284,14 @@ impl Supervisor for SystemdSupervisor {
         })
     }
 
+    /// Returns [`Discovery::observations`] and logs a warning per
+    /// [`Discovery::rejected_units`] name.
     fn discover(&self) -> Operation<'_, Vec<ServiceObservation>> {
-        Box::pin(async move { Ok(self.discover_units().await?.observations) })
+        Box::pin(async move {
+            let discovery = self.discover_units().await?;
+            super::warn_rejected("systemd", &discovery.rejected_units);
+            Ok(discovery.observations)
+        })
     }
 
     fn inspect<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, ServiceObservation> {

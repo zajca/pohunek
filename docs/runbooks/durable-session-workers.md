@@ -98,7 +98,11 @@ native job is missing (the worker is managed; the job was removed outside
 Pohunek), and `stale_worker_generation` marks a still-running job of a
 generation no record owns (left alive, `orphaned`, `runtime_slot` = its service
 ID). A lost session without a journal for its generation reports
-`worker_unavailable`. While the service manager cannot be inspected, affected
+`worker_unavailable`; its job is retired but no leftover process is swept,
+because nothing proves which runtime ran. When the journals or worker sockets
+cannot be read at all, the session is `conflict` with
+`runtime_supervision_ambiguous` and nothing is touched until a later check
+succeeds. While the service manager cannot be inspected, affected
 sessions are retried in the background after 1 s, doubling to at most 60 s.
 
 `pohunek service status --json` lists every worker job of the installation

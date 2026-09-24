@@ -209,8 +209,13 @@ evidence: the private definition, the worker journal, Darwin process inspection
 session ID and generation, start identity), and the authenticated private
 handshake. More than one matching process is `InvalidData`, and a change during
 observation is `Race`. A loaded job without a matching process reports
-`Stopped`, because launchd keeps a `RunAtLoad` job without `KeepAlive` loaded
-after its process exits. Worker readiness comes solely from the private socket;
+`Unknown` with no process: launchd keeps a `RunAtLoad` job without `KeepAlive`
+loaded after its process exits, so that observation covers a job not spawned
+yet, a process that does not match, and an exited one, and it never proves the
+job ended. The daemon proves a worker's death only from its journal (the
+journaled worker PID not running with its start identity) and retires a job
+that never produced a worker after its own initialization deadline. Worker
+readiness comes solely from the private socket;
 there is no `NOTIFY_SOCKET` on Darwin.
 
 **The `SIGKILL` gap.** On `bootout`, launchd sends the job's main process

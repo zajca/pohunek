@@ -5,7 +5,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pohunek_platform::{filesystem::TrustedDir, process::BootIdentity};
+use pohunek_platform::{filesystem::TrustedDir, process::BootIdentity, supervisor::WorkerKey};
 use pohunek_worker_protocol::{ControlCode, InspectSnapshot, ReleasedIdentityClaim, RuntimePhase};
 use protocol::{
     AgentActivity, AgentKind, RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus,
@@ -72,10 +72,13 @@ enum SocketEvidence {
     Unusable(RuntimeState, &'static str),
     /// Several live workers claim the session.
     Multiple,
+    /// The runtime root could not be enumerated, so whether a worker still
+    /// serves the session is unknown.
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct JournalEvidence {
+pub(super) struct JournalEvidence {
     schema_version: u32,
     session_id: String,
     worker_id: String,
@@ -98,7 +101,7 @@ struct JournalEvidence {
 
 impl JournalEvidence {
     /// Returns the worker process facts this journal records.
-    fn worker(&self) -> JournalWorker<'_> {
+    pub(super) fn worker(&self) -> JournalWorker<'_> {
         JournalWorker {
             pid: self.worker_pid,
             start_identity: &self.worker_start_identity,
@@ -396,9 +399,23 @@ impl SessionRegistry {
             .collect::<HashMap<_, _>>();
 
         let lifecycle = self.lifecycle().ok();
-        let (mut discovered, mut inventory) = self.discover_workers(&records).await;
+        let (mut discovered, mut inventory, socket_failure) =
+            match self.discover_workers(&records).await {
+                Ok((discovered, inventory)) => (discovered, inventory, None),
+                Err(detail) => (HashMap::new(), Vec::new(), Some(detail)),
+            };
         let mut journals = self.discover_worker_journals().await;
-        inventory.extend(self.retire_stale_jobs(lifecycle.as_ref(), &records).await);
+        let stale_journal = |key: &WorkerKey| match &journals {
+            Ok(journals) => journals.get(key.session_id()).map_or(Ok(None), |scan| {
+                scan.journal_of_generation(key.generation())
+                    .map(|journal| journal.map(JournalEvidence::worker))
+            }),
+            Err(detail) => Err(detail.clone()),
+        };
+        inventory.extend(
+            self.retire_stale_jobs(lifecycle.as_ref(), &records, stale_journal)
+                .await,
+        );
         for entry in inventory
             .iter()
             .filter(|entry| entry.status != RuntimeInventoryStatus::Managed)
@@ -423,25 +440,53 @@ impl SessionRegistry {
                     continue;
                 }
             }
-            let candidates = discovered.remove(&record.session_id).unwrap_or_default();
-            let socket = match candidates.as_slice() {
-                [candidate] if candidate.slot == record.session_id => {
-                    SocketEvidence::Worker(Box::new(candidate.clone()))
-                }
-                [] => match self.inventory_state_for_slot(&record.session_id).await {
-                    Some((state, reason)) => SocketEvidence::Unusable(state, reason),
-                    None => SocketEvidence::Absent,
-                },
-                _ => SocketEvidence::Multiple,
+            let socket = self
+                .startup_socket_evidence(
+                    &record.session_id,
+                    socket_failure.as_deref(),
+                    discovered.remove(&record.session_id).unwrap_or_default(),
+                )
+                .await;
+            let scan = match &mut journals {
+                Ok(journals) => Ok(journals.remove(&record.session_id).unwrap_or_default()),
+                Err(detail) => Err(detail.clone()),
             };
-            let scan = journals.remove(&record.session_id).unwrap_or_default();
-            if Box::pin(self.reconcile_logical(record, socket, &scan, lifecycle.as_ref(), false))
-                .await
+            if Box::pin(self.reconcile_logical(
+                record,
+                socket,
+                scan.as_ref().map_err(String::as_str),
+                lifecycle.as_ref(),
+                false,
+            ))
+            .await
             {
                 self.schedule_supervision_retry(&id);
             }
         }
         Ok(())
+    }
+
+    /// Classifies the socket evidence startup discovery found for a session;
+    /// `failure` is why the runtime root could not be enumerated at all.
+    async fn startup_socket_evidence(
+        &self,
+        session_id: &str,
+        failure: Option<&str>,
+        mut candidates: Vec<DiscoveredWorker>,
+    ) -> SocketEvidence {
+        if let Some(detail) = failure {
+            return SocketEvidence::Unknown(detail.to_owned());
+        }
+        match candidates.as_slice() {
+            [candidate] if candidate.slot == session_id => {
+                SocketEvidence::Worker(Box::new(candidates.remove(0)))
+            }
+            [] => match self.inventory_state_for_slot(session_id).await {
+                Some((state, reason)) => SocketEvidence::Unusable(state, reason),
+                None => SocketEvidence::Absent,
+            },
+            _ => SocketEvidence::Multiple,
+        }
     }
 
     /// Re-reconciles one durable record from fresh evidence.
@@ -455,9 +500,15 @@ impl SessionRegistry {
         let scan = self
             .discover_worker_journals()
             .await
-            .remove(&record.session_id)
-            .unwrap_or_default();
-        Box::pin(self.reconcile_logical(record, socket, &scan, lifecycle.as_ref(), true)).await
+            .map(|mut journals| journals.remove(&record.session_id).unwrap_or_default());
+        Box::pin(self.reconcile_logical(
+            record,
+            socket,
+            scan.as_ref().map_err(String::as_str),
+            lifecycle.as_ref(),
+            true,
+        ))
+        .await
     }
 
     /// Connects the worker socket of exactly one session, if it has one.
@@ -471,11 +522,15 @@ impl SessionRegistry {
             Ok(Ok(slots)) => slots,
             Ok(Err(error)) => {
                 tracing::warn!(error = %error, "failed to enumerate durable worker runtime root");
-                return SocketEvidence::Absent;
+                return SocketEvidence::Unknown(format!(
+                    "worker runtime root cannot be enumerated: {error}"
+                ));
             }
             Err(error) => {
                 tracing::warn!(error = %error, "durable worker discovery task panicked");
-                return SocketEvidence::Absent;
+                return SocketEvidence::Unknown(format!(
+                    "worker runtime root discovery failed: {error}"
+                ));
             }
         };
         let Some((slot, socket)) = slots
@@ -523,6 +578,11 @@ impl SessionRegistry {
     /// inspected. Returns whether the session needs the background re-check:
     /// its supervisor was unavailable or its generation is ambiguous. In
     /// `retry` mode an unchanged outcome leaves the current entry untouched.
+    ///
+    /// `scan` is `Err` when the journals could not be scanned. Missing socket
+    /// or journal evidence decides nothing: the session is ambiguous and
+    /// re-checked, because only a successful scan without a journal of the
+    /// generation proves that its worker never journaled.
     #[expect(
         clippy::too_many_lines,
         reason = "the classification table stays in one place so every row is visible together"
@@ -531,7 +591,7 @@ impl SessionRegistry {
         &self,
         record: SessionRecord,
         socket: SocketEvidence,
-        scan: &WorkerJournalScan,
+        scan: Result<&WorkerJournalScan, &str>,
         lifecycle: Option<&Lifecycle<'_>>,
         retry: bool,
     ) -> bool {
@@ -542,6 +602,18 @@ impl SessionRegistry {
                 self.insert_unavailable_record(record, RuntimeState::Conflict, IDENTITY_MISMATCH)
                     .await;
                 return false;
+            }
+        };
+        let complete = match (&socket, scan) {
+            (SocketEvidence::Unknown(detail), _) => Err(detail.as_str()),
+            (_, scan) => scan,
+        };
+        let scan = match complete {
+            Ok(scan) => scan,
+            Err(detail) => {
+                tracing::warn!(session_id = %record.session_id, detail, "worker evidence is incomplete; nothing is touched");
+                self.mark_ambiguous(record, retry).await;
+                return true;
             }
         };
         match socket {
@@ -612,7 +684,7 @@ impl SessionRegistry {
                 .await;
                 return false;
             }
-            SocketEvidence::Absent | SocketEvidence::Unusable(..) => {}
+            SocketEvidence::Absent | SocketEvidence::Unusable(..) | SocketEvidence::Unknown(_) => {}
         }
 
         let scoped = WorkerJournalScan {
@@ -733,6 +805,9 @@ impl SessionRegistry {
                 journaled,
                 runtime_id,
             } => {
+                // `runtime_id` is set only for a journaled worker proven gone;
+                // a generation that never journaled has nothing proven to
+                // sweep, so only its job is retired.
                 let cleanup = match runtime_id.as_deref() {
                     Some(runtime_id) => self.sweep_lost_runtime(&id.0, runtime_id).await,
                     None => Cleanup::Complete,
@@ -917,8 +992,15 @@ impl SessionRegistry {
                 journaled,
                 runtime_id,
             } => {
-                let runtime_id = runtime_id.unwrap_or_else(|| expected.runtime_id.clone());
-                let cleanup = self.sweep_lost_runtime(&id.0, &runtime_id).await;
+                // Only a journaled worker whose process is proven gone proves
+                // which runtime died. Without a journal nothing proves what
+                // ran, so no process is swept; the ended job is still retired.
+                let cleanup = if journaled {
+                    let runtime_id = runtime_id.unwrap_or_else(|| expected.runtime_id.clone());
+                    self.sweep_lost_runtime(&id.0, &runtime_id).await
+                } else {
+                    Cleanup::Complete
+                };
                 if let (Some(lifecycle), Some(generation)) = (lifecycle.as_ref(), job.as_ref()) {
                     if let Err(error) = lifecycle.retire(generation).await {
                         tracing::warn!(
@@ -966,11 +1048,18 @@ impl SessionRegistry {
         let Some(generation) = job else {
             return Unreachable::Mismatch("the session names no worker generation".to_owned());
         };
-        let scan = self
-            .discover_worker_journals()
-            .await
-            .remove(&id.0)
-            .unwrap_or_default();
+        let scan = match self.discover_worker_journals().await {
+            Ok(mut journals) => journals.remove(&id.0).unwrap_or_default(),
+            Err(detail) => return Unreachable::Ambiguous(detail),
+        };
+        // An unreadable journal of the session could be this worker's, so
+        // its absence below would prove nothing.
+        if scan.conflict {
+            return Unreachable::Ambiguous(format!(
+                "session {} has an unreadable or mismatched worker journal",
+                id.0
+            ));
+        }
         let journal = scan
             .evidence
             .iter()
@@ -1014,19 +1103,42 @@ impl SessionRegistry {
         }
     }
 
-    async fn discover_worker_journals(&self) -> HashMap<String, WorkerJournalScan> {
+    /// Reads the journal of exactly `key`'s generation from a fresh scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the journal cannot be decided: the scan failed, a journal
+    /// file of the session is unreadable, or several journals name the
+    /// generation.
+    pub(super) async fn generation_journal(
+        &self,
+        key: &WorkerKey,
+    ) -> Result<Option<JournalEvidence>, String> {
+        let journals = self.discover_worker_journals().await?;
+        let Some(scan) = journals.get(key.session_id()) else {
+            return Ok(None);
+        };
+        scan.journal_of_generation(key.generation())
+            .map(Option::<&JournalEvidence>::cloned)
+    }
+
+    /// Scans every session's worker journals.
+    ///
+    /// Returns why the scan failed instead of an empty map: a failed scan is
+    /// no proof that any worker never journaled.
+    async fn discover_worker_journals(&self) -> Result<HashMap<String, WorkerJournalScan>, String> {
         let Some(state_root) = self.inner.config.worker_state_root.clone() else {
-            return HashMap::new();
+            return Ok(HashMap::new());
         };
         match tokio::task::spawn_blocking(move || scan_worker_journals(&state_root)).await {
-            Ok(Ok(journals)) => journals,
+            Ok(Ok(journals)) => Ok(journals),
             Ok(Err(error)) => {
                 tracing::warn!(error = %error, "failed to scan durable worker journals");
-                HashMap::new()
+                Err(format!("worker journals cannot be scanned: {error}"))
             }
             Err(error) => {
                 tracing::warn!(error = %error, "durable worker journal scan task panicked");
-                HashMap::new()
+                Err(format!("worker journal scan failed: {error}"))
             }
         }
     }
@@ -1230,15 +1342,22 @@ impl SessionRegistry {
         self.adopt_live_record(id, worker, record, snapshot).await;
     }
 
+    /// Connects every worker socket under the runtime root.
+    ///
+    /// Returns why the runtime root could not be enumerated instead of an
+    /// empty result: a failed enumeration is no proof that a socket is absent.
     async fn discover_workers(
         &self,
         records: &[SessionRecord],
-    ) -> (
-        HashMap<String, Vec<DiscoveredWorker>>,
-        Vec<RuntimeInventoryEntry>,
-    ) {
+    ) -> Result<
+        (
+            HashMap<String, Vec<DiscoveredWorker>>,
+            Vec<RuntimeInventoryEntry>,
+        ),
+        String,
+    > {
         let Some(runtime_root) = self.inner.config.worker_runtime_root.clone() else {
-            return (HashMap::new(), Vec::new());
+            return Ok((HashMap::new(), Vec::new()));
         };
         let slots = match tokio::task::spawn_blocking(move || discover_runtime_slots(&runtime_root))
             .await
@@ -1246,11 +1365,11 @@ impl SessionRegistry {
             Ok(Ok(slots)) => slots,
             Ok(Err(error)) => {
                 tracing::warn!(error = %error, "failed to enumerate durable worker runtime root");
-                return (HashMap::new(), Vec::new());
+                return Err(format!("worker runtime root cannot be enumerated: {error}"));
             }
             Err(error) => {
                 tracing::warn!(error = %error, "durable worker discovery task panicked");
-                return (HashMap::new(), Vec::new());
+                return Err(format!("worker runtime root discovery failed: {error}"));
             }
         };
 
@@ -1326,7 +1445,7 @@ impl SessionRegistry {
             }
         }
         inventory.sort_by(|left, right| left.runtime_slot.cmp(&right.runtime_slot));
-        (grouped, inventory)
+        Ok((grouped, inventory))
     }
 
     async fn connect_discovered_worker(&self, socket_path: &Path) -> Result<Worker, WorkerError> {
@@ -2565,6 +2684,31 @@ struct WorkerJournalScan {
     conflict: bool,
 }
 
+impl WorkerJournalScan {
+    /// Returns the journal naming `generation`, or `None` when the session has
+    /// none.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the journal cannot be decided: an unreadable or mismatched
+    /// journal file of the session could be that generation's, and several
+    /// journals naming it are ambiguous.
+    fn journal_of_generation(&self, generation: &str) -> Result<Option<&JournalEvidence>, String> {
+        if self.conflict {
+            return Err("the session has an unreadable or mismatched worker journal".to_owned());
+        }
+        let mut journals = self
+            .evidence
+            .iter()
+            .filter(|journal| journal.generation == generation);
+        match (journals.next(), journals.next()) {
+            (None, _) => Ok(None),
+            (Some(journal), None) => Ok(Some(journal)),
+            (Some(_), Some(_)) => Err(format!("several journals name generation {generation}")),
+        }
+    }
+}
+
 fn classify_terminal_journals(
     scan: &WorkerJournalScan,
     record: &SessionRecord,
@@ -2619,7 +2763,10 @@ fn scan_worker_journals(state_root: &Path) -> std::io::Result<HashMap<String, Wo
         else {
             continue;
         };
+        // An unsafe or unreadable session directory may hold any worker's
+        // journal, so it is a conflict rather than an absence.
         let Ok(session_directory) = root.open_child(&session_name, 0o700) else {
+            journals.entry(session_id).or_default().conflict = true;
             continue;
         };
         for journal_name in session_directory
@@ -7127,6 +7274,248 @@ while os.getppid() == parent:
                 .is_empty());
         }
 
+        /// Sets the mode of `path`; a group- or world-accessible worker root
+        /// fails the private-root check, so its scan or enumeration fails.
+        fn set_mode(path: &Path, mode: u32) {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .expect("change worker root mode");
+        }
+
+        /// Mode that makes a private worker root fail validation.
+        const SHARED_ROOT_MODE: u32 = 0o750;
+        /// Mode of a valid private worker root.
+        const PRIVATE_ROOT_MODE: u32 = 0o700;
+
+        #[tokio::test]
+        async fn failed_journal_scan_is_ambiguous_until_a_scan_succeeds() {
+            let fixture = fixture(Arc::new(HostInspector::new()));
+            let marked = Marked::spawn("runtime-s-330");
+            persist_record(&fixture.root, "s-330", Some("runtime-s-330"));
+            write_live_journal(&fixture.root, "s-330", dead_worker(), Some("runtime-s-330"));
+            let id = service_id("s-330", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            let state_root = fixture.root.join("state/workers");
+            set_mode(&state_root, SHARED_ROOT_MODE);
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-330").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
+            assert!(
+                fixture.supervisor.retired().is_empty(),
+                "nothing is retired"
+            );
+            assert!(marked.alive(), "nothing is swept");
+
+            set_mode(&state_root, PRIVATE_ROOT_MODE);
+            let runtime = wait_state(&fixture.registry, "s-330", RuntimeState::Lost).await;
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            marked.wait_gone().await;
+            assert_eq!(fixture.supervisor.retired(), vec![id]);
+        }
+
+        #[tokio::test]
+        async fn failed_runtime_root_enumeration_is_ambiguous_until_it_succeeds() {
+            let fixture = fixture(Arc::new(HostInspector::new()));
+            let marked = Marked::spawn("runtime-s-331");
+            persist_record(&fixture.root, "s-331", Some("runtime-s-331"));
+            write_live_journal(&fixture.root, "s-331", dead_worker(), Some("runtime-s-331"));
+            let id = service_id("s-331", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            let runtime_root = fixture.root.join("runtime/workers");
+            set_mode(&runtime_root, SHARED_ROOT_MODE);
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-331").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
+            assert!(
+                fixture.supervisor.retired().is_empty(),
+                "nothing is retired"
+            );
+            assert!(marked.alive(), "nothing is swept");
+
+            set_mode(&runtime_root, PRIVATE_ROOT_MODE);
+            let runtime = wait_state(&fixture.registry, "s-331", RuntimeState::Lost).await;
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            marked.wait_gone().await;
+            assert_eq!(fixture.supervisor.retired(), vec![id]);
+        }
+
+        #[tokio::test]
+        async fn abandoned_create_is_not_settled_while_its_journals_cannot_be_scanned() {
+            const INITIALIZE: Duration = Duration::from_millis(500);
+
+            let fixture = fixture_with(Arc::new(HostInspector::new()), Some(INITIALIZE));
+            persist_preparing_record(&fixture.root, "s-332");
+            let id = service_id("s-332", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Running, None));
+            let state_root = fixture.root.join("state/workers");
+            set_mode(&state_root, SHARED_ROOT_MODE);
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            tokio::time::sleep(INITIALIZE * 3).await;
+
+            let runtime = runtime_of(&fixture.registry, "s-332").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
+            assert!(
+                fixture.supervisor.retired().is_empty(),
+                "a create whose journals are unknown is never settled"
+            );
+
+            set_mode(&state_root, PRIVATE_ROOT_MODE);
+            wait_removed(&fixture.registry, "s-332").await;
+            assert_eq!(fixture.supervisor.retired(), vec![id]);
+        }
+
+        #[test]
+        fn unreadable_session_journal_directory_is_a_conflict() {
+            let root = temp_root();
+            let state_root = root.join("workers");
+            let session_dir = state_root.join("s-333");
+            std::fs::create_dir_all(&session_dir).expect("create journal directory");
+            set_mode(&state_root, PRIVATE_ROOT_MODE);
+            set_mode(&session_dir, SHARED_ROOT_MODE);
+
+            let journals = super::super::scan_worker_journals(&state_root).expect("scan journals");
+
+            let scan = journals.get("s-333").expect("the session is reported");
+            assert!(scan.conflict);
+            assert!(scan.evidence.is_empty());
+        }
+
+        #[tokio::test]
+        async fn loaded_job_without_a_process_is_decided_by_its_journaled_worker() {
+            let fixture = fixture(Arc::new(HostInspector::new()));
+            let marked = Marked::spawn("runtime-s-334");
+            persist_record(&fixture.root, "s-334", Some("runtime-s-334"));
+            write_live_journal(&fixture.root, "s-334", dead_worker(), Some("runtime-s-334"));
+            persist_record(&fixture.root, "s-335", None);
+            write_live_journal(&fixture.root, "s-335", own_identity(), None);
+            persist_record(&fixture.root, "s-336", None);
+            let crashed = service_id("s-334", TEST_GENERATION);
+            for session_id in ["s-334", "s-335", "s-336"] {
+                fixture.supervisor.script_job(
+                    service_id(session_id, TEST_GENERATION),
+                    present(ServiceState::Unknown, None),
+                );
+            }
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-334").await;
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            marked.wait_gone().await;
+            for session_id in ["s-335", "s-336"] {
+                let runtime = runtime_of(&fixture.registry, session_id).await;
+                assert_eq!(runtime.state, RuntimeState::Conflict, "{session_id}");
+                assert_eq!(
+                    runtime.loss_reason.as_deref(),
+                    Some(SUPERVISION_AMBIGUOUS),
+                    "{session_id}"
+                );
+            }
+            assert_eq!(fixture.supervisor.retired(), vec![crashed]);
+        }
+
+        #[tokio::test]
+        async fn stale_job_without_a_process_is_retired_by_its_journal_or_its_deadline() {
+            const CURRENT_GENERATION: &str = "zzzz3333";
+            const INITIALIZE: Duration = Duration::from_millis(500);
+
+            let fixture = fixture_with(Arc::new(HostInspector::new()), Some(INITIALIZE));
+            write_live_journal(&fixture.root, "s-337", dead_worker(), None);
+            write_live_journal(&fixture.root, "s-339", own_identity(), None);
+            let current = |session_id| service_id(session_id, CURRENT_GENERATION);
+            for session_id in ["s-337", "s-338", "s-339"] {
+                let mut record = identity_record();
+                record.session_id = session_id.to_owned();
+                record.info.id = SessionId(session_id.to_owned());
+                record.recovery.as_mut().expect("recovery").session_id = session_id.to_owned();
+                bind_test_generation(&mut record);
+                record.runtime.generation = Some(CURRENT_GENERATION.to_owned());
+                record.runtime.service_id = Some(current(session_id).to_string());
+                Store::new(fixture.root.join("data/metadata.jsonl"))
+                    .record_session(&record)
+                    .expect("persist a record past the stale generation");
+                fixture
+                    .supervisor
+                    .script_job(current(session_id), present(ServiceState::Failed, None));
+            }
+            let proven = service_id("s-337", TEST_GENERATION);
+            let unjournaled = service_id("s-338", TEST_GENERATION);
+            let running = service_id("s-339", TEST_GENERATION);
+            for id in [&proven, &unjournaled, &running] {
+                fixture
+                    .supervisor
+                    .script_job(id.clone(), present(ServiceState::Unknown, None));
+            }
+            let orphaned = |inventory: &protocol::RuntimeInventoryResult, id: &ServiceId| {
+                inventory.entries.iter().any(|entry| {
+                    entry.runtime_slot == id.as_str()
+                        && entry.status == RuntimeInventoryStatus::Orphaned
+                        && entry.reason.as_deref() == Some(STALE_GENERATION)
+                })
+            };
+
+            let started = tokio::time::Instant::now();
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let retired = fixture.supervisor.retired();
+            assert!(retired.contains(&proven), "{retired:?}");
+            assert!(
+                !retired.contains(&unjournaled),
+                "an unjournaled stale job is kept until its initialization deadline"
+            );
+            let inventory = fixture.registry.runtime_inventory().await;
+            assert!(orphaned(&inventory, &unjournaled), "{inventory:?}");
+            assert!(orphaned(&inventory, &running), "{inventory:?}");
+
+            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            while !fixture.supervisor.retired().contains(&unjournaled) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the unjournaled stale job was never re-checked"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                started.elapsed() >= INITIALIZE,
+                "retired only after its initialization deadline"
+            );
+            tokio::time::sleep(INITIALIZE).await;
+            let inventory = fixture.registry.runtime_inventory().await;
+            assert!(
+                !orphaned(&inventory, &unjournaled),
+                "the retired job left the inventory: {inventory:?}"
+            );
+            assert!(orphaned(&inventory, &running), "{inventory:?}");
+            assert!(
+                !fixture.supervisor.retired().contains(&running),
+                "a stale job whose journaled worker runs is never retired"
+            );
+        }
+
         #[tokio::test]
         async fn reconciliation_waits_for_the_session_lifecycle_lock() {
             let fixture = fixture(Arc::new(HostInspector::new()));
@@ -7161,6 +7550,7 @@ while os.getppid() == parent:
     /// launcher, so the journal records a real worker process that the test
     /// kills, and the PTY runs a hangup-ignoring marked descendant.
     mod running_loss {
+        use std::os::unix::fs::PermissionsExt;
         use std::path::{Path, PathBuf};
         use std::sync::Arc;
         use std::time::Duration;
@@ -7430,6 +7820,76 @@ while os.getppid() == parent:
             assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
             wait_gone(descendant).await;
             assert_eq!(fixture.supervisor.retired(), vec![job]);
+        }
+
+        impl Fixture {
+            /// Journal directory of `id`'s workers.
+            fn journal_dir(&self, id: &SessionId) -> PathBuf {
+                self.root.join("s/pohunek/workers").join(&id.0)
+            }
+
+            /// Reaps the hangup-ignoring PTY tree of a session left alone.
+            async fn reap(&self, created: &SessionInfo, descendant: u32) {
+                let runtime_id = created
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.runtime_id.clone())
+                    .expect("created runtime id");
+                self.registry
+                    .sweep_lost_runtime(&created.id.0, &runtime_id)
+                    .await;
+                wait_gone(descendant).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn crash_without_a_journal_retires_the_job_and_sweeps_nothing() {
+            let fixture = fixture(SHORT_CONNECT);
+            let (created, job, descendant) = fixture.create().await;
+            for entry in std::fs::read_dir(fixture.journal_dir(&created.id)).expect("list journals")
+            {
+                std::fs::remove_file(entry.expect("journal entry").path()).expect("remove journal");
+            }
+
+            fixture.crash(&created.id).await;
+            let runtime = fixture.wait_for(&created.id, RuntimeState::Lost).await;
+
+            assert_eq!(runtime.loss_reason.as_deref(), Some("worker_unavailable"));
+            assert_eq!(fixture.supervisor.retired(), vec![job]);
+            assert!(
+                alive(descendant),
+                "nothing proves which runtime ran, so nothing is swept"
+            );
+            fixture.reap(&created, descendant).await;
+        }
+
+        #[tokio::test]
+        async fn crash_next_to_an_unreadable_journal_is_ambiguous_and_untouched() {
+            let fixture = fixture(SHORT_CONNECT);
+            let (created, _job, descendant) = fixture.create().await;
+            let unreadable = fixture
+                .journal_dir(&created.id)
+                .join("worker-unreadable.json");
+            std::fs::write(&unreadable, b"not json").expect("write unreadable journal");
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600))
+                .expect("private unreadable journal");
+
+            fixture.crash(&created.id).await;
+            let runtime = fixture.wait_for(&created.id, RuntimeState::Conflict).await;
+
+            assert!(
+                matches!(
+                    runtime.loss_reason.as_deref(),
+                    Some(SUPERVISION_AMBIGUOUS | "worker_journal_identity_mismatch")
+                ),
+                "{runtime:?}"
+            );
+            assert!(
+                fixture.supervisor.retired().is_empty(),
+                "nothing is retired"
+            );
+            assert!(alive(descendant), "nothing is swept");
+            fixture.reap(&created, descendant).await;
         }
 
         #[tokio::test]

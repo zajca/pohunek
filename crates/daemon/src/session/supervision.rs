@@ -17,12 +17,16 @@ use std::time::Duration;
 use pohunek_platform::process::{
     sweep_runtime, ProcessIdentity, ProcessInspector, SkipReason, StartIdentity, SweepRequest,
 };
-use pohunek_platform::supervisor::{Error as SupervisorError, ServiceObservation, WorkerKey};
+use pohunek_platform::supervisor::{
+    Error as SupervisorError, ServiceId, ServiceObservation, WorkerKey,
+};
 use protocol::{RuntimeInventoryEntry, RuntimeInventoryStatus, RuntimeState};
 
+use super::reconcile::JournalEvidence;
 use super::{SessionId, SessionRecord, SessionRegistry, SessionRegistryInner};
 use crate::runtime::lifecycle::{
-    observation_live, Generation, Lifecycle, SUPERVISION_AMBIGUOUS, SUPERVISION_UNAVAILABLE,
+    observation_live, observation_unproven, Generation, Lifecycle, SUPERVISION_AMBIGUOUS,
+    SUPERVISION_UNAVAILABLE,
 };
 
 // Rust guideline compliant 2026-09-24
@@ -192,18 +196,23 @@ pub(super) enum Unreachable {
     Ended {
         /// Whether the generation's worker had journaled at all; a journaled
         /// worker that is gone crashed, while a missing journal means it
-        /// never started.
+        /// never started. Callers pass no journal only after a successful
+        /// scan found none for the generation.
         journaled: bool,
-        /// Runtime whose marked processes may have survived the worker.
+        /// Runtime whose marked processes may have survived the worker; set
+        /// only when `journaled`, since only the journal's PID check proves
+        /// which runtime died.
         runtime_id: Option<String>,
     },
 }
 
 /// Decides what a generation without a reachable worker is.
 ///
-/// Worker death is proven only when the job is absent or ended without a
-/// process AND the journaled worker PID is not running with its recorded
-/// start identity (a reused PID therefore counts as not running).
+/// Worker death is proven only when the job is absent, ended without a
+/// process, or without a process in a state that proves nothing (launchd's
+/// loaded label), AND the journaled worker PID is not running with its
+/// recorded start identity (a reused PID therefore counts as not running).
+/// The last job form needs the journal: without one it stays ambiguous.
 pub(super) fn classify_unreachable(
     job: &JobEvidence,
     generation: &Generation,
@@ -216,7 +225,12 @@ pub(super) fn classify_unreachable(
             if let Some(detail) = job_identity_mismatch(observation, generation, worker) {
                 return Unreachable::Mismatch(detail);
             }
-            if observation_live(observation) {
+            // A job without a process whose state proves nothing is decided
+            // by the journaled worker process below; with no journal it may
+            // still spawn one.
+            if observation_live(observation)
+                && !(observation_unproven(observation) && worker.is_some())
+            {
                 return Unreachable::Ambiguous(format!(
                     "job {} is present but its worker socket is not reachable",
                     observation.id
@@ -371,12 +385,20 @@ impl SessionRegistry {
     /// session has no record) is re-inspected under its session's lifecycle
     /// lock. Proven ended, it is retired by exact service ID, which also
     /// removes its definition. Still live, it is left alone and returned as an
-    /// orphaned inventory entry. Discovery failure only skips this cleanup;
-    /// every record's own generation is inspected individually.
-    pub(super) async fn retire_stale_jobs(
+    /// orphaned inventory entry. A job without a process in a state that
+    /// proves nothing is also returned as orphaned; unless its journaled
+    /// worker still runs, it is re-checked once the worker initialization
+    /// deadline has passed since this first sight (see
+    /// [`Self::settle_unproven_stale_job`]). Discovery failure only skips this
+    /// cleanup; every record's own generation is inspected individually.
+    ///
+    /// `journal_of` returns the journaled worker of a stale generation from
+    /// the startup scan, or why it cannot be decided.
+    pub(super) async fn retire_stale_jobs<'j>(
         &self,
         lifecycle: Option<&Lifecycle<'_>>,
         records: &[SessionRecord],
+        journal_of: impl Fn(&WorkerKey) -> Result<Option<JournalWorker<'j>>, String>,
     ) -> Vec<RuntimeInventoryEntry> {
         let Some(lifecycle) = lifecycle else {
             return Vec::new();
@@ -407,25 +429,22 @@ impl SessionRegistry {
             let _guard = self
                 .lock_lifecycle(&SessionId(key.session_id().to_owned()))
                 .await;
-            match stale_job_ended(lifecycle, &observation).await {
-                Ok(true) => match lifecycle.supervisor.retire(&observation.id).await {
-                    Ok(()) | Err(SupervisorError::NotFound(_)) => {
-                        tracing::info!(service_id = %observation.id, "retired an ended stale worker job");
+            let journal = journal_of(&key);
+            let classified = classify_stale_job(
+                lifecycle,
+                &observation.id,
+                journal.as_ref().map(Option::as_ref).map_err(String::as_str),
+                self.inner.inspector.as_ref(),
+            )
+            .await;
+            match classified {
+                Ok(StaleJob::Ended) => retire_stale_job(lifecycle, &observation.id).await,
+                Ok(state @ (StaleJob::Live | StaleJob::Unproven)) => {
+                    tracing::warn!(service_id = %observation.id, "stale worker job may still be live; leaving it untouched");
+                    orphans.push(stale_orphan(&observation.id));
+                    if state == StaleJob::Unproven {
+                        self.settle_unproven_stale_job(key);
                     }
-                    Err(error) => {
-                        tracing::warn!(service_id = %observation.id, error = %error, "failed to retire an ended stale worker job");
-                    }
-                },
-                Ok(false) => {
-                    tracing::warn!(service_id = %observation.id, "stale worker job is still live; leaving it untouched");
-                    orphans.push(RuntimeInventoryEntry {
-                        runtime_slot: observation.id.to_string(),
-                        claimed_session_id: None,
-                        worker_id: None,
-                        runtime_id: None,
-                        status: RuntimeInventoryStatus::Orphaned,
-                        reason: Some(STALE_GENERATION.to_owned()),
-                    });
                 }
                 Err(error) => {
                     tracing::warn!(service_id = %observation.id, error = %error, "stale worker job cannot be inspected; leaving it untouched");
@@ -607,6 +626,85 @@ impl SessionRegistry {
         }
     }
 
+    /// Re-checks a stale job without a process in a state that proves
+    /// nothing once the worker initialization deadline has passed.
+    ///
+    /// A background task waits from first sight until that deadline, then
+    /// re-inspects the job and re-reads its generation's journal under the
+    /// session's lifecycle lock. A job that ended, or whose worker never
+    /// journaled within that window and so never owned a PTY, is retired and
+    /// leaves the inventory. A job whose journaled worker may still run, or
+    /// whose journals cannot be read, stays orphaned for the next start.
+    /// Daemon shutdown leaves it to the next start as well.
+    pub(super) fn settle_unproven_stale_job(&self, key: WorkerKey) {
+        let registry = self.clone();
+        tokio::spawn(async move {
+            let service_id = key.service_id();
+            let settle = tokio::spawn(registry.watch_unproven_stale_job(key));
+            if let Err(error) = settle.await {
+                tracing::warn!(
+                    service_id = %service_id,
+                    task.panicked = error.is_panic(),
+                    error = %error,
+                    "stale worker job re-check ended abnormally; it stays orphaned"
+                );
+            }
+        });
+    }
+
+    /// The body of [`Self::settle_unproven_stale_job`].
+    async fn watch_unproven_stale_job(self, key: WorkerKey) {
+        let shutdown = self.inner.daemon_shutdown.clone();
+        let Ok(lifecycle) = self.lifecycle() else {
+            return;
+        };
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = tokio::time::sleep(lifecycle.config.worker_initialize) => {}
+        }
+        let id = key.service_id();
+        let _guard = self
+            .lock_lifecycle(&SessionId(key.session_id().to_owned()))
+            .await;
+        let journal = self.generation_journal(&key).await;
+        let worker = journal
+            .as_ref()
+            .map(|journal| journal.as_ref().map(JournalEvidence::worker))
+            .map_err(String::as_str);
+        let classified = classify_stale_job(
+            &lifecycle,
+            &id,
+            worker
+                .as_ref()
+                .map(Option::as_ref)
+                .map_err(|detail| *detail),
+            self.inner.inspector.as_ref(),
+        )
+        .await;
+        let ended = match classified {
+            Ok(StaleJob::Ended) => true,
+            // A worker journals before it opens its PTY, so a job whose
+            // successful scan shows no journal by its initialization deadline
+            // never owned one.
+            Ok(StaleJob::Unproven) => journal.is_ok(),
+            Ok(StaleJob::Live) => false,
+            Err(error) => {
+                tracing::warn!(service_id = %id, error = %error, "stale worker job cannot be inspected; leaving it untouched");
+                return;
+            }
+        };
+        if !ended {
+            tracing::warn!(service_id = %id, "stale worker job may still be live after its initialization deadline; leaving it untouched");
+            return;
+        }
+        retire_stale_job(&lifecycle, &id).await;
+        self.inner
+            .runtime_inventory
+            .lock()
+            .await
+            .retain(|entry| entry.runtime_slot != id.as_str());
+    }
+
     /// Hands an abandoned create whose job cannot be settled to the retry.
     async fn defer_abandoned_create(
         &self,
@@ -731,15 +829,71 @@ impl Drop for RunningGuard {
     }
 }
 
-/// Proves a stale job ended with a fresh inspection; absence counts as ended.
-async fn stale_job_ended(
+/// What a fresh inspection proves about a stale job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleJob {
+    /// Absent, ended, or its journaled worker is proven gone.
+    Ended,
+    /// It has a process, a live state, or a journaled worker that may run.
+    Live,
+    /// No process in a state that proves nothing, and no journaled worker
+    /// decides it: no journal of the generation, or its journals unreadable.
+    Unproven,
+}
+
+/// Classifies a stale job from a fresh inspection; absence counts as ended.
+///
+/// `journal` is the generation's journaled worker, or why it cannot be read.
+async fn classify_stale_job(
     lifecycle: &Lifecycle<'_>,
-    observation: &ServiceObservation,
-) -> Result<bool, SupervisorError> {
-    Ok(lifecycle
-        .inspect_service(&observation.id)
-        .await?
-        .is_none_or(|fresh| !observation_live(&fresh)))
+    id: &ServiceId,
+    journal: Result<Option<&JournalWorker<'_>>, &str>,
+    inspector: &dyn ProcessInspector,
+) -> Result<StaleJob, SupervisorError> {
+    let Some(fresh) = lifecycle.inspect_service(id).await? else {
+        return Ok(StaleJob::Ended);
+    };
+    if !observation_live(&fresh) {
+        return Ok(StaleJob::Ended);
+    }
+    if !observation_unproven(&fresh) {
+        return Ok(StaleJob::Live);
+    }
+    let Ok(Some(worker)) = journal else {
+        return Ok(StaleJob::Unproven);
+    };
+    let gone = worker
+        .identity()
+        .is_ok_and(|identity| matches!(inspector.is_running(identity), Ok(false)));
+    Ok(if gone {
+        StaleJob::Ended
+    } else {
+        StaleJob::Live
+    })
+}
+
+/// Retires a stale job by exact service ID; an absent job is fine.
+async fn retire_stale_job(lifecycle: &Lifecycle<'_>, id: &ServiceId) {
+    match lifecycle.supervisor.retire(id).await {
+        Ok(()) | Err(SupervisorError::NotFound(_)) => {
+            tracing::info!(service_id = %id, "retired an ended stale worker job");
+        }
+        Err(error) => {
+            tracing::warn!(service_id = %id, error = %error, "failed to retire an ended stale worker job");
+        }
+    }
+}
+
+/// Inventory entry of a stale job left alone.
+fn stale_orphan(id: &ServiceId) -> RuntimeInventoryEntry {
+    RuntimeInventoryEntry {
+        runtime_slot: id.to_string(),
+        claimed_session_id: None,
+        worker_id: None,
+        runtime_id: None,
+        status: RuntimeInventoryStatus::Orphaned,
+        reason: Some(STALE_GENERATION.to_owned()),
+    }
 }
 
 #[cfg(test)]

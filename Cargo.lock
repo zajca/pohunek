@@ -4360,6 +4360,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "zbus 5.16.0",
 ]
 

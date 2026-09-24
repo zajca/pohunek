@@ -25,8 +25,11 @@ Use this runbook when commands report that the daemon is unreachable or unhealth
    entry pass validation.
 3. If health cannot connect, run `pohunek service status --json`. An installed
    service reports its daemon job (`daemon.state`, `daemon.pid`) and
-   `daemon_error` when the service manager cannot be queried. A `failed` or
-   `stopped` daemon job is restarted by the service manager after its restart
+   `daemon_error` when the service manager cannot be queried. On macOS a
+   loaded job without a running process reports `unknown` without a `pid`,
+   because launchd does not say whether it has not started yet or has exited;
+   check the launchd output files below. A `failed` or `stopped` daemon job is
+   restarted by the service manager after its restart
    throttle; its logs are the daemon's JSON log under
    `~/.local/state/pohunek/logs/` and, on macOS, the launchd output files under
    `~/.local/state/pohunek/logs/launchd/`. If `installed` is false, install the
