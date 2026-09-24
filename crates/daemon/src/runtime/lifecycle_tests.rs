@@ -65,6 +65,9 @@ pub(crate) enum JobScript {
     },
     /// The supervisor cannot inspect this job.
     Unavailable,
+    /// Inspecting or retiring this job panics, standing in for a broken
+    /// invariant inside a background lifecycle task.
+    Panic,
 }
 
 /// One supervisor call, in order.
@@ -287,7 +290,7 @@ impl Supervisor for ScriptedSupervisor {
             observations.extend(self.jobs.lock().expect("jobs").iter().filter_map(
                 |(id, script)| match script {
                     JobScript::Present { .. } => scripted_observation(id, script),
-                    JobScript::Unavailable => None,
+                    JobScript::Unavailable | JobScript::Panic => None,
                 },
             ));
             observations.sort_by(|left, right| left.id.cmp(&right.id));
@@ -299,6 +302,11 @@ impl Supervisor for ScriptedSupervisor {
         Box::pin(async move {
             self.record(Call::Inspect(id.clone()));
             let scripted = self.jobs.lock().expect("jobs").get(id).cloned();
+            // The `jobs` lock is released above, so the panic poisons nothing.
+            assert!(
+                scripted != Some(JobScript::Panic),
+                "scripted supervisor panic inspecting {id}"
+            );
             if let Some(script) = scripted {
                 return scripted_observation(id, &script).ok_or_else(|| unavailable("inspect"));
             }
@@ -328,10 +336,12 @@ impl Supervisor for ScriptedSupervisor {
     fn retire<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, ()> {
         Box::pin(async move {
             self.record(Call::Retire(id.clone()));
-            if let Some(script) = self.jobs.lock().expect("jobs").remove(id) {
+            let scripted = self.jobs.lock().expect("jobs").remove(id);
+            if let Some(script) = scripted {
                 return match script {
                     JobScript::Present { .. } => Ok(()),
                     JobScript::Unavailable => Err(unavailable("retire")),
+                    JobScript::Panic => panic!("scripted supervisor panic retiring {id}"),
                 };
             }
             match &self.delegate {
@@ -354,7 +364,7 @@ fn scripted_observation(id: &ServiceId, script: &JobScript) -> Option<ServiceObs
             process: *process,
             definition: definition.clone(),
         }),
-        JobScript::Unavailable => None,
+        JobScript::Unavailable | JobScript::Panic => None,
     }
 }
 
@@ -481,6 +491,11 @@ impl Harness {
 
     /// Writes a worker journal the engine reads as previous-generation evidence.
     fn write_journal(&self, session_id: &str, worker_id: &str, facts: &serde_json::Value) {
+        self.write_journal_bytes(session_id, worker_id, facts.to_string().as_bytes());
+    }
+
+    /// Writes raw journal bytes, which need not be a valid journal.
+    fn write_journal_bytes(&self, session_id: &str, worker_id: &str, bytes: &[u8]) {
         let directory = self.state_root.join(session_id);
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -492,7 +507,7 @@ impl Harness {
             .mode(0o600)
             .open(directory.join(format!("{worker_id}.json")))
             .expect("create journal");
-        std::io::Write::write_all(&mut file, facts.to_string().as_bytes()).expect("write journal");
+        std::io::Write::write_all(&mut file, bytes).expect("write journal");
     }
 }
 
@@ -1067,6 +1082,97 @@ async fn recovery_refuses_a_journal_of_another_generation() {
         "{refusal:?}"
     );
     assert!(harness.supervisor.retired().is_empty());
+}
+
+#[tokio::test]
+async fn recovery_refuses_a_previous_worker_whose_journal_is_corrupted() {
+    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    harness.supervisor.script_inspects([InspectStep::NotFound]);
+    let (_, previous) = previous(&harness, Some("worker-corrupt"));
+    harness.write_journal_bytes("s-1", "worker-corrupt", b"{\"schema_version\": 4, trunc");
+
+    let refusal = harness
+        .lifecycle()
+        .retire_previous(&previous)
+        .await
+        .expect_err("a corrupted journal proves nothing");
+
+    assert!(
+        matches!(&refusal, PreviousLive::Ambiguous(error) if error.code == SUPERVISION_AMBIGUOUS),
+        "{refusal:?}"
+    );
+    assert!(harness.supervisor.retired().is_empty());
+    assert!(
+        harness.supervisor.calls().is_empty(),
+        "the job is not inspected before the journal is proven readable"
+    );
+}
+
+#[tokio::test]
+async fn recovery_refuses_a_previous_journal_of_another_worker() {
+    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    harness.supervisor.script_inspects([InspectStep::NotFound]);
+    let (generation, previous) = previous(&harness, Some("worker-mine"));
+    harness.write_journal(
+        "s-1",
+        "worker-mine",
+        &journal(
+            "s-1",
+            "worker-foreign",
+            generation.generation(),
+            "live",
+            std::process::id(),
+        ),
+    );
+
+    let refusal = harness
+        .lifecycle()
+        .retire_previous(&previous)
+        .await
+        .expect_err("a journal of another worker proves nothing");
+
+    assert!(
+        matches!(&refusal, PreviousLive::Ambiguous(error) if error.code == SUPERVISION_AMBIGUOUS),
+        "{refusal:?}"
+    );
+    assert!(harness.supervisor.retired().is_empty());
+}
+
+#[tokio::test]
+async fn recovery_retires_a_previous_generation_whose_worker_never_journaled() {
+    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    harness
+        .supervisor
+        .script_inspects([InspectStep::NotFound, InspectStep::NotFound]);
+    let (generation, previous) = previous(&harness, Some("worker-silent"));
+
+    harness
+        .lifecycle()
+        .retire_previous(&previous)
+        .await
+        .expect("a missing journal leaves nothing to cross-check");
+    assert_eq!(harness.supervisor.retired(), [generation.service_id()]);
+
+    harness.write_journal(
+        "s-1",
+        "worker-sibling",
+        &journal(
+            "s-1",
+            "worker-sibling",
+            generation.generation(),
+            "terminal",
+            std::process::id(),
+        ),
+    );
+    harness
+        .lifecycle()
+        .retire_previous(&previous)
+        .await
+        .expect("a missing journal next to another worker's journal is still missing");
+    assert_eq!(
+        harness.supervisor.retired(),
+        [generation.service_id(), generation.service_id()]
+    );
 }
 
 #[tokio::test]

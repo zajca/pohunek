@@ -633,14 +633,39 @@ impl Lifecycle<'_> {
     /// two generations of one session never run at once (they would also
     /// contend for the per-session socket).
     ///
+    /// A missing journal means the previous worker never journaled, so there
+    /// is no process to cross-check. A journal that exists but cannot be read,
+    /// decoded, or matched to its path proves nothing about that process and
+    /// is refused as ambiguous.
+    ///
     /// # Errors
     ///
     /// Returns [`PreviousLive`] when the previous generation cannot be proven
     /// ended; nothing is started or killed in that case.
     pub async fn retire_previous(&self, previous: &PreviousGeneration) -> Result<(), PreviousLive> {
-        let journal = previous.worker_id.as_deref().and_then(|worker_id| {
-            read_journal(self.state_root, &previous.session_id, worker_id).ok()
-        });
+        let journal = match previous.worker_id.as_deref() {
+            None => None,
+            Some(worker_id) => match read_journal(self.state_root, &previous.session_id, worker_id)
+            {
+                Ok(journal) => Some(journal),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %previous.session_id,
+                        worker.id = worker_id,
+                        error = %error,
+                        "previous worker journal is unreadable; recovery is refused"
+                    );
+                    return Err(PreviousLive::Ambiguous(lifecycle_error(
+                        SUPERVISION_AMBIGUOUS,
+                        format!(
+                            "previous worker {worker_id} of session {} has an unreadable journal: {error}",
+                            previous.session_id
+                        ),
+                    )));
+                }
+            },
+        };
         let runtime_ended = journal.as_ref().is_some_and(JournalFacts::runtime_ended);
         let Some(generation) = &previous.generation else {
             return self.prove_worker_process_ended(journal.as_ref(), runtime_ended);
@@ -954,7 +979,10 @@ fn read_journal(
         .and_then(|session| {
             session.read_file(format!("{worker_id}.json"), 0o600, MAX_WORKER_JOURNAL_BYTES)
         })
-        .map_err(std::io::Error::other)?;
+        // The OS error kind is kept so a missing journal stays `NotFound`.
+        .map_err(|error| {
+            std::io::Error::new(error.io_kind().unwrap_or(std::io::ErrorKind::Other), error)
+        })?;
     let journal = serde_json::from_slice::<JournalFacts>(&bytes)?;
     if journal.schema_version != WORKER_JOURNAL_SCHEMA_VERSION
         || journal.session_id != session_id

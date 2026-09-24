@@ -7010,6 +7010,123 @@ while os.getppid() == parent:
             assert_eq!(fixture.supervisor.retired(), vec![id]);
         }
 
+        /// Counts the supervisor inspections of `id` so far.
+        fn inspections(supervisor: &ScriptedSupervisor, id: &ServiceId) -> usize {
+            supervisor
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, Call::Inspect(inspected) if inspected == id))
+                .count()
+        }
+
+        /// Waits until `id` was inspected more than `seen` times.
+        async fn wait_inspected_after(
+            supervisor: &ScriptedSupervisor,
+            id: &ServiceId,
+            seen: usize,
+        ) {
+            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            while inspections(supervisor, id) <= seen {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{id} was never inspected again"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn panicking_retry_pass_keeps_its_session_pending_and_the_loop_serving() {
+            let fixture = fixture(Arc::new(HostInspector::new()));
+            for session_id in ["s-321", "s-322"] {
+                persist_record(&fixture.root, session_id, None);
+                write_live_journal(&fixture.root, session_id, dead_worker(), None);
+                fixture.supervisor.script_job(
+                    service_id(session_id, TEST_GENERATION),
+                    JobScript::Unavailable,
+                );
+            }
+            fixture.supervisor.fail_discovery();
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            for session_id in ["s-321", "s-322"] {
+                let runtime = runtime_of(&fixture.registry, session_id).await;
+                assert_eq!(runtime.state, RuntimeState::Reconnecting);
+                assert_eq!(
+                    runtime.loss_reason.as_deref(),
+                    Some(SUPERVISION_UNAVAILABLE)
+                );
+            }
+
+            let broken = service_id("s-321", TEST_GENERATION);
+            let healthy = service_id("s-322", TEST_GENERATION);
+            let seen = inspections(&fixture.supervisor, &broken);
+            fixture
+                .supervisor
+                .script_job(broken.clone(), JobScript::Panic);
+            fixture
+                .supervisor
+                .script_job(healthy.clone(), present(ServiceState::Failed, None));
+
+            let runtime = wait_state(&fixture.registry, "s-322", RuntimeState::Lost).await;
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            wait_inspected_after(&fixture.supervisor, &broken, seen).await;
+            let panicked = inspections(&fixture.supervisor, &broken);
+            wait_inspected_after(&fixture.supervisor, &broken, panicked).await;
+            let runtime = runtime_of(&fixture.registry, "s-321").await;
+            assert_eq!(runtime.state, RuntimeState::Reconnecting);
+            assert_eq!(
+                runtime.loss_reason.as_deref(),
+                Some(SUPERVISION_UNAVAILABLE)
+            );
+
+            fixture
+                .supervisor
+                .script_job(broken.clone(), present(ServiceState::Failed, None));
+            let runtime = wait_state(&fixture.registry, "s-321", RuntimeState::Lost).await;
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            assert_eq!(fixture.supervisor.retired(), vec![healthy, broken]);
+        }
+
+        #[tokio::test]
+        async fn panicking_abandoned_create_settlement_is_handed_to_the_retry() {
+            const INITIALIZE: Duration = Duration::from_secs(30);
+
+            let fixture = fixture_with(Arc::new(HostInspector::new()), Some(INITIALIZE));
+            persist_preparing_record(&fixture.root, "s-323");
+            let id = service_id("s-323", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Running, None));
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let runtime = runtime_of(&fixture.registry, "s-323").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
+
+            let seen = inspections(&fixture.supervisor, &id);
+            fixture.supervisor.script_job(id.clone(), JobScript::Panic);
+            wait_inspected_after(&fixture.supervisor, &id, seen).await;
+            let panicked = inspections(&fixture.supervisor, &id);
+            wait_inspected_after(&fixture.supervisor, &id, panicked).await;
+            let runtime = runtime_of(&fixture.registry, "s-323").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
+            assert!(fixture.supervisor.retired().is_empty(), "nothing is killed");
+
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            wait_removed(&fixture.registry, "s-323").await;
+            assert_eq!(fixture.supervisor.retired(), vec![id]);
+            assert!(Store::new(fixture.root.join("data/metadata.jsonl"))
+                .load_sessions()
+                .expect("load store")
+                .is_empty());
+        }
+
         #[tokio::test]
         async fn reconciliation_waits_for_the_session_lifecycle_lock() {
             let fixture = fixture(Arc::new(HostInspector::new()));

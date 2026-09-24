@@ -443,7 +443,8 @@ impl SessionRegistry {
     /// with a doubling delay bounded by [`SUPERVISION_RETRY_MAX`]; each pass
     /// classifies from fresh evidence and never kills while it stays
     /// ambiguous. The task stops when no session is pending, when daemon
-    /// shutdown starts, or when the registry is dropped.
+    /// shutdown starts, or when the registry is dropped; however it ends, a
+    /// later call starts a new one.
     pub(super) fn schedule_supervision_retry(&self, id: &SessionId) {
         let start = {
             let mut state = self
@@ -461,6 +462,28 @@ impl SessionRegistry {
             tokio::spawn(async move {
                 run_supervision_retries(inner, shutdown).await;
             });
+        }
+    }
+
+    /// Runs one retry pass of `id` in its own task.
+    ///
+    /// A pass that panics (a broken reconciliation invariant) ends only that
+    /// pass: it is logged, and `false` keeps the session pending, so the next
+    /// pass re-checks it and the loop keeps serving every other session.
+    async fn retry_supervised_session_isolated(&self, id: &SessionId) -> bool {
+        let registry = self.clone();
+        let task_id = id.clone();
+        match tokio::spawn(async move { registry.retry_supervised_session(&task_id).await }).await {
+            Ok(settled) => settled,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %id.0,
+                    task.panicked = error.is_panic(),
+                    error = %error,
+                    "supervision retry pass ended abnormally; the session stays pending"
+                );
+                false
+            }
         }
     }
 
@@ -512,52 +535,76 @@ impl SessionRegistry {
     /// then retires exactly that generation and compensates the create. A job
     /// that ends earlier is retired at once. An inspection or retirement
     /// failure leaves the session `runtime_supervision_unavailable` for the
-    /// supervision retry; daemon shutdown leaves it to the next start.
+    /// supervision retry; daemon shutdown leaves it to the next start. A
+    /// settlement that panics is logged and handed to the supervision retry,
+    /// so the session is never stranded without a re-check.
     pub(super) fn settle_abandoned_create(&self, id: SessionId, generation: Generation) {
         let registry = self.clone();
-        let shutdown = self.inner.daemon_shutdown.clone();
         tokio::spawn(async move {
-            let _guard = registry.lock_lifecycle(&id).await;
-            let Ok(lifecycle) = registry.lifecycle() else {
+            let settle = tokio::spawn(
+                registry
+                    .clone()
+                    .watch_abandoned_create(id.clone(), generation.clone()),
+            );
+            let Err(error) = settle.await else {
                 return;
             };
-            let give_up_at = tokio::time::Instant::now() + lifecycle.config.worker_initialize;
-            loop {
-                match lifecycle.inspect(&generation).await {
-                    Ok(Some(observation)) if observation_live(&observation) => {}
-                    Ok(_ended) => break,
-                    Err(error) => {
-                        registry
-                            .defer_abandoned_create(&id, &generation, &error)
-                            .await;
-                        return;
-                    }
-                }
-                let now = tokio::time::Instant::now();
-                if now >= give_up_at {
-                    break;
-                }
-                tokio::select! {
-                    () = shutdown.cancelled() => return,
-                    () = tokio::time::sleep(ABANDONED_CREATE_POLL.min(give_up_at - now)) => {}
-                }
-            }
-            match lifecycle.retire(&generation).await {
-                Ok(()) => {
-                    tracing::info!(
-                        session_id = %id.0,
-                        service_id = %generation.service_id(),
-                        "retired the generation of an abandoned create"
-                    );
-                    registry.compensate_abandoned_create(&id).await;
-                }
-                Err(error) => {
-                    registry
-                        .defer_abandoned_create(&id, &generation, &error)
-                        .await;
-                }
+            tracing::warn!(
+                session_id = %id.0,
+                service_id = %generation.service_id(),
+                task.panicked = error.is_panic(),
+                error = %error,
+                "abandoned create settlement ended abnormally; nothing is touched"
+            );
+            // The session is still marked ambiguous, which the supervision
+            // retry re-checks from fresh evidence. A cancelled task means the
+            // runtime is shutting down, and the next start reconciles it.
+            if error.is_panic() {
+                registry.schedule_supervision_retry(&id);
             }
         });
+    }
+
+    /// Watches, retires, and compensates one abandoned create; the body of
+    /// [`Self::settle_abandoned_create`].
+    async fn watch_abandoned_create(self, id: SessionId, generation: Generation) {
+        let shutdown = self.inner.daemon_shutdown.clone();
+        let _guard = self.lock_lifecycle(&id).await;
+        let Ok(lifecycle) = self.lifecycle() else {
+            return;
+        };
+        let give_up_at = tokio::time::Instant::now() + lifecycle.config.worker_initialize;
+        loop {
+            match lifecycle.inspect(&generation).await {
+                Ok(Some(observation)) if observation_live(&observation) => {}
+                Ok(_ended) => break,
+                Err(error) => {
+                    self.defer_abandoned_create(&id, &generation, &error).await;
+                    return;
+                }
+            }
+            let now = tokio::time::Instant::now();
+            if now >= give_up_at {
+                break;
+            }
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(ABANDONED_CREATE_POLL.min(give_up_at - now)) => {}
+            }
+        }
+        match lifecycle.retire(&generation).await {
+            Ok(()) => {
+                tracing::info!(
+                    session_id = %id.0,
+                    service_id = %generation.service_id(),
+                    "retired the generation of an abandoned create"
+                );
+                self.compensate_abandoned_create(&id).await;
+            }
+            Err(error) => {
+                self.defer_abandoned_create(&id, &generation, &error).await;
+            }
+        }
     }
 
     /// Hands an abandoned create whose job cannot be settled to the retry.
@@ -596,6 +643,10 @@ async fn run_supervision_retries(
     inner: Weak<SessionRegistryInner>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
+    let mut running = RunningGuard {
+        inner: Weak::clone(&inner),
+        armed: true,
+    };
     let mut delay = SUPERVISION_RETRY_INITIAL;
     loop {
         tokio::select! {
@@ -619,7 +670,7 @@ async fn run_supervision_retries(
                 return;
             }
             let id = SessionId(session_id);
-            if registry.retry_supervised_session(&id).await {
+            if registry.retry_supervised_session_isolated(&id).await {
                 registry
                     .inner
                     .supervision_retries
@@ -638,11 +689,45 @@ async fn run_supervision_retries(
                 .lock()
                 .expect("supervision retry state is never poisoned");
             if state.pending.is_empty() {
+                // Cleared under the same lock as the emptiness check, so a
+                // session scheduled right after it starts a new task.
                 state.running = false;
+                running.armed = false;
                 return;
             }
         }
         delay = (delay * 2).min(SUPERVISION_RETRY_MAX);
+    }
+}
+
+/// Clears the retry task's `running` flag when the task ends early.
+///
+/// Shutdown, a dropped registry, or an unexpected unwind all end the task
+/// with sessions possibly pending; clearing the flag lets the next
+/// [`SessionRegistry::schedule_supervision_retry`] start a new task instead
+/// of assuming one still runs. A normal exit clears the flag itself and
+/// disarms the guard.
+#[derive(Debug)]
+struct RunningGuard {
+    inner: Weak<SessionRegistryInner>,
+    armed: bool,
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(inner) = self.inner.upgrade() {
+            // Recovering a poisoned state is required here: panicking inside
+            // `drop` during an unwind aborts the daemon.
+            inner
+                .supervision_retries
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .running = false;
+        }
     }
 }
 
@@ -655,4 +740,90 @@ async fn stale_job_ended(
         .inspect_service(&observation.id)
         .await?
         .is_none_or(|fresh| !observation_live(&fresh)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::SessionRegistryConfig;
+
+    /// Bound on observing the retry task end.
+    const TASK_END_DEADLINE: Duration = Duration::from_secs(10);
+
+    fn retry_state(registry: &SessionRegistry) -> (bool, BTreeSet<String>) {
+        let state = registry
+            .inner
+            .supervision_retries
+            .state
+            .lock()
+            .expect("supervision retry state is never poisoned");
+        (state.running, state.pending.clone())
+    }
+
+    async fn wait_not_running(registry: &SessionRegistry) {
+        let deadline = tokio::time::Instant::now() + TASK_END_DEADLINE;
+        while retry_state(registry).0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the retry task never cleared its running flag"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_task_that_ends_early_lets_a_later_schedule_start_a_new_one() {
+        let registry = SessionRegistry::new(SessionRegistryConfig::default());
+        registry.begin_daemon_shutdown();
+        let first = SessionId("s-401".to_owned());
+
+        registry.schedule_supervision_retry(&first);
+        wait_not_running(&registry).await;
+        assert_eq!(
+            retry_state(&registry).1,
+            BTreeSet::from([first.0.clone()]),
+            "an early end keeps the session pending"
+        );
+
+        let second = SessionId("s-402".to_owned());
+        registry.schedule_supervision_retry(&second);
+        wait_not_running(&registry).await;
+        assert_eq!(
+            retry_state(&registry).1,
+            BTreeSet::from([first.0, second.0]),
+            "the later schedule ran a new task"
+        );
+    }
+
+    #[test]
+    fn running_guard_clears_the_flag_only_while_armed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let _entered = runtime.enter();
+        let registry = SessionRegistry::new(SessionRegistryConfig::default());
+        let set_running = || {
+            registry
+                .inner
+                .supervision_retries
+                .state
+                .lock()
+                .expect("supervision retry state is never poisoned")
+                .running = true;
+        };
+
+        set_running();
+        drop(RunningGuard {
+            inner: Arc::downgrade(&registry.inner),
+            armed: false,
+        });
+        assert!(retry_state(&registry).0, "a disarmed guard leaves the flag");
+
+        set_running();
+        drop(RunningGuard {
+            inner: Arc::downgrade(&registry.inner),
+            armed: true,
+        });
+        assert!(!retry_state(&registry).0, "an armed guard clears the flag");
+    }
 }
