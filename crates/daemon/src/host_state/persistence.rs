@@ -907,7 +907,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock after epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
+        let path = pohunek_test_support::temp_root().join(format!(
             "pohunek-host-state-unit-{tag}-{}-{nanos}/state/pohunek",
             std::process::id()
         ));

@@ -2283,16 +2283,35 @@ fn prepare_random_staging_directory_mode(
 }
 
 #[cfg(not(target_os = "linux"))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the signature matches the Linux implementation, which can fail"
-)]
 fn prepare_random_staging_directory_mode(
-    _directory: &File,
-    _name: &OsStr,
-    _path: &Path,
-    _mode: u32,
+    directory: &File,
+    name: &OsStr,
+    path: &Path,
+    mode: u32,
 ) -> FsResult<()> {
+    let identity =
+        inspect_entry(directory, path, name, EntryKind::Directory, None)?.ok_or_else(|| {
+            FsError::IdentityChanged {
+                path: path.to_path_buf(),
+            }
+        })?;
+    // An owner-masking umask can leave the new directory without owner search
+    // permission, and without `O_PATH` it cannot be opened to `fchmod` it.
+    // The random name lives inside a retained owner-private directory;
+    // `AT_SYMLINK_NOFOLLOW` never redirects through a link, and the identity
+    // re-check fences a replaced entry before the directory is opened.
+    fs::chmodat(
+        directory,
+        name,
+        mode_from_raw(mode),
+        AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(|source| io_error("set trusted directory staging mode", path, source))?;
+    if inspect_entry(directory, path, name, EntryKind::Directory, Some(mode))? != Some(identity) {
+        return Err(FsError::IdentityChanged {
+            path: path.to_path_buf(),
+        });
+    }
     Ok(())
 }
 

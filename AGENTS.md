@@ -73,6 +73,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/paths`    | Shared XDG path and local socket contract for daemon, CLI, and GUI clients. |
 | `crates/hostcheck`| Host environment probes shared by `doctor` and the daemon's `doctor` RPC. |
 | `crates/logging` | Process-safe size rotation and retention for daemon and per-session worker logs. |
+| `crates/test-support` | Test-only fixture roots that are symlink-free and short enough for Unix sockets on Linux and macOS. |
 | `crates/platform` | Target-neutral process, peer-identity, and native-supervisor contracts plus concrete OS backends. |
 | `crates/service-config` | Typed, fail-fast `service.toml` (installation namespace, deadlines, agent environment allowlist) shared by `pohunek service`, `pohunekd`, and `pohunek-sessiond`. |
 | `crates/gui-core` | Pure, headless state + SDK bridge for the GUI (no Iced dependency; fully unit-testable). |

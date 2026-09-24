@@ -118,7 +118,7 @@ impl Drop for PohunekEnvGuard {
 /// never narrows `PATH` (unlike `health_socket.rs`'s `PathGuard`), so there is
 /// no PATH-isolation race to guard against here.
 fn worker_backed_registry(mut config: SessionRegistryConfig) -> SessionRegistry {
-    let worker_home = std::env::temp_dir().join(format!(
+    let worker_home = pohunek_test_support::temp_root().join(format!(
         "pw-p-{}-{}",
         std::process::id(),
         WORKER_HOME_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -403,7 +403,7 @@ fn native_exit_watch_is_available() -> bool {
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = pohunek_test_support::temp_root().join(format!(
         "pohunek-{tag}-{}-{}",
         std::process::id(),
         unix_nanos()

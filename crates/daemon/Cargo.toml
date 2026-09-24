@@ -54,6 +54,7 @@ pohunek-session-worker = { workspace = true }
 # debounce coordinator tests advance time deterministically instead of sleeping.
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
+pohunek-test-support = { workspace = true }
 wait-timeout = "0.2"
 
 [lints]

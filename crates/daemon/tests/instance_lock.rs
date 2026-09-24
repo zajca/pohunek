@@ -10,7 +10,7 @@ use pohunek_daemon::lock::InstanceLock;
 use std::os::unix::fs::PermissionsExt as _;
 
 fn temp_lock(tag: &str) -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
+    let mut p = pohunek_test_support::temp_root();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());

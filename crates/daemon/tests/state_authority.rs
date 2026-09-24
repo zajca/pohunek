@@ -73,7 +73,7 @@ async fn wait_until_ready(child: &mut tokio::process::Child, socket: &Path) {
 async fn shared_state_rejects_second_daemon_with_a_different_runtime_root() {
     let root = tempfile::Builder::new()
         .prefix("pohunek-state-authority-")
-        .tempdir_in("/tmp")
+        .tempdir_in(pohunek_test_support::temp_root())
         .expect("create short test root");
     let runtime_one = root.path().join("r1");
     let runtime_two = root.path().join("r2");
@@ -122,7 +122,7 @@ async fn shared_state_rejects_second_daemon_with_a_different_runtime_root() {
 async fn shared_data_rejects_second_daemon_with_a_different_state_root() {
     let root = tempfile::Builder::new()
         .prefix("pohunek-data-authority-")
-        .tempdir_in("/tmp")
+        .tempdir_in(pohunek_test_support::temp_root())
         .expect("create short test root");
     let runtime_one = root.path().join("r1");
     let runtime_two = root.path().join("r2");
@@ -175,7 +175,7 @@ async fn shared_data_rejects_second_daemon_with_a_different_state_root() {
 async fn identical_runtime_and_data_base_starts_without_self_deadlock() {
     let root = tempfile::Builder::new()
         .prefix("pohunek-shared-runtime-data-")
-        .tempdir_in("/tmp")
+        .tempdir_in(pohunek_test_support::temp_root())
         .expect("create short test root");
     let shared_home = root.path().join("shared");
     let state_home = root.path().join("state");

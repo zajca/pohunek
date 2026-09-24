@@ -67,7 +67,7 @@ fn temp_dir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = pohunek_test_support::temp_root().join(format!(
         "pohunek-test-{tag}-{}-{nanos}-{n}",
         std::process::id()
     ));
@@ -301,7 +301,7 @@ async fn spawn_worker_backed_server(
     // Short prefix: the worker's own control socket nests several directories
     // below this home (`<runtime_home>/pohunek/workers/<session>/control.sock`),
     // and `AF_UNIX` paths are capped at ~108 bytes.
-    let worker_home = std::env::temp_dir().join(format!(
+    let worker_home = pohunek_test_support::temp_root().join(format!(
         "pw-h-{}-{}",
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -816,7 +816,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
         serde_json::to_value(SessionNewParams {
             name: None,
             agent: "sentinelclaude".to_owned(),
-            cwd: Some(std::env::temp_dir()),
+            cwd: Some(pohunek_test_support::temp_root()),
             cols: 80,
             rows: 24,
             project: None,

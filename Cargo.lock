@@ -4228,6 +4228,7 @@ dependencies = [
  "pohunek-service-config",
  "pohunek-session-worker",
  "pohunek-terminal",
+ "pohunek-test-support",
  "pohunek-worker-protocol",
  "regex",
  "rustix 1.1.4",
@@ -4506,6 +4507,13 @@ version = "0.31.6"
 dependencies = [
  "serde",
  "vt100",
+]
+
+[[package]]
+name = "pohunek-test-support"
+version = "0.31.6"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]

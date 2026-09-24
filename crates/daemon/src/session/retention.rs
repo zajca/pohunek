@@ -686,7 +686,7 @@ mod tests {
     fn private_policy_root() -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let root = tempfile::tempdir().expect("create policy fixture root");
+        let root = pohunek_test_support::tempdir().expect("create policy fixture root");
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
             .expect("set owner-private fixture mode");
         root

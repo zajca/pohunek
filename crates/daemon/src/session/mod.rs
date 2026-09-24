@@ -4429,7 +4429,7 @@ fn test_worker_roots(config: &SessionRegistryConfig) -> (PathBuf, PathBuf) {
     // it explicitly.
     let state_base = config.store_path.as_ref().map_or_else(
         || {
-            std::env::temp_dir().join(format!(
+            pohunek_test_support::temp_root().join(format!(
                 "pohunek-daemon-worker-test-{}-{}",
                 std::process::id(),
                 SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -4445,13 +4445,13 @@ fn test_worker_roots(config: &SessionRegistryConfig) -> (PathBuf, PathBuf) {
 
     // The runtime root holds the worker's Unix domain socket
     // (`<runtime_root>/<session_id>/control.sock`), whose path is bound by
-    // `SUN_LEN` (108 bytes on Linux/BSD). The metadata store's temp
+    // `sun_path` (108 bytes on Linux, 104 on Darwin). The metadata store's temp
     // directory embeds a test tag plus a 19-digit nanosecond timestamp and
     // routinely overflows that budget for longer tags, so -- unlike the
     // state root -- the default runtime root always uses a short, unique
-    // path directly under `temp_dir()`, independent of `store_path`.
+    // path directly under the fixture temp root, independent of `store_path`.
     let runtime_root = config.worker_runtime_root.clone().unwrap_or_else(|| {
-        std::env::temp_dir().join(format!(
+        pohunek_test_support::temp_root().join(format!(
             "pw-{}-{}",
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)

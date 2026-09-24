@@ -75,7 +75,8 @@ impl Fixture {
             binary.display()
         );
         let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let root = temp_root().join(format!("pohunek-env-{}-{sequence}", std::process::id()));
+        let root = pohunek_test_support::temp_root()
+            .join(format!("pohunek-env-{}-{sequence}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for directory in [
             "runtime/pohunek/workers",
@@ -346,16 +347,4 @@ fn worker_binary() -> PathBuf {
         PathBuf::from,
     );
     target.join("debug/pohunek-sessiond")
-}
-
-/// Short, symlink-free temporary root for Unix socket paths.
-///
-/// Darwin's per-user temporary directory lies behind `/var` and is long enough
-/// to overflow the 104-byte `sun_path` limit.
-fn temp_root() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        PathBuf::from("/private/tmp")
-    } else {
-        std::env::temp_dir()
-    }
 }

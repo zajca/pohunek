@@ -235,20 +235,11 @@ async fn governance_service(socket: &Path) -> Arc<HostGovernanceService> {
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "pohunek-test-{tag}-{}-{nanos}-{n}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("create test socket dir");
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-        .expect("make test socket directory private");
-    dir
+    // Owner-private, uniquely named, and short enough for the daemon socket
+    // below it on macOS; kept so the socket outlives the helper.
+    pohunek_test_support::tempdir_with_prefix(&format!("ph-{tag}-"))
+        .expect("create test socket dir")
+        .keep()
 }
 
 fn write_executable(path: &Path, body: &str) {
@@ -419,7 +410,7 @@ fn worker_backed_registry(
     socket: &std::path::Path,
     mut config: SessionRegistryConfig,
 ) -> SessionRegistry {
-    let worker_home = std::env::temp_dir().join(format!(
+    let worker_home = pohunek_test_support::temp_root().join(format!(
         "pw-h-{}-{}",
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -613,7 +604,7 @@ fn session_params() -> SessionNewParams {
     SessionNewParams {
         name: None,
         agent: "shell".to_owned(),
-        cwd: Some(std::env::temp_dir()),
+        cwd: Some(pohunek_test_support::temp_root()),
         cols: 80,
         rows: 24,
         project: None,
@@ -1201,7 +1192,7 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
     // The real worker nests its control socket below the XDG runtime root, and
     // `sockaddr_un` imposes a small platform path bound. Keep this fixture short
     // while retaining an isolated complete XDG environment.
-    let root = std::env::temp_dir().join(format!(
+    let root = pohunek_test_support::temp_root().join(format!(
         "pw-s-{}-{}",
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)

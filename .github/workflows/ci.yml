@@ -156,6 +156,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-service-config
 
+      # Daemon tests build their trusted roots and sockets under
+      # these fixture roots, so their Darwin contract is checked first.
+      - name: Test fixture roots
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-test-support
+
       - name: Test daemon
         # Independent suites: report each even when an earlier one failed.
         if: ${{ !cancelled() }}
@@ -320,6 +326,7 @@ jobs:
               - 'crates/terminal/**'
               - 'crates/logging/**'
               - 'crates/service-config/**'
+              - 'crates/test-support/**'
               - 'crates/daemon/**'
               - 'crates/cli/**'
               - 'crates/protocol/**'

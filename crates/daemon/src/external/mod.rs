@@ -759,7 +759,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
+        let dir = pohunek_test_support::temp_root().join(format!(
             "pohunek-external-{tag}-{}-{nanos}",
             std::process::id()
         ));
@@ -845,7 +845,7 @@ mod observer_tests {
     }
 
     fn transcript_root() -> (tempfile::TempDir, PathBuf) {
-        let root = tempfile::tempdir().expect("transcript root");
+        let root = pohunek_test_support::tempdir().expect("transcript root");
         let transcript = root.path().join("work/session.jsonl");
         std::fs::create_dir_all(transcript.parent().expect("parent")).expect("project dir");
         std::fs::write(

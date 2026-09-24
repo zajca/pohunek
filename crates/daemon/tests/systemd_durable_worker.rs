@@ -427,7 +427,7 @@ impl Fixture {
                 .expect("time after epoch")
                 .subsec_nanos()
         );
-        let root = std::env::temp_dir().join(format!("pohunek-systemd-e2e-{unique}"));
+        let root = pohunek_test_support::temp_root().join(format!("pohunek-systemd-e2e-{unique}"));
         let runtime_home = root.join("runtime");
         let config_home = root.join("config");
         let data_home = root.join("data");

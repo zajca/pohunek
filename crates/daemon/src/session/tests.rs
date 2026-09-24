@@ -411,11 +411,16 @@ async fn managed_observation_returns_runtime_bound_screen_output_and_wait() {
     let _ = registry.stop(&created.id).await;
 }
 
+// Linux keeps the session's terminal usable for descendants after the
+// session leader exits; XNU revokes it (`proc_exit`), so this drain
+// behavior exists only on Linux. The worker's Darwin counterpart is
+// `root_exit_revokes_the_terminal_and_stop_still_ends_the_group`.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn managed_output_remains_available_until_descendant_pty_eof() {
     use base64::prelude::{Engine as _, BASE64_STANDARD};
 
-    let barrier = tempfile::tempdir().expect("create output barrier");
+    let barrier = pohunek_test_support::tempdir().expect("create output barrier");
     let root_exited = barrier.path().join("root-exited");
     let release = barrier.path().join("release");
     let root_exited_arg = root_exited.to_string_lossy().into_owned();
@@ -513,9 +518,14 @@ async fn managed_output_remains_available_until_descendant_pty_eof() {
     );
 }
 
+// Linux keeps the session's terminal usable for descendants after the
+// session leader exits; XNU revokes it (`proc_exit`), so this drain
+// behavior exists only on Linux. The worker's Darwin counterpart is
+// `root_exit_revokes_the_terminal_and_stop_still_ends_the_group`.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn stop_after_root_exit_terminates_a_descendant_that_keeps_the_pty_open() {
-    let barrier = tempfile::tempdir().expect("create stop barrier");
+    let barrier = pohunek_test_support::tempdir().expect("create stop barrier");
     let root_exited = barrier.path().join("root-exited");
     let descendant_ready = barrier.path().join("descendant-ready");
     let root_exited_arg = root_exited.to_string_lossy().into_owned();
@@ -777,6 +787,7 @@ const LIVE_IDENTITY_REPORTER: &str = r#"import datetime
 import json
 import os
 import socket
+import sys
 import time
 
 reporter_pid = os.fork()
@@ -785,9 +796,24 @@ if reporter_pid != 0:
     raise SystemExit(0)
 
 pid = os.getpid()
-with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
-    fields = handle.read().rsplit(")", 1)[1].split()
-start_identity = int(fields[19])
+
+def process_start_identity(pid):
+    if sys.platform == "darwin":
+        # `struct proc_bsdinfo` from `proc_pidinfo(PROC_PIDTBSDINFO)`: the
+        # kernel start time the worker encodes as microseconds.
+        import ctypes
+        import struct
+
+        libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        buffer = ctypes.create_string_buffer(136)
+        assert libsystem.proc_pidinfo(pid, 3, ctypes.c_uint64(0), buffer, 136) == 136
+        seconds, microseconds = struct.unpack_from("=QQ", buffer, 120)
+        return seconds * 1_000_000 + microseconds
+    with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+        fields = handle.read().rsplit(")", 1)[1].split()
+    return int(fields[19])
+
+start_identity = process_start_identity(pid)
 sequence = int(time.time() * 1000)
 
 def send(request):
@@ -1164,7 +1190,7 @@ fn temp_store_path(tag: &str) -> PathBuf {
         .expect("system time after epoch")
         .as_nanos();
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = pohunek_test_support::temp_root().join(format!(
         "pohunek-session-{tag}-{}-{nanos}-{n}",
         std::process::id(),
     ));
@@ -2801,7 +2827,7 @@ async fn session_new_in_a_non_git_cwd_records_no_project() {
     // A plain shell in a non-git directory: no project, no stamping, today's
     // behavior unchanged.
     let (registry, _repo) = project_registry("non-git");
-    let non_git = std::env::temp_dir().join(format!(
+    let non_git = pohunek_test_support::temp_root().join(format!(
         "pohunek-nongit-{}-{}",
         std::process::id(),
         SystemTime::now()
@@ -3077,7 +3103,7 @@ async fn session_new_with_explicit_non_git_repo_errors() {
     // An explicitly named --repo that is not a git work tree must error, not
     // silently launch a plain shell somewhere else (no silent defaults).
     let (registry, _repo) = project_registry("explicit-nonrepo");
-    let nonrepo = std::env::temp_dir().join(format!(
+    let nonrepo = pohunek_test_support::temp_root().join(format!(
         "pohunek-nonrepo-{}-{}",
         std::process::id(),
         SystemTime::now()
@@ -5623,7 +5649,7 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
         .parent()
         .expect("store parent")
         .join("worker-state");
-    let worker_runtime_root = std::env::temp_dir().join(format!(
+    let worker_runtime_root = pohunek_test_support::temp_root().join(format!(
         "pw-hook-{}-{}",
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -10022,7 +10048,14 @@ async fn spontaneous_exit_uses_durable_base_after_uncaptured_resize() {
         .inspect(&created.id)
         .await
         .expect("inspect committed terminal session");
-    let event_info = next_session_updated(&mut events).await;
+    // Process observation may publish a live update (e.g. the procwatch cwd)
+    // before the exit commit; the terminal update is the one under test.
+    let event_info = loop {
+        let info = next_session_updated(&mut events).await;
+        if info.state.is_terminal() {
+            break info;
+        }
+    };
     assert_eq!(registry_info, durable.info);
     assert_eq!(event_info, durable.info);
     assert_no_runtime_event(&mut events).await;

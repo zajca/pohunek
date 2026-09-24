@@ -2806,8 +2806,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
+    #[cfg(target_os = "linux")]
     use base64::Engine as _;
     use pohunek_session_worker::{
         ChildIdentity as JournalChildIdentity, Journal, JournalRecord,
@@ -2850,15 +2851,10 @@ mod tests {
     };
 
     fn temp_root() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time after epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("ph-rec-{}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("create reconciliation root");
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
-            .expect("secure reconciliation root");
-        root
+        // Short enough for worker sockets named by full session ids on macOS.
+        pohunek_test_support::tempdir_with_prefix("ph-rec-")
+            .expect("create reconciliation root")
+            .keep()
     }
 
     fn create_private_dir(path: &Path) {
@@ -2867,8 +2863,11 @@ mod tests {
             .expect("secure private test directory");
     }
 
+    /// Releases the drain fixture's barriers when the Linux-only drain test ends.
+    #[cfg(target_os = "linux")]
     struct ReleaseFiles(Vec<PathBuf>);
 
+    #[cfg(target_os = "linux")]
     impl Drop for ReleaseFiles {
         fn drop(&mut self) {
             for path in &self.0 {
@@ -3733,6 +3732,11 @@ while os.getppid() == parent:
         server_task.abort();
     }
 
+    // Linux keeps the session's terminal usable for descendants after the
+    // session leader exits; XNU revokes it (`proc_exit`), so this drain
+    // behavior exists only on Linux. The worker's Darwin counterpart is
+    // `root_exit_revokes_the_terminal_and_stop_still_ends_the_group`.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
