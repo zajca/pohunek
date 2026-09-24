@@ -10,8 +10,9 @@ use pohunek_daemon::store::{
     DesiredState, ResumeBinding, RuntimeRecord, SessionRecord, Store, StoredInputRules,
 };
 use pohunek_worker_protocol::{
-    Dimensions, Initialize, InitializeLimits, LaunchIdentity, SecretEnv,
+    BaseEnv, Dimensions, Initialize, InitializeLimits, LaunchIdentity, SecretEnv,
     SessionId as WorkerSessionId, StopPolicy, TransactionId, Version,
+    DEFAULT_ENVIRONMENT_ALLOWLIST,
 };
 use protocol::{
     method, AgentActivity, AgentKind, AttachHeader, CwdSource, RuntimeState, SessionAttachParams,
@@ -31,6 +32,8 @@ const REPLAY_BURST_BYTES: usize = 2_655_396;
 const REPLAY_BURST_MARKER: &[u8] = b"replay-burst-complete";
 /// Retains the complete burst to exercise the non-evicted-history regression.
 const REPLAY_HISTORY_BYTES: u64 = 3_000_000;
+/// Fixed daemon-issued generation for the fixture's hand-started workers.
+const WORKER_GENERATION: &str = "abcd2345";
 
 #[tokio::test]
 #[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a real systemd user manager"]
@@ -390,7 +393,12 @@ impl Fixture {
         self.systemd_run(
             &self.worker_unit,
             worker_bin,
-            &["--session-id", self.session_id.as_str()],
+            &[
+                "--session-id",
+                self.session_id.as_str(),
+                "--worker-generation",
+                WORKER_GENERATION,
+            ],
             false,
         );
     }
@@ -399,7 +407,12 @@ impl Fixture {
         self.systemd_run(
             &self.isolation_worker_unit,
             worker_bin,
-            &["--session-id", self.isolation_session_id.as_str()],
+            &[
+                "--session-id",
+                self.isolation_session_id.as_str(),
+                "--worker-generation",
+                WORKER_GENERATION,
+            ],
             false,
         );
     }
@@ -496,6 +509,10 @@ impl Fixture {
             cwd: self.root.clone(),
             dimensions: Dimensions::new(80, 24).expect("dimensions"),
             environment: SecretEnv::new(BTreeMap::new()).expect("environment"),
+            base_environment: Some(
+                BaseEnv::from_allowlist(DEFAULT_ENVIRONMENT_ALLOWLIST, std::env::vars_os())
+                    .expect("base environment"),
+            ),
             limits: InitializeLimits::new(
                 if session_id == self.isolation_session_id {
                     128

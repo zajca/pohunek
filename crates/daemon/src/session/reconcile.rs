@@ -2763,6 +2763,11 @@ while os.getppid() == parent:
         let mut journal = JournalRecord::bootstrap(
             "s-91".to_owned(),
             "worker-valid".to_owned(),
+            pohunek_session_worker::WorkerOrigin {
+                executable: PathBuf::from("/usr/libexec/pohunek-sessiond"),
+                version: "0.0.0-test".to_owned(),
+                generation: "abcd2345".to_owned(),
+            },
             41,
             "410".to_owned(),
             "boot-test".to_owned(),
@@ -3319,6 +3324,7 @@ while os.getppid() == parent:
         let server = Server::bind(ServerArgs {
             session_id: session_id.to_owned(),
             worker_id: worker_id.to_owned(),
+            generation: "abcd2345".to_owned(),
             socket_path: socket.clone(),
             journal_path: journal,
             daemon_socket_path: root.join("runtime/daemon.sock"),
@@ -3363,6 +3369,12 @@ while os.getppid() == parent:
                 cwd: root.clone(),
                 dimensions: Dimensions::new(80, 24).expect("dimensions"),
                 environment: SecretEnv::new(BTreeMap::new()).expect("environment"),
+                base_environment: Some(
+                    crate::runtime::environment::base_environment(
+                        pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+                    )
+                    .expect("base environment"),
+                ),
                 limits: InitializeLimits::new(1_000_000, 100_000, 128, 60_000).expect("limits"),
                 stop_policy: StopPolicy::new(100).expect("stop policy"),
                 hook_protocol_version: Version::new(1).expect("version"),
@@ -3711,6 +3723,7 @@ while os.getppid() == parent:
         let server = Server::bind(ServerArgs {
             session_id: session_id.to_owned(),
             worker_id: worker_id.to_owned(),
+            generation: "abcd2345".to_owned(),
             socket_path: socket.clone(),
             journal_path: journal,
             daemon_socket_path: root.join("runtime/daemon.sock"),
@@ -3745,6 +3758,12 @@ while os.getppid() == parent:
                 cwd: root.clone(),
                 dimensions: Dimensions::new(80, 24).expect("dimensions"),
                 environment: SecretEnv::new(BTreeMap::new()).expect("environment"),
+                base_environment: Some(
+                    crate::runtime::environment::base_environment(
+                        pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+                    )
+                    .expect("base environment"),
+                ),
                 limits: InitializeLimits::new(1_000_000, 100_000, 128, 60_000).expect("limits"),
                 stop_policy: StopPolicy::new(100).expect("stop policy"),
                 hook_protocol_version: Version::new(1).expect("version"),
@@ -4022,6 +4041,11 @@ while os.getppid() == parent:
         let mut journal = JournalRecord::bootstrap(
             "s-205".to_owned(),
             "worker-terminal".to_owned(),
+            pohunek_session_worker::WorkerOrigin {
+                executable: PathBuf::from("/usr/libexec/pohunek-sessiond"),
+                version: "0.0.0-test".to_owned(),
+                generation: "abcd2345".to_owned(),
+            },
             41,
             "410".to_owned(),
             "boot-test".to_owned(),
@@ -4390,6 +4414,7 @@ while os.getppid() == parent:
         let server = Server::bind(ServerArgs {
             session_id: claimed_session.to_owned(),
             worker_id: worker_id.to_owned(),
+            generation: "abcd2345".to_owned(),
             socket_path: socket.clone(),
             journal_path: root
                 .join("state/workers")
@@ -4528,6 +4553,12 @@ while os.getppid() == parent:
                 cwd: root.to_path_buf(),
                 dimensions: Dimensions::new(80, 24).expect("dimensions"),
                 environment: SecretEnv::new(BTreeMap::new()).expect("environment"),
+                base_environment: Some(
+                    crate::runtime::environment::base_environment(
+                        pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+                    )
+                    .expect("base environment"),
+                ),
                 limits: InitializeLimits::new(1_000_000, 100_000, 128, 60_000).expect("limits"),
                 stop_policy: StopPolicy::new(100).expect("stop policy"),
                 hook_protocol_version: Version::new(1).expect("version"),

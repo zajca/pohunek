@@ -854,6 +854,10 @@ impl SessionRegistry {
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
         let environment = SecretEnv::new(command.env.iter().cloned().collect())
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
+        let base_environment = crate::runtime::environment::base_environment(
+            pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+        )
+        .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
         let transaction_id = TransactionId::new(transaction_id)
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
         let worker_session_id = WorkerSessionId::new(&id.0)
@@ -876,6 +880,7 @@ impl SessionRegistry {
                 cwd: command.cwd,
                 dimensions,
                 environment,
+                base_environment: Some(base_environment),
                 limits,
                 stop_policy,
                 hook_protocol_version: Version::new(1)

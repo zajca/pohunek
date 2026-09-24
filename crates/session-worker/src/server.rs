@@ -1,6 +1,6 @@
 //! Serves the private daemon-worker Unix protocol.
 
-// Rust guideline compliant 2026-09-22
+// Rust guideline compliant 2026-09-24
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -44,13 +44,14 @@ use crate::identity::{PeerContext, RejectReason};
 use crate::journal::{
     ActiveIdentity, ChildIdentity, JournalRecord, LaunchIdentity, PendingLaunchClaim,
     ReleasedIdentity, RuntimeOutcome, RuntimePhase as JournalPhase,
-    SubagentPhase as JournalSubagentPhase, SubagentRecord,
+    SubagentPhase as JournalSubagentPhase, SubagentRecord, WorkerOrigin,
 };
 use crate::launch::{self, LaunchClaimStatus};
 use crate::output::OutputCompletion;
 use crate::{
-    Command, ControllerLease, Exit, InputFragment, InputPlan, Journal, LeaseError, LeaseOwner,
-    OutputChunk, OutputEvent, ProcessIdentity, PtyError, PtyOwner, WorkerConfig, WorkerError,
+    Command, ControllerLease, EnvBase, Exit, InputFragment, InputPlan, Journal, LeaseError,
+    LeaseOwner, OutputChunk, OutputEvent, ProcessIdentity, PtyError, PtyOwner, WorkerConfig,
+    WorkerError,
 };
 
 /// How long an idle leased control connection may go unverified.
@@ -84,14 +85,14 @@ const RANDOM_BYTES: usize = 16;
 const CONTROL_INPUT_PREFIX: &str = "input-";
 /// Prefix shared by stream-scoped raw attach input identifiers.
 const ATTACH_INPUT_PREFIX: &str = "attach-";
-/// Environment variables inherited from the systemd worker but never the child.
-const WORKER_ONLY_ENV: [&str; 5] = [
-    "NOTIFY_SOCKET",
-    "WATCHDOG_PID",
-    "WATCHDOG_USEC",
-    "POHUNEK_CONTROLLER_TOKEN",
-    "POHUNEK_BOOTSTRAP_TOKEN",
-];
+/// `TERM` the worker sets for its PTY child.
+///
+/// The PTY is rendered by attaching clients' terminals and modeled by the
+/// xterm-compatible `vt100` parser, while a service-manager-started worker has
+/// no `TERM` of its own. The profile environment may still override it.
+const CHILD_TERM: &str = "xterm-256color";
+/// Package version recorded in the worker journal.
+const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SOCKET_DIRECTORY_MODE: u32 = 0o700;
 const SOCKET_MODE: u32 = 0o600;
 const SOCKET_LOCK_NAME: &str = ".worker.lock";
@@ -103,6 +104,8 @@ pub struct ServerArgs {
     pub session_id: String,
     /// Stable worker process ID.
     pub worker_id: String,
+    /// Daemon-issued generation of this worker process.
+    pub generation: String,
     /// Owner-private worker socket.
     pub socket_path: PathBuf,
     /// Worker-owned durable journal.
@@ -241,6 +244,10 @@ impl Server {
         if pohunek_paths::valid_worker_id(&args.worker_id).is_none() {
             return Err(WorkerError::InvalidWorkerId(args.worker_id));
         }
+        if pohunek_paths::valid_worker_generation(&args.generation).is_none() {
+            return Err(WorkerError::InvalidGeneration(args.generation));
+        }
+        let origin = worker_origin(args.generation)?;
         let session_id = SessionId::new(&args.session_id)
             .map_err(|error| WorkerError::Protocol(error.to_string()))?;
         let worker_id = WorkerId::new(&args.worker_id)
@@ -328,6 +335,7 @@ impl Server {
         let record = JournalRecord::bootstrap(
             args.session_id,
             args.worker_id,
+            origin,
             std::process::id(),
             worker_start.to_string(),
             boot_identity.to_string(),
@@ -873,7 +881,7 @@ async fn handle_request(
         RequestKind::Initialize {
             lease_id,
             initialize,
-        } => initialize_request(shared, connection, &lease_id, initialize).await,
+        } => initialize_request(shared, connection, &lease_id, *initialize).await,
         RequestKind::OpenDataStream {
             scope,
             stream_id,
@@ -1045,6 +1053,10 @@ async fn initialize_request(
     {
         return Err(identity_mismatch());
     }
+    let selected = connection.selected_version.ok_or_else(identity_mismatch)?;
+    initialize
+        .check_version(selected)
+        .map_err(|error| control_error(ControlCode::InvalidRequest, error, false))?;
 
     {
         let state = shared.state.lock().await;
@@ -3627,16 +3639,38 @@ fn validate_lease(
         .map_err(lease_control_error)
 }
 
+/// Builds the PTY child command from a validated `Initialize`.
+///
+/// From protocol version six the child environment starts empty and is layered
+/// as base environment, worker `TERM`, profile environment, then the worker's
+/// authoritative `POHUNEK_*` identity. A version-five `Initialize` has no base
+/// environment, so the child inherits the worker's sanitized environment
+/// instead. Service-manager variables are removed from the result either way.
 fn command_from_initialize(
     shared: &Shared,
     initialize: &Initialize,
     runtime_id: &RuntimeId,
 ) -> Command {
-    let mut environment = initialize.environment.clone().into_inner();
-    for name in WORKER_ONLY_ENV {
-        environment.remove(name);
-    }
-    environment.retain(|name, _| !name.starts_with("POHUNEK_"));
+    let mut environment = BTreeMap::new();
+    let base = match &initialize.base_environment {
+        Some(base_environment) => {
+            environment.extend(
+                base_environment
+                    .iter()
+                    .map(|(name, value)| (name.to_owned(), value.to_owned())),
+            );
+            environment.insert("TERM".to_owned(), CHILD_TERM.to_owned());
+            EnvBase::Empty
+        }
+        None => EnvBase::Inherited,
+    };
+    environment.extend(
+        initialize
+            .environment
+            .iter()
+            .filter(|(name, _)| !name.starts_with("POHUNEK_"))
+            .map(|(name, value)| (name.to_owned(), value.to_owned())),
+    );
     let mut reserved = BTreeMap::from([
         ("POHUNEK_ENV".to_owned(), "1".to_owned()),
         (
@@ -3675,14 +3709,35 @@ fn command_from_initialize(
         );
     }
     environment.extend(reserved);
+    environment.retain(|name, _| !protocol::is_denylisted(name));
     Command {
         program: initialize.executable.to_string_lossy().into_owned(),
         args: initialize.arguments.clone(),
+        base,
         env: environment.into_iter().collect(),
         cwd: initialize.cwd.clone(),
         cols: initialize.dimensions.columns(),
         rows: initialize.dimensions.rows(),
     }
+}
+
+/// Identifies the running worker binary for its journal.
+fn worker_origin(generation: String) -> Result<WorkerOrigin, WorkerError> {
+    let executable =
+        std::env::current_exe().map_err(|source| WorkerError::Executable { source })?;
+    if !executable.is_absolute() {
+        return Err(WorkerError::Executable {
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("executable path {} is not absolute", executable.display()),
+            ),
+        });
+    }
+    Ok(WorkerOrigin {
+        executable,
+        version: WORKER_VERSION.to_owned(),
+        generation,
+    })
 }
 
 fn wire_identity(identity: &ProcessIdentity) -> Result<WireProcessIdentity, ControlError> {
@@ -4288,6 +4343,7 @@ mod tests {
         let args = super::ServerArgs {
             session_id: "s-112".to_owned(),
             worker_id: "worker-lock".to_owned(),
+            generation: "abcd2345".to_owned(),
             socket_path: directory.path().join("worker.sock"),
             journal_path: directory.path().join("journal.json"),
             daemon_socket_path: directory.path().join("daemon.sock"),
@@ -4317,6 +4373,7 @@ mod tests {
             super::Server::bind(super::ServerArgs {
                 session_id: "s-113".to_owned(),
                 worker_id: "worker-invalid-daemon-path".to_owned(),
+                generation: "abcd2345".to_owned(),
                 socket_path: worker_socket.clone(),
                 journal_path: journal.clone(),
                 daemon_socket_path: overlong,
@@ -4337,6 +4394,7 @@ mod tests {
         let server = super::Server::bind(super::ServerArgs {
             session_id: "s-112".into(),
             worker_id: "worker-claim".into(),
+            generation: "abcd2345".to_owned(),
             socket_path: directory.join("worker.sock"),
             journal_path: directory.join("journal.json"),
             daemon_socket_path: directory.join("daemon.sock"),
@@ -4348,6 +4406,7 @@ mod tests {
             crate::Command {
                 program: "/bin/sh".into(),
                 args: vec!["-c".into(), "read -r line".into()],
+                base: crate::EnvBase::Inherited,
                 env: Vec::new(),
                 cwd: directory.clone(),
                 cols: 80,
@@ -4638,6 +4697,7 @@ mod tests {
         let mut journal = JournalRecord::bootstrap(
             "s-identity".to_owned(),
             "worker-identity".to_owned(),
+            crate::test_support::test_origin(),
             10,
             "100".to_owned(),
             "boot-test".to_owned(),
@@ -4664,6 +4724,7 @@ mod tests {
         let mut journal = JournalRecord::bootstrap(
             "s-subagents".to_owned(),
             "worker-subagents".to_owned(),
+            crate::test_support::test_origin(),
             10,
             "100".to_owned(),
             "boot-test".to_owned(),
@@ -4739,6 +4800,7 @@ mod tests {
         let mut journal = JournalRecord::bootstrap(
             "s-subagents".to_owned(),
             "worker-subagents".to_owned(),
+            crate::test_support::test_origin(),
             10,
             "100".to_owned(),
             "boot-test".to_owned(),
@@ -4803,6 +4865,7 @@ mod tests {
                     release.to_string_lossy().into_owned(),
                     barrier.path().to_string_lossy().into_owned(),
                 ],
+                base: crate::EnvBase::Inherited,
                 env: Vec::new(),
                 cwd: std::env::temp_dir(),
                 cols: 80,
@@ -4868,6 +4931,7 @@ mod tests {
         let server = super::Server::bind(super::ServerArgs {
             session_id: "s-113".to_owned(),
             worker_id: "worker-bounded-drain".to_owned(),
+            generation: "abcd2345".to_owned(),
             socket_path: directory.path().join("worker.sock"),
             journal_path: directory.path().join("journal.json"),
             daemon_socket_path: directory.path().join("daemon.sock"),
@@ -4887,6 +4951,7 @@ mod tests {
                     )
                     .to_owned(),
                 ],
+                base: crate::EnvBase::Inherited,
                 env: Vec::new(),
                 cwd: directory.path().to_path_buf(),
                 cols: 80,
@@ -4955,6 +5020,7 @@ mod tests {
         let server = super::Server::bind(super::ServerArgs {
             session_id: "s-115".to_owned(),
             worker_id: "worker-held-monitor".to_owned(),
+            generation: "abcd2345".to_owned(),
             socket_path: directory.path().join("worker.sock"),
             journal_path: directory.path().join("journal.json"),
             daemon_socket_path: directory.path().join("daemon.sock"),
@@ -4979,6 +5045,7 @@ mod tests {
                     directory.path().to_string_lossy().into_owned(),
                     ready.to_string_lossy().into_owned(),
                 ],
+                base: crate::EnvBase::Inherited,
                 env: Vec::new(),
                 cwd: directory.path().to_path_buf(),
                 cols: 80,
@@ -5025,6 +5092,7 @@ mod tests {
         let server = super::Server::bind(super::ServerArgs {
             session_id: "s-114".to_owned(),
             worker_id: "worker-escaped-output".to_owned(),
+            generation: "abcd2345".to_owned(),
             socket_path: directory.path().join("worker.sock"),
             journal_path: directory.path().join("journal.json"),
             daemon_socket_path: directory.path().join("daemon.sock"),
@@ -5049,6 +5117,7 @@ mod tests {
                     directory.path().to_string_lossy().into_owned(),
                     ready.to_string_lossy().into_owned(),
                 ],
+                base: crate::EnvBase::Inherited,
                 env: Vec::new(),
                 cwd: directory.path().to_path_buf(),
                 cols: 80,
@@ -5262,11 +5331,13 @@ mod tests {
 
     #[test]
     fn observation_capability_starts_at_private_version_four() {
+        let version_four = protocol::CONTROL_PLANE_OBSERVATION_VERSION;
         assert!(capabilities(CURRENT_VERSION).contains(&Capability::ControlPlaneObservation));
-        assert!(capabilities(PREVIOUS_VERSION).contains(&Capability::ControlPlaneObservation));
+        assert!(capabilities(version_four).contains(&Capability::ControlPlaneObservation));
         assert!(capabilities(CURRENT_VERSION).contains(&Capability::SubagentObservation));
-        assert!(!capabilities(PREVIOUS_VERSION).contains(&Capability::SubagentObservation));
-        assert!(capabilities(PREVIOUS_VERSION).contains(&Capability::AttachSnapshot));
+        assert!(capabilities(PREVIOUS_VERSION).contains(&Capability::SubagentObservation));
+        assert!(!capabilities(version_four).contains(&Capability::SubagentObservation));
+        assert!(capabilities(version_four).contains(&Capability::AttachSnapshot));
     }
 
     #[test]
@@ -5283,8 +5354,9 @@ mod tests {
                 start_identity: pohunek_platform::process::StartIdentity::new(1),
             }),
         ));
-        previous.selected_version = Some(PREVIOUS_VERSION);
-        previous.capabilities = capabilities(PREVIOUS_VERSION);
+        let version_four = protocol::CONTROL_PLANE_OBSERVATION_VERSION;
+        previous.selected_version = Some(version_four);
+        previous.capabilities = capabilities(version_four);
         let mut current = Connection::new(std::sync::Arc::new(
             crate::identity::PeerContext::for_test(pohunek_platform::process::ProcessIdentity {
                 pid: std::process::id(),
@@ -6202,5 +6274,213 @@ mod tests {
         }
 
         assert_eq!(repaint, ansi);
+    }
+
+    /// Binds a worker below a fresh private child of `root`, which tempfile
+    /// may create with a umask-derived mode the trusted filesystem rejects.
+    async fn environment_fixture(
+        root: &std::path::Path,
+        generation: &str,
+    ) -> Result<super::Server, crate::WorkerError> {
+        let directory = root.join("fixture");
+        super::Server::bind(super::ServerArgs {
+            session_id: "s-114".to_owned(),
+            worker_id: "worker-environment".to_owned(),
+            generation: generation.to_owned(),
+            socket_path: directory.join("worker.sock"),
+            journal_path: directory.join("journal.json"),
+            daemon_socket_path: directory.join("daemon.sock"),
+            config: crate::WorkerConfig::new(),
+        })
+        .await
+    }
+
+    fn environment_initialize(
+        base_environment: Option<protocol::BaseEnv>,
+        profile: &[(&str, &str)],
+    ) -> protocol::Initialize {
+        protocol::Initialize {
+            session_id: protocol::SessionId::new("s-114").expect("session id"),
+            transaction_id: protocol::TransactionId::new("create-environment")
+                .expect("transaction id"),
+            expected_worker_id: protocol::WorkerId::new("worker-environment").expect("worker id"),
+            launch: protocol::LaunchIdentity {
+                agent: "codex".to_owned(),
+                agent_base: "codex".to_owned(),
+                reference_kind: Some("id".to_owned()),
+            },
+            executable: std::path::PathBuf::from("/usr/bin/env"),
+            arguments: Vec::new(),
+            cwd: std::path::PathBuf::from("/"),
+            dimensions: Dimensions::new(80, 24).expect("dimensions"),
+            environment: protocol::SecretEnv::new(
+                profile
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+            )
+            .expect("profile environment"),
+            base_environment,
+            limits: protocol::InitializeLimits::new(1024, 1024, 32, 60_000).expect("limits"),
+            stop_policy: protocol::StopPolicy::new(500).expect("stop policy"),
+            hook_protocol_version: Version::new(1).expect("hook version"),
+            public_protocol_version: 7,
+        }
+    }
+
+    fn base_environment(pairs: &[(&str, &str)]) -> protocol::BaseEnv {
+        protocol::BaseEnv::new(
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+        )
+        .expect("base environment")
+    }
+
+    #[tokio::test]
+    async fn version_six_child_environment_is_exactly_base_term_profile_and_identity() {
+        let directory =
+            tempfile::tempdir_in(crate::test_support::temp_root()).expect("fixture directory");
+        let server = environment_fixture(directory.path(), "abcd2345")
+            .await
+            .expect("bind worker");
+        let initialize = environment_initialize(
+            Some(base_environment(&[
+                ("PATH", "/usr/bin:/bin"),
+                ("HOME", "/home/u"),
+                ("LANG", "C.UTF-8"),
+            ])),
+            &[
+                ("PROFILE_TOKEN", "profile-secret"),
+                ("HOME", "/home/profile"),
+                ("NOTIFY_SOCKET", "/run/profile-notify"),
+                ("WATCHDOG_USEC", "1"),
+                ("XPC_SERVICE_NAME", "profile"),
+                ("POHUNEK_SESSION_ID", "s-spoofed"),
+            ],
+        );
+        let runtime_id = RuntimeId::new("runtime-environment").expect("runtime id");
+
+        let command = super::command_from_initialize(&server.shared, &initialize, &runtime_id);
+
+        assert_eq!(command.base, crate::EnvBase::Empty);
+        let environment = command
+            .env
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let socket_path = directory.path().join("fixture/worker.sock");
+        let daemon_socket_path = directory.path().join("fixture/daemon.sock");
+        assert_eq!(
+            environment,
+            std::collections::BTreeMap::from([
+                ("HOME", "/home/profile"),
+                ("LANG", "C.UTF-8"),
+                ("PATH", "/usr/bin:/bin"),
+                ("POHUNEK_ENV", "1"),
+                ("POHUNEK_NATIVE_REFERENCE_KIND", "id"),
+                ("POHUNEK_PROTOCOL_VERSION", "7"),
+                ("POHUNEK_RUNTIME_ID", "runtime-environment"),
+                ("POHUNEK_SESSION_ID", "s-114"),
+                (
+                    "POHUNEK_SOCKET_PATH",
+                    daemon_socket_path.to_str().expect("UTF-8")
+                ),
+                ("POHUNEK_WORKER_HOOK_PROTOCOL_VERSION", "1"),
+                ("POHUNEK_WORKER_ID", "worker-environment"),
+                (
+                    "POHUNEK_WORKER_SOCKET_PATH",
+                    socket_path.to_str().expect("UTF-8")
+                ),
+                ("PROFILE_TOKEN", "profile-secret"),
+                ("TERM", super::CHILD_TERM),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_environment_may_override_the_worker_term() {
+        let directory =
+            tempfile::tempdir_in(crate::test_support::temp_root()).expect("fixture directory");
+        let server = environment_fixture(directory.path(), "abcd2345")
+            .await
+            .expect("bind worker");
+        let initialize = environment_initialize(Some(base_environment(&[])), &[("TERM", "screen")]);
+        let runtime_id = RuntimeId::new("runtime-environment").expect("runtime id");
+
+        let command = super::command_from_initialize(&server.shared, &initialize, &runtime_id);
+
+        assert!(command
+            .env
+            .contains(&("TERM".to_owned(), "screen".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn version_five_child_inherits_without_service_manager_variables() {
+        let directory =
+            tempfile::tempdir_in(crate::test_support::temp_root()).expect("fixture directory");
+        let server = environment_fixture(directory.path(), "abcd2345")
+            .await
+            .expect("bind worker");
+        let initialize = environment_initialize(
+            None,
+            &[
+                ("PROFILE_TOKEN", "profile-secret"),
+                ("NOTIFY_SOCKET", "/run/profile-notify"),
+                ("POHUNEK_BOOTSTRAP_TOKEN", "token"),
+            ],
+        );
+        let runtime_id = RuntimeId::new("runtime-environment").expect("runtime id");
+
+        let command = super::command_from_initialize(&server.shared, &initialize, &runtime_id);
+
+        assert_eq!(command.base, crate::EnvBase::Inherited);
+        let names = command
+            .env
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"PROFILE_TOKEN"));
+        assert!(!names.contains(&"TERM"));
+        assert!(!names.contains(&"NOTIFY_SOCKET"));
+        assert!(!names.contains(&"POHUNEK_BOOTSTRAP_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn bind_journals_the_worker_executable_version_and_generation() {
+        let directory =
+            tempfile::tempdir_in(crate::test_support::temp_root()).expect("fixture directory");
+
+        let server = environment_fixture(directory.path(), "mzxw6ytb")
+            .await
+            .expect("bind worker");
+
+        let journal = crate::Journal::new(directory.path().join("fixture/journal.json"))
+            .load()
+            .expect("load bootstrap journal");
+        assert_eq!(
+            journal.origin,
+            crate::WorkerOrigin {
+                executable: std::env::current_exe().expect("test executable"),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                generation: "mzxw6ytb".to_owned(),
+            }
+        );
+        assert!(journal.origin.executable.is_absolute());
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_an_invalid_generation_before_touching_disk() {
+        let directory =
+            tempfile::tempdir_in(crate::test_support::temp_root()).expect("fixture directory");
+
+        let error = environment_fixture(directory.path(), "NOT-VALID")
+            .await
+            .expect_err("invalid generation must fail");
+
+        assert!(matches!(error, crate::WorkerError::InvalidGeneration(_)));
+        assert!(!directory.path().join("fixture").exists());
     }
 }

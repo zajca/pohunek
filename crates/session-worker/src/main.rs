@@ -1,6 +1,6 @@
 //! Runs one durable pohunek session worker.
 
-// Rust guideline compliant 2026-09-19
+// Rust guideline compliant 2026-09-24
 
 use std::fmt::Write as _;
 use std::fs;
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use pohunek_paths::{validate_socket_path, BasePaths, Platform, SocketKind};
-use pohunek_session_worker::{Server, ServerArgs, WorkerConfig, WorkerError};
+use pohunek_session_worker::{load_service_config, Server, ServerArgs, WorkerConfig, WorkerError};
 use tracing::{event, Level};
 use tracing_subscriber::prelude::*;
 
@@ -37,6 +37,9 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), WorkerError> {
     let cli = Cli::parse(std::env::args().skip(1))?;
+    if let Some(service_config) = &cli.service_config {
+        load_service_config(service_config)?;
+    }
     let paths = BasePaths::resolve()?;
     let worker_id = match cli.worker_id {
         Some(worker_id) => worker_id,
@@ -60,6 +63,7 @@ async fn run() -> Result<(), WorkerError> {
     let server = Server::bind(ServerArgs {
         session_id: cli.session_id.clone(),
         worker_id: worker_id.clone(),
+        generation: cli.generation.clone(),
         socket_path,
         journal_path,
         daemon_socket_path,
@@ -72,7 +76,8 @@ async fn run() -> Result<(), WorkerError> {
         Level::INFO,
         session.id = %cli.session_id,
         worker.id = %worker_id,
-        "worker bootstrap ready for {{session.id}} as {{worker.id}}",
+        worker.generation = %cli.generation,
+        "worker bootstrap ready for {{session.id}} as {{worker.id}} generation {{worker.generation}}",
     );
     server.serve().await
 }
@@ -80,38 +85,41 @@ async fn run() -> Result<(), WorkerError> {
 #[derive(Debug)]
 struct Cli {
     session_id: String,
+    generation: String,
     worker_id: Option<String>,
     daemon_socket_path: Option<PathBuf>,
+    service_config: Option<PathBuf>,
 }
 
 impl Cli {
     fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Self, WorkerError> {
         let mut arguments = arguments.into_iter();
         let mut session_id = None;
+        let mut generation = None;
         let mut worker_id = None;
         let mut daemon_socket_path = None;
+        let mut service_config = None;
         while let Some(argument) = arguments.next() {
-            match argument.as_str() {
-                "--session-id" => {
-                    session_id = arguments.next();
-                }
-                "--worker-id" => {
-                    worker_id = arguments.next();
-                }
-                "--daemon-socket-path" => {
-                    daemon_socket_path =
-                        Some(PathBuf::from(arguments.next().ok_or_else(|| {
-                            WorkerError::Protocol(
-                                "argument --daemon-socket-path requires a value".to_owned(),
-                            )
-                        })?));
-                }
+            let slot = match argument.as_str() {
+                "--session-id" => &mut session_id,
+                "--worker-generation" => &mut generation,
+                "--worker-id" => &mut worker_id,
+                "--daemon-socket-path" => &mut daemon_socket_path,
+                "--service-config" => &mut service_config,
                 _ => {
                     return Err(WorkerError::Protocol(format!(
                         "unknown worker argument `{argument}`"
                     )));
                 }
+            };
+            if slot.is_some() {
+                return Err(WorkerError::Protocol(format!(
+                    "argument {argument} was given more than once"
+                )));
             }
+            *slot = Some(arguments.next().ok_or_else(|| {
+                WorkerError::Protocol(format!("argument {argument} requires a value"))
+            })?);
         }
         let session_id = session_id.ok_or_else(|| {
             WorkerError::Protocol("required argument --session-id is missing".to_owned())
@@ -119,16 +127,31 @@ impl Cli {
         if pohunek_paths::valid_worker_session_id(&session_id).is_none() {
             return Err(WorkerError::InvalidSessionId(session_id));
         }
+        let generation = generation.ok_or_else(|| {
+            WorkerError::Protocol("required argument --worker-generation is missing".to_owned())
+        })?;
+        if pohunek_paths::valid_worker_generation(&generation).is_none() {
+            return Err(WorkerError::InvalidGeneration(generation));
+        }
         if worker_id
             .as_deref()
             .is_some_and(|id| pohunek_paths::valid_worker_id(id).is_none())
         {
             return Err(WorkerError::InvalidWorkerId(worker_id.unwrap_or_default()));
         }
+        let service_config = service_config.map(PathBuf::from);
+        if let Some(path) = service_config.as_ref().filter(|path| !path.is_absolute()) {
+            return Err(WorkerError::Protocol(format!(
+                "argument --service-config must be an absolute path, got {}",
+                path.display()
+            )));
+        }
         Ok(Self {
             session_id,
+            generation,
             worker_id,
-            daemon_socket_path,
+            daemon_socket_path: daemon_socket_path.map(PathBuf::from),
+            service_config,
         })
     }
 }
@@ -208,18 +231,113 @@ fn generate_worker_id() -> Result<String, WorkerError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use pohunek_session_worker::WorkerError;
+
     use super::{generate_worker_id, Cli};
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
 
     #[test]
     fn cli_requires_safe_managed_session_id() {
-        Cli::parse(["--session-id".to_owned(), "s-42".to_owned()]).expect("valid session");
-        Cli::parse([
-            "--session-id".to_owned(),
-            "s-01KYAPVPFVHD56Z69B9CX3XWN2".to_owned(),
-        ])
+        Cli::parse(arguments(&[
+            "--session-id",
+            "s-42",
+            "--worker-generation",
+            "abcd2345",
+        ]))
+        .expect("valid session");
+        Cli::parse(arguments(&[
+            "--session-id",
+            "s-01KYAPVPFVHD56Z69B9CX3XWN2",
+            "--worker-generation",
+            "abcd2345",
+        ]))
         .expect("valid ULID session");
-        Cli::parse(["--session-id".to_owned(), "../bad".to_owned()])
-            .expect_err("path-like session must fail");
+        Cli::parse(arguments(&[
+            "--session-id",
+            "../bad",
+            "--worker-generation",
+            "abcd2345",
+        ]))
+        .expect_err("path-like session must fail");
+    }
+
+    #[test]
+    fn cli_requires_a_valid_worker_generation() {
+        let error = Cli::parse(arguments(&["--session-id", "s-42"]))
+            .expect_err("missing generation must fail");
+        assert!(error.to_string().contains("--worker-generation"));
+
+        for invalid in ["ABCD2345", "abcd234", "abcd2341", ""] {
+            assert!(
+                matches!(
+                    Cli::parse(arguments(&[
+                        "--session-id",
+                        "s-42",
+                        "--worker-generation",
+                        invalid,
+                    ])),
+                    Err(WorkerError::InvalidGeneration(_))
+                ),
+                "{invalid:?} must be rejected"
+            );
+        }
+
+        let cli = Cli::parse(arguments(&[
+            "--session-id",
+            "s-42",
+            "--worker-generation",
+            "abcd2345",
+        ]))
+        .expect("valid generation");
+        assert_eq!(cli.generation, "abcd2345");
+        assert_eq!(cli.service_config, None);
+    }
+
+    #[test]
+    fn cli_accepts_only_an_absolute_service_config() {
+        let cli = Cli::parse(arguments(&[
+            "--session-id",
+            "s-42",
+            "--worker-generation",
+            "abcd2345",
+            "--service-config",
+            "/home/u/.config/pohunek/service.toml",
+        ]))
+        .expect("absolute service configuration");
+        assert_eq!(
+            cli.service_config.as_deref(),
+            Some(Path::new("/home/u/.config/pohunek/service.toml"))
+        );
+
+        Cli::parse(arguments(&[
+            "--session-id",
+            "s-42",
+            "--worker-generation",
+            "abcd2345",
+            "--service-config",
+            "service.toml",
+        ]))
+        .expect_err("relative service configuration must fail");
+    }
+
+    #[test]
+    fn cli_rejects_repeated_and_valueless_arguments() {
+        Cli::parse(arguments(&[
+            "--session-id",
+            "s-42",
+            "--session-id",
+            "s-43",
+            "--worker-generation",
+            "abcd2345",
+        ]))
+        .expect_err("repeated argument must fail");
+        Cli::parse(arguments(&["--session-id", "s-42", "--worker-generation"]))
+            .expect_err("valueless argument must fail");
     }
 
     #[test]
