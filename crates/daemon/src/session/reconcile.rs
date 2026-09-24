@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 
 use super::supervision::{
     classify_unreachable, job_identity_mismatch, observe, Cleanup, JobEvidence, JournalWorker,
-    Unreachable, RUNTIME_LOST, RUNTIME_LOST_CLEANUP_UNCONFIRMED,
+    Unreachable, RUNTIME_LOST, RUNTIME_LOST_CLEANUP_UNCONFIRMED, UNSUPERVISED_WORKER,
 };
 use super::{
     current_time_millis, event, event_payload, identity_claim_expiry_is_valid, mpsc,
@@ -581,7 +581,12 @@ impl SessionRegistry {
                     // its journal; a job the supervisor cannot show does not
                     // make its live PTY any less adoptable.
                     JobEvidence::Absent => {
-                        tracing::warn!(session_id = %record.session_id, "adopting a live worker whose job is absent");
+                        self.note_unsupervised_worker(
+                            &record.session_id,
+                            &candidate.snapshot,
+                            &generation.service_id(),
+                        )
+                        .await;
                     }
                     JobEvidence::Unavailable(detail) => {
                         tracing::warn!(session_id = %record.session_id, detail, "adopting a live worker without supervisor evidence");
@@ -753,6 +758,59 @@ impl SessionRegistry {
                 false
             }
         }
+    }
+
+    /// Records that a live worker was adopted while its job is proven absent.
+    ///
+    /// The native manager has lost track of a worker that still owns a PTY,
+    /// so the anomaly is logged as a structured warning and noted on the
+    /// session's inventory entry, which is re-announced to subscribers.
+    async fn note_unsupervised_worker(
+        &self,
+        session_id: &str,
+        snapshot: &InspectSnapshot,
+        service_id: &pohunek_platform::supervisor::ServiceId,
+    ) {
+        tracing::warn!(
+            name: "reconcile.adopt.job_absent",
+            session_id,
+            service_id = %service_id,
+            worker_id = %snapshot.worker_id,
+            "adopting a live worker whose supervisor job is absent"
+        );
+        let entry = {
+            let mut inventory = self.inner.runtime_inventory.lock().await;
+            let position = inventory.iter().position(|entry| {
+                entry.runtime_slot == session_id && entry.status == RuntimeInventoryStatus::Managed
+            });
+            let entry = if let Some(position) = position {
+                &mut inventory[position]
+            } else {
+                inventory.push(RuntimeInventoryEntry {
+                    runtime_slot: session_id.to_owned(),
+                    claimed_session_id: Some(session_id.to_owned()),
+                    worker_id: Some(snapshot.worker_id.to_string()),
+                    runtime_id: snapshot.runtime_id.as_ref().map(ToString::to_string),
+                    status: RuntimeInventoryStatus::Managed,
+                    reason: None,
+                });
+                inventory.sort_by(|left, right| left.runtime_slot.cmp(&right.runtime_slot));
+                inventory
+                    .iter_mut()
+                    .find(|entry| {
+                        entry.runtime_slot == session_id
+                            && entry.status == RuntimeInventoryStatus::Managed
+                    })
+                    .expect("the managed entry was just inserted")
+            };
+            entry.reason = Some(UNSUPERVISED_WORKER.to_owned());
+            entry.clone()
+        };
+        let event = crate::events::event(
+            event::SESSION_RUNTIME_DISCOVERED,
+            event_payload(RuntimeInventoryEvent { entry }),
+        );
+        let _ = self.inner.events.send(event);
     }
 
     /// Deletes the record of a create that never produced a usable runtime.
@@ -5901,7 +5959,7 @@ while os.getppid() == parent:
         use protocol::{RuntimeInventoryStatus, RuntimeState, SessionId};
 
         use super::super::super::supervision::{
-            RUNTIME_LOST, RUNTIME_LOST_CLEANUP_UNCONFIRMED, STALE_GENERATION,
+            RUNTIME_LOST, RUNTIME_LOST_CLEANUP_UNCONFIRMED, STALE_GENERATION, UNSUPERVISED_WORKER,
         };
         use super::{
             bind_test_generation, identity_record, spawn_incompatible_worker,
@@ -6280,6 +6338,49 @@ while os.getppid() == parent:
             fixture
                 .registry
                 .stop(&SessionId("s-306".to_owned()))
+                .await
+                .expect("stop adopted worker");
+            server_task.abort();
+        }
+
+        #[tokio::test]
+        async fn live_worker_with_an_absent_job_is_adopted_and_flagged() {
+            let fixture = fixture(Arc::new(HostInspector::new()));
+            let runtime_root = fixture.root.join("runtime/workers");
+            let (controller, runtime_id, _child_pid, server_task) =
+                spawn_initialized_worker(&fixture.root, &runtime_root, "s-315", "worker-s-315")
+                    .await;
+            persist_record(&fixture.root, "s-315", Some(runtime_id.as_str()));
+            drop(controller);
+            let mut events = fixture.registry.subscribe();
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            assert_eq!(
+                runtime_of(&fixture.registry, "s-315").await.state,
+                RuntimeState::Live
+            );
+            let inventory = fixture.registry.runtime_inventory().await;
+            let entry = inventory
+                .entries
+                .iter()
+                .find(|entry| entry.runtime_slot == "s-315")
+                .expect("adopted worker is inventoried");
+            assert_eq!(entry.status, RuntimeInventoryStatus::Managed);
+            assert_eq!(entry.reason.as_deref(), Some(UNSUPERVISED_WORKER));
+            let mut announced = false;
+            while let Ok(event) = events.try_recv() {
+                if event.event() == protocol::event::SESSION_RUNTIME_DISCOVERED {
+                    announced |=
+                        event.payload()["entry"]["reason"].as_str() == Some(UNSUPERVISED_WORKER);
+                }
+            }
+            assert!(announced, "the anomaly is announced to subscribers");
+            fixture
+                .registry
+                .stop(&SessionId("s-315".to_owned()))
                 .await
                 .expect("stop adopted worker");
             server_task.abort();
