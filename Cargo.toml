@@ -101,6 +101,9 @@ vt100 = "0.16.2"
 portable-pty = "0.9"
 tempfile = "3"
 proptest = "1"
+# launchd job definitions are XML property lists built from `plist::Value`;
+# serde support is not needed.
+plist = { version = "1.10", default-features = false }
 zbus = { version = "5.16", default-features = false, features = ["tokio"] }
 pulldown-cmark = "0.12"
 # Session identifiers need durable, globally collision-resistant generation.

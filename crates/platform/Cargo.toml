@@ -23,6 +23,12 @@ nix = { workspace = true, features = ["socket"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 calcifer-macos-acl.workspace = true
 libc.workspace = true
+plist.workspace = true
+
+# The plist rendering and parsing of the launchd backend is target-neutral, so
+# its golden tests run on every host.
+[dev-dependencies]
+plist.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 nix = { workspace = true, features = ["signal"] }
