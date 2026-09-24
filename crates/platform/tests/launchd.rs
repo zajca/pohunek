@@ -49,7 +49,9 @@ const SLEEPING_WORKER: &str = "/bin/sleep 600 & wait";
 /// Worker whose process exits on its own shortly after it starts.
 ///
 /// Three seconds leave the 100 ms observation poll ample time to see it run.
-const EXITING_WORKER: &str = "/bin/sleep 3";
+/// The background job keeps `bash` itself as the main process; a lone simple
+/// command would be `exec`ed and no longer match the definition's executable.
+const EXITING_WORKER: &str = "/bin/sleep 3 & wait";
 
 /// Worker that ignores `SIGTERM` and keeps a child in its process group.
 const STUBBORN_WORKER: &str = "trap '' TERM; /bin/sleep 600 & wait";
