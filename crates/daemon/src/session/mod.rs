@@ -481,6 +481,9 @@ struct SessionRegistryInner {
     retention: retention::RetentionState,
     #[cfg(test)]
     external_association_block: std::sync::Mutex<Option<Arc<ExternalAssociationBlock>>>,
+    /// Rendezvous the next waited input write meets at its send boundary.
+    #[cfg(test)]
+    input_send_hold: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 #[cfg(test)]
@@ -1186,6 +1189,8 @@ impl SessionRegistry {
                 retention,
                 #[cfg(test)]
                 external_association_block: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                input_send_hold: std::sync::Mutex::new(None),
             }),
         };
         if let Some(config) = external_observer {

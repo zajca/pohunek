@@ -48,6 +48,11 @@ use super::{
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.
 const CONCURRENT_TRANSITION_RETRY_LIMIT: usize = 32;
 
+/// Overall input deadline for tests that assert event ordering rather than
+/// deadline expiry. It only bounds a stalled test: a starved host must not
+/// expire it while a deliberately delayed worker ACK is still pending.
+const ORDERING_TEST_INPUT_DEADLINE: Duration = Duration::from_secs(5);
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static NATIVE_REPORT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -4865,10 +4870,8 @@ async fn session_input_wait_rejects_delayed_provider_framing_before_delivery() {
             })
             .await
             .expect("fire-and-forget keeps provider framing");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let output = read_session_output_after_rejection(&registry, &created.id).await;
+        let output = wait_for_session_output(&registry, &created.id, &["got:next-input"]).await;
         assert!(!output.contains(&marker), "output={output:?}");
-        assert!(output.contains("got:next-input"), "output={output:?}");
         let _ = registry.stop(&created.id).await;
     }
 }
@@ -5030,17 +5033,17 @@ async fn session_input_wait_serializes_activity_snapshot_with_send_start() {
     );
     let mut events = registry.subscribe();
     let send_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_input_send(Arc::clone(&send_boundary));
     let write = tokio::spawn({
         let registry = registry.clone();
         let session_id = created.id.clone();
-        let send_boundary = Arc::clone(&send_boundary);
         async move {
             registry
-                .write_waited_input_at_send_boundary(
+                .write_waited_input_with_ack_delay(
                     &session_id,
                     "serialized-boundary",
-                    tokio::time::Instant::now() + Duration::from_secs(1),
-                    send_boundary,
+                    tokio::time::Instant::now() + ORDERING_TEST_INPUT_DEADLINE,
+                    Duration::ZERO,
                 )
                 .await
         }
@@ -5139,8 +5142,9 @@ async fn session_input_wait_timeout_while_worker_reserved_never_sends_late_input
         })
         .await
         .expect("next input succeeds after timed out reservation");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    // The shell answers exactly one line, so its answer names whichever
+    // input reached it first.
+    let output = wait_for_session_output(&registry, &created.id, &["received:"]).await;
     assert!(
         !output.contains("must-not-arrive-late"),
         "output={output:?}"
@@ -5270,13 +5274,12 @@ async fn session_input_wait_timeout_after_atomic_plan_does_not_stage_body() {
         .await
         .expect("next input task joins")
         .expect("next input succeeds after the late plan ACK is consumed");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let output = read_session_output_after_rejection(&registry, &created.id).await;
-    assert!(
-        output.contains("got:atomic-plan-timeout"),
-        "output={output:?}"
-    );
-    assert!(output.contains("got:next-input"), "output={output:?}");
+    let output = wait_for_session_output(
+        &registry,
+        &created.id,
+        &["got:atomic-plan-timeout", "got:next-input"],
+    )
+    .await;
     assert!(!output.contains("got:atomic-plan-timeoutnext-input"));
     let _ = registry.stop(&created.id).await;
 }
@@ -5339,8 +5342,12 @@ async fn session_input_serializes_waited_transactions() {
         .await
         .expect("second waited task joins")
         .expect("second waited transaction succeeds");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    let output = wait_for_session_output(
+        &registry,
+        &created.id,
+        &["got:first-waited", "got:second-waited"],
+    )
+    .await;
     let first_position = output.find("got:first-waited").expect("first output");
     let second_position = output.find("got:second-waited").expect("second output");
     assert!(first_position < second_position, "output={output:?}");
@@ -5403,8 +5410,12 @@ async fn session_input_serializes_waited_and_fire_and_forget_transactions() {
         .await
         .expect("fire task joins")
         .expect("fire-and-forget transaction succeeds");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    let output = wait_for_session_output(
+        &registry,
+        &created.id,
+        &["got:first-waited", "got:second-fire"],
+    )
+    .await;
     let first_position = output.find("got:first-waited").expect("waited output");
     let second_position = output.find("got:second-fire").expect("fire output");
     assert!(first_position < second_position, "output={output:?}");
@@ -5431,30 +5442,45 @@ async fn session_input_wait_accepts_activity_between_submit_flush_and_ack() {
         .await
         .expect("create Claude session");
     let mut events = registry.subscribe();
-    let reports = tokio::spawn({
+    let send_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_input_send(Arc::clone(&send_boundary));
+    let deadline = tokio::time::Instant::now() + ORDERING_TEST_INPUT_DEADLINE;
+    let write = tokio::spawn({
         let registry = registry.clone();
         let session_id = created.id.clone();
         async move {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            assert!(
-                report_input_activity(&registry, &session_id, AgentActivity::Idle, 1)
-                    .await
-                    .recorded
-            );
-            tokio::time::sleep(Duration::from_millis(225)).await;
-            report_input_activity(&registry, &session_id, AgentActivity::Blocked, 2).await
+            registry
+                .write_waited_input_with_ack_delay(
+                    &session_id,
+                    "submit-boundary",
+                    deadline,
+                    Duration::from_millis(500),
+                )
+                .await
         }
     });
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    send_boundary.wait().await;
+    send_boundary.wait().await;
 
-    let submission = registry
-        .write_waited_input_with_ack_delay(
-            &created.id,
-            "submit-boundary",
-            deadline,
-            Duration::from_millis(500),
-        )
+    // The write holds the session lock until its send starts, so both
+    // reports order after the boundary; the delayed ACK keeps them before it.
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Idle, 1)
+            .await
+            .recorded
+    );
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Blocked, 2)
+            .await
+            .recorded
+    );
+    assert!(
+        !write.is_finished(),
+        "activity must be recorded before the delayed worker acknowledgement"
+    );
+    let submission = write
         .await
+        .expect("write task joins")
         .expect("submit write completes after delayed acknowledgement");
     let result = registry
         .await_input_settled(
@@ -5471,7 +5497,6 @@ async fn session_input_wait_accepts_activity_between_submit_flush_and_ack() {
 
     assert_eq!(result.activity, Some(AgentActivity::Idle));
     assert_eq!(result.activity_source, Some(StateSource::Report));
-    assert!(reports.await.expect("report task joins").recorded);
     let _ = registry.stop(&created.id).await;
 }
 
@@ -6846,12 +6871,6 @@ async fn session_input_wait_resnapshots_after_broadcast_lag() {
         .input_activity_snapshot(&created.id, None)
         .await
         .expect("snapshot activity");
-    let submission = InputSubmission {
-        runtime: submitted_revision.runtime.clone(),
-        activity_epoch: registry.daemon_instance_id().to_owned(),
-        after_revision: submitted_revision.revision,
-        deadline: tokio::time::Instant::now() + Duration::from_millis(250),
-    };
     for sequence in 1..=130 {
         assert!(
             report_input_activity(&registry, &created.id, AgentActivity::Working, sequence,)
@@ -6864,6 +6883,14 @@ async fn session_input_wait_resnapshots_after_broadcast_lag() {
             .await
             .recorded
     );
+    // The deadline starts after the report burst so a slow host cannot place
+    // the Idle evidence past it; the burst is setup, not the bounded wait.
+    let submission = InputSubmission {
+        runtime: submitted_revision.runtime.clone(),
+        activity_epoch: registry.daemon_instance_id().to_owned(),
+        after_revision: submitted_revision.revision,
+        deadline: tokio::time::Instant::now() + Duration::from_millis(250),
+    };
 
     let result = registry
         .await_input_settled(
@@ -6899,12 +6926,6 @@ async fn session_input_wait_uses_rapid_target_event_after_latest_state_changes()
         .input_activity_snapshot(&created.id, None)
         .await
         .expect("capture submitted revision");
-    let submission = InputSubmission {
-        runtime: submitted.runtime.clone(),
-        activity_epoch: registry.daemon_instance_id().to_owned(),
-        after_revision: submitted.revision,
-        deadline: tokio::time::Instant::now() + Duration::from_millis(250),
-    };
 
     assert!(
         report_input_activity(&registry, &created.id, AgentActivity::Idle, 1)
@@ -6924,6 +6945,14 @@ async fn session_input_wait_uses_rapid_target_event_after_latest_state_changes()
             .activity,
         Some(AgentActivity::Working)
     );
+    // The deadline starts after the reports so a slow host cannot place the
+    // Idle evidence past it.
+    let submission = InputSubmission {
+        runtime: submitted.runtime.clone(),
+        activity_epoch: registry.daemon_instance_id().to_owned(),
+        after_revision: submitted.revision,
+        deadline: tokio::time::Instant::now() + Duration::from_millis(250),
+    };
 
     let result = registry
         .await_input_settled(
@@ -7192,48 +7221,43 @@ async fn session_input_wait_deduplicates_targets_and_requires_new_event() {
         .await
         .expect("create shell session");
     let mut events = registry.subscribe();
+    let send_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_input_send(Arc::clone(&send_boundary));
 
-    let report_task = tokio::spawn({
+    let input = tokio::spawn({
         let registry = registry.clone();
         let session_id = created.id.clone();
         async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
             registry
-                .report_agent(protocol::SessionReportAgentParams {
+                .input(protocol::SessionInputParams {
                     session_id,
-                    source: "test:pohunek-input-wait".to_owned(),
-                    agent: "codex".to_owned(),
-                    activity: Some(AgentActivity::Idle),
-                    seq: Some(protocol::ReportSequence::new(1)),
-                    pid: None,
-                    agent_session_id: None,
-                    agent_session_path: None,
+                    text: "\n".to_owned(),
+                    wait: Some(protocol::SessionInputWait {
+                        until: Some(vec![
+                            AgentActivity::Idle,
+                            AgentActivity::Blocked,
+                            AgentActivity::Idle,
+                        ]),
+                        timeout_ms: Some(1_000),
+                    }),
                 })
                 .await
         }
     });
+    send_boundary.wait().await;
+    send_boundary.wait().await;
 
-    let result = registry
-        .input(protocol::SessionInputParams {
-            session_id: created.id.clone(),
-            text: "\n".to_owned(),
-            wait: Some(protocol::SessionInputWait {
-                until: Some(vec![
-                    AgentActivity::Idle,
-                    AgentActivity::Blocked,
-                    AgentActivity::Idle,
-                ]),
-                timeout_ms: Some(1_000),
-            }),
-        })
+    // Ordered after the input boundary: the write keeps the session lock
+    // until its send starts.
+    let report = report_input_activity(&registry, &created.id, AgentActivity::Idle, 1).await;
+    assert!(report.recorded);
+    let result = input
         .await
+        .expect("input task joins")
         .expect("input waits for a new matching state event");
     assert!(result.accepted);
     assert_eq!(result.activity, Some(AgentActivity::Idle));
     assert_eq!(result.activity_source, Some(StateSource::Report));
-
-    let report = report_task.await.expect("report task joins");
-    assert!(report.recorded);
     while let Ok(event) = tokio::time::timeout(Duration::from_millis(20), events.recv()).await {
         let _ = event;
     }
@@ -7247,6 +7271,23 @@ async fn read_session_output_after_rejection(registry: &SessionRegistry, id: &Se
         .await
         .expect("inspect terminal after rejected input");
     output.visible_lines.join("\n")
+}
+
+/// Polls the session screen until it shows every needle, so positive output
+/// assertions do not depend on how quickly the PTY program answers.
+async fn wait_for_session_output(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    needles: &[&str],
+) -> String {
+    for _ in 0..500 {
+        let output = read_session_output_after_rejection(registry, id).await;
+        if needles.iter().all(|needle| output.contains(needle)) {
+            return output;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for session output to contain {needles:?}");
 }
 
 fn observable_input_shell() -> ShellCommand {
