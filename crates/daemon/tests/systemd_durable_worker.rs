@@ -619,13 +619,17 @@ impl Fixture {
                 reference_kind: Some("id".to_owned()),
             },
             executable: PathBuf::from("/bin/sh"),
+            // The counter rewrites one line instead of printing one per tick:
+            // an attach snapshot repaints only the visible screen, so a
+            // scrolling counter would push the burst marker off it within a
+            // few seconds, however long the test then takes to attach.
             arguments: vec![
                 "-c".to_owned(),
                 format!(
                     "printf '\\033]0;working\\007'; \
                  head -c {REPLAY_BURST_BYTES} /dev/zero | tr '\\000' 'R'; \
                  printf '\\n{}\\n'; \
-                 (n=0; while :; do n=$((n+1)); printf 'counter:%04d\\n' \"$n\"; \
+                 (n=0; while :; do n=$((n+1)); printf '\\rcounter:%04d' \"$n\"; \
                  sleep 0.1; done) & \
                  while IFS= read -r line; do printf 'input:%s\\n' \"$line\"; done",
                     std::str::from_utf8(REPLAY_BURST_MARKER).expect("replay marker is UTF-8")
