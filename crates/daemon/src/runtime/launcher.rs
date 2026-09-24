@@ -290,8 +290,10 @@ mod test_support {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use pohunek_session_worker::{Server, ServerArgs, WorkerConfig};
+    use pohunek_platform::filesystem::FsError;
+    use pohunek_session_worker::{Server, ServerArgs, WorkerConfig, WorkerError};
     use tokio::sync::Mutex;
     use tokio::task::JoinHandle;
 
@@ -303,12 +305,29 @@ mod test_support {
 
     static WORKER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+    /// Upper bound for a retired generation's socket lock to become free.
+    ///
+    /// Covers the fork-to-exec window of a spawn made by any other thread of
+    /// the test binary, which is milliseconds even on a loaded runner. A lock
+    /// still held after this bound is reported as the contention it is.
+    const FORKED_LOCK_RELEASE_BOUND: Duration = Duration::from_secs(5);
+
+    /// Interval between bind attempts while that fork still holds the lock.
+    const FORKED_LOCK_RELEASE_POLL: Duration = Duration::from_millis(10);
+
     /// Unit-test supervisor running the real worker server in-process.
     ///
     /// Each generation is one task serving the session's socket with the
     /// generation named by its service ID; the definition's executable is not
     /// run. It exists only in `cfg(test)` builds, so production and
     /// integration builds cannot select it.
+    ///
+    /// Retiring a generation drops its server, but every thread of the test
+    /// binary shares one descriptor table: a child forked by another test
+    /// keeps a copy of the retired socket lock until it execs. A real
+    /// supervisor ends the worker process instead, so nothing can inherit the
+    /// lock after `retire`. `start` therefore waits out that window, but only
+    /// while no generation of the same session is still running.
     #[derive(Debug)]
     pub struct InProcessWorkerLauncher {
         runtime_root: PathBuf,
@@ -328,6 +347,14 @@ mod test_support {
                 tasks: Arc::new(Mutex::new(HashMap::new())),
             }
         }
+    }
+
+    /// Whether any generation of `session_id` still has a running task.
+    fn session_running(tasks: &HashMap<ServiceId, JoinHandle<()>>, session_id: &str) -> bool {
+        tasks.iter().any(|(id, task)| {
+            !task.is_finished()
+                && WorkerKey::from_service_id(id).is_ok_and(|key| key.session_id() == session_id)
+        })
     }
 
     fn observe(id: &ServiceId, task: &JoinHandle<()>) -> ServiceObservation {
@@ -363,7 +390,7 @@ mod test_support {
                 let sequence = WORKER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
                 let worker_id = format!("worker-test-{sequence}");
                 let state_dir = self.state_root.join(session_id);
-                let server = Server::bind(ServerArgs {
+                let args = ServerArgs {
                     session_id: session_id.to_owned(),
                     worker_id: worker_id.clone(),
                     generation: key.generation().to_owned(),
@@ -371,9 +398,22 @@ mod test_support {
                     journal_path: state_dir.join(format!("{worker_id}.json")),
                     daemon_socket_path: self.daemon_socket.clone(),
                     config: WorkerConfig::new(),
-                })
-                .await
-                .map_err(|error| operation("start_test_worker", error))?;
+                };
+                let deadline = tokio::time::Instant::now() + FORKED_LOCK_RELEASE_BOUND;
+                let server = loop {
+                    match Server::bind(args.clone()).await {
+                        Ok(server) => break server,
+                        // With no generation of this session left running, only a
+                        // fork elsewhere in this process still holds the lock.
+                        Err(WorkerError::TrustedFilesystem(FsError::LockContended { .. }))
+                            if !session_running(&tasks, session_id)
+                                && tokio::time::Instant::now() < deadline =>
+                        {
+                            tokio::time::sleep(FORKED_LOCK_RELEASE_POLL).await;
+                        }
+                        Err(error) => return Err(operation("start_test_worker", error)),
+                    }
+                };
                 tasks.insert(
                     id.clone(),
                     tokio::spawn(async move {
@@ -562,6 +602,79 @@ mod tests {
             launcher.start(&id, &definition).await,
             Err(Error::InvalidServiceId(_))
         ));
+    }
+
+    /// How long the concurrently forked child stays between `fork` and `exec`.
+    ///
+    /// Long enough that the next generation binds while the child still holds
+    /// a copy of the retired generation's lock descriptors.
+    const PRE_EXEC_HOLD_MICROS: u32 = 700_000;
+
+    /// Upper bound for the forked child to report that it is holding.
+    const FORK_REPORT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Forks a child that, before it execs, holds a copy of every descriptor
+    /// of this test process, and returns once the child reported the fork.
+    fn spawn_child_holding_descriptors() -> std::thread::JoinHandle<()> {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        let (mut parent, child) = std::os::unix::net::UnixStream::pair().expect("report pair");
+        let report_fd = child.as_raw_fd();
+        let spawner = std::thread::spawn(move || {
+            let mut command = std::process::Command::new("/usr/bin/true");
+            #[expect(
+                unsafe_code,
+                reason = "the pre-exec hook models another thread's spawn between fork and exec"
+            )]
+            // SAFETY: the hook only calls the async-signal-safe `write` and
+            // `usleep` on a descriptor inherited from the parent.
+            unsafe {
+                command.pre_exec(move || {
+                    libc::write(report_fd, [1_u8].as_ptr().cast(), 1);
+                    libc::usleep(PRE_EXEC_HOLD_MICROS);
+                    Ok(())
+                })
+            };
+            command.status().expect("pre-exec child runs");
+            drop(child);
+        });
+        parent
+            .set_read_timeout(Some(FORK_REPORT_TIMEOUT))
+            .expect("report timeout");
+        let mut byte = [0_u8; 1];
+        parent
+            .read_exact(&mut byte)
+            .expect("child reports its fork");
+        spawner
+    }
+
+    #[tokio::test]
+    async fn in_process_generation_binds_after_a_forked_copy_of_the_retired_lock_closes() {
+        let root = pohunek_test_support::tempdir().expect("temporary worker root");
+        let runtime_root = root.path().join("r");
+        let state_root = root.path().join("s");
+        for directory in [&runtime_root, &state_root] {
+            std::fs::create_dir_all(directory).expect("worker root");
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                .expect("owner-private worker root");
+        }
+        let launcher = super::InProcessWorkerLauncher::new(runtime_root, state_root);
+        let first = ServiceId::parse("s-42.abcd2345").expect("valid service id");
+        let second = ServiceId::parse("s-42.efgh2345").expect("valid service id");
+        let definition = definition(root.path(), "/bin/true", &[]);
+
+        launcher.start(&first, &definition).await.expect("first");
+        let holder = spawn_child_holding_descriptors();
+        launcher.retire(&first).await.expect("retire first");
+
+        launcher
+            .start(&second, &definition)
+            .await
+            .expect("the retired generation's lock is released once the fork execs");
+        holder.join().expect("holder thread");
+        launcher.retire(&second).await.expect("retire second");
     }
 
     async fn wait_stopped(launcher: &SubprocessWorkerLauncher, id: &ServiceId) {
