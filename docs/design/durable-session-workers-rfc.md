@@ -2,17 +2,23 @@
 
 - **Status:** Implemented; merge-ready
 - **Date:** 2026-07-24
-- **Scope:** Linux session-runtime ownership, daemon recovery, and packaging
+- **Scope:** session-runtime ownership, daemon recovery, and packaging on Linux
+  (systemd) and macOS (launchd)
 - **Audience:** maintainers of `pohunekd`, the Rust clients, release tooling, and
-  the systemd user-service installation
+  the native service installation (`pohunek service`)
 
 ## Implementation Status as of 2026-07-24
 
 The implementation exists on the `zajca/durable-session-workers-rfc` branch and
 satisfies this RFC's Definition of Done. Every remaining pre-merge item now has
 executable evidence (see "Validation evidence" below). This section is the
-authoritative record of the completed state. Normative requirements in the rest
-of the RFC remain unchanged.
+authoritative record of the completed state as of that date.
+
+Issue #100 implements one native job per worker generation (systemd transient units on Linux, launchd
+jobs on macOS), a shared daemon lifecycle engine, supervisor-evidence
+reconciliation, the ownership-marker sweep, the allowlisted base environment,
+and `pohunek service`. Sections 8, 11.5, 15, and 20 state those requirements;
+the implementation record below describes the 2026-07-24 state.
 
 ### Implemented
 
@@ -161,8 +167,9 @@ Codex, Claude Code, or shell         unchanged child process and PID
 
 Each live logical session has exactly one `pohunek-sessiond` worker. The worker
 owns the PTY master, child handle, PTY reader, raw-output history, and generic
-terminal tracker. It runs in a systemd user service that is a sibling of
-`pohunekd.service`, not a child process or lifecycle dependency of it.
+terminal tracker. It runs as its own native service job per worker generation
+(a systemd transient unit or a launchd job) that is a sibling of the daemon job,
+not a child process or lifecycle dependency of it.
 
 Restarting, terminating, or killing `pohunekd` therefore closes client and
 daemon-to-worker connections but does not close the PTY master or signal the
@@ -348,80 +355,127 @@ The implementation MUST maintain these invariants:
 14. Public client operations are served only after startup reconciliation has
     classified every known logical session and discovered worker.
 
-## 8. Process and systemd Model
+## 8. Process and Service-Manager Model
 
-### 8.1 Installed units
+### 8.1 Installed jobs and worker generations
 
-The release installs:
+`pohunek service install` installs exactly one login service, the daemon:
 
-- `pohunekd.service`;
-- `pohunek-session@.service`;
-- `pohunek-sessions.slice`.
+| Target | Daemon job | Worker grouping |
+|--------|------------|-----------------|
+| Linux (systemd user manager, 255 or newer) | `pohunek-<ns>-daemon.service` in the user unit directory, enabled for `default.target` | `pohunek-<ns>-sessions.slice` (`MemoryAccounting`, `TasksAccounting`) |
+| macOS (launchd `gui/<uid>`) | agent `io.github.zajca.pohunek.<ns>.daemon` in `~/Library/LaunchAgents` | none; each worker is its own job |
 
-`pohunek-session@.service` is instantiated by the safe one-component session ID:
+`<ns>` is the installation namespace: the first 12 lowercase hex characters of
+SHA-256 over `"<uid>\0<canonical state root>\0<canonical runtime root>"`
+(`crates/platform/src/supervisor/namespace.rs`). Every name a backend reads back
+is parsed strictly against it; foreign, malformed, and other-namespace names are
+never adopted or retired, so an isolated test installation cannot touch a real
+one in the same user manager or launchd domain.
 
-```text
-pohunek-session@s-42.service
-```
+No worker unit file or template is installed. Every worker **generation** is
+one job the daemon registers itself with an explicit, validated
+`JobDefinition` (`crates/platform/src/supervisor/mod.rs`):
 
-The template has these semantic properties:
+- the absolute versioned executable
+  `<prefix>/libexec/pohunek/<version>/pohunek-sessiond` and its argv
+  `--session-id <id> --worker-generation <generation> --service-config <abs>
+  --daemon-socket-path <abs>` (no shell);
+- a bootstrap environment restricted to `HOME` and the XDG base directories;
+- a working directory, log paths (launchd only), a start timeout, an exit
+  timeout, the restart policy `Never`, and an open-file limit.
 
-```ini
-[Unit]
-Description=Pohunek runtime worker for session %i
+The generation is an 8-character lowercase base32 token that the daemon mints
+and persists in the session record (`runtime.generation`, `runtime.service_id`
+= `<session-id>.<generation>`, `runtime.executable`) before it registers the
+job. The job name embeds it:
 
-[Service]
-Type=notify
-NotifyAccess=main
-ExecStart=%h/.local/libexec/pohunek-sessiond --session-id %i
-Restart=no
-KillMode=control-group
-SendSIGHUP=yes
-Slice=pohunek-sessions.slice
+| Target | Worker job |
+|--------|------------|
+| Linux | transient unit `pohunek-<ns>-worker-<session-id>-<generation>.service` |
+| macOS | job `io.github.zajca.pohunek.<ns>.worker.<session-id>.<generation>` |
 
-[Install]
-WantedBy=
-```
+On Linux the unit is created with `StartTransientUnit` and carries `Type=notify`,
+`NotifyAccess=main`, `KillMode=control-group`, `SendSIGHUP=yes`,
+`Slice=pohunek-<ns>-sessions.slice`, `Restart=no`, `TimeoutStartSec`,
+`TimeoutStopSec`, `LimitNOFILE`, the bootstrap `Environment`, and journal
+stdout/stderr. A transient unit disappears once it is inactive; a failed one is
+cleared with `ResetFailedUnit` after it is proven ended.
 
-The final installed path may be selected by the installer, but it MUST be an
-absolute path substituted into the unit. The unit MUST NOT use `PartOf=`,
-`BindsTo=`, `Requires=`, `Requisite=`, or `WantedBy=pohunekd.service`.
-`pohunekd.service` MUST NOT use `PropagatesStopTo=` or place workers in its own
-service cgroup. A slice groups resources but does not create stop propagation
-from the daemon.
+On macOS the definition is a plist rendered by the `plist` crate, written `0600`
+into the private `<state>/pohunek/launchd/` directory (`0700`) with an atomic
+trusted write, and loaded with `/bin/launchctl bootstrap gui/<uid> <path>`. It
+sets `RunAtLoad`, no `KeepAlive`, `ExitTimeOut`, `AbandonProcessGroup=false`,
+`Soft`/`HardResourceLimits` `NumberOfFiles`, and stdout/stderr under
+`<log_dir>/launchd/`; `ProcessType` is omitted (Standard). Worker definitions
+never live in `~/Library/LaunchAgents`, so launchd never loads them again at
+login.
 
-`Restart=no` is mandatory. If the worker exits unexpectedly, the PTY master is
-gone. Starting a replacement process cannot recreate it and would conceal
-runtime loss.
+Worker jobs MUST NOT have a stop-propagation or lifetime dependency on the
+daemon job (`PartOf=`, `BindsTo=`, `Requires=`, `Requisite=`, or placement in
+the daemon's cgroup or process group). A slice groups resources but does not
+propagate a stop from the daemon.
+
+No restart policy is mandatory (`Restart=no`, no `KeepAlive`). If the worker
+exits unexpectedly, the PTY master is gone. Starting a replacement process
+cannot recreate it and would conceal runtime loss. A new generation is started
+only by an explicit lifecycle action (create or native recovery), never by the
+service manager.
 
 ### 8.2 Starting a worker without deadlock
 
-`pohunekd` starts the instance through the systemd user manager D-Bus API. It
-MUST NOT shell out to a blocking `systemctl start` from the creation path.
+`pohunekd` registers the generation through the platform `Supervisor` (the
+systemd user manager's D-Bus API, or `/bin/launchctl` with argv only, a
+deadline, and bounded output). It MUST NOT shell out to a blocking
+`systemctl start` from the creation path. `Supervisor::start` never waits for
+worker readiness.
 
-The sequence is:
+The daemon lifecycle engine (`crates/daemon/src/runtime/lifecycle.rs`) runs
+every create and native recovery through five commit points, under one
+per-session lifecycle lock:
 
-1. daemon calls the user manager's `StartUnit` and receives the job object path;
-2. worker creates its private runtime directory and binds its control socket;
-3. worker sends `READY=1` to systemd immediately after the bootstrap socket is
-   accepting connections, before waiting for `Initialize`;
-4. daemon concurrently waits for the socket and monitors the D-Bus job;
-5. daemon connects and sends `Initialize`;
-6. worker allocates the PTY and launches the child.
+1. validate the session and runtime intent and private paths, and persist the
+   preparing record with the freshly minted generation;
+2. write the job definition and `start` exactly that generation;
+3. wait, within the configured `worker_connect` deadline, for the authenticated
+   worker whose journal names that generation;
+4. send `Initialize`, or reconcile the exact generation;
+5. expose ready state only after the runtime commit succeeds.
 
-Declaring readiness before `Initialize` prevents a `Type=notify` cycle in which
-systemd waits for readiness while the daemon waits for the start job and the
-worker waits for the daemon. `READY=1` means "bootstrap endpoint ready," not
-"agent running." Agent readiness is reported by the private protocol.
+Meanwhile the worker creates its private runtime directory, binds its control
+socket, and on systemd sends `READY=1` immediately after the bootstrap socket is
+accepting connections, before waiting for `Initialize`. launchd has no readiness
+protocol; readiness comes solely from the private socket. Declaring readiness
+before `Initialize` prevents a `Type=notify` cycle in which systemd waits for
+readiness while the daemon waits for the start job and the worker waits for the
+daemon. `READY=1` means "bootstrap endpoint ready," not "agent running." Agent
+readiness is reported by the private protocol.
 
-The worker has a configured initialization deadline. If no valid controller
-initializes it before that deadline, it writes a `never_initialized` outcome and
-exits. The daemon monitors both the socket and unit job, so an early worker
-failure returns a typed creation error.
+A timeout or cancellation after step 2 never retries blindly. The engine
+inspects the job and connects: a live worker of the right generation is adopted;
+a present job that is not ready is watched until the worker's own
+initialization deadline has provably elapsed and is then retired by exact
+generation; an absent job has its definition cleaned up; an inspection error
+leaves the session `reconnecting` with reason
+`runtime_supervision_unavailable`, kills nothing, and leaves the retry to
+reconciliation. The post-start part runs in a task that owns the outcome, so a
+dropped client request cannot leave an untracked job.
+
+The worker has a configured initialization deadline (`worker_initialize_ms`).
+If no valid controller initializes it before that deadline, it writes a
+`never_initialized` outcome and exits.
+
+Native recovery is a new generation: the old generation is proven ended (its
+journal terminal or its worker process gone by start identity, and the job
+absent or ended) before the new one starts, and the old job and definition are
+retired afterwards. Two generations of one session never hold mutation
+authority at the same time. Stale jobs and definitions are removed only after
+they are proven ended and proven owned (namespace plus a label or definition
+match).
 
 ### 8.3 Daemon readiness
 
-`pohunekd.service` becomes `Type=notify`. The daemon sends `READY=1` only after:
+The systemd daemon unit is `Type=notify`. The daemon sends `READY=1` only after:
 
 - path and configuration validation;
 - instance-lock acquisition;
@@ -451,19 +505,29 @@ surfaced.
 6. records the terminal outcome atomically;
 7. reports completion to the daemon.
 
-Stopping the systemd worker unit is a last-resort administrative operation, not
-the ordinary `session.stop` implementation. `KillMode=control-group` ensures
-that an administrative unit stop or unexpected worker failure does not leave
-unmanaged descendants.
+Retiring a worker job is a lifecycle operation after the generation has ended,
+or a last-resort administrative operation; it is not the ordinary
+`session.stop` implementation. On systemd, `StopUnit` (mode `replace`, because a
+never-ready `Type=notify` unit cannot be stopped with `fail`) plus
+`KillMode=control-group` ends every descendant. On launchd, `bootout` sends the
+job's main process `SIGTERM` and `SIGKILL` after `ExitTimeOut`, but it only sends
+`SIGTERM` to the rest of the process group and never `SIGKILL`s it. The backend
+therefore captures the group's members before `bootout` and escalates to
+`SIGKILL` itself once `ExitTimeOut` has passed, checking each member's start
+identity before every signal. Descendants that left the group, and a worker that
+crashed, are reaped by the reconciliation marker sweep (section 15).
 
 ### 8.5 Development and tests
 
-Worker launch is represented by a `WorkerLauncher` trait. Production Linux uses
-the systemd D-Bus implementation. Integration tests may use a subprocess
-launcher that starts the worker in a separate process group and explicitly does
-not parent its lifetime to the test daemon. Production startup fails clearly if
-the worker template or user D-Bus is unavailable; it does not silently fall
-back to daemon-owned PTYs.
+`pohunekd --service-config <abs>` selects native supervision for the target:
+systemd transient units on Linux and launchd on macOS, with no production stub
+on either. Without `--service-config` the daemon starts only when
+`POHUNEK_WORKER_LAUNCHER=subprocess` is set (`pohunek daemon start
+--dev-subprocess`): a development and test launcher that spawns exactly the
+definition's executable and argv with a cleared environment, in a separate
+process group, without parenting its lifetime to the test daemon. Any other
+combination fails fast naming both options; production never silently falls
+back to daemon-owned PTYs or subprocess workers.
 
 ### 8.6 Runtime configuration
 
@@ -477,8 +541,8 @@ bound every new queue:
 
 | Setting | Initial default | Rationale |
 |---------|-----------------|-----------|
-| worker bootstrap/initialize deadline | 30 seconds | allows a loaded user manager to start while bounding an abandoned unit |
-| daemon worker-connect deadline | 10 seconds | matches an interactive create operation without hiding a broken unit |
+| worker bootstrap/initialize deadline | 45 seconds (`service.toml` `worker_initialize_ms`) | allows a loaded service manager to start while bounding an abandoned job |
+| daemon worker-connect deadline | 10 seconds (`service.toml` `worker_connect_ms`) | matches an interactive create operation without hiding a broken job |
 | raw output history | 10,000,000 bytes | preserves the current per-session history budget |
 | one subscriber queue | 1,000,000 bytes | absorbs repaint bursts without allowing one client to consume the history budget |
 | worker data payload | 64 KiB | bounds allocation while efficiently carrying PTY and prompt fragments |
@@ -762,11 +826,29 @@ the value, and buffers are dropped immediately after spawn. Initialization is
 idempotent by transaction ID: repeating the same ID returns the recorded result;
 a different ID is rejected.
 
-Before spawn, the worker removes its own `NOTIFY_SOCKET`, watchdog, controller,
-and bootstrap variables from the child environment, then appends the reserved
-`POHUNEK_*` session values after profile environment. A profile cannot override
-reserved values. `NotifyAccess=main` and the sanitized environment prevent the
-PTY child from participating in worker service readiness.
+From worker protocol version 6, `Initialize` also carries `base_environment`
+(`BaseEnv`, `crates/worker-protocol/src/env.rs`): a validated, non-secret map
+the daemon selects from its own environment through the `[environment]
+allowlist` of `service.toml` (names or trailing-`*` prefixes; the installer
+writes `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TMPDIR`,
+`SSH_AUTH_SOCK`, `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, and
+`XDG_*`). It is sent in memory only, is kept separate from the secret profile
+environment, and never carries a `POHUNEK_*` or denylisted name. A worker
+started by a service manager carries that manager's environment, which
+describes the worker's supervision rather than the user's session, so the
+worker never forwards its own environment to the child.
+
+Before spawn, the worker builds the child environment on an empty base:
+`BaseEnv`, then its own `TERM`, then the profile environment, then the reserved
+`POHUNEK_*` session values. A profile cannot override reserved values. It then
+always removes the service-manager denylist (`NOTIFY_SOCKET`, `WATCHDOG_*`,
+`INVOCATION_ID`, `JOURNAL_STREAM`, `MANAGERPID`, `SYSTEMD_EXEC_PID`,
+`XPC_SERVICE_NAME`, `XPC_FLAGS`, `__CFBundleIdentifier`, `LaunchInstanceID`,
+and the controller and bootstrap tokens), even when allowlisted by mistake. A
+version-5 `Initialize` has no base environment; the child then starts from the
+worker's own environment with the same denylist removed. New generations always
+negotiate version 6. `NotifyAccess=main` and the sanitized environment prevent
+the PTY child from participating in worker service readiness.
 
 ### 11.6 Data framing
 
@@ -963,7 +1045,8 @@ Creation is a durable transaction. The ordered phases are:
    launch metadata;
 3. resolve project and create or bind the worktree, atomically updating the
    session and worktree records;
-4. ask systemd to start `pohunek-session@<session>.service`;
+4. persist the preparing record with a newly minted worker generation, then
+   ask the platform `Supervisor` to start that generation's job (section 8.2);
 5. negotiate with the bootstrap worker and record worker ID;
 6. send the one-shot `Initialize`, including secret environment only in memory;
 7. worker allocates PTY, spawns the child, writes its live journal, and returns
@@ -1000,30 +1083,58 @@ The daemon reconciles before advertising readiness:
 
 1. acquire the daemon instance lock;
 2. load and validate all logical records;
-3. enumerate active `pohunek-session@*.service` units through user D-Bus;
-4. scan owner-private worker journals and runtime sockets;
-5. connect, negotiate, validate peer identity, and acquire controller leases;
-6. call `Inspect` on every connected worker;
-7. classify every logical record and every discovered worker;
-8. finish recoverable transactions;
-9. construct `SessionEntry` worker proxies and restart detector/procwatch tasks;
-10. bind the public socket, notify readiness, and emit reconciliation events.
+3. discover this namespace's worker jobs through the platform `Supervisor`
+   (`ListUnitsByPatterns` over `pohunek-<ns>-worker-*.service`, or the private
+   launchd definitions directory), bounded at 4,096 entries, with foreign,
+   malformed, and other-namespace names rejected and never touched;
+4. scan owner-private worker journals and runtime sockets, and join all three
+   sources on `(session_id, generation)`; a socket is bound to a generation
+   through the connected worker's journal;
+5. take the per-session lifecycle lock of each record being reconciled;
+6. connect, negotiate, validate peer identity, and acquire controller leases;
+7. call `Inspect` on every connected worker;
+8. classify every logical record and every discovered worker;
+9. finish recoverable transactions;
+10. construct `SessionEntry` worker proxies and restart detector/procwatch tasks;
+11. bind the public socket, notify readiness, and emit reconciliation events.
+
+A job observation is evidence, never readiness. A discovery entry that raced
+(`Race`) is re-inspected a bounded number of times and is never treated as
+absent.
 
 Reconciliation uses this table:
 
-| Logical record | Worker/journal | Result |
-|----------------|----------------|--------|
-| running, exact live identity | live | reconnect and mark live |
-| preparing, exact live identity | live | adopt and commit creation |
-| running, terminal journal | no live worker | import terminal outcome |
+| Logical record | Supervisor job / worker / journal | Result |
+|----------------|-----------------------------------|--------|
+| running, exact live identity | job present, worker live | reconnect and mark live |
+| preparing, exact live identity | job present, worker live | adopt and commit creation |
+| running, terminal journal | no live worker | import terminal outcome; retire the ended job |
 | stop requested, live | live | replay same idempotent stop command |
 | remove requested, live | live | finish stop, then removal |
-| running, no runtime evidence | absent | mark `runtime_lost`; do not native-resume |
+| running | job present, worker socket absent or unconnectable, journal not terminal | `conflict`, reason `runtime_supervision_ambiguous`; nothing killed or retired |
+| running | job absent or ended, journal live, journal worker PID not running (by start identity) | proven crash: marker sweep of that generation, retire the ended job and definition, then `lost` with `runtime_lost` (`runtime_lost_cleanup_unconfirmed` when the sweep could not confirm cleanup); do not native-resume |
+| running, no runtime evidence | no job, no worker, no journal | `lost`; do not native-resume |
+| any | job present whose definition (executable, argv session ID or generation) or live process does not match the record | `conflict`, reason `runtime_identity_mismatch`; fail closed, nothing killed |
+| any | journal PID running but with a different start identity | PID reuse: treated as not running |
+| stale generation or no logical record | job of a non-current generation, proven ended | exact retirement of that generation and definition cleanup |
+| stale generation or no logical record | job of a non-current generation, still running | leave it; inventory `orphaned`; do not kill |
+| any | supervisor `discover` or `inspect` unavailable | keep or move to `reconnecting`, reason `runtime_supervision_unavailable`; nothing killed; a bounded background retry reconciles again |
 | terminal | stale inactive journal | keep summary, schedule safe journal cleanup |
 | no logical record | one valid live worker | create quarantined recovered record and expose `orphaned_worker`; do not kill |
 | any | incompatible live worker | expose `worker_protocol_incompatible`; leave it alive |
 | any | multiple live identities | expose `runtime_conflict`; do not acquire mutation authority or kill |
 | worker identity mismatch | any | expose `runtime_identity_mismatch`; fail closed |
+
+The **marker sweep** runs only when worker death is proven. The Linux and Darwin
+process inspectors enumerate the owner's processes whose allowlisted
+`POHUNEK_RUNTIME_ID` marker equals exactly the lost generation's runtime ID.
+Each process's start identity is verified before `SIGTERM`, again after the
+configured `[sweep] grace_ms`, and before `SIGKILL` (through a pidfd on Linux).
+Unreadable markers are skipped, any other inspection failure stops the sweep
+before further signals, and uncertain evidence kills nothing. The sweep never
+touches another runtime ID. On macOS it is the primary cleanup of descendants
+that left the worker's process group; on Linux it is a backstop behind
+`KillMode=control-group`.
 
 An orphaned live worker can occur only if the logical store was lost after the
 worker journal became durable. The recovered record contains journal-safe
@@ -1200,27 +1311,54 @@ assistant knowledge are updated together when this field lands.
 
 ## 20. Upgrade, Rollback, and Packaging
 
-### 20.1 Release contents
+### 20.1 Release contents and installation
 
-The daemon release archive contains:
+The daemon release archive contains `pohunekd`, `pohunek-sessiond`, `pohunek`,
+and `packaging/install-daemon.sh`. Unit files and plists are not shipped; they
+are rendered by typed Rust code (`crates/platform/src/supervisor/`) from
+validated definitions, with every value escaped for its grammar.
 
-- `pohunekd`;
-- `pohunek-sessiond`;
-- `pohunekd.service`;
-- `pohunek-session@.service`;
-- `pohunek-sessions.slice`;
-- an installer/uninstaller that substitutes absolute binary paths, reloads the
-  user manager, verifies unit definitions, and preserves running workers.
+Both glibc and MUSL daemon archives contain all three binaries. CI builds and
+tests them for each daemon target.
 
-Both glibc and MUSL daemon archives contain both binaries. CI builds and tests
-both binaries for each daemon target. Updating the on-disk worker binary does
-not affect an already mapped worker process.
+`pohunek service install` (which the archive wrapper calls) is a journaled
+transaction (`<state>/pohunek/service-install.json`):
 
-The installer restarts only `pohunekd.service`. It MUST NOT restart, stop,
-`try-restart`, or daemon-reload through a target that propagates to worker
-units. Uninstallation refuses while workers are live unless the operator
-explicitly requests a destructive stop and receives the list of affected
-sessions.
+1. copy the verified binaries (each staged binary's `--version` must equal the
+   CLI's) into a new `<prefix>/libexec/pohunek/<version>/` directory; an
+   identical existing directory is reused, a different one is refused;
+2. write `<config>/pohunek/service.toml` (`0600`, every key required, unknown
+   keys rejected; `crates/service-config`);
+3. build the daemon definition (versioned `pohunekd --service-config <abs>`,
+   restart on failure with the configured throttle) and, on Linux, verify the
+   rendered unit and slice with `systemd-analyze verify`;
+4. install the daemon job: write the unit and slice into
+   `$XDG_CONFIG_HOME/systemd/user`, reload, and enable/start it, or write the
+   agent plist into `~/Library/LaunchAgents` and bootstrap it;
+5. wait until the daemon answers `daemon.health` as the new version;
+6. install `<prefix>/bin/pohunek`.
+
+A failing step rolls the transaction back; an interrupted one is resumed by the
+next `install` or `upgrade` of the same version and rolled back by any other
+operation. The installer refuses a unit or `LaunchAgents` directory that is
+group- or world-writable and names `chmod go-w <path>` instead of changing it.
+
+`pohunek service upgrade` installs the new version directory, switches
+`active_version`, replaces the daemon job definition, and restarts **only** the
+daemon (systemd restart of the daemon unit; launchd `bootout` plus `bootstrap`
+of the daemon label). Worker jobs reference their absolute versioned executable
+and journal it, so they keep their PID, child, and PTY. Afterwards, version
+directories that are neither active, referenced by a non-final worker journal,
+executed by a running process, nor holding the running CLI are removed.
+
+`pohunek service uninstall` refuses while sessions are live and lists them.
+With `--stop-sessions` it stops every session through the worker protocol,
+waits until every worker journal is final and its process is gone, then removes
+the daemon job, ended worker jobs, `service.toml`, the launchd directories,
+unreferenced version directories, and the installed CLI copy. Durable metadata
+(store, event logs, journals, host identity) is kept unless `--purge` is given.
+Uninstall never leaves an orphan job and never deletes a binary a live worker
+still references.
 
 ### 20.2 Worker-aware N/N-1 compatibility
 
@@ -1250,11 +1388,11 @@ Supported rollback across this boundary requires:
 
 1. enumerate and explicitly stop or finish every worker runtime;
 2. export recoverable sessions to legacy resume records;
-3. remove or disable worker units;
+3. verify that no worker job remains and uninstall the service;
 4. start the legacy daemon;
 5. explicitly native-resume exported sessions.
 
-The installer refuses a boundary rollback while a worker unit is live.
+The installer refuses a boundary rollback while a worker job is live.
 
 ## 21. One-time Migration from Daemon-owned PTYs
 
@@ -1499,19 +1637,32 @@ are absent.
 
 On a disposable user manager:
 
-- install substituted units and verify them;
-- start at least two session workers through D-Bus;
-- run `systemctl --user restart pohunekd.service`;
+- install the daemon unit and slice with `pohunek service install` and verify
+  them (`crates/cli/tests/service_systemd.rs`);
+- start at least two worker generations as transient units through D-Bus
+  (`crates/platform/tests/systemd.rs`, `crates/daemon/tests/systemd_durable_worker.rs`);
+- restart the daemon unit;
 - send `SIGKILL` to `pohunekd`;
-- upgrade daemon and worker files in place;
+- upgrade to a new versioned daemon with `pohunek service upgrade`;
 - roll daemon forward and back one worker-aware release;
-- assert worker unit `MainPID`, child PID, cgroup, PTY identity, and output
+- assert the worker unit's `MainPID`, child PID, cgroup, PTY identity, and output
   continuity remain unchanged;
 - assert stopping the daemon unit does not enqueue worker stop jobs;
 - assert stopping one worker unit kills only its control group;
 - assert `Restart=no` leaves a killed worker inactive;
 - assert daemon `READY=1` follows reconciliation and worker bootstrap readiness
   has no D-Bus deadlock.
+
+On macOS CI (a real `gui/<uid>` domain; its absence fails the job):
+
+- start, inspect, discover, and retire worker jobs of a unique namespace per
+  test, ignoring foreign labels (`crates/platform/tests/launchd.rs`);
+- map a missing domain to `DomainUnavailable`;
+- assert `ExitTimeOut` and the process-group `SIGKILL` escalation on retire.
+
+Logout/login and reboot cannot run on hosted CI; the manual procedure
+`scripts/acceptance/macos-launchd-lifetime` records their evidence in
+`docs/acceptance/` (see `docs/acceptance/README.md`).
 
 ### 26.4 Migration and release tests
 
