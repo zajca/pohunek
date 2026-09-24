@@ -50,6 +50,24 @@
 //! | `org.freedesktop.DBus.Error.ServiceUnknown`, `org.freedesktop.DBus.Error.NameHasNoOwner`, `org.freedesktop.DBus.Error.NoServer`, `org.freedesktop.DBus.Error.Disconnected` | [`Error::Unavailable`] |
 //! | `org.freedesktop.DBus.Error.NoReply`, `org.freedesktop.DBus.Error.Timeout`, `org.freedesktop.DBus.Error.TimedOut` | [`Error::Timeout`] |
 //! | any other name | [`Error::Operation`] |
+//!
+//! # Observations
+//!
+//! An observation binds the unit's main process only when it provably runs
+//! `ExecStart`. Unit state, main PID, and control group are read twice around
+//! the process checks; any change between the reads is [`Error::Race`].
+//!
+//! | Unit state | Main process | Result |
+//! |------------|--------------|--------|
+//! | any | none (`MainPID` 0) | state, `process: None` |
+//! | any | runs `ExecStart` (canonical executable and argv) | state, `process: Some` |
+//! | `activating` | not yet `ExecStart`: the manager's pre-`execve` fork (procfs denies it) or another image | [`ServiceState::Starting`], `process: None` |
+//! | any other | not `ExecStart` | [`Error::InvalidData`] |
+//! | any | reused PID or outside the unit's control group | [`Error::Race`] |
+//!
+//! A starting unit whose process is not bound is present but not ready, so
+//! callers watch it until its initialization deadline instead of treating it
+//! as unavailable.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -557,7 +575,8 @@ impl Bus {
     ///
     /// Unit state, main PID, and control group are read twice around the
     /// process checks; any change, a reused PID, or a main process outside the
-    /// unit's control group is a [`Error::Race`].
+    /// unit's control group is a [`Error::Race`]. A starting unit whose main
+    /// process does not run `ExecStart` yet is observed without a process.
     async fn observe(&self, name: &str, id: &ServiceId) -> Result<ServiceObservation, Error> {
         const OPERATION: &str = "inspect";
 
@@ -596,8 +615,11 @@ impl Bus {
                 .ok_or_else(inspect_race)?;
             validate_stable_observation(&before, &after)?;
             validate_process_binding(identity_before, identity_after, in_control_group)?;
-            verify_live_command(&definition, &live, &before.active_state)?;
-            Some(identity_after)
+            let bound = match &live {
+                Some(live) => verify_live_command(&definition, live, &before.active_state)?,
+                None => false,
+            };
+            bound.then_some(identity_after)
         };
         let after = read_snapshot(&unit, &service, "reinspect_snapshot").await?;
         validate_stable_observation(&before, &after)?;
@@ -841,50 +863,53 @@ struct LiveCommand {
 ///
 /// While the unit is `activating`, the main process may still be the manager's
 /// fork before `execve`. It inherits the user manager's non-dumpable flag, so
-/// procfs denies `/proc/<pid>/exe`; that denial is a race then, and a real
-/// failure in any other state.
+/// procfs denies `/proc/<pid>/exe`; that denial means no command is running
+/// yet (`Ok(None)`), and it is a real failure in any other state.
 fn read_live_command(
     inspector: LinuxInspector,
     identity: ProcessIdentity,
     activating: bool,
-) -> Result<LiveCommand, Error> {
-    let executable = inspector
-        .executable(identity.pid)
-        .map_err(|source| live_error("inspect_process_executable", source, activating))?
-        .ok_or_else(inspect_race)?;
-    let fact = inspector
-        .process(identity.pid)
-        .map_err(|source| live_error("inspect_process_command", source, activating))?
-        .ok_or_else(inspect_race)?;
+) -> Result<Option<LiveCommand>, Error> {
+    let executable = match inspector.executable(identity.pid) {
+        Ok(Some(executable)) => executable,
+        Ok(None) => return Err(inspect_race()),
+        Err(source) if before_exec(&source, activating) => return Ok(None),
+        Err(source) => return Err(process_error("inspect_process_executable", source)),
+    };
+    let fact = match inspector.process(identity.pid) {
+        Ok(Some(fact)) => fact,
+        Ok(None) => return Err(inspect_race()),
+        Err(source) if before_exec(&source, activating) => return Ok(None),
+        Err(source) => return Err(process_error("inspect_process_command", source)),
+    };
     if fact.identity() != identity {
         return Err(inspect_race());
     }
-    Ok(LiveCommand {
+    Ok(Some(LiveCommand {
         executable,
         cmdline: fact.cmdline,
-    })
+    }))
 }
 
-fn live_error(operation: &'static str, source: ProcessError, activating: bool) -> Error {
-    if activating && matches!(source, ProcessError::PermissionDenied { .. }) {
-        inspect_race()
-    } else {
-        process_error(operation, source)
-    }
+/// Whether a process read failed because an activating unit has not run
+/// `execve` yet.
+fn before_exec(source: &ProcessError, activating: bool) -> bool {
+    activating && matches!(source, ProcessError::PermissionDenied { .. })
 }
 
 /// Checks that the main process runs the command systemd recorded.
 ///
-/// The executable is compared after resolving symlinks in the recorded path,
-/// because `/proc/<pid>/exe` is always canonical. Empty arguments are skipped
-/// on both sides since the process inspector omits them. While a unit is
-/// `activating`, the forked child may still be systemd's executor before it
-/// runs `ExecStart`, so a mismatch then is a race rather than invalid data.
+/// Returns whether the process is bound to the unit. The executable is
+/// compared after resolving symlinks in the recorded path, because
+/// `/proc/<pid>/exe` is always canonical. Empty arguments are skipped on both
+/// sides since the process inspector omits them. While a unit is
+/// `activating`, the main process may not run `ExecStart` yet, so a mismatch
+/// then leaves it unbound rather than being invalid data.
 fn verify_live_command(
     definition: &DefinitionFacts,
     live: &LiveCommand,
     active_state: &str,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let executable_matches = std::fs::canonicalize(&definition.executable)
         .is_ok_and(|expected| expected == live.executable);
     let expected: Vec<String> =
@@ -894,9 +919,9 @@ fn verify_live_command(
             .collect();
     let cmdline_matches = live.cmdline == expected;
     if executable_matches && cmdline_matches {
-        Ok(())
+        Ok(true)
     } else if active_state == "activating" {
-        Err(inspect_race())
+        Ok(false)
     } else if executable_matches {
         Err(invalid_data(
             "main process command line differs from ExecStart".to_owned(),
@@ -1387,7 +1412,8 @@ mod tests {
             executable: executable.clone(),
             cmdline: vec![path.clone(), "--flag".to_owned(), "value".to_owned()],
         };
-        verify_live_command(&facts, &live, "active").expect("matching command");
+        assert!(verify_live_command(&facts, &live, "active").expect("matching command"));
+        assert!(verify_live_command(&facts, &live, "activating").expect("matching command"));
 
         let other_executable = LiveCommand {
             executable: PathBuf::from("/usr/lib/systemd/systemd-executor"),
@@ -1397,10 +1423,11 @@ mod tests {
             verify_live_command(&facts, &other_executable, "active"),
             Err(Error::InvalidData { .. })
         ));
-        assert!(matches!(
-            verify_live_command(&facts, &other_executable, "activating"),
-            Err(Error::Race { .. })
-        ));
+        assert!(
+            !verify_live_command(&facts, &other_executable, "activating")
+                .expect("a starting unit may not run ExecStart yet"),
+            "the pre-exec process is not bound"
+        );
         let other_arguments = LiveCommand {
             cmdline: vec![path, "--other".to_owned()],
             ..live
@@ -1420,31 +1447,25 @@ mod tests {
     }
 
     #[test]
-    fn denied_process_evidence_is_a_race_only_while_activating() {
+    fn denied_process_evidence_means_before_exec_only_while_activating() {
         let denied = || ProcessError::PermissionDenied {
             operation: "read_executable",
             source: io::Error::from(io::ErrorKind::PermissionDenied),
         };
-        assert!(matches!(
-            live_error("inspect_process_executable", denied(), true),
-            Error::Race { .. }
+        assert!(before_exec(&denied(), true));
+        assert!(!before_exec(&denied(), false));
+        assert!(!before_exec(
+            &ProcessError::Race {
+                operation: "read_executable"
+            },
+            true
         ));
         assert!(matches!(
-            live_error("inspect_process_executable", denied(), false),
+            process_error("inspect_process_executable", denied()),
             Error::Operation {
                 operation: "inspect_process_executable",
                 ..
             }
-        ));
-        assert!(matches!(
-            live_error(
-                "inspect_process_executable",
-                ProcessError::Race {
-                    operation: "read_executable"
-                },
-                false
-            ),
-            Error::Race { .. }
         ));
     }
 

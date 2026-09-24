@@ -56,7 +56,8 @@ fn require_e2e() {
 /// Modes: `ready` notifies and sleeps; `never-ready` sleeps without notifying;
 /// `ready-then-fail` notifies and exits with status 3; `stubborn-descendants`
 /// starts a child and a grandchild that ignore `SIGHUP` and `SIGTERM`, then
-/// notifies and sleeps.
+/// notifies and sleeps; `exec-other` replaces itself with another program
+/// before ever notifying.
 #[test]
 #[ignore = "fixture entry point; does work only inside a unit started by these tests"]
 fn fixture_entry() {
@@ -71,6 +72,14 @@ fn fixture_entry() {
             std::thread::sleep(FIXTURE_LIFETIME);
         }
         "never-ready" => std::thread::sleep(FIXTURE_LIFETIME),
+        "exec-other" => {
+            use std::os::unix::process::CommandExt as _;
+
+            let error = Command::new("/usr/bin/sleep")
+                .arg(FIXTURE_LIFETIME.as_secs().to_string())
+                .exec();
+            panic!("exec another program: {error}");
+        }
         "ready-then-fail" => {
             notify_ready();
             std::process::exit(3);
@@ -393,6 +402,50 @@ async fn a_never_ready_worker_is_retired_while_starting() {
     })
     .await;
     assert!(observation.definition.is_some());
+
+    supervisor
+        .retire(&id)
+        .await
+        .expect("retire a starting worker");
+    assert!(matches!(
+        supervisor.inspect(&id).await,
+        Err(Error::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_starting_unit_not_running_exec_start_is_observed_without_a_process() {
+    /// Consecutive inspections that must all succeed unbound.
+    const STABLE_INSPECTIONS: usize = 5;
+
+    require_e2e();
+    let installation = Installation::new();
+    let supervisor = installation.supervisor().await;
+    let id = worker_id("execothr");
+
+    supervisor
+        .start(&id, &fixture(installation.root.path(), "exec-other"))
+        .await
+        .expect("start transient worker");
+    wait_for(&supervisor, &id, |observation| {
+        observation.state == ServiceState::Starting
+            && observation.process.is_none()
+            && show(&installation.unit(&id), &["MainPID"])
+                .get("MainPID")
+                .is_some_and(|pid| pid != "0")
+    })
+    .await;
+    for _ in 0..STABLE_INSPECTIONS {
+        let observation = supervisor
+            .inspect(&id)
+            .await
+            .expect("a starting unit is observed, not raced");
+        assert_eq!(observation.state, ServiceState::Starting);
+        assert_eq!(observation.process, None, "another image is never bound");
+        assert!(observation.definition.is_some());
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 
     supervisor
         .retire(&id)

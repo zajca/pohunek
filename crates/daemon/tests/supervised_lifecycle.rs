@@ -26,7 +26,7 @@ mod supervised;
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::sys::signal::Signal;
 use pohunek_platform::process::ProcessIdentity;
@@ -230,22 +230,38 @@ async fn late_worker_is_retired_and_every_path_converges_to_one_generation() {
     let held = HeldWorker::install(&fixture);
     fixture.start_daemon().await;
 
-    // Registration succeeds, readiness never comes: the create fails and
+    // Registration succeeds, readiness never comes: the job is watched until
+    // the worker's initialization deadline has elapsed, the create fails, and
     // exactly the late generation is retired.
     let pending = spawn_create(&fixture, "late").await;
     let late = new_job(&fixture, &[]).await;
+    let late_seen = Instant::now();
     let failure = pending
         .await
         .expect("create task")
         .expect_err("a worker that never becomes ready fails the create");
     eprintln!("late create failed with {failure:?}");
+    assert_watched_until_initialize(late_seen, settings.worker_initialize, "late");
     wait_converged(&fixture, "late", &[]).await;
 
     // The client abandons its request after registration: the daemon still
-    // owns the outcome and retires the late generation.
+    // owns the outcome, keeps watching until the initialization deadline, and
+    // retires the late generation.
     let pending = spawn_create(&fixture, "cancelled").await;
     let cancelled = new_job(&fixture, &[]).await;
+    let cancelled_seen = Instant::now();
     pending.abort();
+    let cancelled_id = pohunek_platform::supervisor::ServiceId::parse(cancelled.clone())
+        .expect("valid service ID");
+    explained("retirement of the cancelled generation", || async {
+        if fixture.job_absent(&cancelled_id).await {
+            Ok(())
+        } else {
+            Err(format!("{cancelled} is still registered"))
+        }
+    })
+    .await;
+    assert_watched_until_initialize(cancelled_seen, settings.worker_initialize, "cancelled");
     wait_converged(&fixture, "cancelled", &[]).await;
 
     // The daemon restarts while a registration is pending: the abandoned
@@ -807,6 +823,23 @@ async fn new_job(fixture: &Installation, known: &[String]) -> String {
     .await
 }
 
+/// Asserts that a late job first seen at `seen` was kept at least until its
+/// initialization deadline.
+///
+/// The job registered before the test saw it, so the bound allows for the
+/// test's own discovery latency.
+fn assert_watched_until_initialize(seen: Instant, initialize: Duration, what: &str) {
+    /// Upper bound on the delay between registration and the test's first
+    /// discovery of the job (one poll plus one discovery round trip).
+    const DISCOVERY_LATENCY: Duration = Duration::from_millis(1_500);
+
+    let watched = seen.elapsed();
+    assert!(
+        watched + DISCOVERY_LATENCY >= initialize,
+        "the {what} generation was given up after {watched:?}, before its {initialize:?} initialization deadline"
+    );
+}
+
 /// Waits until the namespace runs exactly `jobs` and no session named `name`
 /// still claims a runtime: the abandoned generation was retired by exact
 /// service ID and its create was settled.
@@ -882,23 +915,39 @@ async fn start_job(
 
 /// A configured worker executable whose process never becomes a worker.
 ///
-/// While held, the version directory's worker path is a script that only
-/// sleeps: its job registers and runs, but no worker socket ever appears,
-/// which is exactly a registration whose readiness is late. Releasing moves
-/// the real worker back to the same path, so later jobs run the real binary
-/// under the path their definitions name.
+/// While held, the version directory's worker path is a native program that
+/// only waits for a signal: its job registers and runs the definition's own
+/// executable and arguments, so both backends bind its process, but no worker
+/// socket ever appears. That is exactly a registration whose readiness is
+/// late. A script would not do: its process image is the interpreter, which
+/// neither backend binds to the definition. Releasing moves the real worker
+/// back to the same path, so later jobs run the real binary under the path
+/// their definitions name.
 struct HeldWorker {
     worker: PathBuf,
     real: PathBuf,
 }
 
 impl HeldWorker {
-    /// Replaces the active version's worker with the holding script.
+    /// Replaces the active version's worker with the holding program.
     fn install(fixture: &Installation) -> Self {
         let worker = fixture.config.worker_executable();
         let real = worker.with_file_name("pohunek-sessiond.real");
         std::fs::rename(&worker, &real).expect("move the real worker aside");
-        std::fs::write(&worker, "#!/bin/sh\nexec sleep 3600\n").expect("write the holding worker");
+        let source = fixture.probe.join("held-worker.c");
+        std::fs::write(
+            &source,
+            "#include <unistd.h>\nint main(void) { for (;;) pause(); }\n",
+        )
+        .expect("write the holding program");
+        // Every supported target links Rust through the system C compiler.
+        let status = std::process::Command::new("cc")
+            .arg("-o")
+            .arg(&worker)
+            .arg(&source)
+            .status()
+            .expect("run the C compiler");
+        assert!(status.success(), "compile the holding program: {status}");
         std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755))
             .expect("executable holding worker");
         Self { worker, real }
