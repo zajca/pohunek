@@ -7,15 +7,22 @@
 # $HOME), and a workspace root wide enough for the workbench to resume runs.
 #
 # Usage:
-#   scripts/harness-milestone <slug> [--task FILE] [--max-rounds N]
+#   scripts/harness-milestone <slug> --issue NUMBER|URL \
+#       [--task FILE] [--max-rounds N]
 #
 # <slug> names the branch `zajca/<slug>` and the worktree
-# /mnt/m2_4t/Code/me/pohunek-worktrees/<slug>. NEXT.md, the transient
-# uncommitted spec, is copied into the worktree when it exists.
+# /mnt/m2_4t/Code/me/pohunek-worktrees/<slug>. The run's spec is the GitHub
+# issue resolved from --issue: repository and default project come from
+# .github/agent-workflow.json, `gh` fetches and validates the issue (exists,
+# open, right repo) before any git state changes, and a rejected run leaves
+# the repository untouched. The canonical issue URL is carried inside the
+# delivered task text through the existing --task mechanism (no new harness
+# flag). There is no NEXT.md dependency: nothing is read from or copied from
+# it here or in the harness workflow.
 
 set -eu
 
-# The manager slices the NEXT.md DoD and analyses gate output; a full cold
+# The manager slices the issue's DoD and analyses gate output; a full cold
 # analysis is rare, so 600 s is generous. The auditor runs the full gate set,
 # where workspace tests plus the release build can exceed ten minutes on a
 # cold cache; 2400 s keeps the loop from burning rounds on an auditor timeout.
@@ -25,9 +32,13 @@ DEFAULT_MAX_ROUNDS=15
 # Upper bound mirrors the harness parser's --max-rounds range (1..1000);
 # anything above would create the worktree and then die at task parsing.
 MAX_ROUNDS_LIMIT=1000
+# The pinned version the gate loop was validated with: adapter behavior and
+# sandbox semantics differ between harness versions, and a mismatch must fail
+# the start instead of silently changing what the executors can do.
+HARNESS_VERSION=0.1.7
 
 usage() {
-    echo "usage: harness-milestone <slug> [--task FILE] [--max-rounds N]" >&2
+    echo "usage: harness-milestone <slug> --issue NUMBER|URL [--task FILE] [--max-rounds N]" >&2
     exit 2
 }
 
@@ -38,10 +49,16 @@ case "$slug" in
     *[!a-z0-9_-]* | "") usage ;;
 esac
 
-task=.lh-harness/workflows/milestone-build.md
+issue_arg=''
+task=''
 max_rounds=$DEFAULT_MAX_ROUNDS
 while [ $# -gt 0 ]; do
     case "$1" in
+        --issue)
+            [ $# -ge 2 ] || usage
+            issue_arg=$2
+            shift 2
+            ;;
         --task)
             [ $# -ge 2 ] || usage
             task=$2
@@ -57,9 +74,21 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+[ -n "$issue_arg" ] || {
+    echo "error: --issue NUMBER|URL is required; the milestone spec must come from an explicit GitHub issue" >&2
+    usage
+}
 
 command -v lh-harness >/dev/null || {
     echo "error: lh-harness is not on PATH" >&2
+    exit 1
+}
+command -v gh >/dev/null || {
+    echo "error: gh is not on PATH" >&2
+    exit 1
+}
+command -v python3 >/dev/null || {
+    echo "error: python3 is not on PATH (needed to parse .github/agent-workflow.json)" >&2
     exit 1
 }
 
@@ -67,13 +96,8 @@ command -v lh-harness >/dev/null || {
 # linked worktree, and the worktrees root lives beside the primary checkout.
 repo=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 worktrees=$(dirname "$repo")/pohunek-worktrees
-worktree="$worktrees/$slug"
 branch="zajca/$slug"
 
-# The pinned version the gate loop was validated with: adapter behavior and
-# sandbox semantics differ between harness versions, and a mismatch must fail
-# the start instead of silently changing what the executors can do.
-HARNESS_VERSION=0.1.7
 case "$(lh-harness --version)" in
     "lh-harness $HARNESS_VERSION") ;;
     *)
@@ -94,41 +118,207 @@ esac
 }
 
 # A build tree can reach tens of GB: it must live on the big disk, never on
-# tmpfs (OOM kill) or under $HOME.
-case "$worktree" in
+# tmpfs (OOM kill) or under $HOME. There is no override: test fixtures place
+# their stand-in checkout beside a writable non-/tmp, non-$HOME base instead.
+worktree_check=$worktrees/$slug
+case "$worktree_check" in
     /tmp/* | "$HOME"/*)
-        echo "error: worktree parent must not be /tmp or \$HOME: $worktree" >&2
+        echo "error: worktree parent must not be /tmp or \$HOME: $worktree_check" >&2
         exit 1
         ;;
 esac
+worktree="$worktrees/$slug"
 
-if [ -d "$worktree" ]; then
+[ -d "$worktree" ] && {
     echo "error: worktree already exists: $worktree" >&2
     exit 1
-fi
+}
 
 # Validate every input before mutating git state: a rejected run must not
 # leave a stray worktree or branch behind.
-if [ "${task#/}" != "$task" ]; then
-    [ -f "$task" ] || {
-        echo "error: task file not found: $task" >&2
-        exit 1
-    }
+if [ -n "$task" ]; then
+    if [ "${task#/}" != "$task" ]; then
+        task_path=$task
+    else
+        task_path=$repo/$task
+    fi
 else
-    [ -f "$repo/$task" ] || {
-        echo "error: task file not found: $repo/$task" >&2
-        exit 1
-    }
+    task_path=$repo/.lh-harness/workflows/milestone-build.md
 fi
-[ -f "$repo/NEXT.md" ] || {
-    echo "error: NEXT.md is missing at the repo root; there is no milestone spec to run against" >&2
+# Readability/existence is validated for the default task as well as any
+# custom task, again before any git mutation.
+[ -f "$task_path" ] && [ -r "$task_path" ] || {
+    echo "error: task file missing or unreadable: $task_path" >&2
     exit 1
 }
+
 case "$max_rounds" in
     "" | *[!0-9]* | 0) usage ;;
 esac
 [ "$max_rounds" -le "$MAX_ROUNDS_LIMIT" ] || usage
 
+# Resolve repository and default-project identities from the single dedicated
+# config (never hardcoded here), and fail on a broken/incomplete config
+# before any side effect.
+config_path=$repo/.github/agent-workflow.json
+[ -f "$config_path" ] || {
+    echo "error: missing agent-workflow config: $config_path" >&2
+    exit 1
+}
+config_resolved=$(python3 - "$config_path" <<'PY'
+import json
+import re
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    cfg = json.load(fh)
+problems = []
+if not isinstance(cfg, dict):
+    problems.append("top level is not an object")
+    cfg = {}
+else:
+    repo = cfg.get("repository")
+    if (
+        not isinstance(repo, str)
+        or repo.count("/") != 1
+        or not re.fullmatch(r"[^/\s]+/[^/\s]+", repo)
+    ):
+        problems.append(
+            "repository must be a non-empty owner/name without whitespace"
+        )
+    project = cfg.get("defaultProject")
+    if not isinstance(project, dict):
+        problems.append("defaultProject must be an object")
+    else:
+        if not isinstance(project.get("owner"), str) or not project.get("owner"):
+            problems.append("defaultProject.owner missing")
+        number = project.get("number")
+        # bool is an int subclass in Python: reject it explicitly, and demand
+        # a positive integer so "number": true or 0 cannot stand in.
+        if type(number) is not int or number <= 0:
+            problems.append("defaultProject.number must be a positive integer")
+        url = project.get("url")
+        if not isinstance(url, str) or not url:
+            problems.append("defaultProject.url missing")
+        if (
+            isinstance(project.get("owner"), str)
+            and project.get("owner")
+            and type(number) is int
+            and number > 0
+            and url
+            and not re.fullmatch(
+                r"https://github\.com/users/%s/projects/%d/?" % (re.escape(project["owner"]), number),
+                url,
+            )
+        ):
+            problems.append(
+                "defaultProject.url must match its own owner and number"
+            )
+    if not isinstance(cfg.get("statusOptions"), list) or not cfg.get("statusOptions"):
+        problems.append("statusOptions must be a non-empty list")
+    if not isinstance(cfg.get("statusSemantics"), dict) or set(cfg["statusSemantics"]) != set(cfg.get("statusOptions") or [None]):
+        problems.append("statusSemantics must cover exactly statusOptions")
+if problems:
+    sys.stderr.write("error: invalid %s: %s\n" % (path, "; ".join(problems)))
+    sys.exit(3)
+owner, name = cfg["repository"].split("/", 1)
+sys.stdout.write(owner + "\n")
+sys.stdout.write(name + "\n")
+PY
+) || {
+    echo "error: .github/agent-workflow.json failed validation (see message above)" >&2
+    exit 1
+}
+repo_owner=$(printf '%s\n' "$config_resolved" | sed -n '1p')
+repo_name=$(printf '%s\n' "$config_resolved" | sed -n '2p')
+repo_slug="$repo_owner/$repo_name"
+
+# Resolve the requested --issue to a canonical URL without contacting GitHub:
+# a plain number, or an issues URL of the configured repository, is fine; any
+# other URL (different repo or different site) or non-numeric input
+# is malformed/cross-repo/ambiguous and stops here.
+canonical_url=$(python3 - "$issue_arg" "$repo_slug" <<'PY'
+import re
+import sys
+
+arg = sys.argv[1]
+repo_slug = sys.argv[2]
+prefix = "https://github.com/%s/issues/" % repo_slug
+if re.fullmatch(r"0*[0-9]+", arg) and int(arg) > 0:
+    print("%s%d" % (prefix, int(arg)))
+    sys.exit(0)
+matched = re.fullmatch(
+    r"https://github.com/([^/]+)/([^/]+)/issues/([1-9][0-9]*)(?:[#?/].*)?", arg
+)
+if matched:
+    given = "%s/%s" % (matched.group(1), matched.group(2))
+    if given != repo_slug:
+        sys.stderr.write(
+            "error: --issue points at repository %s, but this run tracks %s\n"
+            % (given, repo_slug)
+        )
+        sys.exit(6)
+    print("%s%s" % (prefix, matched.group(3)))
+    sys.exit(0)
+sys.stderr.write(
+    "error: --issue must be a plain NUMBER or a %s<number> URL, got: %s\n"
+    % (prefix, arg)
+)
+sys.exit(5)
+PY
+) || {
+    echo "error: could not resolve --issue $issue_arg (see message above)" >&2
+    exit 1
+}
+issue_num=$(printf '%s\n' "$canonical_url" | sed 's|.*/issues/||')
+
+# Fetch the real issue with gh before any mutation: missing issue, missing/
+# broken auth, network failure, a closed issue, or a wrong-repo race must
+# stop here and block the run.
+# CLI diagnostics can contain proxy or authentication details; expose only
+# the operation and its safe identifiers, not the raw upstream output.
+issue_fetched=$(gh issue view "$canonical_url" --repo "$repo_slug" --json number,url,state,title 2>/dev/null) || {
+    echo "error: could not fetch issue $canonical_url in $repo_slug; check gh access, network, and issue existence" >&2
+    exit 1
+}
+issue_title=$(python3 - "$issue_num" "$canonical_url" "$issue_fetched" <<'PY'
+import json
+import sys
+
+expected_number = int(sys.argv[1])
+canonical = sys.argv[2]
+try:
+    data = json.loads(sys.argv[3])
+except json.JSONDecodeError as exc:
+    sys.stderr.write("error: gh returned unparseable JSON: %s\n" % exc)
+    sys.exit(7)
+if data.get("number") != expected_number:
+    sys.stderr.write(
+        "error: gh returned issue number %r, expected %d\n"
+        % (data.get("number"), expected_number)
+    )
+    sys.exit(7)
+if data.get("url") not in (canonical, canonical + "/"):
+    sys.stderr.write(
+        "error: gh returned issue URL %r, expected %r\n"
+        % (data.get("url"), canonical)
+    )
+    sys.exit(7)
+if str(data.get("state", "")).lower() != "open":
+    sys.stderr.write(
+        "error: issue %d is not open (state %r)\n"
+        % (expected_number, data.get("state"))
+    )
+    sys.exit(8)
+sys.stdout.write(str(data.get("title") or ""))
+PY
+) || {
+    echo "error: fetched issue did not match --issue $issue_arg in $repo_slug (see message above)" >&2
+    exit 1
+}
+
+# Everything validated: now and only now mutate git state.
 mkdir -p "$worktrees"
 if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
     git -C "$repo" worktree add "$worktree" "$branch"
@@ -140,15 +330,24 @@ else
     }
 fi
 
-# NEXT.md is uncommitted by design, so a fresh worktree does not have it; the
-# run's contracts are written against the spec at the workspace root.
-if [ -f "$repo/NEXT.md" ]; then
-    cp "$repo/NEXT.md" "$worktree/NEXT.md"
-fi
+# The run's manager reads the spec from the GitHub issue; the delivered task
+# text carries the canonical issue identity explicitly (a gh URL of the
+# configured repository) followed by the selected task text, so the run needs
+# no NEXT.md anywhere.
+task_text_path=$worktree/.lh-harness-task.md
+{
+    printf 'Target issue for this run: %s\n\n' "$canonical_url"
+    printf '%s\n\n' "The single authoritative spec is that issue's body and comments, fetched live with gh; no NEXT.md exists and none is required."
+    printf '%s\n\n' "Workspace: the worktree passed to the harness as --workspace only; never touch any other checkout."
+    printf '%s\n\n' "Operating protocol, requirements, and the gate set come from .lh-harness/workflows/milestone-build.md in the workspace."
+    printf '%s\n\n' 'Everything below the marker line is the pinned task text delivered to this invocation.'
+    printf '%s\n' '---'
+    cat "$task_path"
+} > "$task_text_path"
 
 cd "$repo"
 exec lh-harness run \
-    --task "@$task" \
+    --task "@$task_text_path" \
     --workspace "$worktree" \
     --run-id "ms-$slug-$(date -u +%Y%m%dT%H%M%SZ)" \
     --max-rounds "$max_rounds" \

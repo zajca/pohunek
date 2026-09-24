@@ -3,9 +3,8 @@ name: release
 description: >-
   Cut a pohunek release with scripts/release — bump the workspace version, tag
   vX.Y.Z, push, and verify the GitHub Actions Release workflow builds and
-  publishes the glibc + MUSL x86_64 binaries. Use when the user says "udělej
-  minor release", "release minor/patch/major", "vydej novou verzi", "cut a
-  release", "fok merge do main a release", or asks to publish a new version.
+  publishes the glibc + MUSL x86_64 binaries. Use when the user asks to cut
+  or publish a new version.
 ---
 
 # release — cut and publish a release
@@ -51,7 +50,13 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    wants to inspect the commit/tag locally before pushing (then push the branch
    and tag manually as the script prints).
 
-4. **Verify the Release workflow — do not trust, confirm.** Pushing the `vX.Y.Z`
+4. **Record the release.** Via the `github-workflow` skill, comment the
+   version/tag and release URL on any issue whose delivery this release
+   completes (or opens a dedicated tracking issue beforehand when the release
+   itself is planned work), and update the project status accordingly. Verify
+   the writes from the API response.
+
+5. **Verify the Release workflow — do not trust, confirm.** Pushing the `vX.Y.Z`
    tag triggers `.github/workflows/release.yml`, which runs the fmt/clippy/test
    gate + docs-gate, then builds `pohunek`, `pohunekd`, and `pohunek-gui` for
    both `x86_64-unknown-linux-gnu` (dynamic glibc, primary) and
@@ -64,7 +69,7 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    gh release view "vX.Y.Z"   # confirm the tarballs + .sha256 are attached
    ```
 
-5. **Report.** State the published version/tag, the workflow conclusion
+6. **Report.** State the published version/tag, the workflow conclusion
    (success/failure with the failing job if any), and the attached artifacts. If
    the workflow failed, report why with output — a failed gate means no binary
    was published.
