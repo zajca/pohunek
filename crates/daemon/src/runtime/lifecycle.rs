@@ -114,16 +114,40 @@ const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// absent one.
 const MAX_INSPECT_RACES: usize = 3;
 
-/// Suffix of the launchd standard-output file `<label>.out.log`.
+/// Names the stdout and stderr files of one worker job.
 ///
-/// Mirrors the launchd backend, which rejects definitions naming other log
-/// files so retirement removes exactly what launchd wrote.
-#[cfg(target_os = "macos")]
-const LAUNCHD_STDOUT_SUFFIX: &str = ".out.log";
+/// The native backend owns the naming (launchd rejects definitions naming other
+/// files, so retirement removes exactly what it wrote); backends that keep job
+/// output elsewhere, such as the systemd journal, have no naming.
+#[derive(Clone)]
+pub struct LogNaming(Arc<dyn Fn(&WorkerKey) -> JobLogs + Send + Sync>);
 
-/// Suffix of the launchd standard-error file `<label>.err.log`.
-#[cfg(target_os = "macos")]
-const LAUNCHD_STDERR_SUFFIX: &str = ".err.log";
+impl LogNaming {
+    /// Wraps the backend's naming function.
+    pub fn new(naming: impl Fn(&WorkerKey) -> JobLogs + Send + Sync + 'static) -> Self {
+        Self(Arc::new(naming))
+    }
+
+    /// Returns the log files of `key`'s job.
+    #[must_use]
+    pub fn logs(&self, key: &WorkerKey) -> JobLogs {
+        (self.0)(key)
+    }
+}
+
+impl std::fmt::Debug for LogNaming {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LogNaming(..)")
+    }
+}
+
+impl PartialEq for LogNaming {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for LogNaming {}
 
 /// Supervision inputs shared by every worker generation of one daemon.
 ///
@@ -155,8 +179,9 @@ pub struct SupervisionConfig {
     pub bootstrap_environment: BTreeMap<String, String>,
     /// Absolute working directory of worker jobs (the user's home).
     pub working_directory: PathBuf,
-    /// `<log_dir>/launchd`, receiving launchd job stdout and stderr files.
-    pub launchd_log_dir: PathBuf,
+    /// Backend naming of worker stdout and stderr files; `None` when the
+    /// backend keeps job output elsewhere (systemd journal, dev/test children).
+    pub worker_logs: Option<LogNaming>,
 }
 
 /// Describes an isolated dev/test worker tree for [`super::SubprocessWorkerLauncher`].
@@ -220,11 +245,7 @@ impl SubprocessWorkerEnvironment {
             open_files: DEV_OPEN_FILES,
             bootstrap_environment,
             working_directory: self.home.clone(),
-            launchd_log_dir: self
-                .state_home
-                .join(pohunek_paths::APP_DIR)
-                .join(pohunek_paths::LOGS_SUBDIR)
-                .join(pohunek_paths::LAUNCHD_SUBDIR),
+            worker_logs: None,
         }
     }
 }
@@ -364,36 +385,15 @@ pub fn job_definition(
         arguments,
         environment: config.bootstrap_environment.clone(),
         working_directory: config.working_directory.clone(),
-        logs: job_logs(config, generation),
+        logs: config
+            .worker_logs
+            .as_ref()
+            .map(|naming| naming.logs(generation.key())),
         start_timeout: config.worker_initialize,
         exit_timeout: config.worker_exit_timeout,
         restart: RestartPolicy::Never,
         open_files: config.open_files,
     })
-}
-
-/// launchd writes worker stdout and stderr to `<log_dir>/launchd/<label>.*`.
-#[cfg(target_os = "macos")]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the signature is shared with the systemd target, which keeps logs in the journal"
-)]
-fn job_logs(config: &SupervisionConfig, generation: &Generation) -> Option<JobLogs> {
-    let label = config.namespace.worker_label(generation.key());
-    Some(JobLogs {
-        stdout: config
-            .launchd_log_dir
-            .join(format!("{label}{LAUNCHD_STDOUT_SUFFIX}")),
-        stderr: config
-            .launchd_log_dir
-            .join(format!("{label}{LAUNCHD_STDERR_SUFFIX}")),
-    })
-}
-
-/// systemd keeps worker stdout and stderr in the journal.
-#[cfg(not(target_os = "macos"))]
-fn job_logs(_config: &SupervisionConfig, _generation: &Generation) -> Option<JobLogs> {
-    None
 }
 
 fn path_argument(path: &Path) -> Result<String, SupervisorError> {

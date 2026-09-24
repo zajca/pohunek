@@ -421,12 +421,7 @@ async fn run_observer(
     sessions: ExternalSessions,
     config: ExternalObserverConfig,
 ) {
-    let index = TranscriptIndex::default();
-    if config.roots.is_empty() {
-        debug!("external observer has no transcript roots to watch");
-    }
-    spawn_transcript_watcher(&config.roots, &index, &sessions);
-    index.scan_roots(config.roots.clone()).await;
+    let (index, _watch) = start_transcript_index(&config.roots, &sessions).await;
 
     let mut tick = tokio::time::interval(config.sweep_interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -439,38 +434,103 @@ async fn run_observer(
     }
 }
 
+/// Stable reason reported whenever live transcript watching is not running.
+///
+/// The observer then relies on its startup scan of the transcript roots and
+/// the periodic process sweep.
+pub(crate) const TRANSCRIPT_WATCHER_UNAVAILABLE: &str = "external_transcript_watcher_unavailable";
+
+/// Whether new transcripts are indexed as they are written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TranscriptWatch {
+    /// A live watcher follows the transcript roots.
+    #[cfg(target_os = "linux")]
+    Active,
+    /// Transcripts are indexed only by the startup scan.
+    Unavailable(WatcherUnavailable),
+}
+
+/// Why live transcript watching is not running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatcherUnavailable {
+    /// The Linux inotify watcher could not be opened.
+    #[cfg(target_os = "linux")]
+    OpenFailed,
+    /// The target has no live transcript watcher.
+    #[cfg(not(target_os = "linux"))]
+    UnsupportedTarget,
+}
+
+impl WatcherUnavailable {
+    /// Stable machine-readable cause.
+    const fn cause(self) -> &'static str {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::OpenFailed => "inotify_open_failed",
+            #[cfg(not(target_os = "linux"))]
+            Self::UnsupportedTarget => "unsupported_target",
+        }
+    }
+}
+
+/// Starts transcript watching, reports its availability, and indexes the
+/// transcripts that already exist.
+async fn start_transcript_index(
+    roots: &[TranscriptRoot],
+    sessions: &ExternalSessions,
+) -> (TranscriptIndex, TranscriptWatch) {
+    let index = TranscriptIndex::default();
+    if roots.is_empty() {
+        debug!("external observer has no transcript roots to watch");
+    }
+    let watch = spawn_transcript_watcher(roots, &index, sessions);
+    index.scan_roots(roots.to_vec()).await;
+    (index, watch)
+}
+
+fn report_watcher_unavailable(
+    cause: WatcherUnavailable,
+    error: Option<&io::Error>,
+) -> TranscriptWatch {
+    warn!(
+        name: "external.transcript_watcher.unavailable",
+        reason = TRANSCRIPT_WATCHER_UNAVAILABLE,
+        cause = cause.cause(),
+        error = error.map(tracing::field::display),
+        "external transcript watcher unavailable ({{cause}}); startup scan and process sweep still run"
+    );
+    TranscriptWatch::Unavailable(cause)
+}
+
 /// Watches transcript roots so new transcripts are indexed as they are written.
 #[cfg(target_os = "linux")]
 fn spawn_transcript_watcher(
     roots: &[TranscriptRoot],
     index: &TranscriptIndex,
     sessions: &ExternalSessions,
-) {
+) -> TranscriptWatch {
     match inotify::InotifyWatcher::open(roots) {
         Ok(watcher) => {
             let roots = roots.to_vec();
             let index = index.clone();
             let sessions = sessions.clone();
             tokio::spawn(async move { watcher.run(roots, index, sessions).await });
+            TranscriptWatch::Active
         }
-        Err(error) => {
-            debug!(
-                error = %error,
-                "external transcript inotify watcher unavailable; process sweep still runs"
-            );
-        }
+        Err(error) => report_watcher_unavailable(WatcherUnavailable::OpenFailed, Some(&error)),
     }
 }
 
-/// Live transcript watching is Linux-only; other targets index the roots once
-/// at startup and rely on the process sweep (macOS observation is #101).
+/// Live transcript watching exists only on Linux; issue #101 owns it on macOS.
+/// Until then the observer reports it unavailable and relies on the startup
+/// scan plus the process sweep.
 #[cfg(not(target_os = "linux"))]
 fn spawn_transcript_watcher(
     _roots: &[TranscriptRoot],
     _index: &TranscriptIndex,
     _sessions: &ExternalSessions,
-) {
-    debug!("external transcript watching is unavailable on this target; process sweep still runs");
+) -> TranscriptWatch {
+    report_watcher_unavailable(WatcherUnavailable::UnsupportedTarget, None)
 }
 
 fn external_info_matches(existing: &SessionInfo, incoming: &SessionInfo) -> bool {
@@ -705,5 +765,144 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use protocol::AgentKind;
+
+    #[cfg(not(target_os = "linux"))]
+    use super::WatcherUnavailable;
+    use super::{
+        start_transcript_index, ExternalObserverConfig, ExternalSessions, TranscriptRoot,
+        TranscriptWatch,
+    };
+    use crate::procwatch::{
+        Error, ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity,
+        ProcessInspector,
+    };
+    use crate::session::{SessionRegistry, SessionRegistryConfig};
+
+    /// Sweep interval short enough to observe several sweeps quickly.
+    const SWEEP_INTERVAL: Duration = Duration::from_millis(20);
+    /// Bound on waiting for the observer's periodic sweeps.
+    const SWEEP_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Host inspector that counts process sweeps.
+    #[derive(Debug, Default)]
+    struct CountingInspector {
+        host: HostInspector,
+        sweeps: AtomicUsize,
+    }
+
+    impl ProcessInspector for CountingInspector {
+        fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, Error> {
+            self.host.identity(pid)
+        }
+
+        fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, Error> {
+            self.host.parent_pid(pid)
+        }
+
+        fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, Error> {
+            self.host.process(pid)
+        }
+
+        fn same_user_processes(&self) -> Result<Vec<ProcessFact>, Error> {
+            self.sweeps.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, Error> {
+            self.host.descendants(root)
+        }
+
+        fn cwd(&self, pid: Pid) -> Result<PathBuf, Error> {
+            self.host.cwd(pid)
+        }
+
+        fn executable(&self, pid: Pid) -> Result<Option<PathBuf>, Error> {
+            self.host.executable(pid)
+        }
+
+        fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, Error> {
+            self.host.exit_watch(identity)
+        }
+
+        fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, Error> {
+            self.host.ownership_markers(pid)
+        }
+
+        fn foreground_process_group(&self, root_pid: Pid) -> Result<Option<Pid>, Error> {
+            self.host.foreground_process_group(root_pid)
+        }
+    }
+
+    fn transcript_root() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().expect("transcript root");
+        let transcript = root.path().join("work/session.jsonl");
+        std::fs::create_dir_all(transcript.parent().expect("parent")).expect("project dir");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{{\"session_id\":\"native-observer\",\"cwd\":\"/tmp\",\"transcript_path\":\"{}\"}}\n",
+                transcript.display()
+            ),
+        )
+        .expect("write transcript");
+        (root, transcript)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn expected_watch() -> TranscriptWatch {
+        TranscriptWatch::Active
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn expected_watch() -> TranscriptWatch {
+        TranscriptWatch::Unavailable(WatcherUnavailable::UnsupportedTarget)
+    }
+
+    #[tokio::test]
+    async fn the_observer_reports_its_watcher_and_still_scans_and_sweeps() {
+        let (root, transcript) = transcript_root();
+        let roots = vec![TranscriptRoot {
+            agent_base: AgentKind::Claude,
+            path: root.path().to_path_buf(),
+        }];
+        let sessions = ExternalSessions::new();
+
+        let (index, watch) = start_transcript_index(&roots, &sessions).await;
+
+        assert_eq!(watch, expected_watch());
+        let indexed = index.inner.lock().expect("index").contains_key(&transcript);
+        assert!(indexed, "the startup scan indexes existing transcripts");
+
+        let inspector = Arc::new(CountingInspector::default());
+        let registry = SessionRegistry::new_with_inspector(
+            SessionRegistryConfig::default(),
+            Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+        );
+        sessions.spawn_observer(
+            registry,
+            ExternalObserverConfig {
+                roots,
+                sweep_interval: SWEEP_INTERVAL,
+            },
+        );
+        tokio::time::timeout(SWEEP_TIMEOUT, async {
+            while inspector.sweeps.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(SWEEP_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("the process sweep keeps running");
+        sessions.shutdown();
     }
 }

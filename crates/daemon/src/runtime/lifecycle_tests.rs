@@ -485,10 +485,10 @@ fn minted_generations_are_valid_distinct_and_named_by_the_definition() {
     assert_eq!(definition.start_timeout(), INITIALIZE);
     assert_eq!(definition.exit_timeout(), DEV_WORKER_EXIT_TIMEOUT);
     assert_eq!(definition.open_files(), DEV_OPEN_FILES);
-    #[cfg(target_os = "macos")]
-    assert!(definition.logs().is_some());
-    #[cfg(not(target_os = "macos"))]
-    assert!(definition.logs().is_none());
+    assert!(
+        definition.logs().is_none(),
+        "dev/test jobs name no log files"
+    );
     assert_eq!(
         definition.facts(),
         DefinitionFacts {
@@ -510,6 +510,26 @@ fn installed_definitions_pass_the_service_config() {
         .position(|argument| argument == "--service-config")
         .expect("service config flag");
     assert_eq!(arguments[flag + 1], "/home/u/.config/pohunek/service.toml");
+}
+
+#[test]
+fn definitions_name_exactly_the_backend_log_files() {
+    let mut harness = Harness::scripted(CONNECT, INITIALIZE);
+    harness.config.worker_logs = Some(LogNaming::new(|key: &WorkerKey| JobLogs {
+        stdout: PathBuf::from(format!("/logs/{key}.out.log")),
+        stderr: PathBuf::from(format!("/logs/{key}.err.log")),
+    }));
+    let generation = harness.generation("s-1");
+
+    let definition = job_definition(&harness.config, &generation).expect("valid definition");
+
+    assert_eq!(
+        definition.logs(),
+        Some(&JobLogs {
+            stdout: PathBuf::from(format!("/logs/{}.out.log", generation.key())),
+            stderr: PathBuf::from(format!("/logs/{}.err.log", generation.key())),
+        })
+    );
 }
 
 #[test]

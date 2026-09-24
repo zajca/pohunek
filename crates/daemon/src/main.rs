@@ -44,7 +44,7 @@ use pohunek_daemon::notifications::{
     NOTIFICATIONS_SUBDIR,
 };
 use pohunek_daemon::runtime::lifecycle::{
-    DEV_OPEN_FILES, DEV_SWEEP_GRACE, DEV_WORKER_CONNECT, DEV_WORKER_EXIT_TIMEOUT,
+    LogNaming, DEV_OPEN_FILES, DEV_SWEEP_GRACE, DEV_WORKER_CONNECT, DEV_WORKER_EXIT_TIMEOUT,
     DEV_WORKER_INITIALIZE,
 };
 use pohunek_daemon::runtime::{SubprocessWorkerLauncher, SupervisionConfig, WorkerLauncher};
@@ -125,8 +125,21 @@ const REMOTE_BIND_MAX_RETRY_INTERVAL: Duration = Duration::from_mins(5);
 /// the provider CLI.
 const REMOTE_LISTENER_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Sole argument that prints the binary name and version and exits.
+///
+/// `pohunek service install` runs it to confirm a staged executable before
+/// referencing it, so it is answered before any environment, path, logging,
+/// lock, or socket work.
+const VERSION_FLAG: &str = "--version";
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    if std::env::args_os()
+        .skip(1)
+        .eq([OsString::from(VERSION_FLAG)])
+    {
+        return print_version();
+    }
     // The startup future is large (reconciliation, listeners, event logs); box
     // it so it lives on the heap instead of inflating the `main` task frame.
     match Box::pin(run()).await {
@@ -357,6 +370,19 @@ fn env_bool(var: &str) -> Result<bool, DaemonError> {
     }
 }
 
+/// Prints `pohunekd <version>` for the installer.
+fn print_version() -> ExitCode {
+    use std::io::Write as _;
+
+    match writeln!(std::io::stdout(), "pohunekd {DAEMON_VERSION}") {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("pohunekd: failed to print the version: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Worker supervision selected at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SupervisionMode {
@@ -449,7 +475,6 @@ async fn build_session_registry(
             expected: "an existing absolute directory (the worker working directory)",
         });
     }
-    let launchd_log_dir = paths.log_dir.join(pohunek_paths::LAUNCHD_SUBDIR);
     let (supervision, supervisor): (SupervisionConfig, Arc<dyn WorkerLauncher>) = match mode {
         SupervisionMode::Native(path) => {
             let service = ServiceConfig::load(&path)?;
@@ -460,7 +485,7 @@ async fn build_session_registry(
             )?;
             let deadlines = service.deadlines();
             config.worker_connect_deadline = deadlines.worker_connect;
-            let supervisor = native_supervisor(&service, paths).await?;
+            let (supervisor, worker_logs) = native_supervisor(&service, paths).await?;
             info!(
                 service.namespace = %service.namespace(),
                 service.version = service.active_version(),
@@ -479,7 +504,7 @@ async fn build_session_registry(
                     open_files: service.open_files(),
                     bootstrap_environment,
                     working_directory,
-                    launchd_log_dir,
+                    worker_logs,
                 },
                 supervisor,
             )
@@ -511,7 +536,7 @@ async fn build_session_registry(
                     open_files: DEV_OPEN_FILES,
                     bootstrap_environment,
                     working_directory,
-                    launchd_log_dir,
+                    worker_logs: None,
                 },
                 Arc::new(SubprocessWorkerLauncher::new()),
             )
@@ -539,38 +564,53 @@ fn bootstrap_environment() -> Result<BTreeMap<String, String>, DaemonError> {
         .collect()
 }
 
+/// Native worker supervisor and the log naming its definitions must use.
+type NativeSupervisor = (Arc<dyn WorkerLauncher>, Option<LogNaming>);
+
 /// Connects the systemd user manager that runs workers as transient units.
 ///
-/// One D-Bus call is bounded by the configured `launchctl_command` deadline:
-/// both bound a single request to the user's service manager, so the
-/// installation keeps one knob instead of inventing a second value.
+/// Worker output goes to the journal, so definitions name no log files. One
+/// D-Bus call is bounded by the configured `launchctl_command` deadline: both
+/// bound a single request to the user's service manager, so the installation
+/// keeps one knob instead of inventing a second value.
 #[cfg(target_os = "linux")]
 async fn native_supervisor(
     service: &ServiceConfig,
     _paths: &Paths,
-) -> Result<Arc<dyn WorkerLauncher>, DaemonError> {
+) -> Result<NativeSupervisor, DaemonError> {
     let supervisor = pohunek_platform::supervisor::systemd::SystemdSupervisor::connect(
         service.namespace(),
         service.deadlines().launchctl_command,
     )
     .await?;
-    Ok(Arc::new(supervisor))
+    Ok((Arc::new(supervisor), None))
 }
 
 /// Creates the launchd supervisor that runs workers as `gui/<uid>` jobs.
+///
+/// Definitions must name exactly the log files the backend removes on
+/// retirement, so the naming comes from the backend itself.
 #[cfg(target_os = "macos")]
+#[expect(
+    clippy::unused_async,
+    reason = "the signature is shared with the systemd target, which connects to D-Bus"
+)]
 async fn native_supervisor(
     service: &ServiceConfig,
     paths: &Paths,
-) -> Result<Arc<dyn WorkerLauncher>, DaemonError> {
-    let supervisor = pohunek_platform::supervisor::launchd::LaunchdSupervisor::new(
-        service.namespace(),
-        service.uid(),
-        paths.state_dir.join(pohunek_paths::LAUNCHD_SUBDIR),
-        paths.log_dir.join(pohunek_paths::LAUNCHD_SUBDIR),
-        service.deadlines().launchctl_command,
-    )?;
-    Ok(Arc::new(supervisor))
+) -> Result<NativeSupervisor, DaemonError> {
+    let supervisor = Arc::new(
+        pohunek_platform::supervisor::launchd::LaunchdSupervisor::new(
+            service.namespace(),
+            service.uid(),
+            paths.state_dir.join(pohunek_paths::LAUNCHD_SUBDIR),
+            paths.log_dir.join(pohunek_paths::LAUNCHD_SUBDIR),
+            service.deadlines().launchctl_command,
+        )?,
+    );
+    let naming = Arc::clone(&supervisor);
+    let worker_logs = LogNaming::new(move |key| naming.worker_logs(key));
+    Ok((supervisor, Some(worker_logs)))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

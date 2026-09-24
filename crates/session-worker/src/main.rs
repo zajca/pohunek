@@ -17,8 +17,18 @@ use tracing_subscriber::prelude::*;
 /// Random bytes in a worker process identifier.
 const WORKER_ID_RANDOM_BYTES: usize = 16;
 
+/// Sole argument that prints the binary name and version and exits.
+///
+/// `pohunek service install` runs it to confirm a staged executable before
+/// referencing it, so it must work without any environment or paths.
+const VERSION_FLAG: &str = "--version";
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments == [VERSION_FLAG] {
+        return print_version();
+    }
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -30,6 +40,23 @@ async fn main() -> ExitCode {
                 error.message = %error,
                 "session worker failed: {{error.message}}",
             );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Prints `pohunek-sessiond <version>` for the installer.
+fn print_version() -> ExitCode {
+    use std::io::Write as _;
+
+    match writeln!(
+        std::io::stdout(),
+        "pohunek-sessiond {}",
+        env!("CARGO_PKG_VERSION")
+    ) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("pohunek-sessiond: failed to print the version: {error}");
             ExitCode::FAILURE
         }
     }
@@ -106,6 +133,11 @@ impl Cli {
                 "--worker-id" => &mut worker_id,
                 "--daemon-socket-path" => &mut daemon_socket_path,
                 "--service-config" => &mut service_config,
+                VERSION_FLAG => {
+                    return Err(WorkerError::Protocol(format!(
+                        "{VERSION_FLAG} must be the only argument"
+                    )));
+                }
                 _ => {
                     return Err(WorkerError::Protocol(format!(
                         "unknown worker argument `{argument}`"
