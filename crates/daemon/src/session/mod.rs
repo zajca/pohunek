@@ -72,6 +72,7 @@ mod read;
 mod reconcile;
 mod resume;
 mod retention;
+mod supervision;
 mod target;
 
 pub use attach::{RedeemedAttach, RedeemedRuntime};
@@ -444,6 +445,9 @@ struct SessionRegistryInner {
     /// Serializes create, native recovery, stop, and remove per session, so
     /// one session never runs two lifecycle transactions at once.
     lifecycle_locks: SessionLocks,
+    /// Sessions whose native supervisor could not be inspected, re-reconciled
+    /// in the background until it answers.
+    supervision_retries: supervision::SupervisionRetries,
     /// Per-session worktree binder, present when worktree binding is configured.
     /// Shared into `spawn_blocking` for the (blocking) git subprocesses.
     worktree: Option<Arc<WorktreeManager>>,
@@ -1168,6 +1172,7 @@ impl SessionRegistry {
                 store,
                 persist_lock: Mutex::new(()),
                 lifecycle_locks: SessionLocks::default(),
+                supervision_retries: supervision::SupervisionRetries::default(),
                 worktree,
                 projects,
                 event_log_shutdown: CancellationToken::new(),

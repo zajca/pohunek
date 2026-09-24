@@ -10,7 +10,7 @@ use pohunek_platform::filesystem::{AtomicReplaceError, TrustedDir};
 use serde::{Deserialize, Serialize};
 
 /// Worker journal schema understood by this crate.
-const JOURNAL_SCHEMA_VERSION: u32 = 3;
+const JOURNAL_SCHEMA_VERSION: u32 = 4;
 /// Owner-only directory permissions.
 const PRIVATE_DIR_MODE: u32 = 0o700;
 /// Owner-only journal permissions.

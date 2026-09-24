@@ -675,6 +675,7 @@ impl SessionRegistry {
                     SUPERVISION_UNAVAILABLE,
                 )
                 .await;
+                self.schedule_supervision_retry(&id);
                 return Err(error);
             }
         };

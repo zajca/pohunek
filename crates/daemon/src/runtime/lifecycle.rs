@@ -92,7 +92,7 @@ pub const DEV_OPEN_FILES: u64 = 8_192;
 ///
 /// Written by `pohunek-sessiond`; a journal with another schema is never used
 /// as generation evidence.
-pub(crate) const WORKER_JOURNAL_SCHEMA_VERSION: u32 = 3;
+pub(crate) const WORKER_JOURNAL_SCHEMA_VERSION: u32 = 4;
 
 /// Largest worker journal read as lifecycle evidence.
 ///
@@ -834,20 +834,39 @@ impl Lifecycle<'_> {
     /// Inspects the generation's job; `Ok(None)` means proven absent.
     ///
     /// A `Race` is retried a bounded number of times and never read as absent.
-    async fn inspect(
+    ///
+    /// # Errors
+    ///
+    /// Returns the supervisor error for anything but a proven absence,
+    /// including a `Race` that persisted through every retry.
+    pub(crate) async fn inspect(
         &self,
         generation: &Generation,
     ) -> Result<Option<ServiceObservation>, SupervisorError> {
-        let id = generation.service_id();
+        self.inspect_service(&generation.service_id()).await
+    }
+
+    /// Inspects the job named `id`; `Ok(None)` means proven absent.
+    ///
+    /// A `Race` is retried a bounded number of times and never read as absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the supervisor error for anything but a proven absence,
+    /// including a `Race` that persisted through every retry.
+    pub(crate) async fn inspect_service(
+        &self,
+        id: &ServiceId,
+    ) -> Result<Option<ServiceObservation>, SupervisorError> {
         let mut races = 0;
         loop {
-            match self.supervisor.inspect(&id).await {
+            match self.supervisor.inspect(id).await {
                 Ok(observation) => return Ok(Some(observation)),
                 Err(SupervisorError::NotFound(_)) => return Ok(None),
                 Err(SupervisorError::Race { operation }) if races < MAX_INSPECT_RACES => {
                     races += 1;
                     tracing::debug!(
-                        session_id = generation.session_id(),
+                        service_id = %id,
                         operation,
                         races,
                         "worker job changed during inspection; retrying"
@@ -861,7 +880,7 @@ impl Lifecycle<'_> {
 }
 
 /// Whether an observed job may still have or produce a worker process.
-fn observation_live(observation: &ServiceObservation) -> bool {
+pub(crate) fn observation_live(observation: &ServiceObservation) -> bool {
     observation.process.is_some()
         || matches!(
             observation.state,
