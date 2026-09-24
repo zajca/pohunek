@@ -234,6 +234,10 @@ impl TcpFixtureDaemon {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _address)) => {
+                        // BSD-derived accept inherits the listener's nonblocking flag.
+                        stream
+                            .set_nonblocking(false)
+                            .expect("make fixture connection blocking");
                         let requests = Arc::clone(&thread_requests);
                         handlers.push(thread::spawn(move || {
                             handle_connection(stream, scenario, &requests, None);
@@ -290,6 +294,10 @@ impl FixtureDaemon {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _address)) => {
+                        // BSD-derived accept inherits the listener's nonblocking flag.
+                        stream
+                            .set_nonblocking(false)
+                            .expect("make fixture connection blocking");
                         let requests = Arc::clone(&thread_requests);
                         let request_log = Arc::clone(&thread_request_log);
                         handlers.push(thread::spawn(move || {

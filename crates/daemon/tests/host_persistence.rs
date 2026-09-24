@@ -282,7 +282,13 @@ fn accept_with_timeout(listener: &UnixListener, operation: &str) -> UnixStream {
     let deadline = Instant::now() + LOCK_HELPER_TIMEOUT;
     loop {
         match listener.accept() {
-            Ok((stream, _address)) => return stream,
+            Ok((stream, _address)) => {
+                // BSD-derived accept inherits the listener's nonblocking flag.
+                stream
+                    .set_nonblocking(false)
+                    .expect("make lock-helper connection blocking");
+                return stream;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 assert!(
                     Instant::now() < deadline,
