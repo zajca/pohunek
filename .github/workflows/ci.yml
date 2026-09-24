@@ -156,6 +156,15 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-service-config
 
+      # TEMP (supervised suite dispatch, reverted before merge).
+      - name: TEMP supervised lifecycle suite
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-daemon --test supervised_lifecycle -- --test-threads 1
+
+      - name: TEMP service upgrade suite
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-cli --test service_upgrade -- --test-threads 1
+
       - name: Test daemon
         # Independent suites: report each even when an earlier one failed.
         if: ${{ !cancelled() }}
