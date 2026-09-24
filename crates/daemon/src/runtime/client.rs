@@ -129,6 +129,9 @@ struct Inner {
     lease_id: LeaseId,
     capabilities: Vec<Capability>,
     next_write_sequence: u64,
+    /// Request whose caller was dropped after it was sent but before its
+    /// response was read; the next request discards that response first.
+    abandoned_request: Option<RequestId>,
 }
 
 /// One authenticated framed worker data stream.
@@ -322,6 +325,7 @@ impl Worker {
                 lease_id,
                 capabilities,
                 next_write_sequence: 1,
+                abandoned_request: None,
             })),
             socket_path,
             request_sequence: Arc::new(AtomicU64::new(1)),
@@ -1088,18 +1092,26 @@ fn input_write_id(lease_id: &LeaseId, sequence: u64) -> Result<WriteId, WorkerEr
         .map_err(|error| WorkerError::Protocol(error.to_string()))
 }
 
+/// Sends one request on the shared control connection and reads its response.
+///
+/// Callers may be dropped at any await point (for example a watcher racing a
+/// cancellation token). A request dropped after it was fully sent leaves its
+/// response in the stream, so it is remembered and discarded before the next
+/// request instead of being mistaken for that request's response.
 async fn request_locked(
     inner: &mut Inner,
     request_id: RequestId,
     kind: RequestKind,
 ) -> Result<ResponseKind, WorkerError> {
-    let response = exchange(
-        &mut inner.reader,
-        &mut inner.writer,
-        ControlRequest { request_id, kind },
-    )
-    .await?;
-    Ok(response.kind)
+    if let Some(abandoned) = inner.abandoned_request.take() {
+        read_response(&mut inner.reader, &abandoned).await?;
+    }
+    let expected = request_id.clone();
+    send_request(&mut inner.writer, ControlRequest { request_id, kind }).await?;
+    inner.abandoned_request = Some(expected.clone());
+    let response = read_response(&mut inner.reader, &expected).await;
+    inner.abandoned_request = None;
+    Ok(response?.kind)
 }
 
 async fn exchange(
@@ -1121,6 +1133,14 @@ where
 {
     let expected = request.request_id.clone();
     send_started();
+    send_request(writer, request).await?;
+    read_response(reader, &expected).await
+}
+
+async fn send_request(
+    writer: &mut ControlWriter<OwnedWriteHalf>,
+    request: ControlRequest,
+) -> Result<(), WorkerError> {
     writer
         .write(&ControlMessage::Request(request))
         .await
@@ -1128,7 +1148,13 @@ where
     writer
         .flush()
         .await
-        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+        .map_err(|error| WorkerError::Protocol(error.to_string()))
+}
+
+async fn read_response(
+    reader: &mut ControlReader<OwnedReadHalf>,
+    expected: &RequestId,
+) -> Result<ControlResponse, WorkerError> {
     loop {
         let message = reader
             .read::<ControlMessage>()
@@ -1136,7 +1162,7 @@ where
             .map_err(|error| WorkerError::Protocol(error.to_string()))?
             .ok_or_else(|| WorkerError::Protocol("worker control connection closed".to_owned()))?;
         match message {
-            ControlMessage::Response(response) if response.request_id == expected => {
+            ControlMessage::Response(response) if &response.request_id == expected => {
                 return Ok(response);
             }
             ControlMessage::Event(_) => {}
@@ -1312,6 +1338,52 @@ mod tests {
 
         assert_eq!(current, vec![Capability::SubagentObservation]);
         assert!(previous.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_request_dropped_after_sending_does_not_poison_the_next_response() {
+        const SESSION_ID: &str = "s-9001";
+        let root = test_root("abandoned-request");
+        let socket_path = root.join("socket/worker.sock");
+        let server = Server::bind(ServerArgs {
+            session_id: SESSION_ID.to_owned(),
+            worker_id: "worker-e2e".to_owned(),
+            generation: "abcd2345".to_owned(),
+            socket_path: socket_path.clone(),
+            journal_path: root.join("journal/worker.json"),
+            daemon_socket_path: root.join("daemon.sock"),
+            config: WorkerConfig::new(),
+        })
+        .await
+        .expect("bind real worker");
+        let server_task = tokio::spawn(server.serve());
+        let worker = Worker::connect(&socket_path, SESSION_ID, "daemon-abandoned")
+            .await
+            .expect("control handshake");
+        worker
+            .initialize(observation_initialize(&root, 1_024))
+            .await
+            .expect("initialize runtime");
+
+        // The current-thread runtime cannot run the worker during this single
+        // poll, so the request is sent and its response is still pending when
+        // the caller is dropped, as when a watcher loses a cancellation race.
+        let dropped = futures::FutureExt::now_or_never(worker.inspect());
+        assert!(
+            dropped.is_none(),
+            "the request must still await its response: {dropped:?}"
+        );
+        assert!(worker.inner.lock().await.abandoned_request.is_some());
+
+        let snapshot = worker
+            .inspect()
+            .await
+            .expect("the next request receives its own response");
+        assert_eq!(snapshot.worker_id.as_str(), "worker-e2e");
+        assert!(worker.inner.lock().await.abandoned_request.is_none());
+
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

@@ -32,8 +32,7 @@ use crate::store::{ResumeBinding, SessionWriteOutcome};
 
 /// Maximum worker journal accepted during daemon reconciliation.
 const MAX_WORKER_JOURNAL_BYTES: usize = 1024 * 1024;
-/// Schema written by the current durable session worker.
-const WORKER_JOURNAL_SCHEMA_VERSION: u32 = 3;
+use crate::runtime::lifecycle::WORKER_JOURNAL_SCHEMA_VERSION;
 
 #[derive(Debug, Clone)]
 struct DiscoveredWorker {
@@ -786,6 +785,14 @@ impl SessionRegistry {
                 .await;
             return;
         };
+        let job = match super::Generation::from_record(&record.session_id, &record.runtime) {
+            Ok(job) => job,
+            Err(error) => {
+                self.insert_unavailable_record(record, RuntimeState::Conflict, error.code.as_str())
+                    .await;
+                return;
+            }
+        };
         let mut retry_identity = false;
         let mut root_missing_during_drain = false;
         if snapshot.launch_identity.is_some() || snapshot.active_identity.is_some() {
@@ -950,6 +957,7 @@ impl SessionRegistry {
             activity_evidence: VecDeque::new(),
             input_gate: Arc::new(Mutex::new(())),
             runtime: RuntimeHandle::Worker(worker.clone()),
+            job,
             desired_state: DesiredState::Running,
             detector_cancel: detector_cancel.clone(),
             detector_resize,
@@ -1012,7 +1020,7 @@ impl SessionRegistry {
         clippy::too_many_lines,
         reason = "unavailable-record reconstruction keeps one atomic registry transition together"
     )]
-    async fn insert_unavailable_record(
+    pub(super) async fn insert_unavailable_record(
         &self,
         mut record: SessionRecord,
         state: RuntimeState,
@@ -1088,6 +1096,11 @@ impl SessionRegistry {
             activity_evidence: VecDeque::new(),
             input_gate: Arc::new(Mutex::new(())),
             runtime: RuntimeHandle::Unavailable(state),
+            // A malformed job reference is not adoptable evidence; the runtime is
+            // already classified unavailable, so the entry keeps no job.
+            job: super::Generation::from_record(&record.session_id, &record.runtime)
+                .ok()
+                .flatten(),
             desired_state: record.desired_state,
             detector_cancel: CancellationToken::new(),
             detector_resize,
@@ -1890,7 +1903,9 @@ fn import_legacy_manifest(store: &crate::store::Store) -> Result<(), ProtocolErr
                     state: runtime_state,
                     worker_id: None,
                     runtime_id: None,
-                    unit_name: None,
+                    service_id: None,
+                    generation: None,
+                    executable: None,
                     reason: live.then(|| "legacy_runtime_not_transferable".to_owned()),
                 },
             })
@@ -3540,7 +3555,9 @@ while os.getppid() == parent:
                     state: RuntimeState::Starting,
                     worker_id: None,
                     runtime_id: None,
-                    unit_name: Some("pohunek-session@s-91.service".to_owned()),
+                    service_id: None,
+                    generation: None,
+                    executable: None,
                     reason: None,
                 },
             })
@@ -4760,7 +4777,9 @@ while os.getppid() == parent:
                 state: RuntimeState::Live,
                 worker_id: Some("worker-identity".to_owned()),
                 runtime_id: Some("runtime-identity".to_owned()),
-                unit_name: Some("pohunek-session@s-identity.service".to_owned()),
+                service_id: None,
+                generation: None,
+                executable: None,
                 reason: None,
             },
         }

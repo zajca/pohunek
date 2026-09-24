@@ -196,18 +196,49 @@ fn terminalizing_running_subagents_restores_public_order() {
     assert_eq!(subagents[1].lifecycle, SubagentLifecycle::Lost);
 }
 
+fn production_supervisor() -> Arc<dyn crate::runtime::WorkerLauncher> {
+    Arc::new(crate::runtime::SubprocessWorkerLauncher::new())
+}
+
+fn production_supervision() -> crate::runtime::SupervisionConfig {
+    crate::runtime::SubprocessWorkerEnvironment {
+        runtime_home: PathBuf::from("/run/user/1000"),
+        state_home: PathBuf::from("/home/user/.local/state"),
+        data_home: PathBuf::from("/home/user/.local/share"),
+        config_home: PathBuf::from("/home/user/.config"),
+        cache_home: PathBuf::from("/home/user/.cache"),
+        home: PathBuf::from("/home/user"),
+        daemon_socket: PathBuf::from("/run/user/1000/pohunek/daemon.sock"),
+    }
+    .supervision(PathBuf::from(
+        "/home/user/.local/libexec/pohunek/1.0.0/pohunek-sessiond",
+    ))
+}
+
 #[test]
 fn production_registry_rejects_missing_durable_worker_backend() {
-    let error = SessionRegistry::new_production(SessionRegistryConfig::default())
-        .expect_err("production registry must fail closed without worker runtime root");
+    let error =
+        SessionRegistry::new_production(SessionRegistryConfig::default(), production_supervisor())
+            .expect_err("production registry must fail closed without worker runtime root");
+    assert_eq!(error.code, "worker_backend_required");
+
+    let unsupervised = SessionRegistryConfig {
+        worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
+        worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
+        ..SessionRegistryConfig::default()
+    };
+    let error = SessionRegistry::new_production(unsupervised, production_supervisor())
+        .expect_err("production registry must fail closed without supervision");
     assert_eq!(error.code, "worker_backend_required");
 
     let configured = SessionRegistryConfig {
         worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
         worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
+        supervision: Some(production_supervision()),
         ..SessionRegistryConfig::default()
     };
-    SessionRegistry::new_production(configured).expect("configured production registry");
+    SessionRegistry::new_production(configured, production_supervisor())
+        .expect("configured production registry");
 }
 
 #[test]
@@ -215,10 +246,11 @@ fn production_registry_rejects_invalid_observation_limits() {
     let config = SessionRegistryConfig {
         worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
         worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
+        supervision: Some(production_supervision()),
         observation_output_bytes: 0,
         ..SessionRegistryConfig::default()
     };
-    let error = SessionRegistry::new_production(config)
+    let error = SessionRegistry::new_production(config, production_supervisor())
         .expect_err("production registry must reject zero observation limits");
     assert_eq!(error.code, "observation_limits_invalid");
 
@@ -226,6 +258,7 @@ fn production_registry_rejects_invalid_observation_limits() {
         SessionRegistryConfig {
             worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
             worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
+            supervision: Some(production_supervision()),
             observation_output_wait: Duration::from_millis(u64::from(
                 protocol::MAX_SESSION_WAIT_MS + 1,
             )),
@@ -234,11 +267,12 @@ fn production_registry_rejects_invalid_observation_limits() {
         SessionRegistryConfig {
             worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
             worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
+            supervision: Some(production_supervision()),
             session_wait: Duration::from_millis(u64::from(protocol::MAX_SESSION_WAIT_MS + 1)),
             ..SessionRegistryConfig::default()
         },
     ] {
-        let error = SessionRegistry::new_production(config)
+        let error = SessionRegistry::new_production(config, production_supervisor())
             .expect_err("production registry must reject waits above the shared ceiling");
         assert_eq!(error.code, "observation_limits_invalid");
     }
@@ -11189,7 +11223,16 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
         loss_reason: Some("test_runtime_lost".to_owned()),
     });
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
+    let lost_job = entry.job.clone().expect("created session records its job");
     drop(sessions);
+    // A lost runtime has no worker left: retire the retained terminal worker
+    // so the supervisor evidence matches the injected `Lost` state.
+    registry
+        .lifecycle()
+        .expect("test registry supervises workers")
+        .retire(&lost_job)
+        .await
+        .expect("retire the lost generation");
     let mut events = registry.subscribe();
 
     let resumed = registry
@@ -12869,4 +12912,289 @@ async fn the_worktree_probe_budget_holds_every_candidate_it_could_not_inspect() 
         Some(protocol::SessionRetentionHold::WorktreeUnknown),
         "an uninspected candidate is unproven, so it is kept"
     );
+}
+
+fn scripted_registry(
+    config: SessionRegistryConfig,
+) -> (
+    SessionRegistry,
+    Arc<crate::runtime::lifecycle::tests::ScriptedSupervisor>,
+) {
+    let mut config = config;
+    let (runtime_root, state_root) = super::test_worker_roots(&config);
+    config.worker_runtime_root = Some(runtime_root.clone());
+    config.worker_state_root = Some(state_root.clone());
+    config.supervision = Some(super::test_supervision(&runtime_root, &state_root));
+    let mut supervisor = crate::runtime::lifecycle::tests::ScriptedSupervisor::over(
+        crate::runtime::InProcessWorkerLauncher::new(runtime_root, state_root),
+    );
+    if let Some(store) = config.store_path.clone() {
+        supervisor = supervisor.recording_store(store);
+    }
+    let supervisor = Arc::new(supervisor);
+    let registry = SessionRegistry::new_with_launcher_and_inspector(
+        config,
+        Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
+        Arc::new(crate::procwatch::HostInspector::new()),
+    );
+    (registry, supervisor)
+}
+
+fn stored_record(store_path: &std::path::Path, id: &SessionId) -> crate::store::SessionRecord {
+    crate::store::Store::new(store_path.to_path_buf())
+        .load_sessions()
+        .expect("load session records")
+        .into_iter()
+        .find(|record| record.session_id == id.0)
+        .expect("session record")
+}
+
+/// Bound on waiting for a detached registration to commit.
+const DETACHED_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[tokio::test]
+async fn create_persists_the_generation_before_starting_its_job() {
+    let store_path = temp_store_path("lifecycle-persist-first");
+    let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+
+    let created = registry.create(params()).await.expect("create session");
+
+    let started = supervisor.started();
+    let [job] = started.as_slice() else {
+        panic!("exactly one generation starts: {started:?}");
+    };
+    let key = pohunek_platform::supervisor::WorkerKey::from_service_id(job).expect("worker job");
+    assert_eq!(key.session_id(), created.id.0);
+    assert_eq!(
+        supervisor.persisted_at_start(),
+        [Some(key.generation().to_owned())],
+        "the preparing record names the generation before it is registered"
+    );
+    let record = stored_record(&store_path, &created.id);
+    assert_eq!(record.runtime.service_id.as_deref(), Some(job.as_str()));
+    assert_eq!(record.runtime.generation.as_deref(), Some(key.generation()));
+    assert_eq!(
+        record.runtime.executable.as_deref(),
+        Some(std::path::Path::new("/nonexistent/pohunek-sessiond"))
+    );
+    registry.remove(&created.id).await.expect("remove session");
+    assert_eq!(
+        supervisor.retired(),
+        std::slice::from_ref(job),
+        "removal retires the exact job"
+    );
+    assert!(supervisor.live_jobs().await.is_empty());
+}
+
+#[tokio::test]
+async fn dropping_create_after_start_still_converges_to_one_generation() {
+    let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    supervisor.hold_start(gate.clone());
+
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.create(params()).await }
+    });
+    gate.entered.notified().await;
+    creating.abort();
+    assert!(
+        creating
+            .await
+            .expect_err("create was dropped")
+            .is_cancelled(),
+        "the client-facing create future is gone"
+    );
+    gate.release.notify_one();
+
+    let session = tokio::time::timeout(DETACHED_COMMIT_TIMEOUT, async {
+        loop {
+            let sessions = registry.list().await;
+            if let [session] = sessions.as_slice() {
+                if session
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.state == RuntimeState::Live)
+                {
+                    return session.clone();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the detached registration commits the session");
+
+    let started = supervisor.started();
+    assert_eq!(started.len(), 1, "no second generation: {started:?}");
+    assert_eq!(supervisor.live_jobs().await, started);
+    assert!(supervisor.retired().is_empty());
+    registry.stop(&session.id).await.expect("stop session");
+}
+
+#[tokio::test]
+async fn unavailable_supervision_during_create_leaves_a_reconnecting_session() {
+    let store_path = temp_store_path("lifecycle-unavailable");
+    let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    supervisor.script_starts([crate::runtime::lifecycle::tests::StartStep::Fail]);
+    supervisor.script_inspects([crate::runtime::lifecycle::tests::InspectStep::Unavailable]);
+
+    let error = registry
+        .create(params())
+        .await
+        .expect_err("supervisor outage");
+
+    assert_eq!(
+        error.code,
+        crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE
+    );
+    assert!(supervisor.retired().is_empty(), "nothing is killed");
+    let sessions = registry.list().await;
+    let [session] = sessions.as_slice() else {
+        panic!("the session stays visible for reconciliation: {sessions:?}");
+    };
+    let runtime = session.runtime.as_ref().expect("runtime");
+    assert_eq!(runtime.state, RuntimeState::Reconnecting);
+    assert_eq!(
+        runtime.loss_reason.as_deref(),
+        Some(crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE)
+    );
+    let record = stored_record(&store_path, &session.id);
+    assert_eq!(record.runtime.state, RuntimeState::Reconnecting);
+    assert_eq!(
+        record.runtime.service_id.as_deref(),
+        supervisor
+            .started()
+            .first()
+            .map(pohunek_platform::supervisor::ServiceId::as_str),
+        "the untouched job stays recorded"
+    );
+}
+
+async fn terminal_resumable_session(registry: &SessionRegistry) -> SessionInfo {
+    let created = registry
+        .create(resumable_params())
+        .await
+        .expect("create session");
+    let recorded = registry
+        .report_native_id(native_report!(registry;
+            session_id: created.id.clone(),
+            agent: "claude".to_owned(),
+            native_session_id: format!("native-{}", created.id.0),
+            transcript_path: None,
+        ))
+        .await;
+    assert!(recorded.recorded, "native id captured");
+    let done = registry
+        .wait_for_exit(&created.id, Duration::from_secs(2))
+        .await
+        .expect("session exits");
+    assert_eq!(done.state, SessionState::Done);
+    done
+}
+
+#[tokio::test]
+async fn concurrent_recoveries_of_one_session_start_exactly_one_generation() {
+    let marker = temp_dir("lifecycle-concurrent-resume-marker").join("argv.txt");
+    let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(temp_store_path("lifecycle-concurrent-resume")),
+        agents_dir: Some(temp_agent_that_exits_then_resumes(
+            "lifecycle-concurrent-resume",
+            &marker,
+        )),
+        socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
+        ..SessionRegistryConfig::default()
+    });
+    let done = terminal_resumable_session(&registry).await;
+    let [first_job] = supervisor.started().try_into().expect("one created job");
+
+    let (left, right) = tokio::join!(registry.resume(&done.id), registry.resume(&done.id));
+
+    let outcomes = [left, right];
+    let recovered = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().ok())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recovered.len(),
+        1,
+        "exactly one recovery wins: {outcomes:?}"
+    );
+    let refused = outcomes
+        .iter()
+        .find_map(|outcome| outcome.as_ref().err())
+        .expect("the other recovery is refused");
+    assert_eq!(refused.code, "session_runtime_not_recoverable");
+    let started = supervisor.started();
+    assert_eq!(started.len(), 2, "create plus one recovery: {started:?}");
+    assert_eq!(
+        supervisor.retired(),
+        [first_job],
+        "the superseded generation is retired exactly"
+    );
+    assert_eq!(supervisor.live_jobs().await, [started[1].clone()]);
+    registry
+        .stop(&done.id)
+        .await
+        .expect("stop recovered session");
+}
+
+#[tokio::test]
+async fn recoveries_of_different_sessions_are_not_serialized() {
+    let marker = temp_dir("lifecycle-parallel-resume-marker").join("argv.txt");
+    let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(temp_store_path("lifecycle-parallel-resume")),
+        agents_dir: Some(temp_agent_that_exits_then_resumes(
+            "lifecycle-parallel-resume",
+            &marker,
+        )),
+        socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
+        ..SessionRegistryConfig::default()
+    });
+    let held = terminal_resumable_session(&registry).await;
+    let free = terminal_resumable_session(&registry).await;
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: Some(held.id.0.clone()),
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    supervisor.hold_start(gate.clone());
+
+    let held_recovery = tokio::spawn({
+        let registry = registry.clone();
+        let id = held.id.clone();
+        async move { registry.resume(&id).await }
+    });
+    gate.entered.notified().await;
+    let recovered = tokio::time::timeout(DETACHED_COMMIT_TIMEOUT, registry.resume(&free.id))
+        .await
+        .expect("another session recovers while the first is held")
+        .expect("recover the free session");
+    assert_eq!(recovered.id, free.id);
+
+    gate.release.notify_one();
+    held_recovery
+        .await
+        .expect("held recovery task")
+        .expect("held recovery completes once released");
+    registry.stop(&held.id).await.expect("stop held session");
+    registry.stop(&free.id).await.expect("stop free session");
 }

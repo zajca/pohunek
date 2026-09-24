@@ -313,6 +313,7 @@ fn worker_backed_registry(socket: &Path, root: &Path) -> SessionRegistry {
         data_home: root.join("d"),
         config_home: root.join("c"),
         cache_home: root.join("k"),
+        home: root.to_path_buf(),
         daemon_socket: socket.to_path_buf(),
     };
     let config = SessionRegistryConfig {
@@ -321,11 +322,12 @@ fn worker_backed_registry(socket: &Path, root: &Path) -> SessionRegistry {
         socket_path: Some(socket.to_path_buf()),
         worker_runtime_root: Some(environment.runtime_home.join("pohunek/workers")),
         worker_state_root: Some(environment.state_home.join("pohunek/workers")),
+        supervision: Some(environment.supervision(worker_binary())),
         ..SessionRegistryConfig::default()
     };
     SessionRegistry::new_with_launcher_and_inspector(
         config,
-        Arc::new(SubprocessWorkerLauncher::new(worker_binary(), environment)),
+        Arc::new(SubprocessWorkerLauncher::new()),
         Arc::new(HostInspector::new()),
     )
 }

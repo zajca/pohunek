@@ -8,19 +8,15 @@
 // Rust guideline compliant 2026-09-14
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
-use std::mem;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use protocol::{AgentKind, SessionId, SessionInfo};
 use serde_json::Value;
-use tokio::io::unix::AsyncFd;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
@@ -29,6 +25,9 @@ use tracing::{debug, warn};
 use crate::procwatch::{Pid, ProcessFact, ProcessIdentity};
 use crate::session::SessionRegistry;
 
+#[cfg(target_os = "linux")]
+mod inotify;
+
 /// Prefix for synthetic session ids assigned to external processes.
 pub(crate) const EXTERNAL_SESSION_ID_PREFIX: &str = "ext-";
 /// External agents have no PTY, so their terminal geometry is explicitly zero.
@@ -36,12 +35,6 @@ pub(crate) const EXTERNAL_TERMINAL_COLS: u16 = 0;
 /// External agents have no PTY, so their terminal geometry is explicitly zero.
 pub(crate) const EXTERNAL_TERMINAL_ROWS: u16 = 0;
 
-/// Short debounce for transcript writes before parsing a JSONL file.
-///
-/// Provider CLIs can append multiple small JSON records in quick succession at
-/// session start. Delaying slightly avoids parsing a partially written line
-/// while still making the observer responsive to new files.
-const TRANSCRIPT_WRITE_DEBOUNCE: Duration = Duration::from_millis(75);
 /// Maximum number of initial JSONL records read from a transcript.
 ///
 /// Session identity and cwd are expected near the beginning; bounding this keeps
@@ -52,20 +45,6 @@ const TRANSCRIPT_SCAN_LINE_LIMIT: usize = 32;
 /// The file reader is capped before line splitting, bounding memory and I/O
 /// even if an initial transcript record has no newline.
 const TRANSCRIPT_SCAN_BYTE_LIMIT: usize = 64 * 1024;
-/// Buffer used for one nonblocking `read(2)` from the inotify fd.
-///
-/// The value fits many events at once while staying small enough for a stackless
-/// heap allocation in the watcher task.
-const INOTIFY_BUFFER_BYTES: usize = 16 * 1024;
-/// Flags used when opening the inotify instance.
-const INOTIFY_INIT_FLAGS: libc::c_int = libc::IN_NONBLOCK | libc::IN_CLOEXEC;
-/// Inotify mask for recursively watched transcript directories.
-const INOTIFY_WATCH_MASK: u32 = libc::IN_CREATE
-    | libc::IN_MOVED_TO
-    | libc::IN_CLOSE_WRITE
-    | libc::IN_MODIFY
-    | libc::IN_DELETE_SELF
-    | libc::IN_MOVE_SELF;
 /// Claude config directory override.
 const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 /// Codex home directory override.
@@ -152,20 +131,6 @@ pub(crate) struct TranscriptIndex {
     inner: Arc<Mutex<HashMap<PathBuf, TranscriptCandidate>>>,
 }
 
-#[derive(Debug)]
-struct InotifyWatcher {
-    fd: AsyncFd<OwnedFd>,
-    paths_by_wd: HashMap<libc::c_int, PathBuf>,
-    watched_paths: HashSet<PathBuf>,
-}
-
-#[derive(Debug)]
-struct InotifyEvent {
-    wd: libc::c_int,
-    mask: u32,
-    name: Option<OsString>,
-}
-
 impl ExternalSessions {
     /// Creates an empty external session store.
     #[must_use]
@@ -204,6 +169,7 @@ impl ExternalSessions {
     }
 
     /// Wakes the observer for an immediate sweep.
+    #[cfg(target_os = "linux")]
     pub(crate) fn notify_rescan(&self) {
         self.inner.rescan.notify_one();
     }
@@ -450,129 +416,6 @@ impl TranscriptIndex {
     }
 }
 
-impl InotifyWatcher {
-    fn open(roots: &[TranscriptRoot]) -> io::Result<Self> {
-        let fd = inotify_init()?;
-        let mut watcher = Self {
-            fd: AsyncFd::new(fd)?,
-            paths_by_wd: HashMap::new(),
-            watched_paths: HashSet::new(),
-        };
-        for root in roots {
-            if let Err(err) = watcher.add_tree(&root.path) {
-                debug!(
-                    agent = ?root.agent_base,
-                    error = %err,
-                    "failed to watch external transcript root"
-                );
-            }
-        }
-        Ok(watcher)
-    }
-
-    async fn run(
-        mut self,
-        roots: Vec<TranscriptRoot>,
-        index: TranscriptIndex,
-        sessions: ExternalSessions,
-    ) {
-        loop {
-            tokio::select! {
-                () = sessions.inner.shutdown.cancelled() => break,
-                readiness = self.fd.readable() => {
-                    let Ok(mut guard) = readiness else {
-                        break;
-                    };
-                    match guard.try_io(|inner| read_inotify_events(inner.get_ref().as_raw_fd())) {
-                        Ok(Ok(events)) => self.handle_events(events, &roots, &index, &sessions),
-                        Ok(Err(err)) => {
-                            debug!(error = %err, "failed to read external transcript inotify events");
-                        }
-                        Err(_would_block) => {}
-                    }
-                }
-            }
-        }
-    }
-
-    fn handle_events(
-        &mut self,
-        events: Vec<InotifyEvent>,
-        roots: &[TranscriptRoot],
-        index: &TranscriptIndex,
-        sessions: &ExternalSessions,
-    ) {
-        for event in events {
-            let Some(path) = self.event_path(&event) else {
-                continue;
-            };
-            if event.mask & libc::IN_ISDIR != 0 {
-                if create_or_move_event(event.mask) {
-                    if let Err(err) = self.add_tree(&path) {
-                        debug!(
-                            path = %path.display(),
-                            error = %err,
-                            "failed to watch new external transcript directory"
-                        );
-                    }
-                }
-                continue;
-            }
-            if !write_event(event.mask) || !is_jsonl_path(&path) {
-                continue;
-            }
-            let Some(agent_base) = root_agent_for_path(roots, &path) else {
-                continue;
-            };
-            schedule_transcript_parse(index.clone(), sessions.clone(), agent_base, path);
-        }
-    }
-
-    fn add_tree(&mut self, root: &Path) -> io::Result<()> {
-        if !root.is_dir() {
-            return Ok(());
-        }
-        let mut queue = VecDeque::from([root.to_path_buf()]);
-        while let Some(dir) = queue.pop_front() {
-            self.add_dir(&dir)?;
-            for entry in fs::read_dir(&dir)? {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-                    Err(err) => return Err(err),
-                };
-                let file_type = match entry.file_type() {
-                    Ok(file_type) => file_type,
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-                    Err(err) => return Err(err),
-                };
-                if file_type.is_dir() {
-                    queue.push_back(entry.path());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn add_dir(&mut self, path: &Path) -> io::Result<()> {
-        if self.watched_paths.contains(path) {
-            return Ok(());
-        }
-        let wd = inotify_add_watch(self.fd.get_ref().as_raw_fd(), path)?;
-        self.paths_by_wd.insert(wd, path.to_path_buf());
-        self.watched_paths.insert(path.to_path_buf());
-        Ok(())
-    }
-
-    fn event_path(&self, event: &InotifyEvent) -> Option<PathBuf> {
-        let base = self.paths_by_wd.get(&event.wd)?;
-        Some(match &event.name {
-            Some(name) => base.join(name),
-            None => base.clone(),
-        })
-    }
-}
-
 async fn run_observer(
     registry: SessionRegistry,
     sessions: ExternalSessions,
@@ -582,18 +425,7 @@ async fn run_observer(
     if config.roots.is_empty() {
         debug!("external observer has no transcript roots to watch");
     }
-    if let Ok(watcher) = InotifyWatcher::open(&config.roots) {
-        let watcher_roots = config.roots.clone();
-        let watcher_index = index.clone();
-        let watcher_sessions = sessions.clone();
-        tokio::spawn(async move {
-            watcher
-                .run(watcher_roots, watcher_index, watcher_sessions)
-                .await;
-        });
-    } else {
-        debug!("external transcript inotify watcher unavailable; process sweep still runs");
-    }
+    spawn_transcript_watcher(&config.roots, &index, &sessions);
     index.scan_roots(config.roots.clone()).await;
 
     let mut tick = tokio::time::interval(config.sweep_interval);
@@ -605,6 +437,40 @@ async fn run_observer(
             () = sessions.inner.rescan.notified() => registry.rescan_external_agents(&index).await,
         }
     }
+}
+
+/// Watches transcript roots so new transcripts are indexed as they are written.
+#[cfg(target_os = "linux")]
+fn spawn_transcript_watcher(
+    roots: &[TranscriptRoot],
+    index: &TranscriptIndex,
+    sessions: &ExternalSessions,
+) {
+    match inotify::InotifyWatcher::open(roots) {
+        Ok(watcher) => {
+            let roots = roots.to_vec();
+            let index = index.clone();
+            let sessions = sessions.clone();
+            tokio::spawn(async move { watcher.run(roots, index, sessions).await });
+        }
+        Err(error) => {
+            debug!(
+                error = %error,
+                "external transcript inotify watcher unavailable; process sweep still runs"
+            );
+        }
+    }
+}
+
+/// Live transcript watching is Linux-only; other targets index the roots once
+/// at startup and rely on the process sweep (macOS observation is #101).
+#[cfg(not(target_os = "linux"))]
+fn spawn_transcript_watcher(
+    _roots: &[TranscriptRoot],
+    _index: &TranscriptIndex,
+    _sessions: &ExternalSessions,
+) {
+    debug!("external transcript watching is unavailable on this target; process sweep still runs");
 }
 
 fn external_info_matches(existing: &SessionInfo, incoming: &SessionInfo) -> bool {
@@ -718,13 +584,6 @@ fn is_jsonl_path(path: &Path) -> bool {
     path.extension().and_then(OsStr::to_str) == Some(JSONL_EXTENSION)
 }
 
-fn root_agent_for_path(roots: &[TranscriptRoot], path: &Path) -> Option<AgentKind> {
-    roots
-        .iter()
-        .find(|root| path.starts_with(&root.path))
-        .map(|root| root.agent_base.clone())
-}
-
 fn provider_root(env_var: &str, home_relative: &str, transcript_subdir: &str) -> Option<PathBuf> {
     if let Some(value) = std::env::var_os(env_var).filter(|value| !value.is_empty()) {
         return Some(expand_tilde(PathBuf::from(value)).join(transcript_subdir));
@@ -749,120 +608,6 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
         return PathBuf::from(home).join(rest);
     }
     path
-}
-
-fn schedule_transcript_parse(
-    index: TranscriptIndex,
-    sessions: ExternalSessions,
-    agent_base: AgentKind,
-    path: PathBuf,
-) {
-    tokio::spawn(async move {
-        tokio::time::sleep(TRANSCRIPT_WRITE_DEBOUNCE).await;
-        match index.upsert_path(agent_base, &path) {
-            Ok(true) => sessions.notify_rescan(),
-            Ok(false) => {}
-            Err(err) => {
-                debug!(
-                    path = %path.display(),
-                    error = %err,
-                    "failed to parse external transcript candidate"
-                );
-            }
-        }
-    });
-}
-
-fn create_or_move_event(mask: u32) -> bool {
-    mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0
-}
-
-fn write_event(mask: u32) -> bool {
-    mask & (libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE | libc::IN_MODIFY) != 0
-}
-
-#[expect(unsafe_code, reason = "inotify requires Linux syscalls")]
-fn inotify_init() -> io::Result<OwnedFd> {
-    // SAFETY: `inotify_init1` returns a new file descriptor or -1 with errno set.
-    // `INOTIFY_INIT_FLAGS` only requests nonblocking close-on-exec behavior.
-    let fd = unsafe { libc::inotify_init1(INOTIFY_INIT_FLAGS) };
-    if fd == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let raw_fd = RawFd::try_from(fd)
-        .map_err(|err| io::Error::other(format!("invalid inotify fd {fd}: {err}")))?;
-    // SAFETY: the descriptor was just returned by `inotify_init1` and is owned by
-    // this process; `OwnedFd` closes it exactly once.
-    Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
-}
-
-#[expect(unsafe_code, reason = "inotify requires Linux syscalls")]
-fn inotify_add_watch(fd: RawFd, path: &Path) -> io::Result<libc::c_int> {
-    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_err| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "inotify path contains an interior NUL byte",
-        )
-    })?;
-    // SAFETY: `c_path` is a valid NUL-terminated path for the duration of the
-    // call. `fd` is the live inotify descriptor owned by `InotifyWatcher`.
-    let wd = unsafe { libc::inotify_add_watch(fd, c_path.as_ptr(), INOTIFY_WATCH_MASK) };
-    if wd == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(wd)
-}
-
-#[expect(unsafe_code, reason = "inotify requires Linux syscalls")]
-fn read_inotify_events(fd: RawFd) -> io::Result<Vec<InotifyEvent>> {
-    let mut buffer = vec![0_u8; INOTIFY_BUFFER_BYTES];
-    // SAFETY: `buffer` is valid for writes of `buffer.len()` bytes, and `fd` is a
-    // nonblocking inotify descriptor. The return value is checked before use.
-    let bytes = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
-    if bytes == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let bytes = usize::try_from(bytes)
-        .map_err(|err| io::Error::other(format!("invalid inotify read length: {err}")))?;
-    buffer.truncate(bytes);
-    parse_inotify_events(&buffer)
-}
-
-#[expect(unsafe_code, reason = "inotify event headers are C structs")]
-fn parse_inotify_events(buffer: &[u8]) -> io::Result<Vec<InotifyEvent>> {
-    let header_len = mem::size_of::<libc::inotify_event>();
-    let mut offset = 0_usize;
-    let mut events = Vec::new();
-    while offset + header_len <= buffer.len() {
-        // SAFETY: the bounds check above guarantees a full header is present.
-        // `read_unaligned` is used because inotify event records are byte-packed.
-        let raw = unsafe {
-            std::ptr::read_unaligned(buffer[offset..].as_ptr().cast::<libc::inotify_event>())
-        };
-        let name_len = usize::try_from(raw.len)
-            .map_err(|err| io::Error::other(format!("invalid inotify event name length: {err}")))?;
-        let name_start = offset + header_len;
-        let name_end = name_start.saturating_add(name_len);
-        if name_end > buffer.len() {
-            break;
-        }
-        let name = event_name(&buffer[name_start..name_end]);
-        events.push(InotifyEvent {
-            wd: raw.wd,
-            mask: raw.mask,
-            name,
-        });
-        offset = name_end;
-    }
-    Ok(events)
-}
-
-fn event_name(bytes: &[u8]) -> Option<OsString> {
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(bytes.len());
-    (end > 0).then(|| OsStr::from_bytes(&bytes[..end]).to_owned())
 }
 
 type MutexError<T> = std::sync::PoisonError<T>;

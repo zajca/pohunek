@@ -4203,6 +4203,7 @@ dependencies = [
  "pohunek-paths",
  "pohunek-platform",
  "pohunek-protocol",
+ "pohunek-service-config",
  "pohunek-session-worker",
  "pohunek-terminal",
  "pohunek-worker-protocol",
@@ -4223,7 +4224,6 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "wait-timeout",
- "zbus 5.16.0",
  "zeroize",
 ]
 
