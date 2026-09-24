@@ -37,9 +37,19 @@ class RunWithTimeoutTests(unittest.TestCase):
     def test_early_exit_keeps_status_and_cancels_the_watchdog(self):
         # A distinctive deadline makes the watchdog's sleeper findable in `ps`.
         output, elapsed = run('pohunek_run_with_timeout 17.25 sh -c "exit 3" || status=$?')
-        self.assertIn("status=3", output)
+        # dash reports signalled jobs ("Terminated"); nothing may leak into stdout.
+        self.assertEqual(output, "status=3\n")
         self.assertLess(elapsed, 5)
         self.assertFalse(running("sleep 17.25"), "watchdog sleeper was left behind")
+
+    def test_fast_commands_never_print_job_reports(self):
+        # A command that exits before the watchdog installs its trap used to
+        # make dash print "Terminated" for the cancelled watchdog.
+        body = "\n".join(
+            "pohunek_run_with_timeout 5 true || status=$?" for _ in range(20)
+        )
+        output, _ = run(body)
+        self.assertEqual(output, "status=0\n")
 
     def test_success_returns_zero_and_passes_stdin_and_stdout(self):
         output, _ = run("pohunek_run_with_timeout 10 cat || status=$?", stdin="hello\n")
@@ -47,7 +57,7 @@ class RunWithTimeoutTests(unittest.TestCase):
 
     def test_deadline_returns_124_and_reaps_the_command(self):
         output, elapsed = run("pohunek_run_with_timeout 1 sleep 31.5 || status=$?")
-        self.assertIn("status=124", output)
+        self.assertEqual(output, "status=124\n")
         self.assertLess(elapsed, 6)
         self.assertFalse(running("sleep 31.5"), "timed-out command was left behind")
 

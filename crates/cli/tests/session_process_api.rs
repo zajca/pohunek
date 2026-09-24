@@ -295,6 +295,11 @@ impl FixtureDaemon {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _address)) => {
+                        // BSD sockets inherit O_NONBLOCK from the listener on
+                        // accept; the handler reads with blocking semantics.
+                        stream
+                            .set_nonblocking(false)
+                            .expect("set fixture connection blocking");
                         let requests = Arc::clone(&thread_requests);
                         let request_log = Arc::clone(&thread_request_log);
                         handlers.push(thread::spawn(move || {

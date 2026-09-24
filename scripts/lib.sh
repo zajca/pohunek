@@ -45,10 +45,10 @@ pohunek_run_with_timeout() {
       [ "$_pohunek_cancelled" -eq 0 ] || return 1
       sleep "$1" &
       _pohunek_sleeper=$!
-      [ "$_pohunek_cancelled" -eq 1 ] || wait "$_pohunek_sleeper" || true
+      [ "$_pohunek_cancelled" -eq 1 ] || wait "$_pohunek_sleeper" >/dev/null 2>&1 || true
       if [ "$_pohunek_cancelled" -eq 1 ]; then
         kill "$_pohunek_sleeper" 2>/dev/null || true
-        wait "$_pohunek_sleeper" 2>/dev/null || true
+        wait "$_pohunek_sleeper" >/dev/null 2>&1 || true
         return 1
       fi
     }
@@ -61,10 +61,12 @@ pohunek_run_with_timeout() {
   ) &
   _pohunek_watchdog=$!
   _pohunek_status=0
-  wait "$_pohunek_command" || _pohunek_status=$?
+  # dash reports a signalled job ("Terminated") on the waiting shell's output;
+  # the waits discard that report so only the command's own output remains.
+  wait "$_pohunek_command" >/dev/null 2>&1 || _pohunek_status=$?
   kill -TERM "$_pohunek_watchdog" 2>/dev/null || true
   _pohunek_watchdog_status=0
-  wait "$_pohunek_watchdog" || _pohunek_watchdog_status=$?
+  wait "$_pohunek_watchdog" >/dev/null 2>&1 || _pohunek_watchdog_status=$?
   if [ "$_pohunek_watchdog_status" -eq "$POHUNEK_TIMEOUT_STATUS" ]; then
     return "$POHUNEK_TIMEOUT_STATUS"
   fi
