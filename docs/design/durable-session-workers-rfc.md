@@ -1142,6 +1142,21 @@ runtime ID. On macOS it is the primary cleanup of descendants that left the
 worker's process group; on Linux it is a backstop behind
 `KillMode=control-group`.
 
+The same rows classify a worker that becomes unreachable while the daemon
+runs. When the control connection drops, the session turns `reconnecting` and
+the daemon inspects the generation's job once, under the session's lifecycle
+lock: a proven crash (row 14's evidence) is swept, retired, and marked `lost`
+at once. Otherwise the daemon keeps reconnecting until the worker connect
+deadline, and a worker that answers in that window is adopted again. At the
+deadline, rows 12 to 16 apply to the exact generation: `lost` with
+`runtime_lost` or `runtime_lost_cleanup_unconfirmed` after a proven crash,
+`conflict` with `runtime_supervision_ambiguous` or `runtime_identity_mismatch`
+when the worker may still be live or does not match, and `reconnecting` with
+`runtime_supervision_unavailable` plus the background retry when the manager
+cannot be inspected. A socket that nothing answers on is not evidence by
+itself, so a crashed worker's leftover socket file never turns a record into a
+conflict.
+
 An orphaned live worker can occur only if the logical store was lost after the
 worker journal became durable, or when a stale generation's job is still
 running. It appears only in `session.runtime_inventory` (reason

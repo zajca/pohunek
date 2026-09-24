@@ -56,6 +56,10 @@ Interpret runtime states as follows:
   same, but the sweep could not confirm that every marked process ended;
   inspect `ps` for processes of that session before recovering it. A lost
   session without a journal for its generation reports `worker_unavailable`.
+  The same classification runs when a worker dies while the daemon is running:
+  a proven crash is reported `lost` immediately, and a worker that stays
+  unreachable is classified after the worker connect deadline (`conflict`
+  while its job still runs, `reconnecting` while the manager is unavailable).
 - `conflict`: multiple or mismatched identities claim the session. Do not stop,
   unlink, or kill either candidate automatically. Preserve the job, journal,
   and socket evidence for diagnosis. `runtime_supervision_ambiguous` means the

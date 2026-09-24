@@ -38,6 +38,9 @@ use crate::store::{ResumeBinding, SessionWriteOutcome};
 
 // Rust guideline compliant 2026-09-24
 
+/// Discovery reason of a worker socket that does not answer.
+const UNREACHABLE_SOCKET: &str = "worker_unavailable";
+
 /// Maximum worker journal accepted during daemon reconciliation.
 const MAX_WORKER_JOURNAL_BYTES: usize = 1024 * 1024;
 
@@ -46,6 +49,15 @@ struct DiscoveredWorker {
     slot: String,
     worker: Worker,
     snapshot: InspectSnapshot,
+}
+
+/// Whether classifying an unreachable running worker finished its watch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LossClassification {
+    /// The runtime was classified, or another operation already replaced it.
+    Settled,
+    /// Nothing was decided; the watcher keeps reconnecting.
+    Pending,
 }
 
 /// What the per-session worker socket yielded during reconciliation.
@@ -491,11 +503,12 @@ impl SessionRegistry {
                 }
             }
             Err(error) => {
-                // Same classification startup discovery records in its inventory.
+                // Same classification startup discovery applies to its inventory.
                 match classify_connect_error(&error) {
                     (RuntimeState::Incompatible, reason) => {
                         SocketEvidence::Unusable(RuntimeState::Incompatible, reason)
                     }
+                    (RuntimeState::Lost, _) => SocketEvidence::Absent,
                     _ => SocketEvidence::Unusable(RuntimeState::Conflict, IDENTITY_MISMATCH),
                 }
             }
@@ -813,6 +826,141 @@ impl SessionRegistry {
         let _ = self.inner.events.send(event);
     }
 
+    /// Classifies a running session whose worker control connection is gone.
+    ///
+    /// Runs the unreachable-worker rows of reconciliation for the exact
+    /// generation the entry names, under the session's lifecycle lock: a
+    /// proven crash sweeps the runtime's marked processes, retires the job,
+    /// and is `Lost`; a job or process that may still be live is `Conflict`;
+    /// an unavailable supervisor leaves the runtime `Reconnecting` and
+    /// schedules the background retry. With `proven_only`, anything short of
+    /// a proven crash is left `Pending` so the watcher keeps reconnecting.
+    pub(super) async fn classify_lost_worker(
+        &self,
+        id: &SessionId,
+        expected: &super::RuntimeWatchIdentity,
+        proven_only: bool,
+    ) -> LossClassification {
+        let _guard = self.lock_lifecycle(id).await;
+        let job = {
+            let sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get(id) else {
+                return LossClassification::Settled;
+            };
+            if !expected.matches(entry) || entry.stopping {
+                return LossClassification::Settled;
+            }
+            entry.job.clone()
+        };
+        let lifecycle = self.lifecycle().ok();
+        let decision = self
+            .classify_running_generation(id, expected, job.as_ref(), lifecycle.as_ref())
+            .await;
+        if proven_only
+            && !matches!(
+                decision,
+                Unreachable::Ended {
+                    journaled: true,
+                    ..
+                }
+            )
+        {
+            return LossClassification::Pending;
+        }
+        let (state, reason) = match decision {
+            Unreachable::Unavailable(detail) => {
+                tracing::warn!(session_id = %id.0, detail, "worker supervisor is unavailable; nothing is touched");
+                (RuntimeState::Reconnecting, SUPERVISION_UNAVAILABLE)
+            }
+            Unreachable::Ambiguous(detail) => {
+                tracing::warn!(session_id = %id.0, detail, "unreachable worker may still be live; nothing is touched");
+                (RuntimeState::Conflict, SUPERVISION_AMBIGUOUS)
+            }
+            Unreachable::Mismatch(detail) => {
+                tracing::warn!(session_id = %id.0, detail, "unreachable worker identity mismatch; failing closed");
+                (RuntimeState::Conflict, IDENTITY_MISMATCH)
+            }
+            Unreachable::Ended {
+                journaled,
+                runtime_id,
+            } => {
+                let runtime_id = runtime_id.unwrap_or_else(|| expected.runtime_id.clone());
+                let cleanup = self.sweep_lost_runtime(&id.0, &runtime_id).await;
+                if let (Some(lifecycle), Some(generation)) = (lifecycle.as_ref(), job.as_ref()) {
+                    if let Err(error) = lifecycle.retire(generation).await {
+                        tracing::warn!(
+                            session_id = %id.0,
+                            service_id = %generation.service_id(),
+                            error = %error,
+                            "failed to retire the crashed worker generation"
+                        );
+                    }
+                }
+                let reason = match (journaled, cleanup) {
+                    (false, _) => "worker_unavailable",
+                    (true, Cleanup::Complete) => RUNTIME_LOST,
+                    (true, Cleanup::Unconfirmed) => RUNTIME_LOST_CLEANUP_UNCONFIRMED,
+                };
+                (RuntimeState::Lost, reason)
+            }
+        };
+        match self
+            .mark_worker_unavailable(id, expected, state, reason)
+            .await
+        {
+            super::RuntimeTransitionOutcome::Applied(_) => {
+                if reason == SUPERVISION_UNAVAILABLE {
+                    self.schedule_supervision_retry(id);
+                }
+                LossClassification::Settled
+            }
+            super::RuntimeTransitionOutcome::IdentityMismatch => LossClassification::Settled,
+            super::RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
+            | super::RuntimeTransitionOutcome::RetryableConcurrentChange => {
+                LossClassification::Pending
+            }
+        }
+    }
+
+    /// Decides what the unreachable worker of a running entry is.
+    async fn classify_running_generation(
+        &self,
+        id: &SessionId,
+        expected: &super::RuntimeWatchIdentity,
+        job: Option<&super::Generation>,
+        lifecycle: Option<&Lifecycle<'_>>,
+    ) -> Unreachable {
+        let Some(generation) = job else {
+            return Unreachable::Mismatch("the session names no worker generation".to_owned());
+        };
+        let scan = self
+            .discover_worker_journals()
+            .await
+            .remove(&id.0)
+            .unwrap_or_default();
+        let journal = scan
+            .evidence
+            .iter()
+            .find(|journal| journal.worker_id == expected.worker_id);
+        if let Some(journal) = journal {
+            if journal.generation != generation.generation() {
+                return Unreachable::Mismatch(format!(
+                    "worker journal names generation {} instead of {}",
+                    journal.generation,
+                    generation.generation()
+                ));
+            }
+        }
+        let evidence = observe(lifecycle, generation).await;
+        let worker = journal.map(JournalEvidence::worker);
+        classify_unreachable(
+            &evidence,
+            generation,
+            worker.as_ref(),
+            self.inner.inspector.as_ref(),
+        )
+    }
+
     /// Deletes the record of a create that never produced a usable runtime.
     async fn compensate_abandoned_create(&self, id: &SessionId) {
         if let Err(error) = self.delete_session_record(id).await {
@@ -902,12 +1050,17 @@ impl SessionRegistry {
             .await;
     }
 
+    /// Classifies the session's socket from the startup inventory.
+    ///
+    /// A socket nothing answers on (a crashed worker leaves its socket file
+    /// behind) is no evidence either way; the supervisor and journal decide.
     async fn inventory_state_for_slot(&self, slot: &str) -> Option<(RuntimeState, &'static str)> {
         self.inner
             .runtime_inventory
             .lock()
             .await
             .iter()
+            .filter(|entry| entry.reason.as_deref() != Some(UNREACHABLE_SOCKET))
             .find(|entry| {
                 entry.runtime_slot == slot
                     || entry
@@ -2600,7 +2753,7 @@ fn classify_connect_error(error: &WorkerError) -> (RuntimeState, &'static str) {
         | WorkerError::Protocol(_)
         | WorkerError::Rejected { .. }
         | WorkerError::NotInitialized
-        | WorkerError::AttachReadyTimeout { .. } => (RuntimeState::Lost, "worker_unavailable"),
+        | WorkerError::AttachReadyTimeout { .. } => (RuntimeState::Lost, UNREACHABLE_SOCKET),
     }
 }
 
@@ -6572,6 +6725,318 @@ while os.getppid() == parent:
                 runtime_of(&fixture.registry, "s-314").await.state,
                 RuntimeState::Lost
             );
+        }
+    }
+
+    /// A running daemon classifies a crashed worker through its supervisor.
+    ///
+    /// These fixtures run the real `pohunek-sessiond` under the subprocess
+    /// launcher, so the journal records a real worker process that the test
+    /// kills, and the PTY runs a hangup-ignoring marked descendant.
+    mod running_loss {
+        use std::path::{Path, PathBuf};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use pohunek_platform::supervisor::{ServiceId, ServiceState};
+        use protocol::{RuntimeState, SessionId, SessionInfo};
+
+        use super::super::super::supervision::RUNTIME_LOST;
+        use super::temp_root;
+        use crate::procwatch::{HostInspector, ProcessInspector};
+        use crate::runtime::lifecycle::tests::{JobScript, ScriptedSupervisor};
+        use crate::runtime::lifecycle::{SUPERVISION_AMBIGUOUS, SUPERVISION_UNAVAILABLE};
+        use crate::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
+        use crate::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
+        use crate::store::Store;
+
+        /// Connect deadline that a proven crash must not wait for.
+        const LONG_CONNECT: Duration = Duration::from_secs(120);
+        /// Connect deadline of fixtures whose classification needs it.
+        const SHORT_CONNECT: Duration = Duration::from_millis(300);
+        /// Sweep grace; short so the `SIGKILL` fallback stays fast.
+        const SWEEP_GRACE: Duration = Duration::from_millis(300);
+        /// Bound on observing an asynchronous classification or exit.
+        const EFFECT_DEADLINE: Duration = Duration::from_secs(20);
+        /// Cargo's workspace-local output directory without an override.
+        const DEFAULT_CARGO_TARGET_DIRECTORY: &str = "target";
+
+        fn worker_binary() -> PathBuf {
+            if let Some(binary) = std::env::var_os("POHUNEK_WORKER_BIN") {
+                return PathBuf::from(binary);
+            }
+            let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .expect("daemon crate is inside the workspace");
+            let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+                || workspace.join(DEFAULT_CARGO_TARGET_DIRECTORY),
+                |target| workspace.join(target),
+            );
+            let binary = target.join("debug/pohunek-sessiond");
+            assert!(
+                binary.is_file(),
+                "build the real worker first with `cargo build -p pohunek-session-worker --bin pohunek-sessiond`, or set POHUNEK_WORKER_BIN"
+            );
+            binary
+        }
+
+        struct Fixture {
+            root: PathBuf,
+            registry: SessionRegistry,
+            launcher: SubprocessWorkerLauncher,
+            supervisor: Arc<ScriptedSupervisor>,
+            marker_pid_file: PathBuf,
+        }
+
+        fn fixture(connect: Duration) -> Fixture {
+            let root = temp_root();
+            let environment = SubprocessWorkerEnvironment {
+                runtime_home: root.join("r"),
+                state_home: root.join("s"),
+                data_home: root.join("d"),
+                config_home: root.join("c"),
+                cache_home: root.join("k"),
+                home: root.clone(),
+                daemon_socket: root.join("daemon.sock"),
+            };
+            let mut supervision = environment.supervision(worker_binary());
+            supervision.sweep_grace = SWEEP_GRACE;
+            let marker_pid_file = root.join("descendant.pid");
+            let script = format!(
+                "trap '' HUP; (trap '' HUP; exec sleep 300) & echo $! > {}; while :; do sleep 1; done",
+                marker_pid_file.display()
+            );
+            let launcher = SubprocessWorkerLauncher::new();
+            let supervisor = Arc::new(ScriptedSupervisor::over(launcher.clone()));
+            let registry = SessionRegistry::new_with_launcher_and_inspector(
+                SessionRegistryConfig {
+                    shell_command: ShellCommand::new("/bin/sh", ["-c".to_owned(), script]),
+                    store_path: Some(root.join("data/metadata.jsonl")),
+                    worker_runtime_root: Some(root.join("r/pohunek/workers")),
+                    worker_state_root: Some(root.join("s/pohunek/workers")),
+                    worker_connect_deadline: connect,
+                    supervision: Some(supervision),
+                    ..SessionRegistryConfig::default()
+                },
+                Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
+                Arc::new(HostInspector::new()),
+            );
+            Fixture {
+                root,
+                registry,
+                launcher,
+                supervisor,
+                marker_pid_file,
+            }
+        }
+
+        impl Fixture {
+            /// Creates one shell session and returns it with its job and the
+            /// PID of its hangup-ignoring marked descendant.
+            async fn create(&self) -> (SessionInfo, ServiceId, u32) {
+                let created = self
+                    .registry
+                    .create(protocol::SessionNewParams {
+                        name: None,
+                        agent: "shell".to_owned(),
+                        cwd: Some(self.root.clone()),
+                        cols: 80,
+                        rows: 24,
+                        project: None,
+                        repo: None,
+                        branch: None,
+                        base_branch: None,
+                        input: None,
+                        metadata: std::collections::BTreeMap::new(),
+                    })
+                    .await
+                    .expect("create a supervised session");
+                let service_id = Store::new(self.root.join("data/metadata.jsonl"))
+                    .load_sessions()
+                    .expect("load store")
+                    .into_iter()
+                    .find(|record| record.session_id == created.id.0)
+                    .and_then(|record| record.runtime.service_id)
+                    .expect("the record names its job");
+                let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+                let descendant = loop {
+                    if let Some(pid) = std::fs::read_to_string(&self.marker_pid_file)
+                        .ok()
+                        .and_then(|text| text.trim().parse().ok())
+                    {
+                        break pid;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "PTY never started its descendant"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                };
+                (
+                    created,
+                    ServiceId::parse(service_id).expect("service id"),
+                    descendant,
+                )
+            }
+
+            async fn crash(&self, id: &SessionId) {
+                assert!(
+                    self.launcher
+                        .kill_worker(&id.0)
+                        .await
+                        .expect("kill the worker process"),
+                    "the worker was running"
+                );
+            }
+
+            /// Waits until the session's runtime leaves `live`/`reconnecting`
+            /// for `state`.
+            async fn wait_for(
+                &self,
+                id: &SessionId,
+                state: RuntimeState,
+            ) -> protocol::SessionRuntime {
+                let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+                loop {
+                    let runtime = self
+                        .registry
+                        .inspect(id)
+                        .await
+                        .expect("session stays visible")
+                        .runtime
+                        .expect("runtime");
+                    if runtime.state == state {
+                        return runtime;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "runtime never became {state:?}: {runtime:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+
+        fn alive(pid: u32) -> bool {
+            HostInspector::new()
+                .identity(pid)
+                .is_ok_and(|identity| identity.is_some())
+        }
+
+        async fn wait_gone(pid: u32) {
+            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            while alive(pid) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "marked descendant {pid} survived"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn proven_crash_is_swept_retired_and_lost_before_the_connect_deadline() {
+            let fixture = fixture(LONG_CONNECT);
+            let (created, job, descendant) = fixture.create().await;
+            let started = tokio::time::Instant::now();
+
+            fixture.crash(&created.id).await;
+            let runtime = fixture.wait_for(&created.id, RuntimeState::Lost).await;
+
+            assert!(
+                started.elapsed() < LONG_CONNECT,
+                "a proven crash is classified without waiting for the connect deadline"
+            );
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            wait_gone(descendant).await;
+            assert_eq!(fixture.supervisor.retired(), vec![job]);
+            let stored = Store::new(fixture.root.join("data/metadata.jsonl"))
+                .load_sessions()
+                .expect("load store")
+                .into_iter()
+                .find(|record| record.session_id == created.id.0)
+                .expect("the logical record is kept");
+            assert_eq!(stored.runtime.state, RuntimeState::Lost);
+            assert_eq!(stored.runtime.reason.as_deref(), Some(RUNTIME_LOST));
+        }
+
+        #[tokio::test]
+        async fn unavailable_manager_keeps_the_crashed_session_reconnecting_until_it_answers() {
+            let fixture = fixture(SHORT_CONNECT);
+            let (created, job, descendant) = fixture.create().await;
+            fixture
+                .supervisor
+                .script_job(job.clone(), JobScript::Unavailable);
+
+            fixture.crash(&created.id).await;
+            let runtime = fixture
+                .wait_for(&created.id, RuntimeState::Reconnecting)
+                .await;
+            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            let mut runtime = runtime;
+            while runtime.loss_reason.as_deref() != Some(SUPERVISION_UNAVAILABLE) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "runtime never recorded the unavailable supervisor: {runtime:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                runtime = fixture
+                    .wait_for(&created.id, RuntimeState::Reconnecting)
+                    .await;
+            }
+            assert!(
+                fixture.supervisor.retired().is_empty(),
+                "nothing is retired"
+            );
+            assert!(alive(descendant), "nothing is swept while unavailable");
+
+            fixture.supervisor.script_job(
+                job.clone(),
+                JobScript::Present {
+                    state: ServiceState::Failed,
+                    process: None,
+                    definition: None,
+                },
+            );
+            let runtime = fixture.wait_for(&created.id, RuntimeState::Lost).await;
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            wait_gone(descendant).await;
+            assert_eq!(fixture.supervisor.retired(), vec![job]);
+        }
+
+        #[tokio::test]
+        async fn present_job_with_an_unreachable_worker_is_ambiguous_and_untouched() {
+            let fixture = fixture(SHORT_CONNECT);
+            let (created, job, descendant) = fixture.create().await;
+            fixture.supervisor.script_job(
+                job,
+                JobScript::Present {
+                    state: ServiceState::Running,
+                    process: None,
+                    definition: None,
+                },
+            );
+
+            fixture.crash(&created.id).await;
+            let runtime = fixture.wait_for(&created.id, RuntimeState::Conflict).await;
+
+            assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
+            assert!(
+                fixture.supervisor.retired().is_empty(),
+                "nothing is retired"
+            );
+            assert!(alive(descendant), "nothing is swept");
+            // The fixture's PTY tree ignores hangup; reap it explicitly.
+            let runtime_id = created
+                .runtime
+                .and_then(|runtime| runtime.runtime_id)
+                .expect("created runtime id");
+            fixture
+                .registry
+                .sweep_lost_runtime(&created.id.0, &runtime_id)
+                .await;
+            wait_gone(descendant).await;
         }
     }
 }
