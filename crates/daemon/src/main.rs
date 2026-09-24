@@ -1147,9 +1147,17 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn remote_supervisor_rebinds_when_listener_address_changes() {
+        /// A loopback address distinct from `127.0.0.1`. Linux routes all of
+        /// `127.0.0.0/8` to `lo`; Darwin configures only `127.0.0.1` on `lo0`,
+        /// so the IPv6 loopback is its second local address.
+        #[cfg(not(target_os = "macos"))]
+        const SECOND_LOOPBACK: &str = "127.0.0.2";
+        #[cfg(target_os = "macos")]
+        const SECOND_LOOPBACK: &str = "::1";
+
         let (_state_root, governance) = governance_service().await;
         let first_ip = "127.0.0.1".parse().expect("first IP");
-        let second_ip = "127.0.0.2".parse().expect("second IP");
+        let second_ip = SECOND_LOOPBACK.parse().expect("second IP");
         let probe = TcpListener::bind((first_ip, 0)).await.expect("port probe");
         let port = probe.local_addr().expect("probe address").port();
         drop(probe);

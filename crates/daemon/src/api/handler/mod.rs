@@ -1156,14 +1156,10 @@ mod tests {
                 .iter()
                 .map(|&key| (key, std::env::var(key).ok()))
                 .collect::<Vec<_>>();
-            let root = pohunek_test_support::temp_root().join(format!(
-                "pohunek-handler-{tag}-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system clock is after unix epoch")
-                    .as_nanos()
-            ));
+            // Short enough for the daemon socket below it on macOS.
+            let root = pohunek_test_support::tempdir_with_prefix(&format!("ph-{tag}-"))
+                .expect("create isolated XDG root")
+                .keep();
             std::env::set_var("XDG_RUNTIME_DIR", root.join("runtime"));
             std::env::set_var("XDG_STATE_HOME", root.join("state"));
             std::env::set_var("XDG_DATA_HOME", root.join("data"));

@@ -235,20 +235,11 @@ async fn governance_service(socket: &Path) -> Arc<HostGovernanceService> {
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = pohunek_test_support::temp_root().join(format!(
-        "pohunek-test-{tag}-{}-{nanos}-{n}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("create test socket dir");
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-        .expect("make test socket directory private");
-    dir
+    // Owner-private, uniquely named, and short enough for the daemon socket
+    // below it on macOS; kept so the socket outlives the helper.
+    pohunek_test_support::tempdir_with_prefix(&format!("ph-{tag}-"))
+        .expect("create test socket dir")
+        .keep()
 }
 
 fn write_executable(path: &Path, body: &str) {

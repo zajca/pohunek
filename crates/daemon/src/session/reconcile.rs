@@ -2611,7 +2611,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     use base64::Engine as _;
     use pohunek_session_worker::{
@@ -2655,16 +2655,10 @@ mod tests {
     };
 
     fn temp_root() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time after epoch")
-            .as_nanos();
-        let root = pohunek_test_support::temp_root()
-            .join(format!("ph-rec-{}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("create reconciliation root");
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
-            .expect("secure reconciliation root");
-        root
+        // Short enough for worker sockets named by full session ids on macOS.
+        pohunek_test_support::tempdir_with_prefix("ph-rec-")
+            .expect("create reconciliation root")
+            .keep()
     }
 
     fn create_private_dir(path: &Path) {
@@ -3556,9 +3550,10 @@ while os.getppid() == parent:
         let (script, mut reporters) = identity_reporters(&root, &["agent"]);
         let reporter = reporters.pop().expect("one reporter");
         let command = format!(
+            // `ps` reports the root's zombie state on both Linux and Darwin.
             concat!(
                 "trap '' HUP; root_pid=$$; {} (",
-                "while [ \"$(sed -n 's/^.*) \\([^ ]\\).*/\\1/p' \"/proc/$root_pid/stat\" 2>/dev/null)\" != Z ]; do sleep 0.01; done; ",
+                "until case \"$(ps -o stat= -p \"$root_pid\" 2>/dev/null)\" in *Z*) true ;; *) false ;; esac; do sleep 0.01; done; ",
                 "printf exited > '{}'; ",
                 "while [ ! -e '{}' ]; do sleep 0.01; done; ",
                 "printf 'late-restart-output\\n') & ",

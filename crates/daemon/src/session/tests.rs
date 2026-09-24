@@ -426,9 +426,10 @@ async fn managed_output_remains_available_until_descendant_pty_eof() {
             "/bin/sh",
             [
                 "-c",
+                // `ps` reports the root's zombie state on both Linux and Darwin.
                 concat!(
                     "trap '' HUP; root_pid=$$; (",
-                    "while [ \"$(sed -n 's/^.*) \\([^ ]\\).*/\\1/p' \"/proc/$root_pid/stat\" 2>/dev/null)\" != Z ]; do sleep 0.01; done; ",
+                    "until case \"$(ps -o stat= -p \"$root_pid\" 2>/dev/null)\" in *Z*) true ;; *) false ;; esac; do sleep 0.01; done; ",
                     "printf exited > \"$1\"; ",
                     "while [ ! -e \"$2\" ] && [ -d \"$3\" ]; do sleep 0.01; done; ",
                     "if [ -e \"$2\" ]; then printf 'late-descendant-output\\n'; fi",
@@ -526,10 +527,11 @@ async fn stop_after_root_exit_terminates_a_descendant_that_keeps_the_pty_open() 
             "/bin/sh",
             [
                 "-c",
+                // `ps` reports the root's zombie state on both Linux and Darwin.
                 concat!(
                     "trap '' HUP; root_pid=$$; (",
                     "trap '' HUP TERM; printf ready > \"$2\"; ",
-                    "while [ \"$(sed -n 's/^.*) \\([^ ]\\).*/\\1/p' \"/proc/$root_pid/stat\" 2>/dev/null)\" != Z ]; do sleep 0.01; done; ",
+                    "until case \"$(ps -o stat= -p \"$root_pid\" 2>/dev/null)\" in *Z*) true ;; *) false ;; esac; do sleep 0.01; done; ",
                     "printf exited > \"$1\"; ",
                     "while [ -d \"$3\" ]; do sleep 0.01; done",
                     ") & while [ ! -e \"$2\" ]; do sleep 0.01; done"
@@ -777,6 +779,7 @@ const LIVE_IDENTITY_REPORTER: &str = r#"import datetime
 import json
 import os
 import socket
+import sys
 import time
 
 reporter_pid = os.fork()
@@ -785,9 +788,24 @@ if reporter_pid != 0:
     raise SystemExit(0)
 
 pid = os.getpid()
-with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
-    fields = handle.read().rsplit(")", 1)[1].split()
-start_identity = int(fields[19])
+
+def process_start_identity(pid):
+    if sys.platform == "darwin":
+        # `struct proc_bsdinfo` from `proc_pidinfo(PROC_PIDTBSDINFO)`: the
+        # kernel start time the worker encodes as microseconds.
+        import ctypes
+        import struct
+
+        libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        buffer = ctypes.create_string_buffer(136)
+        assert libsystem.proc_pidinfo(pid, 3, ctypes.c_uint64(0), buffer, 136) == 136
+        seconds, microseconds = struct.unpack_from("=QQ", buffer, 120)
+        return seconds * 1_000_000 + microseconds
+    with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+        fields = handle.read().rsplit(")", 1)[1].split()
+    return int(fields[19])
+
+start_identity = process_start_identity(pid)
 sequence = int(time.time() * 1000)
 
 def send(request):
