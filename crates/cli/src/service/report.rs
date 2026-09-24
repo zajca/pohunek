@@ -118,6 +118,9 @@ pub struct StatusReport {
     pub unreadable_journals: Vec<PathBuf>,
     /// An interrupted install or upgrade awaiting resume or rollback.
     pub pending_transaction: Option<PendingReport>,
+    /// Whether another `pohunek service` command is running right now; its
+    /// record is then in flight rather than interrupted.
+    pub transaction_in_progress: bool,
 }
 
 /// One service-manager job.

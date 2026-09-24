@@ -132,7 +132,11 @@ listed in the upgrade report. After health returns:
 An interrupted install or upgrade is journaled in
 `~/.local/state/pohunek/service-install.json`; running the same command again
 resumes it, and a different command rolls it back first. `pohunek service
-status --json` reports it as `pending_transaction`.
+status --json` reports it as `pending_transaction`. Only one service
+transaction runs at a time: each holds `~/.local/state/pohunek/service-install.lock`,
+a second one fails with `service_transaction_in_progress` (status then reports
+`transaction_in_progress: true`), and a crashed holder's lock is released
+automatically, so rerunning the command is always safe.
 
 `pohunek service uninstall` refuses while sessions are live and lists them.
 `--stop-sessions` stops every session through its worker first; the session

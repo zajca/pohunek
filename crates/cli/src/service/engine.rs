@@ -33,6 +33,16 @@
 //! referenced by a non-final worker journal, executed by a running process,
 //! nor holding the running CLI are removed.
 //!
+//! # Concurrency
+//!
+//! Install, upgrade, and uninstall each hold an exclusive `flock` on
+//! `<state>/pohunek/service-install.lock` for their whole run, covering
+//! resume, rollback of a pending record, and garbage collection. A second
+//! command waits at most two seconds (enough to ride out a `status` probe)
+//! and then fails with `service_transaction_in_progress`; it never touches
+//! a record whose writer is alive. A crashed holder's lock is released by the
+//! kernel, so its record is resumed or rolled back by the next command.
+//!
 //! # Uninstall
 //!
 //! The daemon must enumerate sessions, so an installed but stopped daemon is
@@ -176,6 +186,7 @@ impl<'a> Engine<'a> {
         prefix: &Path,
         version: &str,
     ) -> Result<InstallReport, Error> {
+        let _transaction = self.store.lock().await?;
         layout::check_trusted(self.context.supervisor_dir())?;
         layout::check_trusted(prefix)?;
         let layout = install_layout(prefix)?;
@@ -250,6 +261,7 @@ impl<'a> Engine<'a> {
     /// Returns [`Error::NotInstalled`] without `service.toml`, staging and
     /// probe errors, and the failing step's error after a rollback.
     pub async fn upgrade(&self, from: &Path, version: &str) -> Result<UpgradeReport, Error> {
+        let _transaction = self.store.lock().await?;
         layout::check_trusted(self.context.supervisor_dir())?;
         let config_path = self.context.config_path();
         let pending = self.store.load()?;
@@ -336,6 +348,7 @@ impl<'a> Engine<'a> {
     /// `--stop-sessions`, [`Error::StopTimeout`] when they do not settle, and
     /// [`Error::OrphanWorkers`] when worker jobs survive retirement.
     pub async fn uninstall(&self, options: UninstallOptions) -> Result<UninstallReport, Error> {
+        let _transaction = self.store.lock().await?;
         let mut report = UninstallReport::default();
         if let Some(pending) = self.store.load()? {
             report.rolled_back = Some(pending_report(&pending));
@@ -409,6 +422,7 @@ impl<'a> Engine<'a> {
     /// Returns filesystem errors for unsafe directories; service-manager
     /// failures are reported inside the result instead.
     pub async fn status(&self, config: Option<&ServiceConfig>) -> Result<StatusReport, Error> {
+        let transaction_in_progress = self.store.in_progress()?;
         let pending_transaction = self.store.load()?.as_ref().map(pending_report);
         let mut report = StatusReport {
             installed: config.is_some(),
@@ -423,6 +437,7 @@ impl<'a> Engine<'a> {
             workers_error: None,
             unreadable_journals: Vec::new(),
             pending_transaction,
+            transaction_in_progress,
         };
         let Some(config) = config else {
             return Ok(report);

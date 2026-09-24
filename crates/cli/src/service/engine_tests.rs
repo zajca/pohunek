@@ -831,3 +831,65 @@ fn live_session_classification_covers_runtime_and_logical_state() {
     external.external = Some(true);
     assert!(!is_live(&external));
 }
+
+#[tokio::test]
+async fn a_second_command_is_refused_while_a_transaction_holds_the_lock() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let held = harness.engine().store.lock().await.expect("hold the lock");
+
+    let refused = harness.upgrade(V2).await.expect_err("upgrade while locked");
+    assert!(
+        matches!(refused, Error::TransactionInProgress { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(refused.code(), "service_transaction_in_progress");
+    let refused = harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect_err("uninstall while locked");
+    assert!(
+        matches!(refused, Error::TransactionInProgress { .. }),
+        "{refused:?}"
+    );
+    let config = harness.config();
+    let status = harness
+        .engine()
+        .status(config.as_ref())
+        .await
+        .expect("status while locked");
+    assert!(status.transaction_in_progress);
+    harness.assert_installed(V1);
+
+    drop(held);
+    let status = harness
+        .engine()
+        .status(config.as_ref())
+        .await
+        .expect("status after release");
+    assert!(!status.transaction_in_progress);
+    harness.upgrade(V2).await.expect("upgrade after release");
+    harness.assert_installed(V2);
+}
+
+#[tokio::test]
+async fn a_record_left_by_a_crashed_holder_is_resumed_under_a_fresh_lock() {
+    let harness = Harness::new();
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Config);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+    // The interrupted engine released its lock like a crashed process would.
+    let status = harness.engine().status(None).await.expect("status");
+    assert!(!status.transaction_in_progress);
+    assert_eq!(
+        status.pending_transaction.map(|pending| pending.step),
+        Some(Step::Config.as_str())
+    );
+    let report = harness.install(V1).await.expect("resume");
+    assert!(report.resumed);
+    harness.assert_installed(V1);
+}

@@ -116,6 +116,19 @@ pub const UNIT_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Enough for a screenful of warnings while keeping errors bounded.
 pub const UNIT_VERIFY_OUTPUT: usize = 16 * 1024;
 
+/// Longest wait for the install transaction lock.
+///
+/// Long enough to ride out a concurrent `pohunek service status`, which holds
+/// the lock only while probing it; far shorter than any real transaction, so
+/// a second install, upgrade, or uninstall is refused promptly.
+pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Interval between attempts to take a contended transaction lock.
+///
+/// A status probe releases the lock within microseconds; polling every 50 ms
+/// keeps the wait responsive without spinning.
+pub const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Maximum size of the install transaction record.
 ///
 /// The record holds a few short fields; anything larger is corrupt.
