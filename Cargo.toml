@@ -18,6 +18,7 @@ members = [
     "crates/logging",
     "crates/platform",
     "crates/paths",
+    "crates/service-config",
     "crates/xtask",
     "crates/netbird",
     "crates/overlay",
@@ -60,6 +61,7 @@ overlay = { package = "pohunek-overlay", path = "crates/overlay" }
 pohunek-platform = { path = "crates/platform" }
 pohunek-paths = { path = "crates/paths" }
 pohunek-prompt = { path = "crates/prompt" }
+pohunek-service-config = { path = "crates/service-config" }
 pohunek-protocol = { path = "crates/protocol" }
 pohunek-relay-protocol = { path = "crates/relay-protocol" }
 pohunek-relay = { path = "crates/relay" }

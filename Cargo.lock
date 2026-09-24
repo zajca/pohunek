@@ -4438,6 +4438,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pohunek-service-config"
+version = "0.31.6"
+dependencies = [
+ "pohunek-paths",
+ "pohunek-platform",
+ "proptest",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
 name = "pohunek-session-worker"
 version = "0.31.6"
 dependencies = [
