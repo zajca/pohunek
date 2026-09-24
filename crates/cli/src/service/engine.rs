@@ -619,17 +619,15 @@ impl<'a> Engine<'a> {
     }
 
     /// Creates the launchd log directory the daemon agent writes into.
+    ///
+    /// launchd needs no verification step, so the result is ready at once.
     #[cfg(target_os = "macos")]
-    #[expect(
-        clippy::unused_async,
-        reason = "one signature for both targets; systemd verification is asynchronous"
-    )]
-    async fn prepare_definition(
+    fn prepare_definition(
         &self,
         _config: &ServiceConfig,
         _definition: &JobDefinition,
-    ) -> Result<(), Error> {
-        layout_log_dir(self.context)
+    ) -> std::future::Ready<Result<(), Error>> {
+        std::future::ready(layout_log_dir(self.context))
     }
 
     async fn register(

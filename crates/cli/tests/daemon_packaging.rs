@@ -15,14 +15,7 @@ fn fresh_install_runs_service_install_from_the_archive() {
     let fixture = Fixture::new();
     let output = fixture.run(&[], &[]);
     assert_success(&output);
-    assert_eq!(
-        fixture.pohunek_calls(),
-        [format!(
-            "service install --from {} --prefix {}",
-            fixture.archive.display(),
-            fixture.prefix.display()
-        )]
-    );
+    assert_eq!(fixture.pohunek_calls(), [fixture.install_call()]);
     assert!(
         !fixture.systemctl_log.exists(),
         "a fresh install never touches systemctl"
@@ -44,30 +37,30 @@ fn existing_service_config_runs_service_upgrade() {
     );
 }
 
+const IS_ACTIVE: &str = "--user is-active --quiet pohunekd.service";
+const LIST_WORKERS: &str = "--user list-units pohunek-session@* --state=active --plain --no-legend";
+const DISABLE: &str = "--user disable --now pohunekd.service";
+const RELOAD: &str = "--user daemon-reload";
+
 #[test]
-fn legacy_install_is_retired_after_preflight_before_installing() {
+fn idle_legacy_install_is_retired_after_preflight_before_installing() {
     let fixture = Fixture::new();
     fixture.legacy_install();
-    let output = fixture.run(&["--accept-runtime-loss"], &[]);
+    let output = fixture.run(
+        &["--accept-runtime-loss"],
+        &[("POHUNEK_TEST_LEGACY_ACTIVE", "1")],
+    );
     assert_success(&output);
     assert_eq!(
         fixture.pohunek_calls(),
         [
             "migration preflight --accept-runtime-loss".to_owned(),
-            format!(
-                "service install --from {} --prefix {}",
-                fixture.archive.display(),
-                fixture.prefix.display()
-            ),
+            fixture.install_call(),
         ]
     );
     assert_eq!(
         fixture.systemctl_calls(),
-        [
-            "--user list-units pohunek-session@* --state=active --plain --no-legend",
-            "--user disable --now pohunekd.service",
-            "--user daemon-reload",
-        ]
+        [IS_ACTIVE, LIST_WORKERS, DISABLE, RELOAD]
     );
     for legacy in fixture.legacy_files() {
         assert!(!legacy.exists(), "{} was not removed", legacy.display());
@@ -80,18 +73,20 @@ fn live_legacy_template_workers_refuse_before_anything_changes() {
     fixture.legacy_install();
     let output = fixture.run(
         &[],
-        &[(
-            "POHUNEK_TEST_LIVE_WORKERS",
-            "pohunek-session@s-1.service loaded active running worker",
-        )],
+        &[
+            ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+            (
+                "POHUNEK_TEST_LIVE_WORKERS",
+                "pohunek-session@s-1.service loaded active running worker",
+            ),
+        ],
     );
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("pohunek-session@s-1.service"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("pohunek-session@s-1.service"), "{stderr}");
+    assert!(stderr.contains("pohunek session stop <id>"), "{stderr}");
     assert_eq!(fixture.pohunek_calls(), ["migration preflight"]);
-    assert_eq!(
-        fixture.systemctl_calls(),
-        ["--user list-units pohunek-session@* --state=active --plain --no-legend"]
-    );
+    assert_eq!(fixture.systemctl_calls(), [IS_ACTIVE, LIST_WORKERS]);
     for legacy in fixture.legacy_files() {
         assert!(legacy.exists(), "{} was removed", legacy.display());
     }
@@ -101,13 +96,68 @@ fn live_legacy_template_workers_refuse_before_anything_changes() {
 fn failed_preflight_stops_before_retiring_the_legacy_install() {
     let fixture = Fixture::new();
     fixture.legacy_install();
-    let output = fixture.run(&[], &[("POHUNEK_TEST_PREFLIGHT_STATUS", "23")]);
+    let output = fixture.run(
+        &[],
+        &[
+            ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+            ("POHUNEK_TEST_PREFLIGHT_STATUS", "23"),
+        ],
+    );
     assert_eq!(output.status.code(), Some(23), "{output:?}");
     assert_eq!(fixture.pohunek_calls(), ["migration preflight"]);
-    assert!(!fixture.systemctl_log.exists());
+    assert_eq!(fixture.systemctl_calls(), [IS_ACTIVE]);
     for legacy in fixture.legacy_files() {
         assert!(legacy.exists(), "{} was removed", legacy.display());
     }
+}
+
+#[test]
+fn rerun_after_a_partial_retirement_finishes_without_a_second_preflight() {
+    // The previous run disabled the legacy daemon but stopped before removing
+    // its unit files and binaries.
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let output = fixture.run(&[], &[]);
+    assert_success(&output);
+    assert_eq!(fixture.pohunek_calls(), [fixture.install_call()]);
+    assert_eq!(
+        fixture.systemctl_calls(),
+        [IS_ACTIVE, LIST_WORKERS, DISABLE, RELOAD]
+    );
+    for legacy in fixture.legacy_files() {
+        assert!(!legacy.exists(), "{} was not removed", legacy.display());
+    }
+
+    // Only a legacy binary survived the previous run.
+    let fixture = Fixture::new();
+    write(&fixture.prefix.join("bin/pohunekd"), "legacy\n");
+    let output = fixture.run(&[], &[]);
+    assert_success(&output);
+    assert_eq!(fixture.pohunek_calls(), [fixture.install_call()]);
+    assert!(fixture.systemctl_calls().is_empty());
+    assert!(!fixture.prefix.join("bin/pohunekd").exists());
+}
+
+#[test]
+fn a_failed_install_after_retirement_explains_how_to_recover() {
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let output = fixture.run(
+        &[],
+        &[
+            ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+            ("POHUNEK_TEST_SERVICE_STATUS", "7"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("already retired"), "{stderr}");
+    assert!(stderr.contains("re-run"), "{stderr}");
+
+    let fixture = Fixture::new();
+    let output = fixture.run(&[], &[("POHUNEK_TEST_SERVICE_STATUS", "7")]);
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("already retired"));
 }
 
 #[test]
@@ -131,6 +181,7 @@ fn release_workflow_packages_the_wrapper_and_binaries_only() {
     for expected in [
         r#"cp "${bindir}/pohunek" "${staging}/""#,
         r#"cp "${bindir}/pohunek-sessiond" "${staging}/""#,
+        r#"mkdir -p "${staging}/packaging""#,
         r#"cp packaging/install-daemon.sh "${staging}/packaging/""#,
     ] {
         assert!(
@@ -190,14 +241,18 @@ impl Fixture {
         write_executable(
             &archive.join("pohunek"),
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$POHUNEK_TEST_POHUNEK_LOG\"\n\
-             [ \"$1\" = migration ] && exit \"${POHUNEK_TEST_PREFLIGHT_STATUS:-0}\"\nexit 0\n",
+             [ \"$1\" = migration ] && exit \"${POHUNEK_TEST_PREFLIGHT_STATUS:-0}\"\n\
+             exit \"${POHUNEK_TEST_SERVICE_STATUS:-0}\"\n",
         );
         write_executable(&archive.join("pohunekd"), "#!/bin/sh\nexit 0\n");
         write_executable(&archive.join("pohunek-sessiond"), "#!/bin/sh\nexit 0\n");
         write_executable(
             &commands.join("systemctl"),
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$POHUNEK_TEST_SYSTEMCTL_LOG\"\n\
-             case \"$*\" in *list-units*) printf '%s' \"${POHUNEK_TEST_LIVE_WORKERS:-}\" ;; esac\n",
+             case \"$*\" in\n\
+             *list-units*) printf '%s' \"${POHUNEK_TEST_LIVE_WORKERS:-}\" ;;\n\
+             *is-active*) [ \"${POHUNEK_TEST_LEGACY_ACTIVE:-0}\" = 1 ] || exit 3 ;;\n\
+             esac\n",
         );
         Self {
             home: root.path().join("home"),
@@ -248,6 +303,14 @@ impl Fixture {
             command.env(key, value);
         }
         command.output().expect("run installer")
+    }
+
+    fn install_call(&self) -> String {
+        format!(
+            "service install --from {} --prefix {}",
+            self.archive.display(),
+            self.prefix.display()
+        )
     }
 
     fn pohunek_calls(&self) -> Vec<String> {

@@ -9,7 +9,9 @@
 
 use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
+#[cfg(target_os = "linux")]
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -207,6 +209,7 @@ struct FixtureDaemon {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+#[cfg(target_os = "linux")]
 struct TcpFixtureDaemon {
     address: SocketAddr,
     stop: Arc<AtomicBool>,
@@ -214,6 +217,7 @@ struct TcpFixtureDaemon {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+#[cfg(target_os = "linux")]
 impl TcpFixtureDaemon {
     fn start(ip: Ipv4Addr, scenario: Scenario) -> Self {
         let listener = TcpListener::bind((ip, 0)).expect("bind TCP fixture daemon");

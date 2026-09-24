@@ -107,6 +107,10 @@ pub fn daemon_definition(
 }
 
 #[cfg(target_os = "macos")]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "one signature for both targets; systemd keeps no log files"
+)]
 fn daemon_logs(
     context: &Context,
     config: &ServiceConfig,

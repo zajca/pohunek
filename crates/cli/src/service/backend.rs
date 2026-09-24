@@ -153,37 +153,39 @@ impl Backend {
     ///
     /// Returns [`Error::Supervisor`] for an invalid directory.
     #[cfg(target_os = "macos")]
-    #[expect(
-        clippy::unused_async,
-        reason = "one signature for both targets; systemd connects asynchronously"
-    )]
-    pub async fn connect(
+    pub fn connect(
         context: &Context,
         namespace: &Namespace,
         launchctl_deadline: Duration,
-    ) -> Result<Self, Error> {
+    ) -> std::future::Ready<Result<Self, Error>> {
         use pohunek_platform::supervisor::launchd::{LaunchdDaemon, LaunchdSupervisor};
 
-        let daemon = LaunchdDaemon::new(
+        // launchd needs no connection, so the backend is ready immediately;
+        // the future keeps one call shape with the systemd arm.
+        let backend = LaunchdDaemon::new(
             namespace,
             context.uid(),
             context.supervisor_dir().to_path_buf(),
             launchctl_deadline,
         )
-        .map_err(|source| supervisor_error("connect", source))?;
-        let workers = LaunchdSupervisor::new(
-            namespace.clone(),
-            context.uid(),
-            context.paths().launchd_definitions_dir(),
-            context.paths().launchd_log_dir(),
-            launchctl_deadline,
-        )
-        .map_err(|source| supervisor_error("connect", source))?;
-        Ok(Self::new(
-            Box::new(daemon),
-            Box::new(workers),
-            Box::new(SocketControl::new(context.paths().socket.clone())),
-        ))
+        .and_then(|daemon| {
+            LaunchdSupervisor::new(
+                namespace.clone(),
+                context.uid(),
+                context.paths().launchd_definitions_dir(),
+                context.paths().launchd_log_dir(),
+                launchctl_deadline,
+            )
+            .map(|workers| {
+                Self::new(
+                    Box::new(daemon),
+                    Box::new(workers),
+                    Box::new(SocketControl::new(context.paths().socket.clone())),
+                )
+            })
+        })
+        .map_err(|source| supervisor_error("connect", source));
+        std::future::ready(backend)
     }
 
     /// Returns the daemon supervisor.

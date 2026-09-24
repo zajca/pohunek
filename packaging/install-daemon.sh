@@ -39,33 +39,52 @@ done
 
 # A pre-service install runs `pohunekd.service` from <prefix>/bin with
 # `pohunek-session@.service` template workers. Its daemon holds the instance
-# locks the service daemon needs, so it is retired first. The archive's own CLI
-# runs the preflight, which refuses while the legacy daemon owns live PTYs.
-if [ -e "$legacy_unit_dir/pohunekd.service" ] || [ -e "$prefix/bin/pohunekd" ]; then
-    if [ "$accept_runtime_loss" -eq 1 ]; then
-        "$archive_dir/pohunek" migration preflight --accept-runtime-loss
-    else
-        "$archive_dir/pohunek" migration preflight
-    fi
-    if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
-        live_workers=$(systemctl --user list-units 'pohunek-session@*' \
-            --state=active --plain --no-legend)
-        if [ -n "$live_workers" ]; then
-            echo "legacy template workers are still running; stop their sessions first:" >&2
-            echo "$live_workers" >&2
-            exit 1
+# locks the service daemon needs, so it is retired first, in this order:
+# preflight, active-worker check, disable, removal of the exact legacy paths,
+# daemon-reload. Every step tolerates a previous partial run: the preflight
+# only runs while the legacy daemon is still active, and removal and disable
+# are no-ops for what is already gone.
+legacy_retired=0
+if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
+    # The archive's own CLI runs the preflight, which refuses while the legacy
+    # daemon owns live PTYs.
+    if systemctl --user is-active --quiet pohunekd.service; then
+        if [ "$accept_runtime_loss" -eq 1 ]; then
+            "$archive_dir/pohunek" migration preflight --accept-runtime-loss
+        else
+            "$archive_dir/pohunek" migration preflight
         fi
-        systemctl --user disable --now pohunekd.service
-        rm -f \
-            "$legacy_unit_dir/pohunekd.service" \
-            "$legacy_unit_dir/pohunek-session@.service" \
-            "$legacy_unit_dir/pohunek-sessions.slice"
-        systemctl --user daemon-reload
     fi
+    live_workers=$(systemctl --user list-units 'pohunek-session@*' \
+        --state=active --plain --no-legend)
+    if [ -n "$live_workers" ]; then
+        echo "legacy template workers are still running; nothing was changed:" >&2
+        echo "$live_workers" >&2
+        echo "stop each of these sessions with \`pohunek session stop <id>\` and re-run $0" >&2
+        exit 1
+    fi
+    systemctl --user disable --now pohunekd.service
+    rm -f \
+        "$legacy_unit_dir/pohunekd.service" \
+        "$legacy_unit_dir/pohunek-session@.service" \
+        "$legacy_unit_dir/pohunek-sessions.slice"
+    systemctl --user daemon-reload
+    legacy_retired=1
+fi
+if [ -e "$prefix/bin/pohunekd" ] || [ -e "$prefix/libexec/pohunek-sessiond" ]; then
     rm -f "$prefix/bin/pohunekd" "$prefix/libexec/pohunek-sessiond"
+    legacy_retired=1
 fi
 
 if [ -f "$service_config" ]; then
-    exec "$archive_dir/pohunek" service upgrade --from "$archive_dir"
+    set -- service upgrade --from "$archive_dir"
+else
+    set -- service install --from "$archive_dir" --prefix "$prefix"
 fi
-exec "$archive_dir/pohunek" service install --from "$archive_dir" --prefix "$prefix"
+status=0
+"$archive_dir/pohunek" "$@" || status=$?
+if [ "$status" -ne 0 ] && [ "$legacy_retired" -eq 1 ]; then
+    echo "the legacy pohunekd.service install was already retired before \`pohunek $1 $2\` failed;" >&2
+    echo "fix the reported problem and re-run $0 to finish the installation" >&2
+fi
+exit "$status"

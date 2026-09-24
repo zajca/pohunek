@@ -410,11 +410,8 @@ jobs:
           if [ "${{ matrix.component }}" = "daemon" ]; then
             cp "${bindir}/pohunek" "${staging}/"
             cp "${bindir}/pohunek-sessiond" "${staging}/"
-            mkdir -p "${staging}/packaging/systemd"
+            mkdir -p "${staging}/packaging"
             cp packaging/install-daemon.sh "${staging}/packaging/"
-            cp packaging/systemd/pohunekd.service.in "${staging}/packaging/systemd/"
-            cp packaging/systemd/pohunek-session@.service.in "${staging}/packaging/systemd/"
-            cp packaging/systemd/pohunek-sessions.slice "${staging}/packaging/systemd/"
           fi
           if [ "${{ matrix.component }}" = "cli" ]; then
             mkdir -p "${staging}/packaging"
