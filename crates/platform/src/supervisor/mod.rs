@@ -18,6 +18,8 @@ use std::time::Duration;
 use crate::process::ProcessIdentity;
 
 pub mod namespace;
+#[cfg(target_os = "linux")]
+pub mod systemd;
 
 #[doc(inline)]
 pub use namespace::{Namespace, WorkerKey};

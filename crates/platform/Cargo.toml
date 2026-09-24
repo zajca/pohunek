@@ -19,6 +19,7 @@ rustix = { workspace = true, features = ["fs", "process"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["socket"] }
+zbus.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 calcifer-macos-acl.workspace = true
