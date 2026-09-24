@@ -8,7 +8,7 @@
 
 use std::fmt::{Debug, Formatter};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use protocol::{
     ApprovalKeyReference, HostApprovalSignature, HostGovernanceStatus, HostId,
@@ -32,8 +32,11 @@ const GOVERNANCE_RECORD: &str = pohunek_paths::HOST_GOVERNANCE_NAME;
 const DIAGNOSTIC_SIGNING_PROBE: &[u8] = b"pohunek.host-governance.doctor.v1\0";
 /// Short retry delay lets a concurrent bootstrap finish without an unsafe winner.
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
-/// Five seconds bounds startup blocking while a concurrently bootstrapping process exits.
-const LOCK_RETRY_ATTEMPTS: usize = 500;
+/// Bounds startup blocking while a concurrently bootstrapping process exits.
+///
+/// A wall-clock deadline rather than an attempt count: timer slack (notably on
+/// Darwin) stretches each retry sleep, so a count would overrun this bound.
+const LOCK_WAIT: Duration = Duration::from_secs(5);
 
 /// Failure while loading or durably updating stable host state.
 #[derive(Debug, thiserror::Error)]
@@ -366,10 +369,11 @@ impl HostStateRepository {
 }
 
 fn acquire_lock(directory: &HostStateDir) -> Result<HostStateLock, HostStateRepositoryError> {
-    for attempt in 0..=LOCK_RETRY_ATTEMPTS {
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
         match directory.acquire_lock() {
             Ok(lock) => return Ok(lock),
-            Err(HostStateError::LockContended { .. }) if attempt < LOCK_RETRY_ATTEMPTS => {
+            Err(HostStateError::LockContended { .. }) if Instant::now() < deadline => {
                 std::thread::sleep(LOCK_RETRY_DELAY);
             }
             Err(source) => {
@@ -380,7 +384,6 @@ fn acquire_lock(directory: &HostStateDir) -> Result<HostStateLock, HostStateRepo
             }
         }
     }
-    unreachable!("lock retry range includes its terminal attempt")
 }
 
 fn read(
