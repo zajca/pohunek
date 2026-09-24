@@ -109,6 +109,15 @@ pub(crate) async fn foreign_workers(_root: &Path, namespace: &Namespace) -> Box<
     )
 }
 
+/// Worker output of any namespace goes to the user journal.
+pub(crate) fn foreign_worker_logs(
+    _root: &Path,
+    _namespace: &Namespace,
+    _key: &WorkerKey,
+) -> Option<JobLogs> {
+    None
+}
+
 /// Starts a running unit that matches the namespace's worker pattern but
 /// names no valid session and generation; returns its unit name.
 pub(crate) fn plant_malformed(

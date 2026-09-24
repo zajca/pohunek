@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::Signal;
 use pohunek_platform::process::ProcessIdentity;
 use pohunek_platform::supervisor::{
-    JobDefinition, JobSpec, Namespace, RestartPolicy, Supervisor, WorkerKey,
+    JobDefinition, JobLogs, JobSpec, Namespace, RestartPolicy, Supervisor, WorkerKey,
 };
 use pohunek_worker_protocol::{
     ControlCode, ControlError, ControlMessage, ControlReader, ControlResponse, ControlWriter,
@@ -299,12 +299,18 @@ async fn foreign_malformed_stale_and_incompatible_inputs_fail_closed() {
     // A live and an ended job of generations no record names.
     let stale_running = WorkerKey::new("s-4101", "stal2345").expect("key");
     let stale_ended = WorkerKey::new("s-4102", "stal3456").expect("key");
-    let stale_process =
-        start_running(&fixture, &*fixture.workers, &namespace, &stale_running).await;
+    let logs = |key: &WorkerKey| backend::worker_logs(&fixture.paths, &namespace, key);
+    let stale_process = start_running(
+        &fixture,
+        &*fixture.workers,
+        logs(&stale_running),
+        &stale_running,
+    )
+    .await;
     start_job(
         &fixture,
         &*fixture.workers,
-        &namespace,
+        logs(&stale_ended),
         &stale_ended,
         ENDED_JOB,
     )
@@ -319,8 +325,9 @@ async fn foreign_malformed_stale_and_incompatible_inputs_fail_closed() {
     let foreign_key = WorkerKey::new("s-4103", "frgn2345").expect("key");
     let foreign = backend::foreign_workers(&fixture.root, &foreign_namespace).await;
     fixture.extra().job(&foreign_namespace, &foreign_key);
-    let foreign_process =
-        start_running(&fixture, &*foreign, &foreign_namespace, &foreign_key).await;
+    let foreign_logs =
+        backend::foreign_worker_logs(&fixture.root, &foreign_namespace, &foreign_key);
+    let foreign_process = start_running(&fixture, &*foreign, foreign_logs, &foreign_key).await;
 
     // A job in the namespace whose name carries no session or generation.
     let paths = fixture.paths.clone();
@@ -328,8 +335,13 @@ async fn foreign_malformed_stale_and_incompatible_inputs_fail_closed() {
 
     // A record whose current generation is served by an incompatible peer.
     let incompatible = WorkerKey::new("s-4104", "inco2345").expect("key");
-    let incompatible_process =
-        start_running(&fixture, &*fixture.workers, &namespace, &incompatible).await;
+    let incompatible_process = start_running(
+        &fixture,
+        &*fixture.workers,
+        backend::worker_logs(&fixture.paths, &namespace, &incompatible),
+        &incompatible,
+    )
+    .await;
     let mut runtime = fixture.runtime_record(&incompatible, RuntimeState::Live);
     runtime.worker_id = Some("w-incompatible".to_owned());
     fixture.seed_record(incompatible.session_id(), runtime);
@@ -772,10 +784,10 @@ async fn assert_recovered_after_outage(
 async fn start_running(
     fixture: &Installation,
     supervisor: &dyn Supervisor,
-    namespace: &Namespace,
+    logs: Option<JobLogs>,
     key: &WorkerKey,
 ) -> ProcessIdentity {
-    start_job(fixture, supervisor, namespace, key, RUNNING_JOB).await;
+    start_job(fixture, supervisor, logs, key, RUNNING_JOB).await;
     job_process(supervisor, key).await
 }
 
@@ -880,7 +892,7 @@ async fn wait_converged(fixture: &Installation, name: &str, jobs: &[String]) {
 async fn start_job(
     fixture: &Installation,
     supervisor: &dyn Supervisor,
-    namespace: &Namespace,
+    logs: Option<JobLogs>,
     key: &WorkerKey,
     script: &str,
 ) {
@@ -900,7 +912,7 @@ async fn start_job(
             supervised::path_string(&fixture.home()),
         )]),
         working_directory: fixture.home(),
-        logs: backend::worker_logs(&fixture.paths, namespace, key),
+        logs,
         start_timeout: Duration::from_secs(10),
         exit_timeout: Duration::from_secs(2),
         restart: RestartPolicy::Never,

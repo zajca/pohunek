@@ -126,19 +126,34 @@ pub(crate) fn worker_logs(
     reason = "one signature for both targets; systemd connects to D-Bus"
 )]
 pub(crate) async fn foreign_workers(root: &Path, namespace: &Namespace) -> Box<dyn Supervisor> {
+    Box::new(foreign_supervisor(root, namespace))
+}
+
+/// Log files the foreign namespace's backend names for one generation.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "one signature for both targets; systemd keeps no worker log files"
+)]
+pub(crate) fn foreign_worker_logs(
+    root: &Path,
+    namespace: &Namespace,
+    key: &WorkerKey,
+) -> Option<JobLogs> {
+    Some(foreign_supervisor(root, namespace).worker_logs(key))
+}
+
+fn foreign_supervisor(root: &Path, namespace: &Namespace) -> LaunchdSupervisor {
     let logs = root.join("foreign-logs");
     pohunek_platform::filesystem::TrustedDir::open_or_create_absolute(&logs, LOG_DIR_MODE)
         .expect("create the foreign log directory");
-    Box::new(
-        LaunchdSupervisor::new(
-            namespace.clone(),
-            uid(),
-            root.join("foreign-definitions"),
-            logs,
-            MANAGER_CALL_TIMEOUT,
-        )
-        .expect("valid foreign supervisor"),
+    LaunchdSupervisor::new(
+        namespace.clone(),
+        uid(),
+        root.join("foreign-definitions"),
+        logs,
+        MANAGER_CALL_TIMEOUT,
     )
+    .expect("valid foreign supervisor")
 }
 
 /// Loads a running job from the private definitions directory whose label
