@@ -1,0 +1,42 @@
+{
+  "comment": [
+    "Configuration for the repository's agent work-tracking workflow (GitHub Issues + GitHub Projects), introduced by issue #177.",
+    "Skills under .claude/skills/ reference this file instead of hardcoding project or field identifiers.",
+    "Opaque identifiers (project item/field/status IDs, view IDs) are never stored here or in skills; agents resolve them at runtime with `gh` from the names below."
+  ],
+  "repository": "zajca/pohunek",
+  "issueTracker": {
+    "kind": "github-issues",
+    "baseUrl": "https://github.com/zajca/pohunek/issues",
+    "role": "canonical record for work scope, design proposals and decisions, acceptance criteria, implementation plans, verification evidence, blockers, and handoffs"
+  },
+  "defaultProject": {
+    "owner": "zajca",
+    "number": 1,
+    "url": "https://github.com/users/zajca/projects/1",
+    "name": "Pohunek",
+    "role": "default delivery tracking for actionable repository work"
+  },
+  "statusOptions": ["Todo", "In Progress", "Done"],
+  "statusSemantics": {
+    "Todo": "Tracked, actionable work that has not started yet. For a design-proposal issue, Todo means only that it is tracked pending a decision — it does not imply the proposed design is accepted; acceptance is an explicit decision recorded on the issue.",
+    "In Progress": "Work is being implemented, reviewed, or awaiting verification. Represent review findings and blockers as issue comments while status stays In Progress; do not invent a Review or Blocked status.",
+    "Done": "The issue is closed as completed: for any repository change (code, scripts, harness files, docs, skills, configuration), verified landing on the remote default branch with all DoD items met; only pure planning/investigation with no repository change may complete on the issue-held artifact/evidence. Never set Done when only opening a PR or merging locally without an authorized remote push."
+  },
+  "issueClosure": {
+    "order": "DoD verified -> close issue as completed -> sync Project status Done.",
+    "landing": "A repository change of any kind (code, scripts, docs, skills, config) needs a verified remote default-branch landing before the issue may close; local merge without an authorized push stays In Progress with local-merge evidence.",
+    "noDodShuffling": "Unmet original DoD items are never moved to follow-up issues to claim the current issue done; verified out-of-scope findings may be filed as separate follow-up issues."
+  },
+  "additionalProjects": {
+    "role": "Existing topic projects remain additional views. No destructive migrations; do not remove items from them. List them with `gh` and update only when the task explicitly covers a topic view."
+  },
+  "issueBodyRoles": {
+    "body": "Full scope, accepted decisions with their rationale, definition-of-done items with stable IDs (D1, D2, ...), dependencies, and the plan. Long-lived content; prefer editing own sections over rewriting.",
+    "comments": "Progress reports, verification evidence (commands run and results), handoffs, blockers, and status-change rationale. Append, never overwrite others' comments."
+  },
+  "localFiles": {
+    "NEXT.md": "Not a work authority and never required by any workflow. A pre-existing untracked NEXT.md is a migration read-only source at most.",
+    "SiYuan": "Optional personal notes/pointers; never a competing project authority."
+  }
+}

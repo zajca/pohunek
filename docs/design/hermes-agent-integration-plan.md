@@ -98,10 +98,14 @@ Changing one of these decisions requires updating the RFC first.
 
 ### 3.1 Milestones and release boundaries
 
-Implementation follows the repository milestone workflow:
+Implementation follows the repository milestone workflow, tracking each
+milestone as a GitHub issue (scope, decisions, and definition-of-done) in the
+configured default Project (see `.github/agent-workflow.json` and the
+`github-workflow` skill):
 
-1. write a transient `NEXT.md` from this plan for exactly one of these
-   independently valuable milestones:
+1. record the first selected milestone as a planning issue from this plan
+   (`plan-phase`), with explicit definition-of-done items and stable IDs, for
+   exactly one of these independently valuable milestones:
    - **M1 — provider-neutral foundations:** decouple resume from fork; add
      `session.screen`, `session.output`, and `session.wait`; add private
      control-plane observation; complete CLI JSON parity and stdin input; add
@@ -118,11 +122,13 @@ Implementation follows the repository milestone workflow:
 2. create a fresh `zajca/<ticket-or-topic>/hermes-integration` worktree from the
    then-current `main`;
 3. implement the selected milestone's workstreams below in dependency order;
-4. review the entire branch against `NEXT.md` and this RFC;
+4. review the entire branch against the milestone issue's definition-of-done
+   and this RFC;
 5. run every gate relevant to that milestone, including the full repository
    gate sets where its changes participate;
 6. merge only when the selected milestone's section 18 subset is complete;
-7. remove the transient branch/worktree and replace `NEXT.md` after landing.
+7. remove the transient branch/worktree and update/close the milestone issue
+   per the `github-workflow` skill after landing.
 
 M1 is valuable even if Hermes never ships and may release independently. M2 may
 release on top of M1 as first-class managed-runtime support without the

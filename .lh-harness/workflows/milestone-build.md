@@ -1,15 +1,19 @@
-# Task: Implement the pohunek milestone specified in NEXT.md
+# Task: Implement the pohunek milestone specified in the given GitHub issue
 
-Implement the current pohunek milestone end to end. The single authoritative
-spec is `NEXT.md` at the workspace root. Work happens in the milestone
-worktree passed to the harness as `--workspace`; never touch any other
-checkout. Nothing may be committed, merged, or pushed by this run.
+Implement the pohunek milestone end to end. The single authoritative spec is
+the GitHub issue the task text names (issue URL or number in
+`zajca/pohunek`). Work happens in the milestone worktree passed to the
+harness as `--workspace`; never touch any other checkout. Nothing may be
+committed, merged, or pushed by this run.
 
 ## Requirements
 
-- R1. Implement every definition-of-done item in `NEXT.md`, in full. No PoC,
-  no minimal versions, no stubs, no placeholders. If a DoD item is ambiguous
-  or `NEXT.md` is missing, stop and ask instead of inventing scope.
+- R1. Implement every definition-of-done item pinned from the spec issue's
+  body plus its accepted decision comments (the manager pins DoD item IDs,
+  `updatedAt`, and the accepted decision comments at snapshot time), in full.
+  No PoC, no minimal versions, no stubs, no placeholders. If a DoD item is
+  ambiguous or the issue is missing/unclear, stop and ask instead of inventing
+  scope.
 - R2. The full gate set (below) passes on the final state of the worktree.
   A gate is green only when its command exits 0.
 - R3. When a change touches anything the assistant knowledge bundle describes
@@ -23,20 +27,47 @@ checkout. Nothing may be committed, merged, or pushed by this run.
 - R5. The worktree ends with all milestone work present as file changes.
   Do not run `git commit`, `git merge`, `git push`, or `scripts/release`.
 
+## GitHub issue handling
+
+- Issue identity comes from the task text (URL or issue number). For a direct
+  invocation without an issue, the manager follows `github-workflow`: reuse
+  a unique match or automatically create an issue for clear new scope after
+  deduplication. Ask only when the scope or competing matches are ambiguous.
+- **The manager owns all GitHub writes** — reading the live issue body and
+  comments for the spec, and recording progress, evidence, and handoffs back
+  to the issue/project. Executor and auditor episodes perform no GitHub
+  writes; their shared access to the repository is unchanged (reads of the
+  issue and repo state are fine). Follow `.github/agent-workflow.json` and
+  the `github-workflow` skill for issue structure, project status semantics
+  (`Todo`/`In Progress`/`Done`; `Done` only after verified landing on `main`,
+  never at PR-open), and safe-persistence rules (read before write, verify
+  mutations, paginate searches, block on permission/network errors instead
+  of claiming success).
+- The manager fetches the live issue body and comments at run start, pins the
+  issue's `updatedAt` (or a body digest) **and** the exact DoD item IDs per
+  run, and slices the pinned DoD into bounded subtask contracts in dependency
+  order. One contract covers one DoD item or a coherent slice of it, sized to
+  finish inside one executor episode. Each contract carries its goal,
+  acceptance criteria, boundary constraints, and the relevant files.
+- **Spec drift:** before each round (and at closing), the manager compares
+  the live issue against the pinned snapshot. Substantive changes — new,
+  removed, or reworded DoD items, changed scope or decisions — are reconciled
+  explicitly (re-slice the contracts, state what changed) instead of being
+  silently consumed. Non-substantive edits are noted and ignored.
+- Project status is synced by the manager per the semantic in
+  `.github/agent-workflow.json`: `In Progress` for the whole run; `Done` only
+  after the work has verifiably landed on `main`, which this run never does.
+
 ## Operating protocol
 
-- The manager slices the NEXT.md DoD into bounded subtask contracts in
-  dependency order. One contract covers one DoD item or a coherent slice of
-  it, sized to finish inside one executor episode. Each contract carries its
-  goal, acceptance criteria, boundary constraints, and the relevant files.
 - The executor implements one contract per episode inside the worktree and
   verifies its own work with the narrowest applicable loop (single-crate
   test/clippy) before returning. An execution report is a claim, not
   evidence.
 - The executor report must carry the exact commands it ran with their exit
-  codes; for the final gate run, include the decisive tail lines of each
+  codes; for a final gate run, include the decisive tail lines of each
   command's output so the auditor can cross-check without re-deriving the
-  whole log.
+  whole log. It also lists anything it asked the manager to record on GitHub.
 - The auditor independently verifies each completed contract against its
   acceptance criteria and against the repo's definition of done: produce a
   per-DoD-item verdict (met / partial / missing) with concrete `path:line`
@@ -45,6 +76,9 @@ checkout. Nothing may be committed, merged, or pushed by this run.
   executor's claim alone — only from evidence you gathered yourself.
 - Progress records advance only on clean audit evidence. A failed gate or a
   `partial`/`missing` verdict sends the item back as a new bounded contract.
+- The manager reconciles reported evidence with what it records on GitHub:
+  only auditor-verified results become issue/project updates; claims without
+  evidence are marked as such or left unrecorded, never transcribed as done.
 
 ### Gate economy
 
@@ -58,11 +92,13 @@ wants stronger evidence checks a bounded sample, not the whole set again.
 ### Reconciling a previously interrupted run
 
 The worktree may already contain uncommitted work from an earlier
-interrupted run. Verify that work against `NEXT.md`, keep what is correct,
-and state plainly what was reused. Git forensics (`git fsck`, dangling-object
-analysis, ref archaeology) is a means to reconcile the tree, never a goal:
-time-box it to the minimum needed to know what the tree contains, and never
-spend an episode investigating it beyond that.
+interrupted run. The manager reads the issue's body and comments first
+(progress, evidence, and handoffs from prior runs live there) and the
+executor verifies that work against the pinned DoD, keeping what is correct
+and stating plainly what was reused. Git forensics (`git fsck`,
+dangling-object analysis, ref archaeology) is a means to reconcile the tree,
+never a goal: time-box it to the minimum needed to know what the tree
+contains, and never spend an episode investigating it beyond that.
 
 ## Mandatory repo rules (all roles)
 
@@ -95,7 +131,8 @@ order, as the closing verification of the milestone:
 cargo fmt --all --check
 RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --all-features
 cargo build -p pohunek-session-worker --bin pohunek-sessiond
-cargo test --workspace --all-features
+cargo nextest run --profile ci --test-threads 4 --workspace --all-features
+cargo test --doc --workspace --all-features
 cargo build --workspace --release
 RUSTFLAGS="-D warnings" cargo xtask docs check
 cargo xtask hermes compatibility --pohunek-bin "$PWD/target/release/pohunek"
@@ -133,6 +170,9 @@ POHUNEK_E2E=1 POHUNEK_DAEMON_BIN=<abs>/target/debug/pohunekd \
   CI jobs: `cargo audit`,
   `cargo hack --feature-powerset --workspace clippy --all-targets`,
   `cargo udeps`.
+- `cargo xtask ts check` is required when the change touches the wire
+  protocol or generated TypeScript types (regenerate with
+  `cargo xtask ts generate`); it is otherwise optional.
 - While iterating, narrower loops are fine (`cargo test -p <crate>`,
   `cargo clippy -p <crate> --all-targets`), but a run is not done until the
   full set above passes in order.
@@ -142,7 +182,8 @@ POHUNEK_E2E=1 POHUNEK_DAEMON_BIN=<abs>/target/debug/pohunekd \
 ## Completion
 
 The run is done only when the auditor has verified, with evidence gathered
-from the environment, that every DoD item is met and every gate in the set
-above exited 0 on the final state. The closing reply must list each DoD item
-with its verdict and `path:line` evidence, the gate results, and any open
-gaps or blocked items.
+from the environment, that every pinned DoD item is met and every required
+gate in the set above exited 0 on the final state. The closing reply must
+list each DoD item with its verdict and `path:line` evidence, the gate
+results, and any open gaps or blocked items — matching what the manager has
+recorded on the issue.

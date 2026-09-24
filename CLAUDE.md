@@ -33,23 +33,29 @@ is a failure. For docs/knowledge changes, also run `cargo xtask docs check`.
 
 ## Milestone workflow skills
 
-The milestone loop described in AGENTS.md (`plan → implement in a worktree →
-review against NEXT.md → merge and advance → release`) is encoded as skills under
-`.claude/skills/`. Prefer them over re-deriving the steps each time; they auto-
-trigger from the usual phrasing:
+The milestone loop described in AGENTS.md (plan → implement in a worktree →
+review against the issue's DoD → merge and advance → release) is encoded as
+skills under `.claude/skills/`. Prefer them over re-deriving the steps each
+time; they auto-trigger from the usual phrasing. All of them route their
+GitHub-issue and project updates through the shared **`github-workflow`**
+skill (deduplication, issue body/comment structure, project status
+semantics, safe persistence — config in `.github/agent-workflow.json`).
 
-- **`plan-phase`** — plan the next phase interactively (one open question at a
-  time) and write a complete end-to-end `NEXT.md`.
-- **`milestone`** — implement the next milestone from `NEXT.md` in a fresh
-  worktree, then run the gates.
-- **`milestone-review`** — review a branch/worktree against `NEXT.md`'s DoD with
-  `path:line` evidence, delegate fixes, re-run the gates.
+- **`github-workflow`** — shared GitHub Issues + Project tracking rules that
+  every milestone-loop skill inherits; use it for any issue or project write.
+- **`plan-phase`** — plan the next phase interactively (one open question at
+  a time) and record the complete end-to-end plan as a GitHub issue.
+- **`milestone`** — implement the pohunek milestone specified by a GitHub
+  issue in a fresh worktree, then run the gates.
+- **`milestone-review`** — review a branch/worktree against the issue's DoD
+  with `path:line` evidence, record findings on the issue, delegate fixes,
+  re-run the gates.
 - **`merge-advance`** — commit unsigned, merge to `main`, prune the
-  branch/worktree, write the next `NEXT.md`.
+  branch/worktree, update the milestone issue and project status.
 - **`release`** — cut a version with `scripts/release` and verify the Release
   workflow publishes the glibc + MUSL x86_64 binaries.
-- **`gates`** — the shared verification block (fmt / clippy `-D warnings` / test
-  / release build / `cargo xtask docs check`); the other skills call it.
+- **`gates`** — the shared verification block mirroring the AGENTS.md gate
+  set; the other skills call it.
 
 ## Keep the assistant knowledge bundle current
 
@@ -89,8 +95,12 @@ wait for permission on. Brief every sub-agent with concrete `path:line` context
 
 ## Project memory
 
-Cross-session memory for this project lives under
-`~/.claude/projects/-home-zajca-Code-me-zremoteng/memory/` (index: `MEMORY.md`).
-Relevant standing facts: pohunek is experimental with no back-compat; the GUI is
-the pinned native control-plane direction; the `ms-rust` skill must precede Rust
-edits. Consult it and keep it current.
+The **GitHub issue's body and comments are the cross-session authority** for
+this project's work (scope, decisions, evidence, handoffs — the
+`github-workflow` skill holds the rules). Local memory under
+`~/.claude/projects/-home-zajca-Code-me-zremoteng/memory/` (index:
+`MEMORY.md`) and SiYuan notes are **optional pointers only** — consult them
+for standing facts (pohunek is experimental with no back-compat; the GUI is
+the pinned native control-plane direction; the `ms-rust` skill must precede
+Rust edits), but they are not a mandatory second writing location and never a
+competing project authority.

@@ -337,14 +337,37 @@ PoC or imply that current direct-host execution is a hostile-workload sandbox.
 
 - Work on a branch off `main`; do not commit directly to `main`. Commit/push
   only when the user asks.
-- **Milestones run in worktrees against `NEXT.md`.** Development moves one
-  milestone at a time. `NEXT.md` (repo root) is the **transient** spec for the
-  current milestone: it holds the scope and a testable definition-of-done, is
-  **not committed**, and is deleted/replaced once the milestone lands. The loop
-  is: plan the phase into `NEXT.md` → implement it in a fresh worktree off `main`
-  → review the branch against `NEXT.md`'s DoD → merge to `main`, delete the
-  branch/worktree, write the next `NEXT.md`. Longer-lived design docs live under
-  `docs/design/`, not `NEXT.md`.
+- **Work is tracked in GitHub Issues and the Pohunek Project**, not in local
+  planning files. GitHub Issues are the canonical record for scope, design
+  proposals and decisions, acceptance criteria (DoD items with stable IDs —
+  `D1`, `D2`, ...), plans, verification evidence, blockers, and handoffs; the
+  Pohunek Project tracks delivery status (`Todo` / `In Progress` / `Done`).
+  `NEXT.md` is no longer an authority and no workflow requires it;
+  `docs/design/` stays for accepted long-lived technical design. The shared
+  rules — issue resolution, deduplication, body/comment structure, project
+  status semantics, and safe persistence — live in the **`github-workflow`
+  skill** (`.claude/skills/github-workflow/`) with configuration in
+  `.github/agent-workflow.json`; every agent must follow it for any GitHub
+  issue/comment/project write.
+- **Gate meaningful work on an issue first.** Before meaningful work starts,
+  resolve its issue: use an explicit issue URL/number when given, otherwise
+  deduplicate against existing issues. When the user gives a concrete new
+  scope and no matching issue exists, **auto-create** the issue and add it to
+  the configured project without a further ask; ask only when the scope is
+  genuinely ambiguous or competing issues both plausibly cover it. Verified
+  out-of-scope findings get their own follow-up issue automatically, but an
+  unmet original DoD item never moves to a follow-up to claim the issue done.
+- **The milestone loop runs against a GitHub issue.** Development moves one
+  milestone at a time. The loop is: the phase plan and its DoD land as a
+  GitHub issue (`plan-phase`) → implement it in a fresh worktree off `main`
+  (`milestone`) → review the branch against the issue's DoD
+  (`milestone-review`) → land it locally via `merge-advance` or publish it
+  via `pr-handoff`, with the issue and project updated accordingly (issue
+  closure + `Done` only after verified landing on the remote default branch
+  for any repository change; only pure planning/investigation with no
+  repository change completes on the issue-held artifact). Do not create new
+  local `NEXT.md`/RFC files as work-management authorities; a pre-existing
+  untracked `NEXT.md` is a read-only migration source at most.
 - **Plans are end-to-end complete.** Do not propose or build PoCs, minimal
   versions, or phased-minimal shortcuts unless the user explicitly asks for
   reduced scope. Plan and implement the full solution.
@@ -365,7 +388,8 @@ do not re-report them as review findings:
 - A harness run whose final audit reports every DoD item met with the full
   gate set green **pre-authorizes** the `pr-handoff` flow (commit, push,
   open PR) without a further ask. This intentionally supersedes the default
-  "commit/push only when the user asks" for that one path.
+  "commit/push only when the user asks" for that one path; it is publishing
+  authorization only and does not authorize merging.
 - Harness executors run their model CLI unsandboxed on the operator's host;
   `--workspace` scopes the working directory, not file access.
 
@@ -379,4 +403,15 @@ do not re-report them as review findings:
 - `.agents/rust-guidelines/` — vendored Microsoft Pragmatic Rust Guidelines
   (read before editing `.rs`; `SKILL.md` routes you to the right file,
   `VENDORED.md` documents the source and how to re-sync).
+- `scripts/harness-milestone` starts the milestone-build harness run:
+  `scripts/harness-milestone <slug> --issue NUMBER|URL` (repository/default
+  project resolved from `.github/agent-workflow.json`, the issue fetched and
+  validated with `gh` before any git state changes; no NEXT.md). Its
+  executable tests run with
+  `python3 -m unittest discover -s scripts/tests -p 'test_*.py'`.
+- `.lh-harness/workflows/` — milestone-build harness instructions
+  (issue-driven; `.github/agent-workflow.json` holds the work-tracking
+  config).
+- `.claude/skills/` — milestone-loop skills, including the shared
+  `github-workflow` tracking rules.
 - `README.md` — install, quick start, trust boundary.
