@@ -6,7 +6,9 @@
 
 use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
-use std::os::unix::fs::{symlink, PermissionsExt as _};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::symlink;
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -70,6 +72,8 @@ fn set_mode(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("set fixture mode");
 }
 
+// Linux only: used by the system-Python lifecycle test (see issue #101).
+#[cfg(target_os = "linux")]
 fn write_executable(path: &Path, body: &str) {
     fs::write(path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write executable");
     set_mode(path, 0o700);
@@ -83,6 +87,8 @@ fn run(fixture: &Fixture, arguments: &[&str]) -> Output {
         .expect("run pohunek binary")
 }
 
+// Linux only: used by the system-Python lifecycle test (see issue #101).
+#[cfg(target_os = "linux")]
 fn parse_ok(output: &Output) -> Value {
     assert!(
         output.status.success(),
@@ -106,6 +112,10 @@ fn parse_error(output: &Output) -> Value {
     envelope["err"].clone()
 }
 
+// Linux only: the fixture runtime execs the system `/usr/bin/python3`, which on
+// macOS is Python 3.9 while the embedded plugin requires Python 3.10 or newer.
+// The Hermes integration lifecycle on macOS is owned by issue #101.
+#[cfg(target_os = "linux")]
 #[test]
 #[expect(
     clippy::too_many_lines,
