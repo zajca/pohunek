@@ -260,9 +260,15 @@ fn spawn_lock_holder(root: &Path, state: &Path) -> LockHolder {
         release: None,
     };
     let mut ready_stream = accept_with_timeout(&ready_listener, "lock-holder readiness");
-    ready_stream
-        .set_read_timeout(Some(LOCK_HELPER_TIMEOUT))
-        .expect("bound lock-holder readiness signal");
+    match ready_stream.set_read_timeout(Some(LOCK_HELPER_TIMEOUT)) {
+        Ok(()) => {}
+        // Darwin rejects `SO_RCVTIMEO` with `EINVAL` once the peer has already
+        // closed its end. The signal is then buffered and the read below
+        // completes or reaches EOF without blocking, so no deadline is needed.
+        Err(error)
+            if cfg!(target_os = "macos") && error.kind() == std::io::ErrorKind::InvalidInput => {}
+        Err(error) => panic!("bound lock-holder readiness signal: {error}"),
+    }
     let mut signal = [0_u8; 1];
     ready_stream
         .read_exact(&mut signal)

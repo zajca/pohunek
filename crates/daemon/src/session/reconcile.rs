@@ -2766,6 +2766,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    #[cfg(target_os = "linux")]
     use base64::Engine as _;
     use pohunek_session_worker::{
         ChildIdentity as JournalChildIdentity, Journal, JournalRecord,
@@ -2820,8 +2821,11 @@ mod tests {
             .expect("secure private test directory");
     }
 
+    /// Releases the drain fixture's barriers when the Linux-only drain test ends.
+    #[cfg(target_os = "linux")]
     struct ReleaseFiles(Vec<PathBuf>);
 
+    #[cfg(target_os = "linux")]
     impl Drop for ReleaseFiles {
         fn drop(&mut self) {
             for path in &self.0 {
@@ -3686,6 +3690,11 @@ while os.getppid() == parent:
         server_task.abort();
     }
 
+    // Linux keeps the session's terminal usable for descendants after the
+    // session leader exits; XNU revokes it (`proc_exit`), so this drain
+    // behavior exists only on Linux. The worker's Darwin counterpart is
+    // `root_exit_revokes_the_terminal_and_stop_still_ends_the_group`.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
@@ -3703,10 +3712,9 @@ while os.getppid() == parent:
         let (script, mut reporters) = identity_reporters(&root, &["agent"]);
         let reporter = reporters.pop().expect("one reporter");
         let command = format!(
-            // `ps` reports the root's zombie state on both Linux and Darwin.
             concat!(
                 "trap '' HUP; root_pid=$$; {} (",
-                "until case \"$(ps -o stat= -p \"$root_pid\" 2>/dev/null)\" in *Z*) true ;; *) false ;; esac; do sleep 0.01; done; ",
+                "while [ \"$(sed -n 's/^.*) \\([^ ]\\).*/\\1/p' \"/proc/$root_pid/stat\" 2>/dev/null)\" != Z ]; do sleep 0.01; done; ",
                 "printf exited > '{}'; ",
                 "while [ ! -e '{}' ]; do sleep 0.01; done; ",
                 "printf 'late-restart-output\\n') & ",

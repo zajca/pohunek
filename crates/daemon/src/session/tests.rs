@@ -411,6 +411,11 @@ async fn managed_observation_returns_runtime_bound_screen_output_and_wait() {
     let _ = registry.stop(&created.id).await;
 }
 
+// Linux keeps the session's terminal usable for descendants after the
+// session leader exits; XNU revokes it (`proc_exit`), so this drain
+// behavior exists only on Linux. The worker's Darwin counterpart is
+// `root_exit_revokes_the_terminal_and_stop_still_ends_the_group`.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn managed_output_remains_available_until_descendant_pty_eof() {
     use base64::prelude::{Engine as _, BASE64_STANDARD};
@@ -426,10 +431,9 @@ async fn managed_output_remains_available_until_descendant_pty_eof() {
             "/bin/sh",
             [
                 "-c",
-                // `ps` reports the root's zombie state on both Linux and Darwin.
                 concat!(
                     "trap '' HUP; root_pid=$$; (",
-                    "until case \"$(ps -o stat= -p \"$root_pid\" 2>/dev/null)\" in *Z*) true ;; *) false ;; esac; do sleep 0.01; done; ",
+                    "while [ \"$(sed -n 's/^.*) \\([^ ]\\).*/\\1/p' \"/proc/$root_pid/stat\" 2>/dev/null)\" != Z ]; do sleep 0.01; done; ",
                     "printf exited > \"$1\"; ",
                     "while [ ! -e \"$2\" ] && [ -d \"$3\" ]; do sleep 0.01; done; ",
                     "if [ -e \"$2\" ]; then printf 'late-descendant-output\\n'; fi",
@@ -514,6 +518,11 @@ async fn managed_output_remains_available_until_descendant_pty_eof() {
     );
 }
 
+// Linux keeps the session's terminal usable for descendants after the
+// session leader exits; XNU revokes it (`proc_exit`), so this drain
+// behavior exists only on Linux. The worker's Darwin counterpart is
+// `root_exit_revokes_the_terminal_and_stop_still_ends_the_group`.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn stop_after_root_exit_terminates_a_descendant_that_keeps_the_pty_open() {
     let barrier = pohunek_test_support::tempdir().expect("create stop barrier");
@@ -527,11 +536,10 @@ async fn stop_after_root_exit_terminates_a_descendant_that_keeps_the_pty_open() 
             "/bin/sh",
             [
                 "-c",
-                // `ps` reports the root's zombie state on both Linux and Darwin.
                 concat!(
                     "trap '' HUP; root_pid=$$; (",
                     "trap '' HUP TERM; printf ready > \"$2\"; ",
-                    "until case \"$(ps -o stat= -p \"$root_pid\" 2>/dev/null)\" in *Z*) true ;; *) false ;; esac; do sleep 0.01; done; ",
+                    "while [ \"$(sed -n 's/^.*) \\([^ ]\\).*/\\1/p' \"/proc/$root_pid/stat\" 2>/dev/null)\" != Z ]; do sleep 0.01; done; ",
                     "printf exited > \"$1\"; ",
                     "while [ -d \"$3\" ]; do sleep 0.01; done",
                     ") & while [ ! -e \"$2\" ]; do sleep 0.01; done"
@@ -10040,7 +10048,14 @@ async fn spontaneous_exit_uses_durable_base_after_uncaptured_resize() {
         .inspect(&created.id)
         .await
         .expect("inspect committed terminal session");
-    let event_info = next_session_updated(&mut events).await;
+    // Process observation may publish a live update (e.g. the procwatch cwd)
+    // before the exit commit; the terminal update is the one under test.
+    let event_info = loop {
+        let info = next_session_updated(&mut events).await;
+        if info.state.is_terminal() {
+            break info;
+        }
+    };
     assert_eq!(registry_info, durable.info);
     assert_eq!(event_info, durable.info);
     assert_no_runtime_event(&mut events).await;
