@@ -20,7 +20,7 @@ use pohunek_platform::{
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-// Rust guideline compliant 2026-09-20
+// Rust guideline compliant 2026-09-24
 
 /// Application directory inserted below each XDG base by `pohunek-paths`.
 const APPLICATION_DIRECTORY: &str = "pohunek";
@@ -169,6 +169,8 @@ impl SubprocessWorkerLauncher {
             command
                 .arg("--session-id")
                 .arg(id.as_str())
+                .arg("--worker-generation")
+                .arg(new_generation()?)
                 .arg("--daemon-socket-path")
                 .arg(&self.environment.daemon_socket)
                 .env("XDG_RUNTIME_DIR", &self.environment.runtime_home)
@@ -343,6 +345,14 @@ impl SystemdWorkerLauncher {
     }
 }
 
+/// Draws a fresh daemon-issued worker generation token.
+fn new_generation() -> Result<String, WorkerLaunchError> {
+    let mut entropy = [0_u8; pohunek_paths::WORKER_GENERATION_ENTROPY_BYTES];
+    getrandom::getrandom(&mut entropy)
+        .map_err(|error| operation("generation", std::io::Error::other(error.to_string())))?;
+    Ok(pohunek_paths::encode_worker_generation(entropy))
+}
+
 fn unavailable(
     operation_name: &'static str,
     source: impl std::error::Error + Send + Sync + 'static,
@@ -455,6 +465,7 @@ mod test_support {
                 let server = Server::bind(ServerArgs {
                     session_id: session_id.to_owned(),
                     worker_id: worker_id.clone(),
+                    generation: super::new_generation()?,
                     socket_path: socket_path.clone(),
                     journal_path: state_dir.join(format!("{worker_id}.json")),
                     daemon_socket_path: self.daemon_socket.clone(),

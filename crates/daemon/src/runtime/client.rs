@@ -17,7 +17,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-// Rust guideline compliant 2026-09-11
+// Rust guideline compliant 2026-09-24
 
 /// Prefix for daemon-generated, producer-scoped control input identifiers.
 const INPUT_WRITE_ID_PREFIX: &str = "input";
@@ -369,19 +369,31 @@ impl Worker {
 
     /// Initializes an uninitialized worker exactly once.
     ///
+    /// A worker that negotiated a version below
+    /// [`pohunek_worker_protocol::BASE_ENVIRONMENT_VERSION`] does not know the
+    /// base environment, so it is removed from `initialize` before sending; at
+    /// or above that version it is required.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkerError`] for connection, identity, spawn, or journal
-    /// failure.
-    pub async fn initialize(&self, initialize: Initialize) -> Result<RuntimeId, WorkerError> {
+    /// failure, and [`WorkerError::Protocol`] when a worker that negotiated
+    /// the base-environment version receives no base environment.
+    pub async fn initialize(&self, mut initialize: Initialize) -> Result<RuntimeId, WorkerError> {
         let mut inner = self.inner.lock().await;
+        if inner.selected_version < pohunek_worker_protocol::BASE_ENVIRONMENT_VERSION {
+            initialize.base_environment = None;
+        }
+        initialize
+            .check_version(inner.selected_version)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?;
         let lease_id = inner.lease_id.clone();
         let response = request_locked(
             &mut inner,
             self.next_request_id("initialize")?,
             RequestKind::Initialize {
                 lease_id,
-                initialize,
+                initialize: Box::new(initialize),
             },
         )
         .await?;
@@ -1181,6 +1193,12 @@ mod tests {
             dimensions: Dimensions::new(80, 24).expect("dimensions"),
             environment: pohunek_worker_protocol::SecretEnv::new(BTreeMap::new())
                 .expect("valid environment"),
+            base_environment: Some(
+                crate::runtime::environment::base_environment(
+                    pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+                )
+                .expect("base environment"),
+            ),
             limits: pohunek_worker_protocol::InitializeLimits::new(
                 u64::try_from(output_bytes).expect("history fits u64"),
                 1_048_576,
@@ -1282,13 +1300,13 @@ mod tests {
     }
 
     #[test]
-    fn subagent_observation_requires_current_protocol() {
+    fn subagent_observation_requires_version_five() {
         let current = requested_capabilities(
-            pohunek_worker_protocol::CURRENT_VERSION,
+            pohunek_worker_protocol::SUBAGENT_OBSERVATION_VERSION,
             &[Capability::SubagentObservation],
         );
         let previous = requested_capabilities(
-            pohunek_worker_protocol::PREVIOUS_VERSION,
+            pohunek_worker_protocol::CONTROL_PLANE_OBSERVATION_VERSION,
             &[Capability::SubagentObservation],
         );
 
@@ -1305,6 +1323,7 @@ mod tests {
         let server = Server::bind(ServerArgs {
             session_id: SESSION_ID.to_owned(),
             worker_id: "worker-e2e".to_owned(),
+            generation: "abcd2345".to_owned(),
             socket_path: socket_path.clone(),
             journal_path: root.join("journal/worker.json"),
             daemon_socket_path: root.join("daemon.sock"),

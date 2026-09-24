@@ -7,6 +7,7 @@
 // Rust guideline compliant 2026-07-23
 
 mod client;
+pub(crate) mod environment;
 mod launcher;
 mod systemd;
 

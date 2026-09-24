@@ -12,7 +12,7 @@
 // relies on; the rest of the crate stays free of unsafe code.
 #![deny(unsafe_code)]
 
-// Rust guideline compliant 2026-09-23
+// Rust guideline compliant 2026-09-24
 
 mod config;
 mod error;
@@ -24,6 +24,7 @@ mod lease;
 mod output;
 mod pty;
 mod server;
+mod service;
 #[cfg(test)]
 mod test_support;
 
@@ -38,7 +39,7 @@ pub use input::{InputError, InputFragment, InputPlan, WriteCoordinator};
 #[doc(inline)]
 pub use journal::{
     ActiveIdentity, ChildIdentity, Journal, JournalError, JournalRecord, LaunchIdentity,
-    PendingLaunchClaim, ReleasedIdentity, RuntimeOutcome, RuntimePhase,
+    PendingLaunchClaim, ReleasedIdentity, RuntimeOutcome, RuntimePhase, WorkerOrigin,
 };
 #[doc(inline)]
 pub use lease::{ControllerLease, LeaseError, LeaseOwner};
@@ -50,6 +51,8 @@ pub use output::{
 #[doc(inline)]
 pub use pohunek_terminal::TerminalSnapshot;
 #[doc(inline)]
-pub use pty::{Command, Exit, ProcessIdentity, PtyError, PtyOwner};
+pub use pty::{Command, EnvBase, Exit, ProcessIdentity, PtyError, PtyOwner};
 #[doc(inline)]
 pub use server::{run, Server, ServerArgs};
+#[doc(inline)]
+pub use service::{load_service_config, ServiceConfigError};
