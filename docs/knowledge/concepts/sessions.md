@@ -266,7 +266,10 @@ The same runtime model keeps `cwd` current. A session starts with its launch
 directory, then procwatch reads the cwd of the focus process on each tick: the
 active nested-agent PID when one is bound, otherwise the root PTY child. OSC 7
 terminal output is accepted as an immediate cwd hint, but procwatch remains
-authoritative and overwrites a hint that the process cwd contradicts. Each cwd
+authoritative and overwrites a hint that a later read of the process cwd
+contradicts. Cwd evidence is ordered by when it was observed: a procwatch read
+taken before a hint arrived never replaces that hint, and a hint for the
+current cwd keeps the source that set it. Each cwd
 change emits `session_updated` and re-resolves project and worktree context. If
 the new cwd is inside another registered active worktree, `worktree_path`,
 `branch`, and project metadata move to that worktree; if it is outside every

@@ -5,6 +5,8 @@
 - Documented that a Darwin process between images no longer fails a process
   table read: it is listed without a command line, its markers are
   unobservable, and the runtime sweep skips it as unreadable.
+- Documented that cwd evidence is ordered by observation time: a procwatch read
+  taken before an OSC 7 hint arrived no longer moves the session back.
 - Documented native worker supervision (#100): every worker generation is its
   own systemd transient unit (`pohunek-<ns>-worker-<session-id>-<generation>.service`
   in `pohunek-<ns>-sessions.slice`, systemd 255 or newer) or launchd job

@@ -1683,6 +1683,7 @@ impl SessionRegistry {
             last_agent_report: active_agent,
             last_native_report: record.native_identity_ordering.clone(),
             observed_agents: Vec::<ObservedAgent>::new(),
+            cwd_observed_at: std::time::Instant::now(),
         };
         if let Err(error) = self.write_session_record(record).await {
             tracing::warn!(session_id = %id.0, error = %error, "failed to commit reconciled worker");
@@ -1826,6 +1827,7 @@ impl SessionRegistry {
             last_agent_report: None,
             last_native_report: record.native_identity_ordering.clone(),
             observed_agents: Vec::new(),
+            cwd_observed_at: std::time::Instant::now(),
         };
         if let Err(error) = self.write_session_record(record).await {
             tracing::warn!(session_id = %id.0, error = %error, "failed to persist runtime classification");

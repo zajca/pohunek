@@ -2748,6 +2748,26 @@ fn project_registry(tag: &str) -> (SessionRegistry, PathBuf) {
     (registry, repo)
 }
 
+/// A project registry whose procwatch never reads a session cwd.
+///
+/// The OSC 7 hints these tests send do not move the real shell, so a host
+/// procwatch scan would report the shell's real cwd between two hints and
+/// race the assertions. With no scripted cwd, only the hints move a session.
+fn hint_registry(tag: &str) -> (SessionRegistry, PathBuf) {
+    let store = temp_store_path(tag);
+    let worktree_root = store.parent().expect("store parent").join("worktrees");
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            store_path: Some(store),
+            worktree_root: Some(worktree_root),
+            ..SessionRegistryConfig::default()
+        },
+        Arc::new(MockInspector::default()),
+    );
+    let repo = init_git_repo(tag);
+    (registry, repo)
+}
+
 #[tokio::test]
 async fn session_new_auto_registers_project_from_cwd_and_stamps_ids() {
     // The first observable change (M3): starting a session inside a git work
@@ -2963,7 +2983,7 @@ async fn session_new_branch_with_detected_project_binds_worktree_carrying_projec
 
 #[tokio::test]
 async fn cwd_hint_remaps_between_registered_worktrees() {
-    let (registry, repo) = project_registry("cwd-remap-worktrees");
+    let (registry, repo) = hint_registry("cwd-remap-worktrees");
     let first = registry
         .create(SessionNewParams {
             cwd: Some(repo.clone()),
@@ -3017,6 +3037,70 @@ async fn cwd_hint_remaps_between_registered_worktrees() {
 }
 
 #[tokio::test]
+async fn older_cwd_evidence_never_replaces_newer_evidence() {
+    let (registry, _inspector, created) = mock_procwatch_registry("cwd-evidence-order").await;
+    let launched = created.cwd.clone();
+    let hinted = temp_dir("cwd-evidence-hint");
+    // A procwatch scan read the launch cwd, then an OSC 7 hint landed before
+    // the scan got to apply its result.
+    let scanned = Instant::now();
+    let hinted_at = scanned + Duration::from_millis(1);
+
+    registry
+        .apply_cwd_change(
+            &created.id,
+            hinted.clone(),
+            CwdSource::Osc7,
+            None,
+            hinted_at,
+        )
+        .await;
+    registry
+        .apply_cwd_change(
+            &created.id,
+            launched.clone(),
+            CwdSource::Procwatch,
+            None,
+            scanned,
+        )
+        .await;
+    let kept = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(kept.cwd, hinted);
+    assert_eq!(kept.cwd_source, Some(CwdSource::Osc7));
+
+    // Newer evidence for the same cwd keeps the source that established it.
+    let confirmed_at = hinted_at + Duration::from_millis(1);
+    registry
+        .apply_cwd_change(
+            &created.id,
+            hinted.clone(),
+            CwdSource::Procwatch,
+            None,
+            confirmed_at,
+        )
+        .await;
+    let confirmed = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(confirmed.cwd, hinted);
+    assert_eq!(confirmed.cwd_source, Some(CwdSource::Osc7));
+
+    // Newer evidence of a different cwd moves the session.
+    registry
+        .apply_cwd_change(
+            &created.id,
+            launched.clone(),
+            CwdSource::Procwatch,
+            None,
+            confirmed_at + Duration::from_millis(1),
+        )
+        .await;
+    let moved = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(moved.cwd, launched);
+    assert_eq!(moved.cwd_source, Some(CwdSource::Procwatch));
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
 async fn cwd_hint_into_an_unregistered_repo_registers_no_project() {
     // Regression: cwd hints (OSC 7 / procwatch focus) used to upsert an Auto
     // project record for whatever repo the observed cwd landed in, so a repo a
@@ -3024,7 +3108,7 @@ async fn cwd_hint_into_an_unregistered_repo_registers_no_project() {
     // a nested test-suite daemon — permanently polluted the registry. Hints
     // must only *derive* the association; registration stays on session.new
     // and explicit `project add`.
-    let (registry, repo) = project_registry("hint-no-register");
+    let (registry, repo) = hint_registry("hint-no-register");
     let session = registry
         .create(SessionNewParams {
             cwd: Some(repo),

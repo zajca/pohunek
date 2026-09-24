@@ -756,6 +756,7 @@ impl SessionRegistry {
             last_agent_report: None,
             last_native_report: None,
             observed_agents: Vec::new(),
+            cwd_observed_at: std::time::Instant::now(),
         };
         if let Err(error) = self.commit_session_entry(&id, entry).await {
             self.stop_uncommitted_runtime(&id, &started.handle).await;

@@ -528,6 +528,10 @@ struct SessionEntry {
     last_agent_report: Option<ActiveAgentReport>,
     last_native_report: Option<NativeIdentityReport>,
     observed_agents: Vec<ObservedAgent>,
+    /// When the evidence that set `info.cwd` was observed. Older cwd evidence
+    /// never replaces it, so a scan that read a process before a newer OSC 7
+    /// hint landed cannot move the session back.
+    cwd_observed_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -2158,6 +2162,7 @@ impl SessionRegistry {
         path: String,
         expected: Option<&RuntimeWatchIdentity>,
     ) {
+        let observed_at = Instant::now();
         let cwd = PathBuf::from(path);
         if !cwd.is_absolute() {
             debug!(
@@ -2169,7 +2174,7 @@ impl SessionRegistry {
         }
         match cwd.try_exists() {
             Ok(true) => {
-                self.apply_cwd_change(id, cwd, CwdSource::Osc7, expected)
+                self.apply_cwd_change(id, cwd, CwdSource::Osc7, expected, observed_at)
                     .await;
             }
             Ok(false) => {
@@ -2190,14 +2195,20 @@ impl SessionRegistry {
         }
     }
 
+    /// Moves the session to `cwd` unless the evidence that set its current cwd
+    /// is newer.
+    ///
+    /// `observed_at` is when the evidence was read. Evidence for the current
+    /// cwd changes nothing, so the source that established it stays.
     async fn apply_cwd_change(
         &self,
         id: &SessionId,
         cwd: PathBuf,
         source: CwdSource,
         expected: Option<&RuntimeWatchIdentity>,
+        observed_at: Instant,
     ) {
-        if !self.cwd_update_needed(id, &cwd).await {
+        if !self.cwd_update_needed(id, &cwd, observed_at).await {
             return;
         }
 
@@ -2212,9 +2223,10 @@ impl SessionRegistry {
                 debug!(session_id = %id.0, "cwd update arrived for a superseded runtime");
                 return;
             }
-            if entry.stopping || is_terminal(entry.info.state) || entry.info.cwd == cwd {
+            if !cwd_evidence_moves(entry, &cwd, observed_at) {
                 return;
             }
+            entry.cwd_observed_at = observed_at;
             Some(apply_cwd_change(entry, cwd, source, association))
         };
 
@@ -2223,12 +2235,11 @@ impl SessionRegistry {
         }
     }
 
-    async fn cwd_update_needed(&self, id: &SessionId, cwd: &Path) -> bool {
+    async fn cwd_update_needed(&self, id: &SessionId, cwd: &Path, observed_at: Instant) -> bool {
         let sessions = self.inner.sessions.lock().await;
-        let Some(entry) = sessions.get(id) else {
-            return false;
-        };
-        !entry.stopping && !is_terminal(entry.info.state) && entry.info.cwd != cwd
+        sessions
+            .get(id)
+            .is_some_and(|entry| cwd_evidence_moves(entry, cwd, observed_at))
     }
 
     async fn resolve_cwd_association(
@@ -3771,6 +3782,16 @@ where
     T: serde::Serialize,
 {
     serde_json::to_value(payload).expect("protocol event payload serialization is infallible")
+}
+
+/// Whether cwd evidence observed at `observed_at` moves a live session to `cwd`.
+///
+/// Evidence older than the evidence that set the current cwd is stale.
+fn cwd_evidence_moves(entry: &SessionEntry, cwd: &Path, observed_at: Instant) -> bool {
+    !entry.stopping
+        && !is_terminal(entry.info.state)
+        && observed_at >= entry.cwd_observed_at
+        && entry.info.cwd != cwd
 }
 
 fn apply_cwd_change(
