@@ -147,8 +147,10 @@ jobs:
       - name: Lint daemon, CLI, worker, and service configuration
         run: cargo clippy --locked -p pohunek-daemon -p pohunek-cli -p pohunek-session-worker -p pohunek-service-config -p pohunek-worker-protocol -p pohunek-paths --all-targets -- -D warnings
 
-      # Daemon and CLI integration tests spawn the real binaries by path.
+      # Daemon and CLI integration tests spawn the real binaries by path, so
+      # build them even when an earlier suite failed.
       - name: Build daemon, worker, and CLI binaries
+        if: ${{ !cancelled() }}
         run: cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli --bins
 
       - name: Test service configuration
