@@ -8,8 +8,21 @@
 //! serves them alongside the local Unix socket under one shutdown. A provider
 //! being temporarily unavailable is not an error: the daemon stays reachable
 //! through healthy transports while retrying that listener.
+//!
+//! Worker supervision is selected explicitly:
+//!
+//! - `pohunekd --service-config <absolute service.toml>` supervises workers as
+//!   native jobs (transient systemd units on Linux, launchd jobs on macOS)
+//!   with every value from the installed configuration;
+//! - `POHUNEK_WORKER_LAUNCHER=subprocess` without `--service-config` runs
+//!   workers as direct children under the documented dev/test contract.
+//!
+//! Anything else fails at startup.
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::future::Future;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,14 +43,17 @@ use pohunek_daemon::notifications::{
     AttentionCoordinator, NotificationProjector, NotificationRetentionTask, NotificationService,
     NOTIFICATIONS_SUBDIR,
 };
-use pohunek_daemon::runtime::{
-    SubprocessWorkerEnvironment, SubprocessWorkerLauncher, UnitTemplate, WorkerLauncher,
-    DEFAULT_WORKER_UNIT_TEMPLATE,
+use pohunek_daemon::runtime::lifecycle::{
+    LogNaming, DEV_OPEN_FILES, DEV_SWEEP_GRACE, DEV_WORKER_CONNECT, DEV_WORKER_EXIT_TIMEOUT,
+    DEV_WORKER_INITIALIZE,
 };
+use pohunek_daemon::runtime::{SubprocessWorkerLauncher, SupervisionConfig, WorkerLauncher};
 use pohunek_daemon::session::{
     SessionRegistry, SessionRegistryConfig, SessionRetentionTask, RETENTION_POLICY_NAME,
 };
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
+use pohunek_platform::supervisor::Namespace;
+use pohunek_service_config::ServiceConfig;
 
 /// File name of the unified logical-session metadata store under the data dir.
 const STORE_NAME: &str = "metadata.jsonl";
@@ -52,15 +68,31 @@ const WORKERS_SUBDIR: &str = pohunek_paths::WORKERS_SUBDIR;
 
 /// Env var enabling opt-in observation of agents outside pohunek-owned PTYs.
 const OBSERVE_EXTERNAL_AGENTS_ENV: &str = "POHUNEK_OBSERVE_EXTERNAL_AGENTS";
-/// Optional worker template override for isolated systemd integration tests.
-const WORKER_UNIT_TEMPLATE_ENV: &str = "POHUNEK_WORKER_UNIT_TEMPLATE";
-/// Selects how the daemon activates durable session workers: `systemd` (default)
-/// or `subprocess`. `subprocess` spawns `pohunek-sessiond` as a direct child, for
-/// headless environments (CI, containers) with no systemd user manager.
+/// Selects the dev/test supervision mode; its only accepted value is
+/// [`SUBPROCESS_LAUNCHER`]. Native supervision is selected by
+/// [`SERVICE_CONFIG_FLAG`] instead.
 const WORKER_LAUNCHER_ENV: &str = "POHUNEK_WORKER_LAUNCHER";
+/// Value of [`WORKER_LAUNCHER_ENV`] that runs `pohunek-sessiond` as direct
+/// children, for headless development and tests without a service manager.
+const SUBPROCESS_LAUNCHER: &str = "subprocess";
+/// Command-line flag naming the installed `service.toml`.
+const SERVICE_CONFIG_FLAG: &str = "--service-config";
 /// Overrides the durable worker binary path used by the subprocess launcher.
 /// When unset, the daemon uses the `pohunek-sessiond` co-located next to itself.
 const WORKER_BIN_ENV: &str = "POHUNEK_WORKER_BIN";
+/// Bootstrap variables forwarded to worker jobs when the daemon has them.
+///
+/// A worker resolves its paths from exactly these, so forwarding the daemon's
+/// own values makes both resolve the same tree; unset variables fall back to
+/// the same `HOME`-relative or platform defaults on both sides.
+const BOOTSTRAP_VARIABLES: [&str; 6] = [
+    "XDG_RUNTIME_DIR",
+    "XDG_STATE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "HOME",
+];
 /// Durable worker binary name, expected next to the daemon executable.
 const WORKER_BINARY_NAME: &str = "pohunek-sessiond";
 
@@ -93,8 +125,21 @@ const REMOTE_BIND_MAX_RETRY_INTERVAL: Duration = Duration::from_mins(5);
 /// the provider CLI.
 const REMOTE_LISTENER_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Sole argument that prints the binary name and version and exits.
+///
+/// `pohunek service install` runs it to confirm a staged executable before
+/// referencing it, so it is answered before any environment, path, logging,
+/// lock, or socket work.
+const VERSION_FLAG: &str = "--version";
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    if std::env::args_os()
+        .skip(1)
+        .eq([OsString::from(VERSION_FLAG)])
+    {
+        return print_version();
+    }
     // The startup future is large (reconciliation, listeners, event logs); box
     // it so it lives on the heap instead of inflating the `main` task frame.
     match Box::pin(run()).await {
@@ -114,7 +159,12 @@ async fn main() -> ExitCode {
     reason = "Daemon startup deliberately keeps ordered readiness gates in one auditable sequence."
 )]
 async fn run() -> Result<(), DaemonError> {
-    // 1. Resolve all paths up front; fail fast on missing required env.
+    // 1. Select worker supervision and resolve all paths up front; fail fast on
+    //    a missing mode or required env.
+    let mode = select_supervision(
+        parse_service_config(std::env::args_os().skip(1))?,
+        std::env::var_os(WORKER_LAUNCHER_ENV),
+    )?;
     let paths = Paths::resolve()?;
 
     // 2. Acquire the durable data authority before opening any state service.
@@ -177,10 +227,9 @@ async fn run() -> Result<(), DaemonError> {
         observe_external_agents: env_bool(OBSERVE_EXTERNAL_AGENTS_ENV)?,
         worker_runtime_root: Some(paths.runtime_dir.join(WORKERS_SUBDIR)),
         worker_state_root: Some(paths.state_dir.join(WORKERS_SUBDIR)),
-        worker_unit_template: worker_unit_template()?,
         ..SessionRegistryConfig::default()
     };
-    let sessions = build_session_registry(config, &paths)?;
+    let sessions = build_session_registry(config, &paths, mode).await?;
     // Load the durable retention policy before anything can sweep: a corrupt or
     // unsafely-permissioned document must fail startup rather than silently
     // revert to the shipped default.
@@ -321,120 +370,275 @@ fn env_bool(var: &str) -> Result<bool, DaemonError> {
     }
 }
 
-fn worker_unit_template() -> Result<UnitTemplate, DaemonError> {
-    let value = std::env::var(WORKER_UNIT_TEMPLATE_ENV)
-        .unwrap_or_else(|_| DEFAULT_WORKER_UNIT_TEMPLATE.to_owned());
-    UnitTemplate::parse(&value).map_err(|_template_error| DaemonError::InvalidEnv {
-        var: WORKER_UNIT_TEMPLATE_ENV.to_owned(),
-        value,
-        expected: "an ASCII systemd template like pohunek-session@.service",
-    })
+/// Prints `pohunekd <version>` for the installer.
+fn print_version() -> ExitCode {
+    use std::io::Write as _;
+
+    match writeln!(std::io::stdout(), "pohunekd {DAEMON_VERSION}") {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("pohunekd: failed to print the version: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
-/// Durable worker activation backend selected by [`WORKER_LAUNCHER_ENV`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkerLauncherMode {
-    /// Native systemd user-manager units (production default).
-    Systemd,
-    /// Direct child `pohunek-sessiond` processes (headless / CI).
+/// Worker supervision selected at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SupervisionMode {
+    /// Native jobs configured by the installed `service.toml` at this path.
+    Native(PathBuf),
+    /// Direct `pohunek-sessiond` children under the dev/test contract.
     Subprocess,
 }
 
-/// Builds the session registry with the durable-worker launcher selected by
-/// [`WORKER_LAUNCHER_ENV`]: the systemd user manager by default, or a direct
-/// `pohunek-sessiond` child process for headless environments (CI, containers)
-/// that have no systemd user manager or session D-Bus.
-fn build_session_registry(
-    config: SessionRegistryConfig,
-    paths: &Paths,
-) -> Result<SessionRegistry, DaemonError> {
-    match worker_launcher_mode()? {
-        WorkerLauncherMode::Systemd => {
-            SessionRegistry::new_production(config).map_err(DaemonError::Reconcile)
+/// Parses `pohunekd [--service-config <absolute path>]`.
+fn parse_service_config(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Result<Option<PathBuf>, DaemonError> {
+    let mut arguments = arguments.into_iter();
+    let mut service_config = None;
+    while let Some(argument) = arguments.next() {
+        if argument != SERVICE_CONFIG_FLAG {
+            return Err(DaemonError::Arguments(format!(
+                "unexpected argument {}",
+                argument.to_string_lossy()
+            )));
         }
-        WorkerLauncherMode::Subprocess => Ok(SessionRegistry::new_with_launcher_and_inspector(
-            config,
-            subprocess_worker_launcher(paths)?,
-            Arc::new(pohunek_daemon::procwatch::HostInspector::new()),
-        )),
+        let path = arguments.next().map(PathBuf::from).ok_or_else(|| {
+            DaemonError::Arguments(format!("{SERVICE_CONFIG_FLAG} requires a path"))
+        })?;
+        if !path.is_absolute() {
+            return Err(DaemonError::Arguments(format!(
+                "{SERVICE_CONFIG_FLAG} must be an absolute path, got {}",
+                path.display()
+            )));
+        }
+        if service_config.replace(path).is_some() {
+            return Err(DaemonError::Arguments(format!(
+                "{SERVICE_CONFIG_FLAG} was given more than once"
+            )));
+        }
+    }
+    Ok(service_config)
+}
+
+/// Chooses exactly one supervision mode from the command line and
+/// [`WORKER_LAUNCHER_ENV`].
+fn select_supervision(
+    service_config: Option<PathBuf>,
+    launcher: Option<OsString>,
+) -> Result<SupervisionMode, DaemonError> {
+    let subprocess = match launcher {
+        None => false,
+        Some(value) if value == SUBPROCESS_LAUNCHER => true,
+        Some(value) => {
+            return Err(DaemonError::InvalidEnv {
+                var: WORKER_LAUNCHER_ENV.to_owned(),
+                value: value.to_string_lossy().into_owned(),
+                expected: "subprocess (native supervision is selected by --service-config)",
+            })
+        }
+    };
+    match (service_config, subprocess) {
+        (Some(path), false) => Ok(SupervisionMode::Native(path)),
+        (None, true) => Ok(SupervisionMode::Subprocess),
+        (Some(_), true) => Err(DaemonError::SupervisionMode {
+            detail:
+                "--service-config and POHUNEK_WORKER_LAUNCHER=subprocess are mutually exclusive",
+        }),
+        (None, false) => Err(DaemonError::SupervisionMode {
+            detail: "no supervision mode was selected",
+        }),
     }
 }
 
-fn worker_launcher_mode() -> Result<WorkerLauncherMode, DaemonError> {
-    let Some(value) = std::env::var_os(WORKER_LAUNCHER_ENV) else {
-        return Ok(WorkerLauncherMode::Systemd);
-    };
-    match value
-        .to_str()
-        .map(|raw| raw.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("" | "systemd") => Ok(WorkerLauncherMode::Systemd),
-        Some("subprocess") => Ok(WorkerLauncherMode::Subprocess),
-        Some(other) => Err(DaemonError::InvalidEnv {
-            var: WORKER_LAUNCHER_ENV.to_owned(),
-            value: other.to_owned(),
-            expected: "systemd or subprocess",
-        }),
-        None => Err(DaemonError::InvalidEnv {
-            var: WORKER_LAUNCHER_ENV.to_owned(),
-            value: "<non-utf8>".to_owned(),
-            expected: "systemd or subprocess",
-        }),
+/// Builds the session registry with the worker supervisor of `mode`.
+async fn build_session_registry(
+    mut config: SessionRegistryConfig,
+    paths: &Paths,
+    mode: SupervisionMode,
+) -> Result<SessionRegistry, DaemonError> {
+    let bootstrap_environment = bootstrap_environment()?;
+    let working_directory = bootstrap_environment
+        .get("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| DaemonError::MissingEnv {
+            var: "HOME".to_owned(),
+        })?;
+    // Workers run with HOME as their working directory; a missing one would
+    // only surface later as a failed launch of every session.
+    if !working_directory.is_dir() {
+        return Err(DaemonError::InvalidEnv {
+            var: "HOME".to_owned(),
+            value: working_directory.display().to_string(),
+            expected: "an existing absolute directory (the worker working directory)",
+        });
     }
+    let (supervision, supervisor): (SupervisionConfig, Arc<dyn WorkerLauncher>) = match mode {
+        SupervisionMode::Native(path) => {
+            let service = ServiceConfig::load(&path)?;
+            service.verify_installation(
+                nix::unistd::Uid::effective().as_raw(),
+                &paths.state_dir,
+                &paths.runtime_dir,
+            )?;
+            let deadlines = service.deadlines();
+            config.worker_connect_deadline = deadlines.worker_connect;
+            let (supervisor, worker_logs) = native_supervisor(&service, paths).await?;
+            info!(
+                service.namespace = %service.namespace(),
+                service.version = service.active_version(),
+                "supervising workers as native jobs"
+            );
+            (
+                SupervisionConfig {
+                    namespace: service.namespace(),
+                    worker_executable: service.worker_executable(),
+                    service_config: Some(path),
+                    daemon_socket: paths.socket.clone(),
+                    worker_initialize: deadlines.worker_initialize,
+                    worker_exit_timeout: deadlines.worker_exit_timeout,
+                    environment_allowlist: service.environment_allowlist().to_vec(),
+                    sweep_grace: service.sweep_grace(),
+                    open_files: service.open_files(),
+                    bootstrap_environment,
+                    working_directory,
+                    worker_logs,
+                },
+                supervisor,
+            )
+        }
+        SupervisionMode::Subprocess => {
+            config.worker_connect_deadline = DEV_WORKER_CONNECT;
+            let namespace = Namespace::derive(
+                nix::unistd::Uid::effective().as_raw(),
+                &std::fs::canonicalize(&paths.state_dir)?,
+                &std::fs::canonicalize(&paths.runtime_dir)?,
+            );
+            warn!(
+                service.namespace = %namespace,
+                "supervising workers as direct children (dev/test subprocess mode)"
+            );
+            (
+                SupervisionConfig {
+                    namespace,
+                    worker_executable: resolve_worker_binary()?,
+                    service_config: None,
+                    daemon_socket: paths.socket.clone(),
+                    worker_initialize: DEV_WORKER_INITIALIZE,
+                    worker_exit_timeout: DEV_WORKER_EXIT_TIMEOUT,
+                    environment_allowlist: pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST
+                        .iter()
+                        .map(|pattern| (*pattern).to_owned())
+                        .collect(),
+                    sweep_grace: DEV_SWEEP_GRACE,
+                    open_files: DEV_OPEN_FILES,
+                    bootstrap_environment,
+                    working_directory,
+                    worker_logs: None,
+                },
+                Arc::new(SubprocessWorkerLauncher::new()),
+            )
+        }
+    };
+    config.supervision = Some(supervision);
+    SessionRegistry::new_production(config, supervisor).map_err(DaemonError::Reconcile)
 }
 
-/// Builds a subprocess launcher rooted in the daemon's own XDG base directories,
-/// so a spawned worker resolves the exact runtime/state paths the daemon expects.
-fn subprocess_worker_launcher(paths: &Paths) -> Result<Arc<dyn WorkerLauncher>, DaemonError> {
-    let environment = SubprocessWorkerEnvironment {
-        runtime_home: xdg_base(&paths.runtime_dir)?,
-        state_home: xdg_base(&paths.state_dir)?,
-        data_home: xdg_base(&paths.data_dir)?,
-        config_home: paths.config_home.clone(),
-        cache_home: xdg_base(&paths.cache_dir)?,
-        daemon_socket: paths.socket.clone(),
-    };
-    Ok(Arc::new(SubprocessWorkerLauncher::new(
-        resolve_worker_binary()?,
-        environment,
-    )))
+/// Captures the bootstrap variables this daemon was started with.
+fn bootstrap_environment() -> Result<BTreeMap<String, String>, DaemonError> {
+    BOOTSTRAP_VARIABLES
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (*name, value)))
+        .map(|(name, value)| {
+            value
+                .into_string()
+                .map(|value| (name.to_owned(), value))
+                .map_err(|_non_utf8| DaemonError::InvalidEnv {
+                    var: name.to_owned(),
+                    value: "<non-utf8>".to_owned(),
+                    expected: "a UTF-8 absolute path",
+                })
+        })
+        .collect()
 }
+
+/// Native worker supervisor and the log naming its definitions must use.
+type NativeSupervisor = (Arc<dyn WorkerLauncher>, Option<LogNaming>);
+
+/// Connects the systemd user manager that runs workers as transient units.
+///
+/// Worker output goes to the journal, so definitions name no log files. One
+/// D-Bus call is bounded by the configured `launchctl_command` deadline: both
+/// bound a single request to the user's service manager, so the installation
+/// keeps one knob instead of inventing a second value.
+#[cfg(target_os = "linux")]
+async fn native_supervisor(
+    service: &ServiceConfig,
+    _paths: &Paths,
+) -> Result<NativeSupervisor, DaemonError> {
+    let supervisor = pohunek_platform::supervisor::systemd::SystemdSupervisor::connect(
+        service.namespace(),
+        service.deadlines().launchctl_command,
+    )
+    .await?;
+    Ok((Arc::new(supervisor), None))
+}
+
+/// Creates the launchd supervisor that runs workers as `gui/<uid>` jobs.
+///
+/// Definitions must name exactly the log files the backend removes on
+/// retirement, so the naming comes from the backend itself.
+#[cfg(target_os = "macos")]
+#[expect(
+    clippy::unused_async,
+    reason = "the signature is shared with the systemd target, which connects to D-Bus"
+)]
+async fn native_supervisor(
+    service: &ServiceConfig,
+    paths: &Paths,
+) -> Result<NativeSupervisor, DaemonError> {
+    let supervisor = Arc::new(
+        pohunek_platform::supervisor::launchd::LaunchdSupervisor::new(
+            service.namespace(),
+            service.uid(),
+            paths.state_dir.join(pohunek_paths::LAUNCHD_SUBDIR),
+            paths.log_dir.join(pohunek_paths::LAUNCHD_SUBDIR),
+            service.deadlines().launchctl_command,
+        )?,
+    );
+    let naming = Arc::clone(&supervisor);
+    let worker_logs = LogNaming::new(move |key| naming.worker_logs(key));
+    Ok((supervisor, Some(worker_logs)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("pohunekd supervises workers only through systemd (Linux) or launchd (macOS)");
 
 /// Resolves the durable worker binary: [`WORKER_BIN_ENV`] when set, otherwise the
 /// `pohunek-sessiond` co-located next to the running daemon executable.
-fn resolve_worker_binary() -> Result<std::path::PathBuf, DaemonError> {
-    if let Some(path) = std::env::var_os(WORKER_BIN_ENV) {
-        return Ok(std::path::PathBuf::from(path));
+fn resolve_worker_binary() -> Result<PathBuf, DaemonError> {
+    let binary = match std::env::var_os(WORKER_BIN_ENV) {
+        Some(path) => PathBuf::from(path),
+        None => std::env::current_exe()?
+            .parent()
+            .map(|dir| dir.join(WORKER_BINARY_NAME))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "daemon executable has no parent directory to locate the worker binary",
+                )
+            })?,
+    };
+    if !binary.is_absolute() {
+        return Err(DaemonError::InvalidEnv {
+            var: WORKER_BIN_ENV.to_owned(),
+            value: binary.display().to_string(),
+            expected: "an absolute path to pohunek-sessiond",
+        });
     }
-    let exe = std::env::current_exe()?;
-    exe.parent()
-        .map(|dir| dir.join(WORKER_BINARY_NAME))
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "daemon executable has no parent directory to locate the worker binary",
-            )
-            .into()
-        })
-}
-
-/// Recovers the XDG base directory that produced a `<base>/pohunek` daemon path,
-/// so the worker (which re-appends `pohunek/...`) lands on the same tree.
-fn xdg_base(app_scoped_dir: &std::path::Path) -> Result<std::path::PathBuf, DaemonError> {
-    app_scoped_dir
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "daemon path {} has no XDG base parent",
-                    app_scoped_dir.display()
-                ),
-            )
-            .into()
-        })
+    Ok(binary)
 }
 
 #[derive(Debug)]
@@ -1076,5 +1280,74 @@ mod tests {
         .await
         .expect("shutdown completion is expected");
         assert!(!daemon_shutdown_started.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod supervision_tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use pohunek_daemon::DaemonError;
+
+    use super::{parse_service_config, select_supervision, SupervisionMode};
+
+    fn arguments(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn the_command_line_accepts_only_one_absolute_service_config() {
+        assert_eq!(parse_service_config(arguments(&[])).expect("no flag"), None);
+        assert_eq!(
+            parse_service_config(arguments(&["--service-config", "/etc/p/service.toml"]))
+                .expect("absolute path"),
+            Some(PathBuf::from("/etc/p/service.toml"))
+        );
+        for rejected in [
+            &["--service-config"][..],
+            &["--service-config", "service.toml"],
+            &["--service-config", "/a.toml", "--service-config", "/b.toml"],
+            &["--worker-launcher", "subprocess"],
+        ] {
+            assert!(
+                matches!(
+                    parse_service_config(arguments(rejected)),
+                    Err(DaemonError::Arguments(_))
+                ),
+                "{rejected:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn exactly_one_supervision_mode_must_be_selected() {
+        let config = PathBuf::from("/etc/p/service.toml");
+        assert_eq!(
+            select_supervision(Some(config.clone()), None).expect("native"),
+            SupervisionMode::Native(config.clone())
+        );
+        assert_eq!(
+            select_supervision(None, Some(OsString::from("subprocess"))).expect("dev/test"),
+            SupervisionMode::Subprocess
+        );
+        for (service_config, launcher) in [
+            (None, None),
+            (Some(config.clone()), Some(OsString::from("subprocess"))),
+        ] {
+            let error = select_supervision(service_config, launcher)
+                .expect_err("ambiguous or missing supervision");
+            let message = error.to_string();
+            assert!(matches!(error, DaemonError::SupervisionMode { .. }));
+            assert!(
+                message.contains("--service-config")
+                    && message.contains("POHUNEK_WORKER_LAUNCHER=subprocess"),
+                "the error names both options: {message}"
+            );
+        }
+        assert!(matches!(
+            select_supervision(None, Some(OsString::from("systemd"))),
+            Err(DaemonError::InvalidEnv { .. })
+        ));
     }
 }

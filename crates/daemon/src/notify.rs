@@ -22,10 +22,10 @@ pub fn ready() -> io::Result<()> {
         return Ok(());
     };
     let socket = UnixDatagram::unbound()?;
-    let bytes = address.as_encoded_bytes();
 
+    // Abstract socket names (`@...`) exist only on Linux.
     #[cfg(target_os = "linux")]
-    if let Some(name) = bytes.strip_prefix(b"@") {
+    if let Some(name) = address.as_encoded_bytes().strip_prefix(b"@") {
         use std::os::linux::net::SocketAddrExt;
 
         let address = std::os::unix::net::SocketAddr::from_abstract_name(name)?;

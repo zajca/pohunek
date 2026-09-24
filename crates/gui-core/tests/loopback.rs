@@ -2121,14 +2121,13 @@ fn worker_backed_registry(mut config: SessionRegistryConfig) -> SessionRegistry 
         data_home: worker_home.join("data"),
         config_home: worker_home.join("config"),
         cache_home: worker_home.join("cache"),
+        home: worker_home.clone(),
         daemon_socket: worker_home.join("daemon.sock"),
     };
     config.worker_runtime_root = Some(worker_environment.runtime_home.join("pohunek/workers"));
     config.worker_state_root = Some(worker_environment.state_home.join("pohunek/workers"));
-    let launcher = Arc::new(SubprocessWorkerLauncher::new(
-        worker_binary(),
-        worker_environment,
-    ));
+    config.supervision = Some(worker_environment.supervision(worker_binary()));
+    let launcher = Arc::new(SubprocessWorkerLauncher::new());
     SessionRegistry::new_with_launcher_and_inspector(
         config,
         launcher,

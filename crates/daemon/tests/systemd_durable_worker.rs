@@ -1,4 +1,11 @@
+//! Real-systemd durability of worker generations across daemon restarts.
+//!
+//! Linux-only: it drives transient user units of the systemd backend.
+
+#![cfg(target_os = "linux")]
+
 use std::collections::BTreeMap;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,6 +16,11 @@ use pohunek_daemon::runtime::Worker;
 use pohunek_daemon::store::{
     DesiredState, ResumeBinding, RuntimeRecord, SessionRecord, Store, StoredInputRules,
 };
+use pohunek_platform::supervisor::systemd::SystemdSupervisor;
+use pohunek_platform::supervisor::{
+    JobDefinition, JobSpec, Namespace, RestartPolicy, Supervisor, WorkerKey,
+};
+use pohunek_service_config::{ConfigSpec, Deadlines, ServiceConfig};
 use pohunek_worker_protocol::{
     BaseEnv, Dimensions, Initialize, InitializeLimits, LaunchIdentity, SecretEnv,
     SessionId as WorkerSessionId, StopPolicy, TransactionId, Version,
@@ -34,6 +46,22 @@ const REPLAY_BURST_MARKER: &[u8] = b"replay-burst-complete";
 const REPLAY_HISTORY_BYTES: u64 = 3_000_000;
 /// Fixed daemon-issued generation for the fixture's hand-started workers.
 const WORKER_GENERATION: &str = "abcd2345";
+/// Installation version directory the fixture's `service.toml` activates.
+const FIXTURE_VERSION: &str = "0.0.0-e2e";
+/// Bound on one D-Bus call to the user manager while starting fixture workers.
+const SYSTEMD_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Worker socket negotiation bound written to the fixture's `service.toml`.
+const WORKER_CONNECT: Duration = Duration::from_secs(10);
+/// Worker initialization bound written to the fixture's `service.toml`.
+const WORKER_INITIALIZE: Duration = Duration::from_secs(45);
+/// Worker and daemon stop grace written to the fixture's `service.toml`.
+const EXIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Daemon restart throttle written to the fixture's `service.toml`.
+const RESTART_THROTTLE: Duration = Duration::from_secs(5);
+/// Orphan sweep grace written to the fixture's `service.toml`.
+const SWEEP_GRACE: Duration = Duration::from_secs(5);
+/// Open-file limit written to the fixture's `service.toml`.
+const OPEN_FILES: u64 = 8_192;
 
 #[tokio::test]
 #[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a real systemd user manager"]
@@ -49,10 +77,10 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
     );
     let daemon_bin = required_binary("POHUNEK_DAEMON_BIN");
     let worker_bin = required_binary("POHUNEK_WORKER_BIN");
-    let fixture = Fixture::new();
+    let fixture = Fixture::new(&worker_bin);
 
-    fixture.start_worker(&worker_bin);
-    fixture.start_isolation_worker(&worker_bin);
+    fixture.start_worker(&fixture.worker_key).await;
+    fixture.start_worker(&fixture.isolation_worker_key).await;
     let worker = fixture.connect_worker("fixture-controller").await;
     let worker_id = worker.worker_id().await;
     let runtime_id = worker
@@ -90,7 +118,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
         .pid;
     fixture.persist_record_for(
         &fixture.isolation_session_id,
-        &fixture.isolation_worker_unit,
+        &fixture.isolation_worker_key,
         &isolation_worker_id.to_string(),
         &isolation_runtime_id.to_string(),
         isolation_child_pid,
@@ -266,6 +294,11 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
     assert_eq!(recovered.id.0, fixture.session_id);
     assert_eq!(recovered.created_at, original_created_at);
     assert_ne!(recovered.pid, child_pid);
+    assert_eq!(
+        Fixture::main_pid(&fixture.worker_unit),
+        0,
+        "recovery must retire the superseded generation"
+    );
     assert_ne!(recovered_worker_id, worker_id.as_str());
     assert_ne!(recovered_runtime_id, runtime_id.as_str());
     let persisted = Store::new(fixture.data_home.join("pohunek/metadata.jsonl"))
@@ -283,6 +316,28 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
     assert_eq!(
         persisted.runtime.runtime_id.as_deref(),
         Some(recovered_runtime_id)
+    );
+    let recovered_generation = persisted
+        .runtime
+        .generation
+        .clone()
+        .expect("recovered record names its generation");
+    assert_ne!(recovered_generation, WORKER_GENERATION);
+    let recovered_key = WorkerKey::new(fixture.session_id.clone(), recovered_generation)
+        .expect("recovered generation is valid");
+    assert_eq!(
+        persisted.runtime.service_id.as_deref(),
+        Some(recovered_key.service_id().as_str())
+    );
+    assert_eq!(
+        persisted.runtime.executable.as_deref(),
+        Some(fixture.worker_executable.as_path())
+    );
+    let recovered_unit = fixture.namespace.worker_unit(&recovered_key);
+    assert_ne!(
+        Fixture::main_pid(&recovered_unit),
+        0,
+        "the recovered generation runs as its own transient unit"
     );
 
     let repeated = client
@@ -347,15 +402,23 @@ struct Fixture {
     data_home: PathBuf,
     state_home: PathBuf,
     session_id: String,
+    worker_key: WorkerKey,
     worker_unit: String,
     isolation_session_id: String,
+    isolation_worker_key: WorkerKey,
     isolation_worker_unit: String,
     daemon_unit: String,
     socket: PathBuf,
+    namespace: Namespace,
+    service_config: PathBuf,
+    worker_executable: PathBuf,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    /// Lays out an isolated installation: XDG tree, versioned worker binary,
+    /// and an explicit `service.toml` whose namespace names the fixture's
+    /// transient units.
+    fn new(worker_bin: &Path) -> Self {
         let unique = format!(
             "{}{}",
             std::process::id(),
@@ -372,12 +435,67 @@ impl Fixture {
         for path in [&runtime_home, &config_home, &data_home, &state_home] {
             std::fs::create_dir_all(path).expect("create fixture XDG directory");
         }
+        for path in [
+            runtime_home.join("pohunek"),
+            state_home.join("pohunek"),
+            config_home.join("pohunek"),
+        ] {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .expect("create private application directory");
+        }
+        let state_root =
+            std::fs::canonicalize(state_home.join("pohunek")).expect("canonical state root");
+        let runtime_root =
+            std::fs::canonicalize(runtime_home.join("pohunek")).expect("canonical runtime root");
+        let prefix = std::fs::canonicalize(&root)
+            .expect("canonical fixture root")
+            .join("prefix");
+        let service = ServiceConfig::new(ConfigSpec {
+            prefix,
+            active_version: FIXTURE_VERSION.to_owned(),
+            uid: nix::unistd::Uid::effective().as_raw(),
+            state_root,
+            runtime_root,
+            deadlines: Deadlines {
+                worker_connect: WORKER_CONNECT,
+                worker_initialize: WORKER_INITIALIZE,
+                launchctl_command: SYSTEMD_CALL_TIMEOUT,
+                worker_exit_timeout: EXIT_TIMEOUT,
+                daemon_exit_timeout: EXIT_TIMEOUT,
+                daemon_restart_throttle: RESTART_THROTTLE,
+            },
+            environment_allowlist: DEFAULT_ENVIRONMENT_ALLOWLIST
+                .iter()
+                .map(|pattern| (*pattern).to_owned())
+                .collect(),
+            sweep_grace: SWEEP_GRACE,
+            open_files: OPEN_FILES,
+        })
+        .expect("valid fixture service configuration");
+        let service_config = config_home.join("pohunek/service.toml");
+        service
+            .write(&service_config)
+            .expect("write fixture service configuration");
+        let worker_executable = service.worker_executable();
+        std::fs::create_dir_all(
+            worker_executable
+                .parent()
+                .expect("versioned worker has a directory"),
+        )
+        .expect("create versioned worker directory");
+        std::fs::copy(worker_bin, &worker_executable).expect("install versioned worker binary");
+        let namespace = service.namespace();
         let session_id = format!("s-{unique}");
         let isolation_session_id = format!("s-{unique}9");
+        let worker_key = WorkerKey::new(session_id.clone(), WORKER_GENERATION).expect("worker key");
+        let isolation_worker_key = WorkerKey::new(isolation_session_id.clone(), WORKER_GENERATION)
+            .expect("isolation worker key");
         Self {
             socket: runtime_home.join("pohunek/daemon.sock"),
-            worker_unit: format!("pohunek-session@{session_id}.service"),
-            isolation_worker_unit: format!("pohunek-session@{isolation_session_id}.service"),
+            worker_unit: namespace.worker_unit(&worker_key),
+            isolation_worker_unit: namespace.worker_unit(&isolation_worker_key),
             daemon_unit: format!("pohunek-rfc-daemon-{unique}.service"),
             root,
             runtime_home,
@@ -385,72 +503,79 @@ impl Fixture {
             data_home,
             state_home,
             session_id,
+            worker_key,
             isolation_session_id,
+            isolation_worker_key,
+            namespace,
+            service_config,
+            worker_executable,
         }
     }
 
-    fn start_worker(&self, worker_bin: &Path) {
-        self.systemd_run(
-            &self.worker_unit,
-            worker_bin,
-            &[
-                "--session-id",
-                self.session_id.as_str(),
-                "--worker-generation",
-                WORKER_GENERATION,
+    /// Registers one worker generation through the transient-unit backend,
+    /// exactly as the daemon's lifecycle engine would.
+    async fn start_worker(&self, key: &WorkerKey) {
+        let supervisor = SystemdSupervisor::connect(self.namespace.clone(), SYSTEMD_CALL_TIMEOUT)
+            .await
+            .expect("connect the systemd user manager");
+        let definition = JobDefinition::new(JobSpec {
+            executable: self.worker_executable.clone(),
+            arguments: vec![
+                "--session-id".to_owned(),
+                key.session_id().to_owned(),
+                "--worker-generation".to_owned(),
+                key.generation().to_owned(),
+                "--service-config".to_owned(),
+                path_string(&self.service_config),
+                "--daemon-socket-path".to_owned(),
+                path_string(&self.socket),
             ],
-            false,
-        );
+            environment: self.bootstrap_environment(),
+            working_directory: self.root.clone(),
+            logs: None,
+            start_timeout: WORKER_INITIALIZE,
+            exit_timeout: EXIT_TIMEOUT,
+            restart: RestartPolicy::Never,
+            open_files: OPEN_FILES,
+        })
+        .expect("valid worker definition");
+        supervisor
+            .start(&key.service_id(), &definition)
+            .await
+            .expect("start transient worker unit");
     }
 
-    fn start_isolation_worker(&self, worker_bin: &Path) {
-        self.systemd_run(
-            &self.isolation_worker_unit,
-            worker_bin,
-            &[
-                "--session-id",
-                self.isolation_session_id.as_str(),
-                "--worker-generation",
-                WORKER_GENERATION,
-            ],
-            false,
-        );
+    fn bootstrap_environment(&self) -> BTreeMap<String, String> {
+        [
+            ("XDG_RUNTIME_DIR", &self.runtime_home),
+            ("XDG_CONFIG_HOME", &self.config_home),
+            ("XDG_DATA_HOME", &self.data_home),
+            ("XDG_STATE_HOME", &self.state_home),
+            ("HOME", &self.root),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), path_string(value)))
+        .collect()
     }
 
     fn start_daemon(&self, daemon_bin: &Path) {
-        self.systemd_run(&self.daemon_unit, daemon_bin, &[], true);
-    }
-
-    fn systemd_run(&self, unit: &str, binary: &Path, arguments: &[&str], restart: bool) {
-        let restart_policy = if restart { "on-failure" } else { "no" };
         let mut command = Command::new("systemd-run");
         command
-            .args(["--user", "--unit", unit])
+            .args(["--user", "--unit", self.daemon_unit.as_str()])
             .args(["--property", "Type=notify"])
             .args(["--property", "NotifyAccess=main"])
-            .args(["--property", &format!("Restart={restart_policy}")])
+            .args(["--property", "Restart=on-failure"])
             .args(["--property", "RestartSec=100ms"])
-            .args(["--property", "KillMode=control-group"])
-            .arg(format!(
-                "--setenv=XDG_RUNTIME_DIR={}",
-                self.runtime_home.display()
-            ))
-            .arg(format!(
-                "--setenv=XDG_CONFIG_HOME={}",
-                self.config_home.display()
-            ))
-            .arg(format!(
-                "--setenv=XDG_DATA_HOME={}",
-                self.data_home.display()
-            ))
-            .arg(format!(
-                "--setenv=XDG_STATE_HOME={}",
-                self.state_home.display()
-            ))
+            .args(["--property", "KillMode=control-group"]);
+        for (key, value) in self.bootstrap_environment() {
+            command.arg(format!("--setenv={key}={value}"));
+        }
+        command
             .arg("--setenv=POHUNEK_OBSERVE_EXTERNAL_AGENTS=0")
-            .arg(binary)
-            .args(arguments);
-        let output = command.output().expect("run transient systemd unit");
+            .arg(daemon_bin)
+            .arg("--service-config")
+            .arg(&self.service_config);
+        let output = command.output().expect("run transient daemon unit");
         assert_success(&output);
     }
 
@@ -533,7 +658,7 @@ impl Fixture {
     fn persist_record(&self, worker_id: &str, runtime_id: &str, child_pid: u32) {
         self.persist_record_for(
             &self.session_id,
-            &self.worker_unit,
+            &self.worker_key,
             worker_id,
             runtime_id,
             child_pid,
@@ -543,7 +668,7 @@ impl Fixture {
     fn persist_record_for(
         &self,
         session_id: &str,
-        worker_unit: &str,
+        worker_key: &WorkerKey,
         worker_id: &str,
         runtime_id: &str,
         child_pid: u32,
@@ -636,7 +761,9 @@ impl Fixture {
                     state: RuntimeState::Live,
                     worker_id: Some(worker_id.to_owned()),
                     runtime_id: Some(runtime_id.to_owned()),
-                    unit_name: Some(worker_unit.to_owned()),
+                    service_id: Some(worker_key.service_id().to_string()),
+                    generation: Some(worker_key.generation().to_owned()),
+                    executable: Some(self.worker_executable.clone()),
                     reason: None,
                 },
             })
@@ -768,30 +895,42 @@ impl Fixture {
             .args([
                 "--user",
                 "status",
-                self.worker_unit.as_str(),
+                self.worker_units_pattern().as_str(),
                 self.daemon_unit.as_str(),
                 "--no-pager",
             ])
             .status();
+    }
+
+    /// Matches every worker generation of the fixture's namespace, including
+    /// generations the daemon started during recovery.
+    fn worker_units_pattern(&self) -> String {
+        self.namespace.worker_unit_pattern()
     }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
         for unit in [
-            &self.daemon_unit,
-            &self.worker_unit,
-            &self.isolation_worker_unit,
+            self.daemon_unit.clone(),
+            self.worker_units_pattern(),
+            self.namespace.sessions_slice(),
+            // Parent slice systemd creates implicitly for the dashed sessions slice.
+            format!("pohunek-{}.slice", self.namespace.as_str()),
         ] {
             let _ = Command::new("systemctl")
-                .args(["--user", "stop", unit])
+                .args(["--user", "stop", unit.as_str()])
                 .status();
             let _ = Command::new("systemctl")
-                .args(["--user", "reset-failed", unit])
+                .args(["--user", "reset-failed", unit.as_str()])
                 .status();
         }
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_str().expect("fixture paths are UTF-8").to_owned()
 }
 
 fn required_binary(name: &str) -> PathBuf {

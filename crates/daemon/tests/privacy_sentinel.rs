@@ -312,15 +312,14 @@ async fn spawn_worker_backed_server(
         data_home: worker_home.join("data"),
         config_home: worker_home.join("config"),
         cache_home: worker_home.join("cache"),
+        home: worker_home.clone(),
         daemon_socket: socket.to_path_buf(),
     };
     config.socket_path = Some(socket.to_path_buf());
     config.worker_runtime_root = Some(worker_environment.runtime_home.join("pohunek/workers"));
     config.worker_state_root = Some(worker_environment.state_home.join("pohunek/workers"));
-    let launcher = Arc::new(SubprocessWorkerLauncher::new(
-        worker_binary(),
-        worker_environment,
-    ));
+    config.supervision = Some(worker_environment.supervision(worker_binary()));
+    let launcher = Arc::new(SubprocessWorkerLauncher::new());
     let registry = SessionRegistry::new_with_launcher_and_inspector(
         config,
         launcher,

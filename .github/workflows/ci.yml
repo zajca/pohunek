@@ -64,6 +64,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       # sccache runs on macOS too (content-keyed GHA backend); mold stays
       # Linux-only via the job-level RUSTFLAGS override above.
@@ -78,13 +80,19 @@ jobs:
       - name: Check shared platform contracts
         run: cargo check --locked -p pohunek-platform --all-targets
 
+      # The launchd backend and its integration tests compile only on macOS,
+      # so the Linux clippy gate never sees them.
+      - name: Lint shared platform contracts
+        run: cargo clippy --locked -p pohunek-platform --all-targets -- -D warnings
+
       # Covers the Darwin process backend: same-user facts, descendants, cwd,
       # executable identity, controlling-terminal foreground groups, ownership
       # markers, and the kqueue `NOTE_EXIT` watch. It also covers the Darwin
       # peer backend: `LOCAL_PEERCRED` for the owner, `LOCAL_PEERPID` for the
       # process id, and the `last_pid` drift that `Binding::revalidate` must
-      # reject. Those paths exist only on a native runner, so this step is the
-      # only gate that executes them.
+      # reject. It also runs `tests/launchd.rs` against the runner's real
+      # `gui/<uid>` domain. Those paths exist only on a native runner, so this
+      # step is the only gate that executes them.
       - name: Test shared platform contracts
         run: cargo test --locked -p pohunek-platform
 

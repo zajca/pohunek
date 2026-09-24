@@ -22,6 +22,7 @@ pohunek-netbird = { workspace = true }
 pohunek-platform = { workspace = true }
 overlay = { workspace = true }
 pohunek-paths = { workspace = true }
+pohunek-service-config = { workspace = true }
 pohunek-terminal = { workspace = true }
 pohunek-client = { workspace = true }
 pohunek-worker-protocol = { workspace = true }
@@ -46,9 +47,6 @@ rustix = { workspace = true, features = ["fs"] }
 time = { workspace = true }
 ulid = { workspace = true }
 zeroize = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-zbus = { workspace = true }
 
 [dev-dependencies]
 pohunek-session-worker = { workspace = true }

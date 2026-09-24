@@ -17,6 +17,8 @@ fn daemon_command(
     state_home: &Path,
     data_home: &Path,
 ) -> tokio::process::Command {
+    // HOME is the working directory of every worker, so the daemon requires it.
+    std::fs::create_dir_all(root.join("home")).expect("create isolated home");
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_pohunekd"));
     command
         .env("XDG_RUNTIME_DIR", runtime)
