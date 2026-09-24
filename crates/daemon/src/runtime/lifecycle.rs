@@ -628,8 +628,9 @@ impl Lifecycle<'_> {
     ///
     /// A previous worker whose journal is terminal only retains its final
     /// output, so it is retired first. Otherwise the job must be absent or
-    /// ended without a process, and the journal's worker process must not be
-    /// running. Native recovery calls this before minting a new generation, so
+    /// ended without a process, or have no process in a state that proves
+    /// nothing while a journal exists, and the journal's worker process must
+    /// not be running. Native recovery calls this before minting a new generation, so
     /// two generations of one session never run at once (they would also
     /// contend for the per-session socket).
     ///
@@ -686,7 +687,11 @@ impl Lifecycle<'_> {
             PreviousLive::Unavailable(supervision_unavailable(generation, &error))
         })?;
         let job_live = observation.as_ref().is_some_and(observation_live);
-        if job_live && !runtime_ended {
+        // A job that only lacks a process proves nothing either way, so the
+        // journaled worker process decides.
+        let decided_by_journal =
+            journal.is_some() && observation.as_ref().is_some_and(observation_unproven);
+        if job_live && !runtime_ended && !decided_by_journal {
             return Err(PreviousLive::Ambiguous(lifecycle_error(
                 SUPERVISION_AMBIGUOUS,
                 format!(
@@ -695,7 +700,7 @@ impl Lifecycle<'_> {
                 ),
             )));
         }
-        if !job_live {
+        if !job_live || decided_by_journal {
             self.prove_worker_process_ended(journal.as_ref(), runtime_ended)?;
         }
         self.retire(generation)
@@ -911,6 +916,18 @@ pub(crate) fn observation_live(observation: &ServiceObservation) -> bool {
             observation.state,
             ServiceState::Starting | ServiceState::Running | ServiceState::Unknown
         )
+}
+
+/// Whether a live-looking job has neither a process nor a state that proves
+/// one.
+///
+/// launchd reports a loaded label without a matching process this way; it
+/// cannot tell a job that has not spawned yet from one whose process exited.
+/// Such a job counts as ended only when its journaled worker process is
+/// proven not running; without a journal it is bounded by the worker
+/// initialization deadline instead.
+pub(crate) fn observation_unproven(observation: &ServiceObservation) -> bool {
+    observation.process.is_none() && observation.state == ServiceState::Unknown
 }
 
 fn supervision_unavailable(generation: &Generation, error: &SupervisorError) -> ProtocolError {

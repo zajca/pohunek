@@ -30,6 +30,8 @@ use pohunek_platform::supervisor::{
 };
 use tempfile::TempDir;
 
+mod support;
+
 const E2E_VARIABLE: &str = "POHUNEK_SYSTEMD_E2E";
 /// Command-line prefix that turns `fixture_entry` into a unit main process.
 const FIXTURE_MARKER: &str = "pohunek-systemd-fixture=";
@@ -573,6 +575,17 @@ async fn discovery_ignores_foreign_malformed_and_other_namespace_units() {
         vec![&id]
     );
     assert_eq!(discovery.rejected_units, vec![malformed_unit.clone()]);
+    let captured = support::LogCapture::default();
+    let observations = {
+        let _capture = captured.install();
+        supervisor.discover().await.expect("trait discovery")
+    };
+    assert_eq!(observations.len(), 1);
+    assert_eq!(
+        captured.rejected_entries(),
+        vec![malformed_unit.clone()],
+        "the trait discovery warns about every rejected unit"
+    );
 
     supervisor.retire(&id).await.expect("retire worker");
     for unit in [&other_unit, &malformed_unit, &foreign_unit] {

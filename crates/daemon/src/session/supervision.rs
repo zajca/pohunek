@@ -22,7 +22,8 @@ use protocol::{RuntimeInventoryEntry, RuntimeInventoryStatus, RuntimeState};
 
 use super::{SessionId, SessionRecord, SessionRegistry, SessionRegistryInner};
 use crate::runtime::lifecycle::{
-    observation_live, Generation, Lifecycle, SUPERVISION_AMBIGUOUS, SUPERVISION_UNAVAILABLE,
+    observation_live, observation_unproven, Generation, Lifecycle, SUPERVISION_AMBIGUOUS,
+    SUPERVISION_UNAVAILABLE,
 };
 
 // Rust guideline compliant 2026-09-24
@@ -204,9 +205,11 @@ pub(super) enum Unreachable {
 
 /// Decides what a generation without a reachable worker is.
 ///
-/// Worker death is proven only when the job is absent or ended without a
-/// process AND the journaled worker PID is not running with its recorded
-/// start identity (a reused PID therefore counts as not running).
+/// Worker death is proven only when the job is absent, ended without a
+/// process, or without a process in a state that proves nothing (launchd's
+/// loaded label), AND the journaled worker PID is not running with its
+/// recorded start identity (a reused PID therefore counts as not running).
+/// The last job form needs the journal: without one it stays ambiguous.
 pub(super) fn classify_unreachable(
     job: &JobEvidence,
     generation: &Generation,
@@ -219,7 +222,12 @@ pub(super) fn classify_unreachable(
             if let Some(detail) = job_identity_mismatch(observation, generation, worker) {
                 return Unreachable::Mismatch(detail);
             }
-            if observation_live(observation) {
+            // A job without a process whose state proves nothing is decided
+            // by the journaled worker process below; with no journal it may
+            // still spawn one.
+            if observation_live(observation)
+                && !(observation_unproven(observation) && worker.is_some())
+            {
                 return Unreachable::Ambiguous(format!(
                     "job {} is present but its worker socket is not reachable",
                     observation.id
@@ -376,10 +384,15 @@ impl SessionRegistry {
     /// removes its definition. Still live, it is left alone and returned as an
     /// orphaned inventory entry. Discovery failure only skips this cleanup;
     /// every record's own generation is inspected individually.
-    pub(super) async fn retire_stale_jobs(
+    ///
+    /// `journal_of` names the journaled worker of a stale generation, if a
+    /// successful scan found exactly one; only it can prove that a job
+    /// without a process in a state that proves nothing has ended.
+    pub(super) async fn retire_stale_jobs<'j>(
         &self,
         lifecycle: Option<&Lifecycle<'_>>,
         records: &[SessionRecord],
+        journal_of: impl Fn(&WorkerKey) -> Option<JournalWorker<'j>>,
     ) -> Vec<RuntimeInventoryEntry> {
         let Some(lifecycle) = lifecycle else {
             return Vec::new();
@@ -410,7 +423,15 @@ impl SessionRegistry {
             let _guard = self
                 .lock_lifecycle(&SessionId(key.session_id().to_owned()))
                 .await;
-            match stale_job_ended(lifecycle, &observation).await {
+            let worker = journal_of(&key);
+            match stale_job_ended(
+                lifecycle,
+                &observation,
+                worker.as_ref(),
+                self.inner.inspector.as_ref(),
+            )
+            .await
+            {
                 Ok(true) => match lifecycle.supervisor.retire(&observation.id).await {
                     Ok(()) | Err(SupervisorError::NotFound(_)) => {
                         tracing::info!(service_id = %observation.id, "retired an ended stale worker job");
@@ -735,14 +756,25 @@ impl Drop for RunningGuard {
 }
 
 /// Proves a stale job ended with a fresh inspection; absence counts as ended.
+///
+/// A job without a process in a state that proves nothing has ended only
+/// when `worker`, its journaled worker, is proven not running.
 async fn stale_job_ended(
     lifecycle: &Lifecycle<'_>,
     observation: &ServiceObservation,
+    worker: Option<&JournalWorker<'_>>,
+    inspector: &dyn ProcessInspector,
 ) -> Result<bool, SupervisorError> {
-    Ok(lifecycle
-        .inspect_service(&observation.id)
-        .await?
-        .is_none_or(|fresh| !observation_live(&fresh)))
+    let Some(fresh) = lifecycle.inspect_service(&observation.id).await? else {
+        return Ok(true);
+    };
+    if !observation_live(&fresh) {
+        return Ok(true);
+    }
+    Ok(observation_unproven(&fresh)
+        && worker
+            .and_then(|worker| worker.identity().ok())
+            .is_some_and(|identity| matches!(inspector.is_running(identity), Ok(false))))
 }
 
 #[cfg(test)]

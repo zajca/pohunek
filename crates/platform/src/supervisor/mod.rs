@@ -500,9 +500,78 @@ fn validate_timeout(field: &str, value: Duration) -> Result<(), Error> {
     Ok(())
 }
 
+/// Logs one structured warning per discovered entry a backend rejected.
+///
+/// A rejected entry is a definition file or unit of this namespace that does
+/// not parse or whose label does not match its name; it is never inspected or
+/// retired. Only its name is logged, never its contents.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn warn_rejected(backend: &'static str, names: &[String]) {
+    for name in names {
+        tracing::event!(
+            name: "supervisor.discover.rejected",
+            tracing::Level::WARN,
+            supervisor.backend = backend,
+            supervisor.entry = name.as_str(),
+            "rejected a discovered worker entry of this namespace; it is never touched"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Collects formatted log output of the current thread.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture buffer")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("capture buffer").clone())
+                .expect("UTF-8 log output")
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn every_rejected_entry_is_one_named_warning() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || writer.clone())
+            .finish();
+        let names = ["first.plist".to_owned(), "second.plist".to_owned()];
+
+        tracing::subscriber::with_default(subscriber, || warn_rejected("launchd", &names));
+
+        let text = captured.text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), names.len(), "{text}");
+        for (line, name) in lines.iter().zip(&names) {
+            assert!(line.contains(r#""level":"WARN""#), "{line}");
+            assert!(
+                line.contains(&format!(r#""supervisor.entry":"{name}""#)),
+                "{line}"
+            );
+            assert!(line.contains(r#""supervisor.backend":"launchd""#), "{line}");
+        }
+    }
 
     #[test]
     fn service_ids_are_bounded_and_namespace_safe() {

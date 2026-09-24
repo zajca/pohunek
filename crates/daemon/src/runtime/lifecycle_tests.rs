@@ -793,6 +793,31 @@ async fn a_job_that_ended_without_a_process_is_retired_immediately() {
 }
 
 #[tokio::test]
+async fn a_loaded_job_without_a_process_is_retired_only_after_its_initialize_deadline() {
+    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    harness.supervisor.script_inspects([InspectStep::Present {
+        state: ServiceState::Unknown,
+        process: false,
+    }]);
+    let generation = harness.generation("s-1");
+    let started = Instant::now();
+
+    let failure = harness
+        .lifecycle()
+        .launch(&generation)
+        .await
+        .expect_err("worker never connects");
+
+    assert!(
+        started.elapsed() >= INITIALIZE,
+        "a job without a process may still spawn one; retired after {:?}",
+        started.elapsed()
+    );
+    assert!(matches!(failure, LaunchFailure::Cleaned(_)), "{failure:?}");
+    assert_eq!(harness.supervisor.retired(), [generation.service_id()]);
+}
+
+#[tokio::test]
 async fn an_unavailable_inspection_kills_nothing() {
     let harness = Harness::scripted(CONNECT, INITIALIZE);
     harness
@@ -1173,6 +1198,97 @@ async fn recovery_retires_a_previous_generation_whose_worker_never_journaled() {
         harness.supervisor.retired(),
         [generation.service_id(), generation.service_id()]
     );
+}
+
+/// PID of a process that has exited and been reaped.
+fn exited_pid() -> u32 {
+    let mut child = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn short-lived process");
+    let pid = child.id();
+    child.wait().expect("reap short-lived process");
+    pid
+}
+
+/// A loaded job without a process, as launchd reports one.
+const LOADED_WITHOUT_PROCESS: InspectStep = InspectStep::Present {
+    state: ServiceState::Unknown,
+    process: false,
+};
+
+#[tokio::test]
+async fn recovery_retires_a_loaded_job_without_a_process_once_its_journaled_worker_is_gone() {
+    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    harness.supervisor.script_inspects([LOADED_WITHOUT_PROCESS]);
+    let (generation, previous) = previous(&harness, Some("worker-gone"));
+    harness.write_journal(
+        "s-1",
+        "worker-gone",
+        &journal(
+            "s-1",
+            "worker-gone",
+            generation.generation(),
+            "live",
+            exited_pid(),
+        ),
+    );
+
+    harness
+        .lifecycle()
+        .retire_previous(&previous)
+        .await
+        .expect("the journaled worker is proven gone");
+
+    assert_eq!(harness.supervisor.retired(), [generation.service_id()]);
+}
+
+#[tokio::test]
+async fn recovery_refuses_a_loaded_job_without_a_process_while_its_journaled_worker_runs() {
+    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    harness.supervisor.script_inspects([LOADED_WITHOUT_PROCESS]);
+    let (generation, previous) = previous(&harness, Some("worker-hidden"));
+    harness.write_journal(
+        "s-1",
+        "worker-hidden",
+        &journal(
+            "s-1",
+            "worker-hidden",
+            generation.generation(),
+            "live",
+            std::process::id(),
+        ),
+    );
+
+    let refusal = harness
+        .lifecycle()
+        .retire_previous(&previous)
+        .await
+        .expect_err("the journaled worker still runs");
+
+    assert!(
+        matches!(&refusal, PreviousLive::Ambiguous(error) if error.code == SUPERVISION_AMBIGUOUS),
+        "{refusal:?}"
+    );
+    assert!(harness.supervisor.retired().is_empty());
+}
+
+#[tokio::test]
+async fn recovery_refuses_a_loaded_job_without_a_process_or_a_journal() {
+    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    harness.supervisor.script_inspects([LOADED_WITHOUT_PROCESS]);
+    let (_, previous) = previous(&harness, None);
+
+    let refusal = harness
+        .lifecycle()
+        .retire_previous(&previous)
+        .await
+        .expect_err("nothing proves the job ended");
+
+    assert!(
+        matches!(&refusal, PreviousLive::Ambiguous(error) if error.code == SUPERVISION_AMBIGUOUS),
+        "{refusal:?}"
+    );
+    assert!(harness.supervisor.retired().is_empty());
 }
 
 #[tokio::test]

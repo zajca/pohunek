@@ -7,6 +7,15 @@
 //! learns about a job comes from Pohunek's own evidence: the private definition
 //! file written here and Darwin process inspection.
 //!
+//! An observation is therefore either absent (`print` exits 113), running (a
+//! loaded label with exactly one process matching the stored definition), or
+//! [`ServiceState::Unknown`](super::ServiceState::Unknown) without a process:
+//! a loaded label whose process has not spawned yet, does not match, or has
+//! exited. launchd reports no exit for a job without `KeepAlive`, so that last
+//! state never proves that the job ended. Callers prove a worker's death from
+//! its journaled process identity, and bound a job that never produces a
+//! worker by their own initialization deadline.
+//!
 //! Worker definitions live only in the private `<state>/pohunek/launchd/`
 //! directory, never in `~/Library/LaunchAgents`, so launchd never resurrects a
 //! worker at login. Only the daemon agent is written to `~/Library/LaunchAgents`.
