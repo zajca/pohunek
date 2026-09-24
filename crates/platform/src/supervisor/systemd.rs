@@ -457,9 +457,28 @@ impl DaemonSupervisor for SystemdDaemon {
                 remove_unit(&directory, &name)?;
                 remove_unit(&directory, &self.namespace.sessions_slice())?;
             }
-            self.bus.reload(OPERATION).await
+            self.bus.reload(OPERATION).await?;
+            // The sessions slice and its implicit dash-hierarchy parent stay
+            // active after their last worker exits. Stop them only when their
+            // control groups are empty, so uninstall never touches a worker.
+            for slice in [
+                self.namespace.sessions_slice(),
+                parent_slice(&self.namespace),
+            ] {
+                self.bus.stop_empty_slice(&slice, OPERATION).await?;
+            }
+            Ok(())
         })
     }
+}
+
+/// Returns the implicit parent of the sessions slice.
+///
+/// systemd derives slice nesting from dashes, so `pohunek-<ns>-sessions.slice`
+/// lives below `pohunek-<ns>.slice`, which lives below `pohunek.slice`. The
+/// shared `pohunek.slice` may hold other installations and is never stopped.
+fn parent_slice(namespace: &Namespace) -> String {
+    format!("pohunek-{}.slice", namespace.as_str())
 }
 
 /// Session-bus connection to the systemd user manager.
@@ -632,6 +651,29 @@ impl Bus {
                 return Err(Error::Timeout { operation });
             }
             async_io::Timer::after(SETTLE_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Stops one slice when it is loaded and its control group is empty.
+    ///
+    /// A missing slice or one that still holds processes is left alone.
+    async fn stop_empty_slice(&self, name: &str, operation: &'static str) -> Result<(), Error> {
+        let manager = self.manager(operation).await?;
+        let processes: Vec<UnitProcess> = match manager.call("GetUnitProcesses", &(name,)).await {
+            Ok(processes) => processes,
+            Err(source) if classify(&source) == Fault::Missing => return Ok(()),
+            Err(source) => return Err(bus_error(operation, source)),
+        };
+        if !processes.is_empty() {
+            return Ok(());
+        }
+        match manager
+            .call::<_, _, OwnedObjectPath>("StopUnit", &(name, STOP_MODE))
+            .await
+        {
+            Ok(_job) => Ok(()),
+            Err(source) if classify(&source) == Fault::Missing => Ok(()),
+            Err(source) => Err(bus_error(operation, source)),
         }
     }
 
