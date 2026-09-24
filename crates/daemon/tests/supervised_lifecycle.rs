@@ -67,6 +67,10 @@ const STALE_GENERATION: &str = "stale_worker_generation";
 /// supervision retry together, so any automatic follow-up would show.
 const SETTLED: Duration = Duration::from_secs(4);
 
+/// Counter values the agent must print while the daemon is stopped, so the
+/// graceful absence window provably holds output to deliver.
+const ABSENT_COUNTERS: u64 = 2;
+
 /// Rounds of the repeated lifecycle scenario.
 const CYCLE_ROUNDS: usize = 5;
 
@@ -104,30 +108,33 @@ async fn two_workers_survive_graceful_restart_and_sigkill() {
         fixture.assert_same_runtime(snapshot).await;
     }
 
+    // A graceful stop through the manager, held until the agent has produced
+    // output: a `replace` restart can be shorter than one counter interval,
+    // which would leave nothing to deliver.
     let watched = &sessions[0];
-    let at_kill = fixture.counter(watched);
-    let (killed, revived) = fixture.kill_daemon().await;
-    let at_ready = fixture.counter(watched);
-    assert_eq!(killed, restarted);
-    assert_ne!(revived, killed);
-    assert!(
-        at_ready > at_kill,
-        "the agent kept producing output while the daemon was absent ({at_kill} -> {at_ready})"
-    );
+    let at_stop = fixture.counter(watched);
+    fixture.stop_daemon().await;
+    eventually("output while the daemon is stopped", || async {
+        (fixture.counter(watched) >= at_stop + ABSENT_COUNTERS).then_some(())
+    })
+    .await;
+    let stopped_until = fixture.counter(watched);
+    let started = fixture.start_daemon().await;
+    assert_ne!(started, restarted);
     for snapshot in &before {
         fixture.assert_same_runtime(snapshot).await;
     }
-    let mut attach = fixture.attach(watched).await;
-    let output = read_until(&mut attach, "output from the daemon's absence", |bytes| {
-        counters(bytes)
-            .iter()
-            .any(|value| *value > at_kill && *value <= at_ready)
-    })
-    .await;
-    assert!(
-        contains(&output, b"\x1b[2J\x1b[H"),
-        "a fresh attach repaints the terminal"
-    );
+    assert_absence_delivered(&fixture, watched, at_stop, stopped_until).await;
+
+    let at_kill = fixture.counter(watched);
+    let (killed, revived) = fixture.kill_daemon().await;
+    let at_ready = fixture.counter(watched);
+    assert_eq!(killed, started);
+    assert_ne!(revived, killed);
+    for snapshot in &before {
+        fixture.assert_same_runtime(snapshot).await;
+    }
+    assert_absence_delivered(&fixture, watched, at_kill, at_ready).await;
 
     let mut client = fixture.client().await;
     for (index, session) in sessions.iter().enumerate() {
@@ -801,6 +808,26 @@ async fn job_process(supervisor: &dyn Supervisor, key: &WorkerKey) -> ProcessIde
             .and_then(|job| job.process)
     })
     .await
+}
+
+/// Asserts that output the agent produced while the daemon was absent,
+/// counters in `(before, after]`, reaches a fresh attach.
+async fn assert_absence_delivered(fixture: &Installation, session: &str, before: u64, after: u64) {
+    assert!(
+        after > before,
+        "the agent kept producing output while the daemon was absent ({before} -> {after})"
+    );
+    let mut attach = fixture.attach(session).await;
+    let output = read_until(&mut attach, "output from the daemon's absence", |bytes| {
+        counters(bytes)
+            .iter()
+            .any(|value| *value > before && *value <= after)
+    })
+    .await;
+    assert!(
+        contains(&output, b"\x1b[2J\x1b[H"),
+        "a fresh attach repaints the terminal"
+    );
 }
 
 /// Sorted service IDs of `snapshots`.
