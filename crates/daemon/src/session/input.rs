@@ -144,7 +144,7 @@ impl SessionRegistry {
             deadline,
             Duration::ZERO,
             #[cfg(test)]
-            None,
+            self.take_input_send_hold(),
         )
         .await
     }
@@ -163,21 +163,34 @@ impl SessionRegistry {
             deadline,
             plan_ack_delay,
             #[cfg(test)]
-            None,
+            self.take_input_send_hold(),
         )
         .await
     }
 
+    /// Parks the next waited input write at its send boundary.
+    ///
+    /// The write meets `boundary` once after it captured its activity boundary
+    /// under the session lock, and again before it starts sending. It keeps
+    /// that lock until the send starts, so activity reported after the second
+    /// meeting is ordered after the boundary without relying on wall-clock
+    /// timing.
     #[cfg(test)]
-    pub(super) async fn write_waited_input_at_send_boundary(
-        &self,
-        session_id: &SessionId,
-        text: &str,
-        deadline: tokio::time::Instant,
-        boundary: std::sync::Arc<tokio::sync::Barrier>,
-    ) -> Result<InputSubmission, ProtocolError> {
-        self.write_waited_input_inner(session_id, text, deadline, Duration::ZERO, Some(boundary))
-            .await
+    pub(super) fn hold_next_input_send(&self, boundary: std::sync::Arc<tokio::sync::Barrier>) {
+        *self
+            .inner
+            .input_send_hold
+            .lock()
+            .expect("input send hold test lock") = Some(boundary);
+    }
+
+    #[cfg(test)]
+    fn take_input_send_hold(&self) -> Option<std::sync::Arc<tokio::sync::Barrier>> {
+        self.inner
+            .input_send_hold
+            .lock()
+            .expect("input send hold test lock")
+            .take()
     }
 
     async fn write_waited_input_inner(
