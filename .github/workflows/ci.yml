@@ -159,6 +159,7 @@ jobs:
       # Daemon and CLI tests build their trusted roots and sockets under
       # these fixture roots, so their Darwin contract is checked first.
       - name: Test fixture roots
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-test-support
 
       - name: Test daemon
