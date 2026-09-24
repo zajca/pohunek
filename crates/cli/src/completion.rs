@@ -766,7 +766,7 @@ mod tests {
 
     #[test]
     fn managed_completion_write_is_idempotent_and_updates_mode() {
-        let root = pohunek_test_support::temp_root().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "pohunek-completion-test-{}-{}",
             std::process::id(),
             std::thread::current().name().unwrap_or("unnamed")

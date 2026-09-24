@@ -59,6 +59,7 @@ use crate::worktree::{
     canonical_or_original, run_hook, HookContext, HookEvent, WorktreeCleanup, WorktreeManager,
     WorktreeRequest,
 };
+use reconcile::LossClassification;
 
 mod attach;
 mod detector;
@@ -2915,6 +2916,15 @@ impl SessionRegistry {
         if !self.mark_worker_reconnecting(id, expected, error).await {
             return None;
         }
+        // A worker whose death is already provable is classified at once
+        // instead of after the whole connect deadline.
+        let classified = tokio::select! {
+            () = cancel.cancelled() => return None,
+            classified = self.classify_lost_worker(id, expected, true) => classified,
+        };
+        if classified == LossClassification::Settled {
+            return None;
+        }
         let mut deadline = tokio::time::Instant::now() + self.inner.config.worker_connect_deadline;
         loop {
             if cancel.is_cancelled() || self.inner.daemon_shutdown_started.load(Ordering::Relaxed) {
@@ -2940,15 +2950,20 @@ impl SessionRegistry {
                     }
                 },
                 Err(reconnect_error) if tokio::time::Instant::now() >= deadline => {
-                    match self.mark_worker_lost(id, expected, &reconnect_error).await {
-                        RuntimeTransitionOutcome::Applied(_)
-                        | RuntimeTransitionOutcome::IdentityMismatch => return None,
-                        RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
-                        | RuntimeTransitionOutcome::RetryableConcurrentChange => {
-                            deadline = tokio::time::Instant::now()
-                                + self.inner.config.worker_connect_deadline;
-                        }
+                    debug!(
+                        session_id = %id.0,
+                        error = %reconnect_error,
+                        "session worker stayed unreachable for the connect deadline"
+                    );
+                    let classified = tokio::select! {
+                        () = cancel.cancelled() => return None,
+                        classified = self.classify_lost_worker(id, expected, false) => classified,
+                    };
+                    if classified == LossClassification::Settled {
+                        return None;
                     }
+                    deadline =
+                        tokio::time::Instant::now() + self.inner.config.worker_connect_deadline;
                 }
                 Err(reconnect_error) => {
                     debug!(
@@ -2992,11 +3007,17 @@ impl SessionRegistry {
         true
     }
 
-    async fn mark_worker_lost(
+    /// Commits the classification of a worker whose control connection is gone.
+    ///
+    /// The transition is conditional on `expected` still naming the entry's
+    /// runtime, and it keeps newer durable metadata; a `Lost` classification
+    /// also terminalizes running subagents.
+    async fn mark_worker_unavailable(
         &self,
         id: &SessionId,
         expected: &RuntimeWatchIdentity,
-        error: &WorkerError,
+        state: RuntimeState,
+        reason: &str,
     ) -> RuntimeTransitionOutcome {
         let (base, candidate) = {
             let sessions = self.inner.sessions.lock().await;
@@ -3008,10 +3029,10 @@ impl SessionRegistry {
             }
             let base = Self::session_record(id, entry, entry.desired_state, None);
             let mut candidate = entry.clone();
-            candidate.runtime = RuntimeHandle::Unavailable(RuntimeState::Lost);
+            candidate.runtime = RuntimeHandle::Unavailable(state);
             if let Some(runtime) = candidate.info.runtime.as_mut() {
-                runtime.state = RuntimeState::Lost;
-                runtime.loss_reason = Some("worker_process_lost".to_owned());
+                runtime.state = state;
+                runtime.loss_reason = Some(reason.to_owned());
             }
             candidate.info.updated_at = timestamp_now();
             (base, candidate)
@@ -3021,30 +3042,37 @@ impl SessionRegistry {
             Ok(None) => base.clone(),
             Err(error) => return RuntimeTransitionOutcome::RetryablePersistenceFailure(error),
         };
+        let policy = if state == RuntimeState::Lost {
+            RuntimeMetadataPolicy::Terminal
+        } else {
+            RuntimeMetadataPolicy::Live
+        };
         let outcome = self
-            .commit_runtime_transition(
-                id,
-                expected,
-                &base,
-                &durable_base,
-                candidate,
-                RuntimeMetadataPolicy::Terminal,
-            )
+            .commit_runtime_transition(id, expected, &base, &durable_base, candidate, policy)
             .await;
         if let RuntimeTransitionOutcome::RetryablePersistenceFailure(store_error) = &outcome {
             warn!(
                 session_id = %id.0,
                 error = %store_error,
-                "failed to persist lost worker classification"
+                "failed to persist the unreachable worker classification"
             );
         }
         if let RuntimeTransitionOutcome::Applied(info) = &outcome {
             warn!(
                 session_id = %id.0,
-                error = %error,
-                "session worker could not be reconnected; PTY runtime is lost"
+                runtime.state = ?state,
+                reason,
+                "session worker could not be reconnected"
             );
-            self.emit(event::SESSION_RUNTIME_LOST, info.as_ref());
+            let event_name = match state {
+                RuntimeState::Lost | RuntimeState::Incompatible => event::SESSION_RUNTIME_LOST,
+                RuntimeState::Conflict => event::SESSION_RUNTIME_CONFLICT,
+                RuntimeState::Starting
+                | RuntimeState::Live
+                | RuntimeState::Reconnecting
+                | RuntimeState::Terminal => event::SESSION_UPDATED,
+            };
+            self.emit(event_name, info.as_ref());
         }
         outcome
     }

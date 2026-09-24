@@ -493,6 +493,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-cli --test service_systemd -- --ignored --test-threads 1
 
+      - name: Supervised worker lifecycle
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-daemon --test supervised_lifecycle -- --ignored --test-threads 1
+
+      - name: pohunek service upgrade with live workers
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-cli --test service_upgrade -- --ignored --test-threads 1
+
   # Relay heavy tests are the only PostgreSQL fixture consumers, so they get
   # their own job whose Postgres service only starts when relay-relevant files
   # changed (issue #121) — except on the weekly sweep and manual dispatch,

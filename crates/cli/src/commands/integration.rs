@@ -950,8 +950,8 @@ mod tests {
     }
 
     fn temporary_directory(tag: &str) -> PathBuf {
-        let path = pohunek_test_support::temp_root()
-            .join(format!("pohunek-integration-{tag}-{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("pohunek-integration-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         private_directory(&path);
         path

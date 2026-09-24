@@ -6610,10 +6610,11 @@ async fn lost_transition_preserves_worker_metadata_committed_ahead_of_memory() {
 
     assert!(matches!(
         registry
-            .mark_worker_lost(
+            .mark_worker_unavailable(
                 &created.id,
                 &identity,
-                &WorkerError::Protocol("test lost after durable metadata".to_owned()),
+                RuntimeState::Lost,
+                crate::session::supervision::RUNTIME_LOST,
             )
             .await,
         super::RuntimeTransitionOutcome::Applied(_)
@@ -9636,10 +9637,11 @@ async fn stale_runtime_watchers_emit_nothing_during_new_runtime_commit() {
         )
         .await;
     registry
-        .mark_worker_lost(
+        .mark_worker_unavailable(
             &created.id,
             &expected_old,
-            &WorkerError::Protocol("test disconnect".to_owned()),
+            RuntimeState::Lost,
+            crate::session::supervision::RUNTIME_LOST,
         )
         .await;
     assert!(
@@ -9832,10 +9834,11 @@ async fn lost_transition_retries_precommit_failure_before_single_event() {
 
     assert!(matches!(
         registry
-            .mark_worker_lost(
+            .mark_worker_unavailable(
                 &created.id,
                 &expected,
-                &WorkerError::Protocol("test lost".to_owned()),
+                RuntimeState::Lost,
+                crate::session::supervision::RUNTIME_LOST,
             )
             .await,
         super::RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
@@ -10086,9 +10089,16 @@ async fn assert_lost_transition_applied(
     id: &SessionId,
     expected: &RuntimeWatchIdentity,
 ) {
-    let error = WorkerError::Protocol("test lost retry".to_owned());
     for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
-        match registry.mark_worker_lost(id, expected, &error).await {
+        match registry
+            .mark_worker_unavailable(
+                id,
+                expected,
+                RuntimeState::Lost,
+                crate::session::supervision::RUNTIME_LOST,
+            )
+            .await
+        {
             super::RuntimeTransitionOutcome::Applied(_) => return,
             super::RuntimeTransitionOutcome::RetryableConcurrentChange => {
                 tokio::task::yield_now().await;

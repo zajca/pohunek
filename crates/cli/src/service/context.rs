@@ -231,11 +231,10 @@ pub(crate) mod tests {
 
     /// Creates a temporary root and returns it with its canonical path.
     ///
-    /// The shared fixture root is symlink-free, which the trusted-directory
-    /// checks and process executable paths require, and short enough for the
-    /// daemon socket below it on macOS.
+    /// macOS temporary directories live below the `/var` symlink, which the
+    /// trusted-directory checks and process executable paths never traverse.
     pub(crate) fn temp_root() -> (tempfile::TempDir, PathBuf) {
-        let root = pohunek_test_support::tempdir().expect("temp dir");
+        let root = tempfile::tempdir().expect("temp dir");
         let path = std::fs::canonicalize(root.path()).expect("canonical temp dir");
         (root, path)
     }

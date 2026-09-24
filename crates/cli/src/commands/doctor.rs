@@ -105,7 +105,7 @@ mod tests {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        pohunek_test_support::temp_root().join(format!("pohunek-doctor-test-{pid}-{n}"))
+        std::env::temp_dir().join(format!("pohunek-doctor-test-{pid}-{n}"))
     }
 
     /// Build a `Paths` rooted at `base` (same-crate `pub(crate)` fields).

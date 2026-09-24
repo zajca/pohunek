@@ -19,7 +19,7 @@ fn temp_dir(tag: &str) -> PathBuf {
         .expect("system time after epoch")
         .as_nanos();
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = pohunek_test_support::temp_root().join(format!(
+    let dir = std::env::temp_dir().join(format!(
         "pohunek-cli-gui-parity-{tag}-{}-{nanos}-{n}",
         std::process::id(),
     ));

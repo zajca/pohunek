@@ -227,7 +227,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let root = pohunek_test_support::tempdir().expect("temp dir");
+        let root = tempfile::tempdir().expect("temp dir");
         let archive = root.path().join("archive");
         let commands = root.path().join("commands");
         let pohunek_log = root.path().join("pohunek.log");

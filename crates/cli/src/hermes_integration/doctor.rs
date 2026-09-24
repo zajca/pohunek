@@ -437,7 +437,7 @@ mod tests {
 
     fn unique_private_directory(tag: &str) -> PathBuf {
         loop {
-            let path = pohunek_test_support::temp_root().join(format!(
+            let path = crate::hermes_integration::target::isolated_test_temp_root().join(format!(
                 "pohunek-hermes-doctor-{tag}-{}-{}",
                 std::process::id(),
                 NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)

@@ -15,7 +15,10 @@ fn temp_dir() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let dir = pohunek_test_support::temp_root().join(format!(
+    // The macOS temporary directory sits below the `/var` symlink, which the
+    // CLI's trusted cache-directory checks never traverse.
+    let base = fs::canonicalize(std::env::temp_dir()).expect("canonical temporary directory");
+    let dir = base.join(format!(
         "pohunek-standalone-discovery-{}-{nanos}-{nonce}",
         std::process::id()
     ));

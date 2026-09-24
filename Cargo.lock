@@ -4173,7 +4173,6 @@ dependencies = [
  "pohunek-service-config",
  "pohunek-session-worker",
  "pohunek-terminal",
- "pohunek-test-support",
  "pohunek-worker-protocol",
  "reqwest",
  "serde",

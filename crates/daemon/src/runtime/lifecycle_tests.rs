@@ -1,9 +1,10 @@
 //! Branch coverage for the worker lifecycle engine.
 //!
 //! [`ScriptedSupervisor`] answers `start` and `inspect` from a script so every
-//! reconciliation branch is reachable deterministically. When it wraps the
-//! in-process launcher, unscripted calls run a real worker server, which the
-//! session registry tests use to drive whole lifecycle transactions.
+//! reconciliation branch is reachable deterministically. When it wraps a real
+//! backend (the in-process worker server or the subprocess launcher),
+//! unscripted calls run real workers, which the session registry tests use to
+//! drive whole lifecycle transactions.
 
 use std::collections::VecDeque;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -88,7 +89,7 @@ pub(crate) struct StartGate {
 /// Test supervisor answering from a script, optionally over a real worker.
 #[derive(Debug, Default)]
 pub(crate) struct ScriptedSupervisor {
-    delegate: Option<Arc<InProcessWorkerLauncher>>,
+    delegate: Option<Arc<dyn Supervisor>>,
     starts: StdMutex<VecDeque<StartStep>>,
     inspects: StdMutex<VecDeque<InspectStep>>,
     calls: StdMutex<Vec<Call>>,
@@ -105,8 +106,9 @@ impl ScriptedSupervisor {
         Self::default()
     }
 
-    /// A supervisor over a real in-process worker server.
-    pub(crate) fn over(delegate: InProcessWorkerLauncher) -> Self {
+    /// A supervisor over a real worker backend (the in-process worker server
+    /// or the subprocess launcher running the real worker binary).
+    pub(crate) fn over(delegate: impl Supervisor + 'static) -> Self {
         Self {
             delegate: Some(Arc::new(delegate)),
             ..Self::default()

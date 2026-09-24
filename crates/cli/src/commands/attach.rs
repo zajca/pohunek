@@ -2620,7 +2620,7 @@ mod tests {
 
     fn test_socket_path(prefix: &str) -> PathBuf {
         let id = NEXT_BANNER_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
-        pohunek_test_support::temp_root()
+        std::env::temp_dir()
             .join(format!("{prefix}-{}-{id}.sock", std::process::id()))
             .with_extension("sock")
     }
@@ -2896,7 +2896,7 @@ mod tests {
 
     #[test]
     fn attach_config_reads_reconnect_values() {
-        let root = pohunek_test_support::temp_root().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "pohunek-attach-banner-config-{}",
             std::process::id()
         ));
@@ -2922,7 +2922,7 @@ mod tests {
 
     #[test]
     fn attach_config_rejects_zero_reconnect_attempts() {
-        let root = pohunek_test_support::temp_root().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "pohunek-attach-reconnect-attempts-config-{}",
             std::process::id()
         ));

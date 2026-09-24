@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn empty_store_fingerprint_is_stable() {
-        let path = pohunek_test_support::temp_root().join(format!(
+        let path = std::env::temp_dir().join(format!(
             "pohunek-missing-migration-store-{}",
             std::process::id()
         ));
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn manifest_write_is_owner_private_and_replaces_atomically() {
-        let root = pohunek_test_support::temp_root().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "pohunek-migration-manifest-{}-{}",
             std::process::id(),
             time::OffsetDateTime::now_utc().unix_timestamp_nanos()
