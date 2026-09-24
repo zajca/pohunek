@@ -28,6 +28,9 @@ pohunek-protocol = { workspace = true }
 pohunek-netbird = { workspace = true }
 pohunek-paths = { workspace = true }
 pohunek-platform = { workspace = true }
+pohunek-service-config = { workspace = true }
+pohunek-session-worker = { workspace = true }
+pohunek-worker-protocol = { workspace = true }
 pohunek-client = { workspace = true }
 pohunek-prompt = { workspace = true }
 pohunek-terminal = { workspace = true }

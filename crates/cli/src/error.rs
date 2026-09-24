@@ -168,6 +168,17 @@ pub(crate) enum CliError {
     #[error("failed to start daemon: {0}")]
     Spawn(String),
 
+    /// `pohunek daemon start` found no `service.toml` to run the daemon with.
+    #[error("no service configuration at {}; the daemon has nothing to supervise workers with", path.display())]
+    ServiceNotInstalled {
+        /// The missing `service.toml`.
+        path: PathBuf,
+    },
+
+    /// A `pohunek service` operation failed.
+    #[error(transparent)]
+    Service(#[from] crate::service::Error),
+
     /// Generic I/O error.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
@@ -317,6 +328,25 @@ impl CliError {
                 format!("remote session on host '{host}' was not confirmed"),
                 Some("re-run and confirm, or pass `--yes` to skip the prompt".to_owned()),
             ),
+            CliError::ServiceNotInstalled { path } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "service_not_installed",
+                format!(
+                    "no service configuration at {}; the daemon has nothing to supervise workers with",
+                    path.display()
+                ),
+                Some(
+                    "run `pohunek service install`, or `pohunek daemon start --dev-subprocess` \
+                     for development"
+                        .to_owned(),
+                ),
+            ),
+            CliError::Service(error) => ProtocolError::new(
+                service_error_class(error),
+                error.code(),
+                error.to_string(),
+                error.hint().map(str::to_owned),
+            ),
             CliError::Spawn(msg) => ProtocolError::new(
                 ErrorClass::Daemon,
                 "daemon_spawn_failed",
@@ -341,6 +371,29 @@ impl CliError {
     /// The recovery hint to surface beneath this error, when one applies.
     pub(crate) fn recover_hint(&self) -> Option<String> {
         self.to_protocol_error().recover
+    }
+}
+
+fn service_error_class(error: &crate::service::Error) -> ErrorClass {
+    use crate::service::Error;
+
+    match error {
+        Error::MissingEnv { .. }
+        | Error::Paths(_)
+        | Error::InvalidPath { .. }
+        | Error::Config(_)
+        | Error::UntrustedDirectory { .. }
+        | Error::StagedBinary { .. }
+        | Error::VersionMismatch { .. }
+        | Error::VersionConflict { .. }
+        | Error::AlreadyInstalled { .. }
+        | Error::NotInstalled { .. }
+        | Error::DaemonJobPresent { .. }
+        | Error::VerifierMissing
+        | Error::UnitVerification { .. }
+        | Error::LiveSessions { .. } => ErrorClass::Configuration,
+        Error::DaemonNotReady { .. } | Error::Control { .. } => ErrorClass::Daemon,
+        _ => ErrorClass::Runtime,
     }
 }
 
