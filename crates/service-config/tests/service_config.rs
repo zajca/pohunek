@@ -3,10 +3,11 @@
 // Rust guideline compliant 2026-09-24
 
 use std::fs;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use pohunek_platform::filesystem::FsError;
 use pohunek_platform::supervisor::Namespace;
 use pohunek_service_config::{
     ConfigError, ConfigSpec, Deadlines, ServiceConfig, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES,
@@ -64,7 +65,7 @@ const REQUIRED_KEYS: [&str; 16] = [
     "namespace",
 ];
 
-/// A private `0700` config directory inside a canonical temporary root.
+/// A `0700` config directory inside a canonical temporary root.
 struct Fixture {
     _temp: TempDir,
     root: PathBuf,
@@ -559,15 +560,69 @@ fn group_or_world_accessible_files_are_rejected() {
 }
 
 #[test]
-fn non_private_directories_are_rejected() {
+fn readable_owner_directories_are_accepted() {
     let fixture = Fixture::new();
     let path = fixture.write(GOLDEN, 0o600);
-    fs::set_permissions(&fixture.config_dir, fs::Permissions::from_mode(0o755))
-        .expect("chmod config dir");
-    assert!(matches!(
-        ServiceConfig::load(&path),
-        Err(ConfigError::Untrusted { .. })
-    ));
+    for mode in [0o700, 0o750, 0o755] {
+        fs::set_permissions(&fixture.config_dir, fs::Permissions::from_mode(mode))
+            .expect("chmod config dir");
+        ServiceConfig::load(&path).unwrap_or_else(|error| panic!("{mode:o}: {error}"));
+    }
+}
+
+#[test]
+fn writable_by_others_directories_are_rejected() {
+    let fixture = Fixture::new();
+    let path = fixture.write(GOLDEN, 0o600);
+    for mode in [0o775, 0o777, 0o757, 0o1777] {
+        fs::set_permissions(&fixture.config_dir, fs::Permissions::from_mode(mode))
+            .expect("chmod config dir");
+        let result = ServiceConfig::load(&path);
+        assert!(
+            matches!(result, Err(ConfigError::Untrusted { .. })),
+            "{mode:o}: {result:?}"
+        );
+    }
+}
+
+/// Returns whether the tests run as root, which owns the system directories.
+fn running_as_root() -> bool {
+    let probe = tempfile::tempdir().expect("create temp dir");
+    fs::metadata(probe.path()).expect("stat temp dir").uid() == 0
+}
+
+#[test]
+fn foreign_owned_directories_are_rejected() {
+    // `/usr` is a real, root-owned, not world-writable directory on Linux and
+    // Darwin, so it is foreign-owned for any unprivileged user. A test run as
+    // root cannot produce a foreign owner without `chown`, so it skips.
+    if running_as_root() {
+        return;
+    }
+    let path = Path::new("/usr/service.toml");
+    let result = ServiceConfig::load(path);
+    assert!(
+        matches!(
+            result,
+            Err(ConfigError::Untrusted {
+                source: FsError::UnsafeOwner { .. },
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+    let config = ServiceConfig::new(spec()).expect("valid spec");
+    let result = config.write(path);
+    assert!(
+        matches!(
+            result,
+            Err(ConfigError::Untrusted {
+                source: FsError::UnsafeOwner { .. },
+                ..
+            })
+        ),
+        "{result:?}"
+    );
 }
 
 #[test]
@@ -688,9 +743,34 @@ fn write_creates_a_private_file_in_a_private_directory() {
 }
 
 #[test]
-fn write_refuses_a_non_private_directory() {
+fn write_keeps_an_existing_readable_directory_mode() {
     let fixture = Fixture::new();
     fs::set_permissions(&fixture.config_dir, fs::Permissions::from_mode(0o755))
+        .expect("chmod config dir");
+    let config = ServiceConfig::new(spec()).expect("valid spec");
+    config.write(&fixture.path()).expect("write config");
+    let dir_mode = fs::metadata(&fixture.config_dir)
+        .expect("stat dir")
+        .permissions()
+        .mode()
+        & 0o7777;
+    let file_mode = fs::metadata(fixture.path())
+        .expect("stat file")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(dir_mode, 0o755);
+    assert_eq!(file_mode, 0o600);
+    assert_eq!(
+        ServiceConfig::load(&fixture.path()).expect("reload"),
+        config
+    );
+}
+
+#[test]
+fn write_refuses_a_directory_writable_by_others() {
+    let fixture = Fixture::new();
+    fs::set_permissions(&fixture.config_dir, fs::Permissions::from_mode(0o775))
         .expect("chmod config dir");
     let config = ServiceConfig::new(spec()).expect("valid spec");
     assert!(matches!(

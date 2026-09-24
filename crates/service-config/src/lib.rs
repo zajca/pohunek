@@ -42,11 +42,17 @@
 //!
 //! # File trust
 //!
-//! The file must be a regular `0600` file owned by the effective user inside
-//! an owner-owned `0700` directory; symlinks, hard links, group- or
-//! world-accessible modes, and foreign owners are rejected before any byte is
-//! parsed. Reads are bounded by [`MAX_CONFIG_BYTES`]. [`ServiceConfig::write`]
-//! replaces the file atomically through the same trusted directory.
+//! The file must be a regular `0600` file owned by the effective user, with a
+//! single link and no ACL granting access beyond its mode bits. Its directory
+//! must be owned by the effective user and must not be group- or
+//! world-writable, so both `0700` and the common `0755` config directory
+//! pass. Integrity rests on that directory: nobody else can replace or rename
+//! the file. Confidentiality rests on the `0600` file alone, which is why a
+//! readable directory is acceptable. Symlinks and foreign owners are rejected
+//! before any byte is parsed. Reads are bounded by [`MAX_CONFIG_BYTES`].
+//! [`ServiceConfig::write`] replaces the file atomically through the same
+//! trusted directory, creates a missing directory as `0700`, and never changes
+//! the mode of an existing one.
 //!
 //! # Examples
 //!
@@ -130,8 +136,14 @@ pub const MAX_PATTERN_BYTES: usize = 128;
 /// Owner-only mode required of the configuration file.
 const FILE_MODE: u32 = 0o600;
 
-/// Owner-only mode required of the directory holding the configuration.
+/// Mode of a configuration directory that [`ServiceConfig::write`] creates.
 const DIRECTORY_MODE: u32 = 0o700;
+
+/// Directory mode bits that would let another account replace the file.
+///
+/// Read and search bits for others are allowed: the `0600` file alone keeps
+/// its contents private, while the absence of these bits keeps it intact.
+const FORBIDDEN_DIRECTORY_BITS: u32 = 0o022;
 
 /// Reserved `(uid_t)-1`, which `setuid`-family calls treat as "unchanged".
 const INVALID_UID: u32 = u32::MAX;
@@ -301,7 +313,7 @@ impl ServiceConfig {
     ///
     /// Returns [`ConfigError::ConfigPath`] for a relative or unnormalized path,
     /// [`ConfigError::Untrusted`] for a symlink, special file, foreign owner,
-    /// or any mode other than `0600` (or a directory other than `0700`),
+    /// any file mode other than `0600`, or a group- or world-writable directory,
     /// [`ConfigError::TooLarge`] above [`MAX_CONFIG_BYTES`],
     /// [`ConfigError::Io`] when the file is missing or unreadable,
     /// [`ConfigError::Parse`] for invalid TOML, a missing, unknown, or mistyped
@@ -309,7 +321,7 @@ impl ServiceConfig {
     /// every validation error of [`ServiceConfig::new`].
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let (parent, name) = split_config_path(path)?;
-        let directory = TrustedDir::open_absolute(parent, DIRECTORY_MODE)
+        let directory = TrustedDir::open_absolute_owner_safe(parent, FORBIDDEN_DIRECTORY_BITS)
             .map_err(|source| classify_read_error(path, source))?;
         let bytes = directory
             .read_file(name, FILE_MODE, MAX_CONFIG_BYTES)
@@ -323,19 +335,21 @@ impl ServiceConfig {
 
     /// Atomically writes this configuration to an absolute `path` with mode `0600`.
     ///
-    /// The parent directory is created with mode `0700` when missing and must
-    /// otherwise already be an owner-owned `0700` directory.
+    /// A missing parent directory is created with mode `0700`. An existing one
+    /// must be owned by the effective user and not group- or world-writable;
+    /// its mode is never changed.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError::ConfigPath`] for a relative or unnormalized path,
-    /// [`ConfigError::Untrusted`] when the directory is not owner-private,
+    /// [`ConfigError::Untrusted`] when the directory is foreign-owned or
+    /// group- or world-writable,
     /// [`ConfigError::Io`] when it cannot be opened or created, and
     /// [`ConfigError::Write`] when the replacement fails.
     pub fn write(&self, path: &Path) -> Result<(), ConfigError> {
         let (parent, name) = split_config_path(path)?;
-        let directory = TrustedDir::open_or_create_absolute(parent, DIRECTORY_MODE)
-            .map_err(|source| classify_read_error(path, source))?;
+        let directory =
+            open_or_create_directory(parent).map_err(|source| classify_read_error(path, source))?;
         let temporary = format!(
             ".{FILE_NAME}.{}.{}.tmp",
             std::process::id(),
@@ -636,6 +650,19 @@ fn split_config_path(path: &Path) -> Result<(&Path, &OsStr), ConfigError> {
     match (path.parent(), path.file_name()) {
         (Some(parent), Some(name)) => Ok((parent, name)),
         _ => Err(invalid()),
+    }
+}
+
+/// Opens an existing owner-safe directory, or creates a missing one as `0700`.
+///
+/// Creation also validates the result, so a directory another process
+/// creates in between with a different mode is rejected, not adopted.
+fn open_or_create_directory(parent: &Path) -> Result<TrustedDir, FsError> {
+    match TrustedDir::open_absolute_owner_safe(parent, FORBIDDEN_DIRECTORY_BITS) {
+        Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => {
+            TrustedDir::open_or_create_absolute(parent, DIRECTORY_MODE)
+        }
+        result => result,
     }
 }
 
