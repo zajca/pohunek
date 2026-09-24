@@ -44,6 +44,17 @@ pub const HOST_GOVERNANCE_NAME: &str = "governance.json";
 /// Cross-process host-state lock filename.
 pub const HOST_STATE_LOCK_NAME: &str = "state.lock";
 
+/// Subdirectory for launchd definitions (below state) and job logs (below logs).
+pub const LAUNCHD_SUBDIR: &str = "launchd";
+/// Installation subdirectory holding versioned private executables.
+pub const LIBEXEC_SUBDIR: &str = "libexec";
+/// Daemon executable name inside a version directory.
+pub const DAEMON_EXECUTABLE_NAME: &str = "pohunekd";
+/// Session-worker executable name inside a version directory.
+pub const WORKER_EXECUTABLE_NAME: &str = "pohunek-sessiond";
+/// Upper bound for a version directory name; release versions are far shorter.
+pub const MAX_INSTALL_VERSION_BYTES: usize = 64;
+
 /// XDG environment variable carrying the runtime base directory.
 pub const XDG_RUNTIME_DIR: &str = "XDG_RUNTIME_DIR";
 /// XDG environment variable carrying the data base directory.
@@ -219,6 +230,12 @@ pub enum PathError {
         var: String,
         /// Validation failure.
         reason: InvalidPathReason,
+    },
+    /// An installation prefix is relative or contains a parent component.
+    #[error("installation prefix must be an absolute normalized path: {}", path.display())]
+    InvalidInstallPrefix {
+        /// Rejected prefix.
+        path: PathBuf,
     },
     /// A Unix socket pathname contains an interior NUL byte.
     #[error("{kind} socket path contains a NUL byte: {}", path.display())]
@@ -418,6 +435,21 @@ impl BasePaths {
         )
     }
 
+    /// Returns the owner-private directory holding launchd worker definitions.
+    ///
+    /// Worker job definitions live here rather than in `~/Library/LaunchAgents`
+    /// so launchd never resurrects a worker at login.
+    #[must_use]
+    pub fn launchd_definitions_dir(&self) -> PathBuf {
+        self.state_dir.join(LAUNCHD_SUBDIR)
+    }
+
+    /// Returns the directory receiving launchd job stdout and stderr files.
+    #[must_use]
+    pub fn launchd_log_dir(&self) -> PathBuf {
+        self.log_dir.join(LAUNCHD_SUBDIR)
+    }
+
     /// Returns the owner-private durable host-state directory.
     #[must_use]
     pub fn host_state_dir(&self) -> PathBuf {
@@ -447,6 +479,89 @@ impl BasePaths {
     pub fn host_state_lock_path(&self) -> PathBuf {
         self.host_state_dir().join(HOST_STATE_LOCK_NAME)
     }
+}
+
+/// Versioned executable layout below one installation prefix.
+///
+/// Binaries live in `<prefix>/libexec/pohunek/<version>/` so a live worker keeps
+/// the exact executable its definition names while a newer version installs
+/// beside it. The CLI stays on `PATH` through `<prefix>/bin`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallLayout {
+    prefix: PathBuf,
+}
+
+impl InstallLayout {
+    /// Creates the layout rooted at an absolute installation prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PathError::InvalidInstallPrefix`] when `prefix` is not absolute or
+    /// contains a parent-directory component.
+    pub fn new(prefix: impl Into<PathBuf>) -> Result<Self, PathError> {
+        let prefix = prefix.into();
+        if !prefix.is_absolute()
+            || prefix
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(PathError::InvalidInstallPrefix { path: prefix });
+        }
+        Ok(Self { prefix })
+    }
+
+    /// Returns the installation prefix.
+    #[must_use]
+    pub fn prefix(&self) -> &Path {
+        &self.prefix
+    }
+
+    /// Returns `<prefix>/bin`, the directory holding the `pohunek` CLI.
+    #[must_use]
+    pub fn bin_dir(&self) -> PathBuf {
+        self.prefix.join(BIN_SUBDIR)
+    }
+
+    /// Returns `<prefix>/libexec/pohunek`, the parent of every version directory.
+    #[must_use]
+    pub fn versions_dir(&self) -> PathBuf {
+        self.prefix.join(LIBEXEC_SUBDIR).join(APP_DIR)
+    }
+
+    /// Returns one version directory, or `None` for an unsafe version string.
+    #[must_use]
+    pub fn version_dir(&self, version: &str) -> Option<PathBuf> {
+        valid_install_version(version).map(|version| self.versions_dir().join(version))
+    }
+
+    /// Returns the versioned daemon executable path.
+    #[must_use]
+    pub fn daemon_executable(&self, version: &str) -> Option<PathBuf> {
+        self.version_dir(version)
+            .map(|dir| dir.join(DAEMON_EXECUTABLE_NAME))
+    }
+
+    /// Returns the versioned session-worker executable path.
+    #[must_use]
+    pub fn worker_executable(&self, version: &str) -> Option<PathBuf> {
+        self.version_dir(version)
+            .map(|dir| dir.join(WORKER_EXECUTABLE_NAME))
+    }
+}
+
+/// Validates an installed version directory name.
+///
+/// Versions are one path component of at most [`MAX_INSTALL_VERSION_BYTES`]
+/// ASCII alphanumerics, `.`, `+`, or `-`, and never `.` or `..`.
+#[must_use]
+pub fn valid_install_version(version: &str) -> Option<&str> {
+    (!version.is_empty()
+        && version.len() <= MAX_INSTALL_VERSION_BYTES
+        && !matches!(version, "." | "..")
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-')))
+    .then_some(version)
 }
 
 /// Resolves the platform application runtime root.
@@ -1019,6 +1134,37 @@ mod tests {
             "abcd23\u{e9}",
         ] {
             assert_eq!(valid_worker_generation(invalid), None, "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn install_layout_versions_executables_below_libexec() {
+        let layout = InstallLayout::new("/home/u/.local").expect("absolute prefix");
+        assert_eq!(layout.bin_dir(), Path::new("/home/u/.local/bin"));
+        assert_eq!(
+            layout.versions_dir(),
+            Path::new("/home/u/.local/libexec/pohunek")
+        );
+        assert_eq!(
+            layout.daemon_executable("0.31.6"),
+            Some(PathBuf::from(
+                "/home/u/.local/libexec/pohunek/0.31.6/pohunekd"
+            ))
+        );
+        assert_eq!(
+            layout.worker_executable("0.32.0-rc.1+g1"),
+            Some(PathBuf::from(
+                "/home/u/.local/libexec/pohunek/0.32.0-rc.1+g1/pohunek-sessiond"
+            ))
+        );
+        for unsafe_version in ["", ".", "..", "../x", "a/b", "1 2", &"1".repeat(65)] {
+            assert_eq!(layout.version_dir(unsafe_version), None, "{unsafe_version}");
+        }
+        for prefix in ["relative", "/home/u/../x", ""] {
+            assert!(matches!(
+                InstallLayout::new(prefix),
+                Err(PathError::InvalidInstallPrefix { .. })
+            ));
         }
     }
 

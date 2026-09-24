@@ -1,7 +1,17 @@
 #!/bin/sh
-# Install the pohunek daemon and durable worker systemd user units.
+# Install or upgrade the pohunek daemon service from this release archive.
+#
+# `pohunek service install|upgrade` does the work: versioned binaries under
+# <prefix>/libexec/pohunek/<version>/, service.toml, the daemon job, and the
+# readiness check. This wrapper only locates the staged binaries next to it and
+# retires a pre-service install (a `pohunekd.service` unit with template
+# workers) after the one-time migration preflight.
 
 set -eu
+
+usage() {
+    echo "usage: $0 [--accept-runtime-loss]" >&2
+}
 
 accept_runtime_loss=0
 if [ "${1:-}" = "--accept-runtime-loss" ]; then
@@ -9,84 +19,72 @@ if [ "${1:-}" = "--accept-runtime-loss" ]; then
     shift
 fi
 if [ "$#" -ne 0 ]; then
-    echo "usage: $0 [--accept-runtime-loss]" >&2
+    usage
     exit 2
 fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 archive_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 prefix=${POHUNEK_INSTALL_PREFIX:-"$HOME/.local"}
-bin_dir="$prefix/bin"
-libexec_dir="$prefix/libexec"
-unit_dir="${XDG_CONFIG_HOME:-"$HOME/.config"}/systemd/user"
+config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
+service_config="$config_home/pohunek/service.toml"
+legacy_unit_dir="$config_home/systemd/user"
 
-for required in \
-    "$archive_dir/pohunek" \
-    "$archive_dir/pohunekd" \
-    "$archive_dir/pohunek-sessiond" \
-    "$script_dir/systemd/pohunekd.service.in" \
-    "$script_dir/systemd/pohunek-session@.service.in" \
-    "$script_dir/systemd/pohunek-sessions.slice"
-do
-    if [ ! -f "$required" ]; then
-        echo "required installation asset is missing: $required" >&2
+for required in pohunek pohunekd pohunek-sessiond; do
+    if [ ! -f "$archive_dir/$required" ] || [ ! -x "$archive_dir/$required" ]; then
+        echo "required staged binary is missing or not executable: $archive_dir/$required" >&2
         exit 1
     fi
 done
 
-# The first worker-aware upgrade cannot preserve PTYs owned by a legacy daemon.
-# Use the CLI shipped in this archive so the preflight command is guaranteed to
-# exist even when the installed CLI predates durable workers. A fresh install
-# has no legacy daemon to interrogate. The preflight excludes sessions that
-# already expose durable runtime bindings, so later worker-aware upgrades remain
-# non-destructive while mixed legacy/worker states still fail closed.
-if [ -e "$bin_dir/pohunekd" ] || [ -L "$bin_dir/pohunekd" ]; then
-    if [ "$accept_runtime_loss" -eq 1 ]; then
-        "$archive_dir/pohunek" migration preflight --accept-runtime-loss
-    else
-        "$archive_dir/pohunek" migration preflight
+# A pre-service install runs `pohunekd.service` from <prefix>/bin with
+# `pohunek-session@.service` template workers. Its daemon holds the instance
+# locks the service daemon needs, so it is retired first, in this order:
+# preflight, active-worker check, disable, removal of the exact legacy paths,
+# daemon-reload. Every step tolerates a previous partial run: the preflight
+# only runs while the legacy daemon is still active, and removal and disable
+# are no-ops for what is already gone.
+legacy_retired=0
+if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
+    # The archive's own CLI runs the preflight, which refuses while the legacy
+    # daemon owns live PTYs.
+    if systemctl --user is-active --quiet pohunekd.service; then
+        if [ "$accept_runtime_loss" -eq 1 ]; then
+            "$archive_dir/pohunek" migration preflight --accept-runtime-loss
+        else
+            "$archive_dir/pohunek" migration preflight
+        fi
     fi
+    live_workers=$(systemctl --user list-units 'pohunek-session@*' \
+        --state=active --plain --no-legend)
+    if [ -n "$live_workers" ]; then
+        echo "legacy template workers are still running; nothing was changed:" >&2
+        echo "$live_workers" >&2
+        echo "stop each of these sessions with \`pohunek session stop <id>\` and re-run $0" >&2
+        exit 1
+    fi
+    systemctl --user disable --now pohunekd.service
+    rm -f \
+        "$legacy_unit_dir/pohunekd.service" \
+        "$legacy_unit_dir/pohunek-session@.service" \
+        "$legacy_unit_dir/pohunek-sessions.slice"
+    systemctl --user daemon-reload
+    legacy_retired=1
+fi
+if [ -e "$prefix/bin/pohunekd" ] || [ -e "$prefix/libexec/pohunek-sessiond" ]; then
+    rm -f "$prefix/bin/pohunekd" "$prefix/libexec/pohunek-sessiond"
+    legacy_retired=1
 fi
 
-unit_staging=$(mktemp -d)
-trap 'rm -rf "$unit_staging"' EXIT HUP INT TERM
-sed \
-    -e "s|@BIN_DIR@|$archive_dir|g" \
-    "$script_dir/systemd/pohunekd.service.in" \
-    >"$unit_staging/pohunekd.service"
-sed \
-    -e "s|@LIBEXEC_DIR@|$archive_dir|g" \
-    "$script_dir/systemd/pohunek-session@.service.in" \
-    >"$unit_staging/pohunek-session@.service"
-install -m 0644 \
-    "$script_dir/systemd/pohunek-sessions.slice" \
-    "$unit_staging/pohunek-sessions.slice"
-systemd-analyze verify \
-    "$unit_staging/pohunekd.service" \
-    "$unit_staging/pohunek-session@.service" \
-    "$unit_staging/pohunek-sessions.slice"
-
-sed \
-    -e "s|@BIN_DIR@|$bin_dir|g" \
-    "$script_dir/systemd/pohunekd.service.in" \
-    >"$unit_staging/pohunekd.service"
-sed \
-    -e "s|@LIBEXEC_DIR@|$libexec_dir|g" \
-    "$script_dir/systemd/pohunek-session@.service.in" \
-    >"$unit_staging/pohunek-session@.service"
-
-install -d -m 0755 "$bin_dir" "$libexec_dir" "$unit_dir"
-install -m 0755 "$archive_dir/pohunek" "$bin_dir/pohunek"
-install -m 0755 "$archive_dir/pohunekd" "$bin_dir/pohunekd"
-install -m 0755 "$archive_dir/pohunek-sessiond" "$libexec_dir/pohunek-sessiond"
-install -m 0644 "$unit_staging/pohunekd.service" "$unit_dir/pohunekd.service"
-install -m 0644 \
-    "$unit_staging/pohunek-session@.service" \
-    "$unit_dir/pohunek-session@.service"
-install -m 0644 \
-    "$unit_staging/pohunek-sessions.slice" \
-    "$unit_dir/pohunek-sessions.slice"
-
-systemctl --user daemon-reload
-systemctl --user enable pohunekd.service
-systemctl --user restart pohunekd.service
+if [ -f "$service_config" ]; then
+    set -- service upgrade --from "$archive_dir"
+else
+    set -- service install --from "$archive_dir" --prefix "$prefix"
+fi
+status=0
+"$archive_dir/pohunek" "$@" || status=$?
+if [ "$status" -ne 0 ] && [ "$legacy_retired" -eq 1 ]; then
+    echo "the legacy pohunekd.service install was already retired before \`pohunek $1 $2\` failed;" >&2
+    echo "fix the reported problem and re-run $0 to finish the installation" >&2
+fi
+exit "$status"

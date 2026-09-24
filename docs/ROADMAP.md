@@ -83,6 +83,16 @@ Secret Service, Keychain, and Linux-only Iced features; and native Darwin
 contract CI runs on Apple Silicon. This does **not** advertise working macOS
 applications.
 
+Durable workers under launchd (#100) are implemented: one job per worker
+generation through `/bin/launchctl`, a shared daemon lifecycle engine and
+supervisor-evidence reconciliation on both targets (Linux moved to systemd
+transient units), the ownership-marker sweep of lost generations, the
+allowlisted agent base environment, and `pohunek service
+install|upgrade|uninstall|status` over versioned executables. The daemon and CLI
+build and test on the macOS runner against the real `gui/<uid>` domain. The
+logout/login and reboot lifetime still needs its manual acceptance evidence
+(`scripts/acceptance/macos-launchd-lifetime`, recorded in `docs/acceptance/`).
+
 The live delivery order and dependencies are maintained in GitHub rather than
 duplicated here. #105 remains the support declaration gate.
 

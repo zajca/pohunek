@@ -1,0 +1,513 @@
+#!/bin/sh
+# Manual acceptance procedure for issue #100: launchd worker lifetime on macOS.
+#
+# Proves the documented lifetime scope on a real Mac with the installed
+# service (`pohunek service install`):
+#
+#   screen-lock     sessions survive (same worker PID, generation, PTY, child)
+#   terminal-close  sessions survive
+#   logout-login    runtime_lost, no resurrection, explicit recovery works
+#   reboot          the same outcome as logout-login
+#
+# Logout, reboot, and quitting the terminal end this script, so every step is
+# recorded in a state directory and `continue` resumes where the run stopped.
+# Raw observations are interpreted only by launchd_lifetime_evidence.py, which
+# writes the evidence document (default docs/acceptance/100-launchd-lifetime.json).
+# See docs/acceptance/README.md for the procedure and the evidence schema.
+
+set -eu
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd -P)
+helper="$script_dir/launchd_lifetime_evidence.py"
+
+# Phases in execution order; each line is `<phase> <session set>`. The
+# survival phases share set `a`, which logout-login then ends; reboot needs
+# live sessions again, so it prepares set `b`.
+phase_plan='screen-lock a
+terminal-close a
+logout-login a
+reboot b'
+
+# Shell sessions per set: they carry the PTY liveness probe.
+default_shell_sessions=2
+# Upper bound on the wait for new sessions to become live.
+live_timeout_s=90
+# Upper bound on the wait for the daemon after login or reboot. launchd starts
+# the login agent late in a login session; reconciliation runs before it answers.
+daemon_timeout_s=300
+# Upper bound on the wait for reconciliation to settle every session.
+settle_timeout_s=300
+# Upper bound on the wait for a resumable agent to report its native reference.
+reference_timeout_s=180
+# Upper bound on the wait for a probe's output to reach the screen.
+probe_timeout_s=15
+# Seconds between polls.
+poll_s=2
+# `launchctl print` status of an absent label.
+launchctl_absent=113
+
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/pohunek-acceptance/100-launchd-lifetime"
+output="$repo_root/docs/acceptance/100-launchd-lifetime.json"
+pohunek_bin=pohunek
+python_bin=/usr/bin/python3
+
+usage() {
+  cat <<EOF
+Usage: $(basename -- "$0") [options] start --agent NAME [--agent NAME]... [--shell-sessions N]
+       $(basename -- "$0") [options] continue | status | cleanup
+
+Commands:
+  start      Begin a run: record the host, prepare sessions, run the phases.
+  continue   Resume the run at the recorded phase (after quitting the
+             terminal, logging back in, or rebooting).
+  status     Print the recorded phase and re-assemble the evidence.
+  cleanup    Stop and remove every session this run created.
+
+Options:
+  --state-dir DIR  Run state (default: $state_dir)
+  --output FILE    Evidence document (default: $output)
+  --pohunek BIN    pohunek CLI to drive (default: pohunek on PATH)
+  --python BIN     Python 3 interpreter (default: $python_bin)
+
+start options:
+  --agent NAME          Resumable agent profile to start in every session set
+                        (repeatable, at least one; e.g. claude or codex). Its
+                        native session reference proves explicit recovery.
+  --shell-sessions N    Shell sessions per set (default: $default_shell_sessions)
+EOF
+}
+
+die() {
+  printf 'macos-launchd-lifetime: %s\n' "$*" >&2
+  exit 1
+}
+
+say() {
+  printf '\n==> %s\n' "$*"
+}
+
+now() {
+  date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+# Prompts on the controlling terminal so redirected stdout never hides it.
+confirm() {
+  printf '%s [y/N] ' "$1" >/dev/tty
+  read -r answer </dev/tty || answer=
+  case "$answer" in
+    y | Y | yes | YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+pause() {
+  printf '%s\nPress Enter when done. ' "$1" >/dev/tty
+  read -r _ </dev/tty || true
+}
+
+helper() {
+  "$python_bin" "$helper" "$@"
+}
+
+run_pohunek() {
+  "$pohunek_bin" "$@"
+}
+
+# Records one session list and one service status snapshot into a directory.
+snapshot() {
+  mkdir -p "$1"
+  run_pohunek session list --json >"$1/sessions.json"
+  run_pohunek service status --json >"$1/service.json"
+  sysctl -n kern.boottime >"$1/boottime.txt"
+}
+
+set_file() {
+  printf '%s\n' "$2" >"$1"
+}
+
+current_phase() {
+  if [ -f "$state_dir/phase" ]; then
+    cat "$state_dir/phase"
+  else
+    printf 'none\n'
+  fi
+}
+
+set_phase() {
+  set_file "$state_dir/phase" "$1 $2"
+}
+
+next_phase() {
+  printf '%s\n' "$phase_plan" | awk -v current="$1" '
+    found { print $1; exit }
+    $1 == current { found = 1 }
+  '
+}
+
+phase_set() {
+  printf '%s\n' "$phase_plan" | awk -v phase="$1" '$1 == phase { print $2 }'
+}
+
+session_ids() {
+  if [ -f "$state_dir/sessions-$1.txt" ]; then
+    cat "$state_dir/sessions-$1.txt"
+  fi
+}
+
+assemble() {
+  mkdir -p "$(dirname -- "$output")"
+  helper assemble "$state_dir" "$output"
+  printf 'Evidence written to %s\n' "$output"
+}
+
+wait_for_daemon() {
+  waited=0
+  until run_pohunek health --json >/dev/null 2>&1; do
+    [ "$waited" -lt "$daemon_timeout_s" ] || die "the daemon did not answer within ${daemon_timeout_s}s; check 'pohunek service status'"
+    sleep "$poll_s"
+    waited=$((waited + poll_s))
+  done
+}
+
+# Waits until no listed session is starting or reconnecting (reconciliation
+# and its supervision retries have settled).
+wait_for_settled() {
+  probe="$state_dir/settle.json"
+  waited=0
+  while :; do
+    run_pohunek session list --json >"$probe"
+    # shellcheck disable=SC2046 # one word per session id
+    pending=$(helper states "$probe" $(session_ids "$1") | awk '$2 == "starting" || $2 == "reconnecting" { print $1 }')
+    [ -z "$pending" ] && return 0
+    [ "$waited" -lt "$settle_timeout_s" ] || die "sessions did not settle within ${settle_timeout_s}s: $pending"
+    sleep "$poll_s"
+    waited=$((waited + poll_s))
+  done
+}
+
+wait_for_live() {
+  probe="$state_dir/live.json"
+  waited=0
+  while :; do
+    run_pohunek session list --json >"$probe"
+    # shellcheck disable=SC2046 # one word per session id
+    pending=$(helper states "$probe" $(session_ids "$1") | awk '$2 != "live" { print $1 " (" $2 ")" }')
+    [ -z "$pending" ] && return 0
+    [ "$waited" -lt "$live_timeout_s" ] || die "sessions are not live after ${live_timeout_s}s: $pending"
+    sleep "$poll_s"
+    waited=$((waited + poll_s))
+  done
+}
+
+wait_for_references() {
+  probe="$state_dir/references.json"
+  waited=0
+  prompted=no
+  while :; do
+    run_pohunek session list --json >"$probe"
+    # shellcheck disable=SC2046 # one word per session id
+    missing=$(helper missing-references "$probe" $(session_ids "$1"))
+    [ -z "$missing" ] && return 0
+    if [ "$prompted" = no ]; then
+      say "Waiting for the agent sessions to report their native session reference"
+      printf 'If an agent only creates its session after the first prompt, attach with\n'
+      printf "'%s attach <id>' in another window and send one short message:\n" "$pohunek_bin"
+      # shellcheck disable=SC2086 # one line per session id
+      printf '  %s\n' $missing
+      printf "The agent's session-capture hook must be installed ('pohunek integration install').\n"
+      prompted=yes
+    fi
+    [ "$waited" -lt "$reference_timeout_s" ] || die "no native session reference after ${reference_timeout_s}s: $missing"
+    sleep "$poll_s"
+    waited=$((waited + poll_s))
+  done
+}
+
+create_session() {
+  set_name=$1
+  agent=$2
+  index=$3
+  created="$state_dir/created-$set_name-$index.json"
+  run_pohunek session new --agent "$agent" --cwd "$HOME" \
+    --name "acceptance-100-$set_name-$index" \
+    --meta "acceptance=100-launchd-lifetime" --json >"$created"
+  helper session-id "$created" >>"$state_dir/sessions-$set_name.txt"
+}
+
+# Creates a session set once; a set interrupted mid-creation is refused
+# rather than silently extended.
+prepare_set() {
+  set_name=$1
+  [ ! -f "$state_dir/sessions-$set_name.done" ] || return 0
+  [ ! -s "$state_dir/sessions-$set_name.txt" ] ||
+    die "session set $set_name was interrupted while being created; run '$0 cleanup' and start over"
+  say "Preparing session set $set_name"
+  index=0
+  count=0
+  while [ "$count" -lt "$(cat "$state_dir/shell-sessions")" ]; do
+    index=$((index + 1))
+    count=$((count + 1))
+    create_session "$set_name" shell "$index"
+  done
+  while IFS= read -r agent; do
+    [ -n "$agent" ] || continue
+    index=$((index + 1))
+    create_session "$set_name" "$agent" "$index"
+  done <"$state_dir/agents.txt"
+  wait_for_live "$set_name"
+  wait_for_references "$set_name"
+  : >"$state_dir/sessions-$set_name.done"
+  session_ids "$set_name" | sed 's/^/  /'
+}
+
+# Types `printf 'ok-%s\n' <token>` into every shell session and captures the
+# screen: only the executed command prints `ok-<token>`.
+probe_shells() {
+  phase_dir=$1
+  mkdir -p "$phase_dir/probe"
+  run_pohunek session list --json >"$phase_dir/probe/sessions.json"
+  probe_index=0
+  # shellcheck disable=SC2046 # one word per session id
+  for id in $(helper shell-sessions "$phase_dir/probe/sessions.json" $(cat "$phase_dir/sessions.txt")); do
+    probe_index=$((probe_index + 1))
+    token="$(date -u '+%H%M%S')$$x$probe_index"
+    set_file "$phase_dir/probe/$id.token" "$token"
+    printf "printf 'ok-%%s\\\\n' %s\n" "$token" | run_pohunek session input "$id" --stdin >/dev/null
+    waited=0
+    while :; do
+      run_pohunek session screen "$id" --json >"$phase_dir/probe/$id.screen.json" || true
+      grep -q "ok-$token" "$phase_dir/probe/$id.screen.json" && break
+      [ "$waited" -lt "$probe_timeout_s" ] || break
+      sleep 1
+      waited=$((waited + 1))
+    done
+    run_pohunek session output "$id" --json >"$phase_dir/probe/$id.output.json" || true
+  done
+}
+
+# Records every trace the old worker generations could have left: `ps` lines
+# and the `launchctl print` status of each old label.
+record_traces() {
+  phase_dir=$1
+  ps -axww -o pid=,ppid=,command= >"$phase_dir/after/ps.txt"
+  uid=$(id -u)
+  : >"$phase_dir/after/launchctl.txt"
+  # shellcheck disable=SC2046 # one word per session id
+  for label in $(helper labels "$phase_dir/before/service.json" $(cat "$phase_dir/sessions.txt")); do
+    status=0
+    /bin/launchctl print "gui/$uid/$label" >/dev/null 2>&1 || status=$?
+    printf '%s %s\n' "$label" "$status" >>"$phase_dir/after/launchctl.txt"
+    [ "$status" -eq "$launchctl_absent" ] || printf 'warning: old label %s: launchctl print exited %s\n' "$label" "$status"
+  done
+}
+
+# Explicit native recovery of every recoverable session, then a snapshot, then
+# a stop so the recovered agents do not outlive the run.
+recover_sessions() {
+  phase_dir=$1
+  mkdir -p "$phase_dir/recovery"
+  # shellcheck disable=SC2046 # one word per session id
+  recoverable=$(helper recoverable "$phase_dir/after/sessions.json" $(cat "$phase_dir/sessions.txt"))
+  [ -n "$recoverable" ] || return 0
+  say "Exercising explicit recovery (pohunek session resume)"
+  for id in $recoverable; do
+    status=0
+    run_pohunek session resume "$id" --json >"$phase_dir/recovery/$id.json" 2>"$phase_dir/recovery/$id.err" || status=$?
+    set_file "$phase_dir/recovery/$id.exit" "$status"
+    printf '  %s: exit %s\n' "$id" "$status"
+  done
+  waited=0
+  while :; do
+    snapshot "$phase_dir/recovery"
+    # shellcheck disable=SC2086 # one word per session id
+    pending=$(helper states "$phase_dir/recovery/sessions.json" $recoverable | awk '$2 == "starting" { print $1 }')
+    [ -z "$pending" ] && break
+    [ "$waited" -lt "$live_timeout_s" ] || break
+    sleep "$poll_s"
+    waited=$((waited + poll_s))
+  done
+  for id in $recoverable; do
+    run_pohunek session stop "$id" >/dev/null 2>&1 || printf 'warning: could not stop recovered session %s\n' "$id"
+  done
+}
+
+instructions() {
+  case "$1" in
+    screen-lock)
+      printf 'Lock the screen (Control-Command-Q or the Apple menu > Lock Screen).\n'
+      printf 'Stay locked for at least 60 seconds, then unlock and return here.\n'
+      ;;
+    terminal-close)
+      first=$(head -n 1 "$state_dir/phases/$1/sessions.txt")
+      printf "1. Open a NEW terminal window and run: %s attach %s\n" "$pohunek_bin" "$first"
+      printf '2. Quit the terminal application completely (Command-Q), which also\n'
+      printf '   closes this window and ends this script.\n'
+      printf '3. Start the terminal application again and run:\n'
+      printf '   %s continue\n' "$0"
+      ;;
+    logout-login)
+      printf '1. Log out (Apple menu > Log Out). Untick "Reopen windows when logging back in".\n'
+      printf '2. Log back in to the same account.\n'
+      printf '3. Open a terminal and run: %s continue\n' "$0"
+      ;;
+    reboot)
+      printf '1. Restart the Mac (Apple menu > Restart). Untick "Reopen windows when logging back in".\n'
+      printf '2. Log in to the same account.\n'
+      printf '3. Open a terminal and run: %s continue\n' "$0"
+      ;;
+  esac
+}
+
+# Takes the before snapshot and hands the action to the operator.
+begin_phase() {
+  phase=$1
+  phase_dir="$state_dir/phases/$phase"
+  prepare_set "$(phase_set "$phase")"
+  mkdir -p "$phase_dir"
+  session_ids "$(phase_set "$phase")" >"$phase_dir/sessions.txt"
+  set_file "$phase_dir/started_at" "$(now)"
+  snapshot "$phase_dir/before"
+  set_phase "$phase" awaiting
+  say "Phase $phase"
+  instructions "$phase"
+  if [ "$phase" = screen-lock ]; then
+    pause 'Waiting for the screen lock.'
+    finish_phase "$phase"
+  else
+    exit 0
+  fi
+}
+
+# Confirms the action, takes the after snapshot, and evaluates the phase.
+finish_phase() {
+  phase=$1
+  phase_dir="$state_dir/phases/$phase"
+  confirm "Did you complete the $phase action as instructed?" || die "rerun '$0 continue' after completing the $phase action"
+  set_file "$phase_dir/action_confirmed_at" "$(now)"
+  printf 'Optional note for the evidence (one line, Enter to skip): ' >/dev/tty
+  read -r note </dev/tty || note=
+  [ -z "$note" ] || set_file "$phase_dir/operator_note" "$note"
+  wait_for_daemon
+  wait_for_settled "$(phase_set "$phase")"
+  mkdir -p "$phase_dir/after"
+  if [ "$phase" = screen-lock ] || [ "$phase" = terminal-close ]; then
+    probe_shells "$phase_dir"
+  fi
+  snapshot "$phase_dir/after"
+  record_traces "$phase_dir"
+  if [ "$phase" = logout-login ] || [ "$phase" = reboot ]; then
+    recover_sessions "$phase_dir"
+  fi
+  set_file "$phase_dir/completed_at" "$(now)"
+  assemble
+  following=$(next_phase "$phase")
+  if [ -n "$following" ]; then
+    set_phase "$following" ready
+    begin_phase "$following"
+  else
+    set_phase 'done' 'done'
+    say "All phases recorded"
+    printf "Review %s, then commit it. Remove the sessions with '%s cleanup'.\n" "$output" "$0"
+  fi
+}
+
+resume_run() {
+  [ -f "$state_dir/run.json" ] || die "no run in $state_dir; use 'start'"
+  # shellcheck disable=SC2046 # `<phase> <stage>` splits into two words
+  set -- $(current_phase)
+  case "$2" in
+    ready) begin_phase "$1" ;;
+    awaiting) finish_phase "$1" ;;
+    done) assemble ;;
+    *) die "unknown recorded phase: $*" ;;
+  esac
+}
+
+preflight() {
+  [ "$(uname -s)" = Darwin ] || die "this procedure needs macOS"
+  "$python_bin" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null ||
+    die "$python_bin is not a working Python 3.9+; install the Xcode Command Line Tools (xcode-select --install)"
+  command -v "$pohunek_bin" >/dev/null 2>&1 || die "$pohunek_bin not found"
+  /bin/launchctl print "gui/$(id -u)" >/dev/null 2>&1 || die "no launchd gui/$(id -u) domain; run from the logged-in GUI session"
+}
+
+start_run() {
+  [ ! -e "$state_dir/run.json" ] || die "a run already exists in $state_dir; use 'continue', or move the directory away to start over"
+  [ -s "$agents_file" ] || die "start needs at least one --agent with native resume (e.g. claude or codex)"
+  preflight
+  mkdir -p "$state_dir"
+  chmod 700 "$state_dir"
+  mv "$agents_file" "$state_dir/agents.txt"
+  set_file "$state_dir/shell-sessions" "$shell_sessions"
+  service="$state_dir/service-start.json"
+  run_pohunek service status --json >"$service"
+  [ "$(helper service-field "$service" installed)" = true ] ||
+    die "the service is not installed; run 'pohunek service install' first"
+  [ "$(helper service-field "$service" daemon.state)" = running ] ||
+    die "the daemon job is not running; see 'pohunek service status'"
+  cli_version=$(run_pohunek --version)
+  helper init --output "$state_dir/run.json" --service "$service" \
+    --run-id "$(date -u '+%Y%m%dT%H%M%SZ')-$(hostname -s)" \
+    --product-name "$(sw_vers -productName)" \
+    --product-version "$(sw_vers -productVersion)" \
+    --build-version "$(sw_vers -buildVersion)" \
+    --arch "$(uname -m)" \
+    --hardware-model "$(sysctl -n hw.model)" \
+    --cpu "$(sysctl -n machdep.cpu.brand_string)" \
+    --uid "$(id -u)" \
+    --cli-version "$cli_version"
+  first=$(printf '%s\n' "$phase_plan" | awk 'NR == 1 { print $1 }')
+  set_phase "$first" ready
+  begin_phase "$first"
+}
+
+cleanup_run() {
+  [ -d "$state_dir" ] || die "no run in $state_dir"
+  for set_name in a b; do
+    for id in $(session_ids "$set_name"); do
+      run_pohunek session rm "$id" >/dev/null 2>&1 && printf 'removed %s\n' "$id" ||
+        printf 'warning: could not remove %s\n' "$id"
+    done
+  done
+}
+
+agents_file=$(mktemp "${TMPDIR:-/tmp}/pohunek-acceptance-agents.XXXXXX")
+trap 'rm -f "$agents_file"' EXIT
+shell_sessions=$default_shell_sessions
+command=
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --state-dir) [ "$#" -ge 2 ] || die "--state-dir needs a value"; state_dir=$2; shift 2 ;;
+    --output) [ "$#" -ge 2 ] || die "--output needs a value"; output=$2; shift 2 ;;
+    --pohunek) [ "$#" -ge 2 ] || die "--pohunek needs a value"; pohunek_bin=$2; shift 2 ;;
+    --python) [ "$#" -ge 2 ] || die "--python needs a value"; python_bin=$2; shift 2 ;;
+    --agent) [ "$#" -ge 2 ] || die "--agent needs a value"; printf '%s\n' "$2" >>"$agents_file"; shift 2 ;;
+    --shell-sessions)
+      [ "$#" -ge 2 ] || die "--shell-sessions needs a value"
+      case "$2" in '' | *[!0-9]*) die "--shell-sessions needs a number" ;; esac
+      [ "$2" -ge 1 ] || die "--shell-sessions needs at least 1"
+      shell_sessions=$2
+      shift 2
+      ;;
+    -h | --help) usage; exit 0 ;;
+    start | continue | status | cleanup)
+      [ -z "$command" ] || die "only one command is allowed"
+      command=$1
+      shift
+      ;;
+    *) usage >&2; die "unknown argument: $1" ;;
+  esac
+done
+
+case "$command" in
+  start) start_run ;;
+  continue) preflight; resume_run ;;
+  status)
+    printf 'state: %s\nphase: %s\n' "$state_dir" "$(current_phase)"
+    [ ! -f "$state_dir/run.json" ] || assemble
+    ;;
+  cleanup) cleanup_run ;;
+  *) usage >&2; exit 2 ;;
+esac

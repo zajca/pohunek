@@ -182,7 +182,7 @@ async fn with_servers(condition: GovernanceCondition, transport: OwnerTransport)
 async fn start_servers(condition: GovernanceCondition) -> Servers {
     let root = tempfile::Builder::new()
         .prefix("po-")
-        .tempdir()
+        .tempdir_in(pohunek_test_support::temp_root())
         .expect("create isolated owner-path root");
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
         .expect("secure isolated owner-path root");
@@ -313,6 +313,7 @@ fn worker_backed_registry(socket: &Path, root: &Path) -> SessionRegistry {
         data_home: root.join("d"),
         config_home: root.join("c"),
         cache_home: root.join("k"),
+        home: root.to_path_buf(),
         daemon_socket: socket.to_path_buf(),
     };
     let config = SessionRegistryConfig {
@@ -321,11 +322,12 @@ fn worker_backed_registry(socket: &Path, root: &Path) -> SessionRegistry {
         socket_path: Some(socket.to_path_buf()),
         worker_runtime_root: Some(environment.runtime_home.join("pohunek/workers")),
         worker_state_root: Some(environment.state_home.join("pohunek/workers")),
+        supervision: Some(environment.supervision(worker_binary())),
         ..SessionRegistryConfig::default()
     };
     SessionRegistry::new_with_launcher_and_inspector(
         config,
-        Arc::new(SubprocessWorkerLauncher::new(worker_binary(), environment)),
+        Arc::new(SubprocessWorkerLauncher::new()),
         Arc::new(HostInspector::new()),
     )
 }
@@ -618,7 +620,7 @@ where
         serde_json::to_value(SessionNewParams {
             name: None,
             agent: "shell".to_owned(),
-            cwd: Some(std::env::temp_dir()),
+            cwd: Some(pohunek_test_support::temp_root()),
             cols: 80,
             rows: 24,
             project: None,

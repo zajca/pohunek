@@ -2530,7 +2530,7 @@ mod tests {
             .expect("system time after epoch")
             .as_nanos();
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = pohunek_test_support::temp_root().join(format!(
             "pohunek-integration-{tag}-{}-{nanos}-{sequence}",
             std::process::id()
         ));
@@ -2620,6 +2620,10 @@ mod tests {
                 while requests.len() < expected_requests && std::time::Instant::now() < deadline {
                     match listener.accept() {
                         Ok((mut stream, _addr)) => {
+                            // BSD-derived accept inherits the listener's nonblocking flag.
+                            stream
+                                .set_nonblocking(false)
+                                .expect("make daemon hook stream blocking");
                             let mut raw = Vec::new();
                             let mut byte = [0_u8; 1];
                             while stream.read(&mut byte).expect("read hook request") == 1 {
@@ -2752,20 +2756,38 @@ mod tests {
         request
     }
 
-    fn run_worker_state_asset_with_response(
-        agent: &str,
-        action: &str,
-        input: &Value,
+    /// Accepts one worker hook request on `worker_socket`, answers it with
+    /// `worker_response`, and returns the parsed request.
+    fn capture_worker_hook(
+        worker_socket: &Path,
         worker_response: &'static [u8],
-        expected_public_requests: usize,
-    ) -> (Value, Vec<Value>) {
-        let asset_path = state_asset(agent);
-        let temp = temp_dir(&format!("{agent}-worker-state-run"));
-        let worker_socket = temp.join("worker.sock");
-        let daemon_socket = temp.join("daemon.sock");
-        let listener = UnixListener::bind(&worker_socket).expect("bind worker hook socket");
-        let capture = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept worker hook");
+    ) -> thread::JoinHandle<Value> {
+        let listener = UnixListener::bind(worker_socket).expect("bind worker hook socket");
+        listener
+            .set_nonblocking(true)
+            .expect("make worker hook socket nonblocking");
+        thread::spawn(move || {
+            // Bounded so a hook that never reaches the worker fails the test
+            // instead of blocking it forever.
+            let deadline =
+                std::time::Instant::now() + Duration::from_secs(HOOK_CAPTURE_TIMEOUT_SECS);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _addr)) => break stream,
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "worker hook never connected to the worker socket"
+                        );
+                        thread::sleep(Duration::from_millis(HOOK_CAPTURE_POLL_MS));
+                    }
+                    Err(err) => panic!("accept worker hook: {err}"),
+                }
+            };
+            // BSD-derived accept inherits the listener's nonblocking flag.
+            stream
+                .set_nonblocking(false)
+                .expect("make worker hook stream blocking");
             let mut raw = Vec::new();
             let mut byte = [0_u8; 1];
             while stream.read(&mut byte).expect("read worker hook") == 1 {
@@ -2778,7 +2800,21 @@ mod tests {
                 .write_all(worker_response)
                 .expect("write worker hook response");
             serde_json::from_slice::<Value>(&raw).expect("worker hook JSON")
-        });
+        })
+    }
+
+    fn run_worker_state_asset_with_response(
+        agent: &str,
+        action: &str,
+        input: &Value,
+        worker_response: &'static [u8],
+        expected_public_requests: usize,
+    ) -> (Value, Vec<Value>) {
+        let asset_path = state_asset(agent);
+        let temp = temp_dir(&format!("{agent}-worker-state-run"));
+        let worker_socket = temp.join("worker.sock");
+        let daemon_socket = temp.join("daemon.sock");
+        let capture = capture_worker_hook(&worker_socket, worker_response);
         let daemon_listener = UnixListener::bind(&daemon_socket).expect("bind daemon hook socket");
         daemon_listener
             .set_nonblocking(true)
@@ -2791,6 +2827,10 @@ mod tests {
             {
                 match daemon_listener.accept() {
                     Ok((mut stream, _addr)) => {
+                        // BSD-derived accept inherits the listener's nonblocking flag.
+                        stream
+                            .set_nonblocking(false)
+                            .expect("make daemon hook stream blocking");
                         let mut raw = Vec::new();
                         let mut byte = [0_u8; 1];
                         while stream.read(&mut byte).expect("read daemon hook") == 1 {
@@ -2901,6 +2941,10 @@ mod tests {
                 while std::time::Instant::now() < deadline {
                     match listener.accept() {
                         Ok((mut stream, _addr)) => {
+                            // BSD-derived accept inherits the listener's nonblocking flag.
+                            stream
+                                .set_nonblocking(false)
+                                .expect("make daemon hook stream blocking");
                             let mut raw = Vec::new();
                             let mut byte = [0_u8; 1];
                             while stream.read(&mut byte).expect("read hook request") == 1 {

@@ -467,9 +467,16 @@ pub struct RuntimeRecord {
     /// Stable PTY generation identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_id: Option<String>,
-    /// systemd user unit name.
+    /// Supervisor service identifier `<session-id>.<generation>` of the
+    /// current worker job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unit_name: Option<String>,
+    pub service_id: Option<String>,
+    /// Daemon-issued worker generation token, persisted before the job starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
+    /// Absolute versioned worker executable named by the job definition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<PathBuf>,
     /// Machine-readable loss or conflict reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -1411,7 +1418,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
+        let dir = pohunek_test_support::temp_root().join(format!(
             "pohunek-store-{tag}-{}-{nanos}",
             std::process::id()
         ));

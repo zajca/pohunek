@@ -64,6 +64,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       # sccache runs on macOS too (content-keyed GHA backend); mold stays
       # Linux-only via the job-level RUSTFLAGS override above.
@@ -78,13 +80,19 @@ jobs:
       - name: Check shared platform contracts
         run: cargo check --locked -p pohunek-platform --all-targets
 
+      # The launchd backend and its integration tests compile only on macOS,
+      # so the Linux clippy gate never sees them.
+      - name: Lint shared platform contracts
+        run: cargo clippy --locked -p pohunek-platform --all-targets -- -D warnings
+
       # Covers the Darwin process backend: same-user facts, descendants, cwd,
       # executable identity, controlling-terminal foreground groups, ownership
       # markers, and the kqueue `NOTE_EXIT` watch. It also covers the Darwin
       # peer backend: `LOCAL_PEERCRED` for the owner, `LOCAL_PEERPID` for the
       # process id, and the `last_pid` drift that `Binding::revalidate` must
-      # reject. Those paths exist only on a native runner, so this step is the
-      # only gate that executes them.
+      # reject. It also runs `tests/launchd.rs` against the runner's real
+      # `gui/<uid>` domain. Those paths exist only on a native runner, so this
+      # step is the only gate that executes them.
       - name: Test shared platform contracts
         run: cargo test --locked -p pohunek-platform
 
@@ -127,6 +135,42 @@ jobs:
 
       - name: Test Hermes filesystem lifecycle
         run: cargo test --locked -p pohunek-cli --lib hermes_integration::lifecycle::tests
+
+      # Issue #100: every launchd suite needs the logged-in GUI session's
+      # `gui/<uid>` domain. Its absence is a hard failure, never a skip.
+      - name: Require the launchd gui domain
+        run: /bin/launchctl print "gui/$(id -u)" >/dev/null
+
+      - name: Check daemon, CLI, and service configuration
+        run: cargo check --locked -p pohunek-daemon -p pohunek-cli -p pohunek-service-config --all-targets
+
+      - name: Lint daemon, CLI, worker, and service configuration
+        run: cargo clippy --locked -p pohunek-daemon -p pohunek-cli -p pohunek-session-worker -p pohunek-service-config -p pohunek-worker-protocol -p pohunek-paths --all-targets -- -D warnings
+
+      # Daemon and CLI integration tests spawn the real binaries by path.
+      - name: Build daemon, worker, and CLI binaries
+        run: cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli --bins
+
+      - name: Test service configuration
+        # Independent suites: report each even when an earlier one failed.
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-service-config
+
+      # Daemon tests build their trusted roots and sockets under
+      # these fixture roots, so their Darwin contract is checked first.
+      - name: Test fixture roots
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-test-support
+
+      - name: Test daemon
+        # Independent suites: report each even when an earlier one failed.
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-daemon
+
+      - name: Test CLI
+        # Independent suites: report each even when an earlier one failed.
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-cli
 
   test:
     name: fmt + clippy
@@ -265,10 +309,10 @@ jobs:
               - 'crates/**/*.rs'
               - 'crates/xtask/src/checks.rs'
               - 'crates/xtask/src/lib.rs'
-            # macOS platform, path, private-protocol, session-worker, and
-            # Hermes filesystem contracts run on the native arm64 runner
-            # (issues #96, #97, #98, #99, and #125): gate on every crate
-            # exercised by the job, the cross-platform dependency graph, and
+            # macOS platform, path, private-protocol, session-worker, daemon,
+            # CLI, launchd, and Hermes filesystem contracts run on the native
+            # arm64 runner (issues #96-#100 and #125): gate on every crate
+            # exercised by the job and every crate the daemon and CLI link, the cross-platform dependency graph, and
             # the Cargo configuration (.cargo/config.toml carries Apple-specific
             # linker/target flags that can break only the macOS build). The root
             # manifest is included because these crates inherit workspace
@@ -281,8 +325,21 @@ jobs:
               - 'crates/session-worker/**'
               - 'crates/terminal/**'
               - 'crates/logging/**'
-              - 'crates/cli/Cargo.toml'
-              - 'crates/cli/src/**'
+              - 'crates/service-config/**'
+              - 'crates/test-support/**'
+              - 'crates/daemon/**'
+              - 'crates/cli/**'
+              - 'crates/protocol/**'
+              - 'crates/client/**'
+              - 'crates/knowledge/**'
+              - 'crates/hostcheck/**'
+              - 'crates/netbird/**'
+              - 'crates/overlay/**'
+              - 'crates/prompt/**'
+              - 'crates/gui-core/**'
+              - 'crates/relay-client/**'
+              - 'crates/relay-protocol/**'
+              - 'docs/knowledge/**'
               - 'Cargo.lock'
               - '.cargo/**'
               - '.github/workflows/ci.yml'
@@ -377,6 +434,70 @@ jobs:
           name: nextest-junit-heavy
           path: target/nextest/heavy/junit.xml
           if-no-files-found: warn
+
+  # Issue #100: the ignored real-systemd suites drive the runner's own systemd
+  # user manager (transient worker units, the namespaced daemon unit, and the
+  # `pohunek service` transactions). Hosted Ubuntu runners run a user manager
+  # without lingering; the bus address is exported because the job shell does
+  # not carry one.
+  systemd-supervision:
+    name: real systemd supervision
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
+      POHUNEK_SYSTEMD_E2E: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-
+
+      - name: Require a running systemd user manager
+        run: |
+          systemctl --version | head -n 1
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=${XDG_RUNTIME_DIR}/bus" >> "$GITHUB_ENV"
+          systemctl --user is-system-running --wait || systemctl --user is-system-running | grep -qx degraded
+
+      - name: Build daemon, worker, and CLI binaries
+        run: cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli --bins
+
+      - name: Export binary paths
+        run: |
+          echo "POHUNEK_DAEMON_BIN=$PWD/target/debug/pohunekd" >> "$GITHUB_ENV"
+          echo "POHUNEK_WORKER_BIN=$PWD/target/debug/pohunek-sessiond" >> "$GITHUB_ENV"
+          echo "POHUNEK_CLI_BIN=$PWD/target/debug/pohunek" >> "$GITHUB_ENV"
+
+      - name: Platform systemd backend
+        run: cargo test --locked -p pohunek-platform --test systemd -- --ignored --test-threads 1
+
+      - name: Daemon durability on transient units
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-daemon --test systemd_durable_worker -- --ignored --test-threads 1
+
+      - name: pohunek service transactions
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-cli --test service_systemd -- --ignored --test-threads 1
+
+      - name: Supervised worker lifecycle
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-daemon --test supervised_lifecycle -- --ignored --test-threads 1
+
+      - name: pohunek service upgrade with live workers
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-cli --test service_upgrade -- --ignored --test-threads 1
 
   # Relay heavy tests are the only PostgreSQL fixture consumers, so they get
   # their own job whose Postgres service only starts when relay-relevant files

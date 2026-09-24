@@ -35,6 +35,7 @@ python3 - 3<&0 <<'PY' || exit 0
 import json
 import os
 import socket
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -103,8 +104,46 @@ timestamp_ms = int(time.time() * TIMESTAMP_MS_FACTOR)
 sequence = time.monotonic_ns()
 
 
+# Darwin `proc_pidinfo(PROC_PIDTBSDINFO)` layout of `struct proc_bsdinfo`: the
+# worker compares the report with the same kernel start time, encoded as
+# `pbi_start_tvsec * 1_000_000 + pbi_start_tvusec`.
+DARWIN_LIBSYSTEM = "/usr/lib/libSystem.B.dylib"
+DARWIN_PROC_PIDTBSDINFO = 3
+DARWIN_BSDINFO_SIZE = 136
+DARWIN_BSDINFO_PID_OFFSET = 12
+DARWIN_BSDINFO_START_OFFSET = 120
+MICROSECONDS_PER_SECOND = 1_000_000
+
+
+def darwin_process_start_identity(pid):
+    import ctypes
+    import struct
+
+    libsystem = ctypes.CDLL(DARWIN_LIBSYSTEM, use_errno=True)
+    proc_pidinfo = libsystem.proc_pidinfo
+    proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    proc_pidinfo.restype = ctypes.c_int
+    buffer = ctypes.create_string_buffer(DARWIN_BSDINFO_SIZE)
+    written = proc_pidinfo(pid, DARWIN_PROC_PIDTBSDINFO, 0, buffer, DARWIN_BSDINFO_SIZE)
+    if written != DARWIN_BSDINFO_SIZE:
+        return None
+    (reported_pid,) = struct.unpack_from("=I", buffer, DARWIN_BSDINFO_PID_OFFSET)
+    seconds, microseconds = struct.unpack_from("=QQ", buffer, DARWIN_BSDINFO_START_OFFSET)
+    if reported_pid != pid or microseconds >= MICROSECONDS_PER_SECOND:
+        return None
+    return seconds * MICROSECONDS_PER_SECOND + microseconds
+
+
 def process_start_identity(pid):
     try:
+        if sys.platform == "darwin":
+            return darwin_process_start_identity(pid)
         with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
             stat = handle.read()
         fields = stat[stat.rfind(")") + 2:].split()

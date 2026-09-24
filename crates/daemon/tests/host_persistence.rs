@@ -18,7 +18,7 @@ const LOCK_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 fn temp_root(tag: &str) -> PathBuf {
     tempfile::Builder::new()
         .prefix(&format!("pohunek-host-state-{tag}-"))
-        .tempdir()
+        .tempdir_in(pohunek_test_support::temp_root())
         .expect("create isolated root")
         .keep()
 }
@@ -260,9 +260,15 @@ fn spawn_lock_holder(root: &Path, state: &Path) -> LockHolder {
         release: None,
     };
     let mut ready_stream = accept_with_timeout(&ready_listener, "lock-holder readiness");
-    ready_stream
-        .set_read_timeout(Some(LOCK_HELPER_TIMEOUT))
-        .expect("bound lock-holder readiness signal");
+    match ready_stream.set_read_timeout(Some(LOCK_HELPER_TIMEOUT)) {
+        Ok(()) => {}
+        // Darwin rejects `SO_RCVTIMEO` with `EINVAL` once the peer has already
+        // closed its end. The signal is then buffered and the read below
+        // completes or reaches EOF without blocking, so no deadline is needed.
+        Err(error)
+            if cfg!(target_os = "macos") && error.kind() == std::io::ErrorKind::InvalidInput => {}
+        Err(error) => panic!("bound lock-holder readiness signal: {error}"),
+    }
     let mut signal = [0_u8; 1];
     ready_stream
         .read_exact(&mut signal)
@@ -282,7 +288,13 @@ fn accept_with_timeout(listener: &UnixListener, operation: &str) -> UnixStream {
     let deadline = Instant::now() + LOCK_HELPER_TIMEOUT;
     loop {
         match listener.accept() {
-            Ok((stream, _address)) => return stream,
+            Ok((stream, _address)) => {
+                // BSD-derived accept inherits the listener's nonblocking flag.
+                stream
+                    .set_nonblocking(false)
+                    .expect("make lock-helper connection blocking");
+                return stream;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 assert!(
                     Instant::now() < deadline,

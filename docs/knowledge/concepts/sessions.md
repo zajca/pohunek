@@ -296,6 +296,16 @@ record and diagnostic `loss_reason`. After preserving diagnostic evidence, the
 operator can remove a degraded logical record with `session rm`; this does not
 stop or signal an unavailable or ambiguous worker.
 
+Reconciliation joins the service manager's jobs with worker sockets and
+journals for each worker generation. It reports `runtime_lost` when a worker's
+job ended while its journal still said live, after sweeping that generation's
+leftover processes (`runtime_lost_cleanup_unconfirmed` when that cleanup could
+not be confirmed). It reports `runtime_supervision_ambiguous` (`conflict`) for
+a present job whose worker does not answer, `runtime_identity_mismatch`
+(`conflict`) for a job whose definition or process does not match the record,
+and `runtime_supervision_unavailable` (`reconnecting`) while the service manager
+cannot be inspected. The last three kill nothing.
+
 ## Retention
 
 A host that runs agents for weeks accumulates logical records for sessions that
@@ -364,6 +374,12 @@ registration on macOS. Both re-verify the exact process identity after arming
 the watch, so a reused process id never completes a watch for the process it
 replaced, and a registration failure is reported as a failure rather than as an
 exit.
+
+Workers live for the operating-system login session. Closing a terminal,
+detaching, or locking the screen does not stop a session. Logging out or
+rebooting ends every worker; after the next login the daemon reports those
+sessions `lost` (`runtime_lost`) and never restarts or resurrects them.
+Explicit `session.resume` remains the recovery path.
 
 Detach and client restarts do not stop a session because its worker owns the
 PTY. A daemon restart, daemon `SIGKILL`, or daemon binary upgrade closes client

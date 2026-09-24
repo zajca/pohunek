@@ -4,7 +4,7 @@
 //! buffer. Keeping the decoding here makes region separation, bounds, and
 //! integer conversions testable on every host, not only on macOS.
 
-// Rust guideline compliant 2026-09-22
+// Rust guideline compliant 2026-09-24
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -17,6 +17,8 @@ use super::{OwnershipMarkers, Pid, StartIdentity};
 pub(super) const ENV_DAEMON_ID: &str = "POHUNEK_DAEMON_ID";
 /// Allowlisted session ownership marker.
 pub(super) const ENV_SESSION_ID: &str = "POHUNEK_SESSION_ID";
+/// Allowlisted worker runtime-generation ownership marker.
+pub(super) const ENV_RUNTIME_ID: &str = "POHUNEK_RUNTIME_ID";
 
 /// Width of the leading `KERN_PROCARGS2` argument count, written as a C `int`.
 const ARGUMENT_COUNT_BYTES: usize = 4;
@@ -117,6 +119,9 @@ pub(super) fn parse_process_arguments(buffer: &[u8]) -> Result<NativeArguments, 
 }
 
 /// Collects allowlisted Pohunek markers from an environment region.
+///
+/// The first entry for a key wins, matching what `getenv` reports to the
+/// process itself.
 fn collect_ownership_markers(mut region: &[u8]) -> Result<OwnershipMarkers, LayoutError> {
     let mut markers = OwnershipMarkers::default();
     for _ in 0..MAX_ENVIRONMENT_ENTRIES {
@@ -135,6 +140,8 @@ fn collect_ownership_markers(mut region: &[u8]) -> Result<OwnershipMarkers, Layo
             &mut markers.daemon_id
         } else if key == ENV_SESSION_ID.as_bytes() {
             &mut markers.session_id
+        } else if key == ENV_RUNTIME_ID.as_bytes() {
+            &mut markers.runtime_id
         } else {
             continue;
         };
@@ -142,8 +149,13 @@ fn collect_ownership_markers(mut region: &[u8]) -> Result<OwnershipMarkers, Layo
         if value.len() > MAX_MARKER_VALUE_BYTES {
             return Err(LayoutError::Malformed);
         }
-        *slot = Some(String::from_utf8_lossy(value).into_owned());
-        if markers.daemon_id.is_some() && markers.session_id.is_some() {
+        if slot.is_none() {
+            *slot = Some(String::from_utf8_lossy(value).into_owned());
+        }
+        if markers.daemon_id.is_some()
+            && markers.session_id.is_some()
+            && markers.runtime_id.is_some()
+        {
             break;
         }
     }
@@ -437,6 +449,40 @@ mod tests {
     fn an_oversized_marker_value_is_malformed() {
         let mut entry = b"POHUNEK_SESSION_ID=".to_vec();
         entry.extend(std::iter::repeat_n(b'a', MAX_MARKER_VALUE_BYTES + 1));
+        let buffer = procargs(1, b"/bin/sh", 1, &[b"sh"], &[&entry]);
+
+        assert_eq!(
+            parse_process_arguments(&buffer),
+            Err(LayoutError::Malformed)
+        );
+    }
+
+    #[test]
+    fn the_runtime_marker_is_read_from_the_environment_region_only() {
+        let buffer = procargs(
+            2,
+            b"/bin/sh",
+            1,
+            &[b"sh", b"POHUNEK_RUNTIME_ID=argv-not-a-marker"],
+            &[
+                b"POHUNEK_RUNTIME_IDX=near-miss",
+                b"POHUNEK_RUNTIME_ID=runtime-a",
+                b"POHUNEK_RUNTIME_ID=runtime-b",
+            ],
+        );
+
+        let parsed = parse_process_arguments(&buffer).expect("kernel layout");
+
+        assert_eq!(parsed.markers.runtime_id.as_deref(), Some("runtime-a"));
+        assert_eq!(parsed.markers.session_id, None);
+        assert_eq!(parsed.markers.daemon_id, None);
+        assert!(parsed.markers.is_marked());
+    }
+
+    #[test]
+    fn an_oversized_runtime_marker_is_malformed() {
+        let mut entry = b"POHUNEK_RUNTIME_ID=".to_vec();
+        entry.extend(std::iter::repeat_n(b'r', MAX_MARKER_VALUE_BYTES + 1));
         let buffer = procargs(1, b"/bin/sh", 1, &[b"sh"], &[&entry]);
 
         assert_eq!(

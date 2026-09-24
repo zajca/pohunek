@@ -369,7 +369,7 @@ All params and result type names below refer to structs exported by
 | `session.list` | `SessionListParams` or `null` | `Vec<SessionInfo>` | Lists sessions; filters use AND semantics. |
 | `session.inspect` | `SessionId` | `SessionInfo` | `SessionId` is a JSON string, e.g. `"s-1"`. |
 | `session.stop` | `SessionId` | `SessionStopResult` | Stops a live session (the entry stays in `list`). |
-| `session.resume` | `SessionId` | `SessionResumeResult` | Explicitly recovers a terminal or lost logical session from captured native recovery metadata, reusing the logical session id but creating a new worker and runtime generation. Hermes recovery revalidates the frozen executable against the pinned release before any recovery write or worker launch and returns payload-free `agent_runtime_unsupported` when unavailable or incompatible. Live, reconnecting, conflicting, or incompatible runtimes are rejected; sessions without native metadata return `not_resumable` or `agent_not_resumable`. Daemon restart never calls this method automatically. |
+| `session.resume` | `SessionId` | `SessionResumeResult` | Explicitly recovers a terminal or lost logical session from captured native recovery metadata, reusing the logical session id but starting a new worker generation (a new native service job) with a new runtime id. The previous generation must be proven ended first; two generations of one session are never live at once. Hermes recovery revalidates the frozen executable against the pinned release before any recovery write or worker launch and returns payload-free `agent_runtime_unsupported` when unavailable or incompatible. Live, reconnecting, conflicting, or incompatible runtimes are rejected; sessions without native metadata return `not_resumable` or `agent_not_resumable`. Daemon restart never calls this method automatically. |
 | `session.fork` | `SessionForkParams` | `SessionForkResult` | Forks a native agent conversation into a new pohunek session id and PTY, using the source session's cwd/worktree for `cwd_mode: "same"`. Live sources are allowed. Unknown ids return `session_not_found`; external sessions return `session_external_read_only`; sources without launch-agent native metadata return `not_resumable` or `agent_not_resumable`; Codex- and Hermes-backed sessions return `agent_fork_unsupported`. A successful fork emits `session_created`. |
 | `session.remove` | `SessionId` | `SessionRemoveResult` | Evicts a session from the registry, stopping it first if still live. Unknown id is `session_not_found`. Worktree cleanup is best-effort: the result reports `worktrees_removed` for checkouts that are gone and `worktrees_failed` for an owned checkout whose `git worktree remove` failed, whose binding is dropped regardless, so the leftover directory needs manual cleanup. This is an explicit operator removal and is deliberately not subject to the retention sweep's unsaved-work hold. |
 | `session.runtime_inventory` | `null` | `RuntimeInventoryResult` | Returns the durable-worker runtime inventory captured at startup reconciliation: one `RuntimeInventoryEntry` per discovered worker with its runtime slot, claimed session id, worker/runtime ids, and classification (`managed`, `orphaned`, `conflict`, `incompatible`, or `identity_mismatch`). Read-only operator diagnostic; it never mutates or kills a worker. |
@@ -871,6 +871,20 @@ Managed PTY children inherit these reserved environment values:
 - `POHUNEK_WORKER_SOCKET_PATH`
 - `POHUNEK_WORKER_PROTOCOL_VERSION`
 - `POHUNEK_SOCKET_PATH` for daemon-targeted notification delivery
+
+A managed child does not inherit the daemon's or the worker's process
+environment. Its environment is built from an empty base: the allowlisted
+variables the daemon passes from its own environment (the `[environment]
+allowlist` of `service.toml`, by default `PATH`, `HOME`, `USER`, `LOGNAME`,
+`SHELL`, `LANG`, `LC_*`, `TMPDIR`, `SSH_AUTH_SOCK`, `DISPLAY`,
+`WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, and `XDG_*`), `TERM`, the agent
+profile's environment, and the reserved values above. Service-manager variables
+(`NOTIFY_SOCKET`, `WATCHDOG_*`, `INVOCATION_ID`, `JOURNAL_STREAM`,
+`MANAGERPID`, `SYSTEMD_EXEC_PID`, `XPC_SERVICE_NAME`, `XPC_FLAGS`,
+`__CFBundleIdentifier`, `LaunchInstanceID`) are always removed. A worker kept
+running across an upgrade from the previous private protocol version keeps
+starting its session's children from its own sanitized environment until that
+session gets a new worker generation.
 
 Identity hooks prefer the owner-private worker endpoint so an accepted launch
 or active identity is retained while the daemon is unavailable. Notification

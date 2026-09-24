@@ -1,0 +1,21 @@
+[package]
+name = "pohunek-service-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Typed, owner-private service.toml shared by the Pohunek installer, daemon, and worker."
+
+[dependencies]
+pohunek-paths.workspace = true
+pohunek-platform.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -18,6 +18,8 @@ members = [
     "crates/logging",
     "crates/platform",
     "crates/paths",
+    "crates/service-config",
+    "crates/test-support",
     "crates/xtask",
     "crates/netbird",
     "crates/overlay",
@@ -60,11 +62,13 @@ overlay = { package = "pohunek-overlay", path = "crates/overlay" }
 pohunek-platform = { path = "crates/platform" }
 pohunek-paths = { path = "crates/paths" }
 pohunek-prompt = { path = "crates/prompt" }
+pohunek-service-config = { path = "crates/service-config" }
 pohunek-protocol = { path = "crates/protocol" }
 pohunek-relay-protocol = { path = "crates/relay-protocol" }
 pohunek-relay = { path = "crates/relay" }
 pohunek-relay-client = { path = "crates/relay-client" }
 pohunek-terminal = { path = "crates/terminal" }
+pohunek-test-support = { path = "crates/test-support" }
 pohunek-worker-protocol = { path = "crates/worker-protocol" }
 pohunek-session-worker = { path = "crates/session-worker" }
 iced = { version = "0.14", default-features = false }
@@ -101,6 +105,9 @@ vt100 = "0.16.2"
 portable-pty = "0.9"
 tempfile = "3"
 proptest = "1"
+# launchd job definitions are XML property lists built from `plist::Value`;
+# serde support is not needed.
+plist = { version = "1.10", default-features = false }
 zbus = { version = "5.16", default-features = false, features = ["tokio"] }
 pulldown-cmark = "0.12"
 # Session identifiers need durable, globally collision-resistant generation.

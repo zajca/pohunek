@@ -30,8 +30,8 @@ historical v2 release introduced range negotiation from integer-v1; that
 history does not widen the current supported range.
 
 1. Download the component archive for the binary being updated: CLI (`pohunek`),
-   daemon (`pohunekd` plus `pohunek-sessiond` and its systemd units), or GUI
-   (`pohunek-gui`).
+   daemon (`pohunekd`, `pohunek-sessiond`, and the `pohunek` CLI that installs
+   them as a native service), or GUI (`pohunek-gui`).
 2. Run `pohunek doctor --json` to confirm the current binary can find required
    paths and state directories.
 3. Run `pohunek health --json` to confirm the daemon responds with the expected
@@ -103,14 +103,21 @@ M1 can preserve unknown provider values neutrally on the wire, but it cannot
 operate the M2 Hermes runtime or safely rewrite its persisted launch identity.
 Recover by upgrading forward to the matching M2-or-newer component set.
 
-For a daemon archive upgrade, run its installer rather than replacing only
-`pohunekd`. The installer reloads unit definitions and restarts only
-`pohunekd.service`; it does not restart existing
-`pohunek-session@*.service` workers, so their mapped binary, PTY, and child PID
-remain unchanged. After health returns:
+For a daemon archive upgrade, run its installer
+(`packaging/install-daemon.sh`, which runs
+`pohunek service upgrade --from <archive-dir>`) rather than replacing only `pohunekd`. The upgrade copies the new
+binaries into their own `<prefix>/libexec/pohunek/<version>/` directory,
+switches `active_version` in `service.toml`, rewrites the daemon job to the new
+version, and restarts only the daemon. Worker jobs are separate native jobs
+(systemd transient units or launchd jobs, one per worker generation) that keep
+running the versioned `pohunek-sessiond` they started from, so their PID, PTY,
+and child PID remain unchanged. Version directories that a live worker journal
+or a running process still references are kept; the others are removed and
+listed in the upgrade report. After health returns:
 
-1. Compare `systemctl --user show -p MainPID pohunek-session@<id>.service`
-   before and after the daemon update for an important live session.
+1. Compare `pohunek service status --json` before and after the upgrade for an
+   important live session: its `workers` entry keeps the same `generation` and
+   `pid`, and `versions` still lists the old version as referenced.
 2. Inspect that session and confirm the same `worker_id` and `runtime_id`.
 3. Treat `runtime.state=incompatible`, `conflict`, or `lost` as a diagnostic
    state. Do not restart or kill the worker merely to make the status disappear.
@@ -121,6 +128,15 @@ remain unchanged. After health returns:
    state now reported as authoritative. This code is not a post-rename
    durability warning: the daemon internally logs and applies a commit whose
    rename succeeded but parent-directory sync remained uncertain.
+
+An interrupted install or upgrade is journaled in
+`~/.local/state/pohunek/service-install.json`; running the same command again
+resumes it, and a different command rolls it back first. `pohunek service
+status --json` reports it as `pending_transaction`.
+
+`pohunek service uninstall` refuses while sessions are live and lists them.
+`--stop-sessions` stops every session through its worker first; the session
+store, journals, and host identity are kept unless `--purge` is given.
 
 The first worker-aware release is a destructive compatibility boundary because
 a legacy daemon cannot transfer an already-open PTY. Let all legacy sessions
