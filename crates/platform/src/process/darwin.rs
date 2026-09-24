@@ -1767,6 +1767,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the PTY ownership scenario is linear so each foreground transition stays ordered"
+    )]
     fn foreground_group_tracks_the_terminal_owner() {
         use portable_pty::{native_pty_system, CommandBuilder, PtySize};
         use std::io::Read;
