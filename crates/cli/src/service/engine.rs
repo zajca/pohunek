@@ -148,6 +148,13 @@ impl<'a> Engine<'a> {
     }
 
     /// Version the staged binaries must report when installing `version`.
+    #[cfg_attr(
+        not(feature = "test-util"),
+        expect(
+            clippy::unused_self,
+            reason = "the receiver carries the test-only reported-version override"
+        )
+    )]
     fn reported<'v>(&'v self, version: &'v str) -> &'v str {
         #[cfg(feature = "test-util")]
         if let Some(reported) = &self.reported_version {
