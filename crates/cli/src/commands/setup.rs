@@ -526,8 +526,11 @@ mod tests {
     /// write real files without touching the user's environment.
     fn temp_paths() -> TempPaths {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("pohunek-setup-test-{}-{}", std::process::id(), n));
+        let root = pohunek_test_support::temp_root().join(format!(
+            "pohunek-setup-test-{}-{}",
+            std::process::id(),
+            n
+        ));
         let config_home = root.join("config");
         let data_dir = root.join("data");
         let paths = Paths {

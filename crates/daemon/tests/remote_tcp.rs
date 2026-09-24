@@ -66,7 +66,7 @@ fn temp_dir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = pohunek_test_support::temp_root().join(format!(
         "pohunek-test-{tag}-{}-{nanos}-{n}",
         std::process::id()
     ));
@@ -115,7 +115,7 @@ async fn spawn_dual_servers(
     tokio::task::JoinHandle<()>,
 ) {
     let socket = temp_socket(tag);
-    let worker_home = std::env::temp_dir().join(format!(
+    let worker_home = pohunek_test_support::temp_root().join(format!(
         "pw-r-{}-{}",
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -262,7 +262,7 @@ fn session_params() -> SessionNewParams {
     SessionNewParams {
         name: None,
         agent: "shell".to_owned(),
-        cwd: Some(std::env::temp_dir()),
+        cwd: Some(pohunek_test_support::temp_root()),
         cols: 80,
         rows: 24,
         project: None,

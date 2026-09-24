@@ -1197,7 +1197,8 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         let sequence = TEST_PATH_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
-        std::env::temp_dir().join(format!("pohunek-{name}-{}-{sequence}", std::process::id()))
+        pohunek_test_support::temp_root()
+            .join(format!("pohunek-{name}-{}-{sequence}", std::process::id()))
     }
 
     fn observation_initialize(root: &Path, output_bytes: usize) -> Initialize {

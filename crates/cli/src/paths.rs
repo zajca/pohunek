@@ -158,7 +158,8 @@ mod tests {
     }
 
     fn tmp_base(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("pohunek-cli-paths-{tag}-{}", std::process::id()))
+        pohunek_test_support::temp_root()
+            .join(format!("pohunek-cli-paths-{tag}-{}", std::process::id()))
     }
 
     fn set_all_present(base: &Path) {

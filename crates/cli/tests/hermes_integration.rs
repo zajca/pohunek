@@ -25,7 +25,7 @@ struct Fixture {
 impl Fixture {
     fn new(tag: &str) -> Self {
         let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
+        let root = pohunek_test_support::temp_root().join(format!(
             "pohunek-hermes-process-{tag}-{}-{sequence}",
             std::process::id()
         ));

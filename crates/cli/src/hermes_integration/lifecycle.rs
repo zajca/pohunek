@@ -2096,7 +2096,7 @@ mod tests {
 
     #[test]
     fn reservation_removal_failure_before_unlink_is_not_a_committed_move() {
-        let root = tempfile::tempdir().expect("temporary directory");
+        let root = pohunek_test_support::tempdir().expect("temporary directory");
         fs::set_permissions(
             root.path(),
             fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
@@ -2127,7 +2127,7 @@ mod tests {
 
     #[test]
     fn reservation_removal_failure_after_unlink_is_not_a_committed_move() {
-        let root = tempfile::tempdir().expect("temporary directory");
+        let root = pohunek_test_support::tempdir().expect("temporary directory");
         fs::set_permissions(
             root.path(),
             fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),

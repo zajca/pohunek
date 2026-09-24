@@ -77,7 +77,7 @@ impl Children {
 fn state_dir() -> tempfile::TempDir {
     let temp = tempfile::Builder::new()
         .prefix("pohunek-host-bootstrap-")
-        .tempdir()
+        .tempdir_in(pohunek_test_support::temp_root())
         .expect("create isolated state directory");
     std::fs::set_permissions(
         temp.path(),

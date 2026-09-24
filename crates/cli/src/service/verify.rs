@@ -142,7 +142,7 @@ mod tests {
 
     #[tokio::test]
     async fn rendered_units_pass_systemd_analyze() {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = pohunek_test_support::tempdir().expect("temp dir");
         let context = context(root.path());
         let config =
             initial_config(&context, &root.path().join("prefix"), "1.2.3").expect("config");

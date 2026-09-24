@@ -474,7 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn subprocess_runs_exactly_the_definition_with_a_cleared_environment() {
-        let root = tempfile::tempdir().expect("temporary worker root");
+        let root = pohunek_test_support::tempdir().expect("temporary worker root");
         let output = root.path().join("env.txt");
         let script = format!("env > {}; pwd >> {}", output.display(), output.display());
         let launcher = SubprocessWorkerLauncher::new();
@@ -520,7 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn subprocess_keys_jobs_by_generation_and_retires_exactly_one() {
-        let root = tempfile::tempdir().expect("temporary worker root");
+        let root = pohunek_test_support::tempdir().expect("temporary worker root");
         let launcher = SubprocessWorkerLauncher::new();
         let first = service_id();
         let second = ServiceId::parse("s-42.efgh2345").expect("valid service id");
@@ -553,7 +553,7 @@ mod tests {
 
     #[tokio::test]
     async fn subprocess_rejects_service_ids_that_do_not_name_a_generation() {
-        let root = tempfile::tempdir().expect("temporary worker root");
+        let root = pohunek_test_support::tempdir().expect("temporary worker root");
         let launcher = SubprocessWorkerLauncher::new();
         let id = ServiceId::parse("s-42").expect("valid service id");
         let definition = definition(root.path(), "/bin/true", &[]);

@@ -307,7 +307,7 @@ impl Roots {
         static SEQUENCE: AtomicU64 = AtomicU64::new(1);
         // Worker sockets live below the runtime root and `sockaddr_un` paths
         // are short, so the base stays directly under the temp directory.
-        let base = std::env::temp_dir().join(format!(
+        let base = pohunek_test_support::temp_root().join(format!(
             "pl-{}-{}",
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)

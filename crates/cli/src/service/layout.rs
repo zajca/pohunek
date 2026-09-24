@@ -603,7 +603,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn stage_and_publish_create_an_immutable_version_directory() {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = pohunek_test_support::tempdir().expect("temp dir");
         let layout = InstallLayout::new(root.path().join("prefix")).expect("layout");
         let from = stage_dir(root.path(), "1.0.0");
 
@@ -644,7 +644,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_mismatched_or_missing_binary_is_rejected_before_publishing() {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = pohunek_test_support::tempdir().expect("temp dir");
         let layout = InstallLayout::new(root.path().join("prefix")).expect("layout");
         let from = stage_dir(root.path(), "1.0.0");
         write_fake(&from, WORKER_EXECUTABLE_NAME, "0.9.0");
@@ -664,7 +664,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_binary_that_ignores_version_is_a_probe_failure() {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = pohunek_test_support::tempdir().expect("temp dir");
         let layout = InstallLayout::new(root.path().join("prefix")).expect("layout");
         let from = stage_dir(root.path(), "1.0.0");
         std::fs::write(from.join(DAEMON_EXECUTABLE_NAME), "#!/bin/sh\nexit 3\n")
@@ -677,7 +677,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn cli_copy_is_installed_atomically_and_recognized() {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = pohunek_test_support::tempdir().expect("temp dir");
         let layout = InstallLayout::new(root.path().join("prefix")).expect("layout");
         let from = stage_dir(root.path(), "1.0.0");
         let staged = stage(&layout, &from, "1.0.0").await.expect("stage");
@@ -693,7 +693,7 @@ pub(crate) mod tests {
 
     #[test]
     fn untrusted_install_prefix_is_refused_with_the_directory_named() {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = pohunek_test_support::tempdir().expect("temp dir");
         let prefix = root.path().join("prefix");
         std::fs::create_dir_all(prefix.join("libexec")).expect("prefix");
         std::fs::set_permissions(prefix.join("libexec"), Permissions::from_mode(0o777))

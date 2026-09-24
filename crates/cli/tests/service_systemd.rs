@@ -53,7 +53,7 @@ struct Installation {
 
 impl Installation {
     fn new() -> Self {
-        let root = tempfile::tempdir().expect("temp root");
+        let root = pohunek_test_support::tempdir().expect("temp root");
         let dir = |name: &str| {
             let path = root.path().join(name);
             std::fs::create_dir_all(&path).expect("create XDG root");

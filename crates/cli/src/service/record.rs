@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn record_round_trips_owner_private_and_clears() {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = pohunek_test_support::tempdir().expect("temp dir");
         let state = root.path().join("state/pohunek");
         let store = Store::new(state.clone());
         assert_eq!(store.load().expect("load missing"), None);
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn foreign_schema_and_unknown_fields_are_rejected() {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = pohunek_test_support::tempdir().expect("temp dir");
         let state = root.path().join("state");
         let store = Store::new(state.clone());
         let mut value = serde_json::to_value(record(Step::Started)).expect("value");

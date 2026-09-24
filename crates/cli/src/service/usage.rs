@@ -378,7 +378,7 @@ pub(crate) mod tests {
 
     #[test]
     fn non_final_journals_reference_their_version_and_final_ones_do_not() {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = pohunek_test_support::tempdir().expect("temp dir");
         let paths = super::super::context::tests::paths(root.path());
         let layout = InstallLayout::new(root.path().join("prefix")).expect("layout");
         let old = layout.worker_executable("1.0.0").expect("old");
@@ -411,7 +411,7 @@ pub(crate) mod tests {
 
     #[test]
     fn an_unreadable_journal_keeps_every_version() {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = pohunek_test_support::tempdir().expect("temp dir");
         let paths = super::super::context::tests::paths(root.path());
         let layout = InstallLayout::new(root.path().join("prefix")).expect("layout");
         let old = layout.worker_executable("1.0.0").expect("old");
@@ -437,7 +437,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_running_process_keeps_the_version_it_executes() {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = pohunek_test_support::tempdir().expect("temp dir");
         let layout = InstallLayout::new(root.path().join("prefix")).expect("layout");
         let dir = layout.version_dir("1.0.0").expect("dir");
         std::fs::create_dir_all(&dir).expect("version dir");

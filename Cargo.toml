@@ -19,6 +19,7 @@ members = [
     "crates/platform",
     "crates/paths",
     "crates/service-config",
+    "crates/test-support",
     "crates/xtask",
     "crates/netbird",
     "crates/overlay",
@@ -67,6 +68,7 @@ pohunek-relay-protocol = { path = "crates/relay-protocol" }
 pohunek-relay = { path = "crates/relay" }
 pohunek-relay-client = { path = "crates/relay-client" }
 pohunek-terminal = { path = "crates/terminal" }
+pohunek-test-support = { path = "crates/test-support" }
 pohunek-worker-protocol = { path = "crates/worker-protocol" }
 pohunek-session-worker = { path = "crates/session-worker" }
 iced = { version = "0.14", default-features = false }

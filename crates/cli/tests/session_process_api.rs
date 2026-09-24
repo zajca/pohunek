@@ -95,7 +95,7 @@ struct TestHome {
 impl TestHome {
     fn new() -> Self {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
+        let root = pohunek_test_support::temp_root().join(format!(
             "pohunek-cli-process-api-{}-{sequence}",
             std::process::id()
         ));

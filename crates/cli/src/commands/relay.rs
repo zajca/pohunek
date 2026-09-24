@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn custom_ca_rejects_special_files_and_oversized_bundles() {
-        let directory = tempfile::tempdir().expect("CA fixture");
+        let directory = pohunek_test_support::tempdir().expect("CA fixture");
         let path = directory.path().join("ca.pem");
         nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRUSR).expect("FIFO fixture");
         let connection = Connection {

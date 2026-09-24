@@ -268,7 +268,7 @@ mod tests {
     }
 
     fn temp_dir() -> TempDir {
-        let path = std::env::temp_dir().join(format!(
+        let path = pohunek_test_support::temp_root().join(format!(
             "pohunek-hermes-assets-{}-{}",
             std::process::id(),
             NEXT_DIR.fetch_add(1, Ordering::Relaxed)

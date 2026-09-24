@@ -241,7 +241,7 @@ fn temp_dir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = pohunek_test_support::temp_root().join(format!(
         "pohunek-test-{tag}-{}-{nanos}-{n}",
         std::process::id()
     ));
@@ -419,7 +419,7 @@ fn worker_backed_registry(
     socket: &std::path::Path,
     mut config: SessionRegistryConfig,
 ) -> SessionRegistry {
-    let worker_home = std::env::temp_dir().join(format!(
+    let worker_home = pohunek_test_support::temp_root().join(format!(
         "pw-h-{}-{}",
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -613,7 +613,7 @@ fn session_params() -> SessionNewParams {
     SessionNewParams {
         name: None,
         agent: "shell".to_owned(),
-        cwd: Some(std::env::temp_dir()),
+        cwd: Some(pohunek_test_support::temp_root()),
         cols: 80,
         rows: 24,
         project: None,
@@ -1201,7 +1201,7 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
     // The real worker nests its control socket below the XDG runtime root, and
     // `sockaddr_un` imposes a small platform path bound. Keep this fixture short
     // while retaining an isolated complete XDG environment.
-    let root = std::env::temp_dir().join(format!(
+    let root = pohunek_test_support::temp_root().join(format!(
         "pw-s-{}-{}",
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)

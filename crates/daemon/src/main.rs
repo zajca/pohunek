@@ -972,7 +972,7 @@ mod tests {
     };
 
     async fn governance_service() -> (tempfile::TempDir, Arc<HostGovernanceService>) {
-        let root = tempfile::tempdir().expect("create isolated host-governance root");
+        let root = pohunek_test_support::tempdir().expect("create isolated host-governance root");
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
             .expect("make isolated host-governance root owner-private");
         let service = Arc::new(

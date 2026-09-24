@@ -182,7 +182,7 @@ async fn with_servers(condition: GovernanceCondition, transport: OwnerTransport)
 async fn start_servers(condition: GovernanceCondition) -> Servers {
     let root = tempfile::Builder::new()
         .prefix("po-")
-        .tempdir()
+        .tempdir_in(pohunek_test_support::temp_root())
         .expect("create isolated owner-path root");
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
         .expect("secure isolated owner-path root");
@@ -620,7 +620,7 @@ where
         serde_json::to_value(SessionNewParams {
             name: None,
             agent: "shell".to_owned(),
-            cwd: Some(std::env::temp_dir()),
+            cwd: Some(pohunek_test_support::temp_root()),
             cols: 80,
             rows: 24,
             project: None,

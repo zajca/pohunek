@@ -757,7 +757,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!(
+        pohunek_test_support::temp_root().join(format!(
             "pohunek-handler-notifications-{tag}-{}-{nanos}-{counter}",
             std::process::id()
         ))
@@ -1156,7 +1156,7 @@ mod tests {
                 .iter()
                 .map(|&key| (key, std::env::var(key).ok()))
                 .collect::<Vec<_>>();
-            let root = std::env::temp_dir().join(format!(
+            let root = pohunek_test_support::temp_root().join(format!(
                 "pohunek-handler-{tag}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()

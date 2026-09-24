@@ -18,7 +18,7 @@ const LOCK_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 fn temp_root(tag: &str) -> PathBuf {
     tempfile::Builder::new()
         .prefix(&format!("pohunek-host-state-{tag}-"))
-        .tempdir()
+        .tempdir_in(pohunek_test_support::temp_root())
         .expect("create isolated root")
         .keep()
 }

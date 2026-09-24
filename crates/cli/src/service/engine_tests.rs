@@ -315,7 +315,7 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = pohunek_test_support::tempdir().expect("temp dir");
         let context = context(root.path());
         let fake = Fake::default();
         let backend = Backend::new(

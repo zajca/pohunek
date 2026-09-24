@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn initial_config_writes_the_documented_values() {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = pohunek_test_support::tempdir().expect("temp dir");
         let context = context(root.path());
         let prefix = root.path().join("prefix");
         let config = initial_config(&context, &prefix, "1.2.3").expect("config");
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn daemon_definition_runs_the_versioned_daemon_with_the_config() {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = pohunek_test_support::tempdir().expect("temp dir");
         let context = context(root.path());
         let config =
             initial_config(&context, &root.path().join("prefix"), "1.2.3").expect("config");

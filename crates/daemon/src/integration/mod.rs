@@ -2530,7 +2530,7 @@ mod tests {
             .expect("system time after epoch")
             .as_nanos();
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = pohunek_test_support::temp_root().join(format!(
             "pohunek-integration-{tag}-{}-{nanos}-{sequence}",
             std::process::id()
         ));

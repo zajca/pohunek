@@ -281,7 +281,7 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        pohunek_test_support::temp_root().join(format!(
             "pohunek-discovery-cache-{tag}-{}",
             std::process::id()
         ))

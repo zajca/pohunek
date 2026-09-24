@@ -15,7 +15,7 @@ fn temp_dir() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
+    let dir = pohunek_test_support::temp_root().join(format!(
         "pohunek-standalone-discovery-{}-{nanos}-{nonce}",
         std::process::id()
     ));

@@ -562,7 +562,7 @@ mod tests {
     fn temp_dir(tag: &str) -> Fixture {
         loop {
             let counter = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
+            let path = pohunek_test_support::temp_root().join(format!(
                 "pohunek-hermes-policy-{tag}-{}-{counter}",
                 std::process::id()
             ));

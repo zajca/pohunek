@@ -154,6 +154,11 @@ jobs:
       - name: Test service configuration
         run: cargo test --locked -p pohunek-service-config
 
+      # Daemon and CLI tests build their trusted roots and sockets under
+      # these fixture roots, so their Darwin contract is checked first.
+      - name: Test fixture roots
+        run: cargo test --locked -p pohunek-test-support
+
       - name: Test daemon
         run: cargo test --locked -p pohunek-daemon
 
@@ -314,6 +319,7 @@ jobs:
               - 'crates/terminal/**'
               - 'crates/logging/**'
               - 'crates/service-config/**'
+              - 'crates/test-support/**'
               - 'crates/daemon/**'
               - 'crates/cli/**'
               - 'crates/protocol/**'

@@ -261,7 +261,7 @@ pub(crate) mod tests {
 
     #[test]
     fn bootstrap_environment_names_every_root_explicitly() {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = pohunek_test_support::tempdir().expect("temp dir");
         let context = context(root.path());
         let environment = context.bootstrap_environment();
         let path = |name: &str| root.path().join(name).to_str().expect("utf-8").to_owned();
@@ -280,8 +280,8 @@ pub(crate) mod tests {
 
     #[test]
     fn namespace_is_deterministic_and_depends_on_the_roots() {
-        let first = tempfile::tempdir().expect("temp dir");
-        let second = tempfile::tempdir().expect("temp dir");
+        let first = pohunek_test_support::tempdir().expect("temp dir");
+        let second = pohunek_test_support::tempdir().expect("temp dir");
         let a = context(first.path()).namespace().expect("namespace");
         let again = context(first.path()).namespace().expect("namespace");
         let b = context(second.path()).namespace().expect("namespace");

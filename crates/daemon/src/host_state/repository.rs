@@ -517,7 +517,7 @@ mod tests {
     fn state_dir() -> TempDir {
         let temp = tempfile::Builder::new()
             .prefix("pohunek-host-state-")
-            .tempdir()
+            .tempdir_in(pohunek_test_support::temp_root())
             .expect("create isolated host-state directory");
         std::fs::set_permissions(
             temp.path(),
