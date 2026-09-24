@@ -36,6 +36,11 @@ pub(crate) const RUNTIME_LOST: &str = "runtime_lost";
 /// repeated as a kill loop. Operators inspect the remaining processes.
 pub(crate) const RUNTIME_LOST_CLEANUP_UNCONFIRMED: &str = "runtime_lost_cleanup_unconfirmed";
 
+/// Inventory reason of an adopted live worker whose job the supervisor
+/// proved absent: the native manager no longer tracks a worker that still
+/// owns a PTY.
+pub(crate) const UNSUPERVISED_WORKER: &str = "worker_job_absent";
+
 /// Inventory reason of a live job whose generation no durable record names.
 pub(crate) const STALE_GENERATION: &str = "stale_worker_generation";
 
