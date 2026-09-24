@@ -10,17 +10,20 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pohunek_platform::filesystem::{EntryKind, StageOutcome, TrustedDir};
+use pohunek_platform::filesystem::{AdvisoryLock, EntryKind, FsError, StageOutcome, TrustedDir};
 use serde::{Deserialize, Serialize};
 
 use super::error::{fs_error, replace_error, Error};
-use super::settings::MAX_RECORD_BYTES;
+use super::settings::{LOCK_POLL, LOCK_WAIT, MAX_RECORD_BYTES};
 
 /// Version of the record schema; any other version is rejected.
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// File name of the record inside the application state directory.
 pub const FILE_NAME: &str = "service-install.json";
+
+/// File name of the transaction lock inside the application state directory.
+pub const LOCK_NAME: &str = "service-install.lock";
 
 /// Mode of the record file: owner read/write only.
 const FILE_MODE: u32 = 0o600;
@@ -120,6 +123,16 @@ pub struct Record {
     pub step: Step,
 }
 
+/// Exclusive ownership of the install transaction, released on drop.
+///
+/// The `flock` belongs to this process's open file descriptions, so a
+/// crashed holder releases it and a later run can resume or roll back the
+/// record it left.
+#[derive(Debug)]
+pub struct TransactionLock {
+    _lock: AdvisoryLock,
+}
+
 /// Owner-private storage of the transaction record.
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -198,6 +211,51 @@ impl Store {
             .map_err(|source| replace_error("write install record", source))
     }
 
+    /// Takes the exclusive transaction lock, waiting at most [`LOCK_WAIT`].
+    ///
+    /// Every install, upgrade, uninstall, resume, rollback, and garbage
+    /// collection runs under this lock. The short wait only absorbs a
+    /// concurrent `status` probe, which holds the lock for microseconds; a
+    /// real transaction runs for far longer (daemon readiness, stopping
+    /// sessions), so a second command is refused promptly instead of stalling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::TransactionInProgress`] while another process holds
+    /// the lock, and a filesystem error when the state directory is unsafe.
+    pub async fn lock(&self) -> Result<TransactionLock, Error> {
+        let directory = self
+            .open(true)?
+            .expect("open(create = true) always yields a directory");
+        let deadline = tokio::time::Instant::now() + LOCK_WAIT;
+        loop {
+            match try_lock(&directory)? {
+                Some(lock) => return Ok(lock),
+                None if tokio::time::Instant::now() >= deadline => {
+                    return Err(Error::TransactionInProgress {
+                        path: self.state_dir.join(LOCK_NAME),
+                    });
+                }
+                None => tokio::time::sleep(LOCK_POLL).await,
+            }
+        }
+    }
+
+    /// Returns whether another process currently holds the transaction lock.
+    ///
+    /// The answer is a snapshot for reporting only; it never guards a change,
+    /// and the probe holds the lock only for the instant it takes to test it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem error when the state directory is unsafe.
+    pub fn in_progress(&self) -> Result<bool, Error> {
+        let Some(directory) = self.open(false)? else {
+            return Ok(false);
+        };
+        Ok(try_lock(&directory)?.is_none())
+    }
+
     /// Removes the record; a missing record is not an error.
     ///
     /// # Errors
@@ -212,6 +270,15 @@ impl Store {
 
     fn open(&self, create: bool) -> Result<Option<TrustedDir>, Error> {
         open_state_dir(&self.state_dir, create)
+    }
+}
+
+/// Tries the transaction lock once; `None` means another process holds it.
+fn try_lock(directory: &TrustedDir) -> Result<Option<TransactionLock>, Error> {
+    match directory.acquire_lock(LOCK_NAME, FILE_MODE) {
+        Ok(lock) => Ok(Some(TransactionLock { _lock: lock })),
+        Err(FsError::LockContended { .. }) => Ok(None),
+        Err(source) => Err(fs_error("lock the install transaction", source)),
     }
 }
 

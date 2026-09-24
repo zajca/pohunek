@@ -33,14 +33,17 @@ pohunek_run_with_timeout() {
   _pohunek_command=$!
   exec 3<&-
   (
-    # The trap only records cancellation: a TERM that lands before a
-    # sleeper's PID is known is still honored by the checks in
-    # `watchdog_sleep`, so every sleeper is killed and reaped.
+    # Cancellation is a TERM from the caller. Traps run only between
+    # commands, so a TERM can land after a flag check but before `wait`
+    # blocks; the trap therefore also kills the current sleeper, which ends
+    # that `wait` at once. A TERM that lands before the sleeper's PID is known
+    # is caught by the flag check right after it is recorded.
     _pohunek_cancelled=0
-    trap '_pohunek_cancelled=1' TERM
+    _pohunek_sleeper=
+    trap '_pohunek_cancelled=1; if [ -n "$_pohunek_sleeper" ]; then kill "$_pohunek_sleeper" 2>/dev/null || true; fi' TERM
 
-    # Sleeps $1 seconds in the background so a cancelling TERM interrupts
-    # `wait` at once; fails after cancellation.
+    # Sleeps $1 seconds in the background; fails after cancellation, with
+    # the sleeper killed and reaped.
     watchdog_sleep() {
       [ "$_pohunek_cancelled" -eq 0 ] || return 1
       sleep "$1" &
@@ -49,8 +52,10 @@ pohunek_run_with_timeout() {
       if [ "$_pohunek_cancelled" -eq 1 ]; then
         kill "$_pohunek_sleeper" 2>/dev/null || true
         wait "$_pohunek_sleeper" >/dev/null 2>&1 || true
+        _pohunek_sleeper=
         return 1
       fi
+      _pohunek_sleeper=
     }
 
     watchdog_sleep "$_pohunek_limit" || exit 0

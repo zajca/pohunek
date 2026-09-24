@@ -412,10 +412,10 @@ port is retained.
 | Command | What it does |
 |---|---|
 | `pohunek doctor` | Environment health: binaries, socket, state dirs, NetBird, agents. |
-| `pohunek service install [--from <dir>] [--prefix <dir>]` | Install the daemon as a native login service (systemd user unit or launchd agent) from staged binaries into a versioned `libexec` directory and write `service.toml`. |
-| `pohunek service upgrade [--from <dir>]` | Switch to the staged version, restarting only the daemon; live workers keep their PID and PTY, and unreferenced old versions are removed. |
-| `pohunek service uninstall [--stop-sessions] [--purge]` | Remove the service; refuses while sessions are live unless `--stop-sessions`, and keeps durable metadata unless `--purge`. |
-| `pohunek service status` | Daemon job, namespace, installed versions, and worker jobs per generation. |
+| `pohunek service install [--from <dir>] [--prefix <dir>] [--json]` | Install the daemon as a native login service (systemd user unit or launchd agent) from staged binaries into a versioned `libexec` directory and write `service.toml`. |
+| `pohunek service upgrade [--from <dir>] [--json]` | Switch to the staged version, restarting only the daemon; live workers keep their PID and PTY, and unreferenced old versions are removed. |
+| `pohunek service uninstall [--stop-sessions] [--purge] [--json]` | Remove the service; refuses while sessions are live unless `--stop-sessions`, and keeps durable metadata unless `--purge`. |
+| `pohunek service status [--json]` | Daemon job, namespace, installed versions, worker jobs per generation, and any interrupted or running install transaction. |
 | `pohunek daemon start [--detach] [--dev-subprocess]` | Run the installed daemon by hand (needs `service.toml`), or with `--dev-subprocess` a development daemon with plain subprocess workers. |
 | `pohunek health` / `status` | Daemon liveness, build, and protocol version. |
 | `pohunek session new` | Start a session: `--agent`, `--name`, `--project`/`--repo`, `--branch`, `--base-branch`, `--cwd`, `--input`, `--request-timeout-ms`, `--meta k=v`. |

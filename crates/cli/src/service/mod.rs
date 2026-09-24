@@ -123,6 +123,7 @@ pub async fn status() -> Result<report::StatusReport, Error> {
             workers: Vec::new(),
             workers_error: None,
             unreadable_journals: Vec::new(),
+            transaction_in_progress: store.in_progress()?,
             pending_transaction: store.load()?.map(|pending| report::PendingReport {
                 operation: pending.operation.as_str(),
                 version: pending.version,

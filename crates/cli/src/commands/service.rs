@@ -215,13 +215,7 @@ fn render_uninstall(report: &report::UninstallReport) -> String {
 
 fn render_status(report: &report::StatusReport) -> String {
     let mut text = String::new();
-    if let Some(pending) = &report.pending_transaction {
-        let _ = writeln!(
-            text,
-            "pending    {} {} stopped after step {} (rerun it to resume, or uninstall to roll back)",
-            pending.operation, pending.version, pending.step
-        );
-    }
+    render_transaction(&mut text, report);
     if !report.installed {
         let _ = writeln!(
             text,
@@ -314,6 +308,32 @@ fn render_status(report: &report::StatusReport) -> String {
     text
 }
 
+fn render_transaction(text: &mut String, report: &report::StatusReport) {
+    match (&report.pending_transaction, report.transaction_in_progress) {
+        (Some(pending), true) => {
+            let _ = writeln!(
+                text,
+                "running    {} {} is at step {} in another `pohunek service` command",
+                pending.operation, pending.version, pending.step
+            );
+        }
+        (None, true) => {
+            let _ = writeln!(
+                text,
+                "running    another `pohunek service` command holds the lock"
+            );
+        }
+        (Some(pending), false) => {
+            let _ = writeln!(
+                text,
+                "pending    {} {} stopped after step {} (rerun it to resume, or uninstall to roll back)",
+                pending.operation, pending.version, pending.step
+            );
+        }
+        (None, false) => {}
+    }
+}
+
 fn render_rolled_back(pending: &report::PendingReport) -> String {
     format!(
         "rolled back an interrupted {} of {} (stopped after step {})",
@@ -385,6 +405,7 @@ mod tests {
             workers: Vec::new(),
             workers_error: None,
             unreadable_journals: Vec::new(),
+            transaction_in_progress: false,
             pending_transaction: Some(report::PendingReport {
                 operation: "install",
                 version: "1.0.0".to_owned(),

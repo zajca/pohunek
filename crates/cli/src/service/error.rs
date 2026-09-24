@@ -243,6 +243,13 @@ pub enum Error {
         detail: String,
     },
 
+    /// Another `pohunek service` command holds the transaction lock.
+    #[error("another `pohunek service` command is running (lock {})", path.display())]
+    TransactionInProgress {
+        /// The held lock file.
+        path: PathBuf,
+    },
+
     /// A step failed and rolling the transaction back failed too.
     #[error("{original}; rolling the transaction back also failed: {rollback}")]
     RollbackFailed {
@@ -286,6 +293,7 @@ impl Error {
             Self::UnreadableJournals { .. } => "service_unreadable_journals",
             Self::OrphanWorkers { .. } => "service_orphan_workers",
             Self::Record { .. } => "service_record_invalid",
+            Self::TransactionInProgress { .. } => "service_transaction_in_progress",
             Self::RollbackFailed { .. } => "service_rollback_failed",
             #[cfg(test)]
             Self::Interrupted(_) => "service_interrupted",
@@ -318,6 +326,9 @@ impl Error {
             }
             Self::RollbackFailed { .. } => {
                 Some("rerun the same command; the transaction record resumes the rollback")
+            }
+            Self::TransactionInProgress { .. } => {
+                Some("wait for the other `pohunek service` command to finish, then retry")
             }
             _ => None,
         }
