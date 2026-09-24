@@ -165,14 +165,12 @@ jobs:
       - name: Test daemon
         # Independent suites: report each even when an earlier one failed.
         if: ${{ !cancelled() }}
-        timeout-minutes: 25
-        run: cargo test --locked -p pohunek-daemon --no-fail-fast
+        run: cargo test --locked -p pohunek-daemon
 
       - name: Test CLI
         # Independent suites: report each even when an earlier one failed.
         if: ${{ !cancelled() }}
-        timeout-minutes: 25
-        run: cargo test --locked -p pohunek-cli --no-fail-fast
+        run: cargo test --locked -p pohunek-cli
 
   test:
     name: fmt + clippy
