@@ -110,8 +110,12 @@ launchd backend, so lint it from Linux with
 `cargo clippy --target aarch64-apple-darwin -p <crate> --all-targets -- -D warnings`
 before pushing. The real-systemd suites (`crates/platform/tests/systemd.rs`,
 `crates/daemon/tests/systemd_durable_worker.rs`,
-`crates/cli/tests/service_systemd.rs`) are `#[ignore]`d and run against the
-logged-in user manager with `POHUNEK_SYSTEMD_E2E=1`. Intel Macs are outside the
+`crates/cli/tests/service_systemd.rs`) are `#[ignore]`d and need
+`POHUNEK_SYSTEMD_E2E=1` plus a running user manager; the Linux CI job
+`real systemd supervision` runs all three with `--ignored --test-threads 1`
+after building the daemon, worker, and CLI binaries. Run them locally the same
+way (`POHUNEK_DAEMON_BIN`, `POHUNEK_WORKER_BIN`, and `POHUNEK_CLI_BIN` point the
+suites at the built binaries). Intel Macs are outside the
 current release scope. This gate does not mean complete macOS host support;
 delivery scope, order, and status are tracked by the
 [`Complete macOS support` milestone](https://github.com/zajca/pohunek/milestone/2),

@@ -45,7 +45,7 @@ Interpret runtime states as follows:
   start native recovery or restart the worker. Reason
   `runtime_supervision_unavailable` means the service manager (systemd user
   manager or launchd) could not be inspected; nothing was killed and
-  reconciliation retries on its own.
+  reconciliation retries on its own (after 1 s, doubling to at most 60 s).
 - `terminal`: the worker observed child exit and the logical outcome is being
   retained or has been imported.
 - `lost`: no live PTY generation remains. The logical record is intentionally
@@ -54,7 +54,8 @@ Interpret runtime states as follows:
   journal still said live, and the ownership-marker sweep removed that
   generation's leftover processes. `runtime_lost_cleanup_unconfirmed` means the
   same, but the sweep could not confirm that every marked process ended;
-  inspect `ps` for processes of that session before recovering it.
+  inspect `ps` for processes of that session before recovering it. A lost
+  session without a journal for its generation reports `worker_unavailable`.
 - `conflict`: multiple or mismatched identities claim the session. Do not stop,
   unlink, or kill either candidate automatically. Preserve the job, journal,
   and socket evidence for diagnosis. `runtime_supervision_ambiguous` means the
@@ -79,8 +80,9 @@ connections. On Linux:
 systemctl --user restart pohunek-<ns>-daemon.service
 ```
 
-On macOS, `launchctl kickstart -k gui/$(id -u)/io.github.zajca.pohunek.<ns>.daemon`
-restarts the agent. The namespace `<ns>` is the `namespace` field of
+On macOS, the standard launchctl command
+`launchctl kickstart -k gui/$(id -u)/io.github.zajca.pohunek.<ns>.daemon`
+restarts the agent; it is not exercised by Pohunek's tests. The namespace `<ns>` is the `namespace` field of
 `pohunek service status --json`.
 
 After health returns, the same `worker_id`, `runtime_id`, worker generation

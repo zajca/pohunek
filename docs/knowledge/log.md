@@ -16,7 +16,8 @@
   logout and reboot end workers, which the next login reports as `lost` with
   `runtime_lost` and never restarts. Added the reconciliation reasons
   `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`,
-  `runtime_identity_mismatch`, and `runtime_lost_cleanup_unconfirmed`, and the
+  `runtime_identity_mismatch`, `runtime_lost_cleanup_unconfirmed`,
+  `worker_job_absent`, and `stale_worker_generation`, and the
   manual macOS acceptance procedure in `docs/acceptance/`.
 - Documented that agents no longer inherit the daemon's whole environment:
   the worker builds the child environment from an empty base plus the

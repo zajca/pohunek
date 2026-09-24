@@ -1087,61 +1087,67 @@ The daemon reconciles before advertising readiness:
    (`ListUnitsByPatterns` over `pohunek-<ns>-worker-*.service`, or the private
    launchd definitions directory), bounded at 4,096 entries, with foreign,
    malformed, and other-namespace names rejected and never touched;
-4. scan owner-private worker journals and runtime sockets, and join all three
-   sources on `(session_id, generation)`; a socket is bound to a generation
-   through the connected worker's journal;
-5. take the per-session lifecycle lock of each record being reconciled;
+4. scan owner-private worker journals (schema 4: `generation`, `executable`,
+   `worker_pid`, `worker_start_identity`) and runtime sockets, and join the
+   three sources on each record's current generation (`runtime.generation`,
+   `runtime.service_id`). A socket counts only when the connected worker's
+   journal names that generation; terminal journals of other generations are
+   history and are ignored;
+5. reconcile each record under its session's lifecycle lock;
 6. connect, negotiate, validate peer identity, and acquire controller leases;
 7. call `Inspect` on every connected worker;
-8. classify every logical record and every discovered worker;
-9. finish recoverable transactions;
-10. construct `SessionEntry` worker proxies and restart detector/procwatch tasks;
-11. bind the public socket, notify readiness, and emit reconciliation events.
+8. inspect only the record's own generation's job; a job that races during
+   inspection is retried a bounded number of times and never treated as absent;
+9. classify every logical record and every discovered worker;
+10. finish recoverable transactions;
+11. construct `SessionEntry` worker proxies and restart detector/procwatch tasks;
+12. bind the public socket, notify readiness, and emit reconciliation events.
 
-A job observation is evidence, never readiness. A discovery entry that raced
-(`Race`) is re-inspected a bounded number of times and is never treated as
-absent.
+A job observation is evidence, never readiness.
 
-Reconciliation uses this table:
+Reconciliation applies these rows in order
+(`crates/daemon/src/session/reconcile.rs`, `crates/daemon/src/session/supervision.rs`):
 
-| Logical record | Supervisor job / worker / journal | Result |
-|----------------|-----------------------------------|--------|
-| running, exact live identity | job present, worker live | reconnect and mark live |
-| preparing, exact live identity | job present, worker live | adopt and commit creation |
-| running, terminal journal | no live worker | import terminal outcome; retire the ended job |
-| stop requested, live | live | replay same idempotent stop command |
-| remove requested, live | live | finish stop, then removal |
-| running | job present, worker socket absent or unconnectable, journal not terminal | `conflict`, reason `runtime_supervision_ambiguous`; nothing killed or retired |
-| running | job absent or ended, journal live, journal worker PID not running (by start identity) | proven crash: marker sweep of that generation, retire the ended job and definition, then `lost` with `runtime_lost` (`runtime_lost_cleanup_unconfirmed` when the sweep could not confirm cleanup); do not native-resume |
-| running, no runtime evidence | no job, no worker, no journal | `lost`; do not native-resume |
-| any | job present whose definition (executable, argv session ID or generation) or live process does not match the record | `conflict`, reason `runtime_identity_mismatch`; fail closed, nothing killed |
-| any | journal PID running but with a different start identity | PID reuse: treated as not running |
-| stale generation or no logical record | job of a non-current generation, proven ended | exact retirement of that generation and definition cleanup |
-| stale generation or no logical record | job of a non-current generation, still running | leave it; inventory `orphaned`; do not kill |
-| any | supervisor `discover` or `inspect` unavailable | keep or move to `reconnecting`, reason `runtime_supervision_unavailable`; nothing killed; a bounded background retry reconciles again |
-| terminal | stale inactive journal | keep summary, schedule safe journal cleanup |
-| no logical record | one valid live worker | create quarantined recovered record and expose `orphaned_worker`; do not kill |
-| any | incompatible live worker | expose `worker_protocol_incompatible`; leave it alive |
-| any | multiple live identities | expose `runtime_conflict`; do not acquire mutation authority or kill |
-| worker identity mismatch | any | expose `runtime_identity_mismatch`; fail closed |
+| # | Evidence | Result |
+|---|----------|--------|
+| 1 | record with a malformed or partial generation | `conflict`, `runtime_identity_mismatch` |
+| 2 | several live workers claim the session | `conflict`, `multiple_worker_candidates` |
+| 3 | worker socket answers but its journal names another generation, or the record names none | `conflict`, `runtime_identity_mismatch`; nothing killed |
+| 4 | live worker of the exact generation; job present with a mismatched definition (executable, or argv without `--session-id <id>` / `--worker-generation <gen>`) or a main process that is not the journaled worker | `conflict`, `runtime_identity_mismatch`; nothing killed |
+| 5 | live worker of the exact generation; job proven absent | adopt (`live`); warn `reconcile.adopt.job_absent`; inventory stays `managed` with reason `worker_job_absent`, re-announced as `session_runtime_discovered` |
+| 6 | live worker of the exact generation; job cannot be inspected | adopt (`live`) with a warning; the authenticated worker plus its journal is the proof |
+| 7 | live worker of the exact generation; job matches | reconnect and mark `live`; adopt and commit a preparing create; replay a requested stop or remove |
+| 8 | no reachable worker; terminal journal of this generation | import the terminal outcome; a malformed or `Faulted` journal is `conflict`, `worker_journal_identity_mismatch` |
+| 9 | socket answers but cannot be adopted | incompatible protocol: `incompatible`, `worker_protocol_incompatible`, worker left alive, job not inspected; identity mismatch: `conflict`, `runtime_identity_mismatch` |
+| 10 | record without a generation and without evidence | an unfinished create is deleted; otherwise `lost`, `worker_unavailable` |
+| 11 | several non-terminal journals claim the generation, or the journal's `worker_id` differs from the record's | `conflict`, `runtime_supervision_ambiguous` or `runtime_identity_mismatch` respectively |
+| 12 | no reachable worker; job present and running, or ended while the journaled worker PID still runs with its start identity, or that PID cannot be inspected | `conflict`, `runtime_supervision_ambiguous`; nothing killed or retired |
+| 13 | no reachable worker; job with a mismatched definition or process, or a malformed journaled start identity | `conflict`, `runtime_identity_mismatch` |
+| 14 | no reachable worker; job absent or ended; journal not terminal; journaled worker PID not running with its recorded start identity (a reused PID counts as not running) | proven crash: marker sweep of the journal's `runtime_id`, retire the job (absent is fine), then `lost`, `runtime_lost`; `runtime_lost_cleanup_unconfirmed` when the sweep reports unconfirmed processes, fails, or still finds processes after 3 passes. Never a retried kill loop |
+| 15 | no reachable worker; job absent or ended; no journal for this generation | retire the job, then `lost`, `worker_unavailable`; an unfinished create is deleted only after the retire succeeds, otherwise `reconnecting`, `runtime_supervision_unavailable` and retried |
+| 16 | job inspection fails (unavailable, timeout, or still racing after the retries) | `reconnecting`, `runtime_supervision_unavailable`; nothing touched; background re-reconciliation after 1 s, doubling to at most 60 s, until the session is resolved or changed or the daemon shuts down (a supervisor outage during create schedules the same retry) |
+| 17 | job of a generation that is not a record's current one, or of a session without a record | re-inspected: proven ended or absent is retired by exact service ID (removing its definition); still live is left alone, inventory `orphaned` with `runtime_slot` = its service ID and reason `stale_worker_generation`. When discovery fails this cleanup is skipped and logged; each record's own generation is still inspected |
+| – | worker socket of a session without a logical record | inventory `orphaned`, reason `logical_session_missing`; the worker is left alive |
+| – | terminal record; stale inactive journal | keep summary, schedule safe journal cleanup |
 
-The **marker sweep** runs only when worker death is proven. The Linux and Darwin
-process inspectors enumerate the owner's processes whose allowlisted
+The **marker sweep** runs only for row 14. The Linux and Darwin process
+inspectors enumerate the owner's processes whose allowlisted
 `POHUNEK_RUNTIME_ID` marker equals exactly the lost generation's runtime ID.
 Each process's start identity is verified before `SIGTERM`, again after the
 configured `[sweep] grace_ms`, and before `SIGKILL` (through a pidfd on Linux).
-Unreadable markers are skipped, any other inspection failure stops the sweep
-before further signals, and uncertain evidence kills nothing. The sweep never
-touches another runtime ID. On macOS it is the primary cleanup of descendants
-that left the worker's process group; on Linux it is a backstop behind
+Processes whose environment cannot be read are never signalled and are only
+counted in the log; any other inspection failure stops the sweep before further
+signals; uncertain evidence kills nothing. The sweep never touches another
+runtime ID. On macOS it is the primary cleanup of descendants that left the
+worker's process group; on Linux it is a backstop behind
 `KillMode=control-group`.
 
 An orphaned live worker can occur only if the logical store was lost after the
-worker journal became durable. The recovered record contains journal-safe
-metadata and is attachable only after identity validation. Operations that need
-missing project or launch metadata fail with precise errors. The operator may
-rename, stop, remove, or explicitly adopt it; reconciliation does not invent
-missing metadata.
+worker journal became durable, or when a stale generation's job is still
+running. It appears only in `session.runtime_inventory` (reason
+`logical_session_missing` or `stale_worker_generation`) and is left alive;
+reconciliation neither kills it nor invents a logical record or missing
+metadata.
 
 Existing sessions do not emit `session_created` on daemon startup. The event log
 receives `session_runtime_reconnected`, `session_runtime_lost`,

@@ -51,7 +51,8 @@ plane. On Linux:
 systemctl --user restart pohunek-<ns>-daemon.service
 ```
 
-On macOS:
+On macOS, the standard launchctl command below restarts the agent (it is not
+exercised by Pohunek's tests):
 
 ```bash
 launchctl kickstart -k gui/$(id -u)/io.github.zajca.pohunek.<ns>.daemon
@@ -90,6 +91,15 @@ Interpret the runtime independently from the agent lifecycle:
 | `lost` | The PTY generation no longer exists; `runtime_lost` after its leftover processes were swept, `runtime_lost_cleanup_unconfirmed` when the sweep could not confirm that | Preserve the logical record; use explicit native recovery only when available. After `runtime_lost_cleanup_unconfirmed`, check `ps` for that session's processes first |
 | `conflict` | More than one or mismatched runtime identity is present: `runtime_supervision_ambiguous` (job present, worker socket silent, journal not terminal) or `runtime_identity_mismatch` (job definition or process does not match the record) | Preserve evidence; do not kill a worker automatically. After diagnosis, `session rm` may remove only the logical record. |
 | `incompatible` | A live worker has no compatible private protocol | Run a compatible daemon; leave the worker alive |
+
+`pohunek session runtime-inventory --json` lists worker endpoints and jobs
+outside that table: `worker_job_absent` marks a live, adopted worker whose
+native job is missing (the worker is managed; the job was removed outside
+Pohunek), and `stale_worker_generation` marks a still-running job of a
+generation no record owns (left alive, `orphaned`, `runtime_slot` = its service
+ID). A lost session without a journal for its generation reports
+`worker_unavailable`. While the service manager cannot be inspected, affected
+sessions are retried in the background after 1 s, doubling to at most 60 s.
 
 `pohunek service status --json` lists every worker job of the installation
 with its `generation`, `state`, `pid`, and the executable and arguments the
