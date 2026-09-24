@@ -525,10 +525,18 @@ async fn daemon_agent_installs_replaces_and_uninstalls() {
     let agents = fixture.root.join("LaunchAgents");
     let daemon = LaunchdDaemon::new(&fixture.namespace, uid(), agents.clone(), COMMAND_DEADLINE)
         .expect("valid daemon manager");
-    let definition = |seconds: &str| {
+    // The daemon is matched by launchd parentage, executable, and exact argv.
+    // A bare `/bin/sleep 600` would also match the foreign jobs a concurrent
+    // discovery test loads, so the argv carries this fixture's namespace.
+    let definition = |script: &str| {
         JobDefinition::new(JobSpec {
-            executable: PathBuf::from("/bin/sleep"),
-            arguments: vec![seconds.to_owned()],
+            executable: PathBuf::from("/bin/bash"),
+            arguments: vec![
+                "-c".to_owned(),
+                script.to_owned(),
+                "pohunek-test-daemon".to_owned(),
+                fixture.namespace.as_str().to_owned(),
+            ],
             environment: BTreeMap::new(),
             working_directory: fixture.root.clone(),
             logs: Some(pohunek_platform::supervisor::JobLogs {
@@ -548,7 +556,7 @@ async fn daemon_agent_installs_replaces_and_uninstalls() {
     let _cleanup = Bootout(label.clone());
     let path = agents.join(format!("{label}.plist"));
 
-    let first = definition("600");
+    let first = definition(SLEEPING_WORKER);
     daemon.install(&first).await.expect("daemon installs");
     let observation = wait_for(|| daemon.inspect(), running).await;
     assert_eq!(observation.definition, Some(first.facts()));
@@ -558,7 +566,7 @@ async fn daemon_agent_installs_replaces_and_uninstalls() {
         Err(Error::AlreadyRegistered(_))
     ));
 
-    let second = definition("700");
+    let second = definition("/bin/sleep 700 & wait");
     daemon.replace(&second).await.expect("daemon replaced");
     let observation = wait_for(|| daemon.inspect(), running).await;
     assert_eq!(observation.definition, Some(second.facts()));
