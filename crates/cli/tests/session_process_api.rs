@@ -95,10 +95,15 @@ struct TestHome {
 impl TestHome {
     fn new() -> Self {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "pohunek-cli-process-api-{}-{sequence}",
-            std::process::id()
-        ));
+        // A short canonical base keeps the fixture daemon socket within the
+        // macOS 103-byte `sun_path` limit; the per-user macOS temporary
+        // directory is too long and sits below the `/var` symlink.
+        let root = fs::canonicalize("/tmp")
+            .expect("canonical /tmp")
+            .join(format!(
+                "pohunek-cli-process-api-{}-{sequence}",
+                std::process::id()
+            ));
         for directory in [
             "run/pohunek",
             "state/pohunek/logs",

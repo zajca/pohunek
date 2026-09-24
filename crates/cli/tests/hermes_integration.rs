@@ -27,10 +27,15 @@ struct Fixture {
 impl Fixture {
     fn new(tag: &str) -> Self {
         let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "pohunek-hermes-process-{tag}-{}-{sequence}",
-            std::process::id()
-        ));
+        // A short canonical base keeps the fixture daemon socket within the
+        // macOS 103-byte `sun_path` limit; the per-user macOS temporary
+        // directory is too long and sits below the `/var` symlink.
+        let root = fs::canonicalize("/tmp")
+            .expect("canonical /tmp")
+            .join(format!(
+                "pohunek-hermes-process-{tag}-{}-{sequence}",
+                std::process::id()
+            ));
         fs::create_dir(&root).expect("create fixture root");
         set_mode(&root, 0o700);
         Self { root }
