@@ -136,6 +136,30 @@ jobs:
       - name: Test Hermes filesystem lifecycle
         run: cargo test --locked -p pohunek-cli --lib hermes_integration::lifecycle::tests
 
+      # Issue #100: every launchd suite needs the logged-in GUI session's
+      # `gui/<uid>` domain. Its absence is a hard failure, never a skip.
+      - name: Require the launchd gui domain
+        run: /bin/launchctl print "gui/$(id -u)" >/dev/null
+
+      - name: Check daemon, CLI, and service configuration
+        run: cargo check --locked -p pohunek-daemon -p pohunek-cli -p pohunek-service-config --all-targets
+
+      - name: Lint daemon, CLI, worker, and service configuration
+        run: cargo clippy --locked -p pohunek-daemon -p pohunek-cli -p pohunek-session-worker -p pohunek-service-config -p pohunek-worker-protocol -p pohunek-paths --all-targets -- -D warnings
+
+      # Daemon and CLI integration tests spawn the real binaries by path.
+      - name: Build daemon, worker, and CLI binaries
+        run: cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli --bins
+
+      - name: Test service configuration
+        run: cargo test --locked -p pohunek-service-config
+
+      - name: Test daemon
+        run: cargo test --locked -p pohunek-daemon
+
+      - name: Test CLI
+        run: cargo test --locked -p pohunek-cli
+
   test:
     name: fmt + clippy
     runs-on: ubuntu-latest
@@ -273,10 +297,10 @@ jobs:
               - 'crates/**/*.rs'
               - 'crates/xtask/src/checks.rs'
               - 'crates/xtask/src/lib.rs'
-            # macOS platform, path, private-protocol, session-worker, and
-            # Hermes filesystem contracts run on the native arm64 runner
-            # (issues #96, #97, #98, #99, and #125): gate on every crate
-            # exercised by the job, the cross-platform dependency graph, and
+            # macOS platform, path, private-protocol, session-worker, daemon,
+            # CLI, launchd, and Hermes filesystem contracts run on the native
+            # arm64 runner (issues #96-#100 and #125): gate on every crate
+            # exercised by the job and every crate the daemon and CLI link, the cross-platform dependency graph, and
             # the Cargo configuration (.cargo/config.toml carries Apple-specific
             # linker/target flags that can break only the macOS build). The root
             # manifest is included because these crates inherit workspace
@@ -289,8 +313,20 @@ jobs:
               - 'crates/session-worker/**'
               - 'crates/terminal/**'
               - 'crates/logging/**'
-              - 'crates/cli/Cargo.toml'
-              - 'crates/cli/src/**'
+              - 'crates/service-config/**'
+              - 'crates/daemon/**'
+              - 'crates/cli/**'
+              - 'crates/protocol/**'
+              - 'crates/client/**'
+              - 'crates/knowledge/**'
+              - 'crates/hostcheck/**'
+              - 'crates/netbird/**'
+              - 'crates/overlay/**'
+              - 'crates/prompt/**'
+              - 'crates/gui-core/**'
+              - 'crates/relay-client/**'
+              - 'crates/relay-protocol/**'
+              - 'docs/knowledge/**'
               - 'Cargo.lock'
               - '.cargo/**'
               - '.github/workflows/ci.yml'
