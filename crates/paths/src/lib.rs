@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-19
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -704,62 +704,6 @@ pub fn valid_worker_id(id: &str) -> Option<&str> {
     .then_some(id)
 }
 
-/// Length of a daemon-issued worker generation token.
-///
-/// A generation names one worker process of a session in service-manager
-/// labels and unit names. Eight base32 characters carry 40 random bits, enough
-/// that two generations of one session never collide in practice, while the
-/// full launchd label stays short.
-pub const WORKER_GENERATION_LEN: usize = 8;
-
-/// Random bytes encoded into one worker generation token.
-///
-/// Five bytes are exactly the 40 bits that [`WORKER_GENERATION_LEN`] base32
-/// characters represent, so every token is fully random.
-pub const WORKER_GENERATION_ENTROPY_BYTES: usize = 5;
-
-/// RFC 4648 base32 alphabet in lowercase, as used by generation tokens.
-///
-/// Lowercase letters and digits `2`-`7` are valid unescaped in launchd labels,
-/// systemd unit names, and file names on every supported filesystem.
-const GENERATION_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-
-/// Bits encoded by one base32 character.
-const BASE32_BITS: u32 = 5;
-
-/// Validates a daemon-issued worker generation token.
-///
-/// A token is exactly [`WORKER_GENERATION_LEN`] characters of the lowercase
-/// RFC 4648 base32 alphabet `[a-z2-7]`.
-#[must_use]
-pub fn valid_worker_generation(value: &str) -> Option<&str> {
-    (value.len() == WORKER_GENERATION_LEN
-        && value
-            .bytes()
-            .all(|byte| GENERATION_ALPHABET.contains(&byte)))
-    .then_some(value)
-}
-
-/// Encodes random bytes as a worker generation token.
-///
-/// The caller supplies operating-system entropy; the encoding itself is pure
-/// so that its output grammar is testable. The result always satisfies
-/// [`valid_worker_generation`].
-#[must_use]
-pub fn encode_worker_generation(entropy: [u8; WORKER_GENERATION_ENTROPY_BYTES]) -> String {
-    let bits = entropy
-        .iter()
-        .fold(0_u64, |bits, byte| (bits << 8) | u64::from(*byte));
-    (0..WORKER_GENERATION_LEN)
-        .rev()
-        .map(|index| {
-            let shift = u32::try_from(index).expect("generation length fits u32") * BASE32_BITS;
-            let symbol = usize::try_from((bits >> shift) & 0x1f).expect("5-bit value fits usize");
-            char::from(GENERATION_ALPHABET[symbol])
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,36 +945,5 @@ mod tests {
             paths.host_state_lock_path(),
             host.join(HOST_STATE_LOCK_NAME)
         );
-    }
-
-    #[test]
-    fn worker_generation_accepts_only_eight_lowercase_base32_characters() {
-        for valid in ["abcd2345", "aaaaaaaa", "77777777", "zzzzzzzz"] {
-            assert_eq!(valid_worker_generation(valid), Some(valid));
-        }
-        for invalid in [
-            "",
-            "abcd234",
-            "abcd23456",
-            "ABCD2345",
-            "abcd2301",
-            "abcd-345",
-            "abcd 345",
-            "abcd23\u{e9}",
-        ] {
-            assert_eq!(valid_worker_generation(invalid), None, "{invalid:?}");
-        }
-    }
-
-    #[test]
-    fn worker_generation_encoding_is_rfc4648_base32() {
-        // RFC 4648 section 10 test vector: BASE32("fooba") = "MZXW6YTB".
-        assert_eq!(encode_worker_generation(*b"fooba"), "mzxw6ytb");
-        assert_eq!(encode_worker_generation([0; 5]), "aaaaaaaa");
-        assert_eq!(encode_worker_generation([0xff; 5]), "77777777");
-        for entropy in [[0x12, 0x34, 0x56, 0x78, 0x9a], [1, 2, 3, 4, 5]] {
-            let token = encode_worker_generation(entropy);
-            assert_eq!(valid_worker_generation(&token), Some(token.as_str()));
-        }
     }
 }

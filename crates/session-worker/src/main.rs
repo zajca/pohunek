@@ -16,6 +16,8 @@ use tracing_subscriber::prelude::*;
 
 /// Random bytes in a worker process identifier.
 const WORKER_ID_RANDOM_BYTES: usize = 16;
+/// Characters in a daemon-issued worker generation token (40 random bits).
+const GENERATION_LEN: usize = 8;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -130,7 +132,7 @@ impl Cli {
         let generation = generation.ok_or_else(|| {
             WorkerError::Protocol("required argument --worker-generation is missing".to_owned())
         })?;
-        if pohunek_paths::valid_worker_generation(&generation).is_none() {
+        if valid_generation(&generation).is_none() {
             return Err(WorkerError::InvalidGeneration(generation));
         }
         if worker_id
@@ -154,6 +156,19 @@ impl Cli {
             service_config,
         })
     }
+}
+
+/// Validates a daemon-issued worker generation token.
+///
+/// A token is exactly eight characters of the lowercase RFC 4648 base32
+/// alphabet `[a-z2-7]`. Mirrors `pohunek_paths::valid_worker_generation`,
+/// which replaces it once that function is available on this branch.
+fn valid_generation(value: &str) -> Option<&str> {
+    (value.len() == GENERATION_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte)))
+    .then_some(value)
 }
 
 fn init_logging(
@@ -235,7 +250,7 @@ mod tests {
 
     use pohunek_session_worker::WorkerError;
 
-    use super::{generate_worker_id, Cli};
+    use super::{generate_worker_id, valid_generation, Cli};
 
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
@@ -264,6 +279,25 @@ mod tests {
             "abcd2345",
         ]))
         .expect_err("path-like session must fail");
+    }
+
+    #[test]
+    fn generation_accepts_only_eight_lowercase_base32_characters() {
+        for valid in ["abcd2345", "aaaaaaaa", "77777777", "zzzzzzzz"] {
+            assert_eq!(valid_generation(valid), Some(valid));
+        }
+        for invalid in [
+            "",
+            "abcd234",
+            "abcd23456",
+            "ABCD2345",
+            "abcd2301",
+            "abcd-345",
+            "abcd 345",
+            "abcd23\u{e9}",
+        ] {
+            assert_eq!(valid_generation(invalid), None, "{invalid:?}");
+        }
     }
 
     #[test]

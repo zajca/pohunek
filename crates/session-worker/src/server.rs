@@ -91,6 +91,8 @@ const ATTACH_INPUT_PREFIX: &str = "attach-";
 /// xterm-compatible `vt100` parser, while a service-manager-started worker has
 /// no `TERM` of its own. The profile environment may still override it.
 const CHILD_TERM: &str = "xterm-256color";
+/// Characters in a daemon-issued worker generation token (40 random bits).
+const GENERATION_LEN: usize = 8;
 /// Package version recorded in the worker journal.
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SOCKET_DIRECTORY_MODE: u32 = 0o700;
@@ -244,7 +246,7 @@ impl Server {
         if pohunek_paths::valid_worker_id(&args.worker_id).is_none() {
             return Err(WorkerError::InvalidWorkerId(args.worker_id));
         }
-        if pohunek_paths::valid_worker_generation(&args.generation).is_none() {
+        if valid_generation(&args.generation).is_none() {
             return Err(WorkerError::InvalidGeneration(args.generation));
         }
         let origin = worker_origin(args.generation)?;
@@ -3719,6 +3721,19 @@ fn command_from_initialize(
         cols: initialize.dimensions.columns(),
         rows: initialize.dimensions.rows(),
     }
+}
+
+/// Validates a daemon-issued worker generation token.
+///
+/// Exactly eight characters of the lowercase RFC 4648 base32 alphabet
+/// `[a-z2-7]`. Mirrors `pohunek_paths::valid_worker_generation`, which
+/// replaces it once that function is available on this branch.
+fn valid_generation(value: &str) -> Option<&str> {
+    (value.len() == GENERATION_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte)))
+    .then_some(value)
 }
 
 /// Identifies the running worker binary for its journal.
