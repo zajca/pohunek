@@ -345,44 +345,12 @@ impl SystemdWorkerLauncher {
     }
 }
 
-/// Random bytes in one worker generation token.
-///
-/// Five bytes are exactly the 40 bits of eight base32 characters, the token
-/// grammar `pohunek-sessiond --worker-generation` accepts.
-const GENERATION_ENTROPY_BYTES: usize = 5;
-/// Lowercase RFC 4648 base32 alphabet of generation tokens.
-const GENERATION_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-
 /// Draws a fresh daemon-issued worker generation token.
 fn new_generation() -> Result<String, WorkerLaunchError> {
-    let mut entropy = [0_u8; GENERATION_ENTROPY_BYTES];
+    let mut entropy = [0_u8; pohunek_paths::WORKER_GENERATION_ENTROPY_BYTES];
     getrandom::getrandom(&mut entropy)
         .map_err(|error| operation("generation", std::io::Error::other(error.to_string())))?;
-    Ok(encode_generation(entropy))
-}
-
-/// Encodes 40 bits as eight lowercase base32 characters, most significant first.
-fn encode_generation(entropy: [u8; GENERATION_ENTROPY_BYTES]) -> String {
-    let bits = entropy
-        .iter()
-        .fold(0_u64, |bits, byte| (bits << 8) | u64::from(*byte));
-    (0..8_u32)
-        .rev()
-        .map(|index| {
-            let symbol =
-                usize::try_from((bits >> (index * 5)) & 0x1f).expect("a 5-bit value fits usize");
-            char::from(GENERATION_ALPHABET[symbol])
-        })
-        .collect()
-}
-
-#[cfg(test)]
-#[test]
-fn generation_encoding_is_rfc4648_base32() {
-    // RFC 4648 section 10 test vector: BASE32("fooba") = "MZXW6YTB".
-    assert_eq!(encode_generation(*b"fooba"), "mzxw6ytb");
-    assert_eq!(encode_generation([0; 5]), "aaaaaaaa");
-    assert_eq!(encode_generation([0xff; 5]), "77777777");
+    Ok(pohunek_paths::encode_worker_generation(entropy))
 }
 
 fn unavailable(
