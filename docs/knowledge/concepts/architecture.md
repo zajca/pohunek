@@ -52,7 +52,12 @@ yet reaped keeps its identity on both backends and is reported as no longer
 running. Argument and environment regions stay
 separate, so an environment value is never argument evidence and an argument is
 never an ownership marker. An observation that fails is an explicit typed
-failure, never a healthy absence, and never authorizes a mutation.
+failure, never a healthy absence, and never authorizes a mutation. On Darwin a
+live process between images can expose an argument region that is absent,
+uncopyable, or not yet laid out; that process is still listed, without a
+command line, and its ownership markers read as unobservable rather than
+unmarked, so the runtime sweep skips it as unreadable and never signals it
+while the rest of the process table is still classified.
 
 Darwin adds a privilege boundary Linux does not have: the kernel serves most
 process records only to the owner of the target process and refuses everyone

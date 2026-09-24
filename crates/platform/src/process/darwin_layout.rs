@@ -78,6 +78,36 @@ pub(super) struct NativeArguments {
     pub(super) markers: OwnershipMarkers,
 }
 
+/// What one argument-region read established about a same-user process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ArgumentRegion {
+    /// The region decoded into its distinct parts.
+    Present(NativeArguments),
+    /// The process is exiting or gone, so it holds no region any more.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(
+            dead_code,
+            reason = "only the Darwin backend reads a process that ended"
+        )
+    )]
+    Ended,
+    /// The process is live, but its region cannot be read right now: it has
+    /// forked without an exec yet, its image is being replaced, or the copied
+    /// bytes contradict the documented layout.
+    Unobservable,
+}
+
+/// Decodes the `KERN_PROCARGS2` buffer copied from a live process.
+///
+/// The kernel copies the region out of the live process stack, which an
+/// `exec` may be replacing or the process may have rewritten, so a buffer
+/// that contradicts the layout describes that one process, not a failed
+/// observation: it is [`ArgumentRegion::Unobservable`].
+pub(super) fn decode_argument_region(buffer: &[u8]) -> ArgumentRegion {
+    parse_process_arguments(buffer).map_or(ArgumentRegion::Unobservable, ArgumentRegion::Present)
+}
+
 /// Decodes one `KERN_PROCARGS2` buffer into its distinct regions.
 ///
 /// # Errors
@@ -294,10 +324,11 @@ pub(super) fn children_by_parent(table: &[(Pid, Pid)]) -> HashMap<Pid, Vec<Pid>>
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_descendants, children_by_parent, controlling_terminal_group, decode_command_name,
-        decode_kernel_path, encode_boot_identity, encode_start_identity, parse_process_arguments,
-        LayoutError, MAX_ARGUMENT_COUNT, MAX_DESCENDANT_COUNT, MAX_DESCENDANT_DEPTH,
-        MAX_MARKER_VALUE_BYTES, NO_CONTROLLING_DEVICE,
+        bounded_descendants, children_by_parent, controlling_terminal_group,
+        decode_argument_region, decode_command_name, decode_kernel_path, encode_boot_identity,
+        encode_start_identity, parse_process_arguments, ArgumentRegion, LayoutError,
+        MAX_ARGUMENT_COUNT, MAX_DESCENDANT_COUNT, MAX_DESCENDANT_DEPTH, MAX_MARKER_VALUE_BYTES,
+        NO_CONTROLLING_DEVICE,
     };
     use crate::process::Pid;
     use std::convert::Infallible;
@@ -355,6 +386,67 @@ mod tests {
         );
         assert_eq!(parsed.markers.session_id.as_deref(), Some("01J0SESSION"));
         assert_eq!(parsed.markers.daemon_id, None);
+    }
+
+    #[test]
+    fn a_decodable_region_is_present() {
+        let buffer = procargs(
+            1,
+            b"/bin/sleep",
+            0,
+            &[b"sleep"],
+            &[b"POHUNEK_RUNTIME_ID=runtime-a"],
+        );
+
+        let ArgumentRegion::Present(arguments) = decode_argument_region(&buffer) else {
+            panic!("a well-formed region must decode");
+        };
+        assert_eq!(arguments.argv, vec!["sleep".to_owned()]);
+        assert_eq!(arguments.markers.runtime_id.as_deref(), Some("runtime-a"));
+    }
+
+    #[test]
+    fn a_region_caught_mid_exec_is_unobservable_not_a_failure() {
+        // Shapes a region takes while an exec rewrites the stack it is copied
+        // from: cut short, a count that is not a count yet, an executable not
+        // yet written, and an argument count larger than the strings present.
+        let whole = procargs(2, b"/bin/sh", 0, &[b"sh", b"-c"], &[b"HOME=/"]);
+        let mut negative = whole.clone();
+        negative[..4].copy_from_slice(&(-1_i32).to_ne_bytes());
+        let unwritten = procargs(1, b"", 0, &[b"sh"], &[]);
+        let short_of_arguments = {
+            let mut buffer = 3_i32.to_ne_bytes().to_vec();
+            buffer.extend_from_slice(b"/bin/sh\0sh");
+            buffer
+        };
+        let oversized_marker = procargs(
+            1,
+            b"/bin/sh",
+            0,
+            &[b"sh"],
+            &[format!(
+                "POHUNEK_RUNTIME_ID={}",
+                "r".repeat(MAX_MARKER_VALUE_BYTES + 1)
+            )
+            .as_bytes()],
+        );
+
+        let empty: &[u8] = &[];
+        for buffer in [
+            &whole[..whole.len() / 2],
+            &whole[..2],
+            empty,
+            negative.as_slice(),
+            unwritten.as_slice(),
+            short_of_arguments.as_slice(),
+            oversized_marker.as_slice(),
+        ] {
+            assert_eq!(
+                decode_argument_region(buffer),
+                ArgumentRegion::Unobservable,
+                "{buffer:?}"
+            );
+        }
     }
 
     #[test]

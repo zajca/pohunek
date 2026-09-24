@@ -2,6 +2,9 @@
 
 ## Unreleased (2026-08-12)
 
+- Documented that a Darwin process between images no longer fails a process
+  table read: it is listed without a command line, its markers are
+  unobservable, and the runtime sweep skips it as unreadable.
 - Documented native worker supervision (#100): every worker generation is its
   own systemd transient unit (`pohunek-<ns>-worker-<session-id>-<generation>.service`
   in `pohunek-<ns>-sessions.slice`, systemd 255 or newer) or launchd job

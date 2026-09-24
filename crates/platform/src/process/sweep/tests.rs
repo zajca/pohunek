@@ -27,6 +27,7 @@ const SCRIPTED_POLL: Duration = Duration::from_millis(5);
 enum MarkerAnswer {
     Markers(OwnershipMarkers),
     Denied,
+    Unobservable,
     Failed,
 }
 
@@ -156,6 +157,9 @@ impl ProcessInspector for ScriptedInspector {
             Some(MarkerAnswer::Denied) => Err(Error::PermissionDenied {
                 operation: "scripted_markers",
                 source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            }),
+            Some(MarkerAnswer::Unobservable) => Err(Error::Unobservable {
+                operation: "scripted_markers",
             }),
             Some(MarkerAnswer::Failed) => Err(Error::Io {
                 operation: "scripted_markers",
@@ -442,6 +446,34 @@ async fn unreadable_markers_are_reported_and_never_signalled() {
         }]
     );
     assert!(inspector.is_running(hidden).expect("scripted liveness"));
+}
+
+#[tokio::test]
+async fn a_process_between_images_is_skipped_and_the_rest_still_classified() {
+    let before = identity(10, 100);
+    let exec_ing = identity(11, 110);
+    let after = identity(12, 120);
+    let inspector = ScriptedInspector::default()
+        .with_process(before, marked(RUNTIME))
+        .with_process(exec_ing, MarkerAnswer::Unobservable)
+        .with_process(after, marked(RUNTIME));
+    let sender = RecordingSender::fatal_on(&[Signal::TERM]);
+
+    let report = scripted_sweep(&inspector, &sender).await.expect("sweep");
+
+    assert_eq!(
+        sender.sent(),
+        vec![(before, Signal::TERM), (after, Signal::TERM)]
+    );
+    assert_eq!(report.terminated, vec![before, after]);
+    assert_eq!(
+        report.skipped,
+        vec![Skipped {
+            identity: exec_ing,
+            reason: SkipReason::MarkersUnreadable,
+        }]
+    );
+    assert!(inspector.is_running(exec_ing).expect("scripted liveness"));
 }
 
 #[tokio::test]

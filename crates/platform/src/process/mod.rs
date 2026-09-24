@@ -217,6 +217,13 @@ pub enum Error {
         /// Stable operation label.
         operation: &'static str,
     },
+    /// The process is live, but the requested evidence cannot be read right
+    /// now, for example while the process replaces its image.
+    #[error("process evidence from `{operation}` is not observable right now")]
+    Unobservable {
+        /// Stable operation label.
+        operation: &'static str,
+    },
     /// Process data did not match the operating-system format.
     #[error("process data from `{operation}` is malformed")]
     InvalidData {

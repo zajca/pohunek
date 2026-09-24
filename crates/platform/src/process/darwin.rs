@@ -20,9 +20,9 @@ use std::path::PathBuf;
 use async_io::Async;
 
 use super::darwin_layout::{
-    bounded_descendants, children_by_parent, controlling_terminal_group, decode_command_name,
-    decode_kernel_path, encode_boot_identity, encode_start_identity, parse_process_arguments,
-    LayoutError,
+    bounded_descendants, children_by_parent, controlling_terminal_group, decode_argument_region,
+    decode_command_name, decode_kernel_path, encode_boot_identity, encode_start_identity,
+    ArgumentRegion, LayoutError,
 };
 use super::{
     BootIdentity, Error, ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity,
@@ -205,8 +205,13 @@ impl ProcessInspector for DarwinInspector {
             return Ok(OwnershipMarkers::default());
         };
         match read_arguments(pid, &fact, OPERATION)? {
-            Some(arguments) => Ok(arguments.markers),
-            None => Ok(OwnershipMarkers::default()),
+            ArgumentRegion::Present(arguments) => Ok(arguments.markers),
+            ArgumentRegion::Ended => Ok(OwnershipMarkers::default()),
+            // An unread environment is not an unmarked one; callers that
+            // decide ownership must not mistake it for one.
+            ArgumentRegion::Unobservable => Err(Error::Unobservable {
+                operation: OPERATION,
+            }),
         }
     }
 
@@ -336,9 +341,10 @@ fn read_process_fact(
     let Some(initial) = read_bsd_fact(pid, euid, operation)? else {
         return Ok(None);
     };
-    let cmdline = read_arguments(pid, &initial, operation)?
-        .map(|arguments| arguments.argv)
-        .unwrap_or_default();
+    let cmdline = match read_arguments(pid, &initial, operation)? {
+        ArgumentRegion::Present(arguments) => arguments.argv,
+        ArgumentRegion::Ended | ArgumentRegion::Unobservable => Vec::new(),
+    };
     let Some(current) = read_bsd_fact(pid, euid, operation)? else {
         return Ok(None);
     };
@@ -357,31 +363,32 @@ fn read_process_fact(
 
 /// Reads and decodes the `KERN_PROCARGS2` regions of one same-user process.
 ///
-/// Returns `None` for a process whose argument region cannot be observed right
-/// now: one that exited, one retained as a zombie, one already inside `exit`,
-/// one that has forked but not yet published the region its `exec` will write,
-/// and one whose address space is being replaced or torn down while the kernel
-/// copies it out. The caller has established ownership, so an absent region is
-/// the only thing `EINVAL` can report, and whether the process itself exists
-/// stays a question for the process record, never for this read.
+/// A process retained as a zombie, already inside `exit`, or gone holds no
+/// region any more ([`ArgumentRegion::Ended`]). A live process whose region
+/// cannot be read right now is [`ArgumentRegion::Unobservable`]: it has forked
+/// but not yet published the region its `exec` will write (`EINVAL`), its
+/// address space is being replaced or torn down while the kernel copies it
+/// (`EIO`), or the copied bytes contradict the layout. The caller has
+/// established ownership, and whether the process exists stays a question for
+/// the process record, never for this read.
 fn read_arguments(
     pid: Pid,
     fact: &BsdFact,
     operation: &'static str,
-) -> Result<Option<super::darwin_layout::NativeArguments>, Error> {
+) -> Result<ArgumentRegion, Error> {
     if fact.is_zombie || fact.is_exiting {
-        return Ok(None);
+        return Ok(ArgumentRegion::Ended);
     }
-    let buffer = match native::process_arguments(native_pid(pid, operation)?) {
-        Ok(buffer) => buffer,
-        Err(error) if is_process_race(&error) => return Ok(None),
-        Err(error) if is_missing_argument_region(&error) => return Ok(None),
-        Err(error) if is_uncopyable_argument_region(&error) => return Ok(None),
-        Err(source) => return Err(Error::from_io(operation, source)),
-    };
-    parse_process_arguments(&buffer)
-        .map(Some)
-        .map_err(|error| layout_error(operation, error))
+    match native::process_arguments(native_pid(pid, operation)?) {
+        Ok(buffer) => Ok(decode_argument_region(&buffer)),
+        Err(error) if is_process_race(&error) => Ok(ArgumentRegion::Ended),
+        Err(error)
+            if is_missing_argument_region(&error) || is_uncopyable_argument_region(&error) =>
+        {
+            Ok(ArgumentRegion::Unobservable)
+        }
+        Err(source) => Err(Error::from_io(operation, source)),
+    }
 }
 
 /// Collects the bounded descendant set of one process from the same-user table.
@@ -1073,6 +1080,13 @@ mod tests {
     const IDLE_WATCH_COUNT: usize = 512;
     /// Short-lived processes spawned by the churn test.
     const CHURN_ROUNDS: usize = 64;
+    /// Pseudoterminal launches each exec churn launcher reads through.
+    const EXEC_LAUNCHES: usize = 100;
+    /// Threads launching and reading pseudoterminal roots at the same time.
+    const EXEC_LAUNCHERS: usize = 4;
+    /// How long each launch is read; it covers the `sh` -> `bash` -> command
+    /// exec chain a fresh pseudoterminal root runs through.
+    const EXEC_READ_WINDOW: Duration = Duration::from_millis(30);
     /// Sentinel that must never reach an error, event, or log surface.
     const SECRET_SENTINEL: &str = "pohunek-darwin-secret-sentinel";
 
@@ -1279,6 +1293,74 @@ mod tests {
             );
             churn.0.wait().expect("reap the churn fixture");
         }
+    }
+
+    /// Launches roots one after another and reads each through its exec chain.
+    ///
+    /// Returns the number of reads and every failed observation.
+    fn read_through_exec_chains(inspector: DarwinInspector) -> (usize, Vec<String>) {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+        let mut failures = Vec::new();
+        let mut reads = 0_usize;
+        for _ in 0..EXEC_LAUNCHES {
+            let pair = native_pty_system()
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .expect("open a pseudoterminal");
+            let mut command = CommandBuilder::new("/bin/sh");
+            command.args(["-c", "/bin/sleep 30"]);
+            let child = pair.slave.spawn_command(command).expect("spawn the root");
+            let pid = child.process_id().expect("root process id");
+            let mut root = PtyFixture { child, pid };
+            drop(pair.slave);
+            let started = Instant::now();
+            while started.elapsed() < EXEC_READ_WINDOW {
+                reads += 1;
+                if let Err(error) = inspector.process(pid) {
+                    failures.push(format!("process: {error:?}"));
+                }
+                match inspector.ownership_markers(pid) {
+                    Ok(_) | Err(Error::Unobservable { .. } | Error::Race { .. }) => {}
+                    Err(error) => failures.push(format!("ownership_markers: {error:?}")),
+                }
+            }
+            if let Err(error) = inspector.same_user_processes() {
+                failures.push(format!("same_user_processes: {error:?}"));
+            }
+            assert!(root.reap(), "the launched root must become reapable");
+        }
+        (reads, failures)
+    }
+
+    #[test]
+    fn a_process_replacing_its_image_never_fails_an_observation() {
+        // A session root launches the way a worker launches it: forked from a
+        // multi-threaded process, then `sh` -> `bash` -> the command. While it
+        // replaces its image, its argument region can be absent, uncopyable, or
+        // not yet laid out. That is a fact about that one process and must
+        // never become an observation failure. Parallel launchers keep several
+        // exec chains in flight, as a busy daemon does.
+        let inspector = DarwinInspector::new();
+        let launchers = (0..EXEC_LAUNCHERS)
+            .map(|_| std::thread::spawn(move || read_through_exec_chains(inspector)))
+            .collect::<Vec<_>>();
+        let mut reads = 0_usize;
+        let mut failures = Vec::new();
+        for launcher in launchers {
+            let (launcher_reads, launcher_failures) = launcher.join().expect("launcher thread");
+            reads += launcher_reads;
+            failures.extend(launcher_failures);
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {reads} reads failed: {failures:?}",
+            failures.len()
+        );
     }
 
     #[test]

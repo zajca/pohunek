@@ -122,8 +122,9 @@ pub enum SkipReason {
     IdentityChanged,
     /// The process is the one running the sweep.
     CurrentProcess,
-    /// The operating system denied access to the process environment, so it
-    /// cannot be proven to belong to the runtime.
+    /// The process environment could not be read (access was denied, or the
+    /// process was between images), so it cannot be proven to belong to the
+    /// runtime.
     MarkersUnreadable,
     /// The sweep aborted before signalling the selected process.
     Aborted,
@@ -407,8 +408,9 @@ fn classify(
         // A process that exited has nothing left to reap.
         Err(error) if error.is_race() => return Ok(Selection::Foreign),
         // Same-user processes can still hide their environment (for example
-        // non-dumpable agents); without the marker they are never signalled.
-        Err(Error::PermissionDenied { .. }) => {
+        // non-dumpable agents) or be between images; without the marker they
+        // are never signalled, and the rest of the table is still classified.
+        Err(Error::PermissionDenied { .. } | Error::Unobservable { .. }) => {
             return Ok(Selection::Skip(SkipReason::MarkersUnreadable));
         }
         Err(error) => return Err(error),
