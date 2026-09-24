@@ -74,6 +74,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/hostcheck`| Host environment probes shared by `doctor` and the daemon's `doctor` RPC. |
 | `crates/logging` | Process-safe size rotation and retention for daemon and per-session worker logs. |
 | `crates/platform` | Target-neutral process, peer-identity, and native-supervisor contracts plus concrete OS backends. |
+| `crates/service-config` | Typed, fail-fast `service.toml` (installation namespace, deadlines, agent environment allowlist) shared by `pohunek service`, `pohunekd`, and `pohunek-sessiond`. |
 | `crates/gui-core` | Pure, headless state + SDK bridge for the GUI (no Iced dependency; fully unit-testable). |
 | `crates/gui`      | Native Iced shell that wraps `gui-core` in `Task`/`Subscription`. |
 | `crates/xtask`    | Workspace automation (docs, TypeScript generation, and pinned Hermes compatibility evidence). |
@@ -99,9 +100,23 @@ cargo xtask docs check                                   # schema/drift/source-m
 cargo xtask hermes compatibility --pohunek-bin ABS       # pinned, model-free Hermes CLI/golden gate
 ```
 
-Shared platform contracts also run natively on Apple Silicon macOS CI with
-`MACOSX_DEPLOYMENT_TARGET=14.0`. Intel Macs are outside the current release
-scope. This gate covers the portable library, not complete macOS host support;
+The `platform contracts (arm64)` CI job runs natively on Apple Silicon macOS
+with `MACOSX_DEPLOYMENT_TARGET=14.0`: it checks, lints, and tests
+`pohunek-platform` (including the real-launchd suite `tests/launchd.rs`),
+`pohunek-paths`, `pohunek-session-worker`, `pohunek-service-config`,
+`pohunek-daemon`, and `pohunek-cli`, and fails hard when the runner's
+`gui/<uid>` launchd domain is absent. Linux clippy never compiles the
+launchd backend, so lint it from Linux with
+`cargo clippy --target aarch64-apple-darwin -p <crate> --all-targets -- -D warnings`
+before pushing. The real-systemd suites (`crates/platform/tests/systemd.rs`,
+`crates/daemon/tests/systemd_durable_worker.rs`,
+`crates/cli/tests/service_systemd.rs`) are `#[ignore]`d and need
+`POHUNEK_SYSTEMD_E2E=1` plus a running user manager; the Linux CI job
+`real systemd supervision` runs all three with `--ignored --test-threads 1`
+after building the daemon, worker, and CLI binaries. Run them locally the same
+way (`POHUNEK_DAEMON_BIN`, `POHUNEK_WORKER_BIN`, and `POHUNEK_CLI_BIN` point the
+suites at the built binaries). Intel Macs are outside the
+current release scope. This gate does not mean complete macOS host support;
 delivery scope, order, and status are tracked by the
 [`Complete macOS support` milestone](https://github.com/zajca/pohunek/milestone/2),
 the [macOS project](https://github.com/users/zajca/projects/4), and the issue

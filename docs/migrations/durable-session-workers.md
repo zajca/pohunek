@@ -45,23 +45,31 @@ and runtime id.
    ./packaging/install-daemon.sh
    ```
 
-7. Verify the installed definitions and daemon readiness:
+7. Verify the installed service and daemon readiness:
 
    ```bash
-   systemctl --user cat pohunekd.service
-   systemctl --user cat pohunek-session@.service
-   systemctl --user status pohunek-sessions.slice
+   pohunek service status --json
    pohunek health --json
    ```
 
-8. Create a disposable shell session and verify that
-   `systemctl --user restart pohunekd.service` preserves its `worker_id`,
-   `runtime_id`, root child PID, and worker unit `MainPID`.
+8. Create a disposable shell session and verify that restarting the daemon job
+   (`systemctl --user restart pohunek-<ns>-daemon.service` on Linux) preserves
+   its `worker_id`, `runtime_id`, root child PID, and the worker generation and
+   PID reported by `pohunek service status --json`.
 
-The installer writes the daemon binary to the selected `bin` directory, the
-worker to `libexec`, substitutes absolute paths into both user-service
-definitions, installs the slice, reloads the user manager, and restarts only
-`pohunekd.service`.
+The installer runs `pohunek service install` (or `pohunek service upgrade` for
+an existing service): it copies the binaries into
+`<prefix>/libexec/pohunek/<version>/`, writes `service.toml`, installs the
+daemon job and the sessions slice, and waits for daemon readiness. The daemon
+then starts every worker as its own transient unit per worker generation.
+
+An install that already runs worker-aware sessions under the older
+`pohunek-session@<session-id>.service` template is retired by the same
+installer: it refuses while any of those template workers is active, then
+disables `pohunekd.service` and removes `pohunekd.service`,
+`pohunek-session@.service`, and `pohunek-sessions.slice` from the user unit
+directory before installing the service. Stop those sessions first; their PTYs
+cannot move into the new per-generation jobs.
 
 ## Explicit Runtime-Loss Acceptance
 
@@ -90,17 +98,18 @@ metadata.
 ## Boundary Rollback
 
 A legacy daemon cannot adopt worker-owned PTYs. Do not start a legacy daemon
-beside live worker units: it could treat old resume metadata as independent
+beside live worker jobs: it could treat old resume metadata as independent
 work and launch a duplicate process.
 
 Before crossing back to a legacy release:
 
-1. enumerate `pohunek-session@*.service` units;
+1. enumerate worker jobs with `pohunek service status --json`;
 2. let every worker-backed session finish or stop it explicitly;
 3. export only eligible logical sessions into the legacy recovery format using
    the supported release tooling;
-4. verify that no worker unit is active;
-5. remove or disable worker unit definitions;
+4. verify that no worker job remains;
+5. remove the service with `pohunek service uninstall` (durable metadata is
+   kept without `--purge`);
 6. start the legacy daemon;
 7. recover eligible sessions explicitly.
 
@@ -112,9 +121,10 @@ is blocked. Do not edit tagged metadata records by hand.
 For every new managed session:
 
 - `SessionInfo.runtime` reports the worker and runtime generation;
-- `pohunek-session@<session-id>.service` is active while its PTY is live;
-- restarting `pohunekd.service` closes existing client streams but leaves the
-  worker unit and child unchanged;
+- one worker job per generation (`pohunek-<ns>-worker-<session-id>-<generation>.service`
+  on Linux) is active while its PTY is live;
+- restarting the daemon job closes existing client streams but leaves the
+  worker job and child unchanged;
 - the replacement daemon emits `session_runtime_reconnected`;
 - worker or host loss leaves the logical record visible as `lost`;
 - provider-native recovery is explicit and emits `session_native_recovered`.

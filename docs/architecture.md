@@ -120,8 +120,9 @@ The following invariants span both domains:
        | private owner-only Unix protocol
        v
  +-----------------------------------------------------------+
- | pohunek-session@s-01J00000000000000000000000.service (one worker per live session) |
- | PTY master | child handle | output ring | terminal tracker |
+ |  pohunek-sessiond: one native job per worker generation    |
+ |  (systemd transient unit on Linux, launchd job on macOS)   |
+ |  PTY master | child handle | output ring | terminal tracker |
  +-----------------------------------------------------------+
        |
    Codex / Claude Code / Hermes Agent running in worker-owned PTYs
@@ -292,11 +293,16 @@ inherited. A peer the kernel cannot attest, or one without a process id, is an
 explicit rejection; neither a request field nor the owner alone can stand in for
 one.
 
-Native service supervision exposes validated logical IDs, portable states, and
-stable process identities through start, bounded discovery, inspect, replace,
-and retire operations. Linux implements that contract through systemd without
-exposing unit names, D-Bus paths, or raw `MainPID` semantics to session code.
-Worker readiness and authority still come from the private worker handshake.
+Native service supervision registers one explicit, validated job definition
+(absolute versioned executable, argv, bootstrap environment, logs, timeouts,
+restart policy, open-file limit) per worker generation and exposes validated
+logical IDs, portable states, proven executable and arguments, and stable
+process identities through start, bounded discovery, inspect, and retire
+operations. Linux implements that contract through systemd transient units over
+D-Bus; macOS implements it through `/bin/launchctl` `bootstrap`, `bootout`, and
+`print`, keyed only on exit statuses and never on printed text. Session code
+never sees unit names, labels, D-Bus paths, or raw `MainPID` semantics. Worker
+readiness and authority still come from the private worker handshake.
 
 The shared contract crate compiles and tests natively on Apple Silicon Darwin
 with a macOS 14 deployment target. Intel Macs are outside the current release
@@ -305,9 +311,11 @@ natively on APFS, and native process and peer inspection are in place. The
 session worker's PTY I/O is portable: output readiness is one `poll(2)`
 implementation shared by both targets, and the worker's complete test suite,
 including idle-CPU and descriptor-release evidence, runs on the native runner.
-This is foundation evidence, not a claim that macOS host support ships:
-launchd, clients, packaging, and full acceptance remain ordered work in
-#100-#105.
+The daemon and CLI also build and test on that runner, including the
+real-launchd supervision suite. This is not a claim that macOS host support
+ships: clients, signed packaging, and full acceptance remain ordered work in
+#101-#105, and the logout/reboot lifetime of #100 awaits its manual acceptance
+evidence in `docs/acceptance/`.
 
 The host daemon is the local control plane for one machine, written in Rust.
 
@@ -340,17 +348,26 @@ error rather than falling back to unsafe defaults.
 
 ### Concurrency and supervision
 
-- The daemon uses Tokio. Each runtime is isolated in
-  `pohunek-session@<session-id>.service`, so one worker failure cannot terminate
-  the daemon or any other session.
-- `pohunekd.service` and worker units are siblings. Workers are grouped under
-  `pohunek-sessions.slice`, use `Restart=no`, and have no `PartOf`, `BindsTo`,
-  or other stop-propagation dependency on the daemon.
+- The daemon uses Tokio. Each worker generation runs as its own native service
+  job, so one worker failure cannot terminate the daemon or any other session.
+  On Linux that is a systemd transient unit
+  `pohunek-<ns>-worker-<session-id>-<generation>.service` started through
+  `StartTransientUnit` (`Type=notify`, `KillMode=control-group`,
+  `SendSIGHUP=yes`, `Restart=no`) in `pohunek-<ns>-sessions.slice`. On macOS it
+  is a launchd job `io.github.zajca.pohunek.<ns>.worker.<session-id>.<generation>`
+  bootstrapped into `gui/<uid>` from a private definition directory, with no
+  `KeepAlive`. `<ns>` is derived from the user ID and the canonical state and
+  runtime roots.
+- The daemon job (`pohunek-<ns>-daemon.service` or the launchd agent
+  `io.github.zajca.pohunek.<ns>.daemon`) and worker jobs are siblings. Workers
+  have no restart policy and no `PartOf`, `BindsTo`, or other stop-propagation
+  dependency on the daemon. `pohunek service install` installs the daemon job;
+  the daemon starts and retires worker jobs itself through one lifecycle engine.
 - A stale public Unix socket is detected and replaced on daemon startup. The
   daemon holds independent lifetime locks for its durable state and data roots,
   plus a runtime-instance lock, so independently configured XDG roots cannot
-  let two daemons control the same persistent records. The daemon sends systemd
-  `READY=1` only after store load, worker
+  let two daemons control the same persistent records. Under systemd the daemon
+  sends `READY=1` only after store load, worker
   discovery, reconciliation, and public socket bind.
 
 ## Durable Session Workers
@@ -364,10 +381,13 @@ transaction.
 
 Disconnecting or killing `pohunekd` releases only the private controller lease.
 The worker continues draining output and running the unchanged child. A
-replacement daemon enumerates worker units, journals, and sockets, validates
-the systemd `MainPID` and process start identity, negotiates the private
-protocol, acquires the one-controller lease, calls `Inspect`, and reconstructs
-detector and procwatch state. It does not invoke native resume.
+replacement daemon joins the service manager's worker jobs with worker journals
+and sockets per worker generation, validates the job's process and start
+identity, negotiates the private protocol, acquires the one-controller lease,
+calls `Inspect`, and reconstructs detector and procwatch state. It does not
+invoke native resume. A job whose worker is proven dead has its generation's
+leftover processes swept by ownership marker before the session is reported
+`lost`; unavailable or ambiguous supervisor evidence never kills anything.
 
 The private worker protocol is local-only and owner-private. It uses bounded
 newline-delimited JSON for control requests and binary-safe framed data
@@ -1086,8 +1106,9 @@ Integration tests:
 - **Worker loss destroys one PTY generation.** Mitigation: one isolated
   non-restarting worker per session, durable logical records, explicit lost
   state, and optional operator-triggered native recovery.
-- **Ambiguous runtime identity.** Mitigation: validate systemd PID plus process
-  start identity and journal fields; quarantine conflicts and never
+- **Ambiguous runtime identity.** Mitigation: validate the supervisor job's
+  process, its executable and arguments, the process start identity, and
+  journal fields; quarantine conflicts and never
   automatically kill an ambiguous live worker.
 - **NetBird local state format drift.** Mitigation: defensive parsing + recorded
   fixtures; shell out to the documented `status --json` rather than internals.

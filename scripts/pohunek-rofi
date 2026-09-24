@@ -35,7 +35,6 @@ mark_retry_interval_seconds="$(pohunek_optional_config mark_retry_interval_secon
 pohunek_need_cmd "$pohunek_bin"
 pohunek_need_cmd "$rofi_bin"
 pohunek_need_cmd "$swaymsg_bin"
-pohunek_need_cmd timeout
 pohunek_need_cmd python3
 
 # Mark a freshly spawned window by its (unique) title, retrying until sway's tree
@@ -98,7 +97,7 @@ while IFS= read -r host; do
       [ -n "$filter" ] || continue
       set -- "$@" --filter "$filter"
     done <"$filters_file"
-    if ! timeout "$timeout_seconds" "$@" >"$tmp_dir/$index.json" 2>"$tmp_dir/$index.err"; then
+    if ! pohunek_run_with_timeout "$timeout_seconds" "$@" >"$tmp_dir/$index.json" 2>"$tmp_dir/$index.err"; then
       printf 'error\n' >"$tmp_dir/$index.status"
     fi
   ) &

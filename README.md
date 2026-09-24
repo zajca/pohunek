@@ -204,8 +204,9 @@ where they are doing it, and when they need you.
        | owner-private local worker protocol
        v
  +-----------------------------------------------------------+
- | pohunek-session@s-01J00000000000000000000000.service (one worker per live session) |
- | PTY master | child process | output ring | terminal state  |
+ |  pohunek-sessiond: one native job per worker generation    |
+ |  (systemd transient unit on Linux, launchd job on macOS)   |
+ |  PTY master | child process | output ring | terminal state |
  +-----------------------------------------------------------+
        |
    Codex / Claude Code / Hermes Agent running in worker-owned PTYs
@@ -216,11 +217,14 @@ notifications. Control traffic is newline-delimited JSON; attaching to a
 session opens a **separate raw byte connection**, so JSON stays JSON and
 terminal bytes stay bytes.
 
-Durability is tiered and explicit: detach, client restart, daemon restart,
-daemon crash, and daemon binary upgrade preserve the same live PTY and child
-PID. A host reboot, user-manager shutdown, or worker failure loses that runtime
-generation; the logical session remains visible as `runtime.state=lost` and may
-be recovered explicitly when it has valid native recovery metadata.
+Durability is tiered and explicit: detach, terminal close, screen lock,
+client restart, daemon restart, daemon crash, and daemon binary upgrade
+preserve the same live PTY and child PID. Logout, a host reboot, user-manager
+shutdown, or worker failure loses that runtime generation; after the next login
+the logical session remains visible as `runtime.state=lost` with
+`loss_reason=runtime_lost`, is never restarted automatically, and may be
+recovered explicitly with `pohunek session resume` when it has valid native
+recovery metadata.
 
 ## Install
 
@@ -229,8 +233,8 @@ x86_64 Linux with both glibc and MUSL. The native `pohunek-gui-*` archive is
 published for glibc because its Wayland client and graphics stack are dynamic
 runtime dependencies; there is no self-contained MUSL GUI archive. Every
 archive contains its license and offline documentation under `docs/offline/`.
-Daemon archives contain `pohunekd`, `pohunek-sessiond`, the daemon service, the
-per-session worker template, the worker slice, and the installer.
+Daemon archives contain `pohunekd`, `pohunek-sessiond`, `pohunek`, and the
+`packaging/install-daemon.sh` wrapper around `pohunek service install`.
 
 Releases also publish `pohunek-web-*-linux-x86_64.tar.gz`: a standalone web
 control-center backend with Bun embedded, its compiled SPA, and a user-service
@@ -251,12 +255,38 @@ not raise the public protocol version or require a second coordinated boundary.
 Do not binary-downgrade a host after it has persisted Hermes enum values or the
 provider-keyed notification policy; recover by upgrading forward instead.
 
-For the daemon component, run the included installer so the worker binary and
-all systemd user units are installed together. The first upgrade from a legacy
-daemon-owned PTY release refuses live sessions by default because those open
-PTYs cannot be transferred. Let them finish; use `--accept-runtime-loss` only
-after reviewing the affected ids and knowingly accepting the destructive
-boundary. See the
+For the daemon component, run the included `packaging/install-daemon.sh`. It
+calls `pohunek service install` (or `pohunek service upgrade` when a service is
+already installed), which:
+
+- copies `pohunek`, `pohunekd`, and `pohunek-sessiond` into
+  `<prefix>/libexec/pohunek/<version>/` (prefix default `~/.local`, or
+  `POHUNEK_INSTALL_PREFIX` for the wrapper) and installs `<prefix>/bin/pohunek`;
+- writes `~/.config/pohunek/service.toml` (mode `0600`) with every deadline,
+  the agent environment allowlist, and the installation namespace;
+- registers the daemon as the only login service: the systemd user unit
+  `pohunek-<ns>-daemon.service` and slice `pohunek-<ns>-sessions.slice` on Linux
+  (systemd 255 or newer), or the launchd agent
+  `~/Library/LaunchAgents/io.github.zajca.pohunek.<ns>.daemon.plist` on macOS;
+- waits until the daemon answers, and journals every step in
+  `~/.local/state/pohunek/service-install.json` so an interrupted run resumes or
+  rolls back.
+
+The daemon starts each session worker as its own native job per worker
+generation (a systemd transient unit, or a launchd job whose definition stays in
+`~/.local/state/pohunek/launchd/`), so an upgrade restarts only the daemon while
+live workers keep running from their versioned directory. Agents receive only
+an allowlisted base environment (`[environment] allowlist` in `service.toml`)
+rather than the daemon's whole environment. `pohunek service uninstall` refuses
+while sessions are live unless `--stop-sessions` is given, and keeps durable
+metadata unless `--purge` is given.
+
+The first upgrade from a legacy daemon-owned PTY release refuses live sessions
+by default because those open PTYs cannot be transferred. Let them finish; use
+`--accept-runtime-loss` only after reviewing the affected ids and knowingly
+accepting the destructive boundary. An install that still runs the older
+`pohunek-session@` template workers is retired only once those workers have
+stopped. See the
 [migration guide](docs/migrations/durable-session-workers.md) and
 [operations runbook](docs/runbooks/durable-session-workers.md).
 
@@ -275,8 +305,11 @@ cargo build --release --locked \
 # 1. Check the environment (binaries, socket paths, writable state dirs)
 pohunek doctor
 
-# 2. Start the host daemon in the background
-pohunek daemon start --detach
+# 2. Install the host daemon as a login service. Run the pohunek that sits next
+#    to pohunekd and pohunek-sessiond (unpacked daemon archive or target/release);
+#    --from defaults to its directory.
+./target/release/pohunek service install
+pohunek service status
 pohunek health
 pohunek host governance inspect local --json
 
@@ -379,7 +412,11 @@ port is retained.
 | Command | What it does |
 |---|---|
 | `pohunek doctor` | Environment health: binaries, socket, state dirs, NetBird, agents. |
-| `pohunek daemon start [--detach]` | Run the host daemon (foreground or background). |
+| `pohunek service install [--from <dir>] [--prefix <dir>]` | Install the daemon as a native login service (systemd user unit or launchd agent) from staged binaries into a versioned `libexec` directory and write `service.toml`. |
+| `pohunek service upgrade [--from <dir>]` | Switch to the staged version, restarting only the daemon; live workers keep their PID and PTY, and unreferenced old versions are removed. |
+| `pohunek service uninstall [--stop-sessions] [--purge]` | Remove the service; refuses while sessions are live unless `--stop-sessions`, and keeps durable metadata unless `--purge`. |
+| `pohunek service status` | Daemon job, namespace, installed versions, and worker jobs per generation. |
+| `pohunek daemon start [--detach] [--dev-subprocess]` | Run the installed daemon by hand (needs `service.toml`), or with `--dev-subprocess` a development daemon with plain subprocess workers. |
 | `pohunek health` / `status` | Daemon liveness, build, and protocol version. |
 | `pohunek session new` | Start a session: `--agent`, `--name`, `--project`/`--repo`, `--branch`, `--base-branch`, `--cwd`, `--input`, `--request-timeout-ms`, `--meta k=v`. |
 | `pohunek session list` | List sessions, including a `running/recent` subagent count; `--filter state=running --filter agent=codex` (ANDed), `-q` for ids only. |
