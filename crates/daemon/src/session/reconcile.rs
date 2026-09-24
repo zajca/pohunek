@@ -78,7 +78,7 @@ enum SocketEvidence {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct JournalEvidence {
+pub(super) struct JournalEvidence {
     schema_version: u32,
     session_id: String,
     worker_id: String,
@@ -101,7 +101,7 @@ struct JournalEvidence {
 
 impl JournalEvidence {
     /// Returns the worker process facts this journal records.
-    fn worker(&self) -> JournalWorker<'_> {
+    pub(super) fn worker(&self) -> JournalWorker<'_> {
         JournalWorker {
             pid: self.worker_pid,
             start_identity: &self.worker_start_identity,
@@ -405,13 +405,12 @@ impl SessionRegistry {
                 Err(detail) => (HashMap::new(), Vec::new(), Some(detail)),
             };
         let mut journals = self.discover_worker_journals().await;
-        let stale_journal = |key: &WorkerKey| {
-            journals
-                .as_ref()
-                .ok()?
-                .get(key.session_id())?
-                .sole_journal_of(key.generation())
-                .map(JournalEvidence::worker)
+        let stale_journal = |key: &WorkerKey| match &journals {
+            Ok(journals) => journals.get(key.session_id()).map_or(Ok(None), |scan| {
+                scan.journal_of_generation(key.generation())
+                    .map(|journal| journal.map(JournalEvidence::worker))
+            }),
+            Err(detail) => Err(detail.clone()),
         };
         inventory.extend(
             self.retire_stale_jobs(lifecycle.as_ref(), &records, stale_journal)
@@ -1102,6 +1101,25 @@ impl SessionRegistry {
         if let Some(entry) = removed {
             self.emit(event::SESSION_REMOVED, &entry.info);
         }
+    }
+
+    /// Reads the journal of exactly `key`'s generation from a fresh scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the journal cannot be decided: the scan failed, a journal
+    /// file of the session is unreadable, or several journals name the
+    /// generation.
+    pub(super) async fn generation_journal(
+        &self,
+        key: &WorkerKey,
+    ) -> Result<Option<JournalEvidence>, String> {
+        let journals = self.discover_worker_journals().await?;
+        let Some(scan) = journals.get(key.session_id()) else {
+            return Ok(None);
+        };
+        scan.journal_of_generation(key.generation())
+            .map(Option::<&JournalEvidence>::cloned)
     }
 
     /// Scans every session's worker journals.
@@ -2667,19 +2685,26 @@ struct WorkerJournalScan {
 }
 
 impl WorkerJournalScan {
-    /// Returns the only journal naming `generation`, when the scan read every
-    /// journal file of the session.
-    fn sole_journal_of(&self, generation: &str) -> Option<&JournalEvidence> {
+    /// Returns the journal naming `generation`, or `None` when the session has
+    /// none.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the journal cannot be decided: an unreadable or mismatched
+    /// journal file of the session could be that generation's, and several
+    /// journals naming it are ambiguous.
+    fn journal_of_generation(&self, generation: &str) -> Result<Option<&JournalEvidence>, String> {
         if self.conflict {
-            return None;
+            return Err("the session has an unreadable or mismatched worker journal".to_owned());
         }
         let mut journals = self
             .evidence
             .iter()
             .filter(|journal| journal.generation == generation);
         match (journals.next(), journals.next()) {
-            (Some(journal), None) => Some(journal),
-            _ => None,
+            (None, _) => Ok(None),
+            (Some(journal), None) => Ok(Some(journal)),
+            (Some(_), Some(_)) => Err(format!("several journals name generation {generation}")),
         }
     }
 }
@@ -7412,13 +7437,15 @@ while os.getppid() == parent:
         }
 
         #[tokio::test]
-        async fn stale_job_without_a_process_is_retired_only_when_its_journaled_worker_is_gone() {
+        async fn stale_job_without_a_process_is_retired_by_its_journal_or_its_deadline() {
             const CURRENT_GENERATION: &str = "zzzz3333";
+            const INITIALIZE: Duration = Duration::from_millis(500);
 
-            let fixture = fixture(Arc::new(HostInspector::new()));
+            let fixture = fixture_with(Arc::new(HostInspector::new()), Some(INITIALIZE));
             write_live_journal(&fixture.root, "s-337", dead_worker(), None);
+            write_live_journal(&fixture.root, "s-339", own_identity(), None);
             let current = |session_id| service_id(session_id, CURRENT_GENERATION);
-            for session_id in ["s-337", "s-338"] {
+            for session_id in ["s-337", "s-338", "s-339"] {
                 let mut record = identity_record();
                 record.session_id = session_id.to_owned();
                 record.info.id = SessionId(session_id.to_owned());
@@ -7434,13 +7461,22 @@ while os.getppid() == parent:
                     .script_job(current(session_id), present(ServiceState::Failed, None));
             }
             let proven = service_id("s-337", TEST_GENERATION);
-            let unproven = service_id("s-338", TEST_GENERATION);
-            for id in [&proven, &unproven] {
+            let unjournaled = service_id("s-338", TEST_GENERATION);
+            let running = service_id("s-339", TEST_GENERATION);
+            for id in [&proven, &unjournaled, &running] {
                 fixture
                     .supervisor
                     .script_job(id.clone(), present(ServiceState::Unknown, None));
             }
+            let orphaned = |inventory: &protocol::RuntimeInventoryResult, id: &ServiceId| {
+                inventory.entries.iter().any(|entry| {
+                    entry.runtime_slot == id.as_str()
+                        && entry.status == RuntimeInventoryStatus::Orphaned
+                        && entry.reason.as_deref() == Some(STALE_GENERATION)
+                })
+            };
 
+            let started = tokio::time::Instant::now();
             Box::pin(fixture.registry.reconcile_workers())
                 .await
                 .expect("reconcile");
@@ -7448,17 +7484,36 @@ while os.getppid() == parent:
             let retired = fixture.supervisor.retired();
             assert!(retired.contains(&proven), "{retired:?}");
             assert!(
-                !retired.contains(&unproven),
-                "a stale job without a journal is never retired"
+                !retired.contains(&unjournaled),
+                "an unjournaled stale job is kept until its initialization deadline"
             );
             let inventory = fixture.registry.runtime_inventory().await;
-            let orphan = inventory
-                .entries
-                .iter()
-                .find(|entry| entry.runtime_slot == unproven.as_str())
-                .expect("unproven stale job is inventoried");
-            assert_eq!(orphan.status, RuntimeInventoryStatus::Orphaned);
-            assert_eq!(orphan.reason.as_deref(), Some(STALE_GENERATION));
+            assert!(orphaned(&inventory, &unjournaled), "{inventory:?}");
+            assert!(orphaned(&inventory, &running), "{inventory:?}");
+
+            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            while !fixture.supervisor.retired().contains(&unjournaled) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the unjournaled stale job was never re-checked"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                started.elapsed() >= INITIALIZE,
+                "retired only after its initialization deadline"
+            );
+            tokio::time::sleep(INITIALIZE).await;
+            let inventory = fixture.registry.runtime_inventory().await;
+            assert!(
+                !orphaned(&inventory, &unjournaled),
+                "the retired job left the inventory: {inventory:?}"
+            );
+            assert!(orphaned(&inventory, &running), "{inventory:?}");
+            assert!(
+                !fixture.supervisor.retired().contains(&running),
+                "a stale job whose journaled worker runs is never retired"
+            );
         }
 
         #[tokio::test]
