@@ -292,7 +292,10 @@ impl Drop for Installation {
                 else {
                     return;
                 };
+                // The upgraded daemon runs this build, which reports the
+                // real version rather than the upgrade's directory name.
                 let _uninstalled = Engine::new(&context, &backend)
+                    .with_reported_version(VERSION)
                     .uninstall(UninstallOptions {
                         stop_sessions: true,
                         purge: true,
@@ -304,6 +307,7 @@ impl Drop for Installation {
                         let _retired = backend.workers().retire(&job.id).await;
                     }
                 }
+                stop_namespace_slices(&namespace);
             });
         });
         if teardown.join().is_err() {
@@ -440,6 +444,26 @@ fn require_manager() {
         .expect("run launchctl");
     assert!(status.success(), "launchd domain {domain} is unavailable");
 }
+
+/// Stops the namespace's slices, which stay active until stopped once the
+/// daemon uninstall ran while workers were still retiring.
+#[cfg(target_os = "linux")]
+fn stop_namespace_slices(namespace: &pohunek_platform::supervisor::Namespace) {
+    for slice in [
+        namespace.sessions_slice(),
+        format!("pohunek-{}.slice", namespace.as_str()),
+    ] {
+        // Teardown only: an absent slice is the desired state.
+        let _status = std::process::Command::new("systemctl")
+            .args(["--user", "--quiet", "stop", slice.as_str()])
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+/// launchd has no slices.
+#[cfg(target_os = "macos")]
+fn stop_namespace_slices(_namespace: &pohunek_platform::supervisor::Namespace) {}
 
 /// The manager's unit search path on Linux; never the production config home.
 #[cfg(target_os = "linux")]

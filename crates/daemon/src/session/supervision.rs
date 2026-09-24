@@ -21,7 +21,9 @@ use pohunek_platform::supervisor::{Error as SupervisorError, ServiceObservation,
 use protocol::{RuntimeInventoryEntry, RuntimeInventoryStatus, RuntimeState};
 
 use super::{SessionId, SessionRecord, SessionRegistry, SessionRegistryInner};
-use crate::runtime::lifecycle::{observation_live, Generation, Lifecycle, SUPERVISION_UNAVAILABLE};
+use crate::runtime::lifecycle::{
+    observation_live, Generation, Lifecycle, SUPERVISION_AMBIGUOUS, SUPERVISION_UNAVAILABLE,
+};
 
 // Rust guideline compliant 2026-09-24
 
@@ -62,6 +64,13 @@ const SWEEP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 ///
 /// A restarting user manager usually answers again within a second.
 const SUPERVISION_RETRY_INITIAL: Duration = Duration::from_secs(1);
+
+/// Interval between inspections of an abandoned create's job while it is
+/// watched until its initialization deadline.
+///
+/// Matches the lifecycle engine's own polling of a not-yet-ready job; the
+/// outcome only changes when the job ends or the deadline passes.
+const ABANDONED_CREATE_POLL: Duration = Duration::from_millis(100);
 
 /// Longest delay between supervision retries.
 ///
@@ -426,11 +435,15 @@ impl SessionRegistry {
         orphans
     }
 
-    /// Re-reconciles `id` in the background until its supervisor answers.
+    /// Re-reconciles `id` in the background until its evidence settles.
     ///
-    /// One task serves every pending session with a doubling delay bounded
-    /// by [`SUPERVISION_RETRY_MAX`]. It stops when no session is pending, when
-    /// daemon shutdown starts, or when the registry is dropped.
+    /// Sessions wait here while their supervisor is unavailable or while
+    /// their generation is ambiguous (a job or process that may still be
+    /// live but no reachable worker). One task serves every pending session
+    /// with a doubling delay bounded by [`SUPERVISION_RETRY_MAX`]; each pass
+    /// classifies from fresh evidence and never kills while it stays
+    /// ambiguous. The task stops when no session is pending, when daemon
+    /// shutdown starts, or when the registry is dropped.
     pub(super) fn schedule_supervision_retry(&self, id: &SessionId) {
         let start = {
             let mut state = self
@@ -451,7 +464,8 @@ impl SessionRegistry {
         }
     }
 
-    /// Re-reconciles one session left `runtime_supervision_unavailable`.
+    /// Re-reconciles one session left `runtime_supervision_unavailable` or
+    /// `runtime_supervision_ambiguous`.
     ///
     /// Returns whether the session no longer needs a retry: it was resolved,
     /// removed, or changed by another lifecycle operation.
@@ -466,8 +480,11 @@ impl SessionRegistry {
             .is_some_and(|entry| {
                 matches!(entry.runtime, super::RuntimeHandle::Unavailable(_))
                     && entry.info.runtime.as_ref().is_some_and(|runtime| {
-                        runtime.state == RuntimeState::Reconnecting
-                            && runtime.loss_reason.as_deref() == Some(SUPERVISION_UNAVAILABLE)
+                        matches!(
+                            (runtime.state, runtime.loss_reason.as_deref()),
+                            (RuntimeState::Reconnecting, Some(SUPERVISION_UNAVAILABLE))
+                                | (RuntimeState::Conflict, Some(SUPERVISION_AMBIGUOUS))
+                        )
                     })
             });
         if !waiting {
@@ -482,6 +499,95 @@ impl SessionRegistry {
             }
         };
         !self.reconcile_single_session(record).await
+    }
+}
+
+impl SessionRegistry {
+    /// Settles a create whose daemon went away before its worker was ready.
+    ///
+    /// The create's initialization context died with the previous daemon, so
+    /// its generation is never adopted. A background task takes the session's
+    /// lifecycle lock (startup is not blocked), watches the job from first
+    /// sight until that instant plus the worker initialization deadline, and
+    /// then retires exactly that generation and compensates the create. A job
+    /// that ends earlier is retired at once. An inspection or retirement
+    /// failure leaves the session `runtime_supervision_unavailable` for the
+    /// supervision retry; daemon shutdown leaves it to the next start.
+    pub(super) fn settle_abandoned_create(&self, id: SessionId, generation: Generation) {
+        let registry = self.clone();
+        let shutdown = self.inner.daemon_shutdown.clone();
+        tokio::spawn(async move {
+            let _guard = registry.lock_lifecycle(&id).await;
+            let Ok(lifecycle) = registry.lifecycle() else {
+                return;
+            };
+            let give_up_at = tokio::time::Instant::now() + lifecycle.config.worker_initialize;
+            loop {
+                match lifecycle.inspect(&generation).await {
+                    Ok(Some(observation)) if observation_live(&observation) => {}
+                    Ok(_ended) => break,
+                    Err(error) => {
+                        registry
+                            .defer_abandoned_create(&id, &generation, &error)
+                            .await;
+                        return;
+                    }
+                }
+                let now = tokio::time::Instant::now();
+                if now >= give_up_at {
+                    break;
+                }
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(ABANDONED_CREATE_POLL.min(give_up_at - now)) => {}
+                }
+            }
+            match lifecycle.retire(&generation).await {
+                Ok(()) => {
+                    tracing::info!(
+                        session_id = %id.0,
+                        service_id = %generation.service_id(),
+                        "retired the generation of an abandoned create"
+                    );
+                    registry.compensate_abandoned_create(&id).await;
+                }
+                Err(error) => {
+                    registry
+                        .defer_abandoned_create(&id, &generation, &error)
+                        .await;
+                }
+            }
+        });
+    }
+
+    /// Hands an abandoned create whose job cannot be settled to the retry.
+    async fn defer_abandoned_create(
+        &self,
+        id: &SessionId,
+        generation: &Generation,
+        error: &SupervisorError,
+    ) {
+        tracing::warn!(
+            session_id = %id.0,
+            service_id = %generation.service_id(),
+            error = %error,
+            "abandoned create cannot be settled; nothing is touched"
+        );
+        match self.load_durable_session_record(id).await {
+            Ok(Some(record)) => {
+                self.insert_unavailable_record(
+                    record,
+                    RuntimeState::Reconnecting,
+                    SUPERVISION_UNAVAILABLE,
+                )
+                .await;
+                self.schedule_supervision_retry(id);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(session_id = %id.0, error = %error, "abandoned create record cannot be loaded");
+            }
+        }
     }
 }
 

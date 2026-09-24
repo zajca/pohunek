@@ -64,7 +64,13 @@ Interpret runtime states as follows:
   unlink, or kill either candidate automatically. Preserve the job, journal,
   and socket evidence for diagnosis. `runtime_supervision_ambiguous` means the
   native job is present but its worker socket does not answer and its journal is
-  not terminal. `runtime_identity_mismatch` means the job's definition or
+  not terminal. It is not permanent: the daemon re-checks it in the background
+  (after 1 s, doubling to at most 60 s) without killing anything, adopts the
+  worker when it answers again, and reports `lost` with `runtime_lost` once the
+  job ends and the journaled worker process is gone. A create that was pending
+  when the daemon restarted also shows this reason while its job is watched
+  until the worker initialization deadline; the job is then retired and the
+  unfinished session disappears. `runtime_identity_mismatch` means the job's definition or
   process does not match the recorded executable, session, or generation.
   Afterward, `pohunek session rm <id>` can remove only the quarantined logical
   record; it does not signal a worker.

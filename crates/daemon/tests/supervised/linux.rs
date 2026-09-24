@@ -45,8 +45,14 @@ impl Extra {
     }
 
     /// Records a worker job of another namespace to retire on teardown.
+    ///
+    /// The job's slices belong to that namespace, so they are stopped too.
     pub(crate) fn job(&mut self, namespace: &Namespace, key: &WorkerKey) {
-        self.units.push(namespace.worker_unit(key));
+        self.units.extend([
+            namespace.worker_unit(key),
+            namespace.sessions_slice(),
+            format!("pohunek-{}.slice", namespace.as_str()),
+        ]);
     }
 }
 

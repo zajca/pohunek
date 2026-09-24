@@ -30,7 +30,7 @@ use super::{
 };
 use crate::procwatch::ProcessInspector;
 use crate::runtime::lifecycle::{
-    Lifecycle, IDENTITY_MISMATCH, SUPERVISION_AMBIGUOUS, SUPERVISION_UNAVAILABLE,
+    observation_live, Lifecycle, IDENTITY_MISMATCH, SUPERVISION_AMBIGUOUS, SUPERVISION_UNAVAILABLE,
     WORKER_JOURNAL_SCHEMA_VERSION,
 };
 use crate::session::target::open_detector_output;
@@ -520,8 +520,9 @@ impl SessionRegistry {
     /// The record's current generation binds the evidence: a socket counts only
     /// when its worker's journal names that generation, terminal journals of
     /// other generations are history, and only that generation's job is
-    /// inspected. Returns whether the supervisor was unavailable; in `retry`
-    /// mode that outcome leaves the current entry untouched.
+    /// inspected. Returns whether the session needs the background re-check:
+    /// its supervisor was unavailable or its generation is ambiguous. In
+    /// `retry` mode an unchanged outcome leaves the current entry untouched.
     #[expect(
         clippy::too_many_lines,
         reason = "the classification table stays in one place so every row is visible together"
@@ -672,13 +673,8 @@ impl SessionRegistry {
             [journal] => Some(*journal),
             [_, _, ..] => {
                 tracing::warn!(session_id = %id.0, "several journals claim the record's generation");
-                self.insert_unavailable_record(
-                    record,
-                    RuntimeState::Conflict,
-                    SUPERVISION_AMBIGUOUS,
-                )
-                .await;
-                return false;
+                self.mark_ambiguous(record, retry).await;
+                return true;
             }
         };
         if let (Some(journal), Some(expected)) = (journal, record.runtime.worker_id.as_deref()) {
@@ -689,6 +685,20 @@ impl SessionRegistry {
             }
         }
         let job = observe(lifecycle, &generation).await;
+        if creating && scoped.evidence.is_empty() {
+            if let JobEvidence::Present(observation) = &job {
+                if observation_live(observation)
+                    && job_identity_mismatch(observation, &generation, None).is_none()
+                {
+                    // No worker of this generation ever journaled, so the
+                    // create that registered it died with its daemon.
+                    tracing::warn!(session_id = %id.0, service_id = %generation.service_id(), "settling the live job of an abandoned create");
+                    self.mark_ambiguous(record, retry).await;
+                    self.settle_abandoned_create(id, generation);
+                    return false;
+                }
+            }
+        }
         let worker = journal.map(JournalEvidence::worker);
         match classify_unreachable(
             &job,
@@ -710,13 +720,8 @@ impl SessionRegistry {
             }
             Unreachable::Ambiguous(detail) => {
                 tracing::warn!(session_id = %id.0, detail, "worker generation is ambiguous; nothing is touched");
-                self.insert_unavailable_record(
-                    record,
-                    RuntimeState::Conflict,
-                    SUPERVISION_AMBIGUOUS,
-                )
-                .await;
-                false
+                self.mark_ambiguous(record, retry).await;
+                true
             }
             Unreachable::Mismatch(detail) => {
                 tracing::warn!(session_id = %id.0, detail, "worker job identity mismatch; failing closed");
@@ -771,6 +776,33 @@ impl SessionRegistry {
                 false
             }
         }
+    }
+
+    /// Shows `record` as `Conflict` with `runtime_supervision_ambiguous`.
+    ///
+    /// A retry that finds the same ambiguity leaves the entry, and its
+    /// subscribers, untouched.
+    async fn mark_ambiguous(&self, record: SessionRecord, retry: bool) {
+        let id = SessionId(record.session_id.clone());
+        if retry {
+            let unchanged = self
+                .inner
+                .sessions
+                .lock()
+                .await
+                .get(&id)
+                .is_some_and(|entry| {
+                    entry.info.runtime.as_ref().is_some_and(|runtime| {
+                        runtime.state == RuntimeState::Conflict
+                            && runtime.loss_reason.as_deref() == Some(SUPERVISION_AMBIGUOUS)
+                    })
+                });
+            if unchanged {
+                return;
+            }
+        }
+        self.insert_unavailable_record(record, RuntimeState::Conflict, SUPERVISION_AMBIGUOUS)
+            .await;
     }
 
     /// Records that a live worker was adopted while its job is proven absent.
@@ -831,7 +863,8 @@ impl SessionRegistry {
     /// Runs the unreachable-worker rows of reconciliation for the exact
     /// generation the entry names, under the session's lifecycle lock: a
     /// proven crash sweeps the runtime's marked processes, retires the job,
-    /// and is `Lost`; a job or process that may still be live is `Conflict`;
+    /// and is `Lost`; a job or process that may still be live is `Conflict`
+    /// and re-checked in the background;
     /// an unavailable supervisor leaves the runtime `Reconnecting` and
     /// schedules the background retry. With `proven_only`, anything short of
     /// a proven crash is left `Pending` so the watcher keeps reconnecting.
@@ -909,7 +942,7 @@ impl SessionRegistry {
             .await
         {
             super::RuntimeTransitionOutcome::Applied(_) => {
-                if reason == SUPERVISION_UNAVAILABLE {
+                if reason == SUPERVISION_UNAVAILABLE || reason == SUPERVISION_AMBIGUOUS {
                     self.schedule_supervision_retry(id);
                 }
                 LossClassification::Settled
@@ -966,7 +999,7 @@ impl SessionRegistry {
     /// A create left `runtime_supervision_unavailable` is already listed while
     /// its supervision retry settles it, so that entry leaves the registry
     /// with the record and subscribers see it removed.
-    async fn compensate_abandoned_create(&self, id: &SessionId) {
+    pub(super) async fn compensate_abandoned_create(&self, id: &SessionId) {
         if let Err(error) = self.delete_session_record(id).await {
             tracing::warn!(
                 session_id = %id.0,
@@ -6148,6 +6181,14 @@ while os.getppid() == parent:
         }
 
         fn fixture(inspector: Arc<dyn ProcessInspector>) -> Fixture {
+            fixture_with(inspector, None)
+        }
+
+        /// A fixture whose workers get `worker_initialize` to become ready.
+        fn fixture_with(
+            inspector: Arc<dyn ProcessInspector>,
+            worker_initialize: Option<Duration>,
+        ) -> Fixture {
             let root = temp_root();
             let runtime_root = root.join("runtime/workers");
             let state_root = root.join("state/workers");
@@ -6163,6 +6204,9 @@ while os.getppid() == parent:
             }
             let mut supervision = crate::session::test_supervision(&runtime_root, &state_root);
             supervision.sweep_grace = SWEEP_GRACE;
+            if let Some(worker_initialize) = worker_initialize {
+                supervision.worker_initialize = worker_initialize;
+            }
             let supervisor = Arc::new(ScriptedSupervisor::scripted());
             let registry = SessionRegistry::new_with_launcher_and_inspector(
                 SessionRegistryConfig {
@@ -6768,6 +6812,198 @@ while os.getppid() == parent:
                     && event.payload()["session"]["id"].as_str() == Some("s-316");
             }
             assert!(removed, "subscribers see the settled create removed");
+        }
+
+        /// Persists the preparing record of a create whose worker never
+        /// journaled, naming [`TEST_GENERATION`].
+        fn persist_preparing_record(root: &Path, session_id: &str) {
+            let mut record = persist_record(root, session_id, None);
+            record.runtime.worker_id = None;
+            record.transaction = Some(crate::store::SessionTransaction {
+                id: format!("create-{session_id}"),
+                kind: crate::store::TransactionKind::Create,
+                phase: "preparing".to_owned(),
+                previous_worker_id: None,
+                previous_runtime_id: None,
+            });
+            Store::new(root.join("data/metadata.jsonl"))
+                .record_session(&record)
+                .expect("persist preparing record");
+        }
+
+        /// Waits until `session_id` has left the registry.
+        async fn wait_removed(registry: &SessionRegistry, session_id: &str) {
+            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            while registry
+                .inspect(&SessionId(session_id.to_owned()))
+                .await
+                .is_ok()
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{session_id} is still listed"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Waits until `session_id`'s runtime is in `state`.
+        async fn wait_state(
+            registry: &SessionRegistry,
+            session_id: &str,
+            state: RuntimeState,
+        ) -> protocol::SessionRuntime {
+            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            loop {
+                let runtime = runtime_of(registry, session_id).await;
+                if runtime.state == state {
+                    return runtime;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{session_id} never reached {state:?}: {runtime:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn abandoned_create_with_a_live_job_is_retired_after_its_initialization_deadline() {
+            const INITIALIZE: Duration = Duration::from_secs(1);
+
+            let fixture = fixture_with(Arc::new(HostInspector::new()), Some(INITIALIZE));
+            persist_preparing_record(&fixture.root, "s-317");
+            let id = service_id("s-317", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Running, None));
+
+            let started = tokio::time::Instant::now();
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            assert!(
+                started.elapsed() < INITIALIZE,
+                "startup does not wait for the abandoned create"
+            );
+            let runtime = runtime_of(&fixture.registry, "s-317").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
+            assert!(
+                fixture.supervisor.retired().is_empty(),
+                "nothing is retired early"
+            );
+
+            wait_removed(&fixture.registry, "s-317").await;
+            assert!(
+                started.elapsed() >= INITIALIZE,
+                "the job was watched until its initialization deadline"
+            );
+            assert_eq!(fixture.supervisor.retired(), vec![id]);
+            assert!(Store::new(fixture.root.join("data/metadata.jsonl"))
+                .load_sessions()
+                .expect("load store")
+                .is_empty());
+        }
+
+        #[tokio::test]
+        async fn abandoned_create_waits_for_an_unavailable_supervisor() {
+            const INITIALIZE: Duration = Duration::from_secs(1);
+
+            let fixture = fixture_with(Arc::new(HostInspector::new()), Some(INITIALIZE));
+            persist_preparing_record(&fixture.root, "s-318");
+            let id = service_id("s-318", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Running, None));
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            fixture
+                .supervisor
+                .script_job(id.clone(), JobScript::Unavailable);
+
+            let runtime = wait_state(&fixture.registry, "s-318", RuntimeState::Reconnecting).await;
+            assert_eq!(
+                runtime.loss_reason.as_deref(),
+                Some(SUPERVISION_UNAVAILABLE)
+            );
+            assert!(fixture.supervisor.retired().is_empty(), "nothing is killed");
+
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            wait_removed(&fixture.registry, "s-318").await;
+            assert_eq!(fixture.supervisor.retired(), vec![id]);
+        }
+
+        #[tokio::test]
+        async fn ambiguous_generation_is_adopted_once_its_worker_is_reachable_again() {
+            let fixture = fixture(Arc::new(HostInspector::new()));
+            let runtime_root = fixture.root.join("runtime/workers");
+            let (controller, runtime_id, _child_pid, server_task) =
+                spawn_initialized_worker(&fixture.root, &runtime_root, "s-319", "worker-s-319")
+                    .await;
+            persist_record(&fixture.root, "s-319", Some(runtime_id.as_str()));
+            drop(controller);
+            let socket = runtime_root
+                .join("s-319")
+                .join(pohunek_paths::WORKER_SOCKET_NAME);
+            let hidden = socket.with_extension("hidden");
+            std::fs::rename(&socket, &hidden).expect("hide the worker socket");
+            fixture.supervisor.script_job(
+                service_id("s-319", TEST_GENERATION),
+                present(ServiceState::Running, None),
+            );
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let runtime = runtime_of(&fixture.registry, "s-319").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
+
+            std::fs::rename(&hidden, &socket).expect("restore the worker socket");
+            let runtime = wait_state(&fixture.registry, "s-319", RuntimeState::Live).await;
+            assert_eq!(runtime.runtime_id.as_deref(), Some(runtime_id.as_str()));
+            assert!(
+                fixture.supervisor.retired().is_empty(),
+                "nothing was retired"
+            );
+            fixture
+                .registry
+                .stop(&SessionId("s-319".to_owned()))
+                .await
+                .expect("stop the adopted worker");
+            server_task.abort();
+        }
+
+        #[tokio::test]
+        async fn ambiguous_generation_whose_job_ends_becomes_a_proven_crash() {
+            let fixture = fixture(Arc::new(HostInspector::new()));
+            let marked = Marked::spawn("runtime-s-320");
+            persist_record(&fixture.root, "s-320", Some("runtime-s-320"));
+            write_live_journal(&fixture.root, "s-320", dead_worker(), Some("runtime-s-320"));
+            let id = service_id("s-320", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Running, None));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let runtime = runtime_of(&fixture.registry, "s-320").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
+            assert!(marked.alive(), "nothing is swept while ambiguous");
+
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            let runtime = wait_state(&fixture.registry, "s-320", RuntimeState::Lost).await;
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            marked.wait_gone().await;
+            assert_eq!(fixture.supervisor.retired(), vec![id]);
         }
 
         #[tokio::test]
