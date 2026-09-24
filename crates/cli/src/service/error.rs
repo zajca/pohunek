@@ -143,6 +143,21 @@ pub enum Error {
         path: PathBuf,
     },
 
+    /// `service upgrade` found an interrupted install transaction.
+    ///
+    /// Only `service install` finishes or rolls back an install; an upgrade
+    /// rolling it back would remove a daemon the install may already run.
+    #[error(
+        "an interrupted install of version {version} is pending (last completed step: {step}); \
+         upgrade refuses to touch it"
+    )]
+    PendingInstall {
+        /// The version the pending install targets.
+        version: String,
+        /// The last journaled step of the pending install.
+        step: &'static str,
+    },
+
     /// A daemon job of this namespace exists without an installation record.
     #[error("daemon job {id} is registered, but no service.toml describes it")]
     DaemonJobPresent {
@@ -282,6 +297,7 @@ impl Error {
             Self::VersionConflict { .. } => "service_version_conflict",
             Self::AlreadyInstalled { .. } => "service_already_installed",
             Self::NotInstalled { .. } => "service_not_installed",
+            Self::PendingInstall { .. } => "service_install_pending",
             Self::DaemonJobPresent { .. } => "service_daemon_job_present",
             Self::Supervisor { .. } => "service_supervisor_failed",
             Self::VerifierMissing => "service_verifier_missing",
@@ -308,6 +324,9 @@ impl Error {
                 Some("run `pohunek service upgrade` to install a new version")
             }
             Self::NotInstalled { .. } => Some("run `pohunek service install` first"),
+            Self::PendingInstall { .. } => Some(
+                "rerun `pohunek service install` (or packaging/install-daemon.sh) with the same version and prefix to finish it",
+            ),
             Self::DaemonJobPresent { .. } => Some(
                 "remove the stale daemon job with the service manager, then install again",
             ),

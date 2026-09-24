@@ -415,4 +415,50 @@ mod tests {
         assert!(text.contains("pending    install 1.0.0 stopped after step config"));
         assert!(text.contains("not installed (/c/pohunek/service.toml is missing)"));
     }
+
+    /// `packaging/install-daemon.sh` detects a pending install by matching
+    /// the pretty `"operation": "install"` pair, which only
+    /// `pending_transaction` may carry.
+    #[test]
+    fn status_json_names_only_the_pending_operation() {
+        let observation = report::JobReport {
+            service_id: "pohunek-ns-daemon.service".to_owned(),
+            state: "running",
+            pid: Some(7),
+            executable: Some(PathBuf::from("/p/libexec/pohunek/1.0.0/pohunekd")),
+            arguments: Some(vec!["--service-config".to_owned()]),
+        };
+        let mut status = report::StatusReport {
+            installed: true,
+            config_path: PathBuf::from("/c/pohunek/service.toml"),
+            namespace: Some("ns".to_owned()),
+            prefix: Some(PathBuf::from("/p")),
+            active_version: Some("1.0.0".to_owned()),
+            daemon: Some(observation.clone()),
+            daemon_error: Some("operation failed".to_owned()),
+            versions: Vec::new(),
+            workers: vec![report::WorkerReport {
+                job: observation,
+                session_id: "s-1".to_owned(),
+                generation: "abcd2345".to_owned(),
+                version: Some("1.0.0".to_owned()),
+            }],
+            workers_error: None,
+            unreadable_journals: Vec::new(),
+            transaction_in_progress: false,
+            pending_transaction: Some(report::PendingReport {
+                operation: "install",
+                version: "1.0.0".to_owned(),
+                step: "ready",
+            }),
+        };
+        let json = render_json(&status).expect("status JSON");
+        assert_eq!(json.matches("\"operation\"").count(), 1, "{json}");
+        assert!(json.contains("\"operation\": \"install\""), "{json}");
+
+        status.pending_transaction = None;
+        let json = render_json(&status).expect("status JSON");
+        assert!(!json.contains("\"operation\""), "{json}");
+        assert!(json.contains("\"pending_transaction\": null"), "{json}");
+    }
 }

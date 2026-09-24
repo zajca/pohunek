@@ -257,7 +257,7 @@ provider-keyed notification policy; recover by upgrading forward instead.
 
 For the daemon component, run the included `packaging/install-daemon.sh`. It
 calls `pohunek service install` (or `pohunek service upgrade` when a service is
-already installed), which:
+already installed and no interrupted install is pending), which:
 
 - copies `pohunek`, `pohunekd`, and `pohunek-sessiond` into
   `<prefix>/libexec/pohunek/<version>/` (prefix default `~/.local`, or

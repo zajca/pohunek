@@ -132,7 +132,17 @@ listed in the upgrade report. After health returns:
 An interrupted install or upgrade is journaled in
 `~/.local/state/pohunek/service-install.json`; running the same command again
 resumes it, and a different command rolls it back first. `pohunek service
-status --json` reports it as `pending_transaction`. Only one service
+status --json` reports it as `pending_transaction`. The exception is an
+interrupted install met by `pohunek service upgrade`: once the install passed
+its `config` step, `service.toml` exists and its daemon may already run the new
+version, so the upgrade fails with `service_install_pending` and changes
+nothing. Rerun `pohunek service install` (or `packaging/install-daemon.sh`) to
+finish it: the same version and prefix resume, anything else rolls it back and
+installs afresh. `packaging/install-daemon.sh` asks `pohunek service status
+--json` first and runs `service install` whenever the pending transaction is an
+install, `service upgrade` otherwise when `service.toml` exists, and `service
+install` on a fresh host; a failing status query aborts it before anything
+changes. Only one service
 transaction runs at a time: each holds `~/.local/state/pohunek/service-install.lock`,
 a second one fails with `service_transaction_in_progress` (status then reports
 `transaction_in_progress: true`), and a crashed holder's lock is released

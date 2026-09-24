@@ -534,6 +534,62 @@ async fn an_install_interrupted_after_every_step_rolls_back_without_orphans() {
 }
 
 #[tokio::test]
+async fn an_upgrade_refuses_a_pending_install_and_install_finishes_it() {
+    // From `config` on, service.toml exists, so an installer choosing by that
+    // file alone would call `upgrade`; from `registered` on, a daemon runs.
+    for step in [Step::Config, Step::Registered, Step::Ready] {
+        let harness = Harness::new();
+        let mut engine = harness.engine();
+        engine.interrupt_after = Some(step);
+        engine
+            .install(&harness.staged(V1), &harness.prefix(), V1)
+            .await
+            .expect_err("interrupted");
+        let record = harness.pending().expect("record left behind");
+        let config = std::fs::read(harness.context.config_path()).expect("service.toml");
+        let registered = harness.fake.world().registered.clone();
+        let running = harness.fake.world().running;
+
+        let error = harness.upgrade(V2).await.expect_err("upgrade refuses");
+        assert!(
+            matches!(
+                &error,
+                Error::PendingInstall { version, step: at } if version == V1 && *at == step.as_str()
+            ),
+            "{step:?}: {error:?}"
+        );
+        assert_eq!(error.code(), "service_install_pending");
+        assert!(error.hint().is_some());
+        assert_eq!(harness.pending(), Some(record), "{step:?}: record kept");
+        assert_eq!(
+            std::fs::read(harness.context.config_path()).expect("service.toml kept"),
+            config,
+            "{step:?}: service.toml untouched"
+        );
+        assert_eq!(
+            harness.fake.world().registered,
+            registered,
+            "{step:?}: daemon job untouched"
+        );
+        assert_eq!(harness.fake.world().running, running);
+        assert_eq!(
+            layout::installed_versions(&harness.layout()).expect("versions"),
+            [V1],
+            "{step:?}: nothing staged for the refused upgrade"
+        );
+
+        let report = harness.install(V1).await.expect("install resumes");
+        assert!(report.resumed, "{step:?} resumes");
+        assert_eq!(report.rolled_back, None);
+        harness.assert_installed(V1);
+        assert!(
+            harness.fake.world().installs <= 1,
+            "{step:?}: the daemon job is installed at most once"
+        );
+    }
+}
+
+#[tokio::test]
 async fn an_upgrade_interrupted_after_every_step_resumes_or_rolls_back() {
     for step in STEPS {
         let harness = Harness::new();

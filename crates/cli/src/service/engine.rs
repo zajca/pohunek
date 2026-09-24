@@ -26,8 +26,12 @@
 //!
 //! An interrupted process leaves the record behind. The next `install` or
 //! `upgrade` of the same version and prefix resumes after the recorded step;
-//! any other operation, including `uninstall`, rolls it back first. Every
-//! step is idempotent, so resuming never duplicates a job or a directory.
+//! any other operation, including `uninstall`, rolls it back first. The one
+//! exception is an `upgrade` meeting a pending install: it fails with
+//! `service_install_pending` and touches nothing, because only `install`
+//! may finish or roll back an install whose daemon may already run the new
+//! version. Every step is idempotent, so resuming never duplicates a job or a
+//! directory.
 //!
 //! After a successful upgrade, version directories that are neither active,
 //! referenced by a non-final worker journal, executed by a running process,
@@ -258,7 +262,8 @@ impl<'a> Engine<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NotInstalled`] without `service.toml`, staging and
+    /// Returns [`Error::PendingInstall`] while an interrupted install's record
+    /// exists, [`Error::NotInstalled`] without `service.toml`, staging and
     /// probe errors, and the failing step's error after a rollback.
     pub async fn upgrade(&self, from: &Path, version: &str) -> Result<UpgradeReport, Error> {
         let _transaction = self.store.lock().await?;
@@ -266,9 +271,15 @@ impl<'a> Engine<'a> {
         let config_path = self.context.config_path();
         let pending = self.store.load()?;
         let (resume, rolled_back) = match pending {
-            Some(record) if record.operation == Operation::Upgrade && record.version == version => {
-                (Some(record), None)
+            // Rolling a pending install back would remove its daemon, which
+            // runs the new version once the record reached `ready`.
+            Some(record) if record.operation == Operation::Install => {
+                return Err(Error::PendingInstall {
+                    version: record.version,
+                    step: record.step.as_str(),
+                });
             }
+            Some(record) if record.version == version => (Some(record), None),
             Some(record) => {
                 let report = pending_report(&record);
                 self.rollback_pending(&record).await?;

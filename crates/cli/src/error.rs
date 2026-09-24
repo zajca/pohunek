@@ -388,6 +388,7 @@ fn service_error_class(error: &crate::service::Error) -> ErrorClass {
         | Error::VersionConflict { .. }
         | Error::AlreadyInstalled { .. }
         | Error::NotInstalled { .. }
+        | Error::PendingInstall { .. }
         | Error::DaemonJobPresent { .. }
         | Error::VerifierMissing
         | Error::UnitVerification { .. }

@@ -15,7 +15,10 @@ fn fresh_install_runs_service_install_from_the_archive() {
     let fixture = Fixture::new();
     let output = fixture.run(&[], &[]);
     assert_success(&output);
-    assert_eq!(fixture.pohunek_calls(), [fixture.install_call()]);
+    assert_eq!(
+        fixture.pohunek_calls(),
+        [STATUS.to_owned(), fixture.install_call()]
+    );
     assert!(
         !fixture.systemctl_log.exists(),
         "a fresh install never touches systemctl"
@@ -30,13 +33,82 @@ fn existing_service_config_runs_service_upgrade() {
     assert_success(&output);
     assert_eq!(
         fixture.pohunek_calls(),
-        [format!(
-            "service upgrade --from {}",
-            fixture.archive.display()
-        )]
+        [STATUS.to_owned(), fixture.upgrade_call()]
     );
 }
 
+#[test]
+fn a_pending_install_is_finished_by_service_install_even_with_service_config() {
+    // From its `config` step on, an interrupted install has written
+    // service.toml; `service upgrade` refuses its record.
+    for step in ["config", "registered", "ready"] {
+        let fixture = Fixture::new();
+        write(&fixture.config_home.join("pohunek/service.toml"), "");
+        let output = fixture.run(
+            &[],
+            &[
+                ("POHUNEK_TEST_PENDING_OPERATION", "install"),
+                ("POHUNEK_TEST_PENDING_STEP", step),
+            ],
+        );
+        assert_success(&output);
+        assert_eq!(
+            fixture.pohunek_calls(),
+            [STATUS.to_owned(), fixture.install_call()],
+            "pending install at {step}"
+        );
+    }
+}
+
+#[test]
+fn a_pending_upgrade_keeps_service_upgrade() {
+    let fixture = Fixture::new();
+    write(&fixture.config_home.join("pohunek/service.toml"), "");
+    let output = fixture.run(
+        &[],
+        &[
+            ("POHUNEK_TEST_PENDING_OPERATION", "upgrade"),
+            ("POHUNEK_TEST_PENDING_STEP", "registered"),
+        ],
+    );
+    assert_success(&output);
+    assert_eq!(
+        fixture.pohunek_calls(),
+        [STATUS.to_owned(), fixture.upgrade_call()]
+    );
+}
+
+#[test]
+fn an_unanswered_status_query_aborts_before_anything_changes() {
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let output = fixture.run(
+        &[],
+        &[
+            ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+            ("POHUNEK_TEST_STATUS_QUERY_EXIT", "5"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("service_record_invalid"), "{stderr}");
+    assert!(stderr.contains("nothing was changed"), "{stderr}");
+    assert_eq!(fixture.pohunek_calls(), [STATUS]);
+    assert!(fixture.systemctl_calls().is_empty());
+    for legacy in fixture.legacy_files() {
+        assert!(legacy.exists(), "{} was removed", legacy.display());
+    }
+
+    // A report without `pending_transaction` cannot rule a pending install out.
+    let fixture = Fixture::new();
+    write(&fixture.config_home.join("pohunek/service.toml"), "");
+    let output = fixture.run(&[], &[("POHUNEK_TEST_STATUS_UNEXPECTED", "1")]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("pending_transaction"));
+    assert_eq!(fixture.pohunek_calls(), [STATUS]);
+}
+
+const STATUS: &str = "service status --json";
 const IS_ACTIVE: &str = "--user is-active --quiet pohunekd.service";
 const LIST_WORKERS: &str = "--user list-units pohunek-session@* --state=active --plain --no-legend";
 const DISABLE: &str = "--user disable --now pohunekd.service";
@@ -54,6 +126,7 @@ fn idle_legacy_install_is_retired_after_preflight_before_installing() {
     assert_eq!(
         fixture.pohunek_calls(),
         [
+            STATUS.to_owned(),
             "migration preflight --accept-runtime-loss".to_owned(),
             fixture.install_call(),
         ]
@@ -85,7 +158,7 @@ fn live_legacy_template_workers_refuse_before_anything_changes() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("pohunek-session@s-1.service"), "{stderr}");
     assert!(stderr.contains("pohunek session stop <id>"), "{stderr}");
-    assert_eq!(fixture.pohunek_calls(), ["migration preflight"]);
+    assert_eq!(fixture.pohunek_calls(), [STATUS, "migration preflight"]);
     assert_eq!(fixture.systemctl_calls(), [IS_ACTIVE, LIST_WORKERS]);
     for legacy in fixture.legacy_files() {
         assert!(legacy.exists(), "{} was removed", legacy.display());
@@ -104,7 +177,7 @@ fn failed_preflight_stops_before_retiring_the_legacy_install() {
         ],
     );
     assert_eq!(output.status.code(), Some(23), "{output:?}");
-    assert_eq!(fixture.pohunek_calls(), ["migration preflight"]);
+    assert_eq!(fixture.pohunek_calls(), [STATUS, "migration preflight"]);
     assert_eq!(fixture.systemctl_calls(), [IS_ACTIVE]);
     for legacy in fixture.legacy_files() {
         assert!(legacy.exists(), "{} was removed", legacy.display());
@@ -119,7 +192,10 @@ fn rerun_after_a_partial_retirement_finishes_without_a_second_preflight() {
     fixture.legacy_install();
     let output = fixture.run(&[], &[]);
     assert_success(&output);
-    assert_eq!(fixture.pohunek_calls(), [fixture.install_call()]);
+    assert_eq!(
+        fixture.pohunek_calls(),
+        [STATUS.to_owned(), fixture.install_call()]
+    );
     assert_eq!(
         fixture.systemctl_calls(),
         [IS_ACTIVE, LIST_WORKERS, DISABLE, RELOAD]
@@ -133,7 +209,10 @@ fn rerun_after_a_partial_retirement_finishes_without_a_second_preflight() {
     write(&fixture.prefix.join("bin/pohunekd"), "legacy\n");
     let output = fixture.run(&[], &[]);
     assert_success(&output);
-    assert_eq!(fixture.pohunek_calls(), [fixture.install_call()]);
+    assert_eq!(
+        fixture.pohunek_calls(),
+        [STATUS.to_owned(), fixture.install_call()]
+    );
     assert!(fixture.systemctl_calls().is_empty());
     assert!(!fixture.prefix.join("bin/pohunekd").exists());
 }
@@ -214,6 +293,36 @@ fn release_workflow_packages_static_shell_completions() {
     }
 }
 
+/// Fake archive CLI: logs its arguments and answers `service status --json`
+/// in the pretty envelope the real CLI prints, with a pending transaction
+/// from `POHUNEK_TEST_PENDING_OPERATION`/`_STEP` or `null`.
+/// `POHUNEK_TEST_STATUS_QUERY_EXIT` fails the query with an error document;
+/// `POHUNEK_TEST_STATUS_UNEXPECTED` answers without `pending_transaction`.
+/// `POHUNEK_TEST_PREFLIGHT_STATUS` and `POHUNEK_TEST_SERVICE_STATUS` set the
+/// exit status of the migration preflight and of install/upgrade.
+const FAKE_POHUNEK: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$POHUNEK_TEST_POHUNEK_LOG"
+[ "$1" = migration ] && exit "${POHUNEK_TEST_PREFLIGHT_STATUS:-0}"
+if [ "$1" = service ] && [ "$2" = status ]; then
+    if [ -n "${POHUNEK_TEST_STATUS_QUERY_EXIT:-}" ]; then
+        printf '{\n  "err": {\n    "code": "service_record_invalid"\n  }\n}\n'
+        exit "$POHUNEK_TEST_STATUS_QUERY_EXIT"
+    fi
+    if [ -n "${POHUNEK_TEST_STATUS_UNEXPECTED:-}" ]; then
+        printf '{\n  "ok": {\n    "installed": true\n  }\n}\n'
+        exit 0
+    fi
+    pending=null
+    if [ -n "${POHUNEK_TEST_PENDING_OPERATION:-}" ]; then
+        pending=$(printf '{\n      "operation": "%s",\n      "version": "1.0.0",\n      "step": "%s"\n    }' \
+            "$POHUNEK_TEST_PENDING_OPERATION" "$POHUNEK_TEST_PENDING_STEP")
+    fi
+    printf '{\n  "ok": {\n    "installed": true,\n    "pending_transaction": %s,\n    "transaction_in_progress": false\n  }\n}\n' "$pending"
+    exit 0
+fi
+exit "${POHUNEK_TEST_SERVICE_STATUS:-0}"
+"#;
+
 struct Fixture {
     _root: tempfile::TempDir,
     home: PathBuf,
@@ -238,12 +347,7 @@ impl Fixture {
             archive.join("packaging/install-daemon.sh"),
         )
         .expect("copy wrapper");
-        write_executable(
-            &archive.join("pohunek"),
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$POHUNEK_TEST_POHUNEK_LOG\"\n\
-             [ \"$1\" = migration ] && exit \"${POHUNEK_TEST_PREFLIGHT_STATUS:-0}\"\n\
-             exit \"${POHUNEK_TEST_SERVICE_STATUS:-0}\"\n",
-        );
+        write_executable(&archive.join("pohunek"), FAKE_POHUNEK);
         write_executable(&archive.join("pohunekd"), "#!/bin/sh\nexit 0\n");
         write_executable(&archive.join("pohunek-sessiond"), "#!/bin/sh\nexit 0\n");
         write_executable(
@@ -311,6 +415,10 @@ impl Fixture {
             self.archive.display(),
             self.prefix.display()
         )
+    }
+
+    fn upgrade_call(&self) -> String {
+        format!("service upgrade --from {}", self.archive.display())
     }
 
     fn pohunek_calls(&self) -> Vec<String> {

@@ -1367,7 +1367,10 @@ transaction (`<state>/pohunek/service-install.json`):
 
 A failing step rolls the transaction back; an interrupted one is resumed by the
 next `install` or `upgrade` of the same version and rolled back by any other
-operation. The installer refuses a unit or `LaunchAgents` directory that is
+operation, except that `upgrade` refuses an interrupted install with
+`service_install_pending` and leaves it for `install` to finish. The archive
+wrapper therefore runs `install` whenever `pohunek service status --json`
+reports a pending install. The installer refuses a unit or `LaunchAgents` directory that is
 group- or world-writable and names `chmod go-w <path>` instead of changing it.
 
 `pohunek service upgrade` installs the new version directory, switches

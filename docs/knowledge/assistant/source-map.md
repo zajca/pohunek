@@ -229,7 +229,9 @@ Release packaging and contributor verification:
 - `.github/workflows/release.yml`
 - `README.md`
 - `packaging/install-daemon.sh` — release-archive wrapper that retires a
-  legacy template-unit install, then runs `pohunek service install|upgrade`.
+  legacy template-unit install, then runs `pohunek service install|upgrade`:
+  `install` while `pohunek service status --json` reports a pending install
+  transaction or no `service.toml` exists, `upgrade` otherwise.
 - `crates/cli/tests/daemon_packaging.rs`
 - `scripts/acceptance/macos-launchd-lifetime` — manual macOS logout/reboot
   lifetime procedure; `scripts/acceptance/launchd_lifetime_evidence.py`

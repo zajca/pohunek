@@ -3,9 +3,16 @@
 #
 # `pohunek service install|upgrade` does the work: versioned binaries under
 # <prefix>/libexec/pohunek/<version>/, service.toml, the daemon job, and the
-# readiness check. This wrapper only locates the staged binaries next to it and
+# readiness check. This wrapper only locates the staged binaries next to it,
 # retires a pre-service install (a `pohunekd.service` unit with template
-# workers) after the one-time migration preflight.
+# workers) after the one-time migration preflight, and picks the subcommand:
+#
+# - `service install` while `pohunek service status --json` reports a pending
+#   install transaction: install resumes it (same version and prefix) or rolls
+#   it back and installs afresh. That install already wrote service.toml once
+#   it passed its `config` step, and `service upgrade` refuses such a record;
+# - otherwise `service upgrade` when service.toml exists;
+# - otherwise `service install`.
 
 set -eu
 
@@ -36,6 +43,26 @@ for required in pohunek pohunekd pohunek-sessiond; do
         exit 1
     fi
 done
+
+# Asked before anything changes, so a failing query leaves the host untouched.
+# The status report is pretty-printed JSON in which only `pending_transaction`
+# carries an "operation" key. A `--json` failure prints its error document on
+# stdout, so the captured output is forwarded to stderr.
+if ! status_json=$("$archive_dir/pohunek" service status --json); then
+    printf '%s\n' "$status_json" >&2
+    echo "\`pohunek service status --json\` failed; nothing was changed" >&2
+    echo "fix the reported problem and re-run $0" >&2
+    exit 1
+fi
+if ! printf '%s\n' "$status_json" | grep -q '"pending_transaction"'; then
+    echo "\`pohunek service status --json\` did not report pending_transaction; nothing was changed" >&2
+    exit 1
+fi
+pending_install=0
+if printf '%s\n' "$status_json" \
+    | grep -Eq '"operation"[[:space:]]*:[[:space:]]*"install"'; then
+    pending_install=1
+fi
 
 # A pre-service install runs `pohunekd.service` from <prefix>/bin with
 # `pohunek-session@.service` template workers. Its daemon holds the instance
@@ -76,7 +103,9 @@ if [ -e "$prefix/bin/pohunekd" ] || [ -e "$prefix/libexec/pohunek-sessiond" ]; t
     legacy_retired=1
 fi
 
-if [ -f "$service_config" ]; then
+if [ "$pending_install" -eq 1 ]; then
+    set -- service install --from "$archive_dir" --prefix "$prefix"
+elif [ -f "$service_config" ]; then
     set -- service upgrade --from "$archive_dir"
 else
     set -- service install --from "$archive_dir" --prefix "$prefix"
