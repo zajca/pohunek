@@ -19,7 +19,7 @@ use protocol::{
 
 use super::*;
 use crate::service::backend::{Call, Control};
-use crate::service::context::tests::context;
+use crate::service::context::tests::{context, temp_root};
 use crate::service::layout::tests::stage_dir;
 use crate::service::layout::CLI_NAME;
 use crate::service::usage::tests::{write_journal, SESSION};
@@ -307,7 +307,8 @@ fn session(id: &str, name: Option<&str>) -> SessionInfo {
 }
 
 struct Harness {
-    root: tempfile::TempDir,
+    _temp: tempfile::TempDir,
+    root: PathBuf,
     context: Context,
     fake: Fake,
     backend: Backend,
@@ -315,8 +316,8 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
-        let root = pohunek_test_support::tempdir().expect("temp dir");
-        let context = context(root.path());
+        let (temp, root) = temp_root();
+        let context = context(&root);
         let fake = Fake::default();
         let backend = Backend::new(
             Box::new(fake.clone()),
@@ -324,6 +325,7 @@ impl Harness {
             Box::new(fake.clone()),
         );
         Self {
+            _temp: temp,
             root,
             context,
             fake,
@@ -339,7 +341,7 @@ impl Harness {
     }
 
     fn prefix(&self) -> PathBuf {
-        self.root.path().join("prefix")
+        self.root.as_path().join("prefix")
     }
 
     fn layout(&self) -> InstallLayout {
@@ -347,7 +349,7 @@ impl Harness {
     }
 
     fn staged(&self, version: &str) -> PathBuf {
-        stage_dir(self.root.path(), version)
+        stage_dir(self.root.as_path(), version)
     }
 
     async fn install(&self, version: &str) -> Result<InstallReport, Error> {
@@ -790,7 +792,7 @@ async fn upgrade_keeps_a_version_a_live_journal_references() {
 #[tokio::test]
 async fn an_untrusted_unit_directory_fails_before_anything_changes() {
     let harness = Harness::new();
-    let open = harness.root.path().join("open");
+    let open = harness.root.as_path().join("open");
     std::fs::create_dir_all(&open).expect("open dir");
     std::fs::set_permissions(&open, std::os::unix::fs::PermissionsExt::from_mode(0o777))
         .expect("chmod");

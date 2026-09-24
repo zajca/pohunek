@@ -229,6 +229,17 @@ pub(crate) mod tests {
 
     use super::*;
 
+    /// Creates a temporary root and returns it with its canonical path.
+    ///
+    /// The shared fixture root is symlink-free, which the trusted-directory
+    /// checks and process executable paths require, and short enough for the
+    /// daemon socket below it on macOS.
+    pub(crate) fn temp_root() -> (tempfile::TempDir, PathBuf) {
+        let root = pohunek_test_support::tempdir().expect("temp dir");
+        let path = std::fs::canonicalize(root.path()).expect("canonical temp dir");
+        (root, path)
+    }
+
     /// Resolves application paths below `root` without touching the process environment.
     pub(crate) fn paths(root: &Path) -> BasePaths {
         let env = PathEnv {
@@ -261,10 +272,16 @@ pub(crate) mod tests {
 
     #[test]
     fn bootstrap_environment_names_every_root_explicitly() {
-        let root = pohunek_test_support::tempdir().expect("temp dir");
-        let context = context(root.path());
+        let (_root, root) = temp_root();
+        let context = context(root.as_path());
         let environment = context.bootstrap_environment();
-        let path = |name: &str| root.path().join(name).to_str().expect("utf-8").to_owned();
+        let path = |name: &str| {
+            root.as_path()
+                .join(name)
+                .to_str()
+                .expect("utf-8")
+                .to_owned()
+        };
         assert_eq!(
             environment,
             BTreeMap::from([
@@ -280,14 +297,14 @@ pub(crate) mod tests {
 
     #[test]
     fn namespace_is_deterministic_and_depends_on_the_roots() {
-        let first = pohunek_test_support::tempdir().expect("temp dir");
-        let second = pohunek_test_support::tempdir().expect("temp dir");
-        let a = context(first.path()).namespace().expect("namespace");
-        let again = context(first.path()).namespace().expect("namespace");
-        let b = context(second.path()).namespace().expect("namespace");
+        let (_first, first) = temp_root();
+        let (_second, second) = temp_root();
+        let a = context(&first).namespace().expect("namespace");
+        let again = context(&first).namespace().expect("namespace");
+        let b = context(&second).namespace().expect("namespace");
         assert_eq!(a, again);
         assert_ne!(a, b);
-        assert!(first.path().join("state/pohunek").is_dir());
-        assert!(first.path().join("run/pohunek").is_dir());
+        assert!(first.join("state/pohunek").is_dir());
+        assert!(first.join("run/pohunek").is_dir());
     }
 }

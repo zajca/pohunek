@@ -49,6 +49,23 @@ pub(crate) enum InspectStep {
     Unavailable,
 }
 
+/// Scripted, sticky answer for one service ID, taking precedence over the
+/// inspect script; present jobs are also what `discover` reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JobScript {
+    /// The job exists with these facts.
+    Present {
+        /// Reported lifecycle state.
+        state: ServiceState,
+        /// Reported main process.
+        process: Option<ProcessIdentity>,
+        /// Reported definition facts.
+        definition: Option<DefinitionFacts>,
+    },
+    /// The supervisor cannot inspect this job.
+    Unavailable,
+}
+
 /// One supervisor call, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Call {
@@ -78,6 +95,8 @@ pub(crate) struct ScriptedSupervisor {
     gate: StdMutex<Option<StartGate>>,
     store: Option<PathBuf>,
     persisted_at_start: StdMutex<Vec<Option<String>>>,
+    jobs: StdMutex<HashMap<ServiceId, JobScript>>,
+    discovery_unavailable: std::sync::atomic::AtomicBool,
 }
 
 impl ScriptedSupervisor {
@@ -106,6 +125,17 @@ impl ScriptedSupervisor {
 
     pub(crate) fn script_inspects(&self, steps: impl IntoIterator<Item = InspectStep>) {
         self.inspects.lock().expect("script").extend(steps);
+    }
+
+    /// Scripts every later `inspect` of `id`; a present job is discovered and
+    /// retiring it removes the script.
+    pub(crate) fn script_job(&self, id: ServiceId, script: JobScript) {
+        self.jobs.lock().expect("jobs").insert(id, script);
+    }
+
+    /// Makes `discover` fail as an unreachable manager.
+    pub(crate) fn fail_discovery(&self) {
+        self.discovery_unavailable.store(true, Ordering::Release);
     }
 
     pub(crate) fn hold_start(&self, gate: StartGate) {
@@ -245,16 +275,31 @@ impl Supervisor for ScriptedSupervisor {
 
     fn discover(&self) -> Operation<'_, Vec<ServiceObservation>> {
         Box::pin(async move {
-            match &self.delegate {
-                Some(delegate) => delegate.discover().await,
-                None => Ok(Vec::new()),
+            if self.discovery_unavailable.load(Ordering::Acquire) {
+                return Err(unavailable("discover"));
             }
+            let mut observations = match &self.delegate {
+                Some(delegate) => delegate.discover().await?,
+                None => Vec::new(),
+            };
+            observations.extend(self.jobs.lock().expect("jobs").iter().filter_map(
+                |(id, script)| match script {
+                    JobScript::Present { .. } => scripted_observation(id, script),
+                    JobScript::Unavailable => None,
+                },
+            ));
+            observations.sort_by(|left, right| left.id.cmp(&right.id));
+            Ok(observations)
         })
     }
 
     fn inspect<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, ServiceObservation> {
         Box::pin(async move {
             self.record(Call::Inspect(id.clone()));
+            let scripted = self.jobs.lock().expect("jobs").get(id).cloned();
+            if let Some(script) = scripted {
+                return scripted_observation(id, &script).ok_or_else(|| unavailable("inspect"));
+            }
             match self.next_inspect() {
                 Some(InspectStep::Present { state, process }) => Ok(ServiceObservation {
                     id: id.clone(),
@@ -281,11 +326,40 @@ impl Supervisor for ScriptedSupervisor {
     fn retire<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, ()> {
         Box::pin(async move {
             self.record(Call::Retire(id.clone()));
+            if let Some(script) = self.jobs.lock().expect("jobs").remove(id) {
+                return match script {
+                    JobScript::Present { .. } => Ok(()),
+                    JobScript::Unavailable => Err(unavailable("retire")),
+                };
+            }
             match &self.delegate {
                 Some(delegate) => delegate.retire(id).await,
                 None => Err(SupervisorError::NotFound(id.clone())),
             }
         })
+    }
+}
+
+fn scripted_observation(id: &ServiceId, script: &JobScript) -> Option<ServiceObservation> {
+    match script {
+        JobScript::Present {
+            state,
+            process,
+            definition,
+        } => Some(ServiceObservation {
+            id: id.clone(),
+            state: *state,
+            process: *process,
+            definition: definition.clone(),
+        }),
+        JobScript::Unavailable => None,
+    }
+}
+
+fn unavailable(operation: &'static str) -> SupervisorError {
+    SupervisorError::Unavailable {
+        operation,
+        source: Box::new(std::io::Error::other("scripted manager outage")),
     }
 }
 

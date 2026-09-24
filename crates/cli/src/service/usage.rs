@@ -335,6 +335,7 @@ pub(crate) mod tests {
     use pohunek_session_worker::{JournalRecord, WorkerOrigin};
 
     use super::*;
+    use crate::service::context::tests::temp_root;
 
     pub(crate) const SESSION: &str = "s-01KYAPVPFVHD56Z69B9CX3XWN2";
 
@@ -378,9 +379,9 @@ pub(crate) mod tests {
 
     #[test]
     fn non_final_journals_reference_their_version_and_final_ones_do_not() {
-        let root = pohunek_test_support::tempdir().expect("temp dir");
-        let paths = super::super::context::tests::paths(root.path());
-        let layout = InstallLayout::new(root.path().join("prefix")).expect("layout");
+        let (_root, root) = temp_root();
+        let paths = super::super::context::tests::paths(root.as_path());
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
         let old = layout.worker_executable("1.0.0").expect("old");
         let done = layout.worker_executable("0.9.0").expect("done");
         write_journal(&paths, SESSION, "w-live", &old, RuntimePhase::Live, 1);
@@ -411,9 +412,9 @@ pub(crate) mod tests {
 
     #[test]
     fn an_unreadable_journal_keeps_every_version() {
-        let root = pohunek_test_support::tempdir().expect("temp dir");
-        let paths = super::super::context::tests::paths(root.path());
-        let layout = InstallLayout::new(root.path().join("prefix")).expect("layout");
+        let (_root, root) = temp_root();
+        let paths = super::super::context::tests::paths(root.as_path());
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
         let old = layout.worker_executable("1.0.0").expect("old");
         write_journal(&paths, SESSION, "w-1", &old, RuntimePhase::Terminal, 1);
         let corrupt = paths.worker_journal(SESSION, "w-2").expect("path");
@@ -437,8 +438,8 @@ pub(crate) mod tests {
 
     #[test]
     fn a_running_process_keeps_the_version_it_executes() {
-        let root = pohunek_test_support::tempdir().expect("temp dir");
-        let layout = InstallLayout::new(root.path().join("prefix")).expect("layout");
+        let (_root, root) = temp_root();
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
         let dir = layout.version_dir("1.0.0").expect("dir");
         std::fs::create_dir_all(&dir).expect("version dir");
         let sleeper = dir.join("pohunek-sessiond");

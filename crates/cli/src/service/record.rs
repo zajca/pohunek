@@ -264,6 +264,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
+    use crate::service::context::tests::temp_root;
 
     fn record(step: Step) -> Record {
         Record {
@@ -279,8 +280,8 @@ mod tests {
 
     #[test]
     fn record_round_trips_owner_private_and_clears() {
-        let root = pohunek_test_support::tempdir().expect("temp dir");
-        let state = root.path().join("state/pohunek");
+        let (_root, root) = temp_root();
+        let state = root.as_path().join("state/pohunek");
         let store = Store::new(state.clone());
         assert_eq!(store.load().expect("load missing"), None);
 
@@ -303,8 +304,8 @@ mod tests {
 
     #[test]
     fn foreign_schema_and_unknown_fields_are_rejected() {
-        let root = pohunek_test_support::tempdir().expect("temp dir");
-        let state = root.path().join("state");
+        let (_root, root) = temp_root();
+        let state = root.as_path().join("state");
         let store = Store::new(state.clone());
         let mut value = serde_json::to_value(record(Step::Started)).expect("value");
         value["schema_version"] = 9.into();

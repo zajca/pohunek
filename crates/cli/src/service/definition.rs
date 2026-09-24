@@ -136,12 +136,13 @@ fn daemon_logs(
 mod tests {
     use super::*;
     use crate::service::context::tests::context;
+    use crate::service::context::tests::temp_root;
 
     #[test]
     fn initial_config_writes_the_documented_values() {
-        let root = pohunek_test_support::tempdir().expect("temp dir");
-        let context = context(root.path());
-        let prefix = root.path().join("prefix");
+        let (_root, root) = temp_root();
+        let context = context(root.as_path());
+        let prefix = root.as_path().join("prefix");
         let config = initial_config(&context, &prefix, "1.2.3").expect("config");
         assert_eq!(config.active_version(), "1.2.3");
         assert_eq!(config.prefix(), prefix);
@@ -169,14 +170,14 @@ mod tests {
 
     #[test]
     fn daemon_definition_runs_the_versioned_daemon_with_the_config() {
-        let root = pohunek_test_support::tempdir().expect("temp dir");
-        let context = context(root.path());
+        let (_root, root) = temp_root();
+        let context = context(root.as_path());
         let config =
-            initial_config(&context, &root.path().join("prefix"), "1.2.3").expect("config");
+            initial_config(&context, &root.as_path().join("prefix"), "1.2.3").expect("config");
         let definition = daemon_definition(&context, &config).expect("definition");
         assert_eq!(
             definition.executable(),
-            root.path().join("prefix/libexec/pohunek/1.2.3/pohunekd")
+            root.as_path().join("prefix/libexec/pohunek/1.2.3/pohunekd")
         );
         assert_eq!(
             definition.arguments(),

@@ -138,14 +138,15 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::service::context::tests::context;
+    use crate::service::context::tests::temp_root;
     use crate::service::definition::{daemon_definition, initial_config};
 
     #[tokio::test]
     async fn rendered_units_pass_systemd_analyze() {
-        let root = pohunek_test_support::tempdir().expect("temp dir");
-        let context = context(root.path());
+        let (_root, root) = temp_root();
+        let context = context(root.as_path());
         let config =
-            initial_config(&context, &root.path().join("prefix"), "1.2.3").expect("config");
+            initial_config(&context, &root.as_path().join("prefix"), "1.2.3").expect("config");
         let daemon = config.daemon_executable();
         std::fs::create_dir_all(daemon.parent().expect("version dir")).expect("version dir");
         std::fs::copy("/bin/true", &daemon).expect("stand-in daemon");

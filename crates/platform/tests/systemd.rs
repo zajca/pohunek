@@ -697,3 +697,57 @@ async fn wait_for_daemon(
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn daemon_uninstall_stops_only_empty_namespace_slices() {
+    require_e2e();
+    let mut installation = Installation::new();
+    let unit_dir = user_unit_dir();
+    let slice = installation.namespace.sessions_slice();
+    let parent = format!("pohunek-{}.slice", installation.namespace.as_str());
+    installation.cleanup.unit_dir = Some((
+        unit_dir.clone(),
+        vec![installation.namespace.daemon_unit(), slice.clone()],
+    ));
+    let supervisor = installation.supervisor().await;
+    let daemon = SystemdDaemon::connect(installation.namespace.clone(), unit_dir, CALL_TIMEOUT)
+        .await
+        .expect("connect to the systemd user manager");
+    let id = worker_id("slce2345");
+    supervisor
+        .start(&id, &fixture(installation.root.path(), "ready"))
+        .await
+        .expect("start transient worker");
+    wait_for(&supervisor, &id, |observation| {
+        observation.state == ServiceState::Running
+    })
+    .await;
+
+    daemon
+        .uninstall()
+        .await
+        .expect("uninstall with a live worker");
+    let running = wait_for(&supervisor, &id, |observation| {
+        observation.state == ServiceState::Running
+    })
+    .await;
+    assert!(
+        running.process.is_some(),
+        "uninstall must not touch workers"
+    );
+    assert_eq!(show(&slice, &["ActiveState"])["ActiveState"], "active");
+
+    supervisor.retire(&id).await.expect("retire worker");
+    daemon
+        .uninstall()
+        .await
+        .expect("uninstall after the last worker");
+    let deadline = Instant::now() + STATE_TIMEOUT;
+    for unit in [&slice, &parent] {
+        while show(unit, &["ActiveState"])["ActiveState"] != "inactive" {
+            assert!(Instant::now() < deadline, "{unit} stayed active");
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+}

@@ -580,6 +580,7 @@ pub fn is_scratch(name: &OsStr) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::service::context::tests::temp_root;
 
     /// Writes a fake staged binary answering `--version` like the real one.
     pub(crate) fn write_fake(dir: &Path, name: &str, version: &str) {
@@ -603,9 +604,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn stage_and_publish_create_an_immutable_version_directory() {
-        let root = pohunek_test_support::tempdir().expect("temp dir");
-        let layout = InstallLayout::new(root.path().join("prefix")).expect("layout");
-        let from = stage_dir(root.path(), "1.0.0");
+        let (_root, root) = temp_root();
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
+        let from = stage_dir(root.as_path(), "1.0.0");
 
         let staged = stage(&layout, &from, "1.0.0").await.expect("stage");
         assert!(publish(&layout, &staged, "1.0.0").expect("publish"));
@@ -644,9 +645,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_mismatched_or_missing_binary_is_rejected_before_publishing() {
-        let root = pohunek_test_support::tempdir().expect("temp dir");
-        let layout = InstallLayout::new(root.path().join("prefix")).expect("layout");
-        let from = stage_dir(root.path(), "1.0.0");
+        let (_root, root) = temp_root();
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
+        let from = stage_dir(root.as_path(), "1.0.0");
         write_fake(&from, WORKER_EXECUTABLE_NAME, "0.9.0");
         let error = stage(&layout, &from, "1.0.0").await.expect_err("mismatch");
         assert!(
@@ -664,9 +665,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_binary_that_ignores_version_is_a_probe_failure() {
-        let root = pohunek_test_support::tempdir().expect("temp dir");
-        let layout = InstallLayout::new(root.path().join("prefix")).expect("layout");
-        let from = stage_dir(root.path(), "1.0.0");
+        let (_root, root) = temp_root();
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
+        let from = stage_dir(root.as_path(), "1.0.0");
         std::fs::write(from.join(DAEMON_EXECUTABLE_NAME), "#!/bin/sh\nexit 3\n")
             .expect("broken daemon");
         assert!(matches!(
@@ -677,9 +678,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn cli_copy_is_installed_atomically_and_recognized() {
-        let root = pohunek_test_support::tempdir().expect("temp dir");
-        let layout = InstallLayout::new(root.path().join("prefix")).expect("layout");
-        let from = stage_dir(root.path(), "1.0.0");
+        let (_root, root) = temp_root();
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
+        let from = stage_dir(root.as_path(), "1.0.0");
         let staged = stage(&layout, &from, "1.0.0").await.expect("stage");
         publish(&layout, &staged, "1.0.0").expect("publish");
 
@@ -693,8 +694,8 @@ pub(crate) mod tests {
 
     #[test]
     fn untrusted_install_prefix_is_refused_with_the_directory_named() {
-        let root = pohunek_test_support::tempdir().expect("temp dir");
-        let prefix = root.path().join("prefix");
+        let (_root, root) = temp_root();
+        let prefix = root.as_path().join("prefix");
         std::fs::create_dir_all(prefix.join("libexec")).expect("prefix");
         std::fs::set_permissions(prefix.join("libexec"), Permissions::from_mode(0o777))
             .expect("chmod");
