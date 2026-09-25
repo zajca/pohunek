@@ -111,9 +111,11 @@ switches `active_version` in `service.toml`, rewrites the daemon job to the new
 version, and restarts only the daemon. Worker jobs are separate native jobs
 (systemd transient units or launchd jobs, one per worker generation) that keep
 running the versioned `pohunek-sessiond` they started from, so their PID, PTY,
-and child PID remain unchanged. Version directories that a live worker journal
-or a running process still references are kept; the others are removed and
-listed in the upgrade report. After health returns:
+and child PID remain unchanged. Version directories that a live worker journal,
+a registered worker job (even one that has not started its process yet), or a
+running process still references are kept; the others are removed and listed
+in the upgrade report. When worker jobs cannot be discovered, every version is
+kept. After health returns:
 
 1. Compare `pohunek service status --json` before and after the upgrade for an
    important live session: its `workers` entry keeps the same `generation` and
@@ -151,6 +153,8 @@ automatically, so rerunning the command is always safe.
 `pohunek service uninstall` refuses while sessions are live and lists them.
 `--stop-sessions` stops every session through its worker first; the session
 store, journals, and host identity are kept unless `--purge` is given.
+`service.toml` is removed last, so if an uninstall fails partway, rerunning
+`pohunek service uninstall` finishes the cleanup.
 
 The first worker-aware release is a destructive compatibility boundary because
 a legacy daemon cannot transfer an already-open PTY. Let all legacy sessions

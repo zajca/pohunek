@@ -1,12 +1,14 @@
 //! Which installed versions live workers and journals still reference.
 //!
-//! A version directory may be deleted only when no worker journal in a
-//! non-final phase names an executable inside it, no running process of this
-//! user executes a file inside it, and the running CLI does not live there.
-//! Unreadable journals make every version referenced, because nothing can be
+//! A version directory may be deleted only when no worker journal whose
+//! worker may still run names an executable inside it, no registered worker
+//! job names an executable inside it, no running process of this user
+//! executes a file inside it, and the running CLI does not live there.
+//! Unreadable journals, a failed job discovery, and a job whose executable
+//! cannot be proven make every version referenced, because nothing can be
 //! proven about the worker behind them.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-25
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -16,6 +18,7 @@ use pohunek_platform::filesystem::TrustedDir;
 use pohunek_platform::process::{
     Error as ProcessError, ProcessIdentity, ProcessInspector, StartIdentity,
 };
+use pohunek_platform::supervisor::ServiceObservation;
 use pohunek_session_worker::{Journal, RuntimePhase};
 use serde::Serialize;
 
@@ -204,8 +207,10 @@ fn phase_name(phase: &RuntimePhase) -> &'static str {
 /// Why each installed version is still in use.
 #[derive(Debug, Clone, Default)]
 pub struct Usage {
-    /// Non-final journals per version.
+    /// Journals per version whose worker may still run.
     pub journals: BTreeMap<String, Vec<JournalRef>>,
+    /// Registered worker job IDs per version their definition executes.
+    pub jobs: BTreeMap<String, Vec<String>>,
     /// Running process IDs per version.
     pub processes: BTreeMap<String, Vec<u32>>,
     /// The version the running CLI executes from.
@@ -214,10 +219,16 @@ pub struct Usage {
     pub unreadable: Vec<PathBuf>,
     /// Why the process table could not be read, which keeps every version.
     pub process_error: Option<String>,
+    /// Why worker jobs could not be attributed to versions, which keeps
+    /// every version.
+    pub jobs_error: Option<String>,
 }
 
 impl Usage {
     /// Collects version references from journals, processes, and the CLI.
+    ///
+    /// A non-final journal whose worker has provably exited references
+    /// nothing: the worker never runs again and its executable is unused.
     #[must_use]
     pub fn collect(
         layout: &InstallLayout,
@@ -230,11 +241,7 @@ impl Usage {
             unreadable: journals.unreadable.clone(),
             ..Self::default()
         };
-        for journal in journals
-            .records
-            .iter()
-            .filter(|journal| !journal.final_phase)
-        {
+        for journal in journals.live(inspector) {
             if let Some(version) = version_of(layout, &journal.executable) {
                 usage
                     .journals
@@ -273,6 +280,38 @@ impl Usage {
         usage
     }
 
+    /// Adds the versions registered worker jobs execute or will execute.
+    ///
+    /// Every discovered job counts whatever its state: a job registered but
+    /// not yet executed has neither a process nor a journal, and only the
+    /// daemon retires ended jobs. `discovered` is the discovery result, or
+    /// why discovery failed.
+    pub fn note_jobs(
+        &mut self,
+        layout: &InstallLayout,
+        discovered: Result<&[ServiceObservation], String>,
+    ) {
+        let jobs = match discovered {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                self.jobs_error = Some(error);
+                return;
+            }
+        };
+        for job in jobs {
+            let Some(definition) = &job.definition else {
+                self.jobs_error = Some(format!("worker job {} has no provable executable", job.id));
+                continue;
+            };
+            if let Some(version) = version_of(layout, &definition.executable) {
+                self.jobs
+                    .entry(version)
+                    .or_default()
+                    .push(job.id.to_string());
+            }
+        }
+    }
+
     fn note_process(&mut self, layout: &InstallLayout, executable: &Path, pid: u32) {
         if executable.is_absolute() {
             if let Some(version) = version_of(layout, executable) {
@@ -297,6 +336,9 @@ impl Usage {
                     .join(", ")
             ));
         }
+        if let Some(ids) = self.jobs.get(version) {
+            return Some(format!("registered by worker jobs: {}", ids.join(", ")));
+        }
         if let Some(pids) = self.processes.get(version) {
             return Some(format!(
                 "executed by running processes: {}",
@@ -315,14 +357,19 @@ impl Usage {
         if let Some(error) = &self.process_error {
             return Some(format!("the process table could not be read: {error}"));
         }
+        if let Some(error) = &self.jobs_error {
+            return Some(format!("worker jobs could not be attributed: {error}"));
+        }
         None
     }
 
-    /// Returns every version referenced by journals or processes.
+    // TODO: unused, consider removing
+    /// Returns every version referenced by journals, jobs, or processes.
     #[must_use]
     pub fn referenced(&self) -> BTreeSet<String> {
         self.journals
             .keys()
+            .chain(self.jobs.keys())
             .chain(self.processes.keys())
             .cloned()
             .collect()
@@ -332,6 +379,7 @@ impl Usage {
 #[cfg(test)]
 pub(crate) mod tests {
     use pohunek_platform::process::HostInspector;
+    use pohunek_platform::supervisor::{DefinitionFacts, ServiceId, ServiceState, WorkerKey};
     use pohunek_session_worker::{JournalRecord, WorkerOrigin};
 
     use super::*;
@@ -340,6 +388,9 @@ pub(crate) mod tests {
     pub(crate) const SESSION: &str = "s-01KYAPVPFVHD56Z69B9CX3XWN2";
 
     /// Writes a worker journal the way a worker does.
+    ///
+    /// The recorded worker `pid` carries start identity `1`, which no live
+    /// process has, so the worker has provably exited.
     pub(crate) fn write_journal(
         paths: &BasePaths,
         session: &str,
@@ -347,6 +398,39 @@ pub(crate) mod tests {
         executable: &Path,
         phase: RuntimePhase,
         pid: u32,
+    ) {
+        write_journal_of(paths, session, worker, executable, phase, (pid, "1"));
+    }
+
+    /// Writes a non-final journal whose worker is this test process, which is
+    /// provably alive.
+    pub(crate) fn write_live_journal(
+        paths: &BasePaths,
+        session: &str,
+        worker: &str,
+        executable: &Path,
+    ) {
+        let own = HostInspector::new()
+            .identity(std::process::id())
+            .expect("identity")
+            .expect("own process");
+        write_journal_of(
+            paths,
+            session,
+            worker,
+            executable,
+            RuntimePhase::Live,
+            (own.pid, &own.start_identity.to_string()),
+        );
+    }
+
+    fn write_journal_of(
+        paths: &BasePaths,
+        session: &str,
+        worker: &str,
+        executable: &Path,
+        phase: RuntimePhase,
+        (pid, start_identity): (u32, &str),
     ) {
         let mut record = JournalRecord::bootstrap(
             session.to_owned(),
@@ -357,7 +441,7 @@ pub(crate) mod tests {
                 generation: "abcd2345".to_owned(),
             },
             pid,
-            "1".to_owned(),
+            start_identity.to_owned(),
             "boot".to_owned(),
             (5, 6),
             "2026-09-24T00:00:00Z".to_owned(),
@@ -384,11 +468,14 @@ pub(crate) mod tests {
         let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
         let old = layout.worker_executable("1.0.0").expect("old");
         let done = layout.worker_executable("0.9.0").expect("done");
-        write_journal(&paths, SESSION, "w-live", &old, RuntimePhase::Live, 1);
+        let exited = layout.worker_executable("0.8.0").expect("exited");
+        write_live_journal(&paths, SESSION, "w-live", &old);
         write_journal(&paths, "s-2", "w-done", &done, RuntimePhase::Terminal, 1);
+        // Non-final, but its worker is provably gone.
+        write_journal(&paths, "s-4", "w-gone", &exited, RuntimePhase::Live, 1);
 
         let journals = Journals::scan(&paths).expect("scan");
-        assert_eq!(journals.records.len(), 2);
+        assert_eq!(journals.records.len(), 3);
         assert!(journals.unreadable.is_empty());
         assert_eq!(journals.final_for(SESSION, "abcd2345"), Some(false));
         assert_eq!(journals.final_for("s-2", "abcd2345"), Some(true));
@@ -404,10 +491,75 @@ pub(crate) mod tests {
             .keep_reason("1.0.0", Some("2.0.0"))
             .is_some_and(|reason| reason.contains(SESSION)));
         assert_eq!(usage.keep_reason("0.9.0", Some("2.0.0")), None);
+        assert_eq!(usage.keep_reason("0.8.0", Some("2.0.0")), None);
         assert_eq!(
             usage.keep_reason("2.0.0", Some("2.0.0")).as_deref(),
             Some("active version")
         );
+    }
+
+    fn job(session: &str, state: ServiceState, executable: Option<PathBuf>) -> ServiceObservation {
+        ServiceObservation {
+            id: WorkerKey::new(session, "abcd2345")
+                .expect("worker key")
+                .service_id(),
+            state,
+            process: None,
+            definition: executable.map(|executable| DefinitionFacts {
+                executable,
+                arguments: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_registered_worker_job_keeps_its_version_in_any_state() {
+        let (_root, root) = temp_root();
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
+        let jobs = [
+            job(
+                SESSION,
+                ServiceState::Starting,
+                layout.worker_executable("1.0.0"),
+            ),
+            job(
+                "s-2",
+                ServiceState::Unknown,
+                layout.worker_executable("0.9.0"),
+            ),
+            job(
+                "s-3",
+                ServiceState::Running,
+                Some(PathBuf::from("/elsewhere/pohunek-sessiond")),
+            ),
+        ];
+        let mut usage = Usage::default();
+        usage.note_jobs(&layout, Ok(&jobs));
+
+        let id: ServiceId = jobs[0].id.clone();
+        assert!(usage
+            .keep_reason("1.0.0", Some("2.0.0"))
+            .is_some_and(|reason| reason.contains(&id.to_string())));
+        assert!(usage.keep_reason("0.9.0", Some("2.0.0")).is_some());
+        assert_eq!(usage.keep_reason("0.8.0", Some("2.0.0")), None);
+    }
+
+    #[test]
+    fn an_unattributable_worker_job_or_failed_discovery_keeps_every_version() {
+        let (_root, root) = temp_root();
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
+
+        let mut usage = Usage::default();
+        usage.note_jobs(&layout, Ok(&[job(SESSION, ServiceState::Starting, None)]));
+        assert!(usage
+            .keep_reason("1.0.0", None)
+            .is_some_and(|reason| reason.contains("no provable executable")));
+
+        let mut usage = Usage::default();
+        usage.note_jobs(&layout, Err("manager unreachable".to_owned()));
+        assert!(usage
+            .keep_reason("1.0.0", None)
+            .is_some_and(|reason| reason.contains("manager unreachable")));
     }
 
     #[test]

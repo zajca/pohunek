@@ -34,8 +34,10 @@
 //! directory.
 //!
 //! After a successful upgrade, version directories that are neither active,
-//! referenced by a non-final worker journal, executed by a running process,
-//! nor holding the running CLI are removed.
+//! referenced by the journal of a worker that may still run, named by a
+//! registered worker job, executed by a running process, nor holding the
+//! running CLI are removed. When worker jobs cannot be discovered, every
+//! version is kept.
 //!
 //! # Concurrency
 //!
@@ -54,12 +56,14 @@
 //! uninstall unless `--stop-sessions` is given; then each is stopped through
 //! the daemon and the engine waits until every worker's journal is final and
 //! its process is gone. Only then are the daemon job, the remaining ended
-//! worker jobs, `service.toml`, the launchd directories, unreferenced version
-//! directories, and the installed `<prefix>/bin/pohunek` copy removed.
-//! `--purge` also removes the session store, event logs, worker journals,
-//! and host identity.
+//! worker jobs, the launchd directories, the installed `<prefix>/bin/pohunek`
+//! copy, and unreferenced version directories removed. `--purge` also
+//! removes the session store, event logs, worker journals, and host
+//! identity. `service.toml` goes last: it names the prefix, so while any
+//! earlier removal fails, a rerun of `uninstall` still finds the
+//! installation and finishes the cleanup.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-25
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -334,7 +338,7 @@ impl<'a> Engine<'a> {
         let result = self.run_steps(&mut record, &layout, staged, &target).await;
         self.settle(&record, result).await?;
         let (removed_versions, kept_versions, gc_error) =
-            match self.collect_garbage(&layout, version) {
+            match self.collect_garbage(&layout, version).await {
                 Ok((removed, kept)) => (removed, kept, None),
                 Err(error) => (Vec::new(), Vec::new(), Some(error.to_string())),
             };
@@ -417,10 +421,13 @@ impl<'a> Engine<'a> {
             .map_err(|source| supervisor_error("uninstall daemon", source))?;
         report.retired_workers = self.retire_ended_workers().await?;
 
-        self.remove_installation(&layout, &config_path, &mut report)?;
+        self.remove_installation(&layout, &mut report).await?;
         if options.purge {
             self.purge(&mut report)?;
             report.purged = true;
+        }
+        if remove_config(&config_path)? {
+            report.removed.push(config_path);
         }
         self.store.clear()?;
         Ok(report)
@@ -462,7 +469,8 @@ impl<'a> Engine<'a> {
             Err(supervisor::Error::NotFound(_)) => {}
             Err(error) => report.daemon_error = Some(error.to_string()),
         }
-        match self.backend.workers().discover().await {
+        let discovered = self.backend.workers().discover().await;
+        match &discovered {
             Ok(observations) => {
                 report.workers = observations
                     .iter()
@@ -486,11 +494,10 @@ impl<'a> Engine<'a> {
         }
         let journals = Journals::scan(self.context.paths())?;
         report.unreadable_journals.clone_from(&journals.unreadable);
-        let usage = Usage::collect(
+        let usage = self.collect_usage(
             layout,
             &journals,
-            &self.inspector,
-            self.context.cli_executable(),
+            discovered.as_deref().map_err(ToString::to_string),
         );
         report.versions = layout::installed_versions(layout)?
             .into_iter()
@@ -630,13 +637,7 @@ impl<'a> Engine<'a> {
             }
         }
         if !record.version_dir_preexisted {
-            let journals = Journals::scan(self.context.paths())?;
-            let usage = Usage::collect(
-                &layout,
-                &journals,
-                &self.inspector,
-                self.context.cli_executable(),
-            );
+            let usage = self.usage(&layout).await?;
             if usage.keep_reason(&record.version, None).is_none() {
                 layout::remove_version(&layout, &record.version)?;
             }
@@ -880,32 +881,28 @@ impl<'a> Engine<'a> {
             .map_err(|source| supervisor_error("discover workers", source))
     }
 
-    /// Removes configuration, backend directories, versions, and the CLI copy.
-    fn remove_installation(
+    /// Removes backend directories, the CLI copy, and unreferenced versions.
+    ///
+    /// The CLI copy goes before the versions: it is recognized only by its
+    /// match with a version directory's CLI.
+    async fn remove_installation(
         &self,
         layout: &InstallLayout,
-        config_path: &Path,
         report: &mut UninstallReport,
     ) -> Result<(), Error> {
         let paths = self.context.paths();
-        if remove_config(config_path)? {
-            report.removed.push(config_path.to_path_buf());
-        }
         for directory in [paths.launchd_definitions_dir(), paths.launchd_log_dir()] {
             if remove_child_dir(&directory)? {
                 report.removed.push(directory);
             }
         }
-        let remove_cli = layout::installed_cli_copy(layout)?;
+        if layout::installed_cli_copy(layout)? {
+            layout::remove_cli(layout)?;
+            report.removed.push(layout.bin_dir().join(layout::CLI_NAME));
+        }
         // Re-check references right before deleting: a worker started since
         // the settlement check keeps its version.
-        let journals = Journals::scan(paths)?;
-        let usage = Usage::collect(
-            layout,
-            &journals,
-            &self.inspector,
-            self.context.cli_executable(),
-        );
+        let usage = self.usage(layout).await?;
         for version in layout::installed_versions(layout)? {
             match usage.keep_reason(&version, None) {
                 Some(reason) => report.kept_versions.push(KeptVersion { version, reason }),
@@ -919,10 +916,6 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
-        }
-        if remove_cli {
-            layout::remove_cli(layout)?;
-            report.removed.push(layout.bin_dir().join(layout::CLI_NAME));
         }
         Ok(())
     }
@@ -954,18 +947,12 @@ impl<'a> Engine<'a> {
     }
 
     /// Deletes version directories nothing references any more.
-    fn collect_garbage(
+    async fn collect_garbage(
         &self,
         layout: &InstallLayout,
         active: &str,
     ) -> Result<(Vec<String>, Vec<KeptVersion>), Error> {
-        let journals = Journals::scan(self.context.paths())?;
-        let usage = Usage::collect(
-            layout,
-            &journals,
-            &self.inspector,
-            self.context.cli_executable(),
-        );
+        let usage = self.usage(layout).await?;
         let mut removed = Vec::new();
         let mut kept = Vec::new();
         for version in layout::installed_versions(layout)? {
@@ -977,6 +964,37 @@ impl<'a> Engine<'a> {
             }
         }
         Ok((removed, kept))
+    }
+
+    /// Collects what references each version, discovering worker jobs.
+    ///
+    /// A failed discovery is recorded in the result, which then keeps every
+    /// version.
+    async fn usage(&self, layout: &InstallLayout) -> Result<Usage, Error> {
+        let journals = Journals::scan(self.context.paths())?;
+        let discovered = self.backend.workers().discover().await;
+        Ok(self.collect_usage(
+            layout,
+            &journals,
+            discovered.as_deref().map_err(ToString::to_string),
+        ))
+    }
+
+    /// Collects what references each version from already gathered facts.
+    fn collect_usage(
+        &self,
+        layout: &InstallLayout,
+        journals: &Journals,
+        discovered: Result<&[ServiceObservation], String>,
+    ) -> Usage {
+        let mut usage = Usage::collect(
+            layout,
+            journals,
+            &self.inspector,
+            self.context.cli_executable(),
+        );
+        usage.note_jobs(layout, discovered);
+        usage
     }
 }
 

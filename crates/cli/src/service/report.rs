@@ -3,7 +3,7 @@
 //! These types are the stable `--json` payloads (inside the CLI's usual
 //! `{cli_version, protocol, ok}` envelope). Fields are only ever added.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-25
 
 use std::path::PathBuf;
 
@@ -177,7 +177,7 @@ pub struct VersionReport {
     pub version: String,
     /// Whether `service.toml` names it.
     pub active: bool,
-    /// Non-final worker journals whose executable lives in it.
+    /// Journals of workers that may still run from it.
     pub journals: Vec<JournalRef>,
     /// Running processes executing from it.
     pub pids: Vec<u32>,

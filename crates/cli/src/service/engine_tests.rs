@@ -22,7 +22,7 @@ use crate::service::backend::{Call, Control};
 use crate::service::context::tests::{context, temp_root};
 use crate::service::layout::tests::stage_dir;
 use crate::service::layout::CLI_NAME;
-use crate::service::usage::tests::{write_journal, SESSION};
+use crate::service::usage::tests::{write_journal, write_live_journal, SESSION};
 
 const V1: &str = "1.0.0";
 const V2: &str = "2.0.0";
@@ -43,6 +43,7 @@ struct World {
     registered: Option<JobDefinition>,
     running: bool,
     fail_install: bool,
+    fail_discover: bool,
     silent_version: Option<String>,
     installs: usize,
     sessions: Vec<SessionInfo>,
@@ -158,7 +159,16 @@ impl Supervisor for Fake {
     }
 
     fn discover(&self) -> Pending<'_, Vec<ServiceObservation>> {
-        Box::pin(async move { Ok(self.world().workers.clone()) })
+        Box::pin(async move {
+            let world = self.world();
+            if world.fail_discover {
+                return Err(supervisor::Error::Operation {
+                    operation: "discover",
+                    source: "injected failure".into(),
+                });
+            }
+            Ok(world.workers.clone())
+        })
     }
 
     fn inspect<'a>(&'a self, id: &'a ServiceId) -> Pending<'a, ServiceObservation> {
@@ -734,22 +744,7 @@ async fn stop_sessions_times_out_while_a_worker_stays_live() {
     let harness = Harness::new();
     harness.install(V1).await.expect("install");
     let worker_exe = harness.layout().worker_executable(V1).expect("worker");
-    // The worker behind this journal is this test process: provably alive.
-    let start = pohunek_platform::process::ProcessInspector::identity(
-        &pohunek_platform::process::HostInspector::new(),
-        std::process::id(),
-    )
-    .expect("identity")
-    .expect("own process");
-    write_journal(
-        harness.context.paths(),
-        "s-6",
-        "w-6",
-        &worker_exe,
-        RuntimePhase::Live,
-        std::process::id(),
-    );
-    rewrite_start_identity(&harness, "s-6", "w-6", &start.start_identity.to_string());
+    write_live_journal(harness.context.paths(), "s-6", "w-6", &worker_exe);
     let error = harness
         .engine()
         .uninstall(UninstallOptions {
@@ -760,18 +755,6 @@ async fn stop_sessions_times_out_while_a_worker_stays_live() {
         .expect_err("worker never stops");
     assert!(matches!(error, Error::StopTimeout { .. }), "{error:?}");
     harness.assert_installed(V1);
-}
-
-fn rewrite_start_identity(harness: &Harness, session: &str, worker: &str, identity: &str) {
-    let path = harness
-        .context
-        .paths()
-        .worker_journal(session, worker)
-        .expect("journal path");
-    let journal = pohunek_session_worker::Journal::new(&path);
-    let mut record = journal.load().expect("load journal");
-    record.worker_start_identity = identity.to_owned();
-    journal.write(&record).expect("rewrite journal");
 }
 
 #[tokio::test]
@@ -826,14 +809,7 @@ async fn upgrade_keeps_a_version_a_live_journal_references() {
     let harness = Harness::new();
     harness.install(V1).await.expect("install");
     let worker_exe = harness.layout().worker_executable(V1).expect("worker");
-    write_journal(
-        harness.context.paths(),
-        SESSION,
-        "w-1",
-        &worker_exe,
-        RuntimePhase::Live,
-        1,
-    );
+    write_live_journal(harness.context.paths(), SESSION, "w-1", &worker_exe);
     let report = harness.upgrade(V2).await.expect("upgrade");
     assert!(report.removed_versions.is_empty());
     let kept = report
@@ -843,6 +819,160 @@ async fn upgrade_keeps_a_version_a_live_journal_references() {
         .expect("the referenced version is kept");
     assert!(kept.reason.contains(SESSION), "{kept:?}");
     assert!(worker_exe.is_file(), "the live worker's binary survives");
+}
+
+/// A worker job registered from `executable` that has neither executed nor
+/// written a journal yet.
+fn pending_worker(session: &str, state: ServiceState, executable: PathBuf) -> ServiceObservation {
+    ServiceObservation {
+        definition: Some(pohunek_platform::supervisor::DefinitionFacts {
+            executable,
+            arguments: Vec::new(),
+        }),
+        ..worker(worker_id(session), state)
+    }
+}
+
+#[tokio::test]
+async fn upgrade_keeps_a_version_a_registered_worker_job_will_execute() {
+    for state in [ServiceState::Starting, ServiceState::Unknown] {
+        let harness = Harness::new();
+        harness.install(V1).await.expect("install");
+        let worker_exe = harness.layout().worker_executable(V1).expect("worker");
+        harness.fake.seed(
+            Vec::new(),
+            vec![pending_worker(SESSION, state, worker_exe.clone())],
+        );
+
+        let report = harness.upgrade(V2).await.expect("upgrade");
+        assert!(report.removed_versions.is_empty(), "{state:?}");
+        let kept = report
+            .kept_versions
+            .iter()
+            .find(|kept| kept.version == V1)
+            .expect("the job's version is kept");
+        assert!(
+            kept.reason.contains(&worker_id(SESSION).to_string()),
+            "{state:?}: {kept:?}"
+        );
+        assert!(worker_exe.is_file(), "{state:?}: the job can still exec");
+    }
+}
+
+#[tokio::test]
+async fn upgrade_keeps_every_version_when_worker_jobs_cannot_be_discovered() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.fake.world().fail_discover = true;
+
+    let report = harness.upgrade(V2).await.expect("upgrade");
+    assert!(report.removed_versions.is_empty());
+    let kept = report
+        .kept_versions
+        .iter()
+        .find(|kept| kept.version == V1)
+        .expect("the old version is kept");
+    assert!(kept.reason.contains("injected failure"), "{kept:?}");
+    harness.fake.world().fail_discover = false;
+    harness.assert_installed(V2);
+}
+
+#[tokio::test]
+async fn a_rolled_back_upgrade_keeps_a_version_a_worker_job_registered_from() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let worker_exe = harness.layout().worker_executable(V2).expect("worker");
+    harness.fake.seed(
+        Vec::new(),
+        vec![pending_worker(
+            SESSION,
+            ServiceState::Starting,
+            worker_exe.clone(),
+        )],
+    );
+    harness.fake.world().silent_version = Some(V2.to_owned());
+
+    harness.upgrade(V2).await.expect_err("not ready");
+    harness.fake.world().silent_version = None;
+    assert_eq!(harness.config().expect("config").active_version(), V1);
+    assert_eq!(
+        layout::installed_versions(&harness.layout()).expect("versions"),
+        [V1, V2],
+        "the version the job execs survives the rollback"
+    );
+    assert!(worker_exe.is_file());
+}
+
+#[tokio::test]
+async fn uninstall_removes_a_version_whose_non_final_journal_names_an_exited_worker() {
+    for purge in [false, true] {
+        let harness = Harness::new();
+        harness.install(V1).await.expect("install");
+        let worker_exe = harness.layout().worker_executable(V1).expect("worker");
+        write_journal(
+            harness.context.paths(),
+            SESSION,
+            "w-1",
+            &worker_exe,
+            RuntimePhase::Live,
+            1,
+        );
+
+        let report = harness
+            .engine()
+            .uninstall(UninstallOptions {
+                stop_sessions: false,
+                purge,
+            })
+            .await
+            .expect("uninstall");
+        assert!(report.kept_versions.is_empty(), "purge={purge}: {report:?}");
+        harness.assert_clean();
+    }
+}
+
+#[tokio::test]
+async fn a_failed_uninstall_keeps_service_toml_so_a_rerun_finishes_it() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let versions = harness.layout().versions_dir();
+    std::fs::set_permissions(
+        &versions,
+        std::os::unix::fs::PermissionsExt::from_mode(0o777),
+    )
+    .expect("loosen versions dir");
+
+    let error = harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect_err("an untrusted versions directory stops the removal");
+    assert!(
+        matches!(error, Error::UntrustedDirectory { .. }),
+        "{error:?}"
+    );
+    assert!(
+        harness.config().is_some(),
+        "service.toml survives the failure"
+    );
+    assert!(
+        harness.fake.world().registered.is_none(),
+        "the daemon job is gone"
+    );
+
+    std::fs::set_permissions(
+        &versions,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("restore versions dir");
+    let report = harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect("rerun finishes the uninstall");
+    assert!(report.removed.contains(&harness.context.config_path()));
+    harness.assert_clean();
+    assert!(!harness.layout().bin_dir().join(CLI_NAME).exists());
 }
 
 #[tokio::test]
