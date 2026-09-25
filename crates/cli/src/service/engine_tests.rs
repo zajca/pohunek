@@ -29,10 +29,11 @@ const V2: &str = "2.0.0";
 const GENERATION: &str = "abcd2345";
 
 /// Every step after which a transaction can be interrupted.
-const STEPS: [Step; 6] = [
+const STEPS: [Step; 7] = [
     Step::Binaries,
     Step::Config,
     Step::Definition,
+    Step::Registering,
     Step::Registered,
     Step::Ready,
     Step::Cli,
@@ -48,6 +49,9 @@ struct World {
     installs: usize,
     sessions: Vec<SessionInfo>,
     workers: Vec<ServiceObservation>,
+    /// Registered jobs whose observation raced; the lenient discovery omits
+    /// them the way the systemd backend does, the strict one refuses.
+    raced_workers: Vec<ServiceObservation>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -165,6 +169,27 @@ impl Supervisor for Fake {
                 return Err(supervisor::Error::Operation {
                     operation: "discover",
                     source: "injected failure".into(),
+                });
+            }
+            Ok(world.workers.clone())
+        })
+    }
+
+    /// The destructive discovery: refuses while an observation raced, the
+    /// way the real backends refuse an incomplete job list. An injected
+    /// discovery failure fails both discoveries.
+    fn discover_strict(&self) -> Pending<'_, Vec<ServiceObservation>> {
+        Box::pin(async move {
+            let world = self.world();
+            if world.fail_discover {
+                return Err(supervisor::Error::Operation {
+                    operation: "discover",
+                    source: "injected failure".into(),
+                });
+            }
+            if !world.raced_workers.is_empty() {
+                return Err(supervisor::Error::Race {
+                    operation: "discover",
                 });
             }
             Ok(world.workers.clone())
@@ -522,8 +547,8 @@ async fn an_install_interrupted_after_every_step_resumes_to_one_installation() {
 }
 
 #[tokio::test]
-async fn an_install_interrupted_after_every_step_rolls_back_without_orphans() {
-    for step in STEPS {
+async fn an_install_interrupted_before_registration_rolls_back_without_orphans() {
+    for step in [Step::Binaries, Step::Config, Step::Definition] {
         let harness = Harness::new();
         let mut engine = harness.engine();
         engine.interrupt_after = Some(step);
@@ -531,6 +556,11 @@ async fn an_install_interrupted_after_every_step_rolls_back_without_orphans() {
             .install(&harness.staged(V1), &harness.prefix(), V1)
             .await
             .expect_err("interrupted");
+        assert_eq!(
+            harness.pending().expect("record left behind").step,
+            step,
+            "{step:?}"
+        );
 
         let report = harness
             .engine()
@@ -539,6 +569,35 @@ async fn an_install_interrupted_after_every_step_rolls_back_without_orphans() {
             .expect("uninstall rolls back");
         let rolled_back = report.rolled_back.expect("rollback reported");
         assert_eq!(rolled_back.step, step.as_str());
+        harness.assert_clean();
+    }
+}
+
+#[tokio::test]
+async fn an_install_interrupted_at_or_after_registration_is_removed_by_the_safe_uninstall() {
+    for step in [Step::Registering, Step::Registered, Step::Ready, Step::Cli] {
+        let harness = Harness::new();
+        let mut engine = harness.engine();
+        engine.interrupt_after = Some(step);
+        engine
+            .install(&harness.staged(V1), &harness.prefix(), V1)
+            .await
+            .expect_err("interrupted");
+        assert_eq!(
+            harness.pending().expect("record left behind").step,
+            step,
+            "{step:?}"
+        );
+
+        // No session is live, so the safe uninstall removes the installation
+        // the record describes and consumes the record with it instead of
+        // rolling the transaction back.
+        let report = harness
+            .engine()
+            .uninstall(UninstallOptions::default())
+            .await
+            .expect("uninstall");
+        assert_eq!(report.rolled_back, None, "{step:?}");
         harness.assert_clean();
     }
 }
@@ -772,6 +831,171 @@ async fn uninstall_starts_a_stopped_daemon_to_list_sessions() {
 }
 
 #[tokio::test]
+async fn uninstall_refuses_live_sessions_while_a_pending_install_has_registered_its_daemon() {
+    let harness = Harness::new();
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registering);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+    // The interrupted register call landed before the crash: the daemon job
+    // exists and runs the version `service.toml` names.
+    let config = harness.config().expect("service.toml exists");
+    let definition = daemon_definition(&harness.context, &config).expect("definition");
+    harness
+        .backend
+        .daemon()
+        .install(&definition)
+        .await
+        .expect("register landed");
+    harness.fake.seed(
+        vec![session(SESSION, Some("review"))],
+        vec![worker(worker_id(SESSION), ServiceState::Running)],
+    );
+
+    let error = harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect_err("refused");
+    let Error::LiveSessions { sessions, .. } = &error else {
+        panic!("unexpected error {error:?}");
+    };
+    assert_eq!(sessions.len(), 1);
+    // Nothing was rolled back: the daemon job, `service.toml`, and the
+    // version directory all survive for the session-checked rerun.
+    assert_eq!(
+        harness
+            .config()
+            .expect("service.toml survives")
+            .active_version(),
+        V1
+    );
+    assert_eq!(harness.fake.daemon_version().as_deref(), Some(V1));
+    assert!(harness.fake.world().running);
+    assert!(harness
+        .layout()
+        .daemon_executable(V1)
+        .expect("daemon path")
+        .is_file());
+    assert_eq!(
+        harness.pending().expect("record stays pending").step,
+        Step::Registering
+    );
+
+    let report = harness
+        .engine()
+        .uninstall(UninstallOptions {
+            stop_sessions: true,
+            purge: false,
+        })
+        .await
+        .expect("uninstall with --stop-sessions");
+    assert_eq!(report.stopped_sessions, [SESSION]);
+    harness.assert_clean();
+}
+
+#[tokio::test]
+async fn uninstall_of_a_pending_install_at_the_cli_step_removes_the_installed_cli() {
+    let harness = Harness::new();
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Cli);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+    harness.fake.seed(
+        vec![session(SESSION, None)],
+        vec![worker(worker_id(SESSION), ServiceState::Running)],
+    );
+    let cli = harness.layout().bin_dir().join(CLI_NAME);
+    assert!(cli.is_file(), "the interrupted install installed the CLI");
+
+    let error = harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect_err("refused");
+    let Error::LiveSessions { .. } = &error else {
+        panic!("unexpected error {error:?}");
+    };
+    assert!(cli.is_file(), "the refusal removes nothing");
+
+    let report = harness
+        .engine()
+        .uninstall(UninstallOptions {
+            stop_sessions: true,
+            purge: false,
+        })
+        .await
+        .expect("uninstall with --stop-sessions");
+    assert_eq!(report.stopped_sessions, [SESSION]);
+    harness.assert_clean();
+    assert!(!cli.exists(), "the installed CLI copy is removed");
+}
+
+#[tokio::test]
+async fn uninstall_refuses_a_processless_unknown_worker_job_until_its_journal_proves_the_end() {
+    // launchd reports a loaded job without a matching process as Unknown;
+    // such a job may still be waiting to spawn, so a non-final or missing
+    // journal never proves the runtime ended.
+    for journal in [None, Some(RuntimePhase::Live)] {
+        let harness = Harness::new();
+        harness.install(V1).await.expect("install");
+        if let Some(phase) = journal {
+            write_journal(
+                harness.context.paths(),
+                SESSION,
+                "w-1",
+                &harness.layout().worker_executable(V1).expect("worker"),
+                phase,
+                1,
+            );
+        }
+        harness.fake.seed(
+            Vec::new(),
+            vec![worker(worker_id(SESSION), ServiceState::Unknown)],
+        );
+
+        let error = harness
+            .engine()
+            .uninstall(UninstallOptions::default())
+            .await
+            .expect_err("refused");
+        let Error::LiveSessions { sessions, workers } = &error else {
+            panic!("unexpected error {error:?}");
+        };
+        assert!(sessions.is_empty());
+        assert_eq!(workers, &[worker_id(SESSION).to_string()]);
+        harness.assert_installed(V1);
+    }
+
+    // A final journal is the authoritative proof: the job retires.
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    write_journal(
+        harness.context.paths(),
+        SESSION,
+        "w-1",
+        &harness.layout().worker_executable(V1).expect("worker"),
+        RuntimePhase::Terminal,
+        1,
+    );
+    harness.fake.seed(
+        Vec::new(),
+        vec![worker(worker_id(SESSION), ServiceState::Unknown)],
+    );
+    let report = harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect("uninstall");
+    assert_eq!(report.retired_workers, [worker_id(SESSION).to_string()]);
+    harness.assert_clean();
+}
+
+#[tokio::test]
 async fn purge_removes_durable_metadata_but_never_worktrees() {
     let harness = Harness::new();
     harness.install(V1).await.expect("install");
@@ -875,6 +1099,31 @@ async fn upgrade_keeps_every_version_when_worker_jobs_cannot_be_discovered() {
     assert!(kept.reason.contains("injected failure"), "{kept:?}");
     harness.fake.world().fail_discover = false;
     harness.assert_installed(V2);
+}
+
+#[tokio::test]
+async fn upgrade_keeps_every_version_when_worker_discovery_is_incomplete() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let worker_exe = harness.layout().worker_executable(V1).expect("worker");
+    // A registered not-yet-spawned worker whose observation races is omitted
+    // from the lenient discovery; the strict one must refuse the result so
+    // GC keeps the version the job may still execute.
+    harness.fake.world().raced_workers.push(pending_worker(
+        SESSION,
+        ServiceState::Starting,
+        worker_exe.clone(),
+    ));
+
+    let report = harness.upgrade(V2).await.expect("upgrade");
+    assert!(report.removed_versions.is_empty());
+    let kept = report
+        .kept_versions
+        .iter()
+        .find(|kept| kept.version == V1)
+        .expect("the raced job's version is kept");
+    assert!(kept.reason.contains("changed during"), "{kept:?}");
+    assert!(worker_exe.is_file(), "the job can still exec");
 }
 
 #[tokio::test]
@@ -1016,6 +1265,31 @@ fn live_session_classification_covers_runtime_and_logical_state() {
     let mut external = session("s-2", None);
     external.external = Some(true);
     assert!(!is_live(&external));
+}
+
+#[test]
+fn job_alive_treats_launchd_unknown_as_potentially_alive() {
+    // A stopped job is the only stateless proof of termination; Unknown is
+    // launchd's loaded job without a matching process, which may still spawn.
+    assert!(!job_alive(&worker(
+        worker_id(SESSION),
+        ServiceState::Stopped
+    )));
+    assert!(!job_alive(&worker(
+        worker_id(SESSION),
+        ServiceState::Failed
+    )));
+    for state in [
+        ServiceState::Starting,
+        ServiceState::Running,
+        ServiceState::Stopping,
+        ServiceState::Unknown,
+    ] {
+        assert!(
+            job_alive(&worker(worker_id(SESSION), state)),
+            "{state:?} may still own a PTY"
+        );
+    }
 }
 
 #[tokio::test]

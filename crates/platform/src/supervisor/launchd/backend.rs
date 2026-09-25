@@ -110,6 +110,10 @@ pub struct Discovery {
     /// they do not parse or their `Label` differs from the file name. They
     /// are never loaded.
     pub rejected: Vec<String>,
+    /// Whether a job's inspection raced, so the job may be missing from
+    /// [`Discovery::observations`]; only the strict discovery refuses such a
+    /// result.
+    pub incomplete: bool,
 }
 
 /// Supervises the session workers of one installation namespace in
@@ -175,8 +179,11 @@ impl LaunchdSupervisor {
     /// Enumerates the private definitions directory, keeps only
     /// `<label>.plist` files whose label parses as a worker of this namespace,
     /// and inspects each. Files that do not parse or whose `Label` differs from
-    /// the file name are listed in [`Discovery::rejected`]. Jobs that vanish or
-    /// change during inspection are skipped.
+    /// the file name are listed in [`Discovery::rejected`]. Jobs that vanish
+    /// are skipped; a job that changes during inspection marks the discovery
+    /// [`Discovery::incomplete`] instead of being dropped, because the job
+    /// still exists and only [`LaunchdSupervisor::discover_strict`] may
+    /// decide what a caller that cannot tolerate an omission does.
     ///
     /// # Errors
     ///
@@ -189,6 +196,7 @@ impl LaunchdSupervisor {
         let mut discovery = Discovery {
             observations: Vec::new(),
             rejected: Vec::new(),
+            incomplete: false,
         };
         let Some(directory) = open_private(&self.definitions, OPERATION)? else {
             return Ok(discovery);
@@ -237,7 +245,12 @@ impl LaunchdSupervisor {
         for key in candidates {
             match self.inspect_worker(&key.service_id()).await {
                 Ok(observation) => discovery.observations.push(observation),
-                Err(Error::NotFound(_) | Error::Race { .. }) => {}
+                // The job is not loaded; it cannot reference its version.
+                Err(Error::NotFound(_)) => {}
+                // The job still exists but its identity is unproven, so a
+                // result omitting it is incomplete; only the strict
+                // discovery refuses it.
+                Err(Error::Race { .. }) => discovery.incomplete = true,
                 Err(error) => return Err(error),
             }
         }
@@ -362,11 +375,30 @@ impl Supervisor for LaunchdSupervisor {
         Box::pin(self.start_worker(id, definition))
     }
 
-    /// Returns [`Discovery::observations`] and logs a warning per
-    /// [`Discovery::rejected`] file name.
+    /// Returns the lenient discovery for reconciliation.
+    ///
+    /// A raced job is omitted, because discovery is repeated anyway; the
+    /// destructive [`Supervisor::discover_strict`] refuses such a result
+    /// instead.
     fn discover(&self) -> Operation<'_, Vec<ServiceObservation>> {
         Box::pin(async move {
             let discovery = self.discover_definitions().await?;
+            super::super::warn_rejected("launchd", &discovery.rejected);
+            Ok(discovery.observations)
+        })
+    }
+
+    /// Returns the destructive discovery: a raced job still exists but its
+    /// identity is unproven, so a result that may omit it fails instead of
+    /// letting a caller delete the version it may execute.
+    fn discover_strict(&self) -> Operation<'_, Vec<ServiceObservation>> {
+        Box::pin(async move {
+            let discovery = self.discover_definitions().await?;
+            if discovery.incomplete {
+                return Err(Error::Race {
+                    operation: "discover",
+                });
+            }
             super::super::warn_rejected("launchd", &discovery.rejected);
             Ok(discovery.observations)
         })

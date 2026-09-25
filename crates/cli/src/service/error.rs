@@ -143,13 +143,15 @@ pub enum Error {
         path: PathBuf,
     },
 
-    /// `service upgrade` found an interrupted install transaction.
+    /// A command other than the pending install's own `install` found it.
     ///
-    /// Only `service install` finishes or rolls back an install; an upgrade
-    /// rolling it back would remove a daemon the install may already run.
+    /// Only `service install` with the same version and prefix finishes an
+    /// interrupted install; once it reached the registration step, its daemon
+    /// may already run with live workers, so no other command may roll it
+    /// back.
     #[error(
         "an interrupted install of version {version} is pending (last completed step: {step}); \
-         upgrade refuses to touch it"
+         it may already run its daemon"
     )]
     PendingInstall {
         /// The version the pending install targets.
@@ -325,7 +327,7 @@ impl Error {
             }
             Self::NotInstalled { .. } => Some("run `pohunek service install` first"),
             Self::PendingInstall { .. } => Some(
-                "rerun `pohunek service install` (or packaging/install-daemon.sh) with the same version and prefix to finish it",
+                "rerun `pohunek service install` (or packaging/install-daemon.sh) with the same version and prefix to finish it, or `pohunek service uninstall` to remove it",
             ),
             Self::DaemonJobPresent { .. } => Some(
                 "remove the stale daemon job with the service manager, then install again",

@@ -195,6 +195,10 @@ pub struct Discovery {
     /// Units matching the namespace pattern whose names do not parse strictly;
     /// they are never inspected or retired.
     pub rejected_units: Vec<String>,
+    /// Whether a matching unit's observation raced, so the unit may be
+    /// missing from [`Discovery::observations`]; only
+    /// [`SystemdSupervisor::discover_strict`] refuses such a result.
+    pub incomplete: bool,
 }
 
 impl SystemdSupervisor {
@@ -221,8 +225,12 @@ impl SystemdSupervisor {
 
     /// Discovers this namespace's worker units and reports rejected names.
     ///
-    /// Units that vanish or change generation while being inspected are
-    /// skipped, because discovery is repeated by reconciliation anyway.
+    /// Units that vanish while being inspected are skipped: they are gone,
+    /// so nothing can reference their version any more. A unit that changes
+    /// generation during inspection marks the discovery
+    /// [`Discovery::incomplete`] instead of being dropped, because the unit
+    /// still exists and only [`SystemdSupervisor::discover_strict`] may
+    /// decide what a caller that cannot tolerate an omission does.
     ///
     /// # Errors
     ///
@@ -245,7 +253,7 @@ impl SystemdSupervisor {
         for (name, ..) in units {
             match self.namespace.parse_worker_unit(&name) {
                 Ok(key) => push_discovered_observation(
-                    &mut discovery.observations,
+                    &mut discovery,
                     self.bus.observe(&name, &key.service_id()).await,
                 )?,
                 Err(_rejected) => discovery.rejected_units.push(name),
@@ -284,14 +292,20 @@ impl Supervisor for SystemdSupervisor {
         })
     }
 
-    /// Returns [`Discovery::observations`] and logs a warning per
-    /// [`Discovery::rejected_units`] name.
+    /// Returns the lenient discovery for reconciliation.
+    ///
+    /// A raced unit is omitted, because discovery is repeated anyway; the
+    /// destructive [`Supervisor::discover_strict`] refuses such a result
+    /// instead.
     fn discover(&self) -> Operation<'_, Vec<ServiceObservation>> {
-        Box::pin(async move {
-            let discovery = self.discover_units().await?;
-            super::warn_rejected("systemd", &discovery.rejected_units);
-            Ok(discovery.observations)
-        })
+        Box::pin(async move { Ok(lenient_discovery(self.discover_units().await?)) })
+    }
+
+    /// Returns the destructive discovery: a raced unit still exists but its
+    /// identity is unproven, so a result that may omit it fails instead of
+    /// letting a caller delete the version it may execute.
+    fn discover_strict(&self) -> Operation<'_, Vec<ServiceObservation>> {
+        Box::pin(async move { strict_discovery(self.discover_units().await?) })
     }
 
     fn inspect<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, ServiceObservation> {
@@ -993,15 +1007,37 @@ fn validate_discovery_count(count: usize) -> Result<(), Error> {
 }
 
 fn push_discovered_observation(
-    observations: &mut Vec<ServiceObservation>,
+    discovery: &mut Discovery,
     result: Result<ServiceObservation, Error>,
 ) -> Result<(), Error> {
     match result {
-        Ok(observation) => observations.push(observation),
-        Err(Error::NotFound(_) | Error::Race { .. }) => {}
+        Ok(observation) => discovery.observations.push(observation),
+        // The unit is gone; nothing can reference its version any more.
+        Err(Error::NotFound(_)) => {}
+        // The unit still exists but its identity is unproven, so a result
+        // omitting it is incomplete; only the strict discovery refuses it.
+        Err(Error::Race { .. }) => discovery.incomplete = true,
         Err(error) => return Err(error),
     }
     Ok(())
+}
+
+/// The reconciliation discovery: raced units are omitted, because discovery
+/// is repeated anyway.
+fn lenient_discovery(discovery: Discovery) -> Vec<ServiceObservation> {
+    super::warn_rejected("systemd", &discovery.rejected_units);
+    discovery.observations
+}
+
+/// The destructive discovery: a result that may omit a registered job fails
+/// with [`Error::Race`], so the caller keeps every version.
+fn strict_discovery(discovery: Discovery) -> Result<Vec<ServiceObservation>, Error> {
+    if discovery.incomplete {
+        return Err(Error::Race {
+            operation: "discover",
+        });
+    }
+    Ok(lenient_discovery(discovery))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1542,33 +1578,60 @@ mod tests {
     }
 
     #[test]
-    fn discovery_skips_units_that_disappear_or_race_during_inspection() {
+    fn discovery_skips_only_vanished_units_and_the_strict_one_refuses_a_race() {
         let remaining = observation("s-43.abcd2345");
-        let mut observations = Vec::new();
+        let mut discovery = Discovery::default();
 
         push_discovered_observation(
-            &mut observations,
+            &mut discovery,
             Err(Error::NotFound(
                 ServiceId::parse("s-42.abcd2345").expect("valid service id"),
             )),
         )
-        .expect("vanished unit is an expected discovery race");
+        .expect("a vanished unit is an expected discovery race");
         push_discovered_observation(
-            &mut observations,
+            &mut discovery,
             Err(Error::Race {
                 operation: "inspect_service",
             }),
         )
-        .expect("generation changes are expected discovery races");
-        push_discovered_observation(&mut observations, Ok(remaining.clone()))
+        .expect("a raced unit marks the discovery incomplete");
+        push_discovered_observation(&mut discovery, Ok(remaining.clone()))
             .expect("remaining unit is retained");
         assert!(push_discovered_observation(
-            &mut observations,
+            &mut discovery,
             Err(invalid_data("mismatch".to_owned()))
         )
         .is_err());
 
-        assert_eq!(observations, vec![remaining]);
+        assert_eq!(discovery.observations, vec![remaining.clone()]);
+        assert!(
+            discovery.incomplete,
+            "the raced unit may still be registered"
+        );
+        assert!(matches!(
+            strict_discovery(discovery.clone()),
+            Err(Error::Race {
+                operation: "discover"
+            })
+        ));
+        // The lenient caller still receives the units that were observed.
+        assert_eq!(lenient_discovery(discovery), vec![remaining]);
+    }
+
+    #[test]
+    fn a_complete_discovery_is_accepted_by_both_callers() {
+        let remaining = observation("s-43.abcd2345");
+        let mut discovery = Discovery::default();
+        push_discovered_observation(&mut discovery, Ok(remaining.clone()))
+            .expect("remaining unit is retained");
+
+        assert!(!discovery.incomplete);
+        assert_eq!(
+            strict_discovery(discovery.clone()).expect("complete discovery"),
+            vec![remaining.clone()]
+        );
+        assert_eq!(lenient_discovery(discovery), vec![remaining]);
     }
 
     #[test]

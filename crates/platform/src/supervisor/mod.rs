@@ -407,7 +407,24 @@ pub trait Supervisor: std::fmt::Debug + Send + Sync {
     fn start<'a>(&'a self, id: &'a ServiceId, definition: &'a JobDefinition) -> Operation<'a, ()>;
 
     /// Discovers jobs in this backend's validated namespace.
+    ///
+    /// Best effort for reconciliation: a backend may skip a job whose
+    /// inspection raced, and the caller learns nothing about it because
+    /// discovery is repeated anyway.
     fn discover(&self) -> Operation<'_, Vec<ServiceObservation>>;
+
+    /// Discovers jobs, refusing a result that may be incomplete.
+    ///
+    /// Destructive callers (version garbage collection, uninstall) must use
+    /// this instead of [`Supervisor::discover`]: a job omitted from a partial
+    /// result may still be registered and execute, and treating the list as
+    /// complete would let such a caller delete the version that job runs
+    /// from. Backends whose enumeration can skip a job fail with
+    /// [`Error::Race`]; the default wraps [`Supervisor::discover`], which
+    /// reports every job of the namespace.
+    fn discover_strict(&self) -> Operation<'_, Vec<ServiceObservation>> {
+        self.discover()
+    }
 
     /// Inspects one job; an absent job is [`Error::NotFound`].
     fn inspect<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, ServiceObservation>;

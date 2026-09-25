@@ -16,7 +16,9 @@
 // Rust guideline compliant 2026-09-24
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use pohunek_platform::supervisor::Namespace;
 use pohunek_service_config::ServiceConfig;
 
 pub mod backend;
@@ -165,22 +167,49 @@ fn absolute(flag: &'static str, path: PathBuf) -> Result<PathBuf, Error> {
     }
 }
 
-/// Connects the backend of an installation or of an interrupted install.
+/// Connects the backend of the recorded installation, or of an interrupted
+/// install that has not registered anything yet.
 ///
-/// The configured `launchctl` deadline applies once `service.toml` exists.
+/// With `service.toml` the backend is built from the verified installation:
+/// [`verified_connection`] confirms the recorded user and canonical roots
+/// describe this process, and the namespace and `launchctl` deadline come
+/// from the recording, never from the current environment alone. A changed
+/// `XDG_STATE_HOME` or `XDG_RUNTIME_DIR` would otherwise point the backend at
+/// another installation's jobs while `service.toml` still names the original
+/// one. Without `service.toml` only a pre-registration install connects,
+/// against the namespace this process derives: nothing of that transaction
+/// can have been registered yet.
 async fn connect_installed(context: &Context) -> Result<Backend, Error> {
     let config_path = context.config_path();
+    if exists(&config_path)? {
+        let (namespace, deadline) = verified_connection(context)?;
+        return Backend::connect(context, &namespace, deadline).await;
+    }
     let pending = record::Store::new(context.paths().state_dir.clone()).load()?;
-    let deadline = if exists(&config_path)? {
-        ServiceConfig::load(&config_path)?
-            .deadlines()
-            .launchctl_command
-    } else if pending.is_some() {
-        settings::LAUNCHCTL_COMMAND
-    } else {
+    if pending.is_none() {
         return Err(Error::NotInstalled { path: config_path });
-    };
-    Backend::connect(context, &context.namespace()?, deadline).await
+    }
+    Backend::connect(context, &context.namespace()?, settings::LAUNCHCTL_COMMAND).await
+}
+
+/// Verifies the installation recorded at `context.config_path()` against the
+/// running process and returns the namespace and `launchctl` deadline its
+/// backend must use.
+///
+/// The caller has checked that the file exists.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] when the file cannot be read or its recorded
+/// namespace inputs differ from this process's user or canonical roots.
+fn verified_connection(context: &Context) -> Result<(Namespace, Duration), Error> {
+    let config = ServiceConfig::load(&context.config_path())?;
+    config.verify_installation(
+        context.uid(),
+        &context.paths().state_dir,
+        &context.paths().runtime_dir,
+    )?;
+    Ok((config.namespace(), config.deadlines().launchctl_command))
 }
 
 fn exists(path: &Path) -> Result<bool, Error> {
@@ -188,5 +217,195 @@ fn exists(path: &Path) -> Result<bool, Error> {
         Ok(_metadata) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error::io_error("inspect", path)(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use pohunek_paths::{BasePaths, PathEnv, Platform};
+    use pohunek_service_config::ConfigError;
+
+    use super::*;
+    use crate::service::context::tests::temp_root;
+    use crate::service::definition::initial_config;
+
+    /// Resolves paths from an XDG layout whose state and runtime roots a test
+    /// can move independently; the config home pins where `service.toml` is
+    /// read from.
+    fn moved_paths(
+        root: &Path,
+        config_home: &Path,
+        state_home: &Path,
+        runtime_dir: &Path,
+    ) -> BasePaths {
+        let env = PathEnv {
+            xdg_runtime_dir: Some(OsString::from(runtime_dir)),
+            xdg_data_home: Some(OsString::from(root.join("data"))),
+            xdg_state_home: Some(OsString::from(state_home)),
+            xdg_cache_home: Some(OsString::from(root.join("cache"))),
+            xdg_config_home: Some(OsString::from(config_home)),
+            home: Some(OsString::from(root.join("home"))),
+        };
+        BasePaths::resolve_for(
+            Platform::current().expect("supported platform"),
+            nix::unistd::Uid::effective().as_raw(),
+            &env,
+        )
+        .expect("resolve test paths")
+    }
+
+    fn context_of(
+        root: &Path,
+        config_home: &Path,
+        state_home: &Path,
+        runtime_dir: &Path,
+        uid: u32,
+    ) -> Context {
+        Context::new(
+            moved_paths(root, config_home, state_home, runtime_dir),
+            uid,
+            Some(root.join("home")),
+            Some(runtime_dir.to_path_buf()),
+            root.join("units"),
+            PathBuf::from("/usr/bin/pohunek"),
+        )
+    }
+
+    /// Writes the `service.toml` an install of `context` would record.
+    fn install_config(context: &Context) {
+        let config = initial_config(context, &context.default_prefix().expect("home"), "1.0.0")
+            .expect("valid config");
+        config.write(&context.config_path()).expect("write config");
+    }
+
+    /// The installed context and the canonical roots it recorded.
+    fn installed() -> (tempfile::TempDir, PathBuf, Context, PathBuf) {
+        let (temp, root) = temp_root();
+        let context = context_of(
+            &root,
+            &root.join("config"),
+            &root.join("state"),
+            &root.join("run"),
+            nix::unistd::Uid::effective().as_raw(),
+        );
+        install_config(&context);
+        let state_root = context.roots().expect("roots").0;
+        (temp, root, context, state_root)
+    }
+
+    #[test]
+    fn verified_connection_accepts_the_environment_the_installation_records() {
+        let (_temp, _root, context, _state) = installed();
+        let (namespace, deadline) = verified_connection(&context).expect("verified");
+        assert_eq!(namespace, context.namespace().expect("namespace"));
+        assert_eq!(
+            deadline,
+            ServiceConfig::load(&context.config_path())
+                .expect("config")
+                .deadlines()
+                .launchctl_command
+        );
+    }
+
+    #[test]
+    fn verified_connection_fails_closed_when_xdg_state_home_changed() {
+        let (_temp, root, _context, state_root) = installed();
+        let (moved_temp, moved) = temp_root();
+
+        // Only XDG_STATE_HOME moves; the config home still locates
+        // `service.toml`.
+        let changed = context_of(
+            &root,
+            &root.join("config"),
+            &moved.join("state"),
+            &root.join("run"),
+            nix::unistd::Uid::effective().as_raw(),
+        );
+        changed.roots().expect("the moved roots resolve");
+        let error = verified_connection(&changed).expect_err("mismatch");
+        let Error::Config(ConfigError::NamespaceMismatch {
+            key,
+            recorded: old,
+            actual,
+        }) = &error
+        else {
+            panic!("unexpected error {error:?}");
+        };
+        assert_eq!(*key, "namespace.state_root");
+        assert_eq!(old, &state_root.display().to_string());
+        assert_eq!(actual, &moved.join("state/pohunek").display().to_string());
+        drop(moved_temp);
+        assert_eq!(error.code(), "service_config_invalid");
+    }
+
+    #[test]
+    fn verified_connection_fails_closed_when_xdg_runtime_dir_changed() {
+        let (_temp, root, _context, _state) = installed();
+        let (moved_temp, moved) = temp_root();
+
+        // Only XDG_RUNTIME_DIR moves; the daemon socket the backend would
+        // address lives under the moved runtime root, not the recorded one.
+        let changed = context_of(
+            &root,
+            &root.join("config"),
+            &root.join("state"),
+            &moved.join("run"),
+            nix::unistd::Uid::effective().as_raw(),
+        );
+        changed.roots().expect("the moved roots resolve");
+        let error = verified_connection(&changed).expect_err("mismatch");
+        assert!(
+            matches!(
+                &error,
+                Error::Config(ConfigError::NamespaceMismatch { key, .. }) if *key == "namespace.runtime_root"
+            ),
+            "{error:?}"
+        );
+        drop(moved_temp);
+    }
+
+    #[test]
+    fn verified_connection_fails_closed_for_another_user() {
+        let (_temp, root, _context, _state) = installed();
+        let foreign = context_of(
+            &root,
+            &root.join("config"),
+            &root.join("state"),
+            &root.join("run"),
+            nix::unistd::Uid::effective().as_raw() + 1,
+        );
+        let error = verified_connection(&foreign).expect_err("mismatch");
+        assert!(
+            matches!(
+                &error,
+                Error::Config(ConfigError::NamespaceMismatch { key, .. }) if *key == "namespace.uid"
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_installed_refuses_to_connect_when_the_roots_changed() {
+        let (_temp, root, _context, _state) = installed();
+        let (moved_temp, moved) = temp_root();
+        let changed = context_of(
+            &root,
+            &root.join("config"),
+            &moved.join("state"),
+            &root.join("run"),
+            nix::unistd::Uid::effective().as_raw(),
+        );
+        changed.roots().expect("the moved roots resolve");
+
+        // The mismatch fails before any service manager is contacted, so the
+        // assertion holds with and without a session bus.
+        let error = connect_installed(&changed).await.expect_err("refused");
+        assert!(
+            matches!(&error, Error::Config(ConfigError::NamespaceMismatch { .. })),
+            "{error:?}"
+        );
+        drop(moved_temp);
     }
 }

@@ -25,13 +25,15 @@
 //! next run finishes the CLI step.
 //!
 //! An interrupted process leaves the record behind. The next `install` or
-//! `upgrade` of the same version and prefix resumes after the recorded step;
-//! any other operation, including `uninstall`, rolls it back first. The one
-//! exception is an `upgrade` meeting a pending install: it fails with
-//! `service_install_pending` and touches nothing, because only `install`
-//! may finish or roll back an install whose daemon may already run the new
-//! version. Every step is idempotent, so resuming never duplicates a job or a
-//! directory.
+//! `upgrade` of the same version and prefix resumes after the recorded step.
+//! Any other operation rolls the record back first, except that a
+//! transaction which may already have registered its daemon (`registering`
+//! or later) is never rolled back: `upgrade` and a different `install`
+//! refuse it with `service_install_pending`, and `uninstall` removes it
+//! through the full uninstall below, whose session inventory and
+//! `--stop-sessions` gating are the only safe way to stop a daemon that may
+//! own live workers. Every step is idempotent, so resuming never duplicates
+//! a job or a directory.
 //!
 //! After a successful upgrade, version directories that are neither active,
 //! referenced by the journal of a worker that may still run, named by a
@@ -62,6 +64,10 @@
 //! identity. `service.toml` goes last: it names the prefix, so while any
 //! earlier removal fails, a rerun of `uninstall` still finds the
 //! installation and finishes the cleanup.
+//!
+//! A pending install that already reached the registration step takes this
+//! same flow instead of a rollback: its daemon may already run it with live
+//! workers, and only the session-checked removal above may stop them.
 
 // Rust guideline compliant 2026-09-25
 
@@ -206,6 +212,18 @@ impl<'a> Engine<'a> {
                     && record.prefix == prefix =>
             {
                 (Some(record), None)
+            }
+            // Only the interrupted install's own `install` may finish it. A
+            // transaction that reached the registration step may already run
+            // its daemon with live workers, so no other command may roll it
+            // back without the uninstall flow's session checks.
+            Some(record)
+                if record.operation == Operation::Install && record.step >= Step::Registering =>
+            {
+                return Err(Error::PendingInstall {
+                    version: record.version,
+                    step: record.step.as_str(),
+                });
             }
             Some(record) => {
                 let report = pending_report(&record);
@@ -366,8 +384,17 @@ impl<'a> Engine<'a> {
         let _transaction = self.store.lock().await?;
         let mut report = UninstallReport::default();
         if let Some(pending) = self.store.load()? {
-            report.rolled_back = Some(pending_report(&pending));
-            self.rollback_pending(&pending).await?;
+            // A transaction that may already have registered its daemon
+            // cannot be rolled back here: the daemon may run it with live
+            // workers, and removing both is the session-checked decision of
+            // the uninstall below, which also consumes the record together
+            // with the installation.
+            let registered =
+                pending.operation == Operation::Install && pending.step >= Step::Registering;
+            if !registered {
+                report.rolled_back = Some(pending_report(&pending));
+                self.rollback_pending(&pending).await?;
+            }
         }
         let config_path = self.context.config_path();
         let Some(config) = load_config(&config_path)? else {
@@ -545,6 +572,7 @@ impl<'a> Engine<'a> {
         if record.step < Step::Registered {
             let resuming = record.step == Step::Registering;
             self.advance(record, Step::Registering)?;
+            self.checkpoint(Step::Registering)?;
             self.register(record.operation, &definition, resuming)
                 .await?;
             self.advance(record, Step::Registered)?;
@@ -873,10 +901,14 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Discovers worker jobs for destructive decisions.
+    ///
+    /// The strict discovery refuses a result that may omit a raced job, so
+    /// an uninstall never retires around a job it cannot see.
     async fn discover(&self) -> Result<Vec<ServiceObservation>, Error> {
         self.backend
             .workers()
-            .discover()
+            .discover_strict()
             .await
             .map_err(|source| supervisor_error("discover workers", source))
     }
@@ -968,11 +1000,12 @@ impl<'a> Engine<'a> {
 
     /// Collects what references each version, discovering worker jobs.
     ///
-    /// A failed discovery is recorded in the result, which then keeps every
-    /// version.
+    /// The discovery is strict: a raced job may be missing from the result,
+    /// and a version its job still executes must not be deleted. A failed
+    /// discovery is recorded in the result, which then keeps every version.
     async fn usage(&self, layout: &InstallLayout) -> Result<Usage, Error> {
         let journals = Journals::scan(self.context.paths())?;
-        let discovered = self.backend.workers().discover().await;
+        let discovered = self.backend.workers().discover_strict().await;
         Ok(self.collect_usage(
             layout,
             &journals,
@@ -1034,12 +1067,22 @@ fn is_live(session: &SessionInfo) -> bool {
         )
 }
 
-/// Returns whether a worker job still has a process that may own a PTY.
+/// Returns whether a worker job may still own a live PTY.
+///
+/// A process proves it directly, and `Starting`, `Running`, and `Stopping`
+/// prove it through the service manager. `Unknown` also counts: launchd
+/// reports a loaded job without a matching process as `Unknown`, and such a
+/// job may still be waiting to spawn. Only `Stopped` and `Failed` prove the
+/// end without further evidence; a caller that needs more proof reads the
+/// worker journal.
 fn job_alive(observation: &ServiceObservation) -> bool {
     observation.process.is_some()
         || matches!(
             observation.state,
-            ServiceState::Starting | ServiceState::Running | ServiceState::Stopping
+            ServiceState::Starting
+                | ServiceState::Running
+                | ServiceState::Stopping
+                | ServiceState::Unknown
         )
 }
 
