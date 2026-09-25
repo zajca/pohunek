@@ -148,6 +148,15 @@ fn parse_message(result: Result<ServiceConfig, ConfigError>) -> String {
     }
 }
 
+/// Builds the `Parse` error itself so `Display` and `Debug` can be inspected.
+fn parse_error(text: &str) -> ConfigError {
+    let fixture = Fixture::new();
+    match fixture.load(text) {
+        Err(error) => error,
+        Ok(_) => panic!("expected a parse error"),
+    }
+}
+
 #[test]
 fn golden_example_parses_into_typed_values() {
     let fixture = Fixture::new();
@@ -272,6 +281,55 @@ fn mistyped_values_are_parse_errors() {
     ] {
         parse_message(fixture.load(&text));
     }
+}
+
+/// A property-shaped fake token standing in for what a hand-edited owner
+/// private file could carry under an unknown key.
+const SENTINEL_TOKEN: &str = "PH-TOKEN-sentinel-7f3a-ea91";
+
+/// A parse diagnostic must never quote file contents: the parser `Display`
+/// renders the source line, so a corrupt file could print a holdover value
+/// such as this sentinel into journald or an error envelope. Only the key
+/// name and the position survive.
+#[test]
+fn parse_diagnostics_never_quote_file_contents() {
+    let unknown_key = format!("{GOLDEN}\noperator_token = \"{SENTINEL_TOKEN}\"\n");
+    let broken_integer = replace(
+        GOLDEN,
+        "uid = 1000",
+        &format!("uid = {SENTINEL_TOKEN} # broken"),
+    );
+    let unterminated_string = replace(
+        GOLDEN,
+        "prefix = \"/home/u/.local\"",
+        &format!("prefix = \"{SENTINEL_TOKEN}"),
+    );
+    let string_in_integer = replace(GOLDEN, "uid = 1000", &format!("uid = \"{SENTINEL_TOKEN}\""));
+    for text in [
+        &unknown_key,
+        &broken_integer,
+        &unterminated_string,
+        &string_in_integer,
+    ] {
+        let error = parse_error(text);
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(
+            !display.contains(SENTINEL_TOKEN) && !debug.contains(SENTINEL_TOKEN),
+            "parse diagnostic quotes the file: display={display} debug={debug}"
+        );
+        assert!(
+            display.contains("line ") && display.contains("column "),
+            "diagnostic lost the position: {display}"
+        );
+    }
+    // Deserialization diagnostics for unknown fields name the rejected key;
+    // type and syntax diagnostics name only the position (and u32 etc.).
+    let display = parse_error(&unknown_key).to_string();
+    assert!(
+        display.contains("operator_token"),
+        "diagnostic lost the key: {display}"
+    );
 }
 
 #[test]

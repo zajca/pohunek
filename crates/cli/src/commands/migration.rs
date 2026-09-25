@@ -41,9 +41,14 @@ struct SessionClassification {
 
 /// Queries the legacy daemon, atomically writes the migration manifest, and
 /// refuses replacement while live PTYs exist unless loss was accepted.
+///
+/// `socket` points the preflight at an explicit legacy daemon socket path,
+/// which the install wrapper names after moving the default socket aside as
+/// its connect barrier.
 pub(crate) async fn run_preflight(
     host: &str,
     paths: &Paths,
+    socket: Option<&Path>,
     accept_runtime_loss: bool,
     json: bool,
 ) -> Result<(), CliError> {
@@ -55,7 +60,10 @@ pub(crate) async fn run_preflight(
             Some("run `pohunek migration preflight` locally on that host".to_owned()),
         )));
     }
-    let mut client = Client::connect(host, paths).await?;
+    let mut client = match socket {
+        Some(socket) => Client::connect_socket(socket).await?,
+        None => Client::connect(host, paths).await?,
+    };
     let sessions = client
         .call::<method::SessionList>(protocol::SessionListParams::default())
         .await?;

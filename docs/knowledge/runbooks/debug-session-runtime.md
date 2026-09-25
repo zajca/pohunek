@@ -164,13 +164,15 @@ has no version-policy fields; an installed but unparseable or wrong version is
 their own temporary homes.
 
 For the first worker-aware installation, let all legacy sessions finish or stop
-them explicitly. The archive installer lists live sessions that lack durable
-`runtime` metadata and refuses replacement. Sessions with a runtime binding are
-already worker-owned, are excluded from this one-time guard, and survive the
-daemon restart. `packaging/install-daemon.sh --accept-runtime-loss` is
-destructive consent: existing legacy PTYs cannot be transferred into workers.
-Use it only after recording the affected ids and accepting that shell and
-uncaptured agent sessions cannot be reconstructed. The same installer refuses
-to retire an older template-unit install while its
-`pohunek-session@<id>.service` workers are still active; stop those sessions
-first.
+them explicitly. The archive installer moves the legacy daemon's control socket
+aside first, runs `migration preflight --socket <moved-socket>` there, and
+lists live sessions that lack durable `runtime` metadata to refuse
+replacement. Sessions with a runtime binding are already worker-owned, are
+excluded from this one-time guard, and survive the daemon restart.
+`packaging/install-daemon.sh --accept-runtime-loss` is destructive consent:
+existing legacy PTYs cannot be transferred into workers. Use it only after
+recording the affected ids and accepting that shell and uncaptured agent
+sessions cannot be reconstructed. The same installer refuses to retire an
+older template-unit install while any `pohunek-session@<id>.service` worker
+outside the `inactive` state survives its post-stop re-check; stop those
+sessions first.

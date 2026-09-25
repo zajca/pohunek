@@ -166,9 +166,12 @@ or socket.
 
 The first worker-aware release is a destructive compatibility boundary because
 a legacy daemon cannot transfer an already-open PTY. Let all legacy sessions
-finish before installing. The installer refuses visible live legacy sessions by
-default; `--accept-runtime-loss` is informed consent to lose those existing
-PTYs, not a recovery command. See
+finish before installing. The installer moves the legacy daemon's control
+socket aside, runs `migration preflight --socket <moved-socket>` against it,
+and only then stops the daemon and re-checks template workers in every state
+except `inactive`; any surviving worker aborts without removing legacy files.
+`--accept-runtime-loss` is informed consent to lose those existing PTYs and to
+proceed after the post-stop check, not a recovery command. See
 [debug session runtime](debug-session-runtime.md).
 
 When the assistant feature is available, its update intent should use bundle

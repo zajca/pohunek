@@ -941,6 +941,11 @@ enum MigrationAction {
         /// Record informed consent to import live legacy sessions as runtime-lost.
         #[arg(long)]
         accept_runtime_loss: bool,
+        /// Dial the legacy daemon on this explicit local socket path instead
+        /// of the default one, as the install wrapper does after moving the
+        /// socket aside as its connect barrier.
+        #[arg(long)]
+        socket: Option<PathBuf>,
         /// Emit the sanitized migration manifest as JSON.
         #[arg(long)]
         json: bool,
@@ -2155,10 +2160,17 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             match action {
                 MigrationAction::Preflight {
                     accept_runtime_loss,
+                    socket,
                     json,
                 } => {
-                    commands::migration::run_preflight(&host, &paths, accept_runtime_loss, json)
-                        .await?;
+                    commands::migration::run_preflight(
+                        &host,
+                        &paths,
+                        socket.as_deref(),
+                        accept_runtime_loss,
+                        json,
+                    )
+                    .await?;
                 }
             }
             Ok(ExitCode::SUCCESS)

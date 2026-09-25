@@ -1,5 +1,14 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-09-25)
+
+- Documented that `migration preflight` takes an explicit `--socket <path>` so
+  the archive installer can dial the legacy daemon after renaming its control
+  socket aside as a connect barrier, retire it in a fail-closed order
+  (barrier, preflight, worker inventory, stop, post-stop re-inventory), and
+  abort without removing legacy files when a not-inactive template worker
+  survives.
+
 ## Unreleased (2026-08-12)
 
 - Documented that a Darwin process between images no longer fails a process

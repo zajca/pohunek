@@ -285,8 +285,10 @@ The first upgrade from a legacy daemon-owned PTY release refuses live sessions
 by default because those open PTYs cannot be transferred. Let them finish; use
 `--accept-runtime-loss` only after reviewing the affected ids and knowingly
 accepting the destructive boundary. An install that still runs the older
-`pohunek-session@` template workers is retired only once those workers have
-stopped. See the
+`pohunek-session@` template workers is retired only after the wrapper has
+closed new connections to the legacy daemon, run the migration preflight, and
+re-checked every not-inactive worker state after the daemon stopped; any
+detected worker aborts the installer without removing legacy files. See the
 [migration guide](docs/migrations/durable-session-workers.md) and
 [operations runbook](docs/runbooks/durable-session-workers.md).
 

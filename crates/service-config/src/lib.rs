@@ -601,7 +601,7 @@ struct RawLimits {
 fn parse(path: &Path, text: &str) -> Result<ServiceConfig, ConfigError> {
     let parse_error = |error: toml::de::Error| ConfigError::Parse {
         path: path.to_path_buf(),
-        message: error.to_string(),
+        message: diagnostic(text, &error),
     };
     // The schema version is checked before the typed parse, so a newer file
     // reports its version instead of its first key this schema does not know.
@@ -637,6 +637,99 @@ fn parse(path: &Path, text: &str) -> Result<ServiceConfig, ConfigError> {
         sweep_grace: Duration::from_millis(raw.sweep.grace_ms),
         open_files: raw.limits.open_files,
     })
+}
+
+/// Sanitized diagnostic for one TOML parse failure over `text`.
+///
+/// The parser's `Display` renders the source line the error span points at,
+/// which would print arbitrary file contents — including a hand-edited line
+/// such as an unknown `token = "…"` key — into sticky destinations: journald,
+/// the CLI error envelope, and operator logs. Only the parser's message text
+/// and a byte-offset-derived position survive, never source text: argument
+/// values quoted in parser messages are replaced by a fixed placeholder, and
+/// the line and column are computed from the error's span.
+fn diagnostic(text: &str, error: &toml::de::Error) -> String {
+    let mut message = redact_quoted_values(error.message());
+    if message.is_empty() {
+        message.push_str("TOML parse error");
+    }
+    if let Some(span) = error.span() {
+        let (line, column) = position(text, span.start);
+        std::fmt::Write::write_fmt(
+            &mut message,
+            format_args!(" (line {line}, column {column})"),
+        )
+        .expect("writing to String is infallible");
+    }
+    message
+}
+
+/// Replaces the content of every `"`-delimited run with a fixed placeholder.
+///
+/// Parser messages double-quote argument values only; schema identifiers,
+/// key names, and error descriptors use backticks or plain words. A `\`
+/// escapes exactly one following character, so an escaped `\"` never closes
+/// a run that its `Debug`-escaped token did open. An unterminated run also
+/// renders as the placeholder: replaying that tail could print file text.
+fn redact_quoted_values(message: &str) -> String {
+    let mut redacted = String::with_capacity(message.len());
+    let mut inside_value = false;
+    let mut escaped = false;
+    for character in message.chars() {
+        if inside_value {
+            if escaped {
+                escaped = false;
+            } else if character == '"' {
+                inside_value = false;
+                redacted.push('"');
+                redacted.push_str(REDACTED_PLACEHOLDER);
+                redacted.push('"');
+            } else if character == '\\' {
+                escaped = true;
+            }
+            continue;
+        }
+        if character == '"' {
+            inside_value = true;
+        } else {
+            redacted.push(character);
+        }
+    }
+    if inside_value {
+        // Fail closed: what followed the open quote may be file text.
+        redacted.push('"');
+        redacted.push_str(REDACTED_PLACEHOLDER);
+        redacted.push('"');
+    }
+    redacted
+}
+
+/// Placeholder shown for parser-quoted file contents.
+const REDACTED_PLACEHOLDER: &str = "<redacted>";
+
+/// Returns the 1-based line and character column of a byte offset in `text`.
+///
+/// A non-character-boundary offset backs up to the nearest boundary, so an
+/// offset into a multi-byte character reports the line the character starts on.
+fn position(text: &str, offset: usize) -> (usize, usize) {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let mut line = 1;
+    let mut column = 1;
+    for (index, character) in text.char_indices() {
+        if index >= offset {
+            break;
+        }
+        if character == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
 }
 
 /// Splits an absolute normalized configuration path into directory and name.
@@ -795,4 +888,92 @@ fn millis(value: Duration) -> u64 {
 fn utf8(path: &Path) -> &str {
     path.to_str()
         .expect("recorded paths were validated as UTF-8 by ServiceConfig::new")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redaction_masks_only_closed_quoted_values() {
+        assert_eq!(
+            redact_quoted_values("invalid type: string \"s3cr3t\", expected u32"),
+            "invalid type: string \"<redacted>\", expected u32"
+        );
+        assert_eq!(
+            redact_quoted_values("unknown variant \"other\", expected `x` or `y`"),
+            "unknown variant \"<redacted>\", expected `x` or `y`"
+        );
+        // Backtick-quoted key names never count as values.
+        assert_eq!(
+            redact_quoted_values("unknown field `token`, expected one of `a`"),
+            "unknown field `token`, expected one of `a`"
+        );
+    }
+
+    #[test]
+    fn redaction_fails_closed_on_unterminated_quoted_text() {
+        // Anything after an open quote redacts, including a bare `"` that a
+        // descriptor list emits.
+        assert_eq!(
+            redact_quoted_values("invalid string\nexpected `\"`"),
+            "invalid string\nexpected `\"<redacted>\""
+        );
+        assert_eq!(
+            redact_quoted_values("string \"tail\\"),
+            "string \"<redacted>\""
+        );
+        assert_eq!(redact_quoted_values("\""), "\"<redacted>\"");
+    }
+
+    #[test]
+    fn redaction_handles_escapes_inside_values() {
+        assert_eq!(
+            redact_quoted_values("string \"a\\\"b\" and back"),
+            "string \"<redacted>\" and back"
+        );
+        assert_eq!(
+            redact_quoted_values("string \"tail\\\""),
+            "string \"<redacted>\""
+        );
+        assert_eq!(
+            redact_quoted_values("string \"\" stays"),
+            "string \"<redacted>\" stays"
+        );
+    }
+
+    #[test]
+    fn position_is_one_based_down_to_the_byte() {
+        let text = "\nab\näré\n";
+        assert_eq!(position(text, 0), (1, 1));
+        assert_eq!(position(text, 1), (2, 1));
+        assert_eq!(position(text, 2), (2, 2));
+        assert_eq!(position(text, 4), (3, 1));
+        // The offset inside a multi-byte character reports that character's start.
+        assert_eq!(position(text, 6), (3, 2));
+        // Offsets past the end clamp to the last position.
+        assert_eq!(position(text, text.len()), (4, 1));
+        assert_eq!(position(text, 999), (4, 1));
+    }
+
+    #[test]
+    fn diagnostic_names_the_position_of_a_real_parse_error() {
+        let text = "schema_version = \"PH-TOKEN-sentinel\"\nprefix = \"/x\"\n";
+        let error = parse(Path::new("/fixture/pohunek/service.toml"), text)
+            .expect_err("a string schema_version is a type error");
+        let message = match &error {
+            ConfigError::Parse { message, .. } => message,
+            other => panic!("expected a parse error, got {other:?}"),
+        };
+        // The diagnostic reports only the parser's message with the quoted
+        // value replaced, plus the position; the file text stays unquoted.
+        assert_eq!(
+            message,
+            "invalid type: string \"<redacted>\", expected u32 (line 1, column 18)"
+        );
+        assert_eq!(error.to_string(), "service config /fixture/pohunek/service.toml is invalid: invalid type: string \"<redacted>\", expected u32 (line 1, column 18)");
+        assert!(!message.contains("PH-TOKEN-sentinel"));
+        let utf8 = format!("{error:?}");
+        assert!(!utf8.contains("PH-TOKEN-sentinel"));
+    }
 }

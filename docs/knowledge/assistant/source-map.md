@@ -229,7 +229,9 @@ Release packaging and contributor verification:
 - `.github/workflows/release.yml`
 - `README.md`
 - `packaging/install-daemon.sh` — release-archive wrapper that retires a
-  legacy template-unit install, then runs `pohunek service install|upgrade`:
+  legacy template-unit install in a fail-closed order (socket rename barrier,
+  `migration preflight --socket <moved>`, worker inventory, stop, post-stop
+  re-inventory), then runs `pohunek service install|upgrade`:
   `install` while `pohunek service status --json` reports a pending install
   transaction or no `service.toml` exists, `upgrade` otherwise.
 - `crates/cli/tests/daemon_packaging.rs`

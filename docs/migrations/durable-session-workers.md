@@ -65,11 +65,30 @@ then starts every worker as its own transient unit per worker generation.
 
 An install that already runs worker-aware sessions under the older
 `pohunek-session@<session-id>.service` template is retired by the same
-installer: it refuses while any of those template workers is active, then
-disables `pohunekd.service` and removes `pohunekd.service`,
-`pohunek-session@.service`, and `pohunek-sessions.slice` from the user unit
-directory before installing the service. Stop those sessions first; their PTYs
-cannot move into the new per-generation jobs.
+installer. Because the already-deployed legacy binary cannot gain a
+daemon-side barrier, the installer retires it in this order:
+
+1. it moves the legacy daemon's control socket node aside
+   (`XDG_RUNTIME_DIR/pohunek/daemon.sock`) with `rename(2)`, so new clients
+   cannot open new connections (existing connections keep serving);
+2. it runs `pohunek migration preflight --socket <moved-socket>` over that
+   socket, which refuses while the legacy daemon owns live PTYs;
+3. it lists `pohunek-session@` template jobs in every state except
+   `inactive` and refuses when one survives — including jobs still in
+   `activating`, which a state-filtered check would miss;
+4. only then does it `systemctl --user disable --now pohunekd.service`, which
+   closes the socket and stops new sessions for good;
+5. it re-runs the job inventory: a worker that survived the stop was started
+   after the preflight and aborts the run;
+6. it removes `pohunekd.service`, `pohunek-session@.service`, and
+   `pohunek-sessions.slice` from the user unit directory before installing.
+
+Any refusal above leaves the legacy files untouched, so the operator can
+restart the legacy daemon and decide. Stop those sessions first; their PTYs
+cannot move into the new per-generation jobs. Even with this sequence, a
+client that already held a control connection before the barrier (a
+long-lived GUI) can still start a session into the window until the daemon
+stops; the post-stop inventory catches it.
 
 ## Explicit Runtime-Loss Acceptance
 
@@ -80,7 +99,10 @@ the installer requires an explicit destructive flag:
 ./packaging/install-daemon.sh --accept-runtime-loss
 ```
 
-Before using it:
+The flag is forwarded to the preflight so it records consent in the migration
+manifest. It covers only daemon-owned PTYs: a live template worker, found
+before or after the daemon stop, always aborts the run, because removing the
+unit files it runs from would orphan it. Before using it:
 
 - capture the exact affected session ids;
 - assume every live shell and agent without a launch-native reference is

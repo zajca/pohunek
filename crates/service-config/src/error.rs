@@ -63,9 +63,14 @@ pub enum ConfigError {
     },
     /// The file is not UTF-8 TOML matching the schema.
     ///
-    /// `message` is the TOML parser's diagnostic, which may quote a line of
-    /// the file. The schema holds only paths, versions, numbers, and
-    /// environment variable names, never secrets, so quoting it is safe.
+    /// `message` is a sanitized parser diagnostic: the parser's message text
+    /// with any argument values it quoted replaced by a fixed placeholder,
+    /// plus the error position as a line and column. It never quotes source
+    /// text, so a hand-edited file cannot print its contents — such as an
+    /// unknown `token = "…"` key's value — into journald or an error envelope.
+    ///
+    /// The schema holds identifiers, paths, versions, and numbers, so naming
+    /// the rejected key remains safe.
     #[error("service config {} is invalid: {message}", path.display())]
     Parse {
         /// The configuration file path.
