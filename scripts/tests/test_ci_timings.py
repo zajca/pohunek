@@ -1716,7 +1716,8 @@ class StepTimingTests(unittest.TestCase):
         self.assertEqual(argument.event, "push")
         self.assertEqual(argument.limit, 3)
         self.assertEqual(argument.window, "2026-09-14..2026-09-16")
-        with self.assertRaises(SystemExit):
+        # argparse reports the missing subcommand on stderr before exiting.
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             ci_timings.build_parser().parse_args([])
 
 

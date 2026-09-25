@@ -68,6 +68,16 @@ def _args(tempdir, **overrides):
     return argparse.Namespace(**{**defaults, **overrides})
 
 
+def present_tool(name):
+    """A `shutil.which` stand-in that finds every tool.
+
+    `command_run` binds its `which` default at definition time, so patching
+    `shutil.which` cannot reach it; tests inject this instead, keeping them
+    independent of the tools installed on the machine running them.
+    """
+    return "/usr/bin/" + name
+
+
 class MeasuredProcessFakes(unittest.TestCase):
     """Shared fake executor covering whole runs end to end."""
 
@@ -394,11 +404,10 @@ class RunResultsTests(MeasuredProcessFakes):
             stdout = io.StringIO()
             with unittest.mock.patch.object(
                 measure_dev_loop.shutil, "copy2"
-            ), unittest.mock.patch.object(
-                measure_dev_loop.shutil, "which",
-                side_effect=lambda name: "/usr/bin/" + name,
             ), contextlib.redirect_stdout(stdout):
-                self.assertEqual(measure_dev_loop.command_run(args, executor=executor), 0)
+                self.assertEqual(measure_dev_loop.command_run(
+                    args, executor=executor, which=present_tool
+                ), 0)
             self.assertTrue(envs)
             for env in envs:
                 self.assertEqual(
@@ -416,12 +425,11 @@ class RunResultsTests(MeasuredProcessFakes):
             args = _args(directory, dry_run=False, cases="warm,incremental")
             executor, _ = self.fake_executor(args)
             stdout = io.StringIO()
-            with unittest.mock.patch.object(
-                measure_dev_loop.shutil, "which",
-                side_effect=lambda name: "/usr/bin/" + name,
-            ), contextlib.redirect_stdout(stdout):
+            with contextlib.redirect_stdout(stdout):
                 self.assertEqual(
-                    measure_dev_loop.command_run(args, executor=executor), 0
+                    measure_dev_loop.command_run(
+                    args, executor=executor, which=present_tool
+                ), 0
                 )
             baseline = json.loads(
                 (Path(args.out) / "baseline.json").read_text()
@@ -443,12 +451,11 @@ class RunResultsTests(MeasuredProcessFakes):
             args = _args(directory, dry_run=False, cases="cold,size")
             executor, envs = self.fake_executor(args)
             stdout = io.StringIO()
-            with unittest.mock.patch.object(
-                measure_dev_loop.shutil, "which",
-                side_effect=lambda name: "/usr/bin/" + name,
-            ), contextlib.redirect_stdout(stdout):
+            with contextlib.redirect_stdout(stdout):
                 self.assertEqual(
-                    measure_dev_loop.command_run(args, executor=executor), 0
+                    measure_dev_loop.command_run(
+                    args, executor=executor, which=present_tool
+                ), 0
                 )
             baseline = json.loads(
                 (Path(args.out) / "baseline.json").read_text()
@@ -477,11 +484,10 @@ class RunResultsTests(MeasuredProcessFakes):
                     f"command failed with exit 1: {' '.join(command)}"
                 )
 
-            with unittest.mock.patch.object(
-                measure_dev_loop.shutil, "which",
-                side_effect=lambda name: "/usr/bin/" + name,
-            ), self.assertRaises(ValueError):
-                measure_dev_loop.command_run(args, executor=failing)
+            with self.assertRaises(ValueError):
+                measure_dev_loop.command_run(
+                    args, executor=failing, which=present_tool
+                )
 
 
 class ReportTests(unittest.TestCase):
