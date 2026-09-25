@@ -16,6 +16,12 @@ Every number printed by this tool comes from one of three sources:
   printed by the post-run `sccache-action` step and the `Swatinem/rust-cache`
   restore outcome lines.
 
+`steps` -- per-step medians from the same `gh run view --json jobs`
+  documents (each job object also carries its `steps` with start and
+  completion timestamps). Every counted job's wall clock is additionally
+  rounded up to a whole minute and summed into runner minutes, added
+  beside the wall-clock medians of `runs` and `compare`.
+
 `--cache` keeps fetched run metadata on disk; passing that snapshot back as
 `--input` regenerates the tables in `docs/design/test-performance-report.md`
 without touching the network.
@@ -58,6 +64,9 @@ VIEW_FIELDS = (
     "databaseId,name,displayTitle,event,conclusion,createdAt,updatedAt,"
     "startedAt,attempt,headBranch,workflowName,jobs"
 )
+# GitHub bills each job's runner time rounded UP to a whole minute, so
+# every job's wall clock contributes one minute-quantized step.
+RUNNER_MINUTE = 60
 
 
 def parse_timestamp(value):
@@ -114,14 +123,28 @@ def job_seconds(document):
     return durations
 
 
-def summarize_run(document):
+def runner_minutes(jobs):
+    """Billable runner minutes for one run from its per-job wall clock.
+
+    GitHub rounds each job up to a whole minute, so the per-run total sums
+    the per-job ceilings, never flooring the sum itself. The repo is
+    public, which keeps `/actions/runs/{id}/timing` billable at 0: that
+    field must not be used, and the per-job rounding is the only
+    approximation this tool can compute.
+    """
+    return sum(math.ceil(seconds / RUNNER_MINUTE) for seconds in jobs.values())
+
+
+def summarize_run(document, with_steps=False):
     """Normalize one `gh run view --json` document into a run summary.
 
     `created_at` keeps the run's creation time and selects date windows, so it
     matches the server-side `--created` filter semantics. Wall clock measures
     the actual execution (`started_at` to `updated_at`), not queue time
     between rerun attempts: `createdAt` stays at the original attempt, so
-    reruns would otherwise appear as hour-long runs.
+    reruns would otherwise appear as hour-long runs. `with_steps` also
+    carries the per-job step durations (`steps` key) for the `steps`
+    subcommand; the default keeps the summary shape unchanged.
     """
     started = parse_timestamp(document.get("startedAt"))
     created = parse_timestamp(document.get("createdAt"))
@@ -131,7 +154,8 @@ def summarize_run(document):
     if started is None:
         # Older snapshots predate the startedAt field.
         started = created
-    return {
+    jobs = job_seconds(document)
+    summary = {
         "id": document["databaseId"],
         "created_at": created,
         "started_at": started,
@@ -143,8 +167,12 @@ def summarize_run(document):
         "event": document.get("event"),
         "branch": document.get("headBranch"),
         "title": document.get("displayTitle"),
-        "jobs": job_seconds(document),
+        "jobs": jobs,
+        "runner_minutes": runner_minutes(jobs),
     }
+    if with_steps:
+        summary["steps"] = step_durations(document)
+    return summary
 
 
 
@@ -233,10 +261,12 @@ def window_summary(runs):
     The workflow p90 is reported alongside the median because the report
     quotes both, and a number the tool cannot print is a number no one can
     check. `percentile` is nearest-rank, so p90 is an observed run's wall
-    clock, not an interpolation between two.
+    clock, not an interpolation between two. Runner minutes are sampled
+    per run and summed across the window, beside the wall-clock medians.
     """
     jobs = {}
     walls = [run["wall_seconds"] for run in runs]
+    minutes = [run["runner_minutes"] for run in runs]
     for run in runs:
         for name, seconds in run["jobs"].items():
             jobs.setdefault(name, []).append(seconds)
@@ -244,6 +274,8 @@ def window_summary(runs):
         "runs": len(runs),
         "wall_seconds": statistics.median(walls) if runs else None,
         "wall_p90": percentile(walls, 0.90),
+        "runner_minutes": statistics.median(minutes) if runs else None,
+        "runner_minutes_total": sum(minutes),
         "jobs": {
             name: {
                 "p50": statistics.median(values),
@@ -259,7 +291,7 @@ def compare_windows(baseline, current):
     """Compare two window summaries per job, largest baseline first.
 
     Jobs that exist in only one window still get a row with `n/a` on the
-    missing side, so newly added or removed shards stay visible.
+    missing side, so added or removed shards stay visible.
     """
     names = set(baseline["jobs"]) | set(current["jobs"])
     rows = []
@@ -290,18 +322,23 @@ def compare_windows(baseline, current):
     return rows
 
 
+def format_minutes(minutes):
+    """Render runner minutes as a plain number plus unit, or `n/a`."""
+    return "n/a" if minutes is None else f"{minutes:g} min"
+
+
 def render_runs_markdown(runs):
     """Render one row per run plus the per-job median table."""
     lines = [
-        "| Run | Date | Event | Branch | Conclusion | Wall clock |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| Run | Date | Event | Branch | Conclusion | Wall clock | Runner min |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for run in runs:
         rerun = f" (attempt {run['attempt']})" if run["attempt"] > 1 else ""
         lines.append(
             f"| {run['id']} | {run['created_at'].date()} | {run['event']} | "
             f"{run['branch']}{rerun} | {run['conclusion']} | "
-            f"{format_seconds(run['wall_seconds'])} |"
+            f"{format_seconds(run['wall_seconds'])} | {run['runner_minutes']} |"
         )
     summary = window_summary(runs)
     if summary["runs"]:
@@ -309,7 +346,9 @@ def render_runs_markdown(runs):
         lines.append(
             f"Workflow wall clock over {summary['runs']} run(s): "
             f"p50 {format_seconds(summary['wall_seconds'])}, "
-            f"p90 {format_seconds(summary['wall_p90'])}"
+            f"p90 {format_seconds(summary['wall_p90'])}; "
+            f"runner minutes p50 {format_minutes(summary['runner_minutes'])}, "
+            f"summed {format_minutes(summary['runner_minutes_total'])}"
         )
         lines.append("")
         lines.append("| Job | p50 | p90 | Runs |")
@@ -364,6 +403,38 @@ def render_compare_markdown(baseline, current, rows):
         f"**{format_percent(p90_delta / baseline['wall_p90'] * 100 if baseline['wall_p90'] else None)}** | "
         f"**{baseline['runs']}/{current['runs']}** |"
     )
+    before_med = baseline.get("runner_minutes")
+    after_med = current.get("runner_minutes")
+    med_delta = (
+        after_med - before_med
+        if before_med is not None and after_med is not None else None
+    )
+    before_total = baseline.get("runner_minutes_total")
+    after_total = current.get("runner_minutes_total")
+    total_delta = (
+        after_total - before_total
+        if before_total is not None and after_total is not None else None
+    )
+    med_percent = (
+        med_delta / before_med * 100
+        if med_delta is not None and before_med else None
+    )
+    total_percent = (
+        total_delta / before_total * 100
+        if total_delta is not None and before_total else None
+    )
+    lines.append(
+        f"| **runner minutes (median)** | "
+        f"**{format_minutes(before_med)}** | **{format_minutes(after_med)}** | "
+        f"**{format_minutes(med_delta)}** | **{format_percent(med_percent)}** | "
+        f"**{baseline['runs']}/{current['runs']}** |"
+    )
+    lines.append(
+        f"| **runner minutes (total)** | **{format_minutes(before_total)}** | "
+        f"**{format_minutes(after_total)}** | "
+        f"**{format_minutes(total_delta)}** | **{format_percent(total_percent)}** | "
+        f"**{baseline['runs']}/{current['runs']}** |"
+    )
     return "\n".join(lines)
 
 
@@ -395,6 +466,45 @@ def junit_step_seconds(document,
             break
         durations[job["name"]] = elapsed
     return durations
+
+
+def step_durations(document):
+    """Map job name to {step name: elapsed seconds} for every counted step.
+
+    The `jobs` objects of `gh run view --json jobs` carry each step's start
+    and completion timestamps. Steps are counted exactly like jobs in
+    `job_seconds`: a skipped job or step, null timestamps, the Go zero
+    time, and a non-positive duration all contribute nothing. Two counted
+    steps in one job sharing a name are kept both, the second and later
+    ones keyed as `<name> (#<number>)` after their 1-based step number.
+    """
+    counted = {}
+    for job in document.get("jobs") or []:
+        if (job.get("conclusion") or "") == "skipped":
+            continue
+        steps = {}
+        for step in job.get("steps") or []:
+            if (step.get("conclusion") or "") == "skipped":
+                continue
+            start = parse_timestamp(step.get("startedAt"))
+            end = parse_timestamp(step.get("completedAt"))
+            if start is None or end is None:
+                continue
+            if start.year <= 1 or end.year <= 1:
+                continue
+            seconds = (end - start).total_seconds()
+            if seconds <= 0:
+                continue
+            name = step.get("name") or "?"
+            if name in steps:
+                # The same action can run twice in one job; the step
+                # number disambiguates the collision. A missing number
+                # degrades to `##` rather than overwriting.
+                number = step.get("number")
+                name = f"{name} (#{number})" if number else f"{name} ##"
+            steps[name] = seconds
+        counted[job["name"]] = steps
+    return counted
 
 
 def percentile(values, fraction):
@@ -732,7 +842,7 @@ def list_documents(args, window=None):
 Loaded = collections.namedtuple("Loaded", ("runs", "truncated"))
 
 
-def load_run_summaries(args, window=None):
+def load_run_summaries(args, window=None, with_steps=False):
     """Summaries from a snapshot, or from a fresh window-bounded fetch.
 
     `runs`/`compare` measure the CI workflow only. The fetch passes
@@ -751,7 +861,7 @@ def load_run_summaries(args, window=None):
         name = document.get("workflowName")
         if name is not None and name != "CI":
             continue
-        summaries.append(summarize_run(document))
+        summaries.append(summarize_run(document, with_steps))
     return Loaded(summaries, truncated)
 
 
@@ -1070,6 +1180,86 @@ def command_compare(args):
     return 0
 
 
+def step_summary(runs, jobs=None):
+    """p50/p90 per job and step name across a window of run summaries.
+
+    Every step sample is an elapsed wall clock from `step_durations` handed
+    over by `summarize_run(with_steps=True)`. `jobs` restricts the table to
+    explicitly named jobs; a repeated `--job` keeps each name. Steps that
+    were skipped are already gone from the summaries, so no extra filter
+    here can resurrect them.
+    """
+    wanted = set(jobs) if jobs else None
+    per_job = {}
+    for run in runs:
+        for job, steps in (run.get("steps") or {}).items():
+            if wanted is not None and job not in wanted:
+                continue
+            for name, seconds in steps.items():
+                per_job.setdefault(job, {}).setdefault(name, []).append(seconds)
+    return {
+        job: {
+            name: {
+                "p50": statistics.median(values),
+                "p90": percentile(values, 0.90),
+                "runs": len(values),
+            }
+            for name, values in steps.items()
+        }
+        for job, steps in sorted(per_job.items())
+    }
+
+
+def render_steps_markdown(run_count, summary):
+    """Render the per-job, per-step median table."""
+    lines = [
+        f"Steps over {run_count} run(s)",
+        "",
+        "| Job | Step | p50 | p90 | Runs |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    rows = [
+        (job, name, step)
+        for job, steps in sorted(summary.items())
+        for name, step in sorted(steps.items())
+    ]
+    if not rows:
+        lines.append("| (none) | (none) | n/a | n/a | 0 |")
+    for job, name, step in rows:
+        lines.append(
+            f"| {job} | {name} | {format_seconds(step['p50'])} | "
+            f"{format_seconds(step['p90'])} | {step['runs']} |"
+        )
+    return "\n".join(lines)
+
+
+def command_steps(args):
+    """Per-job, per-step medians over the shared run selection."""
+    window = parse_window(args.window) if args.window else None
+    loaded = load_run_summaries(args, window, with_steps=True)
+    selected = select_runs(loaded.runs, args, window)
+    warnings = []
+    if loaded.truncated and window is not None:
+        warnings.append(truncation_warning("requested", window, args.limit))
+    coverage = selection_coverage_warning(args, window, loaded.runs, selected)
+    if coverage:
+        warnings.append(coverage)
+    summary = step_summary(selected, jobs=args.job)
+    if args.json:
+        print(
+            json.dumps(
+                {"runs": len(selected), "summary": summary},
+                default=json_default,
+                indent=1,
+            )
+        )
+    else:
+        print(render_steps_markdown(len(selected), summary))
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    return 0
+
+
 
 def json_default(value):
     """Serialize datetimes in `--json` output."""
@@ -1184,7 +1374,8 @@ def command_cache(args):
 
 
 def build_parser():
-    """Build the parser for the `runs`, `compare`, `junit`, and `cache` modes."""
+    """Build the parser for the `runs`, `steps`, `compare`, `junit`, and
+    `cache` modes."""
     parser = argparse.ArgumentParser(
         description=__doc__,
         epilog=EPILOG,
@@ -1200,6 +1391,23 @@ def build_parser():
         help="inclusive START..END window of YYYY-MM-DD dates (default: newest runs)",
     )
     runs.set_defaults(handler=command_runs)
+
+    steps = subparsers.add_parser(
+        "steps", help="per-job step medians over the run-selection flags"
+    )
+    add_selection_arguments(steps)
+    steps.add_argument(
+        "--window",
+        default=None,
+        help="inclusive START..END window of YYYY-MM-DD dates (default: newest runs)",
+    )
+    steps.add_argument(
+        "--job",
+        action="append",
+        default=None,
+        help="limit the table to the named job(s); repeat --job to keep each",
+    )
+    steps.set_defaults(handler=command_steps)
 
     compare = subparsers.add_parser(
         "compare", help="before/after per-job medians for two windows"

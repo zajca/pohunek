@@ -1,0 +1,841 @@
+#!/usr/bin/env python3
+"""Measure the local dev-loop baseline (issue #163: dev-loop procedure).
+
+Three time cases and one size case, measured on a single machine:
+
+* `cold` -- one `cargo build --workspace --all-targets --all-features
+  --timings` in a dedicated target dir, timed from empty with
+  `time.monotonic`; the `cargo-timing.html` report is kept in the output
+  directory.
+* `warm` -- the same build command again, a no-op, measured with
+  `hyperfine --warmup/--runs` and exported as JSON.
+* `incremental` -- hyperfine over `cargo nextest run` (fast profile) and
+  `cargo clippy`, where each run's preparation `touch`es a source file to
+  force a small rebuild; `median`/`stddev` come from the hyperfine JSON.
+* `size` -- bytes of the target dir's `debug` tree, walked without
+  following symlinks and counting each hardlink-deduplicated `(st_dev,
+  st_ino)` inode once.
+
+Every cargo/hyperfine subprocess runs with all `POHUNEK_*` variables
+removed (a pohunek session leaks daemon and operator config, and the test
+suite otherwise fails inside one) with `RUSTC_WRAPPER` and
+`CARGO_BUILD_RUSTC_WRAPPER` set to the empty string -- an empty value also
+overrides a wrapper configured in a cargo config file, which deleting the
+variables would not -- and with `CARGO_TARGET_DIR` pointed at the
+dedicated target dir, so the measurement never builds into the default,
+already-warm `target/`. No env var value other than these two disabled
+controls is ever recorded or printed.
+
+The script only deletes a target dir it created itself, proven by the
+`.measure-dev-loop` marker it writes there; an existing unmarked
+non-empty directory is refused outright. The measurement itself is never
+shortcut: a cargo or hyperfine command that exits non-zero aborts the
+whole run.
+"""
+
+import argparse
+import datetime
+import json
+import os
+from pathlib import Path
+import platform
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+# hyperfine plan: the fast nextest suite is long enough that many timed
+# runs would inflate the session hours; one warmup is already enough to
+# compile the test binaries once, which the first incremental run would
+# otherwise measure instead of the touched crates.
+DEFAULT_RUNS = 5
+DEFAULT_WARMUP = 1
+# Smallest accepted hyperfine plan: below these the "median" is a single
+# untimed compile or a warmup without runs, not a measurement.
+MIN_RUNS = 2
+MIN_WARMUP = 1
+# Marker written inside every target dir this script created; its presence
+# is the only proof that a directory is safe to empty again.
+MARKER = ".measure-dev-loop"
+# Marker file contents, so an adoptable marker stays attributable.
+MARKER_TEXT = "created by scripts/measure-dev-loop\n"
+# Default target dir, deliberately not shared with `target/debug`: the cold
+# case needs a controlled empty state, and keeping it separate means a
+# measurement never trims a developer's warm incremental cache.
+TARGET_DIR = ROOT / "target/measure-dev-loop"
+RESULTS_ROOT = ROOT / "target/measure-dev-loop-results"
+# `--timings` writes its HTML report here, under the dedicated target dir.
+TIMING_HTML = Path("cargo-timings/cargo-timing.html")
+# The commands measured; incremental cases touch one source file per run so
+# hyperfine measures the rebuild, not a no-op.
+BUILD_COMMAND = (
+    "cargo", "build", "--workspace", "--all-targets", "--all-features",
+    "--timings",
+)
+NEXTEST_COMMAND = (
+    "cargo", "nextest", "run", "--profile", "fast", "--workspace",
+    "--all-features",
+)
+CLIPPY_COMMAND = ("cargo", "clippy", "--workspace", "--all-targets",
+                  "--all-features")
+CASES = ("cold", "warm", "incremental", "size")
+# `POHUNEK_*` is removed from the environment (it carries daemon/operator
+# config into the build; the test suite fails inside a pohunek session
+# otherwise). The wrapper knobs are overridden instead of deleted: an
+# empty value also beats a wrapper configured in a cargo config file.
+STRIPPED_PREFIX = "POHUNEK_"
+DISABLED_KEYS = ("RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER")
+# Incremental cases and their source-file candidates; the first existing
+# candidate of each case is the one touched between hyperfine runs. The cli
+# case touches the library root: `src/main.rs` is a thin binary shim, and
+# touching it rechecks only that binary, not the crate and its dependents.
+INCREMENTAL_FILES = (
+    ("protocol-leaf", ("crates/protocol/src/lib.rs",)),
+    ("cli-root", ("crates/cli/src/lib.rs",)),
+)
+
+
+def format_command(command):
+    """One shell-shaped line for messages and dry-run output."""
+    return " ".join(shlex.quote(part) for part in command)
+
+
+def format_bytes(size):
+    """Human-readable bytes with binary prefixes; deltas keep their sign."""
+    value = float(size)
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024:
+            return f"{sign}{value:,.1f} {unit}"
+        value /= 1024
+    return f"{sign}{value:,.1f} TiB"
+
+
+def format_number(value):
+    """A measured value at seconds precision, or `-` when absent."""
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    return str(value)
+
+
+def format_percent(value):
+    """Signed percentage, or `n/a` when there is no comparison."""
+    return "n/a" if value is None else f"{value:+.0f} %"
+
+
+def execute(command, env=None, cwd=ROOT):
+    """Run one measurement tool and return its captured stdout.
+
+    A non-zero exit aborts the measurement: continuing would mix a failed
+    build into the medians and report numbers for work that never
+    happened.
+    """
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as error:
+        raise ValueError(f"cannot run {format_command(command)}: {error}")
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip().splitlines()
+        detail = f": {detail[0]}" if detail else ""
+        raise ValueError(
+            f"command failed with exit {result.returncode}: "
+            f"{format_command(command)}{detail}"
+        )
+    return result.stdout
+
+
+def measurement_env(environ, target_dir):
+    """Subprocess env for one measured command, plus the keys touched.
+
+    `CARGO_TARGET_DIR` pins every cargo/hyperfine child to the dedicated
+    target dir (hyperfine passes its environment down), `POHUNEK_*`
+    variables are deleted, and the wrapper knobs are set to the empty
+    string so a configured wrapper -- environment *or* cargo config file
+    is ruled out. The second return value lists the touched keys only,
+    never values.
+    """
+    env = dict(environ if environ is not None else os.environ)
+    stripped = [key for key in env if key.startswith(STRIPPED_PREFIX)]
+    # The wrapper variables are recorded as disabled before the deletion
+    # pass so the record and the env stay about keys, not values.
+    disabled = [key for key in DISABLED_KEYS if key in env]
+    for key in stripped:
+        del env[key]
+    env["CARGO_TARGET_DIR"] = str(Path(target_dir).resolve())
+    for key in DISABLED_KEYS:
+        env[key] = ""
+    return env, {"stripped_keys": sorted(stripped), "disabled_keys": disabled}
+
+
+def prepare_target_dir(path):
+    """Empty `path` so a cold build starts clean, and only then.
+
+    The directory may be emptied only when the marker proves this script
+    created it: an unmarked non-empty directory belongs to something else
+    and is refused without deleting anything. An unmarked but empty
+    directory is adopted and marked. Returns True when contents were
+    removed.
+    """
+    path = Path(path)
+    if not path.exists():
+        path.mkdir(parents=True)
+        (path / MARKER).write_text(MARKER_TEXT)
+        return False
+    if not path.is_dir():
+        raise ValueError(
+            f"{path} is not a directory; refusing to treat it as a target dir"
+        )
+    if not (path / MARKER).exists():
+        entries = list(path.iterdir())
+        if entries:
+            raise ValueError(
+                f"{path} exists without the {MARKER} marker, so it was not "
+                f"created by this script; refusing to delete its "
+                f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'}"
+            )
+    for entry in path.iterdir():
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+    (path / MARKER).write_text(MARKER_TEXT)
+    return True
+
+
+def debug_tree_size(target_dir):
+    """Apparent and allocated bytes of the target dir's `debug` tree.
+
+    The walk never follows symlinks, and every `(st_dev, st_ino)` is
+    counted once: cargo hardlinks dependency artifacts from `target/deps`
+    into `target/debug`, so an st_size walk would multiply-count them.
+    Allocated bytes follow `st_blocks * 512`.
+    """
+    root = Path(target_dir) / "debug"
+    if not root.is_dir():
+        raise ValueError(
+            f"{root} does not exist; the cold or warm case must run first"
+        )
+    seen = set()
+    apparent = allocated = 0
+    counted = []
+    for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+        for name in filenames:
+            entry = os.lstat(os.path.join(dirpath, name))
+            if stat.S_ISLNK(entry.st_mode):
+                continue
+            key = (entry.st_dev, entry.st_ino)
+            if key in seen:
+                continue
+            seen.add(key)
+            apparent += entry.st_size
+            allocated += entry.st_blocks * 512
+            counted.append(os.path.join(dirpath, name))
+    return {
+        "path": str(root),
+        "apparent_bytes": apparent,
+        "allocated_bytes": allocated,
+        "counted": len(counted),
+    }
+
+
+def parse_hyperfine(payload):
+    """Per hyperfine result row: median, stddev, and the run count."""
+    results = []
+    for entry in payload.get("results") or []:
+        runs = entry.get("runs")
+        results.append(
+            {
+                "command": entry.get("command"),
+                "median": entry.get("median"),
+                "stddev": entry.get("stddev"),
+                "runs": len(runs) if isinstance(runs, list) else None,
+            }
+        )
+    return results
+
+
+def parse_rustc_release(text):
+    """The `release:` line of `rustc -vV`, or None on unexpected output."""
+    for line in text.splitlines():
+        if line.startswith("release:"):
+            return line.split(None, 1)[1].strip()
+    return None
+
+
+def parse_cpu_model(text):
+    """The first `model name` value in a `/proc/cpuinfo` file, else
+    `unknown`."""
+    if not text:
+        return "unknown"
+    for line in text.splitlines():
+        if line.startswith("model name") and ":" in line:
+            return line.split(":", 1)[1].strip()
+    return "unknown"
+
+
+def parse_logical_cores(text):
+    """The `/proc/cpuinfo` processor count, or None when unreadable."""
+    if not text:
+        return None
+    count = sum(
+        1 for line in text.splitlines() if line.startswith("processor")
+    )
+    return count or None
+
+
+def parse_meminfo(text):
+    """Total RAM in bytes from `/proc/meminfo`, or None when unreadable."""
+    if not text:
+        return None
+    for line in text.splitlines():
+        if line.startswith("MemTotal:"):
+            return int(line.split()[1]) * 1024
+    return None
+
+
+def parse_mount_fstype(mounts, path):
+    """Filesystem type of the longest `/proc/mounts` mount point above `path`.
+
+    Returns `unknown` when the mount table is unavailable (non-Linux) or no
+    mount point covers `path`. Mount points escape spaces as `\\040`.
+    """
+    if not mounts:
+        return "unknown"
+    target = Path(path)
+    best, fstype = None, "unknown"
+    for line in mounts.splitlines():
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        point = Path(fields[1].replace("\\040", " "))
+        if target != point and point not in target.parents:
+            continue
+        if best is None or len(point.parts) > len(best.parts):
+            best, fstype = point, fields[2]
+    return fstype
+
+
+def read_proc_file(path):
+    """Read a `/proc` file, or return None off Linux or without it."""
+    try:
+        return Path(path).read_text()
+    except OSError:
+        return None
+
+
+def git_state(executor=execute):
+    """HEAD commit and dirty flag of the repository, or (`None`, `None`)."""
+    try:
+        head = executor(["git", "rev-parse", "HEAD"]).strip()
+        dirty = bool(executor(["git", "status", "--porcelain"]).strip())
+        return head, dirty
+    except (OSError, ValueError):
+        return None, None
+
+
+def collect_metadata(target_dir, executor=execute):
+    """Repository and machine facts recorded in every `baseline.json`."""
+    cpuinfo = read_proc_file("/proc/cpuinfo")
+    meminfo = read_proc_file("/proc/meminfo")
+    cores = parse_logical_cores(cpuinfo) if cpuinfo is not None else None
+    metadata = {
+        "timestamp": datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat(),
+        "cargo_target_dir": str(Path(target_dir).resolve()),
+        # Recorded as a fact of the measurement, not an environment dump.
+        "wrappers_disabled": list(DISABLED_KEYS),
+    }
+    metadata["git_head"], metadata["git_dirty"] = git_state(executor)
+    metadata["rustc"] = parse_rustc_release(executor(["rustc", "-vV"]))
+    metadata["cargo"] = executor(["cargo", "--version"]).splitlines()[0]
+    metadata["nextest"] = executor(
+        ["cargo", "nextest", "--version"]
+    ).splitlines()[0]
+    metadata["hyperfine"] = executor(
+        ["hyperfine", "--version"]
+    ).splitlines()[0]
+    # Non-Linux hosts record this explicitly as unknown rather than
+    # inventing a value: the measurement label must stay auditable.
+    metadata["cpu_model"] = (
+        parse_cpu_model(cpuinfo) if cpuinfo is not None else "unknown"
+    )
+    metadata["logical_cores"] = cores if cores else os.cpu_count()
+    metadata["total_ram_bytes"] = (
+        parse_meminfo(meminfo) if meminfo is not None else None
+    )
+    metadata["kernel"] = platform.release()
+    # A target dir on tmpfs measures RAM, not the developer's disk, and can
+    # exhaust memory, so the backing filesystem is part of the label.
+    metadata["filesystem"] = parse_mount_fstype(
+        read_proc_file("/proc/mounts"), metadata["cargo_target_dir"]
+    )
+    return metadata
+
+
+def hyperfine_command(command, out_path, runs, warmup, prepare=None):
+    """The hyperfine argv timing one shell command."""
+    parts = [
+        "hyperfine",
+        "--warmup", str(warmup),
+        "--runs", str(runs),
+        "--export-json", str(out_path),
+    ]
+    if prepare is not None:
+        parts += ["--prepare", prepare]
+    parts.append(shlex.join(command))
+    return parts
+
+
+def incremental_targets(candidates=INCREMENTAL_FILES, root=ROOT):
+    """Absolute source files touched between incremental hyperfine runs.
+
+    Each case uses the first of its candidates that exists; a case with no
+    existing candidate fails the run before hyperfine starts.
+    """
+    root = Path(root)
+    targets = []
+    for name, paths in candidates:
+        for candidate in paths:
+            if (root / candidate).exists():
+                targets.append((name, str((root / candidate).resolve())))
+                break
+        else:
+            raise ValueError(
+                f"source file for the incremental case {name!r} is missing; "
+                f"expected one of: {', '.join(paths)}"
+            )
+    return targets
+
+
+def parse_cases(value):
+    """The selected subset of CASES, in execution order."""
+    if value == "all":
+        return list(CASES)
+    names = {part.strip() for part in value.split(",") if part.strip()}
+    unknown = sorted(names - set(CASES))
+    if unknown or not names:
+        raise ValueError(
+            f"select one or more of {', '.join(CASES)} (or 'all'); got "
+            f"{value!r}" + (f"; unknown: {', '.join(unknown)}" if unknown else "")
+        )
+    return [case for case in CASES if case in names]
+
+
+def plan_cases(cases, out_dir, runs, warmup):
+    """Every subprocess for the selected cases, in execution order.
+
+    The `size` case measures in-process and carries no command, so it has
+    no plan entry; dry-run prints that explicitly instead.
+    """
+    steps = []
+    if "cold" in cases:
+        steps.append({"case": "cold", "command": list(BUILD_COMMAND)})
+    if "warm" in cases:
+        steps.append(
+            {
+                "case": "warm",
+                "command": hyperfine_command(
+                    BUILD_COMMAND, Path(out_dir) / "warm.json", runs, warmup
+                ),
+            }
+        )
+    if "incremental" in cases:
+        for name, source in incremental_targets():
+            for label, command in (
+                ("nextest-fast", NEXTEST_COMMAND),
+                ("clippy", CLIPPY_COMMAND),
+            ):
+                steps.append(
+                    {
+                        "case": "incremental",
+                        "subcase": f"{name}-{label}",
+                        "command": hyperfine_command(
+                            command,
+                            Path(out_dir) / f"{name}-{label}.json",
+                            runs,
+                            warmup,
+                            prepare=f"touch {shlex.quote(source)}",
+                        ),
+                    }
+                )
+    return steps
+
+
+def command_run(args, executor=execute, which=shutil.which):
+    """Measure the selected cases into `<out>/baseline.json`."""
+    target_dir = str(Path(args.target_dir).resolve())
+    cases = parse_cases(args.cases)
+    out_dir = Path(args.out)
+    steps = plan_cases(cases, out_dir, args.runs, args.warmup)
+    if args.dry_run:
+        print(
+            "env: CARGO_TARGET_DIR=%s RUSTC_WRAPPER='' "
+            "CARGO_BUILD_RUSTC_WRAPPER='' (POHUNEK_* variables removed)"
+            % shlex.quote(target_dir)
+        )
+        for step in steps:
+            print(f"{case_label(step)}: {format_command(step['command'])}")
+        if "size" in cases:
+            print("size: (measured in-process; no command)")
+        return 0
+    # The output directory exists before any hyperfine runs, so its export
+    # file can be created; a missing tool fails before any measurement.
+    out_dir.mkdir(parents=True, exist_ok=True)
+    require_tools(which=which, executor=executor)
+    env, touched = measurement_env(os.environ, target_dir)
+    metadata = collect_metadata(target_dir, executor)
+    cases_rows = []
+    size = None
+    for step in steps:
+        row = {"case": step["case"], "subcase": step.get("subcase"),
+               "command": format_command(step["command"]),
+               "unit": "seconds", "runs": args.runs, "stddev": None}
+        if step["case"] == "cold":
+            prepare_target_dir(target_dir)
+            start = time.monotonic()
+            executor(step["command"], env)
+            row["median"] = time.monotonic() - start
+            row["runs"] = 1
+            copy_timing_html(target_dir, out_dir)
+        else:
+            executor(step["command"], env)
+            row.update(timed_row(Path(out_dir) / timed_export_name(step),
+                                 args.runs))
+        cases_rows.append(row)
+    if "size" in cases:
+        size = debug_tree_size(target_dir)
+    payload = {
+        "case_labels": list(cases),
+        "cases": cases_rows,
+        "size": size if "size" in cases else None,
+        "hyperfine": {"runs": args.runs, "warmup": args.warmup},
+        "environment": touched,
+        "metadata": metadata,
+    }
+    (out_dir / "baseline.json").write_text(json.dumps(payload, indent=1) + "\n")
+    print(render_cases_markdown(payload))
+    print(f"baseline written to {out_dir / 'baseline.json'}")
+    return 0
+
+
+def default_out_dir():
+    """Fresh per-session results directory keyed by the UTC timestamp."""
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y%m%dT%H%M%SZ"
+    )
+    return RESULTS_ROOT / stamp
+
+
+def copy_timing_html(target_dir, out_dir):
+    """Keep `cargo-timing.html` beside the results, failing without it."""
+    source = Path(target_dir) / TIMING_HTML
+    if not source.exists():
+        raise ValueError(
+            f"missing {source}: `cargo build --timings` did not produce it"
+        )
+    shutil.copy2(source, Path(out_dir) / source.name)
+
+
+def case_label(step):
+    """Unique per-step label: the case, plus its subcase when present."""
+    subcase = step.get("subcase")
+    return step["case"] if not subcase else f"{step['case']}:{subcase}"
+
+
+def timed_export_name(step):
+    """Which hyperfine JSON export belongs to one timed step."""
+    if step["case"] == "warm":
+        return "warm.json"
+    return f"{step['subcase']}.json"
+
+
+def timed_row(out_path, runs):
+    """Median/stddev from one hyperfine export into a result row."""
+    parsed = parse_hyperfine(json.loads(Path(out_path).read_text()))
+    if not parsed:
+        raise ValueError(f"{out_path} holds no hyperfine result")
+    row = parsed[0]
+    return {
+        "median": row["median"],
+        "stddev": row["stddev"],
+        "runs": row["runs"] if row["runs"] is not None else runs,
+        "command": row.get("command"),
+    }
+
+
+def require_tools(which=shutil.which, executor=execute):
+    """Fail fast naming each missing tool before any measurement starts."""
+    missing = [
+        name for name in ("cargo", "hyperfine") if which(name) is None
+    ]
+    if missing:
+        raise ValueError(
+            f"required tool(s) missing from PATH: {', '.join(missing)}"
+        )
+    # `cargo nextest` is a cargo plugin; its --version fails clearly when
+    # it is not installed.
+    executor(["cargo", "nextest", "--version"])
+
+
+def case_key(entry):
+    """Which comparison slot one case row occupies."""
+    subcase = entry.get("subcase")
+    return entry["case"] if not subcase else f"{entry['case']}:{subcase}"
+
+
+def case_rows(payload):
+    """The case rows of one `baseline.json`, without the size table."""
+    return [
+        {**row, "unit": row.get("unit", "seconds")}
+        for row in payload.get("cases") or []
+    ]
+
+
+def size_rows(size):
+    """The `Metric | Bytes | Human` rows for one size measurement."""
+    return [
+        {"metric": "apparent", "bytes": size.get("apparent_bytes"),
+         "human": format_bytes(size.get("apparent_bytes") or 0)},
+        {"metric": "allocated", "bytes": size.get("allocated_bytes"),
+         "human": format_bytes(size.get("allocated_bytes") or 0)},
+    ]
+
+
+def render_cases_markdown(payload, header="Case"):
+    """The `Case | Command | Median | Stddev | Runs` result table."""
+    lines = [
+        f"| {header} | Command | Median | Stddev | Runs |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for row in case_rows(payload):
+        label = case_key(row)
+        lines.append(
+            f"| {label} | {row.get('command') or '-'} | "
+            f"{format_number(row.get('median'))} | "
+            f"{format_number(row.get('stddev'))} | "
+            f"{row.get('runs') if row.get('runs') is not None else '-'} |"
+        )
+    size = payload.get("size")
+    if size:
+        lines.append("")
+        lines.append(
+            f"Size of `{size.get('path', 'target/debug')}` "
+            "(hardlink-deduplicated)"
+        )
+        lines.append("")
+        lines.append("| Metric | Bytes | Human |")
+        lines.append("| --- | --- | --- |")
+        for row in size_rows(size):
+            lines.append(
+                f"| {row['metric']} | {row['bytes']} | {row['human']} |"
+            )
+    return "\n".join(lines)
+
+
+def compare_baselines(before, after):
+    """Rows keyed by case (and subcase) with delta and percent each."""
+    old_rows = {case_key(row): row for row in case_rows(before)}
+    new_rows = {case_key(row): row for row in case_rows(after)}
+    rows = []
+    for label in sorted(set(old_rows) | set(new_rows)):
+        old = old_rows.get(label)
+        new = new_rows.get(label)
+        delta = (
+            new["median"] - old["median"] if new and old else None
+        )
+        unit = (new or old).get("unit", "seconds")
+        rows.append(
+            {
+                "case": label,
+                "before": old["median"] if old else None,
+                "after": new["median"] if new else None,
+                # Both sides of one row share the unit, so delta and
+                # percent stay comparable within the row.
+                "unit": unit,
+                "delta": delta,
+                "percent": delta / old["median"] * 100
+                if delta is not None and old["median"] else None,
+            }
+        )
+    old_size, new_size = before.get("size"), after.get("size")
+    if old_size or new_size:
+        for metric, label in (
+            ("apparent_bytes", "size:apparent"),
+            ("allocated_bytes", "size:allocated"),
+        ):
+            old_value = (old_size or {}).get(metric)
+            new_value = (new_size or {}).get(metric)
+            delta = None
+            if old_value is not None and new_value is not None:
+                delta = new_value - old_value
+            rows.append(
+                {
+                    "case": label,
+                    "before": old_value,
+                    "after": new_value,
+                    "unit": "bytes",
+                    "delta": delta,
+                    "percent": delta / old_value * 100
+                    if delta is not None and old_value else None,
+                }
+            )
+    return rows
+
+
+def render_compare_markdown(rows):
+    """The before/after table for two `baseline.json` files."""
+    lines = [
+        "| Case | Before | After | Delta | Delta % |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for row in rows:
+        before = "-" if row["before"] is None else (
+            format_number(row["before"])
+            if row["unit"] == "seconds"
+            else format_bytes(row["before"])
+        )
+        after = "-" if row["after"] is None else (
+            format_number(row["after"])
+            if row["unit"] == "seconds"
+            else format_bytes(row["after"])
+        )
+        delta_value = (
+            format_number(row["delta"])
+            if row["unit"] == "seconds"
+            else format_bytes(row["delta"])
+        )
+        lines.append(
+            f"| {row['case']} | {before} | {after} | "
+            f"{delta_value if row['delta'] is not None else '-'} | "
+            f"{format_percent(row['percent'])} |"
+        )
+    return "\n".join(lines)
+
+
+def read_baseline(path):
+    """Load one `baseline.json` written by `run`."""
+    payload = json.loads(Path(path).read_text())
+    if not isinstance(payload, dict) or not isinstance(payload.get("cases"), list):
+        raise ValueError(f"{path} does not hold a baseline with a `cases` list")
+    return payload
+
+
+def command_report(args):
+    """Re-render the Markdown table of one `baseline.json`."""
+    print(render_cases_markdown(read_baseline(args.path)))
+    return 0
+
+
+def command_compare(args):
+    """Before/after table with delta and percent per case."""
+    rows = compare_baselines(
+        read_baseline(args.before), read_baseline(args.after)
+    )
+    if args.json:
+        print(json.dumps(rows, indent=1))
+    else:
+        print(render_compare_markdown(rows))
+    return 0
+
+
+EPILOG = """\
+Reusable evidence flow (issue #163):
+
+  scripts/measure-dev-loop run --dry-run      # print the plan, run nothing
+  scripts/measure-dev-loop run                # all four cases
+  scripts/measure-dev-loop report target/measure-dev-loop-results/<ts>/baseline.json
+  scripts/measure-dev-loop compare BEFORE.json AFTER.json
+"""
+
+
+def build_parser():
+    """Build the parser for the `run`, `report`, and `compare` modes."""
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run = subparsers.add_parser("run", help="measure the dev-loop cases")
+    run.add_argument(
+        "--cases",
+        default="all",
+        help=f"comma list from {', '.join(CASES)} (default: all)",
+    )
+    run.add_argument(
+        "--target-dir",
+        default=str(TARGET_DIR),
+        help="dedicated cargo target dir the measurement owns; it is emptied "
+        f"for the cold case only when the {MARKER} marker proves the "
+        "script created it (default: target/measure-dev-loop)",
+    )
+    run.add_argument(
+        "--out",
+        default=None,
+        help="results directory (default: target/measure-dev-loop-results/"
+        "<UTC timestamp>)",
+    )
+    run.add_argument("--runs", type=int, default=DEFAULT_RUNS,
+                     help=f"hyperfine timed runs per case (>= {MIN_RUNS})")
+    run.add_argument("--warmup", type=int, default=DEFAULT_WARMUP,
+                     help=f"hyperfine warmup runs (>= {MIN_WARMUP})")
+    run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the exact commands without executing any of them",
+    )
+    run.set_defaults(handler=command_run)
+
+    report = subparsers.add_parser(
+        "report", help="re-render a baseline.json as a Markdown table"
+    )
+    report.add_argument("path", help="a baseline.json written by `run`")
+    report.set_defaults(handler=command_report)
+
+    compare = subparsers.add_parser(
+        "compare", help="before/after table for two baseline.json files"
+    )
+    compare.add_argument("before", help="baseline.json of the earlier state")
+    compare.add_argument("after", help="baseline.json of the later state")
+    compare.add_argument("--json", action="store_true", help="emit JSON output")
+    compare.set_defaults(handler=command_compare)
+    return parser
+
+
+def main(argv=None):
+    """Run one measurement mode and return the process exit code."""
+    args = build_parser().parse_args(argv)
+    try:
+        if args.command == "run":
+            if args.runs < MIN_RUNS:
+                raise ValueError("--runs must be >= 2 to form a median")
+            if args.warmup < MIN_WARMUP:
+                raise ValueError("--warmup must be >= 1 so the first timed "
+                                 "run measures the touched file, not the "
+                                 "test binaries' first compile")
+            if args.out is None:
+                args.out = str(default_out_dir())
+        return args.handler(args)
+    except (OSError, ValueError) as error:
+        print(f"measure-dev-loop: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
