@@ -203,6 +203,12 @@ pub(super) enum Unreachable {
         /// only when `journaled`, since only the journal's PID check proves
         /// which runtime died.
         runtime_id: Option<String>,
+        /// Start identity of the journaled worker process instance; set
+        /// alongside `runtime_id`. The marker sweep compares it against the
+        /// start identity of unreadable-marker processes, so long-lived
+        /// non-dumpable bystanders are provably not descendants of the
+        /// runtime.
+        worker_start_identity: Option<StartIdentity>,
     },
 }
 
@@ -243,6 +249,7 @@ pub(super) fn classify_unreachable(
         return Unreachable::Ended {
             journaled: false,
             runtime_id: None,
+            worker_start_identity: None,
         };
     };
     let identity = match worker.identity() {
@@ -253,6 +260,7 @@ pub(super) fn classify_unreachable(
         Ok(false) => Unreachable::Ended {
             journaled: true,
             runtime_id: worker.runtime_id.map(ToOwned::to_owned),
+            worker_start_identity: Some(identity.start_identity),
         },
         Ok(true) => Unreachable::Ambiguous(format!(
             "worker process {} is running but its socket is not reachable",
@@ -277,13 +285,13 @@ pub(super) enum Cleanup {
 /// Sessions waiting for their supervisor to answer again.
 #[derive(Debug, Default)]
 pub(super) struct SupervisionRetries {
-    state: std::sync::Mutex<RetryState>,
+    pub(super) state: std::sync::Mutex<RetryState>,
 }
 
 #[derive(Debug, Default)]
-struct RetryState {
-    pending: BTreeSet<String>,
-    running: bool,
+pub(super) struct RetryState {
+    pub(super) pending: BTreeSet<String>,
+    pub(super) running: bool,
 }
 
 impl SessionRegistry {
@@ -292,7 +300,17 @@ impl SessionRegistry {
     /// Runs [`sweep_runtime`] until a pass selects nothing, at most
     /// [`MAX_SWEEP_PASSES`] times. An unconfirmed exit or a sweep error stops
     /// immediately and is reported; the sweep is never retried as a kill loop.
-    pub(super) async fn sweep_lost_runtime(&self, session_id: &str, runtime_id: &str) -> Cleanup {
+    ///
+    /// `worker_start_identity` is the journaled worker's own start identity.
+    /// With it, a same-user process whose markers cannot be read is provably
+    /// foreign when it started before the worker; without it, every
+    /// unreadable-marker process keeps the cleanup unconfirmed.
+    pub(super) async fn sweep_lost_runtime(
+        &self,
+        session_id: &str,
+        runtime_id: &str,
+        worker_start_identity: Option<StartIdentity>,
+    ) -> Cleanup {
         let Some(grace) = self
             .inner
             .config
@@ -313,7 +331,7 @@ impl SessionRegistry {
             grace,
             SWEEP_POLL_INTERVAL.min(grace),
         ) {
-            Ok(request) => request,
+            Ok(request) => request.with_worker_start_identity(worker_start_identity),
             Err(error) => {
                 tracing::warn!(session_id, runtime_id, error = %error, "lost runtime cannot be swept");
                 return Cleanup::Unconfirmed;
@@ -338,11 +356,6 @@ impl SessionRegistry {
                 .iter()
                 .filter(|skipped| skipped.reason == SkipReason::MarkersUnreadable)
                 .count();
-            let selected = report.terminated.len()
-                + report.killed.len()
-                + report.unconfirmed.len()
-                + report.skipped.len()
-                - unreadable;
             tracing::info!(
                 session_id,
                 runtime_id,
@@ -353,6 +366,10 @@ impl SessionRegistry {
                 sweep.unreadable = unreadable,
                 "swept processes of a lost runtime"
             );
+            // An unreadable-marker process that could still belong to the
+            // runtime counts as selected, so the sweep is retried: a process
+            // caught between images reads its markers on a later pass, while
+            // one that stays unreadable leaves the cleanup unconfirmed below.
             if !report.is_complete()
                 || report
                     .skipped
@@ -366,6 +383,12 @@ impl SessionRegistry {
                 );
                 return Cleanup::Unconfirmed;
             }
+            // Selected counts every process this pass attributed to the
+            // runtime; the sweep repeats until a pass attributes none.
+            let selected = report.terminated.len()
+                + report.killed.len()
+                + report.unconfirmed.len()
+                + report.skipped.len();
             if selected == 0 {
                 return Cleanup::Complete;
             }
@@ -374,7 +397,7 @@ impl SessionRegistry {
             session_id,
             runtime_id,
             sweep.passes = MAX_SWEEP_PASSES,
-            "lost runtime still had marked processes after every sweep pass"
+            "lost runtime still had marked or unreadable processes after every sweep pass"
         );
         Cleanup::Unconfirmed
     }
@@ -438,7 +461,14 @@ impl SessionRegistry {
             )
             .await;
             match classified {
-                Ok(StaleJob::Ended) => retire_stale_job(lifecycle, &observation.id).await,
+                Ok(StaleJob::Ended) => {
+                    if retire_stale_job(lifecycle, &observation.id).await.is_err() {
+                        // The retirement was not confirmed, so the job stays
+                        // recorded as an orphan and a later pass retries it.
+                        orphans.push(stale_orphan(&observation.id));
+                        self.settle_unproven_stale_job(key);
+                    }
+                }
                 Ok(state @ (StaleJob::Live | StaleJob::Unproven)) => {
                     tracing::warn!(service_id = %observation.id, "stale worker job may still be live; leaving it untouched");
                     orphans.push(stale_orphan(&observation.id));
@@ -626,16 +656,19 @@ impl SessionRegistry {
         }
     }
 
-    /// Re-checks a stale job without a process in a state that proves
-    /// nothing once the worker initialization deadline has passed.
+    /// Re-checks a stale job once the worker initialization deadline has
+    /// passed.
     ///
-    /// A background task waits from first sight until that deadline, then
-    /// re-inspects the job and re-reads its generation's journal under the
-    /// session's lifecycle lock. A job that ended, or whose worker never
-    /// journaled within that window and so never owned a PTY, is retired and
-    /// leaves the inventory. A job whose journaled worker may still run, or
-    /// whose journals cannot be read, stays orphaned for the next start.
-    /// Daemon shutdown leaves it to the next start as well.
+    /// Scheduled for a job without a process in a state that proves nothing,
+    /// and for a job whose retirement could not be confirmed. A background
+    /// task waits from first sight until that deadline, then re-inspects the
+    /// job and re-reads its generation's journal under the session's
+    /// lifecycle lock. A job that ended, or whose worker never journaled
+    /// within that window and so never owned a PTY, is retired and leaves
+    /// the inventory. A job whose journaled worker may still run, or whose
+    /// journals cannot be read, stays orphaned for the next start. A
+    /// retirement that fails again stays orphaned and schedules another
+    /// re-check. Daemon shutdown leaves it to the next start as well.
     pub(super) fn settle_unproven_stale_job(&self, key: WorkerKey) {
         let registry = self.clone();
         tokio::spawn(async move {
@@ -697,12 +730,17 @@ impl SessionRegistry {
             tracing::warn!(service_id = %id, "stale worker job may still be live after its initialization deadline; leaving it untouched");
             return;
         }
-        retire_stale_job(&lifecycle, &id).await;
-        self.inner
-            .runtime_inventory
-            .lock()
-            .await
-            .retain(|entry| entry.runtime_slot != id.as_str());
+        if retire_stale_job(&lifecycle, &id).await.is_ok() {
+            self.inner
+                .runtime_inventory
+                .lock()
+                .await
+                .retain(|entry| entry.runtime_slot != id.as_str());
+        } else {
+            // The retirement was not confirmed: the job and its inventory
+            // entry stay, and a later pass retries the retirement.
+            self.settle_unproven_stale_job(key);
+        }
     }
 
     /// Hands an abandoned create whose job cannot be settled to the retry.
@@ -873,13 +911,22 @@ async fn classify_stale_job(
 }
 
 /// Retires a stale job by exact service ID; an absent job is fine.
-async fn retire_stale_job(lifecycle: &Lifecycle<'_>, id: &ServiceId) {
+///
+/// Returns the supervisor error when the retirement could not be confirmed,
+/// so callers keep the job and its inventory entry recorded instead of
+/// forgetting a job that still exists.
+async fn retire_stale_job(
+    lifecycle: &Lifecycle<'_>,
+    id: &ServiceId,
+) -> Result<(), SupervisorError> {
     match lifecycle.supervisor.retire(id).await {
         Ok(()) | Err(SupervisorError::NotFound(_)) => {
             tracing::info!(service_id = %id, "retired an ended stale worker job");
+            Ok(())
         }
         Err(error) => {
             tracing::warn!(service_id = %id, error = %error, "failed to retire an ended stale worker job");
+            Err(error)
         }
     }
 }

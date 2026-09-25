@@ -804,12 +804,16 @@ impl SessionRegistry {
             Unreachable::Ended {
                 journaled,
                 runtime_id,
+                worker_start_identity,
             } => {
                 // `runtime_id` is set only for a journaled worker proven gone;
                 // a generation that never journaled has nothing proven to
                 // sweep, so only its job is retired.
                 let cleanup = match runtime_id.as_deref() {
-                    Some(runtime_id) => self.sweep_lost_runtime(&id.0, runtime_id).await,
+                    Some(runtime_id) => {
+                        self.sweep_lost_runtime(&id.0, runtime_id, worker_start_identity)
+                            .await
+                    }
                     None => Cleanup::Complete,
                 };
                 let retired = match lifecycle {
@@ -991,13 +995,15 @@ impl SessionRegistry {
             Unreachable::Ended {
                 journaled,
                 runtime_id,
+                worker_start_identity,
             } => {
                 // Only a journaled worker whose process is proven gone proves
                 // which runtime died. Without a journal nothing proves what
                 // ran, so no process is swept; the ended job is still retired.
                 let cleanup = if journaled {
                     let runtime_id = runtime_id.unwrap_or_else(|| expected.runtime_id.clone());
-                    self.sweep_lost_runtime(&id.0, &runtime_id).await
+                    self.sweep_lost_runtime(&id.0, &runtime_id, worker_start_identity)
+                        .await
                 } else {
                     Cleanup::Complete
                 };
@@ -2944,7 +2950,8 @@ fn classify_connect_error(error: &WorkerError) -> (RuntimeState, &'static str) {
         | WorkerError::Protocol(_)
         | WorkerError::Rejected { .. }
         | WorkerError::NotInitialized
-        | WorkerError::AttachReadyTimeout { .. } => (RuntimeState::Lost, UNREACHABLE_SOCKET),
+        | WorkerError::AttachReadyTimeout { .. }
+        | WorkerError::TornStream => (RuntimeState::Lost, UNREACHABLE_SOCKET),
     }
 }
 
@@ -3029,6 +3036,7 @@ mod tests {
     struct RetryInspector {
         fail_descendants: AtomicBool,
         fail_enumeration: AtomicBool,
+        fail_markers: AtomicBool,
         descendant_calls: AtomicUsize,
         inner: HostInspector,
     }
@@ -3040,6 +3048,10 @@ mod tests {
 
         fn fail_descendants(&self, fail: bool) {
             self.fail_descendants.store(fail, Ordering::Release);
+        }
+
+        fn fail_markers(&self, fail: bool) {
+            self.fail_markers.store(fail, Ordering::Release);
         }
 
         fn descendant_calls(&self) -> usize {
@@ -3103,6 +3115,12 @@ mod tests {
         }
 
         fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, crate::procwatch::Error> {
+            if self.fail_markers.load(Ordering::Acquire) {
+                return Err(crate::procwatch::Error::from_io(
+                    "test_markers",
+                    std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                ));
+            }
             self.inner.ownership_markers(pid)
         }
 
@@ -6450,6 +6468,18 @@ while os.getppid() == parent:
             (pid, 1)
         }
 
+        /// A dead worker journaled with a realistic start identity.
+        ///
+        /// The sweep classifies unreadable-marker processes against the
+        /// journaled worker start identity. The test process started after
+        /// every long-lived non-dumpable process on the host (a desktop user
+        /// manager, for example), so its own start time is the stand-in that
+        /// proves such bystanders foreign, exactly as a real worker's journal
+        /// would.
+        fn dead_worker_with_realistic_start() -> (u32, u64) {
+            (dead_worker().0, own_identity().1)
+        }
+
         fn own_identity() -> (u32, u64) {
             let identity = HostInspector::new()
                 .identity(std::process::id())
@@ -6555,7 +6585,12 @@ while os.getppid() == parent:
             let lost = Marked::spawn("runtime-s-302");
             let bystander = Marked::spawn("runtime-s-302-other");
             persist_record(&fixture.root, "s-302", Some("runtime-s-302"));
-            write_live_journal(&fixture.root, "s-302", dead_worker(), Some("runtime-s-302"));
+            write_live_journal(
+                &fixture.root,
+                "s-302",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-302"),
+            );
             let id = service_id("s-302", TEST_GENERATION);
             fixture
                 .supervisor
@@ -6594,6 +6629,32 @@ while os.getppid() == parent:
                 Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED)
             );
             assert!(marked.alive(), "an aborted sweep signals nothing");
+        }
+
+        #[tokio::test]
+        async fn unreadable_markers_leave_the_runtime_lost_with_unconfirmed_cleanup() {
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.fail_markers(true);
+            let fixture =
+                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+            let marked = Marked::spawn("runtime-s-306");
+            persist_record(&fixture.root, "s-306", Some("runtime-s-306"));
+            write_live_journal(&fixture.root, "s-306", dead_worker(), Some("runtime-s-306"));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-306").await;
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(
+                runtime.loss_reason.as_deref(),
+                Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED)
+            );
+            assert!(
+                marked.alive(),
+                "an unreadable marker is never a signal permit"
+            );
         }
 
         #[tokio::test]
@@ -6787,7 +6848,12 @@ while os.getppid() == parent:
             let fixture = fixture(Arc::new(HostInspector::new()));
             let marked = Marked::spawn("runtime-s-309");
             persist_record(&fixture.root, "s-309", Some("runtime-s-309"));
-            write_live_journal(&fixture.root, "s-309", dead_worker(), Some("runtime-s-309"));
+            write_live_journal(
+                &fixture.root,
+                "s-309",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-309"),
+            );
             let id = service_id("s-309", TEST_GENERATION);
             fixture
                 .supervisor
@@ -7136,7 +7202,12 @@ while os.getppid() == parent:
             let fixture = fixture(Arc::new(HostInspector::new()));
             let marked = Marked::spawn("runtime-s-320");
             persist_record(&fixture.root, "s-320", Some("runtime-s-320"));
-            write_live_journal(&fixture.root, "s-320", dead_worker(), Some("runtime-s-320"));
+            write_live_journal(
+                &fixture.root,
+                "s-320",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-320"),
+            );
             let id = service_id("s-320", TEST_GENERATION);
             fixture
                 .supervisor
@@ -7293,7 +7364,12 @@ while os.getppid() == parent:
             let fixture = fixture(Arc::new(HostInspector::new()));
             let marked = Marked::spawn("runtime-s-330");
             persist_record(&fixture.root, "s-330", Some("runtime-s-330"));
-            write_live_journal(&fixture.root, "s-330", dead_worker(), Some("runtime-s-330"));
+            write_live_journal(
+                &fixture.root,
+                "s-330",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-330"),
+            );
             let id = service_id("s-330", TEST_GENERATION);
             fixture
                 .supervisor
@@ -7326,7 +7402,12 @@ while os.getppid() == parent:
             let fixture = fixture(Arc::new(HostInspector::new()));
             let marked = Marked::spawn("runtime-s-331");
             persist_record(&fixture.root, "s-331", Some("runtime-s-331"));
-            write_live_journal(&fixture.root, "s-331", dead_worker(), Some("runtime-s-331"));
+            write_live_journal(
+                &fixture.root,
+                "s-331",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-331"),
+            );
             let id = service_id("s-331", TEST_GENERATION);
             fixture
                 .supervisor
@@ -7406,7 +7487,12 @@ while os.getppid() == parent:
             let fixture = fixture(Arc::new(HostInspector::new()));
             let marked = Marked::spawn("runtime-s-334");
             persist_record(&fixture.root, "s-334", Some("runtime-s-334"));
-            write_live_journal(&fixture.root, "s-334", dead_worker(), Some("runtime-s-334"));
+            write_live_journal(
+                &fixture.root,
+                "s-334",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-334"),
+            );
             persist_record(&fixture.root, "s-335", None);
             write_live_journal(&fixture.root, "s-335", own_identity(), None);
             persist_record(&fixture.root, "s-336", None);
@@ -7516,6 +7602,108 @@ while os.getppid() == parent:
                 !fixture.supervisor.retired().contains(&running),
                 "a stale job whose journaled worker runs is never retired"
             );
+        }
+
+        #[tokio::test]
+        async fn failed_stale_job_retirement_keeps_the_orphan_and_retries() {
+            const CURRENT_GENERATION: &str = "zzzz4444";
+            const INITIALIZE: Duration = Duration::from_millis(500);
+
+            let fixture = fixture_with(Arc::new(HostInspector::new()), Some(INITIALIZE));
+            let current = |session_id| service_id(session_id, CURRENT_GENERATION);
+            for session_id in ["s-341", "s-342"] {
+                let mut record = identity_record();
+                record.session_id = session_id.to_owned();
+                record.info.id = SessionId(session_id.to_owned());
+                record.recovery.as_mut().expect("recovery").session_id = session_id.to_owned();
+                bind_test_generation(&mut record);
+                record.runtime.generation = Some(CURRENT_GENERATION.to_owned());
+                record.runtime.service_id = Some(current(session_id).to_string());
+                Store::new(fixture.root.join("data/metadata.jsonl"))
+                    .record_session(&record)
+                    .expect("persist a record past the stale generation");
+            }
+            // s-341's stale job is proven ended, so reconciliation retires it
+            // immediately; s-342's is unproven and settles at its deadline.
+            let ended = service_id("s-341", TEST_GENERATION);
+            write_live_journal(&fixture.root, "s-341", dead_worker(), None);
+            fixture
+                .supervisor
+                .script_job(ended.clone(), present(ServiceState::Failed, None));
+            let unproven = service_id("s-342", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(unproven.clone(), present(ServiceState::Unknown, None));
+            // One transient supervisor failure per retirement.
+            fixture.supervisor.script_retire_unavailable(ended.clone());
+            fixture
+                .supervisor
+                .script_retire_unavailable(unproven.clone());
+            let orphaned = |inventory: &protocol::RuntimeInventoryResult, id: &ServiceId| {
+                inventory.entries.iter().any(|entry| {
+                    entry.runtime_slot == id.as_str()
+                        && entry.status == RuntimeInventoryStatus::Orphaned
+                        && entry.reason.as_deref() == Some(STALE_GENERATION)
+                })
+            };
+            let retire_count = |fixture: &Fixture, id: &ServiceId| {
+                fixture
+                    .supervisor
+                    .retired()
+                    .into_iter()
+                    .filter(|retired| retired == id)
+                    .count()
+            };
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let inventory = fixture.registry.runtime_inventory().await;
+            assert!(orphaned(&inventory, &ended), "{inventory:?}");
+            assert!(orphaned(&inventory, &unproven), "{inventory:?}");
+            assert_eq!(
+                retire_count(&fixture, &ended),
+                1,
+                "{:?}",
+                fixture.supervisor.retired()
+            );
+
+            // The ended job's re-check retires it and drops its orphan.
+            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            while orphaned(&fixture.registry.runtime_inventory().await, &ended) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the ended stale job's orphan was never settled"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(retire_count(&fixture, &ended), 2);
+
+            // The unproven job's first re-check also fails to retire: its
+            // orphan entry must stay, and a further re-check must follow.
+            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            while retire_count(&fixture, &unproven) < 1 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the unproven stale job was never re-checked"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let inventory = fixture.registry.runtime_inventory().await;
+            assert!(
+                orphaned(&inventory, &unproven),
+                "a failed retirement keeps the orphan: {inventory:?}"
+            );
+            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            while orphaned(&fixture.registry.runtime_inventory().await, &unproven) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the unproven stale job was never retried after its failed retirement"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(retire_count(&fixture, &unproven), 2);
         }
 
         #[tokio::test]
@@ -7838,7 +8026,7 @@ while os.getppid() == parent:
                     .and_then(|runtime| runtime.runtime_id.clone())
                     .expect("created runtime id");
                 self.registry
-                    .sweep_lost_runtime(&created.id.0, &runtime_id)
+                    .sweep_lost_runtime(&created.id.0, &runtime_id, None)
                     .await;
                 wait_gone(descendant).await;
             }
@@ -7923,7 +8111,7 @@ while os.getppid() == parent:
                 .expect("created runtime id");
             fixture
                 .registry
-                .sweep_lost_runtime(&created.id.0, &runtime_id)
+                .sweep_lost_runtime(&created.id.0, &runtime_id, None)
                 .await;
             wait_gone(descendant).await;
         }

@@ -258,6 +258,60 @@ fn marked(runtime_id: &str) -> MarkerAnswer {
 }
 
 #[test]
+fn unreadable_marker_processes_are_classified_by_their_start_time() {
+    use super::{classify, Selection, START_IDENTITY_ORDERS_PROCESS_STARTS};
+
+    let bounded = request(RUNTIME).with_worker_start_identity(Some(StartIdentity::new(100)));
+    let inspector = ScriptedInspector::default()
+        .with_process(identity(910, 50), MarkerAnswer::Denied)
+        .with_process(identity(911, 100), MarkerAnswer::Denied)
+        .with_process(identity(912, 200), MarkerAnswer::Unobservable)
+        .with_process(identity(913, 50), MarkerAnswer::Unobservable);
+
+    // A process that started strictly before the worker cannot carry the
+    // runtime's marker, however unreadable it is; where start identities do
+    // not order process starts, nothing is provably foreign.
+    for pid in [910, 913] {
+        let selection = classify(&inspector, identity(pid, 50), &bounded);
+        if START_IDENTITY_ORDERS_PROCESS_STARTS {
+            assert!(matches!(selection, Ok(Selection::Foreign)));
+        } else {
+            assert!(matches!(
+                selection,
+                Ok(Selection::Skip(SkipReason::MarkersUnreadable))
+            ));
+        }
+    }
+    // A process started at or after the worker may still be a descendant
+    // whose markers happen to be unreadable.
+    assert!(matches!(
+        classify(&inspector, identity(911, 100), &bounded),
+        Ok(Selection::Skip(SkipReason::MarkersUnreadable))
+    ));
+    assert!(matches!(
+        classify(&inspector, identity(912, 200), &bounded),
+        Ok(Selection::Skip(SkipReason::MarkersUnreadable))
+    ));
+
+    // Without the worker start bound nothing is provably foreign.
+    let unbounded = request(RUNTIME);
+    assert!(matches!(
+        classify(&inspector, identity(910, 50), &unbounded),
+        Ok(Selection::Skip(SkipReason::MarkersUnreadable))
+    ));
+
+    // An unreadable process that exited between the marker read and the
+    // start read cannot survive the sweep.
+    let exited = ScriptedInspector::default()
+        .with_process(identity(914, 200), MarkerAnswer::Denied)
+        .with_identities(914, [None]);
+    assert!(matches!(
+        classify(&exited, identity(914, 200), &bounded),
+        Ok(Selection::Foreign)
+    ));
+}
+
+#[test]
 fn request_validation_rejects_invalid_parameters() {
     let valid =
         |runtime_id: &str| SweepRequest::new(runtime_id, OWNER, SCRIPTED_GRACE, SCRIPTED_POLL);

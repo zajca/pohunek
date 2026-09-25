@@ -6,7 +6,7 @@
 //! unscripted calls run real workers, which the session registry tests use to
 //! drive whole lifecycle transactions.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
@@ -100,6 +100,7 @@ pub(crate) struct ScriptedSupervisor {
     store: Option<PathBuf>,
     persisted_at_start: StdMutex<Vec<Option<String>>>,
     jobs: StdMutex<HashMap<ServiceId, JobScript>>,
+    retire_unavailable: StdMutex<HashSet<ServiceId>>,
     discovery_unavailable: std::sync::atomic::AtomicBool,
 }
 
@@ -136,6 +137,17 @@ impl ScriptedSupervisor {
     /// retiring it removes the script.
     pub(crate) fn script_job(&self, id: ServiceId, script: JobScript) {
         self.jobs.lock().expect("jobs").insert(id, script);
+    }
+
+    /// Makes the next `retire` of `id` fail as an unreachable manager.
+    ///
+    /// One-shot: a later retry of the same ID retires normally, so a test can
+    /// inject one transient supervisor failure and observe the follow-up.
+    pub(crate) fn script_retire_unavailable(&self, id: ServiceId) {
+        self.retire_unavailable
+            .lock()
+            .expect("retire script")
+            .insert(id);
     }
 
     /// Makes `discover` fail as an unreachable manager.
@@ -336,6 +348,14 @@ impl Supervisor for ScriptedSupervisor {
     fn retire<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, ()> {
         Box::pin(async move {
             self.record(Call::Retire(id.clone()));
+            if self
+                .retire_unavailable
+                .lock()
+                .expect("retire script")
+                .remove(id)
+            {
+                return Err(unavailable("retire"));
+            }
             let scripted = self.jobs.lock().expect("jobs").remove(id);
             if let Some(script) = scripted {
                 return match script {

@@ -767,7 +767,20 @@ impl SessionRegistry {
                     }
                     error
                 }
-                LaunchFailure::Unavailable(error) => error,
+                LaunchFailure::Unavailable(error) => {
+                    // The half-launched runtime could not be retired, so the
+                    // job may still be live; the preparing record stays
+                    // classified for reconciliation instead of being deleted
+                    // or killed.
+                    self.insert_unavailable_record(
+                        preparing_record,
+                        RuntimeState::Reconnecting,
+                        SUPERVISION_UNAVAILABLE,
+                    )
+                    .await;
+                    self.schedule_supervision_retry(&id);
+                    error
+                }
             });
         }
         match registration {

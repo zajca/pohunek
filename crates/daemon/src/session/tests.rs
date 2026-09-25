@@ -13270,6 +13270,213 @@ async fn unavailable_supervision_during_create_leaves_a_reconnecting_session() {
     );
 }
 
+/// Path of the real worker binary the subprocess launcher spawns.
+fn subprocess_worker_binary() -> PathBuf {
+    if let Some(binary) = std::env::var_os("POHUNEK_WORKER_BIN") {
+        return PathBuf::from(binary);
+    }
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("daemon crate is inside the workspace");
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| workspace.join("target"), |target| workspace.join(target));
+    let binary = target.join("debug/pohunek-sessiond");
+    assert!(
+        binary.is_file(),
+        "build the real worker first with `cargo build -p pohunek-session-worker --bin pohunek-sessiond`, or set POHUNEK_WORKER_BIN"
+    );
+    binary
+}
+
+/// Stop grace of the commit-failure fixture: longer than
+/// [`COMMIT_FAILURE_KILL_DELAY`], so the worker kill lands while the stop of
+/// the half-launched runtime is still in flight.
+const COMMIT_FAILURE_STOP_GRACE: Duration = Duration::from_secs(2);
+
+/// Delay between the worker journal naming its runtime and the worker kill
+/// in the commit-failure fixture. It exceeds the daemon's initialize,
+/// inspect, and failed-commit path (milliseconds) and stays inside the
+/// two-second stop grace, so the stop of the half-launched runtime is still
+/// awaiting the trapping child when its worker connection drops.
+const COMMIT_FAILURE_KILL_DELAY: Duration = Duration::from_millis(300);
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the combined commit, stop, and retire sabotage keeps its setup visible end to end"
+)]
+async fn failed_commit_stop_and_retire_keep_the_session_reconnecting() {
+    // Short, unique root: worker socket paths stay inside the `sun_path`
+    // bound, like the reconciliation subprocess fixtures.
+    let root = pohunek_test_support::temp_root().join(format!(
+        "cf-{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    fs::create_dir_all(&root).expect("create fixture root");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("secure fixture root");
+    let store_path = root.join("data/metadata.jsonl");
+    let data_dir = root.join("data");
+    let pid_file = root.join("child.pid");
+    let script = format!(
+        "echo $$ > {pid}; trap '' TERM HUP INT; while :; do sleep 1; done",
+        pid = pid_file.display(),
+    );
+    let environment = crate::runtime::SubprocessWorkerEnvironment {
+        runtime_home: root.join("r"),
+        state_home: root.join("s"),
+        data_home: root.join("d"),
+        config_home: root.join("c"),
+        cache_home: root.join("k"),
+        home: root.clone(),
+        daemon_socket: root.join("daemon.sock"),
+    };
+    let mut supervision = environment.supervision(subprocess_worker_binary());
+    supervision.sweep_grace = Duration::from_secs(5);
+    let launcher = crate::runtime::SubprocessWorkerLauncher::new();
+    let supervisor = Arc::new(crate::runtime::lifecycle::tests::ScriptedSupervisor::over(
+        launcher.clone(),
+    ));
+    let registry = SessionRegistry::new_with_launcher_and_inspector(
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c".to_owned(), script]),
+            store_path: Some(store_path.clone()),
+            worker_runtime_root: Some(root.join("r/pohunek/workers")),
+            worker_state_root: Some(root.join("s/pohunek/workers")),
+            worker_connect_deadline: Duration::from_secs(10),
+            supervision: Some(supervision),
+            stop_grace: COMMIT_FAILURE_STOP_GRACE,
+            ..SessionRegistryConfig::default()
+        },
+        Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
+        Arc::new(crate::procwatch::HostInspector::new()),
+    );
+
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    supervisor.hold_start(gate.clone());
+
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.create(params()).await }
+    });
+    gate.entered.notified().await;
+
+    // The preparing record is durable, so the session and job identities are
+    // fixed and every follow-up can be sabotaged by name.
+    let record = {
+        let records = crate::store::Store::new(store_path.clone())
+            .load_sessions()
+            .expect("load preparing record");
+        let [record] = records.as_slice() else {
+            panic!("one preparing record: {records:?}");
+        };
+        record.clone()
+    };
+    let session_id = SessionId(record.session_id.clone());
+    let service_id = pohunek_platform::supervisor::ServiceId::parse(
+        record
+            .runtime
+            .service_id
+            .clone()
+            .expect("the preparing record names its job"),
+    )
+    .expect("service id");
+    // The final commit of the registration must fail...
+    fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o500))
+        .expect("read-only store directory");
+    // ... the best-effort stop must hit a dying worker, and the retire must
+    // be answered by an unavailable manager.
+    supervisor.script_retire_unavailable(service_id.clone());
+    let kill = tokio::spawn({
+        let launcher = launcher.clone();
+        let journal_dir = root.join("s/pohunek/workers").join(session_id.0.clone());
+        let session = session_id.0.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let initialized = std::fs::read_dir(&journal_dir)
+                    .ok()
+                    .and_then(|entries| {
+                        entries.flatten().find_map(|entry| {
+                            let journal: Option<serde_json::Value> =
+                                std::fs::read_to_string(entry.path())
+                                    .ok()
+                                    .and_then(|text| serde_json::from_str(&text).ok());
+                            let named = journal
+                                .as_ref()
+                                .and_then(|journal| journal.get("runtime_id"))
+                                .is_some_and(serde_json::Value::is_string);
+                            named.then_some(())
+                        })
+                    })
+                    .is_some();
+                if initialized {
+                    tokio::time::sleep(COMMIT_FAILURE_KILL_DELAY).await;
+                    let _ = launcher.kill_worker(&session).await;
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the worker never journaled its runtime"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    });
+    gate.release.notify_one();
+
+    let error = tokio::time::timeout(Duration::from_secs(20), creating)
+        .await
+        .expect("create finishes")
+        .expect("create task joins")
+        .expect_err("the registration cannot commit");
+    kill.await.expect("kill task");
+
+    assert_eq!(
+        error.code,
+        crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE
+    );
+    assert_eq!(
+        supervisor.retired(),
+        vec![service_id],
+        "the retire was attempted and refused"
+    );
+    let pending = registry
+        .inner
+        .supervision_retries
+        .state
+        .lock()
+        .expect("supervision retry state is never poisoned")
+        .pending
+        .clone();
+    assert!(
+        pending.contains(&session_id.0),
+        "an unproven retire schedules a supervision retry: {pending:?}"
+    );
+    // The store refuses non-private directories, so the fixture restores the
+    // mode before reading back the record the branch kept.
+    fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700))
+        .expect("restore store directory");
+    assert_eq!(
+        stored_record(&store_path, &session_id).runtime.generation,
+        record.runtime.generation,
+        "the preparing record is kept for reconciliation, not deleted"
+    );
+
+    // The worker was killed, so its trapping child is an orphan now.
+    if let Ok(pid) = fs::read_to_string(&pid_file) {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", pid.trim()])
+            .status();
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
 async fn terminal_resumable_session(registry: &SessionRegistry) -> SessionInfo {
     let created = registry
         .create(resumable_params())

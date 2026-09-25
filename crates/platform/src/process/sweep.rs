@@ -16,7 +16,7 @@ use std::time::Duration;
 use rustix::process::{Pid as NativePid, Signal};
 use tokio::time::Instant;
 
-use super::{Error, ProcessIdentity, ProcessInspector};
+use super::{Error, ProcessIdentity, ProcessInspector, StartIdentity};
 
 /// Largest accepted runtime ID, in bytes.
 ///
@@ -38,6 +38,9 @@ pub struct SweepRequest {
     owner_uid: u32,
     grace: Duration,
     poll: Duration,
+    /// Start identity of the worker process instance that owned the runtime,
+    /// when the caller knows it; see [`Self::with_worker_start_identity`].
+    worker_start_identity: Option<StartIdentity>,
 }
 
 impl SweepRequest {
@@ -75,7 +78,24 @@ impl SweepRequest {
             owner_uid,
             grace,
             poll,
+            worker_start_identity: None,
         })
+    }
+
+    /// Names the exact worker process instance that owned the runtime.
+    ///
+    /// The daemon takes this from the dead worker's journal. With the bound,
+    /// a same-user process whose markers cannot be read is still provably not
+    /// a descendant of the worker when its own start identity strictly
+    /// precedes the worker's. Without the bound, every unreadable-marker
+    /// process stays skipped and the sweep is reported unconfirmed.
+    #[must_use]
+    pub fn with_worker_start_identity(
+        mut self,
+        worker_start_identity: Option<StartIdentity>,
+    ) -> Self {
+        self.worker_start_identity = worker_start_identity;
+        self
     }
 
     /// Returns the exact runtime ID whose processes are swept.
@@ -100,6 +120,12 @@ impl SweepRequest {
     #[must_use]
     pub const fn poll(&self) -> Duration {
         self.poll
+    }
+
+    /// Returns the worker start identity bound, when the caller knows it.
+    #[must_use]
+    pub const fn worker_start_identity(&self) -> Option<StartIdentity> {
+        self.worker_start_identity
     }
 }
 
@@ -381,7 +407,7 @@ fn select_targets(
     let mut targets = Vec::new();
     for fact in inspector.same_user_processes()? {
         let identity = fact.identity();
-        match classify(inspector, identity, request.runtime_id())? {
+        match classify(inspector, identity, request)? {
             Selection::Target if identity.pid == own_pid => {
                 skip(report, identity, SkipReason::CurrentProcess);
             }
@@ -401,7 +427,7 @@ fn select_targets(
 fn classify(
     inspector: &dyn ProcessInspector,
     identity: ProcessIdentity,
-    runtime_id: &str,
+    request: &SweepRequest,
 ) -> Result<Selection, Error> {
     let markers = match inspector.ownership_markers(identity.pid) {
         Ok(markers) => markers,
@@ -411,11 +437,11 @@ fn classify(
         // non-dumpable agents) or be between images; without the marker they
         // are never signalled, and the rest of the table is still classified.
         Err(Error::PermissionDenied { .. } | Error::Unobservable { .. }) => {
-            return Ok(Selection::Skip(SkipReason::MarkersUnreadable));
+            return Ok(classify_unreadable_markers(inspector, identity, request));
         }
         Err(error) => return Err(error),
     };
-    if markers.runtime_id.as_deref() != Some(runtime_id) {
+    if markers.runtime_id.as_deref() != Some(request.runtime_id()) {
         return Ok(Selection::Foreign);
     }
     Ok(match verify(inspector, identity)? {
@@ -423,6 +449,53 @@ fn classify(
         Some(Delivery::IdentityChanged) => Selection::Skip(SkipReason::IdentityChanged),
         Some(Delivery::Vanished | Delivery::Sent) => Selection::Skip(SkipReason::Vanished),
     })
+}
+
+/// Whether comparing two [`StartIdentity`] values orders their processes' starts.
+///
+/// Linux start identities are `/proc/<pid>/stat` start times in clock ticks
+/// since boot, a monotonic clock. Darwin encodes the wall-clock start time,
+/// which can step backwards, so a descendant could compare older than its
+/// worker; there the ordering proves nothing.
+pub(super) const START_IDENTITY_ORDERS_PROCESS_STARTS: bool = cfg!(target_os = "linux");
+
+/// Classifies a process whose ownership markers could not be read.
+///
+/// A process inherits its environment only when it is forked or execs, and
+/// only the worker and its descendants ever carry this runtime's marker, so
+/// a process carrying the marker must have started at or after the worker
+/// that owns the runtime. A process whose start identity strictly precedes
+/// the journaled worker's start identity therefore cannot be a descendant of
+/// that worker, however unreadable its current markers are. The bound is the
+/// worker's start identity, which identifies the exact process instance, so
+/// a PID that was reused after the worker compares by its own, later start
+/// time and is never dismissed by the bound. Without a bound, when the
+/// process exited between the two reads, or when its start identity cannot
+/// be read either, the process is not provably foreign: it stays skipped
+/// unreadable, which makes the caller's cleanup unconfirmed. The same holds
+/// on a platform whose start identities are not ordered by a monotonic clock
+/// (see [`START_IDENTITY_ORDERS_PROCESS_STARTS`]).
+fn classify_unreadable_markers(
+    inspector: &dyn ProcessInspector,
+    identity: ProcessIdentity,
+    request: &SweepRequest,
+) -> Selection {
+    let Some(worker_start) = request.worker_start_identity() else {
+        return Selection::Skip(SkipReason::MarkersUnreadable);
+    };
+    match inspector.identity(identity.pid) {
+        // The process exited between the marker read and this read, so it
+        // cannot survive the sweep.
+        Ok(None) => Selection::Foreign,
+        Ok(Some(current))
+            if START_IDENTITY_ORDERS_PROCESS_STARTS && current.start_identity < worker_start =>
+        {
+            Selection::Foreign
+        }
+        // A process started at or after the worker, or one whose start read
+        // failed, proves nothing: it stays skipped unreadable.
+        _ => Selection::Skip(SkipReason::MarkersUnreadable),
+    }
 }
 
 /// Rechecks that `identity` still names a live process record.
