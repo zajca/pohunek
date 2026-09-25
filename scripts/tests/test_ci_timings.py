@@ -5,6 +5,7 @@ import contextlib
 import io
 import importlib.machinery
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -1477,3 +1478,289 @@ class SnapshotTests(unittest.TestCase):
             path.write_text('{"runs": []}')
             with self.assertRaisesRegex(ValueError, "JSON list"):
                 ci_timings.read_snapshot(path)
+
+
+class RunnerMinuteTests(unittest.TestCase):
+    def test_runner_minutes_rounds_each_job_up(self):
+        # GitHub bills each job up to a whole minute: 59 s and 60 s bill
+        # 1, 61 s bills 2, and the total sums per job -- it is never the
+        # ceil of the summed wall clock.
+        self.assertEqual(ci_timings.runner_minutes({}), 0)
+        for seconds, billed in ((59.0, 1), (60.0, 1), (61.0, 2)):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(ci_timings.runner_minutes({"j": seconds}), billed)
+        self.assertEqual(
+            ci_timings.runner_minutes({"a": 59.0, "b": 60.0}), 2
+        )
+        self.assertEqual(ci_timings.runner_minutes({"a": 199.0, "b": 226.0}), 8)
+
+    def test_summary_carries_the_per_run_total(self):
+        self.assertEqual(_summary()["runner_minutes"], 8)
+        # A skipped job contributes neither duration nor runner minutes.
+        self.assertEqual(
+            ci_timings.summarize_run({
+                "databaseId": 30, "createdAt": "2026-09-20T10:00:00Z",
+                "startedAt": "2026-09-20T10:00:00Z",
+                "updatedAt": "2026-09-20T10:01:00Z",
+                "jobs": [{"name": "cargo-udeps", "startedAt": None,
+                          "completedAt": None, "conclusion": "skipped"}],
+            })["runner_minutes"], 0
+        )
+
+    def test_window_summary_medians_and_sums_runner_minutes(self):
+        runs = [
+            _summary(databaseId=i, jobs=[{
+                "name": "fmt + clippy",
+                "startedAt": "2026-09-20T10:00:00Z",
+                "completedAt": f"2026-09-20T10:{minutes:02d}Z",
+                "conclusion": "success",
+            }])
+            for i, minutes in enumerate((1, 2, 4), start=1)
+        ]
+        summary = ci_timings.window_summary(runs)
+        self.assertEqual(summary["runner_minutes"], 2.0)
+        self.assertEqual(summary["runner_minutes_total"], 7)
+
+    def test_window_summary_without_runs_has_no_runner_minutes(self):
+        summary = ci_timings.window_summary([])
+        self.assertIsNone(summary["runner_minutes"])
+        self.assertEqual(summary["runner_minutes_total"], 0)
+
+    def test_render_runs_markdown_prints_runner_minutes(self):
+        rendered = ci_timings.render_runs_markdown([_summary()])
+        self.assertIn("Runner min", rendered)
+        self.assertIn("| 1 | 2026-09-20 | pull_request | topic | success | "
+                      "9m30s | 8 |", rendered)
+        self.assertIn("runner minutes p50 8 min, summed 8 min", rendered)
+
+
+class StepTimingTests(unittest.TestCase):
+    def _document(self):
+        """A `gh run view` document with counted and skipped steps."""
+        return {
+            "jobs": [
+                {
+                    "name": "tests (unit, fast)",
+                    "conclusion": "success",
+                    "steps": [
+                        {"name": "Install cargo-nextest", "number": 2,
+                         "startedAt": "2026-09-20T10:00:00Z",
+                         "completedAt": "2026-09-20T10:00:10Z",
+                         "conclusion": "success"},
+                        {"name": "Run fast shard", "number": 3,
+                         "startedAt": "2026-09-20T10:01:00Z",
+                         "completedAt": "2026-09-20T10:04:00Z",
+                         "conclusion": "success"},
+                        # A conditionally skipped step carries timestamps
+                        # but never ran.
+                        {"name": "Upload artifact", "number": 4,
+                         "startedAt": "2026-09-20T10:04:00Z",
+                         "completedAt": "2026-09-20T10:04:30Z",
+                         "conclusion": "skipped"},
+                        # The Go zero start is a half-finished step.
+                        {"name": "Wait for shards", "number": 5,
+                         "startedAt": "0001-01-01T00:00:00Z",
+                         "completedAt": "2026-09-20T10:04:30Z",
+                         "conclusion": "success"},
+                    ],
+                },
+                # A skipped job contributes nothing, even with steps.
+                {"name": "platform contracts (arm64)", "conclusion": "skipped",
+                 "steps": [{"name": "Build", "number": 1,
+                            "startedAt": "2026-09-20T10:00:00Z",
+                            "completedAt": "2026-09-20T10:01:00Z"}]},
+            ]
+        }
+
+    def test_step_durations_counts_only_measured_steps(self):
+        durations = ci_timings.step_durations(self._document())
+        self.assertEqual(
+            sorted(durations["tests (unit, fast)"]),
+            ["Install cargo-nextest", "Run fast shard"],
+        )
+        self.assertEqual(durations["tests (unit, fast)"]["Run fast shard"], 180.0)
+        # A skipped job counts nothing: it appears with no steps at all,
+        # like job_seconds drops it entirely.
+        self.assertEqual(
+            ci_timings.step_durations({"jobs": [self._document()["jobs"][1]]}),
+            {},
+        )
+
+    def test_step_durations_keeps_two_steps_sharing_a_name(self):
+        document = {"jobs": [{
+            "name": "tests (unit, fast)", "conclusion": "success",
+            "steps": [
+                {"name": "Run", "number": 1,
+                 "startedAt": "2026-09-20T10:00:00Z",
+                 "completedAt": "2026-09-20T10:00:30Z",
+                 "conclusion": "success"},
+                {"name": "Run", "number": 2,
+                 "startedAt": "2026-09-20T10:00:30Z",
+                 "completedAt": "2026-09-20T10:01:00Z",
+                 "conclusion": "success"},
+            ],
+        }]}
+        durations = ci_timings.step_durations(document)
+        self.assertEqual(
+            sorted(durations["tests (unit, fast)"]),
+            ["Run", "Run (#2)"],
+        )
+        self.assertEqual(durations["tests (unit, fast)"]["Run"], 30.0)
+        self.assertEqual(durations["tests (unit, fast)"]["Run (#2)"], 30.0)
+
+    def _runs_with_steps(self):
+        first = self._document()
+        second = {
+            "jobs": [{
+                "name": "tests (unit, fast)", "conclusion": "success",
+                "steps": [
+                    {"name": "Install cargo-nextest", "number": 2,
+                     "startedAt": "2026-09-20T11:00:00Z",
+                     "completedAt": "2026-09-20T11:00:20Z",
+                     "conclusion": "success"},
+                    {"name": "Run fast shard", "number": 3,
+                     "startedAt": "2026-09-20T11:01:00Z",
+                     "completedAt": "2026-09-20T11:05:00Z",
+                     "conclusion": "success"},
+                ],
+            }]
+        }
+        return [
+            ci_timings.summarize_run(
+                dict(first, databaseId=41,
+                     createdAt="2026-09-20T10:00:00Z",
+                     startedAt="2026-09-20T10:00:00Z",
+                     updatedAt="2026-09-20T10:10:00Z",
+                     headBranch="topic", event="pull_request",
+                     conclusion="success", displayTitle="CI"),
+                with_steps=True,
+            ),
+            ci_timings.summarize_run(
+                dict(second, databaseId=42, createdAt="2026-09-20T11:00:00Z",
+                     startedAt="2026-09-20T11:00:00Z",
+                     updatedAt="2026-09-20T11:11:00Z",
+                     headBranch="topic", event="pull_request",
+                     conclusion="success", displayTitle="CI"),
+                with_steps=True,
+            ),
+        ]
+
+    def test_step_summary_aggregates_with_p50_p90(self):
+        step = ci_timings.step_summary(
+            self._runs_with_steps()
+        )["tests (unit, fast)"]["Run fast shard"]
+        # Nearest-rank p90 over two samples: the later value.
+        self.assertEqual((step["p50"], step["p90"]), (210.0, 240.0))
+        self.assertEqual(step["runs"], 2)
+
+    def test_step_summary_filters_by_job(self):
+        summary = ci_timings.step_summary(self._runs_with_steps(), jobs=[])
+        self.assertIn("tests (unit, fast)", summary)
+        # No requested job matches: nothing is aggregated.
+        self.assertEqual(
+            ci_timings.step_summary(self._runs_with_steps(),
+                                    jobs=["no-such-job"]),
+            {},
+        )
+
+    def test_render_steps_markdown(self):
+        rendered = ci_timings.render_steps_markdown(
+            2, ci_timings.step_summary(self._runs_with_steps())
+        )
+        self.assertIn(f"Steps over {2} run(s)", rendered)
+        self.assertIn("| Job | Step | p50 | p90 | Runs |", rendered)
+        self.assertIn("| tests (unit, fast) | Run fast shard | 3m30s | "
+                      "4m00s | 2 |", rendered)
+
+    def test_steps_command_renders_an_input_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory) / "ci-runs.json"
+            ci_timings.write_snapshot(
+                snapshot,
+                [dict(
+                    self._document(),
+                    databaseId=51, attempt=1, conclusion="success",
+                    createdAt="2026-09-20T10:00:00Z",
+                    startedAt="2026-09-20T10:00:00Z",
+                    updatedAt="2026-09-20T10:10:00Z",
+                    headBranch="topic", event="pull_request",
+                    displayTitle="CI", workflowName="CI",
+                )],
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = ci_timings.main(
+                    ["steps", "--input", str(snapshot), "--json"]
+                )
+            self.assertEqual(code, 0)
+            payload = json.loads(stdout.getvalue())
+            step = payload["summary"]["tests (unit, fast)"]["Run fast shard"]
+            self.assertEqual(step["p50"], 180.0)
+            rendered = io.StringIO()
+            with contextlib.redirect_stdout(rendered):
+                code = ci_timings.main(["steps", "--input", str(snapshot)])
+            self.assertEqual(code, 0)
+        self.assertIn(
+            "| tests (unit, fast) | Run fast shard | 3m00s | 3m00s | 1 |",
+            rendered.getvalue(),
+        )
+
+    def test_build_parser_understands_steps_selection(self):
+        argument = ci_timings.build_parser().parse_args(
+            ["steps", "--input", "x.json", "--job", "a", "--job", "b",
+             "--branch", "main", "--event", "push", "--limit", "3",
+             "--window", "2026-09-14..2026-09-16"]
+        )
+        self.assertEqual(argument.job, ["a", "b"])
+        self.assertEqual(argument.branch, "main")
+        self.assertEqual(argument.event, "push")
+        self.assertEqual(argument.limit, 3)
+        self.assertEqual(argument.window, "2026-09-14..2026-09-16")
+        # argparse reports the missing subcommand on stderr before exiting.
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            ci_timings.build_parser().parse_args([])
+
+
+class CompareRunnerMinuteTests(unittest.TestCase):
+    def test_render_compare_markdown_reports_runner_minutes(self):
+        baseline = ci_timings.window_summary([_summary()])
+        current = ci_timings.window_summary([
+            _summary(databaseId=13, jobs=[{
+                "name": "fmt + clippy",
+                "startedAt": "2026-09-20T10:00:00Z",
+                "completedAt": "2026-09-20T10:01:30Z",
+                "conclusion": "success",
+            }])
+        ])
+        rendered = ci_timings.render_compare_markdown(
+            baseline, current, ci_timings.compare_windows(baseline, current)
+        )
+        # 90 s bills 2 minutes after; 199 s and 226 s bill 4 + 4 before.
+        self.assertIn(
+            "| **runner minutes (median)** | **8 min** | **2 min** | "
+            "**-6 min** | **-75 %** | **1/1** |",
+            rendered,
+        )
+        self.assertIn(
+            "| **runner minutes (total)** | **8 min** | **2 min** | "
+            "**-6 min** | **-75 %** | **1/1** |",
+            rendered,
+        )
+
+    def test_render_compare_markdown_tolerates_missing_runner_fields(self):
+        baseline = {"runs": 2, "wall_seconds": 584.0, "wall_p90": 697.0,
+                    "jobs": {}}
+        rendered = ci_timings.render_compare_markdown(
+            baseline, dict(baseline), []
+        )
+        self.assertIn(
+            "| **runner minutes (median)** | **n/a** | **n/a** | **n/a** | "
+            "**n/a** | **2/2** |",
+            rendered,
+        )
+        self.assertIn(
+            "| **runner minutes (total)** | **n/a** | **n/a** | **n/a** | "
+            "**n/a** | **2/2** |",
+            rendered,
+        )
+
