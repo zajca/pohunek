@@ -1,6 +1,6 @@
 //! Typed failures of `pohunek service`.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-26
 
 use std::io;
 use std::path::PathBuf;
@@ -160,6 +160,29 @@ pub enum Error {
         step: &'static str,
     },
 
+    /// An install failed after asking the service manager to register its daemon.
+    ///
+    /// The registration call can fail after the job was really registered (a
+    /// D-Bus or `launchctl` timeout), and a registered daemon may already own
+    /// live sessions. The install is therefore kept pending instead of rolled
+    /// back: only a resume with the same version and prefix, or the
+    /// session-checked uninstall, may decide what happens to that daemon.
+    #[error(
+        "{original}; the install of version {version} under {} is kept pending at step {step} \
+         because its daemon job may already be registered",
+        prefix.display()
+    )]
+    InstallIncomplete {
+        /// The failure that stopped the install.
+        original: Box<Error>,
+        /// The version the pending install targets.
+        version: String,
+        /// The prefix the pending install targets.
+        prefix: PathBuf,
+        /// The last journaled step of the pending install.
+        step: &'static str,
+    },
+
     /// A daemon job of this namespace exists without an installation record.
     #[error("daemon job {id} is registered, but no service.toml describes it")]
     DaemonJobPresent {
@@ -300,6 +323,7 @@ impl Error {
             Self::AlreadyInstalled { .. } => "service_already_installed",
             Self::NotInstalled { .. } => "service_not_installed",
             Self::PendingInstall { .. } => "service_install_pending",
+            Self::InstallIncomplete { .. } => "service_install_incomplete",
             Self::DaemonJobPresent { .. } => "service_daemon_job_present",
             Self::Supervisor { .. } => "service_supervisor_failed",
             Self::VerifierMissing => "service_verifier_missing",
@@ -328,6 +352,9 @@ impl Error {
             Self::NotInstalled { .. } => Some("run `pohunek service install` first"),
             Self::PendingInstall { .. } => Some(
                 "rerun `pohunek service install` (or packaging/install-daemon.sh) with the same version and prefix to finish it, or `pohunek service uninstall` to remove it",
+            ),
+            Self::InstallIncomplete { .. } => Some(
+                "rerun `pohunek service install` (or packaging/install-daemon.sh) with the same version and prefix to finish it, or run `pohunek service uninstall`, which checks for live sessions before removing it",
             ),
             Self::DaemonJobPresent { .. } => Some(
                 "remove the stale daemon job with the service manager, then install again",

@@ -115,7 +115,15 @@ and child PID remain unchanged. Version directories that a live worker journal,
 a registered worker job (even one that has not started its process yet), or a
 running process still references are kept; the others are removed and listed
 in the upgrade report. When worker jobs cannot be discovered, every version is
-kept. After health returns:
+kept. The installer counts the daemon as ready only when `daemon.health`
+reports the new version on a connection whose kernel peer credentials name the
+daemon job's running main process, as the service manager reports it. A
+manually started daemon of the same build that holds the socket while the
+supervised job crash-loops therefore never makes the step ready: the command
+keeps polling and then fails with `service_daemon_not_ready`, whose detail names
+both processes (`daemon socket is served by pid X; the supervised job runs pid
+Y`, or `has no process`). Stop the stray daemon and rerun the command. After
+health returns:
 
 1. Compare `pohunek service status --json` before and after the upgrade for an
    important live session: its `workers` entry keeps the same `generation` and
@@ -143,7 +151,15 @@ with another version or prefix, fails with `service_install_pending` and
 changes nothing, and `pohunek service uninstall` removes it through the full
 session-checked uninstall instead (`--stop-sessions` stops the live sessions).
 Rerun `pohunek service install` (or `packaging/install-daemon.sh`) to finish
-it: the same version and prefix resume. `packaging/install-daemon.sh` asks
+it: the same version and prefix resume. The same rule covers an install whose
+step fails at or after `registering` without an interruption: a service-manager
+call can time out after it really registered the daemon job, and that daemon
+may already own live sessions, so the install keeps its record, daemon job, and
+`service.toml` and fails with `service_install_incomplete` instead of rolling
+back. Rerun `pohunek service install` with the same version and prefix to
+finish it, or run `pohunek service uninstall` to remove it after its session
+check. An upgrade that fails before `ready` still rolls back to the previous
+version. `packaging/install-daemon.sh` asks
 `pohunek service status --json` first and runs `service install` whenever the
 pending transaction is an install, `service upgrade` otherwise when
 `service.toml` exists, and `service install` on a fresh host; a failing status

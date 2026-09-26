@@ -268,9 +268,10 @@ already installed and no interrupted install is pending), which:
   `pohunek-<ns>-daemon.service` and slice `pohunek-<ns>-sessions.slice` on Linux
   (systemd 255 or newer), or the launchd agent
   `~/Library/LaunchAgents/io.github.zajca.pohunek.<ns>.daemon.plist` on macOS;
-- waits until the daemon answers, and journals every step in
-  `~/.local/state/pohunek/service-install.json` so an interrupted run resumes or
-  rolls back.
+- waits until the daemon job's own process answers on the socket, and journals
+  every step in `~/.local/state/pohunek/service-install.json` so an interrupted
+  run resumes or rolls back (an install that fails from the registration step on
+  is kept pending for a rerun or `pohunek service uninstall` instead).
 
 The daemon starts each session worker as its own native job per worker
 generation (a systemd transient unit, or a launchd job whose definition stays in

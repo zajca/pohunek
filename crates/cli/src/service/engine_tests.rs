@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use pohunek_client::ClientError;
+use pohunek_platform::process::{ProcessIdentity, StartIdentity};
 use pohunek_platform::supervisor::{DaemonSupervisor, Operation as Pending, ServiceId, Supervisor};
 use pohunek_session_worker::RuntimePhase;
 use protocol::{
@@ -18,7 +19,7 @@ use protocol::{
 };
 
 use super::*;
-use crate::service::backend::{Call, Control};
+use crate::service::backend::{Call, Control, Health};
 use crate::service::context::tests::{context, temp_root};
 use crate::service::layout::tests::stage_dir;
 use crate::service::layout::CLI_NAME;
@@ -27,6 +28,10 @@ use crate::service::usage::tests::{write_journal, write_live_journal, SESSION};
 const V1: &str = "1.0.0";
 const V2: &str = "2.0.0";
 const GENERATION: &str = "abcd2345";
+/// Main process of the fake supervised daemon job while it runs.
+const DAEMON_PID: Pid = 4_242;
+/// A process of the same build that is not the supervised daemon job.
+const FOREIGN_PID: Pid = 7_777;
 
 /// Every step after which a transaction can be interrupted.
 const STEPS: [Step; 7] = [
@@ -39,11 +44,28 @@ const STEPS: [Step; 7] = [
     Step::Cli,
 ];
 
+/// How the fake service manager answers a daemon registration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Registration {
+    /// The job is registered and the call succeeds.
+    #[default]
+    Succeeds,
+    /// The call fails and registers nothing.
+    Fails,
+    /// The job is registered but the call reports failure, like a D-Bus or
+    /// `launchctl` timeout after the service manager accepted the job.
+    FailsAfterRegistering,
+}
+
 #[derive(Debug, Default)]
 struct World {
     registered: Option<JobDefinition>,
     running: bool,
-    fail_install: bool,
+    registration: Registration,
+    /// Process serving the socket instead of the supervised job's process.
+    socket_pid: Option<Pid>,
+    /// The running job reports no main process.
+    processless: bool,
     fail_discover: bool,
     silent_version: Option<String>,
     installs: usize,
@@ -95,7 +117,7 @@ impl DaemonSupervisor for Fake {
         Box::pin(async move {
             let mut world = self.world();
             world.installs += 1;
-            if world.fail_install {
+            if world.registration == Registration::Fails {
                 return Err(supervisor::Error::Operation {
                     operation: "install",
                     source: "injected failure".into(),
@@ -106,6 +128,12 @@ impl DaemonSupervisor for Fake {
             }
             world.registered = Some(definition.clone());
             world.running = true;
+            if world.registration == Registration::FailsAfterRegistering {
+                return Err(supervisor::Error::Operation {
+                    operation: "install",
+                    source: "injected timeout after registration".into(),
+                });
+            }
             Ok(())
         })
     }
@@ -136,7 +164,10 @@ impl DaemonSupervisor for Fake {
                 } else {
                     ServiceState::Stopped
                 },
-                process: None,
+                process: (world.running && !world.processless).then_some(ProcessIdentity {
+                    pid: DAEMON_PID,
+                    start_identity: StartIdentity::new(1),
+                }),
                 definition: Some(definition.facts()),
             })
         })
@@ -222,20 +253,27 @@ impl Supervisor for Fake {
 }
 
 impl Control for Fake {
-    fn health(&self) -> Call<'_, DaemonHealthResult> {
+    fn health(&self) -> Call<'_, Health> {
         Box::pin(async move {
-            let (running, silent) = {
+            let (running, silent, socket_pid) = {
                 let world = self.world();
-                (world.running, world.silent_version.clone())
+                (
+                    world.running,
+                    world.silent_version.clone(),
+                    world.socket_pid,
+                )
             };
             match self
                 .daemon_version()
                 .filter(|version| running && silent.as_ref() != Some(version))
             {
-                Some(version) => Ok(DaemonHealthResult {
-                    status: "ok".to_owned(),
-                    daemon_version: version,
-                    protocol_version: protocol::PROTOCOL_VERSION,
+                Some(version) => Ok(Health {
+                    result: DaemonHealthResult {
+                        status: "ok".to_owned(),
+                        daemon_version: version,
+                        protocol_version: protocol::PROTOCOL_VERSION,
+                    },
+                    pid: socket_pid.unwrap_or(DAEMON_PID),
                 }),
                 None => Err(unreachable()),
             }
@@ -697,13 +735,234 @@ async fn an_upgrade_interrupted_after_every_step_resumes_or_rolls_back() {
     }
 }
 
+/// Asserts that `error` keeps a pending install of `V1` at `step`.
+fn assert_incomplete(harness: &Harness, error: &Error, step: Step) {
+    let Error::InstallIncomplete {
+        version,
+        prefix,
+        step: at,
+        ..
+    } = error
+    else {
+        panic!("unexpected error {error:?}");
+    };
+    assert_eq!(version, V1);
+    assert_eq!(prefix, &harness.prefix());
+    assert_eq!(*at, step.as_str());
+    assert_eq!(error.code(), "service_install_incomplete");
+    let hint = error.hint().expect("hint");
+    assert!(hint.contains("pohunek service install"), "{hint}");
+    assert!(hint.contains("pohunek service uninstall"), "{hint}");
+    assert_eq!(
+        harness.pending().expect("record kept").step,
+        step,
+        "the record stays for a resume or an uninstall"
+    );
+    assert_eq!(
+        harness
+            .config()
+            .expect("service.toml kept")
+            .active_version(),
+        V1
+    );
+}
+
 #[tokio::test]
-async fn a_failed_registration_rolls_everything_back() {
+async fn a_failed_registration_keeps_the_install_pending_until_uninstall() {
     let harness = Harness::new();
-    harness.fake.world().fail_install = true;
+    harness.fake.world().registration = Registration::Fails;
     let error = harness.install(V1).await.expect_err("injected failure");
-    assert!(matches!(error, Error::Supervisor { .. }), "{error:?}");
+    assert_incomplete(&harness, &error, Step::Registering);
+    let Error::InstallIncomplete { original, .. } = &error else {
+        unreachable!("checked above");
+    };
+    assert!(
+        matches!(**original, Error::Supervisor { .. }),
+        "{original:?}"
+    );
+    assert!(harness.fake.world().registered.is_none());
+
+    harness.fake.world().registration = Registration::Succeeds;
+    let report = harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect("uninstall");
+    assert_eq!(report.rolled_back, None);
     harness.assert_clean();
+}
+
+#[tokio::test]
+async fn a_registration_that_fails_after_registering_keeps_the_live_daemon_for_uninstall() {
+    let harness = Harness::new();
+    harness.fake.world().registration = Registration::FailsAfterRegistering;
+    harness.fake.seed(
+        vec![session(SESSION, Some("review"))],
+        vec![worker(worker_id(SESSION), ServiceState::Running)],
+    );
+    let error = harness.install(V1).await.expect_err("ambiguous failure");
+    harness.fake.world().registration = Registration::Succeeds;
+    assert_incomplete(&harness, &error, Step::Registering);
+    // Nothing was rolled back: the job the call really registered still runs
+    // with its live session.
+    assert_eq!(harness.fake.daemon_version().as_deref(), Some(V1));
+    assert!(harness.fake.world().running);
+    assert_eq!(
+        harness.fake.world().sessions[0].state,
+        SessionState::Running
+    );
+    assert!(!harness.layout().bin_dir().join(CLI_NAME).exists());
+
+    let error = harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect_err("refused");
+    assert!(matches!(error, Error::LiveSessions { .. }), "{error:?}");
+    assert_eq!(harness.fake.daemon_version().as_deref(), Some(V1));
+    assert!(harness.fake.world().running);
+    assert!(
+        harness.config().is_some(),
+        "service.toml survives the refusal"
+    );
+    assert_eq!(
+        harness.pending().expect("record stays pending").step,
+        Step::Registering
+    );
+
+    let report = harness
+        .engine()
+        .uninstall(UninstallOptions {
+            stop_sessions: true,
+            purge: false,
+        })
+        .await
+        .expect("uninstall with --stop-sessions");
+    assert_eq!(report.stopped_sessions, [SESSION]);
+    harness.assert_clean();
+}
+
+#[tokio::test]
+async fn a_registration_that_fails_after_registering_is_finished_by_rerunning_install() {
+    let harness = Harness::new();
+    harness.fake.world().registration = Registration::FailsAfterRegistering;
+    let error = harness.install(V1).await.expect_err("ambiguous failure");
+    harness.fake.world().registration = Registration::Succeeds;
+    assert_incomplete(&harness, &error, Step::Registering);
+
+    let report = harness.install(V1).await.expect("resume");
+    assert!(report.resumed);
+    assert_eq!(report.rolled_back, None);
+    harness.assert_installed(V1);
+    assert_eq!(
+        harness.fake.world().installs,
+        1,
+        "the resume replaces the registered job instead of installing twice"
+    );
+}
+
+#[tokio::test]
+async fn a_pending_install_past_registration_is_never_rolled_back() {
+    let harness = Harness::new();
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+    let record = harness.pending().expect("record");
+
+    let error = harness
+        .engine()
+        .rollback(&record)
+        .await
+        .expect_err("invariant");
+    assert!(matches!(error, Error::Record { .. }), "{error:?}");
+    assert_eq!(harness.fake.daemon_version().as_deref(), Some(V1));
+    assert!(harness.fake.world().running);
+    assert!(harness.config().is_some());
+}
+
+#[tokio::test]
+async fn readiness_requires_the_supervised_job_to_serve_the_socket() {
+    for (processless, expected) in [
+        (
+            false,
+            format!(
+                "daemon socket is served by pid {FOREIGN_PID}; the supervised job runs pid {DAEMON_PID}"
+            ),
+        ),
+        (
+            true,
+            format!("daemon socket is served by pid {FOREIGN_PID}; the supervised job has no process"),
+        ),
+    ] {
+        let harness = Harness::new();
+        {
+            let mut world = harness.fake.world();
+            world.socket_pid = Some(FOREIGN_PID);
+            world.processless = processless;
+        };
+        let error = harness.install(V1).await.expect_err("not ready");
+        assert_incomplete(&harness, &error, Step::Registered);
+        let Error::InstallIncomplete { original, .. } = &error else {
+            unreachable!("checked above");
+        };
+        let Error::DaemonNotReady { version, last, .. } = &**original else {
+            panic!("unexpected error {original:?}");
+        };
+        assert_eq!(version, V1);
+        let last = last.as_deref().expect("last observation");
+        assert!(last.contains(&expected), "{last}");
+        assert!(
+            !harness.layout().bin_dir().join(CLI_NAME).exists(),
+            "the CLI copy is not installed"
+        );
+
+        // Once the supervised job serves the socket itself, the resume is ready.
+        {
+            let mut world = harness.fake.world();
+            world.socket_pid = None;
+            world.processless = false;
+        };
+        let report = harness.install(V1).await.expect("resume");
+        assert!(report.resumed);
+        harness.assert_installed(V1);
+    }
+}
+
+#[tokio::test]
+async fn an_upgrade_is_not_ready_while_another_process_serves_the_socket() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.fake.world().socket_pid = Some(FOREIGN_PID);
+    let error = harness.upgrade(V2).await.expect_err("not ready");
+    // The rollback waits for the restored daemon the same way, so it cannot
+    // finish while the foreign process holds the socket either.
+    let Error::RollbackFailed { original, rollback } = &error else {
+        panic!("unexpected error {error:?}");
+    };
+    assert!(
+        matches!(&**original, Error::DaemonNotReady { version, .. } if version == V2),
+        "{original:?}"
+    );
+    assert!(
+        matches!(&**rollback, Error::DaemonNotReady { version, .. } if version == V1),
+        "{rollback:?}"
+    );
+    let cli = std::fs::read(harness.layout().bin_dir().join(CLI_NAME)).expect("installed CLI");
+    let staged = std::fs::read(harness.staged(V1).join(CLI_NAME)).expect("staged CLI");
+    assert_eq!(cli, staged, "the V2 CLI copy is not installed");
+
+    // Once the supervised job serves the socket itself, asking for the
+    // active version finishes the rollback, and a fresh upgrade is ready.
+    harness.fake.world().socket_pid = None;
+    let report = harness.upgrade(V1).await.expect("finish the rollback");
+    assert!(report.unchanged);
+    assert!(report.rolled_back.is_some());
+    harness.assert_installed(V1);
+    harness.upgrade(V2).await.expect("upgrade");
+    harness.assert_installed(V2);
 }
 
 #[tokio::test]

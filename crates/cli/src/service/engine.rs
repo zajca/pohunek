@@ -14,15 +14,25 @@
 //!    verified with `systemd-analyze verify`;
 //! 4. `registering`/`registered`: the service manager installs (install) or
 //!    replaces (upgrade) the daemon job, restarting only the daemon;
-//! 5. `ready`: the daemon answers `daemon.health` as the new version;
+//! 5. `ready`: the daemon answers `daemon.health` as the new version, on a
+//!    connection whose kernel peer credentials name the process the service
+//!    manager reports as the running daemon job's main process;
 //! 6. `cli`: `<prefix>/bin/pohunek` becomes the new CLI.
 //!
-//! A failing step rolls the transaction back: the daemon job is removed
-//! (install) or replaced by the previous version (upgrade), `service.toml`
-//! is removed or restored, and a version directory this transaction created
-//! is removed unless something references it. A failure after `ready` keeps
+//! A failing upgrade step rolls the transaction back: the daemon job is
+//! replaced by the previous version, `service.toml` is restored, and a
+//! version directory this transaction created is removed unless something
+//! references it. An install that fails before `registering` rolls back the
+//! same way, removing `service.toml` instead. A failure after `ready` keeps
 //! the record instead, because the service already runs the new version; the
 //! next run finishes the CLI step.
+//!
+//! An install that fails at or after `registering` also keeps its record, the
+//! daemon job, and `service.toml`, and fails with
+//! `service_install_incomplete`. The registration call can fail after the
+//! service manager really registered the job (a D-Bus or `launchctl`
+//! timeout), and that daemon may already own live sessions, so only the
+//! resume or the session-checked uninstall below may decide its fate.
 //!
 //! An interrupted process leaves the record behind. The next `install` or
 //! `upgrade` of the same version and prefix resumes after the recorded step.
@@ -69,13 +79,13 @@
 //! same flow instead of a rollback: its daemon may already run it with live
 //! workers, and only the session-checked removal above may stop them.
 
-// Rust guideline compliant 2026-09-25
+// Rust guideline compliant 2026-09-26
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use pohunek_paths::InstallLayout;
-use pohunek_platform::process::HostInspector;
+use pohunek_platform::process::{HostInspector, Pid};
 use pohunek_platform::supervisor::{
     self, JobDefinition, ServiceObservation, ServiceState, WorkerKey,
 };
@@ -89,8 +99,8 @@ use super::error::{supervisor_error, Error, LiveSession};
 use super::layout::{self, Staged};
 use super::record::{self, Operation, Record, Step, Store};
 use super::report::{
-    InstallReport, JobReport, KeptVersion, PendingReport, StatusReport, UninstallReport,
-    UpgradeReport, VersionReport, WorkerReport,
+    state_name, InstallReport, JobReport, KeptVersion, PendingReport, StatusReport,
+    UninstallReport, UpgradeReport, VersionReport, WorkerReport,
 };
 use super::settings;
 use super::usage::{Journals, Usage};
@@ -192,8 +202,11 @@ impl<'a> Engine<'a> {
     /// # Errors
     ///
     /// Returns [`Error::AlreadyInstalled`] when `service.toml` exists,
-    /// [`Error::DaemonJobPresent`] for a stale daemon job, staging and probe
-    /// errors, and the failing step's error after a rollback.
+    /// [`Error::DaemonJobPresent`] for a stale daemon job,
+    /// [`Error::PendingInstall`] for another pending install that may already
+    /// run its daemon, staging and probe errors, the failing step's error after
+    /// a rollback, and [`Error::InstallIncomplete`] when a step at or after
+    /// `registering` fails, keeping the record for a resume or an uninstall.
     pub async fn install(
         &self,
         from: &Path,
@@ -602,6 +615,16 @@ impl<'a> Engine<'a> {
         if matches!(error, Error::Interrupted(_)) {
             return Err(error);
         }
+        if record.operation == Operation::Install && record.step >= Step::Registering {
+            // An ambiguous registration may have left a running daemon, and
+            // only the session-checked uninstall may stop one.
+            return Err(Error::InstallIncomplete {
+                original: Box::new(error),
+                version: record.version.clone(),
+                prefix: record.prefix.clone(),
+                step: record.step.as_str(),
+            });
+        }
         if record.step >= Step::Ready {
             return Err(error);
         }
@@ -624,17 +647,30 @@ impl<'a> Engine<'a> {
     }
 
     /// Undoes every effect `record`'s transaction may have had.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Record`] for an install record at or after
+    /// `registering`. Such a transaction may have registered a daemon that
+    /// owns live sessions, and removing it here would bypass the uninstall's
+    /// session check; `settle`, `install`, `upgrade`, and `uninstall` all
+    /// route those records elsewhere, so reaching this is a broken invariant
+    /// that must fail loudly rather than stop sessions.
     async fn rollback(&self, record: &Record) -> Result<(), Error> {
         let layout = install_layout(&record.prefix)?;
         let config_path = self.context.config_path();
         match record.operation {
             Operation::Install => {
                 if record.step >= Step::Registering {
-                    self.backend
-                        .daemon()
-                        .uninstall()
-                        .await
-                        .map_err(|source| supervisor_error("uninstall daemon", source))?;
+                    return Err(Error::Record {
+                        path: self.store.path(),
+                        detail: format!(
+                            "an install that reached step {} is never rolled back; \
+                             finish it with `pohunek service install` or remove it with \
+                             `pohunek service uninstall`",
+                            record.step.as_str()
+                        ),
+                    });
                 }
                 // Install refuses to start while service.toml exists, so any
                 // file present now was written by this transaction.
@@ -748,13 +784,26 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Waits until the daemon answers `daemon.health` as `version`.
+    /// Waits until the supervised daemon answers `daemon.health` as `version`.
+    ///
+    /// The answer counts only when the process serving the socket is the
+    /// daemon job's running main process. Another process of the same build,
+    /// such as a manually started daemon, can hold the socket while the
+    /// supervised job crash-loops, and must never make a transaction ready.
     async fn wait_ready(&self, version: &str) -> Result<(), Error> {
         let deadline = Instant::now() + self.ready_timeout;
         loop {
             let mut last = match self.backend.control().health().await {
-                Ok(health) if health.daemon_version == self.reported(version) => return Ok(()),
-                Ok(health) => Some(format!("daemon reports version {}", health.daemon_version)),
+                Ok(health) if health.result.daemon_version == self.reported(version) => {
+                    match self.served_by_job(health.pid).await {
+                        Ok(()) => return Ok(()),
+                        Err(mismatch) => Some(mismatch),
+                    }
+                }
+                Ok(health) => Some(format!(
+                    "daemon reports version {}",
+                    health.result.daemon_version
+                )),
                 Err(error) => Some(error.to_string()),
             };
             if Instant::now() >= deadline {
@@ -774,6 +823,31 @@ impl<'a> Engine<'a> {
                 });
             }
             tokio::time::sleep(settings::POLL_INTERVAL).await;
+        }
+    }
+
+    /// Checks that `pid`, the process serving the socket, is the daemon job.
+    ///
+    /// Returns the observed mismatch as a readiness detail otherwise.
+    async fn served_by_job(&self, pid: Pid) -> Result<(), String> {
+        let observation = self.backend.daemon().inspect().await.map_err(|error| {
+            format!(
+                "daemon socket is served by pid {pid}; the daemon job cannot be inspected: {error}"
+            )
+        })?;
+        match (observation.state, observation.process) {
+            (ServiceState::Running, Some(process)) if process.pid == pid => Ok(()),
+            (ServiceState::Running, Some(process)) => Err(format!(
+                "daemon socket is served by pid {pid}; the supervised job runs pid {}",
+                process.pid
+            )),
+            (ServiceState::Running, None) => Err(format!(
+                "daemon socket is served by pid {pid}; the supervised job has no process"
+            )),
+            (state, _) => Err(format!(
+                "daemon socket is served by pid {pid}; the supervised job is {}",
+                state_name(state)
+            )),
         }
     }
 

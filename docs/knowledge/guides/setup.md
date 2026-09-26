@@ -54,7 +54,12 @@ runtime roots, so separate installations never touch each other's jobs.
 Session workers are not installed: the daemon starts one systemd transient unit
 or one launchd job per worker generation, and the daemon and workers are
 siblings, so restarting the daemon never stops a worker. The release archive's
-`packaging/install-daemon.sh` wraps this command. Upgrades use
+`packaging/install-daemon.sh` wraps this command. The install is ready only
+when the daemon job's own main process answers `daemon.health` on the socket;
+an install that fails from the registration step on keeps its record and fails
+with `service_install_incomplete`, and rerunning `pohunek service install` with
+the same version and prefix finishes it (`pohunek service uninstall` removes it
+after checking for live sessions instead). Upgrades use
 `pohunek service upgrade`; `pohunek service status` shows the daemon job,
 versions, and workers. For upgrades, removal, and runtime diagnosis, see
 [update after release](../runbooks/update-after-release.md) and
