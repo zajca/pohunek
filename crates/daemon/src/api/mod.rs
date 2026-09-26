@@ -948,7 +948,7 @@ mod pending_socket_tests {
 
     #[test]
     fn pending_socket_guard_cleans_staged_and_published_names() {
-        let temporary = tempfile::tempdir().expect("create socket guard fixture");
+        let temporary = pohunek_test_support::tempdir().expect("create socket guard fixture");
         std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(DIR_MODE))
             .expect("set private fixture mode");
         let directory = TrustedDir::open_absolute(temporary.path(), DIR_MODE)

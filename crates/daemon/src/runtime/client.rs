@@ -1,7 +1,7 @@
 //! Private client for one durable session worker.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-// Rust guideline compliant 2026-09-11
+// Rust guideline compliant 2026-09-24
 
 /// Prefix for daemon-generated, producer-scoped control input identifiers.
 const INPUT_WRITE_ID_PREFIX: &str = "input";
@@ -56,6 +56,13 @@ pub enum WorkerError {
     /// A response did not match the current request.
     #[error("worker response did not match the outstanding request")]
     ResponseMismatch,
+    /// A caller was cancelled while its request was being written, so the
+    /// shared control stream may hold a partial frame. The connection cannot
+    /// carry further exchanges and the worker must be reconnected.
+    #[error(
+        "worker control stream was interrupted mid-request and cannot carry further exchanges"
+    )]
+    TornStream,
     /// The worker runtime has not been initialized.
     #[error("worker has no live runtime generation")]
     NotInitialized,
@@ -129,6 +136,63 @@ struct Inner {
     lease_id: LeaseId,
     capabilities: Vec<Capability>,
     next_write_sequence: u64,
+    /// Byte-stream state between exchanges; see [`StreamState`].
+    stream_state: StreamState,
+    /// Shared send-phase marker the send guard flips when a future is
+    /// dropped mid-write; see [`SEND_IN_FLIGHT`].
+    send_state: Arc<AtomicU8>,
+}
+
+/// Byte-stream state of the shared control connection between exchanges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StreamState {
+    /// Aligned at a message boundary; ready for the next request.
+    Ready,
+    /// The request was fully written but its response was not read, so the
+    /// next exchange must drain that response first. The marker is cleared
+    /// only after the drain actually succeeded, so a caller cancelled again
+    /// during the drain leaves it marked.
+    Unread(RequestId),
+    /// A cancelled or failed send may have torn the request stream; no
+    /// further exchange can be trusted on this connection.
+    Torn,
+}
+
+/// The shared control connection is not being written to.
+const SEND_IDLE: u8 = 0;
+/// A request frame is being written. A future dropped while this is set may
+/// have left a partial frame in the stream.
+const SEND_IN_FLIGHT: u8 = 1;
+/// A future was dropped during an in-flight send; the next exchange must
+/// mark the connection torn instead of trusting the stream.
+const SEND_INTERRUPTED: u8 = 2;
+
+/// Marks the connection torn when its future is dropped during a send.
+///
+/// `write_all` is not cancel-safe: a future dropped mid-frame may have
+/// written only part of the request. The guard observes exactly that case —
+/// it is dropped with the future while [`SEND_IN_FLIGHT`] is still set — and
+/// flags the interruption on the shared atomic, where the next exchange
+/// turns it into a permanent [`StreamState::Torn`]. A completed send clears
+/// the flag before the guard is dropped, so only interrupted sends mark.
+struct SendGuard {
+    state: Arc<AtomicU8>,
+}
+
+impl SendGuard {
+    /// Arms the guard for one request write.
+    fn arm(state: Arc<AtomicU8>) -> Self {
+        state.store(SEND_IN_FLIGHT, Ordering::Release);
+        Self { state }
+    }
+}
+
+impl Drop for SendGuard {
+    fn drop(&mut self) {
+        if self.state.load(Ordering::Acquire) == SEND_IN_FLIGHT {
+            self.state.store(SEND_INTERRUPTED, Ordering::Release);
+        }
+    }
 }
 
 /// One authenticated framed worker data stream.
@@ -322,6 +386,8 @@ impl Worker {
                 lease_id,
                 capabilities,
                 next_write_sequence: 1,
+                stream_state: StreamState::Ready,
+                send_state: Arc::new(AtomicU8::new(SEND_IDLE)),
             })),
             socket_path,
             request_sequence: Arc::new(AtomicU64::new(1)),
@@ -337,6 +403,11 @@ impl Worker {
     /// Returns the stable worker identity.
     pub async fn worker_id(&self) -> WorkerId {
         self.inner.lock().await.worker_id.clone()
+    }
+
+    /// Returns the private protocol version negotiated for this connection.
+    pub async fn selected_version(&self) -> Version {
+        self.inner.lock().await.selected_version
     }
 
     /// Returns the current runtime identity.
@@ -369,19 +440,31 @@ impl Worker {
 
     /// Initializes an uninitialized worker exactly once.
     ///
+    /// A worker that negotiated a version below
+    /// [`pohunek_worker_protocol::BASE_ENVIRONMENT_VERSION`] does not know the
+    /// base environment, so it is removed from `initialize` before sending; at
+    /// or above that version it is required.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkerError`] for connection, identity, spawn, or journal
-    /// failure.
-    pub async fn initialize(&self, initialize: Initialize) -> Result<RuntimeId, WorkerError> {
+    /// failure, and [`WorkerError::Protocol`] when a worker that negotiated
+    /// the base-environment version receives no base environment.
+    pub async fn initialize(&self, mut initialize: Initialize) -> Result<RuntimeId, WorkerError> {
         let mut inner = self.inner.lock().await;
+        if inner.selected_version < pohunek_worker_protocol::BASE_ENVIRONMENT_VERSION {
+            initialize.base_environment = None;
+        }
+        initialize
+            .check_version(inner.selected_version)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?;
         let lease_id = inner.lease_id.clone();
         let response = request_locked(
             &mut inner,
             self.next_request_id("initialize")?,
             RequestKind::Initialize {
                 lease_id,
-                initialize,
+                initialize: Box::new(initialize),
             },
         )
         .await?;
@@ -516,6 +599,12 @@ impl Worker {
         fragments: Vec<InputFragment>,
     ) -> Result<WriteReservation, WorkerError> {
         let mut inner = Arc::clone(&self.inner).lock_owned().await;
+        // A torn stream cannot carry the prepared plan; fail before the
+        // caller starts waiting for its acknowledgement.
+        reconcile_interrupted_send(&mut inner);
+        if inner.stream_state == StreamState::Torn {
+            return Err(WorkerError::TornStream);
+        }
         let scope = scope(&inner)?;
         let sequence = inner.next_write_sequence;
         inner.next_write_sequence = sequence.checked_add(1).ok_or_else(|| {
@@ -768,6 +857,10 @@ impl WriteReservation {
         F: FnOnce(),
     {
         let inner = &mut *self.inner;
+        // A control request dropped after sending leaves its response marked;
+        // it must be drained before the acknowledgement, so the write
+        // acknowledgement cannot be mistaken for a stale response.
+        drain_marked(inner).await?;
         let response = exchange_marked(
             &mut inner.reader,
             &mut inner.writer,
@@ -1076,18 +1169,71 @@ fn input_write_id(lease_id: &LeaseId, sequence: u64) -> Result<WriteId, WorkerEr
         .map_err(|error| WorkerError::Protocol(error.to_string()))
 }
 
+/// Sends one request on the shared control connection and reads its response.
+///
+/// Callers may be dropped at any await point (for example a watcher racing a
+/// cancellation token). Two such drops are handled explicitly: a drop after
+/// the request was fully written leaves its response marked as
+/// [`StreamState::Unread`], and the next request drains that response before
+/// sending its own. A drop during the write itself may leave a partial frame,
+/// which cannot be recovered by draining, so [`SendGuard`] flags it and the
+/// next exchange fails closed with [`WorkerError::TornStream`].
 async fn request_locked(
     inner: &mut Inner,
     request_id: RequestId,
     kind: RequestKind,
 ) -> Result<ResponseKind, WorkerError> {
-    let response = exchange(
-        &mut inner.reader,
-        &mut inner.writer,
-        ControlRequest { request_id, kind },
-    )
-    .await?;
-    Ok(response.kind)
+    drain_marked(inner).await?;
+    let expected = request_id.clone();
+    let send = SendGuard::arm(Arc::clone(&inner.send_state));
+    send_request(&mut inner.writer, ControlRequest { request_id, kind }).await?;
+    // From here the frame is complete: no await separates the marker from the
+    // send, so a dropped caller can only abandon the response, never tear the
+    // stream.
+    inner.stream_state = StreamState::Unread(expected.clone());
+    inner.send_state.store(SEND_IDLE, Ordering::Release);
+    drop(send);
+    let response = read_response(&mut inner.reader, &expected).await;
+    inner.stream_state = match response {
+        Ok(_) => StreamState::Ready,
+        // A failed read leaves the framing unproven; the connection is torn.
+        Err(_) => StreamState::Torn,
+    };
+    response.map(|response| response.kind)
+}
+
+/// Drains the marked response of a dropped caller, if one is pending.
+///
+/// The marker is cleared only after the stale response was fully read, so a
+/// caller cancelled again during the drain leaves it marked for the next
+/// exchange. A torn stream refuses every exchange instead.
+async fn drain_marked(inner: &mut Inner) -> Result<(), WorkerError> {
+    reconcile_interrupted_send(inner);
+    match inner.stream_state.clone() {
+        StreamState::Torn => Err(WorkerError::TornStream),
+        StreamState::Ready => Ok(()),
+        StreamState::Unread(abandoned) => {
+            if let Err(error) = read_response(&mut inner.reader, &abandoned).await {
+                // A failed read leaves the framing unproven.
+                inner.stream_state = StreamState::Torn;
+                return Err(error);
+            }
+            inner.stream_state = StreamState::Ready;
+            Ok(())
+        }
+    }
+}
+
+/// Turns a send dropped mid-write into a permanent [`StreamState::Torn`].
+///
+/// Runs before anything reads or writes the stream: the bytes left behind
+/// may be a partial frame, so neither a drain nor a new request may run over
+/// them.
+fn reconcile_interrupted_send(inner: &mut Inner) {
+    if inner.send_state.load(Ordering::Acquire) == SEND_INTERRUPTED {
+        inner.stream_state = StreamState::Torn;
+        inner.send_state.store(SEND_IDLE, Ordering::Release);
+    }
 }
 
 async fn exchange(
@@ -1109,6 +1255,14 @@ where
 {
     let expected = request.request_id.clone();
     send_started();
+    send_request(writer, request).await?;
+    read_response(reader, &expected).await
+}
+
+async fn send_request(
+    writer: &mut ControlWriter<OwnedWriteHalf>,
+    request: ControlRequest,
+) -> Result<(), WorkerError> {
     writer
         .write(&ControlMessage::Request(request))
         .await
@@ -1116,7 +1270,13 @@ where
     writer
         .flush()
         .await
-        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+        .map_err(|error| WorkerError::Protocol(error.to_string()))
+}
+
+async fn read_response(
+    reader: &mut ControlReader<OwnedReadHalf>,
+    expected: &RequestId,
+) -> Result<ControlResponse, WorkerError> {
     loop {
         let message = reader
             .read::<ControlMessage>()
@@ -1124,7 +1284,7 @@ where
             .map_err(|error| WorkerError::Protocol(error.to_string()))?
             .ok_or_else(|| WorkerError::Protocol("worker control connection closed".to_owned()))?;
         match message {
-            ControlMessage::Response(response) if response.request_id == expected => {
+            ControlMessage::Response(response) if &response.request_id == expected => {
                 return Ok(response);
             }
             ControlMessage::Event(_) => {}
@@ -1159,7 +1319,8 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         let sequence = TEST_PATH_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
-        std::env::temp_dir().join(format!("pohunek-{name}-{}-{sequence}", std::process::id()))
+        pohunek_test_support::temp_root()
+            .join(format!("pohunek-{name}-{}-{sequence}", std::process::id()))
     }
 
     fn observation_initialize(root: &Path, output_bytes: usize) -> Initialize {
@@ -1181,6 +1342,12 @@ mod tests {
             dimensions: Dimensions::new(80, 24).expect("dimensions"),
             environment: pohunek_worker_protocol::SecretEnv::new(BTreeMap::new())
                 .expect("valid environment"),
+            base_environment: Some(
+                crate::runtime::environment::base_environment(
+                    pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+                )
+                .expect("base environment"),
+            ),
             limits: pohunek_worker_protocol::InitializeLimits::new(
                 u64::try_from(output_bytes).expect("history fits u64"),
                 1_048_576,
@@ -1251,6 +1418,118 @@ mod tests {
         write_frame(stream, &close).await.expect("write close");
     }
 
+    /// Answers one fake worker's negotiation and controller acquisition.
+    ///
+    /// Returns once the daemon-side handshake is complete, leaving the
+    /// scripted halves ready for per-test request and response steps.
+    async fn negotiate_and_acquire(
+        reader: &mut ControlReader<OwnedReadHalf>,
+        writer: &mut ControlWriter<OwnedWriteHalf>,
+        session_id: &SessionId,
+        worker_id: &WorkerId,
+        runtime_id: Option<&RuntimeId>,
+        challenge: &pohunek_worker_protocol::LeaseChallenge,
+    ) {
+        let request = read_control_request(reader, "negotiation").await;
+        assert!(matches!(request.kind, RequestKind::Negotiate { .. }));
+        write_response(
+            writer,
+            request.request_id,
+            ResponseKind::Negotiated {
+                selected_version: pohunek_worker_protocol::CURRENT_VERSION,
+                supported_range: pohunek_worker_protocol::SUPPORTED_RANGE,
+                session_id: session_id.clone(),
+                worker_id: worker_id.clone(),
+                runtime_id: runtime_id.cloned(),
+                worker_process: pohunek_worker_protocol::ProcessIdentity {
+                    pid: std::process::id(),
+                    start_identity: 1,
+                },
+                phase: pohunek_worker_protocol::RuntimePhase::Running,
+                capabilities: vec![Capability::ControlPlaneObservation],
+                challenge: challenge.clone(),
+            },
+        )
+        .await;
+
+        let request = read_control_request(reader, "controller acquisition").await;
+        assert!(matches!(
+            request.kind,
+            RequestKind::AcquireController { .. }
+        ));
+        write_response(
+            writer,
+            request.request_id,
+            ResponseKind::ControllerAcquired {
+                lease_id: LeaseId::new("lease-scripted").expect("lease id"),
+                capabilities: vec![Capability::ControlPlaneObservation],
+            },
+        )
+        .await;
+    }
+
+    /// Reads one control request, panicking with `what` when the scripted
+    /// peer sees anything else.
+    async fn read_control_request(
+        reader: &mut ControlReader<OwnedReadHalf>,
+        what: &str,
+    ) -> ControlRequest {
+        let message = reader
+            .read::<ControlMessage>()
+            .await
+            .expect("read control message")
+            .unwrap_or_else(|| panic!("control connection closed before {what}"));
+        let ControlMessage::Request(request) = message else {
+            panic!("expected a control request for {what}");
+        };
+        request
+    }
+
+    /// Writes and flushes one response for `request_id`.
+    async fn write_response(
+        writer: &mut ControlWriter<OwnedWriteHalf>,
+        request_id: RequestId,
+        kind: ResponseKind,
+    ) {
+        writer
+            .write(&ControlMessage::Response(ControlResponse {
+                request_id,
+                kind,
+            }))
+            .await
+            .expect("write control response");
+        writer.flush().await.expect("flush control response");
+    }
+
+    /// Writes the terminal-snapshot response for `request_id`.
+    async fn write_terminal_snapshot(
+        writer: &mut ControlWriter<OwnedWriteHalf>,
+        request_id: &RequestId,
+        runtime_id: &RuntimeId,
+    ) {
+        write_response(
+            writer,
+            request_id.clone(),
+            ResponseKind::TerminalSnapshot {
+                runtime_id: runtime_id.clone(),
+                snapshot: Box::new(pohunek_worker_protocol::TerminalSnapshot {
+                    watermark: 0,
+                    dimensions: Dimensions::new(80, 24).expect("dimensions"),
+                    cursor: pohunek_worker_protocol::Cursor {
+                        column: 0,
+                        row: 0,
+                        visible: true,
+                    },
+                    alternate_screen: false,
+                    title: None,
+                    progress: None,
+                    visible_lines: Vec::new(),
+                }),
+            },
+        )
+        .await;
+    }
+
     #[test]
     fn previous_negotiation_preserves_established_capabilities() {
         let requested = requested_capabilities(
@@ -1282,18 +1561,242 @@ mod tests {
     }
 
     #[test]
-    fn subagent_observation_requires_current_protocol() {
+    fn subagent_observation_requires_version_five() {
         let current = requested_capabilities(
-            pohunek_worker_protocol::CURRENT_VERSION,
+            pohunek_worker_protocol::SUBAGENT_OBSERVATION_VERSION,
             &[Capability::SubagentObservation],
         );
         let previous = requested_capabilities(
-            pohunek_worker_protocol::PREVIOUS_VERSION,
+            pohunek_worker_protocol::CONTROL_PLANE_OBSERVATION_VERSION,
             &[Capability::SubagentObservation],
         );
 
         assert_eq!(current, vec![Capability::SubagentObservation]);
         assert!(previous.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_request_dropped_after_sending_does_not_poison_the_next_response() {
+        const SESSION_ID: &str = "s-9001";
+        let root = test_root("abandoned-request");
+        let socket_path = root.join("socket/worker.sock");
+        let server = Server::bind(ServerArgs {
+            session_id: SESSION_ID.to_owned(),
+            worker_id: "worker-e2e".to_owned(),
+            generation: "abcd2345".to_owned(),
+            socket_path: socket_path.clone(),
+            journal_path: root.join("journal/worker.json"),
+            daemon_socket_path: root.join("daemon.sock"),
+            config: WorkerConfig::new(),
+        })
+        .await
+        .expect("bind real worker");
+        let server_task = tokio::spawn(server.serve());
+        let worker = Worker::connect(&socket_path, SESSION_ID, "daemon-abandoned")
+            .await
+            .expect("control handshake");
+        worker
+            .initialize(observation_initialize(&root, 1_024))
+            .await
+            .expect("initialize runtime");
+
+        // The current-thread runtime cannot run the worker during this single
+        // poll, so the request is sent and its response is still pending when
+        // the caller is dropped, as when a watcher loses a cancellation race.
+        let dropped = futures::FutureExt::now_or_never(worker.inspect());
+        assert!(
+            dropped.is_none(),
+            "the request must still await its response: {dropped:?}"
+        );
+        assert!(
+            matches!(
+                worker.inner.lock().await.stream_state,
+                StreamState::Unread(_)
+            ),
+            "the unread response must stay marked for the next drain"
+        );
+
+        let snapshot = worker
+            .inspect()
+            .await
+            .expect("the next request receives its own response");
+        assert_eq!(snapshot.worker_id.as_str(), "worker-e2e");
+        assert!(matches!(
+            worker.inner.lock().await.stream_state,
+            StreamState::Ready
+        ));
+
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Size of the `initialize` argument that forces a partial send in the
+    /// interrupted-write test. It exceeds the combined default Unix-socket
+    /// send and receive buffers on the supported test platforms (about
+    /// 400 KiB on Linux, far less on macOS), so the write blocks with part of
+    /// the frame already in the stream. It stays below
+    /// `MAX_CONTROL_LINE_BYTES` so a complete frame would still be readable.
+    const PARTIAL_SEND_ARGUMENT_BYTES: usize = 900_000;
+
+    #[tokio::test]
+    async fn a_caller_dropped_mid_write_marks_the_connection_torn() {
+        let root = test_root("torn-write");
+        std::fs::create_dir_all(&root).expect("create test root");
+        let socket_path = root.join("worker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind fake worker");
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept control");
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = ControlReader::new(read_half);
+            let mut writer = ControlWriter::new(write_half);
+            let session_id = SessionId::new("session-torn").expect("session id");
+            let worker_id = WorkerId::new("worker-torn").expect("worker id");
+            let runtime_id = RuntimeId::new("runtime-torn").expect("runtime id");
+            let challenge =
+                pohunek_worker_protocol::LeaseChallenge::new("challenge-torn").expect("challenge");
+            // The peer answers the handshake and then never reads: the
+            // oversized request below cannot drain, so its write stays partial
+            // when the caller is dropped.
+            negotiate_and_acquire(
+                &mut reader,
+                &mut writer,
+                &session_id,
+                &worker_id,
+                Some(&runtime_id),
+                &challenge,
+            )
+            .await;
+            // Park holding the socket so the oversized write stays blocked.
+            futures::future::pending::<()>().await;
+        });
+
+        let worker = Worker::connect(&socket_path, "session-torn", "daemon-torn")
+            .await
+            .expect("connect fake worker");
+        let mut initialize = observation_initialize(&root, 1_024);
+        initialize.arguments = vec!["x".repeat(PARTIAL_SEND_ARGUMENT_BYTES)];
+
+        // The single poll arms the send guard, writes the request until the
+        // socket buffers are full, and then drops the future mid-write.
+        let dropped = futures::FutureExt::now_or_never(worker.initialize(initialize));
+        assert!(
+            dropped.is_none(),
+            "the oversized request must still be mid-write: {dropped:?}"
+        );
+        assert_eq!(
+            worker.inner.lock().await.send_state.load(Ordering::Acquire),
+            SEND_INTERRUPTED,
+            "the dropped send must be flagged"
+        );
+
+        // An input write must not be framed over the partial request either.
+        let reserved = worker.reserve_write(Vec::new()).await;
+        assert!(
+            matches!(reserved, Err(WorkerError::TornStream)),
+            "input write reserved over a torn stream"
+        );
+
+        let error = tokio::time::timeout(Duration::from_secs(5), worker.inspect())
+            .await
+            .expect("the follow-up exchange terminates without peer I/O")
+            .expect_err("a torn stream must refuse further exchanges");
+        assert!(matches!(error, WorkerError::TornStream), "{error:?}");
+        assert!(matches!(
+            worker.inner.lock().await.stream_state,
+            StreamState::Torn
+        ));
+
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_caller_dropped_mid_drain_keeps_the_stale_response_marked() {
+        let root = test_root("torn-drain");
+        std::fs::create_dir_all(&root).expect("create test root");
+        let socket_path = root.join("worker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind fake worker");
+        let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+        let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept control");
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = ControlReader::new(read_half);
+            let mut writer = ControlWriter::new(write_half);
+            let session_id = SessionId::new("session-drain").expect("session id");
+            let worker_id = WorkerId::new("worker-drain").expect("worker id");
+            let runtime_id = RuntimeId::new("runtime-drain").expect("runtime id");
+            let challenge =
+                pohunek_worker_protocol::LeaseChallenge::new("challenge-drain").expect("challenge");
+            negotiate_and_acquire(
+                &mut reader,
+                &mut writer,
+                &session_id,
+                &worker_id,
+                Some(&runtime_id),
+                &challenge,
+            )
+            .await;
+
+            let request = read_control_request(&mut reader, "snapshot request").await;
+            assert!(matches!(request.kind, RequestKind::TerminalSnapshot { .. }));
+            request_seen_tx.send(()).expect("signal request");
+            respond_rx.await.expect("allow delayed response");
+            write_terminal_snapshot(&mut writer, &request.request_id, &runtime_id).await;
+
+            let request = read_control_request(&mut reader, "second snapshot request").await;
+            assert!(matches!(request.kind, RequestKind::TerminalSnapshot { .. }));
+            write_terminal_snapshot(&mut writer, &request.request_id, &runtime_id).await;
+        });
+
+        let worker = Worker::connect(&socket_path, "session-drain", "daemon-drain")
+            .await
+            .expect("connect fake worker");
+
+        // The first caller is dropped after its request was fully sent, so
+        // its response is marked as unread.
+        let first = tokio::spawn({
+            let worker = worker.clone();
+            async move { worker.terminal_snapshot().await }
+        });
+        request_seen_rx
+            .await
+            .expect("the first request reached the peer");
+        first.abort();
+        let _ = first.await;
+        assert!(matches!(
+            worker.inner.lock().await.stream_state,
+            StreamState::Unread(_)
+        ));
+
+        // The next caller starts the drain but is dropped while the peer has
+        // not answered yet; the marker must survive that drop too.
+        let second = futures::FutureExt::now_or_never(worker.terminal_snapshot());
+        assert!(
+            second.is_none(),
+            "the drain must still await the stale response: {second:?}"
+        );
+        assert!(
+            matches!(
+                worker.inner.lock().await.stream_state,
+                StreamState::Unread(_)
+            ),
+            "a caller dropped mid-drain must leave the response marked"
+        );
+
+        respond_tx.send(()).expect("release the stale response");
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), worker.terminal_snapshot())
+            .await
+            .expect("next request deadline")
+            .expect("the next request drains the stale response first");
+        assert_eq!(snapshot.watermark, 0);
+        assert!(matches!(
+            worker.inner.lock().await.stream_state,
+            StreamState::Ready
+        ));
+
+        server_task.await.expect("fake worker task");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -1305,6 +1808,7 @@ mod tests {
         let server = Server::bind(ServerArgs {
             session_id: SESSION_ID.to_owned(),
             worker_id: "worker-e2e".to_owned(),
+            generation: "abcd2345".to_owned(),
             socket_path: socket_path.clone(),
             journal_path: root.join("journal/worker.json"),
             daemon_socket_path: root.join("daemon.sock"),

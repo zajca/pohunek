@@ -832,6 +832,46 @@ mod tests {
         }
     }
 
+    /// `service` manages the local service only; its path flags complete as
+    /// directories in both static and dynamic trees, with no dynamic lookup.
+    #[test]
+    fn service_commands_and_flags_are_completable() {
+        for shell in [
+            CompletionShell::Bash,
+            CompletionShell::Zsh,
+            CompletionShell::Fish,
+        ] {
+            let script = String::from_utf8(render_script(shell, false)).expect("UTF-8 script");
+            for word in ["service", "stop-sessions", "purge", "prefix", "from"] {
+                assert!(
+                    script.contains(word),
+                    "static {shell:?} completion lacks {word:?}"
+                );
+            }
+        }
+        let command = dynamic_command(CompletionContext::default());
+        let service = command.find_subcommand("service").expect("service command");
+        let names: Vec<_> = service.get_subcommands().map(Command::get_name).collect();
+        assert_eq!(names, ["install", "upgrade", "uninstall", "status"]);
+        for (subcommand, flag) in [
+            ("install", "from"),
+            ("install", "prefix"),
+            ("upgrade", "from"),
+        ] {
+            let arg = service
+                .find_subcommand(subcommand)
+                .and_then(|command| command.get_arguments().find(|arg| arg.get_id() == flag))
+                .expect("path flag");
+            assert_eq!(arg.get_value_hint(), clap::ValueHint::DirPath);
+            assert!(arg.get::<ArgValueCompleter>().is_none());
+        }
+        let daemon = command.find_subcommand("daemon").expect("daemon command");
+        let start = daemon.find_subcommand("start").expect("daemon start");
+        assert!(start
+            .get_arguments()
+            .any(|arg| arg.get_id() == "dev_subprocess"));
+    }
+
     /// `agent-skill` is a static command with no dynamic completers; it must
     /// still stay present in the dynamic completion tree so completions never
     /// cover fewer commands than the parser accepts.

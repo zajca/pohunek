@@ -23,6 +23,11 @@ Current CLI and command surface:
 - `crates/cli/src/commands/assistant/bootstrap.rs`
 - `crates/cli/src/commands/doctor.rs`
 - `crates/cli/src/commands/daemon.rs`
+- `crates/cli/src/commands/service.rs` — `pohunek service install|upgrade|uninstall|status`.
+- `crates/cli/src/service/` — the service transactions: install journal
+  (`record.rs`), versioned layout and GC (`layout.rs`, `usage.rs`), installer
+  values written to `service.toml` (`settings.rs`), and the stable `--json`
+  shapes (`report.rs`).
 - `crates/cli/src/commands/attach.rs`
 - `crates/cli/src/commands/health.rs`
 - `crates/cli/src/commands/session.rs`
@@ -223,10 +228,18 @@ Release packaging and contributor verification:
 - `.github/workflows/ci.yml`
 - `.github/workflows/release.yml`
 - `README.md`
-- `packaging/install-daemon.sh`
-- `packaging/systemd/pohunekd.service.in`
-- `packaging/systemd/pohunek-session@.service.in`
-- `packaging/systemd/pohunek-sessions.slice`
+- `packaging/install-daemon.sh` — release-archive wrapper that retires a
+  legacy template-unit install in a fail-closed order (socket rename barrier,
+  `migration preflight --socket <moved>`, worker inventory, stop, post-stop
+  re-inventory), then runs `pohunek service install|upgrade`:
+  `install` while `pohunek service status --json` reports a pending install
+  transaction or no `service.toml` exists, `upgrade` otherwise.
+- `crates/cli/tests/daemon_packaging.rs`
+- `scripts/acceptance/macos-launchd-lifetime` — manual macOS logout/reboot
+  lifetime procedure; `scripts/acceptance/launchd_lifetime_evidence.py`
+  evaluates its observations (tested by
+  `scripts/tests/test_launchd_lifetime_evidence.py`).
+- `docs/acceptance/README.md` — manual acceptance evidence and its schema.
 - `scripts/release`
 - `scripts/provision-hermes-compat`
 - `scripts/tests/provision-hermes-compat.sh`
@@ -240,7 +253,20 @@ Daemon, sessions, integrations, and project state:
 - `crates/platform/src/lib.rs`
 - `crates/platform/src/process/`
 - `crates/platform/src/peer/`
-- `crates/platform/src/supervisor.rs`
+- `crates/platform/src/supervisor/mod.rs` — `Supervisor`, `DaemonSupervisor`,
+  `JobDefinition`, and the typed supervision errors.
+- `crates/platform/src/supervisor/namespace.rs` — installation namespace,
+  launchd labels, and systemd unit names.
+- `crates/platform/src/supervisor/launchd/` — launchd backend (`/bin/launchctl`
+  status table, plist rendering, worker and daemon agents).
+- `crates/platform/src/supervisor/systemd.rs` — systemd transient-unit backend
+  and the daemon unit/slice installer.
+- `crates/platform/src/process/sweep.rs` — ownership-marker sweep of a lost
+  runtime generation.
+- `crates/service-config/src/lib.rs` — `service.toml` schema, trust, and
+  validation.
+- `crates/worker-protocol/src/env.rs` — `BaseEnv`, the default environment
+  allowlist, and the service-manager denylist.
 - `crates/paths/fixtures/runtime-paths.json`
 - `crates/daemon/src/host_state/`
 - `crates/daemon/src/store/mod.rs`
@@ -263,6 +289,8 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/session/target.rs`
 - `crates/daemon/src/session/procwatch.rs`
 - `crates/daemon/src/runtime/`
+- `crates/daemon/src/runtime/lifecycle.rs` — worker generation lifecycle
+  engine: commit points, per-session locks, post-timeout reconciliation.
 - `crates/daemon/src/notify.rs`
 - `crates/daemon/src/external/mod.rs`
 - `crates/daemon/tests/procwatch.rs`

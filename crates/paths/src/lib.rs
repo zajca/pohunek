@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-09-19
+// Rust guideline compliant 2026-09-24
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -43,6 +43,17 @@ pub const HOST_APPROVAL_KEY_NAME: &str = "approval.key";
 pub const HOST_GOVERNANCE_NAME: &str = "governance.json";
 /// Cross-process host-state lock filename.
 pub const HOST_STATE_LOCK_NAME: &str = "state.lock";
+
+/// Subdirectory for launchd definitions (below state) and job logs (below logs).
+pub const LAUNCHD_SUBDIR: &str = "launchd";
+/// Installation subdirectory holding versioned private executables.
+pub const LIBEXEC_SUBDIR: &str = "libexec";
+/// Daemon executable name inside a version directory.
+pub const DAEMON_EXECUTABLE_NAME: &str = "pohunekd";
+/// Session-worker executable name inside a version directory.
+pub const WORKER_EXECUTABLE_NAME: &str = "pohunek-sessiond";
+/// Upper bound for a version directory name; release versions are far shorter.
+pub const MAX_INSTALL_VERSION_BYTES: usize = 64;
 
 /// XDG environment variable carrying the runtime base directory.
 pub const XDG_RUNTIME_DIR: &str = "XDG_RUNTIME_DIR";
@@ -219,6 +230,12 @@ pub enum PathError {
         var: String,
         /// Validation failure.
         reason: InvalidPathReason,
+    },
+    /// An installation prefix is relative or contains a parent component.
+    #[error("installation prefix must be an absolute normalized path: {}", path.display())]
+    InvalidInstallPrefix {
+        /// Rejected prefix.
+        path: PathBuf,
     },
     /// A Unix socket pathname contains an interior NUL byte.
     #[error("{kind} socket path contains a NUL byte: {}", path.display())]
@@ -418,6 +435,21 @@ impl BasePaths {
         )
     }
 
+    /// Returns the owner-private directory holding launchd worker definitions.
+    ///
+    /// Worker job definitions live here rather than in `~/Library/LaunchAgents`
+    /// so launchd never resurrects a worker at login.
+    #[must_use]
+    pub fn launchd_definitions_dir(&self) -> PathBuf {
+        self.state_dir.join(LAUNCHD_SUBDIR)
+    }
+
+    /// Returns the directory receiving launchd job stdout and stderr files.
+    #[must_use]
+    pub fn launchd_log_dir(&self) -> PathBuf {
+        self.log_dir.join(LAUNCHD_SUBDIR)
+    }
+
     /// Returns the owner-private durable host-state directory.
     #[must_use]
     pub fn host_state_dir(&self) -> PathBuf {
@@ -447,6 +479,89 @@ impl BasePaths {
     pub fn host_state_lock_path(&self) -> PathBuf {
         self.host_state_dir().join(HOST_STATE_LOCK_NAME)
     }
+}
+
+/// Versioned executable layout below one installation prefix.
+///
+/// Binaries live in `<prefix>/libexec/pohunek/<version>/` so a live worker keeps
+/// the exact executable its definition names while a newer version installs
+/// beside it. The CLI stays on `PATH` through `<prefix>/bin`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallLayout {
+    prefix: PathBuf,
+}
+
+impl InstallLayout {
+    /// Creates the layout rooted at an absolute installation prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PathError::InvalidInstallPrefix`] when `prefix` is not absolute or
+    /// contains a parent-directory component.
+    pub fn new(prefix: impl Into<PathBuf>) -> Result<Self, PathError> {
+        let prefix = prefix.into();
+        if !prefix.is_absolute()
+            || prefix
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(PathError::InvalidInstallPrefix { path: prefix });
+        }
+        Ok(Self { prefix })
+    }
+
+    /// Returns the installation prefix.
+    #[must_use]
+    pub fn prefix(&self) -> &Path {
+        &self.prefix
+    }
+
+    /// Returns `<prefix>/bin`, the directory holding the `pohunek` CLI.
+    #[must_use]
+    pub fn bin_dir(&self) -> PathBuf {
+        self.prefix.join(BIN_SUBDIR)
+    }
+
+    /// Returns `<prefix>/libexec/pohunek`, the parent of every version directory.
+    #[must_use]
+    pub fn versions_dir(&self) -> PathBuf {
+        self.prefix.join(LIBEXEC_SUBDIR).join(APP_DIR)
+    }
+
+    /// Returns one version directory, or `None` for an unsafe version string.
+    #[must_use]
+    pub fn version_dir(&self, version: &str) -> Option<PathBuf> {
+        valid_install_version(version).map(|version| self.versions_dir().join(version))
+    }
+
+    /// Returns the versioned daemon executable path.
+    #[must_use]
+    pub fn daemon_executable(&self, version: &str) -> Option<PathBuf> {
+        self.version_dir(version)
+            .map(|dir| dir.join(DAEMON_EXECUTABLE_NAME))
+    }
+
+    /// Returns the versioned session-worker executable path.
+    #[must_use]
+    pub fn worker_executable(&self, version: &str) -> Option<PathBuf> {
+        self.version_dir(version)
+            .map(|dir| dir.join(WORKER_EXECUTABLE_NAME))
+    }
+}
+
+/// Validates an installed version directory name.
+///
+/// Versions are one path component of at most [`MAX_INSTALL_VERSION_BYTES`]
+/// ASCII alphanumerics, `.`, `+`, or `-`, and never `.` or `..`.
+#[must_use]
+pub fn valid_install_version(version: &str) -> Option<&str> {
+    (!version.is_empty()
+        && version.len() <= MAX_INSTALL_VERSION_BYTES
+        && !matches!(version, "." | "..")
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-')))
+    .then_some(version)
 }
 
 /// Resolves the platform application runtime root.
@@ -704,6 +819,62 @@ pub fn valid_worker_id(id: &str) -> Option<&str> {
     .then_some(id)
 }
 
+/// Length of a daemon-issued worker generation token.
+///
+/// A generation names one worker process of a session in service-manager
+/// labels and unit names. Eight base32 characters carry 40 random bits, enough
+/// that two generations of one session never collide in practice, while the
+/// full launchd label stays short.
+pub const WORKER_GENERATION_LEN: usize = 8;
+
+/// Random bytes encoded into one worker generation token.
+///
+/// Five bytes are exactly the 40 bits that [`WORKER_GENERATION_LEN`] base32
+/// characters represent, so every token is fully random.
+pub const WORKER_GENERATION_ENTROPY_BYTES: usize = 5;
+
+/// RFC 4648 base32 alphabet in lowercase, as used by generation tokens.
+///
+/// Lowercase letters and digits `2`-`7` are valid unescaped in launchd labels,
+/// systemd unit names, and file names on every supported filesystem.
+const GENERATION_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+
+/// Bits encoded by one base32 character.
+const BASE32_BITS: u32 = 5;
+
+/// Validates a daemon-issued worker generation token.
+///
+/// A token is exactly [`WORKER_GENERATION_LEN`] characters of the lowercase
+/// RFC 4648 base32 alphabet `[a-z2-7]`.
+#[must_use]
+pub fn valid_worker_generation(value: &str) -> Option<&str> {
+    (value.len() == WORKER_GENERATION_LEN
+        && value
+            .bytes()
+            .all(|byte| GENERATION_ALPHABET.contains(&byte)))
+    .then_some(value)
+}
+
+/// Encodes random bytes as a worker generation token.
+///
+/// The caller supplies operating-system entropy; the encoding itself is pure
+/// so that its output grammar is testable. The result always satisfies
+/// [`valid_worker_generation`].
+#[must_use]
+pub fn encode_worker_generation(entropy: [u8; WORKER_GENERATION_ENTROPY_BYTES]) -> String {
+    let bits = entropy
+        .iter()
+        .fold(0_u64, |bits, byte| (bits << 8) | u64::from(*byte));
+    (0..WORKER_GENERATION_LEN)
+        .rev()
+        .map(|index| {
+            let shift = u32::try_from(index).expect("generation length fits u32") * BASE32_BITS;
+            let symbol = usize::try_from((bits >> shift) & 0x1f).expect("5-bit value fits usize");
+            char::from(GENERATION_ALPHABET[symbol])
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -945,5 +1116,67 @@ mod tests {
             paths.host_state_lock_path(),
             host.join(HOST_STATE_LOCK_NAME)
         );
+    }
+
+    #[test]
+    fn worker_generation_accepts_only_eight_lowercase_base32_characters() {
+        for valid in ["abcd2345", "aaaaaaaa", "77777777", "zzzzzzzz"] {
+            assert_eq!(valid_worker_generation(valid), Some(valid));
+        }
+        for invalid in [
+            "",
+            "abcd234",
+            "abcd23456",
+            "ABCD2345",
+            "abcd2301",
+            "abcd-345",
+            "abcd 345",
+            "abcd23\u{e9}",
+        ] {
+            assert_eq!(valid_worker_generation(invalid), None, "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn install_layout_versions_executables_below_libexec() {
+        let layout = InstallLayout::new("/home/u/.local").expect("absolute prefix");
+        assert_eq!(layout.bin_dir(), Path::new("/home/u/.local/bin"));
+        assert_eq!(
+            layout.versions_dir(),
+            Path::new("/home/u/.local/libexec/pohunek")
+        );
+        assert_eq!(
+            layout.daemon_executable("0.31.6"),
+            Some(PathBuf::from(
+                "/home/u/.local/libexec/pohunek/0.31.6/pohunekd"
+            ))
+        );
+        assert_eq!(
+            layout.worker_executable("0.32.0-rc.1+g1"),
+            Some(PathBuf::from(
+                "/home/u/.local/libexec/pohunek/0.32.0-rc.1+g1/pohunek-sessiond"
+            ))
+        );
+        for unsafe_version in ["", ".", "..", "../x", "a/b", "1 2", &"1".repeat(65)] {
+            assert_eq!(layout.version_dir(unsafe_version), None, "{unsafe_version}");
+        }
+        for prefix in ["relative", "/home/u/../x", ""] {
+            assert!(matches!(
+                InstallLayout::new(prefix),
+                Err(PathError::InvalidInstallPrefix { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn worker_generation_encoding_is_rfc4648_base32() {
+        // RFC 4648 section 10 test vector: BASE32("fooba") = "MZXW6YTB".
+        assert_eq!(encode_worker_generation(*b"fooba"), "mzxw6ytb");
+        assert_eq!(encode_worker_generation([0; 5]), "aaaaaaaa");
+        assert_eq!(encode_worker_generation([0xff; 5]), "77777777");
+        for entropy in [[0x12, 0x34, 0x56, 0x78, 0x9a], [1, 2, 3, 4, 5]] {
+            let token = encode_worker_generation(entropy);
+            assert_eq!(valid_worker_generation(&token), Some(token.as_str()));
+        }
     }
 }

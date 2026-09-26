@@ -1,6 +1,6 @@
 //! Owns one PTY master and its managed process identity.
 
-// Rust guideline compliant 2026-09-23
+// Rust guideline compliant 2026-09-24
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -14,6 +14,7 @@ use std::time::Duration;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 use pohunek_platform::process::{HostInspector, ProcessInspector};
+use pohunek_worker_protocol::is_denylisted;
 use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
 use rustix::event::{poll, PollFd, PollFlags};
 use rustix::fd::{BorrowedFd, OwnedFd};
@@ -53,6 +54,20 @@ const CANCEL_SLOT: usize = 1;
 /// a local malformed request from forcing multi-gigabyte VT allocations.
 const MAX_TERMINAL_CELLS: u64 = 4_000_000;
 
+/// Selects the environment a PTY child starts from before [`Command::env`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvBase {
+    /// No inherited variables: the child sees only [`Command::env`].
+    ///
+    /// `portable-pty` always sets `SHELL`; when `env` has none, it uses the
+    /// account's login shell from the password database.
+    Empty,
+    /// The worker's own environment without `POHUNEK_*` markers and without
+    /// service-manager variables, for sessions whose daemon predates the
+    /// base-environment contract.
+    Inherited,
+}
+
 /// Command launched inside one PTY.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Command {
@@ -60,6 +75,8 @@ pub struct Command {
     pub program: String,
     /// Executable arguments.
     pub args: Vec<String>,
+    /// Environment the child starts from.
+    pub base: EnvBase,
     /// Child environment additions or overrides.
     pub env: Vec<(String, String)>,
     /// Working directory.
@@ -75,6 +92,7 @@ impl Debug for Command {
         f.debug_struct("Command")
             .field("program", &"[REDACTED]")
             .field("argument_count", &self.args.len())
+            .field("base", &self.base)
             .field(
                 "env",
                 &format_args!("[REDACTED; {} entries]", self.env.len()),
@@ -387,18 +405,23 @@ impl PtyOwner {
 
         let mut builder = CommandBuilder::new(&command.program);
         builder.args(&command.args);
-        // `CommandBuilder::new` captures this worker process's own environment as
-        // the child's base. Strip every ambient `POHUNEK_*` marker from that base
-        // so the child carries only the worker-authoritative identity set below
-        // from `command.env` (RFC §11.5 environment sanitization; §17.5 removes
-        // daemon id from ownership). Without this, a daemon that itself runs
-        // inside another pohunek session leaks that ancestor's `POHUNEK_DAEMON_ID`
-        // into the agent, and procwatch then mis-attributes the agent as
-        // foreign-owned. `vars_os` avoids panicking on any non-UTF-8 sibling var.
-        for name in std::env::vars_os() {
-            if let Some(name) = name.0.to_str() {
-                if name.starts_with("POHUNEK_") {
-                    builder.env_remove(name);
+        // `CommandBuilder::new` captures this worker process's own environment,
+        // which under a service manager describes the worker's supervision.
+        match command.base {
+            EnvBase::Empty => builder.env_clear(),
+            // Strip every ambient `POHUNEK_*` marker so the child carries only
+            // the worker-authoritative identity from `command.env` (RFC §11.5
+            // environment sanitization; §17.5 removes daemon id from ownership).
+            // Otherwise a daemon running inside another pohunek session leaks
+            // that ancestor's `POHUNEK_DAEMON_ID`, and procwatch mis-attributes
+            // the agent as foreign-owned. `vars_os` tolerates non-UTF-8 names.
+            EnvBase::Inherited => {
+                for name in std::env::vars_os() {
+                    if let Some(name) = name.0.to_str() {
+                        if name.starts_with("POHUNEK_") || is_denylisted(name) {
+                            builder.env_remove(name);
+                        }
+                    }
                 }
             }
         }
@@ -1541,7 +1564,7 @@ fn lock_result<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, PtyE
 mod tests {
     use super::{
         commit_resize_before_resume, drain_available_output, drain_snapshot_boundary,
-        read_process_start, wait_for_child_status, Command, OutputReadState, OutputReady,
+        read_process_start, wait_for_child_status, Command, EnvBase, OutputReadState, OutputReady,
         OutputReadyState, PtyError, PtyOwner, ResizeCommit, ResizeState, SpawnGuard, StartupLatch,
         OUTPUT_DRAIN_BATCH_BYTES, READ_CHUNK_BYTES,
     };
@@ -1587,6 +1610,7 @@ mod tests {
         Command {
             program: "/bin/sh".to_owned(),
             args: vec!["-c".to_owned(), script.to_owned()],
+            base: EnvBase::Inherited,
             env: Vec::new(),
             cwd: std::env::temp_dir(),
             cols: 80,
@@ -1653,6 +1677,49 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&observed).contains("worker-ready"),
             "real PTY output was not drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_base_child_sees_exactly_the_command_environment() {
+        let pty = spawn(Command {
+            program: "/usr/bin/env".to_owned(),
+            args: Vec::new(),
+            base: EnvBase::Empty,
+            env: vec![
+                ("SHELL".to_owned(), "/bin/sh".to_owned()),
+                ("EXPLICIT".to_owned(), "value=with equals".to_owned()),
+            ],
+            cwd: std::env::temp_dir(),
+            cols: 200,
+            rows: 24,
+        });
+        let mut output = pty.subscribe_output(None).expect("subscribe");
+        let exit = pty.wait_exit().await.expect("exit");
+        assert_eq!(exit.exit_code, Some(0));
+
+        let mut observed = Vec::new();
+        while let Some(event) = output.recv().await {
+            match event {
+                OutputEvent::Replay(chunk) | OutputEvent::Output(chunk) => {
+                    observed.extend_from_slice(&chunk.bytes);
+                }
+                OutputEvent::Exit { .. } => break,
+                OutputEvent::Gap { .. } => panic!("environment listing must fit the history"),
+                OutputEvent::TerminalSnapshot(_) => {}
+            }
+        }
+        let observed = String::from_utf8(observed).expect("environment listing is UTF-8");
+        let environment = observed
+            .split("\r\n")
+            .filter(|line| !line.is_empty())
+            .map(|line| line.split_once('=').expect("NAME=value line"))
+            .collect::<HashMap<_, _>>();
+
+        // The test runner's own environment (PATH, HOME, ...) must not appear.
+        assert_eq!(
+            environment,
+            HashMap::from([("SHELL", "/bin/sh"), ("EXPLICIT", "value=with equals")])
         );
     }
 
@@ -1868,6 +1935,7 @@ mod tests {
                 barrier.path().to_string_lossy().into_owned(),
                 ready.to_string_lossy().into_owned(),
             ],
+            base: EnvBase::Inherited,
             env: Vec::new(),
             cwd: std::env::temp_dir(),
             cols: 80,
@@ -1927,6 +1995,7 @@ mod tests {
                 barrier.path().to_string_lossy().into_owned(),
                 ready.to_string_lossy().into_owned(),
             ],
+            base: EnvBase::Inherited,
             env: Vec::new(),
             cwd: std::env::temp_dir(),
             cols: 80,

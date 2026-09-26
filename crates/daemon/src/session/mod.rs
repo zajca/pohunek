@@ -48,7 +48,8 @@ use crate::integration::{
 use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessIdentity, ProcessInspector};
 use crate::project::detect::{project_id, DetectedProject};
 use crate::project::{detect_at, ProjectManager};
-use crate::runtime::{DimensionUpdate, SystemdWorkerLauncher, Worker, WorkerError, WorkerLauncher};
+use crate::runtime::lifecycle::{Generation, LifecycleGuard, SessionLocks};
+use crate::runtime::{DimensionUpdate, SupervisionConfig, Worker, WorkerError, WorkerLauncher};
 use crate::store::{
     DesiredState, ProjectRecord, ResumeBinding, RuntimeRecord, SessionRecord, SessionTransaction,
     SessionWriteOutcome, Store, TransactionKind, WorktreeStatus,
@@ -58,6 +59,7 @@ use crate::worktree::{
     canonical_or_original, run_hook, HookContext, HookEvent, WorktreeCleanup, WorktreeManager,
     WorktreeRequest,
 };
+use reconcile::LossClassification;
 
 mod attach;
 mod detector;
@@ -71,6 +73,7 @@ mod read;
 mod reconcile;
 mod resume;
 mod retention;
+mod supervision;
 mod target;
 
 pub use attach::{RedeemedAttach, RedeemedRuntime};
@@ -340,10 +343,14 @@ pub struct SessionRegistryConfig {
     pub worker_runtime_root: Option<PathBuf>,
     /// Root containing durable per-worker journals.
     pub worker_state_root: Option<PathBuf>,
-    /// Bound on worker unit activation and socket negotiation.
+    /// Bound on a worker generation's socket negotiation, on reconnecting to
+    /// a live worker, and on startup discovery.
     pub worker_connect_deadline: Duration,
-    /// Validated systemd template used for worker instance names.
-    pub worker_unit_template: crate::runtime::UnitTemplate,
+    /// Worker job supervision (definition inputs and deadlines).
+    ///
+    /// `None` disables session launch with `worker_backend_required`; there is
+    /// no daemon-owned PTY fallback.
+    pub supervision: Option<SupervisionConfig>,
 }
 
 impl Default for SessionRegistryConfig {
@@ -381,7 +388,7 @@ impl Default for SessionRegistryConfig {
             worker_runtime_root: None,
             worker_state_root: None,
             worker_connect_deadline: DEFAULT_WORKER_CONNECT_DEADLINE,
-            worker_unit_template: crate::runtime::UnitTemplate::default(),
+            supervision: None,
         }
     }
 }
@@ -420,7 +427,8 @@ struct SessionRegistryInner {
     /// (see [`SessionRegistry::attach`]). Regenerated each start; never persisted.
     daemon_instance_id: String,
     config: SessionRegistryConfig,
-    launcher: Arc<dyn WorkerLauncher>,
+    /// Worker job supervisor; `None` when the registry cannot launch workers.
+    launcher: Option<Arc<dyn WorkerLauncher>>,
     /// Resolves the free-string `agent` name to a base kind + optional host-profile
     /// overrides (Part C). Built from `config.agents_dir` at construction.
     profiles: ProfileRegistry,
@@ -435,9 +443,12 @@ struct SessionRegistryInner {
     /// wins with the freshest size. Held across the (blocking) store I/O instead
     /// of the sessions lock, keeping that hot lock free of file writes.
     persist_lock: Mutex<()>,
-    /// Serializes explicit native recovery so repeated requests cannot replace
-    /// the same runtime generation twice.
-    recovery_lock: Mutex<()>,
+    /// Serializes create, native recovery, stop, and remove per session, so
+    /// one session never runs two lifecycle transactions at once.
+    lifecycle_locks: SessionLocks,
+    /// Sessions whose native supervisor could not be inspected, re-reconciled
+    /// in the background until it answers.
+    supervision_retries: supervision::SupervisionRetries,
     /// Per-session worktree binder, present when worktree binding is configured.
     /// Shared into `spawn_blocking` for the (blocking) git subprocesses.
     worktree: Option<Arc<WorktreeManager>>,
@@ -470,6 +481,9 @@ struct SessionRegistryInner {
     retention: retention::RetentionState,
     #[cfg(test)]
     external_association_block: std::sync::Mutex<Option<Arc<ExternalAssociationBlock>>>,
+    /// Rendezvous the next waited input write meets at its send boundary.
+    #[cfg(test)]
+    input_send_hold: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 #[cfg(test)]
@@ -489,6 +503,8 @@ struct SessionEntry {
     /// Serializes complete input framing transactions for this logical session.
     input_gate: Arc<Mutex<()>>,
     runtime: RuntimeHandle,
+    /// Worker job of the current runtime, when the record names one.
+    job: Option<Generation>,
     desired_state: DesiredState,
     detector_cancel: CancellationToken,
     detector_resize: watch::Sender<(u16, u16)>,
@@ -512,6 +528,10 @@ struct SessionEntry {
     last_agent_report: Option<ActiveAgentReport>,
     last_native_report: Option<NativeIdentityReport>,
     observed_agents: Vec<ObservedAgent>,
+    /// When the evidence that set `info.cwd` was observed. Older cwd evidence
+    /// never replaces it, so a scan that read a process before a newer OSC 7
+    /// hint landed cannot move the session back.
+    cwd_observed_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -982,22 +1002,29 @@ impl SessionRegistry {
         desired_state: DesiredState,
         transaction: Option<SessionTransaction>,
     ) -> SessionRecord {
-        let runtime = entry.info.runtime.as_ref().map_or(
+        let mut runtime = entry.info.runtime.as_ref().map_or(
             RuntimeRecord {
                 state: RuntimeState::Live,
                 worker_id: None,
                 runtime_id: None,
-                unit_name: None,
+                service_id: None,
+                generation: None,
+                executable: None,
                 reason: None,
             },
             |runtime| RuntimeRecord {
                 state: runtime.state,
                 worker_id: runtime.worker_id.clone(),
                 runtime_id: runtime.runtime_id.clone(),
-                unit_name: Some(format!("pohunek-session@{}.service", id.0)),
+                service_id: None,
+                generation: None,
+                executable: None,
                 reason: runtime.loss_reason.clone(),
             },
         );
+        if let Some(job) = &entry.job {
+            job.record_into(&mut runtime);
+        }
         SessionRecord {
             schema_version: SESSION_RECORD_SCHEMA_VERSION,
             session_id: id.0.clone(),
@@ -1013,59 +1040,39 @@ impl SessionRegistry {
     /// Create a registry.
     ///
     /// Production callers must use [`Self::new_production`]. Unit tests inject
-    /// the real worker server through a test-only launcher; no constructor
-    /// falls back to daemon-owned PTYs.
+    /// the real worker server through a test-only launcher; other builds get a
+    /// registry without a worker supervisor, whose launches fail with
+    /// `worker_backend_required`. No constructor falls back to daemon-owned
+    /// PTYs.
     #[must_use]
     pub fn new(config: SessionRegistryConfig) -> Self {
-        #[cfg(test)]
-        {
-            let mut config = config;
-            let (runtime_root, state_root) = test_worker_roots(&config);
-            config.worker_runtime_root = Some(runtime_root.clone());
-            config.worker_state_root = Some(state_root.clone());
-            let launcher = Arc::new(crate::runtime::InProcessWorkerLauncher::new(
-                runtime_root,
-                state_root,
-            ));
-            Self::new_with_launcher_and_inspector(
-                config,
-                launcher,
-                Arc::new(crate::procwatch::HostInspector::new()),
-            )
-        }
-        #[cfg(not(test))]
-        {
-            let launcher = Arc::new(SystemdWorkerLauncher::new(
-                config.worker_unit_template.clone(),
-            ));
-            Self::new_with_launcher_and_inspector(
-                config,
-                launcher,
-                Arc::new(crate::procwatch::HostInspector::new()),
-            )
-        }
+        Self::new_with_inspector(config, Arc::new(crate::procwatch::HostInspector::new()))
     }
 
     /// Create a production registry with a mandatory durable-worker backend.
     ///
     /// # Errors
     ///
-    /// Returns `worker_backend_required` when the per-session worker runtime
-    /// root is absent. Production never falls back to daemon-owned PTYs.
-    pub fn new_production(config: SessionRegistryConfig) -> Result<Self, ProtocolError> {
+    /// Returns `worker_backend_required` when the per-session worker roots or
+    /// the supervision configuration are absent. Production never falls back
+    /// to daemon-owned PTYs.
+    pub fn new_production(
+        config: SessionRegistryConfig,
+        supervisor: Arc<dyn WorkerLauncher>,
+    ) -> Result<Self, ProtocolError> {
         validate_observation_config(&config)?;
-        if config.worker_runtime_root.is_none() || config.worker_state_root.is_none() {
+        if config.worker_runtime_root.is_none()
+            || config.worker_state_root.is_none()
+            || config.supervision.is_none()
+        {
             return Err(runtime_error(
                 "worker_backend_required",
-                "production session registry requires durable worker runtime and state roots",
+                "production session registry requires durable worker roots and supervision",
             ));
         }
-        let launcher = Arc::new(SystemdWorkerLauncher::new(
-            config.worker_unit_template.clone(),
-        ));
         Ok(Self::new_with_launcher_and_inspector(
             config,
-            launcher,
+            supervisor,
             Arc::new(crate::procwatch::HostInspector::new()),
         ))
     }
@@ -1086,6 +1093,9 @@ impl SessionRegistry {
             let (runtime_root, state_root) = test_worker_roots(&config);
             config.worker_runtime_root = Some(runtime_root.clone());
             config.worker_state_root = Some(state_root.clone());
+            if config.supervision.is_none() {
+                config.supervision = Some(test_supervision(&runtime_root, &state_root));
+            }
             let launcher = Arc::new(crate::runtime::InProcessWorkerLauncher::new(
                 runtime_root,
                 state_root,
@@ -1094,10 +1104,7 @@ impl SessionRegistry {
         }
         #[cfg(not(test))]
         {
-            let launcher = Arc::new(SystemdWorkerLauncher::new(
-                config.worker_unit_template.clone(),
-            ));
-            Self::new_with_launcher_and_inspector(config, launcher, inspector)
+            Self::build(config, None, inspector)
         }
     }
 
@@ -1109,6 +1116,14 @@ impl SessionRegistry {
     pub fn new_with_launcher_and_inspector(
         config: SessionRegistryConfig,
         launcher: Arc<dyn WorkerLauncher>,
+        inspector: Arc<dyn ProcessInspector>,
+    ) -> Self {
+        Self::build(config, Some(launcher), inspector)
+    }
+
+    fn build(
+        config: SessionRegistryConfig,
+        launcher: Option<Arc<dyn WorkerLauncher>>,
         inspector: Arc<dyn ProcessInspector>,
     ) -> Self {
         let external = ExternalSessions::new();
@@ -1164,7 +1179,8 @@ impl SessionRegistry {
                 events,
                 store,
                 persist_lock: Mutex::new(()),
-                recovery_lock: Mutex::new(()),
+                lifecycle_locks: SessionLocks::default(),
+                supervision_retries: supervision::SupervisionRetries::default(),
                 worktree,
                 projects,
                 event_log_shutdown: CancellationToken::new(),
@@ -1177,6 +1193,8 @@ impl SessionRegistry {
                 retention,
                 #[cfg(test)]
                 external_association_block: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                input_send_hold: std::sync::Mutex::new(None),
             }),
         };
         if let Some(config) = external_observer {
@@ -1521,6 +1539,7 @@ impl SessionRegistry {
         };
 
         let id = Self::allocate_session_id();
+        let guard = self.lock_lifecycle(&id).await;
 
         let TargetResolution {
             launch_cwd,
@@ -1592,29 +1611,32 @@ impl SessionRegistry {
             )?;
 
             let info = self
-                .register_pty_session(PtySessionSpec {
-                    id: id.clone(),
-                    registration: target::PtyRegistration::Create,
-                    name: validate_session_name(params.name.as_deref())?,
-                    agent: resolved.name.clone(),
-                    agent_base: base.clone(),
-                    input_rules,
-                    snapshot,
-                    manifest_override,
-                    cwd: launch_cwd,
-                    cols: params.cols,
-                    rows: params.rows,
-                    command: plan.command,
-                    native_session_id: None,
-                    native_session_path: None,
-                    project_id,
-                    is_linked_worktree,
-                    repo,
-                    branch,
-                    worktree_path,
-                    metadata: params.metadata.clone(),
-                    warnings,
-                })
+                .register_pty_session(
+                    PtySessionSpec {
+                        id: id.clone(),
+                        registration: target::PtyRegistration::Create,
+                        name: validate_session_name(params.name.as_deref())?,
+                        agent: resolved.name.clone(),
+                        agent_base: base.clone(),
+                        input_rules,
+                        snapshot,
+                        manifest_override,
+                        cwd: launch_cwd,
+                        cols: params.cols,
+                        rows: params.rows,
+                        command: plan.command,
+                        native_session_id: None,
+                        native_session_path: None,
+                        project_id,
+                        is_linked_worktree,
+                        repo,
+                        branch,
+                        worktree_path,
+                        metadata: params.metadata.clone(),
+                        warnings,
+                    },
+                    guard,
+                )
                 .await?;
 
             Ok((info, plan.pending_initial_input))
@@ -2140,6 +2162,7 @@ impl SessionRegistry {
         path: String,
         expected: Option<&RuntimeWatchIdentity>,
     ) {
+        let observed_at = Instant::now();
         let cwd = PathBuf::from(path);
         if !cwd.is_absolute() {
             debug!(
@@ -2151,7 +2174,7 @@ impl SessionRegistry {
         }
         match cwd.try_exists() {
             Ok(true) => {
-                self.apply_cwd_change(id, cwd, CwdSource::Osc7, expected)
+                self.apply_cwd_change(id, cwd, CwdSource::Osc7, expected, observed_at)
                     .await;
             }
             Ok(false) => {
@@ -2172,14 +2195,20 @@ impl SessionRegistry {
         }
     }
 
+    /// Moves the session to `cwd` unless the evidence that set its current cwd
+    /// is newer.
+    ///
+    /// `observed_at` is when the evidence was read. Evidence for the current
+    /// cwd changes nothing, so the source that established it stays.
     async fn apply_cwd_change(
         &self,
         id: &SessionId,
         cwd: PathBuf,
         source: CwdSource,
         expected: Option<&RuntimeWatchIdentity>,
+        observed_at: Instant,
     ) {
-        if !self.cwd_update_needed(id, &cwd).await {
+        if !self.cwd_update_needed(id, &cwd, observed_at).await {
             return;
         }
 
@@ -2194,9 +2223,10 @@ impl SessionRegistry {
                 debug!(session_id = %id.0, "cwd update arrived for a superseded runtime");
                 return;
             }
-            if entry.stopping || is_terminal(entry.info.state) || entry.info.cwd == cwd {
+            if !cwd_evidence_moves(entry, &cwd, observed_at) {
                 return;
             }
+            entry.cwd_observed_at = observed_at;
             Some(apply_cwd_change(entry, cwd, source, association))
         };
 
@@ -2205,12 +2235,11 @@ impl SessionRegistry {
         }
     }
 
-    async fn cwd_update_needed(&self, id: &SessionId, cwd: &Path) -> bool {
+    async fn cwd_update_needed(&self, id: &SessionId, cwd: &Path, observed_at: Instant) -> bool {
         let sessions = self.inner.sessions.lock().await;
-        let Some(entry) = sessions.get(id) else {
-            return false;
-        };
-        !entry.stopping && !is_terminal(entry.info.state) && entry.info.cwd != cwd
+        sessions
+            .get(id)
+            .is_some_and(|entry| cwd_evidence_moves(entry, cwd, observed_at))
     }
 
     async fn resolve_cwd_association(
@@ -2413,6 +2442,8 @@ impl SessionRegistry {
 
     /// Stop a running session.
     pub async fn stop(&self, id: &SessionId) -> Result<SessionStopResult, ProtocolError> {
+        self.ensure_not_external(id).await?;
+        let _guard = self.lock_lifecycle(id).await;
         self.stop_with_intent(id, DesiredState::Stopped, TransactionKind::Stop)
             .await
     }
@@ -2639,6 +2670,7 @@ impl SessionRegistry {
     /// surfaces any PTY shutdown error from the implied stop of a live session.
     pub async fn remove(&self, id: &SessionId) -> Result<SessionRemoveResult, ProtocolError> {
         self.ensure_not_external(id).await?;
+        let _guard = self.lock_lifecycle(id).await;
         let should_stop = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
@@ -2675,6 +2707,8 @@ impl SessionRegistry {
             self.write_session_record(removal_intent).await?;
             false
         };
+
+        self.retire_ended_job(id).await?;
 
         let (cleanup_warnings, cleanup) = self.cleanup_owned_worktrees_for_removal(id).await?;
         if !cleanup_warnings.is_empty() {
@@ -2727,6 +2761,45 @@ impl SessionRegistry {
             stopped,
             worktrees_removed,
             worktrees_failed,
+        })
+    }
+
+    /// Retires the worker job of a session whose runtime is terminal.
+    ///
+    /// A terminal worker only retains its final output, so removal retires
+    /// its exact generation and cleans up the job definition. Lost, conflicting,
+    /// or reconnecting runtimes are left to reconciliation, which never signals
+    /// an ambiguous worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns `runtime_supervision_unavailable` when the supervisor cannot
+    /// retire the job; the logical record is kept so removal can be retried.
+    async fn retire_ended_job(&self, id: &SessionId) -> Result<(), ProtocolError> {
+        let job = {
+            let sessions = self.inner.sessions.lock().await;
+            sessions.get(id).and_then(|entry| {
+                let terminal = entry
+                    .info
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.state == RuntimeState::Terminal);
+                terminal.then(|| entry.job.clone()).flatten()
+            })
+        };
+        let Some(job) = job else {
+            return Ok(());
+        };
+        let lifecycle = self.lifecycle()?;
+        lifecycle.retire(&job).await.map_err(|error| {
+            runtime_error(
+                crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE,
+                format!(
+                    "failed to retire worker generation {} of session {}: {error}",
+                    job.service_id(),
+                    id.0
+                ),
+            )
         })
     }
 
@@ -2859,6 +2932,15 @@ impl SessionRegistry {
         if !self.mark_worker_reconnecting(id, expected, error).await {
             return None;
         }
+        // A worker whose death is already provable is classified at once
+        // instead of after the whole connect deadline.
+        let classified = tokio::select! {
+            () = cancel.cancelled() => return None,
+            classified = self.classify_lost_worker(id, expected, true) => classified,
+        };
+        if classified == LossClassification::Settled {
+            return None;
+        }
         let mut deadline = tokio::time::Instant::now() + self.inner.config.worker_connect_deadline;
         loop {
             if cancel.is_cancelled() || self.inner.daemon_shutdown_started.load(Ordering::Relaxed) {
@@ -2884,15 +2966,20 @@ impl SessionRegistry {
                     }
                 },
                 Err(reconnect_error) if tokio::time::Instant::now() >= deadline => {
-                    match self.mark_worker_lost(id, expected, &reconnect_error).await {
-                        RuntimeTransitionOutcome::Applied(_)
-                        | RuntimeTransitionOutcome::IdentityMismatch => return None,
-                        RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
-                        | RuntimeTransitionOutcome::RetryableConcurrentChange => {
-                            deadline = tokio::time::Instant::now()
-                                + self.inner.config.worker_connect_deadline;
-                        }
+                    debug!(
+                        session_id = %id.0,
+                        error = %reconnect_error,
+                        "session worker stayed unreachable for the connect deadline"
+                    );
+                    let classified = tokio::select! {
+                        () = cancel.cancelled() => return None,
+                        classified = self.classify_lost_worker(id, expected, false) => classified,
+                    };
+                    if classified == LossClassification::Settled {
+                        return None;
                     }
+                    deadline =
+                        tokio::time::Instant::now() + self.inner.config.worker_connect_deadline;
                 }
                 Err(reconnect_error) => {
                     debug!(
@@ -2936,11 +3023,17 @@ impl SessionRegistry {
         true
     }
 
-    async fn mark_worker_lost(
+    /// Commits the classification of a worker whose control connection is gone.
+    ///
+    /// The transition is conditional on `expected` still naming the entry's
+    /// runtime, and it keeps newer durable metadata; a `Lost` classification
+    /// also terminalizes running subagents.
+    async fn mark_worker_unavailable(
         &self,
         id: &SessionId,
         expected: &RuntimeWatchIdentity,
-        error: &WorkerError,
+        state: RuntimeState,
+        reason: &str,
     ) -> RuntimeTransitionOutcome {
         let (base, candidate) = {
             let sessions = self.inner.sessions.lock().await;
@@ -2952,10 +3045,10 @@ impl SessionRegistry {
             }
             let base = Self::session_record(id, entry, entry.desired_state, None);
             let mut candidate = entry.clone();
-            candidate.runtime = RuntimeHandle::Unavailable(RuntimeState::Lost);
+            candidate.runtime = RuntimeHandle::Unavailable(state);
             if let Some(runtime) = candidate.info.runtime.as_mut() {
-                runtime.state = RuntimeState::Lost;
-                runtime.loss_reason = Some("worker_process_lost".to_owned());
+                runtime.state = state;
+                runtime.loss_reason = Some(reason.to_owned());
             }
             candidate.info.updated_at = timestamp_now();
             (base, candidate)
@@ -2965,30 +3058,37 @@ impl SessionRegistry {
             Ok(None) => base.clone(),
             Err(error) => return RuntimeTransitionOutcome::RetryablePersistenceFailure(error),
         };
+        let policy = if state == RuntimeState::Lost {
+            RuntimeMetadataPolicy::Terminal
+        } else {
+            RuntimeMetadataPolicy::Live
+        };
         let outcome = self
-            .commit_runtime_transition(
-                id,
-                expected,
-                &base,
-                &durable_base,
-                candidate,
-                RuntimeMetadataPolicy::Terminal,
-            )
+            .commit_runtime_transition(id, expected, &base, &durable_base, candidate, policy)
             .await;
         if let RuntimeTransitionOutcome::RetryablePersistenceFailure(store_error) = &outcome {
             warn!(
                 session_id = %id.0,
                 error = %store_error,
-                "failed to persist lost worker classification"
+                "failed to persist the unreachable worker classification"
             );
         }
         if let RuntimeTransitionOutcome::Applied(info) = &outcome {
             warn!(
                 session_id = %id.0,
-                error = %error,
-                "session worker could not be reconnected; PTY runtime is lost"
+                runtime.state = ?state,
+                reason,
+                "session worker could not be reconnected"
             );
-            self.emit(event::SESSION_RUNTIME_LOST, info.as_ref());
+            let event_name = match state {
+                RuntimeState::Lost | RuntimeState::Incompatible => event::SESSION_RUNTIME_LOST,
+                RuntimeState::Conflict => event::SESSION_RUNTIME_CONFLICT,
+                RuntimeState::Starting
+                | RuntimeState::Live
+                | RuntimeState::Reconnecting
+                | RuntimeState::Terminal => event::SESSION_UPDATED,
+            };
+            self.emit(event_name, info.as_ref());
         }
         outcome
     }
@@ -3684,6 +3784,16 @@ where
     serde_json::to_value(payload).expect("protocol event payload serialization is infallible")
 }
 
+/// Whether cwd evidence observed at `observed_at` moves a live session to `cwd`.
+///
+/// Evidence older than the evidence that set the current cwd is stale.
+fn cwd_evidence_moves(entry: &SessionEntry, cwd: &Path, observed_at: Instant) -> bool {
+    !entry.stopping
+        && !is_terminal(entry.info.state)
+        && observed_at >= entry.cwd_observed_at
+        && entry.info.cwd != cwd
+}
+
 fn apply_cwd_change(
     entry: &mut SessionEntry,
     cwd: PathBuf,
@@ -4345,7 +4455,7 @@ fn test_worker_roots(config: &SessionRegistryConfig) -> (PathBuf, PathBuf) {
     // it explicitly.
     let state_base = config.store_path.as_ref().map_or_else(
         || {
-            std::env::temp_dir().join(format!(
+            pohunek_test_support::temp_root().join(format!(
                 "pohunek-daemon-worker-test-{}-{}",
                 std::process::id(),
                 SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -4361,13 +4471,13 @@ fn test_worker_roots(config: &SessionRegistryConfig) -> (PathBuf, PathBuf) {
 
     // The runtime root holds the worker's Unix domain socket
     // (`<runtime_root>/<session_id>/control.sock`), whose path is bound by
-    // `SUN_LEN` (108 bytes on Linux/BSD). The metadata store's temp
+    // `sun_path` (108 bytes on Linux, 104 on Darwin). The metadata store's temp
     // directory embeds a test tag plus a 19-digit nanosecond timestamp and
     // routinely overflows that budget for longer tags, so -- unlike the
     // state root -- the default runtime root always uses a short, unique
-    // path directly under `temp_dir()`, independent of `store_path`.
+    // path directly under the fixture temp root, independent of `store_path`.
     let runtime_root = config.worker_runtime_root.clone().unwrap_or_else(|| {
-        std::env::temp_dir().join(format!(
+        pohunek_test_support::temp_root().join(format!(
             "pw-{}-{}",
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -4378,6 +4488,25 @@ fn test_worker_roots(config: &SessionRegistryConfig) -> (PathBuf, PathBuf) {
         .clone()
         .unwrap_or_else(|| state_base.join("state"));
     (runtime_root, state_root)
+}
+
+/// Supervision inputs for the in-process test launcher.
+///
+/// The in-process launcher serves the generation named by the service ID and
+/// never runs the definition's executable, so the definition only has to
+/// satisfy the job contract.
+#[cfg(test)]
+fn test_supervision(runtime_root: &Path, state_root: &Path) -> SupervisionConfig {
+    crate::runtime::SubprocessWorkerEnvironment {
+        runtime_home: runtime_root.to_path_buf(),
+        state_home: state_root.to_path_buf(),
+        data_home: state_root.to_path_buf(),
+        config_home: state_root.to_path_buf(),
+        cache_home: state_root.to_path_buf(),
+        home: state_root.to_path_buf(),
+        daemon_socket: runtime_root.join("test-daemon.sock"),
+    }
+    .supervision(PathBuf::from("/nonexistent/pohunek-sessiond"))
 }
 
 #[cfg(test)]

@@ -16,6 +16,9 @@ default = ["embed-agent-skill"]
 # generate` stays runnable even while the generated artifact itself is
 # missing or damaged; every binary build embeds the checked-in artifact.
 embed-agent-skill = []
+# Test-only seams of the `pohunek service` engine (M-TEST-UTIL); never enabled
+# by a release build.
+test-util = []
 
 [dependencies]
 pohunek-relay-client.workspace = true
@@ -28,6 +31,9 @@ pohunek-protocol = { workspace = true }
 pohunek-netbird = { workspace = true }
 pohunek-paths = { workspace = true }
 pohunek-platform = { workspace = true }
+pohunek-service-config = { workspace = true }
+pohunek-session-worker = { workspace = true }
+pohunek-worker-protocol = { workspace = true }
 pohunek-client = { workspace = true }
 pohunek-prompt = { workspace = true }
 pohunek-terminal = { workspace = true }
@@ -52,6 +58,8 @@ time = { workspace = true }
 workspace = true
 
 [dev-dependencies]
+# Enables `test-util` for this package's own integration tests.
+pohunek-cli = { path = ".", features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 overlay = { workspace = true }

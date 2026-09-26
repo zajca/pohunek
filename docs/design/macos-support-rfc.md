@@ -160,13 +160,120 @@ private worker socket is unreachable, carries no kernel peer binding. It keeps
 its existing runtime, ordering, expiry, and provider rules, and hardening it is
 separate work.
 
-The daemon and every worker are separate sibling launchd jobs in the owner's
-login domain. Worker definitions are private, explicitly registered, and do not
-resurrect stale sessions automatically. Jobs use executable paths and argument
-arrays without shell interpolation. Restarting or upgrading the daemon must
-preserve the live worker PID, child identity, PTY, and output drain. Failed or
-cancelled supervisor operations reconcile observed state before retrying so an
-uncertain commit cannot create a duplicate generation.
+### launchd supervision
+
+The daemon and every worker generation are separate sibling launchd jobs in the
+owner's `gui/<uid>` domain. Restarting or upgrading the daemon preserves the
+live worker PID, child identity, PTY, and output drain. The backend lives in
+`crates/platform/src/supervisor/launchd/` and implements the same `Supervisor`
+and `DaemonSupervisor` contracts as the systemd transient-unit backend; one
+daemon lifecycle engine drives both (see the
+[durable session workers RFC](durable-session-workers-rfc.md), sections 8 and
+15).
+
+| Job | Label | Definition | Key properties |
+|-----|-------|------------|----------------|
+| Daemon (the only login agent) | `io.github.zajca.pohunek.<ns>.daemon` | `~/Library/LaunchAgents/<label>.plist` | `RunAtLoad`, `KeepAlive={SuccessfulExit=false}`, `ThrottleInterval`, `ExitTimeOut`, versioned `pohunekd --service-config <abs>` |
+| Worker generation | `io.github.zajca.pohunek.<ns>.worker.<session-id>.<generation>` | `<state>/pohunek/launchd/<label>.plist` (directory `0700`, file `0600`) | `RunAtLoad`, no `KeepAlive`, `ExitTimeOut`, `AbandonProcessGroup=false`, `NumberOfFiles` limits, stdout/stderr in `<log_dir>/launchd/`, `ProcessType` omitted (Standard) |
+
+`<ns>` is the first 12 hex characters of SHA-256 over the UID and the canonical
+state and runtime roots; labels of another product, another namespace, or with
+extra or malformed segments are never loaded, inspected, or retired. Plists are
+serialized by the `plist` crate and written atomically through the trusted
+directory; worker definitions never enter `~/Library/LaunchAgents`, so launchd
+cannot resurrect a stale session at login. launchd refuses definitions on
+external volumes; that is a typed error (`ExternalVolume`) rather than a
+fallback location. `SMAppService`, `SMJobSubmit`, and `launch_msg` FFI are
+rejected: the backend only runs the absolute `/bin/launchctl` with an argv, a
+deadline (`service.toml` `launchctl_command_ms`), and a 16 KiB cap on each of
+stdout and stderr.
+
+Job presence comes only from the exit status of
+`launchctl print gui/<uid>/<label>`. Human-readable output is never parsed or
+matched; it is kept only as bounded diagnostics. The status table was recorded
+on GitHub-hosted macOS 14.8.9 and 15.7.9 runners (uid 501, Aqua session):
+
+| Status | Meaning | Observed for | Mapped to |
+|--------|---------|--------------|-----------|
+| 0 | success | `print`, `bootstrap`, `bootout` | success / present |
+| 3 | `ESRCH` | `bootout` of an absent label | `NotFound` |
+| 5 | `EIO` | `bootstrap` of an already loaded label | `AlreadyRegistered` (after a `print` probe) |
+| 37 | `EALREADY` | an operation in progress on the label | `Race` |
+| 112 | domain not found | `print`/`bootstrap` in `gui/<unknown uid>` | `DomainUnavailable` |
+| 113 | service not found | `print` of an absent label | absent / `NotFound` |
+
+Every other status, and termination by a signal, is an `Operation` error, and a
+deadline overrun is `Timeout`. State, PID, and identity come from Pohunek's own
+evidence: the private definition, the worker journal, Darwin process inspection
+(PPID 1, same UID, executable equal to the definition's, argv carrying the
+session ID and generation, start identity), and the authenticated private
+handshake. More than one matching process is `InvalidData`, and a change during
+observation is `Race`. A loaded job without a matching process reports
+`Unknown` with no process: launchd keeps a `RunAtLoad` job without `KeepAlive`
+loaded after its process exits, so that observation covers a job not spawned
+yet, a process that does not match, and an exited one, and it never proves the
+job ended. The daemon proves a worker's death only from its journal (the
+journaled worker PID not running with its start identity) and retires a job
+that never produced a worker after its own initialization deadline. Worker
+readiness comes solely from the private socket;
+there is no `NOTIFY_SOCKET` on Darwin.
+
+**The `SIGKILL` gap.** On `bootout`, launchd sends the job's main process
+`SIGTERM` and `SIGKILL` after `ExitTimeOut`, but with
+`AbandonProcessGroup=false` it only sends `SIGTERM` to the rest of the process
+group once the main process is gone, and never `SIGKILL`s it; a member that
+ignores `SIGTERM` outlives the job (observed on macOS 15). The backend closes the
+gap in two layers. `retire` captures the job's process-group members (launchd
+makes the main process the group leader) before `bootout`, then sends survivors
+`SIGTERM` and, once `ExitTimeOut` has passed since `bootout` started, `SIGKILL`,
+checking each member's start identity before every signal: the same bound
+systemd's `KillMode=control-group` applies. Members forked after the capture,
+processes that left the group, and descendants of a crashed worker are handled
+by the daemon's reconciliation marker sweep: when worker death is proven, every
+same-user process whose `POHUNEK_RUNTIME_ID` marker equals exactly the lost
+generation's runtime ID gets `SIGTERM`, then after `[sweep] grace_ms` `SIGKILL`,
+each preceded by a start-identity check. On macOS the sweep is the primary
+cleanup of such processes; on Linux it is a backstop. Uncertain evidence kills
+nothing.
+
+Failed or cancelled supervisor operations reconcile observed state before
+retrying, so an uncertain commit cannot create a duplicate generation, and an
+unavailable launchd (`gui/<uid>` missing, `launchctl` timing out) is reported as
+`runtime_supervision_unavailable` without killing anything.
+
+Workers receive only an allowlisted base environment from the daemon
+(`service.toml` `[environment] allowlist`) and strip launchd variables
+(`XPC_SERVICE_NAME`, `XPC_FLAGS`, `__CFBundleIdentifier`, `LaunchInstanceID`), so
+an agent never sees the bare launchd `PATH` or the worker's own supervision
+environment. A better login-shell `PATH` source is #102.
+
+### Worker lifetime
+
+The supported scope is the logged-in GUI session. Boot-before-login, root
+services, privileged helpers, and `user/<uid>` headless domains are out of
+scope.
+
+- Closing a terminal or locking the screen is safe: every worker keeps its PID,
+  PTY, and child.
+- Logout or reboot ends the `gui/<uid>` domain and with it every job.
+- After the next login launchd starts only the daemon agent. Reconciliation
+  finds each worker's job absent while its journal still said live, sweeps the
+  generation's leftover processes, and reports the session `lost` with
+  `runtime_lost`. No worker is restarted automatically and no old generation
+  is resurrected.
+- Explicit native recovery (`session.resume`) stays a lifecycle action that
+  starts a new generation.
+
+Hosted CI cannot log out or reboot, so the manual procedure
+`scripts/acceptance/macos-launchd-lifetime` records structured evidence for
+screen lock, terminal close, logout/login, and reboot in
+`docs/acceptance/100-launchd-lifetime.json` (schema in
+`docs/acceptance/README.md`). The #100 lifetime item stays open until that
+evidence from real hardware is committed. Every automatable launchd scenario
+runs against the real `gui/<uid>` domain on the macOS CI runner, where a missing
+domain is a hard failure rather than a skip.
+
+### PTY portability
 
 PTY work retains `portable-pty` and the existing attach protocol. Readiness is
 one `poll(2)` implementation shared by both targets rather than a backend per
@@ -224,10 +331,13 @@ Linux theme-detection features are Linux-only while the portable renderer stays
 available. File locking still uses reviewed OS primitives rather than a new
 cross-platform locking dependency.
 
-Native shared-contract CI runs on a pinned Apple Silicon macOS runner label,
-verifies `uname -m`, uses the locked graph, treats warnings as errors, and
-compiles/tests `pohunek-platform`, `pohunek-paths`, and the portable filesystem
-contract with the macOS 14 deployment target. Full application and release
+Native CI runs on a pinned Apple Silicon macOS runner label, verifies
+`uname -m`, uses the locked graph, treats warnings as errors, and compiles/tests
+`pohunek-platform` (including the real-launchd suite), `pohunek-paths`, the
+portable filesystem contract, `pohunek-session-worker`,
+`pohunek-service-config`, `pohunek-daemon`, and `pohunek-cli` with the macOS 14
+deployment target, after requiring the `gui/<uid>` launchd domain. The `plist`
+crate is a macOS-only dependency of `pohunek-platform`; `zbus` is Linux-only. Full application and release
 gates are added with their real native backends; shared contract CI must not
 masquerade as complete host support.
 

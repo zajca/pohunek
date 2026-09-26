@@ -19,9 +19,13 @@ use super::{
     SessionRefKind, SessionRegistry, SessionRuntime, SessionState, SessionTransaction,
     SessionWarning, ShellCommand, StateSource, TransactionKind, Worker, WorktreeRequest,
     DEFAULT_WORKER_SUBSCRIBER_BYTES, DEFAULT_WORKER_TERMINAL_RETENTION,
-    DEFAULT_WORKER_WRITE_DEDUP_ENTRIES, SESSION_RECORD_SCHEMA_VERSION, WORKER_CONNECT_RETRY,
+    DEFAULT_WORKER_WRITE_DEDUP_ENTRIES, SESSION_RECORD_SCHEMA_VERSION,
 };
 use crate::procwatch::{ProcessIdentity, StartIdentity};
+use crate::runtime::lifecycle::{
+    Generation, LaunchFailure, Lifecycle, LifecycleGuard, PreviousGeneration, PreviousLive,
+    SUPERVISION_UNAVAILABLE,
+};
 use crate::store::StoredInputRules;
 
 /// Everything needed to spawn and register one PTY-backed session, shared by
@@ -108,6 +112,8 @@ pub(super) enum PtyRegistration {
         previous_worker_id: Option<String>,
         /// Runtime generation being replaced, when known.
         previous_runtime_id: Option<String>,
+        /// Worker job being replaced, when the record names one.
+        previous_job: Option<Generation>,
         /// Monotonic generation being replaced.
         previous_runtime_generation: protocol::RuntimeGeneration,
         /// Original logical-session creation time.
@@ -404,16 +410,73 @@ impl SessionRegistry {
             })?
     }
 
+    /// Returns the lifecycle engine, or `worker_backend_required` when this
+    /// registry cannot launch workers.
+    pub(super) fn lifecycle(&self) -> Result<Lifecycle<'_>, ProtocolError> {
+        let config = &self.inner.config;
+        match (
+            self.inner.launcher.as_deref(),
+            config.supervision.as_ref(),
+            config.worker_runtime_root.as_deref(),
+            config.worker_state_root.as_deref(),
+        ) {
+            (Some(supervisor), Some(supervision), Some(runtime_root), Some(state_root)) => {
+                Ok(Lifecycle {
+                    supervisor,
+                    config: supervision,
+                    runtime_root,
+                    state_root,
+                    daemon_instance_id: self.daemon_instance_id(),
+                    connect_deadline: config.worker_connect_deadline,
+                    inspector: self.inner.inspector.as_ref(),
+                })
+            }
+            _ => Err(runtime_error(
+                "worker_backend_required",
+                "session launch requires a worker supervisor, durable worker roots, and supervision",
+            )),
+        }
+    }
+
+    /// Waits for exclusive lifecycle authority over one session.
+    pub(super) async fn lock_lifecycle(&self, id: &SessionId) -> LifecycleGuard {
+        self.inner.lifecycle_locks.acquire(&id.0).await
+    }
+
     /// Spawn a PTY for `spec.command`, register the session, and start its
     /// detector and exit watcher. Shared by `create` (first launch) and
     /// `resume_binding` (relaunch after a daemon restart).
+    ///
+    /// The registration runs as a detached task that owns `guard`, so a caller
+    /// dropped after the job was registered (a client disconnect) cannot leave
+    /// an untracked job: the task still commits the session or retires the
+    /// exact generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the launch error; `runtime_supervision_unavailable` leaves the
+    /// session visible as `Reconnecting` for reconciliation.
+    pub(super) async fn register_pty_session(
+        &self,
+        spec: PtySessionSpec,
+        guard: LifecycleGuard,
+    ) -> Result<SessionInfo, ProtocolError> {
+        let registry = self.clone();
+        tokio::spawn(async move { registry.run_pty_registration(spec, guard).await })
+            .await
+            .map_err(|_join_error| {
+                runtime_error("session_launch_failed", "session launch task panicked")
+            })?
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "session registration assembles one protocol snapshot plus task handles"
     )]
-    pub(super) async fn register_pty_session(
-        &self,
+    async fn run_pty_registration(
+        self,
         spec: PtySessionSpec,
+        _guard: LifecycleGuard,
     ) -> Result<SessionInfo, ProtocolError> {
         let PtySessionSpec {
             id,
@@ -448,33 +511,45 @@ impl SessionRegistry {
             fork: snapshot.fork.is_some(),
         };
         let runtime_generation = next_runtime_generation(&registration)?;
-        let (
-            transaction_id,
-            transaction_kind,
-            previous_worker_id,
-            previous_runtime_id,
-            replace_worker,
-        ) = match &registration {
-            PtyRegistration::Create => (
-                format!("create-{}", id.0),
-                TransactionKind::Create,
-                None,
-                None,
-                false,
-            ),
-            PtyRegistration::Recover {
-                transaction_id,
-                previous_worker_id,
-                previous_runtime_id,
-                ..
-            } => (
-                transaction_id.clone(),
-                TransactionKind::Recover,
-                previous_worker_id.clone(),
-                previous_runtime_id.clone(),
-                true,
-            ),
-        };
+        let lifecycle = self.lifecycle()?;
+        let (transaction_id, transaction_kind, previous_worker_id, previous_runtime_id) =
+            match &registration {
+                PtyRegistration::Create => (
+                    format!("create-{}", id.0),
+                    TransactionKind::Create,
+                    None,
+                    None,
+                ),
+                PtyRegistration::Recover {
+                    transaction_id,
+                    previous_worker_id,
+                    previous_runtime_id,
+                    previous_job,
+                    runtime_watch_cancel,
+                    ..
+                } => {
+                    // The superseded runtime must be proven ended and its job
+                    // retired while the durable record still names it, so a
+                    // crash here never leaves an unrecorded live generation.
+                    runtime_watch_cancel.cancel();
+                    tokio::task::yield_now().await;
+                    lifecycle
+                        .retire_previous(&PreviousGeneration {
+                            session_id: id.0.clone(),
+                            generation: previous_job.clone(),
+                            worker_id: previous_worker_id.clone(),
+                        })
+                        .await
+                        .map_err(PreviousLive::into_error)?;
+                    (
+                        transaction_id.clone(),
+                        TransactionKind::Recover,
+                        previous_worker_id.clone(),
+                        previous_runtime_id.clone(),
+                    )
+                }
+            };
+        let generation = Generation::mint(&id.0, lifecycle.config.worker_executable.clone())?;
         let preparing_runtime = SessionRuntime {
             state: RuntimeState::Starting,
             runtime_generation,
@@ -520,7 +595,7 @@ impl SessionRegistry {
             updated_at: created_at.clone(),
             exit_code: None,
         };
-        self.write_session_record(SessionRecord {
+        let mut preparing_record = SessionRecord {
             schema_version: SESSION_RECORD_SCHEMA_VERSION,
             session_id: id.0.clone(),
             desired_state: DesiredState::Running,
@@ -561,39 +636,46 @@ impl SessionRegistry {
                 state: RuntimeState::Starting,
                 worker_id: None,
                 runtime_id: None,
-                unit_name: Some(format!("pohunek-session@{}.service", id.0)),
+                service_id: None,
+                generation: None,
+                executable: None,
                 reason: None,
             },
-        })
-        .await?;
-        if let PtyRegistration::Recover {
-            runtime_watch_cancel,
-            ..
-        } = &registration
-        {
-            runtime_watch_cancel.cancel();
-            tokio::task::yield_now().await;
-        }
+        };
+        generation.record_into(&mut preparing_record.runtime);
+        self.write_session_record(preparing_record.clone()).await?;
 
         let started = match self
             .start_runtime(
+                &lifecycle,
+                &generation,
                 &id,
                 &agent,
                 agent_base.clone(),
                 snapshot.native_ref_kind(),
                 command,
                 &transaction_id,
-                replace_worker,
-                previous_worker_id.as_deref(),
                 runtime_generation,
             )
             .await
         {
             Ok(started) => started,
-            Err(error) => {
+            Err(LaunchFailure::Cleaned(error)) => {
                 if matches!(registration, PtyRegistration::Create) {
                     self.delete_session_record(&id).await?;
                 }
+                return Err(error);
+            }
+            Err(LaunchFailure::Unavailable(error)) => {
+                // The job may still be live; it stays recorded for
+                // reconciliation instead of being deleted or killed.
+                self.insert_unavailable_record(
+                    preparing_record,
+                    RuntimeState::Reconnecting,
+                    SUPERVISION_UNAVAILABLE,
+                )
+                .await;
+                self.schedule_supervision_retry(&id);
                 return Err(error);
             }
         };
@@ -655,6 +737,7 @@ impl SessionRegistry {
             activity_evidence: VecDeque::new(),
             input_gate: Arc::new(Mutex::new(())),
             runtime: started.handle.clone(),
+            job: Some(generation.clone()),
             desired_state: DesiredState::Running,
             detector_cancel: detector_cancel.clone(),
             detector_resize,
@@ -673,10 +756,32 @@ impl SessionRegistry {
             last_agent_report: None,
             last_native_report: None,
             observed_agents: Vec::new(),
+            cwd_observed_at: std::time::Instant::now(),
         };
         if let Err(error) = self.commit_session_entry(&id, entry).await {
             self.stop_uncommitted_runtime(&id, &started.handle).await;
-            return Err(error);
+            return Err(match lifecycle.abandon(&generation, error).await {
+                LaunchFailure::Cleaned(error) => {
+                    if matches!(registration, PtyRegistration::Create) {
+                        self.delete_session_record(&id).await?;
+                    }
+                    error
+                }
+                LaunchFailure::Unavailable(error) => {
+                    // The half-launched runtime could not be retired, so the
+                    // job may still be live; the preparing record stays
+                    // classified for reconciliation instead of being deleted
+                    // or killed.
+                    self.insert_unavailable_record(
+                        preparing_record,
+                        RuntimeState::Reconnecting,
+                        SUPERVISION_UNAVAILABLE,
+                    )
+                    .await;
+                    self.schedule_supervision_retry(&id);
+                    error
+                }
+            });
         }
         match registration {
             PtyRegistration::Create => self.emit(event::SESSION_CREATED, &info),
@@ -748,92 +853,62 @@ impl SessionRegistry {
         }
     }
 
+    /// Launches `generation` and initializes its worker (commit points 2-4).
+    ///
+    /// A worker that connected but cannot be initialized is retired by exact
+    /// generation before the failure is returned.
     #[expect(
         clippy::too_many_arguments,
-        reason = "runtime activation needs the persisted launch and replacement identity fields"
-    )]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "systemd activation, private negotiation, initialization, and stream opening are one transaction"
+        reason = "runtime activation needs the persisted launch and generation identity fields"
     )]
     async fn start_runtime(
         &self,
+        lifecycle: &Lifecycle<'_>,
+        generation: &Generation,
         id: &SessionId,
         agent: &str,
         agent_base: AgentKind,
         reference_kind: Option<SessionRefKind>,
         command: LaunchCommand,
         transaction_id: &str,
-        replace_worker: bool,
-        previous_worker_id: Option<&str>,
+        runtime_generation: protocol::RuntimeGeneration,
+    ) -> Result<StartedRuntime, LaunchFailure> {
+        let worker = lifecycle.launch(generation).await?;
+        match self
+            .initialize_runtime(
+                lifecycle,
+                worker,
+                id,
+                agent,
+                agent_base,
+                reference_kind,
+                command,
+                transaction_id,
+                runtime_generation,
+            )
+            .await
+        {
+            Ok(started) => Ok(started),
+            Err(error) => Err(lifecycle.abandon(generation, error).await),
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "worker initialization carries the persisted launch identity fields"
+    )]
+    async fn initialize_runtime(
+        &self,
+        lifecycle: &Lifecycle<'_>,
+        worker: Worker,
+        id: &SessionId,
+        agent: &str,
+        agent_base: AgentKind,
+        reference_kind: Option<SessionRefKind>,
+        command: LaunchCommand,
+        transaction_id: &str,
         runtime_generation: protocol::RuntimeGeneration,
     ) -> Result<StartedRuntime, ProtocolError> {
-        let Some(worker_root) = self.inner.config.worker_runtime_root.as_ref() else {
-            return Err(runtime_error(
-                "worker_backend_required",
-                "session launch requires a durable worker runtime root",
-            ));
-        };
-        let service_id = pohunek_platform::supervisor::ServiceId::parse(id.0.clone())
-            .map_err(|error| runtime_error("invalid_worker_identity", error.to_string()))?;
-        let activation = if replace_worker {
-            self.inner.launcher.replace(&service_id)
-        } else {
-            self.inner.launcher.start(&service_id)
-        };
-        activation.await.map_err(|error| {
-            runtime_error(
-                "worker_manager_unavailable",
-                format!("failed to activate session worker {}: {error}", id.0),
-            )
-        })?;
-
-        let socket_path = worker_root
-            .join(&id.0)
-            .join(pohunek_paths::WORKER_SOCKET_NAME);
-        let deadline = tokio::time::Instant::now() + self.inner.config.worker_connect_deadline;
-        let worker = loop {
-            match Worker::connect(&socket_path, &id.0, self.daemon_instance_id()).await {
-                Ok(worker) => {
-                    let worker_id = worker.worker_id().await;
-                    let still_previous = replace_worker
-                        && previous_worker_id
-                            .is_some_and(|previous| worker_id.as_str() == previous);
-                    if !still_previous {
-                        break worker;
-                    }
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(runtime_error(
-                            "worker_replacement_failed",
-                            format!(
-                                "session worker {} did not advance to a new worker generation",
-                                id.0
-                            ),
-                        ));
-                    }
-                    debug!(
-                        session_id = %id.0,
-                        "waiting for replacement worker generation"
-                    );
-                    tokio::time::sleep(WORKER_CONNECT_RETRY).await;
-                }
-                Err(error) if tokio::time::Instant::now() < deadline => {
-                    debug!(
-                        session_id = %id.0,
-                        error = %error,
-                        "worker bootstrap socket not ready yet"
-                    );
-                    tokio::time::sleep(WORKER_CONNECT_RETRY).await;
-                }
-                Err(error) => {
-                    return Err(runtime_error(
-                        "worker_connect_failed",
-                        format!("failed to connect to session worker {}: {error}", id.0),
-                    ));
-                }
-            }
-        };
-
         let worker_id = worker.worker_id().await;
         let dimensions = Dimensions::new(command.cols, command.rows)
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
@@ -854,6 +929,9 @@ impl SessionRegistry {
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
         let environment = SecretEnv::new(command.env.iter().cloned().collect())
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
+        let base_environment =
+            crate::runtime::environment::base_environment(&lifecycle.config.environment_allowlist)
+                .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
         let transaction_id = TransactionId::new(transaction_id)
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
         let worker_session_id = WorkerSessionId::new(&id.0)
@@ -876,6 +954,7 @@ impl SessionRegistry {
                 cwd: command.cwd,
                 dimensions,
                 environment,
+                base_environment: Some(base_environment),
                 limits,
                 stop_policy,
                 hook_protocol_version: Version::new(1)
@@ -1006,6 +1085,7 @@ mod tests {
             previous_worker_id: None,
             previous_runtime_id: None,
             previous_runtime_generation: protocol::RuntimeGeneration::new(u64::MAX),
+            previous_job: None,
             created_at: "2026-08-04T00:00:00Z".to_owned(),
             runtime_watch_cancel: CancellationToken::new(),
         };

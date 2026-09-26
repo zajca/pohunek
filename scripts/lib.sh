@@ -11,6 +11,73 @@ pohunek_need_cmd() {
   command -v "$1" >/dev/null 2>&1 || pohunek_fail "required command not found: $1"
 }
 
+# Seconds a timed-out command gets between TERM and KILL. One second lets a
+# well-behaved CLI flush and exit; a command ignoring TERM is then killed.
+POHUNEK_TIMEOUT_KILL_GRACE_SECONDS=1
+
+# Exit status of a command stopped by its deadline, matching GNU timeout(1).
+POHUNEK_TIMEOUT_STATUS=124
+
+# Runs "$@" with a deadline of $1 seconds, without depending on GNU timeout(1).
+#
+# Returns the command's own exit status, or POHUNEK_TIMEOUT_STATUS when the
+# deadline expired: the command then receives TERM and, after
+# POHUNEK_TIMEOUT_KILL_GRACE_SECONDS, KILL. The watchdog is cancelled as soon as
+# the command exits, and every background process is reaped before returning.
+pohunek_run_with_timeout() {
+  _pohunek_limit="$1"
+  shift
+  # Asynchronous commands read /dev/null unless stdin is passed explicitly.
+  exec 3<&0
+  "$@" 0<&3 3<&- &
+  _pohunek_command=$!
+  exec 3<&-
+  (
+    # Cancellation is a TERM from the caller. Traps run only between
+    # commands, so a TERM can land after a flag check but before `wait`
+    # blocks; the trap therefore also kills the current sleeper, which ends
+    # that `wait` at once. A TERM that lands before the sleeper's PID is known
+    # is caught by the flag check right after it is recorded.
+    _pohunek_cancelled=0
+    _pohunek_sleeper=
+    trap '_pohunek_cancelled=1; if [ -n "$_pohunek_sleeper" ]; then kill "$_pohunek_sleeper" 2>/dev/null || true; fi' TERM
+
+    # Sleeps $1 seconds in the background; fails after cancellation, with
+    # the sleeper killed and reaped.
+    watchdog_sleep() {
+      [ "$_pohunek_cancelled" -eq 0 ] || return 1
+      sleep "$1" &
+      _pohunek_sleeper=$!
+      [ "$_pohunek_cancelled" -eq 1 ] || wait "$_pohunek_sleeper" >/dev/null 2>&1 || true
+      if [ "$_pohunek_cancelled" -eq 1 ]; then
+        kill "$_pohunek_sleeper" 2>/dev/null || true
+        wait "$_pohunek_sleeper" >/dev/null 2>&1 || true
+        _pohunek_sleeper=
+        return 1
+      fi
+      _pohunek_sleeper=
+    }
+
+    watchdog_sleep "$_pohunek_limit" || exit 0
+    kill -TERM "$_pohunek_command" 2>/dev/null || exit 0
+    watchdog_sleep "$POHUNEK_TIMEOUT_KILL_GRACE_SECONDS" || exit "$POHUNEK_TIMEOUT_STATUS"
+    kill -KILL "$_pohunek_command" 2>/dev/null || true
+    exit "$POHUNEK_TIMEOUT_STATUS"
+  ) &
+  _pohunek_watchdog=$!
+  _pohunek_status=0
+  # dash reports a signalled job ("Terminated") on the waiting shell's output;
+  # the waits discard that report so only the command's own output remains.
+  wait "$_pohunek_command" >/dev/null 2>&1 || _pohunek_status=$?
+  kill -TERM "$_pohunek_watchdog" 2>/dev/null || true
+  _pohunek_watchdog_status=0
+  wait "$_pohunek_watchdog" >/dev/null 2>&1 || _pohunek_watchdog_status=$?
+  if [ "$_pohunek_watchdog_status" -eq "$POHUNEK_TIMEOUT_STATUS" ]; then
+    return "$POHUNEK_TIMEOUT_STATUS"
+  fi
+  return "$_pohunek_status"
+}
+
 pohunek_config_dir() {
   if [ -n "${POHUNEK_CONFIG_DIR:-}" ]; then
     printf '%s\n' "$POHUNEK_CONFIG_DIR"

@@ -22,7 +22,7 @@
 //! Nothing here interprets the values. Authorization policy stays with the
 //! accepting service.
 
-// Rust guideline compliant 2026-09-22
+// Rust guideline compliant 2026-09-26
 
 use std::os::fd::{AsFd, OwnedFd};
 
@@ -105,6 +105,28 @@ pub const fn provenance() -> Provenance {
 /// Returns [`Error`] when the kernel cannot attest the socket, answers with a
 /// malformed record, or reports no usable process identifier.
 pub fn credentials(socket: &impl AsFd) -> Result<Credentials, Error> {
+    backend::credentials(socket.as_fd())
+}
+
+/// Reads the serving process's credentials from a connecting Unix socket.
+///
+/// A client uses this to learn which process serves a socket path. Both
+/// kernels attest the connecting side with the server's identity. Linux
+/// answers from the `SO_PEERCRED` record the listener stamped when it called
+/// `listen`. Darwin answers `LOCAL_PEERCRED` from the listener's cached
+/// credentials and `LOCAL_PEERPID` from the server-side socket's `last_pid`,
+/// which names the process that last operated on that socket and stays zero
+/// until one did.
+///
+/// Call this after the server has answered on the connection and while it is
+/// still open: only then do both kernels name the process that served it, and
+/// Darwin cannot read a peer id from a closed connection at all.
+///
+/// # Errors
+///
+/// Returns [`Error`] when the socket is not connected, the kernel cannot
+/// attest it, or it reports no usable process identifier.
+pub fn server(socket: &impl AsFd) -> Result<Credentials, Error> {
     backend::credentials(socket.as_fd())
 }
 
@@ -198,8 +220,33 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{credentials, provenance, Binding, Error};
+    use super::{credentials, provenance, server, Binding, Error};
     use std::os::unix::net::{UnixListener, UnixStream};
+
+    /// A client names the process serving a socket path from its own side.
+    #[test]
+    fn connecting_side_names_the_serving_process() {
+        use std::io::{Read as _, Write as _};
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("served.sock");
+        let listening = UnixListener::bind(&path).expect("bind served socket");
+        let mut client = UnixStream::connect(&path).expect("connect served socket");
+        let (mut accepted, _address) = listening.accept().expect("accept served socket");
+        // The server answers first, as a daemon does before the client asks.
+        accepted.write_all(b"\n").expect("server answers");
+        let mut answer = [0_u8; 1];
+        client
+            .read_exact(&mut answer)
+            .expect("client reads the answer");
+
+        let served_by = server(&client).expect("server credentials");
+        assert_eq!(served_by.pid, std::process::id());
+        assert_eq!(
+            served_by.uid,
+            credentials(&accepted).expect("peer credentials").uid
+        );
+    }
 
     #[test]
     fn peer_credentials_come_from_connected_socket() {

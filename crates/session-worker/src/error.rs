@@ -1,11 +1,11 @@
 //! Defines the worker's top-level typed error.
 
-// Rust guideline compliant 2026-09-22
+// Rust guideline compliant 2026-09-24
 
 use std::path::PathBuf;
 
 use crate::identity::RejectReason;
-use crate::{ConfigError, JournalError, PtyError};
+use crate::{ConfigError, JournalError, PtyError, ServiceConfigError};
 
 /// Failure while starting or serving one worker.
 #[derive(Debug, thiserror::Error)]
@@ -25,6 +25,18 @@ pub enum WorkerError {
     /// A worker identifier is unsafe.
     #[error("invalid worker id `{0}`")]
     InvalidWorkerId(String),
+    /// A worker generation token is malformed.
+    #[error("invalid worker generation `{0}`")]
+    InvalidGeneration(String),
+    /// The service configuration file cannot be trusted.
+    #[error(transparent)]
+    ServiceConfig(#[from] ServiceConfigError),
+    /// The running worker executable could not be identified.
+    #[error("cannot identify the worker executable: {source}")]
+    Executable {
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
     /// A required filesystem operation failed.
     #[error("worker filesystem operation failed for {}: {source}", path.display())]
     Filesystem {

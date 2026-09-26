@@ -1,6 +1,6 @@
 //! Persists the worker-owned runtime journal atomically.
 
-// Rust guideline compliant 2026-09-20
+// Rust guideline compliant 2026-09-24
 
 use std::fmt::{Debug, Formatter};
 use std::path::{Path, PathBuf};
@@ -10,7 +10,7 @@ use pohunek_platform::filesystem::{AtomicReplaceError, TrustedDir};
 use serde::{Deserialize, Serialize};
 
 /// Worker journal schema understood by this crate.
-const JOURNAL_SCHEMA_VERSION: u32 = 3;
+const JOURNAL_SCHEMA_VERSION: u32 = 4;
 /// Owner-only directory permissions.
 const PRIVATE_DIR_MODE: u32 = 0o700;
 /// Owner-only journal permissions.
@@ -248,6 +248,20 @@ pub struct SubagentRecord {
     pub finished_at_ms: Option<u64>,
 }
 
+/// Identifies the worker binary and daemon-issued generation behind a journal.
+///
+/// Reconciliation compares these facts with the service manager's definition
+/// of the job, so a journal proves which executable and generation wrote it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerOrigin {
+    /// Absolute path of the running worker executable.
+    pub executable: PathBuf,
+    /// Package version of the running worker.
+    pub version: String,
+    /// Daemon-issued worker generation token.
+    pub generation: String,
+}
+
 /// Durable non-secret worker state.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalRecord {
@@ -257,6 +271,9 @@ pub struct JournalRecord {
     pub session_id: String,
     /// Stable worker identifier.
     pub worker_id: String,
+    /// Worker executable, version, and generation, stored as top-level keys.
+    #[serde(flatten)]
+    pub origin: WorkerOrigin,
     /// Runtime generation identifier after initialization.
     pub runtime_id: Option<String>,
     /// Lowest supported private-protocol version.
@@ -310,6 +327,7 @@ impl Debug for JournalRecord {
             .field("schema_version", &self.schema_version)
             .field("session_id", &self.session_id)
             .field("worker_id", &self.worker_id)
+            .field("origin", &self.origin)
             .field("runtime_id", &self.runtime_id)
             .field("protocol_minimum", &self.protocol_minimum)
             .field("protocol_maximum", &self.protocol_maximum)
@@ -338,9 +356,14 @@ impl Debug for JournalRecord {
 impl JournalRecord {
     /// Creates a bootstrap journal record.
     #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each argument is an independent bootstrap fact with its own source"
+    )]
     pub fn bootstrap(
         session_id: String,
         worker_id: String,
+        origin: WorkerOrigin,
         process_id: u32,
         worker_start_identity: String,
         boot_identity: String,
@@ -351,6 +374,7 @@ impl JournalRecord {
             schema_version: JOURNAL_SCHEMA_VERSION,
             session_id,
             worker_id,
+            origin,
             runtime_id: None,
             protocol_minimum: protocol_range.0,
             protocol_maximum: protocol_range.1,
@@ -472,7 +496,7 @@ mod tests {
 
     use super::{
         Journal, JournalError, JournalRecord, LaunchIdentity, ReleasedIdentity, SubagentPhase,
-        SubagentRecord,
+        SubagentRecord, WorkerOrigin,
     };
     use crate::ChildIdentity;
     use std::fs;
@@ -494,6 +518,11 @@ mod tests {
         let mut record = JournalRecord::bootstrap(
             "s-1".to_owned(),
             "worker-1".to_owned(),
+            WorkerOrigin {
+                executable: PathBuf::from("/opt/pohunek/libexec/pohunek/0.1.0/pohunek-sessiond"),
+                version: "0.1.0".to_owned(),
+                generation: "abcd2345".to_owned(),
+            },
             10,
             "start-1".to_owned(),
             "boot-test".to_owned(),
@@ -566,6 +595,34 @@ mod tests {
             0o700
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn journal_records_executable_version_and_generation_as_top_level_keys() {
+        let record = record("native-reference");
+        let json = serde_json::to_value(&record).expect("serialize journal");
+
+        assert_eq!(
+            json["executable"],
+            "/opt/pohunek/libexec/pohunek/0.1.0/pohunek-sessiond"
+        );
+        assert_eq!(json["version"], "0.1.0");
+        assert_eq!(json["generation"], "abcd2345");
+        assert!(json.get("origin").is_none());
+        assert_eq!(
+            serde_json::from_value::<JournalRecord>(json).expect("deserialize journal"),
+            record
+        );
+    }
+
+    #[test]
+    fn journal_without_origin_is_rejected() {
+        let mut json = serde_json::to_value(record("native-reference")).expect("serialize");
+        json.as_object_mut()
+            .expect("journal object")
+            .remove("generation");
+
+        serde_json::from_value::<JournalRecord>(json).expect_err("generation is required");
     }
 
     #[test]

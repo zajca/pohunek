@@ -232,7 +232,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!(
+        pohunek_test_support::temp_root().join(format!(
             "pohunek-events-{tag}-{}-{nanos}",
             std::process::id()
         ))

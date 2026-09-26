@@ -1,7 +1,7 @@
 //! `pohunek` — the CLI control plane.
 //!
-//! Commands: `doctor`, `daemon start`, `health`/`status`, `session`, `attach`,
-//! `completions`, `integration`, and `host` (discover/list/inspect). The grammar
+//! Commands: `doctor`, `daemon start`, `service`, `health`/`status`, `session`,
+//! `attach`, `completions`, `integration`, and `host` (discover/list/inspect). The grammar
 //! is host-aware
 //! (a `--host` flag and `<host>/<session-id>` targets); the *effective host*
 //! selects the transport, so local and remote (over `NetBird`) execute through one
@@ -15,6 +15,7 @@ mod completion;
 mod error;
 mod hermes_integration;
 mod paths;
+pub mod service;
 mod target;
 
 use std::path::PathBuf;
@@ -93,6 +94,15 @@ enum Commands {
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
+    },
+
+    /// Install, upgrade, uninstall, or inspect the daemon as a native login service.
+    ///
+    /// Purely local: it manages this machine's systemd user unit or launchd
+    /// agent, so the global `--host` flag is ignored.
+    Service {
+        #[command(subcommand)]
+        action: commands::service::Action,
     },
 
     /// Query daemon health over the control socket.
@@ -931,6 +941,11 @@ enum MigrationAction {
         /// Record informed consent to import live legacy sessions as runtime-lost.
         #[arg(long)]
         accept_runtime_loss: bool,
+        /// Dial the legacy daemon on this explicit local socket path instead
+        /// of the default one, as the install wrapper does after moving the
+        /// socket aside as its connect barrier.
+        #[arg(long)]
+        socket: Option<PathBuf>,
         /// Emit the sanitized migration manifest as JSON.
         #[arg(long)]
         json: bool,
@@ -990,10 +1005,18 @@ enum SetupAction {
 #[derive(Debug, Subcommand)]
 enum DaemonAction {
     /// Start the host daemon (foreground by default).
+    ///
+    /// Runs the installed daemon with `--service-config` from
+    /// `pohunek service install`. `--dev-subprocess` instead runs the daemon
+    /// next to this CLI with subprocess workers, for development and tests.
     Start {
         /// Run the daemon in the background instead of the foreground.
         #[arg(long)]
         detach: bool,
+        /// Run workers as plain subprocesses instead of native service jobs
+        /// (development and tests only; needs no `service.toml`).
+        #[arg(long)]
+        dev_subprocess: bool,
     },
 }
 
@@ -1384,6 +1407,7 @@ impl Commands {
             Commands::Migration { action } => match action {
                 MigrationAction::Preflight { json, .. } => *json,
             },
+            Commands::Service { action } => action.wants_json(),
             Commands::Setup { action, json } => {
                 action.as_ref().map_or(*json, SetupAction::wants_json)
             }
@@ -1410,6 +1434,7 @@ impl Commands {
             | Commands::AgentSkill { .. }
             | Commands::Doctor { .. }
             | Commands::Daemon { .. }
+            | Commands::Service { .. }
             | Commands::Health { .. }
             | Commands::Status { .. }
             | Commands::Session { .. }
@@ -1683,11 +1708,24 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         }
         Commands::Daemon { action } => match action {
             // Starting the daemon is inherently local (this machine's process).
-            DaemonAction::Start { detach } => {
-                commands::daemon::start(detach)?;
+            DaemonAction::Start {
+                detach,
+                dev_subprocess,
+            } => {
+                let mode = if dev_subprocess {
+                    commands::daemon::Mode::DevSubprocess
+                } else {
+                    commands::daemon::Mode::Service
+                };
+                commands::daemon::start(detach, mode)?;
                 Ok(ExitCode::SUCCESS)
             }
         },
+        Commands::Service { action } => {
+            // Service management is inherently local; `--host` is ignored.
+            commands::service::run(action).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Health { json } | Commands::Status { json } => {
             let paths = Paths::resolve()?;
             let host = effective_host(&global_host, None);
@@ -2122,10 +2160,17 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             match action {
                 MigrationAction::Preflight {
                     accept_runtime_loss,
+                    socket,
                     json,
                 } => {
-                    commands::migration::run_preflight(&host, &paths, accept_runtime_loss, json)
-                        .await?;
+                    commands::migration::run_preflight(
+                        &host,
+                        &paths,
+                        socket.as_deref(),
+                        accept_runtime_loss,
+                        json,
+                    )
+                    .await?;
                 }
             }
             Ok(ExitCode::SUCCESS)

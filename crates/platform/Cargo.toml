@@ -7,8 +7,11 @@ rust-version.workspace = true
 description = "Shared operating-system contracts for Pohunek host processes."
 
 [dependencies]
+pohunek-paths.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 async-io.workspace = true
@@ -17,10 +20,18 @@ rustix = { workspace = true, features = ["fs", "process"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["socket"] }
+zbus.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 calcifer-macos-acl.workspace = true
 libc.workspace = true
+plist.workspace = true
+
+# The plist rendering and parsing of the launchd backend is target-neutral, so
+# its golden tests run on every host.
+[dev-dependencies]
+plist.workspace = true
+tracing-subscriber.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 nix = { workspace = true, features = ["signal"] }

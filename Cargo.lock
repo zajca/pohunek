@@ -477,6 +477,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4130,6 +4136,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "plist"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2896bade328c13f7042a297ea5ac5b0951f6cf989dea5f32c2fd98da398195cb"
+dependencies = [
+ "base64 0.23.1",
+ "indexmap 2.14.0",
+ "quick-xml 0.42.0",
+ "time",
+]
+
+[[package]]
 name = "pohunek-cli"
 version = "0.31.6"
 dependencies = [
@@ -4140,6 +4158,7 @@ dependencies = [
  "keyring",
  "libc",
  "nix 0.29.0",
+ "pohunek-cli",
  "pohunek-client",
  "pohunek-gui-core",
  "pohunek-hostcheck",
@@ -4152,7 +4171,10 @@ dependencies = [
  "pohunek-protocol",
  "pohunek-relay-client",
  "pohunek-relay-protocol",
+ "pohunek-service-config",
+ "pohunek-session-worker",
  "pohunek-terminal",
+ "pohunek-worker-protocol",
  "reqwest",
  "serde",
  "serde_json",
@@ -4203,8 +4225,10 @@ dependencies = [
  "pohunek-paths",
  "pohunek-platform",
  "pohunek-protocol",
+ "pohunek-service-config",
  "pohunek-session-worker",
  "pohunek-terminal",
+ "pohunek-test-support",
  "pohunek-worker-protocol",
  "regex",
  "rustix 1.1.4",
@@ -4223,7 +4247,6 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "wait-timeout",
- "zbus 5.16.0",
  "zeroize",
 ]
 
@@ -4329,11 +4352,17 @@ dependencies = [
  "getrandom 0.2.17",
  "libc",
  "nix 0.29.0",
+ "plist",
+ "pohunek-paths",
  "portable-pty",
  "rustix 1.1.4",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zbus 5.16.0",
 ]
 
 [[package]]
@@ -4436,6 +4465,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pohunek-service-config"
+version = "0.31.6"
+dependencies = [
+ "pohunek-paths",
+ "pohunek-platform",
+ "proptest",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
 name = "pohunek-session-worker"
 version = "0.31.6"
 dependencies = [
@@ -4444,6 +4486,7 @@ dependencies = [
  "pohunek-logging",
  "pohunek-paths",
  "pohunek-platform",
+ "pohunek-service-config",
  "pohunek-terminal",
  "pohunek-worker-protocol",
  "portable-pty",
@@ -4467,6 +4510,13 @@ version = "0.31.6"
 dependencies = [
  "serde",
  "vt100",
+]
+
+[[package]]
+name = "pohunek-test-support"
+version = "0.31.6"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]
@@ -4651,6 +4701,15 @@ name = "quick-xml"
 version = "0.39.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
 dependencies = [
  "memchr",
 ]
@@ -7142,7 +7201,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c324a910fd86ebdc364a3e61ec1f11737d3b1d6c273c0239ee8ff4bc0d24b4a"
 dependencies = [
  "proc-macro2",
- "quick-xml",
+ "quick-xml 0.39.4",
  "quote",
 ]
 
