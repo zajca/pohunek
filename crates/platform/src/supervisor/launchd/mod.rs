@@ -20,8 +20,9 @@
 //! directory, never in `~/Library/LaunchAgents`, so launchd never resurrects a
 //! worker at login. Only the daemon agent is written to `~/Library/LaunchAgents`.
 //!
-//! The `launchctl` runner and the plist rendering are target-neutral and are
-//! unit-tested on every host; the backends themselves exist only on macOS.
+//! The `launchctl` runner, the plist rendering, and definition registration
+//! are target-neutral and are unit-tested on every host; the backends
+//! themselves exist only on macOS.
 
 use super::Error;
 
@@ -29,15 +30,16 @@ use super::Error;
 
 mod launchctl;
 mod plist;
+mod registration;
 
 #[cfg(target_os = "macos")]
 mod backend;
 
 #[cfg(target_os = "macos")]
 #[doc(inline)]
-pub use backend::{
-    Discovery, ExternalVolume, LaunchdDaemon, LaunchdSupervisor, MAX_DISCOVERED_DEFINITIONS,
-};
+pub use backend::{Discovery, LaunchdDaemon, LaunchdSupervisor, MAX_DISCOVERED_DEFINITIONS};
+#[doc(inline)]
+pub use registration::{ExternalVolume, StrandedDefinition};
 
 use launchctl::{Completion, RunError, Status};
 

@@ -8,6 +8,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -535,6 +536,152 @@ fn a_failed_disable_of_a_stopped_daemon_removes_the_stale_barrier() {
 }
 
 #[test]
+fn an_interrupted_retirement_restores_the_socket_of_a_running_daemon() {
+    // A signal after the barrier rename, while the daemon still runs, must not
+    // leave it reachable only through the moved node: the next run refuses a
+    // missing `daemon.sock`. The installer re-raises the signal after the
+    // cleanup, so it dies from it.
+    for (point, signal, number, systemctl_calls) in [
+        (
+            "preflight",
+            "TERM",
+            libc::SIGTERM,
+            &[IS_ACTIVE, STATE_QUERY][..],
+        ),
+        (
+            "preflight",
+            "INT",
+            libc::SIGINT,
+            &[IS_ACTIVE, STATE_QUERY][..],
+        ),
+        (
+            "disable",
+            "HUP",
+            libc::SIGHUP,
+            &[IS_ACTIVE, LIST_WORKERS, DISABLE, STATE_QUERY][..],
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture.legacy_install();
+        let output = fixture.run(
+            &[],
+            &[
+                ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+                ("POHUNEK_TEST_INTERRUPT_AT", point),
+                ("POHUNEK_TEST_INTERRUPT_SIGNAL", signal),
+            ],
+        );
+        assert_eq!(
+            output.status.signal(),
+            Some(number),
+            "{point}/{signal}: {output:?}"
+        );
+        assert_eq!(
+            fixture.systemctl_calls(),
+            systemctl_calls,
+            "{point}/{signal}"
+        );
+        assert_eq!(
+            fixture.pohunek_calls().len(),
+            2,
+            "{point}: no install or upgrade may run: {:?}",
+            fixture.pohunek_calls()
+        );
+        for legacy in fixture.legacy_files() {
+            assert!(legacy.exists(), "{point}: {} was removed", legacy.display());
+        }
+        assert!(
+            fixture.socket.path.exists(),
+            "{point}: socket was not restored"
+        );
+        assert!(
+            !fixture.socket.retired_exists(),
+            "{point}: renamed barrier socket remains after the interruption"
+        );
+    }
+}
+
+#[test]
+fn an_interrupted_retirement_of_a_stopped_daemon_removes_the_stale_barrier() {
+    // The signal lands while `disable --now` stops the daemon; its moved node
+    // is stale, so the cleanup removes it and leaves the original name vacant.
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let output = fixture.run(
+        &[],
+        &[
+            ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+            ("POHUNEK_TEST_STATE_AFTER_DISABLE", "inactive"),
+            ("POHUNEK_TEST_INTERRUPT_AT", "disable"),
+            ("POHUNEK_TEST_INTERRUPT_SIGNAL", "TERM"),
+        ],
+    );
+    assert_eq!(output.status.signal(), Some(libc::SIGTERM), "{output:?}");
+    assert_eq!(
+        fixture.systemctl_calls(),
+        [IS_ACTIVE, LIST_WORKERS, DISABLE, STATE_QUERY]
+    );
+    assert_eq!(
+        fixture.pohunek_calls().len(),
+        2,
+        "no install or upgrade may run: {:?}",
+        fixture.pohunek_calls()
+    );
+    for legacy in fixture.legacy_files() {
+        assert!(legacy.exists(), "{} was removed", legacy.display());
+    }
+    assert!(
+        !fixture.socket.path.exists(),
+        "socket node was restored for a stopped daemon"
+    );
+    assert!(
+        !fixture.socket.retired_exists(),
+        "renamed barrier socket remains after the interruption"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unexpected_exit_after_the_barrier_restores_the_socket() {
+    // With stderr on `/dev/full` the refusal's first diagnostic fails, so
+    // `set -e` ends the run before its own restore; the exit trap restores the
+    // socket of the still-running daemon and keeps the failing status.
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let full = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let output = fixture
+        .command(
+            &[],
+            &[
+                ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+                (
+                    "POHUNEK_TEST_LIVE_WORKERS",
+                    "pohunek-session@s-1.service loaded active running worker",
+                ),
+            ],
+        )
+        .stderr(full)
+        .output()
+        .expect("run installer");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        fixture.systemctl_calls(),
+        [IS_ACTIVE, LIST_WORKERS, STATE_QUERY]
+    );
+    for legacy in fixture.legacy_files() {
+        assert!(legacy.exists(), "{} was removed", legacy.display());
+    }
+    assert!(fixture.socket.path.exists(), "socket was not restored");
+    assert!(
+        !fixture.socket.retired_exists(),
+        "renamed barrier socket remains after the unexpected exit"
+    );
+}
+
+#[test]
 fn rerun_after_a_partial_retirement_finishes_without_a_second_preflight() {
     // The previous run disabled the legacy daemon but stopped before removing
     // its unit files and binaries.
@@ -650,9 +797,16 @@ fn release_workflow_packages_static_shell_completions() {
 /// `POHUNEK_TEST_STATUS_UNEXPECTED` answers without `pending_transaction`.
 /// `POHUNEK_TEST_PREFLIGHT_STATUS` and `POHUNEK_TEST_SERVICE_STATUS` set the
 /// exit status of the migration preflight and of install/upgrade.
+/// `POHUNEK_TEST_INTERRUPT_AT=preflight` makes the preflight send
+/// `POHUNEK_TEST_INTERRUPT_SIGNAL` to the installer before it returns.
 const FAKE_POHUNEK: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$POHUNEK_TEST_POHUNEK_LOG"
-[ "$1" = migration ] && exit "${POHUNEK_TEST_PREFLIGHT_STATUS:-0}"
+if [ "$1" = migration ]; then
+    if [ "${POHUNEK_TEST_INTERRUPT_AT:-}" = preflight ]; then
+        kill -s "$POHUNEK_TEST_INTERRUPT_SIGNAL" "$PPID"
+    fi
+    exit "${POHUNEK_TEST_PREFLIGHT_STATUS:-0}"
+fi
 if [ "$1" = service ] && [ "$2" = status ]; then
     if [ -n "${POHUNEK_TEST_STATUS_QUERY_EXIT:-}" ]; then
         printf '{\n  "err": {\n    "code": "service_record_invalid"\n  }\n}\n'
@@ -743,6 +897,9 @@ impl Fixture {
              case \"$*\" in\n\
              *disable*|*stop*)\n\
                  : > \"$POHUNEK_TEST_SYSTEMCTL_STOP_MARKER\"\n\
+                 if [ \"${POHUNEK_TEST_INTERRUPT_AT:-}\" = disable ]; then\n\
+                     kill -s \"$POHUNEK_TEST_INTERRUPT_SIGNAL\" \"$PPID\"\n\
+                 fi\n\
                  exit \"${POHUNEK_TEST_DISABLE_STATUS:-0}\" ;;\n\
              *list-units*)\n\
                  if [ -f \"${POHUNEK_TEST_SYSTEMCTL_STOP_MARKER:-}\" ]; then\n\
@@ -808,6 +965,12 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        self.command(args, env).output().expect("run installer")
+    }
+
+    /// The installer invocation with the fixture's environment and `env`
+    /// applied on top, for runs that redirect a standard stream.
+    fn command(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
         let path = format!(
             "{}:{}",
             self.commands.display(),
@@ -841,7 +1004,7 @@ impl Fixture {
         for (key, value) in env {
             command.env(key, value);
         }
-        command.output().expect("run installer")
+        command
     }
 
     fn install_call(&self) -> String {

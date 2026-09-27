@@ -29,13 +29,6 @@ use super::super::{DefinitionFacts, Error, JobDefinition, RestartPolicy};
 /// A valid definition holds at most 64 arguments of 4 KiB plus a few bounded
 /// paths; even if every byte needed the longest XML escape (`&quot;`, six
 /// bytes) it stays below 2 MiB. Larger files are corrupt or foreign.
-#[cfg_attr(
-    not(target_os = "macos"),
-    expect(
-        dead_code,
-        reason = "only the macOS backend reads definitions from disk"
-    )
-)]
 pub(crate) const MAX_DEFINITION_BYTES: usize = 2 * 1024 * 1024;
 
 /// Fields read back from a stored definition.

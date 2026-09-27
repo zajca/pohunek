@@ -81,7 +81,11 @@ daemon-side barrier, the installer retires it in this order:
    the run aborts with its status and keeps the legacy files: a daemon that
    may still run gets its socket node back at the original path, and one that
    `systemctl --user is-active` reports `inactive` or `failed` loses the stale
-   moved node;
+   moved node. The same rule settles the moved node when the run ends any
+   other way while it is in place — `HUP`, `INT` (Ctrl-C), or `TERM`, or an
+   unexpected shell error — so an interrupted run never leaves a running
+   legacy daemon reachable only under the moved name; the run keeps its exit
+   status, and a signal is re-raised after the cleanup;
 5. it re-runs the job inventory: a worker that survived the stop was started
    after the preflight and aborts the run;
 6. it removes `pohunekd.service`, `pohunek-session@.service`, and

@@ -91,9 +91,11 @@ restore_barrier() {
     # The operator can restart the left-in-place legacy install, so put the
     # moved socket node back where the daemon expects it whenever that name
     # is vacant.
-    if [ -n "$barrier_socket" ] && [ ! -e "$legacy_socket" ]; then
+    if [ -n "$barrier_socket" ] && [ -e "$barrier_socket" ] \
+        && [ ! -e "$legacy_socket" ]; then
         mv "$barrier_socket" "$legacy_socket" || true
     fi
+    disarm_barrier
 }
 # After the legacy daemon stopped, a moved node is stale: no daemon listens on
 # it, and the next install binds a fresh socket at the original path, so the
@@ -102,6 +104,54 @@ remove_barrier() {
     if [ -n "$barrier_socket" ]; then
         rm -f "$barrier_socket"
     fi
+    disarm_barrier
+}
+# A settled barrier needs no cleanup on exit or interruption.
+disarm_barrier() {
+    barrier_socket=
+    trap - EXIT HUP INT TERM
+}
+# `is-active` exits non-zero both for a stopped unit and for a failed query,
+# so only its printed `inactive` or `failed` state proves the daemon stopped
+# and the barrier is removed (status 0). Anything else (active, deactivating,
+# no answer) may still be a running daemon, which keeps its socket name
+# reachable, so the node is restored (status 1). `legacy_state` keeps the
+# printed state for the caller's report.
+settle_barrier() {
+    legacy_state=$(systemctl --user is-active pohunekd.service) || :
+    case "$legacy_state" in
+        inactive|failed)
+            remove_barrier
+            return 0
+            ;;
+        *)
+            restore_barrier
+            return 1
+            ;;
+    esac
+}
+# Settles a barrier still in place when the run ends outside the handled
+# paths (an unexpected `set -e` exit or a signal), so the legacy daemon never
+# stays reachable only through the moved node. Further signals are ignored
+# while the state query runs; the exit keeps the original status, and a
+# signal is re-raised with its default action so the caller sees it.
+settle_barrier_on_exit() {
+    trap '' HUP INT TERM
+    if [ -n "$barrier_socket" ] && [ -e "$barrier_socket" ]; then
+        settle_barrier || :
+    fi
+}
+barrier_exit_trap() {
+    barrier_exit_status=$1
+    settle_barrier_on_exit
+    exit "$barrier_exit_status"
+}
+barrier_signal_trap() {
+    trap - EXIT
+    settle_barrier_on_exit
+    trap - "$1"
+    kill -s "$1" "$$" || :
+    exit "$2"
 }
 legacy_retired=0
 if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
@@ -118,7 +168,15 @@ if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
             exit 1
         fi
         barrier_socket="$legacy_socket.retiring.$$"
+        # Armed before the rename so no interruption lands between the move
+        # and the trap; until the moved node exists the traps find nothing to
+        # settle. The fallback status of a signal is 128 plus its number.
+        trap 'barrier_exit_trap "$?"' EXIT
+        trap 'barrier_signal_trap HUP 129' HUP
+        trap 'barrier_signal_trap INT 130' INT
+        trap 'barrier_signal_trap TERM 143' TERM
         if ! mv "$legacy_socket" "$barrier_socket"; then
+            disarm_barrier
             echo "could not move the legacy daemon socket aside; nothing was changed" >&2
             exit 1
         fi
@@ -170,30 +228,20 @@ if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
     disable_status=0
     systemctl --user disable --now pohunekd.service || disable_status=$?
     if [ "$disable_status" -ne 0 ]; then
-        # `is-active` exits non-zero both for a stopped unit and for a failed
-        # query, so only its printed `inactive` or `failed` state proves the
-        # daemon stopped. Anything else (active, deactivating, no answer) may
-        # still be a running daemon, which keeps its socket name reachable.
-        legacy_state=$(systemctl --user is-active pohunekd.service) || :
         echo "\`systemctl --user disable --now pohunekd.service\` failed (status $disable_status);" >&2
         echo "the legacy unit files were kept:" >&2
         echo "  $legacy_unit_dir/pohunekd.service" >&2
         echo "  $legacy_unit_dir/pohunek-session@.service" >&2
         echo "  $legacy_unit_dir/pohunek-sessions.slice" >&2
-        case "$legacy_state" in
-            inactive|failed)
-                remove_barrier
-                echo "the legacy daemon is stopped; fix the reported problem and re-run $0;" >&2
-                echo "to keep using the legacy install instead, start it with" >&2
-                echo "\`systemctl --user enable --now pohunekd.service\`" >&2
-                ;;
-            *)
-                restore_barrier
-                echo "the legacy daemon may still be running (state: ${legacy_state:-unknown})" >&2
-                echo "and stays reachable at $legacy_socket;" >&2
-                echo "fix the reported problem and re-run $0" >&2
-                ;;
-        esac
+        if settle_barrier; then
+            echo "the legacy daemon is stopped; fix the reported problem and re-run $0;" >&2
+            echo "to keep using the legacy install instead, start it with" >&2
+            echo "\`systemctl --user enable --now pohunekd.service\`" >&2
+        else
+            echo "the legacy daemon may still be running (state: ${legacy_state:-unknown})" >&2
+            echo "and stays reachable at $legacy_socket;" >&2
+            echo "fix the reported problem and re-run $0" >&2
+        fi
         exit "$disable_status"
     fi
     remove_barrier

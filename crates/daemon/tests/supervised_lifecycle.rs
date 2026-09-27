@@ -374,18 +374,15 @@ async fn foreign_malformed_stale_and_incompatible_inputs_fail_closed() {
             PROTOCOL_INCOMPATIBLE,
         )
         .await;
+    // Retirement boots the job out before it ends the job's process group and
+    // removes its definition, so the job is absent before the file is gone.
     eventually("retirement of the ended stale job", || async {
-        fixture
-            .job_absent(&stale_ended.service_id())
-            .await
-            .then_some(())
+        let definition_removed = backend::definition_labels(&fixture.paths)
+            .is_none_or(|labels| !labels.contains(&namespace.worker_label(&stale_ended)));
+        (fixture.job_absent(&stale_ended.service_id()).await && definition_removed).then_some(())
     })
     .await;
     if let Some(labels) = backend::definition_labels(&fixture.paths) {
-        assert!(
-            !labels.contains(&namespace.worker_label(&stale_ended)),
-            "the ended stale job's definition was removed: {labels:?}"
-        );
         assert!(labels.contains(&namespace.worker_label(&stale_running)));
         assert!(labels.contains(&malformed), "unowned definitions are kept");
     }

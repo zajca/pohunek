@@ -1,7 +1,6 @@
 //! launchd worker supervisor and daemon agent backends.
 
 use std::ffi::OsStr;
-use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -11,10 +10,11 @@ use super::super::{
 };
 use super::launchctl::{Launchctl, Status};
 use super::plist::{self, Stored, MAX_DEFINITION_BYTES};
-use super::{presence, run_error, status_error, Presence};
-use crate::filesystem::{
-    EntryKind, FsError, MoveOutcome, RemoveOutcome, StageOutcome, StagedEntry, TrustedDir,
+use super::registration::{
+    self, definition_name, fs_error, remove_file, DEFINITION_MODE, DEFINITION_SUFFIX,
 };
+use super::{run_error, status_error, Presence};
+use crate::filesystem::{FsError, TrustedDir};
 use crate::process::{DarwinInspector, Pid, ProcessFact, ProcessIdentity, ProcessInspector as _};
 use rustix::process::{kill_process, Pid as NativePid, Signal};
 
@@ -26,35 +26,17 @@ const LAUNCHD_PID: Pid = 1;
 /// Mode of the private worker definition and log directories.
 const PRIVATE_DIR_MODE: u32 = 0o700;
 
-/// Mode of every definition file; launchd refuses group- or world-writable plists.
-const DEFINITION_MODE: u32 = 0o600;
-
 /// Bits that make a directory unsafe to hold the daemon agent definition.
 ///
 /// `~/Library/LaunchAgents` is commonly `0755`; only write access for others
 /// would let another account substitute the agent.
 const AGENTS_DIR_FORBIDDEN_BITS: u32 = 0o022;
 
-/// File-name suffix of every definition.
-const DEFINITION_SUFFIX: &str = ".plist";
-
 /// Suffix of a worker's launchd standard-output log.
 const STDOUT_SUFFIX: &str = ".out.log";
 
 /// Suffix of a worker's launchd standard-error log.
 const STDERR_SUFFIX: &str = ".err.log";
-
-/// Prefix of the temporary name an atomic definition write starts from.
-///
-/// Starts with `.` and never ends in [`DEFINITION_SUFFIX`], so discovery never
-/// mistakes an interrupted write for a definition.
-const TEMPORARY_PREFIX: &str = ".pohunek-launchd-";
-
-/// Prefix of the quarantine name a removed file passes through.
-const REMOVAL_PREFIX: &str = ".pohunek-launchd-removed-";
-
-/// Random bytes in a temporary definition name.
-const TEMPORARY_RANDOM_BYTES: usize = 8;
 
 /// Most entries discovery reads from the private definitions directory.
 ///
@@ -76,32 +58,11 @@ const ABSENCE_MARGIN: Duration = Duration::from_secs(5);
 /// while adding at most a tenth of a second to retirement.
 const ABSENCE_POLL: Duration = Duration::from_millis(100);
 
-/// Mount point of the boot volume group's data volume.
-///
-/// Since macOS 10.15 the home directories on the boot disk live on this
-/// volume (firmlinked into `/Users`), while `/` is the sealed system volume.
-const BOOT_DATA_VOLUME: &str = "/System/Volumes/Data";
-
 /// Worker argument introducing the session ID.
 const SESSION_ID_ARGUMENT: &str = "--session-id";
 
 /// Worker argument introducing the runtime generation.
 const GENERATION_ARGUMENT: &str = "--worker-generation";
-
-/// launchd refused a definition stored outside the boot volume group.
-///
-/// launchd does not load job definitions from external volumes. The backend
-/// reports this instead of silently storing definitions somewhere else; it is
-/// the source of an [`Error::Unavailable`] from `start` or `install`.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "launchd refused the definition directory {path} because it is not on the boot volume",
-    path = .path.display()
-)]
-pub struct ExternalVolume {
-    /// The definition directory.
-    pub path: PathBuf,
-}
 
 /// Result of [`LaunchdSupervisor::discover_definitions`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,7 +332,9 @@ impl Supervisor for LaunchdSupervisor {
     /// A leftover file of an absent label is moved aside and the label probed
     /// again before the new definition is published without replacing any
     /// file, so a job loaded concurrently keeps the definition it was loaded
-    /// from.
+    /// from. The leftover is discarded only once the new definition is kept;
+    /// when `bootstrap` proves nothing was loaded, the new file is removed and
+    /// the leftover returns to its name.
     fn start<'a>(&'a self, id: &'a ServiceId, definition: &'a JobDefinition) -> Operation<'a, ()> {
         Box::pin(self.start_worker(id, definition))
     }
@@ -572,13 +535,19 @@ impl DaemonSupervisor for LaunchdDaemon {
     /// Writes the agent definition and bootstraps it.
     ///
     /// A loaded daemon label is [`Error::AlreadyRegistered`] and its file is
-    /// left untouched.
+    /// left untouched. A leftover agent file is replaced only once the new
+    /// definition is kept, as in [`Supervisor::start`].
     fn install<'a>(&'a self, definition: &'a JobDefinition) -> Operation<'a, ()> {
         Box::pin(self.install_agent(definition))
     }
 
     /// Boots the agent out, waits until it is absent, then writes and
     /// bootstraps the new definition.
+    ///
+    /// The previous agent file stays set aside until `bootstrap` returns.
+    /// When launchd proves it loaded nothing (such as a missing `gui/<uid>`
+    /// domain), the new file is removed and the previous one returns to its
+    /// name, so launchd still loads the previous agent at the next login.
     fn replace<'a>(&'a self, definition: &'a JobDefinition) -> Operation<'a, ()> {
         Box::pin(self.replace_agent(definition))
     }
@@ -692,23 +661,11 @@ impl Jobs {
     }
 
     async fn presence(&self, operation: &'static str, label: &str) -> Result<Presence, Error> {
-        let target = self.target(label);
-        let completion = self
-            .launchctl
-            .run("print", &[OsStr::new(&target)])
-            .await
-            .map_err(|error| run_error(operation, error))?;
-        presence(operation, &self.domain, &completion)
+        registration::probe(&self.launchctl, &self.domain, label, operation).await
     }
 
-    /// Writes `<label>.plist` into `directory` and bootstraps it.
-    ///
-    /// The definition of a loaded label is never overwritten. launchd may load
-    /// a leftover `<label>.plist` on its own (the daemon agent at login), so
-    /// the leftover is moved aside and the label probed again before the new
-    /// file is published under a name that must not exist yet: a load racing
-    /// this call has then read either the leftover, which is put back, or the
-    /// new file, which is what the loaded job runs.
+    /// Writes `<label>.plist` into `directory` and bootstraps it; see
+    /// [`registration::register`].
     async fn register(
         &self,
         operation: &'static str,
@@ -717,61 +674,16 @@ impl Jobs {
         directory: &TrustedDir,
         bytes: &[u8],
     ) -> Result<(), Error> {
-        if self.presence(operation, label).await? == Presence::Loaded {
-            return Err(Error::AlreadyRegistered(id.clone()));
-        }
-        let file_name = definition_name(label);
-        let leftover = set_aside(directory, &file_name, operation)?;
-        let published = match self.presence(operation, label).await {
-            Ok(Presence::Absent) => publish_definition(directory, &file_name, bytes, operation),
-            Ok(Presence::Loaded) => Err(Error::AlreadyRegistered(id.clone())),
-            Err(error) => Err(error),
-        };
-        if let Some(leftover) = leftover {
-            // Without a published definition the leftover returns to its name,
-            // so a job loaded from it keeps its definition.
-            match &published {
-                Ok(()) => discard(leftover, operation)?,
-                Err(_) => put_back(&leftover, &file_name, operation)?,
-            }
-        }
-        published?;
-        let path = directory.path().join(&file_name);
-        let completion = self
-            .launchctl
-            .run("bootstrap", &[OsStr::new(&self.domain), path.as_os_str()])
-            .await
-            .map_err(|error| run_error(operation, error))?;
-        match completion.status {
-            Status::Success => Ok(()),
-            // `EIO` covers both an already loaded label and a definition
-            // launchd refused to read; `print` tells them apart.
-            Status::InputOutput => {
-                if self.presence(operation, label).await? == Presence::Loaded {
-                    return Err(Error::AlreadyRegistered(id.clone()));
-                }
-                remove_file(directory, &file_name, operation)?;
-                if !on_boot_volume(directory, operation)? {
-                    return Err(Error::Unavailable {
-                        operation,
-                        source: Box::new(ExternalVolume {
-                            path: directory.path().to_path_buf(),
-                        }),
-                    });
-                }
-                Err(status_error(operation, &self.domain, &completion))
-            }
-            Status::NoSuchDomain => {
-                remove_file(directory, &file_name, operation)?;
-                Err(status_error(operation, &self.domain, &completion))
-            }
-            // The label's state is unknown, so its definition stays for
-            // discovery and retirement to reconcile.
-            Status::NoSuchProcess
-            | Status::InProgress
-            | Status::NoSuchService
-            | Status::Unmapped => Err(status_error(operation, &self.domain, &completion)),
-        }
+        registration::register(
+            &self.launchctl,
+            &self.domain,
+            operation,
+            id,
+            label,
+            directory,
+            bytes,
+        )
+        .await
     }
 
     /// Boots `label` out and waits until `print` reports it absent.
@@ -1064,13 +976,6 @@ fn process_error(operation: &'static str, error: crate::process::Error) -> Error
     }
 }
 
-fn fs_error(operation: &'static str) -> impl Fn(FsError) -> Error {
-    move |error| Error::Operation {
-        operation,
-        source: Box::new(error),
-    }
-}
-
 fn require_absolute(field: &str, path: &Path) -> Result<(), Error> {
     if path.is_absolute() {
         Ok(())
@@ -1079,10 +984,6 @@ fn require_absolute(field: &str, path: &Path) -> Result<(), Error> {
             detail: format!("{field} must be absolute"),
         })
     }
-}
-
-fn definition_name(label: &str) -> String {
-    format!("{label}{DEFINITION_SUFFIX}")
 }
 
 /// Opens an existing private directory; a missing one is `None`.
@@ -1140,141 +1041,6 @@ fn stored_exit_timeout(
     usable_stored(directory, file_name, operation).map_or(MAX_JOB_TIMEOUT, |stored| {
         stored.exit_timeout.min(MAX_JOB_TIMEOUT)
     })
-}
-
-/// Publishes a `0600` definition under `file_name`, which must not exist.
-///
-/// The file is written and synchronized under a random temporary name first,
-/// so launchd never reads a partial definition. An occupied `file_name` is
-/// [`Error::Race`] and leaves the existing file untouched.
-fn publish_definition(
-    directory: &TrustedDir,
-    file_name: &str,
-    bytes: &[u8],
-    operation: &'static str,
-) -> Result<(), Error> {
-    let mut random = [0_u8; TEMPORARY_RANDOM_BYTES];
-    getrandom::getrandom(&mut random).map_err(|error| Error::Unavailable {
-        operation,
-        source: Box::new(std::io::Error::other(error.to_string())),
-    })?;
-    let mut temporary = String::from(TEMPORARY_PREFIX);
-    for byte in random {
-        use std::fmt::Write as _;
-        write!(temporary, "{byte:02x}").expect("writing hexadecimal to String cannot fail");
-    }
-    temporary.push_str(".tmp");
-    directory
-        .create_file(&temporary, bytes, DEFINITION_MODE)
-        .map_err(fs_error(operation))?;
-    match directory.move_no_replace(&temporary, directory, file_name) {
-        Ok(MoveOutcome::Moved) => Ok(()),
-        Ok(_) => {
-            remove_file(directory, &temporary, operation)?;
-            Err(Error::Race { operation })
-        }
-        Err(error) => {
-            // The move failure is the error to report; a temporary file that
-            // cannot be removed as well is never read as a definition.
-            if let Err(cleanup) = remove_file(directory, &temporary, operation) {
-                tracing::event!(
-                    name: "supervisor.register.cleanup_failed",
-                    tracing::Level::WARN,
-                    supervisor.entry = temporary.as_str(),
-                    error.message = %cleanup,
-                    "could not remove the temporary definition {{supervisor.entry}}"
-                );
-            }
-            Err(fs_error(operation)(error))
-        }
-    }
-}
-
-/// Moves an existing definition file to a quarantine name; a missing file is
-/// `None`.
-fn set_aside(
-    directory: &TrustedDir,
-    file_name: &str,
-    operation: &'static str,
-) -> Result<Option<StagedEntry>, Error> {
-    let Some(identity) = directory
-        .entry_identity(file_name, EntryKind::RegularFile)
-        .map_err(fs_error(operation))?
-    else {
-        return Ok(None);
-    };
-    match directory
-        .stage_random(file_name, REMOVAL_PREFIX, identity)
-        .map_err(fs_error(operation))?
-    {
-        StageOutcome::Staged(entry) => Ok(Some(entry)),
-        StageOutcome::Missing => Ok(None),
-        _ => Err(Error::Race { operation }),
-    }
-}
-
-/// Restores a definition moved aside by [`set_aside`].
-fn put_back(entry: &StagedEntry, file_name: &str, operation: &'static str) -> Result<(), Error> {
-    match entry.restore(file_name).map_err(fs_error(operation))? {
-        MoveOutcome::Moved => Ok(()),
-        _ => Err(Error::Race { operation }),
-    }
-}
-
-/// Deletes a definition moved aside by [`set_aside`].
-fn discard(entry: StagedEntry, operation: &'static str) -> Result<(), Error> {
-    match entry.remove().map_err(fs_error(operation))? {
-        RemoveOutcome::Removed | RemoveOutcome::Missing => Ok(()),
-        _ => Err(Error::Race { operation }),
-    }
-}
-
-/// Removes one regular file bound to the inode that was inspected.
-fn remove_file(
-    directory: &TrustedDir,
-    file_name: &str,
-    operation: &'static str,
-) -> Result<(), Error> {
-    let Some(identity) = directory
-        .entry_identity(file_name, EntryKind::RegularFile)
-        .map_err(fs_error(operation))?
-    else {
-        return Ok(());
-    };
-    match directory
-        .stage_random(file_name, REMOVAL_PREFIX, identity)
-        .map_err(fs_error(operation))?
-    {
-        StageOutcome::Staged(entry) => match entry.remove().map_err(fs_error(operation))? {
-            RemoveOutcome::Removed | RemoveOutcome::Missing => Ok(()),
-            _ => Err(Error::Race { operation }),
-        },
-        StageOutcome::Missing => Ok(()),
-        _ => Err(Error::Race { operation }),
-    }
-}
-
-/// Returns whether `directory` is on the boot volume group.
-fn on_boot_volume(directory: &TrustedDir, operation: &'static str) -> Result<bool, Error> {
-    let io = |source: std::io::Error| Error::Operation {
-        operation,
-        source: Box::new(source),
-    };
-    let device = directory
-        .try_clone_descriptor()
-        .map_err(fs_error(operation))?
-        .metadata()
-        .map_err(io)?
-        .dev();
-    for root in ["/", BOOT_DATA_VOLUME] {
-        match std::fs::metadata(root) {
-            Ok(metadata) if metadata.dev() == device => return Ok(true),
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io(error)),
-        }
-    }
-    Ok(false)
 }
 
 #[cfg(test)]
@@ -1388,87 +1154,5 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    fn private_directory() -> (tempfile::TempDir, TrustedDir) {
-        let root = tempfile::tempdir().expect("temporary directory");
-        let path = std::fs::canonicalize(root.path()).expect("canonical temporary directory");
-        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .expect("private mode");
-        let directory = TrustedDir::open_absolute(&path, 0o700).expect("private directory");
-        (root, directory)
-    }
-
-    fn names(directory: &TrustedDir) -> Vec<std::ffi::OsString> {
-        let mut names = directory.entry_names().expect("directory listing");
-        names.sort();
-        names
-    }
-
-    #[test]
-    fn publishing_never_replaces_an_existing_definition() {
-        let (_root, directory) = private_directory();
-        publish_definition(&directory, "job.plist", b"first", "start").expect("publish");
-        assert!(matches!(
-            publish_definition(&directory, "job.plist", b"second", "start"),
-            Err(Error::Race { operation: "start" })
-        ));
-        assert_eq!(
-            directory
-                .read_file("job.plist", DEFINITION_MODE, MAX_DEFINITION_BYTES)
-                .expect("definition"),
-            b"first"
-        );
-        assert_eq!(
-            names(&directory),
-            vec![std::ffi::OsString::from("job.plist")]
-        );
-    }
-
-    #[test]
-    fn a_leftover_set_aside_is_put_back_or_discarded() {
-        let (_root, directory) = private_directory();
-        assert!(set_aside(&directory, "job.plist", "start")
-            .expect("missing leftover")
-            .is_none());
-
-        publish_definition(&directory, "job.plist", b"leftover", "start").expect("publish");
-        let leftover = set_aside(&directory, "job.plist", "start")
-            .expect("set aside")
-            .expect("leftover exists");
-        assert!(!names(&directory).contains(&std::ffi::OsString::from("job.plist")));
-        put_back(&leftover, "job.plist", "start").expect("put back");
-        assert_eq!(
-            directory
-                .read_file("job.plist", DEFINITION_MODE, MAX_DEFINITION_BYTES)
-                .expect("definition"),
-            b"leftover"
-        );
-
-        let leftover = set_aside(&directory, "job.plist", "start")
-            .expect("set aside")
-            .expect("leftover exists");
-        publish_definition(&directory, "job.plist", b"new", "start").expect("publish");
-        discard(leftover, "start").expect("discard");
-        assert_eq!(
-            names(&directory),
-            vec![std::ffi::OsString::from("job.plist")]
-        );
-        assert_eq!(
-            directory
-                .read_file("job.plist", DEFINITION_MODE, MAX_DEFINITION_BYTES)
-                .expect("definition"),
-            b"new"
-        );
-    }
-
-    #[test]
-    fn private_directories_are_on_the_boot_volume() {
-        let root = tempfile::tempdir().expect("temporary directory");
-        let path = std::fs::canonicalize(root.path()).expect("canonical temporary directory");
-        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .expect("private mode");
-        let directory = TrustedDir::open_absolute(&path, 0o700).expect("private directory");
-        assert!(on_boot_volume(&directory, "test").expect("volume check"));
     }
 }

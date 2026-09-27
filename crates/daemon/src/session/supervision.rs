@@ -418,10 +418,10 @@ impl SessionRegistry {
     /// lock. Proven ended, it is retired by exact service ID, which also
     /// removes its definition. Still live, it is left alone and returned as an
     /// orphaned inventory entry. A job without a process in a state that
-    /// proves nothing is also returned as orphaned; unless its journaled
-    /// worker still runs, it is re-checked once the worker initialization
-    /// deadline has passed since this first sight (see
-    /// [`Self::settle_unproven_stale_job`]). Discovery failure only skips this
+    /// proves nothing, and a job whose inspection failed, are also returned
+    /// as orphaned; unless a journaled worker still runs, each is re-checked
+    /// once the worker initialization deadline has passed since this first
+    /// sight (see [`Self::settle_unproven_stale_job`]). Discovery failure only skips this
     /// cleanup; every record's own generation is inspected individually.
     ///
     /// `journal_of` returns the journaled worker of a stale generation from
@@ -486,7 +486,11 @@ impl SessionRegistry {
                     }
                 }
                 Err(error) => {
+                    // Unknown state proves nothing, so the job stays recorded
+                    // and a bounded re-check decides it.
                     tracing::warn!(service_id = %observation.id, error = %error, "stale worker job cannot be inspected; leaving it untouched");
+                    orphans.push(stale_orphan(&observation.id));
+                    self.settle_unproven_stale_job(key);
                 }
             }
         }
@@ -672,15 +676,17 @@ impl SessionRegistry {
     /// passed.
     ///
     /// Scheduled for a job without a process in a state that proves nothing,
-    /// and for a job whose retirement could not be confirmed. A background
+    /// for a job that could not be inspected, and for a job whose retirement
+    /// could not be confirmed. A background
     /// task waits from first sight until that deadline, then re-inspects the
     /// job and re-reads its generation's journal under the session's
     /// lifecycle lock. A job that ended, or whose worker never journaled
     /// within that window and so never owned a PTY, is retired and leaves
     /// the inventory. A job whose journaled worker may still run, or whose
-    /// journals cannot be read, stays orphaned for the next start. A
-    /// retirement that fails again stays orphaned and schedules another
-    /// re-check. Daemon shutdown leaves it to the next start as well.
+    /// journals cannot be read, stays orphaned for the next start. An
+    /// inspection or retirement that fails again stays orphaned and schedules
+    /// another re-check; nothing is retired on that uncertain evidence.
+    /// Daemon shutdown leaves it to the next start as well.
     pub(super) fn settle_unproven_stale_job(&self, key: WorkerKey) {
         let registry = self.clone();
         tokio::spawn(async move {
@@ -734,7 +740,10 @@ impl SessionRegistry {
             Ok(StaleJob::Unproven) => journal.is_ok(),
             Ok(StaleJob::Live) => false,
             Err(error) => {
-                tracing::warn!(service_id = %id, error = %error, "stale worker job cannot be inspected; leaving it untouched");
+                tracing::warn!(service_id = %id, error = %error, "stale worker job cannot be inspected; leaving it untouched and re-checking");
+                // The job's state is unknown, not live, so it keeps being
+                // re-checked while its orphan entry stays.
+                self.settle_unproven_stale_job(key);
                 return;
             }
         };

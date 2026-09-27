@@ -72,9 +72,32 @@ enum SocketEvidence {
     Unusable(RuntimeState, &'static str),
     /// Several live workers claim the session.
     Multiple,
-    /// The runtime root could not be enumerated, so whether a worker still
+    /// The runtime root could not be enumerated, or the session's socket did
+    /// not answer before the connect deadline, so whether a worker still
     /// serves the session is unknown.
     Unknown(String),
+}
+
+/// Why a discovered worker socket yielded no inspected worker.
+#[derive(Debug)]
+enum ProbeFailure {
+    /// The connection or the inspection failed with this error.
+    Failed(WorkerError),
+    /// The socket did not answer before the connect deadline; carries the
+    /// detail reported as unknown evidence.
+    Unresponsive(String),
+}
+
+/// Workers found by startup discovery.
+#[derive(Debug, Default)]
+struct WorkerDiscovery {
+    /// Inspected workers, keyed by the session each claims.
+    workers: HashMap<String, Vec<DiscoveredWorker>>,
+    /// Inventory of every answering socket.
+    inventory: Vec<RuntimeInventoryEntry>,
+    /// Runtime slots whose socket did not answer before the connect deadline,
+    /// with the detail reported as unknown evidence.
+    unresponsive: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -399,11 +422,11 @@ impl SessionRegistry {
             .collect::<HashMap<_, _>>();
 
         let lifecycle = self.lifecycle().ok();
-        let (mut discovered, mut inventory, socket_failure) =
-            match self.discover_workers(&records).await {
-                Ok((discovered, inventory)) => (discovered, inventory, None),
-                Err(detail) => (HashMap::new(), Vec::new(), Some(detail)),
-            };
+        let (mut discovered, socket_failure) = match self.discover_workers(&records).await {
+            Ok(discovered) => (discovered, None),
+            Err(detail) => (WorkerDiscovery::default(), Some(detail)),
+        };
+        let mut inventory = std::mem::take(&mut discovered.inventory);
         let mut journals = self.discover_worker_journals().await;
         let stale_journal = |key: &WorkerKey| match &journals {
             Ok(journals) => journals.get(key.session_id()).map_or(Ok(None), |scan| {
@@ -444,7 +467,7 @@ impl SessionRegistry {
                 .startup_socket_evidence(
                     &record.session_id,
                     socket_failure.as_deref(),
-                    discovered.remove(&record.session_id).unwrap_or_default(),
+                    &mut discovered,
                 )
                 .await;
             let scan = match &mut journals {
@@ -466,17 +489,20 @@ impl SessionRegistry {
         Ok(())
     }
 
-    /// Classifies the socket evidence startup discovery found for a session;
-    /// `failure` is why the runtime root could not be enumerated at all.
+    /// Classifies the socket evidence startup discovery found for a session,
+    /// taking its candidates out of `discovered`; `failure` is why the
+    /// runtime root could not be enumerated at all.
     async fn startup_socket_evidence(
         &self,
         session_id: &str,
         failure: Option<&str>,
-        mut candidates: Vec<DiscoveredWorker>,
+        discovered: &mut WorkerDiscovery,
     ) -> SocketEvidence {
-        if let Some(detail) = failure {
+        let unresponsive = discovered.unresponsive.get(session_id);
+        if let Some(detail) = failure.or(unresponsive.map(String::as_str)) {
             return SocketEvidence::Unknown(detail.to_owned());
         }
+        let mut candidates = discovered.workers.remove(session_id).unwrap_or_default();
         match candidates.as_slice() {
             [candidate] if candidate.slot == session_id => {
                 SocketEvidence::Worker(Box::new(candidates.remove(0)))
@@ -512,6 +538,10 @@ impl SessionRegistry {
     }
 
     /// Connects the worker socket of exactly one session, if it has one.
+    ///
+    /// The connection and inspection are bounded by the connect deadline; a
+    /// socket that does not answer in time is unknown evidence, so nothing is
+    /// touched and the session stays pending.
     async fn session_socket_evidence(&self, record: &SessionRecord) -> SocketEvidence {
         let Some(runtime_root) = self.inner.config.worker_runtime_root.clone() else {
             return SocketEvidence::Absent;
@@ -539,11 +569,7 @@ impl SessionRegistry {
         else {
             return SocketEvidence::Absent;
         };
-        let connected = match self.connect_discovered_worker(&socket).await {
-            Ok(worker) => worker.inspect().await.map(|snapshot| (worker, snapshot)),
-            Err(error) => Err(error),
-        };
-        match connected {
+        match self.connect_and_inspect(&socket).await {
             Ok((worker, snapshot)) => {
                 if snapshot.session_id.as_str() != slot
                     || persisted_identity_mismatch(record, &snapshot)
@@ -557,7 +583,8 @@ impl SessionRegistry {
                     }))
                 }
             }
-            Err(error) => {
+            Err(ProbeFailure::Unresponsive(detail)) => SocketEvidence::Unknown(detail),
+            Err(ProbeFailure::Failed(error)) => {
                 // Same classification startup discovery applies to its inventory.
                 match classify_connect_error(&error) {
                     (RuntimeState::Incompatible, reason) => {
@@ -1509,18 +1536,11 @@ impl SessionRegistry {
     ///
     /// Returns why the runtime root could not be enumerated instead of an
     /// empty result: a failed enumeration is no proof that a socket is absent.
-    async fn discover_workers(
-        &self,
-        records: &[SessionRecord],
-    ) -> Result<
-        (
-            HashMap<String, Vec<DiscoveredWorker>>,
-            Vec<RuntimeInventoryEntry>,
-        ),
-        String,
-    > {
+    /// Each socket is bounded by the connect deadline; one that does not
+    /// answer in time is reported as unresponsive rather than absent.
+    async fn discover_workers(&self, records: &[SessionRecord]) -> Result<WorkerDiscovery, String> {
         let Some(runtime_root) = self.inner.config.worker_runtime_root.clone() else {
-            return Ok((HashMap::new(), Vec::new()));
+            return Ok(WorkerDiscovery::default());
         };
         let slots = match tokio::task::spawn_blocking(move || discover_runtime_slots(&runtime_root))
             .await
@@ -1538,17 +1558,22 @@ impl SessionRegistry {
 
         let mut candidates = Vec::new();
         let mut inventory = Vec::new();
+        let mut unresponsive = HashMap::new();
         for (slot, socket) in slots {
-            match self.connect_discovered_worker(&socket).await {
-                Ok(worker) => match worker.inspect().await {
-                    Ok(snapshot) => candidates.push(DiscoveredWorker {
-                        slot,
-                        worker,
-                        snapshot,
-                    }),
-                    Err(error) => inventory.push(discovery_failure_entry(slot, &error)),
-                },
-                Err(error) => inventory.push(discovery_failure_entry(slot, &error)),
+            match self.connect_and_inspect(&socket).await {
+                Ok((worker, snapshot)) => candidates.push(DiscoveredWorker {
+                    slot,
+                    worker,
+                    snapshot,
+                }),
+                Err(ProbeFailure::Failed(error)) => {
+                    inventory.push(discovery_failure_entry(slot, &error));
+                }
+                // Nothing proves who answers there, so the slot is not
+                // inventoried; the session it names stays pending.
+                Err(ProbeFailure::Unresponsive(detail)) => {
+                    unresponsive.insert(slot, detail);
+                }
             }
         }
 
@@ -1608,31 +1633,93 @@ impl SessionRegistry {
             }
         }
         inventory.sort_by(|left, right| left.runtime_slot.cmp(&right.runtime_slot));
-        Ok((grouped, inventory))
+        Ok(WorkerDiscovery {
+            workers: grouped,
+            inventory,
+            unresponsive,
+        })
     }
 
-    async fn connect_discovered_worker(&self, socket_path: &Path) -> Result<Worker, WorkerError> {
-        let controller_deadline =
-            tokio::time::Instant::now() + self.inner.config.worker_connect_deadline;
+    /// Connects a discovered worker socket and inspects its worker.
+    ///
+    /// Negotiation, controller acquisition (including waiting out a previous
+    /// daemon's lease), and the inspection share one absolute deadline of
+    /// `worker_connect_deadline`, so a socket that accepts and then stops
+    /// answering cannot stall reconciliation or the lifecycle lock its caller
+    /// holds.
+    async fn connect_and_inspect(
+        &self,
+        socket_path: &Path,
+    ) -> Result<(Worker, InspectSnapshot), ProbeFailure> {
+        let deadline = tokio::time::Instant::now() + self.inner.config.worker_connect_deadline;
+        let worker = self
+            .connect_discovered_worker(socket_path, deadline)
+            .await?;
+        match tokio::time::timeout_at(deadline, worker.inspect()).await {
+            Ok(Ok(snapshot)) => Ok((worker, snapshot)),
+            Ok(Err(error)) => Err(ProbeFailure::Failed(error)),
+            Err(_elapsed) => Err(self.unresponsive(socket_path)),
+        }
+    }
+
+    /// Connects a discovered worker socket before `deadline`.
+    ///
+    /// A `ControllerBusy` rejection is retried until `deadline`; when the
+    /// deadline cuts a retry short, that rejection is the result.
+    async fn connect_discovered_worker(
+        &self,
+        socket_path: &Path,
+        deadline: tokio::time::Instant,
+    ) -> Result<Worker, ProbeFailure> {
+        let mut busy = None;
         loop {
-            match Worker::connect_discovered(socket_path, self.daemon_instance_id()).await {
-                Ok(worker) => return Ok(worker),
-                Err(
+            let attempt = tokio::time::timeout_at(
+                deadline,
+                Worker::connect_discovered(socket_path, self.daemon_instance_id()),
+            )
+            .await;
+            match attempt {
+                Ok(Ok(worker)) => return Ok(worker),
+                Ok(Err(
                     error @ WorkerError::Rejected {
                         code: ControlCode::ControllerBusy,
                         ..
                     },
-                ) if tokio::time::Instant::now() < controller_deadline => {
+                )) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        return Err(ProbeFailure::Failed(error));
+                    }
                     tracing::debug!(
                         path = %socket_path.display(),
                         error = %error,
                         "waiting for the previous daemon discovery lease to close"
                     );
-                    tokio::time::sleep(WORKER_CONNECT_RETRY).await;
+                    busy = Some(error);
+                    tokio::time::sleep(WORKER_CONNECT_RETRY.min(deadline - now)).await;
                 }
-                Err(error) => return Err(error),
+                Ok(Err(error)) => return Err(ProbeFailure::Failed(error)),
+                Err(_elapsed) => {
+                    return Err(
+                        busy.map_or_else(|| self.unresponsive(socket_path), ProbeFailure::Failed)
+                    );
+                }
             }
         }
+    }
+
+    /// Reports a worker socket that did not answer within the deadline.
+    fn unresponsive(&self, socket_path: &Path) -> ProbeFailure {
+        let deadline = self.inner.config.worker_connect_deadline;
+        tracing::warn!(
+            path = %socket_path.display(),
+            deadline_ms = deadline.as_millis(),
+            "durable worker socket did not answer before the connect deadline; nothing is touched"
+        );
+        ProbeFailure::Unresponsive(format!(
+            "worker socket did not answer within {}ms",
+            deadline.as_millis()
+        ))
     }
 
     #[expect(
@@ -6526,7 +6613,10 @@ while os.getppid() == parent:
         use std::sync::Arc;
         use std::time::Duration;
 
-        use pohunek_platform::supervisor::{DefinitionFacts, ServiceId, ServiceState};
+        use pohunek_platform::supervisor::{
+            DefinitionFacts, Error as SupervisorError, JobDefinition, Operation, ServiceId,
+            ServiceObservation, ServiceState, Supervisor,
+        };
         use pohunek_session_worker::{Journal, JournalRecord, RuntimePhase as JournalRuntimePhase};
         use protocol::{RuntimeInventoryStatus, RuntimeState, SessionId};
 
@@ -6539,7 +6629,7 @@ while os.getppid() == parent:
             TEST_WORKER_EXECUTABLE,
         };
         use crate::procwatch::{HostInspector, ProcessInspector};
-        use crate::runtime::lifecycle::tests::{Call, JobScript, ScriptedSupervisor};
+        use crate::runtime::lifecycle::tests::{Call, InspectStep, JobScript, ScriptedSupervisor};
         use crate::runtime::lifecycle::{
             IDENTITY_MISMATCH, SUPERVISION_AMBIGUOUS, SUPERVISION_UNAVAILABLE,
         };
@@ -6566,6 +6656,15 @@ while os.getppid() == parent:
             inspector: Arc<dyn ProcessInspector>,
             worker_initialize: Option<Duration>,
         ) -> Fixture {
+            fixture_over(inspector, worker_initialize, ScriptedSupervisor::scripted())
+        }
+
+        /// A [`fixture_with`] whose jobs are managed by `supervisor`.
+        fn fixture_over(
+            inspector: Arc<dyn ProcessInspector>,
+            worker_initialize: Option<Duration>,
+            supervisor: ScriptedSupervisor,
+        ) -> Fixture {
             let root = temp_root();
             let runtime_root = root.join("runtime/workers");
             let state_root = root.join("state/workers");
@@ -6584,7 +6683,7 @@ while os.getppid() == parent:
             if let Some(worker_initialize) = worker_initialize {
                 supervision.worker_initialize = worker_initialize;
             }
-            let supervisor = Arc::new(ScriptedSupervisor::scripted());
+            let supervisor = Arc::new(supervisor);
             let registry = SessionRegistry::new_with_launcher_and_inspector(
                 SessionRegistryConfig {
                     store_path: Some(root.join("data/metadata.jsonl")),
@@ -8579,6 +8678,174 @@ while os.getppid() == parent:
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             assert_eq!(retire_count(&fixture, &unproven), 2);
+        }
+
+        /// A backend that discovers exactly one job, finds it absent on
+        /// inspection, and retires it.
+        #[derive(Debug)]
+        struct OneStaleJob(ServiceId);
+
+        impl Supervisor for OneStaleJob {
+            fn start<'a>(
+                &'a self,
+                _id: &'a ServiceId,
+                _definition: &'a JobDefinition,
+            ) -> Operation<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn discover(&self) -> Operation<'_, Vec<ServiceObservation>> {
+                Box::pin(async move {
+                    Ok(vec![ServiceObservation {
+                        id: self.0.clone(),
+                        state: ServiceState::Unknown,
+                        process: None,
+                        definition: None,
+                    }])
+                })
+            }
+
+            fn inspect<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, ServiceObservation> {
+                Box::pin(async move { Err(SupervisorError::NotFound(id.clone())) })
+            }
+
+            fn retire<'a>(&'a self, _id: &'a ServiceId) -> Operation<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        #[tokio::test]
+        async fn uninspectable_stale_job_stays_orphaned_and_is_retired_by_a_re_check() {
+            const INITIALIZE: Duration = Duration::from_millis(300);
+
+            let stale = service_id("s-343", TEST_GENERATION);
+            let supervisor = ScriptedSupervisor::over(OneStaleJob(stale.clone()));
+            // The startup inspection and the first re-check fail; the second
+            // re-check finds the job gone.
+            supervisor.script_inspects([
+                InspectStep::Unavailable,
+                InspectStep::Unavailable,
+                InspectStep::NotFound,
+            ]);
+            let fixture = fixture_over(
+                Arc::new(RetryInspector::readable_host()),
+                Some(INITIALIZE),
+                supervisor,
+            );
+            let orphaned = |inventory: &protocol::RuntimeInventoryResult| {
+                inventory.entries.iter().any(|entry| {
+                    entry.runtime_slot == stale.as_str()
+                        && entry.status == RuntimeInventoryStatus::Orphaned
+                        && entry.reason.as_deref() == Some(STALE_GENERATION)
+                })
+            };
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let inventory = fixture.registry.runtime_inventory().await;
+            assert!(
+                orphaned(&inventory),
+                "an uninspectable stale job stays inventoried: {inventory:?}"
+            );
+            assert!(fixture.supervisor.retired().is_empty());
+
+            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            while !fixture.supervisor.retired().contains(&stale) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the uninspectable stale job was never re-checked to its end"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(
+                inspections(&fixture.supervisor, &stale),
+                3,
+                "retired only once an inspection proved it ended"
+            );
+            assert_eq!(fixture.supervisor.retired(), vec![stale.clone()]);
+            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            while orphaned(&fixture.registry.runtime_inventory().await) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the retired job never left the inventory"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        /// Binds `slot`'s worker socket, accepts every connection, and never
+        /// answers, standing in for a worker that hangs mid-negotiation.
+        fn spawn_silent_worker(runtime_root: &Path, slot: &str) -> tokio::task::JoinHandle<()> {
+            let directory = runtime_root.join(slot);
+            std::fs::create_dir_all(&directory).expect("create silent runtime directory");
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .expect("private runtime directory");
+            let socket = directory.join(pohunek_paths::WORKER_SOCKET_NAME);
+            let listener = tokio::net::UnixListener::bind(&socket).expect("bind silent endpoint");
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+                .expect("private silent socket");
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((stream, _)) = listener.accept().await {
+                    held.push(stream);
+                }
+            })
+        }
+
+        #[tokio::test]
+        async fn unresponsive_worker_socket_is_unknown_evidence_within_the_connect_deadline() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let runtime_root = fixture.root.join("runtime/workers");
+            let record = persist_record(&fixture.root, "s-361", Some("runtime-s-361"));
+            let id = service_id("s-361", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Running, None));
+            let silent = spawn_silent_worker(&runtime_root, "s-361");
+
+            tokio::time::timeout(
+                EFFECT_DEADLINE,
+                Box::pin(fixture.registry.reconcile_workers()),
+            )
+            .await
+            .expect("startup reconciliation is bounded by the connect deadline")
+            .expect("reconcile");
+            let runtime = runtime_of(&fixture.registry, "s-361").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
+
+            // The supervision retry runs both passes with the lock held.
+            let session = SessionId("s-361".to_owned());
+            let guard = fixture.registry.lock_lifecycle(&session).await;
+            let pending = tokio::time::timeout(
+                EFFECT_DEADLINE,
+                fixture.registry.reconcile_single_session(record.clone()),
+            )
+            .await
+            .expect("a retry pass is bounded by the connect deadline");
+            assert!(pending, "unknown socket evidence keeps the session pending");
+            let settled = tokio::time::timeout(
+                EFFECT_DEADLINE,
+                fixture.registry.retry_terminal_retirement(&record),
+            )
+            .await
+            .expect("a retirement retry is bounded by the connect deadline");
+            assert!(
+                !settled,
+                "unknown socket evidence keeps the retirement pending"
+            );
+            drop(guard);
+
+            let runtime = runtime_of(&fixture.registry, "s-361").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
+            assert!(
+                fixture.supervisor.retired().is_empty(),
+                "nothing is retired on unknown evidence"
+            );
+            silent.abort();
         }
 
         #[tokio::test]
