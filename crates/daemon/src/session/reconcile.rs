@@ -576,7 +576,8 @@ impl SessionRegistry {
     /// when its worker's journal names that generation, terminal journals of
     /// other generations are history, and only that generation's job is
     /// inspected. Returns whether the session needs the background re-check:
-    /// its supervisor was unavailable or its generation is ambiguous. In
+    /// its supervisor was unavailable, its generation is ambiguous, or the
+    /// job of its proven-terminal generation could not be retired. In
     /// `retry` mode an unchanged outcome leaves the current entry untouched.
     ///
     /// `scan` is `Err` when the journals could not be scanned. Missing socket
@@ -687,23 +688,22 @@ impl SessionRegistry {
             SocketEvidence::Absent | SocketEvidence::Unusable(..) | SocketEvidence::Unknown(_) => {}
         }
 
-        let scoped = WorkerJournalScan {
-            evidence: scan
-                .evidence
-                .iter()
-                .filter(|journal| {
-                    generation
-                        .as_ref()
-                        .is_none_or(|generation| journal.generation == generation.generation())
-                })
-                .cloned()
-                .collect(),
-            conflict: scan.conflict,
-        };
+        let scoped = scan.scoped_to(generation.as_ref());
         match classify_terminal_journals(&scoped, &record) {
             TerminalJournalClassification::Exact(evidence) => {
+                let session_id = record.session_id.clone();
                 self.import_terminal_journal(record, *evidence).await;
-                return false;
+                // The imported outcome is recorded first; the job of the
+                // proven-terminal generation otherwise stays registered (a
+                // launchd `RunAtLoad` job stays loaded after its worker exits).
+                // A worker that still answers keeps its final output until it
+                // exits, and a later reconciliation retires the job then.
+                if !matches!(socket, SocketEvidence::Absent) {
+                    return false;
+                }
+                return !self
+                    .retire_terminal_generation(&session_id, generation.as_ref(), lifecycle)
+                    .await;
             }
             TerminalJournalClassification::Conflict => {
                 self.insert_unavailable_record(
@@ -1228,6 +1228,82 @@ impl SessionRegistry {
                 Err(format!("worker journal scan failed: {error}"))
             }
         }
+    }
+
+    /// Retires the job of a generation whose terminal journal proves it ended.
+    ///
+    /// Returns whether nothing is left to retry: the job was retired (an
+    /// absent job counts), or there is no generation or supervisor to retire
+    /// it through. A failed retirement is logged and returns `false`, so the
+    /// caller keeps the session for the background re-check.
+    async fn retire_terminal_generation(
+        &self,
+        session_id: &str,
+        generation: Option<&super::Generation>,
+        lifecycle: Option<&Lifecycle<'_>>,
+    ) -> bool {
+        let (Some(generation), Some(lifecycle)) = (generation, lifecycle) else {
+            return true;
+        };
+        match lifecycle.retire(generation).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    service_id = %generation.service_id(),
+                    error = %error,
+                    "failed to retire the terminal worker generation"
+                );
+                false
+            }
+        }
+    }
+
+    /// Re-attempts the retirement of a terminal record's generation.
+    ///
+    /// Used by the supervision retry, with the session's lifecycle lock held,
+    /// for a session whose terminal entry kept its generation's job. The
+    /// generation is retired only while its journal still proves it terminal
+    /// exactly as reconciliation did and no worker answers on the session's
+    /// socket; the entry itself is never changed. Returns whether the session
+    /// no longer needs a retry: incomplete evidence or a failed retirement
+    /// keeps it pending, while evidence that proves nothing leaves the job to
+    /// the next startup reconciliation.
+    pub(super) async fn retry_terminal_retirement(&self, record: &SessionRecord) -> bool {
+        // A malformed generation was already classified; nothing names a job.
+        let Ok(Some(generation)) =
+            super::Generation::from_record(&record.session_id, &record.runtime)
+        else {
+            return true;
+        };
+        let Ok(lifecycle) = self.lifecycle() else {
+            return true;
+        };
+        match self.session_socket_evidence(record).await {
+            SocketEvidence::Absent => {}
+            SocketEvidence::Unknown(_) => return false,
+            SocketEvidence::Worker(_) | SocketEvidence::Unusable(..) | SocketEvidence::Multiple => {
+                return true;
+            }
+        }
+        let scan = match self.discover_worker_journals().await {
+            Ok(mut journals) => journals.remove(&record.session_id).unwrap_or_default(),
+            Err(_) => return false,
+        };
+        let scoped = scan.scoped_to(Some(&generation));
+        if !matches!(
+            classify_terminal_journals(&scoped, record),
+            TerminalJournalClassification::Exact(_)
+        ) {
+            tracing::warn!(
+                session_id = %record.session_id,
+                service_id = %generation.service_id(),
+                "terminal generation is no longer proven by its journal; its job is left to the next reconciliation"
+            );
+            return true;
+        }
+        self.retire_terminal_generation(&record.session_id, Some(&generation), Some(&lifecycle))
+            .await
     }
 
     async fn import_terminal_journal(&self, mut record: SessionRecord, evidence: JournalEvidence) {
@@ -2782,6 +2858,25 @@ struct WorkerJournalScan {
 }
 
 impl WorkerJournalScan {
+    /// Keeps only the journals naming `generation`; `None` keeps every one.
+    ///
+    /// Journals of other generations are history, never evidence about the
+    /// record's current generation.
+    fn scoped_to(&self, generation: Option<&super::Generation>) -> Self {
+        Self {
+            evidence: self
+                .evidence
+                .iter()
+                .filter(|journal| {
+                    generation
+                        .is_none_or(|generation| journal.generation == generation.generation())
+                })
+                .cloned()
+                .collect(),
+            conflict: self.conflict,
+        }
+    }
+
     /// Returns the journal naming `generation`, or `None` when the session has
     /// none.
     ///
@@ -6568,6 +6663,51 @@ while os.getppid() == parent:
             worker: (u32, u64),
             runtime_id: Option<&str>,
         ) {
+            write_journal_record(
+                root,
+                session_id,
+                worker_id,
+                generation,
+                worker,
+                runtime_id,
+                |_| {},
+            );
+        }
+
+        /// Writes the terminal journal of `session_id`'s [`TEST_GENERATION`]
+        /// worker after its child exited successfully.
+        fn write_terminal_journal(root: &Path, session_id: &str, runtime_id: &str) {
+            write_journal_record(
+                root,
+                session_id,
+                &format!("worker-{session_id}"),
+                TEST_GENERATION,
+                dead_worker(),
+                Some(runtime_id),
+                |journal| {
+                    journal.phase = JournalRuntimePhase::Terminal;
+                    journal.outcome = Some(pohunek_session_worker::RuntimeOutcome {
+                        exit_code: Some(0),
+                        signal: None,
+                        success: true,
+                        exited_at: "2026-09-24T00:01:00Z".to_owned(),
+                        reason: "natural_exit".to_owned(),
+                    });
+                },
+            );
+        }
+
+        /// Writes a live journal of `session_id`'s worker `worker_id` naming
+        /// `generation`, adjusted by `finish` before it is persisted.
+        fn write_journal_record(
+            root: &Path,
+            session_id: &str,
+            worker_id: &str,
+            generation: &str,
+            worker: (u32, u64),
+            runtime_id: Option<&str>,
+            finish: impl FnOnce(&mut JournalRecord),
+        ) {
             let mut journal = JournalRecord::bootstrap(
                 session_id.to_owned(),
                 worker_id.to_owned(),
@@ -6584,13 +6724,14 @@ while os.getppid() == parent:
             );
             journal.runtime_id = runtime_id.map(ToOwned::to_owned);
             journal.phase = JournalRuntimePhase::Live;
+            finish(&mut journal);
             let session_dir = root.join("state/workers").join(session_id);
             std::fs::create_dir_all(&session_dir).expect("create journal directory");
             std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700))
                 .expect("private journal directory");
             Journal::new(session_dir.join(format!("{worker_id}.json")))
                 .write(&journal)
-                .expect("write live journal");
+                .expect("write worker journal");
         }
 
         /// Identity of a worker process that has exited and been reaped.
@@ -7052,6 +7193,118 @@ while os.getppid() == parent:
             assert!(!fixture.supervisor.calls().iter().any(
                 |call| matches!(call, Call::Inspect(id) if id.as_str().starts_with("s-310."))
             ));
+            fake.abort();
+        }
+
+        /// Whether `id` is still registered with the supervisor.
+        async fn discovered(supervisor: &ScriptedSupervisor, id: &ServiceId) -> bool {
+            pohunek_platform::supervisor::Supervisor::discover(supervisor)
+                .await
+                .expect("discover scripted jobs")
+                .iter()
+                .any(|observation| observation.id == *id)
+        }
+
+        fn retire_count(supervisor: &ScriptedSupervisor, id: &ServiceId) -> usize {
+            supervisor
+                .retired()
+                .into_iter()
+                .filter(|retired| retired == id)
+                .count()
+        }
+
+        #[tokio::test]
+        async fn terminal_journal_retires_the_loaded_job_of_its_generation() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            persist_record(&fixture.root, "s-350", Some("runtime-s-350"));
+            write_terminal_journal(&fixture.root, "s-350", "runtime-s-350");
+            // A launchd `RunAtLoad` job stays loaded after its worker exits.
+            let id = service_id("s-350", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Unknown, None));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let info = fixture
+                .registry
+                .inspect(&SessionId("s-350".to_owned()))
+                .await
+                .expect("terminal session stays visible");
+            assert_eq!(info.state, protocol::SessionState::Done);
+            assert_eq!(info.runtime.expect("runtime").state, RuntimeState::Terminal);
+            assert_eq!(fixture.supervisor.retired(), vec![id.clone()]);
+            assert!(!discovered(&fixture.supervisor, &id).await);
+        }
+
+        #[tokio::test]
+        async fn failed_terminal_generation_retirement_is_retried() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            persist_record(&fixture.root, "s-351", Some("runtime-s-351"));
+            write_terminal_journal(&fixture.root, "s-351", "runtime-s-351");
+            let id = service_id("s-351", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Stopped, None));
+            fixture.supervisor.script_retire_unavailable(id.clone());
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            // The proven outcome is recorded even though the job survived.
+            let runtime = runtime_of(&fixture.registry, "s-351").await;
+            assert_eq!(runtime.state, RuntimeState::Terminal);
+            assert_eq!(retire_count(&fixture.supervisor, &id), 1);
+            assert!(discovered(&fixture.supervisor, &id).await);
+
+            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            while discovered(&fixture.supervisor, &id).await {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the terminal generation's job was never retired again"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(retire_count(&fixture.supervisor, &id), 2);
+            let runtime = runtime_of(&fixture.registry, "s-351").await;
+            assert_eq!(runtime.state, RuntimeState::Terminal);
+            assert!(
+                !fixture
+                    .registry
+                    .inner
+                    .supervision_retries
+                    .state
+                    .lock()
+                    .expect("retry state")
+                    .pending
+                    .contains("s-351"),
+                "a retired generation leaves the retry"
+            );
+        }
+
+        #[tokio::test]
+        async fn terminal_generation_behind_an_answering_worker_is_not_retired() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let runtime_root = fixture.root.join("runtime/workers");
+            persist_record(&fixture.root, "s-352", Some("runtime-s-352"));
+            write_terminal_journal(&fixture.root, "s-352", "runtime-s-352");
+            let id = service_id("s-352", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Running, None));
+            let fake = spawn_incompatible_worker(&runtime_root, "s-352");
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-352").await;
+            assert_eq!(runtime.state, RuntimeState::Terminal);
+            assert_eq!(retire_count(&fixture.supervisor, &id), 0);
+            assert!(discovered(&fixture.supervisor, &id).await);
             fake.abort();
         }
 

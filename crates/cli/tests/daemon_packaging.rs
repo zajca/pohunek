@@ -400,6 +400,140 @@ fn a_failed_post_stop_inventory_keeps_the_legacy_files() {
     );
 }
 
+const STATE_QUERY: &str = "--user is-active pohunekd.service";
+
+#[test]
+fn a_failed_disable_of_a_running_daemon_restores_its_socket() {
+    // A daemon the failed `disable --now` left running keeps serving only on
+    // its bound socket, so the node goes back to the name new clients open.
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let output = fixture.run(
+        &["--accept-runtime-loss"],
+        &[
+            ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+            ("POHUNEK_TEST_DISABLE_STATUS", "4"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed (status 4)"), "{stderr}");
+    assert!(
+        stderr.contains("the legacy unit files were kept"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("may still be running (state: active)"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fixture.systemctl_calls(),
+        [IS_ACTIVE, LIST_WORKERS, DISABLE, STATE_QUERY]
+    );
+    assert_eq!(
+        fixture.pohunek_calls().len(),
+        2,
+        "no install or upgrade may run: {:?}",
+        fixture.pohunek_calls()
+    );
+    for legacy in fixture.legacy_files() {
+        assert!(legacy.exists(), "{} was removed", legacy.display());
+    }
+    assert!(fixture.socket.path.exists(), "socket was not restored");
+    assert!(
+        !fixture.socket.retired_exists(),
+        "renamed barrier socket remains after the abort"
+    );
+}
+
+#[test]
+fn a_failed_disable_with_an_unknown_daemon_state_restores_its_socket() {
+    // A failed state query cannot prove the daemon stopped, so it is treated
+    // as still running.
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let output = fixture.run(
+        &[],
+        &[
+            ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+            ("POHUNEK_TEST_DISABLE_STATUS", "1"),
+            ("POHUNEK_TEST_STATE_AFTER_DISABLE", "query-fails"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("may still be running (state: unknown)"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fixture.systemctl_calls(),
+        [IS_ACTIVE, LIST_WORKERS, DISABLE, STATE_QUERY]
+    );
+    assert_eq!(
+        fixture.pohunek_calls().len(),
+        2,
+        "{:?}",
+        fixture.pohunek_calls()
+    );
+    for legacy in fixture.legacy_files() {
+        assert!(legacy.exists(), "{} was removed", legacy.display());
+    }
+    assert!(fixture.socket.path.exists(), "socket was not restored");
+    assert!(
+        !fixture.socket.retired_exists(),
+        "renamed barrier socket remains after the abort"
+    );
+}
+
+#[test]
+fn a_failed_disable_of_a_stopped_daemon_removes_the_stale_barrier() {
+    // `disable --now` can stop the daemon and still fail; the moved node of a
+    // stopped daemon is stale, so it is removed rather than restored.
+    for stopped_state in ["inactive", "failed"] {
+        let fixture = Fixture::new();
+        fixture.legacy_install();
+        let output = fixture.run(
+            &[],
+            &[
+                ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+                ("POHUNEK_TEST_DISABLE_STATUS", "5"),
+                ("POHUNEK_TEST_STATE_AFTER_DISABLE", stopped_state),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(5), "{stopped_state}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("failed (status 5)"), "{stderr}");
+        assert!(stderr.contains("the legacy daemon is stopped"), "{stderr}");
+        assert!(
+            stderr.contains("the legacy unit files were kept"),
+            "{stderr}"
+        );
+        assert_eq!(
+            fixture.systemctl_calls(),
+            [IS_ACTIVE, LIST_WORKERS, DISABLE, STATE_QUERY],
+            "{stopped_state}"
+        );
+        assert_eq!(
+            fixture.pohunek_calls().len(),
+            2,
+            "no install or upgrade may run: {:?}",
+            fixture.pohunek_calls()
+        );
+        for legacy in fixture.legacy_files() {
+            assert!(legacy.exists(), "{} was removed", legacy.display());
+        }
+        assert!(
+            !fixture.socket.path.exists(),
+            "{stopped_state}: socket node was restored for a stopped daemon"
+        );
+        assert!(
+            !fixture.socket.retired_exists(),
+            "{stopped_state}: renamed barrier socket remains"
+        );
+    }
+}
+
 #[test]
 fn rerun_after_a_partial_retirement_finishes_without_a_second_preflight() {
     // The previous run disabled the legacy daemon but stopped before removing
@@ -607,7 +741,9 @@ impl Fixture {
             &commands.join("systemctl"),
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$POHUNEK_TEST_SYSTEMCTL_LOG\"\n\
              case \"$*\" in\n\
-             *disable*|*stop*) : > \"$POHUNEK_TEST_SYSTEMCTL_STOP_MARKER\" ;;\n\
+             *disable*|*stop*)\n\
+                 : > \"$POHUNEK_TEST_SYSTEMCTL_STOP_MARKER\"\n\
+                 exit \"${POHUNEK_TEST_DISABLE_STATUS:-0}\" ;;\n\
              *list-units*)\n\
                  if [ -f \"${POHUNEK_TEST_SYSTEMCTL_STOP_MARKER:-}\" ]; then\n\
                      if [ \"${POHUNEK_TEST_LIST_FAILS_AFTER_STOP:-0}\" = 1 ]; then\n\
@@ -620,7 +756,18 @@ impl Fixture {
                      fi\n\
                      printf '%s' \"${POHUNEK_TEST_LIVE_WORKERS:-}\"\n\
                  fi ;;\n\
-             *is-active*) [ \"${POHUNEK_TEST_LEGACY_ACTIVE:-0}\" = 1 ] || exit 3 ;;\n\
+             *is-active*)\n\
+                 state=inactive\n\
+                 [ \"${POHUNEK_TEST_LEGACY_ACTIVE:-0}\" = 1 ] && state=active\n\
+                 if [ -f \"${POHUNEK_TEST_SYSTEMCTL_STOP_MARKER:-}\" ] \\\n\
+                     && [ -n \"${POHUNEK_TEST_STATE_AFTER_DISABLE:-}\" ]; then\n\
+                     state=$POHUNEK_TEST_STATE_AFTER_DISABLE\n\
+                 fi\n\
+                 if [ \"$state\" = query-fails ]; then\n\
+                     echo 'Failed to connect to bus' >&2; exit 1\n\
+                 fi\n\
+                 case \"$*\" in *--quiet*) ;; *) printf '%s\\n' \"$state\" ;; esac\n\
+                 [ \"$state\" = active ] || exit 3 ;;\n\
              esac\n",
         );
         // The legacy daemon binds its control socket as a real AF_UNIX node,

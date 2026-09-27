@@ -70,6 +70,8 @@ struct World {
     processless: bool,
     fail_discover: bool,
     silent_version: Option<String>,
+    /// Version whose daemon definition `replace` refuses without effect.
+    refused_replace: Option<String>,
     installs: usize,
     sessions: Vec<SessionInfo>,
     workers: Vec<ServiceObservation>,
@@ -145,6 +147,12 @@ impl DaemonSupervisor for Fake {
             let mut world = self.world();
             if world.registered.is_none() {
                 return Err(supervisor::Error::NotFound(daemon_id()));
+            }
+            if world.refused_replace.as_deref() == Some(&*version_of(definition.executable())) {
+                return Err(supervisor::Error::Operation {
+                    operation: "replace",
+                    source: "injected failure".into(),
+                });
             }
             world.registered = Some(definition.clone());
             world.running = true;
@@ -965,6 +973,104 @@ async fn an_upgrade_is_not_ready_while_another_process_serves_the_socket() {
     harness.assert_installed(V1);
     harness.upgrade(V2).await.expect("upgrade");
     harness.assert_installed(V2);
+}
+
+/// Fails an upgrade to `V2` at readiness and its rollback at the daemon
+/// restore, after the rollback already rewrote `service.toml` to `V1`.
+async fn fail_upgrade_and_its_rollback(harness: &Harness) {
+    {
+        let mut world = harness.fake.world();
+        world.silent_version = Some(V2.to_owned());
+        world.refused_replace = Some(V1.to_owned());
+    };
+    let error = harness.upgrade(V2).await.expect_err("not ready");
+    let Error::RollbackFailed { original, rollback } = &error else {
+        panic!("unexpected error {error:?}");
+    };
+    assert!(
+        matches!(&**original, Error::DaemonNotReady { version, .. } if version == V2),
+        "{original:?}"
+    );
+    assert!(
+        matches!(&**rollback, Error::Supervisor { .. }),
+        "{rollback:?}"
+    );
+    let pending = harness.pending().expect("record kept");
+    assert_eq!(pending.step, Step::Registered);
+    assert!(pending.rolling_back, "the begun rollback is journaled");
+    assert_eq!(
+        harness.config().expect("config").active_version(),
+        V1,
+        "the rollback restored service.toml before it failed"
+    );
+    assert_eq!(harness.fake.daemon_version().as_deref(), Some(V2));
+    let mut world = harness.fake.world();
+    world.silent_version = None;
+    world.refused_replace = None;
+}
+
+#[tokio::test]
+async fn an_upgrade_whose_rollback_failed_is_rolled_back_before_the_same_upgrade_reruns() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    fail_upgrade_and_its_rollback(&harness).await;
+
+    // Resuming would skip the `config` step whose effect the rollback undid,
+    // registering the V2 daemon with a service.toml that names V1.
+    let report = harness.upgrade(V2).await.expect("upgrade reruns");
+    assert!(!report.resumed, "a rolling-back record is never resumed");
+    assert_eq!(report.from_version, V1);
+    assert_eq!(
+        report.rolled_back.map(|pending| pending.step),
+        Some(Step::Registered.as_str())
+    );
+    harness.assert_installed(V2);
+    assert_eq!(
+        layout::installed_versions(&harness.layout()).expect("versions"),
+        [V2],
+        "service.toml names the only remaining version"
+    );
+}
+
+#[tokio::test]
+async fn an_upgrade_whose_rollback_failed_is_finished_by_asking_for_the_previous_version() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    fail_upgrade_and_its_rollback(&harness).await;
+
+    let report = harness.upgrade(V1).await.expect("finish the rollback");
+    assert!(report.unchanged);
+    assert!(report.rolled_back.is_some());
+    harness.assert_installed(V1);
+    assert_eq!(
+        layout::installed_versions(&harness.layout()).expect("versions"),
+        [V1],
+        "the version the rollback abandoned is removed"
+    );
+}
+
+#[tokio::test]
+async fn an_install_whose_rollback_died_is_started_over_instead_of_resumed() {
+    let harness = Harness::new();
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Config);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+    // A rollback that died right after removing service.toml.
+    let mut record = harness.pending().expect("record left behind");
+    record.rolling_back = true;
+    harness.engine().store.save(&record).expect("save record");
+    assert!(remove_config(&harness.context.config_path()).expect("remove service.toml"));
+
+    let report = harness.install(V1).await.expect("install starts over");
+    assert!(!report.resumed, "a rolling-back record is never resumed");
+    assert_eq!(
+        report.rolled_back.map(|pending| pending.step),
+        Some(Step::Config.as_str())
+    );
+    harness.assert_installed(V1);
 }
 
 #[tokio::test]

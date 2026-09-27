@@ -160,7 +160,11 @@ may already own live sessions, so the install keeps its record, daemon job, and
 back. Rerun `pohunek service install` with the same version and prefix to
 finish it, or run `pohunek service uninstall` to remove it after its session
 check. An upgrade that fails before `ready` still rolls back to the previous
-version. `packaging/install-daemon.sh` asks
+version. A rollback journals that it has begun before it changes anything; if
+it fails or is interrupted partway (for example the restored daemon never
+becomes ready), the record stays and the next `install`, `upgrade`, or
+`uninstall` finishes the rollback first — rerunning the same upgrade then
+starts it over instead of resuming it. `packaging/install-daemon.sh` asks
 `pohunek service status --json` first and runs `service install` whenever the
 pending transaction is an install, `service upgrade` otherwise when
 `service.toml` exists, and `service install` on a fresh host; a failing status

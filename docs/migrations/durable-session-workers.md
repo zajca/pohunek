@@ -77,7 +77,11 @@ daemon-side barrier, the installer retires it in this order:
    `inactive` and refuses when one survives — including jobs still in
    `activating`, which a state-filtered check would miss;
 4. only then does it `systemctl --user disable --now pohunekd.service`, which
-   closes the socket and stops new sessions for good;
+   closes the socket and stops new sessions for good. If that command fails,
+   the run aborts with its status and keeps the legacy files: a daemon that
+   may still run gets its socket node back at the original path, and one that
+   `systemctl --user is-active` reports `inactive` or `failed` loses the stale
+   moved node;
 5. it re-runs the job inventory: a worker that survived the stop was started
    after the preflight and aborts the run;
 6. it removes `pohunekd.service`, `pohunek-session@.service`, and

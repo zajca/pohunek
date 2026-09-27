@@ -34,8 +34,15 @@
 //! timeout), and that daemon may already own live sessions, so only the
 //! resume or the session-checked uninstall below may decide its fate.
 //!
+//! A rollback marks the record `rolling_back` before its first effect. It
+//! restores `service.toml` before the daemon, so a rollback that fails or is
+//! interrupted partway leaves a record whose later steps are already undone;
+//! a later command never resumes it, and finishes that rollback before it
+//! starts its own transaction.
+//!
 //! An interrupted process leaves the record behind. The next `install` or
-//! `upgrade` of the same version and prefix resumes after the recorded step.
+//! `upgrade` of the same version and prefix resumes after the recorded step
+//! unless the record is rolling back.
 //! Any other operation rolls the record back first, except that a
 //! transaction which may already have registered its daemon (`registering`
 //! or later) is never rolled back: `upgrade` and a different `install`
@@ -231,7 +238,8 @@ impl<'a> Engine<'a> {
             Some(record)
                 if record.operation == Operation::Install
                     && record.version == version
-                    && record.prefix == prefix =>
+                    && record.prefix == prefix
+                    && !record.rolling_back =>
             {
                 (Some(record), None)
             }
@@ -284,6 +292,7 @@ impl<'a> Engine<'a> {
                     previous_version: None,
                     version_dir_preexisted: layout::version_exists(&layout, version)?,
                     step: Step::Started,
+                    rolling_back: false,
                 };
                 self.store.save(&record)?;
                 record
@@ -323,7 +332,12 @@ impl<'a> Engine<'a> {
                     step: record.step.as_str(),
                 });
             }
-            Some(record) if record.version == version => (Some(record), None),
+            // A rolling-back record's `config` and later steps may already be
+            // undone, so resuming would skip them; the rollback is finished
+            // below and the upgrade starts over.
+            Some(record) if record.version == version && !record.rolling_back => {
+                (Some(record), None)
+            }
             Some(record) => {
                 let report = pending_report(&record);
                 self.rollback_pending(&record).await?;
@@ -369,6 +383,7 @@ impl<'a> Engine<'a> {
                     previous_version: Some(from_version.clone()),
                     version_dir_preexisted: layout::version_exists(&layout, version)?,
                     step: Step::Started,
+                    rolling_back: false,
                 };
                 self.store.save(&record)?;
                 record
@@ -666,6 +681,11 @@ impl<'a> Engine<'a> {
 
     /// Undoes every effect `record`'s transaction may have had.
     ///
+    /// The record is marked `rolling_back` before the first effect, so a
+    /// rollback that fails or dies partway is finished by the next command
+    /// instead of resumed. Every effect is idempotent, which makes a rerun on
+    /// a partly rolled back installation safe.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Record`] for an install record at or after
@@ -690,6 +710,7 @@ impl<'a> Engine<'a> {
                         ),
                     });
                 }
+                self.mark_rolling_back(record)?;
                 // Install refuses to start while service.toml exists, so any
                 // file present now was written by this transaction.
                 remove_config(&config_path)?;
@@ -702,6 +723,7 @@ impl<'a> Engine<'a> {
                         path: self.store.path(),
                         detail: "an upgrade record names no previous version".to_owned(),
                     })?;
+                self.mark_rolling_back(record)?;
                 let current = load_config(&config_path)?.ok_or(Error::NotInstalled {
                     path: config_path.clone(),
                 })?;
@@ -725,6 +747,17 @@ impl<'a> Engine<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Journals that `record`'s rollback has begun.
+    fn mark_rolling_back(&self, record: &Record) -> Result<(), Error> {
+        if record.rolling_back {
+            return Ok(());
+        }
+        self.store.save(&Record {
+            rolling_back: true,
+            ..record.clone()
+        })
     }
 
     fn advance(&self, record: &mut Record, step: Step) -> Result<(), Error> {

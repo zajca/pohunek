@@ -167,7 +167,35 @@ if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
         restore_barrier
         exit 1
     fi
-    systemctl --user disable --now pohunekd.service
+    disable_status=0
+    systemctl --user disable --now pohunekd.service || disable_status=$?
+    if [ "$disable_status" -ne 0 ]; then
+        # `is-active` exits non-zero both for a stopped unit and for a failed
+        # query, so only its printed `inactive` or `failed` state proves the
+        # daemon stopped. Anything else (active, deactivating, no answer) may
+        # still be a running daemon, which keeps its socket name reachable.
+        legacy_state=$(systemctl --user is-active pohunekd.service) || :
+        echo "\`systemctl --user disable --now pohunekd.service\` failed (status $disable_status);" >&2
+        echo "the legacy unit files were kept:" >&2
+        echo "  $legacy_unit_dir/pohunekd.service" >&2
+        echo "  $legacy_unit_dir/pohunek-session@.service" >&2
+        echo "  $legacy_unit_dir/pohunek-sessions.slice" >&2
+        case "$legacy_state" in
+            inactive|failed)
+                remove_barrier
+                echo "the legacy daemon is stopped; fix the reported problem and re-run $0;" >&2
+                echo "to keep using the legacy install instead, start it with" >&2
+                echo "\`systemctl --user enable --now pohunekd.service\`" >&2
+                ;;
+            *)
+                restore_barrier
+                echo "the legacy daemon may still be running (state: ${legacy_state:-unknown})" >&2
+                echo "and stays reachable at $legacy_socket;" >&2
+                echo "fix the reported problem and re-run $0" >&2
+                ;;
+        esac
+        exit "$disable_status"
+    fi
     remove_barrier
     # The daemon is stopped and disabled, so its socket is closed and no
     # client can start a session anymore. Re-check the workers it could have

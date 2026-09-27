@@ -29,7 +29,7 @@ use crate::runtime::lifecycle::{
     SUPERVISION_UNAVAILABLE,
 };
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 /// Reason recorded when a generation's worker is proven crashed and the
 /// marker sweep confirmed that no process of its runtime is left.
@@ -288,6 +288,15 @@ pub(super) struct SupervisionRetries {
     pub(super) state: std::sync::Mutex<RetryState>,
 }
 
+/// What a pending session waits for in the supervision retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Waiting {
+    /// Supervisor or generation evidence that settles its classification.
+    Evidence,
+    /// Retirement of its terminal generation's job.
+    Retirement,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct RetryState {
     pub(super) pending: BTreeSet<String>,
@@ -486,14 +495,15 @@ impl SessionRegistry {
 
     /// Re-reconciles `id` in the background until its evidence settles.
     ///
-    /// Sessions wait here while their supervisor is unavailable or while
-    /// their generation is ambiguous (a job or process that may still be
-    /// live but no reachable worker). One task serves every pending session
-    /// with a doubling delay bounded by [`SUPERVISION_RETRY_MAX`]; each pass
-    /// classifies from fresh evidence and never kills while it stays
-    /// ambiguous. The task stops when no session is pending, when daemon
-    /// shutdown starts, or when the registry is dropped; however it ends, a
-    /// later call starts a new one.
+    /// Sessions wait here while their supervisor is unavailable, while their
+    /// generation is ambiguous (a job or process that may still be live but
+    /// no reachable worker), or while the job of a terminal session's
+    /// proven-ended generation could not be retired. One task serves every
+    /// pending session with a doubling delay bounded by
+    /// [`SUPERVISION_RETRY_MAX`]; each pass classifies from fresh evidence and
+    /// never kills while it stays ambiguous. The task stops when no session is
+    /// pending, when daemon shutdown starts, or when the registry is dropped;
+    /// however it ends, a later call starts a new one.
     pub(super) fn schedule_supervision_retry(&self, id: &SessionId) {
         let start = {
             let mut state = self
@@ -537,31 +547,30 @@ impl SessionRegistry {
     }
 
     /// Re-reconciles one session left `runtime_supervision_unavailable` or
-    /// `runtime_supervision_ambiguous`.
+    /// `runtime_supervision_ambiguous`, or re-attempts retiring the job of a
+    /// terminal session's generation.
     ///
     /// Returns whether the session no longer needs a retry: it was resolved,
     /// removed, or changed by another lifecycle operation.
     async fn retry_supervised_session(&self, id: &SessionId) -> bool {
         let _guard = self.lock_lifecycle(id).await;
-        let waiting = self
-            .inner
-            .sessions
-            .lock()
-            .await
-            .get(id)
-            .is_some_and(|entry| {
-                matches!(entry.runtime, super::RuntimeHandle::Unavailable(_))
-                    && entry.info.runtime.as_ref().is_some_and(|runtime| {
-                        matches!(
-                            (runtime.state, runtime.loss_reason.as_deref()),
-                            (RuntimeState::Reconnecting, Some(SUPERVISION_UNAVAILABLE))
-                                | (RuntimeState::Conflict, Some(SUPERVISION_AMBIGUOUS))
-                        )
-                    })
-            });
-        if !waiting {
+        let waiting = self.inner.sessions.lock().await.get(id).and_then(|entry| {
+            if !matches!(entry.runtime, super::RuntimeHandle::Unavailable(_)) {
+                return None;
+            }
+            let runtime = entry.info.runtime.as_ref()?;
+            match (runtime.state, runtime.loss_reason.as_deref()) {
+                (RuntimeState::Reconnecting, Some(SUPERVISION_UNAVAILABLE))
+                | (RuntimeState::Conflict, Some(SUPERVISION_AMBIGUOUS)) => Some(Waiting::Evidence),
+                // Only a terminal entry that still names its generation
+                // can have a job left to retire.
+                (RuntimeState::Terminal, _) if entry.job.is_some() => Some(Waiting::Retirement),
+                _ => None,
+            }
+        });
+        let Some(waiting) = waiting else {
             return true;
-        }
+        };
         let record = match self.load_durable_session_record(id).await {
             Ok(Some(record)) => record,
             Ok(None) => return true,
@@ -570,7 +579,10 @@ impl SessionRegistry {
                 return false;
             }
         };
-        !self.reconcile_single_session(record).await
+        match waiting {
+            Waiting::Evidence => !self.reconcile_single_session(record).await,
+            Waiting::Retirement => self.retry_terminal_retirement(&record).await,
+        }
     }
 }
 

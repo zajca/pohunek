@@ -3,9 +3,11 @@
 //! The record exists only while an install or upgrade is in flight. It is
 //! written owner-private (`0600`) with an atomic replace before each step's
 //! effects become visible and after they complete, so a later run knows how
-//! far the interrupted transaction got and can resume or roll it back.
+//! far the interrupted transaction got and can resume or roll it back. A
+//! rollback is journaled the same way: once it begins, the record is never
+//! resumed forward again.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,7 +19,11 @@ use super::error::{fs_error, replace_error, Error};
 use super::settings::{LOCK_POLL, LOCK_WAIT, MAX_RECORD_BYTES};
 
 /// Version of the record schema; any other version is rejected.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 carries [`Record::rolling_back`]. A record of an earlier
+/// version cannot tell a half-rolled-back transaction from a resumable one,
+/// so it is refused rather than guessed at.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// File name of the record inside the application state directory.
 pub const FILE_NAME: &str = "service-install.json";
@@ -121,6 +127,13 @@ pub struct Record {
     pub version_dir_preexisted: bool,
     /// The last completed step.
     pub step: Step,
+    /// Whether a rollback has begun.
+    ///
+    /// Written before the rollback's first effect. A rollback restores
+    /// `service.toml` before it restores the daemon, so a record whose
+    /// rollback stopped partway describes steps whose effects are undone;
+    /// resuming it would skip them. Such a record is only ever rolled back.
+    pub rolling_back: bool,
 }
 
 /// Exclusive ownership of the install transaction, released on drop.
@@ -172,20 +185,28 @@ impl Store {
         let bytes = directory
             .read_file(FILE_NAME, FILE_MODE, MAX_RECORD_BYTES)
             .map_err(|source| fs_error("read install record", source))?;
-        let record: Record = serde_json::from_slice(&bytes).map_err(|error| Error::Record {
+        let malformed = |error: serde_json::Error| Error::Record {
             path: self.path(),
             detail: error.to_string(),
-        })?;
-        if record.schema_version != SCHEMA_VERSION {
+        };
+        // The version is checked before the fields, so a record of another
+        // schema is named as such instead of as a missing or unknown field.
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(malformed)?;
+        let version = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64);
+        if version != Some(u64::from(SCHEMA_VERSION)) {
             return Err(Error::Record {
                 path: self.path(),
                 detail: format!(
                     "schema_version {} is unsupported; expected {SCHEMA_VERSION}",
-                    record.schema_version
+                    value
+                        .get("schema_version")
+                        .unwrap_or(&serde_json::Value::Null)
                 ),
             });
         }
-        Ok(Some(record))
+        serde_json::from_value(value).map(Some).map_err(malformed)
     }
 
     /// Atomically replaces the record.
@@ -342,6 +363,7 @@ mod tests {
             previous_version: Some("1.2.2".to_owned()),
             version_dir_preexisted: false,
             step,
+            rolling_back: false,
         }
     }
 
@@ -389,6 +411,33 @@ mod tests {
         value["unexpected"] = true.into();
         write(&value);
         assert!(matches!(store.load(), Err(Error::Record { .. })));
+
+        // A schema 1 record lacks `rolling_back`; it is refused by its version.
+        let mut value = serde_json::to_value(record(Step::Started)).expect("value");
+        value["schema_version"] = 1.into();
+        value
+            .as_object_mut()
+            .expect("record object")
+            .remove("rolling_back");
+        write(&value);
+        let Err(Error::Record { detail, .. }) = store.load() else {
+            panic!("a schema 1 record is refused");
+        };
+        assert!(
+            detail.contains("schema_version 1 is unsupported"),
+            "{detail}"
+        );
+
+        let mut value = serde_json::to_value(record(Step::Started)).expect("value");
+        value
+            .as_object_mut()
+            .expect("record object")
+            .remove("rolling_back");
+        write(&value);
+        assert!(
+            matches!(store.load(), Err(Error::Record { .. })),
+            "the rollback marker is required"
+        );
     }
 
     #[test]

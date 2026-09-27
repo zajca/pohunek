@@ -1118,7 +1118,7 @@ Reconciliation applies these rows in order
 | 5 | live worker of the exact generation; job proven absent | adopt (`live`); warn `reconcile.adopt.job_absent`; inventory stays `managed` with reason `worker_job_absent`, re-announced as `session_runtime_discovered` |
 | 6 | live worker of the exact generation; job cannot be inspected | adopt (`live`) with a warning; the authenticated worker plus its journal is the proof |
 | 7 | live worker of the exact generation; job matches | reconnect and mark `live`; adopt and commit a preparing create; replay a requested stop or remove |
-| 8 | no reachable worker; terminal journal of this generation | import the terminal outcome; a malformed or `Faulted` journal is `conflict`, `worker_journal_identity_mismatch` |
+| 8 | no reachable worker; terminal journal of this generation | import the terminal outcome, then retire the generation's job (absent is fine; a launchd `RunAtLoad` job stays loaded after its worker exits). A failed retirement keeps the imported outcome and is retried with the row 16 backoff while the journal still proves the generation terminal and no socket answers. A socket that answers but cannot be adopted keeps its worker, which retains only final output, and leaves the job to a later reconciliation. A malformed or `Faulted` journal is `conflict`, `worker_journal_identity_mismatch` |
 | 9 | socket answers but cannot be adopted | incompatible protocol: `incompatible`, `worker_protocol_incompatible`, worker left alive, job not inspected; identity mismatch: `conflict`, `runtime_identity_mismatch` |
 | 10 | record without a generation and without evidence | an unfinished create is deleted; otherwise `lost`, `worker_unavailable` |
 | 11 | several non-terminal journals claim the generation, or the journal's `worker_id` differs from the record's | `conflict`, `runtime_supervision_ambiguous` (re-checked in the background as in row 12) or `runtime_identity_mismatch` respectively |
@@ -1368,7 +1368,9 @@ transaction (`<state>/pohunek/service-install.json`):
 A failing step rolls the transaction back; an interrupted one is resumed by the
 next `install` or `upgrade` of the same version and rolled back by any other
 operation, except that `upgrade` refuses an interrupted install with
-`service_install_pending` and leaves it for `install` to finish. The archive
+`service_install_pending` and leaves it for `install` to finish. A record whose
+rollback has begun (journaled before its first effect) is never resumed: the
+next command finishes the rollback before it starts its own transaction. The archive
 wrapper therefore runs `install` whenever `pohunek service status --json`
 reports a pending install. The installer refuses a unit or `LaunchAgents` directory that is
 group- or world-writable and names `chmod go-w <path>` instead of changing it.
