@@ -787,16 +787,43 @@ pub fn valid_runtime_id(id: &str) -> Option<&Path> {
     }
 }
 
+/// Prefix of every managed worker session ID.
+const WORKER_SESSION_ID_PREFIX: &str = "s-";
+
+/// Most digits a numeric worker session ID may carry.
+///
+/// Numeric IDs were issued from a `u64` counter, whose largest value has 20
+/// decimal digits. The bound keeps every valid session ID short enough for the
+/// service identifiers, launchd labels, and systemd unit names derived from it.
+const MAX_NUMERIC_SESSION_DIGITS: usize = 20;
+
+/// Characters of a Crockford base32 ULID.
+const ULID_LEN: usize = 26;
+
+/// Longest valid managed worker session ID in bytes.
+///
+/// Supervisor backends build names from a session ID plus a
+/// [`WORKER_GENERATION_LEN`] token and rely on this bound to keep them within
+/// their own length limits.
+pub const MAX_WORKER_SESSION_ID_BYTES: usize = WORKER_SESSION_ID_PREFIX.len()
+    + if MAX_NUMERIC_SESSION_DIGITS > ULID_LEN {
+        MAX_NUMERIC_SESSION_DIGITS
+    } else {
+        ULID_LEN
+    };
+
 /// Validates a managed worker session ID.
 ///
 /// Worker units are instantiated only for daemon-issued numeric or ULID session
 /// IDs. Restricting the grammar keeps paths and systemd instance names
-/// interchangeable without escaping.
+/// interchangeable without escaping, and every accepted ID is at most
+/// [`MAX_WORKER_SESSION_ID_BYTES`] long.
 #[must_use]
 pub fn valid_worker_session_id(id: &str) -> Option<&str> {
-    let suffix = id.strip_prefix("s-")?;
-    let numeric = !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit());
-    let ulid = suffix.len() == 26 && suffix.bytes().all(|byte| {
+    let suffix = id.strip_prefix(WORKER_SESSION_ID_PREFIX)?;
+    let numeric = (1..=MAX_NUMERIC_SESSION_DIGITS).contains(&suffix.len())
+        && suffix.bytes().all(|byte| byte.is_ascii_digit());
+    let ulid = suffix.len() == ULID_LEN && suffix.bytes().all(|byte| {
         byte.is_ascii_digit()
             || matches!(byte, b'A'..=b'H' | b'J'..=b'K' | b'M' | b'N' | b'P'..=b'T' | b'V'..=b'Z')
     });
@@ -1115,6 +1142,26 @@ mod tests {
         assert_eq!(
             paths.host_state_lock_path(),
             host.join(HOST_STATE_LOCK_NAME)
+        );
+    }
+
+    #[test]
+    fn worker_session_ids_are_bounded() {
+        assert_eq!(u64::MAX.to_string().len(), MAX_NUMERIC_SESSION_DIGITS);
+        let longest_numeric = format!("s-{}", u64::MAX);
+        assert_eq!(
+            valid_worker_session_id(&longest_numeric),
+            Some(longest_numeric.as_str())
+        );
+        let ulid = "s-01KYAPVPFVHD56Z69B9CX3XWN2";
+        assert_eq!(valid_worker_session_id(ulid), Some(ulid));
+        assert_eq!(ulid.len(), MAX_WORKER_SESSION_ID_BYTES);
+
+        let over_long = format!("s-{}", "9".repeat(MAX_NUMERIC_SESSION_DIGITS + 1));
+        assert_eq!(valid_worker_session_id(&over_long), None);
+        assert_eq!(
+            valid_worker_session_id(&format!("s-{}", "1".repeat(150))),
+            None
         );
     }
 

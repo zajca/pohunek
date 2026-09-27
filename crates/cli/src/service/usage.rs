@@ -7,8 +7,13 @@
 //! Unreadable journals, a failed job discovery, and a job whose executable
 //! cannot be proven make every version referenced, because nothing can be
 //! proven about the worker behind them.
+//!
+//! A journal an older pohunek wrote under an earlier schema names no
+//! executable. Only its worker's process identity and phase are read: once
+//! that worker is provably gone or its phase is final the journal references
+//! nothing, and until then it makes every version referenced.
 
-// Rust guideline compliant 2026-09-25
+// Rust guideline compliant 2026-09-27
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -19,7 +24,7 @@ use pohunek_platform::process::{
     Error as ProcessError, ProcessIdentity, ProcessInspector, StartIdentity,
 };
 use pohunek_platform::supervisor::ServiceObservation;
-use pohunek_session_worker::{Journal, RuntimePhase};
+use pohunek_session_worker::{Journal, LoadedJournal, OutdatedJournal, RuntimePhase};
 use serde::Serialize;
 
 use super::error::{fs_error, Error};
@@ -71,11 +76,62 @@ impl JournalRef {
     }
 }
 
+/// One journal an older pohunek wrote, reduced to its liveness facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutdatedRef {
+    /// Journal file.
+    pub path: PathBuf,
+    /// Schema version the journal records.
+    pub schema_version: u32,
+    /// Recorded worker process ID, when the schema has a readable one.
+    pub worker_pid: Option<u32>,
+    /// Whether the recorded phase is final; an unreadable phase is not.
+    pub final_phase: bool,
+    /// Worker process identity, when both of its fields are readable.
+    pub worker: Option<ProcessIdentity>,
+}
+
+impl OutdatedRef {
+    fn new(path: PathBuf, journal: &OutdatedJournal) -> Self {
+        let worker = journal
+            .worker_pid
+            .zip(journal.worker_start_identity.as_deref())
+            .and_then(|(pid, start)| {
+                start
+                    .parse::<StartIdentity>()
+                    .ok()
+                    .map(|start_identity| ProcessIdentity {
+                        pid,
+                        start_identity,
+                    })
+            });
+        Self {
+            path,
+            schema_version: journal.schema_version,
+            worker_pid: journal.worker_pid,
+            final_phase: journal.phase.as_ref().is_some_and(is_final),
+            worker,
+        }
+    }
+
+    /// Returns whether the worker behind this journal may still run.
+    ///
+    /// An unreadable identity and a failed inspection both count as running.
+    fn may_run(&self, inspector: &dyn ProcessInspector) -> bool {
+        !self.final_phase
+            && self
+                .worker
+                .is_none_or(|identity| inspector.is_running(identity).unwrap_or(true))
+    }
+}
+
 /// All worker journals of one installation.
 #[derive(Debug, Clone, Default)]
 pub struct Journals {
     /// Journals that parsed.
     pub records: Vec<JournalRef>,
+    /// Journals of an older schema.
+    pub outdated: Vec<OutdatedRef>,
     /// Journal files that could not be read or parsed.
     pub unreadable: Vec<PathBuf>,
 }
@@ -134,8 +190,8 @@ impl Journals {
                     continue;
                 };
                 let file = root.join(session).join(&name);
-                match Journal::new(&file).load() {
-                    Ok(record) => journals.records.push(JournalRef {
+                match Journal::new(&file).load_any() {
+                    Ok(LoadedJournal::Current(record)) => journals.records.push(JournalRef {
                         session_id: record.session_id,
                         worker_id: worker_id.to_owned(),
                         generation: record.origin.generation,
@@ -151,6 +207,9 @@ impl Journals {
                                 start_identity,
                             }),
                     }),
+                    Ok(LoadedJournal::Outdated(outdated)) => {
+                        journals.outdated.push(OutdatedRef::new(file, &outdated));
+                    }
                     Err(_corrupt) => journals.unreadable.push(file),
                 }
             }
@@ -169,6 +228,15 @@ impl Journals {
             .filter(|journal| {
                 !journal.final_phase && journal.worker_running(inspector).unwrap_or(true)
             })
+            .collect()
+    }
+
+    /// Returns outdated journals whose worker may still run.
+    #[must_use]
+    pub fn outdated_live<'a>(&'a self, inspector: &dyn ProcessInspector) -> Vec<&'a OutdatedRef> {
+        self.outdated
+            .iter()
+            .filter(|journal| journal.may_run(inspector))
             .collect()
     }
 
@@ -217,6 +285,9 @@ pub struct Usage {
     pub cli: Option<String>,
     /// Journals that could not be read; while any exist every version is kept.
     pub unreadable: Vec<PathBuf>,
+    /// Outdated journals whose worker may still run, from an executable they
+    /// do not name; while any exist every version is kept.
+    pub outdated: Vec<PathBuf>,
     /// Why the process table could not be read, which keeps every version.
     pub process_error: Option<String>,
     /// Why worker jobs could not be attributed to versions, which keeps
@@ -239,6 +310,11 @@ impl Usage {
         let mut usage = Self {
             cli: version_of(layout, cli_executable),
             unreadable: journals.unreadable.clone(),
+            outdated: journals
+                .outdated_live(inspector)
+                .into_iter()
+                .map(|journal| journal.path.clone())
+                .collect(),
             ..Self::default()
         };
         for journal in journals.live(inspector) {
@@ -354,6 +430,11 @@ impl Usage {
         if !self.unreadable.is_empty() {
             return Some("some worker journals are unreadable".to_owned());
         }
+        if !self.outdated.is_empty() {
+            return Some(
+                "worker journals of an older pohunek name workers that may still run".to_owned(),
+            );
+        }
         if let Some(error) = &self.process_error {
             return Some(format!("the process table could not be read: {error}"));
         }
@@ -398,18 +479,66 @@ pub(crate) mod tests {
         worker: &str,
         executable: &Path,
     ) {
-        let own = HostInspector::new()
-            .identity(std::process::id())
-            .expect("identity")
-            .expect("own process");
+        let (pid, start_identity) = own_identity();
         write_journal_of(
             paths,
             session,
             worker,
             executable,
             RuntimePhase::Live,
-            (own.pid, &own.start_identity.to_string()),
+            (pid, &start_identity),
         );
+    }
+
+    /// Worker identity of this test process, which is provably alive.
+    pub(crate) fn own_identity() -> (u32, String) {
+        let own = HostInspector::new()
+            .identity(std::process::id())
+            .expect("identity")
+            .expect("own process");
+        (own.pid, own.start_identity.to_string())
+    }
+
+    /// Writes a schema-3 journal, which names no executable, with `phase`
+    /// and the worker identity `worker` (`None` omits both identity keys).
+    pub(crate) fn write_outdated_journal(
+        paths: &BasePaths,
+        session: &str,
+        worker: &str,
+        phase: &str,
+        identity: Option<(u32, &str)>,
+    ) -> PathBuf {
+        let path = paths
+            .worker_journal(session, worker)
+            .expect("valid journal path");
+        write_journal_of(
+            paths,
+            session,
+            worker,
+            Path::new("/unused"),
+            RuntimePhase::Live,
+            (1, "1"),
+        );
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read journal")).expect("json");
+        let object = json.as_object_mut().expect("journal object");
+        for key in [
+            "executable",
+            "version",
+            "generation",
+            "worker_pid",
+            "worker_start_identity",
+        ] {
+            object.remove(key);
+        }
+        object.insert("schema_version".to_owned(), 3.into());
+        object.insert("phase".to_owned(), phase.into());
+        if let Some((pid, start_identity)) = identity {
+            object.insert("worker_pid".to_owned(), pid.into());
+            object.insert("worker_start_identity".to_owned(), start_identity.into());
+        }
+        std::fs::write(&path, serde_json::to_vec(&json).expect("encode")).expect("rewrite");
+        path
     }
 
     fn write_journal_of(
@@ -574,6 +703,41 @@ pub(crate) mod tests {
             Path::new("/usr/bin/pohunek"),
         );
         assert!(usage.keep_reason("1.0.0", None).is_some());
+    }
+
+    #[test]
+    fn an_outdated_journal_keeps_every_version_only_while_its_worker_may_run() {
+        let (_root, root) = temp_root();
+        let paths = super::super::context::tests::paths(root.as_path());
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
+        let (pid, start) = own_identity();
+        let collect = |journals: &Journals| {
+            Usage::collect(
+                &layout,
+                journals,
+                &HostInspector::new(),
+                Path::new("/usr/bin/pohunek"),
+            )
+        };
+
+        // Exited worker, final phase: neither is unreadable nor referencing.
+        write_outdated_journal(&paths, SESSION, "w-gone", "live", Some((pid, "1")));
+        write_outdated_journal(&paths, "s-2", "w-done", "terminal", Some((pid, &start)));
+        let journals = Journals::scan(&paths).expect("scan");
+        assert!(journals.unreadable.is_empty());
+        assert_eq!(journals.outdated.len(), 2);
+        assert!(journals.outdated_live(&HostInspector::new()).is_empty());
+        assert_eq!(collect(&journals).keep_reason("1.0.0", None), None);
+
+        // A live worker, and one whose identity is unreadable, may still run.
+        let live = write_outdated_journal(&paths, "s-3", "w-live", "live", Some((pid, &start)));
+        let unknown = write_outdated_journal(&paths, "s-4", "w-unknown", "starting", None);
+        let journals = Journals::scan(&paths).expect("scan");
+        let usage = collect(&journals);
+        assert_eq!(usage.outdated, [live, unknown]);
+        assert!(usage
+            .keep_reason("1.0.0", None)
+            .is_some_and(|reason| reason.contains("older pohunek")));
     }
 
     #[test]

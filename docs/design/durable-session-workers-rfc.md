@@ -1384,11 +1384,15 @@ executed by a running process, nor holding the running CLI are removed.
 `pohunek service uninstall` refuses while sessions are live and lists them.
 With `--stop-sessions` it stops every session through the worker protocol,
 waits until every worker journal is final and its process is gone, then removes
-the daemon job, ended worker jobs, `service.toml`, the launchd directories,
-unreferenced version directories, and the installed CLI copy. Durable metadata
-(store, event logs, journals, host identity) is kept unless `--purge` is given.
-Uninstall never leaves an orphan job and never deletes a binary a live worker
-still references.
+the daemon job, ended worker jobs, the launchd directories, unreferenced
+version directories, and the installed CLI copy, then clears the transaction
+record and removes `service.toml` last, so a rerun always finds an unfinished
+uninstall. Durable metadata (store, event logs, journals, host identity) is
+kept unless `--purge` is given. A worker journal of an earlier
+schema whose worker may still run refuses the uninstall with
+`service_outdated_journals`, even with `--stop-sessions`, because this daemon
+cannot stop that worker. Uninstall never leaves an orphan job and never deletes
+a binary a live worker still references.
 
 ### 20.2 Worker-aware N/N-1 compatibility
 

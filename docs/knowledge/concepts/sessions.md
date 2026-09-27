@@ -115,6 +115,9 @@ and JSON/non-interactive remote starts require `--yes`.
 Daemon-issued session IDs use the `s-<ULID>` form. They are time-sortable opaque
 identifiers, not sequence numbers; clients must preserve and display them
 verbatim rather than deriving ordering or lifecycle meaning from their values.
+Worker runtime paths, journals, and service-manager job names are derived only
+from an `s-<ULID>` ID or the numeric `s-<digits>` form of older records, with 1
+to 20 digits; any other ID is rejected there.
 
 A session can carry an optional owner-set display name. Set it at creation with
 `pohunek session new --name <NAME>`, and change or clear it later with
@@ -296,8 +299,24 @@ identity; Pohunek quarantines it and does not kill a worker automatically.
 version, so the daemon leaves it running. Attach, input, and resize are not
 available in these degraded states, but list and inspect retain the logical
 record and diagnostic `loss_reason`. After preserving diagnostic evidence, the
-operator can remove a degraded logical record with `session rm`; this does not
-stop or signal an unavailable or ambiguous worker.
+operator can remove a degraded logical record with `session rm`. A `lost` runtime
+has ended, so removal leaves its worker job alone; a `terminal` worker only
+retains its final output, so removal retires its job. A `reconnecting` or
+`incompatible` worker, or a `conflict` whose reason is
+`runtime_supervision_ambiguous`, cannot be reached yet may still own a live PTY,
+so removal first retires that worker's job through the service manager by the
+exact generation the record names, which stops the worker and its child, then
+requires every worker the session's journals record for that generation to be
+gone, and only then deletes the record. Removal is refused, and the record kept so it can be retried, when:
+the record names no worker generation, or the runtime is a `conflict` for any
+other reason (such as `runtime_identity_mismatch`, a job or worker that is not
+the recorded generation's, which is never touched), both with the runtime code
+(`session_runtime_conflict`, `session_runtime_reconnecting`, or
+`worker_protocol_incompatible`); the service manager cannot complete the
+retirement (`runtime_supervision_unavailable`); a worker journaled under another
+generation still runs (`runtime_identity_mismatch`); or the session's journals
+cannot be read, or a journaled worker of the generation still runs or cannot be
+inspected after the retirement (`runtime_supervision_ambiguous`).
 
 Reconciliation joins the service manager's jobs with worker sockets and
 journals for each worker generation. It reports `runtime_lost` when a worker's

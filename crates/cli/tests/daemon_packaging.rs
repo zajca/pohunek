@@ -315,6 +315,92 @@ fn accepted_runtime_loss_still_refuses_a_worker_that_survives_the_stop() {
 }
 
 #[test]
+fn a_failed_worker_inventory_refuses_before_the_legacy_daemon_stops() {
+    // An unanswered `list-units` cannot rule out live template workers, so
+    // even with the runtime-loss consent the daemon is never disabled.
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let output = fixture.run(
+        &["--accept-runtime-loss"],
+        &[
+            ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+            ("POHUNEK_TEST_LIST_FAILS_BEFORE_STOP", "1"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not list the legacy template workers; nothing was changed"),
+        "{stderr}"
+    );
+    assert_eq!(fixture.systemctl_calls(), [IS_ACTIVE, LIST_WORKERS]);
+    assert!(
+        !fixture.systemctl_calls().iter().any(|call| call == DISABLE),
+        "the legacy daemon was disabled after a failed inventory"
+    );
+    assert_eq!(
+        fixture.pohunek_calls().len(),
+        2,
+        "{:?}",
+        fixture.pohunek_calls()
+    );
+    for legacy in fixture.legacy_files() {
+        assert!(legacy.exists(), "{} was removed", legacy.display());
+    }
+    assert!(fixture.socket.path.exists(), "socket was not restored");
+    assert!(
+        !fixture.socket.retired_exists(),
+        "renamed barrier socket remains after the abort"
+    );
+}
+
+#[test]
+fn a_failed_post_stop_inventory_keeps_the_legacy_files() {
+    // A failed re-check cannot rule out a worker created after the preflight,
+    // so it aborts like a found one instead of removing the unit files.
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let output = fixture.run(
+        &[],
+        &[
+            ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+            ("POHUNEK_TEST_LIST_FAILS_AFTER_STOP", "1"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("the template workers\ncould not be listed"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("the legacy unit files were kept"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fixture.systemctl_calls(),
+        [IS_ACTIVE, LIST_WORKERS, DISABLE, LIST_WORKERS]
+    );
+    assert_eq!(
+        fixture.pohunek_calls().len(),
+        2,
+        "{:?}",
+        fixture.pohunek_calls()
+    );
+    for legacy in fixture.legacy_files() {
+        assert!(legacy.exists(), "{} was removed", legacy.display());
+    }
+    assert!(
+        !fixture.socket.path.exists(),
+        "socket node was restored after the stop"
+    );
+    assert!(
+        !fixture.socket.retired_exists(),
+        "renamed barrier socket remains after the stop"
+    );
+}
+
+#[test]
 fn rerun_after_a_partial_retirement_finishes_without_a_second_preflight() {
     // The previous run disabled the legacy daemon but stopped before removing
     // its unit files and binaries.
@@ -524,8 +610,14 @@ impl Fixture {
              *disable*|*stop*) : > \"$POHUNEK_TEST_SYSTEMCTL_STOP_MARKER\" ;;\n\
              *list-units*)\n\
                  if [ -f \"${POHUNEK_TEST_SYSTEMCTL_STOP_MARKER:-}\" ]; then\n\
+                     if [ \"${POHUNEK_TEST_LIST_FAILS_AFTER_STOP:-0}\" = 1 ]; then\n\
+                         echo 'Failed to connect to bus' >&2; exit 1\n\
+                     fi\n\
                      printf '%s' \"${POHUNEK_TEST_POST_STOP_WORKERS:-}\"\n\
                  else\n\
+                     if [ \"${POHUNEK_TEST_LIST_FAILS_BEFORE_STOP:-0}\" = 1 ]; then\n\
+                         echo 'Failed to connect to bus' >&2; exit 1\n\
+                     fi\n\
                      printf '%s' \"${POHUNEK_TEST_LIVE_WORKERS:-}\"\n\
                  fi ;;\n\
              *is-active*) [ \"${POHUNEK_TEST_LEGACY_ACTIVE:-0}\" = 1 ] || exit 3 ;;\n\

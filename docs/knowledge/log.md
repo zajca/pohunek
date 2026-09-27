@@ -1,5 +1,20 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-09-27)
+
+- Documented that `session rm` of a `conflict`, `reconnecting`, or
+  `incompatible` session retires the worker job of its recorded generation
+  through the service manager before deleting the record, refuses a record that
+  names no generation with its runtime code, and keeps the record with
+  `runtime_supervision_unavailable` when retirement fails.
+- Documented that `service uninstall` clears the transaction record before
+  `service.toml`, uninstalls a registered pending install whose `service.toml`
+  is gone, and refuses with `service_outdated_journals` while a journal of an
+  earlier schema names a worker that may still run; such journals also keep
+  every version directory during an upgrade.
+- Documented the worker session ID grammar: `s-<ULID>` or `s-<digits>` with 1
+  to 20 digits.
+
 ## Unreleased (2026-09-25)
 
 - Documented that `migration preflight` takes an explicit `--socket <path>` so

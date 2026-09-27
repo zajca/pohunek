@@ -61,6 +61,37 @@ class RunWithTimeoutTests(unittest.TestCase):
         self.assertLess(elapsed, 6)
         self.assertFalse(running("sleep 31.5"), "timed-out command was left behind")
 
+    def test_success_reaped_after_the_deadline_is_not_a_timeout(self):
+        # The command stops the calling shell and exits 0 at once, so it stays
+        # an unreaped zombie until a helper resumes the shell. The watchdog
+        # fires in between and its TERM "succeeds" against the zombie; the
+        # shell must still report the command's own success.
+        resume_after = 1.5  # past the 1 s deadline, inside the 1 s TERM grace
+        command = (
+            f"(sleep {resume_after}; kill -CONT \"$1\") >/dev/null 2>&1 & "
+            'kill -STOP "$1"; exit 0'
+        )
+        output, elapsed = run(
+            f"pohunek_run_with_timeout 1 sh -c '{command}' _ \"$$\" || status=$?"
+        )
+        self.assertEqual(output, "status=0\n")
+        self.assertLess(elapsed, 6)
+
+    def test_a_command_failing_after_term_reports_the_timeout(self):
+        # A command that handles TERM and exits non-zero was still stopped by
+        # the deadline, so the helper reports the timeout, not its status.
+        exit_on_term = (
+            "import signal, sys, time; "
+            "signal.signal(signal.SIGTERM, lambda *_: sys.exit(7)); "
+            "time.sleep(33.5)"
+        )
+        output, elapsed = run(
+            f"pohunek_run_with_timeout 1 python3 -c '{exit_on_term}' || status=$?"
+        )
+        self.assertEqual(output, "status=124\n")
+        self.assertLess(elapsed, 6)
+        self.assertFalse(running("time.sleep(33.5)"), "timed-out command survived")
+
     def test_a_command_ignoring_term_is_killed_after_the_grace(self):
         ignore_term = (
             "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "

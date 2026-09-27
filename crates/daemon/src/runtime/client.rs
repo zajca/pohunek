@@ -17,7 +17,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 /// Prefix for daemon-generated, producer-scoped control input identifiers.
 const INPUT_WRITE_ID_PREFIX: &str = "input";
@@ -851,24 +851,21 @@ impl WriteReservation {
     ///
     /// `send_started` runs immediately before the first control writer await.
     /// Callers may cancel safely until that callback; after it, they must keep
-    /// this future alive until the acknowledgement is consumed.
+    /// this future alive until the acknowledgement is consumed. A drop that
+    /// violates this still cannot misframe the connection: an interrupted send
+    /// tears it and an abandoned acknowledgement is drained by the next
+    /// exchange (see [`exchange_locked`]), but the write outcome is unknown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::TornStream`] when an earlier exchange left the
+    /// connection unusable, and another [`WorkerError`] when the send, the
+    /// acknowledgement read, or the worker rejects the plan.
     pub(crate) async fn commit<F>(mut self, send_started: F) -> Result<u64, WorkerError>
     where
         F: FnOnce(),
     {
-        let inner = &mut *self.inner;
-        // A control request dropped after sending leaves its response marked;
-        // it must be drained before the acknowledgement, so the write
-        // acknowledgement cannot be mistaken for a stale response.
-        drain_marked(inner).await?;
-        let response = exchange_marked(
-            &mut inner.reader,
-            &mut inner.writer,
-            self.request,
-            send_started,
-        )
-        .await?
-        .kind;
+        let response = exchange_locked(&mut self.inner, self.request, send_started).await?;
         match response {
             ResponseKind::WriteCompleted { acknowledgement } => Ok(acknowledgement.bytes_written),
             other => response_error(other),
@@ -1171,32 +1168,54 @@ fn input_write_id(lease_id: &LeaseId, sequence: u64) -> Result<WriteId, WorkerEr
 
 /// Sends one request on the shared control connection and reads its response.
 ///
-/// Callers may be dropped at any await point (for example a watcher racing a
-/// cancellation token). Two such drops are handled explicitly: a drop after
-/// the request was fully written leaves its response marked as
-/// [`StreamState::Unread`], and the next request drains that response before
-/// sending its own. A drop during the write itself may leave a partial frame,
-/// which cannot be recovered by draining, so [`SendGuard`] flags it and the
-/// next exchange fails closed with [`WorkerError::TornStream`].
+/// See [`exchange_locked`] for how dropped callers are handled.
 async fn request_locked(
     inner: &mut Inner,
     request_id: RequestId,
     kind: RequestKind,
 ) -> Result<ResponseKind, WorkerError> {
+    exchange_locked(inner, ControlRequest { request_id, kind }, || {}).await
+}
+
+/// Runs one framed exchange on the shared control connection.
+///
+/// Every post-handshake request, including input writes, goes through here so
+/// they share one framing discipline. Callers may be dropped at any await
+/// point (for example a watcher racing a cancellation token):
+///
+/// - a drop during the write may leave a partial frame, which draining cannot
+///   recover, so [`SendGuard`] flags it and the next exchange fails closed with
+///   [`WorkerError::TornStream`]; a failed write is flagged the same way;
+/// - a drop after the frame is complete leaves its response marked as
+///   [`StreamState::Unread`], and the next exchange drains it before sending.
+///   The control reader is cancel-safe, so a drop mid-line keeps the partial
+///   line and the drain resumes it;
+/// - a failed response read leaves the framing unproven and marks the
+///   connection [`StreamState::Torn`].
+///
+/// `send_started` runs after any stale response was drained and immediately
+/// before the first write await.
+async fn exchange_locked<F>(
+    inner: &mut Inner,
+    request: ControlRequest,
+    send_started: F,
+) -> Result<ResponseKind, WorkerError>
+where
+    F: FnOnce(),
+{
     drain_marked(inner).await?;
-    let expected = request_id.clone();
+    let expected = request.request_id.clone();
     let send = SendGuard::arm(Arc::clone(&inner.send_state));
-    send_request(&mut inner.writer, ControlRequest { request_id, kind }).await?;
-    // From here the frame is complete: no await separates the marker from the
-    // send, so a dropped caller can only abandon the response, never tear the
-    // stream.
+    send_started();
+    send_request(&mut inner.writer, request).await?;
+    // No await separates the completed send from the marker, so a dropped
+    // caller can only abandon the response, never tear the stream.
     inner.stream_state = StreamState::Unread(expected.clone());
     inner.send_state.store(SEND_IDLE, Ordering::Release);
     drop(send);
     let response = read_response(&mut inner.reader, &expected).await;
     inner.stream_state = match response {
         Ok(_) => StreamState::Ready,
-        // A failed read leaves the framing unproven; the connection is torn.
         Err(_) => StreamState::Torn,
     };
     response.map(|response| response.kind)
@@ -1236,25 +1255,16 @@ fn reconcile_interrupted_send(inner: &mut Inner) {
     }
 }
 
+/// Runs one handshake exchange on a connection no other caller can reach yet.
+///
+/// A failure or drop here discards the whole connection, so it needs none of
+/// the stream-state tracking of [`exchange_locked`].
 async fn exchange(
     reader: &mut ControlReader<OwnedReadHalf>,
     writer: &mut ControlWriter<OwnedWriteHalf>,
     request: ControlRequest,
 ) -> Result<ControlResponse, WorkerError> {
-    exchange_marked(reader, writer, request, || {}).await
-}
-
-async fn exchange_marked<F>(
-    reader: &mut ControlReader<OwnedReadHalf>,
-    writer: &mut ControlWriter<OwnedWriteHalf>,
-    request: ControlRequest,
-    send_started: F,
-) -> Result<ControlResponse, WorkerError>
-where
-    F: FnOnce(),
-{
     let expected = request.request_id.clone();
-    send_started();
     send_request(writer, request).await?;
     read_response(reader, &expected).await
 }
@@ -1796,6 +1806,257 @@ mod tests {
         ));
 
         server_task.await.expect("fake worker task");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Accepts one daemon connection and completes the scripted handshake
+    /// for a worker whose identifiers all end in `name`.
+    async fn accept_scripted(
+        listener: &tokio::net::UnixListener,
+        name: &str,
+    ) -> (
+        ControlReader<OwnedReadHalf>,
+        ControlWriter<OwnedWriteHalf>,
+        RuntimeId,
+    ) {
+        let (stream, _) = listener.accept().await.expect("accept control");
+        let (read_half, write_half) = stream.into_split();
+        let mut reader = ControlReader::new(read_half);
+        let mut writer = ControlWriter::new(write_half);
+        let runtime_id = RuntimeId::new(format!("runtime-{name}")).expect("runtime id");
+        negotiate_and_acquire(
+            &mut reader,
+            &mut writer,
+            &SessionId::new(format!("session-{name}")).expect("session id"),
+            &WorkerId::new(format!("worker-{name}")).expect("worker id"),
+            Some(&runtime_id),
+            &pohunek_worker_protocol::LeaseChallenge::new(format!("challenge-{name}"))
+                .expect("challenge"),
+        )
+        .await;
+        (reader, writer, runtime_id)
+    }
+
+    /// One input fragment, so a reserved plan is non-empty.
+    fn scripted_fragments() -> Vec<InputFragment> {
+        vec![InputFragment {
+            bytes: pohunek_worker_protocol::SecretBytes::new(b"x".to_vec()),
+            delay_after_ms: 0,
+        }]
+    }
+
+    /// Time the caller below keeps waiting on a half-delivered response
+    /// before it gives up, as a daemon-side deadline would. It only has to
+    /// let the local socket deliver the first half; a longer value makes the
+    /// test slower, never less strict.
+    const PARTIAL_RESPONSE_WAIT: Duration = Duration::from_millis(200);
+
+    #[tokio::test]
+    async fn a_caller_dropped_mid_response_line_leaves_the_connection_usable() {
+        let root = test_root("partial-response");
+        std::fs::create_dir_all(&root).expect("create test root");
+        let socket_path = root.join("worker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind fake worker");
+        let (half_sent_tx, half_sent_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let (mut reader, writer, runtime_id) = accept_scripted(&listener, "partial").await;
+            let mut writer = writer.into_inner();
+
+            let request = read_control_request(&mut reader, "snapshot request").await;
+            assert!(matches!(request.kind, RequestKind::TerminalSnapshot { .. }));
+            // The first response arrives in two writes separated by the
+            // caller's drop, so the drop lands in the middle of one line.
+            let mut line = serde_json::to_vec(&ControlMessage::Response(ControlResponse {
+                request_id: request.request_id,
+                kind: ResponseKind::TerminalSnapshot {
+                    runtime_id: runtime_id.clone(),
+                    snapshot: Box::new(pohunek_worker_protocol::TerminalSnapshot {
+                        watermark: 0,
+                        dimensions: Dimensions::new(80, 24).expect("dimensions"),
+                        cursor: pohunek_worker_protocol::Cursor {
+                            column: 0,
+                            row: 0,
+                            visible: true,
+                        },
+                        alternate_screen: false,
+                        title: None,
+                        progress: None,
+                        visible_lines: Vec::new(),
+                    }),
+                },
+            }))
+            .expect("encode response");
+            line.push(b'\n');
+            let (head, tail) = line.split_at(line.len() / 2);
+            tokio::io::AsyncWriteExt::write_all(&mut writer, head)
+                .await
+                .expect("write first half");
+            half_sent_tx.send(()).expect("signal first half");
+            dropped_rx.await.expect("caller dropped");
+            tokio::io::AsyncWriteExt::write_all(&mut writer, tail)
+                .await
+                .expect("write second half");
+
+            let mut writer = ControlWriter::new(writer);
+            let request = read_control_request(&mut reader, "second snapshot request").await;
+            assert!(matches!(request.kind, RequestKind::TerminalSnapshot { .. }));
+            write_terminal_snapshot(&mut writer, &request.request_id, &runtime_id).await;
+        });
+
+        let worker = Worker::connect(&socket_path, "session-partial", "daemon-partial")
+            .await
+            .expect("connect fake worker");
+        // Boxed so that dropping it really drops the caller and its lock.
+        let mut first = Box::pin(worker.terminal_snapshot());
+        tokio::select! {
+            result = &mut first => panic!("a half-delivered response completed: {result:?}"),
+            sent = half_sent_rx => sent.expect("first half written"),
+        }
+        let timed_out = tokio::time::timeout(PARTIAL_RESPONSE_WAIT, &mut first).await;
+        assert!(
+            timed_out.is_err(),
+            "a half line must not complete: {timed_out:?}"
+        );
+        drop(first);
+        assert!(
+            matches!(
+                worker.inner.lock().await.stream_state,
+                StreamState::Unread(_)
+            ),
+            "a caller dropped mid-line must leave its response marked"
+        );
+        dropped_tx.send(()).expect("release the second half");
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), worker.terminal_snapshot())
+            .await
+            .expect("next request deadline")
+            .expect("the next request resumes the interrupted line and then succeeds");
+        assert_eq!(snapshot.watermark, 0);
+        assert!(matches!(
+            worker.inner.lock().await.stream_state,
+            StreamState::Ready
+        ));
+
+        server_task.await.expect("fake worker task");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn an_input_write_dropped_before_its_ack_is_drained_by_the_next_request() {
+        let root = test_root("abandoned-ack");
+        std::fs::create_dir_all(&root).expect("create test root");
+        let socket_path = root.join("worker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind fake worker");
+        let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+        let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let (mut reader, mut writer, runtime_id) = accept_scripted(&listener, "ack").await;
+
+            let request = read_control_request(&mut reader, "write plan").await;
+            let RequestKind::WritePlan { plan, .. } = request.kind else {
+                panic!("expected a write plan");
+            };
+            request_seen_tx.send(()).expect("signal write plan");
+            respond_rx.await.expect("allow the late acknowledgement");
+            write_response(
+                &mut writer,
+                request.request_id,
+                ResponseKind::WriteCompleted {
+                    acknowledgement: pohunek_worker_protocol::WriteAck {
+                        write_id: plan.write_id().clone(),
+                        bytes_written: 1,
+                    },
+                },
+            )
+            .await;
+
+            let request = read_control_request(&mut reader, "snapshot request").await;
+            assert!(matches!(request.kind, RequestKind::TerminalSnapshot { .. }));
+            write_terminal_snapshot(&mut writer, &request.request_id, &runtime_id).await;
+        });
+
+        let worker = Worker::connect(&socket_path, "session-ack", "daemon-ack")
+            .await
+            .expect("connect fake worker");
+        let write = tokio::spawn({
+            let worker = worker.clone();
+            async move {
+                worker
+                    .reserve_write(scripted_fragments())
+                    .await?
+                    .commit(|| {})
+                    .await
+            }
+        });
+        request_seen_rx
+            .await
+            .expect("the write plan reached the peer");
+        write.abort();
+        let _ = write.await;
+        assert!(
+            matches!(
+                worker.inner.lock().await.stream_state,
+                StreamState::Unread(_)
+            ),
+            "an abandoned acknowledgement must stay marked for the next drain"
+        );
+
+        respond_tx.send(()).expect("release the acknowledgement");
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), worker.terminal_snapshot())
+            .await
+            .expect("next request deadline")
+            .expect("the next request drains the stale acknowledgement first");
+        assert_eq!(snapshot.watermark, 0);
+
+        server_task.await.expect("fake worker task");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_failed_input_ack_read_marks_the_connection_torn() {
+        let root = test_root("failed-ack");
+        std::fs::create_dir_all(&root).expect("create test root");
+        let socket_path = root.join("worker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind fake worker");
+        let server_task = tokio::spawn(async move {
+            let (mut reader, writer, _runtime_id) = accept_scripted(&listener, "failed").await;
+            let mut writer = writer.into_inner();
+            let request = read_control_request(&mut reader, "write plan").await;
+            assert!(matches!(request.kind, RequestKind::WritePlan { .. }));
+            tokio::io::AsyncWriteExt::write_all(&mut writer, b"not a control message\n")
+                .await
+                .expect("write malformed acknowledgement");
+            // Park holding the socket: a request sent over the unproven
+            // framing would hang instead of being answered.
+            futures::future::pending::<()>().await;
+        });
+
+        let worker = Worker::connect(&socket_path, "session-failed", "daemon-failed")
+            .await
+            .expect("connect fake worker");
+        let error = worker
+            .reserve_write(scripted_fragments())
+            .await
+            .expect("reserve input write")
+            .commit(|| {})
+            .await
+            .expect_err("a malformed acknowledgement must fail the write");
+        assert!(matches!(error, WorkerError::Protocol(_)), "{error:?}");
+        assert!(matches!(
+            worker.inner.lock().await.stream_state,
+            StreamState::Torn
+        ));
+
+        let error = tokio::time::timeout(Duration::from_secs(5), worker.terminal_snapshot())
+            .await
+            .expect("the follow-up exchange terminates without peer I/O")
+            .expect_err("a torn stream must refuse further exchanges");
+        assert!(matches!(error, WorkerError::TornStream), "{error:?}");
+        let reserved = worker.reserve_write(scripted_fragments()).await;
+        assert!(matches!(reserved, Err(WorkerError::TornStream)));
+
+        server_task.abort();
         let _ = std::fs::remove_dir_all(root);
     }
 

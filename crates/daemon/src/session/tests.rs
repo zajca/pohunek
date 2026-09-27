@@ -4212,7 +4212,7 @@ async fn remove_stops_a_live_session_then_evicts() {
 }
 
 #[tokio::test]
-async fn remove_evicts_a_conflicted_runtime_without_stopping_it() {
+async fn remove_refuses_a_conflicted_runtime_not_proven_to_be_its_own() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         stop_grace: Duration::from_millis(50),
@@ -4225,23 +4225,22 @@ async fn remove_evicts_a_conflicted_runtime_without_stopping_it() {
     let entry = sessions.get_mut(&created.id).expect("stopped session");
     entry.info.state = SessionState::Running;
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Conflict);
+    let runtime = entry.info.runtime.as_mut().expect("runtime");
+    runtime.state = RuntimeState::Conflict;
+    runtime.loss_reason = Some(crate::runtime::lifecycle::IDENTITY_MISMATCH.to_owned());
     drop(sessions);
 
-    let removed = registry
+    let error = registry
         .remove(&created.id)
         .await
-        .expect("remove conflicted session");
+        .expect_err("a conflict over a foreign job or worker is never retired");
 
-    assert!(removed.removed);
-    assert!(
-        !removed.stopped,
-        "an unavailable runtime must not be signaled"
-    );
-    let error = registry
+    assert_eq!(error.code, "session_runtime_conflict");
+    let kept = registry
         .inspect(&created.id)
         .await
-        .expect_err("removed session is gone");
-    assert_eq!(error.code, "session_not_found");
+        .expect("the refused session stays listed");
+    assert_eq!(kept.runtime.expect("runtime").state, RuntimeState::Conflict);
 }
 
 #[tokio::test]

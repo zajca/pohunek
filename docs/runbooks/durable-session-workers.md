@@ -168,8 +168,21 @@ Do not:
 - edit `worker_id` or `runtime_id` in metadata by hand.
 
 After preserving diagnostic evidence, `pohunek session rm <id>` can remove a
-`lost`, `conflict`, or `incompatible` logical record. It does not stop or signal
-an unavailable runtime; an ambiguous worker remains an operator responsibility.
+`lost`, `conflict`, `reconnecting`, or `incompatible` session. A `lost` runtime
+has ended, so removal leaves its worker job alone. For a `reconnecting`,
+`incompatible`, or `runtime_supervision_ambiguous` conflict session, removal
+first retires the worker job of the exact generation the record names through
+the service manager, which stops that worker and its child, requires every
+worker the session's journals record for that generation to be gone, and then
+deletes the record. Removal is
+refused and the record kept when the record names no worker generation or the
+runtime is a conflict for another reason such as `runtime_identity_mismatch`
+(runtime code `session_runtime_conflict`, `session_runtime_reconnecting`, or
+`worker_protocol_incompatible`), when the service manager cannot complete the
+retirement (`runtime_supervision_unavailable`), when a worker journaled under
+another generation still runs (`runtime_identity_mismatch`), and when the
+session's journals cannot be read or a journaled worker of the generation still
+runs after the retirement (`runtime_supervision_ambiguous`).
 
 ## Runtime Loss and Explicit Recovery
 
@@ -202,7 +215,8 @@ absolute versioned `pohunek-sessiond` and journal it, so an upgrade switches
 `active_version` in `service.toml`, rewrites the daemon job to the new version,
 and restarts only the daemon. Running workers keep their PID, PTY, and child.
 Version directories still referenced by a non-final worker journal or a running
-process are kept; `pohunek service status --json` shows which journals and
+process are kept, and every version is kept while a journal written by an older
+pohunek under an earlier journal schema names a worker that may still run; `pohunek service status --json` shows which journals and
 processes reference each version.
 
 Worker-aware releases negotiate the current and immediately preceding private

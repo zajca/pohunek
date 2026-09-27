@@ -36,7 +36,7 @@ use crate::runtime::lifecycle::{
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 /// Discovery reason of a worker socket that does not answer.
 const UNREACHABLE_SOCKET: &str = "worker_unavailable";
@@ -1109,6 +1109,87 @@ impl SessionRegistry {
         }
     }
 
+    /// Collects the worker processes a removal of `id` must prove gone.
+    ///
+    /// Reads every journal of the session from a fresh scan, the same one
+    /// reconciliation uses, independent of which worker the record names:
+    /// a preparing record names no worker, and several journals may claim
+    /// one generation. Each journal of `generation` whose runtime has not
+    /// ended contributes its worker process. A worker journaled under
+    /// another generation must already be gone, since retiring `generation`
+    /// cannot stop it. A worker journals before it owns a PTY, so a
+    /// successful scan without such journals proves no PTY to orphan.
+    ///
+    /// # Errors
+    ///
+    /// Returns `runtime_supervision_ambiguous` when the journals cannot be
+    /// scanned or one of them is unreadable, or a foreign-generation worker
+    /// cannot be inspected, and `runtime_identity_mismatch` when a journal
+    /// records a malformed worker identity or a worker of another generation
+    /// still runs.
+    pub(super) async fn removal_worker_processes(
+        &self,
+        id: &SessionId,
+        generation: &super::Generation,
+    ) -> Result<Vec<crate::procwatch::ProcessIdentity>, ProtocolError> {
+        let ambiguous = |detail: String| {
+            ProtocolError::new(
+                protocol::ErrorClass::Runtime,
+                SUPERVISION_AMBIGUOUS,
+                format!("session {} cannot be removed: {detail}", id.0),
+                None,
+            )
+        };
+        let mismatch = |detail: String| {
+            ProtocolError::new(
+                protocol::ErrorClass::Runtime,
+                IDENTITY_MISMATCH,
+                format!("session {} cannot be removed: {detail}", id.0),
+                None,
+            )
+        };
+        let scan = self
+            .discover_worker_journals()
+            .await
+            .map_err(ambiguous)?
+            .remove(&id.0)
+            .unwrap_or_default();
+        if scan.conflict {
+            return Err(ambiguous(
+                "the session has an unreadable or mismatched worker journal".to_owned(),
+            ));
+        }
+        let mut workers = Vec::new();
+        for journal in scan.evidence.iter().filter(|journal| {
+            !matches!(
+                journal.phase,
+                JournalPhase::Terminal | JournalPhase::NeverInitialized
+            )
+        }) {
+            let identity = journal.worker().identity().map_err(mismatch)?;
+            if journal.generation == generation.generation() {
+                workers.push(identity);
+                continue;
+            }
+            match self.inner.inspector.is_running(identity) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(mismatch(format!(
+                        "worker {} of generation {} is still running",
+                        journal.worker_id, journal.generation
+                    )));
+                }
+                Err(error) => {
+                    return Err(ambiguous(format!(
+                        "worker {} of generation {} cannot be inspected: {error}",
+                        journal.worker_id, journal.generation
+                    )));
+                }
+            }
+        }
+        Ok(workers)
+    }
+
     /// Reads the journal of exactly `key`'s generation from a fresh scan.
     ///
     /// # Errors
@@ -1695,7 +1776,7 @@ impl SessionRegistry {
             tracing::warn!(session_id = %id.0, error = %error, "failed to commit reconciled worker");
             return;
         }
-        self.inner.sessions.lock().await.insert(id.clone(), entry);
+        self.install_session_entry(&id, entry).await;
         let expected = RuntimeWatchIdentity::from_info(&info)
             .expect("reconciled live runtime has a complete watcher identity");
         self.spawn_detector(DetectorInputs {
@@ -1839,7 +1920,7 @@ impl SessionRegistry {
             tracing::warn!(session_id = %id.0, error = %error, "failed to persist runtime classification");
             return;
         }
-        self.inner.sessions.lock().await.insert(id.clone(), entry);
+        self.install_session_entry(&id, entry).await;
         let event_name = match state {
             RuntimeState::Conflict => event::SESSION_RUNTIME_CONFLICT,
             RuntimeState::Lost | RuntimeState::Incompatible => event::SESSION_RUNTIME_LOST,
@@ -1929,6 +2010,14 @@ impl SessionRegistry {
             }
             if let Err(error) = self.delete_session_record(id).await {
                 tracing::warn!(session_id = %id.0, error = %error, "failed to finish reconciled removal");
+                return;
+            }
+            // A supervision retry finishes the removal of a listed session,
+            // which then leaves the registry like any other removal.
+            let removed = self.inner.sessions.lock().await.remove(id);
+            if let Some(entry) = removed {
+                entry.cancel_runtime_watchers();
+                self.emit(event::SESSION_REMOVED, &entry.info);
             }
         }
     }
@@ -6360,7 +6449,7 @@ while os.getppid() == parent:
             IDENTITY_MISMATCH, SUPERVISION_AMBIGUOUS, SUPERVISION_UNAVAILABLE,
         };
         use crate::session::{SessionRegistry, SessionRegistryConfig};
-        use crate::store::{SessionRecord, Store};
+        use crate::store::{DesiredState, SessionRecord, Store};
 
         /// Sweep grace of the fixtures; short so a `SIGKILL` fallback stays fast.
         const SWEEP_GRACE: Duration = Duration::from_millis(300);
@@ -6454,14 +6543,38 @@ while os.getppid() == parent:
             worker: (u32, u64),
             runtime_id: Option<&str>,
         ) {
+            write_generation_journal(root, session_id, TEST_GENERATION, worker, runtime_id);
+        }
+
+        /// Writes the live journal of `session_id`'s worker naming `generation`.
+        fn write_generation_journal(
+            root: &Path,
+            session_id: &str,
+            generation: &str,
+            worker: (u32, u64),
+            runtime_id: Option<&str>,
+        ) {
             let worker_id = format!("worker-{session_id}");
+            write_worker_journal(root, session_id, &worker_id, generation, worker, runtime_id);
+        }
+
+        /// Writes the live journal of `session_id`'s worker `worker_id`
+        /// naming `generation`.
+        fn write_worker_journal(
+            root: &Path,
+            session_id: &str,
+            worker_id: &str,
+            generation: &str,
+            worker: (u32, u64),
+            runtime_id: Option<&str>,
+        ) {
             let mut journal = JournalRecord::bootstrap(
                 session_id.to_owned(),
-                worker_id.clone(),
+                worker_id.to_owned(),
                 pohunek_session_worker::WorkerOrigin {
                     executable: PathBuf::from(TEST_WORKER_EXECUTABLE),
                     version: "1.0.0".to_owned(),
-                    generation: TEST_GENERATION.to_owned(),
+                    generation: generation.to_owned(),
                 },
                 worker.0,
                 worker.1.to_string(),
@@ -7217,6 +7330,493 @@ while os.getppid() == parent:
                 .await
                 .expect("stop the adopted worker");
             server_task.abort();
+        }
+
+        /// The watcher tokens and identity of `session_id`'s registry entry.
+        async fn watchers_of(
+            registry: &SessionRegistry,
+            session_id: &str,
+        ) -> (
+            [tokio_util::sync::CancellationToken; 3],
+            crate::session::RuntimeWatchIdentity,
+        ) {
+            let sessions = registry.inner.sessions.lock().await;
+            let entry = sessions
+                .get(&SessionId(session_id.to_owned()))
+                .expect("session entry");
+            let identity = crate::session::RuntimeWatchIdentity::from_info(&entry.info)
+                .expect("live watcher identity");
+            (
+                [
+                    entry.detector_cancel.clone(),
+                    entry.procwatch_cancel.clone(),
+                    entry.runtime_watch_cancel.clone(),
+                ],
+                identity,
+            )
+        }
+
+        #[tokio::test]
+        async fn readopted_worker_is_watched_only_by_its_new_watchers() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let runtime_root = fixture.root.join("runtime/workers");
+            let (controller, runtime_id, _child_pid, server_task) =
+                spawn_initialized_worker(&fixture.root, &runtime_root, "s-350", "worker-s-350")
+                    .await;
+            persist_record(&fixture.root, "s-350", Some(runtime_id.as_str()));
+            drop(controller);
+            fixture.supervisor.script_job(
+                service_id("s-350", TEST_GENERATION),
+                present(ServiceState::Running, None),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            assert_eq!(
+                runtime_of(&fixture.registry, "s-350").await.state,
+                RuntimeState::Live
+            );
+            let id = SessionId("s-350".to_owned());
+            let (old_watchers, identity) = watchers_of(&fixture.registry, "s-350").await;
+            assert!(old_watchers.iter().all(|token| !token.is_cancelled()));
+
+            let outcome = fixture
+                .registry
+                .mark_worker_unavailable(
+                    &id,
+                    &identity,
+                    RuntimeState::Conflict,
+                    SUPERVISION_AMBIGUOUS,
+                )
+                .await;
+            assert!(matches!(
+                outcome,
+                crate::session::RuntimeTransitionOutcome::Applied(_)
+            ));
+            assert!(
+                old_watchers
+                    .iter()
+                    .all(tokio_util::sync::CancellationToken::is_cancelled),
+                "an unavailable runtime keeps no watcher"
+            );
+
+            fixture.registry.schedule_supervision_retry(&id);
+            wait_state(&fixture.registry, "s-350", RuntimeState::Live).await;
+            let (new_watchers, readopted) = watchers_of(&fixture.registry, "s-350").await;
+            assert_eq!(readopted, identity, "the same runtime is re-adopted");
+            assert!(
+                new_watchers.iter().all(|token| !token.is_cancelled()),
+                "the re-adopted runtime is watched"
+            );
+            assert!(
+                old_watchers
+                    .iter()
+                    .all(tokio_util::sync::CancellationToken::is_cancelled),
+                "the previous watchers never resume"
+            );
+            fixture
+                .registry
+                .stop(&id)
+                .await
+                .expect("stop the re-adopted worker");
+            server_task.abort();
+        }
+
+        #[tokio::test]
+        async fn reclassified_entry_cancels_the_watchers_it_replaces() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let runtime_root = fixture.root.join("runtime/workers");
+            let (controller, runtime_id, _child_pid, server_task) =
+                spawn_initialized_worker(&fixture.root, &runtime_root, "s-351", "worker-s-351")
+                    .await;
+            let record = persist_record(&fixture.root, "s-351", Some(runtime_id.as_str()));
+            drop(controller);
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            assert_eq!(
+                runtime_of(&fixture.registry, "s-351").await.state,
+                RuntimeState::Live
+            );
+            let (old_watchers, _) = watchers_of(&fixture.registry, "s-351").await;
+
+            fixture
+                .registry
+                .insert_unavailable_record(record, RuntimeState::Conflict, IDENTITY_MISMATCH)
+                .await;
+
+            assert_eq!(
+                runtime_of(&fixture.registry, "s-351").await.state,
+                RuntimeState::Conflict
+            );
+            assert!(
+                old_watchers
+                    .iter()
+                    .all(tokio_util::sync::CancellationToken::is_cancelled),
+                "a replaced entry keeps no watcher"
+            );
+            server_task.abort();
+        }
+
+        /// Whether the store still holds a record of `session_id`.
+        fn recorded(root: &Path, session_id: &str) -> bool {
+            durable_desired_state(root, session_id).is_some()
+        }
+
+        /// The durable desired state of `session_id`, when it is recorded.
+        fn durable_desired_state(root: &Path, session_id: &str) -> Option<DesiredState> {
+            Store::new(root.join("data/metadata.jsonl"))
+                .load_sessions()
+                .expect("load store")
+                .into_iter()
+                .find(|record| record.session_id == session_id)
+                .map(|record| record.desired_state)
+        }
+
+        /// Asserts that removing `session_id` fails with `code` and keeps the
+        /// session exactly as it was, without retiring anything.
+        async fn assert_removal_refused(fixture: &Fixture, session_id: &str, code: &str) {
+            let error = fixture
+                .registry
+                .remove(&SessionId(session_id.to_owned()))
+                .await
+                .expect_err("the removal is refused");
+            assert_eq!(error.code, code, "{error:?}");
+            assert_eq!(
+                durable_desired_state(&fixture.root, session_id),
+                Some(DesiredState::Running),
+                "the record is kept without a removal intent"
+            );
+            assert_eq!(
+                runtime_of(&fixture.registry, session_id).await.state,
+                RuntimeState::Conflict
+            );
+        }
+
+        #[tokio::test]
+        async fn removing_a_conflict_whose_journaled_worker_still_runs_is_refused() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            persist_record(&fixture.root, "s-356", Some("runtime-s-356"));
+            // The test process stands in for a worker that outlived its job.
+            write_live_journal(
+                &fixture.root,
+                "s-356",
+                own_identity(),
+                Some("runtime-s-356"),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let runtime = runtime_of(&fixture.registry, "s-356").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
+
+            assert_removal_refused(&fixture, "s-356", SUPERVISION_AMBIGUOUS).await;
+        }
+
+        #[tokio::test]
+        async fn removing_a_conflict_whose_journal_names_another_generation_is_refused() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            persist_record(&fixture.root, "s-357", Some("runtime-s-357"));
+            write_live_journal(&fixture.root, "s-357", dead_worker(), Some("runtime-s-357"));
+            fixture.supervisor.script_job(
+                service_id("s-357", TEST_GENERATION),
+                present(ServiceState::Running, None),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let runtime = runtime_of(&fixture.registry, "s-357").await;
+            assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
+            write_generation_journal(
+                &fixture.root,
+                "s-357",
+                "efgh2345",
+                own_identity(),
+                Some("runtime-s-357"),
+            );
+
+            assert_removal_refused(&fixture, "s-357", IDENTITY_MISMATCH).await;
+            assert!(
+                fixture.supervisor.retired().is_empty(),
+                "nothing is retired for a foreign journal"
+            );
+        }
+
+        #[tokio::test]
+        async fn removing_a_conflict_whose_record_names_no_worker_proves_the_journaled_one() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let mut record = persist_record(&fixture.root, "s-360", Some("runtime-s-360"));
+            record.runtime.worker_id = None;
+            record.info.runtime.as_mut().expect("runtime").worker_id = None;
+            Store::new(fixture.root.join("data/metadata.jsonl"))
+                .record_session(&record)
+                .expect("persist a record naming no worker");
+            // The test process stands in for a worker that journaled before
+            // the daemon recorded it, and outlived its job.
+            write_live_journal(
+                &fixture.root,
+                "s-360",
+                own_identity(),
+                Some("runtime-s-360"),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let runtime = runtime_of(&fixture.registry, "s-360").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
+            assert_eq!(runtime.worker_id, None);
+
+            assert_removal_refused(&fixture, "s-360", SUPERVISION_AMBIGUOUS).await;
+        }
+
+        #[tokio::test]
+        async fn removing_a_conflict_proves_every_journal_of_its_generation() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            persist_record(&fixture.root, "s-361", Some("runtime-s-361"));
+            write_live_journal(&fixture.root, "s-361", dead_worker(), Some("runtime-s-361"));
+            // A second journal claims the same generation; its worker runs.
+            write_worker_journal(
+                &fixture.root,
+                "s-361",
+                "worker-s-361-other",
+                TEST_GENERATION,
+                own_identity(),
+                Some("runtime-s-361"),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let runtime = runtime_of(&fixture.registry, "s-361").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
+
+            assert_removal_refused(&fixture, "s-361", SUPERVISION_AMBIGUOUS).await;
+        }
+
+        #[tokio::test]
+        async fn removing_a_conflict_over_a_foreign_job_is_refused() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            persist_record(&fixture.root, "s-358", Some("runtime-s-358"));
+            write_live_journal(&fixture.root, "s-358", dead_worker(), Some("runtime-s-358"));
+            fixture.supervisor.script_job(
+                service_id("s-358", TEST_GENERATION),
+                present(
+                    ServiceState::Running,
+                    Some(DefinitionFacts {
+                        executable: PathBuf::from("/opt/other/pohunek-sessiond"),
+                        arguments: vec![
+                            "--session-id".to_owned(),
+                            "s-358".to_owned(),
+                            "--worker-generation".to_owned(),
+                            TEST_GENERATION.to_owned(),
+                        ],
+                    }),
+                ),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let runtime = runtime_of(&fixture.registry, "s-358").await;
+            assert_eq!(runtime.loss_reason.as_deref(), Some(IDENTITY_MISMATCH));
+
+            assert_removal_refused(&fixture, "s-358", "session_runtime_conflict").await;
+            assert!(
+                fixture.supervisor.retired().is_empty(),
+                "a job reconciliation classified foreign is never retired"
+            );
+        }
+
+        #[tokio::test]
+        async fn reconciled_removal_intent_evicts_the_listed_session() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let runtime_root = fixture.root.join("runtime/workers");
+            let (controller, runtime_id, _child_pid, server_task) =
+                spawn_initialized_worker(&fixture.root, &runtime_root, "s-359", "worker-s-359")
+                    .await;
+            let mut record = persist_record(&fixture.root, "s-359", Some(runtime_id.as_str()));
+            drop(controller);
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            assert_eq!(
+                runtime_of(&fixture.registry, "s-359").await.state,
+                RuntimeState::Live
+            );
+            let (watchers, _) = watchers_of(&fixture.registry, "s-359").await;
+            let mut events = fixture.registry.subscribe();
+            record.desired_state = DesiredState::Removed;
+
+            let adopted = fixture
+                .registry
+                .inner
+                .sessions
+                .lock()
+                .await
+                .get(&SessionId("s-359".to_owned()))
+                .and_then(|entry| match &entry.runtime {
+                    crate::session::RuntimeHandle::Worker(worker) => Some(worker.clone()),
+                    crate::session::RuntimeHandle::Unavailable(_) => None,
+                })
+                .expect("adopted worker");
+            fixture
+                .registry
+                .finish_reconciled_removal(&SessionId("s-359".to_owned()), adopted, &record)
+                .await;
+
+            fixture
+                .registry
+                .inspect(&SessionId("s-359".to_owned()))
+                .await
+                .expect_err("the finished removal leaves the registry");
+            assert!(!recorded(&fixture.root, "s-359"));
+            assert!(watchers
+                .iter()
+                .all(tokio_util::sync::CancellationToken::is_cancelled));
+            let removed = loop {
+                let event = tokio::time::timeout(EFFECT_DEADLINE, events.recv())
+                    .await
+                    .expect("removal event")
+                    .expect("event stream");
+                if event.event() == protocol::event::SESSION_REMOVED {
+                    break event;
+                }
+            };
+            assert_eq!(removed.event(), protocol::event::SESSION_REMOVED);
+            server_task.abort();
+        }
+
+        #[tokio::test]
+        async fn removing_a_conflicting_session_retires_its_generation_first() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            persist_record(&fixture.root, "s-352", Some("runtime-s-352"));
+            write_live_journal(&fixture.root, "s-352", dead_worker(), Some("runtime-s-352"));
+            let id = service_id("s-352", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Running, None));
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let runtime = runtime_of(&fixture.registry, "s-352").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert!(fixture.supervisor.retired().is_empty());
+
+            let removed = fixture
+                .registry
+                .remove(&SessionId("s-352".to_owned()))
+                .await
+                .expect("remove the conflicting session");
+
+            assert!(removed.removed);
+            assert_eq!(fixture.supervisor.retired(), vec![id]);
+            assert!(!recorded(&fixture.root, "s-352"));
+        }
+
+        #[tokio::test]
+        async fn removing_a_reconnecting_session_keeps_it_until_its_generation_is_retired() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            persist_record(&fixture.root, "s-353", Some("runtime-s-353"));
+            write_live_journal(&fixture.root, "s-353", dead_worker(), Some("runtime-s-353"));
+            let id = service_id("s-353", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), JobScript::Unavailable);
+            fixture.supervisor.fail_discovery();
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let runtime = runtime_of(&fixture.registry, "s-353").await;
+            assert_eq!(runtime.state, RuntimeState::Reconnecting);
+            let session = SessionId("s-353".to_owned());
+
+            let error = fixture
+                .registry
+                .remove(&session)
+                .await
+                .expect_err("an unretirable generation blocks removal");
+
+            assert_eq!(error.code, SUPERVISION_UNAVAILABLE);
+            assert_eq!(fixture.supervisor.retired(), vec![id.clone()]);
+            assert_eq!(
+                durable_desired_state(&fixture.root, "s-353"),
+                Some(DesiredState::Running),
+                "a failed retirement leaves no removal intent"
+            );
+            fixture
+                .registry
+                .inspect(&session)
+                .await
+                .expect("the session stays listed");
+
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Running, None));
+            let removed = fixture
+                .registry
+                .remove(&session)
+                .await
+                .expect("remove once the generation can be retired");
+
+            assert!(removed.removed);
+            assert_eq!(fixture.supervisor.retired(), vec![id.clone(), id]);
+            assert!(!recorded(&fixture.root, "s-353"));
+        }
+
+        #[tokio::test]
+        async fn removing_a_possibly_live_runtime_without_a_generation_is_refused() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let mut record = persist_record(&fixture.root, "s-354", Some("runtime-s-354"));
+            record.runtime.service_id = None;
+            record.runtime.generation = None;
+            record.runtime.executable = None;
+            fixture
+                .registry
+                .insert_unavailable_record(record, RuntimeState::Conflict, IDENTITY_MISMATCH)
+                .await;
+            let session = SessionId("s-354".to_owned());
+
+            let error = fixture
+                .registry
+                .remove(&session)
+                .await
+                .expect_err("nothing identifies the worker to retire");
+
+            assert_eq!(error.code, "session_runtime_conflict");
+            assert!(fixture.supervisor.retired().is_empty());
+            assert!(recorded(&fixture.root, "s-354"));
+            let runtime = runtime_of(&fixture.registry, "s-354").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+        }
+
+        #[tokio::test]
+        async fn removing_an_incompatible_session_retires_its_generation_first() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let runtime_root = fixture.root.join("runtime/workers");
+            persist_record(&fixture.root, "s-355", Some("runtime-s-355"));
+            let fake = spawn_incompatible_worker(&runtime_root, "s-355");
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            assert_eq!(
+                runtime_of(&fixture.registry, "s-355").await.state,
+                RuntimeState::Incompatible
+            );
+
+            let removed = fixture
+                .registry
+                .remove(&SessionId("s-355".to_owned()))
+                .await
+                .expect("remove the incompatible session");
+
+            assert!(removed.removed);
+            assert_eq!(
+                fixture.supervisor.retired(),
+                vec![service_id("s-355", TEST_GENERATION)]
+            );
+            assert!(!recorded(&fixture.root, "s-355"));
+            fake.abort();
         }
 
         #[tokio::test]

@@ -74,10 +74,23 @@ Interpret runtime states as follows:
   until the worker initialization deadline; the job is then retired and the
   unfinished session disappears. `runtime_identity_mismatch` means the job's definition or
   process does not match the recorded executable, session, or generation.
-  Afterward, `pohunek session rm <id>` can remove only the quarantined logical
-  record; it does not signal a worker.
+  Afterward, `pohunek session rm <id>` removes a
+  `runtime_supervision_ambiguous` session: it retires the worker job of the
+  exact generation the record names through the service manager, which stops
+  that worker and its child, requires every worker the session's journals
+  record for that generation to be gone, and then deletes the logical record. It refuses, keeping the record, a
+  `runtime_identity_mismatch` conflict or a record that names no worker
+  generation (`session_runtime_conflict`), a retirement the service manager
+  cannot complete (`runtime_supervision_unavailable`), a still-running worker
+  journaled under another generation (`runtime_identity_mismatch`), and
+  unreadable session journals or a journaled worker that still runs after the
+  retirement, for example outside its job (`runtime_supervision_ambiguous`). Stop such a worker by hand after
+  preserving the evidence, then retry the removal.
 - `incompatible`: the worker is alive but private protocol negotiation failed.
-  Leave it alive and use a compatible daemon release.
+  Leave it alive and use a compatible daemon release. `pohunek session rm <id>`
+  retires such a worker through the service manager the same way as an
+  ambiguous `conflict` one (refused with `worker_protocol_incompatible` when the
+  record names no worker generation).
 
 Workers live only as long as the login session. Closing a terminal or locking
 the screen is safe. Logging out or rebooting ends every worker job; after the

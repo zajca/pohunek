@@ -534,6 +534,20 @@ struct SessionEntry {
     cwd_observed_at: Instant,
 }
 
+impl SessionEntry {
+    /// Stops the detector, process watcher, and worker exit watcher of this
+    /// entry's runtime.
+    ///
+    /// All three watch the same runtime identity, so a re-adopted runtime
+    /// would otherwise run beside them; stopping them keeps at most one
+    /// watcher set applying updates to a session.
+    fn cancel_runtime_watchers(&self) {
+        self.detector_cancel.cancel();
+        self.procwatch_cancel.cancel();
+        self.runtime_watch_cancel.cancel();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DetectorConfigUpdate {
     generation: u64,
@@ -2653,11 +2667,15 @@ impl SessionRegistry {
     /// session otherwise lingers forever. `remove` is the eviction step. A
     /// still-live worker-backed session is stopped first (so removal never
     /// orphans a live PTY), then the entry is dropped and its resume binding
-    /// cleared so a daemon restart cannot resurrect it. An unavailable runtime
-    /// is already outside the daemon's control, so removal evicts only its
-    /// logical record and deliberately does not signal an ambiguous worker. A
-    /// `session_removed` event is emitted with the final snapshot so subscribed
-    /// clients drop their view of the session.
+    /// cleared so a daemon restart cannot resurrect it. An ambiguous
+    /// conflict, a reconnecting, or an incompatible runtime cannot be stopped
+    /// through its worker yet may still own a live PTY, so its exact recorded
+    /// generation is retired through the supervisor and its journaled worker
+    /// proven gone before the record is deleted. Such a runtime whose record
+    /// names no generation, a conflict over a job or worker that is not the
+    /// recorded generation's, and a worker still running after retirement are
+    /// refused instead. A `session_removed` event is emitted with the final
+    /// snapshot so subscribed clients drop their view of the session.
     ///
     /// Worktree cleanup is best-effort: a checkout that could not be deleted is
     /// counted in [`SessionRemoveResult::worktrees_failed`] instead of failing
@@ -2668,20 +2686,36 @@ impl SessionRegistry {
     ///
     /// Returns `session_not_found` when no session has the given id, and
     /// surfaces any PTY shutdown error from the implied stop of a live session.
+    /// An unreachable runtime that cannot be retired (no recorded generation,
+    /// or a non-ambiguous conflict) fails with its runtime-state code
+    /// (`session_runtime_conflict`, `session_runtime_reconnecting`, or
+    /// `worker_protocol_incompatible`); a generation the supervisor cannot
+    /// retire fails with `runtime_supervision_unavailable`; a worker not
+    /// proven gone afterwards fails with `runtime_supervision_ambiguous` or
+    /// `runtime_identity_mismatch`. The record is kept in every case.
     pub async fn remove(&self, id: &SessionId) -> Result<SessionRemoveResult, ProtocolError> {
         self.ensure_not_external(id).await?;
         let _guard = self.lock_lifecycle(id).await;
         let should_stop = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
+            if let Some(state) = unreachable_live_state(entry) {
+                ensure_retirable(id, entry, state)?;
+            }
             !is_terminal(entry.info.state) && matches!(entry.runtime, RuntimeHandle::Worker(_))
         };
 
         let stopped = if should_stop {
-            self.stop_with_intent(id, DesiredState::Removed, TransactionKind::Remove)
+            let stopped = self
+                .stop_with_intent(id, DesiredState::Removed, TransactionKind::Remove)
                 .await?
-                .stopped
+                .stopped;
+            self.retire_unstopped_job(id).await?;
+            stopped
         } else {
+            // Retiring first means a refused or failed retirement leaves no
+            // removal intent behind; the record keeps its runtime state.
+            self.retire_unstopped_job(id).await?;
             let removal_intent = {
                 let mut sessions = self.inner.sessions.lock().await;
                 let entry = sessions
@@ -2707,8 +2741,6 @@ impl SessionRegistry {
             self.write_session_record(removal_intent).await?;
             false
         };
-
-        self.retire_ended_job(id).await?;
 
         let (cleanup_warnings, cleanup) = self.cleanup_owned_worktrees_for_removal(id).await?;
         if !cleanup_warnings.is_empty() {
@@ -2764,19 +2796,27 @@ impl SessionRegistry {
         })
     }
 
-    /// Retires the worker job of a session whose runtime is terminal.
+    /// Retires the worker job of a session that removal does not stop
+    /// through its worker.
     ///
-    /// A terminal worker only retains its final output, so removal retires
-    /// its exact generation and cleans up the job definition. Lost, conflicting,
-    /// or reconnecting runtimes are left to reconciliation, which never signals
-    /// an ambiguous worker.
+    /// A terminal worker only retains its final output, so its exact
+    /// generation is retired. An unreachable worker that is not proven gone
+    /// (see [`unreachable_live_state`]) may still own a live PTY, and deleting
+    /// its record alone would leave it running unrecorded: every journaled
+    /// worker of the session is collected from a fresh journal scan
+    /// ([`Self::removal_worker_processes`]), the generation is retired, and
+    /// those workers must then be proven gone
+    /// ([`crate::runtime::lifecycle::Lifecycle::retire_for_removal`]). A lost
+    /// runtime was already classified ended and is left alone.
     ///
     /// # Errors
     ///
     /// Returns `runtime_supervision_unavailable` when the supervisor cannot
-    /// retire the job; the logical record is kept so removal can be retried.
-    async fn retire_ended_job(&self, id: &SessionId) -> Result<(), ProtocolError> {
-        let job = {
+    /// retire the job, and `runtime_supervision_ambiguous` or
+    /// `runtime_identity_mismatch` when an unreachable worker is not proven
+    /// gone afterwards; the logical record is kept so removal can be retried.
+    async fn retire_unstopped_job(&self, id: &SessionId) -> Result<(), ProtocolError> {
+        let target = {
             let sessions = self.inner.sessions.lock().await;
             sessions.get(id).and_then(|entry| {
                 let terminal = entry
@@ -2784,13 +2824,23 @@ impl SessionRegistry {
                     .runtime
                     .as_ref()
                     .is_some_and(|runtime| runtime.state == RuntimeState::Terminal);
-                terminal.then(|| entry.job.clone()).flatten()
+                let unreachable = unreachable_live_state(entry).is_some();
+                (terminal || unreachable)
+                    .then(|| entry.job.clone().map(|job| (job, unreachable)))
+                    .flatten()
             })
         };
-        let Some(job) = job else {
+        let Some((job, unreachable)) = target else {
             return Ok(());
         };
         let lifecycle = self.lifecycle()?;
+        if unreachable {
+            let workers = self.removal_worker_processes(id, &job).await?;
+            return lifecycle
+                .retire_for_removal(&job, &workers)
+                .await
+                .map_err(crate::runtime::lifecycle::PreviousLive::into_error);
+        }
         lifecycle.retire(&job).await.map_err(|error| {
             runtime_error(
                 crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE,
@@ -3197,9 +3247,26 @@ impl SessionRegistry {
         if &current_record != memory_base {
             return RuntimeTransitionOutcome::RetryableConcurrentChange;
         }
+        // An unavailable runtime has no worker left to watch; only a later
+        // adoption, with fresh tokens, may watch this session again.
+        if matches!(candidate.runtime, RuntimeHandle::Unavailable(_)) {
+            candidate.cancel_runtime_watchers();
+        }
         let info = candidate.info.clone();
         sessions.insert(id.clone(), candidate);
         RuntimeTransitionOutcome::Applied(Box::new(info))
+    }
+
+    /// Installs `entry`, which carries fresh watcher tokens, as the session's
+    /// registry entry.
+    ///
+    /// The watchers of a replaced entry are cancelled, so re-adopting or
+    /// reclassifying a runtime never leaves a second watcher set on it.
+    async fn install_session_entry(&self, id: &SessionId, entry: SessionEntry) {
+        let replaced = self.inner.sessions.lock().await.insert(id.clone(), entry);
+        if let Some(replaced) = replaced {
+            replaced.cancel_runtime_watchers();
+        }
     }
 
     async fn record_exit(
@@ -4239,18 +4306,70 @@ fn worker_error_to_protocol(err: WorkerError) -> ProtocolError {
 }
 
 fn unavailable_runtime_error(id: &SessionId, state: RuntimeState) -> ProtocolError {
-    let code = match state {
+    runtime_error(
+        unavailable_runtime_code(state),
+        format!("session {} runtime is {}", id.0, runtime_state_label(state)),
+    )
+}
+
+fn unavailable_runtime_code(state: RuntimeState) -> &'static str {
+    match state {
         RuntimeState::Lost => "session_runtime_lost",
         RuntimeState::Conflict => "session_runtime_conflict",
         RuntimeState::Incompatible => "worker_protocol_incompatible",
         RuntimeState::Starting | RuntimeState::Reconnecting => "session_runtime_reconnecting",
         RuntimeState::Terminal => "session_not_running",
         RuntimeState::Live => "worker_operation_failed",
+    }
+}
+
+/// Returns the state of an entry whose worker is unreachable but not proven
+/// gone.
+///
+/// Such a worker may still own a live PTY: the daemon cannot stop it through
+/// its control connection, only retire its recorded generation through the
+/// supervisor. Terminal and lost runtimes have ended.
+fn unreachable_live_state(entry: &SessionEntry) -> Option<RuntimeState> {
+    match entry.runtime {
+        RuntimeHandle::Unavailable(RuntimeState::Terminal | RuntimeState::Lost)
+        | RuntimeHandle::Worker(_) => None,
+        RuntimeHandle::Unavailable(state) => Some(state),
+    }
+}
+
+/// Refuses the removal of an unreachable runtime its session cannot retire.
+///
+/// Retirement needs the generation the record names, and a conflict is
+/// retirable only while it is ambiguous whether this session's own worker
+/// still runs. Any other conflict means reconciliation found a job or worker
+/// that is not the recorded generation's, which is never touched.
+fn ensure_retirable(
+    id: &SessionId,
+    entry: &SessionEntry,
+    state: RuntimeState,
+) -> Result<(), ProtocolError> {
+    let refusal = if entry.job.is_none() {
+        "its record names no worker generation to retire"
+    } else if state == RuntimeState::Conflict
+        && entry
+            .info
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.loss_reason.as_deref())
+            != Some(crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS)
+    {
+        "its job or worker is not proven to be the recorded generation's"
+    } else {
+        return Ok(());
     };
-    runtime_error(
-        code,
-        format!("session {} runtime is {}", id.0, runtime_state_label(state)),
-    )
+    Err(runtime_error(
+        unavailable_runtime_code(state),
+        format!(
+            "session {} runtime is {} and {refusal}; stop its worker before removing the session",
+            id.0,
+            runtime_state_label(state)
+        ),
+    ))
 }
 
 fn runtime_state_label(state: RuntimeState) -> &'static str {

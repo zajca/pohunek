@@ -1,6 +1,6 @@
 //! Typed failures of `pohunek service`.
 
-// Rust guideline compliant 2026-09-26
+// Rust guideline compliant 2026-09-27
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -22,6 +22,32 @@ impl std::fmt::Display for LiveSession {
         match &self.name {
             Some(name) => write!(f, "{} ({name})", self.id),
             None => f.write_str(&self.id),
+        }
+    }
+}
+
+/// A journal of an older schema whose worker may still run.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct OutdatedWorker {
+    /// Journal file.
+    pub path: PathBuf,
+    /// Schema version the journal records.
+    pub schema_version: u32,
+    /// Recorded worker process ID, when the journal holds a readable one.
+    pub pid: Option<u32>,
+}
+
+impl std::fmt::Display for OutdatedWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (schema {}, ",
+            self.path.display(),
+            self.schema_version
+        )?;
+        match self.pid {
+            Some(pid) => write!(f, "worker pid {pid})"),
+            None => f.write_str("no readable worker pid)"),
         }
     }
 }
@@ -268,6 +294,16 @@ pub enum Error {
         paths: Vec<PathBuf>,
     },
 
+    /// Journals of an older schema name workers that may still run.
+    #[error(
+        "worker journals written by an older pohunek name workers that may still run: {}",
+        workers.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+    )]
+    OutdatedJournals {
+        /// The blocking journals.
+        workers: Vec<OutdatedWorker>,
+    },
+
     /// Worker jobs of this namespace remained after retirement.
     #[error("worker jobs remain after uninstall: {}", ids.join(", "))]
     OrphanWorkers {
@@ -334,6 +370,7 @@ impl Error {
             Self::LiveSessions { .. } => "service_live_sessions",
             Self::StopTimeout { .. } => "service_stop_timeout",
             Self::UnreadableJournals { .. } => "service_unreadable_journals",
+            Self::OutdatedJournals { .. } => "service_outdated_journals",
             Self::OrphanWorkers { .. } => "service_orphan_workers",
             Self::Record { .. } => "service_record_invalid",
             Self::TransactionInProgress { .. } => "service_transaction_in_progress",
@@ -367,6 +404,9 @@ impl Error {
                 Some("inspect the listed sessions with `pohunek session list` and retry")
             }
             Self::VerifierMissing => Some("install systemd's `systemd-analyze` and retry"),
+            Self::OutdatedJournals { .. } => Some(
+                "end those sessions with the pohunek version that started them, or terminate the listed worker pids, then retry; a journal whose worker pid is unreadable blocks until you delete it after confirming no older pohunek-sessiond runs",
+            ),
             Self::VersionMismatch { .. } | Self::StagedBinary { .. } => Some(
                 "pass --from with a directory holding pohunek, pohunekd, and pohunek-sessiond of one build",
             ),

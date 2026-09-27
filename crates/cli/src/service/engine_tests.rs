@@ -23,7 +23,9 @@ use crate::service::backend::{Call, Control, Health};
 use crate::service::context::tests::{context, temp_root};
 use crate::service::layout::tests::stage_dir;
 use crate::service::layout::CLI_NAME;
-use crate::service::usage::tests::{write_journal, write_live_journal, SESSION};
+use crate::service::usage::tests::{
+    own_identity, write_journal, write_live_journal, write_outdated_journal, SESSION,
+};
 
 const V1: &str = "1.0.0";
 const V2: &str = "2.0.0";
@@ -1481,6 +1483,184 @@ async fn a_failed_uninstall_keeps_service_toml_so_a_rerun_finishes_it() {
     assert!(report.removed.contains(&harness.context.config_path()));
     harness.assert_clean();
     assert!(!harness.layout().bin_dir().join(CLI_NAME).exists());
+}
+
+#[tokio::test]
+async fn an_uninstall_that_died_before_removing_service_toml_is_finished_by_a_rerun() {
+    let harness = Harness::new();
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+    // The state an uninstall of that pending install leaves when it dies
+    // right after clearing the record: the daemon job and the version
+    // directory are gone, and only `service.toml` remains.
+    harness
+        .backend
+        .daemon()
+        .uninstall()
+        .await
+        .expect("daemon removed");
+    assert!(layout::remove_version(&harness.layout(), V1).expect("remove version"));
+    harness.engine().store.clear().expect("record cleared");
+    assert!(harness.config().is_some());
+
+    let report = harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect("rerun finishes the uninstall");
+    assert!(report.removed.contains(&harness.context.config_path()));
+    harness.assert_clean();
+    harness.install(V1).await.expect("reinstall");
+    harness.assert_installed(V1);
+}
+
+#[tokio::test]
+async fn a_registered_pending_install_without_service_toml_is_uninstalled_through_the_session_check(
+) {
+    let harness = Harness::new();
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+    std::fs::remove_file(harness.context.config_path()).expect("remove service.toml");
+    harness.fake.seed(
+        vec![session(SESSION, None)],
+        vec![worker(worker_id(SESSION), ServiceState::Running)],
+    );
+
+    // The daemon the record registered may own live sessions, so the missing
+    // `service.toml` does not make the installation absent.
+    let error = harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect_err("live sessions refuse the uninstall");
+    assert!(matches!(error, Error::LiveSessions { .. }), "{error:?}");
+    assert_eq!(harness.fake.daemon_version().as_deref(), Some(V1));
+    assert!(harness.pending().is_some(), "the record stays pending");
+
+    let report = harness
+        .engine()
+        .uninstall(UninstallOptions {
+            stop_sessions: true,
+            purge: false,
+        })
+        .await
+        .expect("uninstall with --stop-sessions");
+    assert_eq!(report.stopped_sessions, [SESSION]);
+    harness.assert_clean();
+    harness.install(V1).await.expect("reinstall");
+    harness.upgrade(V2).await.expect("upgrade");
+    harness.assert_installed(V2);
+}
+
+#[tokio::test]
+async fn an_outdated_journal_blocks_uninstall_only_while_its_worker_may_run() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let (pid, start) = own_identity();
+    let journal = write_outdated_journal(
+        harness.context.paths(),
+        SESSION,
+        "w-1",
+        "live",
+        Some((pid, &start)),
+    );
+
+    for stop_sessions in [false, true] {
+        let error = harness
+            .engine()
+            .uninstall(UninstallOptions {
+                stop_sessions,
+                purge: false,
+            })
+            .await
+            .expect_err("a possibly live outdated worker blocks");
+        let Error::OutdatedJournals { workers } = &error else {
+            panic!("unexpected error {error:?}");
+        };
+        assert_eq!(
+            workers,
+            &[OutdatedWorker {
+                path: journal.clone(),
+                schema_version: 3,
+                pid: Some(pid),
+            }]
+        );
+        assert!(error.hint().is_some());
+        assert!(harness.config().is_some(), "nothing was removed");
+    }
+
+    // The worker has exited: its outdated journal proves nothing is live.
+    write_outdated_journal(
+        harness.context.paths(),
+        SESSION,
+        "w-1",
+        "live",
+        Some((pid, "1")),
+    );
+    harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect("uninstall");
+    harness.assert_clean();
+}
+
+/// The in-use protection matches executables by their canonical path, which
+/// equals the configured prefix only while no component of it is a symlink.
+/// Every version-directory operation walks the prefix without following
+/// symlinks, so a prefix reached through one is refused before any deletion.
+#[tokio::test]
+async fn a_prefix_reached_through_a_symlink_is_refused_before_any_version_is_deleted() {
+    let harness = Harness::new();
+    let linked = harness.root.as_path().join("linked");
+    std::fs::create_dir(&linked).expect("linked dir");
+    std::os::unix::fs::symlink(&linked, harness.root.as_path().join("link")).expect("symlink");
+    let through_link = harness.root.as_path().join("link/prefix");
+    let error = harness
+        .engine()
+        .install(&harness.staged(V1), &through_link, V1)
+        .await
+        .expect_err("install through a symlinked prefix");
+    assert!(harness.config().is_none(), "{error:?}");
+    assert!(harness.pending().is_none(), "{error:?}");
+
+    // An installation whose prefix becomes a symlink afterwards: a process
+    // running from the moved version directory reports the canonical path,
+    // which lies outside the configured prefix.
+    harness.install(V1).await.expect("install");
+    let moved = harness.root.as_path().join("moved");
+    std::fs::rename(harness.prefix(), &moved).expect("move prefix");
+    std::os::unix::fs::symlink(&moved, harness.prefix()).expect("symlink prefix");
+    let sleeper = moved.join("libexec/pohunek").join(V1).join("sleeper");
+    std::fs::copy("/bin/sleep", &sleeper).expect("copy sleep");
+    let mut child = std::process::Command::new(&sleeper)
+        .arg("30")
+        .spawn()
+        .expect("spawn stand-in");
+
+    let upgrade = harness.upgrade(V2).await;
+    let uninstall = harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await;
+    child.kill().expect("kill stand-in");
+    child.wait().expect("reap stand-in");
+    upgrade.expect_err("upgrade through a symlinked prefix");
+    uninstall.expect_err("uninstall through a symlinked prefix");
+    assert!(sleeper.is_file(), "the in-use version directory survives");
+    assert!(moved
+        .join("libexec/pohunek")
+        .join(V1)
+        .join("pohunekd")
+        .is_file());
 }
 
 #[tokio::test]

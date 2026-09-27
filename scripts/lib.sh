@@ -24,6 +24,12 @@ POHUNEK_TIMEOUT_STATUS=124
 # deadline expired: the command then receives TERM and, after
 # POHUNEK_TIMEOUT_KILL_GRACE_SECONDS, KILL. The watchdog is cancelled as soon as
 # the command exits, and every background process is reaped before returning.
+#
+# A command that exits 0 always returns 0. The watchdog cannot tell a live
+# command from one that already exited but is not reaped yet (a zombie accepts
+# `kill`), so its signal alone does not prove it stopped the command; a zero
+# status says the command completed, a non-zero one after the watchdog fired
+# is reported as the timeout.
 pohunek_run_with_timeout() {
   _pohunek_limit="$1"
   shift
@@ -72,7 +78,8 @@ pohunek_run_with_timeout() {
   kill -TERM "$_pohunek_watchdog" 2>/dev/null || true
   _pohunek_watchdog_status=0
   wait "$_pohunek_watchdog" >/dev/null 2>&1 || _pohunek_watchdog_status=$?
-  if [ "$_pohunek_watchdog_status" -eq "$POHUNEK_TIMEOUT_STATUS" ]; then
+  if [ "$_pohunek_status" -ne 0 ] \
+    && [ "$_pohunek_watchdog_status" -eq "$POHUNEK_TIMEOUT_STATUS" ]; then
     return "$POHUNEK_TIMEOUT_STATUS"
   fi
   return "$_pohunek_status"

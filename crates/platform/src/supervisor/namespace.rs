@@ -46,6 +46,19 @@ const SERVICE_SUFFIX: &str = ".service";
 /// systemd slice suffix grouping every worker of one namespace.
 const SESSIONS_SLICE_SUFFIX: &str = "-sessions.slice";
 
+/// Separator between the session ID and the generation of a worker service ID.
+const SERVICE_ID_SEPARATOR: char = '.';
+
+// Every validated worker key must form a valid service ID, so that
+// `WorkerKey::service_id` cannot fail for names read back from a manager.
+const _: () = assert!(
+    pohunek_paths::MAX_WORKER_SESSION_ID_BYTES
+        + SERVICE_ID_SEPARATOR.len_utf8()
+        + pohunek_paths::WORKER_GENERATION_LEN
+        <= super::MAX_SERVICE_ID_BYTES,
+    "the longest worker session ID and generation must fit a service ID"
+);
+
 /// Installation namespace embedded in every native job name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Namespace(String);
@@ -240,8 +253,11 @@ impl WorkerKey {
     /// Returns the backend-neutral service ID `<session-id>.<generation>`.
     #[must_use]
     pub fn service_id(&self) -> ServiceId {
-        ServiceId::parse(format!("{}.{}", self.session_id, self.generation))
-            .expect("validated session IDs and generations form a safe service ID")
+        ServiceId::parse(format!(
+            "{}{SERVICE_ID_SEPARATOR}{}",
+            self.session_id, self.generation
+        ))
+        .expect("validated session IDs and generations form a safe service ID")
     }
 
     /// Parses a backend-neutral worker service ID.
@@ -253,7 +269,7 @@ impl WorkerKey {
     pub fn from_service_id(id: &ServiceId) -> Result<Self, Error> {
         let (session_id, generation) = id
             .as_str()
-            .split_once('.')
+            .split_once(SERVICE_ID_SEPARATOR)
             .ok_or_else(|| Error::InvalidServiceId(id.to_string()))?;
         Self::new(session_id, generation)
     }
@@ -423,6 +439,10 @@ mod tests {
             format!("pohunek-{namespace}-worker-{SESSION}-abcd-2345.service"),
             format!("pohunek-{namespace}-worker-s-x-abcd2345.service"),
             format!("other-{namespace}-worker-{SESSION}-abcd2345.service"),
+            format!(
+                "pohunek-{namespace}-worker-s-{}-abcd2345.service",
+                "1".repeat(150)
+            ),
         ] {
             assert!(
                 matches!(
@@ -432,6 +452,48 @@ mod tests {
                 "{unit}"
             );
         }
+    }
+
+    #[test]
+    fn over_long_numeric_session_labels_are_rejected() {
+        let namespace = namespace();
+        let label = format!(
+            "{LABEL_PREFIX}{namespace}{WORKER_LABEL_SEGMENT}s-{}.abcd2345",
+            "1".repeat(150)
+        );
+        assert!(matches!(
+            namespace.parse_worker_label(&label),
+            Err(Error::InvalidServiceId(_))
+        ));
+    }
+
+    #[test]
+    fn longest_worker_keys_form_service_ids() {
+        let namespace = namespace();
+        let generation = "z".repeat(pohunek_paths::WORKER_GENERATION_LEN);
+        for session in [format!("s-{}", u64::MAX), SESSION.to_owned()] {
+            assert!(session.len() <= pohunek_paths::MAX_WORKER_SESSION_ID_BYTES);
+            let key = WorkerKey::new(session, generation.clone()).expect("longest valid key");
+            let id = key.service_id();
+            assert_eq!(WorkerKey::from_service_id(&id).expect("round trip"), key);
+            assert_eq!(
+                namespace
+                    .parse_worker_unit(&namespace.worker_unit(&key))
+                    .expect("unit round trip"),
+                key
+            );
+            assert_eq!(
+                namespace
+                    .parse_worker_label(&namespace.worker_label(&key))
+                    .expect("label round trip"),
+                key
+            );
+        }
+        assert_eq!(
+            SESSION.len(),
+            pohunek_paths::MAX_WORKER_SESSION_ID_BYTES,
+            "a ULID session ID is the longest accepted"
+        );
     }
 
     #[test]

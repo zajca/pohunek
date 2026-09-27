@@ -71,15 +71,24 @@
 //! worker jobs, the launchd directories, the installed `<prefix>/bin/pohunek`
 //! copy, and unreferenced version directories removed. `--purge` also
 //! removes the session store, event logs, worker journals, and host
-//! identity. `service.toml` goes last: it names the prefix, so while any
-//! earlier removal fails, a rerun of `uninstall` still finds the
+//! identity. The transaction record is cleared next and `service.toml` goes
+//! last: it names the prefix, so while any earlier removal fails, or the
+//! process dies before the end, a rerun of `uninstall` still finds the
 //! installation and finishes the cleanup.
 //!
 //! A pending install that already reached the registration step takes this
 //! same flow instead of a rollback: its daemon may already run it with live
-//! workers, and only the session-checked removal above may stop them.
+//! workers, and only the session-checked removal above may stop them. Such a
+//! record found without `service.toml` describes its installation through
+//! its version and prefix, and the uninstall runs the same flow with the
+//! configuration the install wrote.
+//!
+//! Worker journals an older pohunek wrote under an earlier schema block the
+//! uninstall while their worker may still run. The daemon of this version
+//! cannot stop those workers, so the uninstall names them instead of
+//! waiting on them.
 
-// Rust guideline compliant 2026-09-26
+// Rust guideline compliant 2026-09-27
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -95,7 +104,7 @@ use protocol::{RuntimeState, SessionInfo, SessionState};
 use super::backend::Backend;
 use super::context::Context;
 use super::definition::{daemon_definition, initial_config, with_version};
-use super::error::{supervisor_error, Error, LiveSession};
+use super::error::{supervisor_error, Error, LiveSession, OutdatedWorker};
 use super::layout::{self, Staged};
 use super::record::{self, Operation, Record, Step, Store};
 use super::report::{
@@ -396,25 +405,31 @@ impl<'a> Engine<'a> {
     pub async fn uninstall(&self, options: UninstallOptions) -> Result<UninstallReport, Error> {
         let _transaction = self.store.lock().await?;
         let mut report = UninstallReport::default();
+        let mut registered = None;
         if let Some(pending) = self.store.load()? {
             // A transaction that may already have registered its daemon
             // cannot be rolled back here: the daemon may run it with live
             // workers, and removing both is the session-checked decision of
             // the uninstall below, which also consumes the record together
             // with the installation.
-            let registered =
-                pending.operation == Operation::Install && pending.step >= Step::Registering;
-            if !registered {
+            if pending.operation == Operation::Install && pending.step >= Step::Registering {
+                registered = Some(pending);
+            } else {
                 report.rolled_back = Some(pending_report(&pending));
                 self.rollback_pending(&pending).await?;
             }
         }
         let config_path = self.context.config_path();
-        let Some(config) = load_config(&config_path)? else {
-            if report.rolled_back.is_some() {
-                return Ok(report);
+        let config = match (load_config(&config_path)?, &registered) {
+            (Some(config), _) => config,
+            // The install wrote `service.toml` before registering, so a
+            // missing file was removed afterwards; the record still names the
+            // installation, and its daemon may still run live workers.
+            (None, Some(pending)) => {
+                initial_config(self.context, &pending.prefix, &pending.version)?
             }
-            return Err(Error::NotInstalled { path: config_path });
+            (None, None) if report.rolled_back.is_some() => return Ok(report),
+            (None, None) => return Err(Error::NotInstalled { path: config_path }),
         };
         let layout = config.layout().clone();
         let definition = daemon_definition(self.context, &config)?;
@@ -466,10 +481,13 @@ impl<'a> Engine<'a> {
             self.purge(&mut report)?;
             report.purged = true;
         }
+        // The record goes before `service.toml`: a record left without the
+        // file would still route a rerun here, but `service.toml` left
+        // without the record is an ordinary installation to finish removing.
+        self.store.clear()?;
         if remove_config(&config_path)? {
             report.removed.push(config_path);
         }
-        self.store.clear()?;
         Ok(report)
     }
 
@@ -897,6 +915,19 @@ impl<'a> Engine<'a> {
         if !journals.unreadable.is_empty() {
             return Err(Error::UnreadableJournals {
                 paths: journals.unreadable,
+            });
+        }
+        let outdated = journals.outdated_live(&self.inspector);
+        if !outdated.is_empty() {
+            return Err(Error::OutdatedJournals {
+                workers: outdated
+                    .into_iter()
+                    .map(|journal| OutdatedWorker {
+                        path: journal.path.clone(),
+                        schema_version: journal.schema_version,
+                        pid: journal.worker_pid,
+                    })
+                    .collect(),
             });
         }
         let covered = |session: &str| live.iter().any(|live| live.id == session);

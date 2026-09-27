@@ -114,8 +114,9 @@ running the versioned `pohunek-sessiond` they started from, so their PID, PTY,
 and child PID remain unchanged. Version directories that a live worker journal,
 a registered worker job (even one that has not started its process yet), or a
 running process still references are kept; the others are removed and listed
-in the upgrade report. When worker jobs cannot be discovered, every version is
-kept. The installer counts the daemon as ready only when `daemon.health`
+in the upgrade report. When worker jobs cannot be discovered, a worker journal
+cannot be read, or a journal written by an older pohunek under an earlier
+journal schema names a worker that may still run, every version is kept. The installer counts the daemon as ready only when `daemon.health`
 reports the new version on a connection whose kernel peer credentials name the
 daemon job's running main process, as the service manager reports it. A
 manually started daemon of the same build that holds the socket while the
@@ -171,9 +172,23 @@ automatically, so rerunning the command is always safe.
 
 `pohunek service uninstall` refuses while sessions are live and lists them.
 `--stop-sessions` stops every session through its worker first; the session
-store, journals, and host identity are kept unless `--purge` is given.
-`service.toml` is removed last, so if an uninstall fails partway, rerunning
-`pohunek service uninstall` finishes the cleanup. Before `service upgrade` or
+store, journals, and host identity are kept unless `--purge` is given. The
+transaction record (`service-install.json`) is cleared just before
+`service.toml`, which is removed last, so if an uninstall fails partway or is
+interrupted, rerunning `pohunek service uninstall` finishes the cleanup. A
+pending install that reached its `registering` step is uninstalled through the
+same live-session check even when its `service.toml` is already gone: the
+record's version and prefix identify the installation.
+
+A worker journal written by an older pohunek under an earlier journal schema
+blocks the uninstall with `service_outdated_journals` while its worker may still
+run: its recorded phase is not final and its recorded worker process is running
+or cannot be identified. The error lists each journal with its schema version
+and worker pid. This daemon cannot stop such a worker, so `--stop-sessions` does
+not help: end those sessions with the pohunek version that started them, or
+terminate the listed worker pid, then rerun the uninstall. A journal with no
+readable worker pid keeps blocking until you delete it, after confirming that no
+older `pohunek-sessiond` is still running. Before `service upgrade` or
 `service uninstall` touches anything, it verifies `service.toml` against the
 running user and the canonical `XDG_STATE_HOME` and `XDG_RUNTIME_DIR` roots;
 a moved root or another user fails with `service_config_invalid` naming the

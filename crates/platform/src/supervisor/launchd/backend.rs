@@ -12,7 +12,9 @@ use super::super::{
 use super::launchctl::{Launchctl, Status};
 use super::plist::{self, Stored, MAX_DEFINITION_BYTES};
 use super::{presence, run_error, status_error, Presence};
-use crate::filesystem::{EntryKind, FsError, RemoveOutcome, StageOutcome, TrustedDir};
+use crate::filesystem::{
+    EntryKind, FsError, MoveOutcome, RemoveOutcome, StageOutcome, StagedEntry, TrustedDir,
+};
 use crate::process::{DarwinInspector, Pid, ProcessFact, ProcessIdentity, ProcessInspector as _};
 use rustix::process::{kill_process, Pid as NativePid, Signal};
 
@@ -366,11 +368,10 @@ impl Supervisor for LaunchdSupervisor {
     ///
     /// The label is probed with `print` first; a loaded label is
     /// [`Error::AlreadyRegistered`] and its definition file is left untouched.
-    /// Only after the label is proven absent is the definition atomically
-    /// written (a leftover file of an absent label is replaced) and
-    /// bootstrapped. A concurrent `start` of the very same generation between
-    /// the probe and the write is the only way to overwrite a loaded job's
-    /// file, and it would write identical bytes.
+    /// A leftover file of an absent label is moved aside and the label probed
+    /// again before the new definition is published without replacing any
+    /// file, so a job loaded concurrently keeps the definition it was loaded
+    /// from.
     fn start<'a>(&'a self, id: &'a ServiceId, definition: &'a JobDefinition) -> Operation<'a, ()> {
         Box::pin(self.start_worker(id, definition))
     }
@@ -429,7 +430,9 @@ impl Supervisor for LaunchdSupervisor {
     /// bound systemd's `KillMode=control-group` applies. Members forked after
     /// the capture, and processes that left the group, are left to the
     /// daemon's ownership-marker sweep. An absent label still has leftover
-    /// files removed and returns [`Error::NotFound`].
+    /// files removed and returns [`Error::NotFound`]. Several processes
+    /// matching the definition are [`Error::InvalidData`] before anything is
+    /// booted out or removed, because the group to end is unknown.
     fn retire<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, ()> {
         Box::pin(self.retire_worker(id))
     }
@@ -699,6 +702,13 @@ impl Jobs {
     }
 
     /// Writes `<label>.plist` into `directory` and bootstraps it.
+    ///
+    /// The definition of a loaded label is never overwritten. launchd may load
+    /// a leftover `<label>.plist` on its own (the daemon agent at login), so
+    /// the leftover is moved aside and the label probed again before the new
+    /// file is published under a name that must not exist yet: a load racing
+    /// this call has then read either the leftover, which is put back, or the
+    /// new file, which is what the loaded job runs.
     async fn register(
         &self,
         operation: &'static str,
@@ -711,7 +721,21 @@ impl Jobs {
             return Err(Error::AlreadyRegistered(id.clone()));
         }
         let file_name = definition_name(label);
-        write_definition(directory, &file_name, bytes, operation)?;
+        let leftover = set_aside(directory, &file_name, operation)?;
+        let published = match self.presence(operation, label).await {
+            Ok(Presence::Absent) => publish_definition(directory, &file_name, bytes, operation),
+            Ok(Presence::Loaded) => Err(Error::AlreadyRegistered(id.clone())),
+            Err(error) => Err(error),
+        };
+        if let Some(leftover) = leftover {
+            // Without a published definition the leftover returns to its name,
+            // so a job loaded from it keeps its definition.
+            match &published {
+                Ok(()) => discard(leftover, operation)?,
+                Err(_) => put_back(&leftover, &file_name, operation)?,
+            }
+        }
+        published?;
         let path = directory.path().join(&file_name);
         let completion = self
             .launchctl
@@ -857,26 +881,30 @@ impl Jobs {
     /// Captures the process group of the single process matching `expected`.
     ///
     /// launchd makes each job's main process a session and process-group
-    /// leader, so the group ID is the main PID. Without exactly one main
-    /// process nothing is captured.
+    /// leader, so the group ID is the main PID. Without a main process nothing
+    /// is captured; several matching processes are [`Error::InvalidData`], as
+    /// in [`Jobs::observe`], because the job's group is then unknown.
     async fn group_members(
         &self,
         operation: &'static str,
         expected: Expected,
     ) -> Result<Vec<ProcessIdentity>, Error> {
         let inspector = self.inspector;
-        self.blocking(operation, move || {
-            let facts = inspector.same_user_processes()?;
-            let [main] = scan(inspector, &facts, &expected)?[..] else {
-                return Ok(Vec::new());
-            };
-            Ok(facts
-                .iter()
-                .filter(|fact| fact.pgid == main.pid)
-                .map(ProcessFact::identity)
-                .collect())
-        })
-        .await
+        let (facts, matches) = self
+            .blocking(operation, move || {
+                let facts = inspector.same_user_processes()?;
+                let matches = scan(inspector, &facts, &expected)?;
+                Ok((facts, matches))
+            })
+            .await?;
+        let Some(main) = single_process(operation, &matches)? else {
+            return Ok(Vec::new());
+        };
+        Ok(facts
+            .iter()
+            .filter(|fact| fact.pgid == main.pid)
+            .map(ProcessFact::identity)
+            .collect())
     }
 
     /// Ends captured process-group members that outlived their job.
@@ -981,14 +1009,22 @@ impl Jobs {
                 scan(inspector, &inspector.same_user_processes()?, &expected)
             })
             .await?;
-        match matches.as_slice() {
-            [] => Ok(None),
-            [identity] => Ok(Some(*identity)),
-            _ => Err(Error::InvalidData {
-                operation,
-                detail: format!("{} processes match one job", matches.len()),
-            }),
-        }
+        single_process(operation, &matches)
+    }
+}
+
+/// Returns the only process matching one job, rejecting ambiguous matches.
+fn single_process(
+    operation: &'static str,
+    matches: &[ProcessIdentity],
+) -> Result<Option<ProcessIdentity>, Error> {
+    match matches {
+        [] => Ok(None),
+        [identity] => Ok(Some(*identity)),
+        _ => Err(Error::InvalidData {
+            operation,
+            detail: format!("{} processes match one job", matches.len()),
+        }),
     }
 }
 
@@ -1106,8 +1142,12 @@ fn stored_exit_timeout(
     })
 }
 
-/// Atomically writes a `0600` definition through a random temporary name.
-fn write_definition(
+/// Publishes a `0600` definition under `file_name`, which must not exist.
+///
+/// The file is written and synchronized under a random temporary name first,
+/// so launchd never reads a partial definition. An occupied `file_name` is
+/// [`Error::Race`] and leaves the existing file untouched.
+fn publish_definition(
     directory: &TrustedDir,
     file_name: &str,
     bytes: &[u8],
@@ -1125,11 +1165,68 @@ fn write_definition(
     }
     temporary.push_str(".tmp");
     directory
-        .replace_file(file_name, &temporary, bytes, DEFINITION_MODE)
-        .map_err(|error| Error::Operation {
-            operation,
-            source: Box::new(error),
-        })
+        .create_file(&temporary, bytes, DEFINITION_MODE)
+        .map_err(fs_error(operation))?;
+    match directory.move_no_replace(&temporary, directory, file_name) {
+        Ok(MoveOutcome::Moved) => Ok(()),
+        Ok(_) => {
+            remove_file(directory, &temporary, operation)?;
+            Err(Error::Race { operation })
+        }
+        Err(error) => {
+            // The move failure is the error to report; a temporary file that
+            // cannot be removed as well is never read as a definition.
+            if let Err(cleanup) = remove_file(directory, &temporary, operation) {
+                tracing::event!(
+                    name: "supervisor.register.cleanup_failed",
+                    tracing::Level::WARN,
+                    supervisor.entry = temporary.as_str(),
+                    error.message = %cleanup,
+                    "could not remove the temporary definition {{supervisor.entry}}"
+                );
+            }
+            Err(fs_error(operation)(error))
+        }
+    }
+}
+
+/// Moves an existing definition file to a quarantine name; a missing file is
+/// `None`.
+fn set_aside(
+    directory: &TrustedDir,
+    file_name: &str,
+    operation: &'static str,
+) -> Result<Option<StagedEntry>, Error> {
+    let Some(identity) = directory
+        .entry_identity(file_name, EntryKind::RegularFile)
+        .map_err(fs_error(operation))?
+    else {
+        return Ok(None);
+    };
+    match directory
+        .stage_random(file_name, REMOVAL_PREFIX, identity)
+        .map_err(fs_error(operation))?
+    {
+        StageOutcome::Staged(entry) => Ok(Some(entry)),
+        StageOutcome::Missing => Ok(None),
+        _ => Err(Error::Race { operation }),
+    }
+}
+
+/// Restores a definition moved aside by [`set_aside`].
+fn put_back(entry: &StagedEntry, file_name: &str, operation: &'static str) -> Result<(), Error> {
+    match entry.restore(file_name).map_err(fs_error(operation))? {
+        MoveOutcome::Moved => Ok(()),
+        _ => Err(Error::Race { operation }),
+    }
+}
+
+/// Deletes a definition moved aside by [`set_aside`].
+fn discard(entry: StagedEntry, operation: &'static str) -> Result<(), Error> {
+    match entry.remove().map_err(fs_error(operation))? {
+        RemoveOutcome::Removed | RemoveOutcome::Missing => Ok(()),
+        _ => Err(Error::Race { operation }),
+    }
 }
 
 /// Removes one regular file bound to the inode that was inspected.
@@ -1268,6 +1365,101 @@ mod tests {
             &[exe, "--service-config", "/x/service.toml", "--extra"]
         )));
         assert!(!expected.matches(&fact(1, &[exe])));
+    }
+
+    #[test]
+    fn ambiguous_process_matches_are_invalid_data() {
+        let first = fact(1, &[]).identity();
+        let second = ProcessFact {
+            pid: 4_243,
+            pgid: 4_243,
+            ..fact(1, &[])
+        }
+        .identity();
+        assert_eq!(single_process("retire", &[]).expect("no match"), None);
+        assert_eq!(
+            single_process("retire", &[first]).expect("one match"),
+            Some(first)
+        );
+        assert!(matches!(
+            single_process("retire", &[first, second]),
+            Err(Error::InvalidData {
+                operation: "retire",
+                ..
+            })
+        ));
+    }
+
+    fn private_directory() -> (tempfile::TempDir, TrustedDir) {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let path = std::fs::canonicalize(root.path()).expect("canonical temporary directory");
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("private mode");
+        let directory = TrustedDir::open_absolute(&path, 0o700).expect("private directory");
+        (root, directory)
+    }
+
+    fn names(directory: &TrustedDir) -> Vec<std::ffi::OsString> {
+        let mut names = directory.entry_names().expect("directory listing");
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn publishing_never_replaces_an_existing_definition() {
+        let (_root, directory) = private_directory();
+        publish_definition(&directory, "job.plist", b"first", "start").expect("publish");
+        assert!(matches!(
+            publish_definition(&directory, "job.plist", b"second", "start"),
+            Err(Error::Race { operation: "start" })
+        ));
+        assert_eq!(
+            directory
+                .read_file("job.plist", DEFINITION_MODE, MAX_DEFINITION_BYTES)
+                .expect("definition"),
+            b"first"
+        );
+        assert_eq!(
+            names(&directory),
+            vec![std::ffi::OsString::from("job.plist")]
+        );
+    }
+
+    #[test]
+    fn a_leftover_set_aside_is_put_back_or_discarded() {
+        let (_root, directory) = private_directory();
+        assert!(set_aside(&directory, "job.plist", "start")
+            .expect("missing leftover")
+            .is_none());
+
+        publish_definition(&directory, "job.plist", b"leftover", "start").expect("publish");
+        let leftover = set_aside(&directory, "job.plist", "start")
+            .expect("set aside")
+            .expect("leftover exists");
+        assert!(!names(&directory).contains(&std::ffi::OsString::from("job.plist")));
+        put_back(&leftover, "job.plist", "start").expect("put back");
+        assert_eq!(
+            directory
+                .read_file("job.plist", DEFINITION_MODE, MAX_DEFINITION_BYTES)
+                .expect("definition"),
+            b"leftover"
+        );
+
+        let leftover = set_aside(&directory, "job.plist", "start")
+            .expect("set aside")
+            .expect("leftover exists");
+        publish_definition(&directory, "job.plist", b"new", "start").expect("publish");
+        discard(leftover, "start").expect("discard");
+        assert_eq!(
+            names(&directory),
+            vec![std::ffi::OsString::from("job.plist")]
+        );
+        assert_eq!(
+            directory
+                .read_file("job.plist", DEFINITION_MODE, MAX_DEFINITION_BYTES)
+                .expect("definition"),
+            b"new"
+        );
     }
 
     #[test]

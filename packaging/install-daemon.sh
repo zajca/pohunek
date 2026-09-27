@@ -139,13 +139,21 @@ if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
     fi
     # Fail-closed inventory over every template-worker state the stop could
     # still destroy: anything not `inactive` keeps or is acquiring a PTY,
-    # including workers sitting in `activating`.
+    # including workers sitting in `activating`. The unit listing is captured
+    # before filtering because a POSIX pipeline reports only the last command's
+    # status: a failed query must fail the inventory, never read as "no
+    # workers".
     legacy_list_workers() {
-        systemctl --user list-units 'pohunek-session@*' \
-            --all --plain --no-legend \
-            | awk '$3 != "inactive" && NF >= 3'
+        legacy_units=$(systemctl --user list-units 'pohunek-session@*' \
+            --all --plain --no-legend) || return 1
+        printf '%s\n' "$legacy_units" | awk '$3 != "inactive" && NF >= 3'
     }
-    before_stop_workers=$(legacy_list_workers)
+    if ! before_stop_workers=$(legacy_list_workers); then
+        echo "could not list the legacy template workers; nothing was changed" >&2
+        echo "fix the reported \`systemctl --user list-units\` problem and re-run $0" >&2
+        restore_barrier
+        exit 1
+    fi
     if [ -n "$before_stop_workers" ]; then
         echo "legacy template workers are still running; nothing was changed:" >&2
         echo "$before_stop_workers" >&2
@@ -167,7 +175,21 @@ if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
     # that window. `--accept-runtime-loss` does not cover it: like the
     # inventory before the stop, a live template worker always blocks the
     # removal of the unit files it runs from.
-    after_stop_workers=$(legacy_list_workers)
+    # A failed re-check cannot rule such a worker out, so it keeps the unit
+    # files like a found one; the stopped daemon's moved socket node is stale
+    # and stays removed.
+    if ! after_stop_workers=$(legacy_list_workers); then
+        echo "the legacy daemon is stopped and disabled, but the template workers" >&2
+        echo "could not be listed, so a worker that appeared after the preflight" >&2
+        echo "cannot be ruled out; the legacy unit files were kept:" >&2
+        echo "  $legacy_unit_dir/pohunekd.service" >&2
+        echo "  $legacy_unit_dir/pohunek-session@.service" >&2
+        echo "  $legacy_unit_dir/pohunek-sessions.slice" >&2
+        echo "fix the reported \`systemctl --user list-units\` problem and re-run $0;" >&2
+        echo "to keep using the legacy install instead, start it with" >&2
+        echo "\`systemctl --user enable --now pohunekd.service\`" >&2
+        exit 1
+    fi
     if [ -n "$after_stop_workers" ]; then
         echo "the legacy daemon is stopped and disabled, and these template workers" >&2
         echo "appeared after the preflight, so their runtime may be lost:" >&2

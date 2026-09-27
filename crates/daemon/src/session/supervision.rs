@@ -125,7 +125,7 @@ pub(super) struct JournalWorker<'a> {
 
 impl JournalWorker<'_> {
     /// Parses the recorded worker process identity.
-    fn identity(&self) -> Result<ProcessIdentity, String> {
+    pub(super) fn identity(&self) -> Result<ProcessIdentity, String> {
         let start_identity = self
             .start_identity
             .parse::<StartIdentity>()

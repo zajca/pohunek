@@ -11,7 +11,7 @@
 //!
 //! The minimum supported systemd is **255** (Ubuntu 24.04, the CI runner), the
 //! oldest version this backend is exercised against. A probe on that runner
-//! accepted `ExecStart`, `Type`, `NotifyAccess`, `KillMode`, `SendSIGHUP`,
+//! accepted `ExecStartEx`, `Type`, `NotifyAccess`, `KillMode`, `SendSIGHUP`,
 //! `Slice`, `Restart`, both timeouts, and `Environment` as transient
 //! properties. The real-manager tests (`tests/systemd.rs`) read every
 //! property below back from the running manager; they pass on systemd 261.
@@ -21,7 +21,7 @@
 //! | Property | D-Bus type | Value | Reason |
 //! |----------|-----------|-------|--------|
 //! | `Description` | `s` | `Pohunek session worker <session-id> generation <generation>` | Identifies the unit in `systemctl` output. |
-//! | `ExecStart` | `a(sasb)` | one command: the absolute executable, argv (`argv[0]` = executable), failure not ignored | Exact versioned argv; no shell. |
+//! | `ExecStartEx` | `a(sasas)` | one command: the absolute executable, argv (`argv[0]` = executable), flags `["no-env-expand"]` | Exact versioned argv; no shell and no `$VAR` expansion. |
 //! | `Type` | `s` | `notify` | Activation completes on `READY=1`. |
 //! | `NotifyAccess` | `s` | `main` | Only the worker itself may report readiness. |
 //! | `KillMode` | `s` | `control-group` | Stopping kills every descendant, including detached ones. |
@@ -34,6 +34,13 @@
 //! | `WorkingDirectory` | `s` | definition working directory | Deterministic start directory. |
 //! | `LimitNOFILE` / `LimitNOFILESoft` | `t` | definition open-file limit | Same descriptor budget as the launchd backend. |
 //! | `StandardOutput` / `StandardError` | `s` | `journal` | Worker stdio stays in the user journal. |
+//!
+//! systemd expands `$VAR`, `${VAR}`, and `$$` in every argv word of a plain
+//! `ExecStart` when it spawns the process, so a path containing `$` would run
+//! a command line that differs from the definition. The `no-env-expand` flag,
+//! the D-Bus form of the `:` unit-file prefix (systemd 242), keeps argv
+//! verbatim; the manager still reports the command through the `ExecStart`
+//! property that observations read back.
 //!
 //! The call never waits for readiness: a `Type=notify` worker only becomes
 //! ready after the daemon connects to its socket, so waiting here would
@@ -113,6 +120,8 @@ const STOP_MODE: &str = "replace";
 /// `replace` supersedes any queued start or stop of the daemon so the new
 /// definition takes effect.
 const RESTART_MODE: &str = "replace";
+/// `ExecStartEx` flag that passes argv to the process without `$` expansion.
+const NO_ENV_EXPAND: &str = "no-env-expand";
 
 /// Bounds memory and D-Bus follow-up work if the manager returns an unexpectedly
 /// large namespace.
@@ -846,7 +855,10 @@ fn worker_properties(
                 key.generation()
             )),
         ),
-        ("ExecStart", Value::from(vec![(executable, argv, false)])),
+        (
+            "ExecStartEx",
+            Value::from(vec![(executable, argv, vec![NO_ENV_EXPAND.to_owned()])]),
+        ),
         ("Type", Value::from("notify")),
         ("NotifyAccess", Value::from("main")),
         ("KillMode", Value::from("control-group")),
@@ -1325,7 +1337,7 @@ mod tests {
                 )),
             ),
             (
-                "ExecStart",
+                "ExecStartEx",
                 Value::from(vec![(
                     executable.clone(),
                     vec![
@@ -1335,7 +1347,7 @@ mod tests {
                         "--worker-generation".to_owned(),
                         "abcd2345".to_owned(),
                     ],
-                    false,
+                    vec!["no-env-expand".to_owned()],
                 )]),
             ),
             ("Type", Value::from("notify")),
@@ -1365,7 +1377,7 @@ mod tests {
         assert_eq!(properties, expected);
         assert_eq!(
             zbus::zvariant::Signature::from(properties[1].1.value_signature()).to_string(),
-            "a(sasb)"
+            "a(sasas)"
         );
     }
 
@@ -1384,9 +1396,10 @@ mod tests {
         let properties =
             worker_properties(&namespace(), &key(), &definition).expect("worker properties");
         let Value::Array(commands) = &properties[1].1 else {
-            panic!("ExecStart is an array");
+            panic!("ExecStartEx is an array");
         };
         let rendered = format!("{commands:?}");
+        assert!(rendered.contains("\"no-env-expand\""), "{rendered}");
         for argument in &hostile.arguments {
             assert!(
                 rendered.contains(&format!("{argument:?}")),

@@ -389,6 +389,50 @@ async fn worker_generation_starts_inspects_and_retires() {
 
 #[tokio::test]
 #[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn dollar_signs_reach_the_worker_verbatim() {
+    require_e2e();
+    let installation = Installation::new();
+    let supervisor = installation.supervisor().await;
+    let id = worker_id("abcd2345");
+    // systemd expands `$VAR`, `${VAR}`, and `$$` in command lines unless told
+    // not to; the executable path carries the same hazard through argv[0].
+    let directory = installation.root.path().join("bin$HOME${HOME}$$");
+    std::fs::create_dir(&directory).expect("dollar-bearing directory");
+    let executable = directory.join("fixture");
+    std::fs::copy(
+        std::env::current_exe().expect("test executable"),
+        &executable,
+    )
+    .expect("copy fixture executable");
+    let mut spec = fixture_spec(installation.root.path(), "ready");
+    spec.executable = executable;
+    spec.arguments.push("literal-$HOME-${HOME}-$$".to_owned());
+    let definition = JobDefinition::new(spec).expect("valid fixture definition");
+
+    supervisor
+        .start(&id, &definition)
+        .await
+        .expect("start transient worker");
+    let observation = wait_for(&supervisor, &id, |observation| {
+        observation.state == ServiceState::Running
+    })
+    .await;
+    assert_eq!(observation.definition, Some(definition.facts()));
+    let process = observation.process.expect("running worker has a process");
+    let cmdline = std::fs::read(format!("/proc/{}/cmdline", process.pid)).expect("cmdline");
+    let expected: Vec<u8> = std::iter::once(definition.executable().as_os_str().as_encoded_bytes())
+        .chain(definition.arguments().iter().map(String::as_bytes))
+        .flat_map(|argument| argument.iter().copied().chain([0]))
+        .collect();
+    assert_eq!(cmdline, expected);
+    let discovered = supervisor.discover().await.expect("discover workers");
+    assert_eq!(discovered.len(), 1);
+
+    supervisor.retire(&id).await.expect("retire worker");
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
 async fn a_never_ready_worker_is_retired_while_starting() {
     require_e2e();
     let installation = Installation::new();

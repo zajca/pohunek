@@ -41,7 +41,7 @@ use tokio::time::Instant;
 use super::{Worker, WorkerLauncher};
 use crate::store::RuntimeRecord;
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 /// Reason recorded while the native supervisor cannot be inspected.
 ///
@@ -745,6 +745,82 @@ impl Lifecycle<'_> {
         self.retire(generation)
             .await
             .map_err(|error| PreviousLive::Unavailable(supervision_unavailable(generation, &error)))
+    }
+
+    /// Retires `generation` for the removal of its session and proves its
+    /// workers gone.
+    ///
+    /// Removal deletes the only record of the generation, so success must
+    /// mean no worker of it can still own a PTY. `workers` are the processes
+    /// of every journal naming the generation whose runtime has not ended;
+    /// the caller collects them from a complete journal scan. After the job
+    /// is retired each of them must be gone: a retired job gets the worker
+    /// exit timeout to take them down, while an absent job cannot, so a
+    /// worker still running beside it is refused at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreviousLive::Unavailable`] when the supervisor cannot
+    /// retire the job, and [`PreviousLive::Ambiguous`] when a worker process
+    /// still runs, or cannot be inspected, after the retirement.
+    pub async fn retire_for_removal(
+        &self,
+        generation: &Generation,
+        workers: &[ProcessIdentity],
+    ) -> Result<(), PreviousLive> {
+        let retired_job = match self.supervisor.retire(&generation.service_id()).await {
+            Ok(()) => true,
+            Err(SupervisorError::NotFound(_)) => false,
+            Err(error) => {
+                return Err(PreviousLive::Unavailable(supervision_unavailable(
+                    generation, &error,
+                )))
+            }
+        };
+        let give_up_at = Instant::now()
+            + if retired_job {
+                self.config.worker_exit_timeout
+            } else {
+                Duration::ZERO
+            };
+        loop {
+            let proof = self.prove_processes_ended(generation, workers);
+            let now = Instant::now();
+            if proof.is_ok() || now >= give_up_at {
+                return proof;
+            }
+            tokio::time::sleep(SUPERVISION_POLL_INTERVAL.min(give_up_at - now)).await;
+        }
+    }
+
+    /// Proves that none of `workers` of `generation` is running.
+    fn prove_processes_ended(
+        &self,
+        generation: &Generation,
+        workers: &[ProcessIdentity],
+    ) -> Result<(), PreviousLive> {
+        for worker in workers {
+            match self.inspector.is_running(*worker) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(PreviousLive::Ambiguous(lifecycle_error(
+                        SUPERVISION_AMBIGUOUS,
+                        format!(
+                            "worker process {} of generation {} is still running",
+                            worker.pid,
+                            generation.service_id()
+                        ),
+                    )));
+                }
+                Err(error) => {
+                    return Err(PreviousLive::Ambiguous(lifecycle_error(
+                        SUPERVISION_AMBIGUOUS,
+                        format!("worker process {} cannot be inspected: {error}", worker.pid),
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn prove_worker_process_ended(

@@ -1,6 +1,6 @@
 //! Persists the worker-owned runtime journal atomically.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 use std::fmt::{Debug, Formatter};
 use std::path::{Path, PathBuf};
@@ -55,6 +55,19 @@ pub enum JournalError {
         path: PathBuf,
         /// JSON parsing error.
         source: serde_json::Error,
+    },
+    /// The journal was written under a schema this build does not read.
+    #[error(
+        "worker journal {} has schema {found}; this build reads schema {supported}",
+        path.display()
+    )]
+    UnsupportedSchema {
+        /// Journal path.
+        path: PathBuf,
+        /// Schema version recorded in the journal.
+        found: u32,
+        /// Schema version this build reads.
+        supported: u32,
     },
     /// Journal serialization failed.
     #[error("worker journal serialization failed: {0}")]
@@ -400,6 +413,64 @@ impl JournalRecord {
     }
 }
 
+/// Worker-liveness facts of a journal written under an older schema.
+///
+/// Only the fields that decide whether the worker behind the journal may
+/// still run are read. Each is `None` when that schema lacks it or records
+/// it in a form this build cannot interpret, and a caller must then assume
+/// the worker may still run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutdatedJournal {
+    /// Schema version recorded in the journal.
+    pub schema_version: u32,
+    /// Logical session identifier.
+    pub session_id: Option<String>,
+    /// Worker process identifier.
+    pub worker_pid: Option<u32>,
+    /// Worker process start identity.
+    pub worker_start_identity: Option<String>,
+    /// Recorded runtime phase.
+    pub phase: Option<RuntimePhase>,
+}
+
+impl OutdatedJournal {
+    fn from_value(schema_version: u32, value: &serde_json::Value) -> Self {
+        Self {
+            schema_version,
+            session_id: value
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            worker_pid: value
+                .get("worker_pid")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok()),
+            worker_start_identity: value
+                .get("worker_start_identity")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            phase: value
+                .get("phase")
+                .and_then(|phase| RuntimePhase::deserialize(phase).ok()),
+        }
+    }
+}
+
+/// A journal as found on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadedJournal {
+    /// A journal of the schema this build writes.
+    Current(Box<JournalRecord>),
+    /// A journal an older build wrote, reduced to its liveness facts.
+    Outdated(OutdatedJournal),
+}
+
+/// The part of every journal schema that names the schema.
+#[derive(Deserialize)]
+struct SchemaProbe {
+    schema_version: u32,
+}
+
 /// Sole-writer handle for one worker journal.
 #[derive(Debug, Clone)]
 pub struct Journal {
@@ -458,8 +529,27 @@ impl Journal {
     ///
     /// # Errors
     ///
-    /// Returns [`JournalError`] for unsafe paths, I/O, or malformed JSON.
+    /// Returns [`JournalError::UnsupportedSchema`] for a journal of any other
+    /// schema, and [`JournalError`] for unsafe paths, I/O, or malformed JSON.
     pub fn load(&self) -> Result<JournalRecord, JournalError> {
+        match self.load_any()? {
+            LoadedJournal::Current(record) => Ok(*record),
+            LoadedJournal::Outdated(outdated) => Err(JournalError::UnsupportedSchema {
+                path: self.path.clone(),
+                found: outdated.schema_version,
+                supported: JOURNAL_SCHEMA_VERSION,
+            }),
+        }
+    }
+
+    /// Loads the journal, reducing one of an older schema to its liveness facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::UnsupportedSchema`] for a schema newer than
+    /// this build's, whose fields it cannot interpret, and [`JournalError`]
+    /// for unsafe paths, I/O, or malformed JSON.
+    pub fn load_any(&self) -> Result<LoadedJournal, JournalError> {
         let parent = self
             .path
             .parent()
@@ -474,10 +564,28 @@ impl Journal {
             })?;
         let directory = TrustedDir::open_absolute(parent, PRIVATE_DIR_MODE)?;
         let bytes = directory.read_file(name, PRIVATE_FILE_MODE, MAX_JOURNAL_BYTES)?;
-        serde_json::from_slice(&bytes).map_err(|source| JournalError::Corrupt {
+        let corrupt = |source| JournalError::Corrupt {
             path: self.path.clone(),
             source,
-        })
+        };
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(corrupt)?;
+        let schema_version = SchemaProbe::deserialize(&value)
+            .map_err(corrupt)?
+            .schema_version;
+        match schema_version.cmp(&JOURNAL_SCHEMA_VERSION) {
+            std::cmp::Ordering::Equal => JournalRecord::deserialize(value)
+                .map(|record| LoadedJournal::Current(Box::new(record)))
+                .map_err(corrupt),
+            std::cmp::Ordering::Less => Ok(LoadedJournal::Outdated(OutdatedJournal::from_value(
+                schema_version,
+                &value,
+            ))),
+            std::cmp::Ordering::Greater => Err(JournalError::UnsupportedSchema {
+                path: self.path.clone(),
+                found: schema_version,
+                supported: JOURNAL_SCHEMA_VERSION,
+            }),
+        }
     }
 }
 
@@ -495,8 +603,8 @@ mod tests {
     use pohunek_platform::filesystem::AtomicReplaceError;
 
     use super::{
-        Journal, JournalError, JournalRecord, LaunchIdentity, ReleasedIdentity, SubagentPhase,
-        SubagentRecord, WorkerOrigin,
+        Journal, JournalError, JournalRecord, LaunchIdentity, LoadedJournal, OutdatedJournal,
+        ReleasedIdentity, RuntimePhase, SubagentPhase, SubagentRecord, WorkerOrigin,
     };
     use crate::ChildIdentity;
     use std::fs;
@@ -645,6 +753,100 @@ mod tests {
 
         assert!(matches!(
             Journal::new(&path).load(),
+            Err(JournalError::Corrupt { .. })
+        ));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Writes `json` as an owner-private journal file and returns its path.
+    fn write_raw(root: &std::path::Path, json: &serde_json::Value) -> PathBuf {
+        fs::create_dir_all(root).expect("create");
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).expect("chmod");
+        let path = root.join("worker-1.json");
+        fs::write(&path, serde_json::to_vec(json).expect("encode")).expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        path
+    }
+
+    /// A schema-3 journal: the current layout without the worker origin.
+    fn schema_three_json() -> serde_json::Value {
+        let mut json = serde_json::to_value(record("native-reference")).expect("serialize");
+        let object = json.as_object_mut().expect("journal object");
+        for key in ["executable", "version", "generation"] {
+            object.remove(key);
+        }
+        object.insert("schema_version".to_owned(), 3.into());
+        object.insert("phase".to_owned(), "live".into());
+        json
+    }
+
+    #[test]
+    fn schema_three_journal_is_outdated_not_corrupt() {
+        let root = test_dir("schema-three");
+        let path = write_raw(&root, &schema_three_json());
+        let journal = Journal::new(&path);
+
+        assert_eq!(
+            journal.load_any().expect("outdated journals load"),
+            LoadedJournal::Outdated(OutdatedJournal {
+                schema_version: 3,
+                session_id: Some("s-1".to_owned()),
+                worker_pid: Some(10),
+                worker_start_identity: Some("start-1".to_owned()),
+                phase: Some(RuntimePhase::Live),
+            })
+        );
+        assert!(matches!(
+            journal.load(),
+            Err(JournalError::UnsupportedSchema {
+                found: 3,
+                supported: 4,
+                ..
+            })
+        ));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn outdated_journal_without_liveness_fields_reports_them_unknown() {
+        let root = test_dir("schema-one");
+        let path = write_raw(
+            &root,
+            &serde_json::json!({ "schema_version": 1, "phase": "someday", "worker_pid": -1 }),
+        );
+
+        assert_eq!(
+            Journal::new(&path)
+                .load_any()
+                .expect("outdated journals load"),
+            LoadedJournal::Outdated(OutdatedJournal {
+                schema_version: 1,
+                session_id: None,
+                worker_pid: None,
+                worker_start_identity: None,
+                phase: None,
+            })
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn newer_or_unversioned_journals_are_refused() {
+        let root = test_dir("schema-newer");
+        let mut json = serde_json::to_value(record("native-reference")).expect("serialize");
+        json["schema_version"] = 5.into();
+        let path = write_raw(&root, &json);
+        assert!(matches!(
+            Journal::new(&path).load_any(),
+            Err(JournalError::UnsupportedSchema { found: 5, .. })
+        ));
+
+        json.as_object_mut()
+            .expect("journal object")
+            .remove("schema_version");
+        let path = write_raw(&root, &json);
+        assert!(matches!(
+            Journal::new(&path).load_any(),
             Err(JournalError::Corrupt { .. })
         ));
         fs::remove_dir_all(root).expect("cleanup");

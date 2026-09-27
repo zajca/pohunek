@@ -53,6 +53,13 @@ const SLEEPING_WORKER: &str = "/bin/sleep 600 & wait";
 /// command would be `exec`ed and no longer match the definition's executable.
 const EXITING_WORKER: &str = "/bin/sleep 3 & wait";
 
+/// Worker that leaves an orphaned copy of itself for launchd to adopt.
+///
+/// The inner subshell is a fork of `bash` with the worker's argv and never
+/// `exec`s (the trailing `true` prevents it); its parent subshell exits, so
+/// launchd (PID 1) adopts it and two processes match one job.
+const DUPLICATED_WORKER: &str = "( ( /bin/sleep 600; true ) & ); /bin/sleep 600 & wait";
+
 /// Worker that ignores `SIGTERM` and keeps a child in its process group.
 const STUBBORN_WORKER: &str = "trap '' TERM; /bin/sleep 600 & wait";
 
@@ -589,4 +596,80 @@ impl Drop for Bootout {
         // Teardown only: an already absent label is the desired state.
         let _status = launchctl(&["bootout", &format!("gui/{}/{}", uid(), self.0)]);
     }
+}
+
+#[tokio::test]
+async fn retire_refuses_a_job_with_several_matching_processes() {
+    let fixture = Fixture::new();
+    let key = key("s-5001", "cdef2345");
+    let id = key.service_id();
+    let definition = fixture.worker(&key, DUPLICATED_WORKER, Duration::from_secs(5));
+
+    fixture
+        .supervisor
+        .start(&id, &definition)
+        .await
+        .expect("worker starts");
+    let deadline = Instant::now() + SPAWN_WAIT;
+    loop {
+        match fixture.supervisor.inspect(&id).await {
+            Err(Error::InvalidData { .. }) => break,
+            Ok(_) | Err(Error::Race { .. }) => {}
+            Err(error) => panic!("inspection failed: {error}"),
+        }
+        assert!(Instant::now() < deadline, "the orphan was never adopted");
+        tokio::time::sleep(POLL).await;
+    }
+
+    assert!(matches!(
+        fixture.supervisor.retire(&id).await,
+        Err(Error::InvalidData {
+            operation: "retire",
+            ..
+        })
+    ));
+    assert!(
+        fixture.definition_path(&key).exists(),
+        "an ambiguous job keeps its definition"
+    );
+    // The drop guard boots the label out; launchd then signals the job's
+    // process group, which the orphan still belongs to.
+}
+
+#[tokio::test]
+async fn start_replaces_a_leftover_definition_of_an_absent_label() {
+    let mut fixture = Fixture::new();
+    let key = key("s-5002", "ghij2345");
+    let id = key.service_id();
+    let label = fixture.namespace.worker_label(&key);
+    pohunek_platform::filesystem::TrustedDir::open_or_create_absolute(&fixture.definitions, 0o700)
+        .expect("private definitions directory");
+    fixture.plant(
+        &format!("{label}.plist"),
+        &plist_document(&label, &["/bin/sleep", "600"]),
+        None,
+    );
+    let definition = fixture.worker(&key, SLEEPING_WORKER, Duration::from_secs(5));
+
+    fixture
+        .supervisor
+        .start(&id, &definition)
+        .await
+        .expect("worker starts over a leftover definition");
+    let observation = wait_for(|| fixture.supervisor.inspect(&id), running).await;
+    assert_eq!(observation.definition, Some(definition.facts()));
+    let entries: Vec<_> = std::fs::read_dir(&fixture.definitions)
+        .expect("definitions listing")
+        .map(|entry| entry.expect("definition entry").file_name())
+        .collect();
+    assert_eq!(
+        entries,
+        vec![std::ffi::OsString::from(format!("{label}.plist"))]
+    );
+
+    fixture
+        .supervisor
+        .retire(&id)
+        .await
+        .expect("worker retires");
 }

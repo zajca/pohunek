@@ -829,7 +829,7 @@ impl SessionRegistry {
     ) -> Result<(), ProtocolError> {
         let committed = Self::session_record(id, &entry, DesiredState::Running, None);
         self.write_session_record(committed).await?;
-        self.inner.sessions.lock().await.insert(id.clone(), entry);
+        self.install_session_entry(id, entry).await;
         Ok(())
     }
 
