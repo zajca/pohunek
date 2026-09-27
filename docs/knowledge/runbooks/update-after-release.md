@@ -114,9 +114,13 @@ running the versioned `pohunek-sessiond` they started from, so their PID, PTY,
 and child PID remain unchanged. Version directories that a live worker journal,
 a registered worker job (even one that has not started its process yet), or a
 running process still references are kept; the others are removed and listed
-in the upgrade report. When worker jobs cannot be discovered, a worker journal
+in the upgrade report. When worker jobs cannot be discovered (including when a
+worker unit or launchd definition of this installation is malformed), a worker journal
 cannot be read, or a journal written by an older pohunek under an earlier
-journal schema names a worker that may still run, every version is kept. The installer counts the daemon as ready only when `daemon.health`
+journal schema names a worker that may still run, every version is kept.
+Rerunning `pohunek service upgrade` for the already active version restarts
+nothing but repeats this cleanup, so a version kept earlier is removed once
+nothing references it any more. The installer counts the daemon as ready only when `daemon.health`
 reports the new version on a connection whose kernel peer credentials name the
 daemon job's running main process, as the service manager reports it. A
 manually started daemon of the same build that holds the socket while the

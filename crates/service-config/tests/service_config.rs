@@ -1,6 +1,6 @@
 //! Public-API tests for loading, validating, writing, and verifying `service.toml`.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
@@ -332,6 +332,91 @@ fn parse_diagnostics_never_quote_file_contents() {
     );
 }
 
+/// Semantic validation must not echo a rejected value either: a value that
+/// parses but fails validation, such as a secret pasted into a version, path,
+/// or allowlist entry, is described by key, position, reason, and length.
+#[test]
+fn validation_errors_never_quote_rejected_values() {
+    let allowlist = |entries: &str| {
+        let start = GOLDEN.find("allowlist = ").expect("allowlist");
+        let end = GOLDEN.find("\n\n[sweep]").expect("allowlist end");
+        format!(
+            "{}allowlist = [{entries}]{}",
+            &GOLDEN[..start],
+            &GOLDEN[end..]
+        )
+    };
+    let secret = SENTINEL_TOKEN;
+    let long_secret = format!("{secret}{}", "_".repeat(MAX_PATTERN_BYTES));
+    let cases = [
+        (
+            "active_version",
+            replace(
+                GOLDEN,
+                "active_version = \"0.31.6\"",
+                &format!("active_version = \"v {secret}\""),
+            ),
+        ),
+        (
+            "prefix",
+            replace(
+                GOLDEN,
+                "prefix = \"/home/u/.local\"",
+                &format!("prefix = \"relative/{secret}\""),
+            ),
+        ),
+        (
+            "namespace.state_root",
+            replace(
+                GOLDEN,
+                "state_root = \"/home/u/.local/state/pohunek\"",
+                &format!("state_root = \"/home/{secret}/../x\""),
+            ),
+        ),
+        (
+            "namespace.runtime_root",
+            replace(
+                GOLDEN,
+                "runtime_root = \"/run/user/1000/pohunek\"",
+                &format!("runtime_root = \"/run/{secret}/\""),
+            ),
+        ),
+        (
+            "environment.allowlist",
+            allowlist(&format!("\"PATH\", \"{secret}\"")),
+        ),
+        (
+            "environment.allowlist",
+            allowlist(&format!("\"PATH\", \"{long_secret}\"")),
+        ),
+        (
+            "environment.allowlist",
+            allowlist("\"PH_TOKEN_sentinel_7f3a\", \"PATH\", \"PH_TOKEN_sentinel_7f3a\""),
+        ),
+    ];
+    let fixture = Fixture::new();
+    for (key, text) in &cases {
+        let Err(error) = fixture.load(text) else {
+            panic!("{key}: invalid value was accepted");
+        };
+        assert!(
+            !matches!(error, ConfigError::Parse { .. }),
+            "{key}: expected a semantic error, got {error:?}"
+        );
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        for rendered in [&display, &debug] {
+            assert!(
+                !rendered.contains(secret)
+                    && !rendered.contains("sentinel")
+                    && !rendered.contains("PH_TOKEN"),
+                "{key}: the error quotes the rejected value: {rendered}"
+            );
+        }
+        assert!(display.contains(key), "{key}: key missing from {display}");
+    }
+}
+
 #[test]
 fn other_schema_versions_are_rejected_before_their_keys() {
     let fixture = Fixture::new();
@@ -510,7 +595,7 @@ fn install_versions_must_be_one_safe_component() {
             &format!("active_version = \"{bad}\""),
         );
         match fixture.load(&text) {
-            Err(ConfigError::InvalidVersion { value }) => assert_eq!(value, bad),
+            Err(ConfigError::InvalidVersion { length, .. }) => assert_eq!(length, bad.len()),
             other => panic!("{bad:?}: {other:?}"),
         }
     }
@@ -563,7 +648,9 @@ fn allowlist_patterns_are_names_or_trailing_prefixes() {
         long_pattern.as_str(),
     ] {
         match fixture.load(&with_allowlist(&["HOME", bad])) {
-            Err(ConfigError::InvalidPattern { pattern, .. }) => assert_eq!(pattern, bad),
+            Err(ConfigError::InvalidPattern { index, length, .. }) => {
+                assert_eq!((index, length), (1, bad.len()), "{bad:?}");
+            }
             other => panic!("{bad:?}: {other:?}"),
         }
     }
@@ -582,7 +669,7 @@ fn allowlist_patterns_are_names_or_trailing_prefixes() {
     ));
     assert!(matches!(
         fixture.load(&with_allowlist(&["PATH", "HOME", "PATH"])),
-        Err(ConfigError::DuplicatePattern { pattern }) if pattern == "PATH"
+        Err(ConfigError::DuplicatePattern { index: 2, first: 0 })
     ));
 
     let longest = "A".repeat(MAX_PATTERN_BYTES - 1) + "*";

@@ -1340,6 +1340,122 @@ async fn recovery_retires_a_previous_worker_that_only_retains_terminal_output() 
     assert_eq!(harness.supervisor.retired(), [generation.service_id()]);
 }
 
+/// Scripts the previous generation's job as running with `definition`, with
+/// this test process as its main process.
+fn script_previous_job(harness: &Harness, generation: &Generation, definition: DefinitionFacts) {
+    harness.supervisor.script_job(
+        generation.service_id(),
+        JobScript::Present {
+            state: ServiceState::Running,
+            process: Some(own_process()),
+            definition: Some(definition),
+        },
+    );
+}
+
+/// Writes a terminal journal of `generation` whose worker is this process.
+fn write_terminal_journal(harness: &Harness, generation: &Generation, worker_id: &str) {
+    harness.write_journal(
+        "s-1",
+        worker_id,
+        &journal(
+            "s-1",
+            worker_id,
+            generation.generation(),
+            "terminal",
+            std::process::id(),
+        ),
+    );
+}
+
+#[tokio::test]
+async fn recovery_refuses_a_foreign_job_under_the_previous_service_id() {
+    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    let (generation, previous) = previous(&harness, Some("worker-done"));
+    let other = harness.generation("s-1");
+    let own = job_definition(&harness.config, &generation)
+        .expect("valid definition")
+        .facts();
+    let foreign_definitions = [
+        job_definition(&harness.config, &other)
+            .expect("valid definition")
+            .facts(),
+        DefinitionFacts {
+            executable: PathBuf::from("/usr/bin/unrelated"),
+            ..own
+        },
+    ];
+    write_terminal_journal(&harness, &generation, "worker-done");
+
+    for definition in foreign_definitions {
+        script_previous_job(&harness, &generation, definition);
+
+        let refusal = harness
+            .lifecycle()
+            .retire_previous(&previous)
+            .await
+            .expect_err("the job is not the previous generation's");
+
+        assert!(
+            matches!(&refusal, PreviousLive::Ambiguous(error) if error.code == IDENTITY_MISMATCH),
+            "{refusal:?}"
+        );
+        assert!(harness.supervisor.retired().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn recovery_refuses_a_previous_job_whose_process_is_not_the_journaled_worker() {
+    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    let (generation, previous) = previous(&harness, Some("worker-done"));
+    let definition = job_definition(&harness.config, &generation)
+        .expect("valid definition")
+        .facts();
+    script_previous_job(&harness, &generation, definition);
+    harness.write_journal(
+        "s-1",
+        "worker-done",
+        &journal(
+            "s-1",
+            "worker-done",
+            generation.generation(),
+            "terminal",
+            exited_pid(),
+        ),
+    );
+
+    let refusal = harness
+        .lifecycle()
+        .retire_previous(&previous)
+        .await
+        .expect_err("the job's process is not the journaled worker");
+
+    assert!(
+        matches!(&refusal, PreviousLive::Ambiguous(error) if error.code == IDENTITY_MISMATCH),
+        "{refusal:?}"
+    );
+    assert!(harness.supervisor.retired().is_empty());
+}
+
+#[tokio::test]
+async fn recovery_retires_a_previous_job_that_matches_its_generation() {
+    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    let (generation, previous) = previous(&harness, Some("worker-done"));
+    let definition = job_definition(&harness.config, &generation)
+        .expect("valid definition")
+        .facts();
+    script_previous_job(&harness, &generation, definition);
+    write_terminal_journal(&harness, &generation, "worker-done");
+
+    harness
+        .lifecycle()
+        .retire_previous(&previous)
+        .await
+        .expect("the job is exactly the previous generation");
+
+    assert_eq!(harness.supervisor.retired(), [generation.service_id()]);
+}
+
 #[tokio::test]
 async fn recovery_cleans_up_an_ended_previous_generation() {
     let harness = Harness::scripted(CONNECT, INITIALIZE);

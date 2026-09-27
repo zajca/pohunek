@@ -7,12 +7,15 @@ use pohunek_platform::filesystem::{AtomicReplaceError, FsError};
 
 use crate::SCHEMA_VERSION;
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 /// A failure while handling the service configuration.
 ///
 /// Validation variants name the TOML key (`section.key`) they reject so the
-/// operator can fix the file without reading source code.
+/// operator can fix the file without reading source code. They never store a
+/// rejected string value: a hand-edited owner-private file may hold anything,
+/// and both `Display` and `Debug` reach journald and error envelopes. The key,
+/// the entry position, the reason, and the byte length locate the mistake.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConfigError {
@@ -87,22 +90,29 @@ pub enum ConfigError {
     /// A path key is not an absolute normalized UTF-8 path.
     #[error(
         "service config key {key} must be an absolute normalized UTF-8 path without NUL bytes \
-         of at most {max_bytes} bytes: {}",
-        path.display()
+         of at most {max_bytes} bytes; the recorded {length}-byte value {reason}"
     )]
     InvalidPath {
         /// The rejected key.
         key: &'static str,
-        /// The rejected path.
-        path: PathBuf,
+        /// Byte length of the rejected path.
+        length: usize,
+        /// Why the path was rejected.
+        reason: &'static str,
         /// The accepted maximum path length.
         max_bytes: usize,
     },
     /// `active_version` is not a safe install version directory name.
-    #[error("service config key active_version is not a valid install version: {value:?}")]
+    #[error(
+        "service config key active_version must be one path component of ASCII letters, digits, \
+         `.`, `+`, or `-`, other than `.` and `..`, of at most {max_bytes} bytes; \
+         the recorded value has {length} bytes"
+    )]
     InvalidVersion {
-        /// The rejected version.
-        value: String,
+        /// Byte length of the rejected version.
+        length: usize,
+        /// The accepted maximum version length.
+        max_bytes: usize,
     },
     /// `namespace.uid` is the reserved `(uid_t)-1` value.
     #[error("service config key namespace.uid {uid} is not a valid user id")]
@@ -137,18 +147,28 @@ pub enum ConfigError {
         max: usize,
     },
     /// An environment allowlist entry is not a name or a trailing-`*` prefix.
-    #[error("service config key environment.allowlist has invalid pattern {pattern:?}: {reason}")]
+    #[error(
+        "service config key environment.allowlist entry {index} ({length} bytes) is invalid: \
+         {reason}"
+    )]
     InvalidPattern {
-        /// The rejected pattern.
-        pattern: String,
+        /// Zero-based position of the rejected entry.
+        index: usize,
+        /// Byte length of the rejected entry.
+        length: usize,
         /// Why the pattern was rejected.
         reason: &'static str,
     },
     /// An environment allowlist entry appears more than once.
-    #[error("service config key environment.allowlist lists {pattern:?} more than once")]
+    #[error(
+        "service config key environment.allowlist entry {index} repeats entry {first}; \
+         list each pattern once"
+    )]
     DuplicatePattern {
-        /// The repeated pattern.
-        pattern: String,
+        /// Zero-based position of the repeated entry.
+        index: usize,
+        /// Zero-based position of its first occurrence.
+        first: usize,
     },
     /// An installation root could not be canonicalized for verification.
     #[error("failed to canonicalize {key} {}: {source}", path.display())]

@@ -73,15 +73,15 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use pohunek_paths::{valid_install_version, BasePaths, InstallLayout};
+use pohunek_paths::{valid_install_version, BasePaths, InstallLayout, MAX_INSTALL_VERSION_BYTES};
 use pohunek_platform::filesystem::{FsError, TrustedDir};
 use pohunek_platform::supervisor::{
     Namespace, MAX_JOB_TIMEOUT, MAX_JOB_VALUE_BYTES, MAX_OPEN_FILES, MIN_OPEN_FILES,
@@ -242,13 +242,15 @@ impl ServiceConfig {
         let layout = InstallLayout::new(spec.prefix.clone()).map_err(|_invalid_prefix| {
             ConfigError::InvalidPath {
                 key: "prefix",
-                path: spec.prefix.clone(),
+                length: spec.prefix.as_os_str().len(),
+                reason: "is not a usable installation prefix",
                 max_bytes: MAX_PATH_BYTES,
             }
         })?;
         if valid_install_version(&spec.active_version).is_none() {
             return Err(ConfigError::InvalidVersion {
-                value: spec.active_version,
+                length: spec.active_version.len(),
+                max_bytes: MAX_INSTALL_VERSION_BYTES,
             });
         }
         if spec.uid == INVALID_UID {
@@ -787,17 +789,31 @@ fn is_normalized_absolute(path: &Path) -> bool {
 
 /// Validates one recorded path key.
 fn validate_path(key: &'static str, path: &Path) -> Result<(), ConfigError> {
-    if is_normalized_absolute(path)
-        && path.to_str().is_some()
-        && path.as_os_str().len() <= MAX_PATH_BYTES
-    {
-        Ok(())
-    } else {
-        Err(ConfigError::InvalidPath {
+    match path_error(path) {
+        None => Ok(()),
+        Some(reason) => Err(ConfigError::InvalidPath {
             key,
-            path: path.to_path_buf(),
+            length: path.as_os_str().len(),
+            reason,
             max_bytes: MAX_PATH_BYTES,
-        })
+        }),
+    }
+}
+
+/// Explains why `path` is not an absolute normalized UTF-8 path within [`MAX_PATH_BYTES`].
+fn path_error(path: &Path) -> Option<&'static str> {
+    if path.as_os_str().len() > MAX_PATH_BYTES {
+        Some("is too long")
+    } else if path.to_str().is_none() {
+        Some("is not UTF-8")
+    } else if !path.is_absolute() {
+        Some("is not absolute")
+    } else if path.as_os_str().as_encoded_bytes().contains(&0) {
+        Some("contains a NUL byte")
+    } else if !is_normalized_absolute(path) {
+        Some("is not normalized (`.`, `..`, or a repeated or trailing `/`)")
+    } else {
+        None
     }
 }
 
@@ -825,19 +841,19 @@ fn validate_allowlist(patterns: &[String]) -> Result<(), ConfigError> {
             max: MAX_ALLOWLIST_ENTRIES,
         });
     }
-    let mut seen = BTreeSet::new();
-    for pattern in patterns {
+    let mut seen = BTreeMap::new();
+    for (index, pattern) in patterns.iter().enumerate() {
         if let Some(reason) = pattern_error(pattern) {
             return Err(ConfigError::InvalidPattern {
-                pattern: pattern.clone(),
+                index,
+                length: pattern.len(),
                 reason,
             });
         }
-        if !seen.insert(pattern.as_str()) {
-            return Err(ConfigError::DuplicatePattern {
-                pattern: pattern.clone(),
-            });
+        if let Some(&first) = seen.get(pattern.as_str()) {
+            return Err(ConfigError::DuplicatePattern { index, first });
         }
+        seen.insert(pattern.as_str(), index);
     }
     Ok(())
 }

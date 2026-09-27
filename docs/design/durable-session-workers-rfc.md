@@ -371,7 +371,12 @@ SHA-256 over `"<uid>\0<canonical state root>\0<canonical runtime root>"`
 (`crates/platform/src/supervisor/namespace.rs`). Every name a backend reads back
 is parsed strictly against it; foreign, malformed, and other-namespace names are
 never adopted or retired, so an isolated test installation cannot touch a real
-one in the same user manager or launchd domain.
+one in the same user manager or launchd domain. The strict discovery used by
+destructive callers (version garbage collection, uninstall) additionally fails
+when an entry of its own namespace was rejected (a unit name that does not
+parse, or a definition file that does not parse, is labeled differently from
+its name, or is not a private regular file), because such an entry may belong
+to a job that still runs a version.
 
 No worker unit file or template is installed. Every worker **generation** is
 one job the daemon registers itself with an explicit, validated
@@ -468,7 +473,10 @@ If no valid controller initializes it before that deadline, it writes a
 Native recovery is a new generation: the old generation is proven ended (its
 journal terminal or its worker process gone by start identity, and the job
 absent or ended) before the new one starts, and the old job and definition are
-retired afterwards. Two generations of one session never hold mutation
+retired afterwards. A job present under the old service ID is retired only when
+its recorded definition names the old generation's executable, session, and
+generation and its main process is the journaled worker; any mismatch is
+refused as `runtime_identity_mismatch` without retiring anything. Two generations of one session never hold mutation
 authority at the same time. Stale jobs and definitions are removed only after
 they are proven ended and proven owned (namespace plus a label or definition
 match).
@@ -1117,16 +1125,16 @@ Reconciliation applies these rows in order
 | 4 | live worker of the exact generation; job present with a mismatched definition (executable, or argv without `--session-id <id>` / `--worker-generation <gen>`) or a main process that is not the journaled worker | `conflict`, `runtime_identity_mismatch`; nothing killed |
 | 5 | live worker of the exact generation; job proven absent | adopt (`live`); warn `reconcile.adopt.job_absent`; inventory stays `managed` with reason `worker_job_absent`, re-announced as `session_runtime_discovered` |
 | 6 | live worker of the exact generation; job cannot be inspected | adopt (`live`) with a warning; the authenticated worker plus its journal is the proof |
-| 7 | live worker of the exact generation; job matches | reconnect and mark `live`; adopt and commit a preparing create; replay a requested stop or remove |
-| 8 | no reachable worker; terminal journal of this generation | import the terminal outcome, then retire the generation's job (absent is fine; a launchd `RunAtLoad` job stays loaded after its worker exits). A failed retirement keeps the imported outcome and is retried with the row 16 backoff while the journal still proves the generation terminal and no socket answers. A socket that answers but cannot be adopted keeps its worker, which retains only final output, and leaves the job to a later reconciliation. A malformed or `Faulted` journal is `conflict`, `worker_journal_identity_mismatch` |
+| 7 | live worker of the exact generation; job matches | reconnect and mark `live`; adopt and commit a preparing create; replay a requested stop or remove. A replayed remove needs the stop to return the terminal outcome and then runs the removal finalizer (§16.3); a stop without an outcome or a failed stop is `reconnecting`, `runtime_supervision_unavailable` and retried with the row 16 backoff, keeping the intent |
+| 8 | no reachable worker; terminal journal of this generation | import the terminal outcome, then retire the generation's job (absent is fine; a launchd `RunAtLoad` job stays loaded after its worker exits). A removal intent with no socket answering is not imported: the removal finalizer (§16.3) finishes it. A failed retirement keeps the imported outcome and is retried with the row 16 backoff while the journal still proves the generation terminal and no socket answers. A socket that answers but cannot be adopted keeps its worker, which retains only final output, and leaves the job to a later reconciliation. A malformed or `Faulted` journal is `conflict`, `worker_journal_identity_mismatch` |
 | 9 | socket answers but cannot be adopted | incompatible protocol: `incompatible`, `worker_protocol_incompatible`, worker left alive, job not inspected; identity mismatch: `conflict`, `runtime_identity_mismatch` |
 | 10 | record without a generation and without evidence | an unfinished create is deleted; otherwise `lost`, `worker_unavailable` |
 | 11 | several non-terminal journals claim the generation, or the journal's `worker_id` differs from the record's | `conflict`, `runtime_supervision_ambiguous` (re-checked in the background as in row 12) or `runtime_identity_mismatch` respectively |
 | 12a | unfinished create; a successful scan found no journal of its generation; job present and running with a matching definition | the create that registered it died with its daemon: `conflict`, `runtime_supervision_ambiguous` while a background task holding the session's lifecycle lock watches the job from first sight until first sight plus `worker_initialize` (startup does not wait); the generation is never adopted, even if its worker binds in that window. Then the exact generation is retired and the create deleted (`session_removed`); a job that ends earlier is retired at once; an inspection or retirement failure is `reconnecting`, `runtime_supervision_unavailable` and retried |
 | 12 | no reachable worker; job present and running, or loaded without a process and without a journal of the generation, or ended while the journaled worker PID still runs with its start identity, or that PID cannot be inspected | `conflict`, `runtime_supervision_ambiguous`; nothing killed or retired. Re-checked in the background with the row 16 backoff until the evidence resolves: a worker that answers again is adopted, a job that ends while the journaled PID is gone becomes row 14 |
 | 13 | no reachable worker; job with a mismatched definition or process, or a malformed journaled start identity | `conflict`, `runtime_identity_mismatch` |
-| 14 | no reachable worker; job absent, ended, or loaded without a process in a state that proves nothing (launchd reports a loaded label without a matching process as `unknown`); journal not terminal; journaled worker PID not running with its recorded start identity (a reused PID counts as not running) | proven crash: marker sweep of the journal's `runtime_id`, retire the job (absent is fine), then `lost`, `runtime_lost`; `runtime_lost_cleanup_unconfirmed` when the sweep reports unconfirmed processes, fails, leaves a process whose markers could not be read and that started at or after the journaled worker, or still finds processes after 3 passes. Never a retried kill loop |
-| 15 | no reachable worker; job absent or ended; a successful scan found no journal for this generation | retire the job, then `lost`, `worker_unavailable`. No marker sweep: without a journal nothing proves which runtime ran. An unfinished create is deleted only after the retire succeeds, otherwise `reconnecting`, `runtime_supervision_unavailable` and retried |
+| 14 | no reachable worker; job absent, ended, or loaded without a process in a state that proves nothing (launchd reports a loaded label without a matching process as `unknown`); journal not terminal; journaled worker PID not running with its recorded start identity (a reused PID counts as not running) | proven crash: marker sweep of the journal's `runtime_id`, retire the job (absent is fine), then `lost`, `runtime_lost`; a removal intent runs the removal finalizer (§16.3) instead. `lost` counts as ended, so it is published only after the job is retired: a failed retirement is `reconnecting`, `runtime_supervision_unavailable` and retried with the row 16 backoff, which reaches this row again. The same holds when a running session's worker connection drops; `runtime_lost_cleanup_unconfirmed` when the sweep reports unconfirmed processes, fails, leaves a process whose markers could not be read and that started at or after the journaled worker, or still finds processes after 3 passes. Never a retried kill loop |
+| 15 | no reachable worker; job absent or ended; a successful scan found no journal for this generation | retire the job, then `lost`, `worker_unavailable`. No marker sweep: without a journal nothing proves which runtime ran. An unfinished create is deleted only after the retire succeeds, a removal intent runs the removal finalizer (§16.3), and any other failed retirement is `reconnecting`, `runtime_supervision_unavailable` and retried; all three keep the record until the retry succeeds |
 | 16 | job inspection fails (unavailable, timeout, or still racing after the retries) | `reconnecting`, `runtime_supervision_unavailable`; nothing touched; background re-reconciliation after 1 s, doubling to at most 60 s, until the session is resolved or changed or the daemon shuts down (a supervisor outage during create schedules the same retry). The same retry re-checks `runtime_supervision_ambiguous` sessions and never kills while the evidence stays ambiguous |
 | 17 | job of a generation that is not a record's current one, or of a session without a record | re-inspected: proven ended or absent is retired (a job loaded without a process counts as ended when the one journal of its generation names a worker PID that is not running; with no journal it stays `orphaned` until `worker_initialize` has passed since first sight, and is then retired if a fresh check still finds no process and no journal, because a worker journals before it opens its PTY) by exact service ID (removing its definition); still live is left alone, inventory `orphaned` with `runtime_slot` = its service ID and reason `stale_worker_generation`. A job whose inspection fails is also `orphaned`, never retired on that evidence, and re-inspected once `worker_initialize` has passed, repeating while the inspection keeps failing. When discovery fails this cleanup is skipped and logged; each record's own generation is still inspected |
 | – | worker socket of a session without a logical record | inventory `orphaned`, reason `logical_session_missing`; the worker is left alive |
@@ -1206,7 +1214,18 @@ the idempotent stop, imports the terminal result, removes owned worktree state
 according to existing safety rules, removes the systemd unit's inactive state
 and worker journal, and finally deletes the logical record.
 
-If removal crashes, reconciliation continues from the recorded phase. Files or
+If removal crashes, reconciliation continues from the recorded phase once the
+generation is proven ended: an answering worker confirms the replayed stop
+(row 7), an exact terminal journal with no answering socket (row 8), or an
+ended job (rows 14 and 15). One removal finalizer, shared with
+`session.remove`, then retires the exact recorded generation and proves every
+worker journaled for it gone, deletes owned worktrees, the worker log family,
+the registry entry, and the resume binding, and deletes the logical record
+last. A generation the service manager cannot retire, or a cleanup failure, is
+`reconnecting`, `runtime_supervision_unavailable`; a worker not proven gone is
+`conflict`, `runtime_supervision_ambiguous`; both keep the intent and are
+retried with the row 16 backoff. A worker of another generation that still runs
+is `conflict`, `runtime_identity_mismatch` and is not retried. Files or
 worktrees are never deleted merely because a worker cannot be contacted.
 
 ### 16.4 Cleanup

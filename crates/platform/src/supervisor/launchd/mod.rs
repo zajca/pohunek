@@ -20,14 +20,15 @@
 //! directory, never in `~/Library/LaunchAgents`, so launchd never resurrects a
 //! worker at login. Only the daemon agent is written to `~/Library/LaunchAgents`.
 //!
-//! The `launchctl` runner, the plist rendering, and definition registration
-//! are target-neutral and are unit-tested on every host; the backends
+//! The `launchctl` runner, the plist rendering, definition registration, and
+//! the classification of discovered definition files are target-neutral and are unit-tested on every host; the backends
 //! themselves exist only on macOS.
 
 use super::Error;
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
+mod discovery;
 mod launchctl;
 mod plist;
 mod registration;

@@ -111,7 +111,7 @@ fn an_unanswered_status_query_aborts_before_anything_changes() {
 }
 
 const STATUS: &str = "service status --json";
-const IS_ACTIVE: &str = "--user is-active --quiet pohunekd.service";
+const STATE_QUERY: &str = "--user is-active pohunekd.service";
 const LIST_WORKERS: &str = "--user list-units pohunek-session@* --all --plain --no-legend";
 const DISABLE: &str = "--user disable --now pohunekd.service";
 const RELOAD: &str = "--user daemon-reload";
@@ -134,7 +134,7 @@ fn idle_legacy_install_is_retired_after_preflight_before_installing() {
     );
     assert_eq!(
         fixture.systemctl_calls(),
-        [IS_ACTIVE, LIST_WORKERS, DISABLE, LIST_WORKERS, RELOAD]
+        [STATE_QUERY, LIST_WORKERS, DISABLE, LIST_WORKERS, RELOAD]
     );
     for legacy in fixture.legacy_files() {
         assert!(!legacy.exists(), "{} was not removed", legacy.display());
@@ -180,7 +180,7 @@ fn live_legacy_template_workers_refuse_before_anything_changes() {
         "unexpected preflight call: {:?}",
         fixture.pohunek_calls()
     );
-    assert_eq!(fixture.systemctl_calls(), [IS_ACTIVE, LIST_WORKERS]);
+    assert_eq!(fixture.systemctl_calls(), [STATE_QUERY, LIST_WORKERS]);
     for legacy in fixture.legacy_files() {
         assert!(legacy.exists(), "{} was removed", legacy.display());
     }
@@ -209,7 +209,7 @@ fn failed_preflight_stops_before_retiring_the_legacy_install() {
         "unexpected preflight call: {:?}",
         fixture.pohunek_calls()
     );
-    assert_eq!(fixture.systemctl_calls(), [IS_ACTIVE]);
+    assert_eq!(fixture.systemctl_calls(), [STATE_QUERY]);
     for legacy in fixture.legacy_files() {
         assert!(legacy.exists(), "{} was removed", legacy.display());
     }
@@ -262,7 +262,7 @@ fn a_worker_that_survives_the_stop_refuses_without_removing_legacy_files() {
     );
     assert_eq!(
         fixture.systemctl_calls(),
-        [IS_ACTIVE, LIST_WORKERS, DISABLE, LIST_WORKERS]
+        [STATE_QUERY, LIST_WORKERS, DISABLE, LIST_WORKERS]
     );
     for legacy in fixture.legacy_files() {
         assert!(legacy.exists(), "{} was removed", legacy.display());
@@ -304,7 +304,7 @@ fn accepted_runtime_loss_still_refuses_a_worker_that_survives_the_stop() {
     );
     assert_eq!(
         fixture.systemctl_calls(),
-        [IS_ACTIVE, LIST_WORKERS, DISABLE, LIST_WORKERS]
+        [STATE_QUERY, LIST_WORKERS, DISABLE, LIST_WORKERS]
     );
     for legacy in fixture.legacy_files() {
         assert!(legacy.exists(), "{} was removed", legacy.display());
@@ -334,7 +334,7 @@ fn a_failed_worker_inventory_refuses_before_the_legacy_daemon_stops() {
         stderr.contains("could not list the legacy template workers; nothing was changed"),
         "{stderr}"
     );
-    assert_eq!(fixture.systemctl_calls(), [IS_ACTIVE, LIST_WORKERS]);
+    assert_eq!(fixture.systemctl_calls(), [STATE_QUERY, LIST_WORKERS]);
     assert!(
         !fixture.systemctl_calls().iter().any(|call| call == DISABLE),
         "the legacy daemon was disabled after a failed inventory"
@@ -380,7 +380,7 @@ fn a_failed_post_stop_inventory_keeps_the_legacy_files() {
     );
     assert_eq!(
         fixture.systemctl_calls(),
-        [IS_ACTIVE, LIST_WORKERS, DISABLE, LIST_WORKERS]
+        [STATE_QUERY, LIST_WORKERS, DISABLE, LIST_WORKERS]
     );
     assert_eq!(
         fixture.pohunek_calls().len(),
@@ -401,7 +401,159 @@ fn a_failed_post_stop_inventory_keeps_the_legacy_files() {
     );
 }
 
-const STATE_QUERY: &str = "--user is-active pohunekd.service";
+#[test]
+fn a_legacy_daemon_that_is_not_proven_stopped_gets_the_barrier_and_preflight() {
+    // Only `inactive` or `failed` proves the legacy daemon has no clients; a
+    // daemon starting, stopping, or reloading may still own live PTYs, so a
+    // refusing preflight must stop the run before the disable.
+    for state in [
+        "activating",
+        "deactivating",
+        "reloading",
+        "refreshing",
+        "unknown",
+    ] {
+        let fixture = Fixture::new();
+        fixture.legacy_install();
+        let output = fixture.run(
+            &[],
+            &[
+                ("POHUNEK_TEST_LEGACY_STATE", state),
+                ("POHUNEK_TEST_PREFLIGHT_STATUS", "23"),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(23), "{state}: {output:?}");
+        assert!(
+            fixture
+                .pohunek_calls()
+                .get(1)
+                .is_some_and(|call| call.starts_with(&fixture.socket.preflight_prefix())),
+            "{state}: unexpected preflight call: {:?}",
+            fixture.pohunek_calls()
+        );
+        assert_eq!(fixture.pohunek_calls().len(), 2, "{state}");
+        assert_eq!(fixture.systemctl_calls(), [STATE_QUERY], "{state}");
+        for legacy in fixture.legacy_files() {
+            assert!(legacy.exists(), "{state}: {} was removed", legacy.display());
+        }
+        assert!(
+            fixture.socket.path.exists(),
+            "{state}: socket was not restored"
+        );
+        assert!(
+            !fixture.socket.retired_exists(),
+            "{state}: renamed barrier socket remains after the refusal"
+        );
+    }
+
+    // An accepting preflight lets the retirement of a transitional daemon
+    // proceed through the same barrier.
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let output = fixture.run(&[], &[("POHUNEK_TEST_LEGACY_STATE", "activating")]);
+    assert_success(&output);
+    assert!(
+        fixture
+            .pohunek_calls()
+            .get(1)
+            .is_some_and(|call| call.starts_with(&fixture.socket.preflight_prefix())),
+        "unexpected preflight call: {:?}",
+        fixture.pohunek_calls()
+    );
+    assert_eq!(
+        fixture.systemctl_calls(),
+        [STATE_QUERY, LIST_WORKERS, DISABLE, LIST_WORKERS, RELOAD]
+    );
+    for legacy in fixture.legacy_files() {
+        assert!(!legacy.exists(), "{} was not removed", legacy.display());
+    }
+    assert!(!fixture.socket.retired_exists());
+}
+
+#[test]
+fn a_daemon_not_proven_stopped_without_a_socket_refuses_before_anything_changes() {
+    // A daemon still starting may not have bound its socket yet, so no
+    // preflight can ask it about live PTYs.
+    for state in ["activating", "deactivating", "active"] {
+        let fixture = Fixture::new();
+        fixture.legacy_install();
+        fs::remove_file(&fixture.socket.path).expect("remove socket");
+        let output = fixture.run(
+            &["--accept-runtime-loss"],
+            &[("POHUNEK_TEST_LEGACY_STATE", state)],
+        );
+        assert_eq!(output.status.code(), Some(1), "{state}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("not stopped (state: {state})")),
+            "{stderr}"
+        );
+        assert!(stderr.contains("control socket is missing"), "{stderr}");
+        assert!(stderr.contains("nothing was changed"), "{stderr}");
+        assert_eq!(fixture.pohunek_calls(), [STATUS], "{state}");
+        assert_eq!(fixture.systemctl_calls(), [STATE_QUERY], "{state}");
+        for legacy in fixture.legacy_files() {
+            assert!(legacy.exists(), "{state}: {} was removed", legacy.display());
+        }
+    }
+}
+
+#[test]
+fn a_failed_legacy_state_query_refuses_before_anything_changes() {
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let output = fixture.run(
+        &["--accept-runtime-loss"],
+        &[("POHUNEK_TEST_LEGACY_STATE", "query-fails")],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not query the legacy daemon state"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("nothing was changed"), "{stderr}");
+    assert_eq!(fixture.pohunek_calls(), [STATUS]);
+    assert_eq!(fixture.systemctl_calls(), [STATE_QUERY]);
+    for legacy in fixture.legacy_files() {
+        assert!(legacy.exists(), "{} was removed", legacy.display());
+    }
+    assert!(fixture.socket.path.exists(), "socket was moved");
+    assert!(!fixture.socket.retired_exists(), "socket was moved");
+}
+
+#[test]
+fn a_stopped_legacy_daemon_is_retired_without_a_barrier_or_preflight() {
+    for state in ["inactive", "failed"] {
+        let fixture = Fixture::new();
+        fixture.legacy_install();
+        let output = fixture.run(&[], &[("POHUNEK_TEST_LEGACY_STATE", state)]);
+        assert_success(&output);
+        assert_eq!(
+            fixture.pohunek_calls(),
+            [STATUS.to_owned(), fixture.install_call()],
+            "{state}"
+        );
+        assert_eq!(
+            fixture.systemctl_calls(),
+            [STATE_QUERY, LIST_WORKERS, DISABLE, LIST_WORKERS, RELOAD],
+            "{state}"
+        );
+        for legacy in fixture.legacy_files() {
+            assert!(
+                !legacy.exists(),
+                "{state}: {} was not removed",
+                legacy.display()
+            );
+        }
+        // No barrier was placed, so the socket node was never moved.
+        assert!(fixture.socket.path.exists(), "{state}: socket was moved");
+        assert!(
+            !fixture.socket.retired_exists(),
+            "{state}: socket was moved"
+        );
+    }
+}
 
 #[test]
 fn a_failed_disable_of_a_running_daemon_restores_its_socket() {
@@ -429,7 +581,7 @@ fn a_failed_disable_of_a_running_daemon_restores_its_socket() {
     );
     assert_eq!(
         fixture.systemctl_calls(),
-        [IS_ACTIVE, LIST_WORKERS, DISABLE, STATE_QUERY]
+        [STATE_QUERY, LIST_WORKERS, DISABLE, STATE_QUERY]
     );
     assert_eq!(
         fixture.pohunek_calls().len(),
@@ -469,7 +621,7 @@ fn a_failed_disable_with_an_unknown_daemon_state_restores_its_socket() {
     );
     assert_eq!(
         fixture.systemctl_calls(),
-        [IS_ACTIVE, LIST_WORKERS, DISABLE, STATE_QUERY]
+        [STATE_QUERY, LIST_WORKERS, DISABLE, STATE_QUERY]
     );
     assert_eq!(
         fixture.pohunek_calls().len(),
@@ -512,7 +664,7 @@ fn a_failed_disable_of_a_stopped_daemon_removes_the_stale_barrier() {
         );
         assert_eq!(
             fixture.systemctl_calls(),
-            [IS_ACTIVE, LIST_WORKERS, DISABLE, STATE_QUERY],
+            [STATE_QUERY, LIST_WORKERS, DISABLE, STATE_QUERY],
             "{stopped_state}"
         );
         assert_eq!(
@@ -546,19 +698,19 @@ fn an_interrupted_retirement_restores_the_socket_of_a_running_daemon() {
             "preflight",
             "TERM",
             libc::SIGTERM,
-            &[IS_ACTIVE, STATE_QUERY][..],
+            &[STATE_QUERY, STATE_QUERY][..],
         ),
         (
             "preflight",
             "INT",
             libc::SIGINT,
-            &[IS_ACTIVE, STATE_QUERY][..],
+            &[STATE_QUERY, STATE_QUERY][..],
         ),
         (
             "disable",
             "HUP",
             libc::SIGHUP,
-            &[IS_ACTIVE, LIST_WORKERS, DISABLE, STATE_QUERY][..],
+            &[STATE_QUERY, LIST_WORKERS, DISABLE, STATE_QUERY][..],
         ),
     ] {
         let fixture = Fixture::new();
@@ -619,7 +771,7 @@ fn an_interrupted_retirement_of_a_stopped_daemon_removes_the_stale_barrier() {
     assert_eq!(output.status.signal(), Some(libc::SIGTERM), "{output:?}");
     assert_eq!(
         fixture.systemctl_calls(),
-        [IS_ACTIVE, LIST_WORKERS, DISABLE, STATE_QUERY]
+        [STATE_QUERY, LIST_WORKERS, DISABLE, STATE_QUERY]
     );
     assert_eq!(
         fixture.pohunek_calls().len(),
@@ -669,7 +821,7 @@ fn an_unexpected_exit_after_the_barrier_restores_the_socket() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
         fixture.systemctl_calls(),
-        [IS_ACTIVE, LIST_WORKERS, STATE_QUERY]
+        [STATE_QUERY, LIST_WORKERS, STATE_QUERY]
     );
     for legacy in fixture.legacy_files() {
         assert!(legacy.exists(), "{} was removed", legacy.display());
@@ -695,7 +847,7 @@ fn rerun_after_a_partial_retirement_finishes_without_a_second_preflight() {
     );
     assert_eq!(
         fixture.systemctl_calls(),
-        [IS_ACTIVE, LIST_WORKERS, DISABLE, LIST_WORKERS, RELOAD]
+        [STATE_QUERY, LIST_WORKERS, DISABLE, LIST_WORKERS, RELOAD]
     );
     for legacy in fixture.legacy_files() {
         assert!(!legacy.exists(), "{} was not removed", legacy.display());
@@ -891,6 +1043,10 @@ impl Fixture {
         write_executable(&archive.join("pohunek"), FAKE_POHUNEK);
         write_executable(&archive.join("pohunekd"), "#!/bin/sh\nexit 0\n");
         write_executable(&archive.join("pohunek-sessiond"), "#!/bin/sh\nexit 0\n");
+        // `is-active` reports `inactive`, `active` with
+        // `POHUNEK_TEST_LEGACY_ACTIVE=1`, or any `POHUNEK_TEST_LEGACY_STATE`,
+        // and `POHUNEK_TEST_STATE_AFTER_DISABLE` once a stop ran; the state
+        // `query-fails` answers nothing on stdout and exits 1.
         write_executable(
             &commands.join("systemctl"),
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$POHUNEK_TEST_SYSTEMCTL_LOG\"\n\
@@ -916,6 +1072,7 @@ impl Fixture {
              *is-active*)\n\
                  state=inactive\n\
                  [ \"${POHUNEK_TEST_LEGACY_ACTIVE:-0}\" = 1 ] && state=active\n\
+                 [ -n \"${POHUNEK_TEST_LEGACY_STATE:-}\" ] && state=$POHUNEK_TEST_LEGACY_STATE\n\
                  if [ -f \"${POHUNEK_TEST_SYSTEMCTL_STOP_MARKER:-}\" ] \\\n\
                      && [ -n \"${POHUNEK_TEST_STATE_AFTER_DISABLE:-}\" ]; then\n\
                      state=$POHUNEK_TEST_STATE_AFTER_DISABLE\n\

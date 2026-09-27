@@ -8,17 +8,16 @@ use super::super::{
     DaemonSupervisor, Error, JobDefinition, JobLogs, Namespace, Operation, RestartPolicy,
     ServiceId, ServiceObservation, ServiceState, Supervisor, WorkerKey, MAX_JOB_TIMEOUT,
 };
+use super::discovery::{classify, refuse_rejected};
 use super::launchctl::{Launchctl, Status};
 use super::plist::{self, Stored, MAX_DEFINITION_BYTES};
-use super::registration::{
-    self, definition_name, fs_error, remove_file, DEFINITION_MODE, DEFINITION_SUFFIX,
-};
+use super::registration::{self, definition_name, fs_error, remove_file, DEFINITION_MODE};
 use super::{run_error, status_error, Presence};
-use crate::filesystem::{FsError, TrustedDir};
+use crate::filesystem::TrustedDir;
 use crate::process::{DarwinInspector, Pid, ProcessFact, ProcessIdentity, ProcessInspector as _};
 use rustix::process::{kill_process, Pid as NativePid, Signal};
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 /// PID of launchd; every job launchd spawns is its direct child.
 const LAUNCHD_PID: Pid = 1;
@@ -70,8 +69,9 @@ pub struct Discovery {
     /// Loaded jobs of this namespace.
     pub observations: Vec<ServiceObservation>,
     /// Definition file names of this namespace that were skipped because
-    /// they do not parse or their `Label` differs from the file name. They
-    /// are never loaded.
+    /// they do not parse, their `Label` differs from the file name, or they
+    /// are not a private regular file. They are never loaded, and the strict
+    /// discovery refuses a result that lists any.
     pub rejected: Vec<String>,
     /// Whether a job's inspection raced, so the job may be missing from
     /// [`Discovery::observations`]; only the strict discovery refuses such a
@@ -141,8 +141,9 @@ impl LaunchdSupervisor {
     ///
     /// Enumerates the private definitions directory, keeps only
     /// `<label>.plist` files whose label parses as a worker of this namespace,
-    /// and inspects each. Files that do not parse or whose `Label` differs from
-    /// the file name are listed in [`Discovery::rejected`]. Jobs that vanish
+    /// and inspects each. Files that do not parse, whose `Label` differs from
+    /// the file name, or that are not a private regular file are listed in
+    /// [`Discovery::rejected`]. Jobs that vanish
     /// are skipped; a job that changes during inspection marks the discovery
     /// [`Discovery::incomplete`] instead of being dropped, because the job
     /// still exists and only [`LaunchdSupervisor::discover_strict`] may
@@ -174,38 +175,10 @@ impl LaunchdSupervisor {
                 ),
             });
         }
-        let mut candidates = Vec::new();
-        for name in names {
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            let Some(label) = name.strip_suffix(DEFINITION_SUFFIX) else {
-                continue;
-            };
-            let Ok(key) = self.namespace.parse_worker_label(label) else {
-                continue;
-            };
-            match directory.read_file(name, DEFINITION_MODE, MAX_DEFINITION_BYTES) {
-                Ok(bytes) => match plist::parse(&bytes) {
-                    Ok(stored) if stored.label == label => candidates.push(key),
-                    Ok(_) | Err(_) => discovery.rejected.push(name.to_owned()),
-                },
-                // Retired between enumeration and read.
-                Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => {}
-                // Not a file this backend wrote.
-                Err(
-                    FsError::UnsafeType { .. }
-                    | FsError::UnsafeOwner { .. }
-                    | FsError::UnsafeMode { .. }
-                    | FsError::UnsafeAcl { .. }
-                    | FsError::UnsafeLinkCount { .. }
-                    | FsError::FileTooLarge { .. },
-                ) => discovery.rejected.push(name.to_owned()),
-                Err(error) => return Err(fs_error(OPERATION)(error)),
-            }
-        }
+        let entries = classify(&directory, names, &self.namespace, OPERATION)?;
+        discovery.rejected = entries.rejected;
         drop(directory);
-        for key in candidates {
+        for key in entries.candidates {
             match self.inspect_worker(&key.service_id()).await {
                 Ok(observation) => discovery.observations.push(observation),
                 // The job is not loaded; it cannot reference its version.
@@ -353,8 +326,11 @@ impl Supervisor for LaunchdSupervisor {
     }
 
     /// Returns the destructive discovery: a raced job still exists but its
-    /// identity is unproven, so a result that may omit it fails instead of
-    /// letting a caller delete the version it may execute.
+    /// identity is unproven, and a rejected definition of this namespace may
+    /// belong to a loaded job whose process is never matched, so a result
+    /// that may omit either fails instead of letting a caller delete the
+    /// version it may execute. A race is [`Error::Race`], a rejected
+    /// definition [`Error::InvalidData`].
     fn discover_strict(&self) -> Operation<'_, Vec<ServiceObservation>> {
         Box::pin(async move {
             let discovery = self.discover_definitions().await?;
@@ -364,6 +340,7 @@ impl Supervisor for LaunchdSupervisor {
                 });
             }
             super::super::warn_rejected("launchd", &discovery.rejected);
+            refuse_rejected("discover", &discovery.rejected)?;
             Ok(discovery.observations)
         })
     }

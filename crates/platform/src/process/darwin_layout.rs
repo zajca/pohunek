@@ -4,7 +4,7 @@
 //! buffer. Keeping the decoding here makes region separation, bounds, and
 //! integer conversions testable on every host, not only on macOS.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -31,8 +31,11 @@ const MAX_ARGUMENT_COUNT: usize = 4_096;
 
 /// Caps the environment entries scanned for ownership markers.
 ///
-/// The scan stops at the first entry beyond this bound instead of walking an
-/// unbounded region that a malformed buffer could describe.
+/// Bounds the walk of a region that a malformed buffer could describe as
+/// unbounded. An environment with more entries is
+/// [`LayoutError::Malformed`], never a scan that ends early: a marker past the
+/// bound would otherwise read as absent and turn an owned process foreign.
+/// Far above any real environment, which `kern.argmax` (1 MiB) also bounds.
 const MAX_ENVIRONMENT_ENTRIES: usize = 8_192;
 
 /// Caps a retained ownership-marker value.
@@ -113,7 +116,8 @@ pub(super) fn decode_argument_region(buffer: &[u8]) -> ArgumentRegion {
 /// # Errors
 ///
 /// Returns [`LayoutError::Malformed`] when a region is truncated, the argument
-/// count is negative or oversized, or a marker value exceeds its bound.
+/// count is negative or oversized, a marker value exceeds its bound, or the
+/// environment holds more entries than the scan bound.
 pub(super) fn parse_process_arguments(buffer: &[u8]) -> Result<NativeArguments, LayoutError> {
     let Some((count_region, rest)) = buffer.split_at_checked(ARGUMENT_COUNT_BYTES) else {
         return Err(LayoutError::Malformed);
@@ -152,16 +156,24 @@ pub(super) fn parse_process_arguments(buffer: &[u8]) -> Result<NativeArguments, 
 ///
 /// The first entry for a key wins, matching what `getenv` reports to the
 /// process itself.
+///
+/// # Errors
+///
+/// Returns [`LayoutError::Malformed`] for a marker value above its bound and
+/// for an environment with more than [`MAX_ENVIRONMENT_ENTRIES`] entries before
+/// all markers were found.
 fn collect_ownership_markers(mut region: &[u8]) -> Result<OwnershipMarkers, LayoutError> {
     let mut markers = OwnershipMarkers::default();
-    for _ in 0..MAX_ENVIRONMENT_ENTRIES {
-        let Some((entry, rest)) = split_c_string(region) else {
-            break;
-        };
+    let mut scanned = 0_usize;
+    while let Some((entry, rest)) = split_c_string(region) {
         region = rest;
         if entry.is_empty() {
             break;
         }
+        if scanned == MAX_ENVIRONMENT_ENTRIES {
+            return Err(LayoutError::Malformed);
+        }
+        scanned += 1;
         let Some(separator) = entry.iter().position(|byte| *byte == b'=') else {
             continue;
         };
@@ -327,8 +339,8 @@ mod tests {
         bounded_descendants, children_by_parent, controlling_terminal_group,
         decode_argument_region, decode_command_name, decode_kernel_path, encode_boot_identity,
         encode_start_identity, parse_process_arguments, ArgumentRegion, LayoutError,
-        MAX_ARGUMENT_COUNT, MAX_DESCENDANT_COUNT, MAX_DESCENDANT_DEPTH, MAX_MARKER_VALUE_BYTES,
-        NO_CONTROLLING_DEVICE,
+        MAX_ARGUMENT_COUNT, MAX_DESCENDANT_COUNT, MAX_DESCENDANT_DEPTH, MAX_ENVIRONMENT_ENTRIES,
+        MAX_MARKER_VALUE_BYTES, NO_CONTROLLING_DEVICE,
     };
     use crate::process::Pid;
     use std::convert::Infallible;
@@ -580,6 +592,43 @@ mod tests {
         assert_eq!(
             parse_process_arguments(&buffer),
             Err(LayoutError::Malformed)
+        );
+    }
+
+    /// Builds an environment of `filler` unrelated entries followed by the
+    /// runtime marker.
+    fn environment_with_marker_after(filler: usize) -> Vec<Vec<u8>> {
+        let mut environment: Vec<Vec<u8>> = (0..filler)
+            .map(|index| format!("FILLER_{index}=x").into_bytes())
+            .collect();
+        environment.push(b"POHUNEK_RUNTIME_ID=runtime-a".to_vec());
+        environment
+    }
+
+    #[test]
+    fn a_marker_at_the_entry_bound_is_found() {
+        let environment = environment_with_marker_after(MAX_ENVIRONMENT_ENTRIES - 1);
+        let entries: Vec<&[u8]> = environment.iter().map(Vec::as_slice).collect();
+        let buffer = procargs(1, b"/bin/sh", 1, &[b"sh"], &entries);
+
+        let parsed = parse_process_arguments(&buffer).expect("kernel layout");
+
+        assert_eq!(parsed.markers.runtime_id.as_deref(), Some("runtime-a"));
+    }
+
+    #[test]
+    fn an_environment_beyond_the_entry_bound_is_unobservable_not_unmarked() {
+        let environment = environment_with_marker_after(MAX_ENVIRONMENT_ENTRIES);
+        let entries: Vec<&[u8]> = environment.iter().map(Vec::as_slice).collect();
+        let buffer = procargs(1, b"/bin/sh", 1, &[b"sh"], &entries);
+
+        assert_eq!(
+            parse_process_arguments(&buffer),
+            Err(LayoutError::Malformed)
+        );
+        assert_eq!(
+            decode_argument_region(&buffer),
+            ArgumentRegion::Unobservable
         );
     }
 

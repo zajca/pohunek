@@ -66,7 +66,14 @@ then starts every worker as its own transient unit per worker generation.
 An install that already runs worker-aware sessions under the older
 `pohunek-session@<session-id>.service` template is retired by the same
 installer. Because the already-deployed legacy binary cannot gain a
-daemon-side barrier, the installer retires it in this order:
+daemon-side barrier, the installer retires it in this order. It first asks
+`systemctl --user is-active pohunekd.service` for the legacy daemon's state:
+only a printed `inactive` or `failed` counts as stopped and skips steps 1–2;
+every other state (`active`, `activating`, `deactivating`, `reloading`, or
+anything unexpected) takes the barrier and preflight path, and a query that
+answers nothing refuses before anything changes. A daemon that is not stopped
+but has no control socket node yet (or anymore) also refuses unchanged, since
+no preflight can reach it.
 
 1. it moves the legacy daemon's control socket node aside
    (`XDG_RUNTIME_DIR/pohunek/daemon.sock`) with `rename(2)`, so new clients

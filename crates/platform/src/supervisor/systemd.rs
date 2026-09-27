@@ -95,7 +95,7 @@ mod unit_file;
 #[doc(inline)]
 pub use unit_file::{render_daemon_unit, render_sessions_slice};
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 const DESTINATION: &str = "org.freedesktop.systemd1";
 const MANAGER_PATH: &str = "/org/freedesktop/systemd1";
@@ -202,7 +202,8 @@ pub struct Discovery {
     /// Observations of this namespace's worker units, sorted by service ID.
     pub observations: Vec<ServiceObservation>,
     /// Units matching the namespace pattern whose names do not parse strictly;
-    /// they are never inspected or retired.
+    /// they are never inspected or retired, and
+    /// [`SystemdSupervisor::discover_strict`] refuses a result that lists any.
     pub rejected_units: Vec<String>,
     /// Whether a matching unit's observation raced, so the unit may be
     /// missing from [`Discovery::observations`]; only
@@ -311,8 +312,9 @@ impl Supervisor for SystemdSupervisor {
     }
 
     /// Returns the destructive discovery: a raced unit still exists but its
-    /// identity is unproven, so a result that may omit it fails instead of
-    /// letting a caller delete the version it may execute.
+    /// identity is unproven, and a rejected unit of this namespace may still
+    /// run, so a result that may omit either fails instead of letting a
+    /// caller delete the version it may execute.
     fn discover_strict(&self) -> Operation<'_, Vec<ServiceObservation>> {
         Box::pin(async move { strict_discovery(self.discover_units().await?) })
     }
@@ -1041,15 +1043,30 @@ fn lenient_discovery(discovery: Discovery) -> Vec<ServiceObservation> {
     discovery.observations
 }
 
-/// The destructive discovery: a result that may omit a registered job fails
-/// with [`Error::Race`], so the caller keeps every version.
+/// The destructive discovery: a result that may omit a registered job fails,
+/// so the caller keeps every version.
+///
+/// A raced unit is [`Error::Race`]. A rejected unit matches this namespace's
+/// pattern and may still run, but its name never maps to a service ID, so it
+/// is never observed and is [`Error::InvalidData`].
 fn strict_discovery(discovery: Discovery) -> Result<Vec<ServiceObservation>, Error> {
     if discovery.incomplete {
         return Err(Error::Race {
             operation: "discover",
         });
     }
-    Ok(lenient_discovery(discovery))
+    super::warn_rejected("systemd", &discovery.rejected_units);
+    if let Some(first) = discovery.rejected_units.first() {
+        return Err(Error::InvalidData {
+            operation: "discover",
+            detail: format!(
+                "{} worker unit(s) of this namespace cannot be verified, first `{first}`; \
+                 such a unit may still run",
+                discovery.rejected_units.len()
+            ),
+        });
+    }
+    Ok(discovery.observations)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1643,6 +1660,29 @@ mod tests {
         assert_eq!(
             strict_discovery(discovery.clone()).expect("complete discovery"),
             vec![remaining.clone()]
+        );
+        assert_eq!(lenient_discovery(discovery), vec![remaining]);
+    }
+
+    #[test]
+    fn only_the_strict_discovery_refuses_a_rejected_unit() {
+        let remaining = observation("s-43.abcd2345");
+        let rejected = "pohunek-0123456789ab-worker-bad.service".to_owned();
+        let discovery = Discovery {
+            observations: vec![remaining.clone()],
+            rejected_units: vec![rejected.clone()],
+            incomplete: false,
+        };
+
+        let error = strict_discovery(discovery.clone())
+            .expect_err("a rejected unit of this namespace may still run");
+        assert!(
+            matches!(
+                &error,
+                Error::InvalidData { operation: "discover", detail }
+                    if detail.starts_with("1 worker unit(s)") && detail.contains(&rejected)
+            ),
+            "{error}"
         );
         assert_eq!(lenient_discovery(discovery), vec![remaining]);
     }

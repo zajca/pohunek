@@ -73,6 +73,8 @@ struct World {
     /// Version whose daemon definition `replace` refuses without effect.
     refused_replace: Option<String>,
     installs: usize,
+    /// Daemon definition replacements, each of which restarts the daemon.
+    replaces: usize,
     sessions: Vec<SessionInfo>,
     workers: Vec<ServiceObservation>,
     /// Registered jobs whose observation raced; the lenient discovery omits
@@ -145,6 +147,7 @@ impl DaemonSupervisor for Fake {
     fn replace<'a>(&'a self, definition: &'a JobDefinition) -> Pending<'a, ()> {
         Box::pin(async move {
             let mut world = self.world();
+            world.replaces += 1;
             if world.registered.is_none() {
                 return Err(supervisor::Error::NotFound(daemon_id()));
             }
@@ -1448,6 +1451,54 @@ async fn upgrade_keeps_a_version_a_registered_worker_job_will_execute() {
         );
         assert!(worker_exe.is_file(), "{state:?}: the job can still exec");
     }
+}
+
+#[tokio::test]
+async fn rerunning_the_active_upgrade_removes_a_version_whose_worker_job_ended() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let worker_exe = harness.layout().worker_executable(V1).expect("worker");
+    harness.fake.seed(
+        Vec::new(),
+        vec![pending_worker(
+            SESSION,
+            ServiceState::Starting,
+            worker_exe.clone(),
+        )],
+    );
+    let upgraded = harness.upgrade(V2).await.expect("upgrade");
+    assert!(upgraded.kept_versions.iter().any(|kept| kept.version == V1));
+
+    // While the job is still registered, the rerun keeps its version too.
+    let restarts = harness.fake.world().replaces;
+    let still_kept = harness.upgrade(V2).await.expect("repeat upgrade");
+    assert!(still_kept.unchanged);
+    assert!(still_kept.removed_versions.is_empty());
+    assert!(still_kept
+        .kept_versions
+        .iter()
+        .any(|kept| kept.version == V1));
+    assert!(worker_exe.is_file());
+
+    harness.fake.seed(Vec::new(), Vec::new());
+    let collected = harness.upgrade(V2).await.expect("repeat upgrade");
+    assert!(collected.unchanged);
+    assert_eq!(collected.removed_versions, [V1]);
+    assert!(
+        collected
+            .kept_versions
+            .iter()
+            .all(|kept| kept.version != V1),
+        "{collected:?}"
+    );
+    assert_eq!(collected.gc_error, None);
+    assert!(!worker_exe.exists(), "the unreferenced version is removed");
+    assert_eq!(
+        harness.fake.world().replaces,
+        restarts,
+        "an unchanged upgrade never restarts the daemon"
+    );
+    harness.assert_installed(V2);
 }
 
 #[tokio::test]

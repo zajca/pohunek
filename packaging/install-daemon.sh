@@ -78,9 +78,9 @@ fi
 # The legacy binary is already deployed, so the wrapper cannot add a
 # daemon-side barrier to it; the connect barrier closes the only open door and
 # every later step fails closed without removing legacy files. Every step
-# tolerates a previous partial run: the preflight only runs while the legacy
-# daemon is still active, and removal and disable are no-ops for what is
-# already gone.
+# tolerates a previous partial run: the barrier and preflight are skipped only
+# for a daemon `systemctl` reports stopped, and removal and disable are no-ops
+# for what is already gone.
 #
 # Residual windows the wrapper cannot close without a legacy-side change:
 # a client that already holds a control connection (a long-lived GUI) may
@@ -111,14 +111,22 @@ disarm_barrier() {
     barrier_socket=
     trap - EXIT HUP INT TERM
 }
-# `is-active` exits non-zero both for a stopped unit and for a failed query,
-# so only its printed `inactive` or `failed` state proves the daemon stopped
-# and the barrier is removed (status 0). Anything else (active, deactivating,
-# no answer) may still be a running daemon, which keeps its socket name
-# reachable, so the node is restored (status 1). `legacy_state` keeps the
-# printed state for the caller's report.
-settle_barrier() {
+# Sets `legacy_state` to the state `systemctl --user is-active` prints for the
+# legacy daemon. Its exit status is non-zero both for every state but `active`
+# and for a failed query, so only the printed state is trusted: an empty
+# answer is a failed query (status 1). Only `inactive` or `failed` proves the
+# daemon stopped; every other state (activating, deactivating, reloading, an
+# unknown word) may have a running daemon with clients.
+query_legacy_state() {
     legacy_state=$(systemctl --user is-active pohunekd.service) || :
+    [ -n "$legacy_state" ]
+}
+# A proven-stopped daemon's barrier is removed (status 0). Any other answer,
+# including a failed query, may still be a running daemon, which keeps its
+# socket name reachable, so the node is restored (status 1). `legacy_state`
+# keeps the printed state for the caller's report.
+settle_barrier() {
+    query_legacy_state || :
     case "$legacy_state" in
         inactive|failed)
             remove_barrier
@@ -157,14 +165,28 @@ legacy_retired=0
 if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
     legacy_socket="${XDG_RUNTIME_DIR:-}/$POHUNEK_RUNTIME_SUBDIR/$POHUNEK_SOCKET_NAME"
     barrier_socket=
-    if systemctl --user is-active --quiet pohunekd.service; then
+    if ! query_legacy_state; then
+        echo "could not query the legacy daemon state with" >&2
+        echo "\`systemctl --user is-active pohunekd.service\`; nothing was changed" >&2
+        echo "fix the reported problem and re-run $0" >&2
+        exit 1
+    fi
+    legacy_stopped=0
+    case "$legacy_state" in
+        inactive|failed) legacy_stopped=1 ;;
+    esac
+    if [ "$legacy_stopped" -eq 0 ]; then
         # Move the daemon's listening socket node away with rename(2): its
         # bound socket keeps serving established connections, while any new
         # client cannot connect, so no new session can start after the
-        # preflight that follows.
+        # preflight that follows. A daemon that is not proven stopped but has
+        # no socket node (still starting, or already shutting down) cannot be
+        # asked whether it owns live PTYs, so the run refuses.
         if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -S "$legacy_socket" ]; then
-            echo "the active legacy daemon control socket is missing: $legacy_socket" >&2
-            echo "nothing was changed; stop the legacy daemon and re-run $0" >&2
+            echo "the legacy daemon is not stopped (state: $legacy_state), but its control socket is missing:" >&2
+            echo "  $legacy_socket" >&2
+            echo "nothing was changed; wait until the legacy daemon is active or stopped" >&2
+            echo "(or stop it with \`systemctl --user stop pohunekd.service\`) and re-run $0" >&2
             exit 1
         fi
         barrier_socket="$legacy_socket.retiring.$$"

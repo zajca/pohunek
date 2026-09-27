@@ -44,8 +44,13 @@ Interpret runtime states as follows:
 - `reconnecting`: a known worker is still being validated or adopted. Do not
   start native recovery or restart the worker. Reason
   `runtime_supervision_unavailable` means the service manager (systemd user
-  manager or launchd) could not be inspected; nothing was killed and
-  reconciliation retries on its own (after 1 s, doubling to at most 60 s).
+  manager or launchd) could not be inspected, or could not retire the job of a
+  worker generation that is proven ended; nothing was killed and
+  reconciliation retries on its own (after 1 s, doubling to at most 60 s). A
+  session whose removal was interrupted (for example the daemon stopped mid
+  `session rm`) also shows this reason while its removal waits for the job to
+  be retired or its cleanup to succeed; the retry then finishes the removal
+  and the session disappears.
 - `terminal`: the worker observed child exit and the logical outcome is being
   retained or has been imported.
 - `lost`: no live PTY generation remains. The logical record is intentionally
@@ -57,6 +62,8 @@ Interpret runtime states as follows:
   inspect `ps` for processes of that session before recovering it. A lost
   session without a journal for its generation reports `worker_unavailable`;
   its job is retired, but no process is swept, so check `ps` for leftovers.
+  A session is reported `lost` only after the service manager retired its job;
+  until then it stays `reconnecting` with `runtime_supervision_unavailable`.
   The same classification runs when a worker dies while the daemon is running:
   a proven crash is reported `lost` immediately, and a worker that stays
   unreachable is classified after the worker connect deadline (`conflict`

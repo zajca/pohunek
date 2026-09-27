@@ -603,9 +603,14 @@ impl SessionRegistry {
     /// when its worker's journal names that generation, terminal journals of
     /// other generations are history, and only that generation's job is
     /// inspected. Returns whether the session needs the background re-check:
-    /// its supervisor was unavailable, its generation is ambiguous, or the
-    /// job of its proven-terminal generation could not be retired. In
-    /// `retry` mode an unchanged outcome leaves the current entry untouched.
+    /// its supervisor was unavailable, its generation is ambiguous, the job
+    /// of its proven-ended generation could not be retired, or its durable
+    /// removal intent could not be finished. In `retry` mode an unchanged
+    /// outcome leaves the current entry untouched.
+    ///
+    /// A removal intent is finished, not imported, once the generation is
+    /// proven ended with no worker answering (an exact terminal journal or an
+    /// ended job) or its answering worker confirms the stop.
     ///
     /// `scan` is `Err` when the journals could not be scanned. Missing socket
     /// or journal evidence decides nothing: the session is ambiguous and
@@ -706,17 +711,30 @@ impl SessionRegistry {
                         tracing::warn!(session_id = %record.session_id, detail, "adopting a live worker without supervisor evidence");
                     }
                 }
-                Box::pin(
-                    self.reconcile_record(record, Some((candidate.worker, candidate.snapshot))),
-                )
+                return Box::pin(self.reconcile_record(
+                    record,
+                    Some((candidate.worker, candidate.snapshot)),
+                    retry,
+                ))
                 .await;
-                return false;
             }
             SocketEvidence::Absent | SocketEvidence::Unusable(..) | SocketEvidence::Unknown(_) => {}
         }
 
         let scoped = scan.scoped_to(generation.as_ref());
         match classify_terminal_journals(&scoped, &record) {
+            // The journal proves the generation ended and no worker answers,
+            // so the removal intent is finished; the finalizer still proves
+            // every worker journaled for the generation gone.
+            TerminalJournalClassification::Exact(_)
+                if record.desired_state == DesiredState::Removed
+                    && generation.is_some()
+                    && matches!(socket, SocketEvidence::Absent) =>
+            {
+                return self
+                    .finish_removal_intent(record, generation.as_ref(), lifecycle, retry)
+                    .await;
+            }
             TerminalJournalClassification::Exact(evidence) => {
                 let session_id = record.session_id.clone();
                 self.import_terminal_journal(record, *evidence).await;
@@ -843,6 +861,11 @@ impl SessionRegistry {
                     }
                     None => Cleanup::Complete,
                 };
+                if !creating && record.desired_state == DesiredState::Removed {
+                    return self
+                        .finish_removal_intent(record, Some(&generation), lifecycle, retry)
+                        .await;
+                }
                 let retired = match lifecycle {
                     Some(lifecycle) => lifecycle.retire(&generation).await,
                     None => Ok(()),
@@ -872,6 +895,19 @@ impl SessionRegistry {
                     }
                     return true;
                 }
+                // `Lost` counts as ended, so a later removal skips retirement:
+                // it is published only once the job is gone, and a failed
+                // retirement is re-checked until it succeeds.
+                if retired.is_err() {
+                    self.mark_pending(
+                        record,
+                        RuntimeState::Reconnecting,
+                        SUPERVISION_UNAVAILABLE,
+                        retry,
+                    )
+                    .await;
+                    return true;
+                }
                 let reason = match (journaled, cleanup) {
                     (false, _) => "worker_unavailable",
                     (true, Cleanup::Complete) => RUNTIME_LOST,
@@ -889,6 +925,22 @@ impl SessionRegistry {
     /// A retry that finds the same ambiguity leaves the entry, and its
     /// subscribers, untouched.
     async fn mark_ambiguous(&self, record: SessionRecord, retry: bool) {
+        self.mark_pending(record, RuntimeState::Conflict, SUPERVISION_AMBIGUOUS, retry)
+            .await;
+    }
+
+    /// Shows `record` as `state` with `reason` while it waits for the
+    /// background re-check.
+    ///
+    /// A retry that finds the entry already showing the same state and
+    /// reason leaves it, and its subscribers, untouched.
+    async fn mark_pending(
+        &self,
+        record: SessionRecord,
+        state: RuntimeState,
+        reason: &str,
+        retry: bool,
+    ) {
         let id = SessionId(record.session_id.clone());
         if retry {
             let unchanged = self
@@ -899,16 +951,14 @@ impl SessionRegistry {
                 .get(&id)
                 .is_some_and(|entry| {
                     entry.info.runtime.as_ref().is_some_and(|runtime| {
-                        runtime.state == RuntimeState::Conflict
-                            && runtime.loss_reason.as_deref() == Some(SUPERVISION_AMBIGUOUS)
+                        runtime.state == state && runtime.loss_reason.as_deref() == Some(reason)
                     })
                 });
             if unchanged {
                 return;
             }
         }
-        self.insert_unavailable_record(record, RuntimeState::Conflict, SUPERVISION_AMBIGUOUS)
-            .await;
+        self.insert_unavailable_record(record, state, reason).await;
     }
 
     /// Records that a live worker was adopted while its job is proven absent.
@@ -969,11 +1019,12 @@ impl SessionRegistry {
     /// Runs the unreachable-worker rows of reconciliation for the exact
     /// generation the entry names, under the session's lifecycle lock: a
     /// proven crash sweeps the runtime's marked processes, retires the job,
-    /// and is `Lost`; a job or process that may still be live is `Conflict`
-    /// and re-checked in the background;
-    /// an unavailable supervisor leaves the runtime `Reconnecting` and
-    /// schedules the background retry. With `proven_only`, anything short of
-    /// a proven crash is left `Pending` so the watcher keeps reconnecting.
+    /// and is `Lost` only once the job is retired; a job or process that may
+    /// still be live is `Conflict` and re-checked in the background; an
+    /// unavailable supervisor, or a job it could not retire, leaves the
+    /// runtime `Reconnecting` and schedules the background retry. With
+    /// `proven_only`, anything short of a proven crash is left `Pending` so
+    /// the watcher keeps reconnecting.
     pub(super) async fn classify_lost_worker(
         &self,
         id: &SessionId,
@@ -1034,22 +1085,32 @@ impl SessionRegistry {
                 } else {
                     Cleanup::Complete
                 };
-                if let (Some(lifecycle), Some(generation)) = (lifecycle.as_ref(), job.as_ref()) {
-                    if let Err(error) = lifecycle.retire(generation).await {
-                        tracing::warn!(
-                            session_id = %id.0,
-                            service_id = %generation.service_id(),
-                            error = %error,
-                            "failed to retire the crashed worker generation"
-                        );
+                let retired = match (lifecycle.as_ref(), job.as_ref()) {
+                    (Some(lifecycle), Some(generation)) => {
+                        lifecycle.retire(generation).await.map_err(|error| {
+                            tracing::warn!(
+                                session_id = %id.0,
+                                service_id = %generation.service_id(),
+                                error = %error,
+                                "failed to retire the crashed worker generation"
+                            );
+                        })
                     }
-                }
-                let reason = match (journaled, cleanup) {
-                    (false, _) => "worker_unavailable",
-                    (true, Cleanup::Complete) => RUNTIME_LOST,
-                    (true, Cleanup::Unconfirmed) => RUNTIME_LOST_CLEANUP_UNCONFIRMED,
+                    _ => Ok(()),
                 };
-                (RuntimeState::Lost, reason)
+                // `Lost` counts as ended, so a later removal skips retirement:
+                // until the job is retired the session stays unavailable and
+                // the background re-check reaches this classification again.
+                if retired.is_err() {
+                    (RuntimeState::Reconnecting, SUPERVISION_UNAVAILABLE)
+                } else {
+                    let reason = match (journaled, cleanup) {
+                        (false, _) => "worker_unavailable",
+                        (true, Cleanup::Complete) => RUNTIME_LOST,
+                        (true, Cleanup::Unconfirmed) => RUNTIME_LOST_CLEANUP_UNCONFIRMED,
+                    };
+                    (RuntimeState::Lost, reason)
+                }
             }
         };
         match self
@@ -1215,6 +1276,99 @@ impl SessionRegistry {
             }
         }
         Ok(workers)
+    }
+
+    /// Retires `generation` for the removal of `id` and proves every worker
+    /// that may still own one of its PTYs gone.
+    ///
+    /// Removal deletes the only record of the generation, so the workers are
+    /// collected from a fresh journal scan ([`Self::removal_worker_processes`])
+    /// and must be gone after the job is retired
+    /// ([`Lifecycle::retire_for_removal`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `runtime_supervision_unavailable` when the supervisor cannot
+    /// retire the job, and `runtime_supervision_ambiguous` or
+    /// `runtime_identity_mismatch` when a worker is not proven gone.
+    pub(super) async fn retire_generation_for_removal(
+        &self,
+        id: &SessionId,
+        generation: &super::Generation,
+        lifecycle: &Lifecycle<'_>,
+    ) -> Result<(), ProtocolError> {
+        let workers = self.removal_worker_processes(id, generation).await?;
+        lifecycle
+            .retire_for_removal(generation, &workers)
+            .await
+            .map_err(crate::runtime::lifecycle::PreviousLive::into_error)
+    }
+
+    /// Finishes the durable removal intent of `record` once its runtime is
+    /// proven ended or stopped.
+    ///
+    /// The exact recorded generation is retired and its workers proven gone,
+    /// then [`Self::release_removed_session`] deletes everything the session
+    /// owns, the durable record last. Without a supervisor or a recorded
+    /// generation there is no job to retire. Returns whether the removal
+    /// needs the background re-check: a generation the supervisor cannot
+    /// retire keeps the session `runtime_supervision_unavailable`, a worker
+    /// not proven gone keeps it `runtime_supervision_ambiguous`, and a failed
+    /// cleanup keeps it `runtime_supervision_unavailable`; each re-check
+    /// reaches this finalizer again from fresh evidence. A worker of another
+    /// generation that still runs is an identity conflict and is not retried.
+    async fn finish_removal_intent(
+        &self,
+        record: SessionRecord,
+        generation: Option<&super::Generation>,
+        lifecycle: Option<&Lifecycle<'_>>,
+        retry: bool,
+    ) -> bool {
+        let id = SessionId(record.session_id.clone());
+        if let (Some(generation), Some(lifecycle)) = (generation, lifecycle) {
+            if let Err(error) = self
+                .retire_generation_for_removal(&id, generation, lifecycle)
+                .await
+            {
+                tracing::warn!(
+                    session_id = %id.0,
+                    service_id = %generation.service_id(),
+                    error = %error,
+                    "removal intent waits for its generation to be retired"
+                );
+                let (state, reason) = match error.code.as_str() {
+                    SUPERVISION_UNAVAILABLE => {
+                        (RuntimeState::Reconnecting, SUPERVISION_UNAVAILABLE)
+                    }
+                    SUPERVISION_AMBIGUOUS => (RuntimeState::Conflict, SUPERVISION_AMBIGUOUS),
+                    _ => {
+                        self.insert_unavailable_record(
+                            record,
+                            RuntimeState::Conflict,
+                            IDENTITY_MISMATCH,
+                        )
+                        .await;
+                        return false;
+                    }
+                };
+                self.mark_pending(record, state, reason, retry).await;
+                return true;
+            }
+        }
+        match self.release_removed_session(&id).await {
+            Ok(_released) => false,
+            Err(error) => {
+                tracing::warn!(session_id = %id.0, error = %error, "failed to finish reconciled removal");
+                self.mark_pending(
+                    record,
+                    RuntimeState::Reconnecting,
+                    SUPERVISION_UNAVAILABLE,
+                    retry,
+                )
+                .await;
+                true
+            }
+        }
     }
 
     /// Reads the journal of exactly `key`'s generation from a fresh scan.
@@ -1425,16 +1579,21 @@ impl SessionRegistry {
             })
     }
 
+    /// Reconciles `record` with the worker that answers on its socket.
+    ///
+    /// Returns whether the session needs the background re-check, which only
+    /// an unfinished removal intent does.
     async fn reconcile_record(
         &self,
         mut record: SessionRecord,
         candidate: Option<(Worker, InspectSnapshot)>,
-    ) {
+        retry: bool,
+    ) -> bool {
         let id = SessionId(record.session_id.clone());
         let Some((worker, snapshot)) = candidate else {
             self.insert_unavailable_record(record, RuntimeState::Lost, "worker_unavailable")
                 .await;
-            return;
+            return false;
         };
 
         let identity_conflict = record
@@ -1455,7 +1614,7 @@ impl SessionRegistry {
                 "runtime_identity_mismatch",
             )
             .await;
-            return;
+            return false;
         }
         if record.transaction.as_ref().is_some_and(|transaction| {
             transaction.kind == crate::store::TransactionKind::Recover
@@ -1467,12 +1626,11 @@ impl SessionRegistry {
                 "worker_generation_not_advanced",
             )
             .await;
-            return;
+            return false;
         }
 
         if record.desired_state == DesiredState::Removed {
-            self.finish_reconciled_removal(&id, worker, &record).await;
-            return;
+            return Box::pin(self.finish_reconciled_removal(worker, record, retry)).await;
         }
 
         if !matches!(
@@ -1489,7 +1647,7 @@ impl SessionRegistry {
                         "failed to compensate non-live preparing session"
                     );
                 }
-                return;
+                return false;
             }
             let state = if snapshot.phase == RuntimePhase::Exited {
                 RuntimeState::Terminal
@@ -1504,7 +1662,7 @@ impl SessionRegistry {
                 Err(reason) => {
                     self.insert_unavailable_record(record, RuntimeState::Conflict, reason)
                         .await;
-                    return;
+                    return false;
                 }
             }
             terminalize_running_subagents(&mut record.info.subagents, current_time_millis());
@@ -1521,15 +1679,16 @@ impl SessionRegistry {
             }
             self.insert_unavailable_record(record, state, "worker_runtime_terminal")
                 .await;
-            return;
+            return false;
         }
 
         if record.desired_state == DesiredState::Stopped {
             self.finish_reconciled_stop(&id, worker, record).await;
-            return;
+            return false;
         }
 
         self.adopt_live_record(id, worker, record, snapshot).await;
+        false
     }
 
     /// Connects every worker socket under the runtime root.
@@ -2149,40 +2308,71 @@ impl SessionRegistry {
         }
     }
 
+    /// Replays the durable removal intent of `record` through its answering
+    /// worker.
+    ///
+    /// Only a stop that returns the runtime's terminal outcome proves the PTY
+    /// ended; the removal is then finished by [`Self::finish_removal_intent`],
+    /// which retires the exact generation (the worker otherwise retains its
+    /// final output) before the record is deleted. A stop without an outcome
+    /// or a failed stop keeps the session `runtime_supervision_unavailable`
+    /// and returns `true` for the background re-check, which reconnects the
+    /// worker and replays the intent again.
     async fn finish_reconciled_removal(
         &self,
-        id: &SessionId,
         worker: Worker,
-        record: &SessionRecord,
-    ) {
+        record: SessionRecord,
+        retry: bool,
+    ) -> bool {
+        let id = SessionId(record.session_id.clone());
         let transaction_id = record
             .transaction
             .as_ref()
             .map_or_else(|| format!("remove-reconcile-{}", id.0), |tx| tx.id.clone());
-        let Ok(transaction) = pohunek_worker_protocol::TransactionId::new(transaction_id) else {
-            return;
+        let transaction = match pohunek_worker_protocol::TransactionId::new(transaction_id) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                self.insert_unavailable_record(
+                    record,
+                    RuntimeState::Conflict,
+                    &format!("invalid_remove_transaction:{error}"),
+                )
+                .await;
+                return false;
+            }
         };
-        if worker.stop(transaction).await.is_ok() {
-            if let Err(error) = self.cleanup_owned_worktrees_for_removal(id).await {
-                tracing::warn!(
-                    session_id = %id.0,
-                    error = %error,
-                    "failed to finish reconciled worktree removal"
-                );
-                return;
+        match worker.stop(transaction).await {
+            Ok(Some(_exit)) => {}
+            Ok(None) => {
+                tracing::warn!(session_id = %id.0, "worker returned no terminal outcome for the replayed removal");
+                self.mark_pending(
+                    record,
+                    RuntimeState::Reconnecting,
+                    SUPERVISION_UNAVAILABLE,
+                    retry,
+                )
+                .await;
+                return true;
             }
-            if let Err(error) = self.delete_session_record(id).await {
-                tracing::warn!(session_id = %id.0, error = %error, "failed to finish reconciled removal");
-                return;
-            }
-            // A supervision retry finishes the removal of a listed session,
-            // which then leaves the registry like any other removal.
-            let removed = self.inner.sessions.lock().await.remove(id);
-            if let Some(entry) = removed {
-                entry.cancel_runtime_watchers();
-                self.emit(event::SESSION_REMOVED, &entry.info);
+            Err(error) => {
+                tracing::warn!(session_id = %id.0, error = %error, "failed to stop the worker of a replayed removal");
+                self.mark_pending(
+                    record,
+                    RuntimeState::Reconnecting,
+                    SUPERVISION_UNAVAILABLE,
+                    retry,
+                )
+                .await;
+                return true;
             }
         }
+        // `reconcile_logical` already rejected a malformed generation.
+        let generation = super::Generation::from_record(&record.session_id, &record.runtime)
+            .ok()
+            .flatten();
+        let lifecycle = self.lifecycle().ok();
+        self.finish_removal_intent(record, generation.as_ref(), lifecycle.as_ref(), retry)
+            .await
     }
 }
 
@@ -6673,6 +6863,7 @@ while os.getppid() == parent:
                 runtime_root.clone(),
                 root.join("state"),
                 state_root.clone(),
+                root.join("logs"),
             ] {
                 std::fs::create_dir_all(&path).expect("create worker root");
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
@@ -6691,6 +6882,7 @@ while os.getppid() == parent:
                     worker_state_root: Some(state_root),
                     worker_connect_deadline: Duration::from_millis(300),
                     supervision: Some(supervision),
+                    log_dir: Some(root.join("logs")),
                     ..SessionRegistryConfig::default()
                 },
                 Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
@@ -8012,10 +8204,19 @@ while os.getppid() == parent:
                     crate::session::RuntimeHandle::Unavailable(_) => None,
                 })
                 .expect("adopted worker");
-            fixture
-                .registry
-                .finish_reconciled_removal(&SessionId("s-359".to_owned()), adopted, &record)
-                .await;
+            let pending = Box::pin(
+                fixture
+                    .registry
+                    .finish_reconciled_removal(adopted, record, true),
+            )
+            .await;
+
+            assert!(!pending, "a confirmed stop finishes the removal");
+            assert_eq!(
+                fixture.supervisor.retired(),
+                vec![service_id("s-359", TEST_GENERATION)],
+                "the exact generation is retired before its record is deleted"
+            );
 
             fixture
                 .registry
@@ -8036,6 +8237,249 @@ while os.getppid() == parent:
                 }
             };
             assert_eq!(removed.event(), protocol::event::SESSION_REMOVED);
+            server_task.abort();
+        }
+
+        /// Persists a running record of `session_id` (see [`persist_record`])
+        /// carrying a durable removal intent, as `remove` writes it before
+        /// the daemon went away.
+        fn persist_removal_intent(
+            root: &Path,
+            session_id: &str,
+            runtime_id: Option<&str>,
+        ) -> SessionRecord {
+            let mut record = persist_record(root, session_id, runtime_id);
+            record.desired_state = DesiredState::Removed;
+            record.transaction = Some(crate::store::SessionTransaction {
+                id: format!("remove-{session_id}"),
+                kind: crate::store::TransactionKind::Remove,
+                phase: "requested".to_owned(),
+                previous_worker_id: None,
+                previous_runtime_id: None,
+            });
+            Store::new(root.join("data/metadata.jsonl"))
+                .record_session(&record)
+                .expect("persist removal intent");
+            record
+        }
+
+        /// Leaves a worker log family and a resume binding of `record`, the
+        /// state a finished removal must delete.
+        fn seed_removal_leftovers(root: &Path, record: &SessionRecord) {
+            let files = pohunek_logging::config::worker_files(&record.session_id)
+                .expect("safe managed session id");
+            let mut writer = pohunek_logging::Writer::open(
+                &root.join("logs"),
+                files,
+                pohunek_logging::config::worker_policy().expect("valid worker log policy"),
+            )
+            .expect("open worker log family");
+            std::io::Write::write_all(&mut writer, b"{\"worker\":\"running\"}\n")
+                .expect("write worker log");
+            drop(writer);
+            Store::new(root.join("data/metadata.jsonl"))
+                .record_resume(record.recovery.as_ref().expect("recovery"))
+                .expect("persist resume binding");
+        }
+
+        /// Asserts that `session_id` left no record, listing, resume binding,
+        /// or worker log behind.
+        async fn assert_removal_finished(fixture: &Fixture, session_id: &str) {
+            fixture
+                .registry
+                .inspect(&SessionId(session_id.to_owned()))
+                .await
+                .expect_err("the finished removal is not listed");
+            assert!(!recorded(&fixture.root, session_id));
+            assert!(
+                !Store::new(fixture.root.join("data/metadata.jsonl"))
+                    .load_resume()
+                    .expect("load resume bindings")
+                    .iter()
+                    .any(|binding| binding.session_id == session_id),
+                "the resume binding is cleared"
+            );
+            assert!(
+                std::fs::read_dir(fixture.root.join("logs"))
+                    .expect("read log directory")
+                    .next()
+                    .is_none(),
+                "the worker log family is deleted"
+            );
+        }
+
+        #[tokio::test]
+        async fn removal_intent_with_a_terminal_journal_finishes_at_startup() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let record = persist_removal_intent(&fixture.root, "s-370", Some("runtime-s-370"));
+            seed_removal_leftovers(&fixture.root, &record);
+            write_terminal_journal(&fixture.root, "s-370", "runtime-s-370");
+            let id = service_id("s-370", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Unknown, None));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            assert_removal_finished(&fixture, "s-370").await;
+            assert_eq!(fixture.supervisor.retired(), vec![id.clone()]);
+            assert!(!discovered(&fixture.supervisor, &id).await);
+        }
+
+        #[tokio::test]
+        async fn removal_intent_whose_job_ended_finishes_at_startup() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let record = persist_removal_intent(&fixture.root, "s-371", Some("runtime-s-371"));
+            seed_removal_leftovers(&fixture.root, &record);
+            write_live_journal(
+                &fixture.root,
+                "s-371",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-371"),
+            );
+            let id = service_id("s-371", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            assert_removal_finished(&fixture, "s-371").await;
+            assert_eq!(fixture.supervisor.retired(), vec![id]);
+        }
+
+        #[tokio::test]
+        async fn removal_intent_whose_generation_cannot_be_retired_is_retried() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let record = persist_removal_intent(&fixture.root, "s-372", Some("runtime-s-372"));
+            seed_removal_leftovers(&fixture.root, &record);
+            write_terminal_journal(&fixture.root, "s-372", "runtime-s-372");
+            let id = service_id("s-372", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Stopped, None));
+            fixture.supervisor.script_retire_unavailable(id.clone());
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-372").await;
+            assert_eq!(runtime.state, RuntimeState::Reconnecting);
+            assert_eq!(
+                runtime.loss_reason.as_deref(),
+                Some(SUPERVISION_UNAVAILABLE)
+            );
+            assert_eq!(
+                durable_desired_state(&fixture.root, "s-372"),
+                Some(DesiredState::Removed),
+                "an unretired generation keeps the removal intent"
+            );
+            assert_eq!(retire_count(&fixture.supervisor, &id), 1);
+
+            wait_removed(&fixture.registry, "s-372").await;
+            assert_removal_finished(&fixture, "s-372").await;
+            assert_eq!(retire_count(&fixture.supervisor, &id), 2);
+        }
+
+        #[tokio::test]
+        async fn ended_generation_is_lost_only_after_its_job_is_retired() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            persist_record(&fixture.root, "s-373", Some("runtime-s-373"));
+            write_live_journal(
+                &fixture.root,
+                "s-373",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-373"),
+            );
+            let id = service_id("s-373", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            fixture.supervisor.script_retire_unavailable(id.clone());
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-373").await;
+            assert_eq!(runtime.state, RuntimeState::Reconnecting);
+            assert_eq!(
+                runtime.loss_reason.as_deref(),
+                Some(SUPERVISION_UNAVAILABLE)
+            );
+            assert!(discovered(&fixture.supervisor, &id).await);
+
+            let runtime = wait_state(&fixture.registry, "s-373", RuntimeState::Lost).await;
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            assert_eq!(retire_count(&fixture.supervisor, &id), 2);
+            assert!(!discovered(&fixture.supervisor, &id).await);
+        }
+
+        #[tokio::test]
+        async fn replayed_removal_retires_the_generation_and_cleans_up() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let runtime_root = fixture.root.join("runtime/workers");
+            let (controller, runtime_id, _child_pid, server_task) =
+                spawn_initialized_worker(&fixture.root, &runtime_root, "s-374", "worker-s-374")
+                    .await;
+            let record = persist_removal_intent(&fixture.root, "s-374", Some(runtime_id.as_str()));
+            seed_removal_leftovers(&fixture.root, &record);
+            drop(controller);
+            let id = service_id("s-374", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Running, None));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            assert_removal_finished(&fixture, "s-374").await;
+            assert_eq!(fixture.supervisor.retired(), vec![id]);
+            server_task.abort();
+        }
+
+        #[tokio::test]
+        async fn replayed_removal_keeps_its_intent_until_the_generation_is_retired() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let runtime_root = fixture.root.join("runtime/workers");
+            let (controller, runtime_id, _child_pid, server_task) =
+                spawn_initialized_worker(&fixture.root, &runtime_root, "s-375", "worker-s-375")
+                    .await;
+            let record = persist_removal_intent(&fixture.root, "s-375", Some(runtime_id.as_str()));
+            seed_removal_leftovers(&fixture.root, &record);
+            drop(controller);
+            let id = service_id("s-375", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Running, None));
+            fixture.supervisor.script_retire_unavailable(id.clone());
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-375").await;
+            assert_eq!(runtime.state, RuntimeState::Reconnecting);
+            assert_eq!(
+                runtime.loss_reason.as_deref(),
+                Some(SUPERVISION_UNAVAILABLE)
+            );
+            assert_eq!(
+                durable_desired_state(&fixture.root, "s-375"),
+                Some(DesiredState::Removed),
+                "a stopped worker whose generation survived keeps the removal intent"
+            );
+            assert_eq!(retire_count(&fixture.supervisor, &id), 1);
+
+            wait_removed(&fixture.registry, "s-375").await;
+            assert_removal_finished(&fixture, "s-375").await;
+            assert_eq!(retire_count(&fixture.supervisor, &id), 2);
             server_task.abort();
         }
 
@@ -9152,6 +9596,46 @@ while os.getppid() == parent:
             assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
             wait_gone(descendant).await;
             assert_eq!(fixture.supervisor.retired(), vec![job]);
+        }
+
+        #[tokio::test]
+        async fn crashed_session_is_lost_only_after_its_job_is_retired() {
+            let fixture = fixture(SHORT_CONNECT);
+            let (created, job, descendant) = fixture.create().await;
+            fixture.supervisor.script_retire_unavailable(job.clone());
+
+            fixture.crash(&created.id).await;
+            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            loop {
+                let runtime = fixture
+                    .registry
+                    .inspect(&created.id)
+                    .await
+                    .expect("session stays visible")
+                    .runtime
+                    .expect("runtime");
+                assert_ne!(
+                    runtime.state,
+                    RuntimeState::Lost,
+                    "a crash whose job survived is never lost"
+                );
+                if runtime.state == RuntimeState::Reconnecting
+                    && runtime.loss_reason.as_deref() == Some(SUPERVISION_UNAVAILABLE)
+                {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "runtime never waited for the failed retirement: {runtime:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(fixture.supervisor.retired(), vec![job.clone()]);
+
+            let runtime = fixture.wait_for(&created.id, RuntimeState::Lost).await;
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            assert_eq!(fixture.supervisor.retired(), vec![job.clone(), job]);
+            wait_gone(descendant).await;
         }
 
         impl Fixture {

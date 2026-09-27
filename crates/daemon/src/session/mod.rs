@@ -672,6 +672,15 @@ struct RuntimeExit {
     success: bool,
 }
 
+/// What [`SessionRegistry::release_removed_session`] cleaned up.
+#[derive(Debug)]
+struct ReleasedSession {
+    /// Whether a listed entry left the registry.
+    evicted: bool,
+    /// The owned worktrees the removal deleted or left behind.
+    worktrees: WorktreeCleanup,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeWatchIdentity {
     worker_id: String,
@@ -2742,7 +2751,35 @@ impl SessionRegistry {
             false
         };
 
-        let (cleanup_warnings, cleanup) = self.cleanup_owned_worktrees_for_removal(id).await?;
+        let released = self.release_removed_session(id).await?;
+        Ok(SessionRemoveResult {
+            removed: released.evicted,
+            stopped,
+            worktrees_removed: u32::try_from(released.worktrees.removed).unwrap_or(u32::MAX),
+            worktrees_failed: u32::try_from(released.worktrees.failed).unwrap_or(u32::MAX),
+        })
+    }
+
+    /// Deletes everything a removed session owns once its runtime is proven
+    /// gone: owned worktrees, the worker log family, the registry entry, the
+    /// resume binding, and finally the durable record.
+    ///
+    /// Shared by [`Self::remove`] and the reconciliation that finishes a
+    /// durable removal intent, so both leave the same state behind. The
+    /// record is deleted even when no entry is listed (startup reconciliation
+    /// runs before the session is installed), and `session_removed` is
+    /// emitted only for an evicted entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the worktree, log, or store error that stopped the cleanup.
+    /// Every step is idempotent and the durable record is deleted last, so a
+    /// failed cleanup keeps the removal intent for a later attempt.
+    async fn release_removed_session(
+        &self,
+        id: &SessionId,
+    ) -> Result<ReleasedSession, ProtocolError> {
+        let (cleanup_warnings, worktrees) = self.cleanup_owned_worktrees_for_removal(id).await?;
         if !cleanup_warnings.is_empty() {
             let mut sessions = self.inner.sessions.lock().await;
             if let Some(entry) = sessions.get_mut(id) {
@@ -2750,49 +2787,37 @@ impl SessionRegistry {
             }
         }
         // The entry is about to leave the map and its warnings with it, so a
-        // checkout that survived is reported on the result as well.
-        if cleanup.failed > 0 {
+        // checkout that survived is reported to the caller as well.
+        if worktrees.failed > 0 {
             warn!(
                 session_id = %id.0,
-                worktrees_failed = cleanup.failed,
+                worktrees_failed = worktrees.failed,
                 "session removal left an owned worktree on disk"
             );
         }
-        let worktrees_removed = u32::try_from(cleanup.removed).unwrap_or(u32::MAX);
-        let worktrees_failed = u32::try_from(cleanup.failed).unwrap_or(u32::MAX);
 
-        // The PTY has stopped above, so cleanup removes the accumulated family.
-        // A retained terminal worker may still emit a final control diagnostic,
+        // The PTY has ended, so cleanup removes the accumulated family. A
+        // retained terminal worker may still emit a final control diagnostic,
         // but the shared writer keeps any such file within the same hard cap.
         self.delete_session_logs(id).await?;
 
-        let info = {
-            let mut sessions = self.inner.sessions.lock().await;
-            match sessions.remove(id) {
-                Some(entry) => entry.info,
-                // A concurrent `remove` won the race and already evicted it.
-                None => {
-                    return Ok(SessionRemoveResult {
-                        removed: false,
-                        stopped,
-                        worktrees_removed,
-                        worktrees_failed,
-                    })
-                }
-            }
-        };
+        // A concurrent eviction (another removal path) leaves no entry here.
+        let evicted = self.inner.sessions.lock().await.remove(id);
+        if let Some(entry) = &evicted {
+            entry.cancel_runtime_watchers();
+        }
 
         // The entry is gone, so this re-reads as "no live session" and clears any
         // lingering resume binding (idempotent for a session that already dropped
         // its binding on exit or stop).
         self.persist_resume_binding(id).await;
         self.delete_session_record(id).await?;
-        self.emit(event::SESSION_REMOVED, &info);
-        Ok(SessionRemoveResult {
-            removed: true,
-            stopped,
-            worktrees_removed,
-            worktrees_failed,
+        if let Some(entry) = &evicted {
+            self.emit(event::SESSION_REMOVED, &entry.info);
+        }
+        Ok(ReleasedSession {
+            evicted: evicted.is_some(),
+            worktrees,
         })
     }
 
@@ -2803,10 +2828,9 @@ impl SessionRegistry {
     /// generation is retired. An unreachable worker that is not proven gone
     /// (see [`unreachable_live_state`]) may still own a live PTY, and deleting
     /// its record alone would leave it running unrecorded: every journaled
-    /// worker of the session is collected from a fresh journal scan
-    /// ([`Self::removal_worker_processes`]), the generation is retired, and
-    /// those workers must then be proven gone
-    /// ([`crate::runtime::lifecycle::Lifecycle::retire_for_removal`]). A lost
+    /// worker of the session is collected from a fresh journal scan, the
+    /// generation is retired, and those workers must then be proven gone
+    /// ([`Self::retire_generation_for_removal`]). A lost
     /// runtime was already classified ended and is left alone.
     ///
     /// # Errors
@@ -2835,11 +2859,9 @@ impl SessionRegistry {
         };
         let lifecycle = self.lifecycle()?;
         if unreachable {
-            let workers = self.removal_worker_processes(id, &job).await?;
-            return lifecycle
-                .retire_for_removal(&job, &workers)
-                .await
-                .map_err(crate::runtime::lifecycle::PreviousLive::into_error);
+            return self
+                .retire_generation_for_removal(id, &job, &lifecycle)
+                .await;
         }
         lifecycle.retire(&job).await.map_err(|error| {
             runtime_error(

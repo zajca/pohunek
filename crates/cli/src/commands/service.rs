@@ -4,7 +4,7 @@
 //! [`crate::service`]. Every subcommand is local to this machine and ignores
 //! the global `--host`.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -160,15 +160,15 @@ fn render_upgrade(report: &report::UpgradeReport) -> String {
     }
     if report.unchanged {
         let _ = writeln!(text, "pohunek {} is already active", report.to_version);
-        return text;
+    } else {
+        let _ = writeln!(
+            text,
+            "upgraded pohunek {} -> {}{}",
+            report.from_version,
+            report.to_version,
+            if report.resumed { ", resumed" } else { "" }
+        );
     }
-    let _ = writeln!(
-        text,
-        "upgraded pohunek {} -> {}{}",
-        report.from_version,
-        report.to_version,
-        if report.resumed { ", resumed" } else { "" }
-    );
     for version in &report.removed_versions {
         let _ = writeln!(text, "removed version {version}");
     }
@@ -414,6 +414,34 @@ mod tests {
         });
         assert!(text.contains("pending    install 1.0.0 stopped after step config"));
         assert!(text.contains("not installed (/c/pohunek/service.toml is missing)"));
+    }
+
+    #[test]
+    fn an_unchanged_upgrade_renders_its_version_cleanup() {
+        let text = render_upgrade(&report::UpgradeReport {
+            from_version: "2.0.0".to_owned(),
+            to_version: "2.0.0".to_owned(),
+            unchanged: true,
+            resumed: false,
+            rolled_back: None,
+            removed_versions: vec!["1.0.0".to_owned()],
+            kept_versions: vec![report::KeptVersion {
+                version: "1.5.0".to_owned(),
+                reason: "a worker may still run it".to_owned(),
+            }],
+            gc_error: Some("journals unreadable".to_owned()),
+        });
+        assert!(text.contains("pohunek 2.0.0 is already active"), "{text}");
+        assert!(!text.contains("upgraded"), "{text}");
+        assert!(text.contains("removed version 1.0.0"), "{text}");
+        assert!(
+            text.contains("kept version 1.5.0: a worker may still run it"),
+            "{text}"
+        );
+        assert!(
+            text.contains("warning: old versions were not cleaned up: journals unreadable"),
+            "{text}"
+        );
     }
 
     /// `packaging/install-daemon.sh` detects a pending install by matching

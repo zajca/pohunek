@@ -56,7 +56,9 @@
 //! referenced by the journal of a worker that may still run, named by a
 //! registered worker job, executed by a running process, nor holding the
 //! running CLI are removed. When worker jobs cannot be discovered, every
-//! version is kept.
+//! version is kept. An upgrade to the already active version restarts
+//! nothing but runs the same collection, so a version kept for a reason that
+//! has since ended is removed by rerunning the upgrade.
 //!
 //! # Concurrency
 //!
@@ -360,15 +362,17 @@ impl<'a> Engine<'a> {
             layout::verify_existing(&layout, &staged, version)?;
             layout::discard(&layout, &staged)?;
             layout::install_cli(&layout, version)?;
+            let (removed_versions, kept_versions, gc_error) =
+                self.collect_garbage_reported(&layout, version).await;
             return Ok(UpgradeReport {
                 from_version,
                 to_version: version.to_owned(),
                 unchanged: true,
                 resumed: false,
                 rolled_back,
-                removed_versions: Vec::new(),
-                kept_versions: Vec::new(),
-                gc_error: None,
+                removed_versions,
+                kept_versions,
+                gc_error,
             });
         }
         let mut record = if let Some(record) = resume {
@@ -393,10 +397,7 @@ impl<'a> Engine<'a> {
         let result = self.run_steps(&mut record, &layout, staged, &target).await;
         self.settle(&record, result).await?;
         let (removed_versions, kept_versions, gc_error) =
-            match self.collect_garbage(&layout, version).await {
-                Ok((removed, kept)) => (removed, kept, None),
-                Err(error) => (Vec::new(), Vec::new(), Some(error.to_string())),
-            };
+            self.collect_garbage_reported(&layout, version).await;
         Ok(UpgradeReport {
             from_version,
             to_version: version.to_owned(),
@@ -1114,6 +1115,21 @@ impl<'a> Engine<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Runs [`Self::collect_garbage`] for an upgrade report.
+    ///
+    /// The upgrade itself already succeeded, so a collection failure is
+    /// reported beside it instead of failing the command.
+    async fn collect_garbage_reported(
+        &self,
+        layout: &InstallLayout,
+        active: &str,
+    ) -> (Vec<String>, Vec<KeptVersion>, Option<String>) {
+        match self.collect_garbage(layout, active).await {
+            Ok((removed, kept)) => (removed, kept, None),
+            Err(error) => (Vec::new(), Vec::new(), Some(error.to_string())),
+        }
     }
 
     /// Deletes version directories nothing references any more.

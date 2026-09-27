@@ -2,6 +2,11 @@
 
 ## Unreleased (2026-09-27)
 
+- Documented that a session becomes `lost` only after its ended job is retired
+  (otherwise `reconnecting`, `runtime_supervision_unavailable`, retried), and
+  that reconciliation finishes an interrupted removal through the same
+  retirement and cleanup as `session rm`, keeping the session listed and
+  retried until they succeed.
 - Documented that `session rm` of a `conflict`, `reconnecting`, or
   `incompatible` session retires the worker job of its recorded generation
   through the service manager before deleting the record, refuses a record that

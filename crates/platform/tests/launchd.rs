@@ -447,6 +447,64 @@ async fn discovery_ignores_foreign_other_namespace_and_malformed_definitions() {
 }
 
 #[tokio::test]
+async fn strict_discovery_refuses_only_rejected_definitions_of_its_namespace() {
+    let mut fixture = Fixture::new();
+    let other_namespace = Namespace::derive(uid(), &fixture.root.join("other"), &fixture.root);
+    let other = other_namespace.worker_label(&key("s-2101", "abcd2345"));
+    fixture.plant(&format!("{other}.plist"), b"not a plist", None);
+    fixture.plant("com.example.unrelated.plist", b"not a plist", None);
+    let malformed = fixture.namespace.worker_label(&key("s-2102", "efgh2345"));
+    fixture.plant(&format!("{malformed}.plist"), b"not a plist", None);
+    let mismatched = fixture.namespace.worker_label(&key("s-2103", "ijkl2345"));
+    fixture.plant(
+        &format!("{mismatched}.plist"),
+        &plist_document(&other, &["/bin/sleep", "600"]),
+        None,
+    );
+    let unsafe_mode = fixture.namespace.worker_label(&key("s-2104", "mnop2345"));
+    fixture.plant(
+        &format!("{unsafe_mode}.plist"),
+        &plist_document(&unsafe_mode, &["/bin/sleep", "600"]),
+        None,
+    );
+    std::fs::set_permissions(
+        fixture.definitions.join(format!("{unsafe_mode}.plist")),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .expect("unsafe definition mode set");
+
+    // A rejected definition of this namespace may belong to a loaded job whose
+    // process is never matched, so the destructive discovery refuses it.
+    for label in [&malformed, &mismatched, &unsafe_mode] {
+        assert!(
+            matches!(
+                fixture.supervisor.discover_strict().await,
+                Err(Error::InvalidData {
+                    operation: "discover",
+                    ..
+                })
+            ),
+            "{label} must refuse the strict discovery"
+        );
+        assert!(fixture
+            .supervisor
+            .discover()
+            .await
+            .expect("the lenient discovery only warns")
+            .is_empty());
+        std::fs::remove_file(fixture.definitions.join(format!("{label}.plist")))
+            .expect("rejected definition removed");
+    }
+    // Foreign and other-namespace definitions never refuse it.
+    assert!(fixture
+        .supervisor
+        .discover_strict()
+        .await
+        .expect("foreign definitions are ignored")
+        .is_empty());
+}
+
+#[tokio::test]
 async fn an_absent_domain_is_domain_unavailable() {
     let fixture = Fixture::new();
     let supervisor = LaunchdSupervisor::new(

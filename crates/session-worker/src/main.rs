@@ -1,6 +1,6 @@
 //! Runs one durable pohunek session worker.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 use std::fmt::Write as _;
 use std::fs;
@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use pohunek_paths::{validate_socket_path, BasePaths, Platform, SocketKind};
+use pohunek_service_config::ServiceConfig;
 use pohunek_session_worker::{load_service_config, Server, ServerArgs, WorkerConfig, WorkerError};
 use tracing::{event, Level};
 use tracing_subscriber::prelude::*;
@@ -65,16 +66,19 @@ fn print_version() -> ExitCode {
 async fn run() -> Result<(), WorkerError> {
     let cli = Cli::parse(std::env::args().skip(1))?;
     let paths = BasePaths::resolve()?;
-    if let Some(service_config) = &cli.service_config {
-        let executable =
-            std::env::current_exe().map_err(|source| WorkerError::Executable { source })?;
-        load_service_config(
-            service_config,
-            rustix::process::geteuid().as_raw(),
-            &paths,
-            &executable,
-        )?;
-    }
+    let service = match &cli.service_config {
+        Some(service_config) => {
+            let executable =
+                std::env::current_exe().map_err(|source| WorkerError::Executable { source })?;
+            Some(load_service_config(
+                service_config,
+                rustix::process::geteuid().as_raw(),
+                &paths,
+                &executable,
+            )?)
+        }
+        None => None,
+    };
     let worker_id = match cli.worker_id {
         Some(worker_id) => worker_id,
         None => generate_worker_id()?,
@@ -101,7 +105,7 @@ async fn run() -> Result<(), WorkerError> {
         socket_path,
         journal_path,
         daemon_socket_path,
-        config: WorkerConfig::new(),
+        config: worker_config(service.as_ref()),
     })
     .await?;
     notify_systemd("READY=1\nSTATUS=Waiting for daemon initialization")?;
@@ -114,6 +118,21 @@ async fn run() -> Result<(), WorkerError> {
         "worker bootstrap ready for {{session.id}} as {{worker.id}} generation {{worker.generation}}",
     );
     server.serve().await
+}
+
+/// Builds the worker policy for a run with or without `--service-config`.
+///
+/// A supervised worker expires an uninitialized bootstrap after the recorded
+/// `deadlines.worker_initialize_ms`, the same window the daemon waits before
+/// retiring its job. A dev/test worker started as a direct child keeps the
+/// [`WorkerConfig::new`] bootstrap window, which the daemon's subprocess
+/// contract (`DEV_WORKER_INITIALIZE`) deliberately exceeds.
+fn worker_config(service: Option<&ServiceConfig>) -> WorkerConfig {
+    let mut config = WorkerConfig::new();
+    if let Some(service) = service {
+        config.initialize_deadline = service.deadlines().worker_initialize;
+    }
+    config
 }
 
 #[derive(Debug)]
@@ -270,11 +289,13 @@ fn generate_worker_id() -> Result<String, WorkerError> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
-    use pohunek_session_worker::WorkerError;
+    use pohunek_service_config::{ConfigSpec, Deadlines, ServiceConfig};
+    use pohunek_session_worker::{WorkerConfig, WorkerError};
 
-    use super::{generate_worker_id, Cli};
+    use super::{generate_worker_id, worker_config, Cli};
 
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
@@ -377,6 +398,54 @@ mod tests {
         .expect_err("repeated argument must fail");
         Cli::parse(arguments(&["--session-id", "s-42", "--worker-generation"]))
             .expect_err("valueless argument must fail");
+    }
+
+    /// A service configuration whose deadlines differ from every worker default.
+    fn service_config(worker_initialize: Duration) -> ServiceConfig {
+        let other = worker_initialize + Duration::from_millis(1);
+        ServiceConfig::new(ConfigSpec {
+            prefix: PathBuf::from("/home/u/.local"),
+            active_version: "1.2.3".to_owned(),
+            uid: 1000,
+            state_root: PathBuf::from("/home/u/.local/state/pohunek"),
+            runtime_root: PathBuf::from("/run/user/1000/pohunek"),
+            deadlines: Deadlines {
+                worker_connect: other,
+                worker_initialize,
+                launchctl_command: other,
+                worker_exit_timeout: other,
+                daemon_exit_timeout: other,
+                daemon_restart_throttle: other,
+            },
+            environment_allowlist: vec!["PATH".to_owned()],
+            sweep_grace: other,
+            open_files: 8192,
+        })
+        .expect("valid service configuration")
+    }
+
+    #[test]
+    fn a_supervised_worker_uses_the_recorded_initialize_deadline() {
+        let defaults = WorkerConfig::new();
+        let recorded = defaults.initialize_deadline + Duration::from_secs(15);
+
+        let config = worker_config(Some(&service_config(recorded)));
+
+        assert_eq!(config.initialize_deadline, recorded);
+        assert_eq!(
+            config,
+            WorkerConfig {
+                initialize_deadline: recorded,
+                ..defaults
+            },
+            "only the bootstrap window follows service.toml"
+        );
+        config.validate().expect("valid worker policy");
+    }
+
+    #[test]
+    fn a_dev_worker_keeps_the_default_initialize_deadline() {
+        assert_eq!(worker_config(None), WorkerConfig::new());
     }
 
     #[test]

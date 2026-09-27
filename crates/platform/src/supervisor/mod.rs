@@ -419,9 +419,10 @@ pub trait Supervisor: std::fmt::Debug + Send + Sync {
     /// this instead of [`Supervisor::discover`]: a job omitted from a partial
     /// result may still be registered and execute, and treating the list as
     /// complete would let such a caller delete the version that job runs
-    /// from. Backends whose enumeration can skip a job fail with
-    /// [`Error::Race`]; the default wraps [`Supervisor::discover`], which
-    /// reports every job of the namespace.
+    /// from. Backends fail with [`Error::Race`] when a job's inspection raced
+    /// and with [`Error::InvalidData`] when an entry of the namespace was
+    /// rejected, because either may hide a registered job; the default wraps
+    /// [`Supervisor::discover`], which reports every job of the namespace.
     fn discover_strict(&self) -> Operation<'_, Vec<ServiceObservation>> {
         self.discover()
     }

@@ -678,10 +678,16 @@ impl Lifecycle<'_> {
     /// decoded, or matched to its path proves nothing about that process and
     /// is refused as ambiguous.
     ///
+    /// A present job is retired only when it is provably the previous
+    /// generation's ([`job_identity_mismatch`]): retirement acts on the service
+    /// ID, which a foreign or rewritten job can hold even when the journal
+    /// proves the previous runtime ended.
+    ///
     /// # Errors
     ///
     /// Returns [`PreviousLive`] when the previous generation cannot be proven
-    /// ended; nothing is started or killed in that case.
+    /// ended, with [`IDENTITY_MISMATCH`] when its journal or job is not the
+    /// previous generation's; nothing is started or killed in that case.
     pub async fn retire_previous(&self, previous: &PreviousGeneration) -> Result<(), PreviousLive> {
         let journal = match previous.worker_id.as_deref() {
             None => None,
@@ -725,6 +731,17 @@ impl Lifecycle<'_> {
         let observation = self.inspect(generation).await.map_err(|error| {
             PreviousLive::Unavailable(supervision_unavailable(generation, &error))
         })?;
+        // Retirement stops whatever job holds the service ID, so a job that is
+        // not provably this generation's is refused rather than retired.
+        if let Some(observation) = &observation {
+            let worker = journal.as_ref().map(JournalFacts::worker_identity);
+            if let Some(detail) = job_identity_mismatch(observation, generation, worker) {
+                return Err(PreviousLive::Ambiguous(lifecycle_error(
+                    IDENTITY_MISMATCH,
+                    detail,
+                )));
+            }
+        }
         let job_live = observation.as_ref().is_some_and(observation_live);
         // A job that only lacks a process proves nothing either way, so the
         // journaled worker process decides.
@@ -834,15 +851,9 @@ impl Lifecycle<'_> {
         let Some(journal) = journal else {
             return Ok(());
         };
-        let identity = ProcessIdentity {
-            pid: journal.worker_pid,
-            start_identity: journal
-                .worker_start_identity
-                .parse::<StartIdentity>()
-                .map_err(|error| {
-                    PreviousLive::Ambiguous(lifecycle_error(IDENTITY_MISMATCH, error.to_string()))
-                })?,
-        };
+        let identity = journal.worker_identity().map_err(|detail| {
+            PreviousLive::Ambiguous(lifecycle_error(IDENTITY_MISMATCH, detail))
+        })?;
         match self.inspector.is_running(identity) {
             Ok(false) => Ok(()),
             Ok(true) => Err(PreviousLive::Ambiguous(lifecycle_error(
@@ -1024,6 +1035,54 @@ impl Lifecycle<'_> {
     }
 }
 
+/// Returns why a present job is not exactly `generation`'s job, if it is not.
+///
+/// The backend's recorded definition must run the generation's executable
+/// with its `--session-id` and `--worker-generation` arguments, and a main
+/// process must be the journaled worker `worker` (its parsed identity, or why
+/// the journaled identity is malformed). Facts the backend or journal lacks
+/// are not compared.
+pub(crate) fn job_identity_mismatch(
+    observation: &ServiceObservation,
+    generation: &Generation,
+    worker: Option<Result<ProcessIdentity, String>>,
+) -> Option<String> {
+    if let Some(definition) = &observation.definition {
+        if definition.executable != generation.executable() {
+            return Some(format!(
+                "job {} runs {} instead of {}",
+                observation.id,
+                definition.executable.display(),
+                generation.executable().display()
+            ));
+        }
+        let names = |flag: &str, value: &str| {
+            definition
+                .arguments
+                .windows(2)
+                .any(|pair| pair[0] == flag && pair[1] == value)
+        };
+        if !names("--session-id", generation.session_id())
+            || !names("--worker-generation", generation.generation())
+        {
+            return Some(format!(
+                "job {} does not name session {} generation {}",
+                observation.id,
+                generation.session_id(),
+                generation.generation()
+            ));
+        }
+    }
+    match (observation.process, worker) {
+        (Some(_), Some(Err(detail))) => Some(detail),
+        (Some(process), Some(Ok(journal))) if process != journal => Some(format!(
+            "job {} main process {} is not the journaled worker {}",
+            observation.id, process.pid, journal.pid
+        )),
+        _ => None,
+    }
+}
+
 /// Whether an observed job may still have or produce a worker process.
 pub(crate) fn observation_live(observation: &ServiceObservation) -> bool {
     observation.process.is_some()
@@ -1072,6 +1131,18 @@ struct JournalFacts {
 }
 
 impl JournalFacts {
+    /// Parses the journaled worker process identity.
+    fn worker_identity(&self) -> Result<ProcessIdentity, String> {
+        let start_identity = self
+            .worker_start_identity
+            .parse::<StartIdentity>()
+            .map_err(|error| format!("worker journal start identity is malformed: {error}"))?;
+        Ok(ProcessIdentity {
+            pid: self.worker_pid,
+            start_identity,
+        })
+    }
+
     /// Whether the journal proves the PTY runtime is no longer running.
     fn runtime_ended(&self) -> bool {
         matches!(

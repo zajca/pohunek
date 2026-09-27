@@ -326,7 +326,15 @@ not be confirmed). It reports `runtime_supervision_ambiguous` (`conflict`) for
 a present job whose worker does not answer, `runtime_identity_mismatch`
 (`conflict`) for a job whose definition or process does not match the record,
 and `runtime_supervision_unavailable` (`reconnecting`) while the service manager
-cannot be inspected. The last three kill nothing.
+cannot be inspected. The last three kill nothing. A session is reported `lost`
+only after the service manager retired its ended job; while that retirement
+fails it stays `reconnecting` with `runtime_supervision_unavailable` and is
+retried. A removal interrupted by a daemon restart is finished by
+reconciliation through the same steps as `session rm` (retire the recorded
+generation and prove its workers gone, then delete worktrees, logs, the resume
+binding, and the record); until those succeed the session stays listed with
+`runtime_supervision_unavailable` or `runtime_supervision_ambiguous` and is
+retried.
 
 ## Retention
 

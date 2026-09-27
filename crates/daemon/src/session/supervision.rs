@@ -25,7 +25,7 @@ use protocol::{RuntimeInventoryEntry, RuntimeInventoryStatus, RuntimeState};
 use super::reconcile::JournalEvidence;
 use super::{SessionId, SessionRecord, SessionRegistry, SessionRegistryInner};
 use crate::runtime::lifecycle::{
-    observation_live, observation_unproven, Generation, Lifecycle, SUPERVISION_AMBIGUOUS,
+    self, observation_live, observation_unproven, Generation, Lifecycle, SUPERVISION_AMBIGUOUS,
     SUPERVISION_UNAVAILABLE,
 };
 
@@ -139,48 +139,14 @@ impl JournalWorker<'_> {
 
 /// Returns why a present job is not exactly `generation`'s job, if it is not.
 ///
-/// The backend's recorded definition must run the record's executable with
-/// the session's `--session-id` and `--worker-generation` arguments, and its
-/// main process must be the worker the journal names.
+/// Applies [`lifecycle::job_identity_mismatch`] with the journaled worker's
+/// process identity.
 pub(super) fn job_identity_mismatch(
     observation: &ServiceObservation,
     generation: &Generation,
     worker: Option<&JournalWorker<'_>>,
 ) -> Option<String> {
-    if let Some(definition) = &observation.definition {
-        if definition.executable != generation.executable() {
-            return Some(format!(
-                "job {} runs {} instead of {}",
-                observation.id,
-                definition.executable.display(),
-                generation.executable().display()
-            ));
-        }
-        let names = |flag: &str, value: &str| {
-            definition
-                .arguments
-                .windows(2)
-                .any(|pair| pair[0] == flag && pair[1] == value)
-        };
-        if !names("--session-id", generation.session_id())
-            || !names("--worker-generation", generation.generation())
-        {
-            return Some(format!(
-                "job {} does not name session {} generation {}",
-                observation.id,
-                generation.session_id(),
-                generation.generation()
-            ));
-        }
-    }
-    match (observation.process, worker.map(JournalWorker::identity)) {
-        (Some(_), Some(Err(detail))) => Some(detail),
-        (Some(process), Some(Ok(journal))) if process != journal => Some(format!(
-            "job {} main process {} is not the journaled worker {}",
-            observation.id, process.pid, journal.pid
-        )),
-        _ => None,
-    }
+    lifecycle::job_identity_mismatch(observation, generation, worker.map(JournalWorker::identity))
 }
 
 /// Classification of a generation whose worker socket yielded no worker.
