@@ -10,7 +10,7 @@
 
 // Rust guideline compliant 2026-09-25
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use pohunek_paths::{valid_worker_id, valid_worker_session_id, BasePaths, InstallLayout};
@@ -361,18 +361,6 @@ impl Usage {
             return Some(format!("worker jobs could not be attributed: {error}"));
         }
         None
-    }
-
-    // TODO: unused, consider removing
-    /// Returns every version referenced by journals, jobs, or processes.
-    #[must_use]
-    pub fn referenced(&self) -> BTreeSet<String> {
-        self.journals
-            .keys()
-            .chain(self.jobs.keys())
-            .chain(self.processes.keys())
-            .cloned()
-            .collect()
     }
 }
 

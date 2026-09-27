@@ -863,14 +863,21 @@ but observation returns `worker_feature_unavailable`.
 
 ### Active-Agent Hook Payloads
 
-Managed PTY children inherit these reserved environment values:
+Managed PTY children inherit these reserved environment values. The worker
+injects them itself, after any base, profile, or daemon-supplied variable, so
+nothing else can shadow them:
 
 - `POHUNEK_ENV=1`
 - `POHUNEK_SESSION_ID`
 - `POHUNEK_WORKER_ID`
+- `POHUNEK_RUNTIME_ID`
 - `POHUNEK_WORKER_SOCKET_PATH`
-- `POHUNEK_WORKER_PROTOCOL_VERSION`
+- `POHUNEK_WORKER_HOOK_PROTOCOL_VERSION` (private worker-hook protocol version)
 - `POHUNEK_SOCKET_PATH` for daemon-targeted notification delivery
+- `POHUNEK_PROTOCOL_VERSION` (public daemon RPC protocol version required by
+  the provider hooks)
+- `POHUNEK_NATIVE_REFERENCE_KIND` when, and only when, the launch carries a
+  native reference kind
 
 A managed child does not inherit the daemon's or the worker's process
 environment. Its environment is built from an empty base: the allowlisted
@@ -878,10 +885,15 @@ variables the daemon passes from its own environment (the `[environment]
 allowlist` of `service.toml`, by default `PATH`, `HOME`, `USER`, `LOGNAME`,
 `SHELL`, `LANG`, `LC_*`, `TMPDIR`, `SSH_AUTH_SOCK`, `DISPLAY`,
 `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, and `XDG_*`), `TERM`, the agent
-profile's environment, and the reserved values above. Service-manager variables
-(`NOTIFY_SOCKET`, `WATCHDOG_*`, `INVOCATION_ID`, `JOURNAL_STREAM`,
+profile's environment, and the reserved values above. Ambient `POHUNEK_*`
+markers coming from the daemon or the profile are stripped first, so only the
+worker's authoritative reserved values reach the child. Service-manager
+variables (`NOTIFY_SOCKET`, `WATCHDOG_*`, `INVOCATION_ID`, `JOURNAL_STREAM`,
 `MANAGERPID`, `SYSTEMD_EXEC_PID`, `XPC_SERVICE_NAME`, `XPC_FLAGS`,
-`__CFBundleIdentifier`, `LaunchInstanceID`) are always removed. A worker kept
+`__CFBundleIdentifier`, `LaunchInstanceID`) and the worker-authentication
+tokens `POHUNEK_CONTROLLER_TOKEN` and `POHUNEK_BOOTSTRAP_TOKEN` are always
+removed, even when a profile or an allowlist would supply them; the token
+values never reach agent code. A worker kept
 running across an upgrade from the previous private protocol version keeps
 starting its session's children from its own sanitized environment until that
 session gets a new worker generation.

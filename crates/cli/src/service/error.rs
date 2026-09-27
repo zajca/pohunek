@@ -3,7 +3,7 @@
 // Rust guideline compliant 2026-09-26
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use pohunek_platform::filesystem::FsError;
 use pohunek_platform::supervisor;
@@ -54,17 +54,18 @@ pub enum Error {
     #[error(transparent)]
     Config(#[from] pohunek_service_config::ConfigError),
 
-    /// A directory the installer writes into is writable by other users.
-    #[error(
-        "{} is not a trusted directory: {detail}; run `chmod go-w {}` (or fix its owner) and retry",
-        path.display(),
-        path.display()
-    )]
+    /// A directory a service operation depends on lacks the ownership or
+    /// mode the check requires: it lets other users write to it, it does not
+    /// have the exact owner-private mode the check demands, it is owned by
+    /// another user, or it has an unsafe extended ACL.
+    #[error("{} is not a trusted directory: {detail}; {fix}", path.display())]
     UntrustedDirectory {
         /// The directory that failed the ownership or mode check.
         path: PathBuf,
         /// What exactly was wrong with it.
         detail: String,
+        /// The remediation the message names, rendered verbatim.
+        fix: String,
     },
 
     /// A trusted filesystem operation failed.
@@ -401,20 +402,63 @@ fn live_summary(prefix: &str, sessions: &[LiveSession], workers: &[String]) -> S
     format!("{prefix}; {}", parts.join("; "))
 }
 
+/// Group and other write bits.
+///
+/// [`FsError::UnsafeMode`] comes from two rules: the forbidden-bits rule,
+/// which fails exactly when one of these bits is set on the entry
+/// (remediated by `chmod go-w`), and the exact-mode rule, which fails
+/// whenever the entry's mode is not exactly the required owner-private mode
+/// (remediated by `chmod go-rwx`). Their presence therefore discriminates
+/// the two causes so each gets a remediation that actually resolves it.
+const GROUP_OR_OTHER_WRITE_BITS: u32 = 0o022;
+
+/// Builds the remediation for an entry that lets other users write or that
+/// may be owned by someone else: the `chmod go-w` hint plus the ownership
+/// alternative.
+fn writable_fix(path: &Path) -> String {
+    format!(
+        "run `chmod go-w {}` (or fix its owner) and retry",
+        path.display()
+    )
+}
+
+/// Maps both rules that raise [`FsError::UnsafeMode`] to a message whose
+/// remediation resolves the rule that failed: `chmod go-w` for forbidden
+/// group/other write bits, `chmod go-rwx` for an exact-mode mismatch such
+/// as a `0700` state directory found at `0755`.
+fn unsafe_mode_error(path: PathBuf, actual: u32, expected: u32) -> Error {
+    if actual & GROUP_OR_OTHER_WRITE_BITS != 0 {
+        Error::UntrustedDirectory {
+            detail: format!("mode {actual:#o} lets other users write to it"),
+            fix: writable_fix(&path),
+            path,
+        }
+    } else {
+        Error::UntrustedDirectory {
+            detail: format!("must be exactly {expected:#o}, found {actual:#o}"),
+            fix: format!("run `chmod go-rwx {}` and retry", path.display()),
+            path,
+        }
+    }
+}
+
 /// Maps a trusted-filesystem failure, naming an unsafe directory precisely.
 pub(crate) fn fs_error(operation: &'static str, source: FsError) -> Error {
     match source {
-        FsError::UnsafeMode { path, actual, .. } => Error::UntrustedDirectory {
+        FsError::UnsafeMode {
             path,
-            detail: format!("mode {actual:#o} lets other users write to it"),
-        },
+            actual,
+            expected,
+        } => unsafe_mode_error(path, actual, expected),
         FsError::UnsafeOwner { path, actual, .. } => Error::UntrustedDirectory {
-            path,
             detail: format!("it is owned by uid {actual}"),
+            fix: writable_fix(&path),
+            path,
         },
         FsError::UnsafeAcl { path } => Error::UntrustedDirectory {
-            path,
             detail: "an extended ACL grants other users access".to_owned(),
+            fix: writable_fix(&path),
+            path,
         },
         source => Error::Filesystem { operation, source },
     }
@@ -443,16 +487,18 @@ pub(crate) fn supervisor_error(operation: &'static str, source: supervisor::Erro
     if let supervisor::Error::Operation { source: inner, .. } = &source {
         if let Some(fs) = inner.downcast_ref::<FsError>() {
             match fs {
-                FsError::UnsafeMode { path, actual, .. } => {
-                    return Error::UntrustedDirectory {
-                        path: path.clone(),
-                        detail: format!("mode {actual:#o} lets other users write to it"),
-                    };
+                FsError::UnsafeMode {
+                    path,
+                    actual,
+                    expected,
+                } => {
+                    return unsafe_mode_error(path.clone(), *actual, *expected);
                 }
                 FsError::UnsafeOwner { path, actual, .. } => {
                     return Error::UntrustedDirectory {
-                        path: path.clone(),
                         detail: format!("it is owned by uid {actual}"),
+                        fix: writable_fix(path),
+                        path: path.clone(),
                     };
                 }
                 _ => {}
@@ -491,8 +537,59 @@ mod tests {
         );
         let text = error.to_string();
         assert!(text.contains("/home/u/.config"), "{text}");
+        assert!(
+            text.contains("mode 0o40777 lets other users write to it"),
+            "{text}"
+        );
         assert!(text.contains("chmod go-w /home/u/.config"), "{text}");
         assert_eq!(error.code(), "service_untrusted_directory");
+    }
+
+    #[test]
+    fn an_exact_mode_mismatch_names_the_required_mode_and_a_working_fix() {
+        let error = fs_error(
+            "open state directory",
+            FsError::UnsafeMode {
+                path: PathBuf::from("/home/u/.local/state/pohunek"),
+                actual: 0o755,
+                expected: 0o700,
+            },
+        );
+        let text = error.to_string();
+        assert!(text.contains("/home/u/.local/state/pohunek"), "{text}");
+        assert!(
+            text.contains("must be exactly 0o700, found 0o755"),
+            "{text}"
+        );
+        assert!(!text.contains("lets other users write"), "{text}");
+        // The remediation is the command between the backticks; it must be a
+        // plain `chmod` invocation the operator can run verbatim.
+        let fix = text.split('`').nth(1).expect("fix command in backticks");
+        assert_eq!(fix, "chmod go-rwx /home/u/.local/state/pohunek");
+        assert_eq!(error.code(), "service_untrusted_directory");
+    }
+
+    #[test]
+    fn an_exact_mode_mismatch_is_recognized_inside_backend_errors() {
+        let error = supervisor_error(
+            "install",
+            supervisor::Error::Operation {
+                operation: "open_state_directory",
+                source: Box::new(FsError::UnsafeMode {
+                    path: PathBuf::from("/home/u/.local/state/pohunek"),
+                    actual: 0o755,
+                    expected: 0o700,
+                }),
+            },
+        );
+        let Error::UntrustedDirectory { detail, fix, .. } = &error else {
+            panic!("unexpected error {error:?}");
+        };
+        assert_eq!(detail, "must be exactly 0o700, found 0o755");
+        assert_eq!(
+            fix,
+            "run `chmod go-rwx /home/u/.local/state/pohunek` and retry"
+        );
     }
 
     #[test]
