@@ -70,6 +70,9 @@ The issue is the spec — there is no `NEXT.md`.
 6. **Write tests for all new logic.** Unit tests inline (`#[cfg(test)]`) for
    private behavior; `tests/` for integration. Extend the existing
    protocol/state-machine suites rather than adding untested branches.
+   Iterate with `cargo ta` (`cargo xtask affected`), which runs the fast
+   tests of the changed crates and their dependents; it never replaces the
+   gates in step 8.
 7. **Keep the assistant knowledge bundle current.** If the milestone changes a
    CLI command/flag, a protocol method/event, GUI behavior, an operating-model
    concept, a safety rule, `docs/public-api.md`, or a path in

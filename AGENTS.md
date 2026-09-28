@@ -189,6 +189,8 @@ never starts) for non-relay changes.
 Rust:
 
 ```bash
+cargo ta                                      # inner loop: fast tests of changed crates + dependents
+cargo ta --print                              # per-file reasons and the command; runs nothing
 cargo t                                       # cost-filtered fast unit + integration loop
 cargo t -p pohunek-gui-core                   # fast tests in one crate (alias takes -p)
 cargo nextest run --profile local -p pohunek-cli some_test_name  # one test
@@ -196,6 +198,23 @@ cargo clippy -p pohunek-daemon --all-targets  # lint one crate
 python3 scripts/test-partitions run cli       # exact CI shard: unit/daemon/relay/cli/relay-db/heavy
 python3 scripts/test-partitions check         # exhaustive, disjoint nextest inventory check
 ```
+
+`cargo ta` (`cargo xtask affected [--base REF] [--print] [-- NEXTEST_ARGS]`)
+is the inner-loop command. It diffs against the merge base with `origin/main`
+(else `main`, else it fails; `--base` overrides) and adds staged, unstaged,
+and untracked files. Each file selects the package whose directory contains it;
+paths that crates embed or their tests read from outside their own directory
+(`docs/knowledge`, `compat/`, `scripts/`, `packaging/`, the release workflow)
+select those crates. It then runs `cargo t -E 'rdeps(=a) | ...'`, so dependents
+run too and the fast profile's default filter still applies. It fails safe:
+the root `Cargo.toml`, `Cargo.lock`, `.cargo/`, `.config/nextest.toml`,
+`rust-toolchain*`, lint/format configs, and any path no rule covers run
+everything. Only a reviewed allowlist in `crates/xtask/src/affected.rs` (other
+`web/`, `docs/`, `.github/`, `.claude/`, `.agents/`, `assets/`, root `*.md`,
+`LICENSE`, `bacon.toml`) selects no Rust tests; when nothing else changed it
+exits 0 without running nextest and names the follow-up checks (`cargo xtask
+docs check`, the `scripts/` unittests, the Bun gates). It narrows only which
+tests run and never replaces the full gate set.
 
 Web (run inside `web/`):
 
@@ -212,6 +231,7 @@ install with `cargo install --locked bacon`):
 ```bash
 bacon                      # default job `nextest-fast`: profile-fast nextest loop
 bacon clippy-fast          # CI lint command
+bacon affected             # `cargo xtask affected` on every save
 bacon nextest-fast -- -p pohunek-gui-core  # narrow the loop to one crate
 ```
 
