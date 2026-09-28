@@ -8,6 +8,10 @@ import unittest
 LIB = Path(__file__).resolve().parents[1] / "lib.sh"
 # Bound on the wall clock of each scenario; far above every expected duration.
 SCENARIO_TIMEOUT_SECONDS = 20
+# Bound on how long a process killed at the deadline may take to disappear
+# from `ps`, far below the lifetime it would have had without the kill.
+REAP_BOUND_SECONDS = 2
+REAP_POLL_SECONDS = 0.05
 
 
 def run(body, stdin=None):
@@ -31,6 +35,20 @@ def running(marker):
         ["ps", "-A", "-o", "args="], capture_output=True, text=True, check=True
     ).stdout
     return any(marker in line and "ps -A" not in line for line in listing.splitlines())
+
+
+def gone(marker):
+    """Returns whether no process matching `marker` remains within the reap bound.
+
+    A process killed by the helper's last KILL may still await its reaper
+    (init or a subreaper) for a moment after the helper returns.
+    """
+    deadline = time.monotonic() + REAP_BOUND_SECONDS
+    while running(marker):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(REAP_POLL_SECONDS)
+    return True
 
 
 class RunWithTimeoutTests(unittest.TestCase):
@@ -65,14 +83,13 @@ class RunWithTimeoutTests(unittest.TestCase):
         # The command stops the calling shell and exits 0 at once, so it stays
         # an unreaped zombie until a helper resumes the shell. The watchdog
         # fires in between and its TERM "succeeds" against the zombie; the
-        # shell must still report the command's own success.
+        # shell must still report the command's own success. The resumer runs
+        # outside the command's process group, which the deadline kills.
         resume_after = 1.5  # past the 1 s deadline, inside the 1 s TERM grace
-        command = (
-            f"(sleep {resume_after}; kill -CONT \"$1\") >/dev/null 2>&1 & "
-            'kill -STOP "$1"; exit 0'
-        )
         output, elapsed = run(
-            f"pohunek_run_with_timeout 1 sh -c '{command}' _ \"$$\" || status=$?"
+            f'(sleep {resume_after}; kill -CONT "$$") >/dev/null 2>&1 &\n'
+            "pohunek_run_with_timeout 1 sh -c 'kill -STOP \"$1\"; exit 0' _ \"$$\""
+            " || status=$?"
         )
         self.assertEqual(output, "status=0\n")
         self.assertLess(elapsed, 6)
@@ -103,6 +120,41 @@ class RunWithTimeoutTests(unittest.TestCase):
         self.assertIn("status=124", output)
         self.assertLess(elapsed, 8)
         self.assertFalse(running("time.sleep(32.5)"), "TERM-ignoring command survived")
+
+    def test_a_descendant_ignoring_term_is_killed_after_the_grace(self):
+        # The command's own shell dies on TERM, but the child it spawned
+        # ignores TERM; the escalation must still reach it through the group.
+        # The child's output goes to /dev/null so a survivor cannot hold the
+        # captured pipe open.
+        ignore_term = (
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(34.5)"
+        )
+        command = f'python3 -c "{ignore_term}" >/dev/null 2>&1 & wait'
+        output, elapsed = run(
+            f"pohunek_run_with_timeout 1 sh -c '{command}' || status=$?"
+        )
+        self.assertEqual(output, "status=124\n")
+        self.assertLess(elapsed, 8)
+        self.assertTrue(
+            gone("time.sleep(34.5)"), "TERM-ignoring descendant survived the timeout"
+        )
+
+    def test_no_descendant_survives_the_timeout(self):
+        # Descendants in the command's group receive the deadline's TERM even
+        # though only their parent is the helper's child.
+        command = "sleep 35.5 >/dev/null 2>&1 & sleep 36.5 >/dev/null 2>&1 & wait"
+        output, elapsed = run(
+            f"pohunek_run_with_timeout 1 sh -c '{command}' || status=$?"
+        )
+        self.assertEqual(output, "status=124\n")
+        self.assertLess(elapsed, 8)
+        self.assertTrue(gone("sleep 35.5"), "descendant survived the timeout")
+        self.assertTrue(gone("sleep 36.5"), "descendant survived the timeout")
+
+    def test_a_missing_command_keeps_the_shell_status(self):
+        output, _ = run("pohunek_run_with_timeout 5 pohunek-no-such-command || status=$?")
+        self.assertEqual(output, "status=127\n")
 
 
 if __name__ == "__main__":

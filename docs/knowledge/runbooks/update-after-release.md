@@ -200,6 +200,13 @@ interrupted, rerunning `pohunek service uninstall` finishes the cleanup. A
 pending install that reached its `registering` step is uninstalled through the
 same live-session check even when its `service.toml` is already gone: the
 record's version and prefix identify the installation.
+A pending install that stopped before `registering` never started its daemon,
+so `uninstall` rolls it back; with `--purge` it then purges the durable
+metadata too (refusing with `service_daemon_job_present` while any daemon job
+is registered, and with `service_orphan_workers` while a worker still runs),
+and it keeps the transaction record until that purge finished, so a rerun
+resumes it. Without an installation or a pending install, `uninstall --purge`
+fails with `service_not_installed` and purges nothing.
 
 A worker journal written by an older pohunek under an earlier journal schema
 blocks the uninstall with `service_outdated_journals` while its worker may still
@@ -224,7 +231,11 @@ install`, `upgrade`, and `uninstall` also refuse a `--prefix` that
 repeated or trailing `/`, non-UTF-8, or too long; pass the one normalized
 spelling) and an `XDG_*` root or `HOME` that is not UTF-8
 (`service_environment_not_utf8`), which the daemon's job definition cannot
-carry.
+carry. `install` and `upgrade` additionally require `HOME` to be set
+(`missing_env`) and every bootstrap root to be an absolute normalized path,
+with `HOME` an existing directory (`service_environment_invalid`): the daemon
+starts each session worker in `HOME` and refuses to become ready without it,
+even when `--prefix` and every `XDG_*` root are given explicitly.
 
 The first worker-aware release is a destructive compatibility boundary because
 a legacy daemon cannot transfer an already-open PTY. Let all legacy sessions

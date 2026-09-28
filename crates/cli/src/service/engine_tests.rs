@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use pohunek_client::ClientError;
+use pohunek_paths::BasePaths;
 use pohunek_platform::process::{ProcessIdentity, StartIdentity};
 use pohunek_platform::supervisor::{DaemonSupervisor, Operation as Pending, ServiceId, Supervisor};
 use pohunek_session_worker::RuntimePhase;
@@ -745,6 +746,231 @@ async fn a_root_the_daemon_definition_cannot_carry_is_refused_before_any_rollbac
         "{error:?}"
     );
     assert_pending_untouched(&harness, &record);
+}
+
+/// Builds `harness`'s context with `home` as `HOME`.
+fn context_with_home(harness: &Harness, home: Option<PathBuf>) -> Context {
+    Context::new(
+        harness.context.paths().clone(),
+        harness.context.uid(),
+        home,
+        Some(harness.root.join("run")),
+        harness.context.supervisor_dir().to_path_buf(),
+        harness.context.cli_executable().to_path_buf(),
+    )
+}
+
+/// `HOME` values the daemon refuses as its workers' working directory.
+fn unusable_homes(harness: &Harness) -> Vec<(&'static str, Option<PathBuf>)> {
+    let file = harness.root.join("home-file");
+    std::fs::write(&file, "").expect("write a regular file");
+    let home = harness.root.join("home").display().to_string();
+    let (parent, name) = home.rsplit_once('/').expect("absolute home");
+    vec![
+        ("missing", None),
+        ("relative", Some(PathBuf::from("home"))),
+        ("regular file", Some(file)),
+        ("nonexistent", Some(harness.root.join("no-such-home"))),
+        (
+            "unnormalized",
+            Some(PathBuf::from(format!("{parent}/./{name}"))),
+        ),
+    ]
+}
+
+fn assert_unusable_home(case: &str, error: &Error) {
+    match error {
+        Error::MissingEnv { var } if case == "missing" => assert_eq!(var, "HOME"),
+        Error::UnusableEnv { var, .. } if case != "missing" => {
+            assert_eq!(var, "HOME", "{case}");
+            assert_eq!(error.code(), "service_environment_invalid", "{case}");
+        }
+        other => panic!("{case}: unexpected error {other:?}"),
+    }
+    assert!(
+        error.hint().is_some_and(|hint| hint.contains("HOME")),
+        "{case}: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unusable_home_is_refused_before_a_fresh_install_changes_anything() {
+    let harness = Harness::new();
+    for (case, home) in unusable_homes(&harness) {
+        let context = context_with_home(&harness, home);
+        let error = Engine::new(&context, &harness.backend)
+            .install(&harness.staged(V1), &harness.prefix(), V1)
+            .await
+            .expect_err("unusable HOME");
+        assert_unusable_home(case, &error);
+        assert!(!harness.layout().versions_dir().exists(), "{case}");
+        assert_eq!(harness.fake.world().installs, 0, "{case}");
+        harness.assert_clean();
+    }
+}
+
+#[tokio::test]
+async fn an_unusable_home_is_refused_before_any_rollback() {
+    let harness = Harness::new();
+    let record = pending_install_at_config(&harness).await;
+    for (case, home) in unusable_homes(&harness) {
+        let context = context_with_home(&harness, home);
+        let engine = Engine::new(&context, &harness.backend);
+        let error = engine
+            .install(&harness.staged(V2), &harness.prefix(), V2)
+            .await
+            .expect_err("unusable HOME");
+        assert_unusable_home(case, &error);
+        assert_pending_untouched(&harness, &record);
+
+        let error = engine
+            .upgrade(&harness.staged(V2), V2)
+            .await
+            .expect_err("unusable HOME");
+        assert_unusable_home(case, &error);
+        assert_pending_untouched(&harness, &record);
+    }
+
+    // Removing an installation needs no worker working directory.
+    let context = context_with_home(&harness, None);
+    let report = Engine::new(&context, &harness.backend)
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect("uninstall without HOME");
+    assert!(report.rolled_back.is_some());
+    harness.assert_clean();
+}
+
+/// Writes the durable metadata `--purge` removes, plus a worktree it keeps.
+fn seed_durable_metadata(paths: &BasePaths) {
+    std::fs::create_dir_all(paths.data_dir.join("events")).expect("events");
+    std::fs::create_dir_all(paths.data_dir.join("worktrees/repo")).expect("worktrees");
+    std::fs::write(paths.data_dir.join("metadata.jsonl"), "{}\n").expect("store");
+    std::fs::create_dir_all(paths.host_state_dir()).expect("host state");
+    // The daemon and the installer keep both roots owner-private.
+    for root in [&paths.data_dir, &paths.state_dir] {
+        std::fs::set_permissions(root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("make root private");
+    }
+}
+
+fn assert_purged(paths: &BasePaths) {
+    assert!(!paths.data_dir.join("metadata.jsonl").exists());
+    assert!(!paths.data_dir.join("events").exists());
+    assert!(!paths.worker_state_root().exists());
+    assert!(!paths.host_state_dir().exists());
+    assert!(paths.data_dir.join("worktrees/repo").is_dir());
+}
+
+const PURGE: UninstallOptions = UninstallOptions {
+    stop_sessions: false,
+    purge: true,
+};
+
+#[tokio::test]
+async fn purge_follows_the_rollback_of_an_unregistered_install() {
+    let harness = Harness::new();
+    let paths = harness.context.paths().clone();
+    seed_durable_metadata(&paths);
+    write_journal(
+        &paths,
+        "s-5",
+        "w-5",
+        Path::new("/elsewhere/pohunek-sessiond"),
+        RuntimePhase::Terminal,
+        1,
+    );
+    let record = pending_install_at_config(&harness).await;
+
+    let report = harness.engine().uninstall(PURGE).await.expect("uninstall");
+    assert_eq!(
+        report.rolled_back.map(|pending| pending.step),
+        Some(record.step.as_str())
+    );
+    assert!(report.purged, "the report says the metadata is purged");
+    assert_purged(&paths);
+    harness.assert_clean();
+}
+
+#[tokio::test]
+async fn purge_after_a_rollback_keeps_the_record_until_nothing_blocks_it() {
+    let harness = Harness::new();
+    let paths = harness.context.paths().clone();
+    seed_durable_metadata(&paths);
+    let worker_exe = PathBuf::from("/elsewhere/pohunek-sessiond");
+    write_live_journal(&paths, "s-6", "w-6", &worker_exe);
+    pending_install_at_config(&harness).await;
+
+    let error = harness
+        .engine()
+        .uninstall(PURGE)
+        .await
+        .expect_err("a live worker blocks the purge");
+    assert!(matches!(&error, Error::OrphanWorkers { .. }), "{error:?}");
+    assert_eq!(harness.config(), None, "the rollback removed service.toml");
+    assert!(
+        harness.pending().expect("record kept").rolling_back,
+        "a rerun still finds the installation"
+    );
+    assert!(paths.data_dir.join("metadata.jsonl").is_file());
+
+    write_journal(&paths, "s-6", "w-6", &worker_exe, RuntimePhase::Terminal, 1);
+    let report = harness.engine().uninstall(PURGE).await.expect("rerun");
+    assert!(report.rolled_back.is_some());
+    assert!(report.purged);
+    assert_purged(&paths);
+    harness.assert_clean();
+}
+
+#[tokio::test]
+async fn purge_after_a_rollback_refuses_a_registered_daemon_job() {
+    let harness = Harness::new();
+    let paths = harness.context.paths().clone();
+    seed_durable_metadata(&paths);
+    pending_install_at_config(&harness).await;
+    assert!(harness.fake.world().registered.is_none());
+    // A daemon job registered outside this transaction.
+    let definition = daemon_definition(
+        &harness.context,
+        &initial_config(&harness.context, &harness.prefix(), V1).expect("config"),
+    )
+    .expect("definition");
+    {
+        let mut world = harness.fake.world();
+        world.registered = Some(definition);
+        world.running = true;
+    };
+
+    let error = harness
+        .engine()
+        .uninstall(PURGE)
+        .await
+        .expect_err("a daemon job may serve the store");
+    assert!(
+        matches!(&error, Error::DaemonJobPresent { .. }),
+        "{error:?}"
+    );
+    assert!(paths.data_dir.join("metadata.jsonl").is_file());
+    assert!(
+        harness.pending().is_some(),
+        "a rerun still finds the installation"
+    );
+}
+
+#[tokio::test]
+async fn purge_without_an_installation_purges_nothing() {
+    let harness = Harness::new();
+    let paths = harness.context.paths().clone();
+    seed_durable_metadata(&paths);
+    let error = harness
+        .engine()
+        .uninstall(PURGE)
+        .await
+        .expect_err("nothing installed");
+    assert!(matches!(&error, Error::NotInstalled { .. }), "{error:?}");
+    assert!(paths.data_dir.join("metadata.jsonl").is_file());
+    assert!(paths.data_dir.join("events").is_dir());
+    assert!(paths.host_state_dir().is_dir());
 }
 
 #[tokio::test]

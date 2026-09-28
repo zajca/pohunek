@@ -234,7 +234,10 @@ impl<'a> Engine<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::AlreadyInstalled`] when `service.toml` exists,
+    /// Returns [`Error::MissingEnv`], [`Error::NonUtf8Env`], or
+    /// [`Error::UnusableEnv`] before any effect for a `HOME` or bootstrap
+    /// root the daemon would refuse at startup,
+    /// [`Error::AlreadyInstalled`] when `service.toml` exists,
     /// [`Error::DaemonJobPresent`] for a stale daemon job,
     /// [`Error::PendingInstall`] for another pending install that may already
     /// run its daemon, staging and probe errors, the failing step's error after
@@ -250,7 +253,7 @@ impl<'a> Engine<'a> {
         layout::check_trusted(self.context.supervisor_dir())?;
         let layout = install_layout(prefix)?;
         layout::check_trusted(prefix)?;
-        self.context.bootstrap_environment()?;
+        self.context.service_environment()?;
         let pending = self.store.load()?;
         let (resume, rolled_back) = match pending {
             Some(record)
@@ -352,13 +355,14 @@ impl<'a> Engine<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::PendingInstall`] while an interrupted install's record
+    /// Returns the environment errors [`Self::install`] returns before any
+    /// effect, [`Error::PendingInstall`] while an interrupted install's record
     /// exists, [`Error::NotInstalled`] without `service.toml`, staging and
     /// probe errors, and the failing step's error after a rollback.
     pub async fn upgrade(&self, from: &Path, version: &str) -> Result<UpgradeReport, Error> {
         let _transaction = self.store.lock().await?;
         layout::check_trusted(self.context.supervisor_dir())?;
-        self.context.bootstrap_environment()?;
+        self.context.service_environment()?;
         let config_path = self.context.config_path();
         let pending = self.store.load()?;
         let (resume, rolled_back) = match pending {
@@ -451,7 +455,9 @@ impl<'a> Engine<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NotInstalled`] when nothing is installed,
+    /// Returns [`Error::NotInstalled`] when nothing is installed, even with
+    /// `--purge`; [`Error::DaemonJobPresent`] when `--purge` follows the
+    /// rollback of an unregistered install while a daemon job exists;
     /// [`Error::LiveSessions`] when sessions are live without
     /// `--stop-sessions`, [`Error::StopTimeout`] when they do not settle, and
     /// [`Error::OrphanWorkers`] when worker jobs survive retirement.
@@ -468,6 +474,12 @@ impl<'a> Engine<'a> {
             // with the installation.
             if pending.operation == Operation::Install && pending.step >= Step::Registering {
                 registered = Some(pending);
+            } else if options.purge && pending.operation == Operation::Install {
+                // The rollback removes `service.toml`, so only the record lets
+                // a rerun after a failed purge find this installation; it is
+                // cleared once the purge below finished.
+                report.rolled_back = Some(pending_report(&pending));
+                self.rollback(&pending).await?;
             } else {
                 report.rolled_back = Some(pending_report(&pending));
                 self.rollback_pending(&pending).await?;
@@ -482,7 +494,17 @@ impl<'a> Engine<'a> {
             (None, Some(pending)) => {
                 initial_config(self.context, &pending.prefix, &pending.version)?
             }
-            (None, None) if report.rolled_back.is_some() => return Ok(report),
+            // The rolled back install never registered its daemon, so nothing
+            // of it remains; `--purge` still removes the durable metadata.
+            (None, None) if report.rolled_back.is_some() => {
+                if options.purge {
+                    self.purge_unregistered(&mut report).await?;
+                }
+                self.store.clear()?;
+                return Ok(report);
+            }
+            // Without an installation or its record nothing proves which
+            // daemon owns the durable metadata, so `--purge` removes none.
             (None, None) => return Err(Error::NotInstalled { path: config_path }),
         };
         let layout = config.layout().clone();
@@ -1156,6 +1178,27 @@ impl<'a> Engine<'a> {
         if !namespace_bound && layout::release_prefix(layout, namespace)? {
             report.removed.push(layout::owner_record(layout));
         }
+        Ok(())
+    }
+
+    /// Purges durable metadata when no installation's daemon is registered.
+    ///
+    /// Applies the uninstall's own guards: a registered daemon job may still
+    /// serve the session store, and a worker job is retired only after its
+    /// runtime is proven ended, since the purge deletes the journals that prove it.
+    async fn purge_unregistered(&self, report: &mut UninstallReport) -> Result<(), Error> {
+        match self.backend.daemon().inspect().await {
+            Err(supervisor::Error::NotFound(_)) => {}
+            Ok(observation) => {
+                return Err(Error::DaemonJobPresent {
+                    id: observation.id.to_string(),
+                });
+            }
+            Err(source) => return Err(supervisor_error("inspect daemon", source)),
+        }
+        report.retired_workers = self.retire_ended_workers().await?;
+        self.purge(report)?;
+        report.purged = true;
         Ok(())
     }
 

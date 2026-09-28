@@ -6,8 +6,8 @@
 //! `systemctl` on `PATH`, recording every invocation.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -404,6 +404,56 @@ fn a_failed_post_stop_inventory_keeps_the_legacy_files() {
         !fixture.socket.retired_exists(),
         "renamed barrier socket remains after the stop"
     );
+}
+
+#[test]
+fn a_socket_a_restarted_legacy_daemon_bound_survives_the_barrier_restore() {
+    // The legacy unit restarts a failed daemon, which binds a new socket at the
+    // original path while the barrier is in place. Putting the moved node back
+    // must not replace that live socket; the moved node is then stale.
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let restarted = fixture.base().join("restarted.sock");
+    let listener = UnixListener::bind(&restarted).expect("bind restarted socket");
+    let restarted_inode = fs::metadata(&restarted).expect("restarted socket").ino();
+    let restarted_arg = restarted.display().to_string();
+    let output = fixture.run(
+        &[],
+        &[
+            ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+            ("POHUNEK_TEST_PREFLIGHT_STATUS", "23"),
+            ("POHUNEK_TEST_RESTARTED_SOCKET", &restarted_arg),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(23), "{output:?}");
+    assert!(
+        !restarted.exists(),
+        "the fake preflight did not move the socket"
+    );
+    assert_eq!(
+        fs::symlink_metadata(&fixture.socket.path)
+            .expect("socket at the original path")
+            .ino(),
+        restarted_inode,
+        "the restarted daemon's socket was replaced by the moved node"
+    );
+    UnixStream::connect(&fixture.socket.path).expect("dial the restarted daemon");
+    listener
+        .accept()
+        .expect("the restarted daemon accepts the connection");
+    assert!(
+        !fixture.socket.retired_exists(),
+        "stale barrier node remains after the restore"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("a restarted legacy daemon bound a new control socket"),
+        "{stderr}"
+    );
+    assert_eq!(fixture.systemctl_calls(), [STATE_QUERY]);
+    for legacy in fixture.legacy_files() {
+        assert!(legacy.exists(), "{} was removed", legacy.display());
+    }
 }
 
 #[test]
@@ -1515,12 +1565,17 @@ fn release_workflow_packages_static_shell_completions() {
 /// `POHUNEK_TEST_INTERRUPT_AT=preflight` makes the preflight send
 /// `POHUNEK_TEST_INTERRUPT_SIGNAL` to the installer before it returns.
 /// A preflight whose `--socket` names no socket node exits 97, as the real
-/// CLI fails to dial it.
+/// CLI fails to dial it. `POHUNEK_TEST_RESTARTED_SOCKET` names a socket the
+/// preflight renames to the legacy socket path before it returns, as a
+/// legacy daemon restarted by `Restart=on-failure` binds a new one there.
 const FAKE_POHUNEK: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$POHUNEK_TEST_POHUNEK_LOG"
 if [ "$1" = migration ]; then
     if [ "${3:-}" = --socket ] && [ ! -S "${4:-}" ]; then
         exit 97
+    fi
+    if [ -n "${POHUNEK_TEST_RESTARTED_SOCKET:-}" ]; then
+        mv "$POHUNEK_TEST_RESTARTED_SOCKET" "$XDG_RUNTIME_DIR/pohunek/daemon.sock"
     fi
     if [ "${POHUNEK_TEST_INTERRUPT_AT:-}" = preflight ]; then
         kill -s "$POHUNEK_TEST_INTERRUPT_SIGNAL" "$PPID"

@@ -82,6 +82,21 @@ pub enum Error {
         path: PathBuf,
     },
 
+    /// A bootstrap environment variable the daemon would refuse at startup.
+    ///
+    /// The daemon applies the job-definition rules to every bootstrap
+    /// variable and starts each session worker in `HOME`, so it never becomes
+    /// ready with such a value.
+    #[error("{var} ({}) is not usable by the daemon and its session workers: {detail}", path.display())]
+    UnusableEnv {
+        /// The environment variable.
+        var: String,
+        /// The rejected value.
+        path: PathBuf,
+        /// Which rule the value breaks.
+        detail: String,
+    },
+
     /// `--prefix` or `--from` is not an absolute normalized path.
     #[error("{flag} must be an absolute normalized path: {}", path.display())]
     InvalidPath {
@@ -400,6 +415,7 @@ impl Error {
             Self::MissingEnv { .. } => "missing_env",
             Self::Paths(_) => "paths_unavailable",
             Self::NonUtf8Env { .. } => "service_environment_not_utf8",
+            Self::UnusableEnv { .. } => "service_environment_invalid",
             Self::InvalidPath { .. } => "cli_usage",
             Self::Config(_) => "service_config_invalid",
             Self::UntrustedDirectory { .. } => "service_untrusted_directory",
@@ -454,7 +470,7 @@ impl Error {
                 "pass another --prefix, or uninstall the installation of that namespace first; if it no longer exists, delete the named ownership record",
             ),
             Self::DaemonJobPresent { .. } => Some(
-                "remove the stale daemon job with the service manager, then install again",
+                "remove the stale daemon job with the service manager, then retry",
             ),
             Self::LiveSessions { .. } => Some(
                 "stop the sessions first, or pass --stop-sessions to stop them as part of uninstall",
@@ -469,6 +485,12 @@ impl Error {
             Self::NonUtf8Env { .. } => {
                 Some("point the named variable at a UTF-8 path, then retry")
             }
+            Self::MissingEnv { var } if var == pohunek_paths::HOME => Some(
+                "set HOME to your existing home directory, the session workers' working directory, then retry",
+            ),
+            Self::UnusableEnv { .. } => Some(
+                "point the named variable at an absolute normalized path without `.` or `..` segments (HOME must also be an existing directory), then retry",
+            ),
             Self::OutdatedJournals { .. } => Some(
                 "end those sessions with the pohunek version that started them, or terminate the listed worker pids, then retry; a journal whose worker pid is unreadable blocks until you delete it after confirming no older pohunek-sessiond runs",
             ),

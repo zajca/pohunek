@@ -108,7 +108,13 @@ since no preflight can reach it.
    other way while it is in place — `HUP`, `INT` (Ctrl-C), or `TERM`, or an
    unexpected shell error — so an interrupted run never leaves a running
    legacy daemon reachable only under the moved name; the run keeps its exit
-   status, and a signal is re-raised after the cleanup;
+   status, and a signal is re-raised after the cleanup. The node goes back
+   with a hard link to the original name and an unlink of the moved one,
+   which never replaces an existing name: the legacy unit restarts its daemon
+   on failure, and a restarted daemon that already bound a new socket there
+   keeps it, while the then-stale moved node is removed and reported. When
+   the node cannot go back for another reason, the run prints the `mv` that
+   restores it;
 5. it re-runs the job inventory: a worker that survived the stop was started
    after the preflight and aborts the run;
 6. it removes `pohunekd.service`, `pohunek-session@.service`, and

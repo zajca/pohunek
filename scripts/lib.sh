@@ -18,12 +18,48 @@ POHUNEK_TIMEOUT_KILL_GRACE_SECONDS=1
 # Exit status of a command stopped by its deadline, matching GNU timeout(1).
 POHUNEK_TIMEOUT_STATUS=124
 
+# Starts "$@" as the leader of a new process group, so a timed-out command
+# is signalled together with every descendant it spawned (GNU timeout(1) does
+# the same). POSIX sh cannot do this itself: dash ignores `set -m` in a
+# subshell and macOS has no setsid(1), so python3, which every caller of the
+# helper already needs, calls setpgid(2) and execs the command in place.
+# Python ignores SIGPIPE and SIGXFSZ at startup and an ignored disposition
+# survives exec, so both are reset to the default first. A missing or
+# non-executable command fails with the shell's statuses 127 and 126.
+#
+# Like GNU timeout without --foreground, a command reading a terminal is then
+# a background process group and stops on its first read (SIGTTIN).
+POHUNEK_TIMEOUT_EXEC_IN_GROUP='
+import os, signal, sys
+os.setpgid(0, 0)
+for name in ("SIGPIPE", "SIGXFSZ"):
+    if hasattr(signal, name):
+        signal.signal(getattr(signal, name), signal.SIG_DFL)
+try:
+    os.execvp(sys.argv[1], sys.argv[1:])
+except OSError as error:
+    sys.stderr.write(f"{sys.argv[1]}: {error.strerror}\n")
+    sys.exit(127 if isinstance(error, FileNotFoundError) else 126)
+'
+
+# Sends signal $1 to the process group led by PID $2, or to that PID alone
+# while it has not called setpgid(2) yet (it has no descendants before its
+# exec). Fails when neither exists. The group is written `-PID` right after
+# the signal: dash's `kill` parses a `--` operand as a PID and aborts.
+pohunek_signal_group() {
+  kill "-$1" "-$2" 2>/dev/null || kill "-$1" "$2" 2>/dev/null
+}
+
 # Runs "$@" with a deadline of $1 seconds, without depending on GNU timeout(1).
 #
 # Returns the command's own exit status, or POHUNEK_TIMEOUT_STATUS when the
-# deadline expired: the command then receives TERM and, after
-# POHUNEK_TIMEOUT_KILL_GRACE_SECONDS, KILL. The watchdog is cancelled as soon as
-# the command exits, and every background process is reaped before returning.
+# deadline expired: the command's whole process group then receives TERM and,
+# after POHUNEK_TIMEOUT_KILL_GRACE_SECONDS, KILL, so a descendant that outlives
+# or ignores the TERM is killed too. The watchdog is cancelled as soon as the
+# command exits before the deadline; once it fired, the escalation runs to the
+# end. Every background process of the helper is reaped before returning.
+# Descendants that moved to their own session or process group are out of
+# reach, as for GNU timeout(1).
 #
 # A command that exits 0 always returns 0. The watchdog cannot tell a live
 # command from one that already exited but is not reaped yet (a zombie accepts
@@ -31,11 +67,12 @@ POHUNEK_TIMEOUT_STATUS=124
 # status says the command completed, a non-zero one after the watchdog fired
 # is reported as the timeout.
 pohunek_run_with_timeout() {
+  pohunek_need_cmd python3
   _pohunek_limit="$1"
   shift
   # Asynchronous commands read /dev/null unless stdin is passed explicitly.
   exec 3<&0
-  "$@" 0<&3 3<&- &
+  python3 -I -c "$POHUNEK_TIMEOUT_EXEC_IN_GROUP" "$@" 0<&3 3<&- &
   _pohunek_command=$!
   exec 3<&-
   (
@@ -65,9 +102,14 @@ pohunek_run_with_timeout() {
     }
 
     watchdog_sleep "$_pohunek_limit" || exit 0
-    kill -TERM "$_pohunek_command" 2>/dev/null || exit 0
-    watchdog_sleep "$POHUNEK_TIMEOUT_KILL_GRACE_SECONDS" || exit "$POHUNEK_TIMEOUT_STATUS"
-    kill -KILL "$_pohunek_command" 2>/dev/null || true
+    # The caller cancels as soon as the command exits, but a descendant that
+    # ignores TERM outlives it, so the escalation is no longer cancellable. A
+    # cancellation that landed before the trap changed still wins.
+    trap '' TERM
+    [ "$_pohunek_cancelled" -eq 0 ] || exit 0
+    pohunek_signal_group TERM "$_pohunek_command" || exit 0
+    sleep "$POHUNEK_TIMEOUT_KILL_GRACE_SECONDS"
+    pohunek_signal_group KILL "$_pohunek_command" || true
     exit "$POHUNEK_TIMEOUT_STATUS"
   ) &
   _pohunek_watchdog=$!

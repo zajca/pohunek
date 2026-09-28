@@ -331,12 +331,33 @@ fi
 # no offline scan of the legacy persisted store covers such a stop-only
 # session; its template worker is caught by the post-stop inventory instead.
 restore_barrier() {
-    # The operator can restart the left-in-place legacy install, so put the
-    # moved socket node back where the daemon expects it whenever that name
-    # is vacant.
-    if [ -n "$barrier_socket" ] && [ -e "$barrier_socket" ] \
-        && [ ! -e "$legacy_socket" ]; then
-        mv "$barrier_socket" "$legacy_socket" || true
+    # The operator can restart the left-in-place legacy install, so the moved
+    # socket node goes back where the daemon expects it. The legacy unit has
+    # `Restart=on-failure`: a restarted daemon may bind a new socket at that
+    # name at any moment, which a clobbering rename would replace, leaving
+    # that daemon unreachable. A hard link is the portable no-replace rename:
+    # link(2) fails with EEXIST when the name is taken, and the barrier name
+    # is unlinked only after the link exists. The existence check keeps `ln`
+    # from linking into a directory or through a symlink at that name.
+    if [ -n "$barrier_socket" ] && [ -e "$barrier_socket" ]; then
+        if [ ! -e "$legacy_socket" ] && [ ! -L "$legacy_socket" ] \
+            && ln "$barrier_socket" "$legacy_socket"; then
+            rm -f "$barrier_socket" || :
+        elif [ -S "$legacy_socket" ] && [ ! -L "$legacy_socket" ]; then
+            # A socket appeared at the original name after the move, so the
+            # daemon that owned the moved node exited and a restarted one
+            # listens there: the moved node is stale.
+            rm -f "$barrier_socket" || :
+            echo "a restarted legacy daemon bound a new control socket at" >&2
+            echo "  $legacy_socket" >&2
+            echo "while the connect barrier was in place; it stays reachable there," >&2
+            echo "and the stale moved node $barrier_socket was removed" >&2
+        else
+            echo "could not put the legacy daemon socket back; it remains at" >&2
+            echo "  $barrier_socket" >&2
+            echo "move it back with \`mv '$barrier_socket' '$legacy_socket'\`" >&2
+            echo "once nothing else occupies $legacy_socket" >&2
+        fi
     fi
     disarm_barrier
     return_started_legacy

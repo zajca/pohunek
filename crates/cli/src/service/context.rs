@@ -1,13 +1,13 @@
 //! Host facts every `pohunek service` operation starts from.
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-28
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use pohunek_paths::{BasePaths, PathEnv, HOME, XDG_RUNTIME_DIR};
 use pohunek_platform::filesystem::TrustedDir;
-use pohunek_platform::supervisor::Namespace;
+use pohunek_platform::supervisor::{self, Namespace};
 
 use super::error::{fs_error, io_error, Error};
 
@@ -200,6 +200,45 @@ impl Context {
         }
         Ok(environment)
     }
+
+    /// Returns the bootstrap environment after checking the daemon accepts it.
+    ///
+    /// The daemon validates every bootstrap variable with the job-definition
+    /// rules and starts each session worker in `HOME`, refusing to become
+    /// ready without an existing directory there. Install and upgrade apply
+    /// the same rules before their first effect, so a registered daemon never
+    /// fails on them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::bootstrap_environment`],
+    /// [`Error::MissingEnv`] without `HOME`, and [`Error::UnusableEnv`] for a
+    /// value the job-definition rules reject or a `HOME` that is not an
+    /// existing directory.
+    pub fn service_environment(&self) -> Result<BTreeMap<String, String>, Error> {
+        let environment = self.bootstrap_environment()?;
+        for (var, value) in &environment {
+            supervisor::validate_bootstrap_variable(var, value)
+                .map_err(|source| unusable(var, Path::new(value), source.to_string()))?;
+        }
+        let home = environment
+            .get(HOME)
+            .map(Path::new)
+            .ok_or_else(|| Error::MissingEnv {
+                var: HOME.to_owned(),
+            })?;
+        supervisor::validate_working_directory(home)
+            .map_err(|source| unusable(HOME, home, source.to_string()))?;
+        // `is_dir` follows symlinks, exactly like the daemon's check.
+        if !home.is_dir() {
+            return Err(unusable(
+                HOME,
+                home,
+                "it is not an existing directory".to_owned(),
+            ));
+        }
+        Ok(environment)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -223,6 +262,14 @@ fn canonical_root(path: &Path) -> Result<PathBuf, Error> {
     TrustedDir::open_or_create_absolute(path, PRIVATE_DIR_MODE)
         .map_err(|source| fs_error("prepare application directory", source))?;
     std::fs::canonicalize(path).map_err(io_error("canonicalize", path))
+}
+
+fn unusable(var: &str, path: &Path, detail: String) -> Error {
+    Error::UnusableEnv {
+        var: var.to_owned(),
+        path: path.to_path_buf(),
+        detail,
+    }
 }
 
 fn path_error(error: pohunek_paths::PathError) -> Error {
@@ -268,8 +315,9 @@ pub(crate) mod tests {
         .expect("resolve test paths")
     }
 
-    /// Builds a context entirely below `root`.
+    /// Builds a context entirely below `root`, creating its `HOME`.
     pub(crate) fn context(root: &Path) -> Context {
+        std::fs::create_dir_all(root.join("home")).expect("create test HOME");
         Context::new(
             paths(root),
             nix::unistd::Uid::effective().as_raw(),

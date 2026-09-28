@@ -4,7 +4,7 @@
 //! [`crate::service`]. Every subcommand is local to this machine and ignores
 //! the global `--host`.
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-28
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -60,7 +60,8 @@ pub(crate) enum Action {
         #[arg(long)]
         stop_sessions: bool,
         /// Also remove the session store, event logs, worker journals, and
-        /// host identity.
+        /// host identity. Needs an installation or an interrupted install to
+        /// remove; without one, nothing is purged.
         #[arg(long)]
         purge: bool,
         /// Emit machine-readable JSON instead of human text.
