@@ -192,7 +192,12 @@ Release packaging and contributor verification:
 
 - `.config/nextest.toml` — shared fast cost boundary and bounded heavy profile.
 - `.cargo/config.toml` — `cargo t`/`cargo ti` select fast unit and integration
-  tests; `cargo tw` keeps the full suite. Fast loops do not replace full gates.
+  tests; `cargo tw` keeps the full suite; `cargo ta` runs `cargo xtask
+  affected`. Fast loops do not replace full gates.
+- `crates/xtask/src/affected.rs` — `cargo xtask affected`: maps changed,
+  staged, unstaged, and untracked files to workspace packages and runs
+  `cargo t` with an `rdeps` filterset; workspace-wide and unmapped paths run
+  everything, and only a reviewed non-Rust allowlist selects no tests.
 - `scripts/test-partitions` — disjoint unit/daemon/relay/cli/relay-db/heavy CI
   shards and exhaustive inventory check. Heavy is the exact complement of the
   fast filter; relay heavy tests (`relay-db`, the only PostgreSQL fixture
@@ -202,7 +207,8 @@ Release packaging and contributor verification:
   is separate from the approximately two-minute fast-feedback target.
 - `scripts/tests/test_partitions.py` — regression checks for coverage validation.
 - `bacon.toml` — optional watcher jobs for the documented fast loops
-  (`nextest-fast` on the `fast` profile, `clippy-fast`); no gate depends on it.
+  (`nextest-fast` on the `fast` profile, `affected`, `clippy-fast`); no gate
+  depends on it.
 - `scripts/ci-timings` — reproduction of CI timing evidence from `gh` run
   data: per-job wall clock and workflow medians (`runs`, `compare`), per-shard
   nextest JUnit summaries (`junit`), sccache/rust-cache

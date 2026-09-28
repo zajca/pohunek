@@ -5,3 +5,6 @@ xtask = "run -p xtask --"
 t = "nextest run --profile fast --all-features"
 ti = "nextest run --profile fast -p pohunek-daemon -p pohunek-client -p pohunek-session-worker --all-features"
 tw = "nextest run --profile local --test-threads 4 --all-features"
+# `cargo t` narrowed to the packages the current change affects plus their
+# dependents; unmapped or workspace-wide changes still run everything.
+ta = "xtask affected"

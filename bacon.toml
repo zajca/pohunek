@@ -8,6 +8,7 @@
 #   cargo install --locked bacon
 #   bacon                                         # fast unit + integration loop
 #   bacon clippy-fast                             # the CI lint gate
+#   bacon affected                                # fast loop for changed crates only
 #   bacon nextest-fast -- -p pohunek-gui-core      # narrow to one crate
 #   bacon nextest-fast -- some_test_name           # narrow to one test
 #
@@ -26,6 +27,19 @@ command = [
     "cargo", "nextest", "run",
     "--profile", "fast",
     "--all-features",
+    "--hide-progress-bar",
+    "--failure-output", "final",
+]
+need_stdout = true
+analyzer = "nextest"
+
+# `cargo xtask affected`: the `nextest-fast` loop narrowed to the packages the
+# branch, staged, unstaged, and untracked changes touch plus their dependents.
+# It re-diffs on every run and escalates to the whole workspace for unmapped or
+# workspace-wide paths; the trailing arguments go to nextest.
+[jobs.affected]
+command = [
+    "cargo", "xtask", "affected", "--",
     "--hide-progress-bar",
     "--failure-output", "final",
 ]

@@ -72,6 +72,12 @@ Use these to shorten the feedback loop (see AGENTS.md "Fast loops" —
 `cargo t`, `cargo tw`, `python3 scripts/test-partitions run <shard>`),
 but always finish with the full set above.
 
+The inner-loop command is `cargo ta` (`cargo xtask affected`): the fast
+tests of the crates the branch and working tree touch, plus their
+dependents, escalating to everything for workspace-wide or unmapped paths.
+`cargo ta --print` shows the per-file reasons. It is never a substitute for
+any gate above.
+
 ## Extra CI jobs (only when your change touches deps/features)
 
 ```bash

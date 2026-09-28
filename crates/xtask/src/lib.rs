@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod affected;
 mod agent_skill;
 mod checks;
 mod eval;
@@ -16,6 +17,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 
 use clap::{Parser, Subcommand};
 use knowledge::{validate_bundle, CONCEPT_SCHEMA_VERSION};
@@ -66,11 +68,42 @@ pub struct SiteSummary {
 pub enum XtaskError {
     Usage(String),
     BundleValidation(knowledge::BundleValidationError),
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
     UnsupportedFileType(PathBuf),
     Json(serde_json::Error),
     Yaml(serde_yaml::Error),
     InvalidPath(PathBuf),
+    /// A delegated command ran and exited unsuccessfully.
+    ChildExit {
+        command: String,
+        status: ExitStatus,
+    },
+}
+
+/// Process exit code for xtask failures that are not a delegated command's own exit.
+const FAILURE_EXIT_CODE: i32 = 2;
+
+/// Shell convention for a child killed by a signal: 128 plus the signal number.
+const SIGNAL_EXIT_BASE: i32 = 128;
+
+impl XtaskError {
+    /// Process exit code that reports this error.
+    ///
+    /// A failed delegated command propagates its own exit code, so callers such
+    /// as bacon and CI see the test runner's status; every other error exits 2.
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::ChildExit { status, .. } => status.code().unwrap_or_else(|| {
+                use std::os::unix::process::ExitStatusExt as _;
+                SIGNAL_EXIT_BASE + status.signal().unwrap_or(0)
+            }),
+            _ => FAILURE_EXIT_CODE,
+        }
+    }
 }
 
 impl fmt::Display for XtaskError {
@@ -91,6 +124,7 @@ impl fmt::Display for XtaskError {
                 "path `{}` cannot be represented as a deterministic relative path",
                 path.display()
             ),
+            Self::ChildExit { command, status } => write!(f, "`{command}` failed with {status}"),
         }
     }
 }
@@ -102,7 +136,10 @@ impl Error for XtaskError {
             Self::Io { source, .. } => Some(source),
             Self::Json(error) => Some(error),
             Self::Yaml(error) => Some(error),
-            Self::Usage(_) | Self::UnsupportedFileType(_) | Self::InvalidPath(_) => None,
+            Self::Usage(_)
+            | Self::UnsupportedFileType(_)
+            | Self::InvalidPath(_)
+            | Self::ChildExit { .. } => None,
         }
     }
 }
@@ -297,6 +334,7 @@ where
             }
         },
         TopCommand::Hermes { action } => run_hermes(action, &root),
+        TopCommand::Affected(options) => affected::run(&root, &options),
         TopCommand::AgentSkill { action } => match action {
             AgentSkillAction::Generate => {
                 agent_skill::generate(&root)?;
@@ -383,6 +421,12 @@ enum TopCommand {
         #[command(subcommand)]
         action: AgentSkillAction,
     },
+    /// Run the fast tests of packages affected by the current change.
+    ///
+    /// Selects the packages owning changed, staged, unstaged, and untracked
+    /// files plus their dependents, and escalates to every test for
+    /// workspace-wide or unmapped paths. Never a substitute for the full gates.
+    Affected(affected::Options),
 }
 
 #[derive(Debug, Subcommand)]
