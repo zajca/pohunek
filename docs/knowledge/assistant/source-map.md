@@ -267,11 +267,13 @@ Release packaging and contributor verification:
   the main checkout with `cp -a --reflink=always`; a real probe clone must
   succeed first, the main checkout's Cargo locks are held exclusively during
   the copy, both checkouts must use the default target layout per
-  `cargo metadata`, uplifted binaries are not seeded, and any seeding failure
-  rolls back the new worktree and branch. `--no-seed` skips seeding.
+  `cargo metadata`, uplifted binaries are not seeded, and a failing
+  `git worktree add` or seed rolls back whichever of the new worktree and
+  branch exist. `--no-seed` skips seeding.
 - `scripts/tests/test_worktree_new.py` — regression checks for its slug and
   argument validation, fail-closed reflink probe, lock contention, layout
-  checks, rollback, and `--no-seed`, with an injected executor.
+  checks, rollback of partial `git worktree add` failures, and `--no-seed`,
+  with an injected executor.
 - `.github/workflows/ci.yml`
 - `.github/workflows/release.yml`
 - `README.md`

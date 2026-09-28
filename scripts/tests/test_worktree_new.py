@@ -38,6 +38,11 @@ class FakeExecutor:
         self.refs = {"origin/main", "HEAD"}
         self.probe_fails = False
         self.copy_fails_for = None
+        # How `git worktree add` fails: None (it succeeds), "before" (nothing
+        # created), "after-branch" (branch created, checkout failed), or
+        # "after-checkout" (a post-checkout hook failed on a full worktree).
+        self.add_fails = None
+        self.registered = set()
         # Per-root override of `cargo metadata` target/build directories.
         self.layouts = {}
 
@@ -91,14 +96,31 @@ class FakeExecutor:
             return (0 if ref in self.refs else 1), "", ""
         if args[:2] == ["worktree", "add"]:
             branch, path = args[3], Path(args[4])
+            if self.add_fails == "before":
+                return 128, "", "fatal: invalid reference"
+            self.branches.add(branch)
+            if self.add_fails == "after-branch":
+                return 128, "", "fatal: could not create work tree dir"
             path.mkdir()
             (path / "Cargo.toml").write_text("[workspace]\n")
-            self.branches.add(branch)
+            self.registered.add(path)
+            if self.add_fails == "after-checkout":
+                return 1, "", "error: post-checkout hook failed"
             return 0, "", ""
+        if args[:2] == ["worktree", "list"]:
+            lines = [f"worktree {self.common_dir.parent}"]
+            lines += [f"worktree {path}" for path in sorted(self.registered)]
+            return 0, "\n\n".join(lines) + "\n", ""
         if args[:2] == ["worktree", "remove"]:
-            shutil.rmtree(args[-1])
+            path = Path(args[-1])
+            if path not in self.registered:
+                return 128, "", f"fatal: '{path}' is not a working tree"
+            shutil.rmtree(path)
+            self.registered.discard(path)
             return 0, "", ""
         if args[:2] == ["branch", "-D"]:
+            if args[2] not in self.branches:
+                return 1, "", f"error: branch '{args[2]}' not found"
             self.branches.discard(args[2])
             return 0, "", ""
         raise AssertionError(f"unexpected git {args}")
@@ -415,6 +437,58 @@ class RollbackTests(HarnessCase):
         self.assertIn("rolled back", err)
         self.assertFalse(worktree.exists())
         self.assertNotIn("zajca/issue-1", self.h.executor.branches)
+
+
+class WorktreeAddFailureTests(HarnessCase):
+    def run_failing_add(self, mode, *argv):
+        self.h.executor.add_fails = mode
+        code, _, err = self.h.run(*argv, "issue-1")
+        self.assertEqual(code, 1)
+        self.assertIn("git worktree add failed", err)
+        self.assertNotIn("manually", err)
+        self.assertFalse((self.h.worktrees / "issue-1").exists())
+        self.assertNotIn("zajca/issue-1", self.h.executor.branches)
+        self.assertEqual(self.h.executor.registered, set())
+        return err
+
+    def test_branch_left_by_failed_checkout_is_deleted(self):
+        self.run_failing_add("after-branch")
+        self.assertIn(["git", "branch", "-D", "zajca/issue-1"],
+                      self.h.executor.commands)
+        self.assertFalse(self.h.executor.ran("git", "worktree", "remove"))
+
+    def test_worktree_left_by_failed_hook_is_removed(self):
+        err = self.run_failing_add("after-checkout")
+        self.assertIn("post-checkout hook failed", err)
+        self.assertTrue(self.h.executor.ran("git", "worktree", "remove"))
+        self.assertIn(["git", "branch", "-D", "zajca/issue-1"],
+                      self.h.executor.commands)
+
+    def test_failure_before_creation_rolls_back_nothing(self):
+        err = self.run_failing_add("before")
+        self.assertIn("nothing to roll back", err)
+        self.assertFalse(self.h.executor.ran("git", "branch", "-D"))
+        self.assertFalse(self.h.executor.ran("git", "worktree", "remove"))
+
+    def test_no_seed_failure_is_rolled_back_too(self):
+        self.run_failing_add("after-checkout", "--no-seed")
+
+    def test_unregistered_leftover_dir_is_reported_not_deleted(self):
+        worktree = self.h.worktrees / "issue-1"
+        worktree.mkdir(parents=True)
+        (worktree / "keep").write_text("unknown owner")
+        removed, problems = worktree_new.rollback(
+            self.h.repo, worktree, "zajca/issue-1", self.h.executor)
+        self.assertEqual(removed, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("not a registered worktree", problems[0])
+        self.assertTrue((worktree / "keep").exists())
+
+    def test_retry_after_rollback_succeeds(self):
+        self.run_failing_add("after-checkout")
+        self.h.executor.add_fails = None
+        code, _, err = self.h.run("issue-1")
+        self.assertEqual(code, 0, err)
 
 
 class NoSeedTests(HarnessCase):

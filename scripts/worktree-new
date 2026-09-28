@@ -34,8 +34,10 @@ Fail-closed rules:
   `build_directory` equal to `<root>/target` per `cargo metadata`); a
   `CARGO_TARGET_DIR`, `build.target-dir`, or `build.build-dir` override
   would make the seed dead weight or copy the wrong tree;
-* any failure after `git worktree add` removes the new worktree and branch
-  again, so a failed run leaves nothing behind.
+* a failing `git worktree add` or seed removes whichever of the new
+  worktree and branch exist (git can fail after creating the branch, or
+  after a full checkout when a hook fails), so a failed run leaves nothing
+  behind and can be retried.
 """
 
 import argparse
@@ -328,21 +330,52 @@ def seed_target(source_target, dest_target, executor):
                     executor)
 
 
+def worktree_registered(worktree, repo, executor):
+    """True when git lists `worktree` in `git worktree list --porcelain`."""
+    result = executor(
+        ["git", "worktree", "list", "--porcelain"], cwd=repo, check=False
+    )
+    if result.returncode != 0:
+        return False
+    listed = {
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in result.stdout.splitlines()
+        if line.startswith("worktree ")
+    }
+    return worktree.resolve() in listed
+
+
 def rollback(repo, worktree, branch, executor):
-    """Remove the worktree and branch this run created; report leftovers."""
-    problems = []
-    if worktree.exists():
+    """Remove whatever part of the worktree and branch this run created.
+
+    `create` proves before `git worktree add` that neither existed, so any
+    that exists here is this run's artifact; one that was never created
+    (a failure before or during the add) is skipped, not reported. Returns
+    (removed artifacts, problems needing manual cleanup).
+    """
+    removed, problems = [], []
+    if worktree_registered(worktree, repo, executor):
         result = executor(
             ["git", "worktree", "remove", "--force", worktree],
             cwd=repo,
             check=False,
         )
-        if result.returncode != 0:
-            problems.append(f"remove {worktree} manually")
-    result = executor(["git", "branch", "-D", branch], cwd=repo, check=False)
-    if result.returncode != 0:
-        problems.append(f"delete branch {branch} manually")
-    return problems
+        if result.returncode == 0:
+            removed.append(f"worktree {worktree}")
+        else:
+            problems.append(f"remove worktree {worktree} manually")
+    elif worktree.exists() or worktree.is_symlink():
+        # Present on disk but unknown to git: never delete it blindly.
+        problems.append(f"remove {worktree} manually (not a registered "
+                        "worktree)")
+    if branch_exists(branch, repo, executor):
+        result = executor(["git", "branch", "-D", branch], cwd=repo,
+                          check=False)
+        if result.returncode == 0:
+            removed.append(f"branch {branch}")
+        else:
+            problems.append(f"delete branch {branch} manually")
+    return removed, problems
 
 
 def create(args, cwd, executor=execute, out=None):
@@ -371,20 +404,29 @@ def create(args, cwd, executor=execute, out=None):
     locks = (hold_cargo_locks(source_target / PROFILE) if args.seed
              else contextlib.nullcontext())
     with locks:
-        executor(
-            ["git", "worktree", "add", "-b", branch, worktree, base_ref],
-            cwd=repo,
-        )
+        # Every step from here on creates state, so each failure rolls back
+        # what exists: `git worktree add -b` can fail after creating the
+        # branch, or after a full checkout when a post-checkout hook fails.
+        step = "git worktree add"
         try:
+            executor(
+                ["git", "worktree", "add", "-b", branch, worktree, base_ref],
+                cwd=repo,
+            )
             if args.seed:
+                step = "seeding"
                 dest_target = default_target_dir(worktree, executor)
                 seed_target(source_target, dest_target, executor)
         except (OSError, WorktreeError, KeyboardInterrupt) as error:
-            problems = rollback(repo, worktree, branch, executor)
-            cleanup = ("; rolled back the new worktree and branch"
-                       if not problems else "; " + "; ".join(problems))
+            removed, problems = rollback(repo, worktree, branch, executor)
+            if problems:
+                cleanup = "; " + "; ".join(problems)
+            elif removed:
+                cleanup = "; rolled back " + " and ".join(removed)
+            else:
+                cleanup = "; nothing to roll back"
             reason = str(error) or type(error).__name__
-            raise WorktreeError(f"seeding failed: {reason}{cleanup}")
+            raise WorktreeError(f"{step} failed: {reason}{cleanup}")
 
     print(f"created worktree {worktree}", file=out)
     print(f"  branch {branch} from {base_ref}", file=out)
