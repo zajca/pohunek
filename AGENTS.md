@@ -215,6 +215,20 @@ bacon clippy-fast          # CI lint command
 bacon nextest-fast -- -p pohunek-gui-core  # narrow the loop to one crate
 ```
 
+Full debuginfo: the `dev`/`test` profiles emit line tables only for workspace
+crates and no debuginfo for dependencies (root `Cargo.toml`), which keeps
+file:line panic and `RUST_BACKTRACE` frames but not the variables and types a
+step debugger needs. Opt in per invocation; the dependency override in
+`[profile.dev.package."*"]` outranks `CARGO_PROFILE_DEV_DEBUG`, and Cargo has
+no environment variable for a `"*"` package override, so dependencies need
+`--config`. The opt-in compiles separate artifacts, so its first build is cold:
+
+```bash
+CARGO_PROFILE_DEV_DEBUG=true cargo build -p pohunek-daemon      # workspace crates only
+cargo build -p pohunek-daemon --config 'profile.dev.debug=true' \
+    --config 'profile.dev.package."*".debug=true'               # dependencies too
+```
+
 Reproduce CI timing evidence from `gh` run data. Every fetch accumulates into
 the snapshot `target/ci-timings/ci-runs.json`; passing that file as `--input`
 re-measures from it with no network calls, while the plain commands always
