@@ -199,6 +199,19 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
 
+# Line tables keep file:line panic and RUST_BACKTRACE frames for workspace
+# crates while skipping the variable/type DWARF that dominates dev codegen,
+# link time and target/ size. `test` inherits this profile. For a step
+# debugger, opt in per invocation (see AGENTS.md "Full debuginfo").
+[profile.dev]
+debug = "line-tables-only"
+
+# `"*"` matches only non-workspace packages; dependencies are rarely stepped
+# through. This override outranks CARGO_PROFILE_DEV_DEBUG, so full dependency
+# debuginfo needs `--config 'profile.dev.package."*".debug=true'`.
+[profile.dev.package."*"]
+debug = false
+
 # Keep release builds debuggable enough for a daemon while small.
 [profile.release]
 opt-level = 2
