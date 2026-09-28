@@ -684,6 +684,7 @@ impl SessionRegistry {
                 phase: "preparing".to_owned(),
                 previous_worker_id: previous_worker_id.clone(),
                 previous_runtime_id: previous_runtime_id.clone(),
+                daemon_instance_id: None,
             }),
             info: preparing_info,
             native_identity_ordering: None,
@@ -833,7 +834,8 @@ impl SessionRegistry {
             last_native_report: None,
             observed_agents: Vec::new(),
             cwd_observed_at: std::time::Instant::now(),
-            initial_input_pending,
+            initial_input_owner: initial_input_pending
+                .then(|| self.daemon_instance_id().to_owned()),
         };
         if let Err(error) = self.commit_session_entry(&id, entry).await {
             self.stop_uncommitted_runtime(&id, &started.handle).await;

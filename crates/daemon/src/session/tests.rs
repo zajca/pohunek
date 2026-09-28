@@ -14271,6 +14271,7 @@ async fn reconciled_create_whose_worker_ended_is_retired_then_compensated() {
         phase: "preparing".to_owned(),
         previous_worker_id: None,
         previous_runtime_id: None,
+        daemon_instance_id: None,
     });
     record.desired_state = crate::store::DesiredState::Running;
     record.runtime = crate::store::RuntimeRecord {
@@ -14522,6 +14523,7 @@ async fn create_cut_off_before_its_initial_input_is_rolled_back_at_restart() {
 struct InputCommitRace {
     daemon: RestartableDaemon,
     registry: SessionRegistry,
+    supervisor: Arc<crate::runtime::lifecycle::tests::ScriptedSupervisor>,
     creating: tokio::task::JoinHandle<Result<SessionInfo, protocol::ProtocolError>>,
     release: Arc<tokio::sync::Notify>,
     id: SessionId,
@@ -14530,7 +14532,7 @@ struct InputCommitRace {
 impl InputCommitRace {
     async fn start(tag: &str, shell: ShellCommand) -> Self {
         let daemon = RestartableDaemon::new(tag);
-        let (registry, _supervisor) = scripted_registry(SessionRegistryConfig {
+        let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
             shell_command: shell,
             initial_input_startup_grace: Duration::ZERO,
             ..daemon.config.clone()
@@ -14558,6 +14560,7 @@ impl InputCommitRace {
         Self {
             daemon,
             registry,
+            supervisor,
             creating,
             release: gate.release,
             id,
@@ -14640,6 +14643,203 @@ async fn initial_input_commit_keeps_a_concurrent_natural_exit() {
     assert_eq!(record.info.state, SessionState::Failed, "the exit survives");
     assert_eq!(record.info.exit_code, Some(3));
     assert_eq!(record.runtime.state, RuntimeState::Terminal);
+}
+
+/// A create whose initial input was never delivered because its daemon
+/// exited, and the replacement daemon that finds its `initial_input` marker.
+struct OrphanedInputCreate {
+    daemon: RestartableDaemon,
+    supervisor: Arc<crate::runtime::lifecycle::tests::ScriptedSupervisor>,
+    restarted: SessionRegistry,
+    id: SessionId,
+    worktree: PathBuf,
+}
+
+impl OrphanedInputCreate {
+    async fn start(tag: &str) -> Self {
+        let daemon = RestartableDaemon::new(tag);
+        let (registry, supervisor) = scripted_registry(daemon.config.clone());
+        let gate = hold_initial_input(&registry);
+        let _creating = tokio::spawn({
+            let registry = registry.clone();
+            let params = SessionNewParams {
+                input: Some("echo orphaned".to_owned()),
+                ..daemon.params(&format!("feat/{tag}"))
+            };
+            async move { registry.create(params).await }
+        });
+        gate.entered.notified().await;
+        let record = undelivered_create(&daemon);
+        let id = SessionId(record.session_id.clone());
+        // The daemon exits: its in-memory session and worker connections go
+        // away, while the worker keeps running under its job.
+        let entry = registry
+            .inner
+            .sessions
+            .lock()
+            .await
+            .remove(&id)
+            .expect("committed session entry");
+        entry.cancel_runtime_watchers();
+        drop(entry);
+        drop(registry);
+        let restarted = SessionRegistry::new_with_launcher_and_inspector(
+            daemon.config.clone(),
+            Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
+            Arc::new(ReadableHost::new()),
+        );
+        Self {
+            daemon,
+            supervisor,
+            restarted,
+            id,
+            worktree: record.info.worktree_path.clone().expect("bound worktree"),
+        }
+    }
+
+    /// Asserts, with the session's lifecycle lock held so no retry can act,
+    /// that nothing was stopped or cleaned and the session waits as pending.
+    async fn assert_untouched_and_pending(&self) {
+        let _guard = self.restarted.lock_lifecycle(&self.id).await;
+        assert!(
+            self.supervisor.retired().is_empty(),
+            "no generation is retired: {:?}",
+            self.supervisor.calls()
+        );
+        assert!(self.worktree.is_dir(), "the worktree is kept");
+        assert_eq!(self.daemon.bindings().len(), 1, "its binding is kept");
+        let record = undelivered_create(&self.daemon);
+        assert_eq!(
+            record.desired_state,
+            crate::store::DesiredState::Running,
+            "no removal intent was persisted"
+        );
+        let sessions = self.restarted.list().await;
+        let [session] = sessions.as_slice() else {
+            panic!("the session stays visible for the retry: {sessions:?}");
+        };
+        let runtime = session.runtime.as_ref().expect("runtime");
+        assert_eq!(runtime.state, RuntimeState::Conflict);
+        assert_eq!(
+            runtime.loss_reason.as_deref(),
+            Some(crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS)
+        );
+    }
+}
+
+#[tokio::test]
+async fn supervision_retry_never_rolls_back_a_live_create_committing_its_input() {
+    let race = InputCommitRace::start(
+        "input-commit-retry",
+        ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+    )
+    .await;
+    // The worker connection is lost while the create commits its delivered
+    // input, leaving the session reconnecting for the supervision retry.
+    let mut sessions = race.registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&race.id).expect("session entry");
+    entry.cancel_runtime_watchers();
+    entry.runtime = RuntimeHandle::Unavailable(RuntimeState::Reconnecting);
+    let runtime = entry.info.runtime.as_mut().expect("runtime");
+    runtime.state = RuntimeState::Reconnecting;
+    runtime.loss_reason = Some(crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE.to_owned());
+    drop(sessions);
+    {
+        let _guard = race.registry.lock_lifecycle(&race.id).await;
+        let record = race
+            .registry
+            .load_durable_session_record(&race.id)
+            .await
+            .expect("read record")
+            .expect("session record");
+        assert!(
+            record
+                .transaction
+                .as_ref()
+                .is_some_and(crate::store::SessionTransaction::is_initial_input),
+            "the retry sees this daemon's marker"
+        );
+        race.registry.reconcile_single_session(record).await
+    };
+    let supervisor = Arc::clone(&race.supervisor);
+
+    let (daemon, registry, id, created) = race.commit().await;
+
+    assert!(
+        supervisor.retired().is_empty(),
+        "the live create's generation is never retired: {:?}",
+        supervisor.calls()
+    );
+    let record = stored_record(&daemon.store_path, &id);
+    assert_eq!(record.transaction, None, "the delivered input is committed");
+    assert_eq!(record.desired_state, crate::store::DesiredState::Running);
+    let worktree = created.worktree_path.expect("bound worktree");
+    assert!(worktree.is_dir(), "the live create keeps its worktree");
+    assert_eq!(daemon.bindings().len(), 1);
+    registry.stop(&id).await.expect("stop the session");
+}
+
+#[tokio::test]
+async fn failed_undelivered_create_conversion_stops_and_cleans_nothing() {
+    let orphan = OrphanedInputCreate::start("orphan-io").await;
+    orphan
+        .restarted
+        .inner
+        .store
+        .as_ref()
+        .expect("registry store")
+        .fail_next_write_before_rename();
+
+    orphan
+        .restarted
+        .reconcile_workers()
+        .await
+        .expect("startup reconciliation");
+
+    orphan.assert_untouched_and_pending().await;
+}
+
+#[tokio::test]
+async fn stale_undelivered_create_conversion_stops_and_cleans_nothing() {
+    let orphan = OrphanedInputCreate::start("orphan-stale").await;
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *orphan
+        .restarted
+        .inner
+        .undelivered_conversion_hold
+        .lock()
+        .expect("conversion hold is never poisoned") = Some(gate.clone());
+    let reconciling = tokio::spawn({
+        let restarted = orphan.restarted.clone();
+        async move { restarted.reconcile_workers().await }
+    });
+    gate.entered.notified().await;
+    // Another writer persists a newer state of the record the conversion read.
+    let mut newer = undelivered_create(&orphan.daemon);
+    newer.info.updated_at = timestamp_now();
+    newer.info.name = Some("renamed meanwhile".to_owned());
+    orphan
+        .daemon
+        .store()
+        .record_session(&newer)
+        .expect("persist the newer record");
+    gate.release.notify_one();
+
+    reconciling
+        .await
+        .expect("reconciliation joins")
+        .expect("startup reconciliation");
+
+    orphan.assert_untouched_and_pending().await;
+    assert_eq!(
+        stored_record(&orphan.daemon.store_path, &orphan.id),
+        newer,
+        "the newer record is not overwritten"
+    );
 }
 
 /// Path of the real worker binary the subprocess launcher spawns.

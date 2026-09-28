@@ -622,7 +622,17 @@ impl SessionRegistry {
         lifecycle: Option<&Lifecycle<'_>>,
         retry: bool,
     ) -> bool {
-        let record = self.roll_back_undelivered_create(record).await;
+        let record = match self.roll_back_undelivered_create(record).await {
+            UndeliveredCreate::Proceed(record) => record,
+            UndeliveredCreate::Pending(record) => {
+                self.hold_pending_unpersisted(record, retry).await;
+                return true;
+            }
+            UndeliveredCreate::Gone(id) => {
+                self.inner.sessions.lock().await.remove(&id);
+                return false;
+            }
+        };
         let generation = match super::Generation::from_record(&record.session_id, &record.runtime) {
             Ok(generation) => generation,
             Err(error) => {
@@ -716,10 +726,7 @@ impl SessionRegistry {
             SocketEvidence::Absent | SocketEvidence::Unusable(..) | SocketEvidence::Unknown(_) => {}
         }
 
-        let creating = record
-            .transaction
-            .as_ref()
-            .is_some_and(|transaction| transaction.kind == crate::store::TransactionKind::Create);
+        let creating = uncommitted_create(&record);
         let scoped = scan.scoped_to(generation.as_ref());
         match classify_terminal_journals(&scoped, &record) {
             // The journal proves the generation ended and no worker answers,
@@ -930,42 +937,118 @@ impl SessionRegistry {
     /// a removal intent, which the rest of reconciliation finishes exactly as
     /// an interrupted `session rm`.
     ///
-    /// The input lived only in the previous daemon's memory, so the session
-    /// cannot get it and must not keep running without it. The intent is
-    /// persisted first; a failed write is logged, and the record's marker
-    /// makes the next reconciliation convert it again.
-    async fn roll_back_undelivered_create(&self, mut record: SessionRecord) -> SessionRecord {
-        let undelivered = record.desired_state == DesiredState::Running
-            && record
-                .transaction
-                .as_ref()
-                .is_some_and(crate::store::SessionTransaction::is_initial_input);
-        if !undelivered {
-            return record;
+    /// Only a marker another daemon instance wrote (or one naming no
+    /// instance) is orphaned: that instance held the input in memory and is
+    /// gone, so the session cannot get it and must not keep running without
+    /// it. A marker of this instance belongs to a create still delivering
+    /// its input, which reconciliation treats as the running session it is.
+    ///
+    /// The conversion starts from the current durable record and is persisted
+    /// conditionally on it; only an applied intent proceeds to the removal.
+    /// A record that changed meanwhile, or a write that failed, stops nothing
+    /// and cleans nothing: the session stays pending for the retry, which
+    /// re-reads it.
+    async fn roll_back_undelivered_create(&self, record: SessionRecord) -> UndeliveredCreate {
+        if !self.orphaned_initial_input(&record) {
+            return UndeliveredCreate::Proceed(record);
         }
-        tracing::warn!(session_id = %record.session_id, "rolling back a create whose initial input was never delivered");
-        let durable = record.clone();
-        record.desired_state = DesiredState::Removed;
-        record.transaction = Some(crate::store::SessionTransaction {
-            id: format!("remove-create-{}", record.session_id),
+        let id = SessionId(record.session_id.clone());
+        let durable = match self.load_durable_session_record(&id).await {
+            Ok(Some(durable)) => durable,
+            Ok(None) => return UndeliveredCreate::Gone(id),
+            Err(error) => {
+                tracing::warn!(session_id = %id.0, error = %error, "cannot read the record of an undelivered create; it stays pending");
+                return UndeliveredCreate::Pending(record);
+            }
+        };
+        if !self.orphaned_initial_input(&durable) {
+            // Settled by another writer since the evidence was read.
+            return UndeliveredCreate::Pending(durable);
+        }
+        #[cfg(test)]
+        self.hold_undelivered_conversion(&id).await;
+        tracing::warn!(session_id = %id.0, "rolling back a create whose initial input was never delivered");
+        let mut intent = durable.clone();
+        intent.desired_state = DesiredState::Removed;
+        intent.transaction = Some(crate::store::SessionTransaction {
+            id: format!("remove-create-{}", id.0),
             kind: crate::store::TransactionKind::Remove,
             phase: "requested".to_owned(),
             previous_worker_id: None,
             previous_runtime_id: None,
+            daemon_instance_id: None,
         });
-        // Conditional on the record this conversion read, so a state persisted
-        // since then is never overwritten with this snapshot.
-        if let Err(error) = self
-            .write_session_record_if_current(durable, record.clone())
+        match self
+            .write_session_record_if_current(durable.clone(), intent.clone())
             .await
         {
-            tracing::warn!(
-                session_id = %record.session_id,
-                error = %error,
-                "failed to persist the removal intent of an undelivered create"
-            );
+            Ok(()) => UndeliveredCreate::Proceed(intent),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %id.0,
+                    error = %error,
+                    "the removal intent of an undelivered create was not persisted; nothing is stopped"
+                );
+                UndeliveredCreate::Pending(durable)
+            }
         }
-        record
+    }
+
+    /// Whether `record` is a running create whose `initial_input` marker was
+    /// written by another daemon instance, or names none.
+    fn orphaned_initial_input(&self, record: &SessionRecord) -> bool {
+        record.desired_state == DesiredState::Running
+            && record
+                .transaction
+                .as_ref()
+                .is_some_and(crate::store::SessionTransaction::is_initial_input)
+            && initial_input_owner(record).as_deref() != Some(self.daemon_instance_id())
+    }
+
+    /// Parks an undelivered-create conversion before its conditional write
+    /// when a test armed the hold.
+    #[cfg(test)]
+    async fn hold_undelivered_conversion(&self, id: &SessionId) {
+        let gate = self
+            .inner
+            .undelivered_conversion_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|gate| gate.session_id.as_deref().is_none_or(|held| held == id.0));
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Shows `record` as `Conflict` with `runtime_supervision_ambiguous`
+    /// without persisting it, and leaves it for the supervision retry.
+    ///
+    /// Used where the durable record is newer than this snapshot or could
+    /// not be written, so the snapshot must not overwrite it.
+    async fn hold_pending_unpersisted(&self, record: SessionRecord, retry: bool) {
+        let id = SessionId(record.session_id.clone());
+        if retry
+            && self
+                .inner
+                .sessions
+                .lock()
+                .await
+                .get(&id)
+                .is_some_and(|entry| {
+                    entry.info.runtime.as_ref().is_some_and(|runtime| {
+                        runtime.state == RuntimeState::Conflict
+                            && runtime.loss_reason.as_deref() == Some(SUPERVISION_AMBIGUOUS)
+                    })
+                })
+        {
+            return;
+        }
+        let (_record, entry) =
+            self.unavailable_entry(record, RuntimeState::Conflict, SUPERVISION_AMBIGUOUS);
+        let info = entry.info.clone();
+        self.install_session_entry(&id, entry).await;
+        self.emit(event::SESSION_RUNTIME_CONFLICT, &info);
     }
 
     /// Shows `record` as `Conflict` with `runtime_supervision_ambiguous`.
@@ -1899,9 +1982,7 @@ impl SessionRegistry {
                 RuntimePhase::Running | RuntimePhase::Starting
             )
         {
-            if record.transaction.as_ref().is_some_and(|transaction| {
-                transaction.kind == crate::store::TransactionKind::Create
-            }) {
+            if uncommitted_create(&record) {
                 // The worker only retains the final output of a create that
                 // never committed; the session is settled without it. The
                 // caller bound the worker to the record's generation.
@@ -2367,7 +2448,7 @@ impl SessionRegistry {
             last_native_report: record.native_identity_ordering.clone(),
             observed_agents: Vec::<ObservedAgent>::new(),
             cwd_observed_at: std::time::Instant::now(),
-            initial_input_pending: false,
+            initial_input_owner: initial_input_owner(&record),
         };
         if let Err(error) = self.write_session_record(record).await {
             tracing::warn!(session_id = %id.0, error = %error, "failed to commit reconciled worker");
@@ -2408,17 +2489,39 @@ impl SessionRegistry {
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "unavailable-record reconstruction keeps one atomic registry transition together"
-    )]
     pub(super) async fn insert_unavailable_record(
         &self,
-        mut record: SessionRecord,
+        record: SessionRecord,
         state: RuntimeState,
         reason: &str,
     ) {
         let id = SessionId(record.session_id.clone());
+        let (record, entry) = self.unavailable_entry(record, state, reason);
+        let info = entry.info.clone();
+        if let Err(error) = self.write_session_record(record).await {
+            tracing::warn!(session_id = %id.0, error = %error, "failed to persist runtime classification");
+            return;
+        }
+        self.install_session_entry(&id, entry).await;
+        let event_name = match state {
+            RuntimeState::Conflict => event::SESSION_RUNTIME_CONFLICT,
+            RuntimeState::Lost | RuntimeState::Incompatible => event::SESSION_RUNTIME_LOST,
+            RuntimeState::Starting
+            | RuntimeState::Live
+            | RuntimeState::Reconnecting
+            | RuntimeState::Terminal => event::SESSION_UPDATED,
+        };
+        self.emit(event_name, &info);
+    }
+
+    /// Classifies `record` as `state` for `reason` and builds the in-memory
+    /// entry that shows it, returning the classified record with it.
+    fn unavailable_entry(
+        &self,
+        mut record: SessionRecord,
+        state: RuntimeState,
+        reason: &str,
+    ) -> (SessionRecord, SessionEntry) {
         let now = timestamp_now();
         let runtime = record.info.runtime.get_or_insert(SessionRuntime {
             state,
@@ -2432,7 +2535,7 @@ impl SessionRegistry {
         runtime.state = state;
         runtime.loss_reason = (state != RuntimeState::Terminal).then(|| reason.to_owned());
         record.runtime.state = state;
-        record.runtime.reason = runtime.loss_reason.clone();
+        record.runtime.reason.clone_from(&runtime.loss_reason);
         if matches!(state, RuntimeState::Lost | RuntimeState::Terminal) {
             terminalize_running_subagents(&mut record.info.subagents, current_time_millis());
         }
@@ -2512,22 +2615,9 @@ impl SessionRegistry {
             last_native_report: record.native_identity_ordering.clone(),
             observed_agents: Vec::new(),
             cwd_observed_at: std::time::Instant::now(),
-            initial_input_pending: false,
+            initial_input_owner: initial_input_owner(&record),
         };
-        if let Err(error) = self.write_session_record(record).await {
-            tracing::warn!(session_id = %id.0, error = %error, "failed to persist runtime classification");
-            return;
-        }
-        self.install_session_entry(&id, entry).await;
-        let event_name = match state {
-            RuntimeState::Conflict => event::SESSION_RUNTIME_CONFLICT,
-            RuntimeState::Lost | RuntimeState::Incompatible => event::SESSION_RUNTIME_LOST,
-            RuntimeState::Starting
-            | RuntimeState::Live
-            | RuntimeState::Reconnecting
-            | RuntimeState::Terminal => event::SESSION_UPDATED,
-        };
-        self.emit(event_name, &info);
+        (record, entry)
     }
 
     /// Replays the durable stop intent of `record` through its answering
@@ -2680,6 +2770,39 @@ impl SessionRegistry {
         self.finish_removal_intent(record, generation.as_ref(), lifecycle.as_ref(), retry)
             .await
     }
+}
+
+/// Outcome of converting an orphaned undelivered create
+/// ([`SessionRegistry::roll_back_undelivered_create`]).
+enum UndeliveredCreate {
+    /// Reconcile this record: it is not orphaned, or its removal intent is
+    /// durable.
+    Proceed(SessionRecord),
+    /// The intent was not persisted: nothing may be stopped or cleaned, and
+    /// the session stays pending for the retry.
+    Pending(SessionRecord),
+    /// The record no longer exists.
+    Gone(SessionId),
+}
+
+/// The daemon instance an `initial_input` marker of `record` names, which
+/// keeps holding the undelivered input while it runs.
+fn initial_input_owner(record: &SessionRecord) -> Option<String> {
+    record
+        .transaction
+        .as_ref()
+        .filter(|transaction| transaction.is_initial_input())
+        .and_then(|transaction| transaction.daemon_instance_id.clone())
+}
+
+/// Whether `record` is a create that has not committed its session yet.
+///
+/// A committed create still delivering its initial input is a running
+/// session, not an uncommitted create, so no create compensation applies.
+fn uncommitted_create(record: &SessionRecord) -> bool {
+    record.transaction.as_ref().is_some_and(|transaction| {
+        transaction.kind == crate::store::TransactionKind::Create && !transaction.is_initial_input()
+    })
 }
 
 fn import_worker_subagents(snapshot: &InspectSnapshot) -> Result<Vec<SubagentInfo>, &'static str> {
@@ -5178,6 +5301,7 @@ while os.getppid() == parent:
                     phase: "preparing".to_owned(),
                     previous_worker_id: None,
                     previous_runtime_id: None,
+                    daemon_instance_id: None,
                 }),
                 native_identity_ordering: Some(NativeIdentityOrdering {
                     runtime_id: runtime_id.to_string(),
@@ -5604,6 +5728,7 @@ while os.getppid() == parent:
             phase: "preparing".to_owned(),
             previous_worker_id: None,
             previous_runtime_id: None,
+            daemon_instance_id: None,
         });
         record.recovery.as_mut().expect("recovery").session_id = "s-204".to_owned();
         Store::new(store_path.clone())
@@ -6335,6 +6460,7 @@ while os.getppid() == parent:
             phase: "requested".to_owned(),
             previous_worker_id: None,
             previous_runtime_id: None,
+            daemon_instance_id: None,
         });
         let recovery = record.recovery.as_mut().expect("recovery");
         recovery.session_id = id.to_owned();
@@ -8220,6 +8346,7 @@ while os.getppid() == parent:
                 phase: "preparing".to_owned(),
                 previous_worker_id: None,
                 previous_runtime_id: None,
+                daemon_instance_id: None,
             });
             Store::new(fixture.root.join("data/metadata.jsonl"))
                 .record_session(&record)
@@ -8251,6 +8378,7 @@ while os.getppid() == parent:
                 phase: "preparing".to_owned(),
                 previous_worker_id: None,
                 previous_runtime_id: None,
+                daemon_instance_id: None,
             });
             Store::new(fixture.root.join("data/metadata.jsonl"))
                 .record_session(&record)
@@ -8312,6 +8440,7 @@ while os.getppid() == parent:
                 phase: "preparing".to_owned(),
                 previous_worker_id: None,
                 previous_runtime_id: None,
+                daemon_instance_id: None,
             });
             Store::new(root.join("data/metadata.jsonl"))
                 .record_session(&record)
@@ -8877,6 +9006,7 @@ while os.getppid() == parent:
                 phase: "requested".to_owned(),
                 previous_worker_id: None,
                 previous_runtime_id: None,
+                daemon_instance_id: None,
             });
             Store::new(root.join("data/metadata.jsonl"))
                 .record_session(&record)
@@ -9120,6 +9250,7 @@ while os.getppid() == parent:
                 phase: "requested".to_owned(),
                 previous_worker_id: None,
                 previous_runtime_id: None,
+                daemon_instance_id: None,
             });
             Store::new(root.join("data/metadata.jsonl"))
                 .record_session(&record)

@@ -515,6 +515,10 @@ struct SessionRegistryInner {
     #[cfg(test)]
     initial_input_commit_hold:
         std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Holds the next undelivered-create conversion before its write.
+    #[cfg(test)]
+    undelivered_conversion_hold:
+        std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
 }
 
 /// The detached create transactions of one registry.
@@ -574,9 +578,10 @@ struct SessionEntry {
     /// never replaces it, so a scan that read a process before a newer OSC 7
     /// hint landed cannot move the session back.
     cwd_observed_at: Instant,
-    /// Whether the create's initial input is still to be delivered; the
-    /// running session's record then carries the `initial_input` marker.
-    initial_input_pending: bool,
+    /// Daemon instance holding the create's undelivered initial input; the
+    /// running session's record then carries the `initial_input` marker
+    /// naming that instance.
+    initial_input_owner: Option<String>,
 }
 
 impl SessionEntry {
@@ -1094,14 +1099,17 @@ impl SessionRegistry {
             job.record_into(&mut runtime);
         }
         let transaction = transaction.or_else(|| {
-            (entry.initial_input_pending && desired_state == DesiredState::Running).then(|| {
-                SessionTransaction {
-                    id: format!("create-{}", id.0),
-                    kind: TransactionKind::Create,
-                    phase: crate::store::INITIAL_INPUT_PHASE.to_owned(),
-                    previous_worker_id: None,
-                    previous_runtime_id: None,
-                }
+            let owner = entry
+                .initial_input_owner
+                .as_ref()
+                .filter(|_| desired_state == DesiredState::Running)?;
+            Some(SessionTransaction {
+                id: format!("create-{}", id.0),
+                kind: TransactionKind::Create,
+                phase: crate::store::INITIAL_INPUT_PHASE.to_owned(),
+                previous_worker_id: None,
+                previous_runtime_id: None,
+                daemon_instance_id: Some(owner.clone()),
             })
         });
         SessionRecord {
@@ -1293,6 +1301,8 @@ impl SessionRegistry {
                 initial_input_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 initial_input_commit_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                undelivered_conversion_hold: std::sync::Mutex::new(None),
             }),
         };
         if let Some(config) = external_observer {
@@ -1833,7 +1843,7 @@ impl SessionRegistry {
                 })?;
         }
         if let Some(entry) = self.inner.sessions.lock().await.get_mut(id) {
-            entry.initial_input_pending = false;
+            entry.initial_input_owner = None;
         }
         Ok(())
     }
@@ -2880,6 +2890,7 @@ impl SessionRegistry {
                         phase: "requested".to_owned(),
                         previous_worker_id: None,
                         previous_runtime_id: None,
+                        daemon_instance_id: None,
                     }),
                 ),
             )
@@ -3103,6 +3114,7 @@ impl SessionRegistry {
                         phase: "requested".to_owned(),
                         previous_worker_id: None,
                         previous_runtime_id: None,
+                        daemon_instance_id: None,
                     }),
                 )
             };
@@ -4534,6 +4546,7 @@ fn create_intent_record(
             phase: "preparing".to_owned(),
             previous_worker_id: None,
             previous_runtime_id: None,
+            daemon_instance_id: None,
         }),
         info,
         native_identity_ordering: None,

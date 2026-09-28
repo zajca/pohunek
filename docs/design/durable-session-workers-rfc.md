@@ -1095,7 +1095,7 @@ initial input. `session_created` is emitted exactly once.
 | after child spawn, before live journal | worker terminates child because it cannot establish recoverable authority |
 | after live journal, before daemon commit | daemon adopts a live worker into the preparing logical record and commits; a worker whose runtime already ended (it answers with a terminal phase, or only its terminal journal remains) has its generation retired, then the worktree compensated, then the record deleted |
 | after commit, before event | event log reconciliation emits one recovered creation event keyed by transaction ID |
-| during initial input | the committed record still carries `transaction=create/initial_input` (the input lives only in daemon memory), so reconciliation turns it into a removal intent and finishes it like `session rm`: stop, retire, worktree, record |
+| during initial input | the committed record still carries `transaction=create/initial_input` naming the daemon instance that holds the input in memory; reconciliation by another instance turns it into a removal intent, persisted conditionally on the current record, and only an applied intent is finished like `session rm` (stop, retire, worktree, record); a stale or failed write stops nothing and leaves the session pending for the retry. The owning instance's own retries treat it as the running session it is |
 
 Compensation never kills a live worker whose identity does not exactly match the
 preparing record. Such a mismatch becomes `runtime_conflict` for operator

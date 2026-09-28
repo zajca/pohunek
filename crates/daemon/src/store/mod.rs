@@ -454,6 +454,13 @@ pub struct SessionTransaction {
     /// Runtime generation replaced by a recovery transaction, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_runtime_id: Option<String>,
+    /// Daemon instance whose in-memory work the transaction depends on.
+    ///
+    /// Set on the `initial_input` marker, whose input only that instance
+    /// holds: reconciliation rolls back a marker only when another instance
+    /// (or none) wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_instance_id: Option<String>,
 }
 
 /// Phase of a committed create whose initial input is not yet delivered.
