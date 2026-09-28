@@ -228,6 +228,17 @@ exits 0 without running nextest and names the follow-up checks (`cargo xtask
 docs check`, the `scripts/` unittests, the Bun gates). It narrows only which
 tests run and never replaces the full gate set.
 
+New worktree: `scripts/worktree-new <slug> [<base-ref>]` creates
+`../pohunek-worktrees/<slug>` on `zajca/<slug>` (base: `origin/main` after a
+fetch) and seeds its own `target/debug` caches from the main checkout with
+`cp --reflink=always`, so the first build recompiles only the workspace
+crates that differ, not every registry dependency. It needs the main
+checkout's `target/` and the worktree on one reflink-capable filesystem
+(btrfs/XFS; never `/tmp`), fails closed otherwise or while a Cargo build holds
+the main checkout's lock, and never falls back to a full copy; `--no-seed`
+accepts a cold build. The seed helps in proportion to how recently the main
+checkout was built at a similar `Cargo.lock`.
+
 Web (run inside `web/`):
 
 ```bash

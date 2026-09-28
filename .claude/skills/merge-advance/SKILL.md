@@ -49,7 +49,7 @@ green (see the `milestone` and `milestone-review` skills).
    `main`:
 
    ```bash
-   git worktree remove /tmp/pohunek-<milestone-slug>
+   git worktree remove ../pohunek-worktrees/<milestone-slug>
    git branch -d zajca/<milestone-slug>
    git worktree prune
    ```

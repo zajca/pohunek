@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""Create a pohunek git worktree with a reflink-seeded Cargo target dir.
+
+`scripts/worktree-new <slug> [<base-ref>]` creates the worktree
+`<main-parent>/pohunek-worktrees/<slug>` on the branch `zajca/<slug>`
+(`--branch` overrides it) from `<base-ref>`, which defaults to
+`origin/main` after a `git fetch origin main`. An explicit base ref is used
+exactly as given, without a fetch.
+
+Seeding: the worktree builds into its own default `<worktree>/target`, so
+no `CARGO_TARGET_DIR` is needed, daemon tests find the worktree's own
+`target/debug/pohunek-sessiond`, and removing the worktree removes the
+build. That dir is seeded with `cp -a --reflink=always` from the main
+checkout's `target/debug`: copy-on-write clones on btrfs/XFS share every
+extent until one side rewrites a file, cost almost no space, and keep the
+mtimes that make the registry dependencies' fingerprints fresh. Only the
+profile's cache subdirectories (`.fingerprint`, `build`, `deps`,
+`incremental`) and the `CACHEDIR.TAG`/`.rustc_info.json` files are cloned.
+The uplifted top-level outputs (`target/debug/pohunek-sessiond`, the
+`lib*.rlib` copies, `examples/`) are deliberately left out: they are the
+main checkout's build of *another* branch, and a test that resolves the
+worker binary by path must not run it. Cargo re-creates them when it builds
+those units in the worktree.
+
+Fail-closed rules:
+
+* the seed is a real reflink or nothing: a probe clone of the source's
+  `CACHEDIR.TAG` into the worktree parent must succeed first, and there is
+  no fallback to a full copy; `--no-seed` accepts a cold build instead;
+* the main checkout's profile dir is copied only while this script holds
+  every Cargo lock file there exclusively, so a running build (or
+  `cargo check` from an editor) is never snapshotted half-written;
+* both checkouts must use Cargo's default layout (`target_directory` and
+  `build_directory` equal to `<root>/target` per `cargo metadata`); a
+  `CARGO_TARGET_DIR`, `build.target-dir`, or `build.build-dir` override
+  would make the seed dead weight or copy the wrong tree;
+* any failure after `git worktree add` removes the new worktree and branch
+  again, so a failed run leaves nothing behind.
+"""
+
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+
+# Branch namespace of the repository's workflow skills (`milestone`,
+# `deliver-issue`): every agent branch is `zajca/<slug>`.
+BRANCH_PREFIX = "zajca/"
+# Sibling directory of the main checkout that holds all worktrees. It must
+# sit on the same filesystem as the main `target/` for reflinks, which rules
+# out `/tmp` (tmpfs) and `~/.local/share` (a different btrfs here).
+WORKTREES_DIR_NAME = "pohunek-worktrees"
+# Default base: the remote main branch, fetched first so a new worktree
+# never starts from a stale local copy.
+DEFAULT_REMOTE = "origin"
+DEFAULT_REMOTE_BRANCH = "main"
+# A slug is one path component and one ref component: it starts with an
+# alphanumeric (never `-`, so it cannot be read as an option, and never
+# `.`, so it cannot be hidden or `..`) and uses only portable characters.
+SLUG_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+# Upper bound on slug length: well below NAME_MAX (255) and keeps the
+# worktree path and branch name readable in `git worktree list`.
+MAX_SLUG_LENGTH = 100
+# The only profile the dev loop builds; `release` is not seeded.
+PROFILE = "debug"
+# Profile cache subdirectories cloned into the worktree. `.fingerprint` and
+# `deps` are what makes a dependency Fresh; `build` holds build-script
+# outputs (Cargo rewrites their recorded OUT_DIR paths via `root-output`);
+# `incremental` lets rustc reuse workspace-crate query caches.
+SEED_SUBDIRS = (".fingerprint", "build", "deps", "incremental")
+REQUIRED_SEED_SUBDIRS = (".fingerprint", "deps")
+# Target-root files Cargo writes once, when it creates the target dir. It
+# does not add `CACHEDIR.TAG` to a directory that already exists, so the
+# seed must carry it; `.rustc_info.json` only caches `rustc -vV` probes.
+CACHEDIR_TAG = "CACHEDIR.TAG"
+TARGET_ROOT_FILES = (CACHEDIR_TAG, ".rustc_info.json")
+# Lock files Cargo (1.98) holds while it builds in a profile dir: the build
+# and artifact locks exclusively, `.cargo-lock` shared. Lock state lives in
+# the open file description, never in the (empty) file, so cloning the
+# files copies no lock.
+CARGO_LOCK_FILES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
+# Name the profile dir is cloned under before it is renamed into place, so
+# an interrupted copy never leaves a half-populated `target/debug` whose
+# fingerprints Cargo would trust.
+STAGING_NAME = f"{PROFILE}.worktree-new-partial"
+# Probe file cloned into the worktree parent to prove reflink support.
+PROBE_NAME = ".worktree-new-reflink-probe"
+
+
+class WorktreeError(Exception):
+    """A precondition or step failed; the message says why and what next."""
+
+
+def format_command(command):
+    """One shell-shaped line for messages."""
+    return " ".join(shlex.quote(str(part)) for part in command)
+
+
+def execute(command, cwd, check=True):
+    """Run one git/cargo/cp command and return the completed process.
+
+    With `check`, a non-zero exit raises `WorktreeError` carrying the
+    command's first stderr line.
+    """
+    try:
+        result = subprocess.run(
+            [str(part) for part in command],
+            cwd=cwd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as error:
+        raise WorktreeError(f"cannot run {format_command(command)}: {error}")
+    if check and result.returncode != 0:
+        detail = (result.stderr or "").strip().splitlines()
+        detail = f": {detail[0]}" if detail else ""
+        raise WorktreeError(
+            f"command failed with exit {result.returncode}: "
+            f"{format_command(command)}{detail}"
+        )
+    return result
+
+
+def validate_slug(slug):
+    """Reject slugs that could escape the worktree dir or break the ref."""
+    if not slug:
+        raise WorktreeError("the slug must not be empty")
+    if len(slug) > MAX_SLUG_LENGTH:
+        raise WorktreeError(
+            f"the slug is longer than {MAX_SLUG_LENGTH} characters"
+        )
+    if not SLUG_PATTERN.fullmatch(slug):
+        raise WorktreeError(
+            f"invalid slug {slug!r}: use letters, digits, '.', '_' and '-', "
+            "starting with a letter or digit (no '/', no spaces)"
+        )
+    if ".." in slug or slug.endswith(".") or slug.endswith(".lock"):
+        raise WorktreeError(
+            f"invalid slug {slug!r}: it must not contain '..' or end with "
+            "'.' or '.lock'"
+        )
+
+
+def validate_branch(branch, repo, executor):
+    """Let git itself decide whether the branch name is a valid ref."""
+    if branch.startswith("-"):
+        raise WorktreeError(f"invalid branch name {branch!r}")
+    result = executor(
+        ["git", "check-ref-format", "--branch", branch], cwd=repo, check=False
+    )
+    if result.returncode != 0:
+        raise WorktreeError(f"invalid branch name {branch!r}")
+
+
+def main_checkout(cwd, executor):
+    """The main checkout: the directory that owns the shared `.git`."""
+    common = executor(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        cwd=cwd,
+    ).stdout.strip()
+    common_dir = Path(common)
+    if common_dir.name != ".git":
+        raise WorktreeError(
+            f"the git common dir {common_dir} is not a '.git' directory; "
+            "worktree-new needs a non-bare main checkout"
+        )
+    return common_dir.parent
+
+
+def branch_exists(branch, repo, executor):
+    """True when `refs/heads/<branch>` already exists."""
+    result = executor(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=repo,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def resolve_base(base_ref, repo, executor):
+    """Fetch the default base when none is given, then verify it resolves."""
+    if base_ref is None:
+        executor(
+            ["git", "fetch", DEFAULT_REMOTE, DEFAULT_REMOTE_BRANCH], cwd=repo
+        )
+        base_ref = f"{DEFAULT_REMOTE}/{DEFAULT_REMOTE_BRANCH}"
+    result = executor(
+        ["git", "rev-parse", "--verify", "--quiet", f"{base_ref}^{{commit}}"],
+        cwd=repo,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise WorktreeError(f"base ref {base_ref!r} does not name a commit")
+    return base_ref
+
+
+def default_target_dir(root, executor):
+    """`<root>/target`, verified against Cargo's own resolved layout.
+
+    Cargo reports the directories it will really use, after env vars and
+    every config file; anything but the default combined layout fails.
+    """
+    output = executor(
+        ["cargo", "metadata", "--no-deps", "--format-version", "1"], cwd=root
+    ).stdout
+    try:
+        metadata = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise WorktreeError(f"cannot parse `cargo metadata` in {root}: {error}")
+    expected = Path(root) / "target"
+    for key in ("target_directory", "build_directory"):
+        value = metadata.get(key)
+        # `build_directory` is absent on a Cargo without build-dir support,
+        # where the build dir is the target dir by definition.
+        if value is None and key == "build_directory":
+            continue
+        if value is None or Path(value).resolve() != expected.resolve():
+            raise WorktreeError(
+                f"`cargo metadata` in {root} reports {key} {value!r}, not "
+                f"{expected}: a CARGO_TARGET_DIR/CARGO_BUILD_* variable or a "
+                "`build.target-dir`/`build.build-dir` setting is active. "
+                "Unset it to seed, or pass --no-seed."
+            )
+    return expected
+
+
+def check_seed_source(target):
+    """The main target dir must hold a usable profile cache to clone."""
+    profile = target / PROFILE
+    if not profile.is_dir():
+        raise WorktreeError(
+            f"no seed source: {profile} does not exist. Build the main "
+            "checkout once (`cargo build --workspace --all-targets "
+            "--all-features`), or pass --no-seed for a cold build."
+        )
+    for name in REQUIRED_SEED_SUBDIRS:
+        if not (profile / name).is_dir():
+            raise WorktreeError(
+                f"no seed source: {profile / name} is missing, so "
+                f"{profile} is not a Cargo profile dir. Pass --no-seed for "
+                "a cold build."
+            )
+    if not (target / CACHEDIR_TAG).is_file():
+        raise WorktreeError(
+            f"no seed source: {target / CACHEDIR_TAG} is missing, so "
+            f"{target} is not a Cargo target dir. Pass --no-seed for a "
+            "cold build."
+        )
+
+
+def reflink(source, dest, cwd, executor):
+    """Clone `source` to `dest` with `cp -a --reflink=always`."""
+    executor(["cp", "-a", "--reflink=always", source, dest], cwd=cwd)
+
+
+def probe_reflink(source_file, dest_dir, executor):
+    """Prove that a clone from the source filesystem into `dest_dir` works."""
+    probe = dest_dir / PROBE_NAME
+    if probe.exists() or probe.is_symlink():
+        raise WorktreeError(
+            f"{probe} already exists (another worktree-new run, or a "
+            "leftover): remove it and retry"
+        )
+    try:
+        reflink(source_file, probe, dest_dir, executor)
+    except WorktreeError as error:
+        raise WorktreeError(
+            f"reflink is not supported from {source_file.parent} to "
+            f"{dest_dir}: both must be on the same btrfs/XFS filesystem "
+            f"({error}). Refusing to fall back to a full copy; pass "
+            "--no-seed to accept a cold build."
+        )
+    finally:
+        if probe.exists() or probe.is_symlink():
+            probe.unlink()
+
+
+@contextlib.contextmanager
+def hold_cargo_locks(profile_dir):
+    """Hold every Cargo lock in `profile_dir` exclusively, without waiting.
+
+    Missing lock files are skipped: Cargo creates them on first use, and a
+    profile dir without them has no build running in it.
+    """
+    handles = []
+    try:
+        for name in CARGO_LOCK_FILES:
+            path = profile_dir / name
+            if not path.is_file():
+                continue
+            handle = open(path, "rb")
+            handles.append(handle)
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise WorktreeError(
+                    f"a Cargo process holds {path} (a build, test run, or "
+                    "editor check in the main checkout): wait for it to "
+                    "finish and retry, or pass --no-seed"
+                )
+        yield
+    finally:
+        for handle in handles:
+            handle.close()
+
+
+def seed_target(source_target, dest_target, executor):
+    """Clone the profile caches and target-root files into `dest_target`."""
+    source_profile = source_target / PROFILE
+    dest_target.mkdir()
+    staging = dest_target / STAGING_NAME
+    staging.mkdir()
+    for name in SEED_SUBDIRS:
+        if (source_profile / name).is_dir():
+            reflink(source_profile / name, staging / name, dest_target, executor)
+    staging.rename(dest_target / PROFILE)
+    for name in TARGET_ROOT_FILES:
+        if (source_target / name).is_file():
+            reflink(source_target / name, dest_target / name, dest_target,
+                    executor)
+
+
+def rollback(repo, worktree, branch, executor):
+    """Remove the worktree and branch this run created; report leftovers."""
+    problems = []
+    if worktree.exists():
+        result = executor(
+            ["git", "worktree", "remove", "--force", worktree],
+            cwd=repo,
+            check=False,
+        )
+        if result.returncode != 0:
+            problems.append(f"remove {worktree} manually")
+    result = executor(["git", "branch", "-D", branch], cwd=repo, check=False)
+    if result.returncode != 0:
+        problems.append(f"delete branch {branch} manually")
+    return problems
+
+
+def create(args, cwd, executor=execute, out=None):
+    """Create (and seed) one worktree; raise `WorktreeError` on failure."""
+    out = out or sys.stdout
+    validate_slug(args.slug)
+    repo = main_checkout(cwd, executor)
+    branch = args.branch if args.branch is not None else BRANCH_PREFIX + args.slug
+    validate_branch(branch, repo, executor)
+    worktrees_root = repo.parent / WORKTREES_DIR_NAME
+    worktree = worktrees_root / args.slug
+    if worktree.exists() or worktree.is_symlink():
+        raise WorktreeError(f"destination {worktree} already exists")
+    if branch_exists(branch, repo, executor):
+        raise WorktreeError(f"branch {branch} already exists")
+
+    source_target = None
+    if args.seed:
+        source_target = default_target_dir(repo, executor)
+        check_seed_source(source_target)
+    base_ref = resolve_base(args.base_ref, repo, executor)
+    worktrees_root.mkdir(parents=True, exist_ok=True)
+    if args.seed:
+        probe_reflink(source_target / CACHEDIR_TAG, worktrees_root, executor)
+
+    locks = (hold_cargo_locks(source_target / PROFILE) if args.seed
+             else contextlib.nullcontext())
+    with locks:
+        executor(
+            ["git", "worktree", "add", "-b", branch, worktree, base_ref],
+            cwd=repo,
+        )
+        try:
+            if args.seed:
+                dest_target = default_target_dir(worktree, executor)
+                seed_target(source_target, dest_target, executor)
+        except (OSError, WorktreeError, KeyboardInterrupt) as error:
+            problems = rollback(repo, worktree, branch, executor)
+            cleanup = ("; rolled back the new worktree and branch"
+                       if not problems else "; " + "; ".join(problems))
+            reason = str(error) or type(error).__name__
+            raise WorktreeError(f"seeding failed: {reason}{cleanup}")
+
+    print(f"created worktree {worktree}", file=out)
+    print(f"  branch {branch} from {base_ref}", file=out)
+    if args.seed:
+        print(f"  seeded {worktree / 'target' / PROFILE} from "
+              f"{source_target / PROFILE} (reflink, shared extents)", file=out)
+    else:
+        print("  not seeded (--no-seed): the first build compiles every "
+              "dependency", file=out)
+    print("next:", file=out)
+    print(f"  cd {shlex.quote(str(worktree))} && cargo build --workspace "
+          "--all-targets --all-features", file=out)
+    return worktree
+
+
+EPILOG = """\
+examples:
+  scripts/worktree-new issue-168
+  scripts/worktree-new issue-168 origin/zajca/other-base
+  scripts/worktree-new --branch zajca/issue-168/review issue-168-review
+  scripts/worktree-new --no-seed issue-168
+"""
+
+
+def build_parser():
+    """Build the argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="worktree-new",
+        description=__doc__,
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "slug",
+        help=f"worktree dir name under ../{WORKTREES_DIR_NAME}/ and branch "
+        f"suffix ({BRANCH_PREFIX}<slug>)",
+    )
+    parser.add_argument(
+        "base_ref",
+        nargs="?",
+        default=None,
+        help=f"commit-ish to branch from (default: {DEFAULT_REMOTE}/"
+        f"{DEFAULT_REMOTE_BRANCH} after `git fetch {DEFAULT_REMOTE} "
+        f"{DEFAULT_REMOTE_BRANCH}`)",
+    )
+    parser.add_argument(
+        "--branch",
+        default=None,
+        help=f"branch name to create (default: {BRANCH_PREFIX}<slug>)",
+    )
+    parser.add_argument(
+        "--no-seed",
+        dest="seed",
+        action="store_false",
+        help="skip the reflink seed and accept a cold first build",
+    )
+    return parser
+
+
+def main(argv=None, cwd=None, executor=execute):
+    """Parse arguments, create the worktree, and return the exit code."""
+    args = build_parser().parse_args(argv)
+    try:
+        create(args, Path(cwd or os.getcwd()), executor)
+    except (OSError, WorktreeError) as error:
+        print(f"worktree-new: error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

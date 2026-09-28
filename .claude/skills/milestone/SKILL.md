@@ -26,14 +26,19 @@ The issue is the spec — there is no `NEXT.md`.
    evidence that refine the body. Extract the scope and the DoD items with
    their stable IDs — these are the testable success criteria. If they are
    ambiguous, resolve the ambiguity before implementation; do not invent scope.
-2. **Create a worktree off `main`.** Use the existing convention:
+2. **Create a worktree off `main`.** Use the script, which fetches
+   `origin/main`, creates `../pohunek-worktrees/<milestone-slug>` on
+   `zajca/<milestone-slug>`, and reflink-seeds its `target/` from the main
+   checkout so the first build compiles only workspace crates:
 
    ```bash
-   git worktree add /tmp/pohunek-<milestone-slug> -b zajca/<milestone-slug> origin/main
+   scripts/worktree-new <milestone-slug>
    ```
 
-   (Never implement directly on `main`. Do not disturb other checkouts or
-   unrelated active worktrees.)
+   It fails closed when reflinks are unavailable or a build holds the main
+   checkout's Cargo lock; `--no-seed` accepts a cold build instead. Never put
+   a worktree under `/tmp` (a small RAM tmpfs). (Never implement directly on
+   `main`. Do not disturb other checkouts or unrelated active worktrees.)
 3. **Read the Rust guidelines first — mandatory.** Before creating or modifying
    ANY `.rs` file, read the applicable files from `.agents/rust-guidelines/`.
    Use `.agents/rust-guidelines/SKILL.md` as the which-file-when index; at

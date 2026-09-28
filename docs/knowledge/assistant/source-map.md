@@ -261,6 +261,17 @@ Release packaging and contributor verification:
 - `scripts/tests/test_cargo_sweep_targets.py` — regression checks for that
   helper's destructive guards; the CI script-regression step runs
   `python3 -m unittest discover -s scripts/tests -p 'test_*.py'`.
+- `scripts/worktree-new` — creates `../pohunek-worktrees/<slug>` on
+  `zajca/<slug>` and seeds the worktree's own `target/debug` caches
+  (`.fingerprint`, `build`, `deps`, `incremental`, plus `CACHEDIR.TAG`) from
+  the main checkout with `cp -a --reflink=always`; a real probe clone must
+  succeed first, the main checkout's Cargo locks are held exclusively during
+  the copy, both checkouts must use the default target layout per
+  `cargo metadata`, uplifted binaries are not seeded, and any seeding failure
+  rolls back the new worktree and branch. `--no-seed` skips seeding.
+- `scripts/tests/test_worktree_new.py` — regression checks for its slug and
+  argument validation, fail-closed reflink probe, lock contention, layout
+  checks, rollback, and `--no-seed`, with an injected executor.
 - `.github/workflows/ci.yml`
 - `.github/workflows/release.yml`
 - `README.md`
