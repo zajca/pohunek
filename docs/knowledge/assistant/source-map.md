@@ -199,9 +199,12 @@ Release packaging and contributor verification:
 - `bacon.toml` — optional watcher jobs for the documented fast loops
   (`nextest-fast` on the `fast` profile, `clippy-fast`); no gate depends on it.
 - `scripts/ci-timings` — reproduction of CI timing evidence from `gh` run
-  data: per-job wall clock and workflow medians (`runs`, `compare`),
-  per-shard nextest JUnit summaries (`junit`), and sccache/rust-cache
-  cache-hit extraction (`cache`). A fetch accumulates run documents into
+  data: per-job wall clock and workflow medians (`runs`, `compare`), per-shard
+  nextest JUnit summaries (`junit`), sccache/rust-cache
+  cache-hit extraction (`cache`), and per-job step medians (`steps`).
+  Every counted job's wall clock is also rounded up to a whole minute and
+  summed into runner minutes, carried by `runs`, `steps`, `compare`, and
+  every `--json` summary. A fetch accumulates run documents into
   `target/ci-timings/ci-runs.json` (`--cache` writes elsewhere), but a
   measurement covers only the runs its own query named, so a fuller snapshot
   never changes a median; `--input` reads a snapshot instead and makes no
@@ -211,6 +214,19 @@ Release packaging and contributor verification:
   `docs/design/test-performance-report.md`.
 - `scripts/tests/test_ci_timings.py` — regression checks for the timing
   helper's parsing, medians, and markdown renderers.
+- `scripts/measure-dev-loop` — the local dev-loop baseline measurement
+  (issue #163): the `cold`, `warm`, and `incremental` time cases timed
+  with hyperfine or `time.monotonic` in a dedicated, marker-guarded
+  target dir, plus the `debug` tree's hardlink-deduplicated size. Every
+  measured subprocess runs with `CARGO_TARGET_DIR` pinned to that dir,
+  `RUSTC_WRAPPER`/`CARGO_BUILD_RUSTC_WRAPPER` disabled, and all
+  `POHUNEK_*` variables removed; repository/machine metadata lands in
+  every `baseline.json`. Subcommands: `run` (`--dry-run` prints
+  commands without executing), `report`, and `compare`.
+- `scripts/tests/test_measure_dev_loop.py` — regression checks for the
+  local baseline helper's marker-file deletion safety, hardlink size
+  dedup, environment stripping, hyperfine JSON parsing, dry-run plans,
+  and the report/compare renderers; no test starts a real build.
 - `scripts/cargo-sweep-targets` — retention cleanup for per-branch isolated
   Cargo target dirs (`target/<name>`): canonicalizes and sentinel-verifies the
   target root, deletes only entries with Cargo target shape whose newest nested
