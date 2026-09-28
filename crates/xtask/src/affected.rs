@@ -120,7 +120,7 @@ impl Reminder {
     fn message(self) -> String {
         match self {
             Self::DocsCheck => {
-                "docs/knowledge changed: also run `cargo xtask docs check`".to_owned()
+                "documentation inputs changed: also run `cargo xtask docs check`".to_owned()
             }
             Self::ScriptTests => {
                 format!("scripts changed: also run `{SCRIPT_TESTS_COMMAND}`")
@@ -137,7 +137,7 @@ impl Reminder {
 struct Rule {
     pattern: Pattern,
     effect: Effect,
-    reminder: Option<Reminder>,
+    reminders: &'static [Reminder],
     why: &'static str,
 }
 
@@ -145,7 +145,7 @@ const fn rule(pattern: Pattern, effect: Effect, why: &'static str) -> Rule {
     Rule {
         pattern,
         effect,
-        reminder: None,
+        reminders: &[],
         why,
     }
 }
@@ -153,13 +153,13 @@ const fn rule(pattern: Pattern, effect: Effect, why: &'static str) -> Rule {
 const fn reminding(
     pattern: Pattern,
     effect: Effect,
-    reminder: Reminder,
+    reminders: &'static [Reminder],
     why: &'static str,
 ) -> Rule {
     Rule {
         pattern,
         effect,
-        reminder: Some(reminder),
+        reminders,
         why,
     }
 }
@@ -190,7 +190,7 @@ const RULES: &[Rule] = &[
     reminding(
         Pattern::Dir("docs/knowledge"),
         Effect::Packages(&["pohunek-knowledge", "xtask"]),
-        Reminder::DocsCheck,
+        &[Reminder::DocsCheck],
         "knowledge bundle embedded by pohunek-knowledge's build script and read by xtask tests",
     ),
     rule(
@@ -206,7 +206,7 @@ const RULES: &[Rule] = &[
     reminding(
         Pattern::Dir("scripts"),
         Effect::Packages(&["pohunek-cli"]),
-        Reminder::ScriptTests,
+        &[Reminder::ScriptTests],
         "launcher scripts embedded by `pohunek setup` and executed by pohunek-cli tests",
     ),
     rule(
@@ -233,12 +233,13 @@ const RULES: &[Rule] = &[
     reminding(
         Pattern::Dir("web"),
         Effect::NoRustTests,
-        Reminder::WebGates,
+        &[Reminder::WebGates],
         "Bun workspace; xtask only writes its generated bindings, checked by `cargo xtask ts check`",
     ),
-    rule(
+    reminding(
         Pattern::Dir("docs"),
         Effect::NoRustTests,
+        &[Reminder::DocsCheck],
         "prose outside docs/knowledge; only `cargo xtask docs check` reads it",
     ),
     rule(
@@ -249,14 +250,16 @@ const RULES: &[Rule] = &[
     rule(Pattern::Dir(".claude"), Effect::NoRustTests, "agent skills and settings"),
     rule(Pattern::Dir(".agents"), Effect::NoRustTests, "vendored agent guidelines"),
     rule(Pattern::Dir("assets"), Effect::NoRustTests, "images referenced by prose only"),
-    rule(
+    reminding(
         Pattern::RootSuffix(".md"),
         Effect::NoRustTests,
+        &[Reminder::DocsCheck],
         "root prose; README.md is read only by `cargo xtask docs check`",
     ),
-    rule(
+    reminding(
         Pattern::File("LICENSE"),
         Effect::NoRustTests,
+        &[Reminder::DocsCheck],
         "license text; read only by `cargo xtask docs check`",
     ),
     rule(Pattern::File("bacon.toml"), Effect::NoRustTests, "optional watcher configuration"),
@@ -433,12 +436,17 @@ fn plan(changed: &BTreeSet<String>, packages: &[Package]) -> Result<Plan, XtaskE
 }
 
 /// Classifies one repository-relative, `/`-separated path.
-fn classify(path: &str, packages: &[Package]) -> (Decision, Option<Reminder>) {
+fn classify(path: &str, packages: &[Package]) -> (Decision, BTreeSet<Reminder>) {
     let matching: Vec<&Rule> = RULES
         .iter()
         .filter(|rule| rule.pattern.matches(path))
         .collect();
-    let reminder = matching.iter().find_map(|rule| rule.reminder);
+    // Every matching rule contributes its reminders, including rules whose
+    // effect is shadowed by a more specific one.
+    let reminder: BTreeSet<Reminder> = matching
+        .iter()
+        .flat_map(|rule| rule.reminders.iter().copied())
+        .collect();
 
     if let Some(rule) = matching
         .iter()
@@ -932,6 +940,19 @@ mod tests {
         assert!(report.contains("cargo xtask docs check"), "{report}");
         assert!(report.contains(SCRIPT_TESTS_COMMAND), "{report}");
         assert!(report.contains("cargo xtask ts check"), "{report}");
+    }
+
+    #[test]
+    fn every_docs_check_input_reminds_the_docs_check() {
+        for path in ["docs/runbooks/upgrade.md", "README.md", "LICENSE"] {
+            let plan = plan(&changed(&[path]), &fixture()).expect("plan");
+            assert_eq!(plan.selection, Selection::Nothing, "{path}");
+            assert_eq!(
+                plan.reminders,
+                BTreeSet::from([Reminder::DocsCheck]),
+                "{path}"
+            );
+        }
     }
 
     #[test]
