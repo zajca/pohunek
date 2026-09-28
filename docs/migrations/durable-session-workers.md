@@ -103,6 +103,25 @@ no preflight can reach it.
 6. it removes `pohunekd.service`, `pohunek-session@.service`, and
    `pohunek-sessions.slice` from the user unit directory before installing.
 
+Every legacy file the installer removes lies under one validated install
+prefix, resolved before anything changes:
+
+- for a fresh install (or a pending install being finished) it is
+  `POHUNEK_INSTALL_PREFIX`, or `$HOME/.local` when that is unset; for an
+  upgrade it is the prefix recorded in `service.toml`, read from
+  `pohunek service status --json`, and a `POHUNEK_INSTALL_PREFIX` that names
+  a different path refuses the run;
+- the prefix must be an absolute path without `.` or `..` components
+  (repeated and trailing slashes are collapsed); anything else refuses;
+- a legacy `pohunekd.service` must run `<prefix>/bin/pohunekd` for that same
+  prefix, otherwise the run refuses and names the unit's `ExecStart=` path, so
+  point `POHUNEK_INSTALL_PREFIX` at the legacy install's prefix;
+- `<prefix>/bin/pohunekd` and `<prefix>/libexec/pohunek-sessiond` are removed
+  only as regular files owned by the invoking user, reached through no
+  symlinked `bin` or `libexec` directory — the files the legacy installer
+  wrote. A symlink, another user's file, or anything else at those paths is
+  left in place and named on stderr.
+
 Any refusal above leaves the legacy files untouched, so the operator can
 restart the legacy daemon and decide. Stop those sessions first; their PTYs
 cannot move into the new per-generation jobs. Even with this sequence, a

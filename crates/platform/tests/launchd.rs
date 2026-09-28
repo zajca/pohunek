@@ -10,7 +10,7 @@
 //! domain fails them instead of skipping.
 #![cfg(target_os = "macos")]
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-28
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -703,6 +703,88 @@ async fn daemon_replace_without_an_agent_definition_is_not_found() {
         "replace never writes an agent definition"
     );
     assert!(matches!(daemon.inspect().await, Err(Error::NotFound(_))));
+}
+
+#[tokio::test]
+async fn daemon_replace_resumes_after_a_crash_left_the_agent_set_aside() {
+    let fixture = Fixture::new();
+    let agents = fixture.root.join("LaunchAgents");
+    let daemon = LaunchdDaemon::new(&fixture.namespace, uid(), agents.clone(), COMMAND_DEADLINE)
+        .expect("valid daemon manager");
+    let definition = |script: &str| {
+        JobDefinition::new(JobSpec {
+            executable: PathBuf::from("/bin/bash"),
+            arguments: vec![
+                "-c".to_owned(),
+                script.to_owned(),
+                "pohunek-test-daemon".to_owned(),
+                fixture.namespace.as_str().to_owned(),
+            ],
+            environment: BTreeMap::new(),
+            working_directory: fixture.root.clone(),
+            logs: Some(pohunek_platform::supervisor::JobLogs {
+                stdout: fixture.root.join("daemon.out.log"),
+                stderr: fixture.root.join("daemon.err.log"),
+            }),
+            start_timeout: Duration::from_secs(10),
+            exit_timeout: Duration::from_secs(5),
+            restart: RestartPolicy::OnFailure {
+                throttle: Duration::from_secs(1),
+            },
+            open_files: 1_024,
+        })
+        .expect("valid daemon definition")
+    };
+    let label = fixture.namespace.daemon_label();
+    let _cleanup = Bootout(label.clone());
+    let path = agents.join(format!("{label}.plist"));
+    // The fixed name `register` sets a replaced definition aside under.
+    let parked = agents.join(format!(".{label}.plist.replaced"));
+    let listing = || {
+        let mut names: Vec<_> = std::fs::read_dir(&agents)
+            .expect("agents listing")
+            .map(|entry| entry.expect("agent entry").file_name())
+            .collect();
+        names.sort();
+        names
+    };
+
+    daemon
+        .install(&definition(SLEEPING_WORKER))
+        .await
+        .expect("daemon installs");
+    wait_for(|| daemon.inspect(), running).await;
+
+    // A replacement that crashed after `bootout` and the set-aside leaves the
+    // agent stopped with no `<label>.plist`.
+    assert!(launchctl(&["bootout", &format!("gui/{}/{label}", uid())]).success());
+    std::fs::rename(&path, &parked).expect("agent set aside");
+    let second = definition("/bin/sleep 700 & wait");
+    daemon.replace(&second).await.expect("replacement resumes");
+    let observation = wait_for(|| daemon.inspect(), running).await;
+    assert_eq!(observation.definition, Some(second.facts()));
+    assert_eq!(
+        listing(),
+        vec![std::ffi::OsString::from(format!("{label}.plist"))]
+    );
+
+    // A crash after publishing leaves both files; the set-aside one is stale.
+    std::fs::copy(&path, &parked).expect("stale set-aside copy");
+    std::fs::set_permissions(&parked, std::fs::Permissions::from_mode(0o600))
+        .expect("private copy");
+    let third = definition("/bin/sleep 800 & wait");
+    daemon.replace(&third).await.expect("daemon replaced");
+    let observation = wait_for(|| daemon.inspect(), running).await;
+    assert_eq!(observation.definition, Some(third.facts()));
+    assert_eq!(
+        listing(),
+        vec![std::ffi::OsString::from(format!("{label}.plist"))]
+    );
+
+    // Uninstall removes a set-aside definition too, so none survives.
+    std::fs::copy(&path, &parked).expect("stale set-aside copy");
+    daemon.uninstall().await.expect("daemon uninstalls");
+    assert!(listing().is_empty(), "{:?}", listing());
 }
 
 /// Boots one label out when dropped.

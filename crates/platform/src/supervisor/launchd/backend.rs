@@ -17,7 +17,7 @@ use crate::filesystem::TrustedDir;
 use crate::process::{DarwinInspector, Pid, ProcessFact, ProcessIdentity, ProcessInspector as _};
 use rustix::process::{kill_process, Pid as NativePid, Signal};
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-28
 
 /// PID of launchd; every job launchd spawns is its direct child.
 const LAUNCHD_PID: Pid = 1;
@@ -259,6 +259,11 @@ impl LaunchdSupervisor {
         let label = self.namespace.worker_label(&key);
         let file_name = definition_name(&label);
         let directory = open_private(&self.definitions, OPERATION)?;
+        // A definition an interrupted `start` left set aside is settled first,
+        // so its stored `ExitTimeOut` bounds the wait and no file survives.
+        if let Some(directory) = &directory {
+            registration::recover(directory, &label, OPERATION)?;
+        }
         let stored = directory
             .as_ref()
             .and_then(|directory| usable_stored(directory, &file_name, OPERATION))
@@ -307,7 +312,8 @@ impl Supervisor for LaunchdSupervisor {
     /// file, so a job loaded concurrently keeps the definition it was loaded
     /// from. The leftover is discarded only once the new definition is kept;
     /// when `bootstrap` proves nothing was loaded, the new file is removed and
-    /// the leftover returns to its name.
+    /// the leftover returns to its name. A definition an interrupted `start`
+    /// left set aside is settled first; see [`registration::recover`].
     fn start<'a>(&'a self, id: &'a ServiceId, definition: &'a JobDefinition) -> Operation<'a, ()> {
         Box::pin(self.start_worker(id, definition))
     }
@@ -370,7 +376,8 @@ impl Supervisor for LaunchdSupervisor {
     /// bound systemd's `KillMode=control-group` applies. Members forked after
     /// the capture, and processes that left the group, are left to the
     /// daemon's ownership-marker sweep. An absent label still has leftover
-    /// files removed and returns [`Error::NotFound`]. Several processes
+    /// files, including a definition an interrupted `start` left set aside,
+    /// removed and returns [`Error::NotFound`]. Several processes
     /// matching the definition are [`Error::InvalidData`] before anything is
     /// booted out or removed, because the group to end is unknown.
     fn retire<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, ()> {
@@ -464,6 +471,9 @@ impl LaunchdDaemon {
         let directory = self
             .open_agents(OPERATION)?
             .ok_or_else(|| Error::NotFound(self.id.clone()))?;
+        // An interrupted replacement may have stopped the agent and left its
+        // definition set aside; putting it back lets the replacement resume.
+        registration::recover(&directory, self.label(), OPERATION)?;
         registration::require_definition(&directory, &self.id, self.label(), OPERATION)?;
         let exit_timeout =
             stored_exit_timeout(&directory, &definition_name(self.label()), OPERATION);
@@ -498,6 +508,10 @@ impl LaunchdDaemon {
 
         let file_name = definition_name(self.label());
         let directory = self.open_agents(OPERATION)?;
+        // No definition an interrupted registration left set aside survives.
+        if let Some(directory) = &directory {
+            registration::recover(directory, self.label(), OPERATION)?;
+        }
         let exit_timeout = match &directory {
             Some(directory) => stored_exit_timeout(directory, &file_name, OPERATION),
             None => MAX_JOB_TIMEOUT,
@@ -533,6 +547,10 @@ impl DaemonSupervisor for LaunchdDaemon {
     /// When launchd proves it loaded nothing (such as a missing `gui/<uid>`
     /// domain), the new file is removed and the previous one returns to its
     /// name, so launchd still loads the previous agent at the next login.
+    ///
+    /// A replacement interrupted after `bootout` is resumed by calling this
+    /// again: an agent file left set aside returns to its name first when the
+    /// agent file is missing, and is discarded when it is not.
     fn replace<'a>(&'a self, definition: &'a JobDefinition) -> Operation<'a, ()> {
         Box::pin(self.replace_agent(definition))
     }
@@ -542,6 +560,8 @@ impl DaemonSupervisor for LaunchdDaemon {
         Box::pin(self.inspect_agent())
     }
 
+    /// Boots the agent out and removes its definition, including one an
+    /// interrupted registration left set aside.
     fn uninstall(&self) -> Operation<'_, ()> {
         Box::pin(self.uninstall_agent())
     }

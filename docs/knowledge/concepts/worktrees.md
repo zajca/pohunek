@@ -35,6 +35,13 @@ section). Cleanup is best-effort, so a checkout whose removal failed is reported
 rather than silently counted as cleaned, and the leftover directory needs manual
 cleanup.
 
+When `pohunek session new --branch` fails after the worktree was bound, the
+daemon removes that worktree only once the session's worker is proven ended,
+even if the client disconnected meanwhile, so the branch is free for a retry.
+If the worker supervisor cannot confirm that, the create fails with
+`runtime_supervision_unavailable`, the session stays listed as reconnecting,
+and its worktree is kept until reconciliation proves the worker ended.
+
 Assistant guidance should preserve this boundary: verify which checkout or
 worktree is active before editing, avoid deleting user-managed worktrees, and
 prefer explicit project or repository targeting for project work.

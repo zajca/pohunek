@@ -260,8 +260,10 @@ calls `pohunek service install` (or `pohunek service upgrade` when a service is
 already installed and no interrupted install is pending), which:
 
 - copies `pohunek`, `pohunekd`, and `pohunek-sessiond` into
-  `<prefix>/libexec/pohunek/<version>/` (prefix default `~/.local`, or
-  `POHUNEK_INSTALL_PREFIX` for the wrapper) and installs `<prefix>/bin/pohunek`;
+  `<prefix>/libexec/pohunek/<version>/` and installs `<prefix>/bin/pohunek`; a
+  fresh install uses `POHUNEK_INSTALL_PREFIX` (default `~/.local`), an upgrade
+  keeps the prefix recorded in `service.toml` and refuses a different
+  `POHUNEK_INSTALL_PREFIX`;
 - writes `~/.config/pohunek/service.toml` (mode `0600`) with every deadline,
   the agent environment allowlist, and the installation namespace;
 - registers the daemon as the only login service: the systemd user unit

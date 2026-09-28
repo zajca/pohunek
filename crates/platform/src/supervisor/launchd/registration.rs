@@ -2,10 +2,10 @@
 //! definition it replaces.
 //!
 //! Both launchd backends register a job the same way: a leftover
-//! `<label>.plist` of an absent label is moved to a quarantine name, the new
-//! definition is published under `<label>.plist`, and `launchctl bootstrap`
-//! loads it. The leftover stays quarantined until the bootstrap result
-//! decides which file launchd may load:
+//! `<label>.plist` of an absent label is moved to its set-aside name
+//! `.<label>.plist.replaced`, the new definition is published under
+//! `<label>.plist`, and `launchctl bootstrap` loads it. The leftover stays set
+//! aside until the bootstrap result decides which file launchd may load:
 //!
 //! | Outcome | New definition | Leftover |
 //! |---|---|---|
@@ -16,6 +16,11 @@
 //!
 //! A leftover that cannot be put back is reported together with the original
 //! failure as [`StrandedDefinition`]; it is never dropped silently.
+//!
+//! The set-aside name is derived from the label, so a registration interrupted
+//! by a crash is settled by [`recover`] before the label's next registration,
+//! replacement, retirement, or uninstallation: the set-aside file returns to
+//! `<label>.plist` while that name is free and is discarded otherwise.
 //!
 //! The module only needs a [`Launchctl`] runner and a [`TrustedDir`], so it is
 //! target-neutral and its tests run a fake `launchctl` on every host.
@@ -31,7 +36,7 @@ use crate::filesystem::{
     EntryKind, FsError, MoveOutcome, RemoveOutcome, StageOutcome, StagedEntry, TrustedDir,
 };
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-28
 
 /// Mode of every definition file; launchd refuses group- or world-writable plists.
 pub(super) const DEFINITION_MODE: u32 = 0o600;
@@ -45,11 +50,19 @@ pub(super) const DEFINITION_SUFFIX: &str = ".plist";
 /// mistakes an interrupted write for a definition.
 const TEMPORARY_PREFIX: &str = ".pohunek-launchd-";
 
-/// Prefix of the quarantine name a removed or set-aside file passes through.
+/// Prefix of the quarantine name a removed file passes through.
 ///
 /// Never ends in [`DEFINITION_SUFFIX`], so neither discovery nor launchd at
 /// login reads a quarantined file as a definition.
 const REMOVAL_PREFIX: &str = ".pohunek-launchd-removed-";
+
+/// Suffix of the name a replaced definition waits under during [`register`].
+///
+/// The name is `.<label>.plist` followed by this suffix: hidden and never
+/// ending in [`DEFINITION_SUFFIX`], so neither discovery nor launchd at login
+/// reads it as a definition, and fixed per label, so [`recover`] finds it
+/// after a crash.
+const SET_ASIDE_SUFFIX: &str = ".replaced";
 
 /// Random bytes in a temporary definition name.
 const TEMPORARY_RANDOM_BYTES: usize = 8;
@@ -77,10 +90,12 @@ pub struct ExternalVolume {
 
 /// A registration failed and the definition it replaced could not be put back.
 ///
-/// The replaced definition stays under a quarantine name that neither launchd
-/// nor discovery reads, so the job has no definition until an operator moves
-/// [`StrandedDefinition::path`] back to its `<label>.plist` name. It is the
-/// source of an [`Error::Operation`] from `start`, `install`, or `replace`.
+/// The replaced definition stays under its set-aside name
+/// [`StrandedDefinition::path`], which neither launchd nor discovery reads.
+/// The label's next `start`, `install`, `replace`, `retire`, or `uninstall`
+/// settles it first: it returns to `<label>.plist` while that name is free and
+/// is discarded when `<label>.plist` holds a definition. It is the source of an
+/// [`Error::Operation`] from `start`, `install`, or `replace`.
 #[derive(Debug, thiserror::Error)]
 #[error(
     "{failure}; the replaced definition could not be put back and stays at {path}: {restore}",
@@ -111,6 +126,11 @@ enum Outcome {
 /// Returns the definition file name of `label`.
 pub(super) fn definition_name(label: &str) -> String {
     format!("{label}{DEFINITION_SUFFIX}")
+}
+
+/// Returns the name the replaced definition of `label` waits under.
+fn set_aside_name(label: &str) -> String {
+    format!(".{label}{DEFINITION_SUFFIX}{SET_ASIDE_SUFFIX}")
 }
 
 /// Maps a trusted-filesystem failure of `operation`.
@@ -147,6 +167,65 @@ pub(super) fn require_definition(
     }
 }
 
+/// Settles a replaced definition of `label` that an interrupted [`register`]
+/// left set aside in `directory`.
+///
+/// While `<label>.plist` exists it is what launchd loads next, so the set-aside
+/// file is obsolete and removed. Without `<label>.plist` the set-aside file is
+/// the job's only definition and returns to that name. Neither branch replaces
+/// an existing file, so no definition a loaded job was read from is
+/// overwritten. Without a set-aside file nothing changes.
+///
+/// # Errors
+///
+/// Returns [`Error::Operation`] when either name is not a private regular
+/// file or a move fails, and [`Error::Race`] when either name changes while
+/// it is settled.
+pub(super) fn recover(
+    directory: &TrustedDir,
+    label: &str,
+    operation: &'static str,
+) -> Result<(), Error> {
+    let parked = set_aside_name(label);
+    let Some(identity) = directory
+        .entry_identity(&parked, EntryKind::RegularFile)
+        .map_err(fs_error(operation))?
+    else {
+        return Ok(());
+    };
+    let file_name = definition_name(label);
+    if directory
+        .entry_identity(&file_name, EntryKind::RegularFile)
+        .map_err(fs_error(operation))?
+        .is_some()
+    {
+        remove_file(directory, &parked, operation)?;
+        tracing::event!(
+            name: "supervisor.register.set_aside_discarded",
+            tracing::Level::INFO,
+            supervisor.entry = %directory.path().join(&parked).display(),
+            "removed the obsolete replaced definition {{supervisor.entry}}"
+        );
+        return Ok(());
+    }
+    match directory
+        .stage(&parked, &file_name, identity)
+        .map_err(fs_error(operation))?
+    {
+        StageOutcome::Staged(_) => {
+            tracing::event!(
+                name: "supervisor.register.set_aside_restored",
+                tracing::Level::WARN,
+                supervisor.entry = %directory.path().join(&file_name).display(),
+                "restored the definition {{supervisor.entry}} an interrupted registration left set aside"
+            );
+            Ok(())
+        }
+        StageOutcome::Missing => Ok(()),
+        _ => Err(Error::Race { operation }),
+    }
+}
+
 /// Probes whether `label` is loaded in `domain` with `launchctl print`.
 pub(super) async fn probe(
     launchctl: &Launchctl,
@@ -169,8 +248,26 @@ pub(super) async fn probe(
 /// leftover is moved aside and the label probed again before the new file is
 /// published under a name that must not exist yet: a load racing this call
 /// has then read either the leftover, which is put back, or the new file,
-/// which is what the loaded job runs. The leftover stays quarantined until
+/// which is what the loaded job runs. The leftover stays set aside until
 /// `bootstrap` decides which file remains; see the module documentation.
+///
+/// Every file operation is a single rename or removal that never replaces an
+/// existing name, and the leftover waits under the fixed name
+/// `.<label>.plist.replaced`. A crash therefore leaves one of three states,
+/// each settled by [`recover`] before the next registration of the label:
+///
+/// - set aside, nothing published (or a refused definition already removed):
+///   only the set-aside file exists, and it returns to `<label>.plist`;
+/// - published, before or after `bootstrap`: both files exist, the published
+///   definition is kept as launchd may have loaded it, and the set-aside file
+///   is discarded, which is what an unknown `bootstrap` outcome does;
+/// - settled: only `<label>.plist` exists, and nothing changes.
+///
+/// # Errors
+///
+/// Returns [`Error::AlreadyRegistered`] for a loaded label, the `bootstrap`
+/// failure otherwise, and [`StrandedDefinition`] inside [`Error::Operation`]
+/// when the leftover could not be put back.
 pub(super) async fn register(
     launchctl: &Launchctl,
     domain: &str,
@@ -180,11 +277,13 @@ pub(super) async fn register(
     directory: &TrustedDir,
     bytes: &[u8],
 ) -> Result<(), Error> {
+    recover(directory, label, operation)?;
     if probe(launchctl, domain, label, operation).await? == Presence::Loaded {
         return Err(Error::AlreadyRegistered(id.clone()));
     }
     let file_name = definition_name(label);
-    let leftover = set_aside(directory, &file_name, operation)?;
+    let parked = set_aside_name(label);
+    let leftover = set_aside(directory, &file_name, &parked, operation)?;
     // Every path from here settles the leftover; nothing may return early.
     let outcome = match probe(launchctl, domain, label, operation).await {
         Ok(Presence::Absent) => match publish_definition(directory, &file_name, bytes, operation) {
@@ -199,7 +298,7 @@ pub(super) async fn register(
         Ok(Presence::Loaded) => Outcome::Unpublished(Error::AlreadyRegistered(id.clone())),
         Err(error) => Outcome::Unpublished(error),
     };
-    settle(directory, &file_name, leftover, outcome, operation)
+    settle(directory, &file_name, &parked, leftover, outcome, operation)
 }
 
 /// Bootstraps the published `file_name` and classifies what launchd loaded.
@@ -253,6 +352,7 @@ async fn bootstrap(
 fn settle(
     directory: &TrustedDir,
     file_name: &str,
+    parked: &str,
     leftover: Option<StagedEntry>,
     outcome: Outcome,
     operation: &'static str,
@@ -264,9 +364,13 @@ fn settle(
             }
             result
         }
-        Outcome::Unpublished(failure) => Err(restore(leftover, file_name, failure, operation)),
+        Outcome::Unpublished(failure) => Err(restore(
+            directory, parked, leftover, file_name, failure, operation,
+        )),
         Outcome::Refused(failure) => match remove_file(directory, file_name, operation) {
-            Ok(()) => Err(restore(leftover, file_name, failure, operation)),
+            Ok(()) => Err(restore(
+                directory, parked, leftover, file_name, failure, operation,
+            )),
             // The occupied name leaves no room to put the leftover back.
             Err(removal) => Err(match leftover {
                 Some(leftover) => stranded(&leftover, failure, removal, operation),
@@ -279,6 +383,8 @@ fn settle(
 /// Puts `leftover` back under `file_name` and returns `failure`, combined with
 /// the restore error when that fails.
 fn restore(
+    directory: &TrustedDir,
+    parked: &str,
     leftover: Option<StagedEntry>,
     file_name: &str,
     failure: Error,
@@ -287,7 +393,7 @@ fn restore(
     let Some(leftover) = leftover else {
         return failure;
     };
-    match put_back(&leftover, file_name, operation) {
+    match put_back(directory, parked, &leftover, file_name, operation) {
         Ok(()) => failure,
         Err(restore) => stranded(&leftover, failure, restore, operation),
     }
@@ -312,8 +418,9 @@ fn stranded(
 /// Deletes a leftover the kept definition replaced.
 ///
 /// A failure is logged instead of failing a registration that already loaded
-/// or kept the new definition: the quarantine name is never read as a
-/// definition, so the leftover can only waste space.
+/// or kept the new definition: the set-aside name is never read as a
+/// definition, and [`recover`] removes the leftover before the label's next
+/// registration.
 fn discard_obsolete(leftover: StagedEntry, operation: &'static str) {
     let path = leftover.path();
     if let Err(error) = discard(leftover, operation) {
@@ -375,11 +482,14 @@ fn publish_definition(
     }
 }
 
-/// Moves an existing definition file to a quarantine name; a missing file is
-/// `None`.
+/// Moves an existing definition file to the set-aside name `parked`; a
+/// missing file is `None`.
+///
+/// An occupied `parked` is [`Error::Race`]: [`recover`] has settled it before.
 fn set_aside(
     directory: &TrustedDir,
     file_name: &str,
+    parked: &str,
     operation: &'static str,
 ) -> Result<Option<StagedEntry>, Error> {
     let Some(identity) = directory
@@ -389,7 +499,7 @@ fn set_aside(
         return Ok(None);
     };
     match directory
-        .stage_random(file_name, REMOVAL_PREFIX, identity)
+        .stage(file_name, parked, identity)
         .map_err(fs_error(operation))?
     {
         StageOutcome::Staged(entry) => Ok(Some(entry)),
@@ -398,10 +508,22 @@ fn set_aside(
     }
 }
 
-/// Restores a definition moved aside by [`set_aside`].
-fn put_back(entry: &StagedEntry, file_name: &str, operation: &'static str) -> Result<(), Error> {
-    match entry.restore(file_name).map_err(fs_error(operation))? {
-        MoveOutcome::Moved => Ok(()),
+/// Restores a definition moved aside by [`set_aside`] under `parked`.
+///
+/// One identity-checked rename that never replaces `file_name`, so a crash
+/// leaves the definition under either name, where [`recover`] finds it.
+fn put_back(
+    directory: &TrustedDir,
+    parked: &str,
+    entry: &StagedEntry,
+    file_name: &str,
+    operation: &'static str,
+) -> Result<(), Error> {
+    match directory
+        .stage(parked, file_name, entry.identity())
+        .map_err(fs_error(operation))?
+    {
+        StageOutcome::Staged(_) => Ok(()),
         _ => Err(Error::Race { operation }),
     }
 }
@@ -544,6 +666,29 @@ mod tests {
 
         fn names(&self) -> Vec<OsString> {
             names(&self.directory)
+        }
+
+        /// Leaves the state of a registration that crashed right after
+        /// setting the planted leftover aside.
+        fn crash_after_set_aside(&self) {
+            let leftover = set_aside(
+                &self.directory,
+                &definition_name(LABEL),
+                &set_aside_name(LABEL),
+                "start",
+            )
+            .expect("set aside")
+            .expect("leftover exists");
+            drop(leftover);
+            assert_eq!(self.names(), vec![OsString::from(set_aside_name(LABEL))]);
+        }
+
+        /// Runs the file steps of a daemon `replace` after its `bootout`.
+        async fn replace(&self, script: &str) -> Result<(), Error> {
+            let id = ServiceId::parse(LABEL).expect("valid service id");
+            recover(&self.directory, LABEL, "replace")?;
+            require_definition(&self.directory, &id, LABEL, "replace")?;
+            self.register(script).await
         }
 
         fn definition(&self) -> Vec<u8> {
@@ -711,9 +856,14 @@ mod tests {
     fn a_refused_definition_that_cannot_be_removed_strands_the_leftover_visibly() {
         let fixture = Fixture::new();
         fixture.plant_leftover();
-        let leftover = set_aside(&fixture.directory, &definition_name(LABEL), "start")
-            .expect("set aside")
-            .expect("leftover exists");
+        let leftover = set_aside(
+            &fixture.directory,
+            &definition_name(LABEL),
+            &set_aside_name(LABEL),
+            "start",
+        )
+        .expect("set aside")
+        .expect("leftover exists");
         let stranded_path = leftover.path();
         // A directory under the definition name is not a regular file, so the
         // new definition cannot be removed and the name stays occupied.
@@ -722,6 +872,7 @@ mod tests {
         let result = settle(
             &fixture.directory,
             &definition_name(LABEL),
+            &set_aside_name(LABEL),
             Some(leftover),
             Outcome::Refused(Error::DomainUnavailable {
                 domain: DOMAIN.to_owned(),
@@ -737,6 +888,103 @@ mod tests {
         assert!(matches!(stranded.failure, Error::DomainUnavailable { .. }));
         assert_eq!(stranded.path, stranded_path);
         assert!(stranded_path.exists(), "the leftover is never deleted");
+    }
+
+    #[test]
+    fn a_replace_after_a_crash_following_the_set_aside_restores_and_succeeds() {
+        let fixture = Fixture::new();
+        fixture.plant_leftover();
+        fixture.crash_after_set_aside();
+        runtime()
+            .block_on(fixture.replace(&absent_then("0")))
+            .expect("replaced");
+        assert_eq!(fixture.names(), only_definition());
+        assert_eq!(fixture.definition(), b"new");
+    }
+
+    #[test]
+    fn a_crash_following_the_set_aside_is_recovered_before_a_refusal() {
+        let fixture = Fixture::new();
+        fixture.plant_leftover();
+        fixture.crash_after_set_aside();
+        let result = runtime().block_on(fixture.register(&absent_then("112")));
+        assert!(
+            matches!(result, Err(Error::DomainUnavailable { .. })),
+            "{result:?}"
+        );
+        assert_eq!(fixture.names(), only_definition());
+        assert_eq!(fixture.definition(), b"old");
+    }
+
+    #[test]
+    fn a_loaded_label_gets_its_set_aside_definition_back() {
+        let fixture = Fixture::new();
+        fixture.plant_leftover();
+        fixture.crash_after_set_aside();
+        let script = r#"case "$2" in print) exit 0;; esac; exit 1"#;
+        let result = runtime().block_on(fixture.register(script));
+        assert!(
+            matches!(result, Err(Error::AlreadyRegistered(_))),
+            "{result:?}"
+        );
+        assert_eq!(fixture.names(), only_definition());
+        assert_eq!(fixture.definition(), b"old");
+    }
+
+    #[test]
+    fn a_crash_following_the_publish_keeps_the_published_definition() {
+        let fixture = Fixture::new();
+        fixture.plant_leftover();
+        fixture.crash_after_set_aside();
+        publish_definition(
+            &fixture.directory,
+            &definition_name(LABEL),
+            b"published",
+            "start",
+        )
+        .expect("published");
+
+        recover(&fixture.directory, LABEL, "replace").expect("recovered");
+        assert_eq!(fixture.names(), only_definition());
+        assert_eq!(fixture.definition(), b"published");
+
+        runtime()
+            .block_on(fixture.replace(&absent_then("0")))
+            .expect("replaced");
+        assert_eq!(fixture.names(), only_definition());
+        assert_eq!(fixture.definition(), b"new");
+    }
+
+    #[test]
+    fn recovery_without_a_set_aside_definition_changes_nothing() {
+        let fixture = Fixture::new();
+        let id = ServiceId::parse(LABEL).expect("valid service id");
+        recover(&fixture.directory, LABEL, "replace").expect("nothing to recover");
+        assert!(fixture.names().is_empty());
+        let missing = require_definition(&fixture.directory, &id, LABEL, "replace");
+        assert!(
+            matches!(&missing, Err(Error::NotFound(found)) if *found == id),
+            "{missing:?}"
+        );
+        let replaced = runtime().block_on(fixture.replace(&absent_then("0")));
+        assert!(
+            matches!(&replaced, Err(Error::NotFound(found)) if *found == id),
+            "{replaced:?}"
+        );
+        assert!(fixture.names().is_empty());
+
+        fixture.plant_leftover();
+        recover(&fixture.directory, LABEL, "replace").expect("nothing to recover");
+        assert_eq!(fixture.names(), only_definition());
+        assert_eq!(fixture.definition(), b"old");
+    }
+
+    #[test]
+    fn the_set_aside_name_is_never_a_definition_name() {
+        let parked = set_aside_name(LABEL);
+        assert!(parked.starts_with('.'), "{parked}");
+        assert!(!parked.ends_with(DEFINITION_SUFFIX), "{parked}");
+        assert_ne!(parked, definition_name(LABEL));
     }
 
     #[test]
@@ -761,16 +1009,17 @@ mod tests {
     fn a_leftover_set_aside_is_put_back_or_discarded() {
         let fixture = Fixture::new();
         let directory = &fixture.directory;
-        assert!(set_aside(directory, "job.plist", "start")
+        let parked = ".job.plist.replaced";
+        assert!(set_aside(directory, "job.plist", parked, "start")
             .expect("missing leftover")
             .is_none());
 
         publish_definition(directory, "job.plist", b"leftover", "start").expect("publish");
-        let leftover = set_aside(directory, "job.plist", "start")
+        let leftover = set_aside(directory, "job.plist", parked, "start")
             .expect("set aside")
             .expect("leftover exists");
-        assert!(!names(directory).contains(&OsString::from("job.plist")));
-        put_back(&leftover, "job.plist", "start").expect("put back");
+        assert_eq!(names(directory), vec![OsString::from(parked)]);
+        put_back(directory, parked, &leftover, "job.plist", "start").expect("put back");
         assert_eq!(
             directory
                 .read_file("job.plist", DEFINITION_MODE, MAX_DEFINITION_BYTES)
@@ -778,7 +1027,7 @@ mod tests {
             b"leftover"
         );
 
-        let leftover = set_aside(directory, "job.plist", "start")
+        let leftover = set_aside(directory, "job.plist", parked, "start")
             .expect("set aside")
             .expect("leftover exists");
         publish_definition(directory, "job.plist", b"new", "start").expect("publish");

@@ -1183,12 +1183,26 @@ impl SessionRegistry {
         )
     }
 
-    /// Deletes the record of a create that never produced a usable runtime.
+    /// Compensates a create that never produced a usable runtime: removes
+    /// its worktree and binding, then its record.
     ///
-    /// A create left `runtime_supervision_unavailable` is already listed while
-    /// its supervision retry settles it, so that entry leaves the registry
-    /// with the record and subscribers see it removed.
+    /// Callers prove the create's generation ended first (never started, or
+    /// retired by exact generation), since removing the worktree deletes the
+    /// checkout. The record goes last and stays when the worktree binding
+    /// cannot be dropped, so it keeps guarding the rollback: a later
+    /// reconciliation of the preparing record repeats this compensation, and
+    /// a repeat finds nothing left to remove. A create left
+    /// `runtime_supervision_unavailable` is already listed while its
+    /// supervision retry settles it, so that entry leaves the registry with
+    /// the record and subscribers see it removed.
     pub(super) async fn compensate_abandoned_create(&self, id: &SessionId) {
+        if !self.cleanup_bound_worktree(id).await {
+            tracing::warn!(
+                session_id = %id.0,
+                "abandoned create keeps its record until its worktree binding is dropped"
+            );
+            return;
+        }
         if let Err(error) = self.delete_session_record(id).await {
             tracing::warn!(
                 session_id = %id.0,
@@ -3554,6 +3568,7 @@ mod tests {
         merge_persisted_recovery, validate_worker_identity_process_facts, SessionRegistry,
     };
     use crate::agent::{ForkMode, InputRules, ResumeMode, SessionRefKind};
+    use crate::procwatch::readable_host::ReadableHost;
     use crate::procwatch::{
         ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessFact,
         ProcessIdentity as OsProcessIdentity, ProcessInspector,
@@ -3590,31 +3605,18 @@ mod tests {
         }
     }
 
+    /// The [`ReadableHost`] view with injectable enumeration, descendant and
+    /// marker failures.
     #[derive(Debug, Default)]
     struct RetryInspector {
         fail_descendants: AtomicBool,
         fail_enumeration: AtomicBool,
         fail_markers: AtomicBool,
-        hide_unreadable: AtomicBool,
         descendant_calls: AtomicUsize,
-        inner: HostInspector,
+        inner: ReadableHost,
     }
 
     impl RetryInspector {
-        /// The host process table without processes whose ownership markers
-        /// cannot be read.
-        ///
-        /// A sweep treats such a process as possibly belonging to the lost
-        /// runtime, so any unrelated non-dumpable process on the test host
-        /// (a user manager, a sandboxed agent, a CI runner helper) would make
-        /// the cleanup unconfirmed. Tests that assert a confirmed cleanup run
-        /// against this view; real processes are still signalled.
-        fn readable_host() -> Self {
-            let inspector = Self::default();
-            inspector.hide_unreadable.store(true, Ordering::Release);
-            inspector
-        }
-
         fn fail_enumeration(&self, fail: bool) {
             self.fail_enumeration.store(fail, Ordering::Release);
         }
@@ -3640,6 +3642,10 @@ mod tests {
             self.inner.identity(pid)
         }
 
+        fn is_running(&self, identity: OsProcessIdentity) -> Result<bool, crate::procwatch::Error> {
+            self.inner.is_running(identity)
+        }
+
         fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, crate::procwatch::Error> {
             self.inner.parent_pid(pid)
         }
@@ -3655,14 +3661,7 @@ mod tests {
                     std::io::Error::other("process table unreadable"),
                 ));
             }
-            let processes = self.inner.same_user_processes()?;
-            if !self.hide_unreadable.load(Ordering::Acquire) {
-                return Ok(processes);
-            }
-            Ok(processes
-                .into_iter()
-                .filter(|fact| self.inner.ownership_markers(fact.identity().pid).is_ok())
-                .collect())
+            self.inner.same_user_processes()
         }
 
         fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
@@ -3701,22 +3700,7 @@ mod tests {
                     std::io::Error::from(std::io::ErrorKind::PermissionDenied),
                 ));
             }
-            let markers = self.inner.ownership_markers(pid);
-            if !self.hide_unreadable.load(Ordering::Acquire) {
-                return markers;
-            }
-            // A process that turns unreadable after the enumeration filtered it
-            // (a fresh exec, a non-dumpable helper) is reported as exited, so
-            // the hidden view holds for the whole sweep.
-            match markers {
-                Err(
-                    crate::procwatch::Error::PermissionDenied { .. }
-                    | crate::procwatch::Error::Unobservable { .. },
-                ) => Err(crate::procwatch::Error::Race {
-                    operation: "readable_host_markers",
-                }),
-                markers => markers,
-            }
+            self.inner.ownership_markers(pid)
         }
 
         fn foreground_process_group(
@@ -7235,7 +7219,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn present_job_without_a_reachable_worker_is_ambiguous_and_untouched() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let marked = Marked::spawn("runtime-s-301");
             persist_record(&fixture.root, "s-301", Some("runtime-s-301"));
             write_live_journal(&fixture.root, "s-301", dead_worker(), Some("runtime-s-301"));
@@ -7260,7 +7244,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn ended_job_with_a_dead_worker_sweeps_exactly_its_runtime_and_is_lost() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let lost = Marked::spawn("runtime-s-302");
             let bystander = Marked::spawn("runtime-s-302-other");
             persist_record(&fixture.root, "s-302", Some("runtime-s-302"));
@@ -7338,7 +7322,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn mismatched_job_definition_fails_closed() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let marked = Marked::spawn("runtime-s-304");
             persist_record(&fixture.root, "s-304", Some("runtime-s-304"));
             write_live_journal(&fixture.root, "s-304", dead_worker(), Some("runtime-s-304"));
@@ -7371,7 +7355,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn live_worker_behind_a_foreign_job_definition_is_not_adopted() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
             let (controller, runtime_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-305", "worker-s-305")
@@ -7415,7 +7399,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn live_worker_of_the_record_generation_is_adopted_without_supervisor_evidence() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
             let (controller, runtime_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-306", "worker-s-306")
@@ -7444,7 +7428,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn live_worker_with_an_absent_job_is_adopted_and_flagged() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
             let (controller, runtime_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-315", "worker-s-315")
@@ -7487,7 +7471,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn stale_generations_are_retired_when_ended_and_left_orphaned_when_live() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             persist_record(&fixture.root, "s-307", None);
             let current = service_id("s-307", TEST_GENERATION);
             let ended = service_id("s-307", "zzzz2222");
@@ -7524,7 +7508,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn unavailable_supervisor_keeps_the_session_reconnecting_and_retries() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let marked = Marked::spawn("runtime-s-309");
             persist_record(&fixture.root, "s-309", Some("runtime-s-309"));
             write_live_journal(
@@ -7577,7 +7561,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn incompatible_worker_of_a_record_is_left_alive() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
             persist_record(&fixture.root, "s-310", Some("runtime-s-310"));
             let fake = spawn_incompatible_worker(&runtime_root, "s-310");
@@ -7618,7 +7602,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn terminal_journal_retires_the_loaded_job_of_its_generation() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             persist_record(&fixture.root, "s-350", Some("runtime-s-350"));
             write_terminal_journal(&fixture.root, "s-350", "runtime-s-350");
             // A launchd `RunAtLoad` job stays loaded after its worker exits.
@@ -7644,7 +7628,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn failed_terminal_generation_retirement_is_retried() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             persist_record(&fixture.root, "s-351", Some("runtime-s-351"));
             write_terminal_journal(&fixture.root, "s-351", "runtime-s-351");
             let id = service_id("s-351", TEST_GENERATION);
@@ -7690,7 +7674,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn terminal_generation_behind_an_answering_worker_is_not_retired() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
             persist_record(&fixture.root, "s-352", Some("runtime-s-352"));
             write_terminal_journal(&fixture.root, "s-352", "runtime-s-352");
@@ -7713,7 +7697,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn reused_worker_pid_counts_as_not_running() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let (pid, start) = own_identity();
             persist_record(&fixture.root, "s-311", None);
             write_live_journal(&fixture.root, "s-311", (pid, start + 1), None);
@@ -7734,7 +7718,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn abandoned_create_is_compensated_only_after_its_job_is_retired() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let mut record = persist_record(&fixture.root, "s-313", None);
             record.runtime.worker_id = None;
             record.transaction = Some(crate::store::SessionTransaction {
@@ -7765,7 +7749,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn abandoned_create_settled_by_a_retry_leaves_the_registry() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let mut record = persist_record(&fixture.root, "s-316", None);
             record.runtime.worker_id = None;
             record.transaction = Some(crate::store::SessionTransaction {
@@ -7906,7 +7890,7 @@ while os.getppid() == parent:
         async fn abandoned_create_with_a_live_job_is_retired_after_its_initialization_deadline() {
             const INITIALIZE: Duration = Duration::from_secs(1);
 
-            let fixture = fixture_with(Arc::new(RetryInspector::readable_host()), Some(INITIALIZE));
+            let fixture = fixture_with(Arc::new(RetryInspector::default()), Some(INITIALIZE));
             persist_preparing_record(&fixture.root, "s-317");
             let id = service_id("s-317", TEST_GENERATION);
             fixture
@@ -7945,7 +7929,7 @@ while os.getppid() == parent:
         async fn abandoned_create_waits_for_an_unavailable_supervisor() {
             const INITIALIZE: Duration = Duration::from_secs(1);
 
-            let fixture = fixture_with(Arc::new(RetryInspector::readable_host()), Some(INITIALIZE));
+            let fixture = fixture_with(Arc::new(RetryInspector::default()), Some(INITIALIZE));
             persist_preparing_record(&fixture.root, "s-318");
             let id = service_id("s-318", TEST_GENERATION);
             fixture
@@ -7974,7 +7958,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn ambiguous_generation_is_adopted_once_its_worker_is_reachable_again() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
             let (controller, runtime_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-319", "worker-s-319")
@@ -8039,7 +8023,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn readopted_worker_is_watched_only_by_its_new_watchers() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
             let (controller, runtime_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-350", "worker-s-350")
@@ -8112,7 +8096,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn reclassified_entry_cancels_the_watchers_it_replaces() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
             let (controller, runtime_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-351", "worker-s-351")
@@ -8183,7 +8167,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn removing_a_conflict_whose_journaled_worker_still_runs_is_refused() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             persist_record(&fixture.root, "s-356", Some("runtime-s-356"));
             // The test process stands in for a worker that outlived its job.
             write_live_journal(
@@ -8204,7 +8188,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn removing_a_conflict_whose_journal_names_another_generation_is_refused() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             persist_record(&fixture.root, "s-357", Some("runtime-s-357"));
             write_live_journal(&fixture.root, "s-357", dead_worker(), Some("runtime-s-357"));
             fixture.supervisor.script_job(
@@ -8233,7 +8217,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn removing_a_conflict_whose_record_names_no_worker_proves_the_journaled_one() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let mut record = persist_record(&fixture.root, "s-360", Some("runtime-s-360"));
             record.runtime.worker_id = None;
             record.info.runtime.as_mut().expect("runtime").worker_id = None;
@@ -8261,7 +8245,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn removing_a_conflict_proves_every_journal_of_its_generation() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             persist_record(&fixture.root, "s-361", Some("runtime-s-361"));
             write_live_journal(&fixture.root, "s-361", dead_worker(), Some("runtime-s-361"));
             // A second journal claims the same generation; its worker runs.
@@ -8285,7 +8269,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn removing_a_conflict_over_a_foreign_job_is_refused() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             persist_record(&fixture.root, "s-358", Some("runtime-s-358"));
             write_live_journal(&fixture.root, "s-358", dead_worker(), Some("runtime-s-358"));
             fixture.supervisor.script_job(
@@ -8318,7 +8302,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn reconciled_removal_intent_evicts_the_listed_session() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
             let (controller, runtime_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-359", "worker-s-359")
@@ -8454,7 +8438,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn removal_intent_with_a_terminal_journal_finishes_at_startup() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let record = persist_removal_intent(&fixture.root, "s-370", Some("runtime-s-370"));
             seed_removal_leftovers(&fixture.root, &record);
             write_terminal_journal(&fixture.root, "s-370", "runtime-s-370");
@@ -8474,7 +8458,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn removal_intent_whose_job_ended_finishes_at_startup() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let record = persist_removal_intent(&fixture.root, "s-371", Some("runtime-s-371"));
             seed_removal_leftovers(&fixture.root, &record);
             write_live_journal(
@@ -8498,7 +8482,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn removal_intent_whose_generation_cannot_be_retired_is_retried() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let record = persist_removal_intent(&fixture.root, "s-372", Some("runtime-s-372"));
             seed_removal_leftovers(&fixture.root, &record);
             write_terminal_journal(&fixture.root, "s-372", "runtime-s-372");
@@ -8532,7 +8516,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn ended_generation_is_lost_only_after_its_job_is_retired() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             persist_record(&fixture.root, "s-373", Some("runtime-s-373"));
             write_live_journal(
                 &fixture.root,
@@ -8566,7 +8550,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn replayed_removal_retires_the_generation_and_cleans_up() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
             let (controller, runtime_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-374", "worker-s-374")
@@ -8590,7 +8574,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn replayed_removal_keeps_its_intent_until_the_generation_is_retired() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
             let (controller, runtime_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-375", "worker-s-375")
@@ -8629,7 +8613,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn removing_a_conflicting_session_retires_its_generation_first() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             persist_record(&fixture.root, "s-352", Some("runtime-s-352"));
             write_live_journal(&fixture.root, "s-352", dead_worker(), Some("runtime-s-352"));
             let id = service_id("s-352", TEST_GENERATION);
@@ -8656,7 +8640,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn removal_whose_record_cannot_be_deleted_stays_listed_for_a_retry() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             persist_record(&fixture.root, "s-376", Some("runtime-s-376"));
             write_live_journal(&fixture.root, "s-376", dead_worker(), Some("runtime-s-376"));
             let id = service_id("s-376", TEST_GENERATION);
@@ -8725,7 +8709,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn reconciled_removal_whose_record_cannot_be_deleted_is_retried() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let record = persist_removal_intent(&fixture.root, "s-377", Some("runtime-s-377"));
             seed_removal_leftovers(&fixture.root, &record);
             write_terminal_journal(&fixture.root, "s-377", "runtime-s-377");
@@ -8768,7 +8752,7 @@ while os.getppid() == parent:
         /// A fixture whose marker reads fail until the returned inspector
         /// is told otherwise; the process table is the readable host view.
         fn unreadable_marker_fixture() -> (Fixture, Arc<RetryInspector>) {
-            let inspector = Arc::new(RetryInspector::readable_host());
+            let inspector = Arc::new(RetryInspector::default());
             inspector.fail_markers(true);
             let fixture =
                 fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
@@ -8843,7 +8827,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn removal_sweeps_every_runtime_of_its_generation() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let recorded_runtime = Marked::spawn("runtime-s-380");
             let journaled_runtime = Marked::spawn("runtime-s-380-journaled");
             let bystander = Marked::spawn("runtime-s-380-other");
@@ -8880,7 +8864,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn explicit_removal_keeps_its_intent_until_the_runtime_is_swept() {
-            let inspector = Arc::new(RetryInspector::readable_host());
+            let inspector = Arc::new(RetryInspector::default());
             let fixture =
                 fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
             let marked = Marked::spawn("runtime-s-381");
@@ -8925,7 +8909,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn removing_a_reconnecting_session_keeps_it_until_its_generation_is_retired() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             persist_record(&fixture.root, "s-353", Some("runtime-s-353"));
             write_live_journal(&fixture.root, "s-353", dead_worker(), Some("runtime-s-353"));
             let id = service_id("s-353", TEST_GENERATION);
@@ -8975,7 +8959,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn removing_a_possibly_live_runtime_without_a_generation_is_refused() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let mut record = persist_record(&fixture.root, "s-354", Some("runtime-s-354"));
             record.runtime.service_id = None;
             record.runtime.generation = None;
@@ -9001,7 +8985,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn removing_an_incompatible_session_retires_its_generation_first() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
             persist_record(&fixture.root, "s-355", Some("runtime-s-355"));
             let fake = spawn_incompatible_worker(&runtime_root, "s-355");
@@ -9030,7 +9014,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn ambiguous_generation_whose_job_ends_becomes_a_proven_crash() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let marked = Marked::spawn("runtime-s-320");
             persist_record(&fixture.root, "s-320", Some("runtime-s-320"));
             write_live_journal(
@@ -9088,7 +9072,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn panicking_retry_pass_keeps_its_session_pending_and_the_loop_serving() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             for session_id in ["s-321", "s-322"] {
                 persist_record(&fixture.root, session_id, None);
                 write_live_journal(&fixture.root, session_id, dead_worker(), None);
@@ -9144,7 +9128,7 @@ while os.getppid() == parent:
         async fn panicking_abandoned_create_settlement_is_handed_to_the_retry() {
             const INITIALIZE: Duration = Duration::from_secs(30);
 
-            let fixture = fixture_with(Arc::new(RetryInspector::readable_host()), Some(INITIALIZE));
+            let fixture = fixture_with(Arc::new(RetryInspector::default()), Some(INITIALIZE));
             persist_preparing_record(&fixture.root, "s-323");
             let id = service_id("s-323", TEST_GENERATION);
             fixture
@@ -9192,7 +9176,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn failed_journal_scan_is_ambiguous_until_a_scan_succeeds() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let marked = Marked::spawn("runtime-s-330");
             persist_record(&fixture.root, "s-330", Some("runtime-s-330"));
             write_live_journal(
@@ -9230,7 +9214,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn failed_runtime_root_enumeration_is_ambiguous_until_it_succeeds() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let marked = Marked::spawn("runtime-s-331");
             persist_record(&fixture.root, "s-331", Some("runtime-s-331"));
             write_live_journal(
@@ -9270,7 +9254,7 @@ while os.getppid() == parent:
         async fn abandoned_create_is_not_settled_while_its_journals_cannot_be_scanned() {
             const INITIALIZE: Duration = Duration::from_millis(500);
 
-            let fixture = fixture_with(Arc::new(RetryInspector::readable_host()), Some(INITIALIZE));
+            let fixture = fixture_with(Arc::new(RetryInspector::default()), Some(INITIALIZE));
             persist_preparing_record(&fixture.root, "s-332");
             let id = service_id("s-332", TEST_GENERATION);
             fixture
@@ -9315,7 +9299,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn loaded_job_without_a_process_is_decided_by_its_journaled_worker() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let marked = Marked::spawn("runtime-s-334");
             persist_record(&fixture.root, "s-334", Some("runtime-s-334"));
             write_live_journal(
@@ -9360,7 +9344,7 @@ while os.getppid() == parent:
             const CURRENT_GENERATION: &str = "zzzz3333";
             const INITIALIZE: Duration = Duration::from_millis(500);
 
-            let fixture = fixture_with(Arc::new(RetryInspector::readable_host()), Some(INITIALIZE));
+            let fixture = fixture_with(Arc::new(RetryInspector::default()), Some(INITIALIZE));
             write_live_journal(&fixture.root, "s-337", dead_worker(), None);
             write_live_journal(&fixture.root, "s-339", own_identity(), None);
             let current = |session_id| service_id(session_id, CURRENT_GENERATION);
@@ -9440,7 +9424,7 @@ while os.getppid() == parent:
             const CURRENT_GENERATION: &str = "zzzz4444";
             const INITIALIZE: Duration = Duration::from_millis(500);
 
-            let fixture = fixture_with(Arc::new(RetryInspector::readable_host()), Some(INITIALIZE));
+            let fixture = fixture_with(Arc::new(RetryInspector::default()), Some(INITIALIZE));
             let current = |session_id| service_id(session_id, CURRENT_GENERATION);
             for session_id in ["s-341", "s-342"] {
                 let mut record = identity_record();
@@ -9585,7 +9569,7 @@ while os.getppid() == parent:
                 InspectStep::NotFound,
             ]);
             let fixture = fixture_over(
-                Arc::new(RetryInspector::readable_host()),
+                Arc::new(RetryInspector::default()),
                 Some(INITIALIZE),
                 supervisor,
             );
@@ -9653,7 +9637,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn unresponsive_worker_socket_is_unknown_evidence_within_the_connect_deadline() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
             let record = persist_record(&fixture.root, "s-361", Some("runtime-s-361"));
             let id = service_id("s-361", TEST_GENERATION);
@@ -9707,7 +9691,7 @@ while os.getppid() == parent:
 
         #[tokio::test]
         async fn reconciliation_waits_for_the_session_lifecycle_lock() {
-            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
             persist_record(&fixture.root, "s-314", None);
             let guard = fixture
                 .registry
@@ -9749,6 +9733,7 @@ while os.getppid() == parent:
 
         use super::super::super::supervision::RUNTIME_LOST;
         use super::temp_root;
+        use crate::procwatch::readable_host::ReadableHost;
         use crate::procwatch::{HostInspector, ProcessInspector};
         use crate::runtime::lifecycle::tests::{JobScript, ScriptedSupervisor};
         use crate::runtime::lifecycle::{SUPERVISION_AMBIGUOUS, SUPERVISION_UNAVAILABLE};
@@ -9826,7 +9811,7 @@ while os.getppid() == parent:
                     ..SessionRegistryConfig::default()
                 },
                 Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
-                Arc::new(HostInspector::new()),
+                Arc::new(ReadableHost::new()),
             );
             Fixture {
                 root,

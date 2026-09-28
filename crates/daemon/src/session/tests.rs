@@ -30,6 +30,7 @@ use crate::external::{external_session_id, TranscriptIndex};
 use crate::integration::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
+use crate::procwatch::readable_host::ReadableHost;
 use crate::procwatch::{
     ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity, ProcessInspector, StartIdentity,
 };
@@ -12790,12 +12791,12 @@ async fn session_diff_registry_end_to_end_reflects_worktree_changes_against_the_
 /// A registry whose sessions exit immediately, with the metadata store and
 /// worktree binding enabled so a sweep exercises the real removal path.
 fn retention_registry(tag: &str) -> (SessionRegistry, PathBuf, PathBuf) {
-    retention_registry_over(tag, Arc::new(ReadableHost::default()))
+    retention_registry_over(tag, Arc::new(ReadableHost::new()))
 }
 
 fn retention_registry_over(
     tag: &str,
-    inspector: Arc<ReadableHost>,
+    inspector: Arc<dyn ProcessInspector>,
 ) -> (SessionRegistry, PathBuf, PathBuf) {
     let store = temp_store_path(tag);
     let data_dir = store.parent().expect("store parent").to_path_buf();
@@ -12813,58 +12814,54 @@ fn retention_registry_over(
     (registry, data_dir, worktree_root)
 }
 
-/// PID of the scripted unreadable candidate of [`ReadableHost`].
+/// PID of the scripted unreadable candidate of [`UnreadableCandidateHost`].
 ///
 /// Above every PID Linux (`pid_max` is at most 2^22) or Darwin can assign, so
 /// it never names a real process that could be signalled.
 const UNREADABLE_CANDIDATE_PID: Pid = Pid::MAX;
 
-/// The host process table in which every process's ownership markers are
-/// readable, plus one optional scripted process whose markers are not.
-///
-/// Removal sweeps its runtimes' marked processes, and a same-user process
-/// whose markers cannot be read (a non-dumpable agent, a process between
-/// images) may belong to a runtime, so any such unrelated process on the test
-/// host would make the sweep unconfirmed and the removal refused. This view
-/// reports such a process as exited instead, which keeps the enumeration and
-/// the marker read that follows it consistent. Real processes are still
-/// enumerated and signalled; only the scripted candidate is unreadable.
+/// The [`ReadableHost`] view plus one optional scripted same-user process
+/// whose ownership markers cannot be read.
 #[derive(Debug, Default)]
-struct ReadableHost {
-    host: crate::procwatch::HostInspector,
-    unreadable_candidate: AtomicBool,
+struct UnreadableCandidateHost {
+    readable: ReadableHost,
+    candidate: AtomicBool,
 }
 
-impl ReadableHost {
-    fn set_unreadable_candidate(&self, present: bool) {
-        self.unreadable_candidate.store(present, Ordering::Release);
+impl UnreadableCandidateHost {
+    fn set_candidate(&self, present: bool) {
+        self.candidate.store(present, Ordering::Release);
     }
 
     fn scripts_candidate(&self, pid: Pid) -> bool {
-        pid == UNREADABLE_CANDIDATE_PID && self.unreadable_candidate.load(Ordering::Acquire)
+        pid == UNREADABLE_CANDIDATE_PID && self.candidate.load(Ordering::Acquire)
     }
 }
 
-impl ProcessInspector for ReadableHost {
+impl ProcessInspector for UnreadableCandidateHost {
     fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, crate::procwatch::Error> {
         // The candidate's start is never proven older than a worker, so only a
         // sweep without a worker bound still counts it as possibly marked.
         if pid == UNREADABLE_CANDIDATE_PID {
             return Ok(None);
         }
-        self.host.identity(pid)
+        self.readable.identity(pid)
+    }
+
+    fn is_running(&self, identity: ProcessIdentity) -> Result<bool, crate::procwatch::Error> {
+        self.readable.is_running(identity)
     }
 
     fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, crate::procwatch::Error> {
-        self.host.parent_pid(pid)
+        self.readable.parent_pid(pid)
     }
 
     fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, crate::procwatch::Error> {
-        self.host.process(pid)
+        self.readable.process(pid)
     }
 
     fn same_user_processes(&self) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
-        let mut processes = self.host.same_user_processes()?;
+        let mut processes = self.readable.same_user_processes()?;
         if self.scripts_candidate(UNREADABLE_CANDIDATE_PID) {
             processes.push(ProcessFact {
                 pid: UNREADABLE_CANDIDATE_PID,
@@ -12879,19 +12876,26 @@ impl ProcessInspector for ReadableHost {
     }
 
     fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
-        self.host.descendants(root)
+        self.readable.descendants(root)
+    }
+
+    fn descendant_identities(
+        &self,
+        root: ProcessIdentity,
+    ) -> Result<Vec<ProcessIdentity>, crate::procwatch::Error> {
+        self.readable.descendant_identities(root)
     }
 
     fn cwd(&self, pid: Pid) -> Result<PathBuf, crate::procwatch::Error> {
-        self.host.cwd(pid)
+        self.readable.cwd(pid)
     }
 
     fn executable(&self, pid: Pid) -> Result<Option<PathBuf>, crate::procwatch::Error> {
-        self.host.executable(pid)
+        self.readable.executable(pid)
     }
 
     fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, crate::procwatch::Error> {
-        self.host.exit_watch(identity)
+        self.readable.exit_watch(identity)
     }
 
     fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, crate::procwatch::Error> {
@@ -12901,22 +12905,14 @@ impl ProcessInspector for ReadableHost {
                 std::io::Error::from(std::io::ErrorKind::PermissionDenied),
             ));
         }
-        match self.host.ownership_markers(pid) {
-            Err(
-                crate::procwatch::Error::PermissionDenied { .. }
-                | crate::procwatch::Error::Unobservable { .. },
-            ) => Err(crate::procwatch::Error::Race {
-                operation: "readable_host_markers",
-            }),
-            markers => markers,
-        }
+        self.readable.ownership_markers(pid)
     }
 
     fn foreground_process_group(
         &self,
         root_pid: Pid,
     ) -> Result<Option<Pid>, crate::procwatch::Error> {
-        self.host.foreground_process_group(root_pid)
+        self.readable.foreground_process_group(root_pid)
     }
 }
 
@@ -13156,9 +13152,11 @@ async fn retention_sweep_counts_a_removal_it_could_not_complete() {
 /// worker's start identity. Issue #190 tracks bounding the record-only case.
 #[tokio::test]
 async fn removal_of_a_record_only_runtime_is_refused_while_an_unreadable_process_remains() {
-    let inspector = Arc::new(ReadableHost::default());
-    let (registry, _data_dir, _worktree_root) =
-        retention_registry_over("remove-record-only", Arc::clone(&inspector));
+    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+        "remove-record-only",
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
     let journaled = exited_session(&registry, None).await;
     let record_only = exited_session(&registry, None).await;
     // A generation whose worker never journaled leaves the record as the only
@@ -13182,7 +13180,7 @@ async fn removal_of_a_record_only_runtime_is_refused_while_an_unreadable_process
         }
     }
     assert!(removed_journals > 0, "the worker journaled its runtime");
-    inspector.set_unreadable_candidate(true);
+    inspector.set_candidate(true);
 
     registry
         .remove(&journaled.id)
@@ -13203,7 +13201,7 @@ async fn removal_of_a_record_only_runtime_is_refused_while_an_unreadable_process
         "a refused removal leaves the session in place"
     );
 
-    inspector.set_unreadable_candidate(false);
+    inspector.set_candidate(false);
     registry
         .remove(&record_only.id)
         .await
@@ -13339,7 +13337,7 @@ fn scripted_registry(
     let registry = SessionRegistry::new_with_launcher_and_inspector(
         config,
         Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
-        Arc::new(crate::procwatch::HostInspector::new()),
+        Arc::new(ReadableHost::new()),
     );
     (registry, supervisor)
 }
@@ -13491,6 +13489,330 @@ async fn unavailable_supervision_during_create_leaves_a_reconnecting_session() {
     );
 }
 
+/// A scripted registry that binds worktrees, with a `session.new` on
+/// `branch` held at its job start.
+///
+/// At the hold the worktree is bound and the preparing record names the
+/// generation, so a test can arrange how the rest of the create ends before
+/// releasing it.
+struct HeldWorktreeCreate {
+    registry: SessionRegistry,
+    supervisor: Arc<crate::runtime::lifecycle::tests::ScriptedSupervisor>,
+    store_path: PathBuf,
+    repo: PathBuf,
+    creating: tokio::task::JoinHandle<Result<SessionInfo, protocol::ProtocolError>>,
+    release: Arc<tokio::sync::Notify>,
+    id: SessionId,
+    service_id: pohunek_platform::supervisor::ServiceId,
+    worktree: PathBuf,
+}
+
+impl HeldWorktreeCreate {
+    async fn start(tag: &str, branch: &str) -> Self {
+        let store_path = temp_store_path(tag);
+        let worktree_root = store_path.parent().expect("store parent").join("worktrees");
+        let repo = init_git_repo(tag);
+        let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path.clone()),
+            worktree_root: Some(worktree_root),
+            ..SessionRegistryConfig::default()
+        });
+        let gate = crate::runtime::lifecycle::tests::StartGate {
+            session_id: None,
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        supervisor.hold_start(gate.clone());
+        let creating = tokio::spawn({
+            let registry = registry.clone();
+            let params = SessionNewParams {
+                cwd: None,
+                repo: Some(repo.clone()),
+                branch: Some(branch.to_owned()),
+                ..params()
+            };
+            async move { registry.create(params).await }
+        });
+        gate.entered.notified().await;
+        let records = crate::store::Store::new(store_path.clone())
+            .load_sessions()
+            .expect("load preparing record");
+        let [record] = records.as_slice() else {
+            panic!("one preparing record: {records:?}");
+        };
+        let service_id = pohunek_platform::supervisor::ServiceId::parse(
+            record
+                .runtime
+                .service_id
+                .clone()
+                .expect("the preparing record names its job"),
+        )
+        .expect("service id");
+        let worktree = record
+            .info
+            .worktree_path
+            .clone()
+            .expect("the preparing record names its worktree");
+        // Uncommitted work a forced removal would destroy.
+        std::fs::write(worktree.join("uncommitted.txt"), "agent work").expect("write work");
+        Self {
+            id: SessionId(record.session_id.clone()),
+            registry,
+            supervisor,
+            store_path,
+            repo,
+            creating,
+            release: gate.release,
+            service_id,
+            worktree,
+        }
+    }
+
+    /// Makes the commit of the held create's session entry fail.
+    fn fail_entry_commit(&self) {
+        self.registry
+            .inner
+            .store
+            .as_ref()
+            .expect("registry store")
+            .fail_next_write_before_rename();
+    }
+
+    /// Makes every later inspection and retirement of the held job fail as
+    /// an unreachable manager, so no retry can prove it ended.
+    fn keep_supervisor_unavailable(&self) {
+        self.supervisor.script_job(
+            self.service_id.clone(),
+            crate::runtime::lifecycle::tests::JobScript::Unavailable,
+        );
+    }
+
+    /// The create's outcome as its client sees it.
+    async fn outcome(&mut self) -> Result<SessionInfo, protocol::ProtocolError> {
+        tokio::time::timeout(DETACHED_COMMIT_TIMEOUT, &mut self.creating)
+            .await
+            .expect("create finishes")
+            .expect("create task joins")
+    }
+
+    /// Drops the client-facing create future while its job start is held.
+    async fn drop_client(&mut self) {
+        self.creating.abort();
+        assert!(
+            (&mut self.creating)
+                .await
+                .expect_err("create was dropped")
+                .is_cancelled(),
+            "the client-facing create future is gone"
+        );
+    }
+
+    /// Waits until the detached create transaction released the session.
+    async fn settled(&self) {
+        drop(
+            tokio::time::timeout(
+                DETACHED_COMMIT_TIMEOUT,
+                self.registry.lock_lifecycle(&self.id),
+            )
+            .await
+            .expect("the detached create transaction finishes"),
+        );
+    }
+
+    fn binding_exists(&self) -> bool {
+        crate::store::Store::new(self.store_path.clone())
+            .load_worktrees()
+            .expect("load worktree bindings")
+            .iter()
+            .any(|binding| binding.session_id == self.id.0)
+    }
+
+    fn record_exists(&self) -> bool {
+        crate::store::Store::new(self.store_path.clone())
+            .load_sessions()
+            .expect("load session records")
+            .iter()
+            .any(|record| record.session_id == self.id.0)
+    }
+
+    fn assert_worktree_kept(&self) {
+        assert_eq!(
+            std::fs::read_to_string(self.worktree.join("uncommitted.txt")).ok(),
+            Some("agent work".to_owned()),
+            "a possibly live runtime keeps its checkout and work"
+        );
+        assert!(self.binding_exists(), "the worktree binding is kept");
+        assert!(
+            self.record_exists(),
+            "the record is kept for reconciliation"
+        );
+    }
+
+    async fn assert_worktree_removed_and_branch_reusable(&self, branch: &str) {
+        assert!(
+            !self.worktree.exists(),
+            "the proven-ended create's worktree is removed: {}",
+            self.worktree.display()
+        );
+        assert!(!self.binding_exists(), "the worktree binding is dropped");
+        assert!(!self.record_exists(), "the preparing record is deleted");
+        assert!(
+            self.registry.list().await.is_empty(),
+            "nothing of the failed create stays listed"
+        );
+        let retried = self
+            .registry
+            .create(SessionNewParams {
+                cwd: None,
+                repo: Some(self.repo.clone()),
+                branch: Some(branch.to_owned()),
+                ..params()
+            })
+            .await
+            .expect("the freed branch binds again");
+        self.registry
+            .stop(&retried.id)
+            .await
+            .expect("stop the retried session");
+    }
+
+    async fn assert_reconnecting(&self) {
+        let sessions = self.registry.list().await;
+        let [session] = sessions.as_slice() else {
+            panic!("the session stays visible for reconciliation: {sessions:?}");
+        };
+        assert_eq!(session.id, self.id);
+        let runtime = session.runtime.as_ref().expect("runtime");
+        assert_eq!(runtime.state, RuntimeState::Reconnecting);
+        assert_eq!(session.worktree_path.as_ref(), Some(&self.worktree));
+    }
+}
+
+#[tokio::test]
+async fn failed_entry_commit_with_an_unconfirmed_retire_keeps_the_worktree() {
+    let mut held = HeldWorktreeCreate::start("wt-commit-unconfirmed", "feat/kept").await;
+    held.fail_entry_commit();
+    held.keep_supervisor_unavailable();
+    held.release.notify_one();
+
+    let error = held.outcome().await.expect_err("the entry cannot commit");
+
+    assert_eq!(
+        error.code,
+        crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE
+    );
+    assert!(
+        error.msg.contains("keeps its worktree")
+            && error.msg.contains(&held.worktree.display().to_string()),
+        "the error names the kept worktree: {error:?}"
+    );
+    assert_eq!(held.supervisor.retired(), [held.service_id.clone()]);
+    held.assert_worktree_kept();
+    held.assert_reconnecting().await;
+}
+
+#[tokio::test]
+async fn failed_entry_commit_with_a_confirmed_retire_removes_the_worktree() {
+    let mut held = HeldWorktreeCreate::start("wt-commit-retired", "feat/retired").await;
+    held.fail_entry_commit();
+    held.release.notify_one();
+
+    let error = held.outcome().await.expect_err("the entry cannot commit");
+
+    assert_eq!(error.code, "session_store_failed", "got: {error:?}");
+    assert_eq!(held.supervisor.retired(), [held.service_id.clone()]);
+    held.assert_worktree_removed_and_branch_reusable("feat/retired")
+        .await;
+}
+
+#[tokio::test]
+async fn dropped_create_ending_cleaned_still_removes_its_worktree() {
+    let mut held = HeldWorktreeCreate::start("wt-dropped-cleaned", "feat/dropped").await;
+    held.drop_client().await;
+    held.fail_entry_commit();
+    held.release.notify_one();
+
+    held.settled().await;
+
+    assert_eq!(held.supervisor.retired(), [held.service_id.clone()]);
+    held.assert_worktree_removed_and_branch_reusable("feat/dropped")
+        .await;
+}
+
+#[tokio::test]
+async fn dropped_create_with_an_unconfirmed_retire_keeps_its_worktree() {
+    let mut held = HeldWorktreeCreate::start("wt-dropped-unconfirmed", "feat/kept-dropped").await;
+    held.drop_client().await;
+    held.fail_entry_commit();
+    held.keep_supervisor_unavailable();
+    held.release.notify_one();
+
+    held.settled().await;
+
+    assert_eq!(held.supervisor.retired(), [held.service_id.clone()]);
+    held.assert_worktree_kept();
+    held.assert_reconnecting().await;
+}
+
+#[tokio::test]
+async fn unconfirmed_create_is_compensated_with_its_worktree_once_its_job_ends() {
+    let mut held = HeldWorktreeCreate::start("wt-retry-compensated", "feat/retried").await;
+    let (barrier, mut passes) = tokio::sync::mpsc::unbounded_channel();
+    held.registry
+        .inner
+        .supervision_retries
+        .state
+        .lock()
+        .expect("supervision retry state is never poisoned")
+        .pass_finished = Some(barrier);
+    // The job start fails before any worker runs, so no worker journal
+    // exists, and the supervisor cannot tell what is left of the job.
+    held.supervisor
+        .script_starts([crate::runtime::lifecycle::tests::StartStep::Fail]);
+    held.keep_supervisor_unavailable();
+    held.release.notify_one();
+
+    let error = held.outcome().await.expect_err("supervisor outage");
+    assert_eq!(
+        error.code,
+        crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE
+    );
+    assert!(held.supervisor.retired().is_empty(), "nothing is retired");
+    held.assert_worktree_kept();
+    held.assert_reconnecting().await;
+
+    // The supervisor answers again: the job ended without a process.
+    held.supervisor.script_job(
+        held.service_id.clone(),
+        crate::runtime::lifecycle::tests::JobScript::Present {
+            state: pohunek_platform::supervisor::ServiceState::Failed,
+            process: None,
+            definition: None,
+        },
+    );
+    // A pass that ran before the supervisor recovered leaves the session
+    // pending; the first pass that sees the ended job compensates it.
+    tokio::time::timeout(DETACHED_COMMIT_TIMEOUT, async {
+        loop {
+            let (pass, resume) = passes.recv().await.expect("retry barrier open");
+            resume
+                .send(())
+                .expect("the retry loop waits at the barrier");
+            if pass == held.id && !held.record_exists() {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the supervision retry compensates the ended create");
+
+    assert_eq!(held.supervisor.retired(), [held.service_id.clone()]);
+    held.assert_worktree_removed_and_branch_reusable("feat/retried")
+        .await;
+}
+
 /// Path of the real worker binary the subprocess launcher spawns.
 fn subprocess_worker_binary() -> PathBuf {
     if let Some(binary) = std::env::var_os("POHUNEK_WORKER_BIN") {
@@ -13571,7 +13893,7 @@ async fn failed_commit_stop_and_retire_keep_the_session_reconnecting() {
             ..SessionRegistryConfig::default()
         },
         Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
-        Arc::new(crate::procwatch::HostInspector::new()),
+        Arc::new(ReadableHost::new()),
     );
 
     let gate = crate::runtime::lifecycle::tests::StartGate {

@@ -7,6 +7,10 @@
 //! response carries the daemon and protocol versions. It also covers
 //! stale-socket recovery and the `method_not_found` path.
 
+// The daemon's unit tests share this view; it keeps `session.remove`
+// independent of the test host's processes whose markers cannot be read.
+#[path = "../src/procwatch/readable_host.rs"]
+mod readable_host;
 mod support;
 
 use std::collections::BTreeMap;
@@ -432,7 +436,7 @@ fn worker_backed_registry(
     SessionRegistry::new_with_launcher_and_inspector(
         config,
         launcher,
-        Arc::new(HostInspector::new()),
+        Arc::new(readable_host::ReadableHost::new()),
     )
 }
 

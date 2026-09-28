@@ -23,7 +23,7 @@ use super::{
 };
 use crate::procwatch::{ProcessIdentity, StartIdentity};
 use crate::runtime::lifecycle::{
-    Generation, LaunchFailure, Lifecycle, LifecycleGuard, PreviousGeneration, PreviousLive,
+    Generation, LaunchFailure, Lifecycle, LifecycleGuard, PreviousGeneration,
     SUPERVISION_UNAVAILABLE,
 };
 use crate::store::StoredInputRules;
@@ -153,14 +153,21 @@ pub(super) struct TargetResolution {
 }
 
 impl SessionRegistry {
-    /// Roll back a worktree bound earlier in [`Self::create`] when the session
-    /// then fails to launch, removing the checkout (and its binding) so the
-    /// branch is freed for a retry. Best-effort and non-fatal: a rollback failure
-    /// is logged and never masks the original launch error. A no-op when worktree
-    /// binding is not configured.
-    pub(super) async fn cleanup_bound_worktree(&self, id: &SessionId) {
+    /// Roll back a worktree bound for a create whose runtime never ran or is
+    /// proven ended, removing the checkout (and its binding) so the branch is
+    /// freed for a retry.
+    ///
+    /// `git worktree remove --force` deletes uncommitted work, so callers
+    /// reach this only when no runtime of the session can still use the
+    /// checkout. Best-effort and non-fatal: a failure is logged and never masks
+    /// the original launch error. A no-op when worktree binding is not
+    /// configured.
+    ///
+    /// Returns whether the session is left without a worktree binding; `false`
+    /// when the binding store could not be read or updated.
+    pub(super) async fn cleanup_bound_worktree(&self, id: &SessionId) -> bool {
         let Some(manager) = self.inner.worktree.clone() else {
-            return;
+            return true;
         };
         let session_id = id.0.clone();
         match tokio::task::spawn_blocking(move || {
@@ -189,16 +196,23 @@ impl SessionRegistry {
                         "rolled back worktree after a failed launch"
                     );
                 }
+                true
             }
-            Ok(Err(err)) => warn!(
-                session_id = %id.0,
-                error = %err,
-                "failed to roll back worktree after a failed launch"
-            ),
-            Err(_) => warn!(
-                session_id = %id.0,
-                "worktree rollback task panicked"
-            ),
+            Ok(Err(err)) => {
+                warn!(
+                    session_id = %id.0,
+                    error = %err,
+                    "failed to roll back worktree after a failed launch"
+                );
+                false
+            }
+            Err(_) => {
+                warn!(
+                    session_id = %id.0,
+                    "worktree rollback task panicked"
+                );
+                false
+            }
         }
     }
 
@@ -450,7 +464,7 @@ impl SessionRegistry {
     /// The registration runs as a detached task that owns `guard`, so a caller
     /// dropped after the job was registered (a client disconnect) cannot leave
     /// an untracked job: the task still commits the session or retires the
-    /// exact generation.
+    /// exact generation ([`Self::run_pty_registration`]).
     ///
     /// # Errors
     ///
@@ -469,15 +483,67 @@ impl SessionRegistry {
             })?
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "session registration assembles one protocol snapshot plus task handles"
-    )]
-    async fn run_pty_registration(
+    /// Registers `spec` while holding `guard`, then compensates a failed
+    /// first launch.
+    ///
+    /// A create whose generation is proven ended ([`LaunchFailure::Cleaned`]:
+    /// never started, or retired by exact generation) is compensated here,
+    /// worktree first and record last
+    /// ([`Self::compensate_abandoned_create`]), so the durable record guards
+    /// the rollback until it is complete. A generation that may still run
+    /// ([`LaunchFailure::Unavailable`]) keeps its worktree, binding, and
+    /// `Reconnecting` record; reconciliation compensates it once the job is
+    /// proven ended. A recovery never removes its session's worktree.
+    ///
+    /// # Errors
+    ///
+    /// Returns the launch error; for a kept worktree it names the checkout
+    /// left in place.
+    pub(super) async fn run_pty_registration(
         self,
         spec: PtySessionSpec,
         _guard: LifecycleGuard,
     ) -> Result<SessionInfo, ProtocolError> {
+        let id = spec.id.clone();
+        let creating = matches!(spec.registration, PtyRegistration::Create);
+        let worktree_path = spec.worktree_path.clone();
+        match self.transact_pty_registration(spec).await {
+            Ok(info) => Ok(info),
+            Err(LaunchFailure::Cleaned(error)) => {
+                if creating {
+                    self.compensate_abandoned_create(&id).await;
+                }
+                Err(error)
+            }
+            Err(LaunchFailure::Unavailable(mut error)) => {
+                if let (true, Some(path)) = (creating, worktree_path) {
+                    error.msg = format!(
+                        "{}; session {} keeps its worktree {} until its runtime is proven ended",
+                        error.msg,
+                        id.0,
+                        path.display()
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// The registration transaction of [`Self::run_pty_registration`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaunchFailure::Cleaned`] when no runtime of this registration
+    /// can be running, and [`LaunchFailure::Unavailable`] when one may still
+    /// run, with the session recorded for reconciliation.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "session registration assembles one protocol snapshot plus task handles"
+    )]
+    async fn transact_pty_registration(
+        &self,
+        spec: PtySessionSpec,
+    ) -> Result<SessionInfo, LaunchFailure> {
         let PtySessionSpec {
             id,
             registration,
@@ -510,8 +576,9 @@ impl SessionRegistry {
             resume: snapshot.resume.is_some(),
             fork: snapshot.fork.is_some(),
         };
-        let runtime_generation = next_runtime_generation(&registration)?;
-        let lifecycle = self.lifecycle()?;
+        let runtime_generation =
+            next_runtime_generation(&registration).map_err(LaunchFailure::Cleaned)?;
+        let lifecycle = self.lifecycle().map_err(LaunchFailure::Cleaned)?;
         let (transaction_id, transaction_kind, previous_worker_id, previous_runtime_id) =
             match &registration {
                 PtyRegistration::Create => (
@@ -540,7 +607,7 @@ impl SessionRegistry {
                             worker_id: previous_worker_id.clone(),
                         })
                         .await
-                        .map_err(PreviousLive::into_error)?;
+                        .map_err(|previous| LaunchFailure::Cleaned(previous.into_error()))?;
                     (
                         transaction_id.clone(),
                         TransactionKind::Recover,
@@ -549,7 +616,8 @@ impl SessionRegistry {
                     )
                 }
             };
-        let generation = Generation::mint(&id.0, lifecycle.config.worker_executable.clone())?;
+        let generation = Generation::mint(&id.0, lifecycle.config.worker_executable.clone())
+            .map_err(LaunchFailure::Cleaned)?;
         let preparing_runtime = SessionRuntime {
             state: RuntimeState::Starting,
             runtime_generation,
@@ -643,7 +711,9 @@ impl SessionRegistry {
             },
         };
         generation.record_into(&mut preparing_record.runtime);
-        self.write_session_record(preparing_record.clone()).await?;
+        self.write_session_record(preparing_record.clone())
+            .await
+            .map_err(LaunchFailure::Cleaned)?;
 
         let started = match self
             .start_runtime(
@@ -660,12 +730,7 @@ impl SessionRegistry {
             .await
         {
             Ok(started) => started,
-            Err(LaunchFailure::Cleaned(error)) => {
-                if matches!(registration, PtyRegistration::Create) {
-                    self.delete_session_record(&id).await?;
-                }
-                return Err(error);
-            }
+            Err(cleaned @ LaunchFailure::Cleaned(_)) => return Err(cleaned),
             Err(LaunchFailure::Unavailable(error)) => {
                 // The job may still be live; it stays recorded for
                 // reconciliation instead of being deleted or killed.
@@ -676,7 +741,7 @@ impl SessionRegistry {
                 )
                 .await;
                 self.schedule_supervision_retry(&id);
-                return Err(error);
+                return Err(LaunchFailure::Unavailable(error));
             }
         };
         let detector_cancel = CancellationToken::new();
@@ -761,12 +826,7 @@ impl SessionRegistry {
         if let Err(error) = self.commit_session_entry(&id, entry).await {
             self.stop_uncommitted_runtime(&id, &started.handle).await;
             return Err(match lifecycle.abandon(&generation, error).await {
-                LaunchFailure::Cleaned(error) => {
-                    if matches!(registration, PtyRegistration::Create) {
-                        self.delete_session_record(&id).await?;
-                    }
-                    error
-                }
+                cleaned @ LaunchFailure::Cleaned(_) => cleaned,
                 LaunchFailure::Unavailable(error) => {
                     // The half-launched runtime could not be retired, so the
                     // job may still be live; the preparing record stays
@@ -779,7 +839,7 @@ impl SessionRegistry {
                     )
                     .await;
                     self.schedule_supervision_retry(&id);
-                    error
+                    LaunchFailure::Unavailable(error)
                 }
             });
         }
@@ -816,7 +876,11 @@ impl SessionRegistry {
                 self.spawn_worker_exit_watcher(id, worker, expected, runtime_watch_cancel);
             }
             RuntimeHandle::Unavailable(state) => {
-                return Err(super::unavailable_runtime_error(&id, state));
+                // The session is committed; its runtime stays for
+                // reconciliation.
+                return Err(LaunchFailure::Unavailable(
+                    super::unavailable_runtime_error(&id, state),
+                ));
             }
         }
         Ok(info)

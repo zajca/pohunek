@@ -1067,9 +1067,20 @@ impl SessionRegistry {
     /// registry without a worker supervisor, whose launches fail with
     /// `worker_backend_required`. No constructor falls back to daemon-owned
     /// PTYs.
+    ///
+    /// Unit tests observe the host through the test-only `ReadableHost` view,
+    /// so an unrelated process of the test host whose ownership markers cannot
+    /// be read never makes a removal sweep unconfirmed. A unit test that exercises
+    /// unreadable markers injects its inspector through
+    /// [`Self::new_with_inspector`].
     #[must_use]
     pub fn new(config: SessionRegistryConfig) -> Self {
-        Self::new_with_inspector(config, Arc::new(crate::procwatch::HostInspector::new()))
+        #[cfg(test)]
+        let inspector: Arc<dyn ProcessInspector> =
+            Arc::new(crate::procwatch::readable_host::ReadableHost::new());
+        #[cfg(not(test))]
+        let inspector: Arc<dyn ProcessInspector> = Arc::new(crate::procwatch::HostInspector::new());
+        Self::new_with_inspector(config, inspector)
     }
 
     /// Create a production registry with a mandatory durable-worker backend.
@@ -1529,13 +1540,8 @@ impl SessionRegistry {
     /// branch)` (with `--branch`). A non-git directory yields a plain shell with
     /// no project. The session records `project_id`/`is_linked_worktree`, and any
     /// non-fatal worktree warnings ride along on the returned [`SessionInfo`].
-    #[expect(
-        clippy::too_many_lines,
-        reason = "tracked for session module decomposition"
-    )]
     pub async fn create(&self, params: SessionNewParams) -> Result<SessionInfo, ProtocolError> {
         validate_new_params(&params)?;
-        let initial_input = params.input.clone();
         // Resolve and validate the runtime before allocating a logical id or
         // resolving a target: target resolution may bind a git worktree.
         let resolved = self.inner.profiles.resolve_agent(&params.agent)?;
@@ -1562,114 +1568,25 @@ impl SessionRegistry {
         };
 
         let id = Self::allocate_session_id();
-        let guard = self.lock_lifecycle(&id).await;
-
-        let TargetResolution {
-            launch_cwd,
-            repo,
-            branch,
-            worktree_path,
-            project_id,
-            is_linked_worktree,
-            warnings,
-            worktree_bound,
-        } = self.resolve_target(&id, &params, fallback_cwd).await?;
-
-        // When a worktree was bound its branch is now checked out. Any failure
-        // building the launch command or spawning the PTY must roll that back: a
-        // leftover worktree keeps the branch checked out and blocks the next
-        // `session.new` on it with `worktree_branch_in_use` (an orphan a fresh
-        // session id would never reuse). Compensate here — not in
-        // `register_pty_session`, which `resume_binding` shares and where the
-        // worktree must be kept.
-        let launch = async {
-            let capabilities = resolved.capabilities();
-            let input_rules = resolved
-                .profile
-                .as_ref()
-                .and_then(|profile| profile.input_rules)
-                .unwrap_or_else(|| input_rules_for_agent(&base, &self.inner.config));
-            // Freeze the structural relaunch snapshot (C.4) from the resolved agent:
-            // the launch program/args plus the resume template (a profile's override,
-            // else the base kind's). Cloned/copied so `resolved` stays usable below.
-            let snapshot = ResumeSnapshot {
-                program: resolved
-                    .profile
-                    .as_ref()
-                    .map_or_else(|| default_program(&base), |profile| profile.program.clone()),
-                args: resolved
-                    .profile
-                    .as_ref()
-                    .map_or_else(|| default_args(&base), |profile| profile.args.clone()),
-                resume: capabilities.resume,
-                fork: capabilities.fork,
-            };
-            // The detection-manifest override is consumed only by the detector, on
-            // both the launch and resume paths; never persisted (re-resolved by name).
-            let manifest_override = resolved
-                .profile
-                .as_ref()
-                .and_then(|profile| profile.manifest.clone());
-            // Profile env first, then the daemon handshake env appended last, so
-            // every reserved POHUNEK_* key takes the daemon's value (last-write-wins;
-            // the loader also strips POHUNEK_* from the profile env up front).
-            let mut env_extra = resolved
-                .profile
-                .as_ref()
-                .map(|profile| profile.env.clone())
-                .unwrap_or_default();
-            env_extra.extend(self.session_pty_env(base.clone(), &id));
-            let opts = LaunchOpts {
-                cwd: launch_cwd.clone(),
-                cols: params.cols,
-                rows: params.rows,
-                env_extra,
+        // Target binding, registration, and every compensation run as one
+        // detached transaction, so a client dropped after the worktree was
+        // bound cannot strand it: the task still commits the session or
+        // compensates exactly what it created.
+        let registry = self.clone();
+        let (info, pending_initial_input) = tokio::spawn(async move {
+            Box::pin(registry.create_transaction(
+                id,
+                params,
+                resolved,
                 validated_program,
-            };
-            let plan = build_launch_command(
-                &resolved,
-                &self.inner.config.shell_command,
-                &opts,
-                initial_input.clone(),
-            )?;
-
-            let info = self
-                .register_pty_session(
-                    PtySessionSpec {
-                        id: id.clone(),
-                        registration: target::PtyRegistration::Create,
-                        name: validate_session_name(params.name.as_deref())?,
-                        agent: resolved.name.clone(),
-                        agent_base: base.clone(),
-                        input_rules,
-                        snapshot,
-                        manifest_override,
-                        cwd: launch_cwd,
-                        cols: params.cols,
-                        rows: params.rows,
-                        command: plan.command,
-                        native_session_id: None,
-                        native_session_path: None,
-                        project_id,
-                        is_linked_worktree,
-                        repo,
-                        branch,
-                        worktree_path,
-                        metadata: params.metadata.clone(),
-                        warnings,
-                    },
-                    guard,
-                )
-                .await?;
-
-            Ok((info, plan.pending_initial_input))
-        }
-        .await;
-
-        if launch.is_err() && worktree_bound {
-            self.cleanup_bound_worktree(&id).await;
-        }
-        let (info, pending_initial_input) = launch?;
+                fallback_cwd,
+            ))
+            .await
+        })
+        .await
+        .map_err(|_join_error| {
+            runtime_error("session_launch_failed", "session create task panicked")
+        })??;
         self.spawn_session_hook(SessionHookRequest {
             event: HookEvent::SessionStart,
             cwd: info.cwd.clone(),
@@ -1691,12 +1608,148 @@ impl SessionRegistry {
                 // checkout would keep the branch checked out and block the next
                 // `session.new` on it with `worktree_branch_in_use` — exactly
                 // the orphan the launch-failure path above compensates for.
-                self.rollback_failed_initial_input(&info.id, worktree_bound)
+                self.rollback_failed_initial_input(&info.id, info.worktree_path.is_some())
                     .await;
                 return Err(err);
             }
         }
         Ok(info)
+    }
+
+    /// Binds the target of a `session.new` and registers its first runtime,
+    /// compensating whatever it created when that fails.
+    ///
+    /// Runs detached from the caller, under the session's lifecycle lock, in
+    /// this order:
+    ///
+    /// 1. resolve the project and bind the worktree;
+    /// 2. build the launch command; a failure here launched nothing, so the
+    ///    bound worktree is removed at once;
+    /// 3. register the runtime ([`Self::run_pty_registration`]), which owns
+    ///    every later compensation: the worktree and the preparing record are
+    ///    removed only once the generation is proven ended, and a generation
+    ///    that may still run keeps both for reconciliation.
+    ///
+    /// Returns the committed session and the initial input still to deliver.
+    async fn create_transaction(
+        &self,
+        id: SessionId,
+        params: SessionNewParams,
+        resolved: ResolvedAgent,
+        validated_program: Option<crate::agent::ValidatedLaunchProgram>,
+        fallback_cwd: PathBuf,
+    ) -> Result<(SessionInfo, Option<String>), ProtocolError> {
+        let guard = self.lock_lifecycle(&id).await;
+        let target = self.resolve_target(&id, &params, fallback_cwd).await?;
+        let worktree_bound = target.worktree_bound;
+        let (spec, pending_initial_input) =
+            match self.create_spec(&id, &params, &resolved, validated_program, target) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    if worktree_bound {
+                        self.cleanup_bound_worktree(&id).await;
+                    }
+                    return Err(error);
+                }
+            };
+        let info = self.clone().run_pty_registration(spec, guard).await?;
+        Ok((info, pending_initial_input))
+    }
+
+    /// Builds the first-launch registration of a `session.new` in `target`,
+    /// with the initial input its launch command does not carry.
+    fn create_spec(
+        &self,
+        id: &SessionId,
+        params: &SessionNewParams,
+        resolved: &ResolvedAgent,
+        validated_program: Option<crate::agent::ValidatedLaunchProgram>,
+        target: TargetResolution,
+    ) -> Result<(PtySessionSpec, Option<String>), ProtocolError> {
+        let TargetResolution {
+            launch_cwd,
+            repo,
+            branch,
+            worktree_path,
+            project_id,
+            is_linked_worktree,
+            warnings,
+            ..
+        } = target;
+        let base = resolved.base.clone();
+        let capabilities = resolved.capabilities();
+        let input_rules = resolved
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.input_rules)
+            .unwrap_or_else(|| input_rules_for_agent(&base, &self.inner.config));
+        // Freeze the structural relaunch snapshot (C.4) from the resolved agent:
+        // the launch program/args plus the resume template (a profile's override,
+        // else the base kind's).
+        let snapshot = ResumeSnapshot {
+            program: resolved
+                .profile
+                .as_ref()
+                .map_or_else(|| default_program(&base), |profile| profile.program.clone()),
+            args: resolved
+                .profile
+                .as_ref()
+                .map_or_else(|| default_args(&base), |profile| profile.args.clone()),
+            resume: capabilities.resume,
+            fork: capabilities.fork,
+        };
+        // The detection-manifest override is consumed only by the detector, on
+        // both the launch and resume paths; never persisted (re-resolved by name).
+        let manifest_override = resolved
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.manifest.clone());
+        // Profile env first, then the daemon handshake env appended last, so
+        // every reserved POHUNEK_* key takes the daemon's value (last-write-wins;
+        // the loader also strips POHUNEK_* from the profile env up front).
+        let mut env_extra = resolved
+            .profile
+            .as_ref()
+            .map(|profile| profile.env.clone())
+            .unwrap_or_default();
+        env_extra.extend(self.session_pty_env(base.clone(), id));
+        let opts = LaunchOpts {
+            cwd: launch_cwd.clone(),
+            cols: params.cols,
+            rows: params.rows,
+            env_extra,
+            validated_program,
+        };
+        let plan = build_launch_command(
+            resolved,
+            &self.inner.config.shell_command,
+            &opts,
+            params.input.clone(),
+        )?;
+        let spec = PtySessionSpec {
+            id: id.clone(),
+            registration: target::PtyRegistration::Create,
+            name: validate_session_name(params.name.as_deref())?,
+            agent: resolved.name.clone(),
+            agent_base: base,
+            input_rules,
+            snapshot,
+            manifest_override,
+            cwd: launch_cwd,
+            cols: params.cols,
+            rows: params.rows,
+            command: plan.command,
+            native_session_id: None,
+            native_session_path: None,
+            project_id,
+            is_linked_worktree,
+            repo,
+            branch,
+            worktree_path,
+            metadata: params.metadata.clone(),
+            warnings,
+        };
+        Ok((spec, plan.pending_initial_input))
     }
 
     /// Wait for a freshly spawned agent to produce its first PTY output before a
@@ -1743,18 +1796,18 @@ impl SessionRegistry {
     /// PTY and, when the session bound a worktree, free that worktree too.
     ///
     /// `stop()` only terminates the PTY and records the exit; it never releases
-    /// a bound worktree (that is `cleanup_bound_worktree`'s job, otherwise only
-    /// reached by the launch-failure path). Skipping it here would leak the
-    /// checkout and block the branch's next `session.new`. Best-effort: a stop
-    /// failure is logged, never propagated, so the caller still returns the
-    /// original input error.
+    /// a bound worktree, so the checkout is removed here, and only after the
+    /// stop succeeded: a failed stop may leave the agent running in it, so the
+    /// worktree is kept. Best-effort: a stop failure is logged, never
+    /// propagated, so the caller still returns the original input error.
     async fn rollback_failed_initial_input(&self, id: &SessionId, worktree_bound: bool) {
         if let Err(err) = self.stop(id).await {
             warn!(
                 session_id = %id.0,
                 error = %err,
-                "failed to stop session while rolling back a failed initial input"
+                "failed to stop session while rolling back a failed initial input; its worktree is kept"
             );
+            return;
         }
         if worktree_bound {
             self.cleanup_bound_worktree(id).await;

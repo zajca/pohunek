@@ -1085,6 +1085,17 @@ Compensation never kills a live worker whose identity does not exactly match the
 preparing record. Such a mismatch becomes `runtime_conflict` for operator
 inspection.
 
+Phases 3 through 8 run as one daemon task detached from the client request, so
+a client that disconnects mid-create never cancels its compensation. A bound
+worktree is removed (`git worktree remove --force`) only once the create's
+generation is proven ended: it never started, or its job was retired by exact
+generation. Compensation removes the worktree and its binding first and the
+preparing record last, so the record keeps guarding a partial rollback and a
+later reconciliation repeats it. A generation whose retirement the supervisor
+cannot confirm keeps its worktree, binding, and record as
+`runtime_supervision_unavailable`; the create fails with that error, and the
+supervision retry compensates once the job is proven ended.
+
 ## 15. Startup Discovery and Reconciliation
 
 The daemon reconciles before advertising readiness:

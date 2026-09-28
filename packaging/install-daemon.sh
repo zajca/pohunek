@@ -13,6 +13,10 @@
 #   it passed its `config` step, and `service upgrade` refuses such a record;
 # - otherwise `service upgrade` when service.toml exists;
 # - otherwise `service install`.
+#
+# The prefix is `POHUNEK_INSTALL_PREFIX` or `$HOME/.local` for an install and
+# the prefix recorded in service.toml for an upgrade, which refuses a
+# different `POHUNEK_INSTALL_PREFIX`.
 
 set -eu
 
@@ -32,7 +36,6 @@ fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 archive_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-prefix=${POHUNEK_INSTALL_PREFIX:-"$HOME/.local"}
 config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
 service_config="$config_home/pohunek/service.toml"
 legacy_unit_dir="$config_home/systemd/user"
@@ -72,6 +75,114 @@ pending_install=0
 if printf '%s\n' "$status_json" \
     | grep -Eq '"operation"[[:space:]]*:[[:space:]]*"install"'; then
     pending_install=1
+fi
+
+# The install prefix is resolved and validated before anything changes,
+# because the legacy retirement below removes files under it.
+#
+# Sets `normalized_prefix` to $1 with repeated and trailing slashes collapsed
+# (the same path to `pohunek service install --prefix`, which requires an
+# absolute path). Fails (status 1) for a relative path, a `.` or `..`
+# component, or a newline, which the line-based checks below cannot carry.
+normalize_prefix() {
+    case $1 in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    case $1 in
+        *"
+"*) return 1 ;;
+    esac
+    normalized_prefix=
+    prefix_rest=${1#/}
+    while [ -n "$prefix_rest" ]; do
+        prefix_component=${prefix_rest%%/*}
+        case $prefix_rest in
+            */*) prefix_rest=${prefix_rest#*/} ;;
+            *) prefix_rest= ;;
+        esac
+        case $prefix_component in
+            '') ;;
+            .|..) return 1 ;;
+            *) normalized_prefix="$normalized_prefix/$prefix_component" ;;
+        esac
+    done
+    if [ -z "$normalized_prefix" ]; then
+        normalized_prefix=/
+    fi
+}
+refuse_prefix() {
+    echo "$1" >&2
+    echo "nothing was changed; fix the install prefix and re-run $0" >&2
+    exit 1
+}
+requested_prefix=${POHUNEK_INSTALL_PREFIX:-}
+if [ -n "$requested_prefix" ]; then
+    normalize_prefix "$requested_prefix" \
+        || refuse_prefix "POHUNEK_INSTALL_PREFIX must be an absolute path without \`.\` or \`..\` components: $requested_prefix"
+    prefix=$normalized_prefix
+fi
+if [ "$pending_install" -eq 0 ] && [ -f "$service_config" ]; then
+    # `service upgrade` keeps the prefix recorded in service.toml, so that
+    # recorded prefix is the one every step here acts on. It is the report's
+    # only "prefix" key; a value with a JSON escape is refused rather than
+    # decoded.
+    service_action=upgrade
+    if ! configured_line=$(printf '%s\n' "$status_json" | awk '
+        /^[[:space:]]*"prefix"[[:space:]]*:/ { count++; line = $0 }
+        END { if (count != 1) exit 1; print line }'); then
+        refuse_prefix "\`pohunek service status --json\` did not report exactly one configured prefix"
+    fi
+    configured_value=${configured_line#*\"prefix\"}
+    configured_value=${configured_value#*:}
+    configured_value=${configured_value#"${configured_value%%[![:space:]]*}"}
+    configured_value=${configured_value%,}
+    case $configured_value in
+        \"*\") configured_prefix=${configured_value#\"}; configured_prefix=${configured_prefix%\"} ;;
+        *) refuse_prefix "service.toml exists, but \`pohunek service status --json\` reports no configured prefix ($configured_value)" ;;
+    esac
+    case $configured_prefix in
+        *\\*|*\"*) refuse_prefix "the configured prefix contains a JSON escape this installer does not decode: $configured_value" ;;
+    esac
+    normalize_prefix "$configured_prefix" \
+        || refuse_prefix "the configured prefix is not an absolute path without \`.\` or \`..\` components: $configured_prefix"
+    if [ -n "$requested_prefix" ] && [ "$prefix" != "$normalized_prefix" ]; then
+        echo "POHUNEK_INSTALL_PREFIX ($prefix) differs from the prefix of the installed service" >&2
+        echo "($normalized_prefix); \`pohunek service upgrade\` keeps the installed prefix." >&2
+        refuse_prefix "unset POHUNEK_INSTALL_PREFIX (or set it to $normalized_prefix)"
+    fi
+    prefix=$normalized_prefix
+else
+    service_action=install
+    if [ -z "$requested_prefix" ]; then
+        case ${HOME:-} in
+            /*) normalize_prefix "$HOME/.local" ;;
+            *) false ;;
+        esac || refuse_prefix "HOME must be an absolute path when POHUNEK_INSTALL_PREFIX is unset: ${HOME:-<unset>}"
+        prefix=$normalized_prefix
+    fi
+fi
+# The legacy installer rendered `ExecStart=<prefix>/bin/pohunekd` into its
+# daemon unit, which names the prefix whose binaries belong to that install.
+# A unit that names any other daemon path means this run resolved a
+# different prefix, so its binaries are never removed from the wrong tree.
+if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
+    if ! legacy_exec=$(awk '
+        index($0, "ExecStart=") == 1 { count++; value = substr($0, 11) }
+        END { if (count != 1) exit 1; print value }' \
+        "$legacy_unit_dir/pohunekd.service"); then
+        refuse_prefix "the legacy $legacy_unit_dir/pohunekd.service has no single ExecStart= line naming its install prefix"
+    fi
+    legacy_prefix=
+    case $legacy_exec in
+        */bin/pohunekd) legacy_prefix=${legacy_exec%/bin/pohunekd}/ ;;
+    esac
+    if ! normalize_prefix "$legacy_prefix" || [ "$normalized_prefix" != "$prefix" ]; then
+        echo "the legacy $legacy_unit_dir/pohunekd.service runs" >&2
+        echo "  $legacy_exec" >&2
+        echo "which is not <prefix>/bin/pohunekd for the install prefix $prefix;" >&2
+        refuse_prefix "set POHUNEK_INSTALL_PREFIX to the legacy install's prefix (for an upgrade, the installed service's prefix must match it)"
+    fi
 fi
 
 # A pre-service install runs `pohunekd.service` from <prefix>/bin with
@@ -330,14 +441,29 @@ if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
     systemctl --user daemon-reload
     legacy_retired=1
 fi
-if [ -e "$prefix/bin/pohunekd" ] || [ -e "$prefix/libexec/pohunek-sessiond" ]; then
-    rm -f "$prefix/bin/pohunekd" "$prefix/libexec/pohunek-sessiond"
-    legacy_retired=1
-fi
+# The legacy installer wrote <prefix>/bin/pohunekd and
+# <prefix>/libexec/pohunek-sessiond with `install` as the invoking user, so
+# only a regular file owned by this user, reached through no symlink below the
+# prefix, is removed as part of that install. Anything else at those paths
+# (a symlink, another user's file, a directory) is left in place and named.
+retire_legacy_binary() {
+    legacy_binary="$prefix/$1/$2"
+    if [ ! -e "$legacy_binary" ] && [ ! -L "$legacy_binary" ]; then
+        return 0
+    fi
+    if [ ! -L "$prefix/$1" ] && [ ! -L "$legacy_binary" ] && [ -f "$legacy_binary" ] \
+        && [ -n "$(find "$legacy_binary" -prune -user "$(id -u)" -print 2>/dev/null)" ]; then
+        rm -f "$legacy_binary"
+        legacy_retired=1
+    else
+        echo "left $legacy_binary in place: it is not a regular file owned by this user" >&2
+        echo "below $prefix, so it is not a binary of the legacy install" >&2
+    fi
+}
+retire_legacy_binary bin pohunekd
+retire_legacy_binary libexec pohunek-sessiond
 
-if [ "$pending_install" -eq 1 ]; then
-    set -- service install --from "$archive_dir" --prefix "$prefix"
-elif [ -f "$service_config" ]; then
+if [ "$service_action" = upgrade ]; then
     set -- service upgrade --from "$archive_dir"
 else
     set -- service install --from "$archive_dir" --prefix "$prefix"

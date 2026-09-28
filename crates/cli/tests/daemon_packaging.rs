@@ -974,6 +974,209 @@ fn rerun_after_a_partial_retirement_finishes_without_a_second_preflight() {
     assert!(!fixture.prefix.join("bin/pohunekd").exists());
 }
 
+/// Spells an install prefix from the fixture's prefix.
+type PrefixSpelling = fn(&Path) -> String;
+
+#[test]
+fn an_unsound_install_prefix_refuses_before_anything_changes() {
+    let cases: [(&str, PrefixSpelling); 3] = [
+        ("relative", |_| "prefix".to_owned()),
+        ("dot-dot", |prefix| {
+            format!("{}/../prefix", prefix.display())
+        }),
+        ("dot", |prefix| format!("{}/./", prefix.display())),
+    ];
+    for (name, spell) in cases {
+        let fixture = Fixture::new();
+        fixture.legacy_install();
+        let prefix = spell(&fixture.prefix);
+        let output = fixture.run(
+            &[],
+            &[
+                ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+                ("POHUNEK_INSTALL_PREFIX", &prefix),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(1), "{name}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("POHUNEK_INSTALL_PREFIX must be an absolute path"),
+            "{name}: {stderr}"
+        );
+        assert!(stderr.contains("nothing was changed"), "{name}: {stderr}");
+        assert_eq!(fixture.pohunek_calls(), [STATUS], "{name}");
+        assert!(fixture.systemctl_calls().is_empty(), "{name}");
+        assert!(fixture.socket.path.exists(), "{name}: the socket moved");
+        for legacy in fixture.legacy_files() {
+            assert!(legacy.exists(), "{name}: {} was removed", legacy.display());
+        }
+    }
+}
+
+#[test]
+fn an_upgrade_refuses_a_prefix_other_than_the_configured_one() {
+    let fixture = Fixture::new();
+    write(&fixture.config_home.join("pohunek/service.toml"), "");
+    let other = fixture.root.path().join("other");
+    fixture.legacy_install_at(&other);
+    write(&fixture.prefix.join("bin/pohunekd"), "legacy\n");
+    let output = fixture.run(
+        &[],
+        &[
+            ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+            (
+                "POHUNEK_INSTALL_PREFIX",
+                other.to_str().expect("utf-8 path"),
+            ),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("differs from the prefix of the installed service"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("nothing was changed"), "{stderr}");
+    assert_eq!(fixture.pohunek_calls(), [STATUS]);
+    assert!(fixture.systemctl_calls().is_empty());
+    assert!(fixture.socket.path.exists(), "the socket moved");
+    assert!(other.join("bin/pohunekd").exists());
+    assert!(other.join("libexec/pohunek-sessiond").exists());
+    assert!(fixture.prefix.join("bin/pohunekd").exists());
+}
+
+#[test]
+fn an_upgrade_retires_legacy_binaries_under_the_configured_prefix() {
+    // Without POHUNEK_INSTALL_PREFIX the configured prefix, not `$HOME/.local`,
+    // is the one cleaned.
+    let fixture = Fixture::new();
+    write(&fixture.config_home.join("pohunek/service.toml"), "");
+    fixture.legacy_install();
+    let home_prefix = fixture.home.join(".local");
+    write(&home_prefix.join("bin/pohunekd"), "unrelated\n");
+    let output = fixture
+        .command(&[], &[])
+        .env_remove("POHUNEK_INSTALL_PREFIX")
+        .output()
+        .expect("run installer");
+    assert_success(&output);
+    assert_eq!(
+        fixture.pohunek_calls(),
+        [STATUS.to_owned(), fixture.upgrade_call()]
+    );
+    for legacy in fixture.legacy_files() {
+        assert!(!legacy.exists(), "{} was not removed", legacy.display());
+    }
+    assert!(home_prefix.join("bin/pohunekd").exists());
+
+    // The same prefix spelled with redundant slashes is the configured one.
+    let fixture = Fixture::new();
+    write(&fixture.config_home.join("pohunek/service.toml"), "");
+    fixture.legacy_install();
+    let spelled = format!("{}//", fixture.prefix.display()).replacen('/', "//", 1);
+    let output = fixture.run(&[], &[("POHUNEK_INSTALL_PREFIX", &spelled)]);
+    assert_success(&output);
+    assert_eq!(
+        fixture.pohunek_calls(),
+        [STATUS.to_owned(), fixture.upgrade_call()]
+    );
+    for legacy in fixture.legacy_files() {
+        assert!(!legacy.exists(), "{} was not removed", legacy.display());
+    }
+}
+
+#[test]
+fn an_upgrade_without_a_readable_configured_prefix_refuses() {
+    for (name, value) in [
+        ("null", "null"),
+        ("escaped", r#""/home/u/.lo\"cal""#),
+        ("relative", r#""prefix""#),
+    ] {
+        let fixture = Fixture::new();
+        write(&fixture.config_home.join("pohunek/service.toml"), "");
+        fixture.legacy_install();
+        let output = fixture.run(&[], &[("POHUNEK_TEST_CONFIGURED_PREFIX_JSON", value)]);
+        assert_eq!(output.status.code(), Some(1), "{name}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("nothing was changed"), "{name}: {stderr}");
+        assert_eq!(fixture.pohunek_calls(), [STATUS], "{name}");
+        assert!(fixture.systemctl_calls().is_empty(), "{name}");
+        for legacy in fixture.legacy_files() {
+            assert!(legacy.exists(), "{name}: {} was removed", legacy.display());
+        }
+    }
+}
+
+#[test]
+fn a_legacy_unit_of_another_prefix_refuses_before_anything_changes() {
+    let fixture = Fixture::new();
+    let legacy_prefix = fixture.root.path().join("legacy-prefix");
+    fixture.legacy_install_at(&legacy_prefix);
+    write(&fixture.prefix.join("bin/pohunekd"), "unrelated\n");
+    let output = fixture.run(&[], &[("POHUNEK_TEST_LEGACY_ACTIVE", "1")]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("which is not <prefix>/bin/pohunekd"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("nothing was changed"), "{stderr}");
+    assert_eq!(fixture.pohunek_calls(), [STATUS]);
+    assert!(fixture.systemctl_calls().is_empty());
+    assert!(fixture.socket.path.exists(), "the socket moved");
+    assert!(legacy_prefix.join("bin/pohunekd").exists());
+    assert!(fixture.prefix.join("bin/pohunekd").exists());
+
+    // A legacy unit spelled with a redundant slash names the same prefix.
+    let fixture = Fixture::new();
+    fixture.legacy_install_at(&PathBuf::from(format!("{}/", fixture.prefix.display())));
+    let output = fixture.run(&[], &[]);
+    assert_success(&output);
+    for legacy in fixture.legacy_files() {
+        assert!(!legacy.exists(), "{} was not removed", legacy.display());
+    }
+}
+
+#[test]
+fn legacy_binary_paths_reached_through_symlinks_are_left_in_place() {
+    let fixture = Fixture::new();
+    let outside = fixture.root.path().join("outside");
+    write(&outside.join("pohunekd"), "foreign daemon\n");
+    write(
+        &outside.join("libexec/pohunek-sessiond"),
+        "foreign worker\n",
+    );
+    fs::create_dir_all(fixture.prefix.join("bin")).expect("bin dir");
+    std::os::unix::fs::symlink(
+        outside.join("pohunekd"),
+        fixture.prefix.join("bin/pohunekd"),
+    )
+    .expect("binary symlink");
+    std::os::unix::fs::symlink(outside.join("libexec"), fixture.prefix.join("libexec"))
+        .expect("libexec symlink");
+    let output = fixture.run(&[], &[]);
+    assert_success(&output);
+    assert_eq!(
+        fixture.pohunek_calls(),
+        [STATUS.to_owned(), fixture.install_call()]
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("left"), "{stderr}");
+    assert!(
+        fixture
+            .prefix
+            .join("bin/pohunekd")
+            .symlink_metadata()
+            .is_ok(),
+        "the binary symlink was removed"
+    );
+    assert_eq!(read(&outside.join("pohunekd")), "foreign daemon\n");
+    assert_eq!(
+        read(&outside.join("libexec/pohunek-sessiond")),
+        "foreign worker\n"
+    );
+}
+
 #[test]
 fn a_failed_install_after_retirement_explains_how_to_recover() {
     let fixture = Fixture::new();
@@ -1052,7 +1255,11 @@ fn release_workflow_packages_static_shell_completions() {
 
 /// Fake archive CLI: logs its arguments and answers `service status --json`
 /// in the pretty envelope the real CLI prints, with a pending transaction
-/// from `POHUNEK_TEST_PENDING_OPERATION`/`_STEP` or `null`.
+/// from `POHUNEK_TEST_PENDING_OPERATION`/`_STEP` or `null`. With service.toml
+/// present it reports `installed: true` and the configured prefix
+/// `POHUNEK_TEST_CONFIGURED_PREFIX`, or the raw JSON value
+/// `POHUNEK_TEST_CONFIGURED_PREFIX_JSON`; without it `installed: false` and a
+/// `null` prefix, as the real CLI does.
 /// `POHUNEK_TEST_STATUS_QUERY_EXIT` fails the query with an error document;
 /// `POHUNEK_TEST_STATUS_UNEXPECTED` answers without `pending_transaction`.
 /// `POHUNEK_TEST_PREFLIGHT_STATUS` and `POHUNEK_TEST_SERVICE_STATUS` set the
@@ -1086,7 +1293,14 @@ if [ "$1" = service ] && [ "$2" = status ]; then
         pending=$(printf '{\n      "operation": "%s",\n      "version": "1.0.0",\n      "step": "%s"\n    }' \
             "$POHUNEK_TEST_PENDING_OPERATION" "$POHUNEK_TEST_PENDING_STEP")
     fi
-    printf '{\n  "ok": {\n    "installed": true,\n    "pending_transaction": %s,\n    "transaction_in_progress": false\n  }\n}\n' "$pending"
+    installed=false
+    prefix=null
+    if [ -f "$XDG_CONFIG_HOME/pohunek/service.toml" ]; then
+        installed=true
+        prefix=${POHUNEK_TEST_CONFIGURED_PREFIX_JSON:-"\"$POHUNEK_TEST_CONFIGURED_PREFIX\""}
+    fi
+    printf '{\n  "ok": {\n    "installed": %s,\n    "config_path": "%s",\n    "namespace": null,\n    "prefix": %s,\n    "pending_transaction": %s,\n    "transaction_in_progress": false\n  }\n}\n' \
+        "$installed" "$XDG_CONFIG_HOME/pohunek/service.toml" "$prefix" "$pending"
     exit 0
 fi
 exit "${POHUNEK_TEST_SERVICE_STATUS:-0}"
@@ -1240,10 +1454,25 @@ impl Fixture {
         ]
     }
 
+    /// A pre-service install under the fixture prefix: its daemon unit names
+    /// `<prefix>/bin/pohunekd`, as the legacy installer rendered it.
     fn legacy_install(&self) {
-        for file in self.legacy_files() {
-            write(&file, "legacy\n");
-        }
+        self.legacy_install_at(&self.prefix);
+    }
+
+    fn legacy_install_at(&self, prefix: &Path) {
+        let units = self.config_home.join("systemd/user");
+        write(
+            &units.join("pohunekd.service"),
+            &format!(
+                "[Service]\nType=notify\nExecStart={}/bin/pohunekd\n",
+                prefix.display()
+            ),
+        );
+        write(&units.join("pohunek-session@.service"), "legacy\n");
+        write(&units.join("pohunek-sessions.slice"), "legacy\n");
+        write(&prefix.join("bin/pohunekd"), "legacy\n");
+        write(&prefix.join("libexec/pohunek-sessiond"), "legacy\n");
     }
 
     fn run(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
@@ -1265,6 +1494,7 @@ impl Fixture {
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("POHUNEK_INSTALL_PREFIX", &self.prefix)
+            .env("POHUNEK_TEST_CONFIGURED_PREFIX", &self.prefix)
             .env(
                 "XDG_RUNTIME_DIR",
                 self.socket
