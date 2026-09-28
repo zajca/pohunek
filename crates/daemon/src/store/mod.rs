@@ -792,6 +792,33 @@ impl Store {
         }
     }
 
+    /// Clears the `create/initial_input` transaction of one session's
+    /// current record and leaves every other field as persisted.
+    ///
+    /// The record is re-read under the write lock, so a state a concurrent
+    /// stop, removal, or exit persisted is kept. Returns whether a marker was
+    /// cleared; a record without it, or no record at all, is a no-op success.
+    pub fn clear_initial_input(&self, session_id: &str) -> io::Result<StoreMutation<bool>> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (resume, worktrees, projects, mut sessions) = self.read_all()?;
+        let Some(record) = sessions.iter_mut().find(|record| {
+            record.session_id == session_id
+                && record
+                    .transaction
+                    .as_ref()
+                    .is_some_and(SessionTransaction::is_initial_input)
+        }) else {
+            return Ok(StoreMutation::Synced(false));
+        };
+        record.transaction = None;
+        Ok(self
+            .write_all(&resume, &worktrees, &projects, &sessions)?
+            .with_value(true))
+    }
+
     /// Removes one logical session and preserves every other record kind.
     pub fn remove_session(&self, session_id: &str) -> io::Result<StoreMutation<bool>> {
         let _guard = self

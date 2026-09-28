@@ -511,6 +511,10 @@ struct SessionRegistryInner {
     /// Holds the next committed create before its initial input.
     #[cfg(test)]
     initial_input_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Holds the next create between its delivered input and the commit.
+    #[cfg(test)]
+    initial_input_commit_hold:
+        std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
 }
 
 /// The detached create transactions of one registry.
@@ -1287,6 +1291,8 @@ impl SessionRegistry {
                 bound_create_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 initial_input_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                initial_input_commit_hold: std::sync::Mutex::new(None),
             }),
         };
         if let Some(config) = external_observer {
@@ -1798,18 +1804,54 @@ impl SessionRegistry {
         Ok(info)
     }
 
-    /// Clears the `initial_input` marker of a delivered create, in memory
-    /// and durably.
+    /// Clears the `initial_input` marker of a delivered create, durably
+    /// first and then in memory.
+    ///
+    /// The store clears only the marker of the current record
+    /// ([`Store::clear_initial_input`]), so a stop, removal, or exit that
+    /// persisted meanwhile keeps its state. A writer that still builds the
+    /// marker from memory before the flag drops cannot re-add it, since the
+    /// store never re-introduces a cleared marker.
     async fn commit_initial_input(&self, id: &SessionId) -> Result<(), ProtocolError> {
-        let record = {
-            let mut sessions = self.inner.sessions.lock().await;
-            let entry = sessions
-                .get_mut(id)
-                .ok_or_else(|| session_not_found(&id.0))?;
+        #[cfg(test)]
+        self.hold_initial_input_commit(id).await;
+        if let Some(store) = self.inner.store.clone() {
+            let session_id = id.0.clone();
+            tokio::task::spawn_blocking(move || store.clear_initial_input(&session_id))
+                .await
+                .map_err(|_join_error| {
+                    runtime_error(
+                        "session_store_failed",
+                        format!("initial input commit task panicked for {}", id.0),
+                    )
+                })?
+                .map_err(|error| {
+                    runtime_error(
+                        "session_store_failed",
+                        format!("failed to commit the initial input of {}: {error}", id.0),
+                    )
+                })?;
+        }
+        if let Some(entry) = self.inner.sessions.lock().await.get_mut(id) {
             entry.initial_input_pending = false;
-            Self::session_record(id, entry, entry.desired_state, None)
-        };
-        self.write_session_record(record).await
+        }
+        Ok(())
+    }
+
+    /// Parks a create between its delivered input and the marker commit
+    /// when a test armed the hold.
+    #[cfg(test)]
+    async fn hold_initial_input_commit(&self, id: &SessionId) {
+        let gate = self
+            .inner
+            .initial_input_commit_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|gate| gate.session_id.as_deref().is_none_or(|held| held == id.0));
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
     }
 
     /// Parks a create before its initial input when a test armed the hold.

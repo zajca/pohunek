@@ -14517,6 +14517,131 @@ async fn create_cut_off_before_its_initial_input_is_rolled_back_at_restart() {
         .await;
 }
 
+/// A create with an initial input parked between its delivered input and
+/// the durable clearing of its `initial_input` marker.
+struct InputCommitRace {
+    daemon: RestartableDaemon,
+    registry: SessionRegistry,
+    creating: tokio::task::JoinHandle<Result<SessionInfo, protocol::ProtocolError>>,
+    release: Arc<tokio::sync::Notify>,
+    id: SessionId,
+}
+
+impl InputCommitRace {
+    async fn start(tag: &str, shell: ShellCommand) -> Self {
+        let daemon = RestartableDaemon::new(tag);
+        let (registry, _supervisor) = scripted_registry(SessionRegistryConfig {
+            shell_command: shell,
+            initial_input_startup_grace: Duration::ZERO,
+            ..daemon.config.clone()
+        });
+        let gate = crate::runtime::lifecycle::tests::StartGate {
+            session_id: None,
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *registry
+            .inner
+            .initial_input_commit_hold
+            .lock()
+            .expect("initial input commit hold is never poisoned") = Some(gate.clone());
+        let creating = tokio::spawn({
+            let registry = registry.clone();
+            let params = SessionNewParams {
+                input: Some("go".to_owned()),
+                ..daemon.params(&format!("feat/{tag}"))
+            };
+            async move { registry.create(params).await }
+        });
+        gate.entered.notified().await;
+        let id = SessionId(undelivered_create(&daemon).session_id);
+        Self {
+            daemon,
+            registry,
+            creating,
+            release: gate.release,
+            id,
+        }
+    }
+
+    /// Lets the marker commit run and returns the create's outcome.
+    async fn commit(self) -> (RestartableDaemon, SessionRegistry, SessionId, SessionInfo) {
+        self.release.notify_one();
+        let created = self
+            .creating
+            .await
+            .expect("create task joins")
+            .expect("the delivered create succeeds");
+        (self.daemon, self.registry, self.id, created)
+    }
+}
+
+#[tokio::test]
+async fn initial_input_commit_keeps_a_concurrent_stop() {
+    let race = InputCommitRace::start(
+        "input-commit-stop",
+        ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+    )
+    .await;
+    race.registry.stop(&race.id).await.expect("stop session");
+
+    let (daemon, _registry, id, _created) = race.commit().await;
+
+    let record = stored_record(&daemon.store_path, &id);
+    assert_eq!(record.transaction, None, "the marker is cleared");
+    assert_eq!(
+        record.desired_state,
+        crate::store::DesiredState::Stopped,
+        "the explicit stop survives the commit"
+    );
+    assert_eq!(record.info.state, SessionState::Stopped);
+    assert_eq!(record.runtime.state, RuntimeState::Terminal);
+}
+
+#[tokio::test]
+async fn initial_input_commit_keeps_a_concurrent_remove() {
+    let race = InputCommitRace::start(
+        "input-commit-remove",
+        ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+    )
+    .await;
+    race.registry
+        .remove(&race.id)
+        .await
+        .expect("remove session");
+
+    let (daemon, registry, _id, _created) = race.commit().await;
+
+    assert!(
+        daemon.records().is_empty(),
+        "the commit does not bring the removed session back"
+    );
+    assert!(registry.list().await.is_empty());
+}
+
+#[tokio::test]
+async fn initial_input_commit_keeps_a_concurrent_natural_exit() {
+    let race = InputCommitRace::start(
+        "input-commit-exit",
+        ShellCommand::new("/bin/sh", ["-c", "read line; exit 3"]),
+    )
+    .await;
+    let exited = race
+        .registry
+        .wait_for_exit(&race.id, DETACHED_COMMIT_TIMEOUT)
+        .await
+        .expect("the delivered input ends the shell");
+    assert_eq!(exited.exit_code, Some(3));
+
+    let (daemon, _registry, id, _created) = race.commit().await;
+
+    let record = stored_record(&daemon.store_path, &id);
+    assert_eq!(record.transaction, None, "the marker is cleared");
+    assert_eq!(record.info.state, SessionState::Failed, "the exit survives");
+    assert_eq!(record.info.exit_code, Some(3));
+    assert_eq!(record.runtime.state, RuntimeState::Terminal);
+}
+
 /// Path of the real worker binary the subprocess launcher spawns.
 fn subprocess_worker_binary() -> PathBuf {
     if let Some(binary) = std::env::var_os("POHUNEK_WORKER_BIN") {

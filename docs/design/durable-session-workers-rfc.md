@@ -1105,7 +1105,9 @@ Phases 2 through 9 run as one daemon task detached from the client request, so
 a client that disconnects mid-create never cancels its compensation. When the
 create carries an initial input, phase 8 commits the record with
 `transaction=create/initial_input` instead of `none`, and delivering the input
-clears it; the store never lets a stale write bring the marker back. A failed
+clears it as a store update of the current record that touches nothing else,
+so a stop, removal, or exit persisted meanwhile is kept; the store never lets a
+stale write bring the marker back. A failed
 delivery or clearing removes the session (durable removal intent first). Daemon
 shutdown refuses new creates with `daemon_shutting_down` and drains the
 in-flight create tasks, bounded by the registry's create drain timeout, before

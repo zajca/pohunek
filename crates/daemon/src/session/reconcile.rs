@@ -944,6 +944,7 @@ impl SessionRegistry {
             return record;
         }
         tracing::warn!(session_id = %record.session_id, "rolling back a create whose initial input was never delivered");
+        let durable = record.clone();
         record.desired_state = DesiredState::Removed;
         record.transaction = Some(crate::store::SessionTransaction {
             id: format!("remove-create-{}", record.session_id),
@@ -952,7 +953,12 @@ impl SessionRegistry {
             previous_worker_id: None,
             previous_runtime_id: None,
         });
-        if let Err(error) = self.write_session_record(record.clone()).await {
+        // Conditional on the record this conversion read, so a state persisted
+        // since then is never overwritten with this snapshot.
+        if let Err(error) = self
+            .write_session_record_if_current(durable, record.clone())
+            .await
+        {
             tracing::warn!(
                 session_id = %record.session_id,
                 error = %error,
