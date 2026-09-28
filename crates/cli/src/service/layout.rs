@@ -168,6 +168,25 @@ pub fn claim_existing_prefix(layout: &InstallLayout, namespace: &Namespace) -> R
     }
 }
 
+/// Verifies that no other namespace claimed the prefix, without claiming it.
+///
+/// This is the read-only half of [`claim_prefix`]: a missing versions
+/// directory or ownership record passes, because the claim would create it.
+///
+/// # Errors
+///
+/// Returns [`Error::PrefixOwned`] when another namespace owns the prefix and
+/// a filesystem error for an unsafe directory or record.
+pub fn verify_claim(layout: &InstallLayout, namespace: &Namespace) -> Result<(), Error> {
+    let Some(versions) = open_existing_owner_dir(&layout.versions_dir())? else {
+        return Ok(());
+    };
+    match owner(&versions, layout)? {
+        Some(owner) if owner != *namespace => Err(prefix_owned(layout, &owner)),
+        Some(_) | None => Ok(()),
+    }
+}
+
 /// Gives up `namespace`'s claim on the prefix; returns whether a record existed.
 ///
 /// # Errors

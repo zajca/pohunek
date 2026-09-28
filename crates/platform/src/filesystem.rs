@@ -4,6 +4,7 @@ use rustix::fs::{self, AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFl
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
@@ -217,6 +218,14 @@ pub enum FsError {
         /// The lock marker path.
         path: PathBuf,
     },
+    /// A handed-down descriptor does not hold the advisory lock.
+    #[error("inherited descriptor does not hold the lock {path}: {detail}", path = .path.display())]
+    LockNotHeld {
+        /// The lock marker path.
+        path: PathBuf,
+        /// Why the descriptor was refused.
+        detail: &'static str,
+    },
     /// The platform or filesystem cannot provide atomic no-replace rename.
     #[error("atomic no-replace move is unsupported for {path}", path = .path.display())]
     AtomicMoveUnsupported {
@@ -345,7 +354,20 @@ pub struct TrustedDir {
 #[derive(Debug)]
 pub struct AdvisoryLock {
     _directory: File,
-    _marker: File,
+    marker: File,
+    path: PathBuf,
+}
+
+/// An exclusive advisory lock another process holds and handed down.
+///
+/// The `flock` belongs to the holder's open-file description, which this
+/// descriptor shares (see [`TrustedDir::adopt_lock`]). Dropping it closes
+/// only this descriptor, so the lock stays held while any other descriptor
+/// of that description remains open.
+#[derive(Debug)]
+pub struct AdoptedLock {
+    marker: File,
+    path: PathBuf,
 }
 
 /// An entry moved aside and bound to its original inode identity.
@@ -656,8 +678,92 @@ impl TrustedDir {
         validate_fd(&marker, &path, EntryKind::RegularFile, Some(mode))?;
         Ok(AdvisoryLock {
             _directory: directory,
-            _marker: marker,
+            marker,
+            path,
         })
+    }
+
+    /// Adopts the lock `name` through a descriptor its holder handed down.
+    ///
+    /// `marker` must share the open-file description that holds this
+    /// directory's lock `name`, as [`AdvisoryLock::inheritable`] passes it to
+    /// a child process. The descriptor must name the regular file currently
+    /// at `name`, with exactly `mode` and one link. A fresh description of
+    /// that file must then fail to take the lock, proving someone holds it,
+    /// while `marker`'s own description takes it again: `flock` succeeds
+    /// there only for the description that already holds the lock.
+    ///
+    /// Should the holder release the lock between those two steps, `marker`'s
+    /// description takes it instead and holds it exclusively just the same.
+    /// The adopted descriptor is made close-on-exec, so processes this one
+    /// spawns do not inherit it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FsError::LockNotHeld`] when `marker` is not the lock file,
+    /// when nobody holds the lock, or when another description holds it, and
+    /// another [`FsError`] for an unsafe marker or a failed system call.
+    pub fn adopt_lock(
+        &self,
+        name: impl AsRef<OsStr>,
+        mode: u32,
+        marker: File,
+    ) -> FsResult<AdoptedLock> {
+        validate_mode(mode)?;
+        let name = validate_component(name.as_ref())?;
+        let path = self.path.join(name);
+        let named = inspect_entry(&self.file, &path, name, EntryKind::RegularFile, Some(mode))?;
+        // Identity first, so another file is named as such rather than by
+        // whatever about it differs from a lock file.
+        let stat = fs::fstat(&marker)
+            .map_err(|source| io_error("inspect inherited lock descriptor", &path, source))?;
+        let same_inode = named.is_some_and(|named| {
+            named.device() == stat_device(&stat) && named.inode() == stat_inode(&stat)
+        });
+        if !same_inode {
+            return Err(FsError::LockNotHeld {
+                path,
+                detail: "the descriptor is not the lock file",
+            });
+        }
+        let inherited = validate_fd(&marker, &path, EntryKind::RegularFile, Some(mode))?;
+        let probe = File::from(
+            fs::openat(
+                &self.file,
+                name,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|source| io_error("open lock marker", &path, source))?,
+        );
+        if validate_fd(&probe, &path, EntryKind::RegularFile, Some(mode))? != inherited {
+            return Err(FsError::IdentityChanged { path });
+        }
+        match lock_nonblocking(&probe, &path) {
+            Err(FsError::LockContended { .. }) => {}
+            Ok(()) => {
+                return Err(FsError::LockNotHeld {
+                    path,
+                    detail: "no process holds the lock",
+                });
+            }
+            Err(error) => return Err(error),
+        }
+        // Closing the probe releases nothing: its description never held the lock.
+        drop(probe);
+        match lock_nonblocking(&marker, &path) {
+            Ok(()) => {}
+            Err(FsError::LockContended { .. }) => {
+                return Err(FsError::LockNotHeld {
+                    path,
+                    detail: "another open file description holds the lock",
+                });
+            }
+            Err(error) => return Err(error),
+        }
+        rustix::io::fcntl_setfd(&marker, rustix::io::FdFlags::CLOEXEC)
+            .map_err(|source| io_error("mark adopted lock close-on-exec", &path, source))?;
+        Ok(AdoptedLock { marker, path })
     }
 
     /// Captures a trusted entry's stable device and inode identity.
@@ -1628,6 +1734,41 @@ fn validate_ancestor(
         actual: owner,
         expected: effective_uid,
     })
+}
+
+impl AdvisoryLock {
+    /// Duplicates the lock marker's descriptor for a child process to inherit.
+    ///
+    /// The duplicate shares the open-file description that owns the `flock`
+    /// and is not close-on-exec, so every process spawned while it is open
+    /// inherits it; the child proves the lock with [`TrustedDir::adopt_lock`].
+    /// Close it once the intended child is spawned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FsError::Io`] when the descriptor cannot be duplicated.
+    pub fn inheritable(&self) -> FsResult<OwnedFd> {
+        inheritable_marker(&self.marker, &self.path)
+    }
+}
+
+impl AdoptedLock {
+    /// Duplicates the adopted descriptor for a child process to inherit.
+    ///
+    /// Behaves like [`AdvisoryLock::inheritable`], handing the same lock down
+    /// one more level.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FsError::Io`] when the descriptor cannot be duplicated.
+    pub fn inheritable(&self) -> FsResult<OwnedFd> {
+        inheritable_marker(&self.marker, &self.path)
+    }
+}
+
+/// `dup` shares the open-file description and never copies close-on-exec.
+fn inheritable_marker(marker: &File, path: &Path) -> FsResult<OwnedFd> {
+    rustix::io::dup(marker).map_err(|source| io_error("duplicate lock marker", path, source))
 }
 
 impl StagedEntry {
@@ -3015,6 +3156,117 @@ mod tests {
         second
             .acquire_lock("state.lock", FILE_MODE)
             .expect("acquire released lock");
+    }
+
+    fn close_on_exec(file: &impl std::os::fd::AsFd) -> bool {
+        rustix::io::fcntl_getfd(file)
+            .expect("read descriptor flags")
+            .contains(rustix::io::FdFlags::CLOEXEC)
+    }
+
+    fn assert_not_held(result: FsResult<AdoptedLock>, expected: &str) {
+        match result {
+            Err(FsError::LockNotHeld { detail, .. }) => assert_eq!(detail, expected),
+            other => panic!("expected LockNotHeld({expected}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_handed_down_lock_descriptor_is_adopted_and_keeps_the_lock() {
+        let (_temporary, trusted) = trusted_root();
+        let lock = trusted
+            .acquire_lock("state.lock", FILE_MODE)
+            .expect("acquire lock");
+        let inherited = lock.inheritable().expect("inheritable descriptor");
+        assert!(!close_on_exec(&inherited), "a child must inherit it");
+
+        let adopted = trusted
+            .adopt_lock("state.lock", FILE_MODE, File::from(inherited))
+            .expect("adopt the holder's description");
+        assert!(close_on_exec(&adopted.marker), "no grandchild inherits it");
+        let handed_on = adopted.inheritable().expect("hand the lock on");
+        assert!(!close_on_exec(&handed_on));
+
+        // The holder exits while the adopter keeps the shared description,
+        // so the lock stays held.
+        drop(lock);
+        let other = TrustedDir::open_absolute(&trusted.path, DIRECTORY_MODE)
+            .expect("second directory descriptor");
+        assert!(matches!(
+            other.acquire_lock("state.lock", FILE_MODE),
+            Err(FsError::LockContended { .. })
+        ));
+        drop(adopted);
+        assert!(matches!(
+            other.acquire_lock("state.lock", FILE_MODE),
+            Err(FsError::LockContended { .. })
+        ));
+        drop(handed_on);
+        other
+            .acquire_lock("state.lock", FILE_MODE)
+            .expect("the last descriptor released the lock");
+    }
+
+    #[test]
+    fn a_descriptor_that_does_not_hold_the_lock_is_refused() {
+        let (temporary, trusted) = trusted_root();
+        let marker = temporary.path().join("state.lock");
+
+        // Nobody holds the lock: a fresh description of the marker proves
+        // nothing, and the refusal leaves the lock free.
+        drop(
+            trusted
+                .acquire_lock("state.lock", FILE_MODE)
+                .expect("create marker"),
+        );
+        let unlocked = File::open(&marker).expect("open marker");
+        assert_not_held(
+            trusted.adopt_lock("state.lock", FILE_MODE, unlocked),
+            "no process holds the lock",
+        );
+        let lock = trusted
+            .acquire_lock("state.lock", FILE_MODE)
+            .expect("the refused adoption took nothing");
+
+        // Another description of the held marker is not the holder's.
+        let foreign = File::open(&marker).expect("open marker again");
+        assert_not_held(
+            trusted.adopt_lock("state.lock", FILE_MODE, foreign),
+            "another open file description holds the lock",
+        );
+
+        // An unrelated file is not the marker, even while the lock is held.
+        fs::write(temporary.path().join("other"), b"").expect("write other file");
+        fs::set_permissions(
+            temporary.path().join("other"),
+            fs::Permissions::from_mode(FILE_MODE),
+        )
+        .expect("chmod other file");
+        let unrelated = File::open(temporary.path().join("other")).expect("open other file");
+        assert_not_held(
+            trusted.adopt_lock("state.lock", FILE_MODE, unrelated),
+            "the descriptor is not the lock file",
+        );
+
+        // Nor is a directory, or a file of another mode.
+        let directory = trusted
+            .try_clone_descriptor()
+            .expect("directory descriptor");
+        assert_not_held(
+            trusted.adopt_lock("state.lock", FILE_MODE, directory),
+            "the descriptor is not the lock file",
+        );
+        fs::set_permissions(
+            temporary.path().join("other"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .expect("widen other file");
+        let unrelated = File::open(temporary.path().join("other")).expect("open other file");
+        assert_not_held(
+            trusted.adopt_lock("state.lock", FILE_MODE, unrelated),
+            "the descriptor is not the lock file",
+        );
+        drop(lock);
     }
 
     #[test]

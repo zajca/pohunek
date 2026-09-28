@@ -947,7 +947,10 @@ A fresh raw attach never requests historical replay. Its v3 `AttachStart`
 contains optional client dimensions. The worker serializes PTY resize, terminal
 model resize, snapshot capture, and live-subscriber registration against PTY
 output parsing. Normal output reads release that ordering gate after a bounded
-batch. Snapshot and resize operations temporarily suspend slave output, drain
+batch, and the master is non-blocking, so a read that finds no bytes (for
+example while output is suspended, which on Darwin also hides the queued bytes
+from the master) ends the drain instead of sleeping with the gate held; input
+writes wait for queue room with `poll`. Snapshot and resize operations temporarily suspend slave output, drain
 the finite bytes already queued on the master, apply the new geometry, capture
 the snapshot, and resume output on every success or error path. A continuously
 writing child cannot make one ordering-gate hold unbounded, although acquisition

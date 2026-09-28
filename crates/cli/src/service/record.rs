@@ -7,12 +7,16 @@
 //! rollback is journaled the same way: once it begins, the record is never
 //! resumed forward again.
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-28
 
+use std::fs::File;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pohunek_platform::filesystem::{AdvisoryLock, EntryKind, FsError, StageOutcome, TrustedDir};
+use pohunek_platform::filesystem::{
+    AdoptedLock, AdvisoryLock, EntryKind, FsError, StageOutcome, TrustedDir,
+};
 use serde::{Deserialize, Serialize};
 
 use super::error::{fs_error, replace_error, Error};
@@ -138,12 +142,40 @@ pub struct Record {
 
 /// Exclusive ownership of the install transaction, released on drop.
 ///
-/// The `flock` belongs to this process's open file descriptions, so a
-/// crashed holder releases it and a later run can resume or roll back the
-/// record it left.
+/// The `flock` belongs to open file descriptions, so a crashed holder
+/// releases it and a later run can resume or roll back the record it left.
+/// A lock adopted from a `pohunek service lock` ancestor stays held by that
+/// ancestor's description after this process drops its descriptor.
 #[derive(Debug)]
 pub struct TransactionLock {
-    _lock: AdvisoryLock,
+    held: Held,
+}
+
+/// How this process holds the transaction lock.
+#[derive(Debug)]
+enum Held {
+    /// This process acquired it.
+    Acquired(AdvisoryLock),
+    /// An ancestor acquired it and handed a descriptor down.
+    Adopted(AdoptedLock),
+}
+
+impl TransactionLock {
+    /// Duplicates the lock's descriptor for one child process to inherit.
+    ///
+    /// The duplicate is not close-on-exec; close it once the child is
+    /// spawned, so no other process inherits it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem error when the descriptor cannot be duplicated.
+    pub fn inheritable(&self) -> Result<OwnedFd, Error> {
+        match &self.held {
+            Held::Acquired(lock) => lock.inheritable(),
+            Held::Adopted(lock) => lock.inheritable(),
+        }
+        .map_err(|source| fs_error("hand down the transaction lock", source))
+    }
 }
 
 /// Owner-private storage of the transaction record.
@@ -262,6 +294,34 @@ impl Store {
         }
     }
 
+    /// Adopts the transaction lock an ancestor process holds through `marker`.
+    ///
+    /// `marker` is the descriptor `pohunek service lock` handed down (see
+    /// [`super::inherited`]). It must share the open file description that
+    /// holds this store's lock; anything else is refused rather than
+    /// replaced by a lock of this process, because the ancestor relies on
+    /// its lock covering this command.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InheritedLock`] when `marker` does not hold the lock
+    /// or the state directory does not exist, and a filesystem error when
+    /// the directory or the lock file is unsafe.
+    pub fn adopt(&self, marker: File) -> Result<TransactionLock, Error> {
+        let directory = self.open(false)?.ok_or_else(|| Error::InheritedLock {
+            detail: format!(
+                "the state directory {} does not exist",
+                self.state_dir.display()
+            ),
+        })?;
+        directory
+            .adopt_lock(LOCK_NAME, FILE_MODE, marker)
+            .map(|lock| TransactionLock {
+                held: Held::Adopted(lock),
+            })
+            .map_err(|source| fs_error("adopt the inherited transaction lock", source))
+    }
+
     /// Returns whether another process currently holds the transaction lock.
     ///
     /// The answer is a snapshot for reporting only; it never guards a change,
@@ -297,7 +357,9 @@ impl Store {
 /// Tries the transaction lock once; `None` means another process holds it.
 fn try_lock(directory: &TrustedDir) -> Result<Option<TransactionLock>, Error> {
     match directory.acquire_lock(LOCK_NAME, FILE_MODE) {
-        Ok(lock) => Ok(Some(TransactionLock { _lock: lock })),
+        Ok(lock) => Ok(Some(TransactionLock {
+            held: Held::Acquired(lock),
+        })),
         Err(FsError::LockContended { .. }) => Ok(None),
         Err(source) => Err(fs_error("lock the install transaction", source)),
     }

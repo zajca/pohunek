@@ -431,16 +431,26 @@ impl PtyOwner {
         builder.cwd(&command.cwd);
 
         let tty_name = Arc::new(pair.master.tty_name().ok_or(PtyError::MissingTtyName)?);
+        // Every master descriptor below shares this file description, so the
+        // output reader and the input writer both observe non-blocking mode.
+        // See `drain_available_output` for why a read must never park.
+        rustix::io::ioctl_fionbio(borrow_master(&*pair.master)?, true)
+            .map_err(rustix_errno_to_pty_error)?;
         let output_readiness = Arc::new(OutputReadiness::new(borrow_master(&*pair.master)?)?);
         let output_reader = Arc::new(Mutex::new(
             pair.master
                 .try_clone_reader()
                 .map_err(|source| PtyError::Allocate(source.to_string()))?,
         ));
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|source| PtyError::Allocate(source.to_string()))?;
+        let writer = MasterWriter {
+            inner: pair
+                .master
+                .take_writer()
+                .map_err(|source| PtyError::Allocate(source.to_string()))?,
+            master: borrow_master(&*pair.master)?
+                .try_clone_to_owned()
+                .map_err(PtyError::Io)?,
+        };
         let input = WriteCoordinator::new(writer, input_dedup_entries)
             .map_err(|source| PtyError::Io(io::Error::other(source)))?;
         let output = OutputHub::new(history_bytes, subscriber_bytes, command.rows, command.cols)?;
@@ -1159,6 +1169,68 @@ struct OutputReadiness {
     cancel_writer: OwnedFd,
 }
 
+/// Blocking input writer over the non-blocking PTY master description.
+///
+/// Output reads need the shared description non-blocking. Input keeps
+/// blocking semantics by waiting for writability whenever the child's input
+/// queue is full.
+struct MasterWriter {
+    inner: Box<dyn io::Write + Send>,
+    /// Duplicate of the master used only to wait for writability.
+    master: OwnedFd,
+}
+
+impl io::Write for MasterWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        loop {
+            match self.inner.write(buf) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    wait_writable(&self.master)?;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Waits until the PTY master accepts input or reports why it cannot.
+///
+/// # Errors
+///
+/// Returns an I/O error when `poll` fails or the master reports a hangup or
+/// error without writability, so a closed PTY cannot spin its writer.
+fn wait_writable(master: &OwnedFd) -> io::Result<()> {
+    loop {
+        let mut fds = [PollFd::new(master, PollFlags::OUT)];
+        match poll(&mut fds, None) {
+            Ok(_woken) => {
+                let revents = fds[MASTER_SLOT].revents();
+                if revents.contains(PollFlags::OUT) {
+                    return Ok(());
+                }
+                if revents.intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "PTY master cannot accept input",
+                    ));
+                }
+            }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(io::Error::from(error)),
+        }
+    }
+}
+
+/// Stops PTY output at the terminal until resumed or dropped.
+///
+/// Snapshot-boundary operations pause before contending for the ordering gate,
+/// so the bytes still readable from the master are finite. The reader thread
+/// then finishes its current batch without parking in a read and returns to
+/// its unlocked readiness wait, which hands the gate to the waiting operation.
 #[derive(Debug)]
 struct OutputPause {
     tty: OwnedFd,
@@ -1419,6 +1491,14 @@ where
                 drained = drained.saturating_add(read);
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            // Readiness can lapse before the read. Darwin refuses to hand a
+            // stopped terminal's queued output to the master even after `poll`
+            // reported it, so an output pause or a `^S` landing in between
+            // would park a blocking read with the ordering gate held until
+            // output resumes; the resume itself waits for that gate.
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(OutputReadState::Open);
+            }
             Err(error) => return Err(PtyError::Io(error)),
         }
     }
@@ -1582,6 +1662,15 @@ mod tests {
     const ROLLBACK_CHILD_READY_POLL: Duration = Duration::from_millis(10);
     /// Bounds delivery of the rollback kill to both exact process generations.
     const ROLLBACK_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Bounds a drain whose readiness lapsed; a parked read never returns.
+    const LAPSED_READ_DEADLINE: Duration = Duration::from_secs(2);
+    /// Input size well beyond the Linux and Darwin PTY input queues.
+    ///
+    /// One MiB forces many would-block writes on both kernels, whose queues
+    /// hold tens of KiB at most.
+    const OVERSIZED_INPUT_BYTES: usize = 1024 * 1024;
+    /// Bounds each step of the oversized-input round trip.
+    const OVERSIZED_INPUT_DEADLINE: Duration = Duration::from_secs(10);
 
     #[test]
     fn non_reaping_wait_retries_interrupts_without_falling_back_to_reap() {
@@ -2331,6 +2420,100 @@ mod tests {
             .stop("cleanup-noisy", Duration::from_millis(200))
             .await
             .expect("cleanup");
+    }
+
+    /// The master is non-blocking for every descriptor the owner reads through.
+    #[tokio::test]
+    async fn master_description_is_non_blocking() {
+        let pty = spawn(shell("sleep 30"));
+
+        let flags = rustix::fs::fcntl_getfl(&pty.output_readiness.master).expect("master flags");
+        assert!(
+            flags.contains(rustix::fs::OFlags::NONBLOCK),
+            "a blocking master read can park while holding the ordering gate"
+        );
+
+        let _ = pty
+            .stop("cleanup", Duration::from_millis(200))
+            .await
+            .expect("cleanup");
+    }
+
+    /// A read whose readiness lapsed ends the drain instead of parking.
+    ///
+    /// Darwin reports a stopped terminal's queue as unreadable only after the
+    /// stop lands, so an output pause racing the reader's readiness check
+    /// leaves nothing to read. An idle Linux PTY reproduces that state by
+    /// reporting readiness that the real master does not have.
+    #[tokio::test]
+    async fn drain_ends_when_readiness_lapses_before_the_read() {
+        let pty = spawn(shell("sleep 30"));
+        let reader = std::sync::Arc::clone(&pty.output_reader);
+        let order = std::sync::Arc::clone(&pty.output_order);
+        let output = pty.output().clone();
+
+        let drain = tokio::task::spawn_blocking(move || {
+            let _order = order.lock().expect("ordering gate");
+            let readiness = TestReadiness::new([true]);
+            let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
+            drain_available_output(
+                &reader,
+                &readiness,
+                &output,
+                &mut buffer,
+                OUTPUT_DRAIN_BATCH_BYTES,
+            )
+        });
+        let state = tokio::time::timeout(LAPSED_READ_DEADLINE, drain)
+            .await
+            .expect("a lapsed read must not park with the ordering gate held")
+            .expect("drain task")
+            .expect("drain");
+        assert_eq!(state, OutputReadState::Open);
+
+        let _ = pty
+            .stop("cleanup", Duration::from_millis(200))
+            .await
+            .expect("cleanup");
+    }
+
+    /// Input larger than the kernel's PTY queues is written in full.
+    #[tokio::test]
+    async fn input_beyond_the_pty_queue_waits_for_room() {
+        let script =
+            format!("stty raw -echo && printf ready && head -c {OVERSIZED_INPUT_BYTES} >/dev/null");
+        let pty = spawn(shell(&script));
+        let mut output = pty.subscribe_output(None).expect("subscribe");
+        tokio::time::timeout(OVERSIZED_INPUT_DEADLINE, async {
+            let mut observed = Vec::new();
+            while !String::from_utf8_lossy(&observed).contains("ready") {
+                match output.recv().await.expect("output before readiness") {
+                    OutputEvent::Replay(chunk) | OutputEvent::Output(chunk) => {
+                        observed.extend_from_slice(&chunk.bytes);
+                    }
+                    OutputEvent::Exit { .. } => panic!("child exited before readiness"),
+                    OutputEvent::Gap { .. } | OutputEvent::TerminalSnapshot(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("raw-mode readiness");
+
+        tokio::time::timeout(
+            OVERSIZED_INPUT_DEADLINE,
+            pty.input().execute_stream(vec![InputFragment {
+                bytes: vec![b'x'; OVERSIZED_INPUT_BYTES],
+                delay_after: Duration::ZERO,
+            }]),
+        )
+        .await
+        .expect("input deadline")
+        .expect("a full input queue waits for room instead of failing");
+        let exit = tokio::time::timeout(OVERSIZED_INPUT_DEADLINE, pty.wait_exit())
+            .await
+            .expect("exit deadline")
+            .expect("exit");
+        assert_eq!(exit.exit_code, Some(0), "the child consumed every byte");
     }
 
     #[test]

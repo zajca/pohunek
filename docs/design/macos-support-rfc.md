@@ -291,7 +291,12 @@ descendant that ignores the hangup keeps running detached. That is the standing
 a Linux process has once it closes its terminal, so the post-exit drain window,
 which exists for descendants still holding the PTY, only ever engages on Linux.
 `tcflow` output suspension on the terminal device works natively, so the
-snapshot quiescence barrier is the same on both targets. The Darwin process
+snapshot quiescence barrier is the same on both targets, with one Darwin
+difference: while output is suspended XNU does not let the master read the
+queued bytes (`ptcselect`/`ptcread`), so a blocking read issued after readiness
+was reported would sleep until output resumes. The worker therefore keeps the
+master non-blocking on both targets; a read that finds nothing ends the drain
+and releases the ordering gate instead of holding it across the suspension. The Darwin process
 backend reports an exited but unreaped process with its identity, as procfs
 does, which is what lets a stop prove the retained root still owns its process
 group before signalling it.

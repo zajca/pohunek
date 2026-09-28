@@ -1,6 +1,7 @@
 //! Installs, upgrades, uninstalls, and reports the native pohunek service.
 //!
-//! This is the engine behind `pohunek service install|upgrade|uninstall|status`.
+//! This is the engine behind
+//! `pohunek service install|upgrade|uninstall|status|check|lock`.
 //! It installs versioned binaries under `<prefix>/libexec/pohunek/<version>/`,
 //! writes the owner-private `service.toml`, and registers the daemon as a
 //! systemd user unit (Linux) or a launchd login agent (macOS) through the
@@ -8,14 +9,22 @@
 //! transactions; see [`engine`] for the exact steps, resume, and rollback
 //! rules, and [`report`] for the `--json` result shapes.
 //!
+//! `check` runs the checks install or upgrade make before their first effect
+//! without making any, and `lock` runs another command while holding the
+//! transaction lock (see [`inherited`] for how that command's own `pohunek
+//! service` calls reuse it).
+//!
 //! The functions here resolve the host [`Context`], connect the native
 //! [`Backend`], and run the [`Engine`]. Tests and alternative front ends can
 //! assemble those pieces explicitly instead, for example to point the
 //! systemd backend at another unit directory.
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-28
 
+use std::ffi::{OsStr, OsString};
+use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::time::Duration;
 
 use pohunek_platform::supervisor::Namespace;
@@ -26,6 +35,7 @@ pub mod context;
 pub mod definition;
 pub mod engine;
 pub mod error;
+pub mod inherited;
 pub mod layout;
 pub mod record;
 pub mod report;
@@ -60,6 +70,7 @@ pub async fn install(
     prefix: Option<PathBuf>,
 ) -> Result<report::InstallReport, Error> {
     let context = Context::resolve()?;
+    let inherited = inherited_lock(&context)?;
     let from = staged_dir(&context, from)?;
     let prefix = match prefix {
         Some(prefix) => absolute("--prefix", prefix)?,
@@ -67,7 +78,7 @@ pub async fn install(
     };
     let namespace = context.namespace()?;
     let backend = Backend::connect(&context, &namespace, settings::LAUNCHCTL_COMMAND).await?;
-    Engine::new(&context, &backend)
+    engine(&context, &backend, inherited)
         .install(&from, &prefix, VERSION)
         .await
 }
@@ -80,9 +91,10 @@ pub async fn install(
 /// errors as [`install`] otherwise.
 pub async fn upgrade(from: Option<PathBuf>) -> Result<report::UpgradeReport, Error> {
     let context = Context::resolve()?;
+    let inherited = inherited_lock(&context)?;
     let from = staged_dir(&context, from)?;
     let backend = connect_installed(&context).await?;
-    Engine::new(&context, &backend)
+    engine(&context, &backend, inherited)
         .upgrade(&from, VERSION)
         .await
 }
@@ -96,8 +108,219 @@ pub async fn upgrade(from: Option<PathBuf>) -> Result<report::UpgradeReport, Err
 /// absent, and backend errors otherwise.
 pub async fn uninstall(options: UninstallOptions) -> Result<report::UninstallReport, Error> {
     let context = Context::resolve()?;
+    let inherited = inherited_lock(&context)?;
     let backend = connect_installed(&context).await?;
-    Engine::new(&context, &backend).uninstall(options).await
+    engine(&context, &backend, inherited)
+        .uninstall(options)
+        .await
+}
+
+/// Checks whether this CLI's install or upgrade would pass its preflight.
+///
+/// The transaction is the one `packaging/install-daemon.sh` picks: `install`
+/// while an install is pending or nothing is installed, `upgrade` otherwise.
+/// `prefix` is the install prefix, `$HOME/.local` by default; for an upgrade
+/// it must be omitted or equal the installed prefix. The checks run in the
+/// same functions install and upgrade call before their first effect, so
+/// their rules cannot drift apart.
+///
+/// # Errors
+///
+/// Returns the error install or upgrade would return before its first
+/// effect, [`Error::PrefixMismatch`], or [`Error::InheritedLock`] when
+/// `POHUNEK_SERVICE_LOCK_FD` names no held transaction lock.
+pub fn check(prefix: Option<PathBuf>) -> Result<report::CheckReport, Error> {
+    let context = Context::resolve()?;
+    let inherited = inherited_lock(&context)?;
+    check_of(&context, prefix, VERSION, inherited.is_some())
+}
+
+/// Runs `program` with `arguments` while holding the transaction lock.
+///
+/// The lock is taken like install takes it, or adopted from a `pohunek
+/// service lock` ancestor, and handed to the child as an inherited
+/// descriptor named by [`inherited::LOCK_FD_ENV`]. It is released once the
+/// child exits, never earlier: `SIGINT` and `SIGHUP` are left to the child,
+/// which shares the terminal's process group, and `SIGTERM` is forwarded to
+/// it.
+///
+/// # Errors
+///
+/// Returns [`Error::TransactionInProgress`] while another command holds the
+/// lock, [`Error::InheritedLock`] for an invalid inherited descriptor, and
+/// [`Error::Io`] when the child cannot be spawned or waited for.
+pub async fn lock(program: &OsStr, arguments: &[OsString]) -> Result<ExitStatus, Error> {
+    let context = Context::resolve()?;
+    let store = record::Store::new(context.paths().state_dir.clone());
+    let lock = match inherited::take()? {
+        Some(marker) => store.adopt(marker)?,
+        None => store.lock().await?,
+    };
+    run_locked(&lock, program, arguments).await
+}
+
+/// Runs the child of [`lock`] with `lock` handed down.
+async fn run_locked(
+    lock: &record::TransactionLock,
+    program: &OsStr,
+    arguments: &[OsString],
+) -> Result<ExitStatus, Error> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let signals = |kind| signal(kind).map_err(error::io_error("handle signals of", program));
+    let mut terminate = signals(SignalKind::terminate())?;
+    let mut interrupt = signals(SignalKind::interrupt())?;
+    let mut hangup = signals(SignalKind::hangup())?;
+    let inheritable = lock.inheritable()?;
+    let spawned = tokio::process::Command::new(program)
+        .args(arguments)
+        .env(inherited::LOCK_FD_ENV, inheritable.as_raw_fd().to_string())
+        .spawn();
+    // Only the child may inherit the duplicate; it holds its own copy now.
+    drop(inheritable);
+    let mut child = spawned.map_err(error::io_error("run", program))?;
+    loop {
+        tokio::select! {
+            status = child.wait() => return status.map_err(error::io_error("wait for", program)),
+            _ = terminate.recv() => forward_terminate(child.id()),
+            _ = interrupt.recv() => {}
+            _ = hangup.recv() => {}
+        }
+    }
+}
+
+/// Sends `SIGTERM` to the child `pid`, which is not reaped yet.
+fn forward_terminate(pid: Option<u32>) {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
+    if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
+        // A child that exits meanwhile is reported by `wait` next.
+        let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
+    }
+}
+
+/// Exit status of `pohunek service lock` for its child's `status`.
+///
+/// A child killed by a signal maps to 128 plus the signal number, the
+/// convention of POSIX shells, so a caller sees the same status whether or
+/// not the command ran under the lock.
+#[must_use]
+pub fn exit_code(status: ExitStatus) -> u8 {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    /// Offset POSIX shells add to a terminating signal's number.
+    const SIGNAL_EXIT_BASE: i32 = 128;
+    /// Status reported for a child that neither exited nor was killed.
+    const UNKNOWN_EXIT: u8 = 1;
+
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| SIGNAL_EXIT_BASE + signal))
+        .and_then(|code| u8::try_from(code).ok())
+        .unwrap_or(UNKNOWN_EXIT)
+}
+
+/// Adopts the transaction lock a `pohunek service lock` ancestor handed down.
+///
+/// # Errors
+///
+/// Returns [`Error::InheritedLock`] when `POHUNEK_SERVICE_LOCK_FD` was set
+/// but names no descriptor holding `context`'s transaction lock.
+fn inherited_lock(context: &Context) -> Result<Option<record::TransactionLock>, Error> {
+    inherited::take()?
+        .map(|marker| record::Store::new(context.paths().state_dir.clone()).adopt(marker))
+        .transpose()
+}
+
+fn engine<'a>(
+    context: &'a Context,
+    backend: &'a Backend,
+    inherited: Option<record::TransactionLock>,
+) -> Engine<'a> {
+    let engine = Engine::new(context, backend);
+    match inherited {
+        Some(lock) => engine.with_inherited_lock(lock),
+        None => engine,
+    }
+}
+
+/// Runs [`check`] for `context` and `version`.
+///
+/// The checks are the ones install or upgrade make before any effect, in
+/// the same functions: [`engine::install_preflight`] or
+/// [`engine::upgrade_preflight`] with [`engine::check_layout_dirs`], the
+/// pending-transaction decision ([`engine::install_plan`] or
+/// [`engine::upgrade_plan`]), the recorded installation's verification, and
+/// the prefix claim ([`layout::verify_claim`]). Nothing is written except the
+/// owner-private application state and runtime roots, which every service
+/// command prepares to derive the namespace.
+///
+/// # Errors
+///
+/// See [`check`].
+pub(crate) fn check_of(
+    context: &Context,
+    prefix: Option<PathBuf>,
+    version: &str,
+    locked: bool,
+) -> Result<report::CheckReport, Error> {
+    let prefix = prefix
+        .map(|prefix| absolute("--prefix", prefix))
+        .transpose()?;
+    let config_path = context.config_path();
+    let pending = record::Store::new(context.paths().state_dir.clone()).load()?;
+    let pending_install = pending
+        .as_ref()
+        .is_some_and(|record| record.operation == record::Operation::Install);
+    let (operation, prefix, namespace, plan) = if pending_install || !exists(&config_path)? {
+        let prefix = match prefix {
+            Some(prefix) => prefix,
+            None => context.default_prefix()?,
+        };
+        let layout = engine::install_preflight(context, &prefix)?;
+        let plan = engine::install_plan(pending, &prefix, version)?;
+        // A rollback of the pending record removes the `service.toml` it wrote.
+        if matches!(plan, engine::Plan::Fresh) && exists(&config_path)? {
+            return Err(Error::AlreadyInstalled { path: config_path });
+        }
+        let namespace = context.namespace()?;
+        layout::verify_claim(&layout, &namespace)?;
+        (record::Operation::Install, prefix, namespace, plan)
+    } else {
+        let config = verified_config(context)?;
+        engine::upgrade_preflight(context)?;
+        let plan = engine::upgrade_plan(pending, version)?;
+        let layout = config.layout();
+        if let Some(requested) = prefix.filter(|requested| requested != layout.prefix()) {
+            return Err(Error::PrefixMismatch {
+                requested,
+                installed: layout.prefix().to_path_buf(),
+            });
+        }
+        engine::check_layout_dirs(context, layout)?;
+        layout::verify_claim(layout, &config.namespace())?;
+        (
+            record::Operation::Upgrade,
+            layout.prefix().to_path_buf(),
+            config.namespace(),
+            plan,
+        )
+    };
+    Ok(report::CheckReport {
+        operation: operation.as_str(),
+        version: version.to_owned(),
+        prefix,
+        namespace: namespace.as_str().to_owned(),
+        config_path,
+        pending_transaction: plan.record().map(engine::pending_report),
+        pending_action: match plan {
+            engine::Plan::Fresh => None,
+            engine::Plan::Resume(_) => Some("resume"),
+            engine::Plan::RollBack(_) => Some("roll_back"),
+        },
+        locked,
+    })
 }
 
 /// Reports the installation.
@@ -248,8 +471,6 @@ fn exists(path: &Path) -> Result<bool, Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
-
     use pohunek_paths::{BasePaths, PathEnv, Platform};
     use pohunek_service_config::ConfigError;
 
@@ -440,6 +661,82 @@ mod tests {
             );
             assert_eq!(error.code(), "service_config_invalid");
         }
+    }
+
+    fn shell(script: String) -> [OsString; 2] {
+        [OsString::from("-c"), OsString::from(script)]
+    }
+
+    #[tokio::test]
+    async fn lock_runs_the_command_with_the_lock_handed_down() {
+        let (_temp, root) = temp_root();
+        let store = record::Store::new(root.join("state/pohunek"));
+        let lock = store.lock().await.expect("take the lock");
+        let lock_file = store.path().with_file_name(record::LOCK_NAME);
+        let ran = root.join("ran");
+
+        // The child inherits a descriptor of the lock file under the
+        // documented variable, and its status is passed through.
+        let script = format!(
+            "[ \"/dev/fd/${}\" -ef '{}' ] && : > '{}' && exit 7",
+            inherited::LOCK_FD_ENV,
+            lock_file.display(),
+            ran.display()
+        );
+        let status = run_locked(&lock, OsStr::new("sh"), &shell(script))
+            .await
+            .expect("run the command");
+        assert_eq!(exit_code(status), 7);
+        assert!(ran.exists(), "the child saw the inherited lock descriptor");
+
+        let status = run_locked(&lock, OsStr::new("sh"), &shell("kill -TERM $$".to_owned()))
+            .await
+            .expect("run the command");
+        assert_eq!(exit_code(status), 128 + 15, "a signal maps like a shell's");
+
+        let error = run_locked(&lock, OsStr::new("/nonexistent/command"), &[])
+            .await
+            .expect_err("a missing command");
+        assert!(
+            matches!(
+                &error,
+                Error::Io {
+                    operation: "run",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_other_transaction_starts_while_the_locked_command_runs() {
+        let (_temp, root) = temp_root();
+        let store = record::Store::new(root.join("state/pohunek"));
+        let lock = store.lock().await.expect("take the lock");
+        let stop = root.join("stop");
+        let script = format!(
+            "while [ ! -e '{}' ]; do sleep 0.05; done; exit 3",
+            stop.display()
+        );
+        let arguments = shell(script);
+        let child = run_locked(&lock, OsStr::new("sh"), &arguments);
+        let competitor = async {
+            let refused = store.lock().await;
+            std::fs::write(&stop, "").expect("release the child");
+            refused
+        };
+        let (status, refused) = tokio::join!(child, competitor);
+        assert_eq!(exit_code(status.expect("run the command")), 3);
+        assert!(
+            matches!(refused, Err(Error::TransactionInProgress { .. })),
+            "{refused:?}"
+        );
+        drop(lock);
+        store
+            .lock()
+            .await
+            .expect("the lock is free once the command ended");
     }
 
     #[tokio::test]

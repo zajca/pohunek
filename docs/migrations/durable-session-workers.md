@@ -120,29 +120,37 @@ since no preflight can reach it.
 6. it removes `pohunekd.service`, `pohunek-session@.service`, and
    `pohunek-sessions.slice` from the user unit directory before installing.
 
-Before any of these steps the installer also refuses, with nothing changed,
-while `pohunek service status --json` reports `transaction_in_progress: true`
-(another `pohunek service install|upgrade|uninstall` holds the transaction
-lock) or omits the flag. The wrapper cannot hold that lock itself, so a
-transaction started after this query is stopped only by the lock of the final
-`pohunek service install|upgrade`.
+The whole installer run holds the service transaction lock
+(`$XDG_STATE_HOME/pohunek/service-install.lock`): it re-executes itself under
+`pohunek service lock -- …`, which refuses with
+`service_transaction_in_progress`, before anything changes, while another
+`pohunek service install|upgrade|uninstall` holds the lock. From then on no
+such command can start until the run ends, and the final `pohunek service
+install|upgrade` adopts the same lock through the inherited descriptor
+`POHUNEK_SERVICE_LOCK_FD` names. A `pohunek service` command started from
+elsewhere during the retirement is refused instead of racing it.
 
-It then checks every directory it changes files in and every directory
-`pohunek service install|upgrade` requires, with the policy of the service
-command itself, so the legacy install is never retired for an install that
-would then fail: the install prefix, `<prefix>/bin`, `<prefix>/libexec`, and
-`<prefix>/libexec/pohunek`, the user unit directory
-(`$XDG_CONFIG_HOME/systemd/user`), the `service.toml` directory
-(`$XDG_CONFIG_HOME/pohunek`), and the application state and runtime roots
-(`$XDG_STATE_HOME/pohunek`, `$XDG_RUNTIME_DIR/pohunek`). Every existing path
-component must be a directory reached through no symlink, owned by the
-invoking user or by the owner of `/`, and not writable by group or others
-(a sticky directory of `/`'s owner, such as `/tmp`, is accepted as an
-ancestor). The directory itself must be owned by the invoking user; the state
-and runtime roots must have mode `0700` exactly, the others no group or other
-write permission. A missing directory is fine when its nearest existing
-ancestor passes, because the service command creates it. Anything else refuses
-the run and names the offending directory.
+Before the first of the steps above, the installer runs
+`pohunek service check --prefix <prefix> --json`, which makes every check the
+final `pohunek service install|upgrade` makes before its first effect, in the
+same Rust code, and changes nothing: `HOME` must be an existing directory and
+it and every XDG root an absolute, normalized UTF-8 path the daemon's job
+definition can carry; the prefix must be valid; every directory the command
+writes must be trusted — the install prefix, `<prefix>/bin`,
+`<prefix>/libexec`, `<prefix>/libexec/pohunek`, the user unit directory
+(`$XDG_CONFIG_HOME/systemd/user`), and the `service.toml` directory
+(`$XDG_CONFIG_HOME/pohunek`) reached through no symlink, owned by the invoking
+user (or, for an ancestor, by the owner of `/`), and not writable by group or
+others, and the application state and runtime roots (`$XDG_STATE_HOME/pohunek`,
+`$XDG_RUNTIME_DIR/pohunek`) of mode `0700` exactly; a pending transaction the
+command would refuse (`service_install_pending`) refuses; an upgrade's
+recorded installation must describe this user and these XDG roots; and the
+prefix must not belong to another installation (`service_prefix_owned`). A
+failed check prints the error document, with the code the final command would
+fail with, and refuses the run with the legacy install untouched. The check
+also confirms it ran under the run's lock (`"locked": true`); a
+`POHUNEK_SERVICE_LOCK_FD` that names no held lock fails with
+`service_inherited_lock_invalid` rather than running unlocked.
 
 Every legacy file the installer removes lies under one validated install
 prefix, resolved before anything changes:

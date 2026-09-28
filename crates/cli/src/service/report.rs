@@ -3,7 +3,7 @@
 //! These types are the stable `--json` payloads (inside the CLI's usual
 //! `{cli_version, protocol, ok}` envelope). Fields are only ever added.
 
-// Rust guideline compliant 2026-09-25
+// Rust guideline compliant 2026-09-28
 
 use std::path::PathBuf;
 
@@ -69,6 +69,31 @@ pub struct UninstallReport {
     pub started_daemon: bool,
     /// An interrupted transaction that was rolled back first.
     pub rolled_back: Option<PendingReport>,
+}
+
+/// Result of a passing `pohunek service check`.
+///
+/// A failing check returns the error the install or upgrade would return
+/// instead, with the same code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheckReport {
+    /// The transaction the check covered: `install` or `upgrade`.
+    pub operation: &'static str,
+    /// The version that transaction would install.
+    pub version: String,
+    /// The installation prefix it would use.
+    pub prefix: PathBuf,
+    /// The installation namespace.
+    pub namespace: String,
+    /// The `service.toml` it would write or upgrade.
+    pub config_path: PathBuf,
+    /// The interrupted transaction it would resume or roll back first.
+    pub pending_transaction: Option<PendingReport>,
+    /// What it would do with `pending_transaction`: `resume` or `roll_back`.
+    pub pending_action: Option<&'static str>,
+    /// Whether the check ran under a transaction lock a `pohunek service
+    /// lock` ancestor holds, so no other transaction can change the result.
+    pub locked: bool,
 }
 
 /// A version directory garbage collection kept.

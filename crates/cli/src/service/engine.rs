@@ -22,8 +22,12 @@
 //! Before any effect, including the rollback of a pending record, install,
 //! upgrade, and uninstall refuse a prefix `service.toml` would reject and an
 //! XDG root or `HOME` that is not UTF-8, which the daemon's job definition
-//! cannot carry. A command that cannot finish therefore never undoes another
-//! transaction first.
+//! cannot carry. Install and upgrade also refuse an untrusted directory they
+//! would write into and a `HOME` the daemon cannot start workers in. A command
+//! that cannot finish therefore never undoes another transaction first.
+//! `pohunek service check` runs these checks alone through the same functions
+//! (`install_preflight`, `upgrade_preflight`, `check_layout_dirs`,
+//! `install_plan`, `upgrade_plan`).
 //!
 //! Before staging anything, install and upgrade claim the prefix for this
 //! installation's namespace (see [`super::layout`]): a prefix another
@@ -82,6 +86,9 @@
 //! and then fails with `service_transaction_in_progress`; it never touches
 //! a record whose writer is alive. A crashed holder's lock is released by the
 //! kernel, so its record is resumed or rolled back by the next command.
+//! A command started under `pohunek service lock` instead adopts the lock its
+//! ancestor holds ([`Engine::with_inherited_lock`]); it never takes a second
+//! one, which that ancestor's own lock would refuse.
 //!
 //! # Uninstall
 //!
@@ -130,7 +137,7 @@ use super::context::Context;
 use super::definition::{daemon_definition, initial_config, with_version};
 use super::error::{supervisor_error, Error, LiveSession, OutdatedWorker};
 use super::layout::{self, Staged};
-use super::record::{self, Operation, Record, Step, Store};
+use super::record::{self, Operation, Record, Step, Store, TransactionLock};
 use super::report::{
     state_name, InstallReport, JobReport, KeptVersion, PendingReport, StatusReport,
     UninstallReport, UpgradeReport, VersionReport, WorkerReport,
@@ -171,6 +178,9 @@ pub struct Engine<'a> {
     backend: &'a Backend,
     inspector: HostInspector,
     store: Store,
+    /// Transaction lock an ancestor `pohunek service lock` handed down; every
+    /// transaction of this engine runs under it instead of a lock of its own.
+    inherited: Option<TransactionLock>,
     ready_timeout: Duration,
     stop_timeout: Duration,
     #[cfg(test)]
@@ -188,12 +198,35 @@ impl<'a> Engine<'a> {
             backend,
             inspector: HostInspector::new(),
             store: Store::new(context.paths().state_dir.clone()),
+            inherited: None,
             ready_timeout: settings::DAEMON_READY_TIMEOUT,
             stop_timeout: settings::SESSION_STOP_TIMEOUT,
             #[cfg(test)]
             interrupt_after: None,
             #[cfg(feature = "test-util")]
             reported_version: None,
+        }
+    }
+
+    /// Runs every transaction under `lock`, which an ancestor process holds.
+    ///
+    /// `lock` comes from [`Store::adopt`]; the engine then never takes the
+    /// transaction lock itself.
+    #[must_use]
+    pub fn with_inherited_lock(mut self, lock: TransactionLock) -> Self {
+        self.inherited = Some(lock);
+        self
+    }
+
+    /// Takes the transaction lock unless an inherited one covers this engine.
+    ///
+    /// The returned guard, when there is one, must live for the whole
+    /// transaction.
+    async fn transaction(&self) -> Result<Option<TransactionLock>, Error> {
+        if self.inherited.is_some() {
+            Ok(None)
+        } else {
+            self.store.lock().await.map(Some)
         }
     }
 
@@ -249,39 +282,16 @@ impl<'a> Engine<'a> {
         prefix: &Path,
         version: &str,
     ) -> Result<InstallReport, Error> {
-        let _transaction = self.store.lock().await?;
-        layout::check_trusted(self.context.supervisor_dir())?;
-        let layout = install_layout(prefix)?;
-        layout::check_trusted(prefix)?;
-        self.context.service_environment()?;
-        let pending = self.store.load()?;
-        let (resume, rolled_back) = match pending {
-            Some(record)
-                if record.operation == Operation::Install
-                    && record.version == version
-                    && record.prefix == prefix
-                    && !record.rolling_back =>
-            {
-                (Some(record), None)
-            }
-            // Only the interrupted install's own `install` may finish it. A
-            // transaction that reached the registration step may already run
-            // its daemon with live workers, so no other command may roll it
-            // back without the uninstall flow's session checks.
-            Some(record)
-                if record.operation == Operation::Install && record.step >= Step::Registering =>
-            {
-                return Err(Error::PendingInstall {
-                    version: record.version,
-                    step: record.step.as_str(),
-                });
-            }
-            Some(record) => {
+        let _transaction = self.transaction().await?;
+        let layout = install_preflight(self.context, prefix)?;
+        let (resume, rolled_back) = match install_plan(self.store.load()?, prefix, version)? {
+            Plan::Fresh => (None, None),
+            Plan::Resume(record) => (Some(record), None),
+            Plan::RollBack(record) => {
                 let report = pending_report(&record);
                 self.rollback_pending(&record).await?;
                 (None, Some(report))
             }
-            None => (None, None),
         };
         let config_path = self.context.config_path();
         if resume.is_none() {
@@ -360,38 +370,23 @@ impl<'a> Engine<'a> {
     /// exists, [`Error::NotInstalled`] without `service.toml`, staging and
     /// probe errors, and the failing step's error after a rollback.
     pub async fn upgrade(&self, from: &Path, version: &str) -> Result<UpgradeReport, Error> {
-        let _transaction = self.store.lock().await?;
-        layout::check_trusted(self.context.supervisor_dir())?;
-        self.context.service_environment()?;
+        let _transaction = self.transaction().await?;
+        upgrade_preflight(self.context)?;
         let config_path = self.context.config_path();
-        let pending = self.store.load()?;
-        let (resume, rolled_back) = match pending {
-            // Rolling a pending install back would remove its daemon, which
-            // runs the new version once the record reached `ready`.
-            Some(record) if record.operation == Operation::Install => {
-                return Err(Error::PendingInstall {
-                    version: record.version,
-                    step: record.step.as_str(),
-                });
-            }
-            // A rolling-back record's `config` and later steps may already be
-            // undone, so resuming would skip them; the rollback is finished
-            // below and the upgrade starts over.
-            Some(record) if record.version == version && !record.rolling_back => {
-                (Some(record), None)
-            }
-            Some(record) => {
+        let (resume, rolled_back) = match upgrade_plan(self.store.load()?, version)? {
+            Plan::Fresh => (None, None),
+            Plan::Resume(record) => (Some(record), None),
+            Plan::RollBack(record) => {
                 let report = pending_report(&record);
                 self.rollback_pending(&record).await?;
                 (None, Some(report))
             }
-            None => (None, None),
         };
         let config = load_config(&config_path)?.ok_or(Error::NotInstalled {
             path: config_path.clone(),
         })?;
         let layout = config.layout().clone();
-        layout::check_trusted(layout.prefix())?;
+        check_layout_dirs(self.context, &layout)?;
         layout::claim_prefix(&layout, &config.namespace())?;
         let staged = layout::stage(&layout, from, self.reported(version)).await?;
         let resumed = resume.is_some();
@@ -462,7 +457,7 @@ impl<'a> Engine<'a> {
     /// `--stop-sessions`, [`Error::StopTimeout`] when they do not settle, and
     /// [`Error::OrphanWorkers`] when worker jobs survive retirement.
     pub async fn uninstall(&self, options: UninstallOptions) -> Result<UninstallReport, Error> {
-        let _transaction = self.store.lock().await?;
+        let _transaction = self.transaction().await?;
         self.context.bootstrap_environment()?;
         let mut report = UninstallReport::default();
         let mut registered = None;
@@ -1353,11 +1348,149 @@ fn job_alive(observation: &ServiceObservation) -> bool {
         )
 }
 
-fn pending_report(record: &Record) -> PendingReport {
+pub(crate) fn pending_report(record: &Record) -> PendingReport {
     PendingReport {
         operation: record.operation.as_str(),
         version: record.version.clone(),
         step: record.step.as_str(),
+    }
+}
+
+/// What an install or upgrade does with the pending transaction record.
+#[derive(Debug)]
+pub(crate) enum Plan {
+    /// Nothing is pending.
+    Fresh,
+    /// The pending record is this transaction; it resumes after its step.
+    Resume(Record),
+    /// The pending record is another transaction, rolled back first.
+    RollBack(Record),
+}
+
+impl Plan {
+    /// The record the plan resumes or rolls back.
+    pub(crate) fn record(&self) -> Option<&Record> {
+        match self {
+            Self::Fresh => None,
+            Self::Resume(record) | Self::RollBack(record) => Some(record),
+        }
+    }
+}
+
+/// Everything install checks before its first effect.
+///
+/// Refuses an untrusted unit or agent directory, a prefix `service.toml`
+/// would reject, an untrusted directory install writes below the prefix or
+/// `service.toml` into, and a `HOME` or XDG root the daemon's job definition
+/// cannot carry. `pohunek service check` runs exactly these checks.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidPath`], [`Error::UntrustedDirectory`], or the
+/// environment errors of [`Context::service_environment`].
+pub(crate) fn install_preflight(context: &Context, prefix: &Path) -> Result<InstallLayout, Error> {
+    layout::check_trusted(context.supervisor_dir())?;
+    let layout = install_layout(prefix)?;
+    check_layout_dirs(context, &layout)?;
+    context.service_environment()?;
+    Ok(layout)
+}
+
+/// Everything upgrade checks before it reads `service.toml`.
+///
+/// The installed prefix is checked with [`check_layout_dirs`] once
+/// `service.toml` names it.
+///
+/// # Errors
+///
+/// See [`install_preflight`].
+pub(crate) fn upgrade_preflight(context: &Context) -> Result<(), Error> {
+    layout::check_trusted(context.supervisor_dir())?;
+    context.service_environment().map(drop)
+}
+
+/// Checks every directory install or upgrade writes into.
+///
+/// Those are the prefix, `<prefix>/bin`, `<prefix>/libexec`, the versions
+/// directory, and the directory of `service.toml`; a missing one is judged
+/// by its nearest existing ancestor, below which it will be created.
+///
+/// # Errors
+///
+/// Returns [`Error::UntrustedDirectory`] naming the offending directory.
+pub(crate) fn check_layout_dirs(context: &Context, layout: &InstallLayout) -> Result<(), Error> {
+    let versions = layout.versions_dir();
+    let bin = layout.bin_dir();
+    let config_path = context.config_path();
+    let directories = [
+        Some(layout.prefix()),
+        Some(bin.as_path()),
+        versions.parent(),
+        Some(versions.as_path()),
+        config_path.parent(),
+    ];
+    for directory in directories.into_iter().flatten() {
+        layout::check_trusted(directory)?;
+    }
+    Ok(())
+}
+
+/// Decides what an install of `version` into `prefix` does with `pending`.
+///
+/// # Errors
+///
+/// Returns [`Error::PendingInstall`] for another install that reached the
+/// registration step: it may already run its daemon with live workers, so
+/// only its own `install` may finish it and only the uninstall flow's
+/// session checks may remove it.
+pub(crate) fn install_plan(
+    pending: Option<Record>,
+    prefix: &Path,
+    version: &str,
+) -> Result<Plan, Error> {
+    match pending {
+        Some(record)
+            if record.operation == Operation::Install
+                && record.version == version
+                && record.prefix == prefix
+                && !record.rolling_back =>
+        {
+            Ok(Plan::Resume(record))
+        }
+        Some(record)
+            if record.operation == Operation::Install && record.step >= Step::Registering =>
+        {
+            Err(Error::PendingInstall {
+                version: record.version,
+                step: record.step.as_str(),
+            })
+        }
+        Some(record) => Ok(Plan::RollBack(record)),
+        None => Ok(Plan::Fresh),
+    }
+}
+
+/// Decides what an upgrade to `version` does with `pending`.
+///
+/// # Errors
+///
+/// Returns [`Error::PendingInstall`] for any pending install: rolling it
+/// back would remove its daemon, which runs the new version once the record
+/// reached `ready`.
+pub(crate) fn upgrade_plan(pending: Option<Record>, version: &str) -> Result<Plan, Error> {
+    match pending {
+        Some(record) if record.operation == Operation::Install => Err(Error::PendingInstall {
+            version: record.version,
+            step: record.step.as_str(),
+        }),
+        // A rolling-back record's `config` and later steps may already be
+        // undone, so resuming would skip them; the rollback is finished first
+        // and the upgrade starts over.
+        Some(record) if record.version == version && !record.rolling_back => {
+            Ok(Plan::Resume(record))
+        }
+        Some(record) => Ok(Plan::RollBack(record)),
+        None => Ok(Plan::Fresh),
     }
 }
 

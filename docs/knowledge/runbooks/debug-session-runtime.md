@@ -201,10 +201,14 @@ has no version-policy fields; an installed but unparseable or wrong version is
 their own temporary homes.
 
 For the first worker-aware installation, let all legacy sessions finish or stop
-them explicitly. The archive installer refuses before any change while
-`pohunek service status --json` reports `transaction_in_progress`, or while
-the prefix, unit, config, state, or runtime directories are reached through a
-symlink or are not private to the user. It starts a stopped legacy daemon so
+them explicitly. The archive installer runs under
+`pohunek service lock -- <installer>`, so it refuses before any change while
+another service command holds the transaction lock (`service_transaction_in_progress`) and no such command can
+start during its run. It then refuses before any change whenever
+`pohunek service check --json` fails: an unusable `HOME` or XDG root, an invalid
+prefix, or a prefix, unit, config, state, or runtime directory reached through
+a symlink or not private to the user, each reported with the error code the
+final install or upgrade would fail with. It starts a stopped legacy daemon so
 the migration snapshot is always taken, moves the legacy daemon's control
 socket aside, runs `migration preflight --socket <moved-socket>` there, and
 lists live sessions that lack durable `runtime` metadata to refuse

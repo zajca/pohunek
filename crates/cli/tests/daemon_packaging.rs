@@ -8,7 +8,6 @@
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -21,6 +20,7 @@ fn fresh_install_runs_service_install_from_the_archive() {
         fixture.pohunek_calls(),
         [STATUS.to_owned(), fixture.install_call()]
     );
+    fixture.assert_guarded(&[]);
     assert!(
         !fixture.systemctl_log.exists(),
         "a fresh install never touches systemctl"
@@ -130,6 +130,7 @@ fn idle_legacy_install_is_retired_after_preflight_before_installing() {
         &[("POHUNEK_TEST_LEGACY_ACTIVE", "1")],
     );
     assert_success(&output);
+    fixture.assert_guarded(&["--accept-runtime-loss"]);
     let preflight_calls = fixture.pohunek_calls();
     let preflight = preflight_calls.get(1).expect("preflight call");
     assert!(
@@ -793,7 +794,7 @@ fn an_interrupted_start_of_a_stopped_legacy_daemon_stops_it_again() {
             ("POHUNEK_TEST_INTERRUPT_SIGNAL", "INT"),
         ],
     );
-    assert_eq!(output.status.signal(), Some(libc::SIGINT), "{output:?}");
+    assert_killed_by(&output, libc::SIGINT);
     assert_eq!(fixture.systemctl_calls(), [STATE_QUERY, START, STOP]);
     assert_eq!(fixture.pohunek_calls(), [STATUS]);
     for legacy in fixture.legacy_files() {
@@ -1013,11 +1014,7 @@ fn an_interrupted_retirement_restores_the_socket_of_a_running_daemon() {
                 ("POHUNEK_TEST_INTERRUPT_SIGNAL", signal),
             ],
         );
-        assert_eq!(
-            output.status.signal(),
-            Some(number),
-            "{point}/{signal}: {output:?}"
-        );
+        assert_killed_by(&output, number);
         assert_eq!(
             fixture.systemctl_calls(),
             systemctl_calls,
@@ -1058,7 +1055,7 @@ fn an_interrupted_retirement_of_a_stopped_daemon_removes_the_stale_barrier() {
             ("POHUNEK_TEST_INTERRUPT_SIGNAL", "TERM"),
         ],
     );
-    assert_eq!(output.status.signal(), Some(libc::SIGTERM), "{output:?}");
+    assert_killed_by(&output, libc::SIGTERM);
     assert_eq!(
         fixture.systemctl_calls(),
         [STATE_QUERY, LIST_WORKERS, DISABLE, STATE_QUERY]
@@ -1394,6 +1391,7 @@ fn move_behind_symlink(fixture: &Fixture, path: &Path) {
 fn an_untrusted_directory_refuses_before_the_legacy_install_changes() {
     // `pohunek service install|upgrade` refuses these directories, so the
     // legacy install must not be retired for an install that cannot follow.
+    // The real `service check` judges them with the installer's own rules.
     let cases: [(&str, UntrustedSetup); 7] = [
         ("symlinked prefix", |fixture| {
             move_behind_symlink(fixture, &fixture.prefix);
@@ -1430,12 +1428,28 @@ fn an_untrusted_directory_refuses_before_the_legacy_install_changes() {
         setup(&fixture);
         let output = fixture.run(
             &["--accept-runtime-loss"],
-            &[("POHUNEK_TEST_LEGACY_ACTIVE", "1")],
+            &[
+                ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+                ("POHUNEK_TEST_REAL_CHECK", "1"),
+            ],
         );
         assert_eq!(output.status.code(), Some(1), "{name}: {output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("nothing was changed"), "{name}: {stderr}");
-        assert_eq!(fixture.pohunek_calls(), [STATUS], "{name}");
+        if name == "symlinked state root" {
+            // The transaction lock lives in the state root, so the lock
+            // itself refuses it before the wrapper runs again.
+            assert!(stderr.contains("state directory"), "{name}: {stderr}");
+            assert_eq!(
+                fixture.guard_calls(),
+                [fixture.lock_call(&["--accept-runtime-loss"])],
+                "{name}"
+            );
+            assert!(fixture.pohunek_calls().is_empty(), "{name}");
+        } else {
+            assert!(stderr.contains("nothing was changed"), "{name}: {stderr}");
+            fixture.assert_guarded(&["--accept-runtime-loss"]);
+            assert_eq!(fixture.pohunek_calls(), [STATUS], "{name}");
+        }
         assert!(fixture.systemctl_calls().is_empty(), "{name}");
         for legacy in fixture.legacy_files() {
             assert!(legacy.exists(), "{name}: {} was removed", legacy.display());
@@ -1446,30 +1460,193 @@ fn an_untrusted_directory_refuses_before_the_legacy_install_changes() {
 
 #[test]
 fn a_running_service_transaction_refuses_before_anything_changes() {
-    // `true` is another `service install|upgrade|uninstall` holding the
-    // lock; a report without the flag cannot rule one out.
-    for (value, message) in [
-        ("true", "is running; nothing was changed"),
-        ("null", "did not report transaction_in_progress"),
+    // Another `pohunek service` command holds the transaction lock, so the
+    // wrapper's own `service lock` is refused before the wrapper runs again.
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let started = fixture.base().join("holder-started");
+    let release = fixture.base().join("holder-release");
+    let mut holder = fixture
+        .real_pohunek(&[
+            "service",
+            "lock",
+            "--",
+            "sh",
+            "-c",
+            &format!(
+                ": > '{}'; while [ ! -e '{}' ]; do sleep 0.05; done",
+                started.display(),
+                release.display()
+            ),
+        ])
+        .spawn()
+        .expect("start the competing transaction");
+    wait_for(&started);
+
+    let output = fixture.run(
+        &["--accept-runtime-loss"],
+        &[("POHUNEK_TEST_LEGACY_ACTIVE", "1")],
+    );
+    write(&release, "");
+    assert!(holder.wait().expect("holder exits").success());
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("another `pohunek service` command is running"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fixture.guard_calls(),
+        [fixture.lock_call(&["--accept-runtime-loss"])]
+    );
+    assert!(fixture.pohunek_calls().is_empty());
+    assert!(fixture.systemctl_calls().is_empty());
+    for legacy in fixture.legacy_files() {
+        assert!(legacy.exists(), "{} was removed", legacy.display());
+    }
+    assert!(fixture.socket.path.exists(), "the socket moved");
+}
+
+#[test]
+fn no_transaction_starts_while_the_legacy_install_is_retired() {
+    // A `pohunek service` command started from elsewhere between the
+    // wrapper's first query and its final command is refused: the wrapper
+    // holds the lock for its whole run, the retirement included.
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let output = fixture.run(
+        &["--accept-runtime-loss"],
+        &[
+            ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+            ("POHUNEK_TEST_COMPETITOR", "1"),
+        ],
+    );
+    assert_success(&output);
+    assert_eq!(read(&fixture.base().join("competitor-status")), "1\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("another `pohunek service` command is running"),
+        "{stderr}"
+    );
+    fixture.assert_guarded(&["--accept-runtime-loss"]);
+    assert_eq!(
+        fixture.pohunek_calls().last(),
+        Some(&fixture.install_call()),
+        "the wrapper's own install still runs under its lock"
+    );
+    for legacy in fixture.legacy_files() {
+        assert!(!legacy.exists(), "{} was not removed", legacy.display());
+    }
+}
+
+#[test]
+fn a_home_the_service_refuses_stops_the_run_before_anything_changes() {
+    // `pohunek service install` validates HOME before its first effect; the
+    // real `service check` runs that validation before the legacy install is
+    // retired.
+    for (name, home) in [
+        ("nonexistent", "no-such-home"),
+        ("regular file", "home-file"),
     ] {
         let fixture = Fixture::new();
         fixture.legacy_install();
+        write(&fixture.base().join("home-file"), "");
+        let home = fixture.base().join(home);
         let output = fixture.run(
             &["--accept-runtime-loss"],
             &[
                 ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
-                ("POHUNEK_TEST_TRANSACTION_IN_PROGRESS", value),
+                ("POHUNEK_TEST_REAL_CHECK", "1"),
+                ("HOME", &home.display().to_string()),
             ],
         );
-        assert_eq!(output.status.code(), Some(1), "{value}: {output:?}");
+        assert_eq!(output.status.code(), Some(1), "{name}: {output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains(message), "{value}: {stderr}");
-        assert_eq!(fixture.pohunek_calls(), [STATUS], "{value}");
-        assert!(fixture.systemctl_calls().is_empty(), "{value}");
+        assert!(
+            stderr.contains("service_environment_invalid"),
+            "{name}: {stderr}"
+        );
+        assert!(stderr.contains("nothing was changed"), "{name}: {stderr}");
+        fixture.assert_guarded(&["--accept-runtime-loss"]);
+        assert_eq!(fixture.pohunek_calls(), [STATUS], "{name}");
+        assert!(fixture.systemctl_calls().is_empty(), "{name}");
         for legacy in fixture.legacy_files() {
-            assert!(legacy.exists(), "{value}: {} was removed", legacy.display());
+            assert!(legacy.exists(), "{name}: {} was removed", legacy.display());
         }
-        assert!(fixture.socket.path.exists(), "{value}: the socket moved");
+        assert!(fixture.socket.path.exists(), "{name}: the socket moved");
+    }
+}
+
+#[test]
+fn a_failed_or_unlocked_check_stops_the_run_before_anything_changes() {
+    for (name, env, message) in [
+        (
+            "refused",
+            ("POHUNEK_TEST_CHECK_ERROR", "service_install_pending"),
+            "service_install_pending",
+        ),
+        (
+            "unlocked",
+            ("POHUNEK_TEST_CHECK_LOCKED", "false"),
+            "did not run under this run's transaction lock",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture.legacy_install();
+        let output = fixture.run(&[], &[("POHUNEK_TEST_LEGACY_ACTIVE", "1"), env]);
+        assert_eq!(output.status.code(), Some(1), "{name}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(message), "{name}: {stderr}");
+        assert!(stderr.contains("nothing was changed"), "{name}: {stderr}");
+        fixture.assert_guarded(&[]);
+        assert_eq!(fixture.pohunek_calls(), [STATUS], "{name}");
+        assert!(fixture.systemctl_calls().is_empty(), "{name}");
+        for legacy in fixture.legacy_files() {
+            assert!(legacy.exists(), "{name}: {} was removed", legacy.display());
+        }
+    }
+
+    // A lock variable set by the caller is not trusted: without a held lock
+    // the check refuses, and the wrapper does not take one of its own.
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let output = fixture.run(
+        &[],
+        &[
+            ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+            ("POHUNEK_TEST_REAL_CHECK", "1"),
+            ("POHUNEK_SERVICE_LOCK_FD", "97"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("service_inherited_lock_invalid"),
+        "{stderr}"
+    );
+    assert_eq!(fixture.guard_calls(), [fixture.check_call()]);
+    assert!(fixture.systemctl_calls().is_empty());
+    for legacy in fixture.legacy_files() {
+        assert!(legacy.exists(), "{} was removed", legacy.display());
+    }
+}
+
+/// Waits until `path` exists.
+fn wait_for(path: &Path) {
+    /// Bound on waiting for a helper process to signal readiness.
+    const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    /// Poll interval of that wait.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+    let deadline = std::time::Instant::now() + READY_TIMEOUT;
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
+        std::thread::sleep(POLL);
     }
 }
 
@@ -1504,10 +1681,13 @@ fn a_missing_staged_binary_or_extra_argument_fails_without_side_effects() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("pohunek-sessiond"));
     assert!(fixture.pohunek_calls().is_empty());
 
+    assert!(fixture.guard_calls().is_empty());
+
     let fixture = Fixture::new();
     let output = fixture.run(&["--unknown"], &[]);
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     assert!(fixture.pohunek_calls().is_empty());
+    assert!(fixture.guard_calls().is_empty());
 }
 
 #[test]
@@ -1557,9 +1737,21 @@ fn release_workflow_packages_static_shell_completions() {
 /// `POHUNEK_TEST_CONFIGURED_PREFIX_JSON`; without it `installed: false` and a
 /// `null` prefix, as the real CLI does.
 /// `POHUNEK_TEST_STATUS_QUERY_EXIT` fails the query with an error document;
-/// `POHUNEK_TEST_STATUS_UNEXPECTED` answers without `pending_transaction`, and
-/// `POHUNEK_TEST_TRANSACTION_IN_PROGRESS` replaces the `false` it reports as
-/// `transaction_in_progress` with its raw JSON value.
+/// `POHUNEK_TEST_STATUS_UNEXPECTED` answers without `pending_transaction`.
+/// Status reports `transaction_in_progress: true`, as the real CLI does under
+/// the wrapper's own lock.
+/// `service lock` and `service check` are logged to `POHUNEK_TEST_GUARD_LOG`
+/// instead. `service lock` runs the real CLI (`POHUNEK_TEST_REAL_CLI`), which
+/// takes the real transaction lock below the fixture's state directory and
+/// hands it to the re-executed wrapper. `service check` runs the real CLI
+/// with `POHUNEK_TEST_REAL_CHECK=1`; otherwise it refuses without the
+/// inherited lock variable, as the real check does for an invalid one, fails
+/// with the code `POHUNEK_TEST_CHECK_ERROR`, or passes reporting `locked` as
+/// `POHUNEK_TEST_CHECK_LOCKED` (default `true`).
+/// `POHUNEK_TEST_COMPETITOR=1` makes the preflight start a competing real
+/// `pohunek service lock -- true` without the inherited lock, as a command
+/// started from elsewhere would, and write its exit status to
+/// `POHUNEK_TEST_COMPETITOR_STATUS`.
 /// `POHUNEK_TEST_PREFLIGHT_STATUS` and `POHUNEK_TEST_SERVICE_STATUS` set the
 /// exit status of the migration preflight and of install/upgrade.
 /// `POHUNEK_TEST_INTERRUPT_AT=preflight` makes the preflight send
@@ -1569,6 +1761,23 @@ fn release_workflow_packages_static_shell_completions() {
 /// preflight renames to the legacy socket path before it returns, as a
 /// legacy daemon restarted by `Restart=on-failure` binds a new one there.
 const FAKE_POHUNEK: &str = r#"#!/bin/sh
+if [ "$1" = service ] && { [ "$2" = lock ] || [ "$2" = check ]; }; then
+    printf '%s\n' "$*" >> "$POHUNEK_TEST_GUARD_LOG"
+    if [ "$2" = lock ] || [ "${POHUNEK_TEST_REAL_CHECK:-0}" = 1 ]; then
+        exec "$POHUNEK_TEST_REAL_CLI" "$@"
+    fi
+    if [ -z "${POHUNEK_SERVICE_LOCK_FD:-}" ]; then
+        printf '{\n  "err": {\n    "code": "service_inherited_lock_invalid"\n  }\n}\n'
+        exit 1
+    fi
+    if [ -n "${POHUNEK_TEST_CHECK_ERROR:-}" ]; then
+        printf '{\n  "err": {\n    "code": "%s"\n  }\n}\n' "$POHUNEK_TEST_CHECK_ERROR"
+        exit 1
+    fi
+    printf '{\n  "ok": {\n    "operation": "install",\n    "locked": %s\n  }\n}\n' \
+        "${POHUNEK_TEST_CHECK_LOCKED:-true}"
+    exit 0
+fi
 printf '%s\n' "$*" >> "$POHUNEK_TEST_POHUNEK_LOG"
 if [ "$1" = migration ]; then
     if [ "${3:-}" = --socket ] && [ ! -S "${4:-}" ]; then
@@ -1576,6 +1785,12 @@ if [ "$1" = migration ]; then
     fi
     if [ -n "${POHUNEK_TEST_RESTARTED_SOCKET:-}" ]; then
         mv "$POHUNEK_TEST_RESTARTED_SOCKET" "$XDG_RUNTIME_DIR/pohunek/daemon.sock"
+    fi
+    if [ "${POHUNEK_TEST_COMPETITOR:-0}" = 1 ]; then
+        competitor=0
+        (unset POHUNEK_SERVICE_LOCK_FD; exec "$POHUNEK_TEST_REAL_CLI" service lock -- true) \
+            || competitor=$?
+        printf '%s\n' "$competitor" > "$POHUNEK_TEST_COMPETITOR_STATUS"
     fi
     if [ "${POHUNEK_TEST_INTERRUPT_AT:-}" = preflight ]; then
         kill -s "$POHUNEK_TEST_INTERRUPT_SIGNAL" "$PPID"
@@ -1602,9 +1817,8 @@ if [ "$1" = service ] && [ "$2" = status ]; then
         installed=true
         prefix=${POHUNEK_TEST_CONFIGURED_PREFIX_JSON:-"\"$POHUNEK_TEST_CONFIGURED_PREFIX\""}
     fi
-    printf '{\n  "ok": {\n    "installed": %s,\n    "config_path": "%s",\n    "namespace": null,\n    "prefix": %s,\n    "pending_transaction": %s,\n    "transaction_in_progress": %s\n  }\n}\n' \
-        "$installed" "$XDG_CONFIG_HOME/pohunek/service.toml" "$prefix" "$pending" \
-        "${POHUNEK_TEST_TRANSACTION_IN_PROGRESS:-false}"
+    printf '{\n  "ok": {\n    "installed": %s,\n    "config_path": "%s",\n    "namespace": null,\n    "prefix": %s,\n    "pending_transaction": %s,\n    "transaction_in_progress": true\n  }\n}\n' \
+        "$installed" "$XDG_CONFIG_HOME/pohunek/service.toml" "$prefix" "$pending"
     exit 0
 fi
 exit "${POHUNEK_TEST_SERVICE_STATUS:-0}"
@@ -1622,6 +1836,7 @@ struct Fixture {
     commands: PathBuf,
     socket: BarrierSocket,
     pohunek_log: PathBuf,
+    guard_log: PathBuf,
     systemctl_log: PathBuf,
 }
 
@@ -1686,7 +1901,10 @@ impl Fixture {
         let archive = base.join("archive");
         let commands = base.join("commands");
         let pohunek_log = base.join("pohunek.log");
+        let guard_log = base.join("guard.log");
         let systemctl_log = base.join("systemctl.log");
+        // `pohunek service check` requires HOME to be an existing directory.
+        create_dirs(&base.join("home"));
         fs::create_dir_all(archive.join("packaging")).expect("archive");
         fs::copy(
             repo_root().join("packaging/install-daemon.sh"),
@@ -1770,6 +1988,7 @@ impl Fixture {
             commands,
             socket: BarrierSocket { path: socket },
             pohunek_log,
+            guard_log,
             systemctl_log,
             _root: root,
             base,
@@ -1849,6 +2068,12 @@ impl Fixture {
                 self.base().join("systemctl-start-marker"),
             )
             .env("POHUNEK_TEST_POHUNEK_LOG", &self.pohunek_log)
+            .env("POHUNEK_TEST_GUARD_LOG", &self.guard_log)
+            .env("POHUNEK_TEST_REAL_CLI", env!("CARGO_BIN_EXE_pohunek"))
+            .env(
+                "POHUNEK_TEST_COMPETITOR_STATUS",
+                self.base().join("competitor-status"),
+            )
             .env("POHUNEK_TEST_SYSTEMCTL_LOG", &self.systemctl_log)
             .env("PATH", path);
         for (key, value) in env {
@@ -1871,6 +2096,51 @@ impl Fixture {
 
     fn pohunek_calls(&self) -> Vec<String> {
         lines(&self.pohunek_log)
+    }
+
+    /// `service lock` and `service check` calls, in order.
+    fn guard_calls(&self) -> Vec<String> {
+        lines(&self.guard_log)
+    }
+
+    /// The `service lock` call that re-executes the wrapper with `args`.
+    fn lock_call(&self, args: &[&str]) -> String {
+        let mut call = format!(
+            "service lock -- sh {}",
+            self.archive.join("packaging/install-daemon.sh").display()
+        );
+        for arg in args {
+            call.push(' ');
+            call.push_str(arg);
+        }
+        call
+    }
+
+    /// The `service check` call the wrapper makes for the fixture prefix.
+    fn check_call(&self) -> String {
+        format!("service check --prefix {} --json", self.prefix.display())
+    }
+
+    /// Asserts that the wrapper took the lock and ran the check under it.
+    fn assert_guarded(&self, args: &[&str]) {
+        assert_eq!(
+            self.guard_calls(),
+            [self.lock_call(args), self.check_call()]
+        );
+    }
+
+    /// The real CLI with `args` in this fixture's environment.
+    fn real_pohunek(&self, args: &[&str]) -> Command {
+        let template = self.command(&[], &[]);
+        let mut real = Command::new(env!("CARGO_BIN_EXE_pohunek"));
+        real.args(args);
+        for (key, value) in template.get_envs() {
+            match value {
+                Some(value) => real.env(key, value),
+                None => real.env_remove(key),
+            };
+        }
+        real
     }
 
     fn systemctl_calls(&self) -> Vec<String> {
@@ -1923,6 +2193,14 @@ fn write_executable(path: &Path, contents: &str) {
 
 fn read(path: &Path) -> String {
     fs::read_to_string(path).expect("read fixture file")
+}
+
+/// Asserts that the wrapper died from `signal`.
+///
+/// The wrapper runs below `pohunek service lock`, which reports a child a
+/// signal ended with 128 plus the signal number, as a shell does.
+fn assert_killed_by(output: &Output, signal: i32) {
+    assert_eq!(output.status.code(), Some(128 + signal), "{output:?}");
 }
 
 fn assert_success(output: &Output) {

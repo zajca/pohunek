@@ -2464,3 +2464,351 @@ async fn a_record_left_by_a_crashed_holder_is_resumed_under_a_fresh_lock() {
     assert!(report.resumed);
     harness.assert_installed(V1);
 }
+
+/// Hands `holder`'s lock down the way `pohunek service lock` passes it to its
+/// child, and adopts it as that child would.
+fn inherit(harness: &Harness, holder: &TransactionLock) -> TransactionLock {
+    let descriptor = holder.inheritable().expect("inheritable descriptor");
+    harness
+        .engine()
+        .store
+        .adopt(std::fs::File::from(descriptor))
+        .expect("adopt the handed-down lock")
+}
+
+#[tokio::test]
+async fn transactions_run_under_an_inherited_lock_while_others_are_refused() {
+    let harness = Harness::new();
+    let holder = harness.engine().store.lock().await.expect("hold the lock");
+    let inherited = || {
+        harness
+            .engine()
+            .with_inherited_lock(inherit(&harness, &holder))
+    };
+
+    inherited()
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect("install under the inherited lock");
+    harness.assert_installed(V1);
+
+    // Another transaction without the handed-down descriptor stays refused
+    // for as long as the holder lives.
+    let refused = harness.upgrade(V2).await.expect_err("upgrade beside it");
+    assert_eq!(refused.code(), "service_transaction_in_progress");
+
+    inherited()
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("upgrade under the inherited lock");
+    harness.assert_installed(V2);
+    inherited()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect("uninstall under the inherited lock");
+    harness.assert_clean();
+
+    drop(holder);
+    harness
+        .install(V1)
+        .await
+        .expect("install after the release");
+}
+
+#[tokio::test]
+async fn an_inherited_descriptor_that_does_not_hold_the_lock_is_refused() {
+    let harness = Harness::new();
+    let lock_path = harness.context.paths().state_dir.join(record::LOCK_NAME);
+    let store = harness.engine().store;
+    let assert_refused = |result: Result<TransactionLock, Error>, detail: &str| {
+        let error = result.expect_err("refused");
+        assert!(
+            matches!(&error, Error::InheritedLock { detail: actual } if actual == detail),
+            "{error:?}"
+        );
+        assert_eq!(error.code(), "service_inherited_lock_invalid");
+        assert!(
+            error.to_string().contains("POHUNEK_SERVICE_LOCK_FD"),
+            "{error}"
+        );
+    };
+
+    // No state directory yet: nothing can hold the lock.
+    let unrelated = std::fs::File::open(harness.staged(V1).join(CLI_NAME)).expect("any file");
+    let error = store.adopt(unrelated).expect_err("no state directory");
+    assert!(matches!(error, Error::InheritedLock { .. }), "{error:?}");
+
+    // An unlocked description of the lock file proves nothing, and refusing
+    // it takes nothing.
+    drop(store.lock().await.expect("create the lock file"));
+    let unlocked = std::fs::File::open(&lock_path).expect("open lock file");
+    assert_refused(store.adopt(unlocked), "no process holds the lock");
+    let holder = store.lock().await.expect("the refusal took nothing");
+
+    // Another description of the held lock file is not the holder's.
+    let foreign = std::fs::File::open(&lock_path).expect("open lock file again");
+    assert_refused(
+        store.adopt(foreign),
+        "another open file description holds the lock",
+    );
+
+    // Neither is another file of the state directory.
+    let record_path = store.path();
+    store
+        .save(&Record {
+            schema_version: record::SCHEMA_VERSION,
+            operation: Operation::Install,
+            version: V1.to_owned(),
+            prefix: harness.prefix(),
+            previous_version: None,
+            version_dir_preexisted: false,
+            step: Step::Started,
+            rolling_back: false,
+        })
+        .expect("write a record");
+    let unrelated = std::fs::File::open(record_path).expect("open record");
+    assert_refused(
+        store.adopt(unrelated),
+        "the descriptor is not the lock file",
+    );
+    drop(holder);
+}
+
+/// Asserts that `check` changed nothing an install would create.
+fn assert_unchanged(harness: &Harness) {
+    assert!(!harness.prefix().exists(), "the prefix was created");
+    assert!(
+        !harness.context.config_path().exists(),
+        "service.toml was written"
+    );
+    assert!(harness.pending().is_none(), "a record was written");
+    assert_eq!(
+        harness.fake.world().installs,
+        0,
+        "the daemon was registered"
+    );
+}
+
+#[test]
+fn check_passes_a_fresh_install_without_changing_anything() {
+    let harness = Harness::new();
+    let report =
+        super::super::check_of(&harness.context, Some(harness.prefix()), V1, false).expect("pass");
+    assert_eq!(report.operation, "install");
+    assert_eq!(report.version, V1);
+    assert_eq!(report.prefix, harness.prefix());
+    assert_eq!(
+        report.namespace,
+        harness.context.namespace().expect("namespace").as_str()
+    );
+    assert_eq!(report.pending_transaction, None);
+    assert_eq!(report.pending_action, None);
+    assert!(!report.locked);
+    assert_unchanged(&harness);
+
+    // Without --prefix the check covers the default `$HOME/.local`.
+    let report = super::super::check_of(&harness.context, None, V1, true).expect("pass");
+    assert_eq!(
+        report.prefix,
+        harness.context.default_prefix().expect("default")
+    );
+    assert!(report.locked);
+}
+
+/// Installs `V1` into `prefix` with `context` in place of the harness's.
+async fn install_with(
+    harness: &Harness,
+    context: &Context,
+    prefix: &Path,
+) -> Result<InstallReport, Error> {
+    Engine::new(context, &harness.backend)
+        .install(&harness.staged(V1), prefix, V1)
+        .await
+}
+
+#[tokio::test]
+async fn check_refuses_exactly_what_install_refuses_before_its_first_effect() {
+    let harness = Harness::new();
+    let check = |context: &Context, prefix: &Path| {
+        super::super::check_of(context, Some(prefix.to_path_buf()), V1, false)
+    };
+
+    for (case, home) in unusable_homes(&harness) {
+        let context = context_with_home(&harness, home);
+        let checked = check(&context, &harness.prefix()).expect_err(case);
+        assert_unusable_home(case, &checked);
+        let installed = install_with(&harness, &context, &harness.prefix())
+            .await
+            .expect_err(case);
+        assert_eq!(checked.code(), installed.code(), "{case}");
+    }
+
+    let unnormalized = PathBuf::from(format!("{}/.", harness.prefix().display()));
+    let checked = check(&harness.context, &unnormalized).expect_err("unnormalized");
+    assert!(
+        matches!(
+            &checked,
+            Error::InvalidPath {
+                flag: "--prefix",
+                ..
+            }
+        ),
+        "{checked:?}"
+    );
+    let installed = install_with(&harness, &harness.context, &unnormalized)
+        .await
+        .expect_err("same");
+    assert_eq!(checked.code(), installed.code());
+
+    // A group-writable directory install would write into.
+    let shared = harness.root.as_path().join("shared");
+    std::fs::create_dir(&shared).expect("shared dir");
+    std::fs::set_permissions(&shared, std::os::unix::fs::PermissionsExt::from_mode(0o775))
+        .expect("chmod");
+    let checked = check(&harness.context, &shared.join("prefix")).expect_err("untrusted");
+    assert!(
+        matches!(&checked, Error::UntrustedDirectory { path, .. } if path == &shared),
+        "{checked:?}"
+    );
+    let installed = install_with(&harness, &harness.context, &shared.join("prefix"))
+        .await
+        .expect_err("untrusted");
+    assert_eq!(checked.code(), installed.code());
+    assert_eq!(checked.to_string(), installed.to_string());
+    harness.assert_clean();
+    assert_unchanged(&harness);
+}
+
+#[tokio::test]
+async fn check_covers_every_directory_below_the_prefix_the_transaction_writes() {
+    let harness = Harness::new();
+    let layout = harness.layout();
+    for directory in [
+        layout.bin_dir(),
+        layout
+            .versions_dir()
+            .parent()
+            .expect("libexec")
+            .to_path_buf(),
+        layout.versions_dir(),
+    ] {
+        std::fs::create_dir_all(&directory).expect("create directory");
+        std::fs::set_permissions(
+            &directory,
+            std::os::unix::fs::PermissionsExt::from_mode(0o777),
+        )
+        .expect("loosen");
+        let error = super::super::check_of(&harness.context, Some(harness.prefix()), V1, false)
+            .expect_err("untrusted");
+        assert!(
+            matches!(&error, Error::UntrustedDirectory { path, .. } if path == &directory),
+            "{}: {error:?}",
+            directory.display()
+        );
+        let installed = harness
+            .install(V1)
+            .await
+            .expect_err("install refuses it too");
+        assert_eq!(installed.to_string(), error.to_string());
+        std::fs::set_permissions(
+            &directory,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("restore");
+    }
+    assert!(harness.pending().is_none());
+    assert_eq!(harness.fake.world().installs, 0);
+}
+
+#[tokio::test]
+async fn check_reports_how_a_pending_transaction_would_be_handled() {
+    let harness = Harness::new();
+    let record = pending_install_at_config(&harness).await;
+    let check =
+        |version| super::super::check_of(&harness.context, Some(harness.prefix()), version, false);
+
+    let resume = check(V1).expect("same install resumes");
+    assert_eq!(resume.operation, "install");
+    assert_eq!(resume.pending_action, Some("resume"));
+    assert_eq!(
+        resume.pending_transaction.map(|pending| pending.step),
+        Some(Step::Config.as_str())
+    );
+    let roll_back = check(V2).expect("another install rolls it back");
+    assert_eq!(roll_back.operation, "install");
+    assert_eq!(roll_back.pending_action, Some("roll_back"));
+    assert_pending_untouched(&harness, &record);
+
+    // A pending install past registration refuses another install.
+    let mut advanced = record.clone();
+    advanced.step = Step::Registering;
+    harness
+        .engine()
+        .store
+        .save(&advanced)
+        .expect("advance record");
+    let error = check(V2).expect_err("pending registered install");
+    assert_eq!(error.code(), "service_install_pending");
+}
+
+#[tokio::test]
+async fn check_covers_an_upgrade_of_the_recorded_installation() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let report = super::super::check_of(&harness.context, None, V2, false).expect("upgrade passes");
+    assert_eq!(report.operation, "upgrade");
+    assert_eq!(report.prefix, harness.prefix());
+    assert_eq!(report.version, V2);
+    let same = super::super::check_of(&harness.context, Some(harness.prefix()), V2, false)
+        .expect("the installed prefix passes");
+    assert_eq!(same, report);
+
+    let other = harness.root.as_path().join("other");
+    let error = super::super::check_of(&harness.context, Some(other.clone()), V2, false)
+        .expect_err("another prefix");
+    assert!(
+        matches!(&error, Error::PrefixMismatch { requested, installed }
+            if requested == &other && installed == &harness.prefix()),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), "service_prefix_mismatch");
+
+    // The recorded installation must describe this process, as upgrade
+    // verifies it.
+    let moved = Context::new(
+        crate::service::context::tests::paths(&harness.root.join("moved")),
+        harness.context.uid(),
+        Some(harness.root.join("home")),
+        Some(harness.root.join("run")),
+        harness.context.supervisor_dir().to_path_buf(),
+        harness.context.cli_executable().to_path_buf(),
+    );
+    std::fs::create_dir_all(moved.config_path().parent().expect("config dir")).expect("config dir");
+    std::fs::copy(harness.context.config_path(), moved.config_path()).expect("copy service.toml");
+    moved.roots().expect("the moved roots resolve");
+    let error = super::super::check_of(&moved, None, V2, false).expect_err("moved roots");
+    assert!(
+        matches!(
+            &error,
+            Error::Config(pohunek_service_config::ConfigError::NamespaceMismatch { .. })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), "service_config_invalid");
+    harness.assert_installed(V1);
+}
+
+#[tokio::test]
+async fn check_refuses_a_prefix_another_namespace_owns() {
+    let first = Harness::new();
+    first.install(V1).await.expect("first install");
+    let second = Harness::sharing_prefix(&first);
+    let error = super::super::check_of(&second.context, Some(second.prefix()), V2, false)
+        .expect_err("shared prefix");
+    assert_owned_by(&error, &first);
+    let installed = second
+        .install(V2)
+        .await
+        .expect_err("install refuses it too");
+    assert_owned_by(&installed, &first);
+}
