@@ -56,6 +56,10 @@ semantics, safe persistence — config in `.github/agent-workflow.json`).
   workflow publishes the glibc + MUSL x86_64 binaries.
 - **`gates`** — the shared verification block mirroring the AGENTS.md gate
   set; the other skills call it.
+- **`deliver-issue`** — hand over one larger issue and get it back merged:
+  plan, parallel subagents, gates, stacked PRs, then a loop on CI and the
+  automated review of every pushed head until it is clean, merge, verify
+  the landing, close the issue, and file follow-ups — without asking.
 
 ## Keep the assistant knowledge bundle current
 
