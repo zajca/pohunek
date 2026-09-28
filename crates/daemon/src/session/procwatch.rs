@@ -265,11 +265,18 @@ impl SessionRegistry {
         if !focus_is_current() {
             return true;
         }
+        let observed_at = Instant::now();
         match self.inner.inspector.cwd(focus.pid) {
             Ok(cwd) => {
                 if focus_is_current() {
-                    self.apply_cwd_change(id, cwd, CwdSource::Procwatch, Some(expected))
-                        .await;
+                    self.apply_cwd_change(
+                        id,
+                        cwd,
+                        CwdSource::Procwatch,
+                        Some(expected),
+                        observed_at,
+                    )
+                    .await;
                 }
             }
             Err(err) => {

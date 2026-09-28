@@ -1,4 +1,10 @@
 //! Exercises the embedded Hermes plugin suites through their native runtimes.
+//!
+//! Linux only: both suites run the system `/usr/bin/python3` or `/usr/bin/bash`.
+//! On macOS the system Python is 3.9 while the embedded plugin requires Python
+//! 3.10 or newer, and `/usr/bin/bash` does not exist. The Hermes integration
+//! lifecycle on macOS is owned by issue #101.
+#![cfg(target_os = "linux")]
 
 // Rust guideline compliant 2026-08-07
 

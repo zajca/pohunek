@@ -27,6 +27,7 @@ use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
 
@@ -48,7 +49,8 @@ use crate::integration::{
 use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessIdentity, ProcessInspector};
 use crate::project::detect::{project_id, DetectedProject};
 use crate::project::{detect_at, ProjectManager};
-use crate::runtime::{DimensionUpdate, SystemdWorkerLauncher, Worker, WorkerError, WorkerLauncher};
+use crate::runtime::lifecycle::{Generation, LifecycleGuard, SessionLocks};
+use crate::runtime::{DimensionUpdate, SupervisionConfig, Worker, WorkerError, WorkerLauncher};
 use crate::store::{
     DesiredState, ProjectRecord, ResumeBinding, RuntimeRecord, SessionRecord, SessionTransaction,
     SessionWriteOutcome, Store, TransactionKind, WorktreeStatus,
@@ -58,6 +60,7 @@ use crate::worktree::{
     canonical_or_original, run_hook, HookContext, HookEvent, WorktreeCleanup, WorktreeManager,
     WorktreeRequest,
 };
+use reconcile::LossClassification;
 
 mod attach;
 mod detector;
@@ -71,6 +74,7 @@ mod read;
 mod reconcile;
 mod resume;
 mod retention;
+mod supervision;
 mod target;
 
 pub use attach::{RedeemedAttach, RedeemedRuntime};
@@ -130,6 +134,14 @@ const SESSION_RECORD_SCHEMA_VERSION: u32 = 1;
 /// Bound on how long a graceful shutdown waits for the event-log drain to flush
 /// its backlog, so a wedged log write can never hang shutdown.
 const EVENT_LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Default bound on how long daemon shutdown waits for in-flight create
+/// transactions ([`SessionRegistryConfig::create_drain_timeout`]).
+///
+/// It stays well inside the daemon's native stop timeout (30 s by default),
+/// so the remaining shutdown steps still fit. A create still running at the
+/// deadline is recovered by startup reconciliation from its durable record.
+const DEFAULT_CREATE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default per-session raw-output history cap (10 MB), replayed on attach.
 ///
@@ -340,10 +352,18 @@ pub struct SessionRegistryConfig {
     pub worker_runtime_root: Option<PathBuf>,
     /// Root containing durable per-worker journals.
     pub worker_state_root: Option<PathBuf>,
-    /// Bound on worker unit activation and socket negotiation.
+    /// Bound on a worker generation's socket negotiation, on reconnecting to
+    /// a live worker, and on startup discovery.
     pub worker_connect_deadline: Duration,
-    /// Validated systemd template used for worker instance names.
-    pub worker_unit_template: crate::runtime::UnitTemplate,
+    /// Worker job supervision (definition inputs and deadlines).
+    ///
+    /// `None` disables session launch with `worker_backend_required`; there is
+    /// no daemon-owned PTY fallback.
+    pub supervision: Option<SupervisionConfig>,
+    /// Bound on how long [`SessionRegistry::drain_creates`] waits for the
+    /// create transactions still running when daemon shutdown starts.
+    /// Defaults to [`DEFAULT_CREATE_DRAIN_TIMEOUT`].
+    pub create_drain_timeout: Duration,
 }
 
 impl Default for SessionRegistryConfig {
@@ -381,7 +401,8 @@ impl Default for SessionRegistryConfig {
             worker_runtime_root: None,
             worker_state_root: None,
             worker_connect_deadline: DEFAULT_WORKER_CONNECT_DEADLINE,
-            worker_unit_template: crate::runtime::UnitTemplate::default(),
+            supervision: None,
+            create_drain_timeout: DEFAULT_CREATE_DRAIN_TIMEOUT,
         }
     }
 }
@@ -409,6 +430,11 @@ struct SessionRegistryInner {
     /// Set when daemon process shutdown starts. Natural PTY exits observed after
     /// this point are treated as restart fallout, not terminal session state.
     daemon_shutdown_started: AtomicBool,
+    /// Set by startup reconciliation when legacy resume bindings exist with
+    /// no logical record and no migration manifest. The first logical record
+    /// would make a later manifest unimportable, so every path that creates
+    /// one is refused while it holds ([`SessionRegistry::ensure_migration_settled`]).
+    legacy_migration_pending: AtomicBool,
     /// Cancellation signal fired when production daemon shutdown starts.
     ///
     /// Bounded input operations use this token instead of the event-log drain
@@ -420,7 +446,8 @@ struct SessionRegistryInner {
     /// (see [`SessionRegistry::attach`]). Regenerated each start; never persisted.
     daemon_instance_id: String,
     config: SessionRegistryConfig,
-    launcher: Arc<dyn WorkerLauncher>,
+    /// Worker job supervisor; `None` when the registry cannot launch workers.
+    launcher: Option<Arc<dyn WorkerLauncher>>,
     /// Resolves the free-string `agent` name to a base kind + optional host-profile
     /// overrides (Part C). Built from `config.agents_dir` at construction.
     profiles: ProfileRegistry,
@@ -435,9 +462,14 @@ struct SessionRegistryInner {
     /// wins with the freshest size. Held across the (blocking) store I/O instead
     /// of the sessions lock, keeping that hot lock free of file writes.
     persist_lock: Mutex<()>,
-    /// Serializes explicit native recovery so repeated requests cannot replace
-    /// the same runtime generation twice.
-    recovery_lock: Mutex<()>,
+    /// Serializes create, native recovery, stop, and remove per session, so
+    /// one session never runs two lifecycle transactions at once.
+    lifecycle_locks: SessionLocks,
+    /// Detached create transactions, drained at daemon shutdown.
+    creates: CreateTasks,
+    /// Sessions whose native supervisor could not be inspected, re-reconciled
+    /// in the background until it answers.
+    supervision_retries: supervision::SupervisionRetries,
     /// Per-session worktree binder, present when worktree binding is configured.
     /// Shared into `spawn_blocking` for the (blocking) git subprocesses.
     worktree: Option<Arc<WorktreeManager>>,
@@ -470,6 +502,34 @@ struct SessionRegistryInner {
     retention: retention::RetentionState,
     #[cfg(test)]
     external_association_block: std::sync::Mutex<Option<Arc<ExternalAssociationBlock>>>,
+    /// Rendezvous the next waited input write meets at its send boundary.
+    #[cfg(test)]
+    input_send_hold: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    /// Holds the next create once its target is bound, before its launch.
+    #[cfg(test)]
+    bound_create_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Holds the next committed create before its initial input.
+    #[cfg(test)]
+    initial_input_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Holds the next create between its delivered input and the commit.
+    #[cfg(test)]
+    initial_input_commit_hold:
+        std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Holds the next undelivered-create conversion before its write.
+    #[cfg(test)]
+    undelivered_conversion_hold:
+        std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+}
+
+/// The detached create transactions of one registry.
+///
+/// Admission and closing share one lock, so a create is either tracked
+/// before [`SessionRegistry::begin_daemon_shutdown`] closes the tracker, and
+/// so drained, or refused.
+#[derive(Debug, Default)]
+struct CreateTasks {
+    tracker: TaskTracker,
+    admission: std::sync::Mutex<()>,
 }
 
 #[cfg(test)]
@@ -489,6 +549,8 @@ struct SessionEntry {
     /// Serializes complete input framing transactions for this logical session.
     input_gate: Arc<Mutex<()>>,
     runtime: RuntimeHandle,
+    /// Worker job of the current runtime, when the record names one.
+    job: Option<Generation>,
     desired_state: DesiredState,
     detector_cancel: CancellationToken,
     detector_resize: watch::Sender<(u16, u16)>,
@@ -512,6 +574,28 @@ struct SessionEntry {
     last_agent_report: Option<ActiveAgentReport>,
     last_native_report: Option<NativeIdentityReport>,
     observed_agents: Vec<ObservedAgent>,
+    /// When the evidence that set `info.cwd` was observed. Older cwd evidence
+    /// never replaces it, so a scan that read a process before a newer OSC 7
+    /// hint landed cannot move the session back.
+    cwd_observed_at: Instant,
+    /// Daemon instance holding the create's undelivered initial input; the
+    /// running session's record then carries the `initial_input` marker
+    /// naming that instance.
+    initial_input_owner: Option<String>,
+}
+
+impl SessionEntry {
+    /// Stops the detector, process watcher, and worker exit watcher of this
+    /// entry's runtime.
+    ///
+    /// All three watch the same runtime identity, so a re-adopted runtime
+    /// would otherwise run beside them; stopping them keeps at most one
+    /// watcher set applying updates to a session.
+    fn cancel_runtime_watchers(&self) {
+        self.detector_cancel.cancel();
+        self.procwatch_cancel.cancel();
+        self.runtime_watch_cancel.cancel();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -636,6 +720,15 @@ struct ObservedAgent {
 struct RuntimeExit {
     exit_code: Option<i32>,
     success: bool,
+}
+
+/// What [`SessionRegistry::release_removed_session`] cleaned up.
+#[derive(Debug)]
+struct ReleasedSession {
+    /// Whether a listed entry left the registry.
+    evicted: bool,
+    /// The owned worktrees the removal deleted or left behind.
+    worktrees: WorktreeCleanup,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -982,22 +1075,43 @@ impl SessionRegistry {
         desired_state: DesiredState,
         transaction: Option<SessionTransaction>,
     ) -> SessionRecord {
-        let runtime = entry.info.runtime.as_ref().map_or(
+        let mut runtime = entry.info.runtime.as_ref().map_or(
             RuntimeRecord {
                 state: RuntimeState::Live,
                 worker_id: None,
                 runtime_id: None,
-                unit_name: None,
+                service_id: None,
+                generation: None,
+                executable: None,
                 reason: None,
             },
             |runtime| RuntimeRecord {
                 state: runtime.state,
                 worker_id: runtime.worker_id.clone(),
                 runtime_id: runtime.runtime_id.clone(),
-                unit_name: Some(format!("pohunek-session@{}.service", id.0)),
+                service_id: None,
+                generation: None,
+                executable: None,
                 reason: runtime.loss_reason.clone(),
             },
         );
+        if let Some(job) = &entry.job {
+            job.record_into(&mut runtime);
+        }
+        let transaction = transaction.or_else(|| {
+            let owner = entry
+                .initial_input_owner
+                .as_ref()
+                .filter(|_| desired_state == DesiredState::Running)?;
+            Some(SessionTransaction {
+                id: format!("create-{}", id.0),
+                kind: TransactionKind::Create,
+                phase: crate::store::INITIAL_INPUT_PHASE.to_owned(),
+                previous_worker_id: None,
+                previous_runtime_id: None,
+                daemon_instance_id: Some(owner.clone()),
+            })
+        });
         SessionRecord {
             schema_version: SESSION_RECORD_SCHEMA_VERSION,
             session_id: id.0.clone(),
@@ -1013,59 +1127,50 @@ impl SessionRegistry {
     /// Create a registry.
     ///
     /// Production callers must use [`Self::new_production`]. Unit tests inject
-    /// the real worker server through a test-only launcher; no constructor
-    /// falls back to daemon-owned PTYs.
+    /// the real worker server through a test-only launcher; other builds get a
+    /// registry without a worker supervisor, whose launches fail with
+    /// `worker_backend_required`. No constructor falls back to daemon-owned
+    /// PTYs.
+    ///
+    /// Unit tests observe the host through the test-only `ReadableHost` view,
+    /// so an unrelated process of the test host whose ownership markers cannot
+    /// be read never makes a removal sweep unconfirmed. A unit test that exercises
+    /// unreadable markers injects its inspector through
+    /// [`Self::new_with_inspector`].
     #[must_use]
     pub fn new(config: SessionRegistryConfig) -> Self {
         #[cfg(test)]
-        {
-            let mut config = config;
-            let (runtime_root, state_root) = test_worker_roots(&config);
-            config.worker_runtime_root = Some(runtime_root.clone());
-            config.worker_state_root = Some(state_root.clone());
-            let launcher = Arc::new(crate::runtime::InProcessWorkerLauncher::new(
-                runtime_root,
-                state_root,
-            ));
-            Self::new_with_launcher_and_inspector(
-                config,
-                launcher,
-                Arc::new(crate::procwatch::HostInspector::new()),
-            )
-        }
+        let inspector: Arc<dyn ProcessInspector> =
+            Arc::new(crate::procwatch::readable_host::ReadableHost::new());
         #[cfg(not(test))]
-        {
-            let launcher = Arc::new(SystemdWorkerLauncher::new(
-                config.worker_unit_template.clone(),
-            ));
-            Self::new_with_launcher_and_inspector(
-                config,
-                launcher,
-                Arc::new(crate::procwatch::HostInspector::new()),
-            )
-        }
+        let inspector: Arc<dyn ProcessInspector> = Arc::new(crate::procwatch::HostInspector::new());
+        Self::new_with_inspector(config, inspector)
     }
 
     /// Create a production registry with a mandatory durable-worker backend.
     ///
     /// # Errors
     ///
-    /// Returns `worker_backend_required` when the per-session worker runtime
-    /// root is absent. Production never falls back to daemon-owned PTYs.
-    pub fn new_production(config: SessionRegistryConfig) -> Result<Self, ProtocolError> {
+    /// Returns `worker_backend_required` when the per-session worker roots or
+    /// the supervision configuration are absent. Production never falls back
+    /// to daemon-owned PTYs.
+    pub fn new_production(
+        config: SessionRegistryConfig,
+        supervisor: Arc<dyn WorkerLauncher>,
+    ) -> Result<Self, ProtocolError> {
         validate_observation_config(&config)?;
-        if config.worker_runtime_root.is_none() || config.worker_state_root.is_none() {
+        if config.worker_runtime_root.is_none()
+            || config.worker_state_root.is_none()
+            || config.supervision.is_none()
+        {
             return Err(runtime_error(
                 "worker_backend_required",
-                "production session registry requires durable worker runtime and state roots",
+                "production session registry requires durable worker roots and supervision",
             ));
         }
-        let launcher = Arc::new(SystemdWorkerLauncher::new(
-            config.worker_unit_template.clone(),
-        ));
         Ok(Self::new_with_launcher_and_inspector(
             config,
-            launcher,
+            supervisor,
             Arc::new(crate::procwatch::HostInspector::new()),
         ))
     }
@@ -1086,6 +1191,9 @@ impl SessionRegistry {
             let (runtime_root, state_root) = test_worker_roots(&config);
             config.worker_runtime_root = Some(runtime_root.clone());
             config.worker_state_root = Some(state_root.clone());
+            if config.supervision.is_none() {
+                config.supervision = Some(test_supervision(&runtime_root, &state_root));
+            }
             let launcher = Arc::new(crate::runtime::InProcessWorkerLauncher::new(
                 runtime_root,
                 state_root,
@@ -1094,10 +1202,7 @@ impl SessionRegistry {
         }
         #[cfg(not(test))]
         {
-            let launcher = Arc::new(SystemdWorkerLauncher::new(
-                config.worker_unit_template.clone(),
-            ));
-            Self::new_with_launcher_and_inspector(config, launcher, inspector)
+            Self::build(config, None, inspector)
         }
     }
 
@@ -1109,6 +1214,14 @@ impl SessionRegistry {
     pub fn new_with_launcher_and_inspector(
         config: SessionRegistryConfig,
         launcher: Arc<dyn WorkerLauncher>,
+        inspector: Arc<dyn ProcessInspector>,
+    ) -> Self {
+        Self::build(config, Some(launcher), inspector)
+    }
+
+    fn build(
+        config: SessionRegistryConfig,
+        launcher: Option<Arc<dyn WorkerLauncher>>,
         inspector: Arc<dyn ProcessInspector>,
     ) -> Self {
         let external = ExternalSessions::new();
@@ -1156,6 +1269,7 @@ impl SessionRegistry {
                 observation_waiters: AtomicUsize::new(0),
                 observation_session_waiters: std::sync::Mutex::new(HashMap::new()),
                 daemon_shutdown_started: AtomicBool::new(false),
+                legacy_migration_pending: AtomicBool::new(false),
                 daemon_shutdown: CancellationToken::new(),
                 daemon_instance_id: generate_daemon_instance_id(),
                 config,
@@ -1164,7 +1278,9 @@ impl SessionRegistry {
                 events,
                 store,
                 persist_lock: Mutex::new(()),
-                recovery_lock: Mutex::new(()),
+                lifecycle_locks: SessionLocks::default(),
+                creates: CreateTasks::default(),
+                supervision_retries: supervision::SupervisionRetries::default(),
                 worktree,
                 projects,
                 event_log_shutdown: CancellationToken::new(),
@@ -1177,6 +1293,16 @@ impl SessionRegistry {
                 retention,
                 #[cfg(test)]
                 external_association_block: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                input_send_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                bound_create_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                initial_input_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                initial_input_commit_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                undelivered_conversion_hold: std::sync::Mutex::new(None),
             }),
         };
         if let Some(config) = external_observer {
@@ -1235,10 +1361,102 @@ impl SessionRegistry {
             .daemon_shutdown_started
             .swap(true, Ordering::Relaxed);
         self.inner.daemon_shutdown.cancel();
+        self.close_creates();
         if !already_started {
             info!("daemon shutdown started; preserving durable worker runtimes");
         }
         self.inner.external.shutdown();
+    }
+
+    /// Refuses every later create; the ones already admitted stay tracked.
+    fn close_creates(&self) {
+        let _admission = self
+            .inner
+            .creates
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.inner.creates.tracker.close();
+    }
+
+    /// Refuses new creates and waits for the ones still running, bounded by
+    /// [`SessionRegistryConfig::create_drain_timeout`].
+    ///
+    /// Each create commits its session or compensates what it bound before
+    /// the runtime stops, instead of being dropped mid-transaction. Daemon
+    /// shutdown calls it after [`Self::begin_daemon_shutdown`]. Returns
+    /// whether every create finished; one still running at the deadline is
+    /// logged and left to startup reconciliation, which compensates it from
+    /// its durable create record.
+    pub async fn drain_creates(&self) -> bool {
+        self.close_creates();
+        let creates = &self.inner.creates.tracker;
+        let timeout = self.inner.config.create_drain_timeout;
+        if tokio::time::timeout(timeout, creates.wait()).await.is_ok() {
+            return true;
+        }
+        warn!(
+            session.creates_in_flight = creates.len(),
+            timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            "create transactions did not finish within the shutdown drain timeout; startup reconciliation settles them"
+        );
+        false
+    }
+
+    /// Refuses a lifecycle operation that would write the first logical
+    /// record while unmigrated legacy resume bindings exist.
+    ///
+    /// Startup imports a migration manifest only into a store without logical
+    /// records, so a record written first would archive a later manifest
+    /// unimported and lose those bindings. Startup reconciliation decides the
+    /// gate; a later start that imports the manifest lifts it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `migration_manifest_missing` while the gate holds, before
+    /// anything is written.
+    pub(super) fn ensure_migration_settled(&self) -> Result<(), ProtocolError> {
+        if !self.inner.legacy_migration_pending.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Err(ProtocolError::new(
+            ErrorClass::Runtime,
+            reconcile::MIGRATION_MANIFEST_MISSING,
+            "legacy resume bindings exist without a migration manifest; creating a session now would lose them",
+            Some(
+                "run `pohunek migration preflight` against the legacy daemon (reinstall the legacy release and rerun the worker-aware installer), then restart this daemon so it imports the manifest"
+                    .to_owned(),
+            ),
+        ))
+    }
+
+    /// Runs `transaction` detached from the caller and tracked for the
+    /// shutdown drain.
+    ///
+    /// # Errors
+    ///
+    /// Returns `daemon_shutting_down` once daemon shutdown started, before
+    /// anything of the create is written.
+    fn spawn_create<F>(&self, transaction: F) -> Result<JoinHandle<F::Output>, ProtocolError>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let _admission = self
+            .inner
+            .creates
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.inner.creates.tracker.is_closed() {
+            return Err(ProtocolError::new(
+                ErrorClass::Daemon,
+                "daemon_shutting_down",
+                "the daemon is shutting down and accepts no new sessions",
+                Some("retry once the daemon is running again".to_owned()),
+            ));
+        }
+        Ok(self.inner.creates.tracker.spawn(transaction))
     }
 
     /// The project manager, when the metadata store is configured. Exposed for
@@ -1488,13 +1706,17 @@ impl SessionRegistry {
     /// branch)` (with `--branch`). A non-git directory yields a plain shell with
     /// no project. The session records `project_id`/`is_linked_worktree`, and any
     /// non-fatal worktree warnings ride along on the returned [`SessionInfo`].
-    #[expect(
-        clippy::too_many_lines,
-        reason = "tracked for session module decomposition"
-    )]
+    ///
+    /// # Errors
+    ///
+    /// Returns `migration_manifest_missing` while unmigrated legacy resume
+    /// bindings exist and `daemon_shutting_down` once shutdown started, both
+    /// before anything is written, and otherwise the validation, target, or launch error. A
+    /// failed create whose compensation cannot finish stays listed as
+    /// `create_compensation_pending` for the supervision retry.
     pub async fn create(&self, params: SessionNewParams) -> Result<SessionInfo, ProtocolError> {
+        self.ensure_migration_settled()?;
         validate_new_params(&params)?;
-        let initial_input = params.input.clone();
         // Resolve and validate the runtime before allocating a logical id or
         // resolving a target: target resolution may bind a git worktree.
         let resolved = self.inner.profiles.resolve_agent(&params.agent)?;
@@ -1521,110 +1743,47 @@ impl SessionRegistry {
         };
 
         let id = Self::allocate_session_id();
-
-        let TargetResolution {
-            launch_cwd,
-            repo,
-            branch,
-            worktree_path,
-            project_id,
-            is_linked_worktree,
-            warnings,
-            worktree_bound,
-        } = self.resolve_target(&id, &params, fallback_cwd).await?;
-
-        // When a worktree was bound its branch is now checked out. Any failure
-        // building the launch command or spawning the PTY must roll that back: a
-        // leftover worktree keeps the branch checked out and blocks the next
-        // `session.new` on it with `worktree_branch_in_use` (an orphan a fresh
-        // session id would never reuse). Compensate here — not in
-        // `register_pty_session`, which `resume_binding` shares and where the
-        // worktree must be kept.
-        let launch = async {
-            let capabilities = resolved.capabilities();
-            let input_rules = resolved
-                .profile
-                .as_ref()
-                .and_then(|profile| profile.input_rules)
-                .unwrap_or_else(|| input_rules_for_agent(&base, &self.inner.config));
-            // Freeze the structural relaunch snapshot (C.4) from the resolved agent:
-            // the launch program/args plus the resume template (a profile's override,
-            // else the base kind's). Cloned/copied so `resolved` stays usable below.
-            let snapshot = ResumeSnapshot {
-                program: resolved
-                    .profile
-                    .as_ref()
-                    .map_or_else(|| default_program(&base), |profile| profile.program.clone()),
-                args: resolved
-                    .profile
-                    .as_ref()
-                    .map_or_else(|| default_args(&base), |profile| profile.args.clone()),
-                resume: capabilities.resume,
-                fork: capabilities.fork,
-            };
-            // The detection-manifest override is consumed only by the detector, on
-            // both the launch and resume paths; never persisted (re-resolved by name).
-            let manifest_override = resolved
-                .profile
-                .as_ref()
-                .and_then(|profile| profile.manifest.clone());
-            // Profile env first, then the daemon handshake env appended last, so
-            // every reserved POHUNEK_* key takes the daemon's value (last-write-wins;
-            // the loader also strips POHUNEK_* from the profile env up front).
-            let mut env_extra = resolved
-                .profile
-                .as_ref()
-                .map(|profile| profile.env.clone())
-                .unwrap_or_default();
-            env_extra.extend(self.session_pty_env(base.clone(), &id));
-            let opts = LaunchOpts {
-                cwd: launch_cwd.clone(),
-                cols: params.cols,
-                rows: params.rows,
-                env_extra,
+        // The durable intent, target binding, registration, initial input, and
+        // every compensation run as one detached task, so a client dropped
+        // after the worktree was bound cannot strand it: the task still
+        // commits the session or compensates exactly what it created, and
+        // daemon shutdown drains it.
+        let registry = self.clone();
+        self.spawn_create(async move {
+            let (info, pending_initial_input) = Box::pin(registry.create_transaction(
+                id,
+                params,
+                resolved,
                 validated_program,
-            };
-            let plan = build_launch_command(
-                &resolved,
-                &self.inner.config.shell_command,
-                &opts,
-                initial_input.clone(),
-            )?;
+                fallback_cwd,
+            ))
+            .await?;
+            registry.complete_create(info, pending_initial_input).await
+        })?
+        .await
+        .map_err(|_join_error| {
+            runtime_error("session_launch_failed", "session create task panicked")
+        })?
+    }
 
-            let info = self
-                .register_pty_session(PtySessionSpec {
-                    id: id.clone(),
-                    registration: target::PtyRegistration::Create,
-                    name: validate_session_name(params.name.as_deref())?,
-                    agent: resolved.name.clone(),
-                    agent_base: base.clone(),
-                    input_rules,
-                    snapshot,
-                    manifest_override,
-                    cwd: launch_cwd,
-                    cols: params.cols,
-                    rows: params.rows,
-                    command: plan.command,
-                    native_session_id: None,
-                    native_session_path: None,
-                    project_id,
-                    is_linked_worktree,
-                    repo,
-                    branch,
-                    worktree_path,
-                    metadata: params.metadata.clone(),
-                    warnings,
-                })
-                .await?;
-
-            Ok((info, plan.pending_initial_input))
-        }
-        .await;
-
-        if launch.is_err() && worktree_bound {
-            self.cleanup_bound_worktree(&id).await;
-        }
-        let (info, pending_initial_input) = launch?;
+    /// Finishes a committed create: fires its `SessionStart` hook and
+    /// delivers its initial input.
+    ///
+    /// Until the input is delivered, the session's record carries the
+    /// `initial_input` marker, so a daemon that stops or dies first leaves a
+    /// create that reconciliation rolls back instead of a session running
+    /// without its prompt. Delivery clears the marker durably; a failed
+    /// delivery or clearing removes the session ([`Self::remove`]), whose
+    /// durable removal intent reconciliation finishes as well.
+    ///
+    /// # Errors
+    ///
+    /// Returns the delivery or persistence error after the rollback.
+    async fn complete_create(
+        &self,
+        info: SessionInfo,
+        pending_initial_input: Option<String>,
+    ) -> Result<SessionInfo, ProtocolError> {
         self.spawn_session_hook(SessionHookRequest {
             event: HookEvent::SessionStart,
             cwd: info.cwd.clone(),
@@ -1634,24 +1793,269 @@ impl SessionRegistry {
             stop_reason: None,
             activity: None,
         });
-        if let Some(input) = pending_initial_input {
-            // Wait for the agent to come up before injecting the first prompt so
-            // the bytes are not delivered to a stdin reader that has not yet
-            // entered raw/bracketed-paste mode (and would drop or mis-frame
-            // them). Bounded, so a silent agent can never wedge `session.new`.
-            self.await_initial_input_readiness(&info.id).await;
-            if let Err(err) = self.write_input_to_session(&info.id, &input).await {
-                // A failed initial input must roll the session back completely.
-                // `stop()` alone does not free a bound worktree, so a leftover
-                // checkout would keep the branch checked out and block the next
-                // `session.new` on it with `worktree_branch_in_use` — exactly
-                // the orphan the launch-failure path above compensates for.
-                self.rollback_failed_initial_input(&info.id, worktree_bound)
-                    .await;
-                return Err(err);
-            }
+        let Some(input) = pending_initial_input else {
+            return Ok(info);
+        };
+        #[cfg(test)]
+        self.hold_initial_input(&info.id).await;
+        // Wait for the agent to come up before injecting the first prompt so
+        // the bytes are not delivered to a stdin reader that has not yet
+        // entered raw/bracketed-paste mode (and would drop or mis-frame
+        // them). Bounded, so a silent agent can never wedge `session.new`.
+        self.await_initial_input_readiness(&info.id).await;
+        let delivered = match self.write_input_to_session(&info.id, &input).await {
+            Ok(()) => self.commit_initial_input(&info.id).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = delivered {
+            self.rollback_failed_initial_input(&info.id).await;
+            return Err(error);
         }
         Ok(info)
+    }
+
+    /// Clears the `initial_input` marker of a delivered create, durably
+    /// first and then in memory.
+    ///
+    /// The store clears only the marker of the current record
+    /// ([`Store::clear_initial_input`]), so a stop, removal, or exit that
+    /// persisted meanwhile keeps its state. A writer that still builds the
+    /// marker from memory before the flag drops cannot re-add it, since the
+    /// store never re-introduces a cleared marker.
+    async fn commit_initial_input(&self, id: &SessionId) -> Result<(), ProtocolError> {
+        #[cfg(test)]
+        self.hold_initial_input_commit(id).await;
+        if let Some(store) = self.inner.store.clone() {
+            let session_id = id.0.clone();
+            tokio::task::spawn_blocking(move || store.clear_initial_input(&session_id))
+                .await
+                .map_err(|_join_error| {
+                    runtime_error(
+                        "session_store_failed",
+                        format!("initial input commit task panicked for {}", id.0),
+                    )
+                })?
+                .map_err(|error| {
+                    runtime_error(
+                        "session_store_failed",
+                        format!("failed to commit the initial input of {}: {error}", id.0),
+                    )
+                })?;
+        }
+        if let Some(entry) = self.inner.sessions.lock().await.get_mut(id) {
+            entry.initial_input_owner = None;
+        }
+        Ok(())
+    }
+
+    /// Parks a create between its delivered input and the marker commit
+    /// when a test armed the hold.
+    #[cfg(test)]
+    async fn hold_initial_input_commit(&self, id: &SessionId) {
+        let gate = self
+            .inner
+            .initial_input_commit_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|gate| gate.session_id.as_deref().is_none_or(|held| held == id.0));
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Parks a create before its initial input when a test armed the hold.
+    #[cfg(test)]
+    async fn hold_initial_input(&self, id: &SessionId) {
+        let gate = self
+            .inner
+            .initial_input_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|gate| gate.session_id.as_deref().is_none_or(|held| held == id.0));
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Records the intent of a `session.new`, binds its target, and registers
+    /// its first runtime, compensating whatever it created when that fails.
+    ///
+    /// Runs detached from the caller, under the session's lifecycle lock, in
+    /// this order (the phases of RFC section 14):
+    ///
+    /// 1. persist the create intent: a `create/preparing` record without a
+    ///    worker generation ([`create_intent_record`]), so every worktree the
+    ///    create binds is reachable from a record;
+    /// 2. resolve the project and bind the worktree;
+    /// 3. build the launch command;
+    /// 4. register the runtime ([`Self::run_pty_registration`]), which
+    ///    persists the generation before starting its job and owns every
+    ///    later compensation: the worktree and the preparing record are
+    ///    removed only once the generation is proven ended, and a generation
+    ///    that may still run keeps both for reconciliation.
+    ///
+    /// A failure in phases 2 or 3 launched nothing, so the create is
+    /// compensated at once ([`Self::compensate_abandoned_create`]): worktree
+    /// and binding first, record last. A compensation that cannot finish
+    /// keeps the record and lists the session `create_compensation_pending`
+    /// while the supervision retry repeats it; the create still fails with
+    /// its original error. A daemon that dies anywhere after phase 1 leaves
+    /// the record for startup reconciliation.
+    ///
+    /// Returns the committed session and the initial input still to deliver.
+    async fn create_transaction(
+        &self,
+        id: SessionId,
+        params: SessionNewParams,
+        resolved: ResolvedAgent,
+        validated_program: Option<crate::agent::ValidatedLaunchProgram>,
+        fallback_cwd: PathBuf,
+    ) -> Result<(SessionInfo, Option<String>), ProtocolError> {
+        let guard = self.lock_lifecycle(&id).await;
+        let intent = create_intent_record(&id, &params, &resolved, &fallback_cwd)?;
+        self.write_session_record(intent).await?;
+        let prepared = match self.resolve_target(&id, &params, fallback_cwd).await {
+            Ok(target) => {
+                #[cfg(test)]
+                self.hold_bound_create(&id).await;
+                self.create_spec(&id, &params, &resolved, validated_program, target)
+            }
+            Err(error) => Err(error),
+        };
+        let (spec, pending_initial_input) = match prepared {
+            Ok(prepared) => prepared,
+            Err(mut error) => {
+                if !self.compensate_abandoned_create(&id).await {
+                    error.msg = unfinished_compensation_message(&error.msg, &id);
+                }
+                return Err(error);
+            }
+        };
+        let info = self.clone().run_pty_registration(spec, guard).await?;
+        Ok((info, pending_initial_input))
+    }
+
+    /// Parks a create at its bound target when a test armed the hold.
+    #[cfg(test)]
+    async fn hold_bound_create(&self, id: &SessionId) {
+        let gate = {
+            let mut slot = self
+                .inner
+                .bound_create_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let held = slot
+                .as_ref()
+                .is_some_and(|gate| gate.session_id.as_deref().is_none_or(|held| held == id.0));
+            if held {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Builds the first-launch registration of a `session.new` in `target`,
+    /// with the initial input its launch command does not carry.
+    fn create_spec(
+        &self,
+        id: &SessionId,
+        params: &SessionNewParams,
+        resolved: &ResolvedAgent,
+        validated_program: Option<crate::agent::ValidatedLaunchProgram>,
+        target: TargetResolution,
+    ) -> Result<(PtySessionSpec, Option<String>), ProtocolError> {
+        let TargetResolution {
+            launch_cwd,
+            repo,
+            branch,
+            worktree_path,
+            project_id,
+            is_linked_worktree,
+            warnings,
+            ..
+        } = target;
+        let base = resolved.base.clone();
+        let capabilities = resolved.capabilities();
+        let input_rules = resolved
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.input_rules)
+            .unwrap_or_else(|| input_rules_for_agent(&base, &self.inner.config));
+        // Freeze the structural relaunch snapshot (C.4) from the resolved agent:
+        // the launch program/args plus the resume template (a profile's override,
+        // else the base kind's).
+        let snapshot = ResumeSnapshot {
+            program: resolved
+                .profile
+                .as_ref()
+                .map_or_else(|| default_program(&base), |profile| profile.program.clone()),
+            args: resolved
+                .profile
+                .as_ref()
+                .map_or_else(|| default_args(&base), |profile| profile.args.clone()),
+            resume: capabilities.resume,
+            fork: capabilities.fork,
+        };
+        // The detection-manifest override is consumed only by the detector, on
+        // both the launch and resume paths; never persisted (re-resolved by name).
+        let manifest_override = resolved
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.manifest.clone());
+        // Profile env first, then the daemon handshake env appended last, so
+        // every reserved POHUNEK_* key takes the daemon's value (last-write-wins;
+        // the loader also strips POHUNEK_* from the profile env up front).
+        let mut env_extra = resolved
+            .profile
+            .as_ref()
+            .map(|profile| profile.env.clone())
+            .unwrap_or_default();
+        env_extra.extend(self.session_pty_env(base.clone(), id));
+        let opts = LaunchOpts {
+            cwd: launch_cwd.clone(),
+            cols: params.cols,
+            rows: params.rows,
+            env_extra,
+            validated_program,
+        };
+        let plan = build_launch_command(
+            resolved,
+            &self.inner.config.shell_command,
+            &opts,
+            params.input.clone(),
+        )?;
+        let spec = PtySessionSpec {
+            id: id.clone(),
+            registration: target::PtyRegistration::Create,
+            name: validate_session_name(params.name.as_deref())?,
+            agent: resolved.name.clone(),
+            agent_base: base,
+            input_rules,
+            snapshot,
+            manifest_override,
+            cwd: launch_cwd,
+            cols: params.cols,
+            rows: params.rows,
+            command: plan.command,
+            native_session_id: None,
+            native_session_path: None,
+            project_id,
+            is_linked_worktree,
+            repo,
+            branch,
+            worktree_path,
+            metadata: params.metadata.clone(),
+            warnings,
+            initial_input_pending: plan.pending_initial_input.is_some(),
+        };
+        Ok((spec, plan.pending_initial_input))
     }
 
     /// Wait for a freshly spawned agent to produce its first PTY output before a
@@ -1679,11 +2083,17 @@ impl SessionRegistry {
 
         match runtime {
             RuntimeHandle::Worker(worker) => {
+                // Shutdown stops the wait, so the input is delivered while the
+                // create drain still waits for it.
+                let shutdown = self.inner.daemon_shutdown.clone();
                 let _ = tokio::time::timeout(grace, async {
                     loop {
                         match worker.inspect().await {
                             Ok(snapshot) if snapshot.next_offset > 0 => break,
-                            Ok(_) => tokio::time::sleep(WORKER_CONNECT_RETRY).await,
+                            Ok(_) => tokio::select! {
+                                () = shutdown.cancelled() => break,
+                                () = tokio::time::sleep(WORKER_CONNECT_RETRY) => {}
+                            },
                             Err(_) => break,
                         }
                     }
@@ -1694,25 +2104,21 @@ impl SessionRegistry {
         }
     }
 
-    /// Roll back a session whose initial `--input` injection failed: stop the
-    /// PTY and, when the session bound a worktree, free that worktree too.
+    /// Roll back a session whose initial `--input` could not be delivered or
+    /// committed by removing it ([`Self::remove`]): stop the runtime, retire
+    /// its job, and free its worktree, so its branch is free for a retry.
     ///
-    /// `stop()` only terminates the PTY and records the exit; it never releases
-    /// a bound worktree (that is `cleanup_bound_worktree`'s job, otherwise only
-    /// reached by the launch-failure path). Skipping it here would leak the
-    /// checkout and block the branch's next `session.new`. Best-effort: a stop
-    /// failure is logged, never propagated, so the caller still returns the
-    /// original input error.
-    async fn rollback_failed_initial_input(&self, id: &SessionId, worktree_bound: bool) {
-        if let Err(err) = self.stop(id).await {
+    /// The removal persists its intent before it acts, and until then the
+    /// record keeps the `initial_input` marker, so reconciliation finishes a
+    /// rollback this cannot. Best-effort: a failure is logged, never
+    /// propagated, so the caller still returns the original input error.
+    async fn rollback_failed_initial_input(&self, id: &SessionId) {
+        if let Err(err) = self.remove(id).await {
             warn!(
                 session_id = %id.0,
                 error = %err,
-                "failed to stop session while rolling back a failed initial input"
+                "failed to remove a session whose initial input was not delivered; reconciliation finishes the rollback"
             );
-        }
-        if worktree_bound {
-            self.cleanup_bound_worktree(id).await;
         }
     }
 
@@ -2140,6 +2546,7 @@ impl SessionRegistry {
         path: String,
         expected: Option<&RuntimeWatchIdentity>,
     ) {
+        let observed_at = Instant::now();
         let cwd = PathBuf::from(path);
         if !cwd.is_absolute() {
             debug!(
@@ -2151,7 +2558,7 @@ impl SessionRegistry {
         }
         match cwd.try_exists() {
             Ok(true) => {
-                self.apply_cwd_change(id, cwd, CwdSource::Osc7, expected)
+                self.apply_cwd_change(id, cwd, CwdSource::Osc7, expected, observed_at)
                     .await;
             }
             Ok(false) => {
@@ -2172,14 +2579,20 @@ impl SessionRegistry {
         }
     }
 
+    /// Moves the session to `cwd` unless the evidence that set its current cwd
+    /// is newer.
+    ///
+    /// `observed_at` is when the evidence was read. Evidence for the current
+    /// cwd changes nothing, so the source that established it stays.
     async fn apply_cwd_change(
         &self,
         id: &SessionId,
         cwd: PathBuf,
         source: CwdSource,
         expected: Option<&RuntimeWatchIdentity>,
+        observed_at: Instant,
     ) {
-        if !self.cwd_update_needed(id, &cwd).await {
+        if !self.cwd_update_needed(id, &cwd, observed_at).await {
             return;
         }
 
@@ -2194,9 +2607,10 @@ impl SessionRegistry {
                 debug!(session_id = %id.0, "cwd update arrived for a superseded runtime");
                 return;
             }
-            if entry.stopping || is_terminal(entry.info.state) || entry.info.cwd == cwd {
+            if !cwd_evidence_moves(entry, &cwd, observed_at) {
                 return;
             }
+            entry.cwd_observed_at = observed_at;
             Some(apply_cwd_change(entry, cwd, source, association))
         };
 
@@ -2205,12 +2619,11 @@ impl SessionRegistry {
         }
     }
 
-    async fn cwd_update_needed(&self, id: &SessionId, cwd: &Path) -> bool {
+    async fn cwd_update_needed(&self, id: &SessionId, cwd: &Path, observed_at: Instant) -> bool {
         let sessions = self.inner.sessions.lock().await;
-        let Some(entry) = sessions.get(id) else {
-            return false;
-        };
-        !entry.stopping && !is_terminal(entry.info.state) && entry.info.cwd != cwd
+        sessions
+            .get(id)
+            .is_some_and(|entry| cwd_evidence_moves(entry, cwd, observed_at))
     }
 
     async fn resolve_cwd_association(
@@ -2413,6 +2826,8 @@ impl SessionRegistry {
 
     /// Stop a running session.
     pub async fn stop(&self, id: &SessionId) -> Result<SessionStopResult, ProtocolError> {
+        self.ensure_not_external(id).await?;
+        let _guard = self.lock_lifecycle(id).await;
         self.stop_with_intent(id, DesiredState::Stopped, TransactionKind::Stop)
             .await
     }
@@ -2475,6 +2890,7 @@ impl SessionRegistry {
                         phase: "requested".to_owned(),
                         previous_worker_id: None,
                         previous_runtime_id: None,
+                        daemon_instance_id: None,
                     }),
                 ),
             )
@@ -2622,11 +3038,18 @@ impl SessionRegistry {
     /// session otherwise lingers forever. `remove` is the eviction step. A
     /// still-live worker-backed session is stopped first (so removal never
     /// orphans a live PTY), then the entry is dropped and its resume binding
-    /// cleared so a daemon restart cannot resurrect it. An unavailable runtime
-    /// is already outside the daemon's control, so removal evicts only its
-    /// logical record and deliberately does not signal an ambiguous worker. A
-    /// `session_removed` event is emitted with the final snapshot so subscribed
-    /// clients drop their view of the session.
+    /// cleared so a daemon restart cannot resurrect it. An ambiguous
+    /// conflict, a reconnecting, or an incompatible runtime cannot be stopped
+    /// through its worker yet may still own a live PTY, so its exact recorded
+    /// generation is retired through the supervisor and its journaled worker
+    /// proven gone before the record is deleted. Such a runtime whose record
+    /// names no generation, a conflict over a job or worker that is not the
+    /// recorded generation's, and a worker still running after retirement are
+    /// refused instead. Every removal then sweeps the marked processes of the
+    /// session's runtimes, since a descendant that left the worker's process
+    /// group outlives both the stop and the retirement. A `session_removed`
+    /// event is emitted with the final snapshot so subscribed clients drop
+    /// their view of the session.
     ///
     /// Worktree cleanup is best-effort: a checkout that could not be deleted is
     /// counted in [`SessionRemoveResult::worktrees_failed`] instead of failing
@@ -2637,19 +3060,41 @@ impl SessionRegistry {
     ///
     /// Returns `session_not_found` when no session has the given id, and
     /// surfaces any PTY shutdown error from the implied stop of a live session.
+    /// An unreachable runtime that cannot be retired (no recorded generation,
+    /// or a non-ambiguous conflict) fails with its runtime-state code
+    /// (`session_runtime_conflict`, `session_runtime_reconnecting`, or
+    /// `worker_protocol_incompatible`); a generation the supervisor cannot
+    /// retire fails with `runtime_supervision_unavailable`; a worker not
+    /// proven gone afterwards fails with `runtime_supervision_ambiguous` or
+    /// `runtime_identity_mismatch`. The record is kept in every case. A
+    /// marker sweep that cannot confirm every marked process exited fails
+    /// with `runtime_supervision_ambiguous` after the removal intent was
+    /// recorded; like any cleanup that fails then, it keeps the session
+    /// listed with its intent, so the removal can be retried (daemon startup
+    /// reconciliation also finishes it).
     pub async fn remove(&self, id: &SessionId) -> Result<SessionRemoveResult, ProtocolError> {
         self.ensure_not_external(id).await?;
+        let _guard = self.lock_lifecycle(id).await;
         let should_stop = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
+            if let Some(state) = unreachable_live_state(entry) {
+                ensure_retirable(id, entry, state)?;
+            }
             !is_terminal(entry.info.state) && matches!(entry.runtime, RuntimeHandle::Worker(_))
         };
 
         let stopped = if should_stop {
-            self.stop_with_intent(id, DesiredState::Removed, TransactionKind::Remove)
+            let stopped = self
+                .stop_with_intent(id, DesiredState::Removed, TransactionKind::Remove)
                 .await?
-                .stopped
+                .stopped;
+            self.retire_unstopped_job(id).await?;
+            stopped
         } else {
+            // Retiring first means a refused or failed retirement leaves no
+            // removal intent behind; the record keeps its runtime state.
+            self.retire_unstopped_job(id).await?;
             let removal_intent = {
                 let mut sessions = self.inner.sessions.lock().await;
                 let entry = sessions
@@ -2669,6 +3114,7 @@ impl SessionRegistry {
                         phase: "requested".to_owned(),
                         previous_worker_id: None,
                         previous_runtime_id: None,
+                        daemon_instance_id: None,
                     }),
                 )
             };
@@ -2676,7 +3122,60 @@ impl SessionRegistry {
             false
         };
 
-        let (cleanup_warnings, cleanup) = self.cleanup_owned_worktrees_for_removal(id).await?;
+        let (job, runtime_id) = {
+            let sessions = self.inner.sessions.lock().await;
+            let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
+            (
+                entry.job.clone(),
+                entry
+                    .info
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.runtime_id.clone()),
+            )
+        };
+        let released = self
+            .release_removed_session(id, job.as_ref(), runtime_id.as_deref())
+            .await?;
+        Ok(SessionRemoveResult {
+            removed: released.evicted,
+            stopped,
+            worktrees_removed: u32::try_from(released.worktrees.removed).unwrap_or(u32::MAX),
+            worktrees_failed: u32::try_from(released.worktrees.failed).unwrap_or(u32::MAX),
+        })
+    }
+
+    /// Deletes everything a removed session owns once its workers are proven
+    /// gone: marked processes of its runtimes, owned worktrees, the worker log
+    /// family, the registry entry, the resume binding, and finally the
+    /// durable record.
+    ///
+    /// Shared by [`Self::remove`] and the reconciliation that finishes a
+    /// durable removal intent, so both leave the same state behind. The
+    /// marker sweep of every runtime of `generation` and of `runtime_id`
+    /// ([`Self::sweep_removed_runtimes`]) comes first, because nothing
+    /// controls a surviving descendant once the record is gone. The record is
+    /// deleted even when no entry is listed (startup reconciliation runs
+    /// before the session is installed), and `session_removed` is emitted
+    /// only for an evicted entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `runtime_supervision_ambiguous` when a runtime's marked
+    /// processes are not proven gone, before anything is deleted, and
+    /// otherwise the worktree, log, or store error that stopped the cleanup.
+    /// Every step is idempotent and the durable record is deleted last, so a
+    /// failed cleanup keeps the removal intent for a later attempt, and an
+    /// entry evicted before the record could be deleted is listed again.
+    async fn release_removed_session(
+        &self,
+        id: &SessionId,
+        generation: Option<&Generation>,
+        runtime_id: Option<&str>,
+    ) -> Result<ReleasedSession, ProtocolError> {
+        self.sweep_removed_runtimes(id, generation, runtime_id)
+            .await?;
+        let (cleanup_warnings, worktrees) = self.cleanup_owned_worktrees_for_removal(id).await?;
         if !cleanup_warnings.is_empty() {
             let mut sessions = self.inner.sessions.lock().await;
             if let Some(entry) = sessions.get_mut(id) {
@@ -2684,49 +3183,105 @@ impl SessionRegistry {
             }
         }
         // The entry is about to leave the map and its warnings with it, so a
-        // checkout that survived is reported on the result as well.
-        if cleanup.failed > 0 {
+        // checkout that survived is reported to the caller as well.
+        if worktrees.failed > 0 {
             warn!(
                 session_id = %id.0,
-                worktrees_failed = cleanup.failed,
+                worktrees_failed = worktrees.failed,
                 "session removal left an owned worktree on disk"
             );
         }
-        let worktrees_removed = u32::try_from(cleanup.removed).unwrap_or(u32::MAX);
-        let worktrees_failed = u32::try_from(cleanup.failed).unwrap_or(u32::MAX);
 
-        // The PTY has stopped above, so cleanup removes the accumulated family.
-        // A retained terminal worker may still emit a final control diagnostic,
+        // The PTY has ended, so cleanup removes the accumulated family. A
+        // retained terminal worker may still emit a final control diagnostic,
         // but the shared writer keeps any such file within the same hard cap.
         self.delete_session_logs(id).await?;
 
-        let info = {
-            let mut sessions = self.inner.sessions.lock().await;
-            match sessions.remove(id) {
-                Some(entry) => entry.info,
-                // A concurrent `remove` won the race and already evicted it.
-                None => {
-                    return Ok(SessionRemoveResult {
-                        removed: false,
-                        stopped,
-                        worktrees_removed,
-                        worktrees_failed,
-                    })
-                }
-            }
-        };
+        // A concurrent eviction (another removal path) leaves no entry here.
+        let evicted = self.inner.sessions.lock().await.remove(id);
+        if let Some(entry) = &evicted {
+            entry.cancel_runtime_watchers();
+        }
 
         // The entry is gone, so this re-reads as "no live session" and clears any
         // lingering resume binding (idempotent for a session that already dropped
         // its binding on exit or stop).
         self.persist_resume_binding(id).await;
-        self.delete_session_record(id).await?;
-        self.emit(event::SESSION_REMOVED, &info);
-        Ok(SessionRemoveResult {
-            removed: true,
-            stopped,
-            worktrees_removed,
-            worktrees_failed,
+        if let Err(error) = self.delete_session_record(id).await {
+            // The entry leaves first so the binding cleanup above cannot re-read
+            // it as live. The record still holds the removal intent, so the
+            // entry is listed again for a retried removal; the callers hold the
+            // lifecycle lock, so no other entry can have taken its place.
+            if let Some(entry) = evicted {
+                self.inner
+                    .sessions
+                    .lock()
+                    .await
+                    .entry(id.clone())
+                    .or_insert(entry);
+            }
+            return Err(error);
+        }
+        if let Some(entry) = &evicted {
+            self.emit(event::SESSION_REMOVED, &entry.info);
+        }
+        Ok(ReleasedSession {
+            evicted: evicted.is_some(),
+            worktrees,
+        })
+    }
+
+    /// Retires the worker job of a session that removal does not stop
+    /// through its worker.
+    ///
+    /// A terminal worker only retains its final output, so its exact
+    /// generation is retired. An unreachable worker that is not proven gone
+    /// (see [`unreachable_live_state`]) may still own a live PTY, and deleting
+    /// its record alone would leave it running unrecorded: every journaled
+    /// worker of the session is collected from a fresh journal scan, the
+    /// generation is retired, and those workers must then be proven gone
+    /// ([`Self::retire_generation_for_removal`]). A lost
+    /// runtime was already classified ended and is left alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns `runtime_supervision_unavailable` when the supervisor cannot
+    /// retire the job, and `runtime_supervision_ambiguous` or
+    /// `runtime_identity_mismatch` when an unreachable worker is not proven
+    /// gone afterwards; the logical record is kept so removal can be retried.
+    async fn retire_unstopped_job(&self, id: &SessionId) -> Result<(), ProtocolError> {
+        let target = {
+            let sessions = self.inner.sessions.lock().await;
+            sessions.get(id).and_then(|entry| {
+                let terminal = entry
+                    .info
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.state == RuntimeState::Terminal);
+                let unreachable = unreachable_live_state(entry).is_some();
+                (terminal || unreachable)
+                    .then(|| entry.job.clone().map(|job| (job, unreachable)))
+                    .flatten()
+            })
+        };
+        let Some((job, unreachable)) = target else {
+            return Ok(());
+        };
+        let lifecycle = self.lifecycle()?;
+        if unreachable {
+            return self
+                .retire_generation_for_removal(id, &job, &lifecycle)
+                .await;
+        }
+        lifecycle.retire(&job).await.map_err(|error| {
+            runtime_error(
+                crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE,
+                format!(
+                    "failed to retire worker generation {} of session {}: {error}",
+                    job.service_id(),
+                    id.0
+                ),
+            )
         })
     }
 
@@ -2856,7 +3411,22 @@ impl SessionRegistry {
         cancel: &CancellationToken,
         error: &WorkerError,
     ) -> Option<Worker> {
+        // A cancelled watcher no longer owns the runtime, and a daemon that is
+        // shutting down leaves every worker runtime to the next daemon's
+        // reconciliation, so neither rewrites the runtime's state.
+        if cancel.is_cancelled() || self.inner.daemon_shutdown_started.load(Ordering::Relaxed) {
+            return None;
+        }
         if !self.mark_worker_reconnecting(id, expected, error).await {
+            return None;
+        }
+        // A worker whose death is already provable is classified at once
+        // instead of after the whole connect deadline.
+        let classified = tokio::select! {
+            () = cancel.cancelled() => return None,
+            classified = self.classify_lost_worker(id, expected, true) => classified,
+        };
+        if classified == LossClassification::Settled {
             return None;
         }
         let mut deadline = tokio::time::Instant::now() + self.inner.config.worker_connect_deadline;
@@ -2884,15 +3454,20 @@ impl SessionRegistry {
                     }
                 },
                 Err(reconnect_error) if tokio::time::Instant::now() >= deadline => {
-                    match self.mark_worker_lost(id, expected, &reconnect_error).await {
-                        RuntimeTransitionOutcome::Applied(_)
-                        | RuntimeTransitionOutcome::IdentityMismatch => return None,
-                        RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
-                        | RuntimeTransitionOutcome::RetryableConcurrentChange => {
-                            deadline = tokio::time::Instant::now()
-                                + self.inner.config.worker_connect_deadline;
-                        }
+                    debug!(
+                        session_id = %id.0,
+                        error = %reconnect_error,
+                        "session worker stayed unreachable for the connect deadline"
+                    );
+                    let classified = tokio::select! {
+                        () = cancel.cancelled() => return None,
+                        classified = self.classify_lost_worker(id, expected, false) => classified,
+                    };
+                    if classified == LossClassification::Settled {
+                        return None;
                     }
+                    deadline =
+                        tokio::time::Instant::now() + self.inner.config.worker_connect_deadline;
                 }
                 Err(reconnect_error) => {
                     debug!(
@@ -2936,11 +3511,17 @@ impl SessionRegistry {
         true
     }
 
-    async fn mark_worker_lost(
+    /// Commits the classification of a worker whose control connection is gone.
+    ///
+    /// The transition is conditional on `expected` still naming the entry's
+    /// runtime, and it keeps newer durable metadata; a `Lost` classification
+    /// also terminalizes running subagents.
+    async fn mark_worker_unavailable(
         &self,
         id: &SessionId,
         expected: &RuntimeWatchIdentity,
-        error: &WorkerError,
+        state: RuntimeState,
+        reason: &str,
     ) -> RuntimeTransitionOutcome {
         let (base, candidate) = {
             let sessions = self.inner.sessions.lock().await;
@@ -2952,10 +3533,10 @@ impl SessionRegistry {
             }
             let base = Self::session_record(id, entry, entry.desired_state, None);
             let mut candidate = entry.clone();
-            candidate.runtime = RuntimeHandle::Unavailable(RuntimeState::Lost);
+            candidate.runtime = RuntimeHandle::Unavailable(state);
             if let Some(runtime) = candidate.info.runtime.as_mut() {
-                runtime.state = RuntimeState::Lost;
-                runtime.loss_reason = Some("worker_process_lost".to_owned());
+                runtime.state = state;
+                runtime.loss_reason = Some(reason.to_owned());
             }
             candidate.info.updated_at = timestamp_now();
             (base, candidate)
@@ -2965,30 +3546,37 @@ impl SessionRegistry {
             Ok(None) => base.clone(),
             Err(error) => return RuntimeTransitionOutcome::RetryablePersistenceFailure(error),
         };
+        let policy = if state == RuntimeState::Lost {
+            RuntimeMetadataPolicy::Terminal
+        } else {
+            RuntimeMetadataPolicy::Live
+        };
         let outcome = self
-            .commit_runtime_transition(
-                id,
-                expected,
-                &base,
-                &durable_base,
-                candidate,
-                RuntimeMetadataPolicy::Terminal,
-            )
+            .commit_runtime_transition(id, expected, &base, &durable_base, candidate, policy)
             .await;
         if let RuntimeTransitionOutcome::RetryablePersistenceFailure(store_error) = &outcome {
             warn!(
                 session_id = %id.0,
                 error = %store_error,
-                "failed to persist lost worker classification"
+                "failed to persist the unreachable worker classification"
             );
         }
         if let RuntimeTransitionOutcome::Applied(info) = &outcome {
             warn!(
                 session_id = %id.0,
-                error = %error,
-                "session worker could not be reconnected; PTY runtime is lost"
+                runtime.state = ?state,
+                reason,
+                "session worker could not be reconnected"
             );
-            self.emit(event::SESSION_RUNTIME_LOST, info.as_ref());
+            let event_name = match state {
+                RuntimeState::Lost | RuntimeState::Incompatible => event::SESSION_RUNTIME_LOST,
+                RuntimeState::Conflict => event::SESSION_RUNTIME_CONFLICT,
+                RuntimeState::Starting
+                | RuntimeState::Live
+                | RuntimeState::Reconnecting
+                | RuntimeState::Terminal => event::SESSION_UPDATED,
+            };
+            self.emit(event_name, info.as_ref());
         }
         outcome
     }
@@ -3097,9 +3685,26 @@ impl SessionRegistry {
         if &current_record != memory_base {
             return RuntimeTransitionOutcome::RetryableConcurrentChange;
         }
+        // An unavailable runtime has no worker left to watch; only a later
+        // adoption, with fresh tokens, may watch this session again.
+        if matches!(candidate.runtime, RuntimeHandle::Unavailable(_)) {
+            candidate.cancel_runtime_watchers();
+        }
         let info = candidate.info.clone();
         sessions.insert(id.clone(), candidate);
         RuntimeTransitionOutcome::Applied(Box::new(info))
+    }
+
+    /// Installs `entry`, which carries fresh watcher tokens, as the session's
+    /// registry entry.
+    ///
+    /// The watchers of a replaced entry are cancelled, so re-adopting or
+    /// reclassifying a runtime never leaves a second watcher set on it.
+    async fn install_session_entry(&self, id: &SessionId, entry: SessionEntry) {
+        let replaced = self.inner.sessions.lock().await.insert(id.clone(), entry);
+        if let Some(replaced) = replaced {
+            replaced.cancel_runtime_watchers();
+        }
     }
 
     async fn record_exit(
@@ -3684,6 +4289,16 @@ where
     serde_json::to_value(payload).expect("protocol event payload serialization is infallible")
 }
 
+/// Whether cwd evidence observed at `observed_at` moves a live session to `cwd`.
+///
+/// Evidence older than the evidence that set the current cwd is stale.
+fn cwd_evidence_moves(entry: &SessionEntry, cwd: &Path, observed_at: Instant) -> bool {
+    !entry.stopping
+        && !is_terminal(entry.info.state)
+        && observed_at >= entry.cwd_observed_at
+        && entry.info.cwd != cwd
+}
+
 fn apply_cwd_change(
     entry: &mut SessionEntry,
     cwd: PathBuf,
@@ -3851,6 +4466,111 @@ fn validate_new_params(params: &SessionNewParams) -> Result<(), ProtocolError> {
     validate_session_metadata(&params.metadata)?;
     validate_session_name(params.name.as_deref())?;
     Ok(())
+}
+
+/// The durable intent of a `session.new` (RFC section 14, phase 2): a
+/// `create/preparing` record with the create's structural metadata and no
+/// worker generation.
+///
+/// It is written before the target is bound, so a worktree the create binds
+/// is always reachable from a record: reconciliation of a create record that
+/// names no generation proves nothing was launched and compensates it. The
+/// launch directory is provisional until the preparing record of
+/// [`SessionRegistry::run_pty_registration`] replaces the intent.
+///
+/// # Errors
+///
+/// Returns `bad_request` for an invalid session name.
+fn create_intent_record(
+    id: &SessionId,
+    params: &SessionNewParams,
+    resolved: &ResolvedAgent,
+    cwd: &Path,
+) -> Result<SessionRecord, ProtocolError> {
+    let capabilities = resolved.capabilities();
+    let created_at = timestamp_now();
+    let info = SessionInfo {
+        id: id.clone(),
+        external: Some(false),
+        capabilities: protocol::SessionCapabilities {
+            resume: capabilities.resume.is_some(),
+            fork: capabilities.fork.is_some(),
+        },
+        name: validate_session_name(params.name.as_deref())?,
+        agent: resolved.name.clone(),
+        agent_base: resolved.base.clone(),
+        cwd: cwd.to_path_buf(),
+        cwd_source: Some(CwdSource::Launch),
+        pid: 0,
+        runtime: Some(SessionRuntime {
+            state: RuntimeState::Starting,
+            runtime_generation: protocol::RuntimeGeneration::new(1),
+            worker_id: None,
+            runtime_id: None,
+            started_at: None,
+            last_connected_at: None,
+            loss_reason: None,
+        }),
+        cols: params.cols,
+        rows: params.rows,
+        state: SessionState::Starting,
+        state_source: StateSource::Process,
+        activity: None,
+        subagents: Vec::new(),
+        active_agent: None,
+        active_agent_base: None,
+        active_agent_pid: None,
+        active_agent_session_id: None,
+        active_agent_session_path: None,
+        native_session_id: None,
+        native_session_path: None,
+        project_id: None,
+        project_label: None,
+        is_linked_worktree: None,
+        repo: params.repo.clone(),
+        branch: params.branch.clone(),
+        worktree_path: None,
+        metadata: params.metadata.clone(),
+        warnings: Vec::new(),
+        created_at: created_at.clone(),
+        updated_at: created_at,
+        exit_code: None,
+    };
+    Ok(SessionRecord {
+        schema_version: SESSION_RECORD_SCHEMA_VERSION,
+        session_id: id.0.clone(),
+        desired_state: DesiredState::Running,
+        transaction: Some(SessionTransaction {
+            id: format!("create-{}", id.0),
+            kind: TransactionKind::Create,
+            phase: "preparing".to_owned(),
+            previous_worker_id: None,
+            previous_runtime_id: None,
+            daemon_instance_id: None,
+        }),
+        info,
+        native_identity_ordering: None,
+        recovery: None,
+        runtime: RuntimeRecord {
+            state: RuntimeState::Starting,
+            worker_id: None,
+            runtime_id: None,
+            service_id: None,
+            generation: None,
+            executable: None,
+            reason: None,
+        },
+    })
+}
+
+/// Extends a failed create's error `msg` with the compensation it left
+/// pending for the supervision retry.
+fn unfinished_compensation_message(msg: &str, id: &SessionId) -> String {
+    format!(
+        "{msg}; session {} keeps its create record until its worktree is removed, \
+         and stays listed as create_compensation_pending while the daemon retries the removal",
+        id.0
+    )
 }
 
 /// Normalize and validate an owner-set session name.
@@ -4129,18 +4849,70 @@ fn worker_error_to_protocol(err: WorkerError) -> ProtocolError {
 }
 
 fn unavailable_runtime_error(id: &SessionId, state: RuntimeState) -> ProtocolError {
-    let code = match state {
+    runtime_error(
+        unavailable_runtime_code(state),
+        format!("session {} runtime is {}", id.0, runtime_state_label(state)),
+    )
+}
+
+fn unavailable_runtime_code(state: RuntimeState) -> &'static str {
+    match state {
         RuntimeState::Lost => "session_runtime_lost",
         RuntimeState::Conflict => "session_runtime_conflict",
         RuntimeState::Incompatible => "worker_protocol_incompatible",
         RuntimeState::Starting | RuntimeState::Reconnecting => "session_runtime_reconnecting",
         RuntimeState::Terminal => "session_not_running",
         RuntimeState::Live => "worker_operation_failed",
+    }
+}
+
+/// Returns the state of an entry whose worker is unreachable but not proven
+/// gone.
+///
+/// Such a worker may still own a live PTY: the daemon cannot stop it through
+/// its control connection, only retire its recorded generation through the
+/// supervisor. Terminal and lost runtimes have ended.
+fn unreachable_live_state(entry: &SessionEntry) -> Option<RuntimeState> {
+    match entry.runtime {
+        RuntimeHandle::Unavailable(RuntimeState::Terminal | RuntimeState::Lost)
+        | RuntimeHandle::Worker(_) => None,
+        RuntimeHandle::Unavailable(state) => Some(state),
+    }
+}
+
+/// Refuses the removal of an unreachable runtime its session cannot retire.
+///
+/// Retirement needs the generation the record names, and a conflict is
+/// retirable only while it is ambiguous whether this session's own worker
+/// still runs. Any other conflict means reconciliation found a job or worker
+/// that is not the recorded generation's, which is never touched.
+fn ensure_retirable(
+    id: &SessionId,
+    entry: &SessionEntry,
+    state: RuntimeState,
+) -> Result<(), ProtocolError> {
+    let refusal = if entry.job.is_none() {
+        "its record names no worker generation to retire"
+    } else if state == RuntimeState::Conflict
+        && entry
+            .info
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.loss_reason.as_deref())
+            != Some(crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS)
+    {
+        "its job or worker is not proven to be the recorded generation's"
+    } else {
+        return Ok(());
     };
-    runtime_error(
-        code,
-        format!("session {} runtime is {}", id.0, runtime_state_label(state)),
-    )
+    Err(runtime_error(
+        unavailable_runtime_code(state),
+        format!(
+            "session {} runtime is {} and {refusal}; stop its worker before removing the session",
+            id.0,
+            runtime_state_label(state)
+        ),
+    ))
 }
 
 fn runtime_state_label(state: RuntimeState) -> &'static str {
@@ -4345,7 +5117,7 @@ fn test_worker_roots(config: &SessionRegistryConfig) -> (PathBuf, PathBuf) {
     // it explicitly.
     let state_base = config.store_path.as_ref().map_or_else(
         || {
-            std::env::temp_dir().join(format!(
+            pohunek_test_support::temp_root().join(format!(
                 "pohunek-daemon-worker-test-{}-{}",
                 std::process::id(),
                 SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -4361,13 +5133,13 @@ fn test_worker_roots(config: &SessionRegistryConfig) -> (PathBuf, PathBuf) {
 
     // The runtime root holds the worker's Unix domain socket
     // (`<runtime_root>/<session_id>/control.sock`), whose path is bound by
-    // `SUN_LEN` (108 bytes on Linux/BSD). The metadata store's temp
+    // `sun_path` (108 bytes on Linux, 104 on Darwin). The metadata store's temp
     // directory embeds a test tag plus a 19-digit nanosecond timestamp and
     // routinely overflows that budget for longer tags, so -- unlike the
     // state root -- the default runtime root always uses a short, unique
-    // path directly under `temp_dir()`, independent of `store_path`.
+    // path directly under the fixture temp root, independent of `store_path`.
     let runtime_root = config.worker_runtime_root.clone().unwrap_or_else(|| {
-        std::env::temp_dir().join(format!(
+        pohunek_test_support::temp_root().join(format!(
             "pw-{}-{}",
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -4378,6 +5150,25 @@ fn test_worker_roots(config: &SessionRegistryConfig) -> (PathBuf, PathBuf) {
         .clone()
         .unwrap_or_else(|| state_base.join("state"));
     (runtime_root, state_root)
+}
+
+/// Supervision inputs for the in-process test launcher.
+///
+/// The in-process launcher serves the generation named by the service ID and
+/// never runs the definition's executable, so the definition only has to
+/// satisfy the job contract.
+#[cfg(test)]
+fn test_supervision(runtime_root: &Path, state_root: &Path) -> SupervisionConfig {
+    crate::runtime::SubprocessWorkerEnvironment {
+        runtime_home: runtime_root.to_path_buf(),
+        state_home: state_root.to_path_buf(),
+        data_home: state_root.to_path_buf(),
+        config_home: state_root.to_path_buf(),
+        cache_home: state_root.to_path_buf(),
+        home: state_root.to_path_buf(),
+        daemon_socket: runtime_root.join("test-daemon.sock"),
+    }
+    .supervision(PathBuf::from("/nonexistent/pohunek-sessiond"))
 }
 
 #[cfg(test)]

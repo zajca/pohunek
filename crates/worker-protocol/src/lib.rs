@@ -11,7 +11,7 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-09-11
+// Rust guideline compliant 2026-09-24
 
 /// Maximum lifetime accepted for a worker-private identity claim.
 ///
@@ -22,6 +22,7 @@ pub const MAX_IDENTITY_CLAIM_TTL_SECS: u64 = 60;
 mod codec;
 mod control;
 mod data;
+mod env;
 mod id;
 mod secret;
 mod token;
@@ -44,6 +45,12 @@ pub use data::{
     TerminalSnapshot, MAX_DATA_HEADER_BYTES, MAX_DATA_PAYLOAD_BYTES,
 };
 #[doc(inline)]
+pub use env::{
+    is_denylisted, validate_pattern, BaseEnv, EnvError, DEFAULT_ENVIRONMENT_ALLOWLIST,
+    MAX_BASE_ENV_BYTES, MAX_BASE_ENV_ENTRIES, MAX_BASE_ENV_NAME_BYTES, MAX_BASE_ENV_VALUE_BYTES,
+    SERVICE_MANAGER_DENYLIST,
+};
+#[doc(inline)]
 pub use id::{
     DaemonId, IdError, LeaseId, RequestId, RuntimeId, SessionId, StreamId, TransactionId, WorkerId,
     WriteId,
@@ -55,6 +62,6 @@ pub use token::{TokenClaims, TokenError, TokenVault};
 #[doc(inline)]
 pub use version::{
     negotiate, Version, VersionError, VersionRange, ATTACH_SNAPSHOT_VERSION,
-    CONTROL_PLANE_OBSERVATION_VERSION, CURRENT_VERSION, PREVIOUS_VERSION,
+    BASE_ENVIRONMENT_VERSION, CONTROL_PLANE_OBSERVATION_VERSION, CURRENT_VERSION, PREVIOUS_VERSION,
     SUBAGENT_OBSERVATION_VERSION, SUPPORTED_RANGE,
 };

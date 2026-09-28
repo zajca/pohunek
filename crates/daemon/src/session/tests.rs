@@ -30,6 +30,7 @@ use crate::external::{external_session_id, TranscriptIndex};
 use crate::integration::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
+use crate::procwatch::readable_host::ReadableHost;
 use crate::procwatch::{
     ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity, ProcessInspector, StartIdentity,
 };
@@ -47,6 +48,11 @@ use super::{
 
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.
 const CONCURRENT_TRANSITION_RETRY_LIMIT: usize = 32;
+
+/// Overall input deadline for tests that assert event ordering rather than
+/// deadline expiry. It only bounds a stalled test: a starved host must not
+/// expire it while a deliberately delayed worker ACK is still pending.
+const ORDERING_TEST_INPUT_DEADLINE: Duration = Duration::from_secs(5);
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static NATIVE_REPORT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -196,18 +202,49 @@ fn terminalizing_running_subagents_restores_public_order() {
     assert_eq!(subagents[1].lifecycle, SubagentLifecycle::Lost);
 }
 
+fn production_supervisor() -> Arc<dyn crate::runtime::WorkerLauncher> {
+    Arc::new(crate::runtime::SubprocessWorkerLauncher::new())
+}
+
+fn production_supervision() -> crate::runtime::SupervisionConfig {
+    crate::runtime::SubprocessWorkerEnvironment {
+        runtime_home: PathBuf::from("/run/user/1000"),
+        state_home: PathBuf::from("/home/user/.local/state"),
+        data_home: PathBuf::from("/home/user/.local/share"),
+        config_home: PathBuf::from("/home/user/.config"),
+        cache_home: PathBuf::from("/home/user/.cache"),
+        home: PathBuf::from("/home/user"),
+        daemon_socket: PathBuf::from("/run/user/1000/pohunek/daemon.sock"),
+    }
+    .supervision(PathBuf::from(
+        "/home/user/.local/libexec/pohunek/1.0.0/pohunek-sessiond",
+    ))
+}
+
 #[test]
 fn production_registry_rejects_missing_durable_worker_backend() {
-    let error = SessionRegistry::new_production(SessionRegistryConfig::default())
-        .expect_err("production registry must fail closed without worker runtime root");
+    let error =
+        SessionRegistry::new_production(SessionRegistryConfig::default(), production_supervisor())
+            .expect_err("production registry must fail closed without worker runtime root");
+    assert_eq!(error.code, "worker_backend_required");
+
+    let unsupervised = SessionRegistryConfig {
+        worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
+        worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
+        ..SessionRegistryConfig::default()
+    };
+    let error = SessionRegistry::new_production(unsupervised, production_supervisor())
+        .expect_err("production registry must fail closed without supervision");
     assert_eq!(error.code, "worker_backend_required");
 
     let configured = SessionRegistryConfig {
         worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
         worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
+        supervision: Some(production_supervision()),
         ..SessionRegistryConfig::default()
     };
-    SessionRegistry::new_production(configured).expect("configured production registry");
+    SessionRegistry::new_production(configured, production_supervisor())
+        .expect("configured production registry");
 }
 
 #[test]
@@ -215,10 +252,11 @@ fn production_registry_rejects_invalid_observation_limits() {
     let config = SessionRegistryConfig {
         worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
         worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
+        supervision: Some(production_supervision()),
         observation_output_bytes: 0,
         ..SessionRegistryConfig::default()
     };
-    let error = SessionRegistry::new_production(config)
+    let error = SessionRegistry::new_production(config, production_supervisor())
         .expect_err("production registry must reject zero observation limits");
     assert_eq!(error.code, "observation_limits_invalid");
 
@@ -226,6 +264,7 @@ fn production_registry_rejects_invalid_observation_limits() {
         SessionRegistryConfig {
             worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
             worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
+            supervision: Some(production_supervision()),
             observation_output_wait: Duration::from_millis(u64::from(
                 protocol::MAX_SESSION_WAIT_MS + 1,
             )),
@@ -234,11 +273,12 @@ fn production_registry_rejects_invalid_observation_limits() {
         SessionRegistryConfig {
             worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
             worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
+            supervision: Some(production_supervision()),
             session_wait: Duration::from_millis(u64::from(protocol::MAX_SESSION_WAIT_MS + 1)),
             ..SessionRegistryConfig::default()
         },
     ] {
-        let error = SessionRegistry::new_production(config)
+        let error = SessionRegistry::new_production(config, production_supervisor())
             .expect_err("production registry must reject waits above the shared ceiling");
         assert_eq!(error.code, "observation_limits_invalid");
     }
@@ -377,11 +417,16 @@ async fn managed_observation_returns_runtime_bound_screen_output_and_wait() {
     let _ = registry.stop(&created.id).await;
 }
 
+// Linux keeps the session's terminal usable for descendants after the
+// session leader exits; XNU revokes it (`proc_exit`), so this drain
+// behavior exists only on Linux. The worker's Darwin counterpart is
+// `root_exit_revokes_the_terminal_and_stop_still_ends_the_group`.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn managed_output_remains_available_until_descendant_pty_eof() {
     use base64::prelude::{Engine as _, BASE64_STANDARD};
 
-    let barrier = tempfile::tempdir().expect("create output barrier");
+    let barrier = pohunek_test_support::tempdir().expect("create output barrier");
     let root_exited = barrier.path().join("root-exited");
     let release = barrier.path().join("release");
     let root_exited_arg = root_exited.to_string_lossy().into_owned();
@@ -479,9 +524,14 @@ async fn managed_output_remains_available_until_descendant_pty_eof() {
     );
 }
 
+// Linux keeps the session's terminal usable for descendants after the
+// session leader exits; XNU revokes it (`proc_exit`), so this drain
+// behavior exists only on Linux. The worker's Darwin counterpart is
+// `root_exit_revokes_the_terminal_and_stop_still_ends_the_group`.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn stop_after_root_exit_terminates_a_descendant_that_keeps_the_pty_open() {
-    let barrier = tempfile::tempdir().expect("create stop barrier");
+    let barrier = pohunek_test_support::tempdir().expect("create stop barrier");
     let root_exited = barrier.path().join("root-exited");
     let descendant_ready = barrier.path().join("descendant-ready");
     let root_exited_arg = root_exited.to_string_lossy().into_owned();
@@ -743,6 +793,7 @@ const LIVE_IDENTITY_REPORTER: &str = r#"import datetime
 import json
 import os
 import socket
+import sys
 import time
 
 reporter_pid = os.fork()
@@ -751,9 +802,24 @@ if reporter_pid != 0:
     raise SystemExit(0)
 
 pid = os.getpid()
-with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
-    fields = handle.read().rsplit(")", 1)[1].split()
-start_identity = int(fields[19])
+
+def process_start_identity(pid):
+    if sys.platform == "darwin":
+        # `struct proc_bsdinfo` from `proc_pidinfo(PROC_PIDTBSDINFO)`: the
+        # kernel start time the worker encodes as microseconds.
+        import ctypes
+        import struct
+
+        libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        buffer = ctypes.create_string_buffer(136)
+        assert libsystem.proc_pidinfo(pid, 3, ctypes.c_uint64(0), buffer, 136) == 136
+        seconds, microseconds = struct.unpack_from("=QQ", buffer, 120)
+        return seconds * 1_000_000 + microseconds
+    with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+        fields = handle.read().rsplit(")", 1)[1].split()
+    return int(fields[19])
+
+start_identity = process_start_identity(pid)
 sequence = int(time.time() * 1000)
 
 def send(request):
@@ -1130,7 +1196,7 @@ fn temp_store_path(tag: &str) -> PathBuf {
         .expect("system time after epoch")
         .as_nanos();
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = pohunek_test_support::temp_root().join(format!(
         "pohunek-session-{tag}-{}-{nanos}-{n}",
         std::process::id(),
     ));
@@ -1286,6 +1352,18 @@ struct ForegroundBlock {
 }
 
 impl MockInspector {
+    /// Returns the scripted fact for `pid`, if any test registered one.
+    fn fact(&self, pid: Pid) -> Option<ProcessFact> {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .descendants
+            .values()
+            .flatten()
+            .find(|fact| fact.pid == pid)
+            .cloned()
+    }
+
     fn set_descendants(&self, root: Pid, facts: Vec<ProcessFact>) {
         let mut inner = self.inner.lock().expect("mock inspector lock");
         for fact in &facts {
@@ -1473,8 +1551,15 @@ impl ProcessInspector for MockInspector {
         {
             return Ok(identity);
         }
-        self.process(pid)
-            .map(|fact| fact.map(|fact| fact.identity()))
+        match self.fact(pid) {
+            Some(fact) => Ok(Some(fact.identity())),
+            // A real process (the session root) is identified the way the
+            // production liveness checks do it: from the kernel process record
+            // alone. A full `process` read also parses the argument region,
+            // which Darwin can serve malformed while the root is still inside
+            // its `sh` -> `bash` -> command exec chain right after launch.
+            None => crate::procwatch::HostInspector::new().identity(pid),
+        }
     }
 
     fn is_running(&self, identity: ProcessIdentity) -> Result<bool, crate::procwatch::Error> {
@@ -1495,16 +1580,7 @@ impl ProcessInspector for MockInspector {
     }
 
     fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, crate::procwatch::Error> {
-        let fact = self
-            .inner
-            .lock()
-            .expect("mock inspector lock")
-            .descendants
-            .values()
-            .flatten()
-            .find(|fact| fact.pid == pid)
-            .cloned();
-        match fact {
+        match self.fact(pid) {
             Some(fact) => Ok(Some(fact)),
             None => crate::procwatch::HostInspector::new().process(pid),
         }
@@ -1767,6 +1843,7 @@ async fn foreign_foreground_process_does_not_hijack_reconciliation() {
         OwnershipMarkers {
             daemon_id: Some("foreign-daemon".to_owned()),
             session_id: Some("foreign-session".to_owned()),
+            runtime_id: None,
         },
     );
     let root_cwd = temp_dir("foreign-foreground-root");
@@ -2632,7 +2709,11 @@ async fn failed_initial_input_rollback_frees_the_bound_worktree() {
         "session must be worktree-bound for this test: {info:?}"
     );
 
-    registry.rollback_failed_initial_input(&info.id, true).await;
+    registry.rollback_failed_initial_input(&info.id).await;
+    assert!(
+        registry.list().await.is_empty(),
+        "the rolled-back session is removed"
+    );
 
     // The worktree bound for this session must be gone so its branch is free.
     let leftover: Vec<_> = std::fs::read_dir(&worktree_root)
@@ -2668,6 +2749,26 @@ fn project_registry(tag: &str) -> (SessionRegistry, PathBuf) {
         worktree_root: Some(worktree_root),
         ..SessionRegistryConfig::default()
     });
+    let repo = init_git_repo(tag);
+    (registry, repo)
+}
+
+/// A project registry whose procwatch never reads a session cwd.
+///
+/// The OSC 7 hints these tests send do not move the real shell, so a host
+/// procwatch scan would report the shell's real cwd between two hints and
+/// race the assertions. With no scripted cwd, only the hints move a session.
+fn hint_registry(tag: &str) -> (SessionRegistry, PathBuf) {
+    let store = temp_store_path(tag);
+    let worktree_root = store.parent().expect("store parent").join("worktrees");
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            store_path: Some(store),
+            worktree_root: Some(worktree_root),
+            ..SessionRegistryConfig::default()
+        },
+        Arc::new(MockInspector::default()),
+    );
     let repo = init_git_repo(tag);
     (registry, repo)
 }
@@ -2766,7 +2867,7 @@ async fn session_new_in_a_non_git_cwd_records_no_project() {
     // A plain shell in a non-git directory: no project, no stamping, today's
     // behavior unchanged.
     let (registry, _repo) = project_registry("non-git");
-    let non_git = std::env::temp_dir().join(format!(
+    let non_git = pohunek_test_support::temp_root().join(format!(
         "pohunek-nongit-{}-{}",
         std::process::id(),
         SystemTime::now()
@@ -2887,7 +2988,7 @@ async fn session_new_branch_with_detected_project_binds_worktree_carrying_projec
 
 #[tokio::test]
 async fn cwd_hint_remaps_between_registered_worktrees() {
-    let (registry, repo) = project_registry("cwd-remap-worktrees");
+    let (registry, repo) = hint_registry("cwd-remap-worktrees");
     let first = registry
         .create(SessionNewParams {
             cwd: Some(repo.clone()),
@@ -2941,6 +3042,70 @@ async fn cwd_hint_remaps_between_registered_worktrees() {
 }
 
 #[tokio::test]
+async fn older_cwd_evidence_never_replaces_newer_evidence() {
+    let (registry, _inspector, created) = mock_procwatch_registry("cwd-evidence-order").await;
+    let launched = created.cwd.clone();
+    let hinted = temp_dir("cwd-evidence-hint");
+    // A procwatch scan read the launch cwd, then an OSC 7 hint landed before
+    // the scan got to apply its result.
+    let scanned = Instant::now();
+    let hinted_at = scanned + Duration::from_millis(1);
+
+    registry
+        .apply_cwd_change(
+            &created.id,
+            hinted.clone(),
+            CwdSource::Osc7,
+            None,
+            hinted_at,
+        )
+        .await;
+    registry
+        .apply_cwd_change(
+            &created.id,
+            launched.clone(),
+            CwdSource::Procwatch,
+            None,
+            scanned,
+        )
+        .await;
+    let kept = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(kept.cwd, hinted);
+    assert_eq!(kept.cwd_source, Some(CwdSource::Osc7));
+
+    // Newer evidence for the same cwd keeps the source that established it.
+    let confirmed_at = hinted_at + Duration::from_millis(1);
+    registry
+        .apply_cwd_change(
+            &created.id,
+            hinted.clone(),
+            CwdSource::Procwatch,
+            None,
+            confirmed_at,
+        )
+        .await;
+    let confirmed = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(confirmed.cwd, hinted);
+    assert_eq!(confirmed.cwd_source, Some(CwdSource::Osc7));
+
+    // Newer evidence of a different cwd moves the session.
+    registry
+        .apply_cwd_change(
+            &created.id,
+            launched.clone(),
+            CwdSource::Procwatch,
+            None,
+            confirmed_at + Duration::from_millis(1),
+        )
+        .await;
+    let moved = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(moved.cwd, launched);
+    assert_eq!(moved.cwd_source, Some(CwdSource::Procwatch));
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
 async fn cwd_hint_into_an_unregistered_repo_registers_no_project() {
     // Regression: cwd hints (OSC 7 / procwatch focus) used to upsert an Auto
     // project record for whatever repo the observed cwd landed in, so a repo a
@@ -2948,7 +3113,7 @@ async fn cwd_hint_into_an_unregistered_repo_registers_no_project() {
     // a nested test-suite daemon — permanently polluted the registry. Hints
     // must only *derive* the association; registration stays on session.new
     // and explicit `project add`.
-    let (registry, repo) = project_registry("hint-no-register");
+    let (registry, repo) = hint_registry("hint-no-register");
     let session = registry
         .create(SessionNewParams {
             cwd: Some(repo),
@@ -3042,7 +3207,7 @@ async fn session_new_with_explicit_non_git_repo_errors() {
     // An explicitly named --repo that is not a git work tree must error, not
     // silently launch a plain shell somewhere else (no silent defaults).
     let (registry, _repo) = project_registry("explicit-nonrepo");
-    let nonrepo = std::env::temp_dir().join(format!(
+    let nonrepo = pohunek_test_support::temp_root().join(format!(
         "pohunek-nonrepo-{}-{}",
         std::process::id(),
         SystemTime::now()
@@ -4052,7 +4217,7 @@ async fn remove_stops_a_live_session_then_evicts() {
 }
 
 #[tokio::test]
-async fn remove_evicts_a_conflicted_runtime_without_stopping_it() {
+async fn remove_refuses_a_conflicted_runtime_not_proven_to_be_its_own() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         stop_grace: Duration::from_millis(50),
@@ -4065,23 +4230,22 @@ async fn remove_evicts_a_conflicted_runtime_without_stopping_it() {
     let entry = sessions.get_mut(&created.id).expect("stopped session");
     entry.info.state = SessionState::Running;
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Conflict);
+    let runtime = entry.info.runtime.as_mut().expect("runtime");
+    runtime.state = RuntimeState::Conflict;
+    runtime.loss_reason = Some(crate::runtime::lifecycle::IDENTITY_MISMATCH.to_owned());
     drop(sessions);
 
-    let removed = registry
+    let error = registry
         .remove(&created.id)
         .await
-        .expect("remove conflicted session");
+        .expect_err("a conflict over a foreign job or worker is never retired");
 
-    assert!(removed.removed);
-    assert!(
-        !removed.stopped,
-        "an unavailable runtime must not be signaled"
-    );
-    let error = registry
+    assert_eq!(error.code, "session_runtime_conflict");
+    let kept = registry
         .inspect(&created.id)
         .await
-        .expect_err("removed session is gone");
-    assert_eq!(error.code, "session_not_found");
+        .expect("the refused session stays listed");
+    assert_eq!(kept.runtime.expect("runtime").state, RuntimeState::Conflict);
 }
 
 #[tokio::test]
@@ -4794,10 +4958,8 @@ async fn session_input_wait_rejects_delayed_provider_framing_before_delivery() {
             })
             .await
             .expect("fire-and-forget keeps provider framing");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let output = read_session_output_after_rejection(&registry, &created.id).await;
+        let output = wait_for_session_output(&registry, &created.id, &["got:next-input"]).await;
         assert!(!output.contains(&marker), "output={output:?}");
-        assert!(output.contains("got:next-input"), "output={output:?}");
         let _ = registry.stop(&created.id).await;
     }
 }
@@ -4959,17 +5121,17 @@ async fn session_input_wait_serializes_activity_snapshot_with_send_start() {
     );
     let mut events = registry.subscribe();
     let send_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_input_send(Arc::clone(&send_boundary));
     let write = tokio::spawn({
         let registry = registry.clone();
         let session_id = created.id.clone();
-        let send_boundary = Arc::clone(&send_boundary);
         async move {
             registry
-                .write_waited_input_at_send_boundary(
+                .write_waited_input_with_ack_delay(
                     &session_id,
                     "serialized-boundary",
-                    tokio::time::Instant::now() + Duration::from_secs(1),
-                    send_boundary,
+                    tokio::time::Instant::now() + ORDERING_TEST_INPUT_DEADLINE,
+                    Duration::ZERO,
                 )
                 .await
         }
@@ -5068,8 +5230,9 @@ async fn session_input_wait_timeout_while_worker_reserved_never_sends_late_input
         })
         .await
         .expect("next input succeeds after timed out reservation");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    // The shell answers exactly one line, so its answer names whichever
+    // input reached it first.
+    let output = wait_for_session_output(&registry, &created.id, &["received:"]).await;
     assert!(
         !output.contains("must-not-arrive-late"),
         "output={output:?}"
@@ -5199,13 +5362,12 @@ async fn session_input_wait_timeout_after_atomic_plan_does_not_stage_body() {
         .await
         .expect("next input task joins")
         .expect("next input succeeds after the late plan ACK is consumed");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let output = read_session_output_after_rejection(&registry, &created.id).await;
-    assert!(
-        output.contains("got:atomic-plan-timeout"),
-        "output={output:?}"
-    );
-    assert!(output.contains("got:next-input"), "output={output:?}");
+    let output = wait_for_session_output(
+        &registry,
+        &created.id,
+        &["got:atomic-plan-timeout", "got:next-input"],
+    )
+    .await;
     assert!(!output.contains("got:atomic-plan-timeoutnext-input"));
     let _ = registry.stop(&created.id).await;
 }
@@ -5268,8 +5430,12 @@ async fn session_input_serializes_waited_transactions() {
         .await
         .expect("second waited task joins")
         .expect("second waited transaction succeeds");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    let output = wait_for_session_output(
+        &registry,
+        &created.id,
+        &["got:first-waited", "got:second-waited"],
+    )
+    .await;
     let first_position = output.find("got:first-waited").expect("first output");
     let second_position = output.find("got:second-waited").expect("second output");
     assert!(first_position < second_position, "output={output:?}");
@@ -5332,8 +5498,12 @@ async fn session_input_serializes_waited_and_fire_and_forget_transactions() {
         .await
         .expect("fire task joins")
         .expect("fire-and-forget transaction succeeds");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    let output = wait_for_session_output(
+        &registry,
+        &created.id,
+        &["got:first-waited", "got:second-fire"],
+    )
+    .await;
     let first_position = output.find("got:first-waited").expect("waited output");
     let second_position = output.find("got:second-fire").expect("fire output");
     assert!(first_position < second_position, "output={output:?}");
@@ -5360,30 +5530,45 @@ async fn session_input_wait_accepts_activity_between_submit_flush_and_ack() {
         .await
         .expect("create Claude session");
     let mut events = registry.subscribe();
-    let reports = tokio::spawn({
+    let send_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_input_send(Arc::clone(&send_boundary));
+    let deadline = tokio::time::Instant::now() + ORDERING_TEST_INPUT_DEADLINE;
+    let write = tokio::spawn({
         let registry = registry.clone();
         let session_id = created.id.clone();
         async move {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            assert!(
-                report_input_activity(&registry, &session_id, AgentActivity::Idle, 1)
-                    .await
-                    .recorded
-            );
-            tokio::time::sleep(Duration::from_millis(225)).await;
-            report_input_activity(&registry, &session_id, AgentActivity::Blocked, 2).await
+            registry
+                .write_waited_input_with_ack_delay(
+                    &session_id,
+                    "submit-boundary",
+                    deadline,
+                    Duration::from_millis(500),
+                )
+                .await
         }
     });
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    send_boundary.wait().await;
+    send_boundary.wait().await;
 
-    let submission = registry
-        .write_waited_input_with_ack_delay(
-            &created.id,
-            "submit-boundary",
-            deadline,
-            Duration::from_millis(500),
-        )
+    // The write holds the session lock until its send starts, so both
+    // reports order after the boundary; the delayed ACK keeps them before it.
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Idle, 1)
+            .await
+            .recorded
+    );
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Blocked, 2)
+            .await
+            .recorded
+    );
+    assert!(
+        !write.is_finished(),
+        "activity must be recorded before the delayed worker acknowledgement"
+    );
+    let submission = write
         .await
+        .expect("write task joins")
         .expect("submit write completes after delayed acknowledgement");
     let result = registry
         .await_input_settled(
@@ -5400,7 +5585,6 @@ async fn session_input_wait_accepts_activity_between_submit_flush_and_ack() {
 
     assert_eq!(result.activity, Some(AgentActivity::Idle));
     assert_eq!(result.activity_source, Some(StateSource::Report));
-    assert!(reports.await.expect("report task joins").recorded);
     let _ = registry.stop(&created.id).await;
 }
 
@@ -5588,7 +5772,7 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
         .parent()
         .expect("store parent")
         .join("worker-state");
-    let worker_runtime_root = std::env::temp_dir().join(format!(
+    let worker_runtime_root = pohunek_test_support::temp_root().join(format!(
         "pw-hook-{}-{}",
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -5706,6 +5890,49 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
     let serialized = serde_json::to_string(subagent).expect("serialize public subagent");
     assert!(!serialized.contains("transcript"));
     assert!(!serialized.contains("prompt"));
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_worker_connection_lost_during_daemon_shutdown_leaves_the_runtime_live() {
+    let store_path = temp_store_path("shutdown-connection-loss");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+
+    registry.begin_daemon_shutdown();
+    // The watcher shares this connection, so its next poll fails as a lost
+    // control connection.
+    worker
+        .release_controller()
+        .await
+        .expect("release the daemon's controller");
+    // The watcher polls its worker every `WORKER_CONNECT_RETRY`; several polls
+    // give it time to act on the lost connection.
+    tokio::time::sleep(super::WORKER_CONNECT_RETRY * 5).await;
+
+    let memory_state = {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get(&created.id).expect("live session entry");
+        entry.info.runtime.as_ref().map(|runtime| runtime.state)
+    };
+    assert_eq!(
+        memory_state,
+        Some(RuntimeState::Live),
+        "the next daemon reconciles the runtime, so shutdown rewrites nothing"
+    );
+    let durable = crate::store::Store::new(store_path)
+        .load_sessions()
+        .expect("load durable sessions")
+        .pop()
+        .expect("durable record");
+    assert_eq!(durable.runtime.state, RuntimeState::Live);
 
     let _ = registry.stop(&created.id).await;
 }
@@ -6557,10 +6784,11 @@ async fn lost_transition_preserves_worker_metadata_committed_ahead_of_memory() {
 
     assert!(matches!(
         registry
-            .mark_worker_lost(
+            .mark_worker_unavailable(
                 &created.id,
                 &identity,
-                &WorkerError::Protocol("test lost after durable metadata".to_owned()),
+                RuntimeState::Lost,
+                crate::session::supervision::RUNTIME_LOST,
             )
             .await,
         super::RuntimeTransitionOutcome::Applied(_)
@@ -6774,12 +7002,6 @@ async fn session_input_wait_resnapshots_after_broadcast_lag() {
         .input_activity_snapshot(&created.id, None)
         .await
         .expect("snapshot activity");
-    let submission = InputSubmission {
-        runtime: submitted_revision.runtime.clone(),
-        activity_epoch: registry.daemon_instance_id().to_owned(),
-        after_revision: submitted_revision.revision,
-        deadline: tokio::time::Instant::now() + Duration::from_millis(250),
-    };
     for sequence in 1..=130 {
         assert!(
             report_input_activity(&registry, &created.id, AgentActivity::Working, sequence,)
@@ -6792,6 +7014,14 @@ async fn session_input_wait_resnapshots_after_broadcast_lag() {
             .await
             .recorded
     );
+    // The deadline starts after the report burst so a slow host cannot place
+    // the Idle evidence past it; the burst is setup, not the bounded wait.
+    let submission = InputSubmission {
+        runtime: submitted_revision.runtime.clone(),
+        activity_epoch: registry.daemon_instance_id().to_owned(),
+        after_revision: submitted_revision.revision,
+        deadline: tokio::time::Instant::now() + Duration::from_millis(250),
+    };
 
     let result = registry
         .await_input_settled(
@@ -6827,12 +7057,6 @@ async fn session_input_wait_uses_rapid_target_event_after_latest_state_changes()
         .input_activity_snapshot(&created.id, None)
         .await
         .expect("capture submitted revision");
-    let submission = InputSubmission {
-        runtime: submitted.runtime.clone(),
-        activity_epoch: registry.daemon_instance_id().to_owned(),
-        after_revision: submitted.revision,
-        deadline: tokio::time::Instant::now() + Duration::from_millis(250),
-    };
 
     assert!(
         report_input_activity(&registry, &created.id, AgentActivity::Idle, 1)
@@ -6852,6 +7076,14 @@ async fn session_input_wait_uses_rapid_target_event_after_latest_state_changes()
             .activity,
         Some(AgentActivity::Working)
     );
+    // The deadline starts after the reports so a slow host cannot place the
+    // Idle evidence past it.
+    let submission = InputSubmission {
+        runtime: submitted.runtime.clone(),
+        activity_epoch: registry.daemon_instance_id().to_owned(),
+        after_revision: submitted.revision,
+        deadline: tokio::time::Instant::now() + Duration::from_millis(250),
+    };
 
     let result = registry
         .await_input_settled(
@@ -7120,48 +7352,43 @@ async fn session_input_wait_deduplicates_targets_and_requires_new_event() {
         .await
         .expect("create shell session");
     let mut events = registry.subscribe();
+    let send_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_input_send(Arc::clone(&send_boundary));
 
-    let report_task = tokio::spawn({
+    let input = tokio::spawn({
         let registry = registry.clone();
         let session_id = created.id.clone();
         async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
             registry
-                .report_agent(protocol::SessionReportAgentParams {
+                .input(protocol::SessionInputParams {
                     session_id,
-                    source: "test:pohunek-input-wait".to_owned(),
-                    agent: "codex".to_owned(),
-                    activity: Some(AgentActivity::Idle),
-                    seq: Some(protocol::ReportSequence::new(1)),
-                    pid: None,
-                    agent_session_id: None,
-                    agent_session_path: None,
+                    text: "\n".to_owned(),
+                    wait: Some(protocol::SessionInputWait {
+                        until: Some(vec![
+                            AgentActivity::Idle,
+                            AgentActivity::Blocked,
+                            AgentActivity::Idle,
+                        ]),
+                        timeout_ms: Some(1_000),
+                    }),
                 })
                 .await
         }
     });
+    send_boundary.wait().await;
+    send_boundary.wait().await;
 
-    let result = registry
-        .input(protocol::SessionInputParams {
-            session_id: created.id.clone(),
-            text: "\n".to_owned(),
-            wait: Some(protocol::SessionInputWait {
-                until: Some(vec![
-                    AgentActivity::Idle,
-                    AgentActivity::Blocked,
-                    AgentActivity::Idle,
-                ]),
-                timeout_ms: Some(1_000),
-            }),
-        })
+    // Ordered after the input boundary: the write keeps the session lock
+    // until its send starts.
+    let report = report_input_activity(&registry, &created.id, AgentActivity::Idle, 1).await;
+    assert!(report.recorded);
+    let result = input
         .await
+        .expect("input task joins")
         .expect("input waits for a new matching state event");
     assert!(result.accepted);
     assert_eq!(result.activity, Some(AgentActivity::Idle));
     assert_eq!(result.activity_source, Some(StateSource::Report));
-
-    let report = report_task.await.expect("report task joins");
-    assert!(report.recorded);
     while let Ok(event) = tokio::time::timeout(Duration::from_millis(20), events.recv()).await {
         let _ = event;
     }
@@ -7175,6 +7402,23 @@ async fn read_session_output_after_rejection(registry: &SessionRegistry, id: &Se
         .await
         .expect("inspect terminal after rejected input");
     output.visible_lines.join("\n")
+}
+
+/// Polls the session screen until it shows every needle, so positive output
+/// assertions do not depend on how quickly the PTY program answers.
+async fn wait_for_session_output(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    needles: &[&str],
+) -> String {
+    for _ in 0..500 {
+        let output = read_session_output_after_rejection(registry, id).await;
+        if needles.iter().all(|needle| output.contains(needle)) {
+            return output;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for session output to contain {needles:?}");
 }
 
 fn observable_input_shell() -> ShellCommand {
@@ -8698,6 +8942,7 @@ async fn procwatch_skips_agents_owned_by_another_daemon_or_session() {
         OwnershipMarkers {
             daemon_id: Some("d-foreign".to_owned()),
             session_id: Some("s-1".to_owned()),
+            runtime_id: None,
         },
     );
     registry
@@ -8724,6 +8969,7 @@ async fn procwatch_skips_agents_owned_by_another_daemon_or_session() {
         OwnershipMarkers {
             daemon_id: Some(registry.daemon_instance_id().to_owned()),
             session_id: Some(format!("{}-other", created.id.0)),
+            runtime_id: None,
         },
     );
     registry
@@ -8741,6 +8987,7 @@ async fn procwatch_skips_agents_owned_by_another_daemon_or_session() {
         OwnershipMarkers {
             daemon_id: Some(registry.daemon_instance_id().to_owned()),
             session_id: Some(created.id.0.clone()),
+            runtime_id: None,
         },
     );
     registry
@@ -8775,6 +9022,7 @@ async fn external_rescan_skips_processes_marked_by_any_pohunek_daemon() {
         OwnershipMarkers {
             daemon_id: Some("d-foreign".to_owned()),
             session_id: None,
+            runtime_id: None,
         },
     );
 
@@ -9579,10 +9827,11 @@ async fn stale_runtime_watchers_emit_nothing_during_new_runtime_commit() {
         )
         .await;
     registry
-        .mark_worker_lost(
+        .mark_worker_unavailable(
             &created.id,
             &expected_old,
-            &WorkerError::Protocol("test disconnect".to_owned()),
+            RuntimeState::Lost,
+            crate::session::supervision::RUNTIME_LOST,
         )
         .await;
     assert!(
@@ -9775,10 +10024,11 @@ async fn lost_transition_retries_precommit_failure_before_single_event() {
 
     assert!(matches!(
         registry
-            .mark_worker_lost(
+            .mark_worker_unavailable(
                 &created.id,
                 &expected,
-                &WorkerError::Protocol("test lost".to_owned()),
+                RuntimeState::Lost,
+                crate::session::supervision::RUNTIME_LOST,
             )
             .await,
         super::RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
@@ -9980,7 +10230,14 @@ async fn spontaneous_exit_uses_durable_base_after_uncaptured_resize() {
         .inspect(&created.id)
         .await
         .expect("inspect committed terminal session");
-    let event_info = next_session_updated(&mut events).await;
+    // Process observation may publish a live update (e.g. the procwatch cwd)
+    // before the exit commit; the terminal update is the one under test.
+    let event_info = loop {
+        let info = next_session_updated(&mut events).await;
+        if info.state.is_terminal() {
+            break info;
+        }
+    };
     assert_eq!(registry_info, durable.info);
     assert_eq!(event_info, durable.info);
     assert_no_runtime_event(&mut events).await;
@@ -10029,9 +10286,16 @@ async fn assert_lost_transition_applied(
     id: &SessionId,
     expected: &RuntimeWatchIdentity,
 ) {
-    let error = WorkerError::Protocol("test lost retry".to_owned());
     for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
-        match registry.mark_worker_lost(id, expected, &error).await {
+        match registry
+            .mark_worker_unavailable(
+                id,
+                expected,
+                RuntimeState::Lost,
+                crate::session::supervision::RUNTIME_LOST,
+            )
+            .await
+        {
             super::RuntimeTransitionOutcome::Applied(_) => return,
             super::RuntimeTransitionOutcome::RetryableConcurrentChange => {
                 tokio::task::yield_now().await;
@@ -11189,7 +11453,16 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
         loss_reason: Some("test_runtime_lost".to_owned()),
     });
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
+    let lost_job = entry.job.clone().expect("created session records its job");
     drop(sessions);
+    // A lost runtime has no worker left: retire the retained terminal worker
+    // so the supervisor evidence matches the injected `Lost` state.
+    registry
+        .lifecycle()
+        .expect("test registry supervises workers")
+        .retire(&lost_job)
+        .await
+        .expect("retire the lost generation");
     let mut events = registry.subscribe();
 
     let resumed = registry
@@ -12522,17 +12795,129 @@ async fn session_diff_registry_end_to_end_reflects_worktree_changes_against_the_
 /// A registry whose sessions exit immediately, with the metadata store and
 /// worktree binding enabled so a sweep exercises the real removal path.
 fn retention_registry(tag: &str) -> (SessionRegistry, PathBuf, PathBuf) {
+    retention_registry_over(tag, Arc::new(ReadableHost::new()))
+}
+
+fn retention_registry_over(
+    tag: &str,
+    inspector: Arc<dyn ProcessInspector>,
+) -> (SessionRegistry, PathBuf, PathBuf) {
     let store = temp_store_path(tag);
     let data_dir = store.parent().expect("store parent").to_path_buf();
     let worktree_root = data_dir.join("worktrees");
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: ShellCommand::new("/bin/sh", ["-c", "true"]),
-        stop_grace: Duration::from_millis(50),
-        store_path: Some(store),
-        worktree_root: Some(worktree_root.clone()),
-        ..SessionRegistryConfig::default()
-    });
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "true"]),
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store),
+            worktree_root: Some(worktree_root.clone()),
+            ..SessionRegistryConfig::default()
+        },
+        inspector,
+    );
     (registry, data_dir, worktree_root)
+}
+
+/// PID of the scripted unreadable candidate of [`UnreadableCandidateHost`].
+///
+/// Above every PID Linux (`pid_max` is at most 2^22) or Darwin can assign, so
+/// it never names a real process that could be signalled.
+const UNREADABLE_CANDIDATE_PID: Pid = Pid::MAX;
+
+/// The [`ReadableHost`] view plus one optional scripted same-user process
+/// whose ownership markers cannot be read.
+#[derive(Debug, Default)]
+struct UnreadableCandidateHost {
+    readable: ReadableHost,
+    candidate: AtomicBool,
+}
+
+impl UnreadableCandidateHost {
+    fn set_candidate(&self, present: bool) {
+        self.candidate.store(present, Ordering::Release);
+    }
+
+    fn scripts_candidate(&self, pid: Pid) -> bool {
+        pid == UNREADABLE_CANDIDATE_PID && self.candidate.load(Ordering::Acquire)
+    }
+}
+
+impl ProcessInspector for UnreadableCandidateHost {
+    fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, crate::procwatch::Error> {
+        // The candidate's start is never proven older than a worker, so only a
+        // sweep without a worker bound still counts it as possibly marked.
+        if pid == UNREADABLE_CANDIDATE_PID {
+            return Ok(None);
+        }
+        self.readable.identity(pid)
+    }
+
+    fn is_running(&self, identity: ProcessIdentity) -> Result<bool, crate::procwatch::Error> {
+        self.readable.is_running(identity)
+    }
+
+    fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, crate::procwatch::Error> {
+        self.readable.parent_pid(pid)
+    }
+
+    fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, crate::procwatch::Error> {
+        self.readable.process(pid)
+    }
+
+    fn same_user_processes(&self) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
+        let mut processes = self.readable.same_user_processes()?;
+        if self.scripts_candidate(UNREADABLE_CANDIDATE_PID) {
+            processes.push(ProcessFact {
+                pid: UNREADABLE_CANDIDATE_PID,
+                pgid: UNREADABLE_CANDIDATE_PID,
+                ppid: 1,
+                start_identity: StartIdentity::new(1),
+                comm: "unreadable".to_owned(),
+                cmdline: Vec::new(),
+            });
+        }
+        Ok(processes)
+    }
+
+    fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
+        self.readable.descendants(root)
+    }
+
+    fn descendant_identities(
+        &self,
+        root: ProcessIdentity,
+    ) -> Result<Vec<ProcessIdentity>, crate::procwatch::Error> {
+        self.readable.descendant_identities(root)
+    }
+
+    fn cwd(&self, pid: Pid) -> Result<PathBuf, crate::procwatch::Error> {
+        self.readable.cwd(pid)
+    }
+
+    fn executable(&self, pid: Pid) -> Result<Option<PathBuf>, crate::procwatch::Error> {
+        self.readable.executable(pid)
+    }
+
+    fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, crate::procwatch::Error> {
+        self.readable.exit_watch(identity)
+    }
+
+    fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, crate::procwatch::Error> {
+        if self.scripts_candidate(pid) {
+            return Err(crate::procwatch::Error::from_io(
+                "test_markers",
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ));
+        }
+        self.readable.ownership_markers(pid)
+    }
+
+    fn foreground_process_group(
+        &self,
+        root_pid: Pid,
+    ) -> Result<Option<Pid>, crate::procwatch::Error> {
+        self.readable.foreground_process_group(root_pid)
+    }
 }
 
 /// The shortest policy the validator accepts, so a backdated session ages out
@@ -12764,6 +13149,70 @@ async fn retention_sweep_counts_a_removal_it_could_not_complete() {
     );
 }
 
+/// Pins the removal of a runtime that only the record names (no worker
+/// journal, so no worker start bounds its sweep): an unreadable same-user
+/// process may carry its marker, so the removal stays refused until that
+/// process is gone. A journaled runtime dismisses the same process through its
+/// worker's start identity. Issue #190 tracks bounding the record-only case.
+#[tokio::test]
+async fn removal_of_a_record_only_runtime_is_refused_while_an_unreadable_process_remains() {
+    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+        "remove-record-only",
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
+    let journaled = exited_session(&registry, None).await;
+    let record_only = exited_session(&registry, None).await;
+    // A generation whose worker never journaled leaves the record as the only
+    // evidence of its runtime.
+    let journals = registry
+        .inner
+        .config
+        .worker_state_root
+        .as_ref()
+        .expect("worker state root")
+        .join(&record_only.id.0);
+    let mut removed_journals = 0;
+    for journal in fs::read_dir(&journals).expect("read the session's journals") {
+        let journal = journal.expect("journal entry").path();
+        if journal
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            fs::remove_file(&journal).expect("remove the worker journal");
+            removed_journals += 1;
+        }
+    }
+    assert!(removed_journals > 0, "the worker journaled its runtime");
+    inspector.set_candidate(true);
+
+    registry
+        .remove(&journaled.id)
+        .await
+        .expect("the worker's start identity bounds a journaled runtime's sweep");
+    let refused = registry
+        .remove(&record_only.id)
+        .await
+        .expect_err("an unbounded sweep cannot dismiss an unreadable process");
+    assert_eq!(
+        refused.code,
+        crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS,
+        "{refused:?}"
+    );
+    assert_eq!(
+        session_ids(&registry).await,
+        vec![record_only.id.0.clone()],
+        "a refused removal leaves the session in place"
+    );
+
+    inspector.set_candidate(false);
+    registry
+        .remove(&record_only.id)
+        .await
+        .expect("the removal completes once no unreadable process remains");
+    assert!(session_ids(&registry).await.is_empty());
+}
+
 #[tokio::test]
 async fn retention_sweep_reports_a_worktree_it_could_not_delete() {
     let (registry, _data_dir, worktree_root) = retention_registry("sweep-debris");
@@ -12869,4 +13318,1845 @@ async fn the_worktree_probe_budget_holds_every_candidate_it_could_not_inspect() 
         Some(protocol::SessionRetentionHold::WorktreeUnknown),
         "an uninspected candidate is unproven, so it is kept"
     );
+}
+
+fn scripted_registry(
+    config: SessionRegistryConfig,
+) -> (
+    SessionRegistry,
+    Arc<crate::runtime::lifecycle::tests::ScriptedSupervisor>,
+) {
+    let mut config = config;
+    let (runtime_root, state_root) = super::test_worker_roots(&config);
+    config.worker_runtime_root = Some(runtime_root.clone());
+    config.worker_state_root = Some(state_root.clone());
+    config.supervision = Some(super::test_supervision(&runtime_root, &state_root));
+    let mut supervisor = crate::runtime::lifecycle::tests::ScriptedSupervisor::over(
+        crate::runtime::InProcessWorkerLauncher::new(runtime_root, state_root),
+    );
+    if let Some(store) = config.store_path.clone() {
+        supervisor = supervisor.recording_store(store);
+    }
+    let supervisor = Arc::new(supervisor);
+    let registry = SessionRegistry::new_with_launcher_and_inspector(
+        config,
+        Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
+        Arc::new(ReadableHost::new()),
+    );
+    (registry, supervisor)
+}
+
+fn stored_record(store_path: &std::path::Path, id: &SessionId) -> crate::store::SessionRecord {
+    crate::store::Store::new(store_path.to_path_buf())
+        .load_sessions()
+        .expect("load session records")
+        .into_iter()
+        .find(|record| record.session_id == id.0)
+        .expect("session record")
+}
+
+/// Bound on waiting for a detached registration to commit.
+const DETACHED_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[tokio::test]
+async fn create_persists_the_generation_before_starting_its_job() {
+    let store_path = temp_store_path("lifecycle-persist-first");
+    let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+
+    let created = registry.create(params()).await.expect("create session");
+
+    let started = supervisor.started();
+    let [job] = started.as_slice() else {
+        panic!("exactly one generation starts: {started:?}");
+    };
+    let key = pohunek_platform::supervisor::WorkerKey::from_service_id(job).expect("worker job");
+    assert_eq!(key.session_id(), created.id.0);
+    assert_eq!(
+        supervisor.persisted_at_start(),
+        [Some(key.generation().to_owned())],
+        "the preparing record names the generation before it is registered"
+    );
+    let record = stored_record(&store_path, &created.id);
+    assert_eq!(record.runtime.service_id.as_deref(), Some(job.as_str()));
+    assert_eq!(record.runtime.generation.as_deref(), Some(key.generation()));
+    assert_eq!(
+        record.runtime.executable.as_deref(),
+        Some(std::path::Path::new("/nonexistent/pohunek-sessiond"))
+    );
+    registry.remove(&created.id).await.expect("remove session");
+    assert_eq!(
+        supervisor.retired(),
+        std::slice::from_ref(job),
+        "removal retires the exact job"
+    );
+    assert!(supervisor.live_jobs().await.is_empty());
+}
+
+#[tokio::test]
+async fn dropping_create_after_start_still_converges_to_one_generation() {
+    let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    supervisor.hold_start(gate.clone());
+
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.create(params()).await }
+    });
+    gate.entered.notified().await;
+    creating.abort();
+    assert!(
+        creating
+            .await
+            .expect_err("create was dropped")
+            .is_cancelled(),
+        "the client-facing create future is gone"
+    );
+    gate.release.notify_one();
+
+    let session = tokio::time::timeout(DETACHED_COMMIT_TIMEOUT, async {
+        loop {
+            let sessions = registry.list().await;
+            if let [session] = sessions.as_slice() {
+                if session
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.state == RuntimeState::Live)
+                {
+                    return session.clone();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the detached registration commits the session");
+
+    let started = supervisor.started();
+    assert_eq!(started.len(), 1, "no second generation: {started:?}");
+    assert_eq!(supervisor.live_jobs().await, started);
+    assert!(supervisor.retired().is_empty());
+    registry.stop(&session.id).await.expect("stop session");
+}
+
+#[tokio::test]
+async fn unavailable_supervision_during_create_leaves_a_reconnecting_session() {
+    let store_path = temp_store_path("lifecycle-unavailable");
+    let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    supervisor.script_starts([crate::runtime::lifecycle::tests::StartStep::Fail]);
+    supervisor.script_inspects([crate::runtime::lifecycle::tests::InspectStep::Unavailable]);
+
+    let error = registry
+        .create(params())
+        .await
+        .expect_err("supervisor outage");
+
+    assert_eq!(
+        error.code,
+        crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE
+    );
+    assert!(supervisor.retired().is_empty(), "nothing is killed");
+    let sessions = registry.list().await;
+    let [session] = sessions.as_slice() else {
+        panic!("the session stays visible for reconciliation: {sessions:?}");
+    };
+    let runtime = session.runtime.as_ref().expect("runtime");
+    assert_eq!(runtime.state, RuntimeState::Reconnecting);
+    assert_eq!(
+        runtime.loss_reason.as_deref(),
+        Some(crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE)
+    );
+    let record = stored_record(&store_path, &session.id);
+    assert_eq!(record.runtime.state, RuntimeState::Reconnecting);
+    assert_eq!(
+        record.runtime.service_id.as_deref(),
+        supervisor
+            .started()
+            .first()
+            .map(pohunek_platform::supervisor::ServiceId::as_str),
+        "the untouched job stays recorded"
+    );
+}
+
+/// A scripted registry that binds worktrees, with a `session.new` on
+/// `branch` held at its job start.
+///
+/// At the hold the worktree is bound and the preparing record names the
+/// generation, so a test can arrange how the rest of the create ends before
+/// releasing it.
+struct HeldWorktreeCreate {
+    registry: SessionRegistry,
+    supervisor: Arc<crate::runtime::lifecycle::tests::ScriptedSupervisor>,
+    store_path: PathBuf,
+    repo: PathBuf,
+    creating: tokio::task::JoinHandle<Result<SessionInfo, protocol::ProtocolError>>,
+    release: Arc<tokio::sync::Notify>,
+    id: SessionId,
+    service_id: pohunek_platform::supervisor::ServiceId,
+    worktree: PathBuf,
+}
+
+impl HeldWorktreeCreate {
+    async fn start(tag: &str, branch: &str) -> Self {
+        let store_path = temp_store_path(tag);
+        let worktree_root = store_path.parent().expect("store parent").join("worktrees");
+        let repo = init_git_repo(tag);
+        let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path.clone()),
+            worktree_root: Some(worktree_root),
+            ..SessionRegistryConfig::default()
+        });
+        let gate = crate::runtime::lifecycle::tests::StartGate {
+            session_id: None,
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        supervisor.hold_start(gate.clone());
+        let creating = tokio::spawn({
+            let registry = registry.clone();
+            let params = SessionNewParams {
+                cwd: None,
+                repo: Some(repo.clone()),
+                branch: Some(branch.to_owned()),
+                ..params()
+            };
+            async move { registry.create(params).await }
+        });
+        gate.entered.notified().await;
+        let records = crate::store::Store::new(store_path.clone())
+            .load_sessions()
+            .expect("load preparing record");
+        let [record] = records.as_slice() else {
+            panic!("one preparing record: {records:?}");
+        };
+        let service_id = pohunek_platform::supervisor::ServiceId::parse(
+            record
+                .runtime
+                .service_id
+                .clone()
+                .expect("the preparing record names its job"),
+        )
+        .expect("service id");
+        let worktree = record
+            .info
+            .worktree_path
+            .clone()
+            .expect("the preparing record names its worktree");
+        // Uncommitted work a forced removal would destroy.
+        std::fs::write(worktree.join("uncommitted.txt"), "agent work").expect("write work");
+        Self {
+            id: SessionId(record.session_id.clone()),
+            registry,
+            supervisor,
+            store_path,
+            repo,
+            creating,
+            release: gate.release,
+            service_id,
+            worktree,
+        }
+    }
+
+    /// Makes the commit of the held create's session entry fail.
+    fn fail_entry_commit(&self) {
+        self.registry
+            .inner
+            .store
+            .as_ref()
+            .expect("registry store")
+            .fail_next_write_before_rename();
+    }
+
+    /// Makes every later inspection and retirement of the held job fail as
+    /// an unreachable manager, so no retry can prove it ended.
+    fn keep_supervisor_unavailable(&self) {
+        self.supervisor.script_job(
+            self.service_id.clone(),
+            crate::runtime::lifecycle::tests::JobScript::Unavailable,
+        );
+    }
+
+    /// The create's outcome as its client sees it.
+    async fn outcome(&mut self) -> Result<SessionInfo, protocol::ProtocolError> {
+        tokio::time::timeout(DETACHED_COMMIT_TIMEOUT, &mut self.creating)
+            .await
+            .expect("create finishes")
+            .expect("create task joins")
+    }
+
+    /// Drops the client-facing create future while its job start is held.
+    async fn drop_client(&mut self) {
+        self.creating.abort();
+        assert!(
+            (&mut self.creating)
+                .await
+                .expect_err("create was dropped")
+                .is_cancelled(),
+            "the client-facing create future is gone"
+        );
+    }
+
+    /// Waits until the detached create transaction released the session.
+    async fn settled(&self) {
+        drop(
+            tokio::time::timeout(
+                DETACHED_COMMIT_TIMEOUT,
+                self.registry.lock_lifecycle(&self.id),
+            )
+            .await
+            .expect("the detached create transaction finishes"),
+        );
+    }
+
+    fn binding_exists(&self) -> bool {
+        crate::store::Store::new(self.store_path.clone())
+            .load_worktrees()
+            .expect("load worktree bindings")
+            .iter()
+            .any(|binding| binding.session_id == self.id.0)
+    }
+
+    fn record_exists(&self) -> bool {
+        crate::store::Store::new(self.store_path.clone())
+            .load_sessions()
+            .expect("load session records")
+            .iter()
+            .any(|record| record.session_id == self.id.0)
+    }
+
+    fn assert_worktree_kept(&self) {
+        assert_eq!(
+            std::fs::read_to_string(self.worktree.join("uncommitted.txt")).ok(),
+            Some("agent work".to_owned()),
+            "a possibly live runtime keeps its checkout and work"
+        );
+        assert!(self.binding_exists(), "the worktree binding is kept");
+        assert!(
+            self.record_exists(),
+            "the record is kept for reconciliation"
+        );
+    }
+
+    async fn assert_worktree_removed_and_branch_reusable(&self, branch: &str) {
+        assert!(
+            !self.worktree.exists(),
+            "the proven-ended create's worktree is removed: {}",
+            self.worktree.display()
+        );
+        assert!(!self.binding_exists(), "the worktree binding is dropped");
+        assert!(!self.record_exists(), "the preparing record is deleted");
+        assert!(
+            self.registry.list().await.is_empty(),
+            "nothing of the failed create stays listed"
+        );
+        let retried = self
+            .registry
+            .create(SessionNewParams {
+                cwd: None,
+                repo: Some(self.repo.clone()),
+                branch: Some(branch.to_owned()),
+                ..params()
+            })
+            .await
+            .expect("the freed branch binds again");
+        self.registry
+            .stop(&retried.id)
+            .await
+            .expect("stop the retried session");
+    }
+
+    async fn assert_reconnecting(&self) {
+        let sessions = self.registry.list().await;
+        let [session] = sessions.as_slice() else {
+            panic!("the session stays visible for reconciliation: {sessions:?}");
+        };
+        assert_eq!(session.id, self.id);
+        let runtime = session.runtime.as_ref().expect("runtime");
+        assert_eq!(runtime.state, RuntimeState::Reconnecting);
+        assert_eq!(session.worktree_path.as_ref(), Some(&self.worktree));
+    }
+}
+
+#[tokio::test]
+async fn failed_entry_commit_with_an_unconfirmed_retire_keeps_the_worktree() {
+    let mut held = HeldWorktreeCreate::start("wt-commit-unconfirmed", "feat/kept").await;
+    held.fail_entry_commit();
+    held.keep_supervisor_unavailable();
+    held.release.notify_one();
+
+    let error = held.outcome().await.expect_err("the entry cannot commit");
+
+    assert_eq!(
+        error.code,
+        crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE
+    );
+    assert!(
+        error.msg.contains("keeps its worktree")
+            && error.msg.contains(&held.worktree.display().to_string()),
+        "the error names the kept worktree: {error:?}"
+    );
+    assert_eq!(held.supervisor.retired(), [held.service_id.clone()]);
+    held.assert_worktree_kept();
+    held.assert_reconnecting().await;
+}
+
+#[tokio::test]
+async fn failed_entry_commit_with_a_confirmed_retire_removes_the_worktree() {
+    let mut held = HeldWorktreeCreate::start("wt-commit-retired", "feat/retired").await;
+    held.fail_entry_commit();
+    held.release.notify_one();
+
+    let error = held.outcome().await.expect_err("the entry cannot commit");
+
+    assert_eq!(error.code, "session_store_failed", "got: {error:?}");
+    assert_eq!(held.supervisor.retired(), [held.service_id.clone()]);
+    held.assert_worktree_removed_and_branch_reusable("feat/retired")
+        .await;
+}
+
+#[tokio::test]
+async fn dropped_create_ending_cleaned_still_removes_its_worktree() {
+    let mut held = HeldWorktreeCreate::start("wt-dropped-cleaned", "feat/dropped").await;
+    held.drop_client().await;
+    held.fail_entry_commit();
+    held.release.notify_one();
+
+    held.settled().await;
+
+    assert_eq!(held.supervisor.retired(), [held.service_id.clone()]);
+    held.assert_worktree_removed_and_branch_reusable("feat/dropped")
+        .await;
+}
+
+#[tokio::test]
+async fn dropped_create_with_an_unconfirmed_retire_keeps_its_worktree() {
+    let mut held = HeldWorktreeCreate::start("wt-dropped-unconfirmed", "feat/kept-dropped").await;
+    held.drop_client().await;
+    held.fail_entry_commit();
+    held.keep_supervisor_unavailable();
+    held.release.notify_one();
+
+    held.settled().await;
+
+    assert_eq!(held.supervisor.retired(), [held.service_id.clone()]);
+    held.assert_worktree_kept();
+    held.assert_reconnecting().await;
+}
+
+#[tokio::test]
+async fn unconfirmed_create_is_compensated_with_its_worktree_once_its_job_ends() {
+    let mut held = HeldWorktreeCreate::start("wt-retry-compensated", "feat/retried").await;
+    let (barrier, mut passes) = tokio::sync::mpsc::unbounded_channel();
+    held.registry
+        .inner
+        .supervision_retries
+        .state
+        .lock()
+        .expect("supervision retry state is never poisoned")
+        .pass_finished = Some(barrier);
+    // The job start fails before any worker runs, so no worker journal
+    // exists, and the supervisor cannot tell what is left of the job.
+    held.supervisor
+        .script_starts([crate::runtime::lifecycle::tests::StartStep::Fail]);
+    held.keep_supervisor_unavailable();
+    held.release.notify_one();
+
+    let error = held.outcome().await.expect_err("supervisor outage");
+    assert_eq!(
+        error.code,
+        crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE
+    );
+    assert!(held.supervisor.retired().is_empty(), "nothing is retired");
+    held.assert_worktree_kept();
+    held.assert_reconnecting().await;
+
+    // The supervisor answers again: the job ended without a process.
+    held.supervisor.script_job(
+        held.service_id.clone(),
+        crate::runtime::lifecycle::tests::JobScript::Present {
+            state: pohunek_platform::supervisor::ServiceState::Failed,
+            process: None,
+            definition: None,
+        },
+    );
+    // A pass that ran before the supervisor recovered leaves the session
+    // pending; the first pass that sees the ended job compensates it.
+    tokio::time::timeout(DETACHED_COMMIT_TIMEOUT, async {
+        loop {
+            let (pass, resume) = passes.recv().await.expect("retry barrier open");
+            resume
+                .send(())
+                .expect("the retry loop waits at the barrier");
+            if pass == held.id && !held.record_exists() {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the supervision retry compensates the ended create");
+
+    assert_eq!(held.supervisor.retired(), [held.service_id.clone()]);
+    held.assert_worktree_removed_and_branch_reusable("feat/retried")
+        .await;
+}
+
+/// A worktree-binding daemon configuration whose store and worker roots are
+/// fixed, so a registry built again from it models a daemon restart.
+struct RestartableDaemon {
+    config: SessionRegistryConfig,
+    store_path: PathBuf,
+    repo: PathBuf,
+}
+
+impl RestartableDaemon {
+    fn new(tag: &str) -> Self {
+        let store_path = temp_store_path(tag);
+        let worktree_root = store_path.parent().expect("store parent").join("worktrees");
+        let mut config = SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path.clone()),
+            worktree_root: Some(worktree_root),
+            ..SessionRegistryConfig::default()
+        };
+        let (runtime_root, state_root) = super::test_worker_roots(&config);
+        config.supervision = Some(super::test_supervision(&runtime_root, &state_root));
+        config.worker_runtime_root = Some(runtime_root);
+        config.worker_state_root = Some(state_root);
+        Self {
+            config,
+            store_path,
+            repo: init_git_repo(tag),
+        }
+    }
+
+    /// The configuration with a shell program that does not exist, so a
+    /// create fails building its launch command after binding its target.
+    fn without_shell(&self) -> SessionRegistryConfig {
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new(
+                "/nonexistent/pohunek-no-such-shell",
+                std::iter::empty::<String>(),
+            ),
+            ..self.config.clone()
+        }
+    }
+
+    fn params(&self, branch: &str) -> SessionNewParams {
+        SessionNewParams {
+            cwd: None,
+            repo: Some(self.repo.clone()),
+            branch: Some(branch.to_owned()),
+            ..params()
+        }
+    }
+
+    fn store(&self) -> crate::store::Store {
+        crate::store::Store::new(self.store_path.clone())
+    }
+
+    fn records(&self) -> Vec<crate::store::SessionRecord> {
+        self.store().load_sessions().expect("load session records")
+    }
+
+    fn bindings(&self) -> Vec<crate::store::WorktreeBinding> {
+        self.store()
+            .load_worktrees()
+            .expect("load worktree bindings")
+    }
+
+    /// The only durable record, which must be a create intent naming no
+    /// worker generation, and the only binding, which must be its worktree.
+    fn intent_and_worktree(&self) -> (SessionId, PathBuf) {
+        let records = self.records();
+        let [record] = records.as_slice() else {
+            panic!("exactly one create record: {records:?}");
+        };
+        let transaction = record.transaction.as_ref().expect("create transaction");
+        assert_eq!(transaction.kind, crate::store::TransactionKind::Create);
+        assert_eq!(transaction.phase, "preparing");
+        assert_eq!(record.runtime.generation, None, "nothing was launched");
+        let bindings = self.bindings();
+        let [binding] = bindings.as_slice() else {
+            panic!("exactly one worktree binding: {bindings:?}");
+        };
+        assert_eq!(binding.session_id, record.session_id);
+        (SessionId(record.session_id.clone()), binding.path.clone())
+    }
+
+    /// Restarts the daemon over the same store and worker roots and runs
+    /// its startup reconciliation.
+    async fn restart(&self) -> SessionRegistry {
+        let (registry, _supervisor) = scripted_registry(self.config.clone());
+        registry
+            .reconcile_workers()
+            .await
+            .expect("startup reconciliation");
+        registry
+    }
+
+    /// Asserts that nothing of a compensated create is left and that its
+    /// branch binds again.
+    async fn assert_compensated(
+        &self,
+        registry: &SessionRegistry,
+        worktree: &std::path::Path,
+        branch: &str,
+    ) {
+        assert!(
+            !worktree.exists(),
+            "the compensated create's worktree is removed: {}",
+            worktree.display()
+        );
+        assert!(self.bindings().is_empty(), "its binding is dropped");
+        assert!(self.records().is_empty(), "its record is deleted last");
+        assert!(registry.list().await.is_empty(), "nothing stays listed");
+        let retried = registry
+            .create(self.params(branch))
+            .await
+            .expect("the freed branch binds again");
+        registry
+            .stop(&retried.id)
+            .await
+            .expect("stop the retried session");
+    }
+}
+
+/// Arms `registry` to park its next create once the target is bound.
+fn hold_bound_create(registry: &SessionRegistry) -> crate::runtime::lifecycle::tests::StartGate {
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *registry
+        .inner
+        .bound_create_hold
+        .lock()
+        .expect("bound create hold is never poisoned") = Some(gate.clone());
+    gate
+}
+
+#[tokio::test]
+async fn create_killed_between_bind_and_launch_is_compensated_at_restart() {
+    let daemon = RestartableDaemon::new("wt-crash-after-bind");
+    let (registry, supervisor) = scripted_registry(daemon.config.clone());
+    let gate = hold_bound_create(&registry);
+    // The daemon's own runtime: shutting it down drops the create's task at
+    // its current await point, as a killed daemon would.
+    let doomed = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("build the doomed daemon runtime");
+    doomed.spawn({
+        let registry = registry.clone();
+        let params = daemon.params("feat/crashed");
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+
+    let (_id, worktree) = daemon.intent_and_worktree();
+    assert!(worktree.is_dir(), "the target is bound before the launch");
+    doomed.shutdown_background();
+    drop(registry);
+    assert!(supervisor.started().is_empty(), "no job ever started");
+
+    let restarted = daemon.restart().await;
+
+    daemon
+        .assert_compensated(&restarted, &worktree, "feat/crashed")
+        .await;
+}
+
+#[tokio::test]
+async fn daemon_shutdown_drains_an_in_flight_create() {
+    let daemon = RestartableDaemon::new("wt-drain");
+    let (registry, _supervisor) = scripted_registry(daemon.config.clone());
+    let gate = hold_bound_create(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = daemon.params("feat/drained");
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+    let (id, worktree) = daemon.intent_and_worktree();
+
+    registry.begin_daemon_shutdown();
+    let refused = registry
+        .create(daemon.params("feat/refused"))
+        .await
+        .expect_err("shutdown refuses a new create");
+    assert_eq!(refused.code, "daemon_shutting_down");
+    assert_eq!(daemon.records().len(), 1, "a refused create writes nothing");
+    let mut drain = Box::pin(registry.drain_creates());
+    assert!(
+        futures::poll!(drain.as_mut()).is_pending(),
+        "the drain waits for the in-flight create"
+    );
+    gate.release.notify_one();
+
+    assert!(drain.await, "the drain ends once the create settled");
+    let created = creating
+        .await
+        .expect("create task joins")
+        .expect("the drained create commits");
+    assert_eq!(created.id, id);
+    let record = stored_record(&daemon.store_path, &id);
+    assert_eq!(record.transaction, None, "the create committed");
+    assert_eq!(record.info.worktree_path.as_ref(), Some(&worktree));
+    assert_eq!(daemon.bindings().len(), 1, "its worktree stays owned");
+}
+
+#[tokio::test]
+async fn create_drain_gives_up_at_its_deadline() {
+    let daemon = RestartableDaemon::new("wt-drain-deadline");
+    let (registry, _supervisor) = scripted_registry(SessionRegistryConfig {
+        create_drain_timeout: Duration::ZERO,
+        ..daemon.config.clone()
+    });
+    let gate = hold_bound_create(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = daemon.params("feat/undrained");
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+
+    registry.begin_daemon_shutdown();
+    assert!(
+        !registry.drain_creates().await,
+        "a create still running at the deadline is left to reconciliation"
+    );
+    daemon.intent_and_worktree();
+
+    gate.release.notify_one();
+    let created = creating
+        .await
+        .expect("create task joins")
+        .expect("the create commits after the drain gave up");
+    registry.stop(&created.id).await.expect("stop the session");
+}
+
+/// Arms the supervision retry barrier of `registry`: each finished pass is
+/// reported with the handle that resumes the retry loop.
+fn retry_passes(
+    registry: &SessionRegistry,
+) -> tokio::sync::mpsc::UnboundedReceiver<(SessionId, tokio::sync::oneshot::Sender<()>)> {
+    let (barrier, passes) = tokio::sync::mpsc::unbounded_channel();
+    registry
+        .inner
+        .supervision_retries
+        .state
+        .lock()
+        .expect("supervision retry state is never poisoned")
+        .pass_finished = Some(barrier);
+    passes
+}
+
+/// Asserts that `id` is the only listed session and that it waits for its
+/// create compensation to be retried.
+async fn assert_compensation_pending(registry: &SessionRegistry, id: &SessionId) {
+    let sessions = registry.list().await;
+    let [session] = sessions.as_slice() else {
+        panic!("the failed create stays listed for the retry: {sessions:?}");
+    };
+    assert_eq!(&session.id, id);
+    let runtime = session.runtime.as_ref().expect("runtime");
+    assert_eq!(runtime.state, RuntimeState::Reconnecting);
+    assert_eq!(
+        runtime.loss_reason.as_deref(),
+        Some(super::supervision::CREATE_COMPENSATION_PENDING)
+    );
+}
+
+/// Resumes retry passes of `id` until one leaves no durable record, then
+/// asserts that the running `registry` released everything of the create.
+async fn await_compensated(
+    daemon: &RestartableDaemon,
+    registry: &SessionRegistry,
+    passes: &mut tokio::sync::mpsc::UnboundedReceiver<(
+        SessionId,
+        tokio::sync::oneshot::Sender<()>,
+    )>,
+    id: &SessionId,
+    worktree: &std::path::Path,
+) {
+    tokio::time::timeout(DETACHED_COMMIT_TIMEOUT, async {
+        loop {
+            let (pass, resume) = passes.recv().await.expect("retry barrier open");
+            resume
+                .send(())
+                .expect("the retry loop waits at the barrier");
+            if pass == *id && daemon.records().is_empty() {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the supervision retry compensates the create");
+    assert!(!worktree.exists(), "the checkout is removed");
+    assert!(daemon.bindings().is_empty(), "its binding is dropped");
+    assert!(
+        registry.list().await.is_empty(),
+        "the compensated create leaves the running registry"
+    );
+}
+
+#[tokio::test]
+async fn launch_build_failure_with_a_failing_binding_store_is_compensated_by_the_retry() {
+    let daemon = RestartableDaemon::new("wt-build-store-fail");
+    let registry = SessionRegistry::new(daemon.without_shell());
+    let mut passes = retry_passes(&registry);
+    registry
+        .inner
+        .store
+        .as_ref()
+        .expect("registry store")
+        .fail_next_binding_removal();
+
+    let error = registry
+        .create(daemon.params("feat/store-fail"))
+        .await
+        .expect_err("the launch command cannot be built");
+
+    assert_eq!(error.code, "agent_binary_missing", "got: {error:?}");
+    assert!(
+        error.msg.contains("keeps its create record")
+            && error.msg.contains("create_compensation_pending"),
+        "the error names the kept record and its retry: {error:?}"
+    );
+    let (id, worktree) = daemon.intent_and_worktree();
+    assert!(
+        !worktree.exists(),
+        "the checkout is removed even though its binding could not be dropped"
+    );
+    assert_compensation_pending(&registry, &id).await;
+
+    // The binding store recovered, so the retry drops the binding of the
+    // vanished checkout and deletes the record, without a daemon restart.
+    await_compensated(&daemon, &registry, &mut passes, &id, &worktree).await;
+
+    // A launchable daemon binds the freed branch again.
+    daemon
+        .assert_compensated(&daemon.restart().await, &worktree, "feat/store-fail")
+        .await;
+}
+
+#[tokio::test]
+async fn failed_worktree_removal_is_retried_until_the_checkout_is_removable() {
+    let daemon = RestartableDaemon::new("wt-remove-fail");
+    let registry = SessionRegistry::new(daemon.without_shell());
+    let mut passes = retry_passes(&registry);
+    let gate = hold_bound_create(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = daemon.params("feat/locked");
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+    let (id, worktree) = daemon.intent_and_worktree();
+    // A locked worktree refuses `git worktree remove --force`.
+    let worktree_arg = worktree.to_str().expect("utf-8 worktree path");
+    git_in(&daemon.repo, &["worktree", "lock", worktree_arg]);
+    gate.release.notify_one();
+
+    let error = creating
+        .await
+        .expect("create task joins")
+        .expect_err("the launch command cannot be built");
+
+    assert_eq!(error.code, "agent_binary_missing", "got: {error:?}");
+    assert!(
+        worktree.is_dir(),
+        "the checkout that could not be removed stays"
+    );
+    daemon.intent_and_worktree();
+    assert_compensation_pending(&registry, &id).await;
+
+    // A pass while the worktree is still locked changes nothing.
+    let (pass, resume) = tokio::time::timeout(DETACHED_COMMIT_TIMEOUT, passes.recv())
+        .await
+        .expect("a retry pass runs")
+        .expect("retry barrier open");
+    assert_eq!(pass, id);
+    assert!(worktree.is_dir(), "the locked checkout stays");
+    daemon.intent_and_worktree();
+    assert_compensation_pending(&registry, &id).await;
+
+    git_in(&daemon.repo, &["worktree", "unlock", worktree_arg]);
+    resume
+        .send(())
+        .expect("the retry loop waits at the barrier");
+    await_compensated(&daemon, &registry, &mut passes, &id, &worktree).await;
+
+    // A launchable daemon binds the freed branch again.
+    daemon
+        .assert_compensated(&daemon.restart().await, &worktree, "feat/locked")
+        .await;
+}
+
+#[tokio::test]
+async fn unfinished_create_compensation_is_repeated_at_restart() {
+    let daemon = RestartableDaemon::new("wt-remove-fail-restart");
+    let registry = SessionRegistry::new(daemon.without_shell());
+    let gate = hold_bound_create(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = daemon.params("feat/locked-restart");
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+    let (id, worktree) = daemon.intent_and_worktree();
+    let worktree_arg = worktree.to_str().expect("utf-8 worktree path");
+    git_in(&daemon.repo, &["worktree", "lock", worktree_arg]);
+    gate.release.notify_one();
+    creating
+        .await
+        .expect("create task joins")
+        .expect_err("the launch command cannot be built");
+    assert_compensation_pending(&registry, &id).await;
+    // The daemon stops before its retry succeeded.
+    registry.begin_daemon_shutdown();
+    drop(registry);
+    git_in(&daemon.repo, &["worktree", "unlock", worktree_arg]);
+
+    let restarted = daemon.restart().await;
+
+    daemon
+        .assert_compensated(&restarted, &worktree, "feat/locked-restart")
+        .await;
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the dead-create setup, the failed retirement, and the retried settlement stay visible end to end"
+)]
+async fn reconciled_create_whose_worker_ended_is_retired_then_compensated() {
+    let daemon = RestartableDaemon::new("wt-terminal-create");
+    let (registry, supervisor) = scripted_registry(daemon.config.clone());
+    let created = registry
+        .create(daemon.params("feat/ended"))
+        .await
+        .expect("create session");
+    let launched = stored_record(&daemon.store_path, &created.id).runtime;
+    registry.stop(&created.id).await.expect("stop session");
+    let worktree = created.worktree_path.clone().expect("bound worktree");
+    registry.begin_daemon_shutdown();
+    drop(registry);
+    // The daemon died after the worker ran, before it committed the create:
+    // the worker still serves the final output of the ended runtime.
+    let mut record = stored_record(&daemon.store_path, &created.id);
+    record.transaction = Some(crate::store::SessionTransaction {
+        id: format!("create-{}", created.id.0),
+        kind: crate::store::TransactionKind::Create,
+        phase: "preparing".to_owned(),
+        previous_worker_id: None,
+        previous_runtime_id: None,
+        daemon_instance_id: None,
+    });
+    record.desired_state = crate::store::DesiredState::Running;
+    record.runtime = crate::store::RuntimeRecord {
+        state: RuntimeState::Starting,
+        ..launched
+    };
+    record.info.state = SessionState::Starting;
+    if let Some(runtime) = record.info.runtime.as_mut() {
+        runtime.state = RuntimeState::Starting;
+    }
+    daemon
+        .store()
+        .record_session(&record)
+        .expect("persist the preparing create");
+    let service_id = pohunek_platform::supervisor::ServiceId::parse(
+        record
+            .runtime
+            .service_id
+            .clone()
+            .expect("the record names its job"),
+    )
+    .expect("service id");
+    supervisor.script_retire_unavailable(service_id.clone());
+
+    let restarted = SessionRegistry::new_with_launcher_and_inspector(
+        daemon.config.clone(),
+        Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
+        Arc::new(ReadableHost::new()),
+    );
+    let (barrier, mut passes) = tokio::sync::mpsc::unbounded_channel();
+    restarted
+        .inner
+        .supervision_retries
+        .state
+        .lock()
+        .expect("supervision retry state is never poisoned")
+        .pass_finished = Some(barrier);
+    restarted
+        .reconcile_workers()
+        .await
+        .expect("startup reconciliation");
+
+    let calls = supervisor.calls();
+    assert!(
+        matches!(
+            calls.as_slice(),
+            [
+                crate::runtime::lifecycle::tests::Call::Start(_),
+                crate::runtime::lifecycle::tests::Call::Inspect(_),
+                crate::runtime::lifecycle::tests::Call::Retire(_),
+            ]
+        ),
+        "the answering worker's job is inspected, then retired: {calls:?}"
+    );
+    assert_eq!(
+        supervisor.retired(),
+        std::slice::from_ref(&service_id),
+        "the generation is retired before anything else is touched"
+    );
+    assert!(
+        worktree.is_dir(),
+        "an unconfirmed retirement keeps the checkout"
+    );
+    assert_eq!(daemon.bindings().len(), 1, "and its binding");
+    assert_eq!(daemon.records().len(), 1, "and its record");
+    let sessions = restarted.list().await;
+    let [session] = sessions.as_slice() else {
+        panic!("the create stays visible for the retry: {sessions:?}");
+    };
+    let runtime = session.runtime.as_ref().expect("runtime");
+    assert_eq!(runtime.state, RuntimeState::Reconnecting);
+    assert_eq!(
+        runtime.loss_reason.as_deref(),
+        Some(crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE)
+    );
+
+    tokio::time::timeout(DETACHED_COMMIT_TIMEOUT, async {
+        loop {
+            let (pass, resume) = passes.recv().await.expect("retry barrier open");
+            resume
+                .send(())
+                .expect("the retry loop waits at the barrier");
+            if pass == created.id && daemon.records().is_empty() {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the supervision retry settles the ended create");
+
+    assert_eq!(
+        supervisor.retired(),
+        [service_id.clone(), service_id],
+        "the retry retires the exact generation again"
+    );
+    daemon
+        .assert_compensated(&restarted, &worktree, "feat/ended")
+        .await;
+}
+
+/// Arms `registry` to park its next committed create before its initial
+/// input.
+fn hold_initial_input(registry: &SessionRegistry) -> crate::runtime::lifecycle::tests::StartGate {
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *registry
+        .inner
+        .initial_input_hold
+        .lock()
+        .expect("initial input hold is never poisoned") = Some(gate.clone());
+    gate
+}
+
+/// The durable record of the only session, which is committed and still
+/// marked as waiting for its initial input.
+fn undelivered_create(daemon: &RestartableDaemon) -> crate::store::SessionRecord {
+    let records = daemon.records();
+    let [record] = records.as_slice() else {
+        panic!("exactly one session record: {records:?}");
+    };
+    assert!(
+        record
+            .transaction
+            .as_ref()
+            .is_some_and(crate::store::SessionTransaction::is_initial_input),
+        "the committed create is marked until its input is delivered: {record:?}"
+    );
+    assert!(
+        record.runtime.generation.is_some(),
+        "its runtime was launched"
+    );
+    record.clone()
+}
+
+#[tokio::test]
+async fn daemon_shutdown_drains_a_create_through_its_initial_input() {
+    let daemon = RestartableDaemon::new("wt-drain-input");
+    let (registry, _supervisor) = scripted_registry(daemon.config.clone());
+    let gate = hold_initial_input(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = SessionNewParams {
+            input: Some("echo drained".to_owned()),
+            ..daemon.params("feat/drained-input")
+        };
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+    let pending = undelivered_create(&daemon);
+
+    registry.begin_daemon_shutdown();
+    let mut drain = Box::pin(registry.drain_creates());
+    assert!(
+        futures::poll!(drain.as_mut()).is_pending(),
+        "the drain waits for the initial input"
+    );
+    gate.release.notify_one();
+
+    assert!(drain.await, "the drain ends once the input is delivered");
+    let created = creating
+        .await
+        .expect("create task joins")
+        .expect("the create delivers its input");
+    let record = stored_record(&daemon.store_path, &created.id);
+    assert_eq!(record.transaction, None, "delivery clears the marker");
+
+    // A writer that built its record before the clearing cannot bring the
+    // marker back.
+    daemon
+        .store()
+        .record_session(&pending)
+        .expect("write a stale marked record");
+    assert_eq!(
+        stored_record(&daemon.store_path, &created.id).transaction,
+        None,
+        "a delivered create is never marked again"
+    );
+}
+
+#[tokio::test]
+async fn create_cut_off_before_its_initial_input_is_rolled_back_at_restart() {
+    let daemon = RestartableDaemon::new("wt-cut-input");
+    let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+        create_drain_timeout: Duration::ZERO,
+        ..daemon.config.clone()
+    });
+    let gate = hold_initial_input(&registry);
+    let _creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = SessionNewParams {
+            input: Some("echo lost".to_owned()),
+            ..daemon.params("feat/cut-input")
+        };
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+
+    registry.begin_daemon_shutdown();
+    assert!(
+        !registry.drain_creates().await,
+        "the drain gives up before the input is delivered"
+    );
+    // The input exists only in memory, so the durable record says the create
+    // is unfinished.
+    let record = undelivered_create(&daemon);
+    let worktree = record.info.worktree_path.clone().expect("bound worktree");
+    let service_id = record.runtime.service_id.clone().expect("recorded job");
+    // The daemon exits: its in-memory session and worker connections go
+    // away, while the worker keeps running under its job.
+    let entry = registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .remove(&SessionId(record.session_id.clone()))
+        .expect("committed session entry");
+    entry.cancel_runtime_watchers();
+    drop(entry);
+    drop(registry);
+
+    let restarted = SessionRegistry::new_with_launcher_and_inspector(
+        daemon.config.clone(),
+        Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
+        Arc::new(ReadableHost::new()),
+    );
+    restarted
+        .reconcile_workers()
+        .await
+        .expect("startup reconciliation");
+
+    assert!(
+        supervisor
+            .retired()
+            .iter()
+            .any(|retired| retired.as_str() == service_id),
+        "the running generation is retired: {:?}",
+        supervisor.calls()
+    );
+    daemon
+        .assert_compensated(&restarted, &worktree, "feat/cut-input")
+        .await;
+}
+
+/// A create with an initial input parked between its delivered input and
+/// the durable clearing of its `initial_input` marker.
+struct InputCommitRace {
+    daemon: RestartableDaemon,
+    registry: SessionRegistry,
+    supervisor: Arc<crate::runtime::lifecycle::tests::ScriptedSupervisor>,
+    creating: tokio::task::JoinHandle<Result<SessionInfo, protocol::ProtocolError>>,
+    release: Arc<tokio::sync::Notify>,
+    id: SessionId,
+}
+
+impl InputCommitRace {
+    async fn start(tag: &str, shell: ShellCommand) -> Self {
+        let daemon = RestartableDaemon::new(tag);
+        let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+            shell_command: shell,
+            initial_input_startup_grace: Duration::ZERO,
+            ..daemon.config.clone()
+        });
+        let gate = crate::runtime::lifecycle::tests::StartGate {
+            session_id: None,
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *registry
+            .inner
+            .initial_input_commit_hold
+            .lock()
+            .expect("initial input commit hold is never poisoned") = Some(gate.clone());
+        let creating = tokio::spawn({
+            let registry = registry.clone();
+            let params = SessionNewParams {
+                input: Some("go".to_owned()),
+                ..daemon.params(&format!("feat/{tag}"))
+            };
+            async move { registry.create(params).await }
+        });
+        gate.entered.notified().await;
+        let id = SessionId(undelivered_create(&daemon).session_id);
+        Self {
+            daemon,
+            registry,
+            supervisor,
+            creating,
+            release: gate.release,
+            id,
+        }
+    }
+
+    /// Lets the marker commit run and returns the create's outcome.
+    async fn commit(self) -> (RestartableDaemon, SessionRegistry, SessionId, SessionInfo) {
+        self.release.notify_one();
+        let created = self
+            .creating
+            .await
+            .expect("create task joins")
+            .expect("the delivered create succeeds");
+        (self.daemon, self.registry, self.id, created)
+    }
+}
+
+#[tokio::test]
+async fn initial_input_commit_keeps_a_concurrent_stop() {
+    let race = InputCommitRace::start(
+        "input-commit-stop",
+        ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+    )
+    .await;
+    race.registry.stop(&race.id).await.expect("stop session");
+
+    let (daemon, _registry, id, _created) = race.commit().await;
+
+    let record = stored_record(&daemon.store_path, &id);
+    assert_eq!(record.transaction, None, "the marker is cleared");
+    assert_eq!(
+        record.desired_state,
+        crate::store::DesiredState::Stopped,
+        "the explicit stop survives the commit"
+    );
+    assert_eq!(record.info.state, SessionState::Stopped);
+    assert_eq!(record.runtime.state, RuntimeState::Terminal);
+}
+
+#[tokio::test]
+async fn initial_input_commit_keeps_a_concurrent_remove() {
+    let race = InputCommitRace::start(
+        "input-commit-remove",
+        ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+    )
+    .await;
+    race.registry
+        .remove(&race.id)
+        .await
+        .expect("remove session");
+
+    let (daemon, registry, _id, _created) = race.commit().await;
+
+    assert!(
+        daemon.records().is_empty(),
+        "the commit does not bring the removed session back"
+    );
+    assert!(registry.list().await.is_empty());
+}
+
+#[tokio::test]
+async fn initial_input_commit_keeps_a_concurrent_natural_exit() {
+    let race = InputCommitRace::start(
+        "input-commit-exit",
+        ShellCommand::new("/bin/sh", ["-c", "read line; exit 3"]),
+    )
+    .await;
+    let exited = race
+        .registry
+        .wait_for_exit(&race.id, DETACHED_COMMIT_TIMEOUT)
+        .await
+        .expect("the delivered input ends the shell");
+    assert_eq!(exited.exit_code, Some(3));
+
+    let (daemon, _registry, id, _created) = race.commit().await;
+
+    let record = stored_record(&daemon.store_path, &id);
+    assert_eq!(record.transaction, None, "the marker is cleared");
+    assert_eq!(record.info.state, SessionState::Failed, "the exit survives");
+    assert_eq!(record.info.exit_code, Some(3));
+    assert_eq!(record.runtime.state, RuntimeState::Terminal);
+}
+
+/// A create whose initial input was never delivered because its daemon
+/// exited, and the replacement daemon that finds its `initial_input` marker.
+struct OrphanedInputCreate {
+    daemon: RestartableDaemon,
+    supervisor: Arc<crate::runtime::lifecycle::tests::ScriptedSupervisor>,
+    restarted: SessionRegistry,
+    id: SessionId,
+    worktree: PathBuf,
+}
+
+impl OrphanedInputCreate {
+    async fn start(tag: &str) -> Self {
+        let daemon = RestartableDaemon::new(tag);
+        let (registry, supervisor) = scripted_registry(daemon.config.clone());
+        let gate = hold_initial_input(&registry);
+        let _creating = tokio::spawn({
+            let registry = registry.clone();
+            let params = SessionNewParams {
+                input: Some("echo orphaned".to_owned()),
+                ..daemon.params(&format!("feat/{tag}"))
+            };
+            async move { registry.create(params).await }
+        });
+        gate.entered.notified().await;
+        let record = undelivered_create(&daemon);
+        let id = SessionId(record.session_id.clone());
+        // The daemon exits: its in-memory session and worker connections go
+        // away, while the worker keeps running under its job.
+        let entry = registry
+            .inner
+            .sessions
+            .lock()
+            .await
+            .remove(&id)
+            .expect("committed session entry");
+        entry.cancel_runtime_watchers();
+        drop(entry);
+        drop(registry);
+        let restarted = SessionRegistry::new_with_launcher_and_inspector(
+            daemon.config.clone(),
+            Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
+            Arc::new(ReadableHost::new()),
+        );
+        Self {
+            daemon,
+            supervisor,
+            restarted,
+            id,
+            worktree: record.info.worktree_path.clone().expect("bound worktree"),
+        }
+    }
+
+    /// Asserts, with the session's lifecycle lock held so no retry can act,
+    /// that nothing was stopped or cleaned and the session waits as pending.
+    async fn assert_untouched_and_pending(&self) {
+        let _guard = self.restarted.lock_lifecycle(&self.id).await;
+        assert!(
+            self.supervisor.retired().is_empty(),
+            "no generation is retired: {:?}",
+            self.supervisor.calls()
+        );
+        assert!(self.worktree.is_dir(), "the worktree is kept");
+        assert_eq!(self.daemon.bindings().len(), 1, "its binding is kept");
+        let record = undelivered_create(&self.daemon);
+        assert_eq!(
+            record.desired_state,
+            crate::store::DesiredState::Running,
+            "no removal intent was persisted"
+        );
+        let sessions = self.restarted.list().await;
+        let [session] = sessions.as_slice() else {
+            panic!("the session stays visible for the retry: {sessions:?}");
+        };
+        let runtime = session.runtime.as_ref().expect("runtime");
+        assert_eq!(runtime.state, RuntimeState::Conflict);
+        assert_eq!(
+            runtime.loss_reason.as_deref(),
+            Some(crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS)
+        );
+    }
+}
+
+#[tokio::test]
+async fn supervision_retry_never_rolls_back_a_live_create_committing_its_input() {
+    let race = InputCommitRace::start(
+        "input-commit-retry",
+        ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+    )
+    .await;
+    // The worker connection is lost while the create commits its delivered
+    // input, leaving the session reconnecting for the supervision retry.
+    let mut sessions = race.registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&race.id).expect("session entry");
+    entry.cancel_runtime_watchers();
+    entry.runtime = RuntimeHandle::Unavailable(RuntimeState::Reconnecting);
+    let runtime = entry.info.runtime.as_mut().expect("runtime");
+    runtime.state = RuntimeState::Reconnecting;
+    runtime.loss_reason = Some(crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE.to_owned());
+    drop(sessions);
+    {
+        let _guard = race.registry.lock_lifecycle(&race.id).await;
+        let record = race
+            .registry
+            .load_durable_session_record(&race.id)
+            .await
+            .expect("read record")
+            .expect("session record");
+        assert!(
+            record
+                .transaction
+                .as_ref()
+                .is_some_and(crate::store::SessionTransaction::is_initial_input),
+            "the retry sees this daemon's marker"
+        );
+        race.registry.reconcile_single_session(record).await
+    };
+    let supervisor = Arc::clone(&race.supervisor);
+
+    let (daemon, registry, id, created) = race.commit().await;
+
+    assert!(
+        supervisor.retired().is_empty(),
+        "the live create's generation is never retired: {:?}",
+        supervisor.calls()
+    );
+    let record = stored_record(&daemon.store_path, &id);
+    assert_eq!(record.transaction, None, "the delivered input is committed");
+    assert_eq!(record.desired_state, crate::store::DesiredState::Running);
+    let worktree = created.worktree_path.expect("bound worktree");
+    assert!(worktree.is_dir(), "the live create keeps its worktree");
+    assert_eq!(daemon.bindings().len(), 1);
+    registry.stop(&id).await.expect("stop the session");
+}
+
+#[tokio::test]
+async fn failed_undelivered_create_conversion_stops_and_cleans_nothing() {
+    let orphan = OrphanedInputCreate::start("orphan-io").await;
+    orphan
+        .restarted
+        .inner
+        .store
+        .as_ref()
+        .expect("registry store")
+        .fail_next_write_before_rename();
+
+    orphan
+        .restarted
+        .reconcile_workers()
+        .await
+        .expect("startup reconciliation");
+
+    orphan.assert_untouched_and_pending().await;
+}
+
+#[tokio::test]
+async fn stale_undelivered_create_conversion_stops_and_cleans_nothing() {
+    let orphan = OrphanedInputCreate::start("orphan-stale").await;
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *orphan
+        .restarted
+        .inner
+        .undelivered_conversion_hold
+        .lock()
+        .expect("conversion hold is never poisoned") = Some(gate.clone());
+    let reconciling = tokio::spawn({
+        let restarted = orphan.restarted.clone();
+        async move { restarted.reconcile_workers().await }
+    });
+    gate.entered.notified().await;
+    // Another writer persists a newer state of the record the conversion read.
+    let mut newer = undelivered_create(&orphan.daemon);
+    newer.info.updated_at = timestamp_now();
+    newer.info.name = Some("renamed meanwhile".to_owned());
+    orphan
+        .daemon
+        .store()
+        .record_session(&newer)
+        .expect("persist the newer record");
+    gate.release.notify_one();
+
+    reconciling
+        .await
+        .expect("reconciliation joins")
+        .expect("startup reconciliation");
+
+    orphan.assert_untouched_and_pending().await;
+    assert_eq!(
+        stored_record(&orphan.daemon.store_path, &orphan.id),
+        newer,
+        "the newer record is not overwritten"
+    );
+}
+
+/// Path of the real worker binary the subprocess launcher spawns.
+fn subprocess_worker_binary() -> PathBuf {
+    if let Some(binary) = std::env::var_os("POHUNEK_WORKER_BIN") {
+        return PathBuf::from(binary);
+    }
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("daemon crate is inside the workspace");
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| workspace.join("target"), |target| workspace.join(target));
+    let binary = target.join("debug/pohunek-sessiond");
+    assert!(
+        binary.is_file(),
+        "build the real worker first with `cargo build -p pohunek-session-worker --bin pohunek-sessiond`, or set POHUNEK_WORKER_BIN"
+    );
+    binary
+}
+
+/// Stop grace of the commit-failure fixture: longer than
+/// [`COMMIT_FAILURE_KILL_DELAY`], so the worker kill lands while the stop of
+/// the half-launched runtime is still in flight.
+const COMMIT_FAILURE_STOP_GRACE: Duration = Duration::from_secs(2);
+
+/// Delay between the worker journal naming its runtime and the worker kill
+/// in the commit-failure fixture. It exceeds the daemon's initialize,
+/// inspect, and failed-commit path (milliseconds) and stays inside the
+/// two-second stop grace, so the stop of the half-launched runtime is still
+/// awaiting the trapping child when its worker connection drops.
+const COMMIT_FAILURE_KILL_DELAY: Duration = Duration::from_millis(300);
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the combined commit, stop, and retire sabotage keeps its setup visible end to end"
+)]
+async fn failed_commit_stop_and_retire_keep_the_session_reconnecting() {
+    // Short, unique root: worker socket paths stay inside the `sun_path`
+    // bound, like the reconciliation subprocess fixtures.
+    let root = pohunek_test_support::temp_root().join(format!(
+        "cf-{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    fs::create_dir_all(&root).expect("create fixture root");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("secure fixture root");
+    let store_path = root.join("data/metadata.jsonl");
+    let data_dir = root.join("data");
+    let pid_file = root.join("child.pid");
+    let script = format!(
+        "echo $$ > {pid}; trap '' TERM HUP INT; while :; do sleep 1; done",
+        pid = pid_file.display(),
+    );
+    let environment = crate::runtime::SubprocessWorkerEnvironment {
+        runtime_home: root.join("r"),
+        state_home: root.join("s"),
+        data_home: root.join("d"),
+        config_home: root.join("c"),
+        cache_home: root.join("k"),
+        home: root.clone(),
+        daemon_socket: root.join("daemon.sock"),
+    };
+    let mut supervision = environment.supervision(subprocess_worker_binary());
+    supervision.sweep_grace = Duration::from_secs(5);
+    let launcher = crate::runtime::SubprocessWorkerLauncher::new();
+    let supervisor = Arc::new(crate::runtime::lifecycle::tests::ScriptedSupervisor::over(
+        launcher.clone(),
+    ));
+    let registry = SessionRegistry::new_with_launcher_and_inspector(
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c".to_owned(), script]),
+            store_path: Some(store_path.clone()),
+            worker_runtime_root: Some(root.join("r/pohunek/workers")),
+            worker_state_root: Some(root.join("s/pohunek/workers")),
+            worker_connect_deadline: Duration::from_secs(10),
+            supervision: Some(supervision),
+            stop_grace: COMMIT_FAILURE_STOP_GRACE,
+            ..SessionRegistryConfig::default()
+        },
+        Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
+        Arc::new(ReadableHost::new()),
+    );
+
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    supervisor.hold_start(gate.clone());
+
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.create(params()).await }
+    });
+    gate.entered.notified().await;
+
+    // The preparing record is durable, so the session and job identities are
+    // fixed and every follow-up can be sabotaged by name.
+    let record = {
+        let records = crate::store::Store::new(store_path.clone())
+            .load_sessions()
+            .expect("load preparing record");
+        let [record] = records.as_slice() else {
+            panic!("one preparing record: {records:?}");
+        };
+        record.clone()
+    };
+    let session_id = SessionId(record.session_id.clone());
+    let service_id = pohunek_platform::supervisor::ServiceId::parse(
+        record
+            .runtime
+            .service_id
+            .clone()
+            .expect("the preparing record names its job"),
+    )
+    .expect("service id");
+    // The final commit of the registration must fail...
+    fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o500))
+        .expect("read-only store directory");
+    // ... the best-effort stop must hit a dying worker, and the retire must
+    // be answered by an unavailable manager.
+    supervisor.script_retire_unavailable(service_id.clone());
+    let kill = tokio::spawn({
+        let launcher = launcher.clone();
+        let journal_dir = root.join("s/pohunek/workers").join(session_id.0.clone());
+        let session = session_id.0.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let initialized = std::fs::read_dir(&journal_dir)
+                    .ok()
+                    .and_then(|entries| {
+                        entries.flatten().find_map(|entry| {
+                            let journal: Option<serde_json::Value> =
+                                std::fs::read_to_string(entry.path())
+                                    .ok()
+                                    .and_then(|text| serde_json::from_str(&text).ok());
+                            let named = journal
+                                .as_ref()
+                                .and_then(|journal| journal.get("runtime_id"))
+                                .is_some_and(serde_json::Value::is_string);
+                            named.then_some(())
+                        })
+                    })
+                    .is_some();
+                if initialized {
+                    tokio::time::sleep(COMMIT_FAILURE_KILL_DELAY).await;
+                    let _ = launcher.kill_worker(&session).await;
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the worker never journaled its runtime"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    });
+    gate.release.notify_one();
+
+    let error = tokio::time::timeout(Duration::from_secs(20), creating)
+        .await
+        .expect("create finishes")
+        .expect("create task joins")
+        .expect_err("the registration cannot commit");
+    kill.await.expect("kill task");
+
+    assert_eq!(
+        error.code,
+        crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE
+    );
+    assert_eq!(
+        supervisor.retired(),
+        vec![service_id],
+        "the retire was attempted and refused"
+    );
+    let pending = registry
+        .inner
+        .supervision_retries
+        .state
+        .lock()
+        .expect("supervision retry state is never poisoned")
+        .pending
+        .clone();
+    assert!(
+        pending.contains(&session_id.0),
+        "an unproven retire schedules a supervision retry: {pending:?}"
+    );
+    // The store refuses non-private directories, so the fixture restores the
+    // mode before reading back the record the branch kept.
+    fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700))
+        .expect("restore store directory");
+    assert_eq!(
+        stored_record(&store_path, &session_id).runtime.generation,
+        record.runtime.generation,
+        "the preparing record is kept for reconciliation, not deleted"
+    );
+
+    // The worker was killed, so its trapping child is an orphan now.
+    if let Ok(pid) = fs::read_to_string(&pid_file) {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", pid.trim()])
+            .status();
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+async fn terminal_resumable_session(registry: &SessionRegistry) -> SessionInfo {
+    let created = registry
+        .create(resumable_params())
+        .await
+        .expect("create session");
+    let recorded = registry
+        .report_native_id(native_report!(registry;
+            session_id: created.id.clone(),
+            agent: "claude".to_owned(),
+            native_session_id: format!("native-{}", created.id.0),
+            transcript_path: None,
+        ))
+        .await;
+    assert!(recorded.recorded, "native id captured");
+    let done = registry
+        .wait_for_exit(&created.id, Duration::from_secs(2))
+        .await
+        .expect("session exits");
+    assert_eq!(done.state, SessionState::Done);
+    done
+}
+
+#[tokio::test]
+async fn concurrent_recoveries_of_one_session_start_exactly_one_generation() {
+    let marker = temp_dir("lifecycle-concurrent-resume-marker").join("argv.txt");
+    let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(temp_store_path("lifecycle-concurrent-resume")),
+        agents_dir: Some(temp_agent_that_exits_then_resumes(
+            "lifecycle-concurrent-resume",
+            &marker,
+        )),
+        socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
+        ..SessionRegistryConfig::default()
+    });
+    let done = terminal_resumable_session(&registry).await;
+    let [first_job] = supervisor.started().try_into().expect("one created job");
+
+    let (left, right) = tokio::join!(registry.resume(&done.id), registry.resume(&done.id));
+
+    let outcomes = [left, right];
+    let recovered = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().ok())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recovered.len(),
+        1,
+        "exactly one recovery wins: {outcomes:?}"
+    );
+    let refused = outcomes
+        .iter()
+        .find_map(|outcome| outcome.as_ref().err())
+        .expect("the other recovery is refused");
+    assert_eq!(refused.code, "session_runtime_not_recoverable");
+    let started = supervisor.started();
+    assert_eq!(started.len(), 2, "create plus one recovery: {started:?}");
+    assert_eq!(
+        supervisor.retired(),
+        [first_job],
+        "the superseded generation is retired exactly"
+    );
+    assert_eq!(supervisor.live_jobs().await, [started[1].clone()]);
+    registry
+        .stop(&done.id)
+        .await
+        .expect("stop recovered session");
+}
+
+#[tokio::test]
+async fn recoveries_of_different_sessions_are_not_serialized() {
+    let marker = temp_dir("lifecycle-parallel-resume-marker").join("argv.txt");
+    let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(temp_store_path("lifecycle-parallel-resume")),
+        agents_dir: Some(temp_agent_that_exits_then_resumes(
+            "lifecycle-parallel-resume",
+            &marker,
+        )),
+        socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
+        ..SessionRegistryConfig::default()
+    });
+    let held = terminal_resumable_session(&registry).await;
+    let free = terminal_resumable_session(&registry).await;
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: Some(held.id.0.clone()),
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    supervisor.hold_start(gate.clone());
+
+    let held_recovery = tokio::spawn({
+        let registry = registry.clone();
+        let id = held.id.clone();
+        async move { registry.resume(&id).await }
+    });
+    gate.entered.notified().await;
+    let recovered = tokio::time::timeout(DETACHED_COMMIT_TIMEOUT, registry.resume(&free.id))
+        .await
+        .expect("another session recovers while the first is held")
+        .expect("recover the free session");
+    assert_eq!(recovered.id, free.id);
+
+    gate.release.notify_one();
+    held_recovery
+        .await
+        .expect("held recovery task")
+        .expect("held recovery completes once released");
+    registry.stop(&held.id).await.expect("stop held session");
+    registry.stop(&free.id).await.expect("stop free session");
 }

@@ -30,8 +30,8 @@ historical v2 release introduced range negotiation from integer-v1; that
 history does not widen the current supported range.
 
 1. Download the component archive for the binary being updated: CLI (`pohunek`),
-   daemon (`pohunekd` plus `pohunek-sessiond` and its systemd units), or GUI
-   (`pohunek-gui`).
+   daemon (`pohunekd`, `pohunek-sessiond`, and the `pohunek` CLI that installs
+   them as a native service), or GUI (`pohunek-gui`).
 2. Run `pohunek doctor --json` to confirm the current binary can find required
    paths and state directories.
 3. Run `pohunek health --json` to confirm the daemon responds with the expected
@@ -103,14 +103,47 @@ M1 can preserve unknown provider values neutrally on the wire, but it cannot
 operate the M2 Hermes runtime or safely rewrite its persisted launch identity.
 Recover by upgrading forward to the matching M2-or-newer component set.
 
-For a daemon archive upgrade, run its installer rather than replacing only
-`pohunekd`. The installer reloads unit definitions and restarts only
-`pohunekd.service`; it does not restart existing
-`pohunek-session@*.service` workers, so their mapped binary, PTY, and child PID
-remain unchanged. After health returns:
+For a daemon archive upgrade, run its installer
+(`packaging/install-daemon.sh`, which runs
+`pohunek service upgrade --from <archive-dir>`) rather than replacing only `pohunekd`. The upgrade copies the new
+binaries into their own `<prefix>/libexec/pohunek/<version>/` directory,
+switches `active_version` in `service.toml`, rewrites the daemon job to the new
+version, and restarts only the daemon. Worker jobs are separate native jobs
+(systemd transient units or launchd jobs, one per worker generation) that keep
+running the versioned `pohunek-sessiond` they started from, so their PID, PTY,
+and child PID remain unchanged. Version directories that a live worker journal,
+a registered worker job (even one that has not started its process yet), or a
+running process still references are kept; the others are removed and listed
+in the upgrade report. When worker jobs cannot be discovered (including when a
+worker unit or launchd definition of this installation is malformed), a worker journal
+cannot be read, or a journal written by an older pohunek under an earlier
+journal schema names a worker that may still run, every version is kept.
+Rerunning `pohunek service upgrade` for the already active version restarts
+nothing but repeats this cleanup, so a version kept earlier is removed once
+nothing references it any more. This cleanup sees only the journals and worker
+jobs of its own installation namespace, so a prefix belongs to exactly one
+namespace (`<prefix>/libexec/pohunek/installation_owner`): an upgrade,
+uninstall, or cleanup of another namespace fails with `service_prefix_owned`
+before it changes anything. The owning installation's uninstall releases the
+prefix. If the named namespace no longer has an installation (for example its
+state directory was deleted by hand), delete that record and rerun. A version
+directory that already exists is reused only when it and its binaries are
+owned by you, mode `0755`, free of symbolic links, and single-linked;
+otherwise the command fails with `service_version_untrusted` naming the
+offending entry. Make sure nothing runs from it, remove it, and rerun. The
+installer counts the daemon as ready only when `daemon.health`
+reports the new version on a connection whose kernel peer credentials name the
+daemon job's running main process, as the service manager reports it. A
+manually started daemon of the same build that holds the socket while the
+supervised job crash-loops therefore never makes the step ready: the command
+keeps polling and then fails with `service_daemon_not_ready`, whose detail names
+both processes (`daemon socket is served by pid X; the supervised job runs pid
+Y`, or `has no process`). Stop the stray daemon and rerun the command. After
+health returns:
 
-1. Compare `systemctl --user show -p MainPID pohunek-session@<id>.service`
-   before and after the daemon update for an important live session.
+1. Compare `pohunek service status --json` before and after the upgrade for an
+   important live session: its `workers` entry keeps the same `generation` and
+   `pid`, and `versions` still lists the old version as referenced.
 2. Inspect that session and confirm the same `worker_id` and `runtime_id`.
 3. Treat `runtime.state=incompatible`, `conflict`, or `lost` as a diagnostic
    state. Do not restart or kill the worker merely to make the status disappear.
@@ -122,11 +155,96 @@ remain unchanged. After health returns:
    durability warning: the daemon internally logs and applies a commit whose
    rename succeeded but parent-directory sync remained uncertain.
 
+An interrupted install or upgrade is journaled in
+`~/.local/state/pohunek/service-install.json`; running the same command again
+resumes it, and a different command rolls it back first — but only while the
+transaction has not reached its `registering` step, because only then can
+nothing have been registered. `pohunek service status --json` reports it as
+`pending_transaction`. A transaction that passed its `config` step may already
+run its daemon with live workers, so it is never rolled back directly: an
+interrupted install met by `pohunek service upgrade`, or by `service install`
+with another version or prefix, fails with `service_install_pending` and
+changes nothing, and `pohunek service uninstall` removes it through the full
+session-checked uninstall instead (`--stop-sessions` stops the live sessions).
+Rerun `pohunek service install` (or `packaging/install-daemon.sh`) to finish
+it: the same version and prefix resume. The same rule covers an install whose
+step fails at or after `registering` without an interruption: a service-manager
+call can time out after it really registered the daemon job, and that daemon
+may already own live sessions, so the install keeps its record, daemon job, and
+`service.toml` and fails with `service_install_incomplete` instead of rolling
+back. Rerun `pohunek service install` with the same version and prefix to
+finish it, or run `pohunek service uninstall` to remove it after its session
+check. An upgrade that fails before `ready` still rolls back to the previous
+version. A rollback journals that it has begun before it changes anything; if
+it fails or is interrupted partway (for example the restored daemon never
+becomes ready), the record stays and the next `install`, `upgrade`, or
+`uninstall` finishes the rollback first — rerunning the same upgrade then
+starts it over instead of resuming it. `packaging/install-daemon.sh` asks
+`pohunek service status --json` first and runs `service install` whenever the
+pending transaction is an install, `service upgrade` otherwise when
+`service.toml` exists, and `service install` on a fresh host; a failing status
+query aborts it before anything changes. Only one service
+transaction runs at a time: each holds `~/.local/state/pohunek/service-install.lock`,
+a second one fails with `service_transaction_in_progress` (status then reports
+`transaction_in_progress: true`), and a crashed holder's lock is released
+automatically, so rerunning the command is always safe.
+
+`pohunek service uninstall` refuses while sessions are live and lists them.
+`--stop-sessions` stops every session through its worker first; the session
+store, journals, and host identity are kept unless `--purge` is given. The
+prefix ownership record is removed after the prefix's version directories and
+CLI copy (it stays while a version is kept for a worker journal or job of this
+installation). The transaction record (`service-install.json`) is cleared just before
+`service.toml`, which is removed last, so if an uninstall fails partway or is
+interrupted, rerunning `pohunek service uninstall` finishes the cleanup. A
+pending install that reached its `registering` step is uninstalled through the
+same live-session check even when its `service.toml` is already gone: the
+record's version and prefix identify the installation.
+A pending install that stopped before `registering` never started its daemon,
+so `uninstall` rolls it back; with `--purge` it then purges the durable
+metadata too (refusing with `service_daemon_job_present` while any daemon job
+is registered, and with `service_orphan_workers` while a worker still runs),
+and it keeps the transaction record until that purge finished, so a rerun
+resumes it. Without an installation or a pending install, `uninstall --purge`
+fails with `service_not_installed` and purges nothing.
+
+A worker journal written by an older pohunek under an earlier journal schema
+blocks the uninstall with `service_outdated_journals` while its worker may still
+run: its recorded phase is not final and its recorded worker process is running
+or cannot be identified. The error lists each journal with its schema version
+and worker pid. This daemon cannot stop such a worker, so `--stop-sessions` does
+not help: end those sessions with the pohunek version that started them, or
+terminate the listed worker pid, then rerun the uninstall. A journal with no
+readable worker pid keeps blocking until you delete it, after confirming that no
+older `pohunek-sessiond` is still running. Before `service upgrade`,
+`service uninstall`, or `service status` touches anything, it verifies
+`service.toml` against the running user and the canonical `XDG_STATE_HOME`
+and `XDG_RUNTIME_DIR` roots; a moved root or another user fails with
+`service_config_invalid` naming the differing key, so the command can never
+address another installation's jobs or socket, and `status --json` never
+reports the recorded namespace and prefix beside another environment's
+transaction store.
+
+Before any effect, including rolling back a pending transaction, `service
+install`, `upgrade`, and `uninstall` also refuse a `--prefix` that
+`service.toml` would reject (`cli_usage`: relative, `.` or `..` components,
+repeated or trailing `/`, non-UTF-8, or too long; pass the one normalized
+spelling) and an `XDG_*` root or `HOME` that is not UTF-8
+(`service_environment_not_utf8`), which the daemon's job definition cannot
+carry. `install` and `upgrade` additionally require `HOME` to be set
+(`missing_env`) and every bootstrap root to be an absolute normalized path,
+with `HOME` an existing directory (`service_environment_invalid`): the daemon
+starts each session worker in `HOME` and refuses to become ready without it,
+even when `--prefix` and every `XDG_*` root are given explicitly.
+
 The first worker-aware release is a destructive compatibility boundary because
 a legacy daemon cannot transfer an already-open PTY. Let all legacy sessions
-finish before installing. The installer refuses visible live legacy sessions by
-default; `--accept-runtime-loss` is informed consent to lose those existing
-PTYs, not a recovery command. See
+finish before installing. The installer moves the legacy daemon's control
+socket aside, runs `migration preflight --socket <moved-socket>` against it,
+and only then stops the daemon and re-checks template workers in every state
+except `inactive`; any surviving worker aborts without removing legacy files.
+`--accept-runtime-loss` is informed consent to lose those existing PTYs and to
+proceed after the post-stop check, not a recovery command. See
 [debug session runtime](debug-session-runtime.md).
 
 When the assistant feature is available, its update intent should use bundle

@@ -22,7 +22,8 @@ center.
 ## Preconditions
 
 1. Run `pohunek doctor --json`.
-2. Start the daemon with `pohunek daemon start --detach` if needed.
+2. If the daemon does not answer, check `pohunek service status --json` and
+   install the login service with `pohunek service install` if needed.
 3. Run `pohunek health --json` or `pohunek status --json`.
 4. Run `pohunek host inspect local --json` to confirm agent capabilities.
 5. Run `pohunek host governance inspect local --json` when verifying the

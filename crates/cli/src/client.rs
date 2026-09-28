@@ -1,5 +1,6 @@
 //! CLI compatibility wrapper around the public SDK client.
 
+use std::path::Path;
 use std::time::Duration;
 
 use protocol::{DoctorReport, Method, Request, SessionInputParams, SessionInputResult};
@@ -20,6 +21,18 @@ impl Client {
     /// Connect to the daemon for `host`.
     pub(crate) async fn connect(host: &str, paths: &Paths) -> Result<Self, CliError> {
         Self::connect_with_options(host, paths, pohunek_client::ClientOptions::default()).await
+    }
+
+    /// Connect to an explicit local daemon socket.
+    ///
+    /// The migration preflight dials the legacy daemon through this path after
+    /// the install wrapper moved the socket node aside as its connect barrier,
+    /// so the socket clap-side knob carries the renamed absolute path.
+    pub(crate) async fn connect_socket(socket: &Path) -> Result<Self, CliError> {
+        let inner = pohunek_client::Client::connect_local(socket)
+            .await
+            .map_err(map_connect_error)?;
+        Ok(Self { inner })
     }
 
     /// Connect with a custom daemon response timeout.

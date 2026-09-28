@@ -4,7 +4,7 @@
 //! connection. Unknown additive object fields are ignored by serde, while
 //! unknown operations fail deserialization and affect only that connection.
 
-// Rust guideline compliant 2026-09-11
+// Rust guideline compliant 2026-09-24
 
 use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    DaemonId, DataToken, LeaseChallenge, LeaseId, RequestId, RuntimeId, SecretBytes, SecretEnv,
-    SessionId, StreamId, TransactionId, Version, VersionRange, WorkerId, WriteId,
+    BaseEnv, DaemonId, DataToken, LeaseChallenge, LeaseId, RequestId, RuntimeId, SecretBytes,
+    SecretEnv, SessionId, StreamId, TransactionId, Version, VersionRange, WorkerId, WriteId,
+    BASE_ENVIRONMENT_VERSION,
 };
 
 /// Features a daemon or worker may negotiate.
@@ -135,6 +136,17 @@ pub enum ControlTypeError {
     /// An input plan contained no fragments or only empty fragments.
     #[error("input plan must contain at least one nonempty fragment")]
     EmptyInputPlan,
+    /// An `Initialize` base environment did not match the negotiated version.
+    #[error(
+        "worker protocol {version} requires the base environment to be {}",
+        if *required { "present" } else { "absent" }
+    )]
+    BaseEnvironmentMismatch {
+        /// Protocol version negotiated for the connection.
+        version: Version,
+        /// Whether that version requires the field.
+        required: bool,
+    },
 }
 
 /// Identifies the logical launch agent without provider credentials.
@@ -367,6 +379,15 @@ pub struct Initialize {
     pub dimensions: Dimensions,
     /// Profile environment passed only to child construction.
     pub environment: SecretEnv,
+    /// Allowlisted non-secret environment placed under the child.
+    ///
+    /// Present exactly when the negotiated version is at least
+    /// [`BASE_ENVIRONMENT_VERSION`]. The wire omits it when absent so a
+    /// version-five peer neither sends nor sees it; `Option` rather than an
+    /// empty map keeps "not sent" distinguishable from "sent empty", which
+    /// [`Initialize::check_version`] relies on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_environment: Option<BaseEnv>,
     /// Bounded worker memory and retention configuration.
     pub limits: InitializeLimits,
     /// Explicit process-group stop policy.
@@ -393,11 +414,35 @@ impl Debug for Initialize {
             .field("cwd", &"<redacted>")
             .field("dimensions", &self.dimensions)
             .field("environment", &self.environment)
+            .field("base_environment", &self.base_environment)
             .field("limits", &self.limits)
             .field("stop_policy", &self.stop_policy)
             .field("hook_protocol_version", &self.hook_protocol_version)
             .field("public_protocol_version", &self.public_protocol_version)
             .finish()
+    }
+}
+
+impl Initialize {
+    /// Checks that the base environment presence matches `version`.
+    ///
+    /// Serde accepts `Initialize` independently of the negotiated version, so
+    /// both peers call this after negotiation: from
+    /// [`BASE_ENVIRONMENT_VERSION`] the field is required, below it the field
+    /// must be absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlTypeError::BaseEnvironmentMismatch`] when the field is
+    /// missing for a version that requires it, or present for one that does
+    /// not know it.
+    pub fn check_version(&self, version: Version) -> Result<(), ControlTypeError> {
+        let required = version >= BASE_ENVIRONMENT_VERSION;
+        if self.base_environment.is_some() == required {
+            Ok(())
+        } else {
+            Err(ControlTypeError::BaseEnvironmentMismatch { version, required })
+        }
     }
 }
 
@@ -692,8 +737,8 @@ pub enum RequestKind {
     Initialize {
         /// Current controller lease.
         lease_id: LeaseId,
-        /// Sensitive launch plan.
-        initialize: Initialize,
+        /// Sensitive launch plan, boxed because it dwarfs every other request.
+        initialize: Box<Initialize>,
     },
     /// Mints one short-lived data-stream token.
     OpenDataStream {
@@ -1006,6 +1051,13 @@ mod tests {
             dimensions: Dimensions::new(120, 40).expect("valid dimensions"),
             environment: SecretEnv::new(BTreeMap::from([("TOKEN".to_owned(), secret.to_owned())]))
                 .expect("valid environment"),
+            base_environment: Some(
+                BaseEnv::new(BTreeMap::from([(
+                    "HOME".to_owned(),
+                    format!("/home/{secret}"),
+                )]))
+                .expect("valid base environment"),
+            ),
             limits: InitializeLimits::new(1024, 1024, 32, 60_000).expect("valid limits"),
             stop_policy: StopPolicy::new(5_000).expect("valid policy"),
             hook_protocol_version: CURRENT_VERSION,
@@ -1020,6 +1072,64 @@ mod tests {
 
         assert!(!rendered.contains(secret));
         assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn initialize_requires_the_base_environment_from_version_six() {
+        let v6 = initialize("value");
+        v6.check_version(BASE_ENVIRONMENT_VERSION)
+            .expect("version six carries the base environment");
+        assert_eq!(
+            v6.check_version(crate::PREVIOUS_VERSION),
+            Err(ControlTypeError::BaseEnvironmentMismatch {
+                version: crate::PREVIOUS_VERSION,
+                required: false,
+            })
+        );
+
+        let v5 = Initialize {
+            base_environment: None,
+            ..initialize("value")
+        };
+        v5.check_version(crate::PREVIOUS_VERSION)
+            .expect("version five omits the base environment");
+        assert_eq!(
+            v5.check_version(BASE_ENVIRONMENT_VERSION),
+            Err(ControlTypeError::BaseEnvironmentMismatch {
+                version: BASE_ENVIRONMENT_VERSION,
+                required: true,
+            })
+        );
+    }
+
+    #[test]
+    fn version_five_initialize_wire_has_no_base_environment_field() {
+        let v5 = Initialize {
+            base_environment: None,
+            ..initialize("value")
+        };
+        let json = serde_json::to_value(&v5).expect("serialize initialize");
+        assert!(json.get("base_environment").is_none());
+        assert_eq!(
+            serde_json::from_value::<Initialize>(json).expect("deserialize v5 initialize"),
+            v5
+        );
+
+        let v6 = initialize("value");
+        let json = serde_json::to_value(&v6).expect("serialize initialize");
+        assert_eq!(json["base_environment"]["HOME"], "/home/value");
+        assert_eq!(
+            serde_json::from_value::<Initialize>(json).expect("deserialize v6 initialize"),
+            v6
+        );
+    }
+
+    #[test]
+    fn initialize_deserialization_revalidates_the_base_environment() {
+        let mut json = serde_json::to_value(initialize("value")).expect("serialize initialize");
+        json["base_environment"] = serde_json::json!({ "NOTIFY_SOCKET": "/run/notify" });
+
+        serde_json::from_value::<Initialize>(json).expect_err("denylisted base must fail");
     }
 
     #[test]

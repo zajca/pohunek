@@ -9,7 +9,9 @@
 
 use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
+#[cfg(target_os = "linux")]
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -93,10 +95,15 @@ struct TestHome {
 impl TestHome {
     fn new() -> Self {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "pohunek-cli-process-api-{}-{sequence}",
-            std::process::id()
-        ));
+        // A short canonical base keeps the fixture daemon socket within the
+        // macOS 103-byte `sun_path` limit; the per-user macOS temporary
+        // directory is too long and sits below the `/var` symlink.
+        let root = fs::canonicalize("/tmp")
+            .expect("canonical /tmp")
+            .join(format!(
+                "pohunek-cli-process-api-{}-{sequence}",
+                std::process::id()
+            ));
         for directory in [
             "run/pohunek",
             "state/pohunek/logs",
@@ -207,6 +214,7 @@ struct FixtureDaemon {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+#[cfg(target_os = "linux")]
 struct TcpFixtureDaemon {
     address: SocketAddr,
     stop: Arc<AtomicBool>,
@@ -214,6 +222,7 @@ struct TcpFixtureDaemon {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+#[cfg(target_os = "linux")]
 impl TcpFixtureDaemon {
     fn start(ip: Ipv4Addr, scenario: Scenario) -> Self {
         let listener = TcpListener::bind((ip, 0)).expect("bind TCP fixture daemon");
@@ -286,6 +295,11 @@ impl FixtureDaemon {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _address)) => {
+                        // BSD sockets inherit O_NONBLOCK from the listener on
+                        // accept; the handler reads with blocking semantics.
+                        stream
+                            .set_nonblocking(false)
+                            .expect("set fixture connection blocking");
                         let requests = Arc::clone(&thread_requests);
                         let request_log = Arc::clone(&thread_request_log);
                         handlers.push(thread::spawn(move || {

@@ -35,6 +35,28 @@ section). Cleanup is best-effort, so a checkout whose removal failed is reported
 rather than silently counted as cleaned, and the leftover directory needs manual
 cleanup.
 
+`pohunek session new` writes a durable create record before it binds a
+worktree, and the worktree binding before the checkout, so every worktree a
+create makes can be traced back to its session. When the create fails after
+the worktree was bound, the daemon removes that worktree only once the
+session's worker is proven ended, even if the client disconnected meanwhile,
+so the branch is free for a retry: it retires the worker, then removes the
+checkout and its binding, then deletes the create record. If the worker
+supervisor cannot confirm the worker ended, the create fails with
+`runtime_supervision_unavailable`, the session stays listed as reconnecting,
+and its worktree is kept until reconciliation proves the worker ended. A
+checkout that cannot be removed (for example a worktree locked with `git
+worktree lock`) keeps its binding and the create record: the create still
+fails with its original error, the session stays listed as reconnecting with
+reason `create_compensation_pending`, and the running daemon retries the
+removal with the supervision backoff (1 s doubling to 60 s) until it succeeds,
+so unlocking the worktree is enough; the next daemon start retries it too. A daemon that stops or crashes mid-create leaves
+the same record, so the next start removes the half-created worktree; a
+graceful stop first lets in-flight creates finish, including delivery of a
+`--input` prompt, and refuses new ones with `daemon_shutting_down`. A create
+whose prompt was not delivered before the daemon stopped is removed at the next
+start, worktree included, since the prompt was never stored.
+
 Assistant guidance should preserve this boundary: verify which checkout or
 worktree is active before editing, avoid deleting user-managed worktrees, and
 prefer explicit project or repository targeting for project work.

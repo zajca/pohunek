@@ -4,7 +4,7 @@
 //! ranges. Every worker-aware release supports the current protocol and the
 //! immediately preceding protocol.
 
-// Rust guideline compliant 2026-09-11
+// Rust guideline compliant 2026-09-24
 
 use std::fmt::{Display, Formatter};
 
@@ -12,10 +12,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 /// Current worker protocol version.
-pub const CURRENT_VERSION: Version = Version(5);
+pub const CURRENT_VERSION: Version = Version(6);
 
 /// Immediately preceding worker protocol version.
-pub const PREVIOUS_VERSION: Version = Version(4);
+pub const PREVIOUS_VERSION: Version = Version(5);
 
 /// First version with atomic attach snapshots.
 ///
@@ -29,6 +29,13 @@ pub const CONTROL_PLANE_OBSERVATION_VERSION: Version = Version(4);
 
 /// First version with durable provider-managed subagent observation.
 pub const SUBAGENT_OBSERVATION_VERSION: Version = Version(5);
+
+/// First version whose `Initialize` carries the child's base environment.
+///
+/// From version six the worker builds the child environment from an empty
+/// base plus the daemon-selected `BaseEnv`, never from its own service-manager
+/// environment. A version-five peer neither sends nor accepts the field.
+pub const BASE_ENVIRONMENT_VERSION: Version = Version(6);
 
 /// Versions supported by this crate release.
 pub const SUPPORTED_RANGE: VersionRange = VersionRange {
@@ -219,10 +226,31 @@ mod tests {
     }
 
     #[test]
+    fn current_workers_negotiate_the_base_environment_version() {
+        assert_eq!(CURRENT_VERSION, BASE_ENVIRONMENT_VERSION);
+        assert_eq!(
+            negotiate(SUPPORTED_RANGE, SUPPORTED_RANGE).expect("identical ranges"),
+            BASE_ENVIRONMENT_VERSION
+        );
+    }
+
+    #[test]
+    fn a_version_five_peer_negotiates_below_the_base_environment_version() {
+        let five = Version::new(5).expect("valid version");
+        let previous_release = VersionRange::new(Version::new(4).expect("valid version"), five)
+            .expect("ordered range");
+
+        let selected = negotiate(SUPPORTED_RANGE, previous_release).expect("overlapping ranges");
+
+        assert_eq!(selected, five);
+        assert!(selected < BASE_ENVIRONMENT_VERSION);
+    }
+
+    #[test]
     fn negotiation_rejects_disjoint_ranges() {
         let remote = VersionRange::new(
-            Version::new(6).expect("valid version"),
             Version::new(7).expect("valid version"),
+            Version::new(8).expect("valid version"),
         )
         .expect("ordered range");
 

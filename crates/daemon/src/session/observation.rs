@@ -594,7 +594,8 @@ pub(crate) fn observation_worker_error(error: WorkerError) -> ProtocolError {
         | WorkerError::Rejected { .. }
         | WorkerError::NotInitialized
         | WorkerError::AttachSnapshotUnsupported { .. }
-        | WorkerError::AttachReadyTimeout { .. } => ProtocolError::session_terminal_unavailable(),
+        | WorkerError::AttachReadyTimeout { .. }
+        | WorkerError::TornStream => ProtocolError::session_terminal_unavailable(),
     }
 }
 

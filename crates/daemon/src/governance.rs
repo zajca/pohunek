@@ -584,7 +584,7 @@ impl HostGovernanceService {
 
         let root = tempfile::Builder::new()
             .prefix("pohunek-governance-test-")
-            .tempdir()
+            .tempdir_in(pohunek_test_support::temp_root())
             .expect("create isolated host-governance root");
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
             .expect("make host-governance root owner-private");
@@ -1398,7 +1398,7 @@ mod tests {
     async fn service_uses_the_application_state_root_once() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let root = tempfile::tempdir().expect("create isolated application state root");
+        let root = pohunek_test_support::tempdir().expect("create isolated application state root");
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
             .expect("make isolated application state root owner-private");
         let service = HostGovernanceService::open(root.path().to_path_buf())
@@ -1753,7 +1753,7 @@ mod tests {
             EnrollmentStatus::Rotating,
             EnrollmentStatus::LocallyUnenrolled,
         ] {
-            let root = tempfile::tempdir().expect("create durable service root");
+            let root = pohunek_test_support::tempdir().expect("create durable service root");
             let service = open_service_at(root.path()).await;
             let before = establish_lifecycle(&service, origin).await;
             let before_revision = before
@@ -1834,7 +1834,7 @@ mod tests {
 
     #[tokio::test]
     async fn signed_current_projection_survives_quarantine_restart_exact_recovery_and_retry() {
-        let root = tempfile::tempdir().expect("create durable service root");
+        let root = pohunek_test_support::tempdir().expect("create durable service root");
         let service = open_service_at(root.path()).await;
         let active = activate_new_host(&service).await;
         let proposal = transfer(&active, 121, 122, principal(123));
@@ -2043,7 +2043,7 @@ mod tests {
 
     #[tokio::test]
     async fn exact_transfer_retry_survives_response_loss_restart_and_expiry() {
-        let root = tempfile::tempdir().expect("create durable service root");
+        let root = pohunek_test_support::tempdir().expect("create durable service root");
         let service = open_service_at(root.path()).await;
         let active = activate_new_host(&service).await;
         let proposal = transfer_with_expiry(&active, 61, 62, principal(63), "2026-01-02T00:00:00Z");
@@ -2116,7 +2116,7 @@ mod tests {
     #[tokio::test]
     async fn precommit_and_postrename_transfer_failures_preserve_the_required_publication_boundary()
     {
-        let root = tempfile::tempdir().expect("create durable service root");
+        let root = pohunek_test_support::tempdir().expect("create durable service root");
         let service = open_service_at(root.path()).await;
         let active = activate_new_host(&service).await;
         let precommit = transfer(&active, 71, 72, principal(73));

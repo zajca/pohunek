@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
-// Rust guideline compliant 2026-09-23
+// Rust guideline compliant 2026-09-28
 
 /// Permission and special-mode bits reported by `stat`.
 const MODE_MASK: u32 = 0o7777;
@@ -26,7 +26,7 @@ enum Links {
     MayBeUnlinked,
 }
 
-/// Points inside [`TrustedDir::read_file`] where tests replace the file, to hit
+/// Points inside trusted regular-file opens where tests replace the file, to hit
 /// the rename windows deterministically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadStage {
@@ -820,6 +820,26 @@ impl TrustedDir {
         Ok(())
     }
 
+    /// Opens a trusted regular file for reading through the directory descriptor.
+    ///
+    /// The name is inspected and opened without following a symbolic link, and
+    /// the opened descriptor must be a regular file owned by the effective user,
+    /// with exactly `mode`, exactly one hard link, and on macOS no extended ACL
+    /// beyond deny entries. The returned descriptor is that validated inode, so
+    /// reads through it never observe another file. A missing name returns
+    /// `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FsError`] when the mode, name, or entry is unsafe, including a
+    /// symbolic link, special file, or file renamed over `name` while it was
+    /// being opened, or when the open fails.
+    pub fn open_file(&self, name: impl AsRef<OsStr>, mode: u32) -> FsResult<Option<File>> {
+        Ok(self
+            .open_regular(name.as_ref(), mode, Links::Named)?
+            .map(|(file, _path)| file))
+    }
+
     /// Reads an owner-private regular file through the trusted directory descriptor.
     ///
     /// The open is no-follow, the descriptor is validated before reading, and
@@ -839,47 +859,17 @@ impl TrustedDir {
         mode: u32,
         max_bytes: usize,
     ) -> FsResult<Vec<u8>> {
-        validate_mode(mode)?;
-        let name = validate_component(name.as_ref())?;
-        let path = self.path.join(name);
-        // A rename over `name` can unlink the looked-up inode before the stat
-        // reads it, so an inspected link count of zero is not a failure here.
-        if inspect_entry_links(
-            &self.file,
-            &path,
-            name,
-            EntryKind::RegularFile,
-            Some(mode),
-            Links::MayBeUnlinked,
-        )?
-        .is_none()
-        {
+        let name = name.as_ref();
+        // A rename over `name` can unlink the inode after it is looked up or
+        // opened, and the descriptor then still holds that whole version, so
+        // a link count of zero is not a failure here.
+        let Some((mut file, path)) = self.open_regular(name, mode, Links::MayBeUnlinked)? else {
             return Err(FsError::Io {
                 operation: "inspect trusted file before opening",
-                path,
+                path: self.path.join(name),
                 source: io::Error::new(io::ErrorKind::NotFound, "trusted file does not exist"),
             });
-        }
-        run_read_interleave(ReadStage::BeforeOpen);
-        let fd = fs::openat(
-            &self.file,
-            name,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-            Mode::empty(),
-        )
-        .map_err(|source| io_error("open trusted file", &path, source))?;
-        let mut file = File::from(fd);
-        run_read_interleave(ReadStage::BeforeValidate);
-        // The open resolved `name` inside this directory, so a descriptor with
-        // no links lost its name to a rename after the open and still holds
-        // that whole version. A hard-linked file is still refused.
-        validate_fd_links(
-            &file,
-            &path,
-            EntryKind::RegularFile,
-            Some(mode),
-            Links::MayBeUnlinked,
-        )?;
+        };
         let limit = u64::try_from(max_bytes)
             .unwrap_or(u64::MAX)
             .saturating_add(1);
@@ -1388,6 +1378,50 @@ impl TrustedDir {
     pub fn sync(&self) -> FsResult<()> {
         durable_sync(&self.file)
             .map_err(|source| io_error("durably synchronize directory", &self.path, source))
+    }
+
+    /// Opens and validates a regular file below this directory for reading.
+    ///
+    /// The name is inspected first only so a symbolic link or special file is
+    /// never opened; the descriptor validated after the open decides what the
+    /// caller reads. A missing name is `None`. `links` states whether an inode
+    /// that lost its name to a rename after the lookup is still acceptable; a
+    /// hard-linked file is refused either way.
+    fn open_regular(
+        &self,
+        name: &OsStr,
+        mode: u32,
+        links: Links,
+    ) -> FsResult<Option<(File, PathBuf)>> {
+        validate_mode(mode)?;
+        let name = validate_component(name)?;
+        let path = self.path.join(name);
+        if inspect_entry_links(
+            &self.file,
+            &path,
+            name,
+            EntryKind::RegularFile,
+            Some(mode),
+            links,
+        )?
+        .is_none()
+        {
+            return Ok(None);
+        }
+        run_read_interleave(ReadStage::BeforeOpen);
+        // `NONBLOCK` keeps a FIFO renamed over `name` after the inspection
+        // from blocking the open before validation rejects it.
+        let fd = fs::openat(
+            &self.file,
+            name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|source| io_error("open trusted file", &path, source))?;
+        let file = File::from(fd);
+        run_read_interleave(ReadStage::BeforeValidate);
+        validate_fd_links(&file, &path, EntryKind::RegularFile, Some(mode), links)?;
+        Ok(Some((file, path)))
     }
 
     fn open_absolute_inner(path: &Path, mode: u32, create: bool) -> FsResult<Self> {
@@ -2283,16 +2317,35 @@ fn prepare_random_staging_directory_mode(
 }
 
 #[cfg(not(target_os = "linux"))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the signature matches the Linux implementation, which can fail"
-)]
 fn prepare_random_staging_directory_mode(
-    _directory: &File,
-    _name: &OsStr,
-    _path: &Path,
-    _mode: u32,
+    directory: &File,
+    name: &OsStr,
+    path: &Path,
+    mode: u32,
 ) -> FsResult<()> {
+    let identity =
+        inspect_entry(directory, path, name, EntryKind::Directory, None)?.ok_or_else(|| {
+            FsError::IdentityChanged {
+                path: path.to_path_buf(),
+            }
+        })?;
+    // An owner-masking umask can leave the new directory without owner search
+    // permission, and without `O_PATH` it cannot be opened to `fchmod` it.
+    // The random name lives inside a retained owner-private directory;
+    // `AT_SYMLINK_NOFOLLOW` never redirects through a link, and the identity
+    // re-check fences a replaced entry before the directory is opened.
+    fs::chmodat(
+        directory,
+        name,
+        mode_from_raw(mode),
+        AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(|source| io_error("set trusted directory staging mode", path, source))?;
+    if inspect_entry(directory, path, name, EntryKind::Directory, Some(mode))? != Some(identity) {
+        return Err(FsError::IdentityChanged {
+            path: path.to_path_buf(),
+        });
+    }
     Ok(())
 }
 
@@ -3191,6 +3244,139 @@ mod tests {
             trusted.read_file("record", FILE_MODE, 3),
             Err(FsError::UnsafeLinkCount { actual: 2, .. })
         ));
+    }
+
+    #[test]
+    fn open_file_returns_the_validated_inode_and_none_for_a_missing_name() {
+        let (temporary, trusted) = trusted_root();
+        write_private(&temporary.path().join("record"), b"contents");
+
+        let mut file = trusted
+            .open_file("record", FILE_MODE)
+            .expect("open trusted file")
+            .expect("existing file");
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).expect("read opened file");
+        assert_eq!(contents, b"contents");
+        assert_eq!(
+            file.metadata().expect("inspect opened file").ino(),
+            fs::symlink_metadata(temporary.path().join("record"))
+                .expect("inspect record")
+                .ino()
+        );
+        assert!(trusted
+            .open_file("missing", FILE_MODE)
+            .expect("missing file is not an error")
+            .is_none());
+        assert!(matches!(
+            trusted.open_file("record", 0o700),
+            Err(FsError::UnsafeMode {
+                actual: FILE_MODE,
+                expected: 0o700,
+                ..
+            })
+        ));
+        assert!(matches!(
+            trusted.open_file("../record", FILE_MODE),
+            Err(FsError::InvalidComponent { .. })
+        ));
+    }
+
+    #[test]
+    fn open_file_refuses_symlinks_special_files_and_hard_links() {
+        let (temporary, trusted) = trusted_root();
+        let root = temporary.path();
+        write_private(&root.join("record"), b"contents");
+        std::os::unix::fs::symlink("record", root.join("link")).expect("create symlink");
+        nix::unistd::mkfifo(&root.join("fifo"), nix::sys::stat::Mode::S_IRUSR)
+            .expect("create FIFO fixture");
+        fs::create_dir(root.join("directory")).expect("create directory");
+        write_private(&root.join("linked"), b"contents");
+        fs::hard_link(root.join("linked"), root.join("second")).expect("create second link");
+
+        for name in ["link", "fifo", "directory"] {
+            assert!(
+                matches!(
+                    trusted.open_file(name, FILE_MODE),
+                    Err(FsError::UnsafeType { .. })
+                ),
+                "{name} must be refused as a non-regular file"
+            );
+        }
+        assert!(matches!(
+            trusted.open_file("linked", FILE_MODE),
+            Err(FsError::UnsafeLinkCount { actual: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn open_file_refuses_a_symlink_renamed_over_before_open() {
+        let (temporary, trusted) = trusted_root();
+        let root = temporary.path().to_path_buf();
+        write_private(&root.join("record"), b"old");
+        write_private(&root.join("elsewhere"), b"leak");
+        during_read(ReadStage::BeforeOpen, move || {
+            std::os::unix::fs::symlink("elsewhere", root.join(".record.link"))
+                .expect("stage symlink");
+            fs::rename(root.join(".record.link"), root.join("record"))
+                .expect("rename symlink over record");
+        });
+
+        let error = trusted
+            .open_file("record", FILE_MODE)
+            .expect_err("the no-follow open must refuse the symlink");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::LOOP.raw_os_error())
+        );
+        assert_eq!(pending_read_interleaves(), 0);
+    }
+
+    #[test]
+    fn open_file_refuses_a_file_renamed_over_after_open() {
+        let (temporary, trusted) = trusted_root();
+        write_private(&temporary.path().join("record"), b"old");
+        replace_during_read(
+            ReadStage::BeforeValidate,
+            temporary.path(),
+            "record",
+            b"new",
+        );
+
+        assert!(matches!(
+            trusted.open_file("record", FILE_MODE),
+            Err(FsError::UnsafeLinkCount { actual: 0, .. })
+        ));
+        assert_eq!(pending_read_interleaves(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn open_file_rejects_a_macos_acl_granting_access_and_accepts_deny_only() {
+        let temporary = tempfile::tempdir_in("/private/tmp").expect("create macOS fixture root");
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("set fixture root mode");
+        let trusted =
+            TrustedDir::open_absolute(temporary.path(), DIRECTORY_MODE).expect("open fixture root");
+        for (name, acl) in [("writable", WRITABLE_ACL), ("deny-only", DENY_ONLY_ACL)] {
+            let file = temporary.path().join(name);
+            write_private(&file, b"contents");
+            let status = std::process::Command::new("/bin/chmod")
+                .args(["+a", acl])
+                .arg(&file)
+                .status()
+                .expect("run native ACL fixture command");
+            assert!(status.success(), "native ACL fixture command must succeed");
+        }
+
+        assert!(matches!(
+            trusted.open_file("writable", FILE_MODE),
+            Err(FsError::UnsafeAcl { .. })
+        ));
+        assert!(trusted
+            .open_file("deny-only", FILE_MODE)
+            .expect("a deny-only ACL grants nothing")
+            .is_some());
     }
 
     #[cfg(target_os = "macos")]

@@ -236,7 +236,10 @@ pohunek session fork <target> --name <fork-name> --json
 ```
 
 `session rm` removes the logical session from the daemon and stops it first if
-it is still live. It also removes the session's Pohunek-owned worktree with
+it is still live. A `reconnecting`, `incompatible`, or ambiguous `conflict`
+session is unreachable but may still run its agent: `session rm` retires that
+worker job through the service manager, which kills the agent, and proves the
+worker gone before deleting the record; it refuses when it cannot. It also removes the session's Pohunek-owned worktree with
 `git worktree remove --force`: any uncommitted changes in that worktree are
 destroyed irreversibly. For a live session never diff and remove in one flow:
 the agent can write further changes after the diff, and `session rm` stops it

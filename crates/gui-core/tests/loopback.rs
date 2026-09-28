@@ -901,11 +901,7 @@ async fn launch_from_rendered_preset_creates_one_session_with_rendered_input() {
     let bin_dir = temp_dir("gui-core-m3-launch-bin");
     let record_dir = temp_dir("gui-core-m3-launch-record");
     let prompt_out = record_dir.join("prompt.txt");
-    let _prompt_out = EnvGuard::set("GUI_TEST_PROMPT_OUT", &prompt_out);
-    write_executable(
-        &bin_dir.join("codex"),
-        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$GUI_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
-    );
+    write_executable(&bin_dir.join("codex"), &recording_script(&prompt_out));
     let _path = PathGuard::prepend(&bin_dir);
 
     let daemon = LoopbackDaemon::spawn("m3-launch", "0.3.0-launch").await;
@@ -998,11 +994,7 @@ async fn assistant_launch_creates_project_session_with_opening_prompt() {
     let bin_dir = temp_dir("gui-core-assistant-bin");
     let record_dir = temp_dir("gui-core-assistant-record");
     let prompt_out = record_dir.join("prompt.txt");
-    let _prompt_out = EnvGuard::set("GUI_TEST_PROMPT_OUT", &prompt_out);
-    write_executable(
-        &bin_dir.join("codex"),
-        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$GUI_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
-    );
+    write_executable(&bin_dir.join("codex"), &recording_script(&prompt_out));
     let _path = PathGuard::prepend(&bin_dir);
 
     let daemon = LoopbackDaemon::spawn("assistant-launch", "0.4.0-assistant").await;
@@ -1077,11 +1069,7 @@ async fn provider_launch_linear_issue_creates_one_linked_session_and_persists_me
     let bin_dir = temp_dir("gui-core-m4-linear-bin");
     let record_dir = temp_dir("gui-core-m4-linear-record");
     let prompt_out = record_dir.join("prompt.txt");
-    let _prompt_out = EnvGuard::set("GUI_TEST_PROMPT_OUT", &prompt_out);
-    write_executable(
-        &bin_dir.join("codex"),
-        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$GUI_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
-    );
+    write_executable(&bin_dir.join("codex"), &recording_script(&prompt_out));
     let _path = PathGuard::prepend(&bin_dir);
 
     let store_path = temp_dir("gui-core-m4-linear-store").join("metadata.jsonl");
@@ -1191,11 +1179,7 @@ async fn provider_launch_github_pr_creates_one_linked_session_with_rendered_inpu
     let bin_dir = temp_dir("gui-core-m4-github-bin");
     let record_dir = temp_dir("gui-core-m4-github-record");
     let prompt_out = record_dir.join("prompt.txt");
-    let _prompt_out = EnvGuard::set("GUI_TEST_PROMPT_OUT", &prompt_out);
-    write_executable(
-        &bin_dir.join("claude"),
-        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$GUI_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
-    );
+    write_executable(&bin_dir.join("claude"), &recording_script(&prompt_out));
     let _path = PathGuard::prepend(&bin_dir);
 
     let daemon = LoopbackDaemon::spawn("m4-github", "0.4.0-github").await;
@@ -1582,7 +1566,7 @@ async fn review_dispatch_creates_one_session_in_the_same_worktree_with_copied_li
     let _xdg = install_review_template("gui-core-review-dispatch-config-home");
 
     // Plain no-op `codex` for the *source* session: it takes no `input`, so
-    // it must not touch `GUI_TEST_PROMPT_OUT` at all. If it shared the
+    // it must not touch the recorded prompt file at all. If it shared the
     // recording script installed below, its own (empty) invocation could win
     // a race against the dispatched session's write to the same file.
     let sleep_bin_dir = temp_dir("gui-core-review-dispatch-sleep-bin");
@@ -1611,10 +1595,9 @@ async fn review_dispatch_creates_one_session_in_the_same_worktree_with_copied_li
     let record_bin_dir = temp_dir("gui-core-review-dispatch-record-bin");
     let record_dir = temp_dir("gui-core-review-dispatch-record");
     let prompt_out = record_dir.join("prompt.txt");
-    let _prompt_out = EnvGuard::set("GUI_TEST_PROMPT_OUT", &prompt_out);
     write_executable(
         &record_bin_dir.join("codex"),
-        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$GUI_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
+        &recording_script(&prompt_out),
     );
     let _record_path = PathGuard::prepend(&record_bin_dir);
 
@@ -2138,14 +2121,13 @@ fn worker_backed_registry(mut config: SessionRegistryConfig) -> SessionRegistry 
         data_home: worker_home.join("data"),
         config_home: worker_home.join("config"),
         cache_home: worker_home.join("cache"),
+        home: worker_home.clone(),
         daemon_socket: worker_home.join("daemon.sock"),
     };
     config.worker_runtime_root = Some(worker_environment.runtime_home.join("pohunek/workers"));
     config.worker_state_root = Some(worker_environment.state_home.join("pohunek/workers"));
-    let launcher = Arc::new(SubprocessWorkerLauncher::new(
-        worker_binary(),
-        worker_environment,
-    ));
+    config.supervision = Some(worker_environment.supervision(worker_binary()));
+    let launcher = Arc::new(SubprocessWorkerLauncher::new());
     SessionRegistry::new_with_launcher_and_inspector(
         config,
         launcher,
@@ -2693,6 +2675,18 @@ fn make_owner_private(dir: &Path) {
 
 #[cfg(not(unix))]
 fn make_owner_private(_dir: &Path) {}
+
+/// Returns a fake `codex` that records its first argument in `prompt_out`.
+///
+/// The path is embedded in the script because a session's agent receives only
+/// the allowlisted base environment, never arbitrary daemon variables.
+fn recording_script(prompt_out: &Path) -> String {
+    let quoted = prompt_out
+        .to_str()
+        .expect("UTF-8 prompt path")
+        .replace('\'', "'\\''");
+    format!("#!/bin/sh\nprintf '%s' \"${{1:-}}\" > '{quoted}'\n/bin/sleep 30\n")
+}
 
 fn write_executable(path: &Path, body: &str) {
     std::fs::write(path, body).expect("write executable");

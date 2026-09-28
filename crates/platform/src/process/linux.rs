@@ -1,6 +1,6 @@
 //! Linux `/proc` and pidfd process inspection.
 
-// Rust guideline compliant 2026-09-22
+// Rust guideline compliant 2026-09-24
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
@@ -25,6 +25,7 @@ const PROC_ROOT: &str = "/proc";
 const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 const ENV_DAEMON_ID: &str = "POHUNEK_DAEMON_ID";
 const ENV_SESSION_ID: &str = "POHUNEK_SESSION_ID";
+const ENV_RUNTIME_ID: &str = "POHUNEK_RUNTIME_ID";
 /// `/proc/<pid>/stat` process-group field number (`pgrp`).
 const STAT_PGRP_FIELD: usize = 5;
 /// `/proc/<pid>/stat` parent-process field number (`ppid`).
@@ -372,35 +373,51 @@ fn cgroup_path_matches(actual: &str, expected: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-/// Reads `POHUNEK_DAEMON_ID` / `POHUNEK_SESSION_ID` from `/proc/<pid>/environ`.
+/// Reads the allowlisted ownership markers from `/proc/<pid>/environ`.
 ///
 /// `environ` holds the environment the process was `execve`d with, which is
 /// exactly where a pohunek daemon's PTY markers live — they are injected before
-/// exec and inherited by every child. Entries are NUL-separated `KEY=VALUE`
-/// pairs; values are decoded lossily because marker ids are ASCII.
+/// exec and inherited by every child.
 fn ownership_markers(pid: Pid) -> io::Result<OwnershipMarkers> {
-    let bytes = match fs::read(proc_path(pid).join("environ")) {
-        Ok(bytes) => bytes,
-        Err(err) if is_process_race(&err) => return Ok(OwnershipMarkers::default()),
-        Err(err) => return Err(err),
-    };
+    match fs::read(proc_path(pid).join("environ")) {
+        Ok(bytes) => Ok(parse_ownership_markers(&bytes)),
+        Err(err) if is_process_race(&err) => Ok(OwnershipMarkers::default()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Extracts the allowlisted markers from NUL-separated `KEY=VALUE` entries.
+///
+/// No other entry is retained. The first entry for a key wins, matching what
+/// `getenv` reports to the process itself. Values are decoded lossily because
+/// marker ids are ASCII.
+fn parse_ownership_markers(environ: &[u8]) -> OwnershipMarkers {
     let mut markers = OwnershipMarkers::default();
-    for entry in bytes.split(|byte| *byte == 0) {
+    for entry in environ.split(|byte| *byte == 0) {
         let Some(separator) = entry.iter().position(|byte| *byte == b'=') else {
             continue;
         };
         let (key, rest) = entry.split_at(separator);
-        let value = || String::from_utf8_lossy(&rest[1..]).into_owned();
-        if key == ENV_DAEMON_ID.as_bytes() {
-            markers.daemon_id = Some(value());
+        let slot = if key == ENV_DAEMON_ID.as_bytes() {
+            &mut markers.daemon_id
         } else if key == ENV_SESSION_ID.as_bytes() {
-            markers.session_id = Some(value());
+            &mut markers.session_id
+        } else if key == ENV_RUNTIME_ID.as_bytes() {
+            &mut markers.runtime_id
+        } else {
+            continue;
+        };
+        if slot.is_none() {
+            *slot = Some(String::from_utf8_lossy(&rest[1..]).into_owned());
         }
-        if markers.daemon_id.is_some() && markers.session_id.is_some() {
+        if markers.daemon_id.is_some()
+            && markers.session_id.is_some()
+            && markers.runtime_id.is_some()
+        {
             break;
         }
     }
-    Ok(markers)
+    markers
 }
 
 fn same_user_processes() -> io::Result<Vec<ProcessFact>> {
@@ -1015,6 +1032,71 @@ mod tests {
             .expect("runtime without I/O driver")
             .block_on(watch.wait())
             .expect("observe exit without Tokio I/O driver");
+    }
+
+    #[test]
+    fn environ_parser_retains_only_allowlisted_markers() {
+        let environ = b"AWS_SECRET_ACCESS_KEY=super-secret\0POHUNEK_DAEMON_ID=d-1\0\
+POHUNEK_SESSION_ID=s-1\0POHUNEK_RUNTIME_ID=r-1\0POHUNEK_RUNTIME_IDX=r-2\0HOME=/home/u\0";
+
+        let markers = parse_ownership_markers(environ);
+
+        assert_eq!(
+            markers,
+            OwnershipMarkers {
+                daemon_id: Some("d-1".to_owned()),
+                session_id: Some("s-1".to_owned()),
+                runtime_id: Some("r-1".to_owned()),
+            }
+        );
+        assert!(!format!("{markers:?}").contains("super-secret"));
+    }
+
+    #[test]
+    fn environ_parser_keeps_the_first_duplicate_like_getenv() {
+        let markers =
+            parse_ownership_markers(b"POHUNEK_RUNTIME_ID=first\0POHUNEK_RUNTIME_ID=second\0");
+
+        assert_eq!(markers.runtime_id.as_deref(), Some("first"));
+        assert!(markers.is_marked());
+    }
+
+    #[test]
+    fn environ_parser_ignores_entries_without_a_separator() {
+        let markers = parse_ownership_markers(b"POHUNEK_RUNTIME_ID\0\0garbage");
+
+        assert_eq!(markers, OwnershipMarkers::default());
+        assert!(!markers.is_marked());
+    }
+
+    #[test]
+    fn runtime_marker_is_read_from_a_live_process_environment() {
+        let inspector = LinuxInspector::new();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .env("POHUNEK_RUNTIME_ID", "runtime-live")
+            .env("POHUNEK_TEST_SECRET", "not-a-marker")
+            .spawn()
+            .expect("spawn marked child");
+
+        // `spawn` can return while `execve` is still installing the new image,
+        // whose argument and environment regions are then briefly empty.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while inspector
+            .process(child.id())
+            .expect("inspect marked child")
+            .is_none_or(|fact| fact.cmdline != ["/bin/sleep", "30"])
+        {
+            assert!(std::time::Instant::now() < deadline, "child never exec'd");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let markers = inspector.ownership_markers(child.id());
+        child.kill().expect("terminate marked child");
+        child.wait().expect("reap marked child");
+
+        let markers = markers.expect("inspect child markers");
+        assert_eq!(markers.runtime_id.as_deref(), Some("runtime-live"));
+        assert!(!format!("{markers:?}").contains("not-a-marker"));
     }
 
     #[test]

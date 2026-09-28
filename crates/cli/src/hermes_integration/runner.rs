@@ -1413,11 +1413,21 @@ mod tests {
     }
 
     struct StageFixture {
+        // Only the Linux-only system-Python tests read these fields (issue
+        // #101 owns Hermes on macOS); `root` also keeps the fixture alive.
+        #[cfg_attr(
+            not(target_os = "linux"),
+            expect(dead_code, reason = "read only by the Linux-only system-Python tests")
+        )]
         root: Fixture,
         target: ResolvedTarget,
         runner: HermesRunner,
         plugin: PathBuf,
         policy: PathBuf,
+        #[cfg_attr(
+            not(target_os = "linux"),
+            expect(dead_code, reason = "read only by the Linux-only system-Python tests")
+        )]
         runtime: PathBuf,
     }
 
@@ -1900,6 +1910,10 @@ mod tests {
         );
     }
 
+    // Linux only: this test runs the system `/usr/bin/python3`, which on macOS
+    // is Python 3.9 while the embedded plugin requires Python 3.10 or newer.
+    // The Hermes integration lifecycle on macOS is owned by issue #101.
+    #[cfg(target_os = "linux")]
     #[test]
     #[expect(
         clippy::too_many_lines,
@@ -2145,6 +2159,8 @@ mod tests {
         policy
     }
 
+    // Linux only: its sole caller runs the system Python (see issue #101).
+    #[cfg(target_os = "linux")]
     fn assert_stage_error(stage: &StageFixture, expected: Error) {
         assert_eq!(
             stage
@@ -2154,12 +2170,16 @@ mod tests {
         );
     }
 
+    // Linux only: its sole callers run the system Python (see issue #101).
+    #[cfg(target_os = "linux")]
     fn append_file(path: &Path, suffix: &str) {
         let mut contents = fs::read_to_string(path).expect("read staged file");
         contents.push_str(suffix);
         fs::write(path, contents).expect("append staged file");
     }
 
+    // Linux only: its sole callers run the system Python (see issue #101).
+    #[cfg(target_os = "linux")]
     fn replace_file(path: &Path, needle: &str, replacement: &str) {
         let contents = fs::read_to_string(path).expect("read staged file");
         assert!(contents.contains(needle), "mutation needle is present");
@@ -2265,6 +2285,10 @@ mod tests {
         assert!(!rendered.contains(&root.0.display().to_string()));
     }
 
+    // Linux only: this test runs the system `/usr/bin/python3`, which on macOS
+    // is Python 3.9 while the embedded plugin requires Python 3.10 or newer.
+    // The Hermes integration lifecycle on macOS is owned by issue #101.
+    #[cfg(target_os = "linux")]
     #[test]
     fn staged_runtime_spawns_through_symlinked_venv_with_venv_only_module() {
         let root = fixture("venv-runtime");

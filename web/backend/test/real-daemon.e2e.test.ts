@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { constants } from "node:fs";
+import { constants, readFileSync } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -69,7 +69,12 @@ const MARKER = "pohunek-backend-real-daemon-e2e-marker";
 // accepts its owner-private launch identity. This remains far below the fixture timeout.
 const CONTROLLED_HERMES_IDENTITY_RETRY_ATTEMPTS = 40;
 const CONTROLLED_HERMES_IDENTITY_TOTAL_CEILING_MS = 2_000;
-const CONTROLLED_HERMES_IDENTITY_STEP_BUDGET_MS = 50;
+const HERMES_HOOKS_SOURCE = join(HERMES_PLUGIN_ASSETS, "pohunek", "hooks.py");
+// The worker acknowledges an identity report only after its journal is durable, so each
+// step gets exactly the product hook's default socket timeout, read from the shipped hook.
+const CONTROLLED_HERMES_IDENTITY_STEP_BUDGET_MS = productHookTimeoutMs(
+  readFileSync(HERMES_HOOKS_SOURCE, "utf8"),
+);
 const CONTROLLED_HERMES_IDENTITY_RETRY_DELAY_MS = 25;
 const SAFE_AGENT_PREFERENCE = ["shell"] as const;
 const NETBIRD_FIXTURE_SCRIPT = `#!/bin/sh
@@ -920,6 +925,28 @@ int bind(int fd, const struct sockaddr *address, socklen_t length) {
     return redirect(real_bind, "bind", fd, address, length);
 }
 `;
+
+/** Returns the shipped Hermes hook's default timeout, validated against its own ceiling. */
+function productHookTimeoutMs(source: string): number {
+  const defaultMs = hookSecondsConstantMs(source, "_DEFAULT_HOOK_TIMEOUT_SECONDS");
+  const maximumMs = hookSecondsConstantMs(source, "_MAX_HOOK_TIMEOUT_SECONDS");
+  if (defaultMs > maximumMs) {
+    throw new Error(`${HERMES_HOOKS_SOURCE}: default hook timeout exceeds its maximum`);
+  }
+  if (defaultMs >= CONTROLLED_HERMES_IDENTITY_TOTAL_CEILING_MS) {
+    throw new Error(`${HERMES_HOOKS_SOURCE}: hook timeout leaves no identity retry window`);
+  }
+  return defaultMs;
+}
+
+function hookSecondsConstantMs(source: string, name: string): number {
+  const match = new RegExp(`^${name} = ([0-9]+(?:\\.[0-9]+)?)$`, "m").exec(source);
+  const seconds = match?.[1] === undefined ? Number.NaN : Number(match[1]);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    throw new Error(`${HERMES_HOOKS_SOURCE}: missing positive ${name}`);
+  }
+  return Math.round(seconds * 1_000);
+}
 
 const CONTROLLED_HERMES_SOURCE = String.raw`#define _GNU_SOURCE
 #include <errno.h>

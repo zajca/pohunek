@@ -132,6 +132,7 @@ mod tests {
         let mut journal = JournalRecord::bootstrap(
             "s-1".into(),
             "worker-1".into(),
+            crate::test_support::test_origin(),
             1,
             "1".into(),
             "boot-test".into(),

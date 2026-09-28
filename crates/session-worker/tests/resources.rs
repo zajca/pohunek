@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use nix::sys::resource::{getrusage, UsageWho};
-use pohunek_session_worker::{Command, PtyOwner, WorkerConfig};
+use pohunek_session_worker::{Command, EnvBase, PtyOwner, WorkerConfig};
 
 /// Idle sessions held open at once.
 ///
@@ -39,6 +39,7 @@ fn shell(script: &str) -> Command {
     Command {
         program: "/bin/sh".to_owned(),
         args: vec!["-c".to_owned(), script.to_owned()],
+        base: EnvBase::Inherited,
         env: Vec::new(),
         cwd: std::env::temp_dir(),
         cols: 80,

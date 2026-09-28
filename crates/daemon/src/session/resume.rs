@@ -112,8 +112,8 @@ impl SessionRegistry {
     /// `not_resumable` when the entry lacks the native reference required by its
     /// frozen resume template, or any worker launch error from recovery.
     pub async fn resume(&self, id: &SessionId) -> Result<SessionInfo, ProtocolError> {
-        let _recovery = self.inner.recovery_lock.lock().await;
         self.ensure_not_external(id).await?;
+        let guard = self.lock_lifecycle(id).await;
         let (binding, registration) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
@@ -155,6 +155,7 @@ impl SessionRegistry {
                         .runtime
                         .as_ref()
                         .and_then(|runtime| runtime.runtime_id.clone()),
+                    previous_job: entry.job.clone(),
                     previous_runtime_generation: entry
                         .info
                         .runtime
@@ -172,7 +173,7 @@ impl SessionRegistry {
             crate::capabilities::validate_launch_runtime(&binding.agent_base, &configured_program)?;
 
         let info = match self
-            .resume_binding_with_registration(binding, registration, validated_program)
+            .resume_binding_with_registration(binding, registration, validated_program, guard)
             .await
         {
             Ok(info) => info,
@@ -205,23 +206,16 @@ impl SessionRegistry {
     }
 
     /// Fork a native agent conversation into a new pohunek session.
+    ///
+    /// # Errors
+    ///
+    /// Returns `migration_manifest_missing` while unmigrated legacy resume
+    /// bindings exist, before anything is written, and otherwise the source
+    /// lookup, launch-template, or launch error.
     pub async fn fork(&self, params: SessionForkParams) -> Result<SessionInfo, ProtocolError> {
+        self.ensure_migration_settled()?;
         self.ensure_not_external(&params.session_id).await?;
-        let (binding, repo, branch, worktree_path) = {
-            let sessions = self.inner.sessions.lock().await;
-            let entry = sessions
-                .get(&params.session_id)
-                .ok_or_else(|| session_not_found(&params.session_id.0))?;
-            if !entry.info.capabilities.fork {
-                return Err(agent_fork_unsupported());
-            }
-            (
-                Self::resume_binding_from_entry(&params.session_id, entry),
-                entry.info.repo.clone(),
-                entry.info.branch.clone(),
-                entry.info.worktree_path.clone(),
-            )
-        };
+        let (binding, repo, branch, worktree_path) = self.fork_source(&params.session_id).await?;
 
         let fork_template = binding_fork_template(&binding).ok_or_else(agent_fork_unsupported)?;
         let session_ref = session_ref_from_binding(fork_template.resume, &binding)?;
@@ -276,33 +270,64 @@ impl SessionRegistry {
             resume: resume_template,
             fork: Some(fork_template),
         };
+        let guard = self.lock_lifecycle(&id).await;
         let info = self
-            .register_pty_session(PtySessionSpec {
-                id,
-                registration: super::target::PtyRegistration::Create,
-                name: validate_session_name(params.name.as_deref())?,
-                agent: binding.agent,
-                agent_base: binding.agent_base.clone(),
-                input_rules,
-                snapshot,
-                manifest_override,
-                cwd: binding.cwd,
-                cols: params.cols,
-                rows: params.rows,
-                command,
-                native_session_id: binding.native_session_id,
-                native_session_path: binding.native_session_path,
-                project_id: binding.project_id,
-                is_linked_worktree: binding.is_linked_worktree,
-                repo,
-                branch,
-                worktree_path,
-                metadata: binding.metadata,
-                warnings: Vec::new(),
-            })
+            .register_pty_session(
+                PtySessionSpec {
+                    id,
+                    registration: super::target::PtyRegistration::Create,
+                    name: validate_session_name(params.name.as_deref())?,
+                    agent: binding.agent,
+                    agent_base: binding.agent_base.clone(),
+                    input_rules,
+                    snapshot,
+                    manifest_override,
+                    cwd: binding.cwd,
+                    cols: params.cols,
+                    rows: params.rows,
+                    command,
+                    native_session_id: binding.native_session_id,
+                    native_session_path: binding.native_session_path,
+                    project_id: binding.project_id,
+                    is_linked_worktree: binding.is_linked_worktree,
+                    repo,
+                    branch,
+                    worktree_path,
+                    metadata: binding.metadata,
+                    warnings: Vec::new(),
+                    initial_input_pending: false,
+                },
+                guard,
+            )
             .await?;
         self.persist_resume_binding(&info.id).await;
         Ok(info)
+    }
+
+    /// The resume binding and git context a fork of `id` launches from.
+    async fn fork_source(
+        &self,
+        id: &SessionId,
+    ) -> Result<
+        (
+            ResumeBinding,
+            Option<PathBuf>,
+            Option<String>,
+            Option<PathBuf>,
+        ),
+        ProtocolError,
+    > {
+        let sessions = self.inner.sessions.lock().await;
+        let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
+        if !entry.info.capabilities.fork {
+            return Err(agent_fork_unsupported());
+        }
+        Ok((
+            Self::resume_binding_from_entry(id, entry),
+            entry.info.repo.clone(),
+            entry.info.branch.clone(),
+            entry.info.worktree_path.clone(),
+        ))
     }
 
     pub(super) fn resume_binding_from_entry(id: &SessionId, entry: &SessionEntry) -> ResumeBinding {
@@ -349,12 +374,14 @@ impl SessionRegistry {
         let validated_program =
             crate::capabilities::validate_launch_runtime(&binding.agent_base, &configured_program)?;
         let id = SessionId(binding.session_id.clone());
+        let guard = self.lock_lifecycle(&id).await;
         let registration = match self.load_durable_session_record(&id).await? {
             Some(record) => super::target::PtyRegistration::Recover {
                 transaction_id: format!(
                     "recover-{}",
                     self.inner.next_write_id.fetch_add(1, Ordering::Relaxed)
                 ),
+                previous_job: super::Generation::from_record(&id.0, &record.runtime)?,
                 previous_worker_id: record.runtime.worker_id,
                 previous_runtime_id: record.runtime.runtime_id,
                 previous_runtime_generation: record
@@ -369,7 +396,7 @@ impl SessionRegistry {
             },
             None => super::target::PtyRegistration::Create,
         };
-        self.resume_binding_with_registration(binding, registration, validated_program)
+        self.resume_binding_with_registration(binding, registration, validated_program, guard)
             .await
     }
 
@@ -379,6 +406,7 @@ impl SessionRegistry {
         binding: ResumeBinding,
         registration: super::target::PtyRegistration,
         validated_program: Option<ValidatedLaunchProgram>,
+        guard: super::LifecycleGuard,
     ) -> Result<SessionInfo, ProtocolError> {
         // The resume mechanics come from the frozen structural snapshot (C.4). An
         // explicit `(resume_mode, ref_kind)` pair drives the argv; a legacy binding
@@ -464,29 +492,33 @@ impl SessionRegistry {
         // without project context until its next persist.
         let project_id = binding.project_id.clone();
         let is_linked_worktree = binding.is_linked_worktree;
-        self.register_pty_session(PtySessionSpec {
-            id,
-            registration,
-            name: binding.name,
-            agent: binding.agent,
-            agent_base: binding.agent_base.clone(),
-            input_rules,
-            snapshot,
-            manifest_override,
-            cwd: binding.cwd,
-            cols: binding.cols,
-            rows: binding.rows,
-            command,
-            native_session_id: binding.native_session_id,
-            native_session_path: binding.native_session_path,
-            project_id,
-            is_linked_worktree,
-            repo,
-            branch,
-            worktree_path,
-            metadata: binding.metadata,
-            warnings: Vec::new(),
-        })
+        self.register_pty_session(
+            PtySessionSpec {
+                id,
+                registration,
+                name: binding.name,
+                agent: binding.agent,
+                agent_base: binding.agent_base.clone(),
+                input_rules,
+                snapshot,
+                manifest_override,
+                cwd: binding.cwd,
+                cols: binding.cols,
+                rows: binding.rows,
+                command,
+                native_session_id: binding.native_session_id,
+                native_session_path: binding.native_session_path,
+                project_id,
+                is_linked_worktree,
+                repo,
+                branch,
+                worktree_path,
+                metadata: binding.metadata,
+                warnings: Vec::new(),
+                initial_input_pending: false,
+            },
+            guard,
+        )
         .await
     }
 

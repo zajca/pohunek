@@ -251,22 +251,31 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use std::fs;
+    #[cfg(target_os = "linux")]
     use std::process::Command;
+    #[cfg(target_os = "linux")]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
+    // The scratch-directory helpers serve only the Linux-only system-Python
+    // test below (issue #101 owns Hermes on macOS).
+    #[cfg(target_os = "linux")]
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
+    #[cfg(target_os = "linux")]
     struct TempDir(std::path::PathBuf);
 
+    #[cfg(target_os = "linux")]
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn temp_dir() -> TempDir {
         let path = std::env::temp_dir().join(format!(
             "pohunek-hermes-assets-{}-{}",
@@ -304,6 +313,10 @@ mod tests {
         );
     }
 
+    // Linux only: this test runs the system `/usr/bin/python3`, which on macOS
+    // is Python 3.9 while the embedded plugin requires Python 3.10 or newer.
+    // The Hermes integration lifecycle on macOS is owned by issue #101.
+    #[cfg(target_os = "linux")]
     #[test]
     fn rendered_init_is_valid_python_for_escaped_absolute_paths() {
         let temp = temp_dir();

@@ -18,6 +18,7 @@ path = "src/main.rs"
 pohunek-logging = { workspace = true }
 pohunek-platform = { workspace = true }
 pohunek-paths = { workspace = true }
+pohunek-service-config = { workspace = true }
 pohunek-terminal = { workspace = true }
 pohunek-worker-protocol = { path = "../worker-protocol" }
 libc = { workspace = true }

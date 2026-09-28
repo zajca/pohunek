@@ -20,3 +20,12 @@ pub(crate) fn temp_root() -> PathBuf {
         std::env::temp_dir()
     }
 }
+
+/// Returns a fixed worker origin for journals built directly in tests.
+pub(crate) fn test_origin() -> crate::WorkerOrigin {
+    crate::WorkerOrigin {
+        executable: PathBuf::from("/usr/libexec/pohunek-sessiond"),
+        version: "0.0.0-test".to_owned(),
+        generation: "abcd2345".to_owned(),
+    }
+}

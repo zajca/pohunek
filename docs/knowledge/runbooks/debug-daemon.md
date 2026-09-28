@@ -23,8 +23,26 @@ Use this runbook when commands report that the daemon is unreachable or unhealth
    private mode, and every application-owned component. Do not recursively
    delete it or follow a symlink, and do not use broad `chmod` to make a foreign
    entry pass validation.
-3. If health cannot connect, start the daemon with
-   `pohunek daemon start --detach`.
+   The daemon also refuses to start when `HOME` or a forwarded `XDG_*`
+   variable is one a worker job definition would reject: every value must be
+   an absolute normalized UTF-8 path (no `.` or `..` segments), and `HOME`, the
+   workers' working directory, must exist. The fatal error names the variable;
+   a relative `HOME` such as `.` fails this way even when every `XDG_*` root is
+   absolute.
+3. If health cannot connect, run `pohunek service status --json`. An installed
+   service reports its daemon job (`daemon.state`, `daemon.pid`) and
+   `daemon_error` when the service manager cannot be queried. On macOS a
+   loaded job without a running process reports `unknown` without a `pid`,
+   because launchd does not say whether it has not started yet or has exited;
+   check the launchd output files below. A `failed` or `stopped` daemon job is
+   restarted by the service manager after its restart
+   throttle; its logs are the daemon's JSON log under
+   `~/.local/state/pohunek/logs/` and, on macOS, the launchd output files under
+   `~/.local/state/pohunek/logs/launchd/`. If `installed` is false, install the
+   service with `pohunek service install`. `pohunek daemon start --detach` runs
+   the installed daemon by hand and fails with `service_not_installed` when
+   `service.toml` is missing; `pohunek daemon start --dev-subprocess --detach` is
+   for development only.
 4. Run `pohunek health --json` again and inspect the reported socket, version,
    and status.
 5. Run `pohunek host governance inspect local --json` to distinguish a healthy
@@ -50,6 +68,13 @@ Use this runbook when commands report that the daemon is unreachable or unhealth
    `runtime_id`, then use the
    [session runtime runbook](debug-session-runtime.md) for `reconnecting`,
    `lost`, `conflict`, or `incompatible`.
+9. If `pohunek session new` or `session fork` fails with
+   `migration_manifest_missing`, the daemon found legacy resume bindings that
+   no migration manifest imported and refuses to write a first session record
+   that would make them unimportable. Follow the migration section of the
+   [session runtime runbook](debug-session-runtime.md): run
+   `pohunek migration preflight` through the worker-aware installer against
+   the legacy daemon, and the next daemon start imports the manifest.
 
 For durable notification issues:
 

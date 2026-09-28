@@ -115,6 +115,9 @@ and JSON/non-interactive remote starts require `--yes`.
 Daemon-issued session IDs use the `s-<ULID>` form. They are time-sortable opaque
 identifiers, not sequence numbers; clients must preserve and display them
 verbatim rather than deriving ordering or lifecycle meaning from their values.
+Worker runtime paths, journals, and service-manager job names are derived only
+from an `s-<ULID>` ID or the numeric `s-<digits>` form of older records, with 1
+to 20 digits; any other ID is rejected there.
 
 A session can carry an optional owner-set display name. Set it at creation with
 `pohunek session new --name <NAME>`, and change or clear it later with
@@ -266,7 +269,10 @@ The same runtime model keeps `cwd` current. A session starts with its launch
 directory, then procwatch reads the cwd of the focus process on each tick: the
 active nested-agent PID when one is bound, otherwise the root PTY child. OSC 7
 terminal output is accepted as an immediate cwd hint, but procwatch remains
-authoritative and overwrites a hint that the process cwd contradicts. Each cwd
+authoritative and overwrites a hint that a later read of the process cwd
+contradicts. Cwd evidence is ordered by when it was observed: a procwatch read
+taken before a hint arrived never replaces that hint, and a hint for the
+current cwd keeps the source that set it. Each cwd
 change emits `session_updated` and re-resolves project and worktree context. If
 the new cwd is inside another registered active worktree, `worktree_path`,
 `branch`, and project metadata move to that worktree; if it is outside every
@@ -293,8 +299,67 @@ identity; Pohunek quarantines it and does not kill a worker automatically.
 version, so the daemon leaves it running. Attach, input, and resize are not
 available in these degraded states, but list and inspect retain the logical
 record and diagnostic `loss_reason`. After preserving diagnostic evidence, the
-operator can remove a degraded logical record with `session rm`; this does not
-stop or signal an unavailable or ambiguous worker.
+operator can remove a degraded logical record with `session rm`. A `lost` runtime
+has ended, so removal leaves its worker job alone; a `terminal` worker only
+retains its final output, so removal retires its job. A `reconnecting` or
+`incompatible` worker, or a `conflict` whose reason is
+`runtime_supervision_ambiguous`, cannot be reached yet may still own a live PTY,
+so removal first retires that worker's job through the service manager by the
+exact generation the record names, which stops the worker and its child, then
+requires every worker the session's journals record for that generation to be
+gone, and only then deletes the record. Removal is refused, and the record kept so it can be retried, when:
+the record names no worker generation, or the runtime is a `conflict` for any
+other reason (such as `runtime_identity_mismatch`, a job or worker that is not
+the recorded generation's, which is never touched), both with the runtime code
+(`session_runtime_conflict`, `session_runtime_reconnecting`, or
+`worker_protocol_incompatible`); the service manager cannot complete the
+retirement (`runtime_supervision_unavailable`); a worker journaled under another
+generation still runs (`runtime_identity_mismatch`); or the session's journals
+cannot be read, or a journaled worker of the generation still runs or cannot be
+inspected after the retirement (`runtime_supervision_ambiguous`). Every
+removal, whatever the runtime state, then sweeps the processes that carry the
+session's runtime ownership markers, because a descendant that left the
+worker's process group (macOS kills only the group) outlives the stop and the
+job retirement. A sweep that cannot confirm every marked process exited fails
+the removal with `runtime_supervision_ambiguous` and keeps the session listed
+with its removal intent; `session rm` again, or the next daemon start,
+finishes it once the leftover process is gone.
+
+Reconciliation joins the service manager's jobs with worker sockets and
+journals for each worker generation. It reports `runtime_lost` when a worker's
+job ended while its journal still said live, after sweeping that generation's
+leftover processes (`runtime_lost_cleanup_unconfirmed` when that cleanup could
+not be confirmed). It reports `runtime_supervision_ambiguous` (`conflict`) for
+a present job whose worker does not answer, `runtime_identity_mismatch`
+(`conflict`) for a job whose definition or process does not match the record,
+and `runtime_supervision_unavailable` (`reconnecting`) while the service manager
+cannot be inspected. The last three kill nothing. A session is reported `lost`
+only after the service manager retired its ended job; while that retirement
+fails it stays `reconnecting` with `runtime_supervision_unavailable` and is
+retried. A removal interrupted by a daemon restart is finished by
+reconciliation through the same steps as `session rm` (retire the recorded
+generation and prove its workers gone, sweep its runtimes' marked processes,
+then delete worktrees, logs, the resume binding, and the record); until those
+succeed the session stays listed with `runtime_supervision_unavailable` or
+`runtime_supervision_ambiguous` and is retried. A stop interrupted the same way
+is replayed through its answering worker and committed `stopped` only once the
+worker returns the terminal outcome; until then it stays `reconnecting` with
+`runtime_supervision_unavailable` and the retry replays it. A create
+interrupted before it committed is compensated from its durable create record
+once its worker is proven ended (never launched, or its runtime ended): the
+generation is retired first, then the worktree and its binding are removed,
+then the record is deleted, and a step that fails keeps the rest for a retry. A
+committed create whose `--input` prompt was not yet delivered is removed like
+`session rm`, since the prompt lived only in the stopped daemon's memory.
+A compensation that cannot finish while the daemon runs (a checkout that
+cannot be removed, or a binding or record the store cannot drop) keeps the
+session listed as `reconnecting` with `create_compensation_pending`, and the
+supervision retry repeats it until the session is removed (`session_removed`).
+A job of a
+generation no record names is retired only once its journaled worker is proven
+gone as well, even when the job itself already ended; while that worker runs or
+the session's journals cannot be read, the job stays `orphaned` in the runtime
+inventory (`stale_worker_generation`).
 
 ## Retention
 
@@ -364,6 +429,12 @@ registration on macOS. Both re-verify the exact process identity after arming
 the watch, so a reused process id never completes a watch for the process it
 replaced, and a registration failure is reported as a failure rather than as an
 exit.
+
+Workers live for the operating-system login session. Closing a terminal,
+detaching, or locking the screen does not stop a session. Logging out or
+rebooting ends every worker; after the next login the daemon reports those
+sessions `lost` (`runtime_lost`) and never restarts or resurrects them.
+Explicit `session.resume` remains the recovery path.
 
 Detach and client restarts do not stop a session because its worker owns the
 PTY. A daemon restart, daemon `SIGKILL`, or daemon binary upgrade closes client

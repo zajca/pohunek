@@ -1,7 +1,68 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-09-27)
+
+- Documented that a failed `session new` whose worktree compensation cannot
+  finish stays listed as `reconnecting` with `create_compensation_pending`
+  and is retried by the running daemon, and that `session new` and `session
+  fork` fail with `migration_manifest_missing` while unimported legacy resume
+  bindings exist.
+- Documented that a session becomes `lost` only after its ended job is retired
+  (otherwise `reconnecting`, `runtime_supervision_unavailable`, retried), and
+  that reconciliation finishes an interrupted removal through the same
+  retirement and cleanup as `session rm`, keeping the session listed and
+  retried until they succeed.
+- Documented that `session rm` of a `conflict`, `reconnecting`, or
+  `incompatible` session retires the worker job of its recorded generation
+  through the service manager before deleting the record, refuses a record that
+  names no generation with its runtime code, and keeps the record with
+  `runtime_supervision_unavailable` when retirement fails.
+- Documented that `service uninstall` clears the transaction record before
+  `service.toml`, uninstalls a registered pending install whose `service.toml`
+  is gone, and refuses with `service_outdated_journals` while a journal of an
+  earlier schema names a worker that may still run; such journals also keep
+  every version directory during an upgrade.
+- Documented the worker session ID grammar: `s-<ULID>` or `s-<digits>` with 1
+  to 20 digits.
+
+## Unreleased (2026-09-25)
+
+- Documented that `migration preflight` takes an explicit `--socket <path>` so
+  the archive installer can dial the legacy daemon after renaming its control
+  socket aside as a connect barrier, retire it in a fail-closed order
+  (barrier, preflight, worker inventory, stop, post-stop re-inventory), and
+  abort without removing legacy files when a not-inactive template worker
+  survives.
+
 ## Unreleased (2026-08-12)
 
+- Documented that a Darwin process between images no longer fails a process
+  table read: it is listed without a command line, its markers are
+  unobservable, and the runtime sweep skips it as unreadable.
+- Documented that cwd evidence is ordered by observation time: a procwatch read
+  taken before an OSC 7 hint arrived no longer moves the session back.
+- Documented native worker supervision (#100): every worker generation is its
+  own systemd transient unit (`pohunek-<ns>-worker-<session-id>-<generation>.service`
+  in `pohunek-<ns>-sessions.slice`, systemd 255 or newer) or launchd job
+  (`io.github.zajca.pohunek.<ns>.worker.<session-id>.<generation>`, private
+  definition, no `KeepAlive`); the `pohunek-session@.service` template and the
+  `packaging/systemd` files are gone. Added `pohunek service
+  install|upgrade|uninstall|status`, the versioned
+  `<prefix>/libexec/pohunek/<version>/` layout, `service.toml`, the install
+  journal, and `pohunek daemon start --dev-subprocess`; `pohunek daemon start`
+  now requires an installed service.
+- Documented the lifetime scope: terminal close and screen lock are safe;
+  logout and reboot end workers, which the next login reports as `lost` with
+  `runtime_lost` and never restarts. Added the reconciliation reasons
+  `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`,
+  `runtime_identity_mismatch`, `runtime_lost_cleanup_unconfirmed`,
+  `worker_job_absent`, and `stale_worker_generation`, and the
+  manual macOS acceptance procedure in `docs/acceptance/`.
+- Documented that agents no longer inherit the daemon's whole environment:
+  the worker builds the child environment from an empty base plus the
+  allowlisted `BaseEnv` (`[environment] allowlist` in `service.toml`), `TERM`,
+  the profile environment, and its `POHUNEK_*` identity, and always strips
+  service-manager variables.
 - Documented portable PTY readiness in the session worker: one `poll(2)`
   implementation over the PTY master and a cancellation self-pipe on Linux and
   Darwin, with the worker's complete test suite running on native macOS CI.

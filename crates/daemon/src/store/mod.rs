@@ -454,6 +454,27 @@ pub struct SessionTransaction {
     /// Runtime generation replaced by a recovery transaction, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_runtime_id: Option<String>,
+    /// Daemon instance whose in-memory work the transaction depends on.
+    ///
+    /// Set on the `initial_input` marker, whose input only that instance
+    /// holds: reconciliation rolls back a marker only when another instance
+    /// (or none) wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_instance_id: Option<String>,
+}
+
+/// Phase of a committed create whose initial input is not yet delivered.
+///
+/// Reconciliation rolls such a create back, since the input exists only in
+/// the daemon's memory and the session must not run without it.
+pub const INITIAL_INPUT_PHASE: &str = "initial_input";
+
+impl SessionTransaction {
+    /// Whether this is a committed create still delivering its initial input.
+    #[must_use]
+    pub fn is_initial_input(&self) -> bool {
+        self.kind == TransactionKind::Create && self.phase == INITIAL_INPUT_PHASE
+    }
 }
 
 /// Last durable binding between a logical session and its worker runtime.
@@ -467,9 +488,16 @@ pub struct RuntimeRecord {
     /// Stable PTY generation identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_id: Option<String>,
-    /// systemd user unit name.
+    /// Supervisor service identifier `<session-id>.<generation>` of the
+    /// current worker job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unit_name: Option<String>,
+    pub service_id: Option<String>,
+    /// Daemon-issued worker generation token, persisted before the job starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
+    /// Absolute versioned worker executable named by the job definition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<PathBuf>,
     /// Machine-readable loss or conflict reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -608,6 +636,8 @@ pub struct Store {
     fail_parent_sync_after_rename: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_before_rename_countdown: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    fail_binding_removal: std::sync::atomic::AtomicBool,
 }
 
 impl Store {
@@ -621,7 +651,16 @@ impl Store {
             fail_parent_sync_after_rename: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_before_rename_countdown: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_binding_removal: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Makes the next [`Self::remove_worktree_binding`] fail before it writes.
+    #[cfg(test)]
+    pub(crate) fn fail_next_binding_removal(&self) {
+        self.fail_binding_removal
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -706,6 +745,7 @@ impl Store {
             }
             let mut replacement = record.clone();
             preserve_newer_native_identity(existing, &mut replacement);
+            keep_initial_input_settled(existing, &mut replacement);
             *existing = replacement;
         } else {
             sessions.push(record.clone());
@@ -747,6 +787,7 @@ impl Store {
         }
         let mut replacement = record.clone();
         preserve_newer_native_identity(existing, &mut replacement);
+        keep_initial_input_settled(existing, &mut replacement);
         *existing = replacement;
         match self.write_all(&resume, &worktrees, &projects, &sessions)? {
             MetadataWriteOutcome::Synced => Ok(SessionWriteOutcome::Applied),
@@ -756,6 +797,33 @@ impl Store {
                 })
             }
         }
+    }
+
+    /// Clears the `create/initial_input` transaction of one session's
+    /// current record and leaves every other field as persisted.
+    ///
+    /// The record is re-read under the write lock, so a state a concurrent
+    /// stop, removal, or exit persisted is kept. Returns whether a marker was
+    /// cleared; a record without it, or no record at all, is a no-op success.
+    pub fn clear_initial_input(&self, session_id: &str) -> io::Result<StoreMutation<bool>> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (resume, worktrees, projects, mut sessions) = self.read_all()?;
+        let Some(record) = sessions.iter_mut().find(|record| {
+            record.session_id == session_id
+                && record
+                    .transaction
+                    .as_ref()
+                    .is_some_and(SessionTransaction::is_initial_input)
+        }) else {
+            return Ok(StoreMutation::Synced(false));
+        };
+        record.transaction = None;
+        Ok(self
+            .write_all(&resume, &worktrees, &projects, &sessions)?
+            .with_value(true))
     }
 
     /// Removes one logical session and preserves every other record kind.
@@ -901,6 +969,41 @@ impl Store {
                 .with_value(removed));
         }
         Ok(StoreMutation::Synced(0))
+    }
+
+    /// Remove the one worktree binding keyed like `binding` (`(session_id,
+    /// repository, branch_slug)`), preserving every other record. Returns
+    /// whether a binding was removed (`false` is a no-op success).
+    pub fn remove_worktree_binding(
+        &self,
+        binding: &WorktreeBinding,
+    ) -> io::Result<StoreMutation<bool>> {
+        #[cfg(test)]
+        if self
+            .fail_binding_removal
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(io::Error::other(
+                "injected worktree binding removal failure",
+            ));
+        }
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (resume, mut worktrees, projects, sessions) = self.read_all()?;
+        let before = worktrees.len();
+        worktrees.retain(|existing| {
+            existing.session_id != binding.session_id
+                || existing.repository != binding.repository
+                || existing.branch_slug != binding.branch_slug
+        });
+        if worktrees.len() != before {
+            return Ok(self
+                .write_all(&resume, &worktrees, &projects, &sessions)?
+                .with_value(true));
+        }
+        Ok(StoreMutation::Synced(false))
     }
 
     /// Atomically read-modify-write the project keyed by canonical
@@ -1207,6 +1310,26 @@ fn fs_error_to_io(error: FsError) -> io::Error {
     io::Error::new(kind, error)
 }
 
+/// Drops a pending-initial-input marker that `replacement` would re-add.
+///
+/// The marker is written only by the create commit, over the create's own
+/// transaction, and cleared once the input is delivered. A writer that built
+/// its record before that clearing must not bring the marker back, or a
+/// restart would roll back a session that already received its input.
+fn keep_initial_input_settled(existing: &SessionRecord, replacement: &mut SessionRecord) {
+    let reintroduced = replacement
+        .transaction
+        .as_ref()
+        .is_some_and(SessionTransaction::is_initial_input)
+        && existing
+            .transaction
+            .as_ref()
+            .is_none_or(|transaction| transaction.kind != TransactionKind::Create);
+    if reintroduced {
+        replacement.transaction = None;
+    }
+}
+
 pub(crate) fn preserve_newer_native_identity(
     existing: &SessionRecord,
     replacement: &mut SessionRecord,
@@ -1411,7 +1534,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
+        let dir = pohunek_test_support::temp_root().join(format!(
             "pohunek-store-{tag}-{}-{nanos}",
             std::process::id()
         ));
@@ -1702,6 +1825,34 @@ mod tests {
             .into_value();
         assert_eq!(removed, 2);
         assert!(store.load_worktrees().expect("load").is_empty());
+    }
+
+    #[test]
+    fn worktree_binding_removal_drops_only_the_keyed_binding() {
+        let store = Store::new(temp_store_path("worktree-remove-one"));
+        let kept_branch = worktree("s-1", "x");
+        let removed_branch = worktree("s-1", "y");
+        let other_session = worktree("s-2", "y");
+        for binding in [&kept_branch, &removed_branch, &other_session] {
+            store.record_worktree(binding).expect("record binding");
+        }
+
+        let removed = store
+            .remove_worktree_binding(&removed_branch)
+            .expect("remove one binding")
+            .into_value();
+        let again = store
+            .remove_worktree_binding(&removed_branch)
+            .expect("repeat removal")
+            .into_value();
+
+        assert!(removed, "the keyed binding is removed");
+        assert!(!again, "a repeated removal is a no-op success");
+        assert_eq!(
+            store.load_worktrees().expect("load"),
+            [kept_branch, other_session],
+            "the session's other branch and other sessions keep their bindings"
+        );
     }
 
     #[test]

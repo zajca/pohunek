@@ -121,6 +121,29 @@ pub enum DaemonError {
     #[error("host governance startup failed: {0}")]
     Governance(#[from] crate::governance::HostGovernanceError),
 
+    /// The daemon command line is malformed.
+    #[error("invalid pohunekd arguments: {0}")]
+    Arguments(String),
+
+    /// Neither `--service-config` nor the dev/test subprocess mode was chosen,
+    /// or both were.
+    #[error(
+        "worker supervision is not configured: {detail}; run `pohunekd --service-config <absolute service.toml>` \
+         (installed by `pohunek service install`) or set POHUNEK_WORKER_LAUNCHER=subprocess for dev/test"
+    )]
+    SupervisionMode {
+        /// What was wrong with the selection.
+        detail: &'static str,
+    },
+
+    /// `service.toml` is missing, invalid, or belongs to another installation.
+    #[error("service configuration is unusable: {0}")]
+    ServiceConfig(#[from] pohunek_service_config::ConfigError),
+
+    /// The native worker supervisor could not be reached or configured.
+    #[error("native worker supervisor is unavailable: {0}")]
+    Supervisor(#[from] pohunek_platform::supervisor::Error),
+
     /// Generic I/O error not tied to a specific resource above.
     #[error("io error: {0}")]
     Io(#[from] io::Error),

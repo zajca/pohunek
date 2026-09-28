@@ -4,7 +4,7 @@
 //! it, so an oversized line is rejected before its claimed size is allocated.
 //! The writer serializes one JSON value followed by exactly one newline.
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-09-27
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -69,18 +69,32 @@ where
     /// A clean EOF with no buffered bytes returns `Ok(None)`. A final JSON value
     /// without a newline is accepted.
     ///
+    /// # Cancel safety
+    ///
+    /// This method is cancel-safe: dropping its future loses no input. Bytes of
+    /// an unterminated line are retained and the next call resumes that line,
+    /// so a caller racing it in `select!` or under a timeout cannot desynchronize
+    /// the stream. The retained prefix counts towards the same line bound.
+    ///
     /// # Errors
     ///
     /// Returns [`ControlCodecError`] for I/O failures, malformed JSON, or a line
-    /// exceeding the configured bound.
+    /// exceeding the configured bound. Every error discards the pending line.
     pub async fn read<T>(&mut self) -> Result<Option<T>, ControlCodecError>
     where
         T: DeserializeOwned,
     {
-        self.buffer.clear();
-
+        // `buffer` holds only the unterminated prefix of the current line: every
+        // completed or failed line is scrubbed before returning, so a non-empty
+        // buffer here is a line interrupted by a dropped caller.
         loop {
-            let available = self.inner.fill_buf().await?;
+            let available = match self.inner.fill_buf().await {
+                Ok(available) => available,
+                Err(error) => {
+                    scrub(&mut self.buffer);
+                    return Err(ControlCodecError::Io(error));
+                }
+            };
             if available.is_empty() {
                 return if self.buffer.is_empty() {
                     Ok(None)
@@ -303,6 +317,66 @@ mod tests {
         );
         assert_eq!(reader.read::<Message>().await.expect("clean EOF"), None);
         task.await.expect("sender task");
+    }
+
+    /// Polls one `read` exactly once, returning `None` when it was still
+    /// pending and its future was dropped.
+    async fn poll_read_once<R>(
+        reader: &mut ControlReader<R>,
+    ) -> Option<Result<Option<Message>, ControlCodecError>>
+    where
+        R: AsyncRead + Unpin + Send,
+    {
+        tokio::select! {
+            biased;
+            result = reader.read::<Message>() => Some(result),
+            () = std::future::ready(()) => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_resumes_a_line_interrupted_by_a_dropped_caller() {
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        let mut reader = ControlReader::with_maximum(receiver, 64).expect("valid limit");
+
+        sender.write_all(b"{\"value\":").await.expect("first half");
+        assert!(
+            poll_read_once(&mut reader).await.is_none(),
+            "an unterminated line must leave the read pending"
+        );
+        sender.write_all(b"\"sp").await.expect("second part");
+        assert!(poll_read_once(&mut reader).await.is_none());
+        sender.write_all(b"lit\"}\n").await.expect("line end");
+
+        assert_eq!(
+            reader.read::<Message>().await.expect("resumed message"),
+            Some(Message {
+                value: "split".to_owned()
+            })
+        );
+        assert!(reader.buffer.is_empty(), "a decoded line must be scrubbed");
+    }
+
+    #[tokio::test]
+    async fn resumed_lines_stay_bound_by_the_configured_limit() {
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        let mut reader = ControlReader::with_maximum(receiver, 16).expect("valid limit");
+
+        sender.write_all(b"{\"value\":\"").await.expect("prefix");
+        assert!(poll_read_once(&mut reader).await.is_none());
+        sender.write_all(b"overflow").await.expect("overflow");
+        let result = poll_read_once(&mut reader)
+            .await
+            .expect("an overlong resumed line must fail without waiting");
+
+        assert!(matches!(
+            result,
+            Err(ControlCodecError::LineTooLong {
+                actual: 18,
+                maximum: 16
+            })
+        ));
+        assert!(reader.buffer.is_empty(), "a rejected line must be scrubbed");
     }
 
     #[tokio::test]

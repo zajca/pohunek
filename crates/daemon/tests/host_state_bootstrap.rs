@@ -2,7 +2,7 @@
 
 // Rust guideline compliant 2026-09-04
 
-use std::io::{Read as _, Write as _};
+use std::io::{ErrorKind, Read as _, Write as _};
 use std::os::unix::{
     fs::{MetadataExt as _, PermissionsExt as _},
     net::{UnixListener, UnixStream},
@@ -77,7 +77,7 @@ impl Children {
 fn state_dir() -> tempfile::TempDir {
     let temp = tempfile::Builder::new()
         .prefix("pohunek-host-bootstrap-")
-        .tempdir()
+        .tempdir_in(pohunek_test_support::temp_root())
         .expect("create isolated state directory");
     std::fs::set_permissions(
         temp.path(),
@@ -114,9 +114,14 @@ fn accept_with_timeout(listener: &UnixListener, stage: &'static str) -> UnixStre
 
 fn receive_event(listener: &UnixListener, stage: &'static str) -> ChildEvent {
     let stream = accept_with_timeout(listener, stage);
-    stream
-        .set_read_timeout(Some(IPC_TIMEOUT))
-        .expect("set child event read deadline");
+    match stream.set_read_timeout(Some(IPC_TIMEOUT)) {
+        Ok(()) => {}
+        // Darwin rejects `SO_RCVTIMEO` with `EINVAL` once the peer has already
+        // closed its end. The event is then fully buffered and the read below
+        // reaches EOF without blocking, so no deadline is needed.
+        Err(error) if cfg!(target_os = "macos") && error.kind() == ErrorKind::InvalidInput => {}
+        Err(error) => panic!("set child event read deadline: {error}"),
+    }
     let mut bytes = Vec::new();
     stream
         .take(MAX_IPC_EVENT_BYTES + 1)

@@ -4,7 +4,7 @@
 //! buffer. Keeping the decoding here makes region separation, bounds, and
 //! integer conversions testable on every host, not only on macOS.
 
-// Rust guideline compliant 2026-09-22
+// Rust guideline compliant 2026-09-27
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -17,6 +17,8 @@ use super::{OwnershipMarkers, Pid, StartIdentity};
 pub(super) const ENV_DAEMON_ID: &str = "POHUNEK_DAEMON_ID";
 /// Allowlisted session ownership marker.
 pub(super) const ENV_SESSION_ID: &str = "POHUNEK_SESSION_ID";
+/// Allowlisted worker runtime-generation ownership marker.
+pub(super) const ENV_RUNTIME_ID: &str = "POHUNEK_RUNTIME_ID";
 
 /// Width of the leading `KERN_PROCARGS2` argument count, written as a C `int`.
 const ARGUMENT_COUNT_BYTES: usize = 4;
@@ -29,8 +31,11 @@ const MAX_ARGUMENT_COUNT: usize = 4_096;
 
 /// Caps the environment entries scanned for ownership markers.
 ///
-/// The scan stops at the first entry beyond this bound instead of walking an
-/// unbounded region that a malformed buffer could describe.
+/// Bounds the walk of a region that a malformed buffer could describe as
+/// unbounded. An environment with more entries is
+/// [`LayoutError::Malformed`], never a scan that ends early: a marker past the
+/// bound would otherwise read as absent and turn an owned process foreign.
+/// Far above any real environment, which `kern.argmax` (1 MiB) also bounds.
 const MAX_ENVIRONMENT_ENTRIES: usize = 8_192;
 
 /// Caps a retained ownership-marker value.
@@ -76,12 +81,43 @@ pub(super) struct NativeArguments {
     pub(super) markers: OwnershipMarkers,
 }
 
+/// What one argument-region read established about a same-user process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ArgumentRegion {
+    /// The region decoded into its distinct parts.
+    Present(NativeArguments),
+    /// The process is exiting or gone, so it holds no region any more.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(
+            dead_code,
+            reason = "only the Darwin backend reads a process that ended"
+        )
+    )]
+    Ended,
+    /// The process is live, but its region cannot be read right now: it has
+    /// forked without an exec yet, its image is being replaced, or the copied
+    /// bytes contradict the documented layout.
+    Unobservable,
+}
+
+/// Decodes the `KERN_PROCARGS2` buffer copied from a live process.
+///
+/// The kernel copies the region out of the live process stack, which an
+/// `exec` may be replacing or the process may have rewritten, so a buffer
+/// that contradicts the layout describes that one process, not a failed
+/// observation: it is [`ArgumentRegion::Unobservable`].
+pub(super) fn decode_argument_region(buffer: &[u8]) -> ArgumentRegion {
+    parse_process_arguments(buffer).map_or(ArgumentRegion::Unobservable, ArgumentRegion::Present)
+}
+
 /// Decodes one `KERN_PROCARGS2` buffer into its distinct regions.
 ///
 /// # Errors
 ///
 /// Returns [`LayoutError::Malformed`] when a region is truncated, the argument
-/// count is negative or oversized, or a marker value exceeds its bound.
+/// count is negative or oversized, a marker value exceeds its bound, or the
+/// environment holds more entries than the scan bound.
 pub(super) fn parse_process_arguments(buffer: &[u8]) -> Result<NativeArguments, LayoutError> {
     let Some((count_region, rest)) = buffer.split_at_checked(ARGUMENT_COUNT_BYTES) else {
         return Err(LayoutError::Malformed);
@@ -117,16 +153,27 @@ pub(super) fn parse_process_arguments(buffer: &[u8]) -> Result<NativeArguments, 
 }
 
 /// Collects allowlisted Pohunek markers from an environment region.
+///
+/// The first entry for a key wins, matching what `getenv` reports to the
+/// process itself.
+///
+/// # Errors
+///
+/// Returns [`LayoutError::Malformed`] for a marker value above its bound and
+/// for an environment with more than [`MAX_ENVIRONMENT_ENTRIES`] entries before
+/// all markers were found.
 fn collect_ownership_markers(mut region: &[u8]) -> Result<OwnershipMarkers, LayoutError> {
     let mut markers = OwnershipMarkers::default();
-    for _ in 0..MAX_ENVIRONMENT_ENTRIES {
-        let Some((entry, rest)) = split_c_string(region) else {
-            break;
-        };
+    let mut scanned = 0_usize;
+    while let Some((entry, rest)) = split_c_string(region) {
         region = rest;
         if entry.is_empty() {
             break;
         }
+        if scanned == MAX_ENVIRONMENT_ENTRIES {
+            return Err(LayoutError::Malformed);
+        }
+        scanned += 1;
         let Some(separator) = entry.iter().position(|byte| *byte == b'=') else {
             continue;
         };
@@ -135,6 +182,8 @@ fn collect_ownership_markers(mut region: &[u8]) -> Result<OwnershipMarkers, Layo
             &mut markers.daemon_id
         } else if key == ENV_SESSION_ID.as_bytes() {
             &mut markers.session_id
+        } else if key == ENV_RUNTIME_ID.as_bytes() {
+            &mut markers.runtime_id
         } else {
             continue;
         };
@@ -142,8 +191,13 @@ fn collect_ownership_markers(mut region: &[u8]) -> Result<OwnershipMarkers, Layo
         if value.len() > MAX_MARKER_VALUE_BYTES {
             return Err(LayoutError::Malformed);
         }
-        *slot = Some(String::from_utf8_lossy(value).into_owned());
-        if markers.daemon_id.is_some() && markers.session_id.is_some() {
+        if slot.is_none() {
+            *slot = Some(String::from_utf8_lossy(value).into_owned());
+        }
+        if markers.daemon_id.is_some()
+            && markers.session_id.is_some()
+            && markers.runtime_id.is_some()
+        {
             break;
         }
     }
@@ -282,9 +336,10 @@ pub(super) fn children_by_parent(table: &[(Pid, Pid)]) -> HashMap<Pid, Vec<Pid>>
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_descendants, children_by_parent, controlling_terminal_group, decode_command_name,
-        decode_kernel_path, encode_boot_identity, encode_start_identity, parse_process_arguments,
-        LayoutError, MAX_ARGUMENT_COUNT, MAX_DESCENDANT_COUNT, MAX_DESCENDANT_DEPTH,
+        bounded_descendants, children_by_parent, controlling_terminal_group,
+        decode_argument_region, decode_command_name, decode_kernel_path, encode_boot_identity,
+        encode_start_identity, parse_process_arguments, ArgumentRegion, LayoutError,
+        MAX_ARGUMENT_COUNT, MAX_DESCENDANT_COUNT, MAX_DESCENDANT_DEPTH, MAX_ENVIRONMENT_ENTRIES,
         MAX_MARKER_VALUE_BYTES, NO_CONTROLLING_DEVICE,
     };
     use crate::process::Pid;
@@ -343,6 +398,67 @@ mod tests {
         );
         assert_eq!(parsed.markers.session_id.as_deref(), Some("01J0SESSION"));
         assert_eq!(parsed.markers.daemon_id, None);
+    }
+
+    #[test]
+    fn a_decodable_region_is_present() {
+        let buffer = procargs(
+            1,
+            b"/bin/sleep",
+            0,
+            &[b"sleep"],
+            &[b"POHUNEK_RUNTIME_ID=runtime-a"],
+        );
+
+        let ArgumentRegion::Present(arguments) = decode_argument_region(&buffer) else {
+            panic!("a well-formed region must decode");
+        };
+        assert_eq!(arguments.argv, vec!["sleep".to_owned()]);
+        assert_eq!(arguments.markers.runtime_id.as_deref(), Some("runtime-a"));
+    }
+
+    #[test]
+    fn a_region_caught_mid_exec_is_unobservable_not_a_failure() {
+        // Shapes a region takes while an exec rewrites the stack it is copied
+        // from: cut short, a count that is not a count yet, an executable not
+        // yet written, and an argument count larger than the strings present.
+        let whole = procargs(2, b"/bin/sh", 0, &[b"sh", b"-c"], &[b"HOME=/"]);
+        let mut negative = whole.clone();
+        negative[..4].copy_from_slice(&(-1_i32).to_ne_bytes());
+        let unwritten = procargs(1, b"", 0, &[b"sh"], &[]);
+        let short_of_arguments = {
+            let mut buffer = 3_i32.to_ne_bytes().to_vec();
+            buffer.extend_from_slice(b"/bin/sh\0sh");
+            buffer
+        };
+        let oversized_marker = procargs(
+            1,
+            b"/bin/sh",
+            0,
+            &[b"sh"],
+            &[format!(
+                "POHUNEK_RUNTIME_ID={}",
+                "r".repeat(MAX_MARKER_VALUE_BYTES + 1)
+            )
+            .as_bytes()],
+        );
+
+        let empty: &[u8] = &[];
+        for buffer in [
+            &whole[..whole.len() / 2],
+            &whole[..2],
+            empty,
+            negative.as_slice(),
+            unwritten.as_slice(),
+            short_of_arguments.as_slice(),
+            oversized_marker.as_slice(),
+        ] {
+            assert_eq!(
+                decode_argument_region(buffer),
+                ArgumentRegion::Unobservable,
+                "{buffer:?}"
+            );
+        }
     }
 
     #[test]
@@ -442,6 +558,77 @@ mod tests {
         assert_eq!(
             parse_process_arguments(&buffer),
             Err(LayoutError::Malformed)
+        );
+    }
+
+    #[test]
+    fn the_runtime_marker_is_read_from_the_environment_region_only() {
+        let buffer = procargs(
+            2,
+            b"/bin/sh",
+            1,
+            &[b"sh", b"POHUNEK_RUNTIME_ID=argv-not-a-marker"],
+            &[
+                b"POHUNEK_RUNTIME_IDX=near-miss",
+                b"POHUNEK_RUNTIME_ID=runtime-a",
+                b"POHUNEK_RUNTIME_ID=runtime-b",
+            ],
+        );
+
+        let parsed = parse_process_arguments(&buffer).expect("kernel layout");
+
+        assert_eq!(parsed.markers.runtime_id.as_deref(), Some("runtime-a"));
+        assert_eq!(parsed.markers.session_id, None);
+        assert_eq!(parsed.markers.daemon_id, None);
+        assert!(parsed.markers.is_marked());
+    }
+
+    #[test]
+    fn an_oversized_runtime_marker_is_malformed() {
+        let mut entry = b"POHUNEK_RUNTIME_ID=".to_vec();
+        entry.extend(std::iter::repeat_n(b'r', MAX_MARKER_VALUE_BYTES + 1));
+        let buffer = procargs(1, b"/bin/sh", 1, &[b"sh"], &[&entry]);
+
+        assert_eq!(
+            parse_process_arguments(&buffer),
+            Err(LayoutError::Malformed)
+        );
+    }
+
+    /// Builds an environment of `filler` unrelated entries followed by the
+    /// runtime marker.
+    fn environment_with_marker_after(filler: usize) -> Vec<Vec<u8>> {
+        let mut environment: Vec<Vec<u8>> = (0..filler)
+            .map(|index| format!("FILLER_{index}=x").into_bytes())
+            .collect();
+        environment.push(b"POHUNEK_RUNTIME_ID=runtime-a".to_vec());
+        environment
+    }
+
+    #[test]
+    fn a_marker_at_the_entry_bound_is_found() {
+        let environment = environment_with_marker_after(MAX_ENVIRONMENT_ENTRIES - 1);
+        let entries: Vec<&[u8]> = environment.iter().map(Vec::as_slice).collect();
+        let buffer = procargs(1, b"/bin/sh", 1, &[b"sh"], &entries);
+
+        let parsed = parse_process_arguments(&buffer).expect("kernel layout");
+
+        assert_eq!(parsed.markers.runtime_id.as_deref(), Some("runtime-a"));
+    }
+
+    #[test]
+    fn an_environment_beyond_the_entry_bound_is_unobservable_not_unmarked() {
+        let environment = environment_with_marker_after(MAX_ENVIRONMENT_ENTRIES);
+        let entries: Vec<&[u8]> = environment.iter().map(Vec::as_slice).collect();
+        let buffer = procargs(1, b"/bin/sh", 1, &[b"sh"], &entries);
+
+        assert_eq!(
+            parse_process_arguments(&buffer),
+            Err(LayoutError::Malformed)
+        );
+        assert_eq!(
+            decode_argument_region(&buffer),
+            ArgumentRegion::Unobservable
         );
     }
 

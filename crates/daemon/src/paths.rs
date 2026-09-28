@@ -196,7 +196,8 @@ mod tests {
     }
 
     fn tmp_base(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("pohunek-paths-{tag}-{}", std::process::id()))
+        pohunek_test_support::temp_root()
+            .join(format!("pohunek-paths-{tag}-{}", std::process::id()))
     }
 
     /// Set every base var the resolver reads to temp paths, so a test can exercise

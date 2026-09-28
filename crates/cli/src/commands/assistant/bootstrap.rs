@@ -51,7 +51,7 @@ pub(crate) async fn ensure_daemon(
 /// Start the local daemon in the background and poll the socket until it answers
 /// or the bounded timeout elapses.
 async fn start_and_wait(host: &str, paths: &Paths) -> Result<(), CliError> {
-    crate::commands::daemon::start(true)?;
+    crate::commands::daemon::start(true, crate::commands::daemon::Mode::Service)?;
 
     let deadline = tokio::time::Instant::now() + START_TIMEOUT;
     loop {

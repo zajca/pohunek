@@ -24,6 +24,7 @@ pub(crate) mod notifications;
 pub(crate) mod project;
 pub(crate) mod prompt;
 pub(crate) mod relay;
+pub(crate) mod service;
 pub(crate) mod session;
 pub(crate) mod setup;
 

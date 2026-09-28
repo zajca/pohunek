@@ -22,10 +22,15 @@ Start with public, non-destructive inspection:
 3. Record `runtime.state`, `runtime.worker_id`, `runtime.runtime_id`,
    decimal-string `runtime.runtime_generation`, `runtime.last_connected_at`,
    and `runtime.loss_reason`.
-4. On the session's host, inspect the unit without changing it:
-   `systemctl --user status pohunek-session@<session-id>.service` and
-   `systemctl --user show -p ActiveState -p SubState -p MainPID
-   pohunek-session@<session-id>.service`.
+4. On the session's host, run `pohunek service status --json`. Each entry in
+   `workers` is one worker generation (`session_id`, `generation`,
+   `service_id`, `state`, `pid`, and the proven executable and arguments). A
+   session has at most one worker generation. To inspect the native job without
+   changing it, derive its name from the namespace and generation: on Linux
+   `systemctl --user status pohunek-<ns>-worker-<session-id>-<generation>.service`;
+   on macOS `launchctl print gui/$(id -u)/io.github.zajca.pohunek.<ns>.worker.<session-id>.<generation>`
+   (read its exit status: `0` loaded, `113` absent; the printed text is
+   informational only).
 5. Inspect daemon and worker structured logs under
    `~/.local/state/pohunek/logs/`. Do not copy prompt, input, or raw terminal
    content into reports. `pohunekd.jsonl` plus seven rotations retain at most
@@ -37,28 +42,100 @@ Interpret runtime states as follows:
 - `live`: the daemon has the current worker controller lease. Attach should use
   the existing runtime.
 - `reconnecting`: a known worker is still being validated or adopted. Do not
-  start native recovery or restart the worker.
+  start native recovery or restart the worker. Reason
+  `runtime_supervision_unavailable` means the service manager (systemd user
+  manager or launchd) could not be inspected, or could not retire the job of a
+  worker generation that is proven ended; nothing was killed and
+  reconciliation retries on its own (after 1 s, doubling to at most 60 s). A
+  session whose removal was interrupted (for example the daemon stopped mid
+  `session rm`) also shows this reason while its removal waits for the job to
+  be retired or its cleanup to succeed; the retry then finishes the removal
+  and the session disappears. A session whose stop was interrupted shows this
+  reason too while its stop replay fails (its worker answers but returns no
+  terminal outcome yet); the retry replays the stop until the worker commits
+  it, and the session then reads `stopped`. Reason
+  `create_compensation_pending` marks a `session new` that failed after
+  binding a worktree and whose runtime is proven ended, but whose checkout,
+  worktree binding, or create record could not be removed yet (typically a
+  worktree locked with `git worktree lock`, or a store write failure). Nothing
+  of it runs; the same retry repeats the removal, so fix the cause (for
+  example `git worktree unlock <path>`) and the session disappears with
+  `session_removed` on the next pass, without a daemon restart.
 - `terminal`: the worker observed child exit and the logical outcome is being
   retained or has been imported.
 - `lost`: no live PTY generation remains. The logical record is intentionally
   retained; explicit native recovery is possible only with a valid launch
-  recovery reference.
+  recovery reference. Reason `runtime_lost` means the worker job ended while its
+  journal still said live, and the ownership-marker sweep removed that
+  generation's leftover processes. `runtime_lost_cleanup_unconfirmed` means the
+  same, but the sweep could not confirm that every marked process ended;
+  inspect `ps` for processes of that session before recovering it. A lost
+  session without a journal for its generation reports `worker_unavailable`;
+  its job is retired, but no process is swept, so check `ps` for leftovers.
+  A session is reported `lost` only after the service manager retired its job;
+  until then it stays `reconnecting` with `runtime_supervision_unavailable`.
+  The same classification runs when a worker dies while the daemon is running:
+  a proven crash is reported `lost` immediately, and a worker that stays
+  unreachable is classified after the worker connect deadline (`conflict`
+  while its job still runs, `reconnecting` while the manager is unavailable).
 - `conflict`: multiple or mismatched identities claim the session. Do not stop,
-  unlink, or kill either candidate automatically. Preserve the unit, journal,
-  and socket evidence for diagnosis. Afterward, `pohunek session rm <id>` can
-  remove only the quarantined logical record; it does not signal a worker.
+  unlink, or kill either candidate automatically. Preserve the job, journal,
+  and socket evidence for diagnosis. `runtime_supervision_ambiguous` means the
+  native job is present but its worker socket does not answer and its journal is
+  not terminal, or that its journals or worker socket directory could not be
+  read at all. It is not permanent: the daemon re-checks it in the background
+  (after 1 s, doubling to at most 60 s) without killing anything, adopts the
+  worker when it answers again, and reports `lost` with `runtime_lost` once the
+  job ends and the journaled worker process is gone. A create that was pending
+  when the daemon restarted also shows this reason while its job is watched
+  until the worker initialization deadline; the job is then retired and the
+  unfinished session disappears. `runtime_identity_mismatch` means the job's definition or
+  process does not match the recorded executable, session, or generation.
+  Afterward, `pohunek session rm <id>` removes a
+  `runtime_supervision_ambiguous` session: it retires the worker job of the
+  exact generation the record names through the service manager, which stops
+  that worker and its child, requires every worker the session's journals
+  record for that generation to be gone, and then deletes the logical record. It refuses, keeping the record, a
+  `runtime_identity_mismatch` conflict or a record that names no worker
+  generation (`session_runtime_conflict`), a retirement the service manager
+  cannot complete (`runtime_supervision_unavailable`), a still-running worker
+  journaled under another generation (`runtime_identity_mismatch`), and
+  unreadable session journals or a journaled worker that still runs after the
+  retirement, for example outside its job (`runtime_supervision_ambiguous`). Stop such a worker by hand after
+  preserving the evidence, then retry the removal. Every removal also sweeps
+  the processes carrying the session's runtime ownership markers and fails
+  with `runtime_supervision_ambiguous`, keeping the session and its removal
+  intent, while that sweep cannot confirm every marked process exited (for
+  example one whose environment cannot be read); look for leftover processes
+  of the session with `ps`, stop them, and retry. A removal finished by
+  reconciliation after a daemon restart shows this `conflict` reason while it
+  retries on its own.
 - `incompatible`: the worker is alive but private protocol negotiation failed.
-  Leave it alive and use a compatible daemon release.
+  Leave it alive and use a compatible daemon release. `pohunek session rm <id>`
+  retires such a worker through the service manager the same way as an
+  ambiguous `conflict` one (refused with `worker_protocol_incompatible` when the
+  record names no worker generation).
 
-Restarting `pohunekd.service` is safe for workers, but it closes current public
-connections:
+Workers live only as long as the login session. Closing a terminal or locking
+the screen is safe. Logging out or rebooting ends every worker job; after the
+next login the daemon reports those sessions `lost` with `runtime_lost` and
+never restarts them. Use `pohunek session resume <id>` to recover a session
+with a native recovery reference into a new worker generation.
+
+Restarting the daemon job is safe for workers, but it closes current public
+connections. On Linux:
 
 ```bash
-systemctl --user restart pohunekd.service
+systemctl --user restart pohunek-<ns>-daemon.service
 ```
 
-After health returns, the same `worker_id`, `runtime_id`, worker `MainPID`, and
-agent child PID demonstrate reconnection. A new runtime id means explicit
+On macOS, the standard launchctl command
+`launchctl kickstart -k gui/$(id -u)/io.github.zajca.pohunek.<ns>.daemon`
+restarts the agent; it is not exercised by Pohunek's tests. The namespace `<ns>` is the `namespace` field of
+`pohunek service status --json`.
+
+After health returns, the same `worker_id`, `runtime_id`, worker generation
+and PID, and agent child PID demonstrate reconnection. A new runtime id means explicit
 recovery or a defect; it is not normal daemon restart behavior.
 
 If a lifecycle or runtime operation returns
@@ -109,11 +186,11 @@ usable for lifecycle/attach but cannot provide control-plane observation.
 `session_waiter_limit_reached` is temporary bounded resource pressure; wait no
 longer than eight seconds and retry instead of opening unbounded parallel waits.
 
-Do not run `systemctl --user restart pohunek-session@<id>.service`. Worker units
-use `Restart=no` because once a worker exits its PTY cannot be recreated. An
-administrative worker stop kills that unit's process group and therefore loses
-the runtime generation. Use `pohunek session stop <session-id>` for an
-intentional session stop.
+Do not restart, stop, or boot out a worker job by hand. A worker job has no
+restart policy (systemd `Restart=no`, launchd without `KeepAlive`) because once
+a worker exits its PTY cannot be recreated. Stopping the job ends that
+generation's processes and therefore loses the runtime. Use
+`pohunek session stop <session-id>` for an intentional session stop.
 
 For a Hermes runtime, first run `pohunek host inspect local --json`. The runtime
 must identify `agent_base: "hermes"`, `version: "0.20.0"`, and
@@ -124,10 +201,33 @@ has no version-policy fields; an installed but unparseable or wrong version is
 their own temporary homes.
 
 For the first worker-aware installation, let all legacy sessions finish or stop
-them explicitly. The archive installer lists live sessions that lack durable
-`runtime` metadata and refuses replacement. Sessions with a runtime binding are
-already worker-owned, are excluded from this one-time guard, and survive the
-daemon restart. `packaging/install-daemon.sh --accept-runtime-loss` is
-destructive consent: existing legacy PTYs cannot be transferred into workers.
-Use it only after recording the affected ids and accepting that shell and
-uncaptured agent sessions cannot be reconstructed.
+them explicitly. The archive installer refuses before any change while
+`pohunek service status --json` reports `transaction_in_progress`, or while
+the prefix, unit, config, state, or runtime directories are reached through a
+symlink or are not private to the user. It starts a stopped legacy daemon so
+the migration snapshot is always taken, moves the legacy daemon's control
+socket aside, runs `migration preflight --socket <moved-socket>` there, and
+lists live sessions that lack durable `runtime` metadata to refuse
+replacement. Sessions with a runtime binding are already worker-owned, are
+excluded from this one-time guard, and survive the daemon restart.
+`packaging/install-daemon.sh --accept-runtime-loss` is destructive consent:
+existing legacy PTYs cannot be transferred into workers. Use it only after
+recording the affected ids and accepting that shell and uncaptured agent
+sessions cannot be reconstructed. The same installer refuses to retire an
+older template-unit install while any `pohunek-session@<id>.service` worker
+outside the `inactive` state survives its post-stop re-check; stop those
+sessions first.
+
+A worker-aware daemon started over a legacy store without that preflight (for
+example after replacing the binary by hand) finds legacy resume bindings but no
+logical record and no manifest. It starts anyway and imports nothing: `pohunek
+session list` shows none of those sessions, and `pohunek session runtime-inventory`
+lists each binding as `orphaned` with reason `migration_manifest_missing`
+(the daemon log carries `reconcile.migration.manifest_missing`). The bindings
+stay on disk, and while they are unimported `pohunek session new` and `session
+fork` fail with `migration_manifest_missing` before writing anything, because
+a first logical record would make a later manifest unimportable. To recover
+them, reinstall the legacy release, then rerun the worker-aware installer so
+its `pohunek migration preflight` snapshots them; the worker-aware daemon it
+starts imports the manifest, and session creation works again. Once any
+logical record exists, a later manifest is archived without being imported.

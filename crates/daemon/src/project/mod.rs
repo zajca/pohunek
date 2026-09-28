@@ -528,8 +528,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("pohunek-pm-{tag}-{}-{nanos}", std::process::id()));
+        let dir = pohunek_test_support::temp_root()
+            .join(format!("pohunek-pm-{tag}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
             .expect("secure temp directory");
