@@ -1191,11 +1191,10 @@ mod credential_router_tests {
         )
         .expect("rejected rotation JSON");
         assert_eq!(rejected_json["error"]["code"], "rotation_rejected");
-        let excessive_lifetime = (time::OffsetDateTime::now_utc() + time::Duration::seconds(601))
-            .replace_nanosecond(0)
-            .expect("whole-second excessive lifetime")
-            .format(&time::format_description::well_known::Rfc3339)
-            .expect("RFC3339 excessive lifetime");
+        let excessive_lifetime =
+            auth_tests::expiry_beyond_lifetime(router_auth_limits().human_credential_lifetime())
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("RFC3339 excessive lifetime");
         let lifetime_rejection = json!({
             "overlap_seconds":1,
             "idempotency":{"correlation_id":Uuid::now_v7(),"idempotency_key":Uuid::now_v7()},
