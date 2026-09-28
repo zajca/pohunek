@@ -221,6 +221,30 @@ scripts/ci-timings junit --label "tests (unit, fast)" --run RUN_ID junit-unit.xm
 scripts/ci-timings cache --run RUN_ID             # sccache JSON + rust-cache hits per job
 ```
 
+Record the local baseline before and after a change to the dev loop, and
+reproduce CI timing evidence beside it -- this is the before/after
+procedure for the dev-workflow performance project
+([#163](https://github.com/zajca/pohunek/issues/163)). The local tool
+measures cold/warm/incremental build + test cases into a dedicated target
+dir and records metadata, sizes, and stripped environment variables in
+`baseline.json`; `ci-timings` reports per-run and per-job wall clock, per-step
+medians, and runner minutes from the same run data:
+
+```bash
+python3 scripts/measure-dev-loop run --dry-run    # print the exact commands, run nothing
+python3 scripts/measure-dev-loop run              # cold, warm, incremental, size
+python3 scripts/measure-dev-loop report target/measure-dev-loop-results/<ts>/baseline.json
+python3 scripts/measure-dev-loop compare BEFORE.json AFTER.json
+scripts/ci-timings runs --limit 3 --branch main --event push   # per-run + runner minutes
+scripts/ci-timings steps --input target/ci-timings/ci-runs.json
+scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 \
+    --current 2026-09-20..2026-09-21 --event pull_request
+```
+
+The real measurements are not part of any test or gate; run them
+deliberately, one at a time, and keep the emitted `baseline.json` files
+in the issue's evidence.
+
 Hermes M3 supports only the pinned local interactive Hermes Agent `0.20.0`
 runtime and its explicit profile-owned Pohunek operator plugin. The stable
 model-free compatibility gate (`cargo xtask hermes compatibility
