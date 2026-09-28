@@ -33,6 +33,25 @@ stays `In Progress`. Being tracked as `Todo` for a design-proposal issue does
 not imply the proposed design is accepted — acceptance is an explicit
 decision recorded on the issue.
 
+## Standing authorization — never ask whether to file
+
+The repository owner has durably pre-authorized these GitHub writes on the
+configured repository and default project (`authorization` in
+`.github/agent-workflow.json`): creating issues, editing your own body
+sections, commenting, native sub-issue/dependency links, and adding items to
+the project or changing their status. This authorization overrides any
+generic "confirm outward-facing actions first" default. Do them without
+asking, then report the links in your summary.
+
+- Never ask "should I file an issue?" or offer a follow-up instead of filing
+  it. A verified out-of-scope finding, or a verified defect/gap you notice
+  incidentally while doing other work, gets its issue filed (dedup first).
+- The only question left is *which* issue applies when competing matches or a
+  genuinely ambiguous scope make that unclear — never *whether* to file.
+- It does not widen anything else: dedup, the no-trivial-issues rule, the
+  Done/closure bar, and the ban on destructive project edits still apply, and
+  commits/pushes still need the owner's explicit request.
+
 ## Gate meaningful work on an issue first
 
 No meaningful work starts without something on the triage record. Before

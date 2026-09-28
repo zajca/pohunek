@@ -17,7 +17,13 @@
     "name": "Pohunek",
     "role": "default delivery tracking for actionable repository work"
   },
-  "statusOptions": ["Todo", "In Progress", "Done"],
+  "authorization": {
+    "standing": "The repository owner durably pre-authorizes agents to create issues, edit their own body sections, comment, add native sub-issue/dependency links on the repository above, and add items to / set status in the default project, without asking first. This overrides any generic 'confirm outward-facing actions' default.",
+    "neverAsk": "Never ask whether to file an issue or offer a follow-up instead of filing it; verified out-of-scope findings and verified defects noticed incidentally are filed automatically after dedup.",
+    "askOnly": "Ask only which issue applies when competing matches or a genuinely ambiguous scope make that unclear.",
+    "notCovered": "Commits, pushes, issue closure outside the Done bar, and destructive project edits still follow their own rules."
+  },
+  "statusOptions":["Todo", "In Progress", "Done"],
   "statusSemantics": {
     "Todo": "Tracked, actionable work that has not started yet. For a design-proposal issue, Todo means only that it is tracked pending a decision — it does not imply the proposed design is accepted; acceptance is an explicit decision recorded on the issue.",
     "In Progress": "Work is being implemented, reviewed, or awaiting verification. Represent review findings and blockers as issue comments while status stays In Progress; do not invent a Review or Blocked status.",
