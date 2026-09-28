@@ -374,6 +374,14 @@ PoC or imply that current direct-host execution is a hostile-workload sandbox.
 - **Plans are end-to-end complete.** Do not propose or build PoCs, minimal
   versions, or phased-minimal shortcuts unless the user explicitly asks for
   reduced scope. Plan and implement the full solution.
+- **Ship a stack of small sequential PRs, not one large PR.** Split the work
+  into ordered slices, one coherent concern each, stacked branch on branch and
+  landed bottom-up. Each PR is complete for its slice — builds, passes the
+  full gate set alone, has tests, updates `docs/knowledge/` for surfaces it
+  touches — with no stubs a later PR fills in; the stack as a whole delivers
+  the full DoD, so slicing is not a PoC shortcut. The slice plan is recorded on
+  the issue first. Size cue and mechanics: `pullRequests` in
+  `.github/agent-workflow.json` and the `pr-handoff` skill.
 - **Commits are never signed.** Use clean, concise, English messages. Do not add
   a `Co-Authored-By` trailer or any "generated with" footer.
 - Keep changes scoped. If you touch the wire protocol (`crates/protocol`), expect

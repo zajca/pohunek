@@ -91,8 +91,10 @@ issue stays open at `In Progress` until its own DoD is met.
 - **Body** (long-lived, structured): full scope; accepted decisions with
   rationale; definition-of-done items with stable IDs (`D1`, `D2`, ...);
   dependencies (linked issues/APIs, including parent/sub-issue links); the
-  plan. Preserve user-written sections when editing — edit or extend your own
-  sections, read the body first.
+  plan, including the PR stack slice plan (ordered slices → DoD items, per
+  `pullRequests` in `.github/agent-workflow.json`) and, once opened, the
+  ordered PR links. Preserve user-written sections when editing — edit or
+  extend your own sections, read the body first.
 - **Comments** (append-only): progress, verification evidence (exact commands
   and their results), handoffs between agents, blockers, and the reason for
   any status change. Never overwrite or delete another author's comment.

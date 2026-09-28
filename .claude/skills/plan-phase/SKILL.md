@@ -53,7 +53,9 @@ no local `NEXT.md` is written.
    into `client`/`daemon`/`cli`/`gui-core` if the wire changes),
    knowledge-bundle and `docs/public-api.md` impact, and an explicit, testable
    definition-of-done list with stable IDs (`D1`, `D2`, ...) the `milestone`
-   and `milestone-review` skills will check against. Ensure the issue is in
+   and `milestone-review` skills will check against, and a proposed PR stack:
+   ordered slices, one coherent concern each, mapped to DoD items (per
+   `pullRequests` in `.github/agent-workflow.json`). Ensure the issue is in
    the configured project for delivery tracking. Being tracked as `Todo` does
    not imply the proposed design is accepted; acceptance is an explicit
    decision recorded on the issue.

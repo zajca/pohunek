@@ -22,14 +22,16 @@ issue via the `github-workflow` skill.
   user or task; otherwise infer per the `github-workflow` skill's
   resolution rules — unique unambiguous match only, otherwise ask).
 - The branch or worktree to review (e.g. `zajca/milestone-4-attach-stream`, or
-  a path like `/tmp/pohunek-milestone-3-pty-sessions`).
+  a path like `/tmp/pohunek-milestone-3-pty-sessions`). For a stack, the
+  ordered slice branches/PRs and the slice plan recorded on the issue.
 
 ## Steps
 
 1. **Load the DoD.** Fetch the live issue body and comments (comments may
    refine scope or record decisions) and enumerate every definition-of-done
    item with its stable ID. These are the checklist you review against —
-   nothing more, nothing less.
+   nothing more, nothing less. For a stack, also load the issue's slice plan
+   (slice → DoD items).
 2. **Review read-only, item by item.** Check out or `cd` into the branch/worktree
    and verify each DoD item is actually implemented. For every item record a
    verdict (met / partial / missing) with concrete `path:line` evidence. Read the
@@ -53,6 +55,13 @@ issue via the `github-workflow` skill.
    follow-up to claim the milestone done.
 5. **Re-run the gates after fixes.** Invoke the `gates` skill on the branch
    once fixes land. Iterate until green.
+   For a stack, review each slice against its own diff (`git diff
+   <lower-slice-branch>...<slice-branch>`) and the DoD items the slice plan
+   assigns it, and flag a slice that mixes concerns, exceeds the
+   `pullRequests` size cue in `.github/agent-workflow.json` without reason,
+   or depends on a later slice (stub, dead code, placeholder, or red gates on
+   its own). Fixes go to the slice that owns the gap, then the branches above
+   it are restacked.
 6. **Final verdict.** Walk each DoD item with its final status and `path:line`
    evidence, and state the gate results. Say plainly whether the milestone
    matches its issue's specification, and record that final verdict as an

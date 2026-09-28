@@ -1,9 +1,10 @@
 ---
 name: merge-advance
 description: >-
-  Commit the current milestone unsigned, merge it into main, delete the branch
-  and prune its worktree, then update the milestone's issue and project status.
-  Use when the user asks to land a finished milestone locally.
+  Commit the current milestone unsigned, merge its slice stack into main
+  bottom-up, delete the branches and prune the worktree, then update the
+  milestone's issue and project status. Use when the user asks to land a
+  finished milestone locally.
 ---
 
 # merge-advance — land a milestone locally and update tracking
@@ -17,7 +18,10 @@ green (see the `milestone` and `milestone-review` skills).
 
 - The gates pass on the branch (run the `gates` skill first if unsure — never
   merge red).
-- You are on a milestone branch off `main`, not on `main` itself.
+- You are on a milestone slice branch, not on `main` itself. A milestone
+  delivered as a stack (see the `milestone` and `pr-handoff` skills) lands
+  bottom-up: merge the bottom slice, then the next, never an upper slice
+  before the ones below it.
 - The milestone's GitHub issue is known (explicit URL/number from the user or
   task; otherwise resolve per the `github-workflow` skill — unique
   unambiguous match only, otherwise ask).
@@ -29,7 +33,7 @@ green (see the `milestone` and `milestone-review` skills).
    `Co-Authored-By` trailer or any "generated with" footer. Commit in logical
    chunks if the change is large. Exclude transient files the user does not
    want committed (e.g. `idea.md`, harness run state) when they say so.
-2. **Merge into `main`.** Merge the branch into `main`:
+2. **Merge into `main`, one slice at a time, bottom-up.** For each slice:
 
    ```bash
    git switch main
@@ -37,7 +41,10 @@ green (see the `milestone` and `milestone-review` skills).
    ```
 
    Resolve conflicts if any; re-run the `gates` skill on `main` after a
-   non-trivial merge.
+   non-trivial merge. When the stack is published as PRs, merge them on
+   GitHub in the same order and retarget the next PR to `main` after each
+   merge (`gh pr edit <n> --base main`) — the repository does not delete
+   head branches on merge, so GitHub does not retarget it for you.
 3. **Delete the branch and prune the worktree.** Everything should now live in
    `main`:
 
@@ -55,7 +62,9 @@ green (see the `milestone` and `milestone-review` skills).
    (code, scripts, docs, skills, config): keep the issue open at `In
    Progress` and record the local merge commit as evidence instead of closing
    it. Close the issue as completed and set the project to `Done` only when
-   the landing on the remote default branch is verified (and its DoD met).
+   the landing of the whole stack on the remote default branch is verified
+   (and its DoD met); a landed lower slice is a progress comment, not
+   closure.
    Verified out-of-scope follow-ups discovered during the milestone go to
    their own issues, never into this one's scope; never move an unmet original
    DoD item to a follow-up to claim the milestone done. Verify every write
