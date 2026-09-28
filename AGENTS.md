@@ -353,7 +353,10 @@ PoC or imply that current direct-host execution is a hostile-workload sandbox.
   resolve its issue: use an explicit issue URL/number when given, otherwise
   deduplicate against existing issues. When the user gives a concrete new
   scope and no matching issue exists, **auto-create** the issue and add it to
-  the configured project without a further ask; ask only when the scope is
+  the configured project without a further ask. Issue/comment/project writes
+  on the configured repository are a standing owner authorization: never ask
+  whether to file an issue, and file verified defects noticed incidentally
+  too (see the `github-workflow` skill). Ask only when the scope is
   genuinely ambiguous or competing issues both plausibly cover it. Verified
   out-of-scope findings get their own follow-up issue automatically, but an
   unmet original DoD item never moves to a follow-up to claim the issue done.
