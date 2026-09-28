@@ -5889,6 +5889,49 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
     let _ = registry.stop(&created.id).await;
 }
 
+#[tokio::test]
+async fn a_worker_connection_lost_during_daemon_shutdown_leaves_the_runtime_live() {
+    let store_path = temp_store_path("shutdown-connection-loss");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+
+    registry.begin_daemon_shutdown();
+    // The watcher shares this connection, so its next poll fails as a lost
+    // control connection.
+    worker
+        .release_controller()
+        .await
+        .expect("release the daemon's controller");
+    // The watcher polls its worker every `WORKER_CONNECT_RETRY`; several polls
+    // give it time to act on the lost connection.
+    tokio::time::sleep(super::WORKER_CONNECT_RETRY * 5).await;
+
+    let memory_state = {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get(&created.id).expect("live session entry");
+        entry.info.runtime.as_ref().map(|runtime| runtime.state)
+    };
+    assert_eq!(
+        memory_state,
+        Some(RuntimeState::Live),
+        "the next daemon reconciles the runtime, so shutdown rewrites nothing"
+    );
+    let durable = crate::store::Store::new(store_path)
+        .load_sessions()
+        .expect("load durable sessions")
+        .pop()
+        .expect("durable record");
+    assert_eq!(durable.runtime.state, RuntimeState::Live);
+
+    let _ = registry.stop(&created.id).await;
+}
+
 /// Waits until both records name the snapshot's worker runtime as live.
 ///
 /// Applying worker metadata requires the in-memory and the durable record to be
@@ -12747,17 +12790,134 @@ async fn session_diff_registry_end_to_end_reflects_worktree_changes_against_the_
 /// A registry whose sessions exit immediately, with the metadata store and
 /// worktree binding enabled so a sweep exercises the real removal path.
 fn retention_registry(tag: &str) -> (SessionRegistry, PathBuf, PathBuf) {
+    retention_registry_over(tag, Arc::new(ReadableHost::default()))
+}
+
+fn retention_registry_over(
+    tag: &str,
+    inspector: Arc<ReadableHost>,
+) -> (SessionRegistry, PathBuf, PathBuf) {
     let store = temp_store_path(tag);
     let data_dir = store.parent().expect("store parent").to_path_buf();
     let worktree_root = data_dir.join("worktrees");
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: ShellCommand::new("/bin/sh", ["-c", "true"]),
-        stop_grace: Duration::from_millis(50),
-        store_path: Some(store),
-        worktree_root: Some(worktree_root.clone()),
-        ..SessionRegistryConfig::default()
-    });
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "true"]),
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store),
+            worktree_root: Some(worktree_root.clone()),
+            ..SessionRegistryConfig::default()
+        },
+        inspector,
+    );
     (registry, data_dir, worktree_root)
+}
+
+/// PID of the scripted unreadable candidate of [`ReadableHost`].
+///
+/// Above every PID Linux (`pid_max` is at most 2^22) or Darwin can assign, so
+/// it never names a real process that could be signalled.
+const UNREADABLE_CANDIDATE_PID: Pid = Pid::MAX;
+
+/// The host process table in which every process's ownership markers are
+/// readable, plus one optional scripted process whose markers are not.
+///
+/// Removal sweeps its runtimes' marked processes, and a same-user process
+/// whose markers cannot be read (a non-dumpable agent, a process between
+/// images) may belong to a runtime, so any such unrelated process on the test
+/// host would make the sweep unconfirmed and the removal refused. This view
+/// reports such a process as exited instead, which keeps the enumeration and
+/// the marker read that follows it consistent. Real processes are still
+/// enumerated and signalled; only the scripted candidate is unreadable.
+#[derive(Debug, Default)]
+struct ReadableHost {
+    host: crate::procwatch::HostInspector,
+    unreadable_candidate: AtomicBool,
+}
+
+impl ReadableHost {
+    fn set_unreadable_candidate(&self, present: bool) {
+        self.unreadable_candidate.store(present, Ordering::Release);
+    }
+
+    fn scripts_candidate(&self, pid: Pid) -> bool {
+        pid == UNREADABLE_CANDIDATE_PID && self.unreadable_candidate.load(Ordering::Acquire)
+    }
+}
+
+impl ProcessInspector for ReadableHost {
+    fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, crate::procwatch::Error> {
+        // The candidate's start is never proven older than a worker, so only a
+        // sweep without a worker bound still counts it as possibly marked.
+        if pid == UNREADABLE_CANDIDATE_PID {
+            return Ok(None);
+        }
+        self.host.identity(pid)
+    }
+
+    fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, crate::procwatch::Error> {
+        self.host.parent_pid(pid)
+    }
+
+    fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, crate::procwatch::Error> {
+        self.host.process(pid)
+    }
+
+    fn same_user_processes(&self) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
+        let mut processes = self.host.same_user_processes()?;
+        if self.scripts_candidate(UNREADABLE_CANDIDATE_PID) {
+            processes.push(ProcessFact {
+                pid: UNREADABLE_CANDIDATE_PID,
+                pgid: UNREADABLE_CANDIDATE_PID,
+                ppid: 1,
+                start_identity: StartIdentity::new(1),
+                comm: "unreadable".to_owned(),
+                cmdline: Vec::new(),
+            });
+        }
+        Ok(processes)
+    }
+
+    fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
+        self.host.descendants(root)
+    }
+
+    fn cwd(&self, pid: Pid) -> Result<PathBuf, crate::procwatch::Error> {
+        self.host.cwd(pid)
+    }
+
+    fn executable(&self, pid: Pid) -> Result<Option<PathBuf>, crate::procwatch::Error> {
+        self.host.executable(pid)
+    }
+
+    fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, crate::procwatch::Error> {
+        self.host.exit_watch(identity)
+    }
+
+    fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, crate::procwatch::Error> {
+        if self.scripts_candidate(pid) {
+            return Err(crate::procwatch::Error::from_io(
+                "test_markers",
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ));
+        }
+        match self.host.ownership_markers(pid) {
+            Err(
+                crate::procwatch::Error::PermissionDenied { .. }
+                | crate::procwatch::Error::Unobservable { .. },
+            ) => Err(crate::procwatch::Error::Race {
+                operation: "readable_host_markers",
+            }),
+            markers => markers,
+        }
+    }
+
+    fn foreground_process_group(
+        &self,
+        root_pid: Pid,
+    ) -> Result<Option<Pid>, crate::procwatch::Error> {
+        self.host.foreground_process_group(root_pid)
+    }
 }
 
 /// The shortest policy the validator accepts, so a backdated session ages out
@@ -12987,6 +13147,68 @@ async fn retention_sweep_counts_a_removal_it_could_not_complete() {
         vec![session.id.0.clone()],
         "a failed removal leaves the session in place"
     );
+}
+
+/// Pins the removal of a runtime that only the record names (no worker
+/// journal, so no worker start bounds its sweep): an unreadable same-user
+/// process may carry its marker, so the removal stays refused until that
+/// process is gone. A journaled runtime dismisses the same process through its
+/// worker's start identity. Issue #190 tracks bounding the record-only case.
+#[tokio::test]
+async fn removal_of_a_record_only_runtime_is_refused_while_an_unreadable_process_remains() {
+    let inspector = Arc::new(ReadableHost::default());
+    let (registry, _data_dir, _worktree_root) =
+        retention_registry_over("remove-record-only", Arc::clone(&inspector));
+    let journaled = exited_session(&registry, None).await;
+    let record_only = exited_session(&registry, None).await;
+    // A generation whose worker never journaled leaves the record as the only
+    // evidence of its runtime.
+    let journals = registry
+        .inner
+        .config
+        .worker_state_root
+        .as_ref()
+        .expect("worker state root")
+        .join(&record_only.id.0);
+    let mut removed_journals = 0;
+    for journal in fs::read_dir(&journals).expect("read the session's journals") {
+        let journal = journal.expect("journal entry").path();
+        if journal
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            fs::remove_file(&journal).expect("remove the worker journal");
+            removed_journals += 1;
+        }
+    }
+    assert!(removed_journals > 0, "the worker journaled its runtime");
+    inspector.set_unreadable_candidate(true);
+
+    registry
+        .remove(&journaled.id)
+        .await
+        .expect("the worker's start identity bounds a journaled runtime's sweep");
+    let refused = registry
+        .remove(&record_only.id)
+        .await
+        .expect_err("an unbounded sweep cannot dismiss an unreadable process");
+    assert_eq!(
+        refused.code,
+        crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS,
+        "{refused:?}"
+    );
+    assert_eq!(
+        session_ids(&registry).await,
+        vec![record_only.id.0.clone()],
+        "a refused removal leaves the session in place"
+    );
+
+    inspector.set_unreadable_candidate(false);
+    registry
+        .remove(&record_only.id)
+        .await
+        .expect("the removal completes once no unreadable process remains");
+    assert!(session_ids(&registry).await.is_empty());
 }
 
 #[tokio::test]

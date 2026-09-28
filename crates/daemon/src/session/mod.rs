@@ -3048,6 +3048,12 @@ impl SessionRegistry {
         cancel: &CancellationToken,
         error: &WorkerError,
     ) -> Option<Worker> {
+        // A cancelled watcher no longer owns the runtime, and a daemon that is
+        // shutting down leaves every worker runtime to the next daemon's
+        // reconciliation, so neither rewrites the runtime's state.
+        if cancel.is_cancelled() || self.inner.daemon_shutdown_started.load(Ordering::Relaxed) {
+            return None;
+        }
         if !self.mark_worker_reconnecting(id, expected, error).await {
             return None;
         }

@@ -3701,7 +3701,22 @@ mod tests {
                     std::io::Error::from(std::io::ErrorKind::PermissionDenied),
                 ));
             }
-            self.inner.ownership_markers(pid)
+            let markers = self.inner.ownership_markers(pid);
+            if !self.hide_unreadable.load(Ordering::Acquire) {
+                return markers;
+            }
+            // A process that turns unreadable after the enumeration filtered it
+            // (a fresh exec, a non-dumpable helper) is reported as exited, so
+            // the hidden view holds for the whole sweep.
+            match markers {
+                Err(
+                    crate::procwatch::Error::PermissionDenied { .. }
+                    | crate::procwatch::Error::Unobservable { .. },
+                ) => Err(crate::procwatch::Error::Race {
+                    operation: "readable_host_markers",
+                }),
+                markers => markers,
+            }
         }
 
         fn foreground_process_group(
