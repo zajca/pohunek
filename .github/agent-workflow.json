@@ -23,6 +23,16 @@
     "askOnly": "Ask only which issue applies when competing matches or a genuinely ambiguous scope make that unclear.",
     "notCovered": "Commits, pushes, issue closure outside the Done bar, and destructive project edits still follow their own rules."
   },
+  "pullRequests": {
+    "shape": "stacked",
+    "policy": "Deliver work as a stack of small, sequential PRs, each one coherent concern, landed bottom-up. A single PR is right only when the whole change is already one small concern.",
+    "sliceRules": "Every PR is complete production code for its slice: it builds, passes the full gate set on its own, has tests, and updates docs/knowledge/ and docs/public-api.md for any surface it touches. No stubs, dead code, or placeholders a later PR fills in. Slices follow dependency order; the stack as a whole delivers the full DoD.",
+    "softMaxChangedLines": 400,
+    "softMaxNote": "Hand-written changed lines per PR, excluding tests, lockfiles, and generated files. A cue to split, not a hard limit: a coherent slice beats an arbitrary cut.",
+    "issueReferences": "Non-final PRs use 'Refs #N'; only the final PR of the stack uses 'Closes #N'.",
+    "deleteBranchOnMerge": false,
+    "retargetNote": "The repository does not delete head branches on merge, so GitHub never auto-retargets the next stacked PR: retarget it to the default branch explicitly after the PR below it merges."
+  },
   "statusOptions":["Todo", "In Progress", "Done"],
   "statusSemantics": {
     "Todo": "Tracked, actionable work that has not started yet. For a design-proposal issue, Todo means only that it is tracked pending a decision — it does not imply the proposed design is accepted; acceptance is an explicit decision recorded on the issue.",
