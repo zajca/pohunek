@@ -295,6 +295,7 @@ impl SessionRegistry {
                     worktree_path,
                     metadata: binding.metadata,
                     warnings: Vec::new(),
+                    initial_input_pending: false,
                 },
                 guard,
             )
@@ -514,6 +515,7 @@ impl SessionRegistry {
                 worktree_path,
                 metadata: binding.metadata,
                 warnings: Vec::new(),
+                initial_input_pending: false,
             },
             guard,
         )

@@ -52,8 +52,10 @@ reason `create_compensation_pending`, and the running daemon retries the
 removal with the supervision backoff (1 s doubling to 60 s) until it succeeds,
 so unlocking the worktree is enough; the next daemon start retries it too. A daemon that stops or crashes mid-create leaves
 the same record, so the next start removes the half-created worktree; a
-graceful stop first lets in-flight creates finish and refuses new ones with
-`daemon_shutting_down`.
+graceful stop first lets in-flight creates finish, including delivery of a
+`--input` prompt, and refuses new ones with `daemon_shutting_down`. A create
+whose prompt was not delivered before the daemon stopped is removed at the next
+start, worktree included, since the prompt was never stored.
 
 Assistant guidance should preserve this boundary: verify which checkout or
 worktree is active before editing, avoid deleting user-managed worktrees, and

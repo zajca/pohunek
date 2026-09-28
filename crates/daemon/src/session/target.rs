@@ -74,6 +74,9 @@ pub(super) struct PtySessionSpec {
     pub(super) metadata: BTreeMap<String, String>,
     /// Non-fatal worktree-setup warnings to surface on the session.
     pub(super) warnings: Vec<SessionWarning>,
+    /// Whether an initial input follows the commit; the committed record
+    /// then carries the `initial_input` marker until it is delivered.
+    pub(super) initial_input_pending: bool,
 }
 
 fn next_runtime_generation(
@@ -573,6 +576,7 @@ impl SessionRegistry {
             worktree_path,
             metadata,
             warnings,
+            initial_input_pending,
         } = spec;
 
         let created_at = match &registration {
@@ -829,6 +833,7 @@ impl SessionRegistry {
             last_native_report: None,
             observed_agents: Vec::new(),
             cwd_observed_at: std::time::Instant::now(),
+            initial_input_pending,
         };
         if let Err(error) = self.commit_session_entry(&id, entry).await {
             self.stop_uncommitted_runtime(&id, &started.handle).await;

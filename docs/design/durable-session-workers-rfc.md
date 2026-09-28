@@ -1095,14 +1095,18 @@ initial input. `session_created` is emitted exactly once.
 | after child spawn, before live journal | worker terminates child because it cannot establish recoverable authority |
 | after live journal, before daemon commit | daemon adopts a live worker into the preparing logical record and commits; a worker whose runtime already ended (it answers with a terminal phase, or only its terminal journal remains) has its generation retired, then the worktree compensated, then the record deleted |
 | after commit, before event | event log reconciliation emits one recovered creation event keyed by transaction ID |
-| during initial input | same write ID is inspected/retried; definite failure triggers durable stop and worktree compensation |
+| during initial input | the committed record still carries `transaction=create/initial_input` (the input lives only in daemon memory), so reconciliation turns it into a removal intent and finishes it like `session rm`: stop, retire, worktree, record |
 
 Compensation never kills a live worker whose identity does not exactly match the
 preparing record. Such a mismatch becomes `runtime_conflict` for operator
 inspection.
 
-Phases 2 through 8 run as one daemon task detached from the client request, so
-a client that disconnects mid-create never cancels its compensation. Daemon
+Phases 2 through 9 run as one daemon task detached from the client request, so
+a client that disconnects mid-create never cancels its compensation. When the
+create carries an initial input, phase 8 commits the record with
+`transaction=create/initial_input` instead of `none`, and delivering the input
+clears it; the store never lets a stale write bring the marker back. A failed
+delivery or clearing removes the session (durable removal intent first). Daemon
 shutdown refuses new creates with `daemon_shutting_down` and drains the
 in-flight create tasks, bounded by the registry's create drain timeout, before
 the runtime stops; a create still running at that deadline, or one cut short by

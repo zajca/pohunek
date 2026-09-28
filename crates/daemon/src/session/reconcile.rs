@@ -622,6 +622,7 @@ impl SessionRegistry {
         lifecycle: Option<&Lifecycle<'_>>,
         retry: bool,
     ) -> bool {
+        let record = self.roll_back_undelivered_create(record).await;
         let generation = match super::Generation::from_record(&record.session_id, &record.runtime) {
             Ok(generation) => generation,
             Err(error) => {
@@ -923,6 +924,42 @@ impl SessionRegistry {
                 false
             }
         }
+    }
+
+    /// Turns a committed create whose initial input was never delivered into
+    /// a removal intent, which the rest of reconciliation finishes exactly as
+    /// an interrupted `session rm`.
+    ///
+    /// The input lived only in the previous daemon's memory, so the session
+    /// cannot get it and must not keep running without it. The intent is
+    /// persisted first; a failed write is logged, and the record's marker
+    /// makes the next reconciliation convert it again.
+    async fn roll_back_undelivered_create(&self, mut record: SessionRecord) -> SessionRecord {
+        let undelivered = record.desired_state == DesiredState::Running
+            && record
+                .transaction
+                .as_ref()
+                .is_some_and(crate::store::SessionTransaction::is_initial_input);
+        if !undelivered {
+            return record;
+        }
+        tracing::warn!(session_id = %record.session_id, "rolling back a create whose initial input was never delivered");
+        record.desired_state = DesiredState::Removed;
+        record.transaction = Some(crate::store::SessionTransaction {
+            id: format!("remove-create-{}", record.session_id),
+            kind: crate::store::TransactionKind::Remove,
+            phase: "requested".to_owned(),
+            previous_worker_id: None,
+            previous_runtime_id: None,
+        });
+        if let Err(error) = self.write_session_record(record.clone()).await {
+            tracing::warn!(
+                session_id = %record.session_id,
+                error = %error,
+                "failed to persist the removal intent of an undelivered create"
+            );
+        }
+        record
     }
 
     /// Shows `record` as `Conflict` with `runtime_supervision_ambiguous`.
@@ -2324,6 +2361,7 @@ impl SessionRegistry {
             last_native_report: record.native_identity_ordering.clone(),
             observed_agents: Vec::<ObservedAgent>::new(),
             cwd_observed_at: std::time::Instant::now(),
+            initial_input_pending: false,
         };
         if let Err(error) = self.write_session_record(record).await {
             tracing::warn!(session_id = %id.0, error = %error, "failed to commit reconciled worker");
@@ -2468,6 +2506,7 @@ impl SessionRegistry {
             last_native_report: record.native_identity_ordering.clone(),
             observed_agents: Vec::new(),
             cwd_observed_at: std::time::Instant::now(),
+            initial_input_pending: false,
         };
         if let Err(error) = self.write_session_record(record).await {
             tracing::warn!(session_id = %id.0, error = %error, "failed to persist runtime classification");

@@ -348,7 +348,9 @@ worker returns the terminal outcome; until then it stays `reconnecting` with
 interrupted before it committed is compensated from its durable create record
 once its worker is proven ended (never launched, or its runtime ended): the
 generation is retired first, then the worktree and its binding are removed,
-then the record is deleted, and a step that fails keeps the rest for a retry.
+then the record is deleted, and a step that fails keeps the rest for a retry. A
+committed create whose `--input` prompt was not yet delivered is removed like
+`session rm`, since the prompt lived only in the stopped daemon's memory.
 A compensation that cannot finish while the daemon runs (a checkout that
 cannot be removed, or a binding or record the store cannot drop) keeps the
 session listed as `reconnecting` with `create_compensation_pending`, and the

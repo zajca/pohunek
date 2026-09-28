@@ -508,6 +508,9 @@ struct SessionRegistryInner {
     /// Holds the next create once its target is bound, before its launch.
     #[cfg(test)]
     bound_create_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Holds the next committed create before its initial input.
+    #[cfg(test)]
+    initial_input_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
 }
 
 /// The detached create transactions of one registry.
@@ -567,6 +570,9 @@ struct SessionEntry {
     /// never replaces it, so a scan that read a process before a newer OSC 7
     /// hint landed cannot move the session back.
     cwd_observed_at: Instant,
+    /// Whether the create's initial input is still to be delivered; the
+    /// running session's record then carries the `initial_input` marker.
+    initial_input_pending: bool,
 }
 
 impl SessionEntry {
@@ -1083,6 +1089,17 @@ impl SessionRegistry {
         if let Some(job) = &entry.job {
             job.record_into(&mut runtime);
         }
+        let transaction = transaction.or_else(|| {
+            (entry.initial_input_pending && desired_state == DesiredState::Running).then(|| {
+                SessionTransaction {
+                    id: format!("create-{}", id.0),
+                    kind: TransactionKind::Create,
+                    phase: crate::store::INITIAL_INPUT_PHASE.to_owned(),
+                    previous_worker_id: None,
+                    previous_runtime_id: None,
+                }
+            })
+        });
         SessionRecord {
             schema_version: SESSION_RECORD_SCHEMA_VERSION,
             session_id: id.0.clone(),
@@ -1268,6 +1285,8 @@ impl SessionRegistry {
                 input_send_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 bound_create_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                initial_input_hold: std::sync::Mutex::new(None),
             }),
         };
         if let Some(config) = external_observer {
@@ -1708,27 +1727,47 @@ impl SessionRegistry {
         };
 
         let id = Self::allocate_session_id();
-        // The durable intent, target binding, registration, and every
-        // compensation run as one detached transaction, so a client dropped
+        // The durable intent, target binding, registration, initial input, and
+        // every compensation run as one detached task, so a client dropped
         // after the worktree was bound cannot strand it: the task still
         // commits the session or compensates exactly what it created, and
         // daemon shutdown drains it.
         let registry = self.clone();
-        let (info, pending_initial_input) = self
-            .spawn_create(async move {
-                Box::pin(registry.create_transaction(
-                    id,
-                    params,
-                    resolved,
-                    validated_program,
-                    fallback_cwd,
-                ))
-                .await
-            })?
-            .await
-            .map_err(|_join_error| {
-                runtime_error("session_launch_failed", "session create task panicked")
-            })??;
+        self.spawn_create(async move {
+            let (info, pending_initial_input) = Box::pin(registry.create_transaction(
+                id,
+                params,
+                resolved,
+                validated_program,
+                fallback_cwd,
+            ))
+            .await?;
+            registry.complete_create(info, pending_initial_input).await
+        })?
+        .await
+        .map_err(|_join_error| {
+            runtime_error("session_launch_failed", "session create task panicked")
+        })?
+    }
+
+    /// Finishes a committed create: fires its `SessionStart` hook and
+    /// delivers its initial input.
+    ///
+    /// Until the input is delivered, the session's record carries the
+    /// `initial_input` marker, so a daemon that stops or dies first leaves a
+    /// create that reconciliation rolls back instead of a session running
+    /// without its prompt. Delivery clears the marker durably; a failed
+    /// delivery or clearing removes the session ([`Self::remove`]), whose
+    /// durable removal intent reconciliation finishes as well.
+    ///
+    /// # Errors
+    ///
+    /// Returns the delivery or persistence error after the rollback.
+    async fn complete_create(
+        &self,
+        info: SessionInfo,
+        pending_initial_input: Option<String>,
+    ) -> Result<SessionInfo, ProtocolError> {
         self.spawn_session_hook(SessionHookRequest {
             event: HookEvent::SessionStart,
             cwd: info.cwd.clone(),
@@ -1738,24 +1777,54 @@ impl SessionRegistry {
             stop_reason: None,
             activity: None,
         });
-        if let Some(input) = pending_initial_input {
-            // Wait for the agent to come up before injecting the first prompt so
-            // the bytes are not delivered to a stdin reader that has not yet
-            // entered raw/bracketed-paste mode (and would drop or mis-frame
-            // them). Bounded, so a silent agent can never wedge `session.new`.
-            self.await_initial_input_readiness(&info.id).await;
-            if let Err(err) = self.write_input_to_session(&info.id, &input).await {
-                // A failed initial input must roll the session back completely.
-                // `stop()` alone does not free a bound worktree, so a leftover
-                // checkout would keep the branch checked out and block the next
-                // `session.new` on it with `worktree_branch_in_use` — exactly
-                // the orphan the launch-failure path above compensates for.
-                self.rollback_failed_initial_input(&info.id, info.worktree_path.is_some())
-                    .await;
-                return Err(err);
-            }
+        let Some(input) = pending_initial_input else {
+            return Ok(info);
+        };
+        #[cfg(test)]
+        self.hold_initial_input(&info.id).await;
+        // Wait for the agent to come up before injecting the first prompt so
+        // the bytes are not delivered to a stdin reader that has not yet
+        // entered raw/bracketed-paste mode (and would drop or mis-frame
+        // them). Bounded, so a silent agent can never wedge `session.new`.
+        self.await_initial_input_readiness(&info.id).await;
+        let delivered = match self.write_input_to_session(&info.id, &input).await {
+            Ok(()) => self.commit_initial_input(&info.id).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = delivered {
+            self.rollback_failed_initial_input(&info.id).await;
+            return Err(error);
         }
         Ok(info)
+    }
+
+    /// Clears the `initial_input` marker of a delivered create, in memory
+    /// and durably.
+    async fn commit_initial_input(&self, id: &SessionId) -> Result<(), ProtocolError> {
+        let record = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let entry = sessions
+                .get_mut(id)
+                .ok_or_else(|| session_not_found(&id.0))?;
+            entry.initial_input_pending = false;
+            Self::session_record(id, entry, entry.desired_state, None)
+        };
+        self.write_session_record(record).await
+    }
+
+    /// Parks a create before its initial input when a test armed the hold.
+    #[cfg(test)]
+    async fn hold_initial_input(&self, id: &SessionId) {
+        let gate = self
+            .inner
+            .initial_input_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|gate| gate.session_id.as_deref().is_none_or(|held| held == id.0));
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
     }
 
     /// Records the intent of a `session.new`, binds its target, and registers
@@ -1932,6 +2001,7 @@ impl SessionRegistry {
             worktree_path,
             metadata: params.metadata.clone(),
             warnings,
+            initial_input_pending: plan.pending_initial_input.is_some(),
         };
         Ok((spec, plan.pending_initial_input))
     }
@@ -1961,11 +2031,17 @@ impl SessionRegistry {
 
         match runtime {
             RuntimeHandle::Worker(worker) => {
+                // Shutdown stops the wait, so the input is delivered while the
+                // create drain still waits for it.
+                let shutdown = self.inner.daemon_shutdown.clone();
                 let _ = tokio::time::timeout(grace, async {
                     loop {
                         match worker.inspect().await {
                             Ok(snapshot) if snapshot.next_offset > 0 => break,
-                            Ok(_) => tokio::time::sleep(WORKER_CONNECT_RETRY).await,
+                            Ok(_) => tokio::select! {
+                                () = shutdown.cancelled() => break,
+                                () = tokio::time::sleep(WORKER_CONNECT_RETRY) => {}
+                            },
                             Err(_) => break,
                         }
                     }
@@ -1976,25 +2052,21 @@ impl SessionRegistry {
         }
     }
 
-    /// Roll back a session whose initial `--input` injection failed: stop the
-    /// PTY and, when the session bound a worktree, free that worktree too.
+    /// Roll back a session whose initial `--input` could not be delivered or
+    /// committed by removing it ([`Self::remove`]): stop the runtime, retire
+    /// its job, and free its worktree, so its branch is free for a retry.
     ///
-    /// `stop()` only terminates the PTY and records the exit; it never releases
-    /// a bound worktree, so the checkout is removed here, and only after the
-    /// stop succeeded: a failed stop may leave the agent running in it, so the
-    /// worktree is kept. Best-effort: a stop failure is logged, never
+    /// The removal persists its intent before it acts, and until then the
+    /// record keeps the `initial_input` marker, so reconciliation finishes a
+    /// rollback this cannot. Best-effort: a failure is logged, never
     /// propagated, so the caller still returns the original input error.
-    async fn rollback_failed_initial_input(&self, id: &SessionId, worktree_bound: bool) {
-        if let Err(err) = self.stop(id).await {
+    async fn rollback_failed_initial_input(&self, id: &SessionId) {
+        if let Err(err) = self.remove(id).await {
             warn!(
                 session_id = %id.0,
                 error = %err,
-                "failed to stop session while rolling back a failed initial input; its worktree is kept"
+                "failed to remove a session whose initial input was not delivered; reconciliation finishes the rollback"
             );
-            return;
-        }
-        if worktree_bound {
-            self.cleanup_bound_worktree(id).await;
         }
     }
 

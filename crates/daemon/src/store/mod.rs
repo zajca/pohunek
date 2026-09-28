@@ -456,6 +456,20 @@ pub struct SessionTransaction {
     pub previous_runtime_id: Option<String>,
 }
 
+/// Phase of a committed create whose initial input is not yet delivered.
+///
+/// Reconciliation rolls such a create back, since the input exists only in
+/// the daemon's memory and the session must not run without it.
+pub const INITIAL_INPUT_PHASE: &str = "initial_input";
+
+impl SessionTransaction {
+    /// Whether this is a committed create still delivering its initial input.
+    #[must_use]
+    pub fn is_initial_input(&self) -> bool {
+        self.kind == TransactionKind::Create && self.phase == INITIAL_INPUT_PHASE
+    }
+}
+
 /// Last durable binding between a logical session and its worker runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeRecord {
@@ -724,6 +738,7 @@ impl Store {
             }
             let mut replacement = record.clone();
             preserve_newer_native_identity(existing, &mut replacement);
+            keep_initial_input_settled(existing, &mut replacement);
             *existing = replacement;
         } else {
             sessions.push(record.clone());
@@ -765,6 +780,7 @@ impl Store {
         }
         let mut replacement = record.clone();
         preserve_newer_native_identity(existing, &mut replacement);
+        keep_initial_input_settled(existing, &mut replacement);
         *existing = replacement;
         match self.write_all(&resume, &worktrees, &projects, &sessions)? {
             MetadataWriteOutcome::Synced => Ok(SessionWriteOutcome::Applied),
@@ -1258,6 +1274,26 @@ fn fs_error_to_io(error: FsError) -> io::Error {
         _ => error.io_kind().unwrap_or(io::ErrorKind::Other),
     };
     io::Error::new(kind, error)
+}
+
+/// Drops a pending-initial-input marker that `replacement` would re-add.
+///
+/// The marker is written only by the create commit, over the create's own
+/// transaction, and cleared once the input is delivered. A writer that built
+/// its record before that clearing must not bring the marker back, or a
+/// restart would roll back a session that already received its input.
+fn keep_initial_input_settled(existing: &SessionRecord, replacement: &mut SessionRecord) {
+    let reintroduced = replacement
+        .transaction
+        .as_ref()
+        .is_some_and(SessionTransaction::is_initial_input)
+        && existing
+            .transaction
+            .as_ref()
+            .is_none_or(|transaction| transaction.kind != TransactionKind::Create);
+    if reintroduced {
+        replacement.transaction = None;
+    }
 }
 
 pub(crate) fn preserve_newer_native_identity(

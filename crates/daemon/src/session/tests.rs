@@ -2709,7 +2709,11 @@ async fn failed_initial_input_rollback_frees_the_bound_worktree() {
         "session must be worktree-bound for this test: {info:?}"
     );
 
-    registry.rollback_failed_initial_input(&info.id, true).await;
+    registry.rollback_failed_initial_input(&info.id).await;
+    assert!(
+        registry.list().await.is_empty(),
+        "the rolled-back session is removed"
+    );
 
     // The worktree bound for this session must be gone so its branch is free.
     let leftover: Vec<_> = std::fs::read_dir(&worktree_root)
@@ -14364,6 +14368,152 @@ async fn reconciled_create_whose_worker_ended_is_retired_then_compensated() {
     );
     daemon
         .assert_compensated(&restarted, &worktree, "feat/ended")
+        .await;
+}
+
+/// Arms `registry` to park its next committed create before its initial
+/// input.
+fn hold_initial_input(registry: &SessionRegistry) -> crate::runtime::lifecycle::tests::StartGate {
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *registry
+        .inner
+        .initial_input_hold
+        .lock()
+        .expect("initial input hold is never poisoned") = Some(gate.clone());
+    gate
+}
+
+/// The durable record of the only session, which is committed and still
+/// marked as waiting for its initial input.
+fn undelivered_create(daemon: &RestartableDaemon) -> crate::store::SessionRecord {
+    let records = daemon.records();
+    let [record] = records.as_slice() else {
+        panic!("exactly one session record: {records:?}");
+    };
+    assert!(
+        record
+            .transaction
+            .as_ref()
+            .is_some_and(crate::store::SessionTransaction::is_initial_input),
+        "the committed create is marked until its input is delivered: {record:?}"
+    );
+    assert!(
+        record.runtime.generation.is_some(),
+        "its runtime was launched"
+    );
+    record.clone()
+}
+
+#[tokio::test]
+async fn daemon_shutdown_drains_a_create_through_its_initial_input() {
+    let daemon = RestartableDaemon::new("wt-drain-input");
+    let (registry, _supervisor) = scripted_registry(daemon.config.clone());
+    let gate = hold_initial_input(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = SessionNewParams {
+            input: Some("echo drained".to_owned()),
+            ..daemon.params("feat/drained-input")
+        };
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+    let pending = undelivered_create(&daemon);
+
+    registry.begin_daemon_shutdown();
+    let mut drain = Box::pin(registry.drain_creates());
+    assert!(
+        futures::poll!(drain.as_mut()).is_pending(),
+        "the drain waits for the initial input"
+    );
+    gate.release.notify_one();
+
+    assert!(drain.await, "the drain ends once the input is delivered");
+    let created = creating
+        .await
+        .expect("create task joins")
+        .expect("the create delivers its input");
+    let record = stored_record(&daemon.store_path, &created.id);
+    assert_eq!(record.transaction, None, "delivery clears the marker");
+
+    // A writer that built its record before the clearing cannot bring the
+    // marker back.
+    daemon
+        .store()
+        .record_session(&pending)
+        .expect("write a stale marked record");
+    assert_eq!(
+        stored_record(&daemon.store_path, &created.id).transaction,
+        None,
+        "a delivered create is never marked again"
+    );
+}
+
+#[tokio::test]
+async fn create_cut_off_before_its_initial_input_is_rolled_back_at_restart() {
+    let daemon = RestartableDaemon::new("wt-cut-input");
+    let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+        create_drain_timeout: Duration::ZERO,
+        ..daemon.config.clone()
+    });
+    let gate = hold_initial_input(&registry);
+    let _creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = SessionNewParams {
+            input: Some("echo lost".to_owned()),
+            ..daemon.params("feat/cut-input")
+        };
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+
+    registry.begin_daemon_shutdown();
+    assert!(
+        !registry.drain_creates().await,
+        "the drain gives up before the input is delivered"
+    );
+    // The input exists only in memory, so the durable record says the create
+    // is unfinished.
+    let record = undelivered_create(&daemon);
+    let worktree = record.info.worktree_path.clone().expect("bound worktree");
+    let service_id = record.runtime.service_id.clone().expect("recorded job");
+    // The daemon exits: its in-memory session and worker connections go
+    // away, while the worker keeps running under its job.
+    let entry = registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .remove(&SessionId(record.session_id.clone()))
+        .expect("committed session entry");
+    entry.cancel_runtime_watchers();
+    drop(entry);
+    drop(registry);
+
+    let restarted = SessionRegistry::new_with_launcher_and_inspector(
+        daemon.config.clone(),
+        Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
+        Arc::new(ReadableHost::new()),
+    );
+    restarted
+        .reconcile_workers()
+        .await
+        .expect("startup reconciliation");
+
+    assert!(
+        supervisor
+            .retired()
+            .iter()
+            .any(|retired| retired.as_str() == service_id),
+        "the running generation is retired: {:?}",
+        supervisor.calls()
+    );
+    daemon
+        .assert_compensated(&restarted, &worktree, "feat/cut-input")
         .await;
 }
 

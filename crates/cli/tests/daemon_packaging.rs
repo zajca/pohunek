@@ -1162,7 +1162,7 @@ fn an_unsound_install_prefix_refuses_before_anything_changes() {
 fn an_upgrade_refuses_a_prefix_other_than_the_configured_one() {
     let fixture = Fixture::new();
     write(&fixture.config_home.join("pohunek/service.toml"), "");
-    let other = fixture.root.path().join("other");
+    let other = fixture.base().join("other");
     fixture.legacy_install_at(&other);
     write(&fixture.prefix.join("bin/pohunekd"), "legacy\n");
     let output = fixture.run(
@@ -1263,7 +1263,7 @@ fn an_upgrade_without_a_readable_configured_prefix_refuses() {
 #[test]
 fn a_legacy_unit_of_another_prefix_refuses_before_anything_changes() {
     let fixture = Fixture::new();
-    let legacy_prefix = fixture.root.path().join("legacy-prefix");
+    let legacy_prefix = fixture.base().join("legacy-prefix");
     fixture.legacy_install_at(&legacy_prefix);
     write(&fixture.prefix.join("bin/pohunekd"), "unrelated\n");
     let output = fixture.run(&[], &[("POHUNEK_TEST_LEGACY_ACTIVE", "1")]);
@@ -1293,7 +1293,7 @@ fn a_legacy_unit_of_another_prefix_refuses_before_anything_changes() {
 #[test]
 fn legacy_binary_symlinks_are_left_in_place() {
     let fixture = Fixture::new();
-    let outside = fixture.root.path().join("outside");
+    let outside = fixture.base().join("outside");
     write(&outside.join("pohunekd"), "foreign daemon\n");
     write(&outside.join("pohunek-sessiond"), "foreign worker\n");
     create_dirs(&fixture.prefix.join("bin"));
@@ -1331,10 +1331,10 @@ type UntrustedSetup = fn(&Fixture);
 
 /// Replaces the directory `path` of `fixture` with a symlink to a moved copy.
 fn move_behind_symlink(fixture: &Fixture, path: &Path) {
-    let real = fixture.root.path().join("real").join(
-        path.strip_prefix(fixture.root.path())
-            .expect("fixture path"),
-    );
+    let real = fixture
+        .base()
+        .join("real")
+        .join(path.strip_prefix(fixture.base()).expect("fixture path"));
     create_dirs(real.parent().expect("parent"));
     fs::rename(path, &real).expect("move directory");
     std::os::unix::fs::symlink(&real, path).expect("directory symlink");
@@ -1367,7 +1367,7 @@ fn an_untrusted_directory_refuses_before_the_legacy_install_changes() {
                 .expect("chmod runtime root");
         }),
         ("symlinked state root", |fixture| {
-            let state = fixture.root.path().join("state/pohunek");
+            let state = fixture.base().join("state/pohunek");
             create_dirs(&state);
             fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
                 .expect("chmod state root");
@@ -1556,7 +1556,10 @@ exit "${POHUNEK_TEST_SERVICE_STATUS:-0}"
 "#;
 
 struct Fixture {
-    root: tempfile::TempDir,
+    /// Owns the temporary directory for the fixture's lifetime.
+    _root: tempfile::TempDir,
+    /// The temporary directory without symlinked components.
+    base: PathBuf,
     home: PathBuf,
     archive: PathBuf,
     prefix: PathBuf,
@@ -1593,6 +1596,10 @@ impl BarrierSocket {
 }
 
 impl Fixture {
+    fn base(&self) -> &Path {
+        &self.base
+    }
+
     fn new() -> Self {
         Self::with_runtime_dir(|root| root.join("runtime"))
     }
@@ -1618,10 +1625,13 @@ impl Fixture {
 
     fn with_runtime_dir(runtime_dir: impl FnOnce(&Path) -> PathBuf) -> Self {
         let root = tempfile::tempdir().expect("temp dir");
-        let archive = root.path().join("archive");
-        let commands = root.path().join("commands");
-        let pohunek_log = root.path().join("pohunek.log");
-        let systemctl_log = root.path().join("systemctl.log");
+        // macOS places temporary directories below the `/var` symlink, which
+        // the wrapper's trusted-directory check refuses like the installer.
+        let base = fs::canonicalize(root.path()).expect("canonical temp dir");
+        let archive = base.join("archive");
+        let commands = base.join("commands");
+        let pohunek_log = base.join("pohunek.log");
+        let systemctl_log = base.join("systemctl.log");
         fs::create_dir_all(archive.join("packaging")).expect("archive");
         fs::copy(
             repo_root().join("packaging/install-daemon.sh"),
@@ -1688,7 +1698,7 @@ impl Fixture {
         );
         // The legacy daemon binds its control socket as a real AF_UNIX node,
         // so the barrier rename has a socket file to move.
-        let runtime = runtime_dir(root.path());
+        let runtime = runtime_dir(&base);
         let socket_dir = runtime.join("pohunek");
         create_dirs(&socket_dir);
         // The daemon creates its runtime root owner-private, and the wrapper
@@ -1698,15 +1708,16 @@ impl Fixture {
         let socket = socket_dir.join("daemon.sock");
         UnixListener::bind(&socket).expect("bind barrier socket");
         Self {
-            home: root.path().join("home"),
-            prefix: root.path().join("prefix"),
-            config_home: root.path().join("config"),
+            home: base.join("home"),
+            prefix: base.join("prefix"),
+            config_home: base.join("config"),
             archive,
             commands,
             socket: BarrierSocket { path: socket },
             pohunek_log,
             systemctl_log,
-            root,
+            _root: root,
+            base,
         }
     }
 
@@ -1760,7 +1771,7 @@ impl Fixture {
             .args(args)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.config_home)
-            .env("XDG_STATE_HOME", self.root.path().join("state"))
+            .env("XDG_STATE_HOME", self.base().join("state"))
             .env("POHUNEK_INSTALL_PREFIX", &self.prefix)
             .env("POHUNEK_TEST_CONFIGURED_PREFIX", &self.prefix)
             .env(
@@ -1776,11 +1787,11 @@ impl Fixture {
             )
             .env(
                 "POHUNEK_TEST_SYSTEMCTL_STOP_MARKER",
-                self.root.path().join("systemctl-stop-marker"),
+                self.base().join("systemctl-stop-marker"),
             )
             .env(
                 "POHUNEK_TEST_SYSTEMCTL_START_MARKER",
-                self.root.path().join("systemctl-start-marker"),
+                self.base().join("systemctl-start-marker"),
             )
             .env("POHUNEK_TEST_POHUNEK_LOG", &self.pohunek_log)
             .env("POHUNEK_TEST_SYSTEMCTL_LOG", &self.systemctl_log)
