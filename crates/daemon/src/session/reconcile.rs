@@ -7729,17 +7729,42 @@ while os.getppid() == parent:
                 .expect("persist preparing record");
         }
 
-        /// Waits until `session_id` has left the registry.
-        async fn wait_removed(registry: &SessionRegistry, session_id: &str) {
+        /// Waits until `session_id` has left both the registry and the store.
+        ///
+        /// A removal evicts the entry before it deletes the durable record,
+        /// the last ownership record it removes, so an unlisted session is
+        /// not yet a finished removal.
+        async fn wait_removed(fixture: &Fixture, session_id: &str) {
             let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
-            while registry
+            while fixture
+                .registry
                 .inspect(&SessionId(session_id.to_owned()))
                 .await
                 .is_ok()
+                || recorded(&fixture.root, session_id)
             {
                 assert!(
                     tokio::time::Instant::now() < deadline,
-                    "{session_id} is still listed"
+                    "{session_id} is still listed or recorded"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Waits until procwatch has recorded `session_id`'s observed cwd.
+        async fn wait_procwatch_cwd(registry: &SessionRegistry, session_id: &str) {
+            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            loop {
+                let info = registry
+                    .inspect(&SessionId(session_id.to_owned()))
+                    .await
+                    .expect("session stays visible");
+                if info.cwd_source == Some(protocol::CwdSource::Procwatch) {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "procwatch never observed the cwd of {session_id}: {info:?}"
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -7792,7 +7817,7 @@ while os.getppid() == parent:
                 "nothing is retired early"
             );
 
-            wait_removed(&fixture.registry, "s-317").await;
+            wait_removed(&fixture, "s-317").await;
             assert!(
                 started.elapsed() >= INITIALIZE,
                 "the job was watched until its initialization deadline"
@@ -7831,7 +7856,7 @@ while os.getppid() == parent:
             fixture
                 .supervisor
                 .script_job(id.clone(), present(ServiceState::Failed, None));
-            wait_removed(&fixture.registry, "s-318").await;
+            wait_removed(&fixture, "s-318").await;
             assert_eq!(fixture.supervisor.retired(), vec![id]);
         }
 
@@ -7921,6 +7946,10 @@ while os.getppid() == parent:
                 RuntimeState::Live
             );
             let id = SessionId("s-350".to_owned());
+            // The adopted procwatch moves the recorded cwd to the worker's
+            // shortly after adoption; a transition racing that move is a
+            // retryable concurrent change, so the entry must settle first.
+            wait_procwatch_cwd(&fixture.registry, "s-350").await;
             let (old_watchers, identity) = watchers_of(&fixture.registry, "s-350").await;
             assert!(old_watchers.iter().all(|token| !token.is_cancelled()));
 
@@ -7933,10 +7962,13 @@ while os.getppid() == parent:
                     SUPERVISION_AMBIGUOUS,
                 )
                 .await;
-            assert!(matches!(
-                outcome,
-                crate::session::RuntimeTransitionOutcome::Applied(_)
-            ));
+            assert!(
+                matches!(
+                    outcome,
+                    crate::session::RuntimeTransitionOutcome::Applied(_)
+                ),
+                "the live runtime is marked unavailable: {outcome:?}"
+            );
             assert!(
                 old_watchers
                     .iter()
@@ -8381,7 +8413,7 @@ while os.getppid() == parent:
             );
             assert_eq!(retire_count(&fixture.supervisor, &id), 1);
 
-            wait_removed(&fixture.registry, "s-372").await;
+            wait_removed(&fixture, "s-372").await;
             assert_removal_finished(&fixture, "s-372").await;
             assert_eq!(retire_count(&fixture.supervisor, &id), 2);
         }
@@ -8477,7 +8509,7 @@ while os.getppid() == parent:
             );
             assert_eq!(retire_count(&fixture.supervisor, &id), 1);
 
-            wait_removed(&fixture.registry, "s-375").await;
+            wait_removed(&fixture, "s-375").await;
             assert_removal_finished(&fixture, "s-375").await;
             assert_eq!(retire_count(&fixture.supervisor, &id), 2);
             server_task.abort();
@@ -8508,6 +8540,117 @@ while os.getppid() == parent:
             assert!(removed.removed);
             assert_eq!(fixture.supervisor.retired(), vec![id]);
             assert!(!recorded(&fixture.root, "s-352"));
+        }
+
+        #[tokio::test]
+        async fn removal_whose_record_cannot_be_deleted_stays_listed_for_a_retry() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            persist_record(&fixture.root, "s-376", Some("runtime-s-376"));
+            write_live_journal(&fixture.root, "s-376", dead_worker(), Some("runtime-s-376"));
+            let id = service_id("s-376", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Running, None));
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            assert_eq!(
+                runtime_of(&fixture.registry, "s-376").await.state,
+                RuntimeState::Conflict
+            );
+            let session = SessionId("s-376".to_owned());
+            let mut events = fixture.registry.subscribe();
+            // The removal intent is the first write; the record deletion that
+            // follows the eviction is the second.
+            fixture
+                .registry
+                .inner
+                .store
+                .as_ref()
+                .expect("registry store")
+                .fail_write_before_rename_after(2);
+
+            let error = fixture
+                .registry
+                .remove(&session)
+                .await
+                .expect_err("the record deletion fails");
+
+            assert_eq!(error.code, "session_store_failed");
+            assert_eq!(
+                durable_desired_state(&fixture.root, "s-376"),
+                Some(DesiredState::Removed),
+                "the failed deletion keeps the removal intent"
+            );
+            assert_eq!(
+                runtime_of(&fixture.registry, "s-376").await.state,
+                RuntimeState::Conflict,
+                "the session stays listed for a retried removal"
+            );
+            while let Ok(event) = events.try_recv() {
+                assert_ne!(
+                    event.event(),
+                    protocol::event::SESSION_REMOVED,
+                    "an unfinished removal is not announced"
+                );
+            }
+
+            let removed = fixture
+                .registry
+                .remove(&session)
+                .await
+                .expect("the retried removal finishes");
+
+            assert!(removed.removed);
+            assert!(!recorded(&fixture.root, "s-376"));
+            assert_eq!(retire_count(&fixture.supervisor, &id), 2);
+            let mut announced = false;
+            while let Ok(event) = events.try_recv() {
+                announced |= event.event() == protocol::event::SESSION_REMOVED;
+            }
+            assert!(announced, "the finished removal is announced");
+        }
+
+        #[tokio::test]
+        async fn reconciled_removal_whose_record_cannot_be_deleted_is_retried() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let record = persist_removal_intent(&fixture.root, "s-377", Some("runtime-s-377"));
+            seed_removal_leftovers(&fixture.root, &record);
+            write_terminal_journal(&fixture.root, "s-377", "runtime-s-377");
+            let id = service_id("s-377", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Unknown, None));
+            // Clearing the resume binding is the first write; the record
+            // deletion is the second.
+            fixture
+                .registry
+                .inner
+                .store
+                .as_ref()
+                .expect("registry store")
+                .fail_write_before_rename_after(2);
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-377").await;
+            assert_eq!(runtime.state, RuntimeState::Reconnecting);
+            assert_eq!(
+                runtime.loss_reason.as_deref(),
+                Some(SUPERVISION_UNAVAILABLE)
+            );
+            assert_eq!(
+                durable_desired_state(&fixture.root, "s-377"),
+                Some(DesiredState::Removed),
+                "the failed deletion keeps the removal intent"
+            );
+            assert_eq!(retire_count(&fixture.supervisor, &id), 1);
+
+            wait_removed(&fixture, "s-377").await;
+            assert_removal_finished(&fixture, "s-377").await;
+            assert_eq!(retire_count(&fixture.supervisor, &id), 2);
         }
 
         #[tokio::test]
@@ -8757,7 +8900,7 @@ while os.getppid() == parent:
             fixture
                 .supervisor
                 .script_job(id.clone(), present(ServiceState::Failed, None));
-            wait_removed(&fixture.registry, "s-323").await;
+            wait_removed(&fixture, "s-323").await;
             assert_eq!(fixture.supervisor.retired(), vec![id]);
             assert!(Store::new(fixture.root.join("data/metadata.jsonl"))
                 .load_sessions()
@@ -8880,7 +9023,7 @@ while os.getppid() == parent:
             );
 
             set_mode(&state_root, PRIVATE_ROOT_MODE);
-            wait_removed(&fixture.registry, "s-332").await;
+            wait_removed(&fixture, "s-332").await;
             assert_eq!(fixture.supervisor.retired(), vec![id]);
         }
 

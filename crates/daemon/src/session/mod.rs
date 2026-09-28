@@ -2701,7 +2701,9 @@ impl SessionRegistry {
     /// `worker_protocol_incompatible`); a generation the supervisor cannot
     /// retire fails with `runtime_supervision_unavailable`; a worker not
     /// proven gone afterwards fails with `runtime_supervision_ambiguous` or
-    /// `runtime_identity_mismatch`. The record is kept in every case.
+    /// `runtime_identity_mismatch`. The record is kept in every case, and a
+    /// cleanup that fails after the removal intent was recorded keeps the
+    /// session listed, so the removal can be retried.
     pub async fn remove(&self, id: &SessionId) -> Result<SessionRemoveResult, ProtocolError> {
         self.ensure_not_external(id).await?;
         let _guard = self.lock_lifecycle(id).await;
@@ -2774,7 +2776,8 @@ impl SessionRegistry {
     ///
     /// Returns the worktree, log, or store error that stopped the cleanup.
     /// Every step is idempotent and the durable record is deleted last, so a
-    /// failed cleanup keeps the removal intent for a later attempt.
+    /// failed cleanup keeps the removal intent for a later attempt, and an
+    /// entry evicted before the record could be deleted is listed again.
     async fn release_removed_session(
         &self,
         id: &SessionId,
@@ -2811,7 +2814,21 @@ impl SessionRegistry {
         // lingering resume binding (idempotent for a session that already dropped
         // its binding on exit or stop).
         self.persist_resume_binding(id).await;
-        self.delete_session_record(id).await?;
+        if let Err(error) = self.delete_session_record(id).await {
+            // The entry leaves first so the binding cleanup above cannot re-read
+            // it as live. The record still holds the removal intent, so the
+            // entry is listed again for a retried removal; the callers hold the
+            // lifecycle lock, so no other entry can have taken its place.
+            if let Some(entry) = evicted {
+                self.inner
+                    .sessions
+                    .lock()
+                    .await
+                    .entry(id.clone())
+                    .or_insert(entry);
+            }
+            return Err(error);
+        }
         if let Some(entry) = &evicted {
             self.emit(event::SESSION_REMOVED, &entry.info);
         }

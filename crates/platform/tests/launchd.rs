@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -161,6 +161,13 @@ impl Fixture {
 
     /// Writes a plist into the definitions directory and optionally loads it.
     fn plant(&mut self, file_name: &str, contents: &[u8], load: Option<&str>) {
+        // The supervisor creates its private definitions directory only when
+        // it first registers a job, so a plant before that creates it `0700`.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.definitions)
+            .expect("definitions directory created");
         let path = self.definitions.join(file_name);
         std::fs::write(&path, contents).expect("definition written");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
