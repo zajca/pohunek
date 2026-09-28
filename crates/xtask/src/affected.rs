@@ -541,12 +541,12 @@ fn command_line(args: Option<&[OsString]>) -> String {
 
 /// Full `--print` output: base, one reason per file, selection, reminders, command.
 fn render_report(base: &str, plan: &Plan, args: Option<&[OsString]>) -> String {
-    let mut out = format!("base: {base}\n");
+    let mut out = format!("base: {}\n", printable(base));
     if plan.decisions.is_empty() {
         out.push_str("no changed files\n");
     }
     for (path, decision) in &plan.decisions {
-        let _ = writeln!(out, "{path} -> {}", decision.describe());
+        let _ = writeln!(out, "{} -> {}", printable(path), decision.describe());
     }
     let _ = writeln!(out, "{}", selection_line(&plan.selection));
     for reminder in &plan.reminders {
@@ -559,12 +559,18 @@ fn render_report(base: &str, plan: &Plan, args: Option<&[OsString]>) -> String {
 /// Short summary printed before running: base, escalation causes, selection, reminders.
 fn render_summary(base: &str, plan: &Plan, args: Option<&[OsString]>) -> String {
     let mut out = format!(
-        "affected: base {base}, {} changed files\n",
+        "affected: base {}, {} changed files\n",
+        printable(base),
         plan.decisions.len()
     );
     for (path, decision) in &plan.decisions {
         if matches!(decision, Decision::Everything(_) | Decision::Unmapped) {
-            let _ = writeln!(out, "affected: {path} -> {}", decision.describe());
+            let _ = writeln!(
+                out,
+                "affected: {} -> {}",
+                printable(path),
+                decision.describe()
+            );
         }
     }
     let _ = writeln!(out, "affected: {}", selection_line(&plan.selection));
@@ -575,6 +581,23 @@ fn render_summary(base: &str, plan: &Plan, args: Option<&[OsString]>) -> String 
         let _ = writeln!(out, "affected: running {}", command_line(args));
     }
     out
+}
+
+/// Escapes control characters in a git-supplied path or ref before it reaches
+/// the terminal.
+///
+/// File names may contain newlines or ESC; printed raw they could forge report
+/// lines or drive terminal escape sequences. Other characters stay readable.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// Quotes `arg` for display in a POSIX shell when it contains special characters.
@@ -980,6 +1003,30 @@ mod tests {
              gates\") and `cargo xtask ts check`\n\
              cargo t -E 'rdeps(=pohunek-cli)'\n"
         );
+    }
+
+    #[test]
+    fn control_characters_in_paths_and_base_are_escaped() {
+        // Unmapped, so the pre-run summary prints it as an escalation cause too.
+        let hostile = "a\nforged -> nothing\x1b[2J.rs";
+        let plan = plan(&changed(&[hostile]), &fixture()).expect("plan");
+        let args = nextest_args(&plan.selection, &[]);
+        for output in [
+            render_report("main\x1b]0;x\x07", &plan, args.as_deref()),
+            render_summary("main\x1b]0;x\x07", &plan, args.as_deref()),
+        ] {
+            assert!(
+                !output.chars().any(|c| c.is_control() && c != '\n'),
+                "{output:?}"
+            );
+            assert!(!output.contains("\nforged"), "{output:?}");
+            assert!(
+                output.contains(r"a\nforged -> nothing\u{1b}[2J.rs"),
+                "{output:?}"
+            );
+            assert!(output.contains(r"main\u{1b}]0;x\u{7}"), "{output:?}");
+        }
+        assert_eq!(printable("crates/ünïcode.rs"), "crates/ünïcode.rs");
     }
 
     #[test]
