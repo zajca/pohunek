@@ -341,7 +341,23 @@ reconciliation through the same steps as `session rm` (retire the recorded
 generation and prove its workers gone, sweep its runtimes' marked processes,
 then delete worktrees, logs, the resume binding, and the record); until those
 succeed the session stays listed with `runtime_supervision_unavailable` or
-`runtime_supervision_ambiguous` and is retried.
+`runtime_supervision_ambiguous` and is retried. A stop interrupted the same way
+is replayed through its answering worker and committed `stopped` only once the
+worker returns the terminal outcome; until then it stays `reconnecting` with
+`runtime_supervision_unavailable` and the retry replays it. A create
+interrupted before it committed is compensated from its durable create record
+once its worker is proven ended (never launched, or its runtime ended): the
+generation is retired first, then the worktree and its binding are removed,
+then the record is deleted, and a step that fails keeps the rest for a retry.
+A compensation that cannot finish while the daemon runs (a checkout that
+cannot be removed, or a binding or record the store cannot drop) keeps the
+session listed as `reconnecting` with `create_compensation_pending`, and the
+supervision retry repeats it until the session is removed (`session_removed`).
+A job of a
+generation no record names is retired only once its journaled worker is proven
+gone as well, even when the job itself already ended; while that worker runs or
+the session's journals cannot be read, the job stays `orphaned` in the runtime
+inventory (`stale_worker_generation`).
 
 ## Retention
 

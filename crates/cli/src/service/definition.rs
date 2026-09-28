@@ -74,7 +74,8 @@ pub fn with_version(config: &ServiceConfig, version: &str) -> Result<ServiceConf
 ///
 /// # Errors
 ///
-/// Returns [`Error::Supervisor`] when the definition fails validation.
+/// Returns [`Error::NonUtf8Env`] for a bootstrap root the definition cannot
+/// carry and [`Error::Supervisor`] when the definition fails validation.
 pub fn daemon_definition(
     context: &Context,
     config: &ServiceConfig,
@@ -93,7 +94,7 @@ pub fn daemon_definition(
                 })?
                 .to_owned(),
         ],
-        environment: context.bootstrap_environment(),
+        environment: context.bootstrap_environment()?,
         working_directory: config.state_root().to_path_buf(),
         logs: daemon_logs(context, config),
         start_timeout: settings::DAEMON_START_TIMEOUT,
@@ -192,7 +193,10 @@ mod tests {
                 throttle: settings::DAEMON_RESTART_THROTTLE
             }
         );
-        assert_eq!(definition.environment(), &context.bootstrap_environment());
+        assert_eq!(
+            definition.environment(),
+            &context.bootstrap_environment().expect("utf-8 roots")
+        );
         assert_eq!(definition.working_directory(), config.state_root());
         assert_eq!(definition.open_files(), settings::OPEN_FILES);
     }

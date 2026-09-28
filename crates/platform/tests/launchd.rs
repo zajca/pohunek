@@ -512,6 +512,91 @@ async fn strict_discovery_refuses_only_rejected_definitions_of_its_namespace() {
 }
 
 #[tokio::test]
+async fn strict_discovery_holds_a_loaded_worker_whose_definition_is_set_aside() {
+    let mut fixture = Fixture::new();
+    // No worker was ever registered: the missing directory is an empty registry.
+    assert!(!fixture.definitions.exists());
+    assert!(fixture
+        .supervisor
+        .discover_strict()
+        .await
+        .expect("a missing definitions directory is empty")
+        .is_empty());
+
+    // An absent label's set-aside definition runs nothing and stays in place.
+    let idle = fixture.namespace.worker_label(&key("s-2201", "abcd2345"));
+    let idle_parked = format!(".{idle}.plist.replaced");
+    fixture.plant(
+        &idle_parked,
+        &plist_document(&idle, &["/bin/sleep", "600"]),
+        None,
+    );
+    assert!(fixture
+        .supervisor
+        .discover_strict()
+        .await
+        .expect("an absent set-aside worker is not a loaded job")
+        .is_empty());
+    assert!(fixture.definitions.join(&idle_parked).exists());
+
+    // A crash between setting a loaded job's definition aside and publishing
+    // its successor leaves the job loaded without `<label>.plist`.
+    let loaded = key("s-2202", "efgh2345");
+    let id = loaded.service_id();
+    let label = fixture.namespace.worker_label(&loaded);
+    fixture.extra_labels.push(label.clone());
+    let definition = fixture.worker(&loaded, SLEEPING_WORKER, Duration::from_secs(5));
+    fixture
+        .supervisor
+        .start(&id, &definition)
+        .await
+        .expect("worker starts");
+    wait_for(|| fixture.supervisor.inspect(&id), running).await;
+    let path = fixture.definition_path(&loaded);
+    let parked = fixture.definitions.join(format!(".{label}.plist.replaced"));
+    std::fs::rename(&path, &parked).expect("definition set aside");
+
+    assert!(
+        matches!(
+            fixture.supervisor.discover_strict().await,
+            Err(Error::Race {
+                operation: "discover"
+            })
+        ),
+        "a loaded set-aside worker must hold the strict discovery"
+    );
+    assert!(fixture
+        .supervisor
+        .discover()
+        .await
+        .expect("the lenient discovery omits it")
+        .is_empty());
+    assert!(
+        parked.exists(),
+        "discovery never moves a set-aside definition"
+    );
+
+    std::fs::rename(&parked, &path).expect("definition put back");
+    let observations = fixture
+        .supervisor
+        .discover_strict()
+        .await
+        .expect("the settled worker is discovered");
+    assert_eq!(
+        observations
+            .iter()
+            .map(|observation| &observation.id)
+            .collect::<Vec<_>>(),
+        [&id]
+    );
+    fixture
+        .supervisor
+        .retire(&id)
+        .await
+        .expect("worker retires");
+}
+
+#[tokio::test]
 async fn an_absent_domain_is_domain_unavailable() {
     let fixture = Fixture::new();
     let supervisor = LaunchdSupervisor::new(

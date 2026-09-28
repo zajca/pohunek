@@ -206,23 +206,16 @@ impl SessionRegistry {
     }
 
     /// Fork a native agent conversation into a new pohunek session.
+    ///
+    /// # Errors
+    ///
+    /// Returns `migration_manifest_missing` while unmigrated legacy resume
+    /// bindings exist, before anything is written, and otherwise the source
+    /// lookup, launch-template, or launch error.
     pub async fn fork(&self, params: SessionForkParams) -> Result<SessionInfo, ProtocolError> {
+        self.ensure_migration_settled()?;
         self.ensure_not_external(&params.session_id).await?;
-        let (binding, repo, branch, worktree_path) = {
-            let sessions = self.inner.sessions.lock().await;
-            let entry = sessions
-                .get(&params.session_id)
-                .ok_or_else(|| session_not_found(&params.session_id.0))?;
-            if !entry.info.capabilities.fork {
-                return Err(agent_fork_unsupported());
-            }
-            (
-                Self::resume_binding_from_entry(&params.session_id, entry),
-                entry.info.repo.clone(),
-                entry.info.branch.clone(),
-                entry.info.worktree_path.clone(),
-            )
-        };
+        let (binding, repo, branch, worktree_path) = self.fork_source(&params.session_id).await?;
 
         let fork_template = binding_fork_template(&binding).ok_or_else(agent_fork_unsupported)?;
         let session_ref = session_ref_from_binding(fork_template.resume, &binding)?;
@@ -308,6 +301,32 @@ impl SessionRegistry {
             .await?;
         self.persist_resume_binding(&info.id).await;
         Ok(info)
+    }
+
+    /// The resume binding and git context a fork of `id` launches from.
+    async fn fork_source(
+        &self,
+        id: &SessionId,
+    ) -> Result<
+        (
+            ResumeBinding,
+            Option<PathBuf>,
+            Option<String>,
+            Option<PathBuf>,
+        ),
+        ProtocolError,
+    > {
+        let sessions = self.inner.sessions.lock().await;
+        let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
+        if !entry.info.capabilities.fork {
+            return Err(agent_fork_unsupported());
+        }
+        Ok((
+            Self::resume_binding_from_entry(id, entry),
+            entry.info.repo.clone(),
+            entry.info.branch.clone(),
+            entry.info.worktree_path.clone(),
+        ))
     }
 
     pub(super) fn resume_binding_from_entry(id: &SessionId, entry: &SessionEntry) -> ResumeBinding {

@@ -643,6 +643,110 @@ async fn an_install_interrupted_before_registration_rolls_back_without_orphans()
     }
 }
 
+/// Leaves an install of `V1` pending at `config`, which any other command
+/// would roll back, and returns its record.
+async fn pending_install_at_config(harness: &Harness) -> Record {
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Config);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+    harness.pending().expect("record left behind")
+}
+
+/// Asserts that the pending install `record` and everything it wrote remain.
+fn assert_pending_untouched(harness: &Harness, record: &Record) {
+    assert_eq!(harness.pending().as_ref(), Some(record), "record untouched");
+    assert_eq!(
+        harness
+            .config()
+            .expect("service.toml kept")
+            .active_version(),
+        V1
+    );
+    assert!(harness
+        .layout()
+        .daemon_executable(V1)
+        .expect("daemon path")
+        .is_file());
+    assert!(harness.fake.world().registered.is_none());
+}
+
+#[tokio::test]
+async fn an_unnormalized_prefix_is_refused_before_a_pending_install_is_rolled_back() {
+    let harness = Harness::new();
+    let record = pending_install_at_config(&harness).await;
+    let prefix = harness.prefix().display().to_string();
+    let (parent, name) = prefix.rsplit_once('/').expect("absolute prefix");
+    for spelling in [
+        format!("{prefix}/."),
+        format!("{prefix}/"),
+        format!("{parent}//{name}"),
+        format!("{parent}/./{name}"),
+    ] {
+        let error = harness
+            .engine()
+            .install(&harness.staged(V2), Path::new(&spelling), V2)
+            .await
+            .expect_err("unnormalized prefix");
+        assert!(
+            matches!(&error, Error::InvalidPath { flag: "--prefix", path } if path == Path::new(&spelling)),
+            "{spelling}: {error:?}"
+        );
+        assert_pending_untouched(&harness, &record);
+    }
+}
+
+#[tokio::test]
+async fn a_root_the_daemon_definition_cannot_carry_is_refused_before_any_rollback() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let harness = Harness::new();
+    let record = pending_install_at_config(&harness).await;
+    let mut home = harness.root.as_os_str().to_owned();
+    home.push(std::ffi::OsStr::from_bytes(b"/home-\xff"));
+    let broken = Context::new(
+        harness.context.paths().clone(),
+        harness.context.uid(),
+        Some(PathBuf::from(home)),
+        Some(harness.root.join("run")),
+        harness.context.supervisor_dir().to_path_buf(),
+        harness.context.cli_executable().to_path_buf(),
+    );
+    let engine = Engine::new(&broken, &harness.backend);
+
+    let error = engine
+        .install(&harness.staged(V2), &harness.prefix(), V2)
+        .await
+        .expect_err("non-UTF-8 HOME");
+    assert!(
+        matches!(&error, Error::NonUtf8Env { var: "HOME", .. }),
+        "{error:?}"
+    );
+    assert_pending_untouched(&harness, &record);
+
+    let error = engine
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect_err("non-UTF-8 HOME");
+    assert!(
+        matches!(&error, Error::NonUtf8Env { var: "HOME", .. }),
+        "{error:?}"
+    );
+    assert_pending_untouched(&harness, &record);
+
+    let error = engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("non-UTF-8 HOME");
+    assert!(
+        matches!(&error, Error::NonUtf8Env { var: "HOME", .. }),
+        "{error:?}"
+    );
+    assert_pending_untouched(&harness, &record);
+}
+
 #[tokio::test]
 async fn an_install_interrupted_at_or_after_registration_is_removed_by_the_safe_uninstall() {
     for step in [Step::Registering, Step::Registered, Step::Ready, Step::Cli] {

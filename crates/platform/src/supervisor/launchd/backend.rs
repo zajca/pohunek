@@ -8,7 +8,7 @@ use super::super::{
     DaemonSupervisor, Error, JobDefinition, JobLogs, Namespace, Operation, RestartPolicy,
     ServiceId, ServiceObservation, ServiceState, Supervisor, WorkerKey, MAX_JOB_TIMEOUT,
 };
-use super::discovery::{classify, refuse_rejected};
+use super::discovery::{classify, refuse_rejected, set_aside_loaded};
 use super::launchctl::{Launchctl, Status};
 use super::plist::{self, Stored, MAX_DEFINITION_BYTES};
 use super::registration::{self, definition_name, fs_error, remove_file, DEFINITION_MODE};
@@ -73,9 +73,10 @@ pub struct Discovery {
     /// are not a private regular file. They are never loaded, and the strict
     /// discovery refuses a result that lists any.
     pub rejected: Vec<String>,
-    /// Whether a job's inspection raced, so the job may be missing from
-    /// [`Discovery::observations`]; only the strict discovery refuses such a
-    /// result.
+    /// Whether a job may be missing from [`Discovery::observations`]: its
+    /// inspection raced, or it is loaded while its only definition is the
+    /// set-aside file of an interrupted registration. Only the strict
+    /// discovery refuses such a result.
     pub incomplete: bool,
 }
 
@@ -149,6 +150,16 @@ impl LaunchdSupervisor {
     /// still exists and only [`LaunchdSupervisor::discover_strict`] may
     /// decide what a caller that cannot tolerate an omission does.
     ///
+    /// A worker whose `<label>.plist` is missing while an interrupted
+    /// registration left its `.<label>.plist.replaced` is probed without
+    /// moving either file: a loaded label marks the discovery incomplete, an
+    /// absent one runs nothing. A missing definitions directory is an empty
+    /// result, because every worker is bootstrapped from a definition `start`
+    /// publishes into the directory it creates, and only an uninstall that
+    /// retired every worker removes the directory. launchd lists no labels
+    /// without parsing `launchctl` output, so the directory is the registry
+    /// the systemd backend gets from its manager.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidData`] for more than
@@ -175,9 +186,17 @@ impl LaunchdSupervisor {
                 ),
             });
         }
-        let entries = classify(&directory, names, &self.namespace, OPERATION)?;
+        let entries = classify(&directory, &names, &self.namespace, OPERATION)?;
         discovery.rejected = entries.rejected;
         drop(directory);
+        discovery.incomplete = set_aside_loaded(
+            &self.jobs.launchctl,
+            &self.jobs.domain,
+            &self.namespace,
+            &entries.set_aside,
+            OPERATION,
+        )
+        .await?;
         for key in entries.candidates {
             match self.inspect_worker(&key.service_id()).await {
                 Ok(observation) => discovery.observations.push(observation),
@@ -332,11 +351,13 @@ impl Supervisor for LaunchdSupervisor {
     }
 
     /// Returns the destructive discovery: a raced job still exists but its
-    /// identity is unproven, and a rejected definition of this namespace may
-    /// belong to a loaded job whose process is never matched, so a result
-    /// that may omit either fails instead of letting a caller delete the
-    /// version it may execute. A race is [`Error::Race`], a rejected
-    /// definition [`Error::InvalidData`].
+    /// identity is unproven, a loaded job whose only definition is set aside
+    /// cannot be inspected until its registration settles, and a rejected
+    /// definition of this namespace may belong to a loaded job whose process
+    /// is never matched, so a result that may omit any of them fails instead
+    /// of letting a caller delete the version it may execute. A race or a
+    /// set-aside loaded job is [`Error::Race`], a rejected definition
+    /// [`Error::InvalidData`].
     fn discover_strict(&self) -> Operation<'_, Vec<ServiceObservation>> {
         Box::pin(async move {
             let discovery = self.discover_definitions().await?;

@@ -615,6 +615,8 @@ pub struct Store {
     fail_parent_sync_after_rename: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_before_rename_countdown: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    fail_binding_removal: std::sync::atomic::AtomicBool,
 }
 
 impl Store {
@@ -628,7 +630,16 @@ impl Store {
             fail_parent_sync_after_rename: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_before_rename_countdown: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_binding_removal: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Makes the next [`Self::remove_worktree_binding`] fail before it writes.
+    #[cfg(test)]
+    pub(crate) fn fail_next_binding_removal(&self) {
+        self.fail_binding_removal
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -908,6 +919,41 @@ impl Store {
                 .with_value(removed));
         }
         Ok(StoreMutation::Synced(0))
+    }
+
+    /// Remove the one worktree binding keyed like `binding` (`(session_id,
+    /// repository, branch_slug)`), preserving every other record. Returns
+    /// whether a binding was removed (`false` is a no-op success).
+    pub fn remove_worktree_binding(
+        &self,
+        binding: &WorktreeBinding,
+    ) -> io::Result<StoreMutation<bool>> {
+        #[cfg(test)]
+        if self
+            .fail_binding_removal
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(io::Error::other(
+                "injected worktree binding removal failure",
+            ));
+        }
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (resume, mut worktrees, projects, sessions) = self.read_all()?;
+        let before = worktrees.len();
+        worktrees.retain(|existing| {
+            existing.session_id != binding.session_id
+                || existing.repository != binding.repository
+                || existing.branch_slug != binding.branch_slug
+        });
+        if worktrees.len() != before {
+            return Ok(self
+                .write_all(&resume, &worktrees, &projects, &sessions)?
+                .with_value(true));
+        }
+        Ok(StoreMutation::Synced(false))
     }
 
     /// Atomically read-modify-write the project keyed by canonical
@@ -1709,6 +1755,34 @@ mod tests {
             .into_value();
         assert_eq!(removed, 2);
         assert!(store.load_worktrees().expect("load").is_empty());
+    }
+
+    #[test]
+    fn worktree_binding_removal_drops_only_the_keyed_binding() {
+        let store = Store::new(temp_store_path("worktree-remove-one"));
+        let kept_branch = worktree("s-1", "x");
+        let removed_branch = worktree("s-1", "y");
+        let other_session = worktree("s-2", "y");
+        for binding in [&kept_branch, &removed_branch, &other_session] {
+            store.record_worktree(binding).expect("record binding");
+        }
+
+        let removed = store
+            .remove_worktree_binding(&removed_branch)
+            .expect("remove one binding")
+            .into_value();
+        let again = store
+            .remove_worktree_binding(&removed_branch)
+            .expect("repeat removal")
+            .into_value();
+
+        assert!(removed, "the keyed binding is removed");
+        assert!(!again, "a repeated removal is a no-op success");
+        assert_eq!(
+            store.load_worktrees().expect("load"),
+            [kept_branch, other_session],
+            "the session's other branch and other sessions keep their bindings"
+        );
     }
 
     #[test]

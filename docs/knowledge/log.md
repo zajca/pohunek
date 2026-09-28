@@ -2,6 +2,11 @@
 
 ## Unreleased (2026-09-27)
 
+- Documented that a failed `session new` whose worktree compensation cannot
+  finish stays listed as `reconnecting` with `create_compensation_pending`
+  and is retried by the running daemon, and that `session new` and `session
+  fork` fail with `migration_manifest_missing` while unimported legacy resume
+  bindings exist.
 - Documented that a session becomes `lost` only after its ended job is retired
   (otherwise `reconnecting`, `runtime_supervision_unavailable`, retried), and
   that reconciliation finishes an interrupted removal through the same

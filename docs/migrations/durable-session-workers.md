@@ -67,13 +67,24 @@ An install that already runs worker-aware sessions under the older
 `pohunek-session@<session-id>.service` template is retired by the same
 installer. Because the already-deployed legacy binary cannot gain a
 daemon-side barrier, the installer retires it in this order. It first asks
-`systemctl --user is-active pohunekd.service` for the legacy daemon's state:
-only a printed `inactive` or `failed` counts as stopped and skips steps 1–2;
-every other state (`active`, `activating`, `deactivating`, `reloading`, or
-anything unexpected) takes the barrier and preflight path, and a query that
-answers nothing refuses before anything changes. A daemon that is not stopped
-but has no control socket node yet (or anymore) also refuses unchanged, since
-no preflight can reach it.
+`systemctl --user is-active pohunekd.service` for the legacy daemon's state;
+a query that answers nothing refuses before anything changes.
+
+The new daemon converts the legacy session records (including their resume
+bindings) only from the migration manifest that `pohunek migration preflight`
+writes against the running legacy daemon, so every retirement takes a fresh
+snapshot. A daemon reported `inactive` or `failed` is started with
+`systemctl --user start pohunekd.service` for it (the legacy unit is
+`Type=notify`, so the start returns once the daemon serves its socket). A
+start that fails, or a daemon that is not `active` afterwards, refuses the run
+without retiring anything, because retiring without the snapshot would leave
+resume bindings unimported or a stale manifest from an earlier refused run in
+place. Every later refusal, and an interruption, stops a daemon the run
+started again, so a refused run leaves the legacy install stopped as it found
+it. Every other state (`active`, `activating`, `deactivating`, `reloading`, or
+anything unexpected) goes straight to the barrier. A daemon that is not
+stopped but has no control socket node yet (or anymore) refuses unchanged,
+since no preflight can reach it.
 
 1. it moves the legacy daemon's control socket node aside
    (`XDG_RUNTIME_DIR/pohunek/daemon.sock`) with `rename(2)` to the sibling
@@ -102,6 +113,30 @@ no preflight can reach it.
    after the preflight and aborts the run;
 6. it removes `pohunekd.service`, `pohunek-session@.service`, and
    `pohunek-sessions.slice` from the user unit directory before installing.
+
+Before any of these steps the installer also refuses, with nothing changed,
+while `pohunek service status --json` reports `transaction_in_progress: true`
+(another `pohunek service install|upgrade|uninstall` holds the transaction
+lock) or omits the flag. The wrapper cannot hold that lock itself, so a
+transaction started after this query is stopped only by the lock of the final
+`pohunek service install|upgrade`.
+
+It then checks every directory it changes files in and every directory
+`pohunek service install|upgrade` requires, with the policy of the service
+command itself, so the legacy install is never retired for an install that
+would then fail: the install prefix, `<prefix>/bin`, `<prefix>/libexec`, and
+`<prefix>/libexec/pohunek`, the user unit directory
+(`$XDG_CONFIG_HOME/systemd/user`), the `service.toml` directory
+(`$XDG_CONFIG_HOME/pohunek`), and the application state and runtime roots
+(`$XDG_STATE_HOME/pohunek`, `$XDG_RUNTIME_DIR/pohunek`). Every existing path
+component must be a directory reached through no symlink, owned by the
+invoking user or by the owner of `/`, and not writable by group or others
+(a sticky directory of `/`'s owner, such as `/tmp`, is accepted as an
+ancestor). The directory itself must be owned by the invoking user; the state
+and runtime roots must have mode `0700` exactly, the others no group or other
+write permission. A missing directory is fine when its nearest existing
+ancestor passes, because the service command creates it. Anything else refuses
+the run and names the offending directory.
 
 Every legacy file the installer removes lies under one validated install
 prefix, resolved before anything changes:
@@ -189,6 +224,16 @@ For every new managed session:
 - the replacement daemon emits `session_runtime_reconnected`;
 - worker or host loss leaves the logical record visible as `lost`;
 - provider-native recovery is explicit and emits `session_native_recovered`.
+
+A worker-aware daemon that starts over legacy resume bindings with no logical
+record and no migration manifest (the binary was replaced without this
+installer's preflight) imports nothing and still starts. Each binding stays on
+disk and is listed by `pohunek session runtime-inventory` as `orphaned` with
+reason `migration_manifest_missing`, and `session.new` and `session.fork` are
+refused with the error code `migration_manifest_missing` until a daemon start
+imports a manifest. Reinstall the legacy release and rerun this installer so
+the preflight snapshots them; once a logical record exists, a later manifest is
+archived without being imported.
 
 See the
 [durable worker operations runbook](../runbooks/durable-session-workers.md) for

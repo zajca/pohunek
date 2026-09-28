@@ -19,6 +19,12 @@
 //!    manager reports as the running daemon job's main process;
 //! 6. `cli`: `<prefix>/bin/pohunek` becomes the new CLI.
 //!
+//! Before any effect, including the rollback of a pending record, install,
+//! upgrade, and uninstall refuse a prefix `service.toml` would reject and an
+//! XDG root or `HOME` that is not UTF-8, which the daemon's job definition
+//! cannot carry. A command that cannot finish therefore never undoes another
+//! transaction first.
+//!
 //! Before staging anything, install and upgrade claim the prefix for this
 //! installation's namespace (see [`super::layout`]): a prefix another
 //! namespace owns is refused with `service_prefix_owned`, because version
@@ -242,8 +248,9 @@ impl<'a> Engine<'a> {
     ) -> Result<InstallReport, Error> {
         let _transaction = self.store.lock().await?;
         layout::check_trusted(self.context.supervisor_dir())?;
-        layout::check_trusted(prefix)?;
         let layout = install_layout(prefix)?;
+        layout::check_trusted(prefix)?;
+        self.context.bootstrap_environment()?;
         let pending = self.store.load()?;
         let (resume, rolled_back) = match pending {
             Some(record)
@@ -351,6 +358,7 @@ impl<'a> Engine<'a> {
     pub async fn upgrade(&self, from: &Path, version: &str) -> Result<UpgradeReport, Error> {
         let _transaction = self.store.lock().await?;
         layout::check_trusted(self.context.supervisor_dir())?;
+        self.context.bootstrap_environment()?;
         let config_path = self.context.config_path();
         let pending = self.store.load()?;
         let (resume, rolled_back) = match pending {
@@ -449,6 +457,7 @@ impl<'a> Engine<'a> {
     /// [`Error::OrphanWorkers`] when worker jobs survive retirement.
     pub async fn uninstall(&self, options: UninstallOptions) -> Result<UninstallReport, Error> {
         let _transaction = self.store.lock().await?;
+        self.context.bootstrap_environment()?;
         let mut report = UninstallReport::default();
         let mut registered = None;
         if let Some(pending) = self.store.load()? {
@@ -1309,8 +1318,13 @@ fn pending_report(record: &Record) -> PendingReport {
     }
 }
 
+/// Validates `prefix` with the exact rule [`ServiceConfig::new`] applies.
+///
+/// Install and rollback check the prefix before any effect, so a prefix the
+/// configuration would reject never lets a pending transaction be rolled
+/// back first.
 fn install_layout(prefix: &Path) -> Result<InstallLayout, Error> {
-    InstallLayout::new(prefix).map_err(|_invalid| Error::InvalidPath {
+    pohunek_service_config::validate_prefix(prefix).map_err(|_invalid| Error::InvalidPath {
         flag: "--prefix",
         path: prefix.to_path_buf(),
     })

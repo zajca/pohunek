@@ -209,12 +209,22 @@ and worker pid. This daemon cannot stop such a worker, so `--stop-sessions` does
 not help: end those sessions with the pohunek version that started them, or
 terminate the listed worker pid, then rerun the uninstall. A journal with no
 readable worker pid keeps blocking until you delete it, after confirming that no
-older `pohunek-sessiond` is still running. Before `service upgrade` or
-`service uninstall` touches anything, it verifies `service.toml` against the
-running user and the canonical `XDG_STATE_HOME` and `XDG_RUNTIME_DIR` roots;
-a moved root or another user fails with `service_config_invalid` naming the
-differing key, so the command can never address another installation's jobs
-or socket.
+older `pohunek-sessiond` is still running. Before `service upgrade`,
+`service uninstall`, or `service status` touches anything, it verifies
+`service.toml` against the running user and the canonical `XDG_STATE_HOME`
+and `XDG_RUNTIME_DIR` roots; a moved root or another user fails with
+`service_config_invalid` naming the differing key, so the command can never
+address another installation's jobs or socket, and `status --json` never
+reports the recorded namespace and prefix beside another environment's
+transaction store.
+
+Before any effect, including rolling back a pending transaction, `service
+install`, `upgrade`, and `uninstall` also refuse a `--prefix` that
+`service.toml` would reject (`cli_usage`: relative, `.` or `..` components,
+repeated or trailing `/`, non-UTF-8, or too long; pass the one normalized
+spelling) and an `XDG_*` root or `HOME` that is not UTF-8
+(`service_environment_not_utf8`), which the daemon's job definition cannot
+carry.
 
 The first worker-aware release is a destructive compatibility boundary because
 a legacy daemon cannot transfer an already-open PTY. Let all legacy sessions

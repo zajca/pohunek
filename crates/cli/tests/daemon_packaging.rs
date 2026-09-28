@@ -114,6 +114,8 @@ const STATUS: &str = "service status --json";
 const STATE_QUERY: &str = "--user is-active pohunekd.service";
 const LIST_WORKERS: &str = "--user list-units pohunek-session@* --all --plain --no-legend";
 const DISABLE: &str = "--user disable --now pohunekd.service";
+const START: &str = "--user start pohunekd.service";
+const STOP: &str = "--user stop pohunekd.service";
 const RELOAD: &str = "--user daemon-reload";
 /// Sibling name the wrapper renames the legacy socket node to
 /// (`POHUNEK_BARRIER_NAME` in the script).
@@ -631,7 +633,10 @@ fn a_failed_legacy_state_query_refuses_before_anything_changes() {
 }
 
 #[test]
-fn a_stopped_legacy_daemon_is_retired_without_a_barrier_or_preflight() {
+fn a_stopped_legacy_daemon_is_started_for_the_preflight_snapshot() {
+    // The service daemon imports the legacy records only from the manifest a
+    // preflight against the running legacy daemon writes, so a stopped one is
+    // started for it and retired through the same barrier.
     for state in ["inactive", "failed"] {
         let fixture = Fixture::new();
         fixture.legacy_install();
@@ -639,12 +644,24 @@ fn a_stopped_legacy_daemon_is_retired_without_a_barrier_or_preflight() {
         assert_success(&output);
         assert_eq!(
             fixture.pohunek_calls(),
-            [STATUS.to_owned(), fixture.install_call()],
+            [
+                STATUS.to_owned(),
+                fixture.socket.preflight_call(),
+                fixture.install_call()
+            ],
             "{state}"
         );
         assert_eq!(
             fixture.systemctl_calls(),
-            [STATE_QUERY, LIST_WORKERS, DISABLE, LIST_WORKERS, RELOAD],
+            [
+                STATE_QUERY,
+                START,
+                STATE_QUERY,
+                LIST_WORKERS,
+                DISABLE,
+                LIST_WORKERS,
+                RELOAD
+            ],
             "{state}"
         );
         for legacy in fixture.legacy_files() {
@@ -654,12 +671,127 @@ fn a_stopped_legacy_daemon_is_retired_without_a_barrier_or_preflight() {
                 legacy.display()
             );
         }
-        // No barrier was placed, so the socket node was never moved.
-        assert!(fixture.socket.path.exists(), "{state}: socket was moved");
+        assert!(
+            !fixture.socket.path.exists(),
+            "{state}: stale socket node remains"
+        );
         assert!(
             !fixture.socket.retired_exists(),
-            "{state}: socket was moved"
+            "{state}: renamed barrier socket remains"
         );
+    }
+}
+
+#[test]
+fn a_refused_snapshot_of_a_started_legacy_daemon_stops_it_again() {
+    // A refusing preflight (live PTYs, or a store it cannot fingerprint)
+    // leaves the legacy install as the run found it: installed and stopped.
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let output = fixture.run(&[], &[("POHUNEK_TEST_PREFLIGHT_STATUS", "23")]);
+    assert_eq!(output.status.code(), Some(23), "{output:?}");
+    assert_eq!(
+        fixture.pohunek_calls(),
+        [STATUS.to_owned(), fixture.socket.preflight_call()]
+    );
+    assert_eq!(
+        fixture.systemctl_calls(),
+        [STATE_QUERY, START, STATE_QUERY, STOP]
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("stopped the legacy daemon again"),
+        "{stderr}"
+    );
+    for legacy in fixture.legacy_files() {
+        assert!(legacy.exists(), "{} was removed", legacy.display());
+    }
+    assert!(fixture.socket.path.exists(), "socket was not restored");
+    assert!(!fixture.socket.retired_exists(), "barrier node remains");
+
+    // Live template workers refuse the same way after the snapshot.
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let output = fixture.run(
+        &[],
+        &[(
+            "POHUNEK_TEST_LIVE_WORKERS",
+            "pohunek-session@s-1.service loaded active running worker",
+        )],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        fixture.systemctl_calls(),
+        [STATE_QUERY, START, STATE_QUERY, LIST_WORKERS, STOP]
+    );
+    for legacy in fixture.legacy_files() {
+        assert!(legacy.exists(), "{} was removed", legacy.display());
+    }
+    assert!(fixture.socket.path.exists(), "socket was not restored");
+}
+
+#[test]
+fn an_interrupted_start_of_a_stopped_legacy_daemon_stops_it_again() {
+    // A signal before the barrier exists still leaves the daemon this run
+    // started stopped, as the run found it; the signal is re-raised.
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let output = fixture.run(
+        &[],
+        &[
+            ("POHUNEK_TEST_INTERRUPT_AT", "start"),
+            ("POHUNEK_TEST_INTERRUPT_SIGNAL", "INT"),
+        ],
+    );
+    assert_eq!(output.status.signal(), Some(libc::SIGINT), "{output:?}");
+    assert_eq!(fixture.systemctl_calls(), [STATE_QUERY, START, STOP]);
+    assert_eq!(fixture.pohunek_calls(), [STATUS]);
+    for legacy in fixture.legacy_files() {
+        assert!(legacy.exists(), "{} was removed", legacy.display());
+    }
+    assert!(fixture.socket.path.exists(), "socket was moved");
+}
+
+/// A named refused start: extra environment and the expected `systemctl` calls.
+type StartCase = (
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static [&'static str],
+);
+
+#[test]
+fn a_stopped_legacy_daemon_that_cannot_start_is_not_retired() {
+    // Without a running legacy daemon there is no snapshot, so the run refuses
+    // instead of retiring the install without its migration manifest.
+    let cases: [StartCase; 2] = [
+        (
+            "start fails",
+            &[("POHUNEK_TEST_START_STATUS", "1")],
+            &[STATE_QUERY, START, STOP],
+        ),
+        (
+            "not active after the start",
+            &[("POHUNEK_TEST_STATE_AFTER_START", "failed")],
+            &[STATE_QUERY, START, STATE_QUERY, STOP],
+        ),
+    ];
+    for (name, env, systemctl_calls) in cases {
+        let fixture = Fixture::new();
+        fixture.legacy_install();
+        let output = fixture.run(&["--accept-runtime-loss"], env);
+        assert_eq!(output.status.code(), Some(1), "{name}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("the legacy install was not retired"),
+            "{name}: {stderr}"
+        );
+        assert_eq!(fixture.pohunek_calls(), [STATUS], "{name}");
+        assert_eq!(fixture.systemctl_calls(), systemctl_calls, "{name}");
+        for legacy in fixture.legacy_files() {
+            assert!(legacy.exists(), "{name}: {} was removed", legacy.display());
+        }
+        assert!(fixture.socket.path.exists(), "{name}: socket was moved");
+        assert!(!fixture.socket.retired_exists(), "{name}: socket was moved");
     }
 }
 
@@ -942,20 +1074,33 @@ fn an_unexpected_exit_after_the_barrier_restores_the_socket() {
 }
 
 #[test]
-fn rerun_after_a_partial_retirement_finishes_without_a_second_preflight() {
+fn rerun_after_a_partial_retirement_takes_a_fresh_snapshot() {
     // The previous run disabled the legacy daemon but stopped before removing
-    // its unit files and binaries.
+    // its unit files and binaries; the daemon's own shutdown may have changed
+    // the store since that run's manifest, so the rerun snapshots it again.
     let fixture = Fixture::new();
     fixture.legacy_install();
     let output = fixture.run(&[], &[]);
     assert_success(&output);
     assert_eq!(
         fixture.pohunek_calls(),
-        [STATUS.to_owned(), fixture.install_call()]
+        [
+            STATUS.to_owned(),
+            fixture.socket.preflight_call(),
+            fixture.install_call()
+        ]
     );
     assert_eq!(
         fixture.systemctl_calls(),
-        [STATE_QUERY, LIST_WORKERS, DISABLE, LIST_WORKERS, RELOAD]
+        [
+            STATE_QUERY,
+            START,
+            STATE_QUERY,
+            LIST_WORKERS,
+            DISABLE,
+            LIST_WORKERS,
+            RELOAD
+        ]
     );
     for legacy in fixture.legacy_files() {
         assert!(!legacy.exists(), "{} was not removed", legacy.display());
@@ -1062,7 +1207,11 @@ fn an_upgrade_retires_legacy_binaries_under_the_configured_prefix() {
     assert_success(&output);
     assert_eq!(
         fixture.pohunek_calls(),
-        [STATUS.to_owned(), fixture.upgrade_call()]
+        [
+            STATUS.to_owned(),
+            fixture.socket.preflight_call(),
+            fixture.upgrade_call()
+        ]
     );
     for legacy in fixture.legacy_files() {
         assert!(!legacy.exists(), "{} was not removed", legacy.display());
@@ -1078,7 +1227,11 @@ fn an_upgrade_retires_legacy_binaries_under_the_configured_prefix() {
     assert_success(&output);
     assert_eq!(
         fixture.pohunek_calls(),
-        [STATUS.to_owned(), fixture.upgrade_call()]
+        [
+            STATUS.to_owned(),
+            fixture.socket.preflight_call(),
+            fixture.upgrade_call()
+        ]
     );
     for legacy in fixture.legacy_files() {
         assert!(!legacy.exists(), "{} was not removed", legacy.display());
@@ -1138,22 +1291,23 @@ fn a_legacy_unit_of_another_prefix_refuses_before_anything_changes() {
 }
 
 #[test]
-fn legacy_binary_paths_reached_through_symlinks_are_left_in_place() {
+fn legacy_binary_symlinks_are_left_in_place() {
     let fixture = Fixture::new();
     let outside = fixture.root.path().join("outside");
     write(&outside.join("pohunekd"), "foreign daemon\n");
-    write(
-        &outside.join("libexec/pohunek-sessiond"),
-        "foreign worker\n",
-    );
-    fs::create_dir_all(fixture.prefix.join("bin")).expect("bin dir");
+    write(&outside.join("pohunek-sessiond"), "foreign worker\n");
+    create_dirs(&fixture.prefix.join("bin"));
+    create_dirs(&fixture.prefix.join("libexec"));
     std::os::unix::fs::symlink(
         outside.join("pohunekd"),
         fixture.prefix.join("bin/pohunekd"),
     )
     .expect("binary symlink");
-    std::os::unix::fs::symlink(outside.join("libexec"), fixture.prefix.join("libexec"))
-        .expect("libexec symlink");
+    std::os::unix::fs::symlink(
+        outside.join("pohunek-sessiond"),
+        fixture.prefix.join("libexec/pohunek-sessiond"),
+    )
+    .expect("worker symlink");
     let output = fixture.run(&[], &[]);
     assert_success(&output);
     assert_eq!(
@@ -1162,19 +1316,111 @@ fn legacy_binary_paths_reached_through_symlinks_are_left_in_place() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("left"), "{stderr}");
-    assert!(
-        fixture
-            .prefix
-            .join("bin/pohunekd")
-            .symlink_metadata()
-            .is_ok(),
-        "the binary symlink was removed"
-    );
+    for link in ["bin/pohunekd", "libexec/pohunek-sessiond"] {
+        assert!(
+            fixture.prefix.join(link).symlink_metadata().is_ok(),
+            "the {link} symlink was removed"
+        );
+    }
     assert_eq!(read(&outside.join("pohunekd")), "foreign daemon\n");
-    assert_eq!(
-        read(&outside.join("libexec/pohunek-sessiond")),
-        "foreign worker\n"
+    assert_eq!(read(&outside.join("pohunek-sessiond")), "foreign worker\n");
+}
+
+/// Builds an untrusted directory into a fixture that holds a legacy install.
+type UntrustedSetup = fn(&Fixture);
+
+/// Replaces the directory `path` of `fixture` with a symlink to a moved copy.
+fn move_behind_symlink(fixture: &Fixture, path: &Path) {
+    let real = fixture.root.path().join("real").join(
+        path.strip_prefix(fixture.root.path())
+            .expect("fixture path"),
     );
+    create_dirs(real.parent().expect("parent"));
+    fs::rename(path, &real).expect("move directory");
+    std::os::unix::fs::symlink(&real, path).expect("directory symlink");
+}
+
+#[test]
+fn an_untrusted_directory_refuses_before_the_legacy_install_changes() {
+    // `pohunek service install|upgrade` refuses these directories, so the
+    // legacy install must not be retired for an install that cannot follow.
+    let cases: [(&str, UntrustedSetup); 7] = [
+        ("symlinked prefix", |fixture| {
+            move_behind_symlink(fixture, &fixture.prefix);
+        }),
+        ("symlinked libexec", |fixture| {
+            move_behind_symlink(fixture, &fixture.prefix.join("libexec"));
+        }),
+        ("symlinked unit directory", |fixture| {
+            move_behind_symlink(fixture, &fixture.config_home.join("systemd/user"));
+        }),
+        ("symlinked config home", |fixture| {
+            move_behind_symlink(fixture, &fixture.config_home);
+        }),
+        ("group-writable prefix", |fixture| {
+            fs::set_permissions(&fixture.prefix, fs::Permissions::from_mode(0o775))
+                .expect("chmod prefix");
+        }),
+        ("shared runtime root", |fixture| {
+            let runtime = fixture.socket.path.parent().expect("runtime root");
+            fs::set_permissions(runtime, fs::Permissions::from_mode(0o755))
+                .expect("chmod runtime root");
+        }),
+        ("symlinked state root", |fixture| {
+            let state = fixture.root.path().join("state/pohunek");
+            create_dirs(&state);
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
+                .expect("chmod state root");
+            move_behind_symlink(fixture, &state);
+        }),
+    ];
+    for (name, setup) in cases {
+        let fixture = Fixture::new();
+        fixture.legacy_install();
+        setup(&fixture);
+        let output = fixture.run(
+            &["--accept-runtime-loss"],
+            &[("POHUNEK_TEST_LEGACY_ACTIVE", "1")],
+        );
+        assert_eq!(output.status.code(), Some(1), "{name}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("nothing was changed"), "{name}: {stderr}");
+        assert_eq!(fixture.pohunek_calls(), [STATUS], "{name}");
+        assert!(fixture.systemctl_calls().is_empty(), "{name}");
+        for legacy in fixture.legacy_files() {
+            assert!(legacy.exists(), "{name}: {} was removed", legacy.display());
+        }
+        assert!(fixture.socket.path.exists(), "{name}: the socket moved");
+    }
+}
+
+#[test]
+fn a_running_service_transaction_refuses_before_anything_changes() {
+    // `true` is another `service install|upgrade|uninstall` holding the
+    // lock; a report without the flag cannot rule one out.
+    for (value, message) in [
+        ("true", "is running; nothing was changed"),
+        ("null", "did not report transaction_in_progress"),
+    ] {
+        let fixture = Fixture::new();
+        fixture.legacy_install();
+        let output = fixture.run(
+            &["--accept-runtime-loss"],
+            &[
+                ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+                ("POHUNEK_TEST_TRANSACTION_IN_PROGRESS", value),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(1), "{value}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(message), "{value}: {stderr}");
+        assert_eq!(fixture.pohunek_calls(), [STATUS], "{value}");
+        assert!(fixture.systemctl_calls().is_empty(), "{value}");
+        for legacy in fixture.legacy_files() {
+            assert!(legacy.exists(), "{value}: {} was removed", legacy.display());
+        }
+        assert!(fixture.socket.path.exists(), "{value}: the socket moved");
+    }
 }
 
 #[test]
@@ -1261,7 +1507,9 @@ fn release_workflow_packages_static_shell_completions() {
 /// `POHUNEK_TEST_CONFIGURED_PREFIX_JSON`; without it `installed: false` and a
 /// `null` prefix, as the real CLI does.
 /// `POHUNEK_TEST_STATUS_QUERY_EXIT` fails the query with an error document;
-/// `POHUNEK_TEST_STATUS_UNEXPECTED` answers without `pending_transaction`.
+/// `POHUNEK_TEST_STATUS_UNEXPECTED` answers without `pending_transaction`, and
+/// `POHUNEK_TEST_TRANSACTION_IN_PROGRESS` replaces the `false` it reports as
+/// `transaction_in_progress` with its raw JSON value.
 /// `POHUNEK_TEST_PREFLIGHT_STATUS` and `POHUNEK_TEST_SERVICE_STATUS` set the
 /// exit status of the migration preflight and of install/upgrade.
 /// `POHUNEK_TEST_INTERRUPT_AT=preflight` makes the preflight send
@@ -1299,8 +1547,9 @@ if [ "$1" = service ] && [ "$2" = status ]; then
         installed=true
         prefix=${POHUNEK_TEST_CONFIGURED_PREFIX_JSON:-"\"$POHUNEK_TEST_CONFIGURED_PREFIX\""}
     fi
-    printf '{\n  "ok": {\n    "installed": %s,\n    "config_path": "%s",\n    "namespace": null,\n    "prefix": %s,\n    "pending_transaction": %s,\n    "transaction_in_progress": false\n  }\n}\n' \
-        "$installed" "$XDG_CONFIG_HOME/pohunek/service.toml" "$prefix" "$pending"
+    printf '{\n  "ok": {\n    "installed": %s,\n    "config_path": "%s",\n    "namespace": null,\n    "prefix": %s,\n    "pending_transaction": %s,\n    "transaction_in_progress": %s\n  }\n}\n' \
+        "$installed" "$XDG_CONFIG_HOME/pohunek/service.toml" "$prefix" "$pending" \
+        "${POHUNEK_TEST_TRANSACTION_IN_PROGRESS:-false}"
     exit 0
 fi
 exit "${POHUNEK_TEST_SERVICE_STATUS:-0}"
@@ -1383,13 +1632,23 @@ impl Fixture {
         write_executable(&archive.join("pohunekd"), "#!/bin/sh\nexit 0\n");
         write_executable(&archive.join("pohunek-sessiond"), "#!/bin/sh\nexit 0\n");
         // `is-active` reports `inactive`, `active` with
-        // `POHUNEK_TEST_LEGACY_ACTIVE=1`, or any `POHUNEK_TEST_LEGACY_STATE`,
-        // and `POHUNEK_TEST_STATE_AFTER_DISABLE` once a stop ran; the state
-        // `query-fails` answers nothing on stdout and exits 1.
+        // `POHUNEK_TEST_LEGACY_ACTIVE=1`, or any `POHUNEK_TEST_LEGACY_STATE`;
+        // after a successful `start` (exit status `POHUNEK_TEST_START_STATUS`,
+        // interrupted like `disable` with `POHUNEK_TEST_INTERRUPT_AT=start`)
+        // it reports `POHUNEK_TEST_STATE_AFTER_START` or `active`, and once a
+        // stop ran `POHUNEK_TEST_STATE_AFTER_DISABLE` or the initial state. The
+        // state `query-fails` answers nothing on stdout and exits 1.
         write_executable(
             &commands.join("systemctl"),
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$POHUNEK_TEST_SYSTEMCTL_LOG\"\n\
              case \"$*\" in\n\
+             '--user start '*)\n\
+                 start_status=${POHUNEK_TEST_START_STATUS:-0}\n\
+                 [ \"$start_status\" -eq 0 ] && : > \"$POHUNEK_TEST_SYSTEMCTL_START_MARKER\"\n\
+                 if [ \"${POHUNEK_TEST_INTERRUPT_AT:-}\" = start ]; then\n\
+                     kill -s \"$POHUNEK_TEST_INTERRUPT_SIGNAL\" \"$PPID\"\n\
+                 fi\n\
+                 exit \"$start_status\" ;;\n\
              *disable*|*stop*)\n\
                  : > \"$POHUNEK_TEST_SYSTEMCTL_STOP_MARKER\"\n\
                  if [ \"${POHUNEK_TEST_INTERRUPT_AT:-}\" = disable ]; then\n\
@@ -1412,6 +1671,10 @@ impl Fixture {
                  state=inactive\n\
                  [ \"${POHUNEK_TEST_LEGACY_ACTIVE:-0}\" = 1 ] && state=active\n\
                  [ -n \"${POHUNEK_TEST_LEGACY_STATE:-}\" ] && state=$POHUNEK_TEST_LEGACY_STATE\n\
+                 if [ -f \"${POHUNEK_TEST_SYSTEMCTL_START_MARKER:-}\" ] \\\n\
+                     && [ ! -f \"${POHUNEK_TEST_SYSTEMCTL_STOP_MARKER:-}\" ]; then\n\
+                     state=${POHUNEK_TEST_STATE_AFTER_START:-active}\n\
+                 fi\n\
                  if [ -f \"${POHUNEK_TEST_SYSTEMCTL_STOP_MARKER:-}\" ] \\\n\
                      && [ -n \"${POHUNEK_TEST_STATE_AFTER_DISABLE:-}\" ]; then\n\
                      state=$POHUNEK_TEST_STATE_AFTER_DISABLE\n\
@@ -1427,7 +1690,11 @@ impl Fixture {
         // so the barrier rename has a socket file to move.
         let runtime = runtime_dir(root.path());
         let socket_dir = runtime.join("pohunek");
-        fs::create_dir_all(&socket_dir).expect("create runtime dir");
+        create_dirs(&socket_dir);
+        // The daemon creates its runtime root owner-private, and the wrapper
+        // refuses any other mode as `pohunek service install` does.
+        fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o700))
+            .expect("make runtime dir private");
         let socket = socket_dir.join("daemon.sock");
         UnixListener::bind(&socket).expect("bind barrier socket");
         Self {
@@ -1493,6 +1760,7 @@ impl Fixture {
             .args(args)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.config_home)
+            .env("XDG_STATE_HOME", self.root.path().join("state"))
             .env("POHUNEK_INSTALL_PREFIX", &self.prefix)
             .env("POHUNEK_TEST_CONFIGURED_PREFIX", &self.prefix)
             .env(
@@ -1509,6 +1777,10 @@ impl Fixture {
             .env(
                 "POHUNEK_TEST_SYSTEMCTL_STOP_MARKER",
                 self.root.path().join("systemctl-stop-marker"),
+            )
+            .env(
+                "POHUNEK_TEST_SYSTEMCTL_START_MARKER",
+                self.root.path().join("systemctl-start-marker"),
             )
             .env("POHUNEK_TEST_POHUNEK_LOG", &self.pohunek_log)
             .env("POHUNEK_TEST_SYSTEMCTL_LOG", &self.systemctl_log)
@@ -1557,8 +1829,20 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Creates `path` and its missing ancestors without group or other write
+/// permission whatever the umask, as the wrapper's directory checks require.
+fn create_dirs(path: &Path) {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(path)
+        .expect("create directories");
+}
+
 fn write(path: &Path, contents: &str) {
-    fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+    create_dirs(path.parent().expect("parent"));
     fs::write(path, contents).expect("write file");
 }
 

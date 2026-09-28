@@ -148,23 +148,24 @@ pub(super) struct TargetResolution {
     pub(super) is_linked_worktree: Option<bool>,
     /// Non-fatal worktree-setup warnings to surface on the session.
     pub(super) warnings: Vec<SessionWarning>,
-    /// Whether a worktree was actually bound (drives launch-failure rollback).
-    pub(super) worktree_bound: bool,
 }
 
 impl SessionRegistry {
-    /// Roll back a worktree bound for a create whose runtime never ran or is
-    /// proven ended, removing the checkout (and its binding) so the branch is
-    /// freed for a retry.
+    /// Roll back the worktrees bound for a create whose runtime never ran or
+    /// is proven ended, removing each checkout and its binding so the branch
+    /// is freed for a retry.
     ///
     /// `git worktree remove --force` deletes uncommitted work, so callers
     /// reach this only when no runtime of the session can still use the
-    /// checkout. Best-effort and non-fatal: a failure is logged and never masks
-    /// the original launch error. A no-op when worktree binding is not
-    /// configured.
+    /// checkout. A checkout that could not be removed keeps its binding
+    /// ([`crate::worktree::WorktreeManager::compensate_session`]), so the
+    /// caller keeps the session's record and a later reconciliation retries.
+    /// Failures are logged and never mask the original launch error. A no-op
+    /// when worktree binding is not configured.
     ///
-    /// Returns whether the session is left without a worktree binding; `false`
-    /// when the binding store could not be read or updated.
+    /// Returns whether the session is left without a worktree or binding:
+    /// `false` when a checkout could not be removed or the binding store
+    /// could not be read or updated.
     pub(super) async fn cleanup_bound_worktree(&self, id: &SessionId) -> bool {
         let Some(manager) = self.inner.worktree.clone() else {
             return true;
@@ -174,7 +175,7 @@ impl SessionRegistry {
             // Remove-hook warnings on the rollback path are logged (the launch error
             // is what the caller surfaces).
             let mut hook_warnings = Vec::new();
-            let result = manager.cleanup_session(&session_id, &mut hook_warnings);
+            let result = manager.compensate_session(&session_id, &mut hook_warnings);
             for warning in &hook_warnings {
                 warn!(
                     session_id = %session_id,
@@ -187,16 +188,24 @@ impl SessionRegistry {
         })
         .await
         {
-            Ok(Ok(cleanup)) => {
+            Ok(Ok(cleanup)) if cleanup.failed == 0 => {
                 if cleanup.attempted() > 0 {
                     debug!(
                         session_id = %id.0,
                         removed = cleanup.removed,
-                        failed = cleanup.failed,
                         "rolled back worktree after a failed launch"
                     );
                 }
                 true
+            }
+            Ok(Ok(cleanup)) => {
+                warn!(
+                    session_id = %id.0,
+                    removed = cleanup.removed,
+                    failed = cleanup.failed,
+                    "worktree rollback left checkouts in place; their bindings are kept"
+                );
+                false
             }
             Ok(Err(err)) => {
                 warn!(
@@ -288,7 +297,6 @@ impl SessionRegistry {
             project_id,
             is_linked_worktree: Some(true),
             warnings: bound.warnings,
-            worktree_bound: true,
         })
     }
 
@@ -326,7 +334,6 @@ impl SessionRegistry {
             project_id,
             is_linked_worktree,
             warnings: Vec::new(),
-            worktree_bound: false,
         }
     }
 
@@ -509,9 +516,9 @@ impl SessionRegistry {
         let worktree_path = spec.worktree_path.clone();
         match self.transact_pty_registration(spec).await {
             Ok(info) => Ok(info),
-            Err(LaunchFailure::Cleaned(error)) => {
-                if creating {
-                    self.compensate_abandoned_create(&id).await;
+            Err(LaunchFailure::Cleaned(mut error)) => {
+                if creating && !self.compensate_abandoned_create(&id).await {
+                    error.msg = super::unfinished_compensation_message(&error.msg, &id);
                 }
                 Err(error)
             }

@@ -362,10 +362,14 @@ impl WorktreeManager {
     }
 
     /// Fresh-create path: create the worktree directory, resolve the base branch +
-    /// fetch start-point, run the pre/post-create hooks, `git worktree add`, then
-    /// persist the binding (rolling the checkout back if the persist fails) and
-    /// return the freshly bound worktree. Reached only when the reuse / recreate /
-    /// foreign-conflict decision in [`Self::check_existing_worktree`] said "create".
+    /// fetch start-point, run the pre-create hook, persist the binding, `git
+    /// worktree add`, then run the post-create hook and return the freshly bound
+    /// worktree. Reached only when the reuse / recreate / foreign-conflict
+    /// decision in [`Self::check_existing_worktree`] said "create".
+    ///
+    /// The binding is persisted before the checkout exists, so a daemon killed
+    /// at any later point leaves a checkout its session's compensation can find
+    /// ([`Self::compensate_session`]); a failed `git worktree add` drops it again.
     fn create_and_bind(
         &self,
         req: &WorktreeRequest,
@@ -403,18 +407,6 @@ impl WorktreeManager {
             &base_branch,
             &mut warnings,
         );
-        Self::create_worktree(&repository, &path, &req.branch, &start_point)?;
-        // Post-create hook (replaces the legacy `.pohunek/setup` script, which it
-        // still falls back to): runs IN the freshly created worktree.
-        self.run_worktree_hook(
-            HookEvent::PostCreate,
-            &path,
-            req,
-            &repository,
-            Some(&path),
-            &base_branch,
-            &mut warnings,
-        );
 
         let now = now_rfc3339();
         let binding = WorktreeBinding {
@@ -433,21 +425,33 @@ impl WorktreeManager {
         self.store
             .record_worktree(&binding)
             .map(StoreMutation::into_value)
-            .map_err(|err| {
-                // The worktree directory and branch checkout already exist. If the
-                // binding cannot be persisted we would orphan them: with no binding
-                // the ownership gate can never reclaim the tree, and the branch stays
-                // checked out, blocking the next `session.new` on it with
-                // `worktree_branch_in_use`. Roll the checkout back before erroring.
-                if let Err(message) = worktree_remove(&repository, &path) {
-                    warn!(
-                        path = %path.display(),
-                        error = %message,
-                        "failed to remove worktree after a failed binding persist"
-                    );
-                }
-                store_error("persist worktree binding", &err)
-            })?;
+            .map_err(|err| store_error("persist worktree binding", &err))?;
+        if let Err(add_error) = Self::create_worktree(&repository, &path, &req.branch, &start_point)
+        {
+            // Nothing was checked out, so the binding owns nothing. A binding
+            // that cannot be dropped is settled by the session's compensation,
+            // which drops a binding whose checkout is gone.
+            if let Err(err) = self.store.remove_worktree_binding(&binding) {
+                warn!(
+                    session_id = %req.session_id,
+                    path = %path.display(),
+                    error = %err,
+                    "failed to drop the binding of a worktree that was never added"
+                );
+            }
+            return Err(add_error);
+        }
+        // Post-create hook (replaces the legacy `.pohunek/setup` script, which it
+        // still falls back to): runs IN the freshly created worktree.
+        self.run_worktree_hook(
+            HookEvent::PostCreate,
+            &path,
+            req,
+            &repository,
+            Some(&path),
+            &base_branch,
+            &mut warnings,
+        );
 
         Ok(WorktreeBound {
             path,
@@ -583,6 +587,54 @@ impl WorktreeManager {
                 .remove_worktree_session(session_id)
                 .map(StoreMutation::into_value)
                 .map_err(|err| store_error("drop worktree bindings", &err))?;
+        }
+        Ok(cleanup)
+    }
+
+    /// Remove the worktrees owned by `session_id` for a create compensation,
+    /// dropping only the bindings whose checkout is gone.
+    ///
+    /// Unlike [`Self::cleanup_session`], a checkout that is still on disk
+    /// keeps its binding, so a retried compensation can still find it. A
+    /// checkout counts as gone when `git worktree remove` succeeded, or when
+    /// its directory no longer exists and either its repository is gone too or
+    /// `git worktree prune` ran for it; the latter settles a retry after an
+    /// earlier removal whose binding could not be dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `worktree_store_error` when the binding store cannot be read
+    /// or a binding of a removed checkout cannot be dropped.
+    pub fn compensate_session(
+        &self,
+        session_id: &str,
+        warnings: &mut Vec<SessionWarning>,
+    ) -> Result<WorktreeCleanup, ProtocolError> {
+        let bindings = self
+            .store
+            .load_worktrees()
+            .map_err(|err| store_error("read worktree binding store", &err))?;
+        let mut cleanup = WorktreeCleanup::default();
+        for binding in bindings
+            .into_iter()
+            .filter(|binding| binding.session_id == session_id)
+        {
+            let removed = self.cleanup_one_worktree(&binding, warnings, |message| {
+                warn!(
+                    session_id = %session_id,
+                    path = %binding.path.display(),
+                    error = %message,
+                    "git worktree remove failed during create compensation"
+                );
+            });
+            if removed || checkout_released(&binding) {
+                self.store
+                    .remove_worktree_binding(&binding)
+                    .map_err(|err| store_error("drop worktree binding", &err))?;
+                cleanup.removed += 1;
+            } else {
+                cleanup.failed += 1;
+            }
         }
         Ok(cleanup)
     }
@@ -1205,6 +1257,29 @@ fn worktree_remove(repo: &Path, path: &Path) -> Result<(), String> {
     let mut cmd = git_command(repo);
     cmd.arg("worktree").arg("remove").arg("--force").arg(path);
     run_command(cmd).map(|_| ())
+}
+
+/// Whether the checkout of `binding` is gone: its directory is absent, and
+/// its repository is gone or `git worktree prune` ran to drop the vanished
+/// worktree's admin entry (git keeps a locked entry, as it does for any prune).
+fn checkout_released(binding: &WorktreeBinding) -> bool {
+    if binding.path.exists() {
+        return false;
+    }
+    if !binding.repository.is_dir() {
+        return true;
+    }
+    match worktree_prune(&binding.repository) {
+        Ok(()) => true,
+        Err(message) => {
+            warn!(
+                path = %binding.path.display(),
+                error = %message,
+                "git worktree prune failed for a vanished worktree; its binding is kept"
+            );
+            false
+        }
+    }
 }
 
 /// `git worktree prune` — drop admin entries for vanished worktrees.

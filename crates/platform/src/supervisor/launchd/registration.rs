@@ -61,7 +61,7 @@ const REMOVAL_PREFIX: &str = ".pohunek-launchd-removed-";
 /// The name is `.<label>.plist` followed by this suffix: hidden and never
 /// ending in [`DEFINITION_SUFFIX`], so neither discovery nor launchd at login
 /// reads it as a definition, and fixed per label, so [`recover`] finds it
-/// after a crash.
+/// after a crash and discovery probes the label it names.
 const SET_ASIDE_SUFFIX: &str = ".replaced";
 
 /// Random bytes in a temporary definition name.
@@ -91,7 +91,8 @@ pub struct ExternalVolume {
 /// A registration failed and the definition it replaced could not be put back.
 ///
 /// The replaced definition stays under its set-aside name
-/// [`StrandedDefinition::path`], which neither launchd nor discovery reads.
+/// [`StrandedDefinition::path`], which launchd never reads; discovery probes
+/// its label while `<label>.plist` is missing.
 /// The label's next `start`, `install`, `replace`, `retire`, or `uninstall`
 /// settles it first: it returns to `<label>.plist` while that name is free and
 /// is discarded when `<label>.plist` holds a definition. It is the source of an
@@ -129,8 +130,16 @@ pub(super) fn definition_name(label: &str) -> String {
 }
 
 /// Returns the name the replaced definition of `label` waits under.
-fn set_aside_name(label: &str) -> String {
+pub(super) fn set_aside_name(label: &str) -> String {
     format!(".{label}{DEFINITION_SUFFIX}{SET_ASIDE_SUFFIX}")
+}
+
+/// Returns the label whose replaced definition waits under `name`, or `None`
+/// when `name` is not a set-aside name.
+pub(super) fn set_aside_label(name: &str) -> Option<&str> {
+    name.strip_prefix('.')?
+        .strip_suffix(SET_ASIDE_SUFFIX)?
+        .strip_suffix(DEFINITION_SUFFIX)
 }
 
 /// Maps a trusted-filesystem failure of `operation`.
@@ -1104,6 +1113,19 @@ mod tests {
             ),
             "{hard_link:?}"
         );
+    }
+
+    #[test]
+    fn set_aside_names_map_back_to_their_label() {
+        assert_eq!(set_aside_label(&set_aside_name(LABEL)), Some(LABEL));
+        for name in [
+            definition_name(LABEL),
+            format!("{LABEL}{DEFINITION_SUFFIX}{SET_ASIDE_SUFFIX}"),
+            format!(".{LABEL}{SET_ASIDE_SUFFIX}"),
+            format!("{REMOVAL_PREFIX}0011"),
+        ] {
+            assert_eq!(set_aside_label(&name), None, "{name}");
+        }
     }
 
     // Only macOS guarantees a temporary directory on the boot volume.

@@ -40,10 +40,11 @@ config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
 service_config="$config_home/pohunek/service.toml"
 legacy_unit_dir="$config_home/systemd/user"
 
-# Subdirectory below the runtime directory and control-socket file name the
-# daemon binds, per the shared path contract in crates/paths (`APP_DIR` and
-# `SOCKET_NAME`); changing either must stay in step with that crate.
-POHUNEK_RUNTIME_SUBDIR=pohunek
+# Application subdirectory below each XDG root (the runtime directory among
+# them) and control-socket file name the daemon binds, per the shared path
+# contract in crates/paths (`APP_DIR` and `SOCKET_NAME`); changing either must
+# stay in step with that crate.
+POHUNEK_APP_DIR=pohunek
 POHUNEK_SOCKET_NAME=daemon.sock
 # Sibling name the legacy socket node is renamed to as the connect barrier.
 # It is no longer than POHUNEK_SOCKET_NAME, so a socket path that fits
@@ -69,6 +70,22 @@ if ! status_json=$("$archive_dir/pohunek" service status --json); then
 fi
 if ! printf '%s\n' "$status_json" | grep -q '"pending_transaction"'; then
     echo "\`pohunek service status --json\` did not report pending_transaction; nothing was changed" >&2
+    exit 1
+fi
+# A running `pohunek service install|upgrade|uninstall` holds the transaction
+# lock, which status reports as `transaction_in_progress: true`; retiring the
+# legacy service beside it could race its supervisor and prefix changes. The
+# wrapper cannot hold that lock itself, so a transaction that starts after
+# this query is caught only by the lock of the final `service` command.
+if printf '%s\n' "$status_json" \
+    | grep -Eq '"transaction_in_progress"[[:space:]]*:[[:space:]]*true'; then
+    echo "another \`pohunek service install|upgrade|uninstall\` is running; nothing was changed" >&2
+    echo "wait until it finishes and re-run $0" >&2
+    exit 1
+fi
+if ! printf '%s\n' "$status_json" \
+    | grep -Eq '"transaction_in_progress"[[:space:]]*:[[:space:]]*false'; then
+    echo "\`pohunek service status --json\` did not report transaction_in_progress; nothing was changed" >&2
     exit 1
 fi
 pending_install=0
@@ -185,6 +202,117 @@ if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
     fi
 fi
 
+# Every directory this wrapper changes files in, and every directory the
+# final `pohunek service install|upgrade` requires, is checked before the
+# legacy retirement below, which the service command cannot undo: a directory
+# that command would refuse must never have its legacy install removed first.
+#
+# The check mirrors `TrustedDir` in crates/platform/src/filesystem.rs. Each
+# existing component of the absolute path must be a directory, not a
+# symlink, and owned either by this user or by the owner of `/`, without
+# group or other write permission unless it is `/`'s owner's sticky directory
+# (`validate_ancestor`). The existing directory itself must be owned by this
+# user and, for `private`, have mode 0700 exactly (the application roots),
+# otherwise no group or other write permission (`open_absolute_owner_safe`).
+# The first missing component ends the walk, because the service command
+# creates the rest under the last existing, validated directory.
+trusted_uid=$(id -u)
+if ! system_uid=$(ls -dn / | awk 'NR == 1 { print $3 }') || [ -z "$system_uid" ]; then
+    echo "could not read the owner of /; nothing was changed" >&2
+    exit 1
+fi
+refuse_untrusted() {
+    echo "$1" >&2
+    echo "\`pohunek service install|upgrade\` refuses a directory reached through a symlink," >&2
+    echo "owned by another user, or writable by group or others, so the legacy install" >&2
+    echo "is not retired for it; nothing was changed. Fix the directory and re-run $0" >&2
+    exit 1
+}
+# Usage: check_trusted_dir <absolute-directory> owner|private
+check_trusted_dir() {
+    trust_policy=$2
+    normalize_prefix "$1" \
+        || refuse_untrusted "not an absolute path without \`.\` or \`..\` components: $1"
+    trust_rest=${normalized_prefix#/}
+    trust_path=
+    while [ -n "$trust_rest" ]; do
+        trust_component=${trust_rest%%/*}
+        case $trust_rest in
+            */*) trust_rest=${trust_rest#*/} ;;
+            *) trust_rest= ;;
+        esac
+        trust_path="$trust_path/$trust_component"
+        if [ -L "$trust_path" ]; then
+            refuse_untrusted "$trust_path is a symbolic link (checking $1)"
+        fi
+        if [ ! -e "$trust_path" ]; then
+            return 0
+        fi
+        if [ ! -d "$trust_path" ]; then
+            refuse_untrusted "$trust_path is not a directory (checking $1)"
+        fi
+        # `ls -n` prints the mode string and the numeric owner first, whatever
+        # the path spells.
+        if ! trust_entry=$(ls -dn -- "$trust_path" | awk 'NR == 1 { print $1, $3 }') \
+            || [ -z "$trust_entry" ]; then
+            refuse_untrusted "could not inspect $trust_path (checking $1)"
+        fi
+        trust_mode=${trust_entry%% *}
+        trust_owner=${trust_entry#* }
+        trust_shared=0
+        case $trust_mode in
+            ?????w*|????????w*) trust_shared=1 ;;
+        esac
+        trust_sticky=0
+        case $trust_mode in
+            ?????????[tT]*) trust_sticky=1 ;;
+        esac
+        if [ "$trust_owner" = "$system_uid" ] && [ "$trust_sticky" -eq 1 ]; then
+            :
+        elif [ "$trust_owner" = "$trusted_uid" ] && [ "$trust_shared" -eq 0 ]; then
+            :
+        elif [ "$trust_owner" = "$system_uid" ] && [ "$trust_shared" -eq 0 ]; then
+            :
+        else
+            refuse_untrusted "$trust_path is owned by uid $trust_owner with mode $trust_mode (checking $1)"
+        fi
+        if [ -z "$trust_rest" ]; then
+            if [ "$trust_owner" != "$trusted_uid" ]; then
+                refuse_untrusted "$trust_path is owned by uid $trust_owner, not by this user (uid $trusted_uid)"
+            fi
+            case $trust_policy in
+                private)
+                    case $trust_mode in
+                        drwx------|drwx------?) ;;
+                        *) refuse_untrusted "$trust_path has mode $trust_mode, not the private 0700 (drwx------)" ;;
+                    esac
+                    ;;
+                *)
+                    if [ "$trust_shared" -eq 1 ]; then
+                        refuse_untrusted "$trust_path is writable by group or others (mode $trust_mode)"
+                    fi
+                    ;;
+            esac
+        fi
+    done
+}
+# The install layout (`<prefix>/bin`, `<prefix>/libexec/pohunek`), the legacy
+# binary directory `<prefix>/libexec`, the user unit directory the legacy
+# units live in and the systemd backend writes, the directory holding
+# service.toml, and the application state and runtime roots, resolved as
+# crates/paths resolves them.
+for trusted_dir in "$prefix" "$prefix/bin" "$prefix/libexec" "$prefix/libexec/pohunek" \
+    "$legacy_unit_dir" "$config_home/pohunek"; do
+    check_trusted_dir "$trusted_dir" owner
+done
+state_home=${XDG_STATE_HOME:-"${HOME:-}/.local/state"}
+case $state_home in
+    /*) check_trusted_dir "$state_home/$POHUNEK_APP_DIR" private ;;
+esac
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    check_trusted_dir "$XDG_RUNTIME_DIR/$POHUNEK_APP_DIR" private
+fi
+
 # A pre-service install runs `pohunekd.service` from <prefix>/bin with
 # `pohunek-session@.service` template workers. Its daemon holds the instance
 # locks the service daemon needs, so it is retired first, in this order:
@@ -193,9 +321,9 @@ fi
 # The legacy binary is already deployed, so the wrapper cannot add a
 # daemon-side barrier to it; the connect barrier closes the only open door and
 # every later step fails closed without removing legacy files. Every step
-# tolerates a previous partial run: the barrier and preflight are skipped only
-# for a daemon `systemctl` reports stopped, and removal and disable are no-ops
-# for what is already gone.
+# tolerates a previous partial run: a legacy daemon `systemctl` reports
+# stopped is started for the barrier and preflight, and removal and disable
+# are no-ops for what is already gone.
 #
 # Residual windows the wrapper cannot close without a legacy-side change:
 # a client that already holds a control connection (a long-lived GUI) may
@@ -211,6 +339,21 @@ restore_barrier() {
         mv "$barrier_socket" "$legacy_socket" || true
     fi
     disarm_barrier
+    return_started_legacy
+}
+# A legacy daemon this run started only for the migration snapshot is stopped
+# again whenever the run refuses before retiring it, so a refused run leaves
+# it stopped as it found it.
+return_started_legacy() {
+    if [ "$legacy_started" -eq 1 ]; then
+        legacy_started=0
+        if systemctl --user stop pohunekd.service; then
+            echo "stopped the legacy daemon again; this run started it only for the migration snapshot" >&2
+        else
+            echo "could not stop the legacy daemon this run started for the migration snapshot;" >&2
+            echo "stop it with \`systemctl --user stop pohunekd.service\`" >&2
+        fi
+    fi
 }
 # After the legacy daemon stopped, a moved node is stale: no daemon listens on
 # it, and the next install binds a fresh socket at the original path, so the
@@ -255,14 +398,26 @@ settle_barrier() {
 }
 # Settles a barrier still in place when the run ends outside the handled
 # paths (an unexpected `set -e` exit or a signal), so the legacy daemon never
-# stays reachable only through the moved node. Further signals are ignored
-# while the state query runs; the exit keeps the original status, and a
-# signal is re-raised with its default action so the caller sees it.
+# stays reachable only through the moved node, and stops a legacy daemon this
+# run started before any barrier existed. Further signals are ignored while
+# the state query runs; the exit keeps the original status, and a signal is
+# re-raised with its default action so the caller sees it.
 settle_barrier_on_exit() {
     trap '' HUP INT TERM
     if [ -n "$barrier_socket" ] && [ -e "$barrier_socket" ]; then
         settle_barrier || :
+    else
+        return_started_legacy
     fi
+}
+# Armed before the first step that changes the legacy install; until a moved
+# node or a started daemon exists the traps find nothing to settle. The
+# fallback status of a signal is 128 plus its number.
+arm_barrier_traps() {
+    trap 'barrier_exit_trap "$?"' EXIT
+    trap 'barrier_signal_trap HUP 129' HUP
+    trap 'barrier_signal_trap INT 130' INT
+    trap 'barrier_signal_trap TERM 143' TERM
 }
 barrier_exit_trap() {
     barrier_exit_status=$1
@@ -277,9 +432,10 @@ barrier_signal_trap() {
     exit "$2"
 }
 legacy_retired=0
+legacy_started=0
 if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
-    legacy_socket="${XDG_RUNTIME_DIR:-}/$POHUNEK_RUNTIME_SUBDIR/$POHUNEK_SOCKET_NAME"
-    barrier_path="${XDG_RUNTIME_DIR:-}/$POHUNEK_RUNTIME_SUBDIR/$POHUNEK_BARRIER_NAME"
+    legacy_socket="${XDG_RUNTIME_DIR:-}/$POHUNEK_APP_DIR/$POHUNEK_SOCKET_NAME"
+    barrier_path="${XDG_RUNTIME_DIR:-}/$POHUNEK_APP_DIR/$POHUNEK_BARRIER_NAME"
     barrier_socket=
     if ! query_legacy_state; then
         echo "could not query the legacy daemon state with" >&2
@@ -287,67 +443,93 @@ if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
         echo "fix the reported problem and re-run $0" >&2
         exit 1
     fi
-    legacy_stopped=0
     case "$legacy_state" in
-        inactive|failed) legacy_stopped=1 ;;
-    esac
-    if [ "$legacy_stopped" -eq 0 ]; then
-        # Move the daemon's listening socket node away with rename(2): its
-        # bound socket keeps serving established connections, while any new
-        # client cannot connect, so no new session can start after the
-        # preflight that follows. A daemon that is not proven stopped but has
-        # no socket node (still starting, or already shutting down) cannot be
-        # asked whether it owns live PTYs, so the run refuses.
-        if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -S "$legacy_socket" ]; then
-            echo "the legacy daemon is not stopped (state: $legacy_state), but its control socket is missing:" >&2
-            echo "  $legacy_socket" >&2
-            if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "$barrier_path" ]; then
-                echo "an interrupted earlier run left it moved to $barrier_path;" >&2
-                echo "nothing was changed; move it back with" >&2
-                echo "\`mv '$barrier_path' '$legacy_socket'\` and re-run $0" >&2
+        inactive|failed)
+            # The service daemon converts the legacy records on its first
+            # start only from the manifest a preflight against the running
+            # legacy daemon writes. Retiring a stopped daemon without that
+            # snapshot would leave its resume bindings unimported, or leave
+            # the stale manifest of an earlier refused preflight to block the
+            # first start, so the daemon is started for the snapshot and every
+            # refusal below stops it again. The legacy unit is `Type=notify`:
+            # the start returns once the daemon reported ready, after it bound
+            # its control socket.
+            arm_barrier_traps
+            legacy_started=1
+            start_status=0
+            systemctl --user start pohunekd.service || start_status=$?
+            if [ "$start_status" -ne 0 ]; then
+                echo "the legacy daemon is stopped (state: $legacy_state), and" >&2
+                echo "\`systemctl --user start pohunekd.service\` failed (status $start_status);" >&2
+                echo "the migration preflight needs it running, so the legacy install was not retired" >&2
+                return_started_legacy
+                echo "nothing else was changed; fix the legacy daemon so it starts and re-run $0" >&2
                 exit 1
             fi
-            echo "nothing was changed; wait until the legacy daemon is active or stopped" >&2
-            echo "(or stop it with \`systemctl --user stop pohunekd.service\`) and re-run $0" >&2
+            if ! query_legacy_state || [ "$legacy_state" != active ]; then
+                echo "the legacy daemon started for the migration preflight is not active" >&2
+                echo "(state: ${legacy_state:-unknown}), so the legacy install was not retired" >&2
+                return_started_legacy
+                echo "nothing else was changed; fix the legacy daemon so it starts and re-run $0" >&2
+                exit 1
+            fi
+            ;;
+    esac
+    # Move the daemon's listening socket node away with rename(2): its bound
+    # socket keeps serving established connections, while any new client
+    # cannot connect, so no new session can start after the preflight that
+    # follows. A daemon that is not proven stopped but has no socket node
+    # (still starting, or already shutting down) cannot be asked whether it
+    # owns live PTYs, so the run refuses.
+    if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -S "$legacy_socket" ]; then
+        echo "the legacy daemon is not stopped (state: $legacy_state), but its control socket is missing:" >&2
+        echo "  $legacy_socket" >&2
+        return_started_legacy
+        if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "$barrier_path" ]; then
+            echo "an interrupted earlier run left it moved to $barrier_path;" >&2
+            echo "nothing was changed; move it back with" >&2
+            echo "\`mv '$barrier_path' '$legacy_socket'\` and re-run $0" >&2
             exit 1
         fi
-        # A node left at the barrier name by an interrupted earlier run is
-        # never overwritten or reused: rename(2) would replace it, and `mv`
-        # would move the socket into a directory of that name.
-        if [ -e "$barrier_path" ] || [ -L "$barrier_path" ]; then
-            echo "a connect-barrier node from an interrupted earlier run remains:" >&2
-            echo "  $barrier_path" >&2
-            echo "nothing was changed; the legacy daemon listens at $legacy_socket," >&2
-            echo "so that node is stale: remove it and re-run $0" >&2
-            exit 1
-        fi
-        barrier_socket=$barrier_path
-        # Armed before the rename so no interruption lands between the move
-        # and the trap; until the moved node exists the traps find nothing to
-        # settle. The fallback status of a signal is 128 plus its number.
-        trap 'barrier_exit_trap "$?"' EXIT
-        trap 'barrier_signal_trap HUP 129' HUP
-        trap 'barrier_signal_trap INT 130' INT
-        trap 'barrier_signal_trap TERM 143' TERM
-        if ! mv "$legacy_socket" "$barrier_socket"; then
-            disarm_barrier
-            echo "could not move the legacy daemon socket aside; nothing was changed" >&2
-            exit 1
-        fi
-        # The archive's own CLI runs the preflight over the moved socket. It
-        # refuses while the legacy daemon owns live PTYs.
-        preflight_status=0
-        if [ "$accept_runtime_loss" -eq 1 ]; then
-            "$archive_dir/pohunek" migration preflight \
-                --socket "$barrier_socket" --accept-runtime-loss || preflight_status=$?
-        else
-            "$archive_dir/pohunek" migration preflight \
-                --socket "$barrier_socket" || preflight_status=$?
-        fi
-        if [ "$preflight_status" -ne 0 ]; then
-            restore_barrier
-            exit "$preflight_status"
-        fi
+        echo "nothing was changed; wait until the legacy daemon is active or stopped" >&2
+        echo "(or stop it with \`systemctl --user stop pohunekd.service\`) and re-run $0" >&2
+        exit 1
+    fi
+    # A node left at the barrier name by an interrupted earlier run is never
+    # overwritten or reused: rename(2) would replace it, and `mv` would move
+    # the socket into a directory of that name.
+    if [ -e "$barrier_path" ] || [ -L "$barrier_path" ]; then
+        echo "a connect-barrier node from an interrupted earlier run remains:" >&2
+        echo "  $barrier_path" >&2
+        return_started_legacy
+        echo "nothing was changed; the legacy daemon listens at $legacy_socket," >&2
+        echo "so that node is stale: remove it and re-run $0" >&2
+        exit 1
+    fi
+    barrier_socket=$barrier_path
+    # Armed before the rename so no interruption lands between the move and
+    # the trap.
+    arm_barrier_traps
+    if ! mv "$legacy_socket" "$barrier_socket"; then
+        disarm_barrier
+        echo "could not move the legacy daemon socket aside; nothing was changed" >&2
+        return_started_legacy
+        exit 1
+    fi
+    # The archive's own CLI runs the preflight over the moved socket. It
+    # writes the migration manifest and refuses while the legacy daemon owns
+    # live PTYs.
+    preflight_status=0
+    if [ "$accept_runtime_loss" -eq 1 ]; then
+        "$archive_dir/pohunek" migration preflight \
+            --socket "$barrier_socket" --accept-runtime-loss || preflight_status=$?
+    else
+        "$archive_dir/pohunek" migration preflight \
+            --socket "$barrier_socket" || preflight_status=$?
+    fi
+    if [ "$preflight_status" -ne 0 ]; then
+        restore_barrier
+        exit "$preflight_status"
     fi
     # Fail-closed inventory over every template-worker state the stop could
     # still destroy: anything not `inactive` keeps or is acquiring a PTY,
@@ -398,6 +580,7 @@ if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
         fi
         exit "$disable_status"
     fi
+    legacy_started=0
     remove_barrier
     # The daemon is stopped and disabled, so its socket is closed and no
     # client can start a session anymore. Re-check the workers it could have

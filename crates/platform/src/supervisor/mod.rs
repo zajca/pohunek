@@ -29,7 +29,7 @@ pub mod systemd;
 #[doc(inline)]
 pub use namespace::{Namespace, WorkerKey};
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 /// Longest accepted service identifier.
 ///
@@ -203,7 +203,7 @@ impl JobDefinition {
     /// open-file limit outside `MIN_OPEN_FILES..=MAX_OPEN_FILES`.
     pub fn new(spec: JobSpec) -> Result<Self, Error> {
         validate_path("executable", &spec.executable)?;
-        validate_path("working_directory", &spec.working_directory)?;
+        validate_working_directory(&spec.working_directory)?;
         if let Some(logs) = &spec.logs {
             validate_path("stdout", &logs.stdout)?;
             validate_path("stderr", &logs.stderr)?;
@@ -218,13 +218,7 @@ impl JobDefinition {
             validate_value("argument", argument)?;
         }
         for (key, value) in &spec.environment {
-            if !BOOTSTRAP_ENV_ALLOWLIST.contains(&key.as_str()) {
-                return Err(invalid(format!(
-                    "environment key `{key}` is outside the bootstrap allowlist"
-                )));
-            }
-            validate_value("environment value", value)?;
-            validate_path("environment path", Path::new(value))?;
+            validate_bootstrap_variable(key, value)?;
         }
         validate_timeout("start_timeout", spec.start_timeout)?;
         validate_timeout("exit_timeout", spec.exit_timeout)?;
@@ -482,6 +476,41 @@ fn validate_value(field: &str, value: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Validates a job working directory with the rule [`JobDefinition::new`]
+/// applies.
+///
+/// Lets a caller that fixes one working directory for every job reject it
+/// before the first job is defined.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidDefinition`] for a relative or non-normalized
+/// path, a NUL byte, non-UTF-8, or more than [`MAX_JOB_VALUE_BYTES`] bytes.
+pub fn validate_working_directory(path: &Path) -> Result<(), Error> {
+    validate_path("working_directory", path)
+}
+
+/// Validates one bootstrap environment variable with the rule
+/// [`JobDefinition::new`] applies.
+///
+/// Lets a caller that fixes one bootstrap environment for every job reject it
+/// before the first job is defined.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidDefinition`] for a key outside
+/// [`BOOTSTRAP_ENV_ALLOWLIST`], or a value that is not an absolute normalized
+/// UTF-8 path of at most [`MAX_JOB_VALUE_BYTES`] bytes without NUL.
+pub fn validate_bootstrap_variable(key: &str, value: &str) -> Result<(), Error> {
+    if !BOOTSTRAP_ENV_ALLOWLIST.contains(&key) {
+        return Err(invalid(format!(
+            "environment key `{key}` is outside the bootstrap allowlist"
+        )));
+    }
+    validate_value("environment value", value)?;
+    validate_path("environment path", Path::new(value))
+}
+
 fn validate_path(field: &str, path: &Path) -> Result<(), Error> {
     let bytes = path.as_os_str().as_encoded_bytes();
     if bytes.len() > MAX_JOB_VALUE_BYTES {
@@ -687,6 +716,38 @@ mod tests {
             spec.environment
                 .insert("HOME".to_owned(), "relative/home".to_owned());
         });
+    }
+
+    #[test]
+    fn standalone_validators_apply_the_definition_rules() {
+        validate_working_directory(Path::new("/home/u")).expect("absolute normalized directory");
+        for rejected in [".", "./home", "home", "/home/./u", "/home/../u"] {
+            assert!(
+                matches!(
+                    validate_working_directory(Path::new(rejected)),
+                    Err(Error::InvalidDefinition { .. })
+                ),
+                "{rejected:?}"
+            );
+            rejects(|spec| spec.working_directory = PathBuf::from(rejected));
+        }
+        validate_bootstrap_variable("HOME", "/home/u").expect("absolute normalized home");
+        for (key, value) in [
+            ("HOME", "."),
+            ("XDG_CACHE_HOME", "/home/u/./cache"),
+            ("PATH", "/usr/bin"),
+        ] {
+            assert!(
+                matches!(
+                    validate_bootstrap_variable(key, value),
+                    Err(Error::InvalidDefinition { .. })
+                ),
+                "{key}={value:?}"
+            );
+            rejects(|spec| {
+                spec.environment.insert(key.to_owned(), value.to_owned());
+            });
+        }
     }
 
     #[test]

@@ -50,7 +50,17 @@ Interpret runtime states as follows:
   session whose removal was interrupted (for example the daemon stopped mid
   `session rm`) also shows this reason while its removal waits for the job to
   be retired or its cleanup to succeed; the retry then finishes the removal
-  and the session disappears.
+  and the session disappears. A session whose stop was interrupted shows this
+  reason too while its stop replay fails (its worker answers but returns no
+  terminal outcome yet); the retry replays the stop until the worker commits
+  it, and the session then reads `stopped`. Reason
+  `create_compensation_pending` marks a `session new` that failed after
+  binding a worktree and whose runtime is proven ended, but whose checkout,
+  worktree binding, or create record could not be removed yet (typically a
+  worktree locked with `git worktree lock`, or a store write failure). Nothing
+  of it runs; the same retry repeats the removal, so fix the cause (for
+  example `git worktree unlock <path>`) and the session disappears with
+  `session_removed` on the next pass, without a daemon restart.
 - `terminal`: the worker observed child exit and the logical outcome is being
   retained or has been imported.
 - `lost`: no live PTY generation remains. The logical record is intentionally
@@ -191,8 +201,12 @@ has no version-policy fields; an installed but unparseable or wrong version is
 their own temporary homes.
 
 For the first worker-aware installation, let all legacy sessions finish or stop
-them explicitly. The archive installer moves the legacy daemon's control socket
-aside first, runs `migration preflight --socket <moved-socket>` there, and
+them explicitly. The archive installer refuses before any change while
+`pohunek service status --json` reports `transaction_in_progress`, or while
+the prefix, unit, config, state, or runtime directories are reached through a
+symlink or are not private to the user. It starts a stopped legacy daemon so
+the migration snapshot is always taken, moves the legacy daemon's control
+socket aside, runs `migration preflight --socket <moved-socket>` there, and
 lists live sessions that lack durable `runtime` metadata to refuse
 replacement. Sessions with a runtime binding are already worker-owned, are
 excluded from this one-time guard, and survive the daemon restart.
@@ -203,3 +217,17 @@ sessions cannot be reconstructed. The same installer refuses to retire an
 older template-unit install while any `pohunek-session@<id>.service` worker
 outside the `inactive` state survives its post-stop re-check; stop those
 sessions first.
+
+A worker-aware daemon started over a legacy store without that preflight (for
+example after replacing the binary by hand) finds legacy resume bindings but no
+logical record and no manifest. It starts anyway and imports nothing: `pohunek
+session list` shows none of those sessions, and `pohunek session runtime-inventory`
+lists each binding as `orphaned` with reason `migration_manifest_missing`
+(the daemon log carries `reconcile.migration.manifest_missing`). The bindings
+stay on disk, and while they are unimported `pohunek session new` and `session
+fork` fail with `migration_manifest_missing` before writing anything, because
+a first logical record would make a later manifest unimportable. To recover
+them, reinstall the legacy release, then rerun the worker-aware installer so
+its `pohunek migration preflight` snapshots them; the worker-aware daemon it
+starts imports the manifest, and session creation works again. Once any
+logical record exists, a later manifest is archived without being imported.

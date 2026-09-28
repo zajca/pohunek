@@ -52,7 +52,7 @@ use pohunek_daemon::session::{
     SessionRegistry, SessionRegistryConfig, SessionRetentionTask, RETENTION_POLICY_NAME,
 };
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
-use pohunek_platform::supervisor::Namespace;
+use pohunek_platform::supervisor::{self, Namespace};
 use pohunek_service_config::ServiceConfig;
 
 /// File name of the unified logical-session metadata store under the data dir.
@@ -330,6 +330,9 @@ async fn run() -> Result<(), DaemonError> {
         remote_shutdown_sessions.begin_daemon_shutdown();
     });
     let ((), remote_result) = tokio::join!(unix_serve, remote_serve);
+    // In-flight creates commit or compensate before the runtime stops; shutdown
+    // already refuses new ones.
+    sessions.drain_creates().await;
 
     // 11. Flush the append-only event log before exit so events buffered at
     //     shutdown are not lost (bounded so a wedged write cannot hang exit).
@@ -460,21 +463,7 @@ async fn build_session_registry(
     mode: SupervisionMode,
 ) -> Result<SessionRegistry, DaemonError> {
     let bootstrap_environment = bootstrap_environment()?;
-    let working_directory = bootstrap_environment
-        .get("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| DaemonError::MissingEnv {
-            var: "HOME".to_owned(),
-        })?;
-    // Workers run with HOME as their working directory; a missing one would
-    // only surface later as a failed launch of every session.
-    if !working_directory.is_dir() {
-        return Err(DaemonError::InvalidEnv {
-            var: "HOME".to_owned(),
-            value: working_directory.display().to_string(),
-            expected: "an existing absolute directory (the worker working directory)",
-        });
-    }
+    let working_directory = worker_working_directory(&bootstrap_environment)?;
     let (supervision, supervisor): (SupervisionConfig, Arc<dyn WorkerLauncher>) = match mode {
         SupervisionMode::Native(path) => {
             let service = ServiceConfig::load(&path)?;
@@ -544,6 +533,42 @@ async fn build_session_registry(
     };
     config.supervision = Some(supervision);
     SessionRegistry::new_production(config, supervisor).map_err(DaemonError::Reconcile)
+}
+
+/// Validates the bootstrap environment every worker job carries and returns
+/// its working directory, `HOME`.
+///
+/// Every job definition applies the same rules, so a value they reject would
+/// only surface after readiness as a failed launch of every session; startup
+/// refuses it instead.
+fn worker_working_directory(
+    environment: &BTreeMap<String, String>,
+) -> Result<PathBuf, DaemonError> {
+    for (name, value) in environment {
+        if let Err(error) = supervisor::validate_bootstrap_variable(name, value) {
+            error!(env.name = %name, error = %error, "bootstrap variable is not usable in a worker job");
+            return Err(DaemonError::InvalidEnv {
+                var: name.clone(),
+                value: value.clone(),
+                expected: "an absolute normalized path without `.` or `..` segments",
+            });
+        }
+    }
+    let home =
+        environment
+            .get("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| DaemonError::MissingEnv {
+                var: "HOME".to_owned(),
+            })?;
+    if supervisor::validate_working_directory(&home).is_err() || !home.is_dir() {
+        return Err(DaemonError::InvalidEnv {
+            var: "HOME".to_owned(),
+            value: home.display().to_string(),
+            expected: "an existing absolute normalized directory (the worker working directory)",
+        });
+    }
+    Ok(home)
 }
 
 /// Captures the bootstrap variables this daemon was started with.
@@ -1298,7 +1323,9 @@ mod supervision_tests {
 
     use pohunek_daemon::DaemonError;
 
-    use super::{parse_service_config, select_supervision, SupervisionMode};
+    use super::{
+        parse_service_config, select_supervision, worker_working_directory, SupervisionMode,
+    };
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
@@ -1356,6 +1383,57 @@ mod supervision_tests {
         assert!(matches!(
             select_supervision(None, Some(OsString::from("systemd"))),
             Err(DaemonError::InvalidEnv { .. })
+        ));
+    }
+
+    fn environment(entries: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn worker_bootstrap_environment_must_satisfy_the_job_definition_rules() {
+        let home =
+            pohunek_test_support::tempdir_with_prefix("ph-home-").expect("create home directory");
+        let home = home.path().to_str().expect("utf-8 home").to_owned();
+        let state = format!("{home}/.local/state");
+        assert_eq!(
+            worker_working_directory(&environment(&[("HOME", &home), ("XDG_STATE_HOME", &state)]))
+                .expect("absolute normalized home"),
+            PathBuf::from(&home)
+        );
+
+        // Absolute XDG roots resolve every daemon path while HOME stays
+        // relative; every worker job would reject it after readiness.
+        for (name, value) in [
+            ("HOME", "."),
+            ("HOME", "relative/home"),
+            ("HOME", "/nonexistent-pohunek-home"),
+        ] {
+            let error = worker_working_directory(&environment(&[
+                (name, value),
+                ("XDG_STATE_HOME", &state),
+            ]))
+            .expect_err("unusable worker working directory");
+            assert!(
+                matches!(&error, DaemonError::InvalidEnv { var, .. } if var == "HOME"),
+                "{value:?}: {error}"
+            );
+        }
+        let error = worker_working_directory(&environment(&[
+            ("HOME", &home),
+            ("XDG_CACHE_HOME", &format!("{home}/./cache")),
+        ]))
+        .expect_err("non-normalized bootstrap variable");
+        assert!(
+            matches!(&error, DaemonError::InvalidEnv { var, .. } if var == "XDG_CACHE_HOME"),
+            "{error}"
+        );
+        assert!(matches!(
+            worker_working_directory(&environment(&[("XDG_STATE_HOME", &state)])),
+            Err(DaemonError::MissingEnv { .. })
         ));
     }
 }

@@ -77,11 +77,14 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use pohunek_paths::{valid_install_version, BasePaths, InstallLayout, MAX_INSTALL_VERSION_BYTES};
+use pohunek_paths::{
+    is_normalized_absolute, valid_install_version, BasePaths, InstallLayout,
+    MAX_INSTALL_VERSION_BYTES,
+};
 use pohunek_platform::filesystem::{FsError, TrustedDir};
 use pohunek_platform::supervisor::{
     Namespace, MAX_JOB_TIMEOUT, MAX_JOB_VALUE_BYTES, MAX_OPEN_FILES, MIN_OPEN_FILES,
@@ -238,15 +241,7 @@ impl ServiceConfig {
     /// [`ConfigError::InvalidPattern`], or [`ConfigError::DuplicatePattern`]
     /// for the respective invalid value.
     pub fn new(spec: ConfigSpec) -> Result<Self, ConfigError> {
-        validate_path("prefix", &spec.prefix)?;
-        let layout = InstallLayout::new(spec.prefix.clone()).map_err(|_invalid_prefix| {
-            ConfigError::InvalidPath {
-                key: "prefix",
-                length: spec.prefix.as_os_str().len(),
-                reason: "is not a usable installation prefix",
-                max_bytes: MAX_PATH_BYTES,
-            }
-        })?;
+        let layout = validate_prefix(&spec.prefix)?;
         if valid_install_version(&spec.active_version).is_none() {
             return Err(ConfigError::InvalidVersion {
                 length: spec.active_version.len(),
@@ -775,16 +770,24 @@ fn classify_read_error(path: &Path, source: FsError) -> ConfigError {
     }
 }
 
-/// Returns whether `path` is absolute and spelled exactly as its components.
+/// Validates an installation prefix exactly as [`ServiceConfig::new`] does.
 ///
-/// Rejects `..`, `.`, repeated or trailing separators, and NUL bytes.
-fn is_normalized_absolute(path: &Path) -> bool {
-    path.is_absolute()
-        && !path.as_os_str().as_encoded_bytes().contains(&0)
-        && path
-            .components()
-            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
-        && path.components().collect::<PathBuf>().as_os_str() == path.as_os_str()
+/// Callers that act on a prefix before building the configuration check it
+/// here first, so a prefix the configuration would reject is refused before
+/// any of their effects.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidPath`] with key `prefix` for a relative,
+/// unnormalized, non-UTF-8, or oversized path.
+pub fn validate_prefix(prefix: &Path) -> Result<InstallLayout, ConfigError> {
+    validate_path("prefix", prefix)?;
+    InstallLayout::new(prefix).map_err(|_invalid_prefix| ConfigError::InvalidPath {
+        key: "prefix",
+        length: prefix.as_os_str().len(),
+        reason: "is not a usable installation prefix",
+        max_bytes: MAX_PATH_BYTES,
+    })
 }
 
 /// Validates one recorded path key.

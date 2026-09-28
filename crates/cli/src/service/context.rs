@@ -1,6 +1,6 @@
 //! Host facts every `pohunek service` operation starts from.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -170,24 +170,35 @@ impl Context {
     /// Every XDG root is passed explicitly, so the daemon resolves exactly the
     /// paths this CLI resolved regardless of the service manager's own
     /// environment. `XDG_RUNTIME_DIR` and `HOME` are passed only when set.
-    #[must_use]
-    pub fn bootstrap_environment(&self) -> BTreeMap<String, String> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NonUtf8Env`] for a root that is not UTF-8. Job
+    /// definitions carry UTF-8 values only, and a daemon missing that
+    /// variable would fall back to `HOME` and open other files than this
+    /// CLI's, so the root is refused instead of left out.
+    pub fn bootstrap_environment(&self) -> Result<BTreeMap<String, String>, Error> {
+        let roots: [(&'static str, Option<&Path>); 6] = [
+            (XDG_RUNTIME_DIR, self.runtime_base.as_deref()),
+            (pohunek_paths::XDG_STATE_HOME, self.paths.state_dir.parent()),
+            (pohunek_paths::XDG_DATA_HOME, self.paths.data_dir.parent()),
+            (pohunek_paths::XDG_CACHE_HOME, self.paths.cache_dir.parent()),
+            (
+                pohunek_paths::XDG_CONFIG_HOME,
+                Some(self.paths.config_home.as_path()),
+            ),
+            (HOME, self.home.as_deref()),
+        ];
         let mut environment = BTreeMap::new();
-        let mut insert = |key: &str, path: Option<&Path>| {
-            if let Some(value) = path.and_then(Path::to_str) {
-                environment.insert(key.to_owned(), value.to_owned());
-            }
-        };
-        insert(XDG_RUNTIME_DIR, self.runtime_base.as_deref());
-        insert(pohunek_paths::XDG_STATE_HOME, self.paths.state_dir.parent());
-        insert(pohunek_paths::XDG_DATA_HOME, self.paths.data_dir.parent());
-        insert(pohunek_paths::XDG_CACHE_HOME, self.paths.cache_dir.parent());
-        insert(
-            pohunek_paths::XDG_CONFIG_HOME,
-            Some(self.paths.config_home.as_path()),
-        );
-        insert(HOME, self.home.as_deref());
-        environment
+        for (var, path) in roots {
+            let Some(path) = path else { continue };
+            let value = path.to_str().ok_or_else(|| Error::NonUtf8Env {
+                var,
+                path: path.to_path_buf(),
+            })?;
+            environment.insert(var.to_owned(), value.to_owned());
+        }
+        Ok(environment)
     }
 }
 
@@ -273,7 +284,7 @@ pub(crate) mod tests {
     fn bootstrap_environment_names_every_root_explicitly() {
         let (_root, root) = temp_root();
         let context = context(root.as_path());
-        let environment = context.bootstrap_environment();
+        let environment = context.bootstrap_environment().expect("utf-8 roots");
         let path = |name: &str| {
             root.as_path()
                 .join(name)
@@ -291,6 +302,62 @@ pub(crate) mod tests {
                 ("XDG_RUNTIME_DIR".to_owned(), path("run")),
                 ("XDG_STATE_HOME".to_owned(), path("state")),
             ])
+        );
+    }
+
+    #[test]
+    fn bootstrap_environment_refuses_a_root_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let (_root, root) = temp_root();
+        let mut data_home = root.as_os_str().to_owned();
+        data_home.push(std::ffi::OsStr::from_bytes(b"/data-\xff"));
+        let mut env = PathEnv {
+            xdg_runtime_dir: Some(OsString::from(root.join("run"))),
+            xdg_data_home: Some(data_home.clone()),
+            xdg_state_home: Some(OsString::from(root.join("state"))),
+            xdg_cache_home: Some(OsString::from(root.join("cache"))),
+            xdg_config_home: Some(OsString::from(root.join("config"))),
+            home: Some(OsString::from(root.join("home"))),
+        };
+        let resolve = |env: &PathEnv| {
+            BasePaths::resolve_for(
+                Platform::current().expect("supported platform"),
+                nix::unistd::Uid::effective().as_raw(),
+                env,
+            )
+            .expect("the path contract accepts non-UTF-8 roots")
+        };
+        let context_of = |paths: BasePaths, home: PathBuf| {
+            Context::new(
+                paths,
+                nix::unistd::Uid::effective().as_raw(),
+                Some(home),
+                Some(root.join("run")),
+                root.join("units"),
+                PathBuf::from("/usr/bin/pohunek"),
+            )
+        };
+
+        let error = context_of(resolve(&env), root.join("home"))
+            .bootstrap_environment()
+            .expect_err("a non-UTF-8 XDG_DATA_HOME is refused");
+        let Error::NonUtf8Env { var, path } = &error else {
+            panic!("unexpected error {error:?}");
+        };
+        assert_eq!(*var, "XDG_DATA_HOME");
+        assert_eq!(path.as_os_str(), data_home.as_os_str());
+        assert_eq!(error.code(), "service_environment_not_utf8");
+
+        env.xdg_data_home = Some(OsString::from(root.join("data")));
+        let mut home = root.as_os_str().to_owned();
+        home.push(std::ffi::OsStr::from_bytes(b"/home-\xfe"));
+        let error = context_of(resolve(&env), PathBuf::from(home))
+            .bootstrap_environment()
+            .expect_err("a non-UTF-8 HOME is refused");
+        assert!(
+            matches!(&error, Error::NonUtf8Env { var, .. } if *var == "HOME"),
+            "{error:?}"
         );
     }
 

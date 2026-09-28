@@ -27,6 +27,7 @@ use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
 
@@ -133,6 +134,14 @@ const SESSION_RECORD_SCHEMA_VERSION: u32 = 1;
 /// Bound on how long a graceful shutdown waits for the event-log drain to flush
 /// its backlog, so a wedged log write can never hang shutdown.
 const EVENT_LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Default bound on how long daemon shutdown waits for in-flight create
+/// transactions ([`SessionRegistryConfig::create_drain_timeout`]).
+///
+/// It stays well inside the daemon's native stop timeout (30 s by default),
+/// so the remaining shutdown steps still fit. A create still running at the
+/// deadline is recovered by startup reconciliation from its durable record.
+const DEFAULT_CREATE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default per-session raw-output history cap (10 MB), replayed on attach.
 ///
@@ -351,6 +360,10 @@ pub struct SessionRegistryConfig {
     /// `None` disables session launch with `worker_backend_required`; there is
     /// no daemon-owned PTY fallback.
     pub supervision: Option<SupervisionConfig>,
+    /// Bound on how long [`SessionRegistry::drain_creates`] waits for the
+    /// create transactions still running when daemon shutdown starts.
+    /// Defaults to [`DEFAULT_CREATE_DRAIN_TIMEOUT`].
+    pub create_drain_timeout: Duration,
 }
 
 impl Default for SessionRegistryConfig {
@@ -389,6 +402,7 @@ impl Default for SessionRegistryConfig {
             worker_state_root: None,
             worker_connect_deadline: DEFAULT_WORKER_CONNECT_DEADLINE,
             supervision: None,
+            create_drain_timeout: DEFAULT_CREATE_DRAIN_TIMEOUT,
         }
     }
 }
@@ -416,6 +430,11 @@ struct SessionRegistryInner {
     /// Set when daemon process shutdown starts. Natural PTY exits observed after
     /// this point are treated as restart fallout, not terminal session state.
     daemon_shutdown_started: AtomicBool,
+    /// Set by startup reconciliation when legacy resume bindings exist with
+    /// no logical record and no migration manifest. The first logical record
+    /// would make a later manifest unimportable, so every path that creates
+    /// one is refused while it holds ([`SessionRegistry::ensure_migration_settled`]).
+    legacy_migration_pending: AtomicBool,
     /// Cancellation signal fired when production daemon shutdown starts.
     ///
     /// Bounded input operations use this token instead of the event-log drain
@@ -446,6 +465,8 @@ struct SessionRegistryInner {
     /// Serializes create, native recovery, stop, and remove per session, so
     /// one session never runs two lifecycle transactions at once.
     lifecycle_locks: SessionLocks,
+    /// Detached create transactions, drained at daemon shutdown.
+    creates: CreateTasks,
     /// Sessions whose native supervisor could not be inspected, re-reconciled
     /// in the background until it answers.
     supervision_retries: supervision::SupervisionRetries,
@@ -484,6 +505,20 @@ struct SessionRegistryInner {
     /// Rendezvous the next waited input write meets at its send boundary.
     #[cfg(test)]
     input_send_hold: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    /// Holds the next create once its target is bound, before its launch.
+    #[cfg(test)]
+    bound_create_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+}
+
+/// The detached create transactions of one registry.
+///
+/// Admission and closing share one lock, so a create is either tracked
+/// before [`SessionRegistry::begin_daemon_shutdown`] closes the tracker, and
+/// so drained, or refused.
+#[derive(Debug, Default)]
+struct CreateTasks {
+    tracker: TaskTracker,
+    admission: std::sync::Mutex<()>,
 }
 
 #[cfg(test)]
@@ -1205,6 +1240,7 @@ impl SessionRegistry {
                 observation_waiters: AtomicUsize::new(0),
                 observation_session_waiters: std::sync::Mutex::new(HashMap::new()),
                 daemon_shutdown_started: AtomicBool::new(false),
+                legacy_migration_pending: AtomicBool::new(false),
                 daemon_shutdown: CancellationToken::new(),
                 daemon_instance_id: generate_daemon_instance_id(),
                 config,
@@ -1214,6 +1250,7 @@ impl SessionRegistry {
                 store,
                 persist_lock: Mutex::new(()),
                 lifecycle_locks: SessionLocks::default(),
+                creates: CreateTasks::default(),
                 supervision_retries: supervision::SupervisionRetries::default(),
                 worktree,
                 projects,
@@ -1229,6 +1266,8 @@ impl SessionRegistry {
                 external_association_block: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 input_send_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                bound_create_hold: std::sync::Mutex::new(None),
             }),
         };
         if let Some(config) = external_observer {
@@ -1287,10 +1326,102 @@ impl SessionRegistry {
             .daemon_shutdown_started
             .swap(true, Ordering::Relaxed);
         self.inner.daemon_shutdown.cancel();
+        self.close_creates();
         if !already_started {
             info!("daemon shutdown started; preserving durable worker runtimes");
         }
         self.inner.external.shutdown();
+    }
+
+    /// Refuses every later create; the ones already admitted stay tracked.
+    fn close_creates(&self) {
+        let _admission = self
+            .inner
+            .creates
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.inner.creates.tracker.close();
+    }
+
+    /// Refuses new creates and waits for the ones still running, bounded by
+    /// [`SessionRegistryConfig::create_drain_timeout`].
+    ///
+    /// Each create commits its session or compensates what it bound before
+    /// the runtime stops, instead of being dropped mid-transaction. Daemon
+    /// shutdown calls it after [`Self::begin_daemon_shutdown`]. Returns
+    /// whether every create finished; one still running at the deadline is
+    /// logged and left to startup reconciliation, which compensates it from
+    /// its durable create record.
+    pub async fn drain_creates(&self) -> bool {
+        self.close_creates();
+        let creates = &self.inner.creates.tracker;
+        let timeout = self.inner.config.create_drain_timeout;
+        if tokio::time::timeout(timeout, creates.wait()).await.is_ok() {
+            return true;
+        }
+        warn!(
+            session.creates_in_flight = creates.len(),
+            timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            "create transactions did not finish within the shutdown drain timeout; startup reconciliation settles them"
+        );
+        false
+    }
+
+    /// Refuses a lifecycle operation that would write the first logical
+    /// record while unmigrated legacy resume bindings exist.
+    ///
+    /// Startup imports a migration manifest only into a store without logical
+    /// records, so a record written first would archive a later manifest
+    /// unimported and lose those bindings. Startup reconciliation decides the
+    /// gate; a later start that imports the manifest lifts it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `migration_manifest_missing` while the gate holds, before
+    /// anything is written.
+    pub(super) fn ensure_migration_settled(&self) -> Result<(), ProtocolError> {
+        if !self.inner.legacy_migration_pending.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Err(ProtocolError::new(
+            ErrorClass::Runtime,
+            reconcile::MIGRATION_MANIFEST_MISSING,
+            "legacy resume bindings exist without a migration manifest; creating a session now would lose them",
+            Some(
+                "run `pohunek migration preflight` against the legacy daemon (reinstall the legacy release and rerun the worker-aware installer), then restart this daemon so it imports the manifest"
+                    .to_owned(),
+            ),
+        ))
+    }
+
+    /// Runs `transaction` detached from the caller and tracked for the
+    /// shutdown drain.
+    ///
+    /// # Errors
+    ///
+    /// Returns `daemon_shutting_down` once daemon shutdown started, before
+    /// anything of the create is written.
+    fn spawn_create<F>(&self, transaction: F) -> Result<JoinHandle<F::Output>, ProtocolError>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let _admission = self
+            .inner
+            .creates
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.inner.creates.tracker.is_closed() {
+            return Err(ProtocolError::new(
+                ErrorClass::Daemon,
+                "daemon_shutting_down",
+                "the daemon is shutting down and accepts no new sessions",
+                Some("retry once the daemon is running again".to_owned()),
+            ));
+        }
+        Ok(self.inner.creates.tracker.spawn(transaction))
     }
 
     /// The project manager, when the metadata store is configured. Exposed for
@@ -1540,7 +1671,16 @@ impl SessionRegistry {
     /// branch)` (with `--branch`). A non-git directory yields a plain shell with
     /// no project. The session records `project_id`/`is_linked_worktree`, and any
     /// non-fatal worktree warnings ride along on the returned [`SessionInfo`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `migration_manifest_missing` while unmigrated legacy resume
+    /// bindings exist and `daemon_shutting_down` once shutdown started, both
+    /// before anything is written, and otherwise the validation, target, or launch error. A
+    /// failed create whose compensation cannot finish stays listed as
+    /// `create_compensation_pending` for the supervision retry.
     pub async fn create(&self, params: SessionNewParams) -> Result<SessionInfo, ProtocolError> {
+        self.ensure_migration_settled()?;
         validate_new_params(&params)?;
         // Resolve and validate the runtime before allocating a logical id or
         // resolving a target: target resolution may bind a git worktree.
@@ -1568,25 +1708,27 @@ impl SessionRegistry {
         };
 
         let id = Self::allocate_session_id();
-        // Target binding, registration, and every compensation run as one
-        // detached transaction, so a client dropped after the worktree was
-        // bound cannot strand it: the task still commits the session or
-        // compensates exactly what it created.
+        // The durable intent, target binding, registration, and every
+        // compensation run as one detached transaction, so a client dropped
+        // after the worktree was bound cannot strand it: the task still
+        // commits the session or compensates exactly what it created, and
+        // daemon shutdown drains it.
         let registry = self.clone();
-        let (info, pending_initial_input) = tokio::spawn(async move {
-            Box::pin(registry.create_transaction(
-                id,
-                params,
-                resolved,
-                validated_program,
-                fallback_cwd,
-            ))
+        let (info, pending_initial_input) = self
+            .spawn_create(async move {
+                Box::pin(registry.create_transaction(
+                    id,
+                    params,
+                    resolved,
+                    validated_program,
+                    fallback_cwd,
+                ))
+                .await
+            })?
             .await
-        })
-        .await
-        .map_err(|_join_error| {
-            runtime_error("session_launch_failed", "session create task panicked")
-        })??;
+            .map_err(|_join_error| {
+                runtime_error("session_launch_failed", "session create task panicked")
+            })??;
         self.spawn_session_hook(SessionHookRequest {
             event: HookEvent::SessionStart,
             cwd: info.cwd.clone(),
@@ -1616,19 +1758,30 @@ impl SessionRegistry {
         Ok(info)
     }
 
-    /// Binds the target of a `session.new` and registers its first runtime,
-    /// compensating whatever it created when that fails.
+    /// Records the intent of a `session.new`, binds its target, and registers
+    /// its first runtime, compensating whatever it created when that fails.
     ///
     /// Runs detached from the caller, under the session's lifecycle lock, in
-    /// this order:
+    /// this order (the phases of RFC section 14):
     ///
-    /// 1. resolve the project and bind the worktree;
-    /// 2. build the launch command; a failure here launched nothing, so the
-    ///    bound worktree is removed at once;
-    /// 3. register the runtime ([`Self::run_pty_registration`]), which owns
-    ///    every later compensation: the worktree and the preparing record are
+    /// 1. persist the create intent: a `create/preparing` record without a
+    ///    worker generation ([`create_intent_record`]), so every worktree the
+    ///    create binds is reachable from a record;
+    /// 2. resolve the project and bind the worktree;
+    /// 3. build the launch command;
+    /// 4. register the runtime ([`Self::run_pty_registration`]), which
+    ///    persists the generation before starting its job and owns every
+    ///    later compensation: the worktree and the preparing record are
     ///    removed only once the generation is proven ended, and a generation
     ///    that may still run keeps both for reconciliation.
+    ///
+    /// A failure in phases 2 or 3 launched nothing, so the create is
+    /// compensated at once ([`Self::compensate_abandoned_create`]): worktree
+    /// and binding first, record last. A compensation that cannot finish
+    /// keeps the record and lists the session `create_compensation_pending`
+    /// while the supervision retry repeats it; the create still fails with
+    /// its original error. A daemon that dies anywhere after phase 1 leaves
+    /// the record for startup reconciliation.
     ///
     /// Returns the committed session and the initial input still to deliver.
     async fn create_transaction(
@@ -1640,20 +1793,51 @@ impl SessionRegistry {
         fallback_cwd: PathBuf,
     ) -> Result<(SessionInfo, Option<String>), ProtocolError> {
         let guard = self.lock_lifecycle(&id).await;
-        let target = self.resolve_target(&id, &params, fallback_cwd).await?;
-        let worktree_bound = target.worktree_bound;
-        let (spec, pending_initial_input) =
-            match self.create_spec(&id, &params, &resolved, validated_program, target) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    if worktree_bound {
-                        self.cleanup_bound_worktree(&id).await;
-                    }
-                    return Err(error);
+        let intent = create_intent_record(&id, &params, &resolved, &fallback_cwd)?;
+        self.write_session_record(intent).await?;
+        let prepared = match self.resolve_target(&id, &params, fallback_cwd).await {
+            Ok(target) => {
+                #[cfg(test)]
+                self.hold_bound_create(&id).await;
+                self.create_spec(&id, &params, &resolved, validated_program, target)
+            }
+            Err(error) => Err(error),
+        };
+        let (spec, pending_initial_input) = match prepared {
+            Ok(prepared) => prepared,
+            Err(mut error) => {
+                if !self.compensate_abandoned_create(&id).await {
+                    error.msg = unfinished_compensation_message(&error.msg, &id);
                 }
-            };
+                return Err(error);
+            }
+        };
         let info = self.clone().run_pty_registration(spec, guard).await?;
         Ok((info, pending_initial_input))
+    }
+
+    /// Parks a create at its bound target when a test armed the hold.
+    #[cfg(test)]
+    async fn hold_bound_create(&self, id: &SessionId) {
+        let gate = {
+            let mut slot = self
+                .inner
+                .bound_create_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let held = slot
+                .as_ref()
+                .is_some_and(|gate| gate.session_id.as_deref().is_none_or(|held| held == id.0));
+            if held {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
     }
 
     /// Builds the first-launch registration of a `session.new` in `target`,
@@ -4156,6 +4340,110 @@ fn validate_new_params(params: &SessionNewParams) -> Result<(), ProtocolError> {
     validate_session_metadata(&params.metadata)?;
     validate_session_name(params.name.as_deref())?;
     Ok(())
+}
+
+/// The durable intent of a `session.new` (RFC section 14, phase 2): a
+/// `create/preparing` record with the create's structural metadata and no
+/// worker generation.
+///
+/// It is written before the target is bound, so a worktree the create binds
+/// is always reachable from a record: reconciliation of a create record that
+/// names no generation proves nothing was launched and compensates it. The
+/// launch directory is provisional until the preparing record of
+/// [`SessionRegistry::run_pty_registration`] replaces the intent.
+///
+/// # Errors
+///
+/// Returns `bad_request` for an invalid session name.
+fn create_intent_record(
+    id: &SessionId,
+    params: &SessionNewParams,
+    resolved: &ResolvedAgent,
+    cwd: &Path,
+) -> Result<SessionRecord, ProtocolError> {
+    let capabilities = resolved.capabilities();
+    let created_at = timestamp_now();
+    let info = SessionInfo {
+        id: id.clone(),
+        external: Some(false),
+        capabilities: protocol::SessionCapabilities {
+            resume: capabilities.resume.is_some(),
+            fork: capabilities.fork.is_some(),
+        },
+        name: validate_session_name(params.name.as_deref())?,
+        agent: resolved.name.clone(),
+        agent_base: resolved.base.clone(),
+        cwd: cwd.to_path_buf(),
+        cwd_source: Some(CwdSource::Launch),
+        pid: 0,
+        runtime: Some(SessionRuntime {
+            state: RuntimeState::Starting,
+            runtime_generation: protocol::RuntimeGeneration::new(1),
+            worker_id: None,
+            runtime_id: None,
+            started_at: None,
+            last_connected_at: None,
+            loss_reason: None,
+        }),
+        cols: params.cols,
+        rows: params.rows,
+        state: SessionState::Starting,
+        state_source: StateSource::Process,
+        activity: None,
+        subagents: Vec::new(),
+        active_agent: None,
+        active_agent_base: None,
+        active_agent_pid: None,
+        active_agent_session_id: None,
+        active_agent_session_path: None,
+        native_session_id: None,
+        native_session_path: None,
+        project_id: None,
+        project_label: None,
+        is_linked_worktree: None,
+        repo: params.repo.clone(),
+        branch: params.branch.clone(),
+        worktree_path: None,
+        metadata: params.metadata.clone(),
+        warnings: Vec::new(),
+        created_at: created_at.clone(),
+        updated_at: created_at,
+        exit_code: None,
+    };
+    Ok(SessionRecord {
+        schema_version: SESSION_RECORD_SCHEMA_VERSION,
+        session_id: id.0.clone(),
+        desired_state: DesiredState::Running,
+        transaction: Some(SessionTransaction {
+            id: format!("create-{}", id.0),
+            kind: TransactionKind::Create,
+            phase: "preparing".to_owned(),
+            previous_worker_id: None,
+            previous_runtime_id: None,
+        }),
+        info,
+        native_identity_ordering: None,
+        recovery: None,
+        runtime: RuntimeRecord {
+            state: RuntimeState::Starting,
+            worker_id: None,
+            runtime_id: None,
+            service_id: None,
+            generation: None,
+            executable: None,
+            reason: None,
+        },
+    })
+}
+
+/// Extends a failed create's error `msg` with the compensation it left
+/// pending for the supervision retry.
+fn unfinished_compensation_message(msg: &str, id: &SessionId) -> String {
+    format!(
+        "{msg}; session {} keeps its create record until its worktree is removed, \
+         and stays listed as create_compensation_pending while the daemon retries the removal",
+        id.0
+    )
 }
 
 /// Normalize and validate an owner-set session name.

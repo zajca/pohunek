@@ -67,6 +67,21 @@ pub enum Error {
     #[error("invalid application path configuration: {0}")]
     Paths(#[source] pohunek_paths::PathError),
 
+    /// A bootstrap environment root is not UTF-8.
+    ///
+    /// The daemon's job definition carries UTF-8 values only, and a daemon
+    /// started without the variable would resolve another root from `HOME`.
+    #[error(
+        "{var} is not UTF-8 ({}), so the daemon's job definition cannot pass it on unchanged",
+        path.display()
+    )]
+    NonUtf8Env {
+        /// The environment variable naming the root.
+        var: &'static str,
+        /// The rejected root.
+        path: PathBuf,
+    },
+
     /// `--prefix` or `--from` is not an absolute normalized path.
     #[error("{flag} must be an absolute normalized path: {}", path.display())]
     InvalidPath {
@@ -384,6 +399,7 @@ impl Error {
         match self {
             Self::MissingEnv { .. } => "missing_env",
             Self::Paths(_) => "paths_unavailable",
+            Self::NonUtf8Env { .. } => "service_environment_not_utf8",
             Self::InvalidPath { .. } => "cli_usage",
             Self::Config(_) => "service_config_invalid",
             Self::UntrustedDirectory { .. } => "service_untrusted_directory",
@@ -447,6 +463,12 @@ impl Error {
                 Some("inspect the listed sessions with `pohunek session list` and retry")
             }
             Self::VerifierMissing => Some("install systemd's `systemd-analyze` and retry"),
+            Self::Config(pohunek_service_config::ConfigError::NamespaceMismatch { .. }) => Some(
+                "run the command as the user and with the XDG_STATE_HOME and XDG_RUNTIME_DIR the installation was made with",
+            ),
+            Self::NonUtf8Env { .. } => {
+                Some("point the named variable at a UTF-8 path, then retry")
+            }
             Self::OutdatedJournals { .. } => Some(
                 "end those sessions with the pohunek version that started them, or terminate the listed worker pids, then retry; a journal whose worker pid is unreadable blocks until you delete it after confirming no older pohunek-sessiond runs",
             ),

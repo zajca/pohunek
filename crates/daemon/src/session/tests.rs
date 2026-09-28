@@ -13813,6 +13813,560 @@ async fn unconfirmed_create_is_compensated_with_its_worktree_once_its_job_ends()
         .await;
 }
 
+/// A worktree-binding daemon configuration whose store and worker roots are
+/// fixed, so a registry built again from it models a daemon restart.
+struct RestartableDaemon {
+    config: SessionRegistryConfig,
+    store_path: PathBuf,
+    repo: PathBuf,
+}
+
+impl RestartableDaemon {
+    fn new(tag: &str) -> Self {
+        let store_path = temp_store_path(tag);
+        let worktree_root = store_path.parent().expect("store parent").join("worktrees");
+        let mut config = SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path.clone()),
+            worktree_root: Some(worktree_root),
+            ..SessionRegistryConfig::default()
+        };
+        let (runtime_root, state_root) = super::test_worker_roots(&config);
+        config.supervision = Some(super::test_supervision(&runtime_root, &state_root));
+        config.worker_runtime_root = Some(runtime_root);
+        config.worker_state_root = Some(state_root);
+        Self {
+            config,
+            store_path,
+            repo: init_git_repo(tag),
+        }
+    }
+
+    /// The configuration with a shell program that does not exist, so a
+    /// create fails building its launch command after binding its target.
+    fn without_shell(&self) -> SessionRegistryConfig {
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new(
+                "/nonexistent/pohunek-no-such-shell",
+                std::iter::empty::<String>(),
+            ),
+            ..self.config.clone()
+        }
+    }
+
+    fn params(&self, branch: &str) -> SessionNewParams {
+        SessionNewParams {
+            cwd: None,
+            repo: Some(self.repo.clone()),
+            branch: Some(branch.to_owned()),
+            ..params()
+        }
+    }
+
+    fn store(&self) -> crate::store::Store {
+        crate::store::Store::new(self.store_path.clone())
+    }
+
+    fn records(&self) -> Vec<crate::store::SessionRecord> {
+        self.store().load_sessions().expect("load session records")
+    }
+
+    fn bindings(&self) -> Vec<crate::store::WorktreeBinding> {
+        self.store()
+            .load_worktrees()
+            .expect("load worktree bindings")
+    }
+
+    /// The only durable record, which must be a create intent naming no
+    /// worker generation, and the only binding, which must be its worktree.
+    fn intent_and_worktree(&self) -> (SessionId, PathBuf) {
+        let records = self.records();
+        let [record] = records.as_slice() else {
+            panic!("exactly one create record: {records:?}");
+        };
+        let transaction = record.transaction.as_ref().expect("create transaction");
+        assert_eq!(transaction.kind, crate::store::TransactionKind::Create);
+        assert_eq!(transaction.phase, "preparing");
+        assert_eq!(record.runtime.generation, None, "nothing was launched");
+        let bindings = self.bindings();
+        let [binding] = bindings.as_slice() else {
+            panic!("exactly one worktree binding: {bindings:?}");
+        };
+        assert_eq!(binding.session_id, record.session_id);
+        (SessionId(record.session_id.clone()), binding.path.clone())
+    }
+
+    /// Restarts the daemon over the same store and worker roots and runs
+    /// its startup reconciliation.
+    async fn restart(&self) -> SessionRegistry {
+        let (registry, _supervisor) = scripted_registry(self.config.clone());
+        registry
+            .reconcile_workers()
+            .await
+            .expect("startup reconciliation");
+        registry
+    }
+
+    /// Asserts that nothing of a compensated create is left and that its
+    /// branch binds again.
+    async fn assert_compensated(
+        &self,
+        registry: &SessionRegistry,
+        worktree: &std::path::Path,
+        branch: &str,
+    ) {
+        assert!(
+            !worktree.exists(),
+            "the compensated create's worktree is removed: {}",
+            worktree.display()
+        );
+        assert!(self.bindings().is_empty(), "its binding is dropped");
+        assert!(self.records().is_empty(), "its record is deleted last");
+        assert!(registry.list().await.is_empty(), "nothing stays listed");
+        let retried = registry
+            .create(self.params(branch))
+            .await
+            .expect("the freed branch binds again");
+        registry
+            .stop(&retried.id)
+            .await
+            .expect("stop the retried session");
+    }
+}
+
+/// Arms `registry` to park its next create once the target is bound.
+fn hold_bound_create(registry: &SessionRegistry) -> crate::runtime::lifecycle::tests::StartGate {
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *registry
+        .inner
+        .bound_create_hold
+        .lock()
+        .expect("bound create hold is never poisoned") = Some(gate.clone());
+    gate
+}
+
+#[tokio::test]
+async fn create_killed_between_bind_and_launch_is_compensated_at_restart() {
+    let daemon = RestartableDaemon::new("wt-crash-after-bind");
+    let (registry, supervisor) = scripted_registry(daemon.config.clone());
+    let gate = hold_bound_create(&registry);
+    // The daemon's own runtime: shutting it down drops the create's task at
+    // its current await point, as a killed daemon would.
+    let doomed = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("build the doomed daemon runtime");
+    doomed.spawn({
+        let registry = registry.clone();
+        let params = daemon.params("feat/crashed");
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+
+    let (_id, worktree) = daemon.intent_and_worktree();
+    assert!(worktree.is_dir(), "the target is bound before the launch");
+    doomed.shutdown_background();
+    drop(registry);
+    assert!(supervisor.started().is_empty(), "no job ever started");
+
+    let restarted = daemon.restart().await;
+
+    daemon
+        .assert_compensated(&restarted, &worktree, "feat/crashed")
+        .await;
+}
+
+#[tokio::test]
+async fn daemon_shutdown_drains_an_in_flight_create() {
+    let daemon = RestartableDaemon::new("wt-drain");
+    let (registry, _supervisor) = scripted_registry(daemon.config.clone());
+    let gate = hold_bound_create(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = daemon.params("feat/drained");
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+    let (id, worktree) = daemon.intent_and_worktree();
+
+    registry.begin_daemon_shutdown();
+    let refused = registry
+        .create(daemon.params("feat/refused"))
+        .await
+        .expect_err("shutdown refuses a new create");
+    assert_eq!(refused.code, "daemon_shutting_down");
+    assert_eq!(daemon.records().len(), 1, "a refused create writes nothing");
+    let mut drain = Box::pin(registry.drain_creates());
+    assert!(
+        futures::poll!(drain.as_mut()).is_pending(),
+        "the drain waits for the in-flight create"
+    );
+    gate.release.notify_one();
+
+    assert!(drain.await, "the drain ends once the create settled");
+    let created = creating
+        .await
+        .expect("create task joins")
+        .expect("the drained create commits");
+    assert_eq!(created.id, id);
+    let record = stored_record(&daemon.store_path, &id);
+    assert_eq!(record.transaction, None, "the create committed");
+    assert_eq!(record.info.worktree_path.as_ref(), Some(&worktree));
+    assert_eq!(daemon.bindings().len(), 1, "its worktree stays owned");
+}
+
+#[tokio::test]
+async fn create_drain_gives_up_at_its_deadline() {
+    let daemon = RestartableDaemon::new("wt-drain-deadline");
+    let (registry, _supervisor) = scripted_registry(SessionRegistryConfig {
+        create_drain_timeout: Duration::ZERO,
+        ..daemon.config.clone()
+    });
+    let gate = hold_bound_create(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = daemon.params("feat/undrained");
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+
+    registry.begin_daemon_shutdown();
+    assert!(
+        !registry.drain_creates().await,
+        "a create still running at the deadline is left to reconciliation"
+    );
+    daemon.intent_and_worktree();
+
+    gate.release.notify_one();
+    let created = creating
+        .await
+        .expect("create task joins")
+        .expect("the create commits after the drain gave up");
+    registry.stop(&created.id).await.expect("stop the session");
+}
+
+/// Arms the supervision retry barrier of `registry`: each finished pass is
+/// reported with the handle that resumes the retry loop.
+fn retry_passes(
+    registry: &SessionRegistry,
+) -> tokio::sync::mpsc::UnboundedReceiver<(SessionId, tokio::sync::oneshot::Sender<()>)> {
+    let (barrier, passes) = tokio::sync::mpsc::unbounded_channel();
+    registry
+        .inner
+        .supervision_retries
+        .state
+        .lock()
+        .expect("supervision retry state is never poisoned")
+        .pass_finished = Some(barrier);
+    passes
+}
+
+/// Asserts that `id` is the only listed session and that it waits for its
+/// create compensation to be retried.
+async fn assert_compensation_pending(registry: &SessionRegistry, id: &SessionId) {
+    let sessions = registry.list().await;
+    let [session] = sessions.as_slice() else {
+        panic!("the failed create stays listed for the retry: {sessions:?}");
+    };
+    assert_eq!(&session.id, id);
+    let runtime = session.runtime.as_ref().expect("runtime");
+    assert_eq!(runtime.state, RuntimeState::Reconnecting);
+    assert_eq!(
+        runtime.loss_reason.as_deref(),
+        Some(super::supervision::CREATE_COMPENSATION_PENDING)
+    );
+}
+
+/// Resumes retry passes of `id` until one leaves no durable record, then
+/// asserts that the running `registry` released everything of the create.
+async fn await_compensated(
+    daemon: &RestartableDaemon,
+    registry: &SessionRegistry,
+    passes: &mut tokio::sync::mpsc::UnboundedReceiver<(
+        SessionId,
+        tokio::sync::oneshot::Sender<()>,
+    )>,
+    id: &SessionId,
+    worktree: &std::path::Path,
+) {
+    tokio::time::timeout(DETACHED_COMMIT_TIMEOUT, async {
+        loop {
+            let (pass, resume) = passes.recv().await.expect("retry barrier open");
+            resume
+                .send(())
+                .expect("the retry loop waits at the barrier");
+            if pass == *id && daemon.records().is_empty() {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the supervision retry compensates the create");
+    assert!(!worktree.exists(), "the checkout is removed");
+    assert!(daemon.bindings().is_empty(), "its binding is dropped");
+    assert!(
+        registry.list().await.is_empty(),
+        "the compensated create leaves the running registry"
+    );
+}
+
+#[tokio::test]
+async fn launch_build_failure_with_a_failing_binding_store_is_compensated_by_the_retry() {
+    let daemon = RestartableDaemon::new("wt-build-store-fail");
+    let registry = SessionRegistry::new(daemon.without_shell());
+    let mut passes = retry_passes(&registry);
+    registry
+        .inner
+        .store
+        .as_ref()
+        .expect("registry store")
+        .fail_next_binding_removal();
+
+    let error = registry
+        .create(daemon.params("feat/store-fail"))
+        .await
+        .expect_err("the launch command cannot be built");
+
+    assert_eq!(error.code, "agent_binary_missing", "got: {error:?}");
+    assert!(
+        error.msg.contains("keeps its create record")
+            && error.msg.contains("create_compensation_pending"),
+        "the error names the kept record and its retry: {error:?}"
+    );
+    let (id, worktree) = daemon.intent_and_worktree();
+    assert!(
+        !worktree.exists(),
+        "the checkout is removed even though its binding could not be dropped"
+    );
+    assert_compensation_pending(&registry, &id).await;
+
+    // The binding store recovered, so the retry drops the binding of the
+    // vanished checkout and deletes the record, without a daemon restart.
+    await_compensated(&daemon, &registry, &mut passes, &id, &worktree).await;
+
+    // A launchable daemon binds the freed branch again.
+    daemon
+        .assert_compensated(&daemon.restart().await, &worktree, "feat/store-fail")
+        .await;
+}
+
+#[tokio::test]
+async fn failed_worktree_removal_is_retried_until_the_checkout_is_removable() {
+    let daemon = RestartableDaemon::new("wt-remove-fail");
+    let registry = SessionRegistry::new(daemon.without_shell());
+    let mut passes = retry_passes(&registry);
+    let gate = hold_bound_create(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = daemon.params("feat/locked");
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+    let (id, worktree) = daemon.intent_and_worktree();
+    // A locked worktree refuses `git worktree remove --force`.
+    let worktree_arg = worktree.to_str().expect("utf-8 worktree path");
+    git_in(&daemon.repo, &["worktree", "lock", worktree_arg]);
+    gate.release.notify_one();
+
+    let error = creating
+        .await
+        .expect("create task joins")
+        .expect_err("the launch command cannot be built");
+
+    assert_eq!(error.code, "agent_binary_missing", "got: {error:?}");
+    assert!(
+        worktree.is_dir(),
+        "the checkout that could not be removed stays"
+    );
+    daemon.intent_and_worktree();
+    assert_compensation_pending(&registry, &id).await;
+
+    // A pass while the worktree is still locked changes nothing.
+    let (pass, resume) = tokio::time::timeout(DETACHED_COMMIT_TIMEOUT, passes.recv())
+        .await
+        .expect("a retry pass runs")
+        .expect("retry barrier open");
+    assert_eq!(pass, id);
+    assert!(worktree.is_dir(), "the locked checkout stays");
+    daemon.intent_and_worktree();
+    assert_compensation_pending(&registry, &id).await;
+
+    git_in(&daemon.repo, &["worktree", "unlock", worktree_arg]);
+    resume
+        .send(())
+        .expect("the retry loop waits at the barrier");
+    await_compensated(&daemon, &registry, &mut passes, &id, &worktree).await;
+
+    // A launchable daemon binds the freed branch again.
+    daemon
+        .assert_compensated(&daemon.restart().await, &worktree, "feat/locked")
+        .await;
+}
+
+#[tokio::test]
+async fn unfinished_create_compensation_is_repeated_at_restart() {
+    let daemon = RestartableDaemon::new("wt-remove-fail-restart");
+    let registry = SessionRegistry::new(daemon.without_shell());
+    let gate = hold_bound_create(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = daemon.params("feat/locked-restart");
+        async move { registry.create(params).await }
+    });
+    gate.entered.notified().await;
+    let (id, worktree) = daemon.intent_and_worktree();
+    let worktree_arg = worktree.to_str().expect("utf-8 worktree path");
+    git_in(&daemon.repo, &["worktree", "lock", worktree_arg]);
+    gate.release.notify_one();
+    creating
+        .await
+        .expect("create task joins")
+        .expect_err("the launch command cannot be built");
+    assert_compensation_pending(&registry, &id).await;
+    // The daemon stops before its retry succeeded.
+    registry.begin_daemon_shutdown();
+    drop(registry);
+    git_in(&daemon.repo, &["worktree", "unlock", worktree_arg]);
+
+    let restarted = daemon.restart().await;
+
+    daemon
+        .assert_compensated(&restarted, &worktree, "feat/locked-restart")
+        .await;
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the dead-create setup, the failed retirement, and the retried settlement stay visible end to end"
+)]
+async fn reconciled_create_whose_worker_ended_is_retired_then_compensated() {
+    let daemon = RestartableDaemon::new("wt-terminal-create");
+    let (registry, supervisor) = scripted_registry(daemon.config.clone());
+    let created = registry
+        .create(daemon.params("feat/ended"))
+        .await
+        .expect("create session");
+    let launched = stored_record(&daemon.store_path, &created.id).runtime;
+    registry.stop(&created.id).await.expect("stop session");
+    let worktree = created.worktree_path.clone().expect("bound worktree");
+    registry.begin_daemon_shutdown();
+    drop(registry);
+    // The daemon died after the worker ran, before it committed the create:
+    // the worker still serves the final output of the ended runtime.
+    let mut record = stored_record(&daemon.store_path, &created.id);
+    record.transaction = Some(crate::store::SessionTransaction {
+        id: format!("create-{}", created.id.0),
+        kind: crate::store::TransactionKind::Create,
+        phase: "preparing".to_owned(),
+        previous_worker_id: None,
+        previous_runtime_id: None,
+    });
+    record.desired_state = crate::store::DesiredState::Running;
+    record.runtime = crate::store::RuntimeRecord {
+        state: RuntimeState::Starting,
+        ..launched
+    };
+    record.info.state = SessionState::Starting;
+    if let Some(runtime) = record.info.runtime.as_mut() {
+        runtime.state = RuntimeState::Starting;
+    }
+    daemon
+        .store()
+        .record_session(&record)
+        .expect("persist the preparing create");
+    let service_id = pohunek_platform::supervisor::ServiceId::parse(
+        record
+            .runtime
+            .service_id
+            .clone()
+            .expect("the record names its job"),
+    )
+    .expect("service id");
+    supervisor.script_retire_unavailable(service_id.clone());
+
+    let restarted = SessionRegistry::new_with_launcher_and_inspector(
+        daemon.config.clone(),
+        Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
+        Arc::new(ReadableHost::new()),
+    );
+    let (barrier, mut passes) = tokio::sync::mpsc::unbounded_channel();
+    restarted
+        .inner
+        .supervision_retries
+        .state
+        .lock()
+        .expect("supervision retry state is never poisoned")
+        .pass_finished = Some(barrier);
+    restarted
+        .reconcile_workers()
+        .await
+        .expect("startup reconciliation");
+
+    let calls = supervisor.calls();
+    assert!(
+        matches!(
+            calls.as_slice(),
+            [
+                crate::runtime::lifecycle::tests::Call::Start(_),
+                crate::runtime::lifecycle::tests::Call::Inspect(_),
+                crate::runtime::lifecycle::tests::Call::Retire(_),
+            ]
+        ),
+        "the answering worker's job is inspected, then retired: {calls:?}"
+    );
+    assert_eq!(
+        supervisor.retired(),
+        std::slice::from_ref(&service_id),
+        "the generation is retired before anything else is touched"
+    );
+    assert!(
+        worktree.is_dir(),
+        "an unconfirmed retirement keeps the checkout"
+    );
+    assert_eq!(daemon.bindings().len(), 1, "and its binding");
+    assert_eq!(daemon.records().len(), 1, "and its record");
+    let sessions = restarted.list().await;
+    let [session] = sessions.as_slice() else {
+        panic!("the create stays visible for the retry: {sessions:?}");
+    };
+    let runtime = session.runtime.as_ref().expect("runtime");
+    assert_eq!(runtime.state, RuntimeState::Reconnecting);
+    assert_eq!(
+        runtime.loss_reason.as_deref(),
+        Some(crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE)
+    );
+
+    tokio::time::timeout(DETACHED_COMMIT_TIMEOUT, async {
+        loop {
+            let (pass, resume) = passes.recv().await.expect("retry barrier open");
+            resume
+                .send(())
+                .expect("the retry loop waits at the barrier");
+            if pass == created.id && daemon.records().is_empty() {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the supervision retry settles the ended create");
+
+    assert_eq!(
+        supervisor.retired(),
+        [service_id.clone(), service_id],
+        "the retry retires the exact generation again"
+    );
+    daemon
+        .assert_compensated(&restarted, &worktree, "feat/ended")
+        .await;
+}
+
 /// Path of the real worker binary the subprocess launcher spawns.
 fn subprocess_worker_binary() -> PathBuf {
     if let Some(binary) = std::env::var_os("POHUNEK_WORKER_BIN") {

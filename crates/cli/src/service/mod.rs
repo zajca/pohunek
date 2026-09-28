@@ -13,7 +13,7 @@
 //! assemble those pieces explicitly instead, for example to point the
 //! systemd backend at another unit directory.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -107,9 +107,26 @@ pub async fn uninstall(options: UninstallOptions) -> Result<report::UninstallRep
 ///
 /// # Errors
 ///
-/// Returns [`Error`] for an unreadable `service.toml` or unsafe directories.
+/// Returns [`Error`] for an unreadable `service.toml` or unsafe directories,
+/// and [`Error::Config`] when the recorded installation does not describe
+/// this process (see [`status_of`]).
 pub async fn status() -> Result<report::StatusReport, Error> {
-    let context = Context::resolve()?;
+    status_of(&Context::resolve()?).await
+}
+
+/// Reports the installation `context` locates.
+///
+/// A recorded installation is verified like [`upgrade`] and [`uninstall`]
+/// verify it: its user and canonical roots must be this process's. Otherwise
+/// the report would mix the recorded namespace and prefix with the socket and
+/// transaction store the current `XDG_STATE_HOME` and `XDG_RUNTIME_DIR`
+/// select, and a caller acting on it would address another installation.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] with the differing key when the verification
+/// fails, before any service manager is contacted.
+async fn status_of(context: &Context) -> Result<report::StatusReport, Error> {
     let config_path = context.config_path();
     if !exists(&config_path)? {
         let store = record::Store::new(context.paths().state_dir.clone());
@@ -133,14 +150,14 @@ pub async fn status() -> Result<report::StatusReport, Error> {
             }),
         });
     }
-    let config = ServiceConfig::load(&config_path)?;
+    let config = verified_config(context)?;
     let backend = Backend::connect(
-        &context,
+        context,
         &config.namespace(),
         config.deadlines().launchctl_command,
     )
     .await?;
-    Engine::new(&context, &backend).status(Some(&config)).await
+    Engine::new(context, &backend).status(Some(&config)).await
 }
 
 fn staged_dir(context: &Context, from: Option<PathBuf>) -> Result<PathBuf, Error> {
@@ -153,14 +170,12 @@ fn staged_dir(context: &Context, from: Option<PathBuf>) -> Result<PathBuf, Error
     }
 }
 
+/// Accepts only the one normalized spelling of an absolute path.
+///
+/// `service.toml` rejects any other spelling of the prefix, so the flag is
+/// refused here rather than silently normalized.
 fn absolute(flag: &'static str, path: PathBuf) -> Result<PathBuf, Error> {
-    use std::path::Component;
-
-    let normalized = path.is_absolute()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)));
-    if normalized {
+    if pohunek_paths::is_normalized_absolute(&path) {
         Ok(path)
     } else {
         Err(Error::InvalidPath { flag, path })
@@ -203,13 +218,24 @@ async fn connect_installed(context: &Context) -> Result<Backend, Error> {
 /// Returns [`Error::Config`] when the file cannot be read or its recorded
 /// namespace inputs differ from this process's user or canonical roots.
 fn verified_connection(context: &Context) -> Result<(Namespace, Duration), Error> {
+    let config = verified_config(context)?;
+    Ok((config.namespace(), config.deadlines().launchctl_command))
+}
+
+/// Loads the installation recorded at `context.config_path()` and verifies
+/// its namespace inputs against the running process.
+///
+/// # Errors
+///
+/// See [`verified_connection`].
+fn verified_config(context: &Context) -> Result<ServiceConfig, Error> {
     let config = ServiceConfig::load(&context.config_path())?;
     config.verify_installation(
         context.uid(),
         &context.paths().state_dir,
         &context.paths().runtime_dir,
     )?;
-    Ok((config.namespace(), config.deadlines().launchctl_command))
+    Ok(config)
 }
 
 fn exists(path: &Path) -> Result<bool, Error> {
@@ -384,6 +410,36 @@ mod tests {
             ),
             "{error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn status_refuses_a_report_when_the_roots_changed() {
+        let (_temp, root, _context, _state) = installed();
+        for (state_home, runtime_dir, key) in [
+            ("moved-state", "run", "namespace.state_root"),
+            ("state", "moved-run", "namespace.runtime_root"),
+        ] {
+            let changed = context_of(
+                &root,
+                &root.join("config"),
+                &root.join(state_home),
+                &root.join(runtime_dir),
+                nix::unistd::Uid::effective().as_raw(),
+            );
+            changed.roots().expect("the moved roots resolve");
+
+            // The mismatch fails before any service manager is contacted, so
+            // the assertion holds with and without a session bus.
+            let error = status_of(&changed).await.expect_err("refused");
+            assert!(
+                matches!(
+                    &error,
+                    Error::Config(ConfigError::NamespaceMismatch { key: rejected, .. }) if *rejected == key
+                ),
+                "{error:?}"
+            );
+            assert_eq!(error.code(), "service_config_invalid");
+        }
     }
 
     #[tokio::test]

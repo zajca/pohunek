@@ -380,6 +380,7 @@ fn service_error_class(error: &crate::service::Error) -> ErrorClass {
     match error {
         Error::MissingEnv { .. }
         | Error::Paths(_)
+        | Error::NonUtf8Env { .. }
         | Error::InvalidPath { .. }
         | Error::Config(_)
         | Error::UntrustedDirectory { .. }

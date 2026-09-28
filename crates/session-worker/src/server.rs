@@ -1117,27 +1117,14 @@ async fn initialize_request(
     effective_config
         .validate()
         .map_err(|error| control_error(ControlCode::InvalidRequest, error, false))?;
-    let pty = spawn_pty(command, &effective_config)?;
-    let child_process = wire_identity(pty.identity())?;
-    let live_commit = {
-        let mut state = shared.state.lock().await;
-        state.phase = WireRuntimePhase::Running;
-        state.stop_grace = stop_grace;
-        state.terminal_retention = retention;
-        state.launch_agent_base = Some(initialize.launch.agent_base);
-        state.journal.phase = JournalPhase::Live;
-        state.journal.child = Some(journal_identity(pty.identity()));
-        state.journal.pty_created_at = Some(timestamp());
-        state.journal.cols = Some(initialize.dimensions.columns());
-        state.journal.rows = Some(initialize.dimensions.rows());
-        state.journal.updated_at = timestamp();
-        state.pty = Some(pty.clone());
-        persist(shared.journal.clone(), state.journal.clone()).await
-    };
-    if let Err(error) = live_commit {
-        let _ = pty.stop("journal-failure", stop_grace).await;
-        return Err(control_error(ControlCode::RuntimeFault, error, false));
-    }
+    let (pty, child_process) = spawn_running(
+        shared,
+        command,
+        &effective_config,
+        initialize.launch.agent_base,
+        &initialize.dimensions,
+    )
+    .await?;
     shared.initialized_tx.send_replace(true);
     shared.emit(EventKind::RuntimeStarted {
         runtime_id: runtime_id.clone(),
@@ -1148,6 +1135,43 @@ async fn initialize_request(
         runtime_id,
         child_process,
     })
+}
+
+/// Spawns the runtime's child and commits `Running` in one state-lock hold.
+///
+/// The child can report its identity as soon as it runs, and a hook claim is
+/// admitted only in `Running`. Holding the lock across the spawn makes every
+/// claim wait for the commit instead of racing it and being refused.
+async fn spawn_running(
+    shared: &Shared,
+    command: Command,
+    config: &WorkerConfig,
+    agent_base: String,
+    dimensions: &Dimensions,
+) -> Result<(PtyOwner, WireProcessIdentity), ControlError> {
+    let (pty, child_process, committed) = {
+        let mut state = shared.state.lock().await;
+        let pty = spawn_pty(command, config)?;
+        let child_process = wire_identity(pty.identity())?;
+        state.phase = WireRuntimePhase::Running;
+        state.stop_grace = config.stop_grace;
+        state.terminal_retention = config.terminal_retention;
+        state.launch_agent_base = Some(agent_base);
+        state.journal.phase = JournalPhase::Live;
+        state.journal.child = Some(journal_identity(pty.identity()));
+        state.journal.pty_created_at = Some(timestamp());
+        state.journal.cols = Some(dimensions.columns());
+        state.journal.rows = Some(dimensions.rows());
+        state.journal.updated_at = timestamp();
+        state.pty = Some(pty.clone());
+        let committed = persist(shared.journal.clone(), state.journal.clone()).await;
+        (pty, child_process, committed)
+    };
+    if let Err(error) = committed {
+        let _ = pty.stop("journal-failure", config.stop_grace).await;
+        return Err(control_error(ControlCode::RuntimeFault, error, false));
+    }
+    Ok((pty, child_process))
 }
 
 fn spawn_pty(command: Command, config: &WorkerConfig) -> Result<PtyOwner, ControlError> {
@@ -6482,5 +6506,103 @@ mod tests {
 
         assert!(matches!(error, crate::WorkerError::InvalidGeneration(_)));
         assert!(!directory.path().join("fixture").exists());
+    }
+
+    /// How long a lock holder observing `Starting` watches for the child.
+    ///
+    /// Long enough for `/bin/sh` to start and write its marker when the child
+    /// is spawned outside the lock; a shorter wait only lowers the test's
+    /// sensitivity, never makes it fail spuriously.
+    const STARTING_CHILD_WATCH: Duration = Duration::from_millis(500);
+
+    /// Interval between checks for the child's marker file.
+    const MARKER_POLL: Duration = Duration::from_millis(5);
+
+    /// A runtime's child never runs while the worker is observably `Starting`.
+    ///
+    /// Hook claims are admitted only in `Running`, and a child reports its
+    /// identity as soon as it runs. A child spawned before the `Running`
+    /// commit could have that report rejected as `phase_not_running` and exit
+    /// on the refusal, so the spawn and the commit share one state-lock hold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initialize_spawns_the_child_only_under_the_running_commit() {
+        let directory =
+            tempfile::tempdir_in(crate::test_support::temp_root()).expect("fixture directory");
+        let server = environment_fixture(directory.path(), "abcd2345")
+            .await
+            .expect("bind worker");
+        let marker = directory.path().join("child-started");
+        let mut initialize = environment_initialize(
+            Some(base_environment(&[("PATH", "/usr/bin:/bin")])),
+            &[("CHILD_MARKER", marker.to_str().expect("UTF-8 marker path"))],
+        );
+        initialize.executable = std::path::PathBuf::from("/bin/sh");
+        initialize.arguments = vec![
+            "-c".to_owned(),
+            ": > \"$CHILD_MARKER\"; read -r line".to_owned(),
+        ];
+        let owner = crate::LeaseOwner {
+            daemon_id: "daemon-initialize".to_owned(),
+            peer_pid: std::process::id(),
+            peer_start_identity: "7400".to_owned(),
+        };
+        let lease_id = LeaseId::new("lease-initialize").expect("lease id");
+        server
+            .shared
+            .lease
+            .acquire(owner.clone(), lease_id.as_str().to_owned())
+            .expect("acquire lease");
+        let mut connection = Connection::new(std::sync::Arc::new(owner_peer(&owner)));
+        connection.owner = Some(owner);
+        connection.lease_id = Some(lease_id.clone());
+        connection.selected_version = Some(CURRENT_VERSION);
+
+        let shared = std::sync::Arc::clone(&server.shared);
+        let observer_marker = marker.clone();
+        let observer = tokio::spawn(async move {
+            loop {
+                let state = shared.state.lock().await;
+                match state.phase {
+                    super::WireRuntimePhase::Uninitialized => {
+                        drop(state);
+                        tokio::task::yield_now().await;
+                    }
+                    super::WireRuntimePhase::Starting => {
+                        let deadline = tokio::time::Instant::now() + STARTING_CHILD_WATCH;
+                        while tokio::time::Instant::now() < deadline {
+                            if observer_marker.exists() {
+                                return Some(true);
+                            }
+                            tokio::time::sleep(MARKER_POLL).await;
+                        }
+                        drop(state);
+                        return Some(false);
+                    }
+                    _ => return None,
+                }
+            }
+        });
+        let initialized =
+            super::initialize_request(&server.shared, &connection, &lease_id, initialize)
+                .await
+                .expect("initialize runtime");
+
+        assert!(matches!(initialized, ResponseKind::Initialized { .. }));
+        assert_eq!(
+            observer.await.expect("observer task"),
+            Some(false),
+            "the observer must see `Starting` and no child while it holds the lock"
+        );
+        let pty = server
+            .shared
+            .state
+            .lock()
+            .await
+            .pty
+            .clone()
+            .expect("running PTY");
+        pty.stop("test-cleanup", Duration::from_millis(500))
+            .await
+            .expect("stop child");
     }
 }

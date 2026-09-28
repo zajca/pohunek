@@ -576,6 +576,59 @@ fn paths_must_be_absolute_and_normalized() {
 }
 
 #[test]
+fn validate_prefix_decides_exactly_as_the_config_does() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let long = format!("/{}", "a".repeat(4096));
+    let non_utf8 = PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/\xff/.local"));
+    let mut prefixes: Vec<PathBuf> = [
+        "/home/u/.local",
+        "/",
+        "relative/dir",
+        "",
+        "/a/../b",
+        "/a/.",
+        "/a/./b",
+        "/a//b",
+        "/a/b/",
+        "/a/\0b",
+        long.as_str(),
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+    prefixes.push(non_utf8);
+    for prefix in prefixes {
+        let mut value = spec();
+        value.prefix.clone_from(&prefix);
+        match (
+            pohunek_service_config::validate_prefix(&prefix),
+            ServiceConfig::new(value),
+        ) {
+            (Ok(layout), Ok(config)) => assert_eq!(&layout, config.layout(), "{prefix:?}"),
+            (
+                Err(ConfigError::InvalidPath {
+                    key: "prefix",
+                    reason,
+                    ..
+                }),
+                Err(ConfigError::InvalidPath {
+                    key: "prefix",
+                    reason: config_reason,
+                    ..
+                }),
+            ) => assert_eq!(reason, config_reason, "{prefix:?}"),
+            other => panic!("{prefix:?}: {other:?}"),
+        }
+    }
+    assert!(matches!(
+        pohunek_service_config::validate_prefix(Path::new("/a/.")),
+        Err(ConfigError::InvalidPath { key: "prefix", .. })
+    ));
+    pohunek_service_config::validate_prefix(Path::new("/home/u/.local")).expect("normalized");
+}
+
+#[test]
 fn install_versions_must_be_one_safe_component() {
     let fixture = Fixture::new();
     let too_long = "1".repeat(65);

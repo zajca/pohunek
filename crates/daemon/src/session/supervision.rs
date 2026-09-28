@@ -50,6 +50,13 @@ pub(crate) const UNSUPERVISED_WORKER: &str = "worker_job_absent";
 /// Inventory reason of a live job whose generation no durable record names.
 pub(crate) const STALE_GENERATION: &str = "stale_worker_generation";
 
+/// Reason of an unfinished create whose runtime is proven ended but whose
+/// worktree, binding, or record could not be removed yet.
+///
+/// The session stays listed as `reconnecting` with this reason while the
+/// supervision retry repeats the compensation; nothing of it can run.
+pub(crate) const CREATE_COMPENSATION_PENDING: &str = "create_compensation_pending";
+
 /// Upper bound on marker-sweep passes for one lost runtime.
 ///
 /// A single pass selects its targets before signalling, so a process forked
@@ -261,6 +268,9 @@ enum Waiting {
     Evidence,
     /// Retirement of its terminal generation's job.
     Retirement,
+    /// Removal of what an unfinished create bound, once its runtime is
+    /// proven ended.
+    Compensation,
 }
 
 #[derive(Debug, Default)]
@@ -392,11 +402,13 @@ impl SessionRegistry {
     ///
     /// A job whose generation is not a record's current generation (or whose
     /// session has no record) is re-inspected under its session's lifecycle
-    /// lock. Proven ended, it is retired by exact service ID, which also
+    /// lock. Proven ended (see [`classify_stale_job`]: its journaled worker
+    /// must be gone too), it is retired by exact service ID, which also
     /// removes its definition. Still live, it is left alone and returned as an
     /// orphaned inventory entry. A job without a process in a state that
-    /// proves nothing, and a job whose inspection failed, are also returned
-    /// as orphaned; unless a journaled worker still runs, each is re-checked
+    /// proves nothing, a job whose generation's journals cannot be read, and a
+    /// job whose inspection failed are also returned as orphaned; unless a
+    /// journaled worker still runs, each is re-checked
     /// once the worker initialization deadline has passed since this first
     /// sight (see [`Self::settle_unproven_stale_job`]). Discovery failure only skips this
     /// cleanup; every record's own generation is inspected individually.
@@ -478,9 +490,10 @@ impl SessionRegistry {
     ///
     /// Sessions wait here while their supervisor is unavailable, while their
     /// generation is ambiguous (a job or process that may still be live but
-    /// no reachable worker), or while the job of a terminal session's
-    /// proven-ended generation could not be retired. One task serves every
-    /// pending session with a doubling delay bounded by
+    /// no reachable worker), while the job of a terminal session's
+    /// proven-ended generation could not be retired, or while an unfinished
+    /// create's worktree, binding, or record could not be removed. One task
+    /// serves every pending session with a doubling delay bounded by
     /// [`SUPERVISION_RETRY_MAX`]; each pass classifies from fresh evidence and
     /// never kills while it stays ambiguous. The task stops when no session is
     /// pending, when daemon shutdown starts, or when the registry is dropped;
@@ -549,8 +562,9 @@ impl SessionRegistry {
     }
 
     /// Re-reconciles one session left `runtime_supervision_unavailable` or
-    /// `runtime_supervision_ambiguous`, or re-attempts retiring the job of a
-    /// terminal session's generation.
+    /// `runtime_supervision_ambiguous`, re-attempts retiring the job of a
+    /// terminal session's generation, or repeats the compensation of a create
+    /// left `create_compensation_pending`.
     ///
     /// Returns whether the session no longer needs a retry: it was resolved,
     /// removed, or changed by another lifecycle operation.
@@ -564,6 +578,9 @@ impl SessionRegistry {
             match (runtime.state, runtime.loss_reason.as_deref()) {
                 (RuntimeState::Reconnecting, Some(SUPERVISION_UNAVAILABLE))
                 | (RuntimeState::Conflict, Some(SUPERVISION_AMBIGUOUS)) => Some(Waiting::Evidence),
+                (RuntimeState::Reconnecting, Some(CREATE_COMPENSATION_PENDING)) => {
+                    Some(Waiting::Compensation)
+                }
                 // Only a terminal entry that still names its generation
                 // can have a job left to retire.
                 (RuntimeState::Terminal, _) if entry.job.is_some() => Some(Waiting::Retirement),
@@ -581,8 +598,19 @@ impl SessionRegistry {
                 return false;
             }
         };
+        let creating = record
+            .transaction
+            .as_ref()
+            .is_some_and(|transaction| transaction.kind == crate::store::TransactionKind::Create);
         match waiting {
-            Waiting::Evidence => !self.reconcile_single_session(record).await,
+            // The runtime was proven ended before the first attempt, and a
+            // create generation never runs again, so only the removal repeats.
+            Waiting::Compensation if creating => self.try_compensate_create(id).await,
+            // A later lifecycle operation replaced the create intent, so the
+            // record is classified from fresh evidence instead.
+            Waiting::Compensation | Waiting::Evidence => {
+                !self.reconcile_single_session(record).await
+            }
             Waiting::Retirement => self.retry_terminal_retirement(&record).await,
         }
     }
@@ -906,44 +934,59 @@ impl Drop for RunningGuard {
 /// What a fresh inspection proves about a stale job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StaleJob {
-    /// Absent, ended, or its journaled worker is proven gone.
+    /// Absent or ended, and no journaled worker of its generation runs:
+    /// either the one journal names a worker proven gone, or a successful
+    /// scan found none.
     Ended,
     /// It has a process, a live state, or a journaled worker that may run.
     Live,
-    /// No process in a state that proves nothing, and no journaled worker
-    /// decides it: no journal of the generation, or its journals unreadable.
+    /// Nothing decides it: its journals cannot be read, or it has no
+    /// process in a state that proves nothing and no journal of the
+    /// generation.
     Unproven,
 }
 
-/// Classifies a stale job from a fresh inspection; absence counts as ended.
+/// Classifies a stale job from a fresh inspection and its generation's
+/// journal.
 ///
 /// `journal` is the generation's journaled worker, or why it cannot be read.
+/// A job that is absent or ended still proves nothing about its worker (a
+/// worker outlives a job the manager stopped or forgot), so the journal
+/// decides every job that is not live: a journaled worker must be proven gone
+/// by PID and start identity, and an unreadable journal leaves it unproven.
 async fn classify_stale_job(
     lifecycle: &Lifecycle<'_>,
     id: &ServiceId,
     journal: Result<Option<&JournalWorker<'_>>, &str>,
     inspector: &dyn ProcessInspector,
 ) -> Result<StaleJob, SupervisorError> {
-    let Some(fresh) = lifecycle.inspect_service(id).await? else {
-        return Ok(StaleJob::Ended);
-    };
-    if !observation_live(&fresh) {
-        return Ok(StaleJob::Ended);
-    }
-    if !observation_unproven(&fresh) {
+    let fresh = lifecycle.inspect_service(id).await?;
+    let ended = fresh.as_ref().is_none_or(|fresh| !observation_live(fresh));
+    if !ended
+        && fresh
+            .as_ref()
+            .is_some_and(|fresh| !observation_unproven(fresh))
+    {
         return Ok(StaleJob::Live);
     }
-    let Ok(Some(worker)) = journal else {
-        return Ok(StaleJob::Unproven);
-    };
-    let gone = worker
-        .identity()
-        .is_ok_and(|identity| matches!(inspector.is_running(identity), Ok(false)));
-    Ok(if gone {
-        StaleJob::Ended
-    } else {
-        StaleJob::Live
-    })
+    match journal {
+        Err(detail) => {
+            tracing::warn!(service_id = %id, detail, "stale worker job's journals cannot be read; its worker is unproven");
+            Ok(StaleJob::Unproven)
+        }
+        Ok(Some(worker)) => {
+            let gone = worker
+                .identity()
+                .is_ok_and(|identity| matches!(inspector.is_running(identity), Ok(false)));
+            Ok(if gone {
+                StaleJob::Ended
+            } else {
+                StaleJob::Live
+            })
+        }
+        Ok(None) if ended => Ok(StaleJob::Ended),
+        Ok(None) => Ok(StaleJob::Unproven),
+    }
 }
 
 /// Retires a stale job by exact service ID; an absent job is fine.

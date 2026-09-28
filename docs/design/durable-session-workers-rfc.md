@@ -378,6 +378,17 @@ parse, or a definition file that does not parse, is labeled differently from
 its name, or is not a private regular file), because such an entry may belong
 to a job that still runs a version.
 
+systemd lists worker units from the user manager. launchd lists no labels
+without parsing `launchctl` output, so the private definitions directory is the
+launchd registry: `start` creates it and publishes `<label>.plist` there before
+`bootstrap`, retirement removes a definition only once its label is absent,
+and only an uninstall that retired every worker removes the directory. A
+missing directory is therefore an empty result. A worker whose `<label>.plist`
+is missing while an interrupted registration left `.<label>.plist.replaced` is
+probed with `launchctl print` without moving either file: a loaded label fails
+the strict discovery as a race, an absent one runs nothing, and the label's
+next registration or retirement settles the file.
+
 No worker unit file or template is installed. Every worker **generation** is
 one job the daemon registers itself with an explicit, validated
 `JobDefinition` (`crates/platform/src/supervisor/mod.rs`):
@@ -387,6 +398,10 @@ one job the daemon registers itself with an explicit, validated
   `--session-id <id> --worker-generation <generation> --service-config <abs>
   --daemon-socket-path <abs>` (no shell);
 - a bootstrap environment restricted to `HOME` and the XDG base directories;
+  the daemon checks every forwarded value, and `HOME` as an existing
+  directory, against the same `JobDefinition` rules at startup and refuses to
+  start on a value they reject (for example a relative `HOME`), instead of
+  reporting ready and failing every `session.new`;
 - a working directory, log paths (launchd only), a start timeout, an exit
   timeout, the restart policy `Never`, and an open-file limit.
 
@@ -1049,10 +1064,11 @@ Creation is a durable transaction. The ordered phases are:
 
 1. validate public parameters and resolve the agent profile;
 2. allocate session ID and create a `SessionRecord` with
-   `desired_state=running`, `transaction=create/preparing`, and structural
-   launch metadata;
-3. resolve project and create or bind the worktree, atomically updating the
-   session and worktree records;
+   `desired_state=running`, `transaction=create/preparing`, structural
+   launch metadata, and no worker generation (the create intent);
+3. resolve project and create or bind the worktree; the worktree binding is
+   persisted before `git worktree add`, so every checkout the create makes is
+   reachable from its binding and, through the session ID, from the record;
 4. persist the preparing record with a newly minted worker generation, then
    ask the platform `Supervisor` to start that generation's job (section 8.2);
 5. negotiate with the bootstrap worker and record worker ID;
@@ -1072,12 +1088,12 @@ initial input. `session_created` is emitted exactly once.
 | Crash point | Reconciliation outcome |
 |-------------|------------------------|
 | before phase 2 | no session exists |
-| after phase 2, before worktree bind | mark create failed and remove empty record |
-| during worktree bind | inspect authoritative worktree binding; finish or compensate without guessing |
+| after phase 2, before worktree bind | the record names no generation, so nothing was launched; compensate (no binding to remove) and delete the record |
+| during or after worktree bind, before phase 4 | the record still names no generation; remove every checkout bound to the session and its binding, then delete the record |
 | after unit start, before initialization | worker initialization deadline exits it; mark create failed |
 | during `Initialize`, before child spawn | same transaction ID is retried or worker reports pre-spawn failure |
 | after child spawn, before live journal | worker terminates child because it cannot establish recoverable authority |
-| after live journal, before daemon commit | daemon adopts worker into the preparing logical record and commits |
+| after live journal, before daemon commit | daemon adopts a live worker into the preparing logical record and commits; a worker whose runtime already ended (it answers with a terminal phase, or only its terminal journal remains) has its generation retired, then the worktree compensated, then the record deleted |
 | after commit, before event | event log reconciliation emits one recovered creation event keyed by transaction ID |
 | during initial input | same write ID is inspected/retried; definite failure triggers durable stop and worktree compensation |
 
@@ -1085,16 +1101,37 @@ Compensation never kills a live worker whose identity does not exactly match the
 preparing record. Such a mismatch becomes `runtime_conflict` for operator
 inspection.
 
-Phases 3 through 8 run as one daemon task detached from the client request, so
-a client that disconnects mid-create never cancels its compensation. A bound
-worktree is removed (`git worktree remove --force`) only once the create's
-generation is proven ended: it never started, or its job was retired by exact
-generation. Compensation removes the worktree and its binding first and the
-preparing record last, so the record keeps guarding a partial rollback and a
-later reconciliation repeats it. A generation whose retirement the supervisor
-cannot confirm keeps its worktree, binding, and record as
+Phases 2 through 8 run as one daemon task detached from the client request, so
+a client that disconnects mid-create never cancels its compensation. Daemon
+shutdown refuses new creates with `daemon_shutting_down` and drains the
+in-flight create tasks, bounded by the registry's create drain timeout, before
+the runtime stops; a create still running at that deadline, or one cut short by
+a killed daemon, is settled by startup reconciliation from its phase 2 record.
+
+A bound worktree is removed (`git worktree remove --force`) only once the
+create's generation is proven ended: it never started (the record names no
+generation, or its job start failed), or its job was retired by exact
+generation. The final order of a compensation is:
+
+1. retire the create's generation by exact service ID, when one was recorded;
+2. remove each checkout bound to the session, dropping a binding only when its
+   checkout is gone (removed, or its directory already vanished and `git
+   worktree prune` ran);
+3. delete the preparing record, only once no binding of the session is left.
+
+Any step that fails stops the sequence and keeps what follows it, so the
+record keeps guarding a partial rollback and a later reconciliation repeats
+it; a repeat finds nothing left to remove. A generation whose retirement the
+supervisor cannot confirm keeps its worktree, binding, and record as
 `runtime_supervision_unavailable`; the create fails with that error, and the
-supervision retry compensates once the job is proven ended.
+supervision retry compensates once the job is proven ended. A compensation
+that cannot finish once the generation is proven ended (a checkout that cannot
+be removed keeps its binding, or the store cannot drop the binding or the
+record) keeps the record and lists the session `reconnecting` with
+`create_compensation_pending`; the create still fails with its original error,
+and the supervision retry (row 16 backoff) repeats steps 2 and 3 in the running
+daemon until they succeed and the session leaves with `session_removed`.
+Startup reconciliation of the preparing record repeats them as well.
 
 ## 15. Startup Discovery and Reconciliation
 
@@ -1136,7 +1173,7 @@ Reconciliation applies these rows in order
 | 4 | live worker of the exact generation; job present with a mismatched definition (executable, or argv without `--session-id <id>` / `--worker-generation <gen>`) or a main process that is not the journaled worker | `conflict`, `runtime_identity_mismatch`; nothing killed |
 | 5 | live worker of the exact generation; job proven absent | adopt (`live`); warn `reconcile.adopt.job_absent`; inventory stays `managed` with reason `worker_job_absent`, re-announced as `session_runtime_discovered` |
 | 6 | live worker of the exact generation; job cannot be inspected | adopt (`live`) with a warning; the authenticated worker plus its journal is the proof |
-| 7 | live worker of the exact generation; job matches | reconnect and mark `live`; adopt and commit a preparing create; replay a requested stop or remove. A replayed remove needs the stop to return the terminal outcome and then runs the removal finalizer (§16.3); a stop without an outcome or a failed stop is `reconnecting`, `runtime_supervision_unavailable` and retried with the row 16 backoff, keeping the intent |
+| 7 | live worker of the exact generation; job matches | reconnect and mark `live`; adopt and commit a preparing create; replay a requested stop or remove, also on a worker still `stopping`. A replayed stop commits `stopped` only once the worker returns the terminal outcome; a replayed remove needs that outcome and then runs the removal finalizer (§16.3). For either, a stop without an outcome or a failed stop is `reconnecting`, `runtime_supervision_unavailable` and retried with the row 16 backoff, which replays the stop again, keeping the intent |
 | 8 | no reachable worker; terminal journal of this generation | import the terminal outcome, then retire the generation's job (absent is fine; a launchd `RunAtLoad` job stays loaded after its worker exits). A removal intent with no socket answering is not imported: the removal finalizer (§16.3) finishes it. A failed retirement keeps the imported outcome and is retried with the row 16 backoff while the journal still proves the generation terminal and no socket answers. A socket that answers but cannot be adopted keeps its worker, which retains only final output, and leaves the job to a later reconciliation. A malformed or `Faulted` journal is `conflict`, `worker_journal_identity_mismatch` |
 | 9 | socket answers but cannot be adopted | incompatible protocol: `incompatible`, `worker_protocol_incompatible`, worker left alive, job not inspected; identity mismatch: `conflict`, `runtime_identity_mismatch` |
 | 10 | record without a generation and without evidence | an unfinished create is deleted; otherwise `lost`, `worker_unavailable` |
@@ -1147,7 +1184,7 @@ Reconciliation applies these rows in order
 | 14 | no reachable worker; job absent, ended, or loaded without a process in a state that proves nothing (launchd reports a loaded label without a matching process as `unknown`); journal not terminal; journaled worker PID not running with its recorded start identity (a reused PID counts as not running) | proven crash: marker sweep of the journal's `runtime_id`, retire the job (absent is fine), then `lost`, `runtime_lost`; a removal intent runs the removal finalizer (§16.3) instead, whose own sweep must be confirmed before the record is deleted. `lost` counts as ended, so it is published only after the job is retired: a failed retirement is `reconnecting`, `runtime_supervision_unavailable` and retried with the row 16 backoff, which reaches this row again. The same holds when a running session's worker connection drops; `runtime_lost_cleanup_unconfirmed` when the sweep reports unconfirmed processes, fails, leaves a process whose markers could not be read and that started at or after the journaled worker, or still finds processes after 3 passes. Never a retried kill loop |
 | 15 | no reachable worker; job absent or ended; a successful scan found no journal for this generation | retire the job, then `lost`, `worker_unavailable`. No marker sweep: without a journal nothing proves which runtime ran. An unfinished create is deleted only after the retire succeeds, a removal intent runs the removal finalizer (§16.3), and any other failed retirement is `reconnecting`, `runtime_supervision_unavailable` and retried; all three keep the record until the retry succeeds |
 | 16 | job inspection fails (unavailable, timeout, or still racing after the retries) | `reconnecting`, `runtime_supervision_unavailable`; nothing touched; background re-reconciliation after 1 s, doubling to at most 60 s, until the session is resolved or changed or the daemon shuts down (a supervisor outage during create schedules the same retry). The same retry re-checks `runtime_supervision_ambiguous` sessions and never kills while the evidence stays ambiguous; a removal waiting for a confirmed marker sweep (§16.3) re-runs that sweep, which signals only processes carrying exactly a removed runtime's marker |
-| 17 | job of a generation that is not a record's current one, or of a session without a record | re-inspected: proven ended or absent is retired (a job loaded without a process counts as ended when the one journal of its generation names a worker PID that is not running; with no journal it stays `orphaned` until `worker_initialize` has passed since first sight, and is then retired if a fresh check still finds no process and no journal, because a worker journals before it opens its PTY) by exact service ID (removing its definition); still live is left alone, inventory `orphaned` with `runtime_slot` = its service ID and reason `stale_worker_generation`. A job whose inspection fails is also `orphaned`, never retired on that evidence, and re-inspected once `worker_initialize` has passed, repeating while the inspection keeps failing. When discovery fails this cleanup is skipped and logged; each record's own generation is still inspected |
+| 17 | job of a generation that is not a record's current one, or of a session without a record | re-inspected: proven ended is retired by exact service ID (removing its definition). An absent or ended job is no proof by itself, because its worker can outlive it: the one journal of its generation must name a worker PID that is not running with its recorded start identity, or a successful scan must find no journal of the generation. A job loaded without a process counts as ended by the same journal proof; with no journal it stays `orphaned` until `worker_initialize` has passed since first sight, and is then retired if a fresh check still finds no process and no journal, because a worker journals before it opens its PTY. A journaled worker that still runs keeps the job `orphaned`; journals of the session that cannot be read keep it `orphaned` as well and are re-read once `worker_initialize` has passed, never retiring on that evidence. Still live is left alone. A job left alone is inventory `orphaned` with `runtime_slot` = its service ID and reason `stale_worker_generation`. A job whose inspection fails is also `orphaned`, never retired on that evidence, and re-inspected once `worker_initialize` has passed, repeating while the inspection keeps failing. When discovery fails this cleanup is skipped and logged; each record's own generation is still inspected |
 | – | worker socket of a session without a logical record | inventory `orphaned`, reason `logical_session_missing`; the worker is left alive |
 | – | terminal record; stale inactive journal | keep summary, schedule safe journal cleanup |
 
@@ -1516,6 +1553,22 @@ Startup never treats a legacy `resume` record as proof that no live legacy
 daemon exists. Migration requires the legacy daemon instance lock to be released
 and the signed-off manifest to match the store fingerprint. An incomplete or
 mismatched migration fails closed with an actionable diagnostic.
+
+A store that holds legacy resume bindings but no logical record, with no
+manifest to import, was never snapshotted by the preflight. A binding alone
+proves neither the session's state nor consent to runtime loss, so it is not
+imported. The daemon still starts, because the preflight that fixes it needs
+the legacy daemon, not this one, and nothing live is at stake: the legacy PTYs
+ended with the legacy daemon. Each such binding is kept on disk untouched and
+listed in the runtime inventory as `orphaned` with reason
+`migration_manifest_missing` (announced with `session_runtime_discovered`, and
+logged as `reconcile.migration.manifest_missing`). To import them the
+operator reinstalls the legacy release and reruns the worker-aware installer,
+whose `pohunek migration preflight` snapshots them: once a logical record
+exists, a later manifest is archived without being imported. While such
+bindings are listed, `session.new` and `session.fork` fail with
+`migration_manifest_missing` before anything is written; the gate is decided
+at startup, so the start that imports the manifest lifts it.
 
 ## 22. Security and Privacy
 

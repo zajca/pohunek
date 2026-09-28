@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -231,7 +231,7 @@ pub enum PathError {
         /// Validation failure.
         reason: InvalidPathReason,
     },
-    /// An installation prefix is relative or contains a parent component.
+    /// An installation prefix is not an absolute normalized path.
     #[error("installation prefix must be an absolute normalized path: {}", path.display())]
     InvalidInstallPrefix {
         /// Rejected prefix.
@@ -492,19 +492,15 @@ pub struct InstallLayout {
 }
 
 impl InstallLayout {
-    /// Creates the layout rooted at an absolute installation prefix.
+    /// Creates the layout rooted at an absolute normalized installation prefix.
     ///
     /// # Errors
     ///
-    /// Returns [`PathError::InvalidInstallPrefix`] when `prefix` is not absolute or
-    /// contains a parent-directory component.
+    /// Returns [`PathError::InvalidInstallPrefix`] when `prefix` fails
+    /// [`is_normalized_absolute`].
     pub fn new(prefix: impl Into<PathBuf>) -> Result<Self, PathError> {
         let prefix = prefix.into();
-        if !prefix.is_absolute()
-            || prefix
-                .components()
-                .any(|component| matches!(component, Component::ParentDir))
-        {
+        if !is_normalized_absolute(&prefix) {
             return Err(PathError::InvalidInstallPrefix { path: prefix });
         }
         Ok(Self { prefix })
@@ -547,6 +543,21 @@ impl InstallLayout {
         self.version_dir(version)
             .map(|dir| dir.join(WORKER_EXECUTABLE_NAME))
     }
+}
+
+/// Returns whether `path` is absolute and spelled exactly as its components.
+///
+/// Rejects `.`, `..`, repeated or trailing separators, and NUL bytes, so the
+/// accepted spelling is the only one: a path recorded in `service.toml` or a
+/// job definition compares equal to every later spelling of the same path.
+#[must_use]
+pub fn is_normalized_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && !path_bytes(path).contains(&0)
+        && path
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+        && path.components().collect::<PathBuf>().as_os_str() == path.as_os_str()
 }
 
 /// Validates an installed version directory name.
@@ -1207,11 +1218,43 @@ mod tests {
         for unsafe_version in ["", ".", "..", "../x", "a/b", "1 2", &"1".repeat(65)] {
             assert_eq!(layout.version_dir(unsafe_version), None, "{unsafe_version}");
         }
-        for prefix in ["relative", "/home/u/../x", ""] {
-            assert!(matches!(
-                InstallLayout::new(prefix),
-                Err(PathError::InvalidInstallPrefix { .. })
-            ));
+        for prefix in [
+            "relative",
+            "/home/u/../x",
+            "",
+            "/home/u/.local/.",
+            "/home/u/./.local",
+            "/home//u/.local",
+            "/home/u/.local/",
+            "/home/u/\0/.local",
+        ] {
+            assert!(
+                matches!(
+                    InstallLayout::new(prefix),
+                    Err(PathError::InvalidInstallPrefix { .. })
+                ),
+                "{prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_absolute_paths_have_exactly_one_spelling() {
+        for accepted in ["/", "/home/u/.local", "/a/b.c/..d"] {
+            assert!(is_normalized_absolute(Path::new(accepted)), "{accepted:?}");
+        }
+        for rejected in [
+            "",
+            "relative/x",
+            "/a/..",
+            "/a/.",
+            "/./a",
+            "//a",
+            "/a//b",
+            "/a/",
+            "/a\0b",
+        ] {
+            assert!(!is_normalized_absolute(Path::new(rejected)), "{rejected:?}");
         }
     }
 
