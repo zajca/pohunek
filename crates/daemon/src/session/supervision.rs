@@ -265,16 +265,27 @@ enum Waiting {
 
 #[derive(Debug, Default)]
 pub(super) struct RetryState {
+    /// Sessions waiting for a pass; a session is absent while its own pass
+    /// runs and is inserted again when that pass does not settle it.
     pub(super) pending: BTreeSet<String>,
     pub(super) running: bool,
+    /// Test barrier notified after each pass and before the pass outcome is
+    /// applied; the retry loop waits until the receiver resumes it.
+    #[cfg(test)]
+    pub(super) pass_finished:
+        Option<tokio::sync::mpsc::UnboundedSender<(SessionId, tokio::sync::oneshot::Sender<()>)>>,
 }
 
 impl SessionRegistry {
-    /// Reaps the processes a proven-crashed generation's runtime left behind.
+    /// Reaps the processes an ended generation's runtime left behind.
     ///
     /// Runs [`sweep_runtime`] until a pass selects nothing, at most
     /// [`MAX_SWEEP_PASSES`] times. An unconfirmed exit or a sweep error stops
-    /// immediately and is reported; the sweep is never retried as a kill loop.
+    /// immediately and is reported; a crash classification never repeats the
+    /// sweep as a kill loop. Removal sweeps every runtime of the session it
+    /// forgets ([`Self::sweep_removed_runtimes`]) and repeats that sweep only
+    /// through its backed-off retry, because it must not finish while a
+    /// marked process may survive.
     ///
     /// `worker_start_identity` is the journaled worker's own start identity.
     /// With it, a same-user process whose markers cannot be read is provably
@@ -491,6 +502,27 @@ impl SessionRegistry {
             tokio::spawn(async move {
                 run_supervision_retries(inner, shutdown).await;
             });
+        }
+    }
+
+    /// Parks the retry loop at the [`RetryState::pass_finished`] barrier.
+    #[cfg(test)]
+    async fn supervision_pass_finished(&self, id: &SessionId) {
+        let barrier = self
+            .inner
+            .supervision_retries
+            .state
+            .lock()
+            .expect("supervision retry state is never poisoned")
+            .pass_finished
+            .clone();
+        let Some(barrier) = barrier else {
+            return;
+        };
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        if barrier.send((id.clone(), resume)).is_ok() {
+            // A dropped resume handle releases the loop as well.
+            let _ = resumed.await;
         }
     }
 
@@ -792,8 +824,25 @@ async fn run_supervision_retries(
             if shutdown.is_cancelled() {
                 return;
             }
+            // The session leaves the pending set before its pass, so a
+            // schedule that arrives during the pass re-inserts it and is
+            // served by a later pass instead of being cleared with this one.
+            let taken = registry
+                .inner
+                .supervision_retries
+                .state
+                .lock()
+                .expect("supervision retry state is never poisoned")
+                .pending
+                .remove(&session_id);
+            if !taken {
+                continue;
+            }
             let id = SessionId(session_id);
-            if registry.retry_supervised_session_isolated(&id).await {
+            let settled = registry.retry_supervised_session_isolated(&id).await;
+            #[cfg(test)]
+            registry.supervision_pass_finished(&id).await;
+            if !settled {
                 registry
                     .inner
                     .supervision_retries
@@ -801,7 +850,7 @@ async fn run_supervision_retries(
                     .lock()
                     .expect("supervision retry state is never poisoned")
                     .pending
-                    .remove(&id.0);
+                    .insert(id.0);
             }
         }
         {
@@ -980,6 +1029,43 @@ mod tests {
             retry_state(&registry).1,
             BTreeSet::from([first.0, second.0]),
             "the later schedule ran a new task"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn schedule_during_a_settling_pass_runs_another_pass() {
+        let registry = SessionRegistry::new(SessionRegistryConfig::default());
+        let (barrier, mut finished) = tokio::sync::mpsc::unbounded_channel();
+        registry
+            .inner
+            .supervision_retries
+            .state
+            .lock()
+            .expect("supervision retry state is never poisoned")
+            .pass_finished = Some(barrier);
+        // No entry is listed, so every pass settles the session.
+        let id = SessionId("s-403".to_owned());
+        registry.schedule_supervision_retry(&id);
+
+        let (pass_id, resume) = tokio::time::timeout(TASK_END_DEADLINE, finished.recv())
+            .await
+            .expect("the first pass runs")
+            .expect("barrier open");
+        assert_eq!(pass_id, id);
+        // The pass has settled but its outcome is not applied yet.
+        registry.schedule_supervision_retry(&id);
+        resume.send(()).expect("the loop waits at the barrier");
+
+        let (pass_id, resume) = tokio::time::timeout(TASK_END_DEADLINE, finished.recv())
+            .await
+            .expect("the schedule made during the pass runs another pass")
+            .expect("barrier open");
+        assert_eq!(pass_id, id);
+        resume.send(()).expect("the loop waits at the barrier");
+        wait_not_running(&registry).await;
+        assert!(
+            retry_state(&registry).1.is_empty(),
+            "the second pass settled the session"
         );
     }
 

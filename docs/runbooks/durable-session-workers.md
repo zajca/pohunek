@@ -182,7 +182,17 @@ runtime is a conflict for another reason such as `runtime_identity_mismatch`
 retirement (`runtime_supervision_unavailable`), when a worker journaled under
 another generation still runs (`runtime_identity_mismatch`), and when the
 session's journals cannot be read or a journaled worker of the generation still
-runs after the retirement (`runtime_supervision_ambiguous`).
+runs after the retirement (`runtime_supervision_ambiguous`). Every removal,
+including that of a live, terminal, or `lost` session, then sweeps the
+processes carrying the session's `POHUNEK_RUNTIME_ID` markers, because on macOS
+a descendant that left the worker's process group survives both the stop and
+the job retirement. A sweep that cannot confirm every marked process exited
+(for example a process whose environment cannot be read) fails the removal
+with `runtime_supervision_ambiguous` and keeps the session listed with its
+removal intent. Run `session rm` again once the leftover process is gone; the
+next daemon start also finishes the removal. A removal that reconciliation
+finishes after a daemon restart shows the session as `conflict` with that
+reason while it retries in the background.
 
 ## Runtime Loss and Explicit Recovery
 

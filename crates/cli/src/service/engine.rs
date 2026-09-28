@@ -19,6 +19,13 @@
 //!    manager reports as the running daemon job's main process;
 //! 6. `cli`: `<prefix>/bin/pohunek` becomes the new CLI.
 //!
+//! Before staging anything, install and upgrade claim the prefix for this
+//! installation's namespace (see [`super::layout`]): a prefix another
+//! namespace owns is refused with `service_prefix_owned`, because version
+//! collection and uninstall see only their own namespace's references.
+//! Rollback, collection, and uninstall verify the claim before deleting
+//! anything; a rolled-back install and a finished uninstall release it.
+//!
 //! A failing upgrade step rolls the transaction back: the daemon job is
 //! replaced by the previous version, `service.toml` is restored, and a
 //! version directory this transaction created is removed unless something
@@ -78,12 +85,14 @@
 //! the daemon and the engine waits until every worker's journal is final and
 //! its process is gone. Only then are the daemon job, the remaining ended
 //! worker jobs, the launchd directories, the installed `<prefix>/bin/pohunek`
-//! copy, and unreferenced version directories removed. `--purge` also
-//! removes the session store, event logs, worker journals, and host
-//! identity. The transaction record is cleared next and `service.toml` goes
-//! last: it names the prefix, so while any earlier removal fails, or the
-//! process dies before the end, a rerun of `uninstall` still finds the
-//! installation and finishes the cleanup.
+//! copy, unreferenced version directories, and the prefix ownership record
+//! removed; the record stays while a version is kept for a worker journal or
+//! job, which only this namespace can see. `--purge` also removes the session
+//! store, event logs, worker journals, and host identity. The transaction
+//! record is cleared next and `service.toml` goes last: it names the prefix,
+//! so while any earlier removal fails, or the process dies before the end, a
+//! rerun of `uninstall` still finds the installation and finishes the
+//! cleanup.
 //!
 //! A pending install that already reached the registration step takes this
 //! same flow instead of a rollback: its daemon may already run it with live
@@ -97,7 +106,7 @@
 //! cannot stop those workers, so the uninstall names them instead of
 //! waiting on them.
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-28
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -105,7 +114,7 @@ use std::time::{Duration, Instant};
 use pohunek_paths::InstallLayout;
 use pohunek_platform::process::{HostInspector, Pid};
 use pohunek_platform::supervisor::{
-    self, JobDefinition, ServiceObservation, ServiceState, WorkerKey,
+    self, JobDefinition, Namespace, ServiceObservation, ServiceState, WorkerKey,
 };
 use pohunek_service_config::ServiceConfig;
 use protocol::{RuntimeState, SessionInfo, SessionState};
@@ -280,12 +289,14 @@ impl<'a> Engine<'a> {
             }
         }
         let config = initial_config(self.context, prefix, version)?;
-        let staged = layout::stage(&layout, from, self.reported(version)).await?;
+        let namespace = config.namespace();
+        let claimed = layout::claim_prefix(&layout, &namespace)?;
         let resumed = resume.is_some();
-        let mut record = if let Some(record) = resume {
-            record
-        } else {
-            {
+        let started = async {
+            let staged = layout::stage(&layout, from, self.reported(version)).await?;
+            let record = if let Some(record) = resume {
+                record
+            } else {
                 let record = Record {
                     schema_version: record::SCHEMA_VERSION,
                     operation: Operation::Install,
@@ -298,7 +309,24 @@ impl<'a> Engine<'a> {
                 };
                 self.store.save(&record)?;
                 record
+            };
+            Ok::<_, Error>((staged, record))
+        }
+        .await;
+        let (staged, mut record) = match started {
+            Ok(started) => started,
+            // Without a record no rollback runs, so a claim this call made
+            // is given up here instead.
+            Err(error) if claimed => {
+                return Err(match layout::release_prefix(&layout, &namespace) {
+                    Ok(_released) => error,
+                    Err(release) => Error::RollbackFailed {
+                        original: Box::new(error),
+                        rollback: Box::new(release),
+                    },
+                });
             }
+            Err(error) => return Err(error),
         };
         let result = self.run_steps(&mut record, &layout, staged, &config).await;
         self.settle(&record, result).await?;
@@ -352,6 +380,7 @@ impl<'a> Engine<'a> {
         })?;
         let layout = config.layout().clone();
         layout::check_trusted(layout.prefix())?;
+        layout::claim_prefix(&layout, &config.namespace())?;
         let staged = layout::stage(&layout, from, self.reported(version)).await?;
         let resumed = resume.is_some();
         let from_version = resume
@@ -448,6 +477,9 @@ impl<'a> Engine<'a> {
             (None, None) => return Err(Error::NotInstalled { path: config_path }),
         };
         let layout = config.layout().clone();
+        // Another namespace's prefix holds nothing of this installation, and
+        // its versions and CLI copy must survive this uninstall.
+        layout::claim_existing_prefix(&layout, &config.namespace())?;
         let definition = daemon_definition(self.context, &config)?;
 
         let reachable = self
@@ -492,7 +524,8 @@ impl<'a> Engine<'a> {
             .map_err(|source| supervisor_error("uninstall daemon", source))?;
         report.retired_workers = self.retire_ended_workers().await?;
 
-        self.remove_installation(&layout, &mut report).await?;
+        self.remove_installation(&layout, &config.namespace(), &mut report)
+            .await?;
         if options.purge {
             self.purge(&mut report)?;
             report.purged = true;
@@ -741,11 +774,25 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        if !record.version_dir_preexisted {
-            let usage = self.usage(&layout).await?;
-            if usage.keep_reason(&record.version, None).is_none() {
-                layout::remove_version(&layout, &record.version)?;
-            }
+        let namespace = self.context.namespace()?;
+        layout::claim_existing_prefix(&layout, &namespace)?;
+        let install = record.operation == Operation::Install;
+        if record.version_dir_preexisted && !install {
+            return Ok(());
+        }
+        let usage = self.usage(&layout).await?;
+        if !record.version_dir_preexisted && usage.keep_reason(&record.version, None).is_none() {
+            layout::remove_version(&layout, &record.version)?;
+        }
+        // An install starts only without `service.toml` and is rolled back
+        // only before registering, so without a namespace-bound reference
+        // this namespace keeps nothing in the prefix.
+        if install
+            && !layout::installed_versions(&layout)?
+                .iter()
+                .any(|version| usage.namespace_bound(version))
+        {
+            layout::release_prefix(&layout, &namespace)?;
         }
         Ok(())
     }
@@ -1052,13 +1099,18 @@ impl<'a> Engine<'a> {
             .map_err(|source| supervisor_error("discover workers", source))
     }
 
-    /// Removes backend directories, the CLI copy, and unreferenced versions.
+    /// Removes backend directories, the CLI copy, unreferenced versions, and
+    /// the prefix ownership record.
     ///
     /// The CLI copy goes before the versions: it is recognized only by its
-    /// match with a version directory's CLI.
+    /// match with a version directory's CLI. The ownership record goes last,
+    /// so a rerun after a failure still owns the prefix. It is released only
+    /// when no version is kept for a reference only this namespace can see;
+    /// another namespace's collection honors every other reason.
     async fn remove_installation(
         &self,
         layout: &InstallLayout,
+        namespace: &Namespace,
         report: &mut UninstallReport,
     ) -> Result<(), Error> {
         let paths = self.context.paths();
@@ -1074,9 +1126,13 @@ impl<'a> Engine<'a> {
         // Re-check references right before deleting: a worker started since
         // the settlement check keeps its version.
         let usage = self.usage(layout).await?;
+        let mut namespace_bound = false;
         for version in layout::installed_versions(layout)? {
             match usage.keep_reason(&version, None) {
-                Some(reason) => report.kept_versions.push(KeptVersion { version, reason }),
+                Some(reason) => {
+                    namespace_bound |= usage.namespace_bound(&version);
+                    report.kept_versions.push(KeptVersion { version, reason });
+                }
                 None => {
                     if layout::remove_version(layout, &version)? {
                         report.removed.push(
@@ -1087,6 +1143,9 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
+        }
+        if !namespace_bound && layout::release_prefix(layout, namespace)? {
+            report.removed.push(layout::owner_record(layout));
         }
         Ok(())
     }
@@ -1138,6 +1197,8 @@ impl<'a> Engine<'a> {
         layout: &InstallLayout,
         active: &str,
     ) -> Result<(Vec<String>, Vec<KeptVersion>), Error> {
+        // The usage below knows only this namespace's journals and jobs.
+        layout::claim_existing_prefix(layout, &self.context.namespace()?)?;
         let usage = self.usage(layout).await?;
         let mut removed = Vec::new();
         let mut kept = Vec::new();

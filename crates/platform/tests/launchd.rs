@@ -653,6 +653,58 @@ async fn daemon_agent_installs_replaces_and_uninstalls() {
     daemon.uninstall().await.expect("absent daemon uninstalls");
 }
 
+#[tokio::test]
+async fn daemon_replace_without_an_agent_definition_is_not_found() {
+    let fixture = Fixture::new();
+    let agents = fixture.root.join("LaunchAgents");
+    let daemon = LaunchdDaemon::new(&fixture.namespace, uid(), agents.clone(), COMMAND_DEADLINE)
+        .expect("valid daemon manager");
+    let definition = JobDefinition::new(JobSpec {
+        executable: PathBuf::from("/bin/bash"),
+        arguments: vec![
+            "-c".to_owned(),
+            SLEEPING_WORKER.to_owned(),
+            "pohunek-test-daemon".to_owned(),
+            fixture.namespace.as_str().to_owned(),
+        ],
+        environment: BTreeMap::new(),
+        working_directory: fixture.root.clone(),
+        logs: Some(pohunek_platform::supervisor::JobLogs {
+            stdout: fixture.root.join("daemon.out.log"),
+            stderr: fixture.root.join("daemon.err.log"),
+        }),
+        start_timeout: Duration::from_secs(10),
+        exit_timeout: Duration::from_secs(5),
+        restart: RestartPolicy::OnFailure {
+            throttle: Duration::from_secs(1),
+        },
+        open_files: 1_024,
+    })
+    .expect("valid daemon definition");
+    let label = fixture.namespace.daemon_label();
+    let _cleanup = Bootout(label.clone());
+
+    let replaced = daemon.replace(&definition).await;
+    assert!(matches!(replaced, Err(Error::NotFound(_))), "{replaced:?}");
+    assert!(
+        !agents.exists(),
+        "replace never creates the agents directory"
+    );
+
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&agents)
+        .expect("agents directory");
+    let replaced = daemon.replace(&definition).await;
+    assert!(matches!(replaced, Err(Error::NotFound(_))), "{replaced:?}");
+    assert_eq!(
+        std::fs::read_dir(&agents).expect("agents listing").count(),
+        0,
+        "replace never writes an agent definition"
+    );
+    assert!(matches!(daemon.inspect().await, Err(Error::NotFound(_))));
+}
+
 /// Boots one label out when dropped.
 struct Bootout(String);
 

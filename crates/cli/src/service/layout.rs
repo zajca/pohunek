@@ -5,9 +5,24 @@
 //! in a private staging directory next to it, each binary's `--version` is
 //! probed there, and only then is it renamed into place without replacement.
 //! An existing version directory is never overwritten; identical contents
-//! make publishing idempotent.
+//! make publishing idempotent. An existing directory is reused only when it is
+//! exactly what publishing creates: owned by this user, mode `0755`, reached
+//! without a symbolic link, and holding single-link `0755` regular files. The
+//! service manager executes those files later, so anything another account
+//! could replace between this check and that execution is refused.
+//!
+//! # Prefix ownership
+//!
+//! Version directories and `<prefix>/bin/pohunek` are keyed only by the
+//! prefix, while worker journals, worker jobs, and the transaction lock are
+//! per installation namespace. Garbage collection and uninstall can only see
+//! the references of their own namespace, so one prefix serves exactly one
+//! namespace: `<prefix>/libexec/pohunek/installation_owner` names it. Install
+//! and upgrade create the record with no-replace semantics before staging
+//! anything, every destructive operation verifies it first, and uninstall
+//! removes it after the prefix is emptied.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-28
 
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions, Permissions};
@@ -21,7 +36,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use pohunek_paths::{
     valid_install_version, InstallLayout, DAEMON_EXECUTABLE_NAME, WORKER_EXECUTABLE_NAME,
 };
-use pohunek_platform::filesystem::{EntryKind, MoveOutcome, StageOutcome, TrustedDir};
+use pohunek_platform::filesystem::{EntryKind, FsError, MoveOutcome, StageOutcome, TrustedDir};
+use pohunek_platform::supervisor::Namespace;
 use tokio::io::AsyncReadExt as _;
 
 use super::error::{fs_error, io_error, Error};
@@ -49,6 +65,19 @@ const STAGING_PREFIX: &str = ".pohunek-staging-";
 
 /// Name prefix of entries staged for removal.
 const REMOVAL_PREFIX: &str = ".pohunek-removed-";
+
+/// Name of the prefix ownership record inside the versions directory.
+///
+/// `_` is not allowed in a version, so the record is never listed, swept, or
+/// collected as a version directory.
+const OWNER_NAME: &str = "installation_owner";
+
+/// Mode of the prefix ownership record.
+const OWNER_MODE: u32 = 0o600;
+
+/// Read bound of the prefix ownership record, which holds one namespace and a
+/// newline; anything longer is not a record this module wrote.
+const OWNER_MAX_BYTES: usize = pohunek_platform::supervisor::namespace::NAMESPACE_LEN + 1;
 
 /// Disambiguates staging and temporary names created by one process.
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -101,6 +130,116 @@ pub fn check_trusted(path: &Path) -> Result<(), Error> {
         candidate = current.parent();
     }
     Ok(())
+}
+
+/// Returns the prefix ownership record's path.
+#[must_use]
+pub fn owner_record(layout: &InstallLayout) -> PathBuf {
+    layout.versions_dir().join(OWNER_NAME)
+}
+
+/// Claims the prefix for `namespace`, creating its versions directory.
+///
+/// A missing record is created without replacement, so of two installations
+/// claiming one prefix concurrently exactly one wins. An existing record must
+/// name `namespace`. Returns whether this call created the record.
+///
+/// # Errors
+///
+/// Returns [`Error::PrefixOwned`] when another namespace owns the prefix and
+/// a filesystem error for an unsafe directory or record.
+pub fn claim_prefix(layout: &InstallLayout, namespace: &Namespace) -> Result<bool, Error> {
+    let versions = open_owner_dir(&layout.versions_dir(), PUBLIC_MODE)?;
+    claim(&versions, layout, namespace)
+}
+
+/// Claims the prefix for `namespace` when its versions directory exists.
+///
+/// Without a versions directory there is nothing to protect, and nothing is
+/// created.
+///
+/// # Errors
+///
+/// See [`claim_prefix`].
+pub fn claim_existing_prefix(layout: &InstallLayout, namespace: &Namespace) -> Result<(), Error> {
+    match open_existing_owner_dir(&layout.versions_dir())? {
+        Some(versions) => claim(&versions, layout, namespace).map(drop),
+        None => Ok(()),
+    }
+}
+
+/// Gives up `namespace`'s claim on the prefix; returns whether a record existed.
+///
+/// # Errors
+///
+/// Returns [`Error::PrefixOwned`] when another namespace owns the prefix, and
+/// a filesystem error when removal fails.
+pub fn release_prefix(layout: &InstallLayout, namespace: &Namespace) -> Result<bool, Error> {
+    let Some(versions) = open_existing_owner_dir(&layout.versions_dir())? else {
+        return Ok(false);
+    };
+    match owner(&versions, layout)? {
+        None => Ok(false),
+        Some(owner) if owner == *namespace => {
+            super::record::remove_file(&versions, OWNER_NAME)?;
+            Ok(true)
+        }
+        Some(owner) => Err(prefix_owned(layout, &owner)),
+    }
+}
+
+fn claim(
+    versions: &TrustedDir,
+    layout: &InstallLayout,
+    namespace: &Namespace,
+) -> Result<bool, Error> {
+    let contents = format!("{}\n", namespace.as_str());
+    match versions.create_file(OWNER_NAME, contents.as_bytes(), OWNER_MODE) {
+        Ok(_identity) => return Ok(true),
+        Err(error) if error.io_kind() == Some(io::ErrorKind::AlreadyExists) => {}
+        Err(source) => return Err(fs_error("create prefix ownership record", source)),
+    }
+    match owner(versions, layout)? {
+        Some(owner) if owner == *namespace => Ok(false),
+        Some(owner) => Err(prefix_owned(layout, &owner)),
+        // Removed by its owner's uninstall between the two calls; nothing
+        // may be decided on a prefix whose ownership just changed.
+        None => Err(Error::Io {
+            operation: "claim the prefix",
+            path: owner_record(layout),
+            source: io::Error::other("the ownership record changed while it was being claimed"),
+        }),
+    }
+}
+
+/// Reads the namespace the ownership record names; a missing record is `None`.
+fn owner(versions: &TrustedDir, layout: &InstallLayout) -> Result<Option<Namespace>, Error> {
+    let bytes = match versions.read_file(OWNER_NAME, OWNER_MODE, OWNER_MAX_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if error.io_kind() == Some(io::ErrorKind::NotFound) => return Ok(None),
+        Err(source) => return Err(fs_error("read prefix ownership record", source)),
+    };
+    std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| text.strip_suffix('\n'))
+        .and_then(|text| Namespace::parse(text).ok())
+        .map(Some)
+        .ok_or_else(|| Error::Io {
+            operation: "read prefix ownership record",
+            path: owner_record(layout),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the record does not name an installation namespace",
+            ),
+        })
+}
+
+fn prefix_owned(layout: &InstallLayout, owner: &Namespace) -> Error {
+    Error::PrefixOwned {
+        prefix: layout.prefix().to_path_buf(),
+        owner: owner.as_str().to_owned(),
+        record: owner_record(layout),
+    }
 }
 
 /// Binaries copied into a private staging directory and verified there.
@@ -189,7 +328,7 @@ pub fn publish(layout: &InstallLayout, staged: &Staged, version: &str) -> Result
     match outcome {
         MoveOutcome::Moved => Ok(true),
         MoveOutcome::DestinationExists => {
-            let identical = same_binaries(&staged.path, &versions.path().join(version));
+            let identical = same_binaries(&versions, &staged.name, version);
             remove_tree(&versions, &staged.name)?;
             if identical? {
                 Ok(false)
@@ -211,7 +350,9 @@ pub fn publish(layout: &InstallLayout, staged: &Staged, version: &str) -> Result
 ///
 /// # Errors
 ///
-/// Returns [`Error::VersionConflict`] when contents differ or are missing.
+/// Returns [`Error::VersionConflict`] when contents differ or are missing, and
+/// [`Error::UntrustedVersion`] when the directory or a binary is not exactly
+/// what publishing creates.
 pub fn verify_existing(
     layout: &InstallLayout,
     staged: &Staged,
@@ -220,7 +361,11 @@ pub fn verify_existing(
     let path = layout
         .version_dir(version)
         .expect("callers pass validated versions");
-    if same_binaries(&staged.path, &path)? {
+    let identical = match open_existing_owner_dir(&layout.versions_dir())? {
+        Some(versions) => same_binaries(&versions, &staged.name, version)?,
+        None => false,
+    };
+    if identical {
         Ok(())
     } else {
         Err(Error::VersionConflict { path })
@@ -249,7 +394,7 @@ pub fn version_exists(layout: &InstallLayout, version: &str) -> Result<bool, Err
     versions
         .entry_identity(version, EntryKind::Directory)
         .map(|identity| identity.is_some())
-        .map_err(|source| fs_error("inspect version directory", source))
+        .map_err(|source| version_error(versions.path().join(version), source))
 }
 
 /// Lists installed version directories in ascending name order.
@@ -271,7 +416,7 @@ pub fn installed_versions(layout: &InstallLayout) -> Result<Vec<String>, Error> 
         };
         if versions
             .entry_identity(name, EntryKind::Directory)
-            .map_err(|source| fs_error("inspect version directory", source))?
+            .map_err(|source| version_error(versions.path().join(name), source))?
             .is_some()
         {
             found.push(name.to_owned());
@@ -348,12 +493,21 @@ pub fn installed_cli_copy(layout: &InstallLayout) -> Result<bool, Error> {
     if !regular_file(&cli)? {
         return Ok(false);
     }
+    let Some(versions) = open_existing_owner_dir(&layout.versions_dir())? else {
+        return Ok(false);
+    };
     for version in installed_versions(layout)? {
-        let candidate = layout
-            .version_dir(&version)
-            .expect("listed versions are valid")
-            .join(CLI_NAME);
-        if regular_file(&candidate)? && same_contents(&cli, &candidate)? {
+        let directory = open_version(&versions, &version)?;
+        let Some(mut candidate) = open_binary(&directory, CLI_NAME)? else {
+            continue;
+        };
+        let mut installed = File::options()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&cli)
+            .map_err(io_error("open", &cli))?;
+        let candidate_path = directory.path().join(CLI_NAME);
+        if same_contents((&mut installed, &cli), (&mut candidate, &candidate_path))? {
             return Ok(true);
         }
     }
@@ -517,23 +671,81 @@ fn regular_file(path: &Path) -> Result<bool, Error> {
     }
 }
 
-fn same_binaries(left: &Path, right: &Path) -> Result<bool, Error> {
+/// Compares the staging directory `staged` with the version directory
+/// `version`, both below `versions`, through verified descriptors.
+///
+/// A missing binary makes them differ; an untrusted directory or binary on
+/// either side fails instead.
+fn same_binaries(versions: &TrustedDir, staged: &str, version: &str) -> Result<bool, Error> {
+    let staged = open_version(versions, staged)?;
+    let existing = open_version(versions, version)?;
     for binary in BINARIES {
-        let (left, right) = (left.join(binary), right.join(binary));
-        if !regular_file(&left)? || !regular_file(&right)? || !same_contents(&left, &right)? {
+        let (Some(mut left), Some(mut right)) = (
+            open_binary(&staged, binary)?,
+            open_binary(&existing, binary)?,
+        ) else {
+            return Ok(false);
+        };
+        let (left_path, right_path) = (staged.path().join(binary), existing.path().join(binary));
+        if !same_contents((&mut left, &left_path), (&mut right, &right_path))? {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-/// Compares two files byte by byte in bounded chunks.
-fn same_contents(left: &Path, right: &Path) -> Result<bool, Error> {
+/// Opens a version or staging directory below `versions` without following
+/// a symbolic link and checks it is exactly what publishing creates.
+fn open_version(versions: &TrustedDir, name: &str) -> Result<TrustedDir, Error> {
+    versions
+        .open_child(name, PUBLIC_MODE)
+        .map_err(|source| version_error(versions.path().join(name), source))
+}
+
+/// Opens one binary of a verified version directory for reading.
+///
+/// The binary is opened relative to the directory descriptor without
+/// following a symbolic link, and the descriptor must be a regular file of
+/// this user with mode `0755`, one link, and on macOS no extended ACL granting
+/// access, so the contents read are those of the verified file. A missing
+/// binary is `None`.
+fn open_binary(directory: &TrustedDir, name: &str) -> Result<Option<File>, Error> {
+    directory
+        .open_file(name, PUBLIC_MODE)
+        .map_err(|source| version_error(directory.path().join(name), source))
+}
+
+/// Maps a failed verification of a version directory or binary at `path`.
+///
+/// A symbolic link or non-directory where a version directory belongs fails
+/// the no-follow open with `ELOOP` or `ENOTDIR`.
+fn version_error(path: PathBuf, source: FsError) -> Error {
+    let detail = match &source {
+        FsError::UnsafeType { actual, .. } => format!("it is a {actual}"),
+        FsError::UnsafeOwner { actual, .. } => format!("it is owned by uid {actual}"),
+        FsError::UnsafeMode { actual, .. } => {
+            format!("its mode is {actual:#o}, not {PUBLIC_MODE:#o}")
+        }
+        FsError::UnsafeLinkCount { actual, .. } => format!("it has {actual} hard links"),
+        FsError::UnsafeAcl { .. } => "an extended ACL grants other users access".to_owned(),
+        FsError::Io { .. }
+            if matches!(source.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) =>
+        {
+            "it is a symbolic link or not a directory".to_owned()
+        }
+        _ => return fs_error("inspect version directory", source),
+    };
+    Error::UntrustedVersion { path, detail }
+}
+
+/// Compares two open files byte by byte in bounded chunks.
+fn same_contents(
+    (left_file, left): (&mut File, &Path),
+    (right_file, right): (&mut File, &Path),
+) -> Result<bool, Error> {
     /// Chunk size for streaming comparison; binaries can be hundreds of MiB.
     const CHUNK: usize = 64 * 1024;
 
-    let mut left_file = File::open(left).map_err(io_error("open", left))?;
-    let mut right_file = File::open(right).map_err(io_error("open", right))?;
     if left_file
         .metadata()
         .map_err(io_error("inspect", left))?
@@ -548,9 +760,8 @@ fn same_contents(left: &Path, right: &Path) -> Result<bool, Error> {
     let mut left_buffer = vec![0_u8; CHUNK];
     let mut right_buffer = vec![0_u8; CHUNK];
     loop {
-        let read = read_full(&mut left_file, &mut left_buffer).map_err(io_error("read", left))?;
-        let other =
-            read_full(&mut right_file, &mut right_buffer).map_err(io_error("read", right))?;
+        let read = read_full(left_file, &mut left_buffer).map_err(io_error("read", left))?;
+        let other = read_full(right_file, &mut right_buffer).map_err(io_error("read", right))?;
         if read != other || left_buffer[..read] != right_buffer[..other] {
             return Ok(false);
         }
@@ -691,6 +902,145 @@ pub(crate) mod tests {
         std::fs::write(layout.bin_dir().join(CLI_NAME), "someone else's pohunek")
             .expect("replace cli");
         assert!(!installed_cli_copy(&layout).expect("foreign copy"));
+    }
+
+    /// Publishes `1.0.0` and stages an identical copy for reuse checks.
+    async fn published_and_restaged(root: &Path) -> (InstallLayout, Staged) {
+        let layout = InstallLayout::new(root.join("prefix")).expect("layout");
+        let from = stage_dir(root, "1.0.0");
+        let staged = stage(&layout, &from, "1.0.0").await.expect("stage");
+        assert!(publish(&layout, &staged, "1.0.0").expect("publish"));
+        let again = stage(&layout, &from, "1.0.0").await.expect("stage again");
+        (layout, again)
+    }
+
+    fn assert_untrusted(result: Result<impl std::fmt::Debug, Error>, expected: &Path) {
+        let error = result.expect_err("an untrusted version is refused");
+        assert!(
+            matches!(&error, Error::UntrustedVersion { path, .. } if path == expected),
+            "{error:?}"
+        );
+        assert_eq!(error.code(), "service_version_untrusted");
+        assert!(error.hint().is_some());
+    }
+
+    #[tokio::test]
+    async fn an_exact_existing_version_directory_is_reused() {
+        let (_root, root) = temp_root();
+        let (layout, again) = published_and_restaged(root.as_path()).await;
+        verify_existing(&layout, &again, "1.0.0").expect("verified reuse");
+        assert!(!publish(&layout, &again, "1.0.0").expect("identical publish"));
+    }
+
+    #[tokio::test]
+    async fn a_writable_version_directory_is_never_reused() {
+        let (_root, root) = temp_root();
+        let (layout, again) = published_and_restaged(root.as_path()).await;
+        let dir = layout.version_dir("1.0.0").expect("version dir");
+        std::fs::set_permissions(&dir, Permissions::from_mode(0o775)).expect("chmod");
+        assert_untrusted(verify_existing(&layout, &again, "1.0.0"), &dir);
+        assert_untrusted(publish(&layout, &again, "1.0.0"), &dir);
+        assert_eq!(
+            installed_versions(&layout).expect("list"),
+            ["1.0.0"],
+            "the staging directory is removed either way"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_writable_binary_is_never_reused() {
+        let (_root, root) = temp_root();
+        let (layout, again) = published_and_restaged(root.as_path()).await;
+        let daemon = layout.daemon_executable("1.0.0").expect("daemon path");
+        std::fs::set_permissions(&daemon, Permissions::from_mode(0o775)).expect("chmod");
+        assert_untrusted(verify_existing(&layout, &again, "1.0.0"), &daemon);
+    }
+
+    #[tokio::test]
+    async fn a_hard_linked_binary_is_never_reused() {
+        let (_root, root) = temp_root();
+        let (layout, again) = published_and_restaged(root.as_path()).await;
+        let worker = layout.worker_executable("1.0.0").expect("worker path");
+        std::fs::hard_link(&worker, root.as_path().join("second-name")).expect("hard link");
+        assert_untrusted(verify_existing(&layout, &again, "1.0.0"), &worker);
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_binary_is_never_reused() {
+        let (_root, root) = temp_root();
+        let (layout, again) = published_and_restaged(root.as_path()).await;
+        let cli = layout
+            .version_dir("1.0.0")
+            .expect("version dir")
+            .join(CLI_NAME);
+        let elsewhere = root.as_path().join("elsewhere");
+        std::fs::rename(&cli, &elsewhere).expect("move CLI");
+        std::os::unix::fs::symlink(&elsewhere, &cli).expect("symlink");
+        assert_untrusted(verify_existing(&layout, &again, "1.0.0"), &cli);
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_version_directory_is_never_reused() {
+        let (_root, root) = temp_root();
+        let (layout, again) = published_and_restaged(root.as_path()).await;
+        let dir = layout.version_dir("1.0.0").expect("version dir");
+        let elsewhere = root.as_path().join("elsewhere");
+        std::fs::rename(&dir, &elsewhere).expect("move version dir");
+        std::os::unix::fs::symlink(&elsewhere, &dir).expect("symlink");
+        assert_untrusted(verify_existing(&layout, &again, "1.0.0"), &dir);
+        assert_untrusted(version_exists(&layout, "1.0.0"), &dir);
+    }
+
+    #[test]
+    fn one_namespace_owns_a_prefix_until_it_releases_it() {
+        let (_root, root) = temp_root();
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
+        let first = Namespace::parse("0123456789ab").expect("namespace");
+        let second = Namespace::parse("ba9876543210").expect("namespace");
+
+        assert!(!release_prefix(&layout, &first).expect("nothing to release"));
+        claim_existing_prefix(&layout, &first).expect("nothing to claim");
+        assert!(!layout.versions_dir().exists(), "nothing is created");
+
+        assert!(claim_prefix(&layout, &first).expect("claim"));
+        assert!(!claim_prefix(&layout, &first).expect("claim again"));
+        claim_existing_prefix(&layout, &first).expect("verified claim");
+        for error in [
+            claim_prefix(&layout, &second).map(drop),
+            claim_existing_prefix(&layout, &second),
+            release_prefix(&layout, &second).map(drop),
+        ] {
+            let error = error.expect_err("another namespace is refused");
+            assert!(
+                matches!(&error, Error::PrefixOwned { owner, record, .. }
+                    if owner == first.as_str() && record == &owner_record(&layout)),
+                "{error:?}"
+            );
+            assert_eq!(error.code(), "service_prefix_owned");
+        }
+        assert!(
+            installed_versions(&layout).expect("list").is_empty(),
+            "the record is not a version"
+        );
+
+        assert!(release_prefix(&layout, &first).expect("release"));
+        assert!(claim_prefix(&layout, &second).expect("claim after release"));
+    }
+
+    #[test]
+    fn an_ownership_record_that_names_no_namespace_is_refused() {
+        let (_root, root) = temp_root();
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
+        let namespace = Namespace::parse("0123456789ab").expect("namespace");
+        std::fs::create_dir_all(layout.versions_dir()).expect("versions dir");
+        std::fs::write(owner_record(&layout), "not a namespace\n").expect("record");
+        std::fs::set_permissions(owner_record(&layout), Permissions::from_mode(OWNER_MODE))
+            .expect("chmod");
+        assert!(matches!(
+            claim_prefix(&layout, &namespace),
+            Err(Error::Filesystem { .. } | Error::Io { .. })
+        ));
+        assert!(owner_record(&layout).exists(), "the record is kept");
     }
 
     #[test]

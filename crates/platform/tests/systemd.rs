@@ -723,6 +723,14 @@ async fn daemon_unit_installs_replaces_inspects_and_uninstalls() {
     spec.restart = RestartPolicy::OnFailure {
         throttle: Duration::from_secs(1),
     };
+    // `WorkingDirectory=` takes backslashes and quotes verbatim; the manager's
+    // parsed value proves the rendering round-trips them and `%`.
+    let working_directory = installation
+        .root
+        .path()
+        .join("wd a\\s b\\\\c \"q\" 'r' 100%");
+    std::fs::create_dir(&working_directory).expect("working directory");
+    spec.working_directory = working_directory.clone();
     let definition = JobDefinition::new(spec.clone()).expect("valid definition");
     let rendered_dir = installation.root.path().join("rendered");
     std::fs::create_dir(&rendered_dir).expect("render directory");
@@ -753,6 +761,12 @@ async fn daemon_unit_installs_replaces_inspects_and_uninstalls() {
     .await;
     assert_eq!(first.id.as_str(), daemon_unit);
     assert_eq!(first.definition, Some(definition.facts()));
+    assert_eq!(
+        show(&daemon_unit, &["WorkingDirectory"])
+            .get("WorkingDirectory")
+            .map(String::as_str),
+        working_directory.to_str()
+    );
     assert_eq!(unit_file_state(&daemon_unit), "enabled");
     let accounting = show(&slice, &["MemoryAccounting", "TasksAccounting"]);
     for key in ["MemoryAccounting", "TasksAccounting"] {

@@ -115,6 +115,9 @@ const STATE_QUERY: &str = "--user is-active pohunekd.service";
 const LIST_WORKERS: &str = "--user list-units pohunek-session@* --all --plain --no-legend";
 const DISABLE: &str = "--user disable --now pohunekd.service";
 const RELOAD: &str = "--user daemon-reload";
+/// Sibling name the wrapper renames the legacy socket node to
+/// (`POHUNEK_BARRIER_NAME` in the script).
+const BARRIER_NAME: &str = "retiring";
 
 #[test]
 fn idle_legacy_install_is_retired_after_preflight_before_installing() {
@@ -128,7 +131,7 @@ fn idle_legacy_install_is_retired_after_preflight_before_installing() {
     let preflight_calls = fixture.pohunek_calls();
     let preflight = preflight_calls.get(1).expect("preflight call");
     assert!(
-        preflight.starts_with(&fixture.socket.preflight_prefix())
+        preflight.starts_with(&fixture.socket.preflight_call())
             && preflight.ends_with(" --accept-runtime-loss"),
         "unexpected preflight call: {preflight}"
     );
@@ -176,7 +179,7 @@ fn live_legacy_template_workers_refuse_before_anything_changes() {
         fixture
             .pohunek_calls()
             .get(1)
-            .is_some_and(|call| call.starts_with(&fixture.socket.preflight_prefix())),
+            .is_some_and(|call| call.starts_with(&fixture.socket.preflight_call())),
         "unexpected preflight call: {:?}",
         fixture.pohunek_calls()
     );
@@ -205,7 +208,7 @@ fn failed_preflight_stops_before_retiring_the_legacy_install() {
         fixture
             .pohunek_calls()
             .get(1)
-            .is_some_and(|call| call.starts_with(&fixture.socket.preflight_prefix())),
+            .is_some_and(|call| call.starts_with(&fixture.socket.preflight_call())),
         "unexpected preflight call: {:?}",
         fixture.pohunek_calls()
     );
@@ -256,7 +259,7 @@ fn a_worker_that_survives_the_stop_refuses_without_removing_legacy_files() {
         fixture
             .pohunek_calls()
             .get(1)
-            .is_some_and(|call| call.starts_with(&fixture.socket.preflight_prefix())),
+            .is_some_and(|call| call.starts_with(&fixture.socket.preflight_call())),
         "unexpected preflight call: {:?}",
         fixture.pohunek_calls()
     );
@@ -427,7 +430,7 @@ fn a_legacy_daemon_that_is_not_proven_stopped_gets_the_barrier_and_preflight() {
             fixture
                 .pohunek_calls()
                 .get(1)
-                .is_some_and(|call| call.starts_with(&fixture.socket.preflight_prefix())),
+                .is_some_and(|call| call.starts_with(&fixture.socket.preflight_call())),
             "{state}: unexpected preflight call: {:?}",
             fixture.pohunek_calls()
         );
@@ -456,7 +459,7 @@ fn a_legacy_daemon_that_is_not_proven_stopped_gets_the_barrier_and_preflight() {
         fixture
             .pohunek_calls()
             .get(1)
-            .is_some_and(|call| call.starts_with(&fixture.socket.preflight_prefix())),
+            .is_some_and(|call| call.starts_with(&fixture.socket.preflight_call())),
         "unexpected preflight call: {:?}",
         fixture.pohunek_calls()
     );
@@ -496,6 +499,111 @@ fn a_daemon_not_proven_stopped_without_a_socket_refuses_before_anything_changes(
             assert!(legacy.exists(), "{state}: {} was removed", legacy.display());
         }
     }
+}
+
+#[test]
+fn a_legacy_socket_at_the_sun_path_limit_is_retired_through_a_dialable_barrier() {
+    // The legacy daemon may bind the longest path `sun_path` holds; the
+    // renamed node must stay within that limit so the preflight can dial it.
+    let max_bytes = pohunek_paths::Platform::current()
+        .expect("supported platform")
+        .socket_path_max_bytes();
+    let fixture = Fixture::with_socket_path_bytes(max_bytes);
+    assert_eq!(fixture.socket.path.as_os_str().len(), max_bytes);
+    // Any sibling name longer than the socket's would not fit.
+    let mut longer = fixture.socket.path.clone().into_os_string();
+    longer.push(".1");
+    std::os::unix::net::SocketAddr::from_pathname(&longer)
+        .expect_err("a path past the socket's length exceeds sun_path");
+    fixture.legacy_install();
+    let output = fixture.run(&[], &[("POHUNEK_TEST_LEGACY_ACTIVE", "1")]);
+    assert_success(&output);
+    let calls = fixture.pohunek_calls();
+    assert_eq!(calls.get(1), Some(&fixture.socket.preflight_call()));
+    let barrier = fixture.socket.barrier();
+    assert!(
+        barrier.as_os_str().len() <= fixture.socket.path.as_os_str().len(),
+        "barrier {} is longer than the socket it replaces",
+        barrier.display()
+    );
+    std::os::unix::net::SocketAddr::from_pathname(&barrier).expect("barrier path fits sockaddr_un");
+    assert_eq!(
+        fixture.systemctl_calls(),
+        [STATE_QUERY, LIST_WORKERS, DISABLE, LIST_WORKERS, RELOAD]
+    );
+    for legacy in fixture.legacy_files() {
+        assert!(!legacy.exists(), "{} was not removed", legacy.display());
+    }
+    assert!(!fixture.socket.path.exists());
+    assert!(!fixture.socket.retired_exists());
+}
+
+#[test]
+fn a_leftover_barrier_node_refuses_before_the_socket_moves() {
+    // rename(2) would replace a leftover node and `mv` would move the socket
+    // into a leftover directory, so either refuses with nothing changed.
+    for leftover_is_dir in [false, true] {
+        let fixture = Fixture::new();
+        fixture.legacy_install();
+        let barrier = fixture.socket.barrier();
+        if leftover_is_dir {
+            fs::create_dir(&barrier).expect("leftover barrier dir");
+        } else {
+            write(&barrier, "stale\n");
+        }
+        let output = fixture.run(&[], &[("POHUNEK_TEST_LEGACY_ACTIVE", "1")]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("connect-barrier node from an interrupted earlier run"),
+            "{stderr}"
+        );
+        assert!(stderr.contains(&barrier.display().to_string()), "{stderr}");
+        assert!(stderr.contains("nothing was changed"), "{stderr}");
+        assert_eq!(fixture.pohunek_calls(), [STATUS]);
+        assert_eq!(fixture.systemctl_calls(), [STATE_QUERY]);
+        for legacy in fixture.legacy_files() {
+            assert!(legacy.exists(), "{} was removed", legacy.display());
+        }
+        assert!(fixture.socket.path.exists(), "socket was moved");
+        assert_eq!(barrier.is_dir(), leftover_is_dir, "leftover was replaced");
+        if leftover_is_dir {
+            assert_eq!(
+                barrier.read_dir().expect("list leftover dir").count(),
+                0,
+                "socket was moved into the leftover directory"
+            );
+        } else {
+            assert_eq!(read(&barrier), "stale\n", "leftover was replaced");
+        }
+    }
+}
+
+#[test]
+fn a_socket_left_at_the_barrier_by_a_killed_run_is_named_for_restoring() {
+    // A run killed after the rename leaves a running daemon reachable only at
+    // the barrier name; the refusal names the command that restores it.
+    let fixture = Fixture::new();
+    fixture.legacy_install();
+    let barrier = fixture.socket.barrier();
+    fs::rename(&fixture.socket.path, &barrier).expect("move socket to barrier");
+    let output = fixture.run(&[], &[("POHUNEK_TEST_LEGACY_ACTIVE", "1")]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("control socket is missing"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "mv '{}' '{}'",
+            barrier.display(),
+            fixture.socket.path.display()
+        )),
+        "{stderr}"
+    );
+    assert!(stderr.contains("nothing was changed"), "{stderr}");
+    assert_eq!(fixture.pohunek_calls(), [STATUS]);
+    assert_eq!(fixture.systemctl_calls(), [STATE_QUERY]);
+    assert!(!fixture.socket.path.exists());
+    assert!(fixture.socket.retired_exists(), "barrier node was touched");
 }
 
 #[test]
@@ -951,9 +1059,14 @@ fn release_workflow_packages_static_shell_completions() {
 /// exit status of the migration preflight and of install/upgrade.
 /// `POHUNEK_TEST_INTERRUPT_AT=preflight` makes the preflight send
 /// `POHUNEK_TEST_INTERRUPT_SIGNAL` to the installer before it returns.
+/// A preflight whose `--socket` names no socket node exits 97, as the real
+/// CLI fails to dial it.
 const FAKE_POHUNEK: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$POHUNEK_TEST_POHUNEK_LOG"
 if [ "$1" = migration ]; then
+    if [ "${3:-}" = --socket ] && [ ! -S "${4:-}" ]; then
+        exit 97
+    fi
     if [ "${POHUNEK_TEST_INTERRUPT_AT:-}" = preflight ]; then
         kill -s "$POHUNEK_TEST_INTERRUPT_SIGNAL" "$PPID"
     fi
@@ -991,44 +1104,56 @@ struct Fixture {
     systemctl_log: PathBuf,
 }
 
-/// The legacy daemon's control socket and the connect-barrier variants the
-/// script derives from its name.
+/// The legacy daemon's control socket and the connect-barrier node the script
+/// renames it to.
 struct BarrierSocket {
     /// Path the daemon bound (`XDG_RUNTIME_DIR/pohunek/daemon.sock`).
     path: PathBuf,
 }
 
 impl BarrierSocket {
-    /// Expected start of a `migration preflight --socket` call the wrapper
-    /// makes against the renamed node, whose name carries the script's pid.
-    fn preflight_prefix(&self) -> String {
-        let name = self.path.file_name().expect("socket name");
-        format!(
-            "migration preflight --socket {}/{}.retiring.",
-            self.path.parent().expect("socket parent").display(),
-            name.to_string_lossy()
-        )
+    /// Sibling path the wrapper renames the socket to for the preflight.
+    fn barrier(&self) -> PathBuf {
+        self.path.with_file_name(BARRIER_NAME)
+    }
+
+    /// The `migration preflight --socket` call the wrapper makes against the
+    /// renamed node, without the optional `--accept-runtime-loss`.
+    fn preflight_call(&self) -> String {
+        format!("migration preflight --socket {}", self.barrier().display())
     }
 
     /// Whether the renamed barrier node remains next to the socket.
     fn retired_exists(&self) -> bool {
-        self.path
-            .parent()
-            .expect("socket parent")
-            .read_dir()
-            .expect("list runtime dir")
-            .filter_map(Result::ok)
-            .any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains("daemon.sock.retiring.")
-            })
+        self.barrier().symlink_metadata().is_ok()
     }
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_runtime_dir(|root| root.join("runtime"))
+    }
+
+    /// A fixture whose legacy socket path is exactly `socket_bytes` long,
+    /// padded through the runtime directory name.
+    fn with_socket_path_bytes(socket_bytes: usize) -> Self {
+        Self::with_runtime_dir(|root| {
+            let suffix_bytes = Path::new("pohunek/daemon.sock").as_os_str().len() + 1;
+            let root_bytes = root.as_os_str().len() + 1;
+            let padding = socket_bytes
+                .checked_sub(root_bytes + suffix_bytes)
+                .filter(|padding| *padding > 0)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "temp root {} leaves no room for a {socket_bytes}-byte socket path",
+                        root.display()
+                    )
+                });
+            root.join("r".repeat(padding))
+        })
+    }
+
+    fn with_runtime_dir(runtime_dir: impl FnOnce(&Path) -> PathBuf) -> Self {
         let root = tempfile::tempdir().expect("temp dir");
         let archive = root.path().join("archive");
         let commands = root.path().join("commands");
@@ -1086,7 +1211,7 @@ impl Fixture {
         );
         // The legacy daemon binds its control socket as a real AF_UNIX node,
         // so the barrier rename has a socket file to move.
-        let runtime = root.path().join("runtime");
+        let runtime = runtime_dir(root.path());
         let socket_dir = runtime.join("pohunek");
         fs::create_dir_all(&socket_dir).expect("create runtime dir");
         let socket = socket_dir.join("daemon.sock");

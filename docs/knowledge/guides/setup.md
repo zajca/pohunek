@@ -51,6 +51,14 @@ Linux, or the launchd agent
 `~/Library/LaunchAgents/io.github.zajca.pohunek.<ns>.daemon.plist` on macOS.
 `<ns>` is a 12-hex-digit namespace derived from the user ID and the state and
 runtime roots, so separate installations never touch each other's jobs.
+They never share a prefix either: the first install claims it in
+`<prefix>/libexec/pohunek/installation_owner`, and an install from another
+namespace (different XDG state or runtime roots) into the same prefix fails
+with `service_prefix_owned`; pick another `--prefix`, or uninstall the owning
+installation first, which releases the prefix. An existing version directory
+is reused only when it and its binaries are exactly what the installer creates
+(owned by you, mode `0755`, no symbolic links, no extra hard links); otherwise
+the install fails with `service_version_untrusted`.
 Session workers are not installed: the daemon starts one systemd transient unit
 or one launchd job per worker generation, and the daemon and workers are
 siblings, so restarting the daemon never stops a worker. The release archive's

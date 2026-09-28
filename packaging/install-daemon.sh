@@ -42,6 +42,10 @@ legacy_unit_dir="$config_home/systemd/user"
 # `SOCKET_NAME`); changing either must stay in step with that crate.
 POHUNEK_RUNTIME_SUBDIR=pohunek
 POHUNEK_SOCKET_NAME=daemon.sock
+# Sibling name the legacy socket node is renamed to as the connect barrier.
+# It is no longer than POHUNEK_SOCKET_NAME, so a socket path that fits
+# `sun_path` still fits after the rename and the preflight can dial it.
+POHUNEK_BARRIER_NAME=retiring
 
 for required in pohunek pohunekd pohunek-sessiond; do
     if [ ! -f "$archive_dir/$required" ] || [ ! -x "$archive_dir/$required" ]; then
@@ -164,6 +168,7 @@ barrier_signal_trap() {
 legacy_retired=0
 if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
     legacy_socket="${XDG_RUNTIME_DIR:-}/$POHUNEK_RUNTIME_SUBDIR/$POHUNEK_SOCKET_NAME"
+    barrier_path="${XDG_RUNTIME_DIR:-}/$POHUNEK_RUNTIME_SUBDIR/$POHUNEK_BARRIER_NAME"
     barrier_socket=
     if ! query_legacy_state; then
         echo "could not query the legacy daemon state with" >&2
@@ -185,11 +190,27 @@ if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
         if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -S "$legacy_socket" ]; then
             echo "the legacy daemon is not stopped (state: $legacy_state), but its control socket is missing:" >&2
             echo "  $legacy_socket" >&2
+            if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "$barrier_path" ]; then
+                echo "an interrupted earlier run left it moved to $barrier_path;" >&2
+                echo "nothing was changed; move it back with" >&2
+                echo "\`mv '$barrier_path' '$legacy_socket'\` and re-run $0" >&2
+                exit 1
+            fi
             echo "nothing was changed; wait until the legacy daemon is active or stopped" >&2
             echo "(or stop it with \`systemctl --user stop pohunekd.service\`) and re-run $0" >&2
             exit 1
         fi
-        barrier_socket="$legacy_socket.retiring.$$"
+        # A node left at the barrier name by an interrupted earlier run is
+        # never overwritten or reused: rename(2) would replace it, and `mv`
+        # would move the socket into a directory of that name.
+        if [ -e "$barrier_path" ] || [ -L "$barrier_path" ]; then
+            echo "a connect-barrier node from an interrupted earlier run remains:" >&2
+            echo "  $barrier_path" >&2
+            echo "nothing was changed; the legacy daemon listens at $legacy_socket," >&2
+            echo "so that node is stale: remove it and re-run $0" >&2
+            exit 1
+        fi
+        barrier_socket=$barrier_path
         # Armed before the rename so no interruption lands between the move
         # and the trap; until the moved node exists the traps find nothing to
         # settle. The fallback status of a signal is 128 plus its number.

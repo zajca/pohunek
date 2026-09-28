@@ -1,6 +1,6 @@
 //! Typed failures of `pohunek service`.
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-28
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -154,6 +154,41 @@ pub enum Error {
     VersionConflict {
         /// The existing version directory.
         path: PathBuf,
+    },
+
+    /// An installed version directory or one of its binaries is not exactly
+    /// what staging and publishing create: owned by this user, mode `0755`,
+    /// no symbolic link, and each binary a single-link regular file.
+    ///
+    /// The service manager executes these binaries later, so an entry another
+    /// account could replace is never reused.
+    #[error("{} cannot be trusted as an installed version: {detail}", path.display())]
+    UntrustedVersion {
+        /// The offending version directory or binary.
+        path: PathBuf,
+        /// What exactly was wrong with it.
+        detail: String,
+    },
+
+    /// The prefix belongs to another installation namespace.
+    ///
+    /// Version directories and `<prefix>/bin/pohunek` are shared by every
+    /// installation using the prefix, while journals, worker jobs, and
+    /// transactions are per namespace, so one prefix serves exactly one
+    /// namespace.
+    #[error(
+        "{} belongs to the pohunek installation with namespace {owner} (recorded in {}); \
+         two installations never share a prefix",
+        prefix.display(),
+        record.display()
+    )]
+    PrefixOwned {
+        /// The contested prefix.
+        prefix: PathBuf,
+        /// The namespace the ownership record names.
+        owner: String,
+        /// The ownership record.
+        record: PathBuf,
     },
 
     /// `service install` found an existing installation.
@@ -357,6 +392,8 @@ impl Error {
             Self::VersionProbe { .. } => "service_version_probe_failed",
             Self::VersionMismatch { .. } => "service_version_mismatch",
             Self::VersionConflict { .. } => "service_version_conflict",
+            Self::UntrustedVersion { .. } => "service_version_untrusted",
+            Self::PrefixOwned { .. } => "service_prefix_owned",
             Self::AlreadyInstalled { .. } => "service_already_installed",
             Self::NotInstalled { .. } => "service_not_installed",
             Self::PendingInstall { .. } => "service_install_pending",
@@ -393,6 +430,12 @@ impl Error {
             ),
             Self::InstallIncomplete { .. } => Some(
                 "rerun `pohunek service install` (or packaging/install-daemon.sh) with the same version and prefix to finish it, or run `pohunek service uninstall`, which checks for live sessions before removing it",
+            ),
+            Self::UntrustedVersion { .. } => Some(
+                "make sure nothing runs from that version directory, remove it, and rerun the command to install it again",
+            ),
+            Self::PrefixOwned { .. } => Some(
+                "pass another --prefix, or uninstall the installation of that namespace first; if it no longer exists, delete the named ownership record",
             ),
             Self::DaemonJobPresent { .. } => Some(
                 "remove the stale daemon job with the service manager, then install again",

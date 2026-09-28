@@ -121,6 +121,32 @@ pub(super) fn fs_error(operation: &'static str) -> impl Fn(FsError) -> Error {
     }
 }
 
+/// Requires the `<label>.plist` a replacement rewrites to exist in `directory`.
+///
+/// A missing file is [`Error::NotFound`], so a replacement never turns into a
+/// fresh registration that hides a lost installation. The file must be a
+/// private regular file as [`register`] writes it; a symlink, a hard-linked
+/// file, or another owner or mode is refused. Its content is not parsed: a
+/// damaged definition is what a replacement repairs.
+pub(super) fn require_definition(
+    directory: &TrustedDir,
+    id: &ServiceId,
+    label: &str,
+    operation: &'static str,
+) -> Result<(), Error> {
+    match directory
+        .entry_identity_with_mode(
+            definition_name(label),
+            EntryKind::RegularFile,
+            DEFINITION_MODE,
+        )
+        .map_err(fs_error(operation))?
+    {
+        Some(_) => Ok(()),
+        None => Err(Error::NotFound(id.clone())),
+    }
+}
+
 /// Probes whether `label` is loaded in `domain` with `launchctl print`.
 pub(super) async fn probe(
     launchctl: &Launchctl,
@@ -763,6 +789,71 @@ mod tests {
                 .read_file("job.plist", DEFINITION_MODE, MAX_DEFINITION_BYTES)
                 .expect("definition"),
             b"new"
+        );
+    }
+
+    #[test]
+    fn a_replacement_requires_an_existing_private_definition() {
+        let fixture = Fixture::new();
+        let directory = &fixture.directory;
+        let id = ServiceId::parse(LABEL).expect("valid service id");
+        let path = directory.path().join(definition_name(LABEL));
+        let require = || require_definition(directory, &id, LABEL, "replace");
+
+        let missing = require();
+        assert!(
+            matches!(&missing, Err(Error::NotFound(found)) if *found == id),
+            "{missing:?}"
+        );
+
+        // A damaged but private definition is what a replacement repairs.
+        fixture.plant_leftover();
+        require().expect("private definition");
+
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o620))
+            .expect("group-writable mode");
+        let unsafe_mode = require();
+        assert!(
+            matches!(
+                unsafe_mode,
+                Err(Error::Operation {
+                    operation: "replace",
+                    ..
+                })
+            ),
+            "{unsafe_mode:?}"
+        );
+
+        std::fs::remove_file(&path).expect("remove definition");
+        let target = directory.path().join("target.plist");
+        std::fs::write(&target, b"target").expect("symlink target");
+        std::fs::set_permissions(&target, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("private target");
+        std::os::unix::fs::symlink(&target, &path).expect("symlinked definition");
+        let symlink = require();
+        assert!(
+            matches!(
+                symlink,
+                Err(Error::Operation {
+                    operation: "replace",
+                    ..
+                })
+            ),
+            "{symlink:?}"
+        );
+
+        std::fs::remove_file(&path).expect("remove symlink");
+        std::fs::hard_link(&target, &path).expect("hard-linked definition");
+        let hard_link = require();
+        assert!(
+            matches!(
+                hard_link,
+                Err(Error::Operation {
+                    operation: "replace",
+                    ..
+                })
+            ),
+            "{hard_link:?}"
         );
     }
 

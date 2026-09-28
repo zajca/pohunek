@@ -13,7 +13,7 @@
 //! that worker is provably gone or its phase is final the journal references
 //! nothing, and until then it makes every version referenced.
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-28
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -394,6 +394,21 @@ impl Usage {
                 self.processes.entry(version).or_default().push(pid);
             }
         }
+    }
+
+    /// Returns whether `version` is kept for a reference only this
+    /// installation's namespace can see: a journal, a worker job, or a
+    /// journal or job that could not be proven harmless.
+    ///
+    /// Running processes and the running CLI are found by executable path,
+    /// so every namespace using the prefix honors them.
+    #[must_use]
+    pub fn namespace_bound(&self, version: &str) -> bool {
+        self.journals.contains_key(version)
+            || self.jobs.contains_key(version)
+            || !self.unreadable.is_empty()
+            || !self.outdated.is_empty()
+            || self.jobs_error.is_some()
     }
 
     /// Returns why `version` must be kept, or `None` when it may be deleted.

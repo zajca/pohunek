@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use super::super::{Error, JobDefinition, RestartPolicy};
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-27
 
 /// Description of the daemon unit shown by `systemctl --user status`.
 const DAEMON_DESCRIPTION: &str = "Pohunek host control plane";
@@ -187,9 +187,13 @@ fn environment_assignment(key: &str, value: &str) -> Result<String, Error> {
 
 /// Renders an unquoted path value such as `WorkingDirectory=`.
 ///
-/// These settings expand specifiers but never unquote, and the parser trims
-/// surrounding whitespace and treats a trailing `\` as a line continuation, so
-/// such paths are rejected instead of silently changed.
+/// `WorkingDirectory=` expands specifiers but neither unquotes nor
+/// C-unescapes, so `\` and `"` reach systemd verbatim and only `%` needs
+/// escaping; escaping a backslash here would double it in the parsed path.
+/// The line reader trims surrounding whitespace and joins a line ending in a
+/// `\` with the next, so such paths are rejected instead of silently
+/// changed. An absolute path starts with `/`, so the `-` and `~` forms never
+/// apply.
 fn plain_path(path: &Path) -> Result<String, Error> {
     let value = path_str(path)?;
     reject_control("WorkingDirectory", value)?;
@@ -363,11 +367,22 @@ mod tests {
     }
 
     #[test]
-    fn working_directories_escape_specifiers() {
-        assert_eq!(
-            plain_path(Path::new("/srv/100% done")).expect("expressible"),
-            "/srv/100%% done"
-        );
+    fn working_directories_escape_only_specifiers() {
+        for (input, expected) in [
+            ("/srv/100% done", "/srv/100%% done"),
+            ("/srv/%h", "/srv/%%h"),
+            ("/srv/a\\sb", "/srv/a\\sb"),
+            ("/srv/a\\\\b", "/srv/a\\\\b"),
+            ("/srv/\"q\" 'single'", "/srv/\"q\" 'single'"),
+            ("/srv/$HOME", "/srv/$HOME"),
+            ("/srv/\\/x", "/srv/\\/x"),
+        ] {
+            assert_eq!(plain_path(Path::new(input)).expect("expressible"), expected);
+        }
+        let definition = definition(&[], "/srv/a\\s \"q\" 100%").expect("valid definition");
+        assert!(render_daemon_unit(&definition)
+            .expect("renderable unit")
+            .contains("\nWorkingDirectory=/srv/a\\s \"q\" 100%%\n"));
     }
 
     #[test]

@@ -316,7 +316,14 @@ the recorded generation's, which is never touched), both with the runtime code
 retirement (`runtime_supervision_unavailable`); a worker journaled under another
 generation still runs (`runtime_identity_mismatch`); or the session's journals
 cannot be read, or a journaled worker of the generation still runs or cannot be
-inspected after the retirement (`runtime_supervision_ambiguous`).
+inspected after the retirement (`runtime_supervision_ambiguous`). Every
+removal, whatever the runtime state, then sweeps the processes that carry the
+session's runtime ownership markers, because a descendant that left the
+worker's process group (macOS kills only the group) outlives the stop and the
+job retirement. A sweep that cannot confirm every marked process exited fails
+the removal with `runtime_supervision_ambiguous` and keeps the session listed
+with its removal intent; `session rm` again, or the next daemon start,
+finishes it once the leftover process is gone.
 
 Reconciliation joins the service manager's jobs with worker sockets and
 journals for each worker generation. It reports `runtime_lost` when a worker's
@@ -331,10 +338,10 @@ only after the service manager retired its ended job; while that retirement
 fails it stays `reconnecting` with `runtime_supervision_unavailable` and is
 retried. A removal interrupted by a daemon restart is finished by
 reconciliation through the same steps as `session rm` (retire the recorded
-generation and prove its workers gone, then delete worktrees, logs, the resume
-binding, and the record); until those succeed the session stays listed with
-`runtime_supervision_unavailable` or `runtime_supervision_ambiguous` and is
-retried.
+generation and prove its workers gone, sweep its runtimes' marked processes,
+then delete worktrees, logs, the resume binding, and the record); until those
+succeed the session stays listed with `runtime_supervision_unavailable` or
+`runtime_supervision_ambiguous` and is retried.
 
 ## Retention
 

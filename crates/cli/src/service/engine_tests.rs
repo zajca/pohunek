@@ -395,6 +395,7 @@ fn session(id: &str, name: Option<&str>) -> SessionInfo {
 struct Harness {
     _temp: tempfile::TempDir,
     root: PathBuf,
+    prefix: PathBuf,
     context: Context,
     fake: Fake,
     backend: Backend,
@@ -403,6 +404,23 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         let (temp, root) = temp_root();
+        let prefix = root.join("prefix");
+        Self::build(temp, root, prefix)
+    }
+
+    /// A second installation with its own XDG roots, and therefore its own
+    /// namespace and service manager, that installs into `other`'s prefix.
+    fn sharing_prefix(other: &Self) -> Self {
+        let (temp, root) = temp_root();
+        let harness = Self::build(temp, root, other.prefix());
+        assert_ne!(
+            harness.context.namespace().expect("namespace"),
+            other.context.namespace().expect("namespace")
+        );
+        harness
+    }
+
+    fn build(temp: tempfile::TempDir, root: PathBuf, prefix: PathBuf) -> Self {
         let context = context(&root);
         let fake = Fake::default();
         let backend = Backend::new(
@@ -413,6 +431,7 @@ impl Harness {
         Self {
             _temp: temp,
             root,
+            prefix,
             context,
             fake,
             backend,
@@ -427,7 +446,7 @@ impl Harness {
     }
 
     fn prefix(&self) -> PathBuf {
-        self.root.as_path().join("prefix")
+        self.prefix.clone()
     }
 
     fn layout(&self) -> InstallLayout {
@@ -1602,18 +1621,17 @@ async fn uninstall_removes_a_version_whose_non_final_journal_names_an_exited_wor
 async fn a_failed_uninstall_keeps_service_toml_so_a_rerun_finishes_it() {
     let harness = Harness::new();
     harness.install(V1).await.expect("install");
-    let versions = harness.layout().versions_dir();
-    std::fs::set_permissions(
-        &versions,
-        std::os::unix::fs::PermissionsExt::from_mode(0o777),
-    )
-    .expect("loosen versions dir");
+    // The versions directory is verified before anything is removed, so the
+    // CLI copy's directory is what fails once the daemon job is gone.
+    let bin = harness.layout().bin_dir();
+    std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o777))
+        .expect("loosen bin dir");
 
     let error = harness
         .engine()
         .uninstall(UninstallOptions::default())
         .await
-        .expect_err("an untrusted versions directory stops the removal");
+        .expect_err("an untrusted bin directory stops the removal");
     assert!(
         matches!(error, Error::UntrustedDirectory { .. }),
         "{error:?}"
@@ -1627,11 +1645,8 @@ async fn a_failed_uninstall_keeps_service_toml_so_a_rerun_finishes_it() {
         "the daemon job is gone"
     );
 
-    std::fs::set_permissions(
-        &versions,
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )
-    .expect("restore versions dir");
+    std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .expect("restore bin dir");
     let report = harness
         .engine()
         .uninstall(UninstallOptions::default())
@@ -1768,6 +1783,176 @@ async fn an_outdated_journal_blocks_uninstall_only_while_its_worker_may_run() {
         .await
         .expect("uninstall");
     harness.assert_clean();
+}
+
+/// Asserts that `error` refuses the prefix `holder` owns.
+fn assert_owned_by(error: &Error, holder: &Harness) {
+    let namespace = holder.context.namespace().expect("namespace");
+    assert!(
+        matches!(error, Error::PrefixOwned { owner, prefix, record }
+            if owner == namespace.as_str()
+                && prefix == &holder.prefix()
+                && record == &layout::owner_record(&holder.layout())),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), "service_prefix_owned");
+}
+
+/// Two installations with different XDG roots never share a prefix: the
+/// second install is refused before it stages anything, and the owner's
+/// uninstall releases the prefix only after removing its own files.
+#[tokio::test]
+async fn a_prefix_serves_one_namespace_until_its_uninstall_releases_it() {
+    let first = Harness::new();
+    first.install(V1).await.expect("first install");
+    let record = layout::owner_record(&first.layout());
+    assert!(record.is_file(), "the install claims the prefix");
+
+    let second = Harness::sharing_prefix(&first);
+    let error = second.install(V2).await.expect_err("shared prefix");
+    assert_owned_by(&error, &first);
+    assert!(second.config().is_none(), "{error:?}");
+    assert!(second.pending().is_none(), "{error:?}");
+    assert!(second.fake.world().registered.is_none(), "{error:?}");
+    assert_eq!(
+        layout::installed_versions(&first.layout()).expect("versions"),
+        [V1],
+        "nothing of the second installation is staged or published"
+    );
+    first.assert_installed(V1);
+
+    first.upgrade(V2).await.expect("the owner still upgrades");
+    let report = first
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect("owner uninstall");
+    assert!(report.removed.contains(&record));
+    first.assert_clean();
+    assert!(!record.exists(), "the uninstall releases the prefix");
+
+    second
+        .install(V1)
+        .await
+        .expect("install into the released prefix");
+    second.assert_installed(V1);
+    second
+        .upgrade(V2)
+        .await
+        .expect("upgrade in the released prefix");
+    second.assert_installed(V2);
+}
+
+/// A prefix another namespace claimed is never cleaned by this one: upgrade,
+/// its version collection, and uninstall are all refused before anything is
+/// removed, so the owner's binaries and CLI copy survive.
+#[tokio::test]
+async fn a_prefix_claimed_by_another_namespace_is_never_cleaned_by_this_one() {
+    let first = Harness::new();
+    first.install(V1).await.expect("first install");
+    // An installation made before prefixes had owners: the record is gone,
+    // and the second installation claims the prefix with its own install.
+    let record = layout::owner_record(&first.layout());
+    std::fs::remove_file(&record).expect("remove record");
+    let second = Harness::sharing_prefix(&first);
+    second
+        .install(V2)
+        .await
+        .expect("second install claims the prefix");
+    second.assert_installed(V2);
+
+    let error = first.upgrade(V2).await.expect_err("upgrade");
+    assert_owned_by(&error, &second);
+    let error = first
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect_err("uninstall");
+    assert_owned_by(&error, &second);
+    let error = first
+        .engine()
+        .collect_garbage(&first.layout(), V1)
+        .await
+        .expect_err("collection");
+    assert_owned_by(&error, &second);
+
+    assert_eq!(
+        first.fake.daemon_version().as_deref(),
+        Some(V1),
+        "the refused uninstall kept its daemon job"
+    );
+    assert!(first.config().is_some());
+    assert_eq!(
+        layout::installed_versions(&second.layout()).expect("versions"),
+        [V1, V2],
+        "no version directory was removed"
+    );
+    second.assert_installed(V2);
+}
+
+#[tokio::test]
+async fn an_install_that_fails_or_rolls_back_gives_the_prefix_up() {
+    let first = Harness::new();
+    let from = first.staged(V1);
+    layout::tests::write_fake(&from, CLI_NAME, "0.9.0");
+    let error = first
+        .engine()
+        .install(&from, &first.prefix(), V1)
+        .await
+        .expect_err("mismatched binaries");
+    assert!(matches!(error, Error::VersionMismatch { .. }), "{error:?}");
+    assert!(!layout::owner_record(&first.layout()).exists());
+
+    let mut engine = first.engine();
+    engine.interrupt_after = Some(Step::Config);
+    engine
+        .install(&first.staged(V1), &first.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+    assert!(layout::owner_record(&first.layout()).is_file());
+    first
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect("uninstall rolls the install back");
+    first.assert_clean();
+    assert!(!layout::owner_record(&first.layout()).exists());
+
+    let second = Harness::sharing_prefix(&first);
+    second
+        .install(V1)
+        .await
+        .expect("install into the free prefix");
+    second.assert_installed(V1);
+}
+
+/// The prefix is verified before the uninstall touches anything, so an
+/// untrusted versions directory leaves the whole installation in place.
+#[tokio::test]
+async fn an_untrusted_versions_directory_fails_the_uninstall_before_any_change() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let versions = harness.layout().versions_dir();
+    std::fs::set_permissions(
+        &versions,
+        std::os::unix::fs::PermissionsExt::from_mode(0o777),
+    )
+    .expect("loosen versions dir");
+    let error = harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect_err("untrusted");
+    assert!(
+        matches!(&error, Error::UntrustedDirectory { path, .. } if path == &versions),
+        "{error:?}"
+    );
+    std::fs::set_permissions(
+        &versions,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("restore versions dir");
+    harness.assert_installed(V1);
 }
 
 /// The in-use protection matches executables by their canonical path, which

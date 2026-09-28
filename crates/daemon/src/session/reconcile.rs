@@ -5,7 +5,11 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pohunek_platform::{filesystem::TrustedDir, process::BootIdentity, supervisor::WorkerKey};
+use pohunek_platform::{
+    filesystem::TrustedDir,
+    process::{BootIdentity, StartIdentity},
+    supervisor::WorkerKey,
+};
 use pohunek_worker_protocol::{ControlCode, InspectSnapshot, ReleasedIdentityClaim, RuntimePhase};
 use protocol::{
     AgentActivity, AgentKind, RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus,
@@ -851,6 +855,13 @@ impl SessionRegistry {
                 runtime_id,
                 worker_start_identity,
             } => {
+                // The removal finalizer sweeps every runtime of the
+                // generation itself and finishes only on a confirmed sweep.
+                if !creating && record.desired_state == DesiredState::Removed {
+                    return self
+                        .finish_removal_intent(record, Some(&generation), lifecycle, retry)
+                        .await;
+                }
                 // `runtime_id` is set only for a journaled worker proven gone;
                 // a generation that never journaled has nothing proven to
                 // sweep, so only its job is retired.
@@ -861,11 +872,6 @@ impl SessionRegistry {
                     }
                     None => Cleanup::Complete,
                 };
-                if !creating && record.desired_state == DesiredState::Removed {
-                    return self
-                        .finish_removal_intent(record, Some(&generation), lifecycle, retry)
-                        .await;
-                }
                 let retired = match lifecycle {
                     Some(lifecycle) => lifecycle.retire(&generation).await,
                     None => Ok(()),
@@ -1304,16 +1310,104 @@ impl SessionRegistry {
             .map_err(crate::runtime::lifecycle::PreviousLive::into_error)
     }
 
+    /// Proves that no marked process of a runtime the removal of `id`
+    /// forgets is left.
+    ///
+    /// Removal deletes the only record of the session's runtimes, and a
+    /// descendant that left the worker's process group (launchd kills only
+    /// the group) is reaped by nothing but the marker sweep. Every runtime
+    /// the record names (`runtime_id`) or a journal of `generation` records,
+    /// terminal journals included, is swept ([`Self::sweep_lost_runtime`])
+    /// with the start identity of the worker that journaled it; a runtime no
+    /// journal records is swept without one, which counts every
+    /// unreadable-marker process as possibly its own. Callers sweep only
+    /// once every worker of the generation is proven gone, so no live
+    /// worker is still starting marked processes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `runtime_supervision_ambiguous` when the journals cannot be
+    /// scanned or one of them is unreadable, or a sweep cannot confirm that
+    /// every marked process exited. The caller keeps the record and its
+    /// removal intent.
+    pub(super) async fn sweep_removed_runtimes(
+        &self,
+        id: &SessionId,
+        generation: Option<&super::Generation>,
+        runtime_id: Option<&str>,
+    ) -> Result<(), ProtocolError> {
+        let ambiguous = |detail: String| {
+            ProtocolError::new(
+                protocol::ErrorClass::Runtime,
+                SUPERVISION_AMBIGUOUS,
+                format!("session {} cannot be removed: {detail}", id.0),
+                None,
+            )
+        };
+        let mut runtimes: Vec<(String, Option<StartIdentity>)> = Vec::new();
+        if let Some(generation) = generation {
+            let scan = self
+                .discover_worker_journals()
+                .await
+                .map_err(ambiguous)?
+                .remove(&id.0)
+                .unwrap_or_default();
+            if scan.conflict {
+                return Err(ambiguous(
+                    "the session has an unreadable or mismatched worker journal".to_owned(),
+                ));
+            }
+            for journal in scan
+                .evidence
+                .iter()
+                .filter(|journal| journal.generation == generation.generation())
+            {
+                let worker = journal.worker();
+                let Some(journaled) = worker.runtime_id else {
+                    continue;
+                };
+                // A malformed start identity proves no bystander foreign, so
+                // the sweep then treats every unreadable marker as the
+                // runtime's own.
+                let start = worker
+                    .identity()
+                    .ok()
+                    .map(|identity| identity.start_identity);
+                match runtimes.iter_mut().find(|(known, _)| known == journaled) {
+                    // Several workers journaling one runtime cannot tell
+                    // which one started it, so none of them bounds it.
+                    Some((_, known_start)) if *known_start != start => *known_start = None,
+                    Some(_) => {}
+                    None => runtimes.push((journaled.to_owned(), start)),
+                }
+            }
+        }
+        if let Some(runtime_id) = runtime_id {
+            if !runtimes.iter().any(|(known, _)| known == runtime_id) {
+                runtimes.push((runtime_id.to_owned(), None));
+            }
+        }
+        for (runtime_id, start) in runtimes {
+            if self.sweep_lost_runtime(&id.0, &runtime_id, start).await == Cleanup::Unconfirmed {
+                return Err(ambiguous(format!(
+                    "processes of runtime {runtime_id} are not proven gone"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Finishes the durable removal intent of `record` once its runtime is
     /// proven ended or stopped.
     ///
     /// The exact recorded generation is retired and its workers proven gone,
-    /// then [`Self::release_removed_session`] deletes everything the session
-    /// owns, the durable record last. Without a supervisor or a recorded
-    /// generation there is no job to retire. Returns whether the removal
-    /// needs the background re-check: a generation the supervisor cannot
-    /// retire keeps the session `runtime_supervision_unavailable`, a worker
-    /// not proven gone keeps it `runtime_supervision_ambiguous`, and a failed
+    /// then [`Self::release_removed_session`] sweeps the session's runtimes
+    /// and deletes everything the session owns, the durable record last.
+    /// Without a supervisor or a recorded generation there is no job to
+    /// retire. Returns whether the removal needs the background re-check: a
+    /// generation the supervisor cannot retire keeps the session
+    /// `runtime_supervision_unavailable`, a worker or a marked process not
+    /// proven gone keeps it `runtime_supervision_ambiguous`, and a failed
     /// cleanup keeps it `runtime_supervision_unavailable`; each re-check
     /// reaches this finalizer again from fresh evidence. A worker of another
     /// generation that still runs is an identity conflict and is not retried.
@@ -1355,17 +1449,20 @@ impl SessionRegistry {
                 return true;
             }
         }
-        match self.release_removed_session(&id).await {
+        let runtime_id = record.runtime.runtime_id.clone();
+        match self
+            .release_removed_session(&id, generation, runtime_id.as_deref())
+            .await
+        {
             Ok(_released) => false,
             Err(error) => {
                 tracing::warn!(session_id = %id.0, error = %error, "failed to finish reconciled removal");
-                self.mark_pending(
-                    record,
-                    RuntimeState::Reconnecting,
-                    SUPERVISION_UNAVAILABLE,
-                    retry,
-                )
-                .await;
+                let (state, reason) = if error.code == SUPERVISION_AMBIGUOUS {
+                    (RuntimeState::Conflict, SUPERVISION_AMBIGUOUS)
+                } else {
+                    (RuntimeState::Reconnecting, SUPERVISION_UNAVAILABLE)
+                };
+                self.mark_pending(record, state, reason, retry).await;
                 true
             }
         }
@@ -8651,6 +8748,164 @@ while os.getppid() == parent:
             wait_removed(&fixture, "s-377").await;
             assert_removal_finished(&fixture, "s-377").await;
             assert_eq!(retire_count(&fixture.supervisor, &id), 2);
+        }
+
+        /// A fixture whose marker reads fail until the returned inspector
+        /// is told otherwise; the process table is the readable host view.
+        fn unreadable_marker_fixture() -> (Fixture, Arc<RetryInspector>) {
+            let inspector = Arc::new(RetryInspector::readable_host());
+            inspector.fail_markers(true);
+            let fixture =
+                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+            (fixture, inspector)
+        }
+
+        /// Asserts that `session_id` waits, listed and recorded with its
+        /// removal intent, for its runtime's marked processes to be swept.
+        async fn assert_removal_waits_for_the_sweep(fixture: &Fixture, session_id: &str) {
+            let runtime = runtime_of(&fixture.registry, session_id).await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
+            assert_eq!(
+                durable_desired_state(&fixture.root, session_id),
+                Some(DesiredState::Removed),
+                "an unconfirmed sweep keeps the removal intent"
+            );
+        }
+
+        #[tokio::test]
+        async fn removal_intent_with_a_terminal_journal_waits_for_a_confirmed_sweep() {
+            let (fixture, inspector) = unreadable_marker_fixture();
+            let marked = Marked::spawn("runtime-s-378");
+            let record = persist_removal_intent(&fixture.root, "s-378", Some("runtime-s-378"));
+            seed_removal_leftovers(&fixture.root, &record);
+            write_terminal_journal(&fixture.root, "s-378", "runtime-s-378");
+            let id = service_id("s-378", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Unknown, None));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            assert_removal_waits_for_the_sweep(&fixture, "s-378").await;
+            assert!(
+                marked.alive(),
+                "an unreadable marker is never a signal permit"
+            );
+
+            inspector.fail_markers(false);
+            wait_removed(&fixture, "s-378").await;
+            assert_removal_finished(&fixture, "s-378").await;
+            marked.wait_gone().await;
+        }
+
+        #[tokio::test]
+        async fn removal_intent_whose_job_ended_waits_for_a_confirmed_sweep() {
+            let (fixture, inspector) = unreadable_marker_fixture();
+            let marked = Marked::spawn("runtime-s-379");
+            let record = persist_removal_intent(&fixture.root, "s-379", Some("runtime-s-379"));
+            seed_removal_leftovers(&fixture.root, &record);
+            write_live_journal(&fixture.root, "s-379", dead_worker(), Some("runtime-s-379"));
+            let id = service_id("s-379", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            assert_removal_waits_for_the_sweep(&fixture, "s-379").await;
+            assert!(marked.alive());
+
+            inspector.fail_markers(false);
+            wait_removed(&fixture, "s-379").await;
+            assert_removal_finished(&fixture, "s-379").await;
+            marked.wait_gone().await;
+        }
+
+        #[tokio::test]
+        async fn removal_sweeps_every_runtime_of_its_generation() {
+            let fixture = fixture(Arc::new(RetryInspector::readable_host()));
+            let recorded_runtime = Marked::spawn("runtime-s-380");
+            let journaled_runtime = Marked::spawn("runtime-s-380-journaled");
+            let bystander = Marked::spawn("runtime-s-380-other");
+            persist_record(&fixture.root, "s-380", Some("runtime-s-380"));
+            write_live_journal(&fixture.root, "s-380", dead_worker(), Some("runtime-s-380"));
+            // A second journal of the generation names a runtime the record
+            // does not.
+            write_worker_journal(
+                &fixture.root,
+                "s-380",
+                "worker-s-380-other",
+                TEST_GENERATION,
+                dead_worker(),
+                Some("runtime-s-380-journaled"),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let runtime = runtime_of(&fixture.registry, "s-380").await;
+            assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
+
+            let removed = fixture
+                .registry
+                .remove(&SessionId("s-380".to_owned()))
+                .await
+                .expect("remove once every worker is gone");
+
+            assert!(removed.removed);
+            assert!(!recorded(&fixture.root, "s-380"));
+            recorded_runtime.wait_gone().await;
+            journaled_runtime.wait_gone().await;
+            assert!(bystander.alive(), "another runtime is never swept");
+        }
+
+        #[tokio::test]
+        async fn explicit_removal_keeps_its_intent_until_the_runtime_is_swept() {
+            let inspector = Arc::new(RetryInspector::readable_host());
+            let fixture =
+                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+            let marked = Marked::spawn("runtime-s-381");
+            persist_record(&fixture.root, "s-381", Some("runtime-s-381"));
+            write_live_journal(&fixture.root, "s-381", dead_worker(), Some("runtime-s-381"));
+            let id = service_id("s-381", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Running, None));
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            assert_eq!(
+                runtime_of(&fixture.registry, "s-381").await.state,
+                RuntimeState::Conflict
+            );
+            let session = SessionId("s-381".to_owned());
+            inspector.fail_markers(true);
+
+            let error = fixture
+                .registry
+                .remove(&session)
+                .await
+                .expect_err("an unconfirmed sweep blocks the removal");
+
+            assert_eq!(error.code, SUPERVISION_AMBIGUOUS, "{error:?}");
+            assert_removal_waits_for_the_sweep(&fixture, "s-381").await;
+            assert!(marked.alive());
+            assert_eq!(fixture.supervisor.retired(), vec![id.clone()]);
+
+            inspector.fail_markers(false);
+            let removed = fixture
+                .registry
+                .remove(&session)
+                .await
+                .expect("the retried removal sweeps and finishes");
+
+            assert!(removed.removed);
+            assert!(!recorded(&fixture.root, "s-381"));
+            marked.wait_gone().await;
         }
 
         #[tokio::test]

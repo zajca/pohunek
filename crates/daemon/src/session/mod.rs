@@ -2683,8 +2683,11 @@ impl SessionRegistry {
     /// proven gone before the record is deleted. Such a runtime whose record
     /// names no generation, a conflict over a job or worker that is not the
     /// recorded generation's, and a worker still running after retirement are
-    /// refused instead. A `session_removed` event is emitted with the final
-    /// snapshot so subscribed clients drop their view of the session.
+    /// refused instead. Every removal then sweeps the marked processes of the
+    /// session's runtimes, since a descendant that left the worker's process
+    /// group outlives both the stop and the retirement. A `session_removed`
+    /// event is emitted with the final snapshot so subscribed clients drop
+    /// their view of the session.
     ///
     /// Worktree cleanup is best-effort: a checkout that could not be deleted is
     /// counted in [`SessionRemoveResult::worktrees_failed`] instead of failing
@@ -2701,9 +2704,12 @@ impl SessionRegistry {
     /// `worker_protocol_incompatible`); a generation the supervisor cannot
     /// retire fails with `runtime_supervision_unavailable`; a worker not
     /// proven gone afterwards fails with `runtime_supervision_ambiguous` or
-    /// `runtime_identity_mismatch`. The record is kept in every case, and a
-    /// cleanup that fails after the removal intent was recorded keeps the
-    /// session listed, so the removal can be retried.
+    /// `runtime_identity_mismatch`. The record is kept in every case. A
+    /// marker sweep that cannot confirm every marked process exited fails
+    /// with `runtime_supervision_ambiguous` after the removal intent was
+    /// recorded; like any cleanup that fails then, it keeps the session
+    /// listed with its intent, so the removal can be retried (daemon startup
+    /// reconciliation also finishes it).
     pub async fn remove(&self, id: &SessionId) -> Result<SessionRemoveResult, ProtocolError> {
         self.ensure_not_external(id).await?;
         let _guard = self.lock_lifecycle(id).await;
@@ -2753,7 +2759,21 @@ impl SessionRegistry {
             false
         };
 
-        let released = self.release_removed_session(id).await?;
+        let (job, runtime_id) = {
+            let sessions = self.inner.sessions.lock().await;
+            let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
+            (
+                entry.job.clone(),
+                entry
+                    .info
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.runtime_id.clone()),
+            )
+        };
+        let released = self
+            .release_removed_session(id, job.as_ref(), runtime_id.as_deref())
+            .await?;
         Ok(SessionRemoveResult {
             removed: released.evicted,
             stopped,
@@ -2762,26 +2782,36 @@ impl SessionRegistry {
         })
     }
 
-    /// Deletes everything a removed session owns once its runtime is proven
-    /// gone: owned worktrees, the worker log family, the registry entry, the
-    /// resume binding, and finally the durable record.
+    /// Deletes everything a removed session owns once its workers are proven
+    /// gone: marked processes of its runtimes, owned worktrees, the worker log
+    /// family, the registry entry, the resume binding, and finally the
+    /// durable record.
     ///
     /// Shared by [`Self::remove`] and the reconciliation that finishes a
     /// durable removal intent, so both leave the same state behind. The
-    /// record is deleted even when no entry is listed (startup reconciliation
-    /// runs before the session is installed), and `session_removed` is
-    /// emitted only for an evicted entry.
+    /// marker sweep of every runtime of `generation` and of `runtime_id`
+    /// ([`Self::sweep_removed_runtimes`]) comes first, because nothing
+    /// controls a surviving descendant once the record is gone. The record is
+    /// deleted even when no entry is listed (startup reconciliation runs
+    /// before the session is installed), and `session_removed` is emitted
+    /// only for an evicted entry.
     ///
     /// # Errors
     ///
-    /// Returns the worktree, log, or store error that stopped the cleanup.
+    /// Returns `runtime_supervision_ambiguous` when a runtime's marked
+    /// processes are not proven gone, before anything is deleted, and
+    /// otherwise the worktree, log, or store error that stopped the cleanup.
     /// Every step is idempotent and the durable record is deleted last, so a
     /// failed cleanup keeps the removal intent for a later attempt, and an
     /// entry evicted before the record could be deleted is listed again.
     async fn release_removed_session(
         &self,
         id: &SessionId,
+        generation: Option<&Generation>,
+        runtime_id: Option<&str>,
     ) -> Result<ReleasedSession, ProtocolError> {
+        self.sweep_removed_runtimes(id, generation, runtime_id)
+            .await?;
         let (cleanup_warnings, worktrees) = self.cleanup_owned_worktrees_for_removal(id).await?;
         if !cleanup_warnings.is_empty() {
             let mut sessions = self.inner.sessions.lock().await;

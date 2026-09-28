@@ -76,8 +76,13 @@ but has no control socket node yet (or anymore) also refuses unchanged, since
 no preflight can reach it.
 
 1. it moves the legacy daemon's control socket node aside
-   (`XDG_RUNTIME_DIR/pohunek/daemon.sock`) with `rename(2)`, so new clients
-   cannot open new connections (existing connections keep serving);
+   (`XDG_RUNTIME_DIR/pohunek/daemon.sock`) with `rename(2)` to the sibling
+   `XDG_RUNTIME_DIR/pohunek/retiring`, so new clients cannot open new
+   connections (existing connections keep serving). The moved name is no
+   longer than `daemon.sock`, so it fits the `sun_path` limit whenever the
+   original does. A node already at that name, left by a run killed before
+   it could clean up, refuses the run unchanged; when the daemon's socket
+   itself is the one left there, the refusal prints the `mv` that restores it;
 2. it runs `pohunek migration preflight --socket <moved-socket>` over that
    socket, which refuses while the legacy daemon owns live PTYs;
 3. it lists `pohunek-session@` template jobs in every state except

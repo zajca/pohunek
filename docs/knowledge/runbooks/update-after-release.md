@@ -120,7 +120,18 @@ cannot be read, or a journal written by an older pohunek under an earlier
 journal schema names a worker that may still run, every version is kept.
 Rerunning `pohunek service upgrade` for the already active version restarts
 nothing but repeats this cleanup, so a version kept earlier is removed once
-nothing references it any more. The installer counts the daemon as ready only when `daemon.health`
+nothing references it any more. This cleanup sees only the journals and worker
+jobs of its own installation namespace, so a prefix belongs to exactly one
+namespace (`<prefix>/libexec/pohunek/installation_owner`): an upgrade,
+uninstall, or cleanup of another namespace fails with `service_prefix_owned`
+before it changes anything. The owning installation's uninstall releases the
+prefix. If the named namespace no longer has an installation (for example its
+state directory was deleted by hand), delete that record and rerun. A version
+directory that already exists is reused only when it and its binaries are
+owned by you, mode `0755`, free of symbolic links, and single-linked;
+otherwise the command fails with `service_version_untrusted` naming the
+offending entry. Make sure nothing runs from it, remove it, and rerun. The
+installer counts the daemon as ready only when `daemon.health`
 reports the new version on a connection whose kernel peer credentials name the
 daemon job's running main process, as the service manager reports it. A
 manually started daemon of the same build that holds the socket while the
@@ -181,7 +192,9 @@ automatically, so rerunning the command is always safe.
 `pohunek service uninstall` refuses while sessions are live and lists them.
 `--stop-sessions` stops every session through its worker first; the session
 store, journals, and host identity are kept unless `--purge` is given. The
-transaction record (`service-install.json`) is cleared just before
+prefix ownership record is removed after the prefix's version directories and
+CLI copy (it stays while a version is kept for a worker journal or job of this
+installation). The transaction record (`service-install.json`) is cleared just before
 `service.toml`, which is removed last, so if an uninstall fails partway or is
 interrupted, rerunning `pohunek service uninstall` finishes the cleanup. A
 pending install that reached its `registering` step is uninstalled through the

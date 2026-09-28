@@ -1133,15 +1133,16 @@ Reconciliation applies these rows in order
 | 12a | unfinished create; a successful scan found no journal of its generation; job present and running with a matching definition | the create that registered it died with its daemon: `conflict`, `runtime_supervision_ambiguous` while a background task holding the session's lifecycle lock watches the job from first sight until first sight plus `worker_initialize` (startup does not wait); the generation is never adopted, even if its worker binds in that window. Then the exact generation is retired and the create deleted (`session_removed`); a job that ends earlier is retired at once; an inspection or retirement failure is `reconnecting`, `runtime_supervision_unavailable` and retried |
 | 12 | no reachable worker; job present and running, or loaded without a process and without a journal of the generation, or ended while the journaled worker PID still runs with its start identity, or that PID cannot be inspected | `conflict`, `runtime_supervision_ambiguous`; nothing killed or retired. Re-checked in the background with the row 16 backoff until the evidence resolves: a worker that answers again is adopted, a job that ends while the journaled PID is gone becomes row 14 |
 | 13 | no reachable worker; job with a mismatched definition or process, or a malformed journaled start identity | `conflict`, `runtime_identity_mismatch` |
-| 14 | no reachable worker; job absent, ended, or loaded without a process in a state that proves nothing (launchd reports a loaded label without a matching process as `unknown`); journal not terminal; journaled worker PID not running with its recorded start identity (a reused PID counts as not running) | proven crash: marker sweep of the journal's `runtime_id`, retire the job (absent is fine), then `lost`, `runtime_lost`; a removal intent runs the removal finalizer (§16.3) instead. `lost` counts as ended, so it is published only after the job is retired: a failed retirement is `reconnecting`, `runtime_supervision_unavailable` and retried with the row 16 backoff, which reaches this row again. The same holds when a running session's worker connection drops; `runtime_lost_cleanup_unconfirmed` when the sweep reports unconfirmed processes, fails, leaves a process whose markers could not be read and that started at or after the journaled worker, or still finds processes after 3 passes. Never a retried kill loop |
+| 14 | no reachable worker; job absent, ended, or loaded without a process in a state that proves nothing (launchd reports a loaded label without a matching process as `unknown`); journal not terminal; journaled worker PID not running with its recorded start identity (a reused PID counts as not running) | proven crash: marker sweep of the journal's `runtime_id`, retire the job (absent is fine), then `lost`, `runtime_lost`; a removal intent runs the removal finalizer (§16.3) instead, whose own sweep must be confirmed before the record is deleted. `lost` counts as ended, so it is published only after the job is retired: a failed retirement is `reconnecting`, `runtime_supervision_unavailable` and retried with the row 16 backoff, which reaches this row again. The same holds when a running session's worker connection drops; `runtime_lost_cleanup_unconfirmed` when the sweep reports unconfirmed processes, fails, leaves a process whose markers could not be read and that started at or after the journaled worker, or still finds processes after 3 passes. Never a retried kill loop |
 | 15 | no reachable worker; job absent or ended; a successful scan found no journal for this generation | retire the job, then `lost`, `worker_unavailable`. No marker sweep: without a journal nothing proves which runtime ran. An unfinished create is deleted only after the retire succeeds, a removal intent runs the removal finalizer (§16.3), and any other failed retirement is `reconnecting`, `runtime_supervision_unavailable` and retried; all three keep the record until the retry succeeds |
-| 16 | job inspection fails (unavailable, timeout, or still racing after the retries) | `reconnecting`, `runtime_supervision_unavailable`; nothing touched; background re-reconciliation after 1 s, doubling to at most 60 s, until the session is resolved or changed or the daemon shuts down (a supervisor outage during create schedules the same retry). The same retry re-checks `runtime_supervision_ambiguous` sessions and never kills while the evidence stays ambiguous |
+| 16 | job inspection fails (unavailable, timeout, or still racing after the retries) | `reconnecting`, `runtime_supervision_unavailable`; nothing touched; background re-reconciliation after 1 s, doubling to at most 60 s, until the session is resolved or changed or the daemon shuts down (a supervisor outage during create schedules the same retry). The same retry re-checks `runtime_supervision_ambiguous` sessions and never kills while the evidence stays ambiguous; a removal waiting for a confirmed marker sweep (§16.3) re-runs that sweep, which signals only processes carrying exactly a removed runtime's marker |
 | 17 | job of a generation that is not a record's current one, or of a session without a record | re-inspected: proven ended or absent is retired (a job loaded without a process counts as ended when the one journal of its generation names a worker PID that is not running; with no journal it stays `orphaned` until `worker_initialize` has passed since first sight, and is then retired if a fresh check still finds no process and no journal, because a worker journals before it opens its PTY) by exact service ID (removing its definition); still live is left alone, inventory `orphaned` with `runtime_slot` = its service ID and reason `stale_worker_generation`. A job whose inspection fails is also `orphaned`, never retired on that evidence, and re-inspected once `worker_initialize` has passed, repeating while the inspection keeps failing. When discovery fails this cleanup is skipped and logged; each record's own generation is still inspected |
 | – | worker socket of a session without a logical record | inventory `orphaned`, reason `logical_session_missing`; the worker is left alive |
 | – | terminal record; stale inactive journal | keep summary, schedule safe journal cleanup |
 
-The **marker sweep** runs only for row 14, whose journaled worker PID check
-proved the worker gone. The Linux and Darwin process
+The **marker sweep** runs for row 14, whose journaled worker PID check
+proved the worker gone, and in the removal finalizer (§16.3) once every worker
+of the removed generation is proven gone. The Linux and Darwin process
 inspectors enumerate the owner's processes whose allowlisted
 `POHUNEK_RUNTIME_ID` marker equals exactly the lost generation's runtime ID.
 Each process's start identity is verified before `SIGTERM`, again after the
@@ -1219,12 +1220,19 @@ generation is proven ended: an answering worker confirms the replayed stop
 (row 7), an exact terminal journal with no answering socket (row 8), or an
 ended job (rows 14 and 15). One removal finalizer, shared with
 `session.remove`, then retires the exact recorded generation and proves every
-worker journaled for it gone, deletes owned worktrees, the worker log family,
-the registry entry, and the resume binding, and deletes the logical record
-last. A generation the service manager cannot retire, or a cleanup failure, is
-`reconnecting`, `runtime_supervision_unavailable`; a worker not proven gone is
-`conflict`, `runtime_supervision_ambiguous`; both keep the intent and are
-retried with the row 16 backoff. A worker of another generation that still runs
+worker journaled for it gone, runs the marker sweep of every runtime the
+record or a journal of that generation names (terminal journals included, each
+with its journaled worker's start identity), deletes owned worktrees, the
+worker log family, the registry entry, and the resume binding, and deletes the
+logical record last. The sweep runs on every removal, since a descendant that
+left the worker's process group survives both the stop and the job retirement
+and nothing controls it once the record is gone. A generation the service
+manager cannot retire, or a cleanup failure, is `reconnecting`,
+`runtime_supervision_unavailable`; a worker not proven gone, or a sweep that
+cannot confirm every marked process exited, is `conflict`,
+`runtime_supervision_ambiguous`; both keep the intent and are retried with the
+row 16 backoff (an explicit `session.remove` fails with the same code, keeps
+the intent, and is finished by a retried removal or the next startup). A worker of another generation that still runs
 is `conflict`, `runtime_identity_mismatch` and is not retried. Files or
 worktrees are never deleted merely because a worker cannot be contacted.
 
@@ -1368,11 +1376,25 @@ Both glibc and MUSL daemon archives contain all three binaries. CI builds and
 tests them for each daemon target.
 
 `pohunek service install` (which the archive wrapper calls) is a journaled
-transaction (`<state>/pohunek/service-install.json`):
+transaction (`<state>/pohunek/service-install.json`). Before it stages
+anything it claims the prefix for its installation namespace: version
+directories and `<prefix>/bin/pohunek` are keyed only by the prefix, while
+journals, worker jobs, and the transaction lock are per namespace, so one
+prefix serves exactly one namespace. The claim is the owner-private record
+`<prefix>/libexec/pohunek/installation_owner` naming the namespace, created
+without replacement; a prefix another namespace owns is refused with
+`service_prefix_owned`. Upgrade claims it the same way, and rollback, version
+collection, and uninstall verify it before deleting anything. A rolled-back
+install and a finished uninstall remove it, unless a version is still kept for
+a worker journal or job of this namespace.
 
 1. copy the verified binaries (each staged binary's `--version` must equal the
    CLI's) into a new `<prefix>/libexec/pohunek/<version>/` directory; an
-   identical existing directory is reused, a different one is refused;
+   identical existing directory is reused only when it is exactly what this
+   step creates (owned by the user, mode `0755`, no symbolic link, each binary
+   a single-link `0755` regular file compared through the verified descriptor),
+   an untrusted one is refused with `service_version_untrusted`, and a
+   different one with `service_version_conflict`;
 2. write `<config>/pohunek/service.toml` (`0600`, every key required, unknown
    keys rejected; `crates/service-config`);
 3. build the daemon definition (versioned `pohunekd --service-config <abs>`,
@@ -1406,7 +1428,8 @@ executed by a running process, nor holding the running CLI are removed.
 With `--stop-sessions` it stops every session through the worker protocol,
 waits until every worker journal is final and its process is gone, then removes
 the daemon job, ended worker jobs, the launchd directories, unreferenced
-version directories, and the installed CLI copy, then clears the transaction
+version directories, the installed CLI copy, and the prefix ownership record
+(verified before the first removal), then clears the transaction
 record and removes `service.toml` last, so a rerun always finds an unfinished
 uninstall. Durable metadata (store, event logs, journals, host identity) is
 kept unless `--purge` is given. A worker journal of an earlier

@@ -92,7 +92,14 @@ Interpret runtime states as follows:
   journaled under another generation (`runtime_identity_mismatch`), and
   unreadable session journals or a journaled worker that still runs after the
   retirement, for example outside its job (`runtime_supervision_ambiguous`). Stop such a worker by hand after
-  preserving the evidence, then retry the removal.
+  preserving the evidence, then retry the removal. Every removal also sweeps
+  the processes carrying the session's runtime ownership markers and fails
+  with `runtime_supervision_ambiguous`, keeping the session and its removal
+  intent, while that sweep cannot confirm every marked process exited (for
+  example one whose environment cannot be read); look for leftover processes
+  of the session with `ps`, stop them, and retry. A removal finished by
+  reconciliation after a daemon restart shows this `conflict` reason while it
+  retries on its own.
 - `incompatible`: the worker is alive but private protocol negotiation failed.
   Leave it alive and use a compatible daemon release. `pohunek session rm <id>`
   retires such a worker through the service manager the same way as an

@@ -393,7 +393,8 @@ pub struct LaunchdDaemon {
 impl LaunchdDaemon {
     /// Creates the daemon agent manager for `namespace` in `gui/<uid>`.
     ///
-    /// `agents` is the `LaunchAgents` directory, created `0700` when missing.
+    /// `agents` is the `LaunchAgents` directory; `install` creates it `0700`
+    /// when missing.
     ///
     /// # Errors
     ///
@@ -460,7 +461,10 @@ impl LaunchdDaemon {
 
         Self::validate(definition)?;
         let bytes = plist::render(self.label(), definition)?;
-        let directory = self.create_agents(OPERATION)?;
+        let directory = self
+            .open_agents(OPERATION)?
+            .ok_or_else(|| Error::NotFound(self.id.clone()))?;
+        registration::require_definition(&directory, &self.id, self.label(), OPERATION)?;
         let exit_timeout =
             stored_exit_timeout(&directory, &definition_name(self.label()), OPERATION);
         self.jobs
@@ -520,6 +524,10 @@ impl DaemonSupervisor for LaunchdDaemon {
 
     /// Boots the agent out, waits until it is absent, then writes and
     /// bootstraps the new definition.
+    ///
+    /// A missing agents directory or agent file is [`Error::NotFound`] and
+    /// leaves launchd untouched; an agent file that is not a private regular
+    /// file is refused the same way.
     ///
     /// The previous agent file stays set aside until `bootstrap` returns.
     /// When launchd proves it loaded nothing (such as a missing `gui/<uid>`
