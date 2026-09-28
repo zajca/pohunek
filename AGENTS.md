@@ -425,6 +425,11 @@ do not re-report them as review findings:
   open PR) without a further ask. This intentionally supersedes the default
   "commit/push only when the user asks" for that one path; it is publishing
   authorization only and does not authorize merging.
+- Invoking the `deliver-issue` skill on an issue is the owner's explicit
+  request to commit, push, open that issue's PRs, and merge them once the
+  skill's merge criteria hold (green checks and a review of the final head
+  with no unanswered actionable finding). It covers that one issue only and
+  never releases, tags, or force-pushes `main`.
 - Harness executors run their model CLI unsandboxed on the operator's host;
   `--workspace` scopes the working directory, not file access.
 
