@@ -93,7 +93,9 @@ class ArchiveModeTests(unittest.TestCase):
         for direct in ("/bin/cargo-nextest", None):
             with self.subTest(direct=direct), \
                     mock.patch.object(partitions.shutil, "which", return_value=direct):
-                command = partitions.nextest_command("list", "ci", self.ARCHIVE)
+                command = partitions.nextest_command(
+                    "list", "ci", partitions.Archive(self.ARCHIVE)
+                )
                 self.assertEqual(
                     command[:3], [direct, "nextest", "list"] if direct else ["cargo", "nextest", "list"]
                 )
@@ -103,6 +105,54 @@ class ArchiveModeTests(unittest.TestCase):
                 self.assertIn("--extract-overwrite", command)
                 self.assertNotIn("--workspace", command)
                 self.assertNotIn("--all-features", command)
+
+    def test_only_the_first_call_extracts_the_archive(self):
+        archive = partitions.Archive(self.ARCHIVE)
+        calls = [partitions.nextest_command("list", "ci", archive) for _ in range(3)]
+        self.assertEqual([("--extract-to" in c) for c in calls], [True, False, False])
+        self.assertEqual([("--archive-file" in c) for c in calls], [True, False, False])
+        store = partitions.ROOT / "target" / "nextest"
+        for command in calls[1:]:
+            self.assertEqual(
+                command[command.index("--binaries-metadata") + 1],
+                str(store / "binaries-metadata.json"),
+            )
+            self.assertEqual(
+                command[command.index("--cargo-metadata") + 1],
+                str(store / "cargo-metadata.json"),
+            )
+            self.assertEqual(command[command.index("--workspace-remap") + 1], str(partitions.ROOT))
+
+    def test_check_extracts_once_and_still_detects_overlap_and_gaps(self):
+        shards = {name: {(f"bin-{name}", "t")} for name in partitions.SHARDS}
+        universe = set.union(*shards.values())
+
+        def run_check(selections):
+            commands = []
+
+            def fake_run(command, **kwargs):
+                commands.append(command)
+                return subprocess.CompletedProcess(command, 0, stdout=b"{}")
+
+            answers = iter([universe, *[selections[n] for n in partitions.SHARDS]])
+            with mock.patch.object(partitions, "require_archive_built_here"), \
+                    mock.patch.object(partitions.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(partitions, "selected_tests", side_effect=lambda _d: next(answers)), \
+                    mock.patch.object(sys, "argv", [
+                        "test-partitions", "--archive-file", str(self.ARCHIVE), "check",
+                    ]):
+                partitions.main()
+            return commands
+
+        commands = run_check(shards)
+        self.assertEqual(len(commands), 1 + len(partitions.SHARDS))
+        self.assertEqual(sum("--extract-to" in c for c in commands), 1)
+        overlapping = {**shards, "cli": shards["cli"] | shards["unit"]}
+        with self.assertRaisesRegex(ValueError, "overlap="):
+            run_check(overlapping)
+        gapped = {**shards, "heavy": set()}
+        with self.assertRaisesRegex(ValueError, "empty=|missing="):
+            run_check(gapped)
 
     def test_profile_and_filter_survive_in_archive_mode(self):
         with tempfile.TemporaryDirectory() as root:

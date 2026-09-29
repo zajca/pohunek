@@ -92,14 +92,44 @@ def junit_report(config, profile, root):
     return None
 
 
+class Archive:
+    """A nextest archive, extracted into this checkout by its first use.
+
+    The first nextest call extracts the archive (about 1.4 GB, seconds of
+    work); every later call of the same invocation reuses the extracted
+    binaries through the metadata files the archive carries, so `check`
+    extracts once instead of once per shard.
+    """
+
+    def __init__(self, file):
+        self.file = Path(file)
+        self.extracted = False
+
+    def arguments(self):
+        """The nextest options selecting the build; extracts on the first call."""
+        if not self.extracted:
+            self.extracted = True
+            return [
+                "--archive-file", str(self.file),
+                "--extract-to", str(ROOT), "--extract-overwrite",
+                "--workspace-remap", str(ROOT),
+            ]
+        store = ROOT / "target" / "nextest"
+        return [
+            "--binaries-metadata", str(store / "binaries-metadata.json"),
+            "--cargo-metadata", str(store / "cargo-metadata.json"),
+            "--workspace-remap", str(ROOT),
+            "--target-dir-remap", str(ROOT / "target"),
+        ]
+
+
 def nextest_command(subcommand, profile, archive):
     """The nextest invocation prefix for `subcommand` (`list` or `run`).
 
     A build run passes the workspace selection to cargo. An archive run takes
-    its package and feature selection from the archive, extracts it into this
-    checkout (overwriting an earlier extraction), and maps the workspace root
-    to this checkout. It calls the `cargo-nextest` binary directly when that
-    is on PATH, so CI test jobs need no Rust toolchain; otherwise
+    its package and feature selection from the archive and maps the workspace
+    root to this checkout. It calls the `cargo-nextest` binary directly when
+    that is on PATH, so CI test jobs need no Rust toolchain; otherwise
     `cargo nextest` finds it.
     """
     if archive is None:
@@ -110,10 +140,7 @@ def nextest_command(subcommand, profile, archive):
     direct = shutil.which("cargo-nextest")
     return [
         *([direct, "nextest"] if direct else ["cargo", "nextest"]),
-        subcommand, "--profile", profile,
-        "--archive-file", str(archive),
-        "--extract-to", str(ROOT), "--extract-overwrite",
-        "--workspace-remap", str(ROOT),
+        subcommand, "--profile", profile, *archive.arguments(),
     ]
 
 
@@ -170,11 +197,11 @@ def main():
     args = parser.parse_args()
     archive = None
     if args.archive_file is not None:
-        archive = args.archive_file.resolve()
         try:
-            require_archive_built_here(archive)
+            require_archive_built_here(args.archive_file.resolve())
         except ValueError as error:
             parser.error(str(error))
+        archive = Archive(args.archive_file.resolve())
     expressions = filters()
     if args.action == "check":
         if args.shard is not None:
