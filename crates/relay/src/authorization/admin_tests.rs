@@ -214,12 +214,26 @@ async fn management_state(store: &Store, team_id: Uuid) -> (String, i64, i64, i6
     )
 }
 
-async fn wait_for_management_replay_lock(pool: &PgPool) {
+/// Waits until a transaction blocks on the receipt lock of this actor/action/key.
+///
+/// The match is on the exact advisory key because `pg_locks` is cluster-wide and
+/// concurrent test processes share one database.
+async fn wait_for_management_replay_lock(
+    pool: &PgPool,
+    actor: crate::store::ActorContext,
+    action: &str,
+    key: Uuid,
+) {
+    // PostgreSQL shows a bigint advisory key as classid (high half), objid (low half), objsubid 1.
+    let lock_name = super::admin::receipt_lock_name(actor.principal_id(), action, key);
     tokio::time::timeout(ADVISORY_WAIT_TIMEOUT, async {
         loop {
             let waiting: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%pg_advisory_xact_lock%')",
+                "WITH lock AS (SELECT hashtextextended($1, $2) AS key) SELECT EXISTS (SELECT 1 FROM pg_locks, lock WHERE locktype = 'advisory' AND NOT granted AND objsubid = 1 AND classid = ((lock.key >> 32) & $3)::oid AND objid = (lock.key & $3)::oid)",
             )
+            .bind(&lock_name)
+            .bind(super::admin::RECEIPT_ADVISORY_LOCK_SEED)
+            .bind(i64::from(u32::MAX))
             .fetch_one(pool)
             .await
             .expect("read PostgreSQL advisory-lock wait state");
@@ -263,11 +277,12 @@ async fn exact_replay_rejects_lost_local_authority(stop: impl FnOnce(&Authority)
     .expect("hold external receipt advisory lock");
 
     let authority = Arc::new(authority);
+    let key = command.idempotency_key;
     let replay = {
         let authority = Arc::clone(&authority);
         tokio::spawn(async move { authority.create_group(actor, command).await })
     };
-    wait_for_management_replay_lock(store.pool()).await;
+    wait_for_management_replay_lock(store.pool(), actor, "group.create", key).await;
     stop(&authority);
     lock.rollback()
         .await
@@ -437,40 +452,40 @@ async fn concurrent_group_create_replays_one_durable_mutation() {
     let key = Uuid::now_v7();
     let witness_before = authority.witness_sequence().expect("read witness sequence");
     let epoch_before = authority.admission_epoch().expect("read admission epoch");
-    let start = Arc::new(tokio::sync::Barrier::new(2));
-    let first_authority = Arc::clone(&authority);
-    let first_start = Arc::clone(&start);
-    let first = async move {
-        first_start.wait().await;
-        first_authority
-            .create_group(
-                actor,
-                CreateGroup {
-                    team_id,
-                    display_name: "concurrent operators".into(),
-                    correlation_id: Uuid::now_v7(),
-                    idempotency_key: key,
-                },
-            )
-            .await
+    let command = CreateGroup {
+        team_id,
+        display_name: "concurrent operators".into(),
+        correlation_id: Uuid::now_v7(),
+        idempotency_key: key,
     };
-    let second_authority = Arc::clone(&authority);
-    let second_start = Arc::clone(&start);
-    let second = async move {
-        second_start.wait().await;
-        second_authority
-            .create_group(
-                actor,
-                CreateGroup {
-                    team_id,
-                    display_name: "concurrent operators".into(),
-                    correlation_id: Uuid::now_v7(),
-                    idempotency_key: key,
-                },
-            )
-            .await
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    authority
+        .set_mutation_pause(Arc::clone(&entered), Arc::clone(&release))
+        .expect("pause the first group create before commit");
+    let first = {
+        let authority = Arc::clone(&authority);
+        let command = command.clone();
+        tokio::spawn(async move { authority.create_group(actor, command).await })
     };
-    let (first, second) = tokio::join!(first, second);
+    // Once this passes, the first create holds the receipt lock and its receipt is uncommitted.
+    entered.wait().await;
+    authority
+        .clear_mutation_pause()
+        .expect("let the replay commit without pausing");
+    let second = {
+        let authority = Arc::clone(&authority);
+        let command = CreateGroup {
+            correlation_id: Uuid::now_v7(),
+            ..command
+        };
+        tokio::spawn(async move { authority.create_group(actor, command).await })
+    };
+    // The replay's snapshot predates the first commit once it blocks on the lock.
+    wait_for_management_replay_lock(store.pool(), actor, "group.create", key).await;
+    release.wait().await;
+    let first = first.await.expect("first create task");
+    let second = second.await.expect("replay task");
     assert_eq!(
         first.expect("first replay").group_id,
         second.expect("second replay").group_id

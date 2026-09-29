@@ -877,6 +877,18 @@ async fn verify_subject(
     }
 }
 
+/// Seeds `hashtextextended` for management receipt locks.
+///
+/// It differs from the identity lock seed, so receipt and identity lock keys are
+/// hashed independently. Every relay sharing a database must use the same value,
+/// or concurrent replays of one key stop serializing.
+pub(super) const RECEIPT_ADVISORY_LOCK_SEED: i64 = 85;
+
+/// Names the advisory lock that serializes one actor/action/idempotency key.
+pub(super) fn receipt_lock_name(principal_id: Uuid, action: &str, key: Uuid) -> String {
+    format!("{principal_id}\u{1f}{action}\u{1f}{key}")
+}
+
 /// Serializes one actor/action/key before any receipt or authorization query.
 pub(crate) async fn lock_management_receipt(
     tx: &mut Transaction<'_, sqlx::Postgres>,
@@ -884,9 +896,8 @@ pub(crate) async fn lock_management_receipt(
     action: &str,
     key: Uuid,
 ) -> Result<(), StoreError> {
-    const RECEIPT_ADVISORY_LOCK_SEED: i64 = 85;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
-        .bind(format!("{}\u{1f}{action}\u{1f}{key}", actor.principal_id()))
+        .bind(receipt_lock_name(actor.principal_id(), action, key))
         .bind(RECEIPT_ADVISORY_LOCK_SEED)
         .execute(&mut **tx)
         .await
