@@ -462,7 +462,7 @@ impl Usage {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::io::BufRead as _;
+    use std::time::Duration;
 
     use pohunek_platform::process::HostInspector;
     use pohunek_platform::supervisor::{DefinitionFacts, ServiceId, ServiceState, WorkerKey};
@@ -757,16 +757,36 @@ pub(crate) mod tests {
             .is_some_and(|reason| reason.contains("older pohunek")));
     }
 
-    /// Line the stand-in prints once it runs as the copied image.
+    /// Longest the test waits for the spawned stand-in to run as its copied image.
     ///
-    /// `spawn` can return while `execve` is still in flight, when
-    /// `/proc/<pid>/exe` still names the parent image. Output from the new
-    /// image is the only point at which the exec has provably completed.
-    const STAND_IN_READY: &str = "ready\n";
+    /// The exec finishes within microseconds; the bound only absorbs scheduling on
+    /// a loaded runner, and expiry means the image never changed.
+    const STAND_IN_EXEC_DEADLINE: Duration = Duration::from_secs(10);
 
-    /// Prints the readiness line, then blocks reading the piped stdin until
-    /// the test kills it.
-    const STAND_IN_SCRIPT: &str = "echo ready; read -r _";
+    /// Poll interval while the stand-in's executable path is read back.
+    const STAND_IN_EXEC_POLL: Duration = Duration::from_millis(2);
+
+    /// Waits until the inspector reports `image` as the executable of `pid`.
+    ///
+    /// `spawn` can return while `execve` is still in flight, when the process
+    /// still runs the parent image; the collector matches processes by
+    /// executable path, so the exec must have taken effect before collecting.
+    fn await_executable(inspector: &dyn ProcessInspector, pid: u32, image: &Path) {
+        let deadline = std::time::Instant::now() + STAND_IN_EXEC_DEADLINE;
+        while inspector
+            .executable(pid)
+            .expect("read executable")
+            .as_deref()
+            != Some(image)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stand-in never executed {}",
+                image.display()
+            );
+            std::thread::sleep(STAND_IN_EXEC_POLL);
+        }
+    }
 
     #[test]
     fn a_running_process_keeps_the_version_it_executes() {
@@ -774,24 +794,19 @@ pub(crate) mod tests {
         let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
         let dir = layout.version_dir("1.0.0").expect("dir");
         std::fs::create_dir_all(&dir).expect("version dir");
-        let stand_in = dir.join("pohunek-sessiond");
-        std::fs::copy("/bin/sh", &stand_in).expect("copy shell");
-        let mut child = std::process::Command::new(&stand_in)
-            .args(["-c", STAND_IN_SCRIPT])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
+        let sleeper = dir.join("pohunek-sessiond");
+        std::fs::copy("/bin/sleep", &sleeper).expect("copy sleep");
+        let mut child = std::process::Command::new(&sleeper)
+            .arg("30")
             .spawn()
             .expect("spawn live worker stand-in");
-        let mut ready = String::new();
-        std::io::BufReader::new(child.stdout.take().expect("stand-in stdout"))
-            .read_line(&mut ready)
-            .expect("read stand-in readiness");
-        assert_eq!(ready, STAND_IN_READY);
+        let inspector = HostInspector::new();
+        await_executable(&inspector, child.id(), &sleeper);
 
         let usage = Usage::collect(
             &layout,
             &Journals::default(),
-            &HostInspector::new(),
+            &inspector,
             Path::new("/usr/bin/pohunek"),
         );
         child.kill().expect("kill stand-in");
