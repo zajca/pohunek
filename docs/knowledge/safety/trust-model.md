@@ -30,6 +30,10 @@ The assistant must:
   be real, effective-UID-owned, and not group/world writable. Ancestors above the
   selected root are outside this chain so normal home/XDG paths are not rejected
   solely because a shared system ancestor exists.
+- Run the daemon-managed hook interpreters in Python isolated mode (`-I`). A file
+  in the agent's working directory, a `PYTHON*` variable, or a user site-package
+  cannot shadow the standard library modules a hook imports, so a checked-out
+  project cannot execute code inside a hook.
 - Treat Claude `settings.json`, Codex `hooks.json`, and Codex `config.toml` as
   owner-private registration authority. Status reads metadata and bounded
   content from one no-follow descriptor and requires a regular effective-UID-
