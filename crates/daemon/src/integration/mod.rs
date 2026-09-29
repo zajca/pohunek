@@ -2928,11 +2928,33 @@ mod tests {
             args,
             input.to_string().as_bytes(),
             socket_available,
-            Some("session-123"),
-            None,
-            false,
+            NotificationRunOptions::default(),
         );
         (status, stdout, stderr, requests)
+    }
+
+    /// Optional inputs of `run_notification_asset_custom`.
+    #[derive(Clone, Copy)]
+    struct NotificationRunOptions<'a> {
+        /// Value of the session-id environment variable; unset when `None`.
+        session_id: Option<&'a str>,
+        /// `TMPDIR` for the hook instead of the run's own temp directory.
+        tmpdir_override: Option<&'a Path>,
+        /// Tolerate the hook closing stdin before all input was written.
+        allow_broken_pipe: bool,
+        /// Working directory of the hook process.
+        cwd: Option<&'a Path>,
+    }
+
+    impl Default for NotificationRunOptions<'_> {
+        fn default() -> Self {
+            Self {
+                session_id: Some("session-123"),
+                tmpdir_override: None,
+                allow_broken_pipe: false,
+                cwd: None,
+            }
+        }
     }
 
     fn run_notification_asset_custom(
@@ -2940,10 +2962,14 @@ mod tests {
         args: &[&str],
         input: &[u8],
         socket_available: bool,
-        session_id: Option<&str>,
-        tmpdir_override: Option<&Path>,
-        allow_broken_pipe: bool,
+        options: NotificationRunOptions<'_>,
     ) -> (std::process::ExitStatus, String, String, Vec<Value>, usize) {
+        let NotificationRunOptions {
+            session_id,
+            tmpdir_override,
+            allow_broken_pipe,
+            cwd,
+        } = options;
         let asset_path = notification_asset(agent);
         assert!(
             asset_path.is_file(),
@@ -3010,6 +3036,9 @@ mod tests {
             .stderr(Stdio::piped());
         if let Some(session_id) = session_id {
             command.env(ENV_SESSION_ID, session_id);
+        }
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
         }
         let mut child = command.spawn().expect("spawn notification hook");
         let mut bytes_written = 0;
@@ -3152,9 +3181,10 @@ mod tests {
                 &args,
                 br#"{"hook_event_id":"hostile-session"}"#,
                 true,
-                Some("session-123\nhostile"),
-                None,
-                false,
+                NotificationRunOptions {
+                    session_id: Some("session-123\nhostile"),
+                    ..NotificationRunOptions::default()
+                },
             );
 
             assert!(
@@ -3192,9 +3222,10 @@ mod tests {
                 &args,
                 &input,
                 false,
-                Some("session-123"),
-                None,
-                true,
+                NotificationRunOptions {
+                    allow_broken_pipe: true,
+                    ..NotificationRunOptions::default()
+                },
             );
 
             assert!(
@@ -3223,9 +3254,10 @@ mod tests {
                 &args,
                 &input,
                 true,
-                Some("session-123"),
-                None,
-                true,
+                NotificationRunOptions {
+                    allow_broken_pipe: true,
+                    ..NotificationRunOptions::default()
+                },
             );
 
             assert!(
@@ -3255,9 +3287,11 @@ mod tests {
                 &args,
                 br#"{"hook_event_id":"broken-tmpdir"}"#,
                 false,
-                Some("session-123"),
-                Some(&missing_tmpdir),
-                true,
+                NotificationRunOptions {
+                    tmpdir_override: Some(&missing_tmpdir),
+                    allow_broken_pipe: true,
+                    ..NotificationRunOptions::default()
+                },
             );
 
             assert!(
@@ -3429,6 +3463,47 @@ mod tests {
                 requests.len(),
                 STATE_SESSION_REQUEST_COUNT,
                 "{agent} state hook must still report from a shadowed working directory"
+            );
+        }
+    }
+
+    /// The notification hooks run in the agent's working directory as well.
+    #[test]
+    fn notification_hooks_ignore_modules_in_the_working_directory() {
+        for agent in ["claude", "codex"] {
+            let workdir = temp_dir(&format!("{agent}-notify-shadowed-cwd"));
+            let marker = workdir.join("shadow-imported");
+            for module in ["json", "os", "socket", "time", "datetime"] {
+                fs::write(
+                    workdir.join(format!("{module}.py")),
+                    format!("open({marker:?}, 'w').close()\nraise ImportError('shadowed')\n"),
+                )
+                .expect("write shadow module");
+            }
+
+            let (status, _stdout, stderr, requests, _bytes_written) = run_notification_asset_custom(
+                agent,
+                &["stop"],
+                br#"{"hook_event_id":"shadowed-cwd"}"#,
+                true,
+                NotificationRunOptions {
+                    cwd: Some(&workdir),
+                    ..NotificationRunOptions::default()
+                },
+            );
+
+            assert!(
+                status.success(),
+                "{agent} notification hook exited with {status}: {stderr}"
+            );
+            assert!(
+                !marker.exists(),
+                "{agent} notification hook imported a module from its working directory"
+            );
+            assert_eq!(
+                requests.len(),
+                1,
+                "{agent} notification hook must still report from a shadowed working directory"
             );
         }
     }

@@ -1,5 +1,11 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-09-29)
+
+- Documented that the managed agent hook scripts run Python in isolated mode, so
+  modules in the agent's working directory and `PYTHON*` variables cannot affect
+  the hook interpreter's configuration or module resolution.
+
 ## Unreleased (2026-09-28)
 
 - Documented `pohunek service lock -- <command>`, which runs a command under
