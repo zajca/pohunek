@@ -363,6 +363,18 @@ class CheckTests(DevBootstrapCase):
                     output,
                 )
 
+    def test_failing_cargo_subcommand_reports_its_diagnostic_first(self):
+        error = subprocess.CalledProcessError(
+            101, ["cargo", "nextest", "--version"],
+            stderr="error: user-defined alias `nextest` is shadowing an external subcommand\n",
+        )
+        tools = dict(CURRENT)
+        tools["cargo-nextest"] = error
+        status, output = self.run_main(FakeHost(on_path=tools))
+        self.assertEqual(status, 1, output)
+        self.assertIn("alias `nextest` is shadowing an external subcommand", output)
+        self.assertIn("resolve the error above; if the binary itself is broken:", output)
+
     def test_cargo_subcommand_without_cargo_is_a_failure(self):
         status, output = self.run_main(FakeHost(cargo=False))
         self.assertEqual(status, 1, output)

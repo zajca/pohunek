@@ -58,6 +58,8 @@ HYPERFINE_MIN_VERSION = (1, 9, 0)
 # has been linked with in CI; CI itself pins a newer release (`MOLD_VERSION`
 # in .github/workflows/ci.yml). A local mold is optional and only links.
 MOLD_MIN_VERSION = (2, 30, 0)
+# Longest diagnostic line quoted from a failing version command.
+DETAIL_LIMIT = 200
 # Upper bound for one `--version` call; a tool that hangs longer is broken.
 VERSION_TIMEOUT_SECONDS = 30
 
@@ -339,12 +341,24 @@ def shadowed_or(result, tool, home, runner, shadow):
     )
 
 
+def failure_detail(error):
+    """The error plus the command's first diagnostic line, bounded."""
+    detail = str(error)
+    for stream in (getattr(error, "stderr", None), getattr(error, "stdout", None)):
+        if isinstance(stream, bytes):
+            stream = stream.decode(errors="replace")
+        lines = [line.strip() for line in (stream or "").splitlines() if line.strip()]
+        if lines:
+            return f"{detail}: {lines[0][:DETAIL_LIMIT]}"
+    return detail
+
+
 def version_result(tool, argv, path, runner):
     """Run one version command and compare it with the tool's minimum."""
     try:
         output = runner(argv)
     except (OSError, subprocess.SubprocessError) as error:
-        return Result(tool, UNKNOWN_VERSION, path=path, detail=str(error))
+        return Result(tool, UNKNOWN_VERSION, path=path, detail=failure_detail(error))
     version = parse_version(output)
     if version is None:
         first = output.strip().splitlines()[0] if output.strip() else ""
@@ -380,6 +394,12 @@ def fix_hint(result, cargo_bin):
             f"found at {result.path} but {where}; put it first: "
             f"{path_fix(cargo_bin)}"
         )
+    if result.status == UNKNOWN_VERSION:
+        # The tool exists but its version command failed or printed nothing
+        # usable (an alias, a broken config, a damaged binary): reinstalling
+        # fixes only the last case, so the reported error comes first.
+        reinstall = install_fix(result, cargo_bin) if result.tool.install else result.tool.manual
+        return f"resolve the error above; if the binary itself is broken: {reinstall}"
     if result.tool.install is not None:
         return install_fix(result, cargo_bin)
     return result.tool.manual
