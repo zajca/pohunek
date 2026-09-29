@@ -1867,12 +1867,12 @@ mod tests {
     const LAPSED_READ_DEADLINE: Duration = Duration::from_secs(2);
     /// Settle timeout for fake terminals; short because nothing real is awaited.
     const TEST_HELD_OUTPUT_SETTLE_TIMEOUT: Duration = Duration::from_millis(50);
-    /// Bounds each wait of the real Darwin held-output fixture.
+    /// Bounds each signal of the real Darwin held-output fixture.
+    ///
+    /// Every wait ends on an explicit fixture signal, so this only absorbs
+    /// process scheduling on a loaded runner; expiry means the signal never came.
     #[cfg(target_os = "macos")]
     const HELD_QUEUE_DEADLINE: Duration = Duration::from_secs(5);
-    /// Poll interval while the Darwin fixture's terminal queue fills.
-    #[cfg(target_os = "macos")]
-    const HELD_QUEUE_POLL: Duration = Duration::from_millis(10);
     /// Input size well beyond the Linux and Darwin PTY input queues.
     ///
     /// One MiB forces many would-block writes on both kernels, whose queues
@@ -2154,42 +2154,118 @@ mod tests {
         assert!(terminal.lock().flow_changes.is_empty());
     }
 
+    /// Spawns a fixture that prints `ready` once its FIFOs exist, then prints
+    /// `held-before-boundary` after `release` delivers a line and acknowledges
+    /// that returned write with one byte on `written`.
+    #[cfg(target_os = "macos")]
+    fn held_output_fixture(release: &std::path::Path, written: &std::path::Path) -> PtyOwner {
+        let mut command = shell(
+            "mkfifo \"$HELD_RELEASE\" \"$HELD_WRITTEN\" && printf ready \
+             && read go < \"$HELD_RELEASE\" && printf held-before-boundary \
+             && printf w > \"$HELD_WRITTEN\" && sleep 30",
+        );
+        command.env = vec![
+            (
+                "HELD_RELEASE".to_owned(),
+                release.to_str().expect("UTF-8 FIFO path").to_owned(),
+            ),
+            (
+                "HELD_WRITTEN".to_owned(),
+                written.to_str().expect("UTF-8 FIFO path").to_owned(),
+            ),
+        ];
+        spawn(command)
+    }
+
+    /// Waits until the PTY has produced exactly `expected`.
+    #[cfg(target_os = "macos")]
+    async fn await_output(pty: &PtyOwner, expected: &[u8]) {
+        let mut subscriber = pty.subscribe_output(None).expect("subscribe");
+        let mut observed = Vec::new();
+        tokio::time::timeout(HELD_QUEUE_DEADLINE, async {
+            while observed.len() < expected.len() {
+                match subscriber.recv().await {
+                    Some(OutputEvent::Replay(chunk) | OutputEvent::Output(chunk)) => {
+                        observed.extend_from_slice(&chunk.bytes);
+                    }
+                    other => panic!("fixture output ended early: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("fixture output");
+        assert_eq!(observed, expected);
+    }
+
+    /// Waits for the fixture's one-byte acknowledgement on a non-blocking FIFO.
+    #[cfg(target_os = "macos")]
+    async fn await_acknowledgement(written: &tokio::io::unix::AsyncFd<rustix::fd::OwnedFd>) {
+        tokio::time::timeout(HELD_QUEUE_DEADLINE, async {
+            loop {
+                let mut guard = written.readable().await.expect("acknowledgement readiness");
+                let mut acknowledgement = [0_u8; 1];
+                if let Ok(read) = guard.try_io(|fd| {
+                    rustix::io::read(fd.get_ref(), &mut acknowledgement[..])
+                        .map_err(std::io::Error::from)
+                }) {
+                    assert_eq!(read.expect("read the acknowledgement"), 1);
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the fixture's write to the suspended terminal returns");
+    }
+
     /// A real suspended Darwin terminal hides output until the boundary drains it.
     ///
     /// XNU accepts the child's write into the stopped terminal's queue, keeps
     /// it unreadable on the master, and reports it through `TIOCOUTQ`. The
     /// boundary drain must parse those bytes before returning.
+    ///
+    /// The fixture is released and acknowledges its write through FIFOs, never
+    /// through terminal input: a PTY starts with `IXANY`, and XNU's `ttyinput`
+    /// restarts suspended output on any input byte, which would hand the write
+    /// to the master instead of holding it.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn darwin_boundary_drains_output_the_suspended_terminal_holds() {
+        use rustix::fs::{open, Mode, OFlags};
+
         const HELD: &[u8] = b"held-before-boundary";
-        let pty = spawn(shell(
-            "stty -echo && printf ready && read go && printf held-before-boundary && sleep 30",
-        ));
-        tokio::time::timeout(HELD_QUEUE_DEADLINE, async {
-            while pty.output().next_offset() < b"ready".len() as u64 {
-                tokio::time::sleep(HELD_QUEUE_POLL).await;
-            }
-        })
-        .await
-        .expect("fixture readiness");
+        let fifos = tempfile::tempdir().expect("fixture FIFO directory");
+        let release_path = fifos.path().join("release");
+        let written_path = fifos.path().join("written");
+        let pty = held_output_fixture(&release_path, &written_path);
+        // `ready` follows `mkfifo`, so both FIFOs exist once it is parsed.
+        await_output(&pty, b"ready").await;
         let before = pty.output().next_offset();
 
         let pause = super::OutputPause::new(&pty.tty_name).expect("pause output");
-        pty.input()
-            .execute_stream(vec![InputFragment {
-                bytes: b"go\n".to_vec(),
-                delay_after: Duration::ZERO,
-            }])
-            .await
-            .expect("release the fixture");
-        tokio::time::timeout(HELD_QUEUE_DEADLINE, async {
-            while pause.held_bytes().expect("TIOCOUTQ") < HELD.len() {
-                tokio::time::sleep(HELD_QUEUE_POLL).await;
-            }
-        })
-        .await
-        .expect("the suspended terminal accepts and holds the write");
+        // Read-write opens of a FIFO never wait for a peer on XNU, and holding
+        // both ends keeps the release buffered until the fixture reads it.
+        let written = tokio::io::unix::AsyncFd::with_interest(
+            open(
+                &written_path,
+                OFlags::RDWR | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .expect("open the acknowledgement"),
+            tokio::io::Interest::READABLE,
+        )
+        .expect("watch the acknowledgement");
+        let release = open(&release_path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
+            .expect("open the release");
+        assert_eq!(
+            rustix::io::write(&release, b"go\n").expect("release the fixture"),
+            b"go\n".len()
+        );
+        await_acknowledgement(&written).await;
+        assert_eq!(
+            pause.held_bytes().expect("TIOCOUTQ"),
+            HELD.len(),
+            "the suspended terminal holds exactly the acknowledged write"
+        );
         assert_eq!(
             pty.output().next_offset(),
             before,
