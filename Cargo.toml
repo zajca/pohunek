@@ -1,3 +1,4 @@
+# verification only
 # pohunek Cargo workspace.
 #
 # Single-user, CLI-first tool: durable per-session workers own PTYs running
