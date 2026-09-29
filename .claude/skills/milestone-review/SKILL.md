@@ -22,7 +22,10 @@ issue via the `github-workflow` skill.
   user or task; otherwise infer per the `github-workflow` skill's
   resolution rules — unique unambiguous match only, otherwise ask).
 - The branch or worktree to review (e.g. `zajca/milestone-4-attach-stream`, or
-  a path like `/tmp/pohunek-milestone-3-pty-sessions`). For a stack, the
+  an absolute path like
+  `<primary-parent>/pohunek-worktrees/milestone-3-pty-sessions`, where
+  `<primary-parent>` is the directory holding the primary checkout). For a
+  stack, the
   ordered slice branches/PRs and the slice plan recorded on the issue.
 
 ## Steps

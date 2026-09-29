@@ -64,9 +64,12 @@ the review loop, CI triage, and the merge decision. Where a step below says
 
 ## Phase 3 — implement through subagents
 
-Create the worktree per `milestone` step 2, but **never under `/tmp`** (a
-small RAM tmpfs): use a sibling directory such as
-`<repo>/../pohunek-worktrees/<slug>`. Then, per slice:
+Create the worktree per `milestone` step 2 with `scripts/worktree-new
+<slug>`: it lands in `pohunek-worktrees/<slug>` beside the primary checkout
+(the parent of `git rev-parse --path-format=absolute --git-common-dir`)
+whichever checkout it runs from, and prints that absolute path (**never under
+`/tmp`**, a small RAM tmpfs) with a reflink-seeded `target/`. Then, per
+slice:
 
 1. Write a **shared context file** (in the session scratchpad) holding: the
    worktree path and HEAD, "no commits, no pushes, no branches", the mandatory

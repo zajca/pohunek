@@ -270,6 +270,41 @@ Release packaging and contributor verification:
 - `scripts/tests/test_cargo_sweep_targets.py` — regression checks for that
   helper's destructive guards; the CI script-regression step runs
   `python3 -m unittest discover -s scripts/tests -p 'test_*.py'`.
+- `scripts/worktree-new` — creates `pohunek-worktrees/<slug>` beside the
+  primary checkout (whichever checkout it runs from) on
+  `zajca/<slug>` and seeds the worktree's own `target/debug` caches
+  (`.fingerprint`, `build`, `deps`, `incremental`, plus `CACHEDIR.TAG`) from
+  the main checkout with `cp -a --reflink=always`; one run at a time holds
+  an exclusive lock on `<git-common-dir>/worktree-new.lock` from the
+  existence checks through any rollback, a real probe clone into a private
+  `mkdtemp` directory must succeed first, the main checkout's three Cargo
+  lock files are created if absent and held exclusively while the source
+  is validated and copied, a symlink anywhere in the profile dir's seeded
+  trees or as a target-root file fails closed, both checkouts must use the
+  default target layout per `cargo metadata`, and uplifted binaries are not
+  seeded. A temporary branch `zajca/worktree-new-tmp-<slug>-<pid>-<random>`
+  is created with `git branch --no-track` at the resolved base commit and
+  the worktree is added and seeded at the matching temporary sibling path,
+  then `git worktree move`d to its slug, and the branch is renamed to its
+  final name last with `git branch -m`; a failure before that rename
+  removes only the worktree at the temporary path, only while git lists it
+  on the temporary branch, and never with `--force` (so modified or
+  untracked files survive), and deletes only the temporary branch by `git update-ref -d` against the commit it was created
+  at, and only once no registered worktree still has it checked out, so
+  plain-git work under the final names is never touched. Worktrees are
+  read from `git worktree list --porcelain -z`, so any path parses intact. A failed
+  final rename keeps the worktree on its temporary branch and reports both.
+  `--no-seed` skips seeding.
+- `scripts/tests/test_worktree_new.py` — regression checks for its slug and
+  argument validation, fail-closed reflink probe, Cargo and repository lock
+  contention (including two concurrent runs for one slug), layout checks,
+  symlinked seed sources (including nested ones), the private probe
+  directory, rollback of partial `git worktree add` failures, races with
+  plain `git` creating the same worktree or branch, moving the temporary
+  branch, recreating the final branch during rollback, or taking the final
+  name before the rename, a failed worktree removal keeping its branch,
+  NUL-separated worktree listings with newline paths, the temporary-path
+  lifecycle, and `--no-seed`, with an injected executor.
 - `.github/workflows/ci.yml`
 - `.github/workflows/release.yml`
 - `README.md`
