@@ -2079,7 +2079,7 @@ async fn a_busy_controller_lease_is_retried_until_the_worker_is_adopted() {
     // One attempt, as after a job-end report, must outlast the busy lease.
     let worker = harness
         .lifecycle()
-        .try_connect(&generation, Instant::now() + GENEROUS)
+        .try_connect(&generation, Instant::now() + GENEROUS, None)
         .await
         .expect("the worker is adopted once its lease is free");
 
@@ -2112,7 +2112,7 @@ async fn a_controller_lease_busy_until_the_deadline_ends_with_the_deadline() {
         GENEROUS,
         harness
             .lifecycle()
-            .try_connect(&generation, started + CONNECT),
+            .try_connect(&generation, started + CONNECT, None),
     )
     .await
     .expect("a busy lease never extends the attempt deadline");
@@ -2125,6 +2125,44 @@ async fn a_controller_lease_busy_until_the_deadline_ends_with_the_deadline() {
     assert!(
         rejections.load(Ordering::Relaxed) >= 2,
         "the busy lease was retried within the deadline"
+    );
+    fake.abort();
+}
+
+#[tokio::test]
+async fn an_ended_job_stops_the_busy_lease_retries_after_the_first_refusal() {
+    let harness = Harness::scripted(NEVER, INITIALIZE);
+    // The job reads as absent from the first inspection on.
+    harness.supervisor.script_inspects([InspectStep::NotFound]);
+    let generation = harness.generation("s-1");
+    let (fake, rejections) = serve_fake_version_five_worker(
+        &harness
+            .runtime_root
+            .join("s-1")
+            .join(pohunek_paths::WORKER_SOCKET_NAME),
+        "s-1",
+        "worker-v5",
+        None,
+        usize::MAX,
+    );
+
+    let outcome = tokio::time::timeout(
+        GENEROUS,
+        harness
+            .lifecycle()
+            .connect_until(&generation, Instant::now() + NEVER),
+    )
+    .await
+    .expect("an ended job does not wait out a busy lease until the connect deadline");
+
+    assert!(
+        matches!(outcome, Err(NotReady::Ended(JobEnd::Absent))),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        rejections.load(Ordering::Relaxed),
+        1,
+        "the attempt in flight completed, and no retry followed the end report"
     );
     fake.abort();
 }

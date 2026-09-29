@@ -946,7 +946,7 @@ impl Lifecycle<'_> {
         stop: &CancellationToken,
     ) -> Option<Worker> {
         loop {
-            if let Some(worker) = self.try_connect(generation, deadline).await {
+            if let Some(worker) = self.try_connect(generation, deadline, Some(stop)).await {
                 return Some(worker);
             }
             let now = Instant::now();
@@ -1037,8 +1037,15 @@ impl Lifecycle<'_> {
     ///
     /// A `ControllerBusy` rejection is retried every poll interval until
     /// `until`: the worker releases a lease only once it has processed the
-    /// previous controller connection's close.
-    async fn try_connect(&self, generation: &Generation, until: Instant) -> Option<Worker> {
+    /// previous controller connection's close. A cancelled `stop` ends the
+    /// retries after a completed rejection; it never interrupts a connect in
+    /// flight.
+    async fn try_connect(
+        &self,
+        generation: &Generation,
+        until: Instant,
+        stop: Option<&CancellationToken>,
+    ) -> Option<Worker> {
         let socket = self
             .runtime_root
             .join(generation.session_id())
@@ -1065,12 +1072,30 @@ impl Lifecycle<'_> {
                         );
                         return None;
                     }
+                    if stop.is_some_and(CancellationToken::is_cancelled) {
+                        tracing::debug!(
+                            session_id = generation.session_id(),
+                            error = %error,
+                            "worker job ended while its controller lease was busy"
+                        );
+                        return None;
+                    }
                     tracing::debug!(
                         session_id = generation.session_id(),
                         error = %error,
                         "waiting for the previous controller lease to close"
                     );
-                    tokio::time::sleep_until((now + SUPERVISION_POLL_INTERVAL).min(until)).await;
+                    let retry =
+                        tokio::time::sleep_until((now + SUPERVISION_POLL_INTERVAL).min(until));
+                    match stop {
+                        Some(stop) => {
+                            tokio::select! {
+                                () = retry => {}
+                                () = stop.cancelled() => return None,
+                            }
+                        }
+                        None => retry.await,
+                    }
                 }
                 other => break other,
             }
@@ -1150,7 +1175,7 @@ impl Lifecycle<'_> {
                 // Every settle attempt gets at least one poll interval, even
                 // at the initialization deadline.
                 let until = give_up_at.max(Instant::now() + SUPERVISION_POLL_INTERVAL);
-                if let Some(worker) = self.try_connect(generation, until).await {
+                if let Some(worker) = self.try_connect(generation, until, None).await {
                     tracing::info!(
                         session_id = generation.session_id(),
                         worker.generation = generation.generation(),
