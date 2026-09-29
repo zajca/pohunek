@@ -59,12 +59,19 @@ def validate_coverage(universe, selections):
         )
 
 
-def junit_report(config, profile, target_dir):
+# nextest's default `[store] dir`, relative to the workspace root. It does not
+# follow CARGO_TARGET_DIR.
+DEFAULT_STORE_DIR = "target/nextest"
+
+
+def junit_report(config, profile, root):
     """The JUnit file nextest writes for `profile`, or None when it writes none.
 
-    `junit.path` is inherited along `inherits`, ending at `default`, like every
-    other nextest profile setting.
+    Reports live under `[store] dir` (relative to the workspace `root`), then
+    the profile name. `junit.path` is inherited along `inherits`, ending at
+    `default`, like every other nextest profile setting.
     """
+    store = Path(root) / config.get("store", {}).get("dir", DEFAULT_STORE_DIR)
     profiles = config.get("profile", {})
     name = profile
     seen = set()
@@ -73,18 +80,9 @@ def junit_report(config, profile, target_dir):
         settings = profiles.get(name, {})
         path = settings.get("junit", {}).get("path")
         if path is not None:
-            return Path(target_dir) / "nextest" / profile / path
+            return store / profile / path
         name = settings.get("inherits", "default" if name != "default" else None)
     return None
-
-
-def target_directory():
-    """Cargo's resolved target directory (honours CARGO_TARGET_DIR and config)."""
-    result = subprocess.run(
-        ["cargo", "metadata", "--no-deps", "--format-version", "1"],
-        cwd=ROOT, check=True, stdout=subprocess.PIPE,
-    )
-    return json.loads(result.stdout)["target_directory"]
 
 
 def inventory(expression=None):
@@ -125,7 +123,7 @@ def main():
     # CI uploads each job's report under its shard name. Local fast shard runs
     # share the ci report path; copy it before starting the next run if needed.
     with (ROOT / ".config/nextest.toml").open("rb") as config:
-        report = junit_report(tomllib.load(config), profile, target_directory())
+        report = junit_report(tomllib.load(config), profile, ROOT)
     # nextest writes the report only when a run completes, so a report left by
     # an earlier run (or restored with target/) would pass for this one when
     # the build fails first; the job summary and upload must see none instead.
