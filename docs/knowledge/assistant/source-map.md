@@ -268,16 +268,23 @@ Release packaging and contributor verification:
   an exclusive lock on `<git-common-dir>/worktree-new.lock` from the
   existence checks through any rollback, a real probe clone must succeed
   first, the main checkout's three Cargo lock files are created if absent
-  and held exclusively while the source is validated and copied, both
-  checkouts must use the default target layout per `cargo metadata`,
-  uplifted binaries are not seeded, and a failing `git worktree add` or
-  seed rolls back whichever of the new worktree and branch exist.
-  `--no-seed` skips seeding.
+  and held exclusively while the source is validated and copied, a
+  symlinked profile dir, seeded subdirectory, or target-root file fails
+  closed, both checkouts must use the default target layout per `cargo
+  metadata`, and uplifted binaries are not seeded. The branch is created
+  with `git branch --no-track` at the resolved base commit and the worktree
+  is added and seeded at a unique temporary sibling path, then `git
+  worktree move`d to its slug; a failure removes only the worktree at that
+  temporary name and deletes the branch only by `git update-ref -d` against
+  the commit it was created at, so plain-git work under the same names is
+  never touched. `--no-seed` skips seeding.
 - `scripts/tests/test_worktree_new.py` — regression checks for its slug and
   argument validation, fail-closed reflink probe, Cargo and repository lock
   contention (including two concurrent runs for one slug), layout checks,
-  rollback of partial `git worktree add` failures, and `--no-seed`, with an
-  injected executor.
+  symlinked seed sources, rollback of partial `git worktree add` failures,
+  races with plain `git` creating the same worktree or branch or moving the
+  branch, the temporary-path lifecycle, and `--no-seed`, with an injected
+  executor.
 - `.github/workflows/ci.yml`
 - `.github/workflows/release.yml`
 - `README.md`

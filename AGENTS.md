@@ -235,8 +235,12 @@ fetch) and seeds its own `target/debug` caches from the main checkout with
 crates that differ, not every registry dependency. It needs the main
 checkout's `target/` and the worktree on one reflink-capable filesystem
 (btrfs/XFS; never `/tmp`), fails closed otherwise, while a Cargo build holds
-the main checkout's lock, or while another `worktree-new` run is in progress,
-and never falls back to a full copy; `--no-seed` accepts a cold build. The seed helps in proportion to how recently the main
+the main checkout's lock, while another `worktree-new` run is in progress, or
+when a seeded source entry is a symlink, and never falls back to a full copy;
+`--no-seed` accepts a cold build. It builds the worktree at a temporary sibling
+path and `git worktree move`s it into place, so a failed run rolls back only
+the worktree and branch it provably created (the branch by compare-and-delete)
+and never touches ones another process made under the same name. The seed helps in proportion to how recently the main
 checkout was built at a similar `Cargo.lock`.
 
 Web (run inside `web/`):
