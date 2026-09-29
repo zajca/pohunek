@@ -246,15 +246,18 @@ recorded, and each revision increments the turn's `settlement_revision`
 - a `timed_out` turn **completes late** when correlated turn-end evidence
   for it (the same `prompt_id`/`turn_id`, or an OpenCode execution end for
   the bound execution) arrives after the deadline and before any later turn
-  was delivered. Late finalization first **re-acquires occupancy** through
-  the same check-and-set as a delivery (invariant 11): when the tree is
-  free, the turn is revised to `completed` (or `failed`) with the usual
+  was delivered. Every occupancy acquisition increments a persisted
+  **worktree generation**, and a `timed_out` settlement records the
+  generation current at that moment. Late finalization first
+  **re-acquires occupancy** through the same check-and-set as a delivery
+  (invariant 11) and compares generations: when the tree is free **and** the
+  generation is unchanged since the timeout, the turn is revised to `completed` (or `failed`) with the usual
   finality rules, snapshots and checks, so the work appears in its
-  `turn_delta` instead of being lost; when another task already occupies
-  the tree, no snapshot or check runs, the turn is revised with
-  `integrity: suspect` and reason `late_completion_conflict`, the occupant's
-  current or next result is marked suspect too, and the changes are
-  attributed to nobody. No `task.extend` is needed, and the
+  `turn_delta` instead of being lost; when another task occupies the tree, or any
+  other task held it since the timeout (generation advanced), no snapshot
+  or check runs, the turn is revised with `integrity: suspect` and reason
+  `late_completion_conflict`, the occupant's current or next result is
+  marked suspect too, and the changes are attributed to nobody. No `task.extend` is needed, and the
   open-time ceiling does not block it: completion evidence closes a turn,
   it does not keep one open. Uncorrelated late evidence is never applied;
   it only marks the next result `drift_since_previous_turn`;
@@ -264,6 +267,13 @@ recorded, and each revision increments the turn's `settlement_revision`
   `task.answer` fails `task_attention_stale`. Together with an answer and a
   terminal resolution this is the only way out of a settled `attention`, and
   it is atomic with the session stop.
+
+`task.stop` also **seals** the task: it records a stop fence (the session
+stop plus a task-level generation), after which no settlement of that task
+is revisable — a `timed_out` turn can no longer complete late, a heuristic
+`completed` turn can no longer re-open, and no queued delivery runs. Evidence
+that arrives after the fence is recorded on the turn as `ignored_after_stop`
+and never acquires occupancy, runs checks or changes a result.
 
 A resumed or re-opened turn receives a fresh deadline window, but the total
 open time of one turn across all its windows is bounded by
@@ -417,8 +427,16 @@ settles with `completed` (section 12).
     to every other task sharing it (`task_worktree_busy`) and refuses
     terminal input into their sessions: `session.input` fails with
     `worktree_busy` and attach is admitted read-only (observation without
-    terminal control), so no human or client can make an idle agent in
-    another session write into the tree A is working in. The daemon cannot
+    terminal control). Acquiring occupancy is a **quiescence barrier** for
+    attaches that already exist: under the input lock the daemon flips
+    every controlling attach on the other sessions of the tree to
+    read-only, waits for the bridge to acknowledge that no further input
+    frame will be forwarded (the bridge fences each input frame on the
+    session's current fence state, so a frame in flight is dropped, not
+    written), and only then completes the acquisition; an attach that does
+    not acknowledge within `tasks.attach_fence_grace_ms` is closed. No human
+    or client can therefore make an idle agent in another session write
+    into the tree A is working in. The daemon cannot
     stop a provider from resuming on its own inside a non-occupying session;
     such a resumption is observed as a working transition there and marks
     A's current or next result `integrity: suspect` and the resuming task's
@@ -709,8 +727,11 @@ the client's liveness plus the configured keepalive detection time, not by
 Relay-path waits arrive multiplexed over the long-lived host link, whose
 socket stays up when a public client disconnects, so socket liveness cannot
 release them. Every routed `task.wait` therefore carries a relay request id,
-and the relay sends `operation.cancel { request_id }` on the host link when
-the public client disconnects, when its principal is revoked or its
+and the relay sends `operation.cancel { request_id }` — a new v4 host-link
+frame listed among the relay dark factory RFC's amendments (its section 3):
+idempotent, scoped to one link generation, a no-op that returns the
+request's final state when the response already left — when the public
+client disconnects, when its principal is revoked or its
 credential expires, and on relay shutdown; the daemon releases the slot on
 cancel, and the relay additionally bounds concurrent waits per principal.
 
@@ -959,16 +980,20 @@ the worker for the delivery id's journal state and resolves:
 **Addressed answers.** An OpenCode answer (section 8.5) is a provider API
 call rather than a PTY write, but it is the same kind of external side
 effect and follows the same protocol with the journal states `sending`
-(recorded before the request is issued, with the `attention_id` and the
-provider request or form id) and `sent` (recorded with the provider's
-response). Recovery: `absent` — not sent, issue the request; `sent` —
+(recorded before the request is issued, with the `attention_id`, the
+provider request or form id and the **keyed fingerprint** of the answer
+value — never the value itself, since the journal holds no input) and
+`sent` (recorded with the provider's response status). Recovery: `absent` — not sent, issue the request; `sent` —
 record `delivered` from the journaled response; `sending` — the worker asks
-the provider for the request's state: already replied resolves to `delivered` only when the provider's recorded
-reply equals the journaled answer value for that request id; a different
-recorded reply means someone else answered and resolves to
+the provider for the request's state: already replied resolves to `delivered` only when the fingerprint of the
+provider's recorded reply equals the journaled fingerprint for that request
+id; a different fingerprint means someone else answered and resolves to
 `resolved_elsewhere` (the attention marked so, this answer not delivered); a
 reply the provider cannot report resolves to `delivery_uncertain`; still
-pending re-issues the request; gone resolves to `task_attention_stale`. `task.answer` therefore keeps
+pending moves the delivery to `awaiting_resubmission`, because the daemon
+no longer holds the answer value and re-sends only what the client presents
+again (the resubmission rules below); gone resolves to
+`task_attention_stale`. `task.answer` therefore keeps
 invariant 3 on both answer paths.
 
 **Resubmission.** A delivery in `awaiting_resubmission` resumes only when
@@ -1621,7 +1646,12 @@ therefore never contains a partially-filled `checks` list. `outcome` is
   plus a walk of descendants carrying the launch token, is recorded as
   `containment: process_group`, and the result's `integrity` is capped at
   `suspect`, because a check that calls `setsid`, drops the token and exits
-  its parent cannot be proven gone.
+  its parent cannot be proven gone. For that reason an unconfined check's
+  scope is never treated as provably empty by the cancel-and-join barrier:
+  occupancy is released only after `tasks.unconfined_release_grace_ms` with
+  no further write observed in the tree, and the worktree is never removed
+  automatically while such a check ran in it — removal needs an explicit
+  owner `session.remove { force_unconfined: true }` on the owner path.
 - Finalization has its own deadline, `tasks.finalize_max_ms`, independent of
   the turn deadline (which only bounds the agent's part of the turn). On
   expiry, the running check is killed (`timed_out`), the remaining ones are
@@ -1690,7 +1720,7 @@ the result says so (`baseline_on: "worktree"`).
 | `task.inspect` | Task record, lifecycle state, evidence sources and degradation, worktree users, and one page of turns (see paging below). Also resolves a task by `(caller_scope, client_request_id)` for delivery reconciliation. |
 | `task.list` | One page of tasks on the host, filterable by project, lifecycle state, outcome, owner task and run id (see paging below). |
 | `task.extend` | Extend an open turn's deadline, or re-open a `timed_out` turn whose work has not visibly ended, within `tasks.turn_open_ceiling_ms` (section 6.3). |
-| `task.stop` | Cancel and join the task's check processes (section 12), stop its session and settle any open turn — or a settled `attention` turn, as a new revision (section 6.3) — as `stopped`; on a task without an open turn it is the explicit end of a finished task (section 6.1). Optional preconditions `if_latest_turn` and `require_idle: true` make the stop atomic with a check that the latest turn is exactly that one and has no open turn, pending attention or finalizing result; otherwise it fails with `task_stop_precondition_failed` and changes nothing. On a task that is already `ended`, `task.stop` succeeds as a no-op and returns the recorded end (`already_ended: true`) without evaluating preconditions, so a retried cleanup never fails on its own earlier success. The worktree, metadata and result content survive for `task.result` and `task.review`. Idempotent. |
+| `task.stop` | Cancel and join the task's check processes (section 12), stop its session and settle any open turn — or a settled `attention` turn, as a new revision (section 6.3) — as `stopped`, and seal every other settlement against later revision (section 6.3); on a task without an open turn it is the explicit end of a finished task (section 6.1). Optional preconditions `if_latest_turn` and `require_idle: true` make the stop atomic with a check that the latest turn is exactly that one and has no open turn, pending attention or finalizing result; otherwise it fails with `task_stop_precondition_failed` and changes nothing. On a task that is already `ended`, `task.stop` succeeds as a no-op and returns the recorded end (`already_ended: true`) without evaluating preconditions, so a retried cleanup never fails on its own earlier success. The worktree, metadata and result content survive for `task.result` and `task.review`. Idempotent. |
 | `task.review` | Record an external verdict (`accepted`, `changes_requested`, `rejected`) bound to a `result_id` and the `worktree_fingerprint` the reviewer verified, with optional notes and check references (see review binding below). Idempotent per `(task_id, caller_scope, client_request_id)`. |
 | `task.check_log` | Page a check log by reference and byte offset. |
 | `task.retain_worktree` | Set the retain hold on the worktree's owner task after the fact, while the worktree exists (section 8.7). Idempotent. |
@@ -1866,8 +1896,16 @@ to ship the adapter in the same milestone is an open question (section 19).
   `tasks.max_tasks_retained` caps retained task directories; `task.start` and
   `task.continue` are refused with `task_store_full` when a cap would be
   exceeded, retention sweeps the oldest retired content first within the
-  caps, a full disk fails the mutation typed and never truncates a record,
-  and the startup scan is bounded by the same caps.
+  caps, and the startup scan is bounded by the same caps. Admission
+  reserves the task's worst-case **terminal capacity**
+  (`tasks.store_reserve_bytes`: the result revisions, evidence, check
+  metadata and stop records one turn can still need) against
+  `tasks.store_max_bytes`, so settlement and `task.stop` always have room
+  once a turn was admitted. A full disk is a different failure: terminal
+  records (settlement, stop intent and completion, check `interrupted`)
+  are written through a small pre-allocated **emergency journal** so the
+  daemon never leaves a process, occupancy or stop half-recorded; any other
+  mutation fails typed and never truncates a record.
   Mutations that span records, the session store and external effects
   follow a persisted **task operation journal** shaped like the relay RFC's
   ticket journal (section 12.5) and the create intent of #192: `task.start`
@@ -2216,7 +2254,16 @@ without blocking the rest.
      a provider reply that differs from the journaled answer resolves to
      `resolved_elsewhere`; `session diff --turn` refused without evidence
      rights on the relay path; metadata-only coverage never yields
-     `modified: false`; review notes retire with the session;
+     `modified: false`; review notes retire with the session; a late
+     completion after an intermediate occupant reports
+     `late_completion_conflict` (worktree generation advanced); an attach
+     opened before occupancy is fenced read-only and an in-flight input
+     frame is dropped; an addressed answer in `sending` with a pending
+     request goes to `awaiting_resubmission` rather than re-sending a stored
+     value; an unconfined check never lets the worktree be auto-removed;
+     evidence after `task.stop` is `ignored_after_stop` and never re-opens a
+     turn; settlement and stop succeed with the store at its cap through the
+     reserve, and on a full disk through the emergency journal;
      check definitions: a host definition shadows an in-repo one of the same
      name, an in-repo definition edited in the worktree during the turn is
      not what runs, and `repo_base` checks cap integrity at `suspect`;
@@ -2300,6 +2347,8 @@ present, no detection-only settlement for OpenCode, and the share of
    `tasks.check_launch_grace_ms`, `tasks.fingerprint_max_file_bytes`,
    `tasks.fingerprint_max_read_bytes`, `tasks.fingerprint_max_ms`,
    `tasks.max_reviews_per_result`, `tasks.review_notes_max_bytes`,
+   `tasks.store_reserve_bytes`, `tasks.attach_fence_grace_ms`,
+   `tasks.unconfined_release_grace_ms`,
    `tasks.wait_keepalive_idle_ms`,
    `tasks.wait_keepalive_interval_ms`, `tasks.wait_keepalive_count`,
    `tasks.store_max_bytes`, `tasks.max_turns_per_task`,

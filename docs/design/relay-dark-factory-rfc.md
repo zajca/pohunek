@@ -107,6 +107,10 @@ supported operating mode or an accident.
     section 18.1 for re-measurement;
   - the data classification table (relay RFC section 17.2) gains the rows of
     section 9;
+  - the v4 host link gains an idempotent `operation.cancel { request_id }`
+    frame for routed waits (task RFC section 8.3) and the relay methods
+    `factory.run.open`, `factory.run.add_member`, `factory.run.reconcile`
+    and `factory.run.failover` (section 12.2);
   - the operation-ticket state machine (relay RFC section 12.5) gains a
     repeatable `awaiting_resubmission` → `begun` transition for a
     matching-fingerprint `begin`, bounded by the host's resubmission window
@@ -535,7 +539,16 @@ section 18.1.
   monotonic **admission ledger** in the witness-protected storage of relay
   RFC section 19.1 before the database transaction commits; after a
   restore the ledger supplies counter floors and the key → ticket bindings,
-  and admission stays closed until the ledger and the database agree. If
+  and admission stays closed until the ledger and the database agree. The
+  two are kept consistent by a prepare/commit protocol: the ledger entry is
+  appended as `prepared`, the database transaction commits, then the entry
+  is marked `committed`; on restart a `prepared` entry without its database
+  row is treated as **consumed** (counters charged, key bound to its ticket,
+  audit row re-emitted from the entry) because the ticket may already have
+  been issued, and a database row without a ledger entry cannot exist since
+  the entry precedes the commit. Compaction of the ledger never drops an
+  entry before its ticket has expired, its budget window has reset and its
+  audit retention has passed. If
   the ledger itself is unavailable, admission stays closed until every
   ticket that could exist has expired and every affected budget window has
   reset. Restore and rollback tests cover both.
@@ -677,9 +690,10 @@ Data classification additions to relay RFC section 17.2:
 
 | Data | Host persistence | Relay persistence | Logs/audit | Retention |
 |---|---|---|---|---|
-| Task/turn metadata (ids, lifecycle state, outcomes, `settled_by`, integrity, timings) | Authoritative | Catalog projection (section 10) | IDs, states, decisions | Host: `tasks.metadata_retention`; relay: configured metadata policy |
+| Task/turn metadata (ids, `mode`, lifecycle state, outcomes, `settled_by`, integrity, timings) | Authoritative | Catalog projection (section 10) | IDs, states, decisions | Host: `tasks.metadata_retention`; relay: configured metadata policy |
 | Task results, check logs, final messages | Owner-private host files (task RFC section 14) | Never | Never | Existing host policy (retire with the session) |
-| Prompts | Keyed fingerprint only (task RFC invariant 7) | Keyed fingerprint on the admission record only | Never | Admission-record retention |
+| Prompts (task metadata) | Keyed fingerprint only (task RFC invariant 7) | Keyed fingerprint on the admission record only | Never | Admission-record retention |
+| Prompt text as typed into the PTY | Owner-private scrollback of the session (existing session content, session ACL and retention) | Never | Never | Existing scrollback policy |
 | Budget counters | No | PostgreSQL | Decision + counter name | Configured policy |
 | Run IDs (`run_id`) | Task metadata, attribution only | Catalog projection and audit | ULID/UUID only, never free text | As task metadata / audit policy |
 
@@ -696,9 +710,11 @@ A task binds exactly one session and a session belongs to at most one task
 **`task` field on the existing session projection row** (relay RFC section
 16), not a separate projection. For a relay-origin session on an active share
 that is a task session, the row carries the metadata of the classification
-row in section 9: task id, lifecycle state, open turn, last outcome,
-`settled_by`, integrity, turn count, owner task, `run_id` and
-timestamps. Turn-level detail (per-turn results) is not projected; clients
+row in section 9: task id, immutable `mode` (`execute` or `investigate`,
+which the relay needs to authorize `task.stop` for `task.investigate`
+holders and to refuse an executor `worktree_of` through an investigate task
+before forwarding), lifecycle state, open turn, last outcome, `settled_by`,
+integrity, turn count, owner task, `run_id` and timestamps. Turn-level detail (per-turn results) is not projected; clients
 fetch it through `task.evidence.read` routed calls.
 
 - Folding tasks into the session row keeps the snapshot coordinator's
@@ -857,18 +873,26 @@ the task RFC's CLI workstream lands.
   `run_generation` as indexed fields, and the method returns them paged
   with their current state (resolving `reserved`/`uncertain` through
   `operation.result.get` on the way). The barrier is closed server-side:
-  `factory.run.failover` succeeds only once no non-terminal record remains,
-  and a `quarantined` record is resolved only by the explicit administrative
-  action of section 8.3 — the successor cannot proceed past it. The
+  `factory.run.failover` succeeds only once no **unresolved** record remains
+  — exactly `reserved`, `uncertain`, `awaiting_resubmission` and
+  `quarantined`; `confirmed` starts of running tasks are not unresolved and
+  are handed to the successor for adoption — and a `quarantined` record is
+  resolved only by the explicit administrative action of section 8.3, so
+  the successor cannot proceed past it. The
   successor then adopts every task the catalog lists under that `run_id`
   and never starts a new first-round task while any task of the run
   exists. Second, a **server-side generation fence**: every budgeted
-  request carries `run_id` and `run_generation`; the relay stores the highest
-  generation admitted per **run owner** — the `(team, principal, run_id)` of
-  the principal whose `task.start` first used that `run_id`, so another
-  principal reusing the string gets its own namespace and can neither fence
-  nor join a run it does not own — and refuses a lower generation with
-  `factory_run_fenced` before forwarding; the fence applies to **every**
+  request carries `run_id` and `run_generation`; the relay keeps a **run
+  record** per `(team, run_id)`, opened by the first `task.start` that uses
+  the id (or explicitly by `factory.run.open`), owned by that principal, and
+  carrying the member principals the owner admits with
+  `factory.run.add_member` — the auditor in the reference loop — plus one
+  generation counter shared by every member. A principal that is neither
+  owner nor member of the record cannot admit work under that `run_id`
+  (`factory_run_not_member`), so a colliding id neither fences nor joins a
+  run; catalog recovery adopts only tasks whose admission records belong to
+  the run record, never bare `run_id` matches. The relay refuses a lower
+  generation from any member with `factory_run_fenced` before forwarding; the fence applies to **every**
   run-scoped mutation — `task.stop`, `task.review`, `task.retain_worktree`,
   `task.release_worktree` and cascading `session.remove` as well as the
   budgeted calls — so a predecessor cannot stop, review or remove the
@@ -876,7 +900,7 @@ the task RFC's CLI workstream lands.
   through an audited `factory.run.failover` action by a team administrator
   or by the owner account after its credential rotation; a request cannot
   raise it by itself. `run_id` stays attribution, not authorization: the
-  fence is admission state keyed by the admitting principal. A same-key,
+  fence is admission state keyed by the run record and its members. A same-key,
   same-fingerprint retry of an existing admission record — the write-ahead
   resubmission below — is resolved **before** the fence and is never refused
   by it, so a successor can finish the predecessor's `awaiting_resubmission`
@@ -1114,7 +1138,12 @@ Ordered by dependency; each lands with the tests named:
      `quarantined` record remains, a rotation with overlap refused as a
      failover precondition, a restore reconciled from the admission ledger,
      an escalation target lacking evidence rights rejected at setup, an
-     auditor without `session.metadata.read` unable to review, and
+     auditor without `session.metadata.read` unable to review, a non-member
+     principal refused under a colliding `run_id`, the auditor member fenced
+     by the manager's failover, `factory.run.failover` succeeding with
+     `confirmed` running starts adopted, a crash between the ledger
+     `prepared` entry and the database commit recovered as consumed, a late
+     `operation.cancel` after the response left being a no-op, and
      by stale preconditions, revocation after an irreversible host commit
      but before response delivery resolved by the failover barrier, the
      last human target's removal refused or suspending turn-opening
