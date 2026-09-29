@@ -37,7 +37,9 @@ from pohunek.tools import TOOL_SCHEMAS, Tools, _MAX_INPUT_BYTES, _input
 # `true` lives at this path on both Linux and macOS (`/bin/true` is absent on macOS).
 TRUE_BINARY = "/usr/bin/true"
 
-# Bulk pipe tests verify byte limits, not scheduler latency on shared runners.
+# Tests that spawn a Python child and move bulk output verify byte limits, not
+# scheduler latency on shared runners: an unloaded run takes ~20 ms against the
+# 100 ms default deadline, which a loaded runner can exceed.
 _BULK_COLLECTION_TIMEOUT_MS = 5_000
 
 
@@ -197,7 +199,9 @@ class RunnerTests(unittest.TestCase):
         self.assertLessEqual(len(response), _stdout_wire_cap(low_policy))
         with tempfile.TemporaryDirectory() as directory:
             executable, _pid_file = self._controlled_cli(Path(directory), response)
-            runner = CliRunner(policy(executable, max_output_bytes=1, max_screen_bytes=1))
+            runner = CliRunner(policy(executable, max_output_bytes=1, max_screen_bytes=1,
+                tool_timeout_ms=_BULK_COLLECTION_TIMEOUT_MS,
+            ))
             self.assertEqual(runner.run(Invocation(("session", "inspect", "s-42", "--json"))), session)
 
     def test_low_policy_accepts_pretty_session_info_collection_near_control_line_limit(self) -> None:
@@ -230,7 +234,9 @@ class RunnerTests(unittest.TestCase):
         self.assertLessEqual(len(response), _stdout_wire_cap(low_policy))
         with tempfile.TemporaryDirectory() as directory:
             executable, _pid_file = self._controlled_cli(Path(directory), response)
-            runner = CliRunner(policy(executable, max_output_bytes=1, max_screen_bytes=1))
+            runner = CliRunner(policy(executable, max_output_bytes=1, max_screen_bytes=1,
+                tool_timeout_ms=_BULK_COLLECTION_TIMEOUT_MS,
+            ))
             self.assertEqual(runner.run(Invocation(("session", "list", "--json"))), sessions)
 
     def test_maximum_decoded_base64_response_and_envelope_fit_wire_cap(self) -> None:
@@ -244,7 +250,9 @@ class RunnerTests(unittest.TestCase):
             }, separators=(",", ":")).encode("utf-8")
             self.assertLessEqual(len(response), _stdout_wire_cap(bounded))
             executable, _pid_file = self._controlled_cli(Path(directory), response)
-            runner = CliRunner(policy(executable, max_output_bytes=1024, max_screen_bytes=1))
+            runner = CliRunner(policy(executable, max_output_bytes=1024, max_screen_bytes=1,
+                tool_timeout_ms=_BULK_COLLECTION_TIMEOUT_MS,
+            ))
 
             self.assertEqual(
                 runner.run(Invocation(("session", "output", "--json"))),

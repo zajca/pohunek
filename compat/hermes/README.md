@@ -40,6 +40,22 @@ root required by Pohunek's executable-containment checks, and uses the reviewed
 frozen upstream resolution. Its network-free fail-closed test is
 `scripts/tests/provision-hermes-compat.sh`.
 
+The same gate runs natively on Apple Silicon in the
+`hermes-compatibility-macos` CI job. That job provisions the locked runtime
+with the stock macOS `/bin/bash` 3.2 and BSD userland (the provisioner uses
+`sha256sum` or `shasum -a 256`, whichever exists, and no GNU `realpath`),
+runs both shell tests, the xtask Hermes unit tests, the compatibility gate, and
+`scripts/smoke-hermes-plugin-release`. The smoke runs a release `pohunek`
+copied outside the checkout with a clean isolated home, so the plugin and skill
+it installs can only come from assets embedded in the binary; it resolves
+symlinked temporary parents (macOS `/tmp` and `/var/tmp`) before validating
+them. The harness resolves symlinks in its isolation root so redaction matches
+the paths child processes print, and uses `en_US.UTF-8` where macOS lacks
+`C.UTF-8`. The production-plugin isolation root and the smoke root are chosen
+short enough that `$XDG_RUNTIME_DIR/pohunek/daemon.sock` fits the platform
+socket path limit (103 bytes on macOS); when no candidate parent fits, the run
+fails with the byte budget. A missing prerequisite fails the job.
+
 Refresh PTY evidence explicitly with the real pinned Hermes process and PTY
 against the repository-owned deterministic model mock:
 

@@ -508,7 +508,10 @@ jobs:
             # and protocol crates are included because `pohunek integration`
             # resolves its install home via `pohunek_paths::state_home()` and
             # negotiates via `pohunek_protocol` types
-            # (`SUPPORTED_PROTOCOL_VERSIONS`, `IntegrationRecovery`).
+            # (`SUPPORTED_PROTOCOL_VERSIONS`, `IntegrationRecovery`). The
+            # `hermes-compatibility` (Linux) and `hermes-compatibility-macos`
+            # jobs share this filter; the smoke script and its fixtures are
+            # inputs of the macOS job's packaged-plugin smoke.
             hermes:
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -521,6 +524,9 @@ jobs:
               - 'crates/xtask/src/**'
               - 'scripts/provision-hermes-compat'
               - 'scripts/tests/provision-hermes-compat.sh'
+              - 'scripts/smoke-hermes-plugin-release'
+              - 'scripts/tests/smoke-hermes-plugin-release.sh'
+              - 'scripts/tests/fixtures/smoke-*'
               - '.github/workflows/ci.yml'
             # Generated TS binding drift lives under a schedule or when the
             # protocol surface or generation driver changes (issue #125).
@@ -955,6 +961,170 @@ jobs:
           path: ${{ runner.temp }}/hermes-compat-cache
           key: >-
             hermes-runtime-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-
+            ${{ hashFiles('compat/hermes/compatibility-lock.json') }}-
+            ${{ hashFiles('scripts/provision-hermes-compat') }}-
+            ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
+            ${{ hashFiles('.github/workflows/ci.yml') }}
+
+  # Native Apple Silicon counterpart of `hermes-compatibility`. It provisions
+  # the same locked Hermes runtime under the runner's /bin/bash 3.2 and BSD
+  # userland, then runs the model-free compatibility gate and the packaged
+  # plugin smoke natively. Every missing prerequisite fails the job; nothing
+  # is skipped.
+  hermes-compatibility-macos:
+    name: pinned Hermes compatibility (macOS arm64, model-free)
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.hermes == 'true' }}
+    needs: changes
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+      # mold is Linux-only: keep the default linker on macOS runners.
+      RUSTFLAGS: -D warnings
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify native runner architecture
+        shell: bash
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Install Python
+        id: python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+
+      # The runtime is provisioned by scripts/provision-hermes-compat, which
+      # needs git, python3, uv, and one SHA-256 tool (macOS ships shasum).
+      - name: Require provisioning prerequisites
+        shell: /bin/bash {0}
+        run: |
+          set -euo pipefail
+          for executable in git python3 uv shasum; do
+            command -v "$executable" >/dev/null 2>&1 \
+              || { echo "required executable is unavailable: $executable" >&2; exit 1; }
+          done
+          /bin/bash --version | head -n 1
+
+      # Same inputs as the Linux runtime cache plus the CPU architecture; a
+      # runtime provisioned on Linux is never restored here.
+      - name: Cache Hermes runtime
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/hermes-compat-cache
+          key: >-
+            hermes-runtime-${{ runner.os }}-${{ runner.arch }}-py${{ steps.python.outputs.python-version }}-
+            ${{ hashFiles('compat/hermes/compatibility-lock.json') }}-
+            ${{ hashFiles('scripts/provision-hermes-compat') }}-
+            ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
+            ${{ hashFiles('.github/workflows/ci.yml') }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: hermes-macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Runs the shell tests with /bin/bash (3.2) first on PATH, so the
+      # provisioner and the smoke run under the stock macOS shell.
+      - name: Check fail-closed Hermes provisioning and smoke scripts
+        shell: /bin/bash {0}
+        run: |
+          set -euo pipefail
+          PATH="/bin:$PATH" /bin/bash scripts/tests/provision-hermes-compat.sh
+          PATH="/bin:$PATH" /bin/bash scripts/tests/smoke-hermes-plugin-release.sh
+
+      - name: Provision locked Hermes runtime
+        id: hermes
+        shell: /bin/bash {0}
+        run: |
+          set -euo pipefail
+          cache_dir="${{ runner.temp }}/hermes-compat-cache"
+          install_dir="$RUNNER_TEMP/hermes-compat"
+          if [[ -d "$cache_dir" ]]; then
+            # Cache hit: restore the previously provisioned runtime; fail
+            # closed if the restored cache lacks the executable.
+            rm -rf "$install_dir"
+            cp -a "$cache_dir" "$install_dir"
+            hermes_bin="$install_dir/venv/bin/hermes"
+          else
+            hermes_bin="$(scripts/provision-hermes-compat "$install_dir")"
+            # A partial cache_dir under an immutable key would poison later
+            # runs, so a copy error fails the step and the staged copy is
+            # verified.
+            rm -rf "$cache_dir"
+            cp -a "$install_dir" "$cache_dir"
+            [[ -f "$cache_dir/venv/bin/hermes" && -x "$cache_dir/venv/bin/hermes" ]] \
+              || { echo "cached Hermes copy incomplete at $cache_dir/venv/bin/hermes" >&2; exit 1; }
+          fi
+          [[ -f "$hermes_bin" && -x "$hermes_bin" ]] \
+            || { echo "provisioned Hermes executable missing at $hermes_bin" >&2; exit 1; }
+          printf 'bin=%s\n' "$hermes_bin" >> "$GITHUB_OUTPUT"
+
+      - name: Test Hermes harness natively
+        run: cargo test --locked -p xtask --lib hermes
+
+      - name: Build release CLI
+        run: cargo build --locked --release -p pohunek-cli --bin pohunek
+
+      # The release binary and the packaged smoke script are copied to a
+      # directory outside the checkout, so the gate and the smoke can only use
+      # assets embedded in the binary.
+      - name: Stage packaged CLI outside the source tree
+        id: packaged
+        shell: /bin/bash {0}
+        run: |
+          set -euo pipefail
+          packaged_dir="$RUNNER_TEMP/packaged-pohunek"
+          rm -rf "$packaged_dir"
+          mkdir -p "$packaged_dir"
+          cp target/release/pohunek "$packaged_dir/pohunek"
+          cp scripts/smoke-hermes-plugin-release "$packaged_dir/smoke-hermes-plugin-release"
+          chmod 0755 "$packaged_dir/pohunek" "$packaged_dir/smoke-hermes-plugin-release"
+          packaged_dir="$(cd "$packaged_dir" && pwd -P)"
+          if git -C "$packaged_dir" rev-parse --git-dir >/dev/null 2>&1; then
+            echo "packaged directory is inside a Git worktree: $packaged_dir" >&2
+            exit 1
+          fi
+          printf 'dir=%s\n' "$packaged_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Check pinned Hermes compatibility
+        shell: /bin/bash {0}
+        run: |
+          set -euo pipefail
+          cargo xtask hermes compatibility \
+            --hermes-bin "${{ steps.hermes.outputs.bin }}" \
+            --pohunek-bin "${{ steps.packaged.outputs.dir }}/pohunek"
+
+      - name: Smoke packaged plugin installation against pinned Hermes
+        shell: /bin/bash {0}
+        run: |
+          set -euo pipefail
+          "${{ steps.packaged.outputs.dir }}/smoke-hermes-plugin-release" \
+            "${{ steps.packaged.outputs.dir }}/pohunek" \
+            "${{ steps.hermes.outputs.bin }}"
+
+      # Persist the staged runtime only after the gate and smoke passed.
+      - name: Persist Hermes runtime cache
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/hermes-compat-cache
+          key: >-
+            hermes-runtime-${{ runner.os }}-${{ runner.arch }}-py${{ steps.python.outputs.python-version }}-
             ${{ hashFiles('compat/hermes/compatibility-lock.json') }}-
             ${{ hashFiles('scripts/provision-hermes-compat') }}-
             ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
