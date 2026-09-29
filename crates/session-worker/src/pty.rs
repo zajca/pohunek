@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
@@ -38,6 +38,16 @@ const READ_CHUNK_BYTES: usize = 8 * 1024;
 /// under an unbounded producer such as `yes`. This bounds one holder's work,
 /// but does not guarantee which waiting operation acquires the gate next.
 const OUTPUT_DRAIN_BATCH_BYTES: usize = 256 * 1024;
+/// Longest wait for terminal-held output to reach the master at a boundary.
+///
+/// Released bytes are readable as soon as output flows again, so this only
+/// absorbs scheduling delay. It bounds how long a resize or snapshot holds the
+/// ordering gate before failing with a retryable error instead of crossing the
+/// boundary with old-geometry bytes still queued.
+const HELD_OUTPUT_SETTLE_TIMEOUT: Duration = Duration::from_secs(1);
+/// How often a quiet master re-checks whether the terminal discarded held
+/// output, which ends the boundary wait without reading those bytes.
+const HELD_OUTPUT_RECHECK_INTERVAL: Duration = Duration::from_millis(10);
 /// Blocking and non-blocking readiness timeouts.
 ///
 /// Negative one waits indefinitely and zero checks without blocking, which is
@@ -188,6 +198,10 @@ pub enum PtyError {
     /// Queued output exceeds the atomic resize or snapshot drain limit.
     #[error("queued PTY output exceeds the atomic resize or snapshot drain limit")]
     OutputDrainLimit,
+    /// Output the terminal held back did not reach the resize or snapshot
+    /// boundary in time; the operation changed nothing and can be retried.
+    #[error("PTY output held by the terminal did not reach the resize or snapshot boundary")]
+    OutputBoundaryUnsettled,
     /// Process identity changed before a signal.
     #[error("managed process identity no longer matches pid {pid}")]
     IdentityChanged {
@@ -528,7 +542,11 @@ impl PtyOwner {
                         &mut buffer,
                         OUTPUT_DRAIN_BATCH_BYTES,
                     ) {
-                        Ok(OutputReadState::Open | OutputReadState::BudgetExhausted) => {}
+                        Ok(
+                            OutputReadState::Open
+                            | OutputReadState::Lapsed
+                            | OutputReadState::BudgetExhausted,
+                        ) => {}
                         Ok(OutputReadState::Eof | OutputReadState::Cancelled) => break,
                         Err(error) => {
                             event!(
@@ -680,9 +698,13 @@ impl PtyOwner {
             drain_snapshot_boundary(
                 &output_reader,
                 &*output_readiness,
+                &output_pause,
                 &output,
                 &mut buffer,
-                OUTPUT_DRAIN_BATCH_BYTES,
+                SnapshotDrain {
+                    byte_budget: OUTPUT_DRAIN_BATCH_BYTES,
+                    settle_timeout: HELD_OUTPUT_SETTLE_TIMEOUT,
+                },
             )?;
             let master = master.lock().map_err(|_poison| PtyError::Poisoned)?;
             master
@@ -752,9 +774,13 @@ impl PtyOwner {
             drain_snapshot_boundary(
                 &output_reader,
                 &*output_readiness,
+                &output_pause,
                 &output,
                 &mut buffer,
-                OUTPUT_DRAIN_BATCH_BYTES,
+                SnapshotDrain {
+                    byte_budget: OUTPUT_DRAIN_BATCH_BYTES,
+                    settle_timeout: HELD_OUTPUT_SETTLE_TIMEOUT,
+                },
             )?;
             if let Some((cols, rows)) = dimensions {
                 let master = master.lock().map_err(|_poison| PtyError::Poisoned)?;
@@ -1138,7 +1164,14 @@ fn commit_resize_before_resume(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputReadState {
+    /// Nothing was readable when the drain looked.
     Open,
+    /// Readiness was reported, but the read then found nothing.
+    ///
+    /// Harmless for the reader loop. At a snapshot boundary it can mean the
+    /// terminal holds bytes the master cannot read, which
+    /// [`drain_snapshot_boundary`] resolves before the boundary is taken.
+    Lapsed,
     Eof,
     BudgetExhausted,
     Cancelled,
@@ -1235,6 +1268,73 @@ fn wait_writable(master: &OwnedFd) -> io::Result<()> {
 struct OutputPause {
     tty: OwnedFd,
     resumed: bool,
+}
+
+/// Terminal-side view of output that a pause keeps away from the master.
+trait HeldOutput {
+    /// Returns how many accepted bytes the terminal holds unreadable.
+    fn held_bytes(&self) -> Result<usize, PtyError>;
+
+    /// Lets held output reach the master, or suspends it again.
+    fn set_output_flow(&self, flowing: bool) -> Result<(), PtyError>;
+}
+
+impl HeldOutput for OutputPause {
+    fn held_bytes(&self) -> Result<usize, PtyError> {
+        terminal_output_queue(&self.tty)
+    }
+
+    fn set_output_flow(&self, flowing: bool) -> Result<(), PtyError> {
+        let action = if flowing { Action::OOn } else { Action::OOff };
+        tcflow(&self.tty, action).map_err(rustix_errno_to_pty_error)
+    }
+}
+
+/// Counts output a suspended Darwin terminal holds away from the master.
+///
+/// XNU keeps a stopped terminal's `t_outq` unreadable on the master and lets
+/// writers keep filling it up to the high-water mark; `TIOCOUTQ` on the
+/// terminal reports that queue.
+///
+/// # Errors
+///
+/// Returns [`PtyError::Io`] when the `ioctl` fails or reports a negative count.
+#[cfg(target_os = "macos")]
+#[expect(
+    unsafe_code,
+    reason = "rustix exposes TIOCOUTQ only through its typed unsafe ioctl interface"
+)]
+fn terminal_output_queue(tty: &OwnedFd) -> Result<usize, PtyError> {
+    // SAFETY: `TIOCOUTQ` is `_IOR('t', 115, int)` in Darwin's `sys/ttycom.h`:
+    // the kernel writes exactly one `int`, which is the getter's output type.
+    let getter = unsafe { rustix::ioctl::Getter::<{ libc::TIOCOUTQ }, libc::c_int>::new() };
+    // SAFETY: `tty` is an open terminal descriptor, and the getter matches the
+    // request's direction and size as stated above.
+    let count = unsafe { rustix::ioctl::ioctl(tty, getter) }.map_err(rustix_errno_to_pty_error)?;
+    usize::try_from(count).map_err(|_negative| {
+        PtyError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "terminal reported a negative output queue",
+        ))
+    })
+}
+
+/// Reports that a suspended Linux terminal holds no output.
+///
+/// Linux refuses PTY writes while output is suspended (`pty_write`), so the
+/// writer blocks in the child and every accepted byte stays readable on the
+/// master, where the boundary drain already consumes it.
+///
+/// # Errors
+///
+/// Never fails; the signature matches the Darwin query.
+#[cfg(not(target_os = "macos"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the fallible Darwin TIOCOUTQ query"
+)]
+fn terminal_output_queue(_tty: &OwnedFd) -> Result<usize, PtyError> {
+    Ok(0)
 }
 
 impl OutputPause {
@@ -1497,35 +1597,136 @@ where
             // would park a blocking read with the ordering gate held until
             // output resumes; the resume itself waits for that gate.
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                return Ok(OutputReadState::Open);
+                return Ok(OutputReadState::Lapsed);
             }
             Err(error) => return Err(PtyError::Io(error)),
         }
     }
 }
 
-fn drain_snapshot_boundary<R>(
+/// Bounds for draining output up to a resize or snapshot boundary.
+#[derive(Debug, Clone, Copy)]
+struct SnapshotDrain {
+    /// Most bytes one boundary may consume from the master.
+    byte_budget: usize,
+    /// Longest wait for terminal-held bytes to reach the master.
+    settle_timeout: Duration,
+}
+
+/// Drains every byte the PTY accepted before a paused boundary.
+///
+/// The caller has suspended output and holds the ordering gate. Bytes readable
+/// on the master are drained first. Bytes the terminal still holds away from
+/// the master (Darwin keeps a suspended terminal's queue unreadable) are then
+/// released under the same gate, read up to the counted amount, and suspended
+/// again, so none of them is parsed after the geometry changes. Output the
+/// child writes after that count is live output, exactly like a Linux writer
+/// that blocked on the suspension.
+///
+/// # Errors
+///
+/// Returns [`PtyError::OutputDrainLimit`] when the queue exceeds the budget,
+/// [`PtyError::OutputBoundaryUnsettled`] when held bytes do not arrive within
+/// the settle timeout, and the closed or forced-close errors of the PTY.
+fn drain_snapshot_boundary<R, H>(
     reader: &Mutex<Box<dyn Read + Send>>,
     readiness: &R,
+    held: &H,
     output: &OutputHub,
     buffer: &mut [u8],
-    byte_budget: usize,
+    drain: SnapshotDrain,
 ) -> Result<(), PtyError>
 where
     R: OutputReady + ?Sized,
+    H: HeldOutput + ?Sized,
 {
-    match drain_available_output(reader, readiness, output, buffer, byte_budget)? {
-        OutputReadState::Open => Ok(()),
-        OutputReadState::Eof => {
-            output.mark_exit();
-            Err(PtyError::Io(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "PTY closed before atomic resize or snapshot",
-            )))
-        }
-        OutputReadState::Cancelled => Err(PtyError::OutputForcedClosed),
-        OutputReadState::BudgetExhausted => Err(PtyError::OutputDrainLimit),
+    match drain_available_output(reader, readiness, output, buffer, drain.byte_budget)? {
+        OutputReadState::Open | OutputReadState::Lapsed => {}
+        OutputReadState::Eof => return Err(closed_before_boundary(output)),
+        OutputReadState::Cancelled => return Err(PtyError::OutputForcedClosed),
+        OutputReadState::BudgetExhausted => return Err(PtyError::OutputDrainLimit),
     }
+    let held_bytes = held.held_bytes()?;
+    if held_bytes == 0 {
+        return Ok(());
+    }
+    if held_bytes > drain.byte_budget {
+        return Err(PtyError::OutputDrainLimit);
+    }
+    held.set_output_flow(true)?;
+    let consumed = consume_held_output(
+        reader,
+        readiness,
+        held,
+        output,
+        buffer,
+        held_bytes,
+        drain.settle_timeout,
+    );
+    let suspended = held.set_output_flow(false);
+    consumed.and(suspended)
+}
+
+/// Reads `remaining` released bytes from the master into the output model.
+///
+/// Reads never exceed the count, so a producer refilling the terminal
+/// cannot extend the gate hold. A quiet master re-checks the held count, which
+/// drops to zero when the terminal discarded its queue.
+///
+/// # Errors
+///
+/// Returns [`PtyError::OutputBoundaryUnsettled`] when the bytes do not arrive
+/// before `settle_timeout`, or the PTY's closed, forced-close, and I/O errors.
+fn consume_held_output<R, H>(
+    reader: &Mutex<Box<dyn Read + Send>>,
+    readiness: &R,
+    held: &H,
+    output: &OutputHub,
+    buffer: &mut [u8],
+    mut remaining: usize,
+    settle_timeout: Duration,
+) -> Result<(), PtyError>
+where
+    R: OutputReady + ?Sized,
+    H: HeldOutput + ?Sized,
+{
+    let deadline = Instant::now() + settle_timeout;
+    while remaining > 0 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(PtyError::OutputBoundaryUnsettled);
+        }
+        let wait_ms = isize::try_from(left.min(HELD_OUTPUT_RECHECK_INTERVAL).as_millis())
+            .map_err(|_range| PtyError::OutputBoundaryUnsettled)?;
+        if readiness.ready(wait_ms)? == Some(OutputReadyState::Cancelled) {
+            return Err(PtyError::OutputForcedClosed);
+        }
+        let limit = remaining.min(buffer.len());
+        match lock_result(reader)?.read(&mut buffer[..limit]) {
+            Ok(0) => return Err(closed_before_boundary(output)),
+            Ok(read) => {
+                output.push(&buffer[..read])?;
+                remaining = remaining.saturating_sub(read);
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(PtyError::Io(error)),
+        }
+        if held.held_bytes()? == 0 {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Records the PTY close that ended a boundary drain and reports it.
+fn closed_before_boundary(output: &OutputHub) -> PtyError {
+    output.mark_exit();
+    PtyError::Io(io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "PTY closed before atomic resize or snapshot",
+    ))
 }
 
 fn observe_child_exit(pid: u32) -> Result<Exit, io::Error> {
@@ -1644,9 +1845,9 @@ fn lock_result<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, PtyE
 mod tests {
     use super::{
         commit_resize_before_resume, drain_available_output, drain_snapshot_boundary,
-        read_process_start, wait_for_child_status, Command, EnvBase, OutputReadState, OutputReady,
-        OutputReadyState, PtyError, PtyOwner, ResizeCommit, ResizeState, SpawnGuard, StartupLatch,
-        OUTPUT_DRAIN_BATCH_BYTES, READ_CHUNK_BYTES,
+        read_process_start, wait_for_child_status, Command, EnvBase, HeldOutput, OutputReadState,
+        OutputReady, OutputReadyState, PtyError, PtyOwner, ResizeCommit, ResizeState,
+        SnapshotDrain, SpawnGuard, StartupLatch, OUTPUT_DRAIN_BATCH_BYTES, READ_CHUNK_BYTES,
     };
     use crate::{InputFragment, InputPlan, OutputEvent, OutputHub, WorkerConfig};
     use pohunek_platform::process::{HostInspector, ProcessInspector};
@@ -1664,6 +1865,14 @@ mod tests {
     const ROLLBACK_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
     /// Bounds a drain whose readiness lapsed; a parked read never returns.
     const LAPSED_READ_DEADLINE: Duration = Duration::from_secs(2);
+    /// Settle timeout for fake terminals; short because nothing real is awaited.
+    const TEST_HELD_OUTPUT_SETTLE_TIMEOUT: Duration = Duration::from_millis(50);
+    /// Bounds each wait of the real Darwin held-output fixture.
+    #[cfg(target_os = "macos")]
+    const HELD_QUEUE_DEADLINE: Duration = Duration::from_secs(5);
+    /// Poll interval while the Darwin fixture's terminal queue fills.
+    #[cfg(target_os = "macos")]
+    const HELD_QUEUE_POLL: Duration = Duration::from_millis(10);
     /// Input size well beyond the Linux and Darwin PTY input queues.
     ///
     /// One MiB forces many would-block writes on both kernels, whose queues
@@ -1741,6 +1950,275 @@ mod tests {
                 .unwrap_or(false)
                 .then_some(OutputReadyState::Output))
         }
+    }
+
+    /// Suspended terminal whose queue the master cannot read, as on Darwin.
+    ///
+    /// The same state backs both the master reader and the terminal-side
+    /// [`HeldOutput`] view, so a test sees exactly which bytes a boundary read
+    /// and in which flow state.
+    #[derive(Debug, Clone)]
+    struct FakeTerminal {
+        state: std::sync::Arc<Mutex<FakeTerminalState>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeTerminalState {
+        queue: VecDeque<u8>,
+        flowing: bool,
+        flow_changes: Vec<bool>,
+        /// Bytes a producer appends as soon as output flows again.
+        refill: Vec<u8>,
+        /// Whether releasing output discards the queue, as `tcflush` does.
+        discard_on_release: bool,
+        /// Whether released bytes never become readable.
+        stuck: bool,
+    }
+
+    impl FakeTerminal {
+        fn holding(bytes: &[u8]) -> Self {
+            Self::with(bytes, |_state| {})
+        }
+
+        fn with(bytes: &[u8], configure: impl FnOnce(&mut FakeTerminalState)) -> Self {
+            let mut state = FakeTerminalState {
+                queue: bytes.iter().copied().collect(),
+                ..FakeTerminalState::default()
+            };
+            configure(&mut state);
+            Self {
+                state: std::sync::Arc::new(Mutex::new(state)),
+            }
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, FakeTerminalState> {
+            self.state.lock().expect("fake terminal lock")
+        }
+
+        fn master_reader(&self) -> Mutex<Box<dyn std::io::Read + Send>> {
+            Mutex::new(Box::new(self.clone()))
+        }
+    }
+
+    impl std::io::Read for FakeTerminal {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut state = self.lock();
+            if !state.flowing || state.stuck || state.queue.is_empty() {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let read = buf.len().min(state.queue.len());
+            for (slot, byte) in buf.iter_mut().zip(state.queue.drain(..read)) {
+                *slot = byte;
+            }
+            Ok(read)
+        }
+    }
+
+    impl HeldOutput for FakeTerminal {
+        fn held_bytes(&self) -> Result<usize, PtyError> {
+            Ok(self.lock().queue.len())
+        }
+
+        fn set_output_flow(&self, flowing: bool) -> Result<(), PtyError> {
+            let mut state = self.lock();
+            state.flowing = flowing;
+            state.flow_changes.push(flowing);
+            if flowing {
+                if state.discard_on_release {
+                    state.queue.clear();
+                }
+                let refill = state.refill.clone();
+                state.queue.extend(refill);
+            }
+            Ok(())
+        }
+    }
+
+    fn test_drain(byte_budget: usize) -> SnapshotDrain {
+        SnapshotDrain {
+            byte_budget,
+            settle_timeout: TEST_HELD_OUTPUT_SETTLE_TIMEOUT,
+        }
+    }
+
+    /// Bytes a paused terminal hides at the boundary are parsed before it.
+    ///
+    /// Readiness is reported, the read finds nothing because output is
+    /// suspended, and the terminal still holds old-geometry bytes. The drain
+    /// must consume exactly those bytes and suspend output again, leaving
+    /// bytes the producer adds after the count as live output.
+    #[test]
+    fn boundary_consumes_output_the_paused_terminal_holds() {
+        let terminal = FakeTerminal::with(b"old-geometry", |state| {
+            state.refill = b"live".to_vec();
+        });
+        let output = OutputHub::new(64 * 1024, 64 * 1024, 24, 80).expect("output hub");
+        let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
+
+        drain_snapshot_boundary(
+            &terminal.master_reader(),
+            &TestReadiness::new([true]),
+            &terminal,
+            &output,
+            &mut buffer,
+            test_drain(OUTPUT_DRAIN_BATCH_BYTES),
+        )
+        .expect("held bytes settle before the boundary");
+
+        assert_eq!(output.next_offset(), b"old-geometry".len() as u64);
+        let state = terminal.lock();
+        assert_eq!(state.flow_changes, [true, false]);
+        assert!(!state.flowing, "output stays suspended for the boundary");
+        assert_eq!(state.queue, b"live".to_vec(), "later bytes stay live");
+    }
+
+    /// Held bytes that never arrive fail the boundary before any commit.
+    #[test]
+    fn unsettled_held_output_fails_the_boundary_retryably() {
+        let terminal = FakeTerminal::with(b"old-geometry", |state| state.stuck = true);
+        let output = OutputHub::new(64 * 1024, 64 * 1024, 24, 80).expect("output hub");
+        let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
+        let mut state = ResizeState {
+            cols: 80,
+            rows: 24,
+            sequences: HashMap::new(),
+        };
+        let mut committed = false;
+
+        let error = drain_snapshot_boundary(
+            &terminal.master_reader(),
+            &TestReadiness::new([true]),
+            &terminal,
+            &output,
+            &mut buffer,
+            test_drain(OUTPUT_DRAIN_BATCH_BYTES),
+        )
+        .and_then(|()| {
+            committed = true;
+            commit_resize_before_resume(
+                &mut state,
+                ResizeCommit::Attach { cols: 90, rows: 28 },
+                || Ok(()),
+            )
+        })
+        .expect_err("held bytes that never arrive must not cross the boundary");
+
+        assert!(matches!(error, PtyError::OutputBoundaryUnsettled));
+        assert!(!committed);
+        assert_eq!((state.cols, state.rows), (80, 24));
+        assert_eq!(output.next_offset(), 0);
+        assert_eq!(terminal.lock().flow_changes, [true, false]);
+    }
+
+    /// A terminal that discards its held queue settles the boundary at once.
+    #[test]
+    fn discarded_held_output_settles_the_boundary() {
+        let terminal = FakeTerminal::with(b"old-geometry", |state| {
+            state.discard_on_release = true;
+        });
+        let output = OutputHub::new(64 * 1024, 64 * 1024, 24, 80).expect("output hub");
+        let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
+
+        drain_snapshot_boundary(
+            &terminal.master_reader(),
+            &TestReadiness::new([true]),
+            &terminal,
+            &output,
+            &mut buffer,
+            test_drain(OUTPUT_DRAIN_BATCH_BYTES),
+        )
+        .expect("a discarded queue leaves nothing to cross the boundary");
+
+        assert_eq!(output.next_offset(), 0);
+        assert_eq!(terminal.lock().flow_changes, [true, false]);
+    }
+
+    /// Held output beyond the budget is refused without releasing output.
+    #[test]
+    fn held_output_beyond_the_budget_is_refused() {
+        let terminal = FakeTerminal::holding(&[b'x'; READ_CHUNK_BYTES + 1]);
+        let output = OutputHub::new(64 * 1024, 64 * 1024, 24, 80).expect("output hub");
+        let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
+
+        let error = drain_snapshot_boundary(
+            &terminal.master_reader(),
+            &TestReadiness::new([]),
+            &terminal,
+            &output,
+            &mut buffer,
+            test_drain(READ_CHUNK_BYTES),
+        )
+        .expect_err("held output beyond the budget");
+
+        assert!(matches!(error, PtyError::OutputDrainLimit));
+        assert!(terminal.lock().flow_changes.is_empty());
+    }
+
+    /// A real suspended Darwin terminal hides output until the boundary drains it.
+    ///
+    /// XNU accepts the child's write into the stopped terminal's queue, keeps
+    /// it unreadable on the master, and reports it through `TIOCOUTQ`. The
+    /// boundary drain must parse those bytes before returning.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn darwin_boundary_drains_output_the_suspended_terminal_holds() {
+        const HELD: &[u8] = b"held-before-boundary";
+        let pty = spawn(shell(
+            "stty -echo && printf ready && read go && printf held-before-boundary && sleep 30",
+        ));
+        tokio::time::timeout(HELD_QUEUE_DEADLINE, async {
+            while pty.output().next_offset() < b"ready".len() as u64 {
+                tokio::time::sleep(HELD_QUEUE_POLL).await;
+            }
+        })
+        .await
+        .expect("fixture readiness");
+        let before = pty.output().next_offset();
+
+        let pause = super::OutputPause::new(&pty.tty_name).expect("pause output");
+        pty.input()
+            .execute_stream(vec![InputFragment {
+                bytes: b"go\n".to_vec(),
+                delay_after: Duration::ZERO,
+            }])
+            .await
+            .expect("release the fixture");
+        tokio::time::timeout(HELD_QUEUE_DEADLINE, async {
+            while pause.held_bytes().expect("TIOCOUTQ") < HELD.len() {
+                tokio::time::sleep(HELD_QUEUE_POLL).await;
+            }
+        })
+        .await
+        .expect("the suspended terminal accepts and holds the write");
+        assert_eq!(
+            pty.output().next_offset(),
+            before,
+            "held bytes must not be readable on the master"
+        );
+
+        let order = pty.output_order.lock().expect("ordering gate");
+        let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
+        drain_snapshot_boundary(
+            &pty.output_reader,
+            &*pty.output_readiness,
+            &pause,
+            pty.output(),
+            &mut buffer,
+            SnapshotDrain {
+                byte_budget: OUTPUT_DRAIN_BATCH_BYTES,
+                settle_timeout: super::HELD_OUTPUT_SETTLE_TIMEOUT,
+            },
+        )
+        .expect("held bytes settle before the boundary");
+        drop(order);
+        assert_eq!(pty.output().next_offset(), before + HELD.len() as u64);
+        assert_eq!(pause.held_bytes().expect("TIOCOUTQ"), 0);
+        pause.resume().expect("resume output");
+
+        let _ = pty
+            .stop("cleanup", Duration::from_millis(200))
+            .await
+            .expect("cleanup");
     }
 
     #[tokio::test]
@@ -2469,7 +2947,7 @@ mod tests {
             .expect("a lapsed read must not park with the ordering gate held")
             .expect("drain task")
             .expect("drain");
-        assert_eq!(state, OutputReadState::Open);
+        assert_eq!(state, OutputReadState::Lapsed);
 
         let _ = pty
             .stop("cleanup", Duration::from_millis(200))
@@ -2558,17 +3036,23 @@ mod tests {
         let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
         let mut committed = false;
 
-        let error =
-            drain_snapshot_boundary(&reader, &readiness, &output, &mut buffer, READ_CHUNK_BYTES)
-                .and_then(|()| {
-                    committed = true;
-                    commit_resize_before_resume(
-                        &mut state,
-                        ResizeCommit::Attach { cols: 90, rows: 28 },
-                        || Ok(()),
-                    )
-                })
-                .expect_err("queued bytes beyond the budget must reject the atomic operation");
+        let error = drain_snapshot_boundary(
+            &reader,
+            &readiness,
+            &FakeTerminal::holding(b""),
+            &output,
+            &mut buffer,
+            test_drain(READ_CHUNK_BYTES),
+        )
+        .and_then(|()| {
+            committed = true;
+            commit_resize_before_resume(
+                &mut state,
+                ResizeCommit::Attach { cols: 90, rows: 28 },
+                || Ok(()),
+            )
+        })
+        .expect_err("queued bytes beyond the budget must reject the atomic operation");
 
         assert!(matches!(error, PtyError::OutputDrainLimit));
         assert!(!committed);

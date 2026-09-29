@@ -12,7 +12,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 /// The real CLI under test.
@@ -271,4 +271,153 @@ fn a_token_that_proves_no_live_holder_fails_instead_of_locking_anew() {
         .output()
         .expect("run check");
     assert_refused(&output, "stale token");
+}
+
+/// Polls `child` until it exits, failing after [`WAIT_TIMEOUT`].
+fn wait_exit(child: &mut Child) -> std::process::ExitStatus {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait().expect("poll the lock process") {
+            return status;
+        }
+        assert!(Instant::now() < deadline, "the lock process never exited");
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Waits until `path` exists.
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
+        std::thread::sleep(POLL);
+    }
+}
+
+impl Host {
+    /// Starts `pohunek service lock -- sh -c <script>` without waiting.
+    fn spawn_locked_shell(&self, script: &str) -> Child {
+        self.pohunek(&["service", "lock", "--", "sh", "-c", script])
+            .env("POHUNEK", POHUNEK)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start pohunek service lock")
+    }
+
+    /// Whether a new, unrelated transaction may start right now.
+    fn lock_is_free(&self) -> bool {
+        self.pohunek(&["service", "lock", "--", "true"])
+            .output()
+            .expect("run pohunek service lock")
+            .status
+            .success()
+    }
+}
+
+/// A command that leaves a nested `service lock` adopter running in the
+/// background until `stop` exists, and exits once the adopter holds the
+/// lock: an adopter that only starts after the holder's command ended is
+/// refused, because the holder is releasing the lock by then.
+fn background_adopter(started: &Path, stop: &Path, done: &Path) -> String {
+    format!(
+        "\"$POHUNEK\" service lock -- sh -c ': > {started}; \
+         while [ ! -e {stop} ]; do sleep 0.05; done; : > {done}' \
+         </dev/null >/dev/null 2>&1 & \
+         while [ ! -e {started} ]; do sleep 0.05; done; exit 0",
+        started = started.display(),
+        stop = stop.display(),
+        done = done.display(),
+    )
+}
+
+#[test]
+fn the_holder_waits_for_an_adopter_its_command_left_running() {
+    let host = Host::new();
+    let (started, stop, done) = (
+        host.root.join("started"),
+        host.root.join("stop"),
+        host.root.join("done"),
+    );
+    let mut holder = host.spawn_locked_shell(&background_adopter(&started, &stop, &done));
+    wait_for_file(&started);
+    // The holder's own command has exited, yet the holder keeps the lock
+    // while the adopter it left behind runs.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        holder.try_wait().expect("poll").is_none(),
+        "the holder released the lock under a running adopter"
+    );
+    assert!(
+        !host.lock_is_free(),
+        "a transaction started beside the adopter"
+    );
+
+    fs::write(&stop, "").expect("stop the adopter");
+    assert!(wait_exit(&mut holder).success());
+    assert!(done.exists());
+    assert!(
+        host.lock_is_free(),
+        "the lock stayed held after everything ended"
+    );
+    assert!(!host.holder_record().exists());
+}
+
+#[test]
+fn an_adopter_keeps_other_transactions_out_after_its_holder_crashed() {
+    let host = Host::new();
+    let (started, stop, done) = (
+        host.root.join("started"),
+        host.root.join("stop"),
+        host.root.join("done"),
+    );
+    let mut holder = host.spawn_locked_shell(&background_adopter(&started, &stop, &done));
+    wait_for_file(&started);
+    // SIGKILL: the holder cannot clean up, and its flock dies with it.
+    holder.kill().expect("kill the holder");
+    holder.wait().expect("reap the holder");
+    assert!(
+        !host.lock_is_free(),
+        "a transaction started while an adopter of the dead holder runs"
+    );
+
+    fs::write(&stop, "").expect("stop the adopter");
+    wait_for_file(&done);
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    while !host.lock_is_free() {
+        assert!(Instant::now() < deadline, "the lock never became free");
+        std::thread::sleep(POLL);
+    }
+}
+
+#[test]
+fn a_signal_sent_to_the_lock_process_alone_reaches_its_command() {
+    for signal in ["INT", "HUP", "TERM"] {
+        let host = Host::new();
+        let ready = host.root.join("ready");
+        let script = format!(
+            "trap 'exit 9' INT HUP TERM; : > '{}'; while :; do sleep 0.05; done",
+            ready.display()
+        );
+        let mut holder = host.spawn_locked_shell(&script);
+        wait_for_file(&ready);
+        // Only the lock process is signalled, not its process group.
+        let sent = Command::new("kill")
+            .args([format!("-{signal}"), holder.id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(sent.success(), "{signal}");
+        let status = wait_exit(&mut holder);
+        assert_eq!(
+            status.code(),
+            Some(9),
+            "{signal}: the command did not get it"
+        );
+        assert!(host.lock_is_free(), "{signal}: the lock stayed held");
+    }
 }

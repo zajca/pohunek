@@ -1381,10 +1381,13 @@ impl Plan {
 /// Returns [`Error::InvalidPath`], [`Error::UntrustedDirectory`], or the
 /// environment errors of [`Context::service_environment`].
 pub(crate) fn install_preflight(context: &Context, prefix: &Path) -> Result<InstallLayout, Error> {
+    // The environment goes first: on macOS the agent directory lies below
+    // `HOME`, so an unusable `HOME` is named as such rather than as the
+    // directory it breaks.
+    context.service_environment()?;
     layout::check_trusted(context.supervisor_dir())?;
     let layout = install_layout(prefix)?;
     check_layout_dirs(context, &layout)?;
-    context.service_environment()?;
     Ok(layout)
 }
 
@@ -1397,8 +1400,8 @@ pub(crate) fn install_preflight(context: &Context, prefix: &Path) -> Result<Inst
 ///
 /// See [`install_preflight`].
 pub(crate) fn upgrade_preflight(context: &Context) -> Result<(), Error> {
-    layout::check_trusted(context.supervisor_dir())?;
-    context.service_environment().map(drop)
+    context.service_environment()?;
+    layout::check_trusted(context.supervisor_dir())
 }
 
 /// Checks every directory install or upgrade writes into.

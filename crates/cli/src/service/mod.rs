@@ -148,11 +148,15 @@ pub async fn check(prefix: Option<PathBuf>) -> Result<report::CheckReport, Error
 /// service lock` ancestor. This process keeps it; the child only receives
 /// the holder token in [`inherited::LOCK_TOKEN_ENV`], with which it and the
 /// `pohunek service` commands it runs adopt the lock (see
-/// [`record::Store::hand_off`]). Once the child exits the holder record is
-/// removed and the lock released, so a background process the child left
-/// behind can neither keep nor adopt the lock. `SIGINT` and `SIGHUP` are
-/// left to the child, which shares the terminal's process group, and
-/// `SIGTERM` is forwarded to it.
+/// [`record::Store::hand_off`] and [`record::Store::adopt`]).
+///
+/// `SIGTERM`, `SIGINT`, and `SIGHUP` are forwarded to the child. Once it
+/// exits, a holder that acquired the lock waits until every adopter, such as
+/// a `pohunek service` command the child left running in the background, has
+/// finished, then removes the holder record and releases the lock, so nothing
+/// adopts the lock afterwards. A signal received during that wait ends the
+/// wait early: the lock is released, while the adopters still running keep
+/// every other transaction out through their shared lock until they end.
 ///
 /// # Errors
 ///
@@ -163,33 +167,66 @@ pub async fn check(prefix: Option<PathBuf>) -> Result<report::CheckReport, Error
 pub async fn lock(program: &OsStr, arguments: &[OsString]) -> Result<ExitStatus, Error> {
     let context = Context::resolve()?;
     let store = record::Store::new(context.paths().state_dir.clone());
+    let mut signals = Signals::new(program)?;
     let lock = match inherited::take()? {
         Some(token) => store.adopt(&token)?,
         None => store.lock().await?,
     };
     let handoff = store.hand_off(&lock)?;
-    let status = run_locked(handoff.token(), program, arguments).await;
+    let status = run_locked(handoff.token(), program, arguments, &mut signals).await;
+    let excluded = if lock.is_adopted() {
+        Ok(None)
+    } else {
+        wait_for_adopters(&store, &mut signals).await
+    };
     // The record goes before the lock, so no command can adopt the lock
     // with this token once it is free.
     let released = handoff.release();
+    drop(excluded);
     drop(lock);
     let status = status?;
     released?;
     Ok(status)
 }
 
-/// Runs the child of [`lock`] with the holder `token`.
+/// The signals `pohunek service lock` handles while its child runs.
+struct Signals {
+    terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn new(program: &OsStr) -> Result<Self, Error> {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let handle = |kind| signal(kind).map_err(error::io_error("handle signals of", program));
+        Ok(Self {
+            terminate: handle(SignalKind::terminate())?,
+            interrupt: handle(SignalKind::interrupt())?,
+            hangup: handle(SignalKind::hangup())?,
+        })
+    }
+
+    /// Waits for the next handled signal.
+    async fn recv(&mut self) -> nix::sys::signal::Signal {
+        use nix::sys::signal::Signal;
+
+        tokio::select! {
+            _ = self.terminate.recv() => Signal::SIGTERM,
+            _ = self.interrupt.recv() => Signal::SIGINT,
+            _ = self.hangup.recv() => Signal::SIGHUP,
+        }
+    }
+}
+
+/// Runs the child of [`lock`] with the holder `token`, forwarding `signals`.
 async fn run_locked(
     token: &inherited::Token,
     program: &OsStr,
     arguments: &[OsString],
+    signals: &mut Signals,
 ) -> Result<ExitStatus, Error> {
-    use tokio::signal::unix::{signal, SignalKind};
-
-    let signals = |kind| signal(kind).map_err(error::io_error("handle signals of", program));
-    let mut terminate = signals(SignalKind::terminate())?;
-    let mut interrupt = signals(SignalKind::interrupt())?;
-    let mut hangup = signals(SignalKind::hangup())?;
     let mut child = tokio::process::Command::new(program)
         .args(arguments)
         .env(inherited::LOCK_TOKEN_ENV, token.as_str())
@@ -198,21 +235,37 @@ async fn run_locked(
     loop {
         tokio::select! {
             status = child.wait() => return status.map_err(error::io_error("wait for", program)),
-            _ = terminate.recv() => forward_terminate(child.id()),
-            _ = interrupt.recv() => {}
-            _ = hangup.recv() => {}
+            signal = signals.recv() => forward(child.id(), signal),
         }
     }
 }
 
-/// Sends `SIGTERM` to the child `pid`, which is not reaped yet.
-fn forward_terminate(pid: Option<u32>) {
-    use nix::sys::signal::{kill, Signal};
+/// Waits until no command holds the adopted lock and returns its exclusion.
+///
+/// `None` means a signal ended the wait while an adopter still ran.
+async fn wait_for_adopters(
+    store: &record::Store,
+    signals: &mut Signals,
+) -> Result<Option<pohunek_platform::filesystem::FileLock>, Error> {
+    loop {
+        if let Some(excluded) = store.exclude_adopters()? {
+            return Ok(Some(excluded));
+        }
+        tokio::select! {
+            () = tokio::time::sleep(settings::LOCK_POLL) => {}
+            _signal = signals.recv() => return Ok(None),
+        }
+    }
+}
+
+/// Sends `signal` to the child `pid`, which is not reaped yet.
+fn forward(pid: Option<u32>, signal: nix::sys::signal::Signal) {
+    use nix::sys::signal::kill;
     use nix::unistd::Pid;
 
     if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
         // A child that exits meanwhile is reported by `wait` next.
-        let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
+        let _ = kill(Pid::from_raw(pid), signal);
     }
 }
 
@@ -766,6 +819,7 @@ mod tests {
 
     #[tokio::test]
     async fn lock_runs_the_command_with_a_token_that_adopts_the_lock() {
+        let mut signals = Signals::new(OsStr::new("sh")).expect("handle signals");
         let (_temp, root) = temp_root();
         let state_dir = root.join("state/pohunek");
         let store = record::Store::new(state_dir.clone());
@@ -777,6 +831,7 @@ mod tests {
             handoff.token(),
             OsStr::new("sh"),
             &shell(probe_script(&state_dir)),
+            &mut signals,
         )
         .await
         .expect("run the command");
@@ -789,23 +844,43 @@ mod tests {
         // Once the record is gone, the same token adopts nothing.
         let token = handoff.token().clone();
         handoff.release().expect("remove the holder record");
-        let status = run_locked(&token, OsStr::new("sh"), &shell(probe_script(&state_dir)))
-            .await
-            .expect("run the command");
+        let status = run_locked(
+            &token,
+            OsStr::new("sh"),
+            &shell(probe_script(&state_dir)),
+            &mut signals,
+        )
+        .await
+        .expect("run the command");
         assert_eq!(exit_code(status), 3, "a released token adopts nothing");
 
-        let status = run_locked(&token, OsStr::new("sh"), &shell("exit 42".to_owned()))
-            .await
-            .expect("run the command");
+        let status = run_locked(
+            &token,
+            OsStr::new("sh"),
+            &shell("exit 42".to_owned()),
+            &mut signals,
+        )
+        .await
+        .expect("run the command");
         assert_eq!(exit_code(status), 42);
-        let status = run_locked(&token, OsStr::new("sh"), &shell("kill -TERM $$".to_owned()))
-            .await
-            .expect("run the command");
+        let status = run_locked(
+            &token,
+            OsStr::new("sh"),
+            &shell("kill -TERM $$".to_owned()),
+            &mut signals,
+        )
+        .await
+        .expect("run the command");
         assert_eq!(exit_code(status), 128 + 15, "a signal maps like a shell's");
 
-        let error = run_locked(&token, OsStr::new("/nonexistent/command"), &[])
-            .await
-            .expect_err("a missing command");
+        let error = run_locked(
+            &token,
+            OsStr::new("/nonexistent/command"),
+            &[],
+            &mut signals,
+        )
+        .await
+        .expect_err("a missing command");
         assert!(
             matches!(
                 &error,
@@ -821,6 +896,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_other_transaction_starts_while_the_locked_command_runs() {
+        let mut signals = Signals::new(OsStr::new("sh")).expect("handle signals");
         let (_temp, root) = temp_root();
         let store = record::Store::new(root.join("state/pohunek"));
         let lock = store.lock().await.expect("take the lock");
@@ -831,7 +907,7 @@ mod tests {
             stop.display()
         );
         let arguments = shell(script);
-        let child = run_locked(handoff.token(), OsStr::new("sh"), &arguments);
+        let child = run_locked(handoff.token(), OsStr::new("sh"), &arguments, &mut signals);
         let competitor = async {
             let refused = store.lock().await;
             std::fs::write(&stop, "").expect("release the child");

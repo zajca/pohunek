@@ -6,10 +6,11 @@
 //! directly; [`Server`] exposes the private owner-only Unix protocol used by
 //! `pohunekd`.
 
-// `portable-pty` exposes the PTY master only as a raw descriptor, while
-// duplicating it safely needs a `BorrowedFd`. One helper in `pty` opts back in
-// with a localized `#[expect(unsafe_code)]` and documents the invariant it
-// relies on; the rest of the crate stays free of unsafe code.
+// Two helpers in `pty` opt back in with a localized `#[expect(unsafe_code)]`
+// and document the invariant they rely on: `portable-pty` exposes the PTY
+// master only as a raw descriptor, and Darwin's `TIOCOUTQ` query is reachable
+// only through rustix's unsafe typed `ioctl`. The rest of the crate stays free
+// of unsafe code.
 #![deny(unsafe_code)]
 
 // Rust guideline compliant 2026-09-24

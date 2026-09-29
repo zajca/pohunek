@@ -290,13 +290,23 @@ the moment the root exits: output ends after the root's trailing bytes, and a
 descendant that ignores the hangup keeps running detached. That is the standing
 a Linux process has once it closes its terminal, so the post-exit drain window,
 which exists for descendants still holding the PTY, only ever engages on Linux.
-`tcflow` output suspension on the terminal device works natively, so the
-snapshot quiescence barrier is the same on both targets, with one Darwin
-difference: while output is suspended XNU does not let the master read the
-queued bytes (`ptcselect`/`ptcread`), so a blocking read issued after readiness
-was reported would sleep until output resumes. The worker therefore keeps the
-master non-blocking on both targets; a read that finds nothing ends the drain
-and releases the ordering gate instead of holding it across the suspension. The Darwin process
+`tcflow` output suspension on the terminal device works natively, but the
+snapshot quiescence barrier differs in one respect. Linux refuses PTY writes
+while output is suspended, so every byte the terminal accepted stays readable
+on the master. XNU keeps accepting writes into a suspended terminal's output
+queue up to its high-water mark (about 2 KiB) and hides that queue from the
+master (`ptcselect`/`ptcread`), so a blocking read issued after readiness was
+reported would sleep until output resumes, and a drain that stopped at the
+first empty read would let those old-geometry bytes cross the boundary. The
+worker therefore keeps the master non-blocking on both targets, so a read never
+parks with the ordering gate held, and at a resize or snapshot boundary it
+counts the hidden queue with `TIOCOUTQ` on the terminal. When bytes are held,
+it briefly lets output flow under the same gate, reads exactly the counted
+bytes into the terminal model, and suspends output again before the geometry
+changes; bytes the child writes after the count are live output, as they are
+for a Linux writer that blocked on the suspension. If the counted bytes do not
+arrive within a bounded settle window, the resize or snapshot fails with a
+retryable error and changes nothing. The Darwin process
 backend reports an exited but unreaped process with its identity, as procfs
 does, which is what lets a stop prove the retained root still owns its process
 group before signalling it.

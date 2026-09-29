@@ -1399,8 +1399,12 @@ fn an_untrusted_directory_refuses_before_the_legacy_install_changes() {
         ("symlinked libexec", |fixture| {
             move_behind_symlink(fixture, &fixture.prefix.join("libexec"));
         }),
-        ("symlinked unit directory", |fixture| {
-            move_behind_symlink(fixture, &fixture.config_home.join("systemd/user"));
+        ("symlinked supervisor directory", |fixture| {
+            // The systemd user unit directory on Linux, `LaunchAgents` on
+            // macOS: the directory the service backend writes.
+            let supervisor = fixture.supervisor_dir();
+            create_dirs(&supervisor);
+            move_behind_symlink(fixture, &supervisor);
         }),
         ("symlinked config home", |fixture| {
             move_behind_symlink(fixture, &fixture.config_home);
@@ -2096,6 +2100,32 @@ impl Fixture {
 
     fn pohunek_calls(&self) -> Vec<String> {
         lines(&self.pohunek_log)
+    }
+
+    /// The directory the service backend writes the daemon definition to,
+    /// resolved by the CLI's own rule from this fixture's environment.
+    fn supervisor_dir(&self) -> PathBuf {
+        let env = pohunek_paths::PathEnv {
+            xdg_runtime_dir: self
+                .socket
+                .path
+                .parent()
+                .and_then(Path::parent)
+                .map(Into::into),
+            xdg_data_home: None,
+            xdg_state_home: Some(self.base().join("state").into()),
+            xdg_cache_home: None,
+            xdg_config_home: Some(self.config_home.clone().into()),
+            home: Some(self.home.clone().into()),
+        };
+        let paths = pohunek_paths::BasePaths::resolve_for(
+            pohunek_paths::Platform::current().expect("supported platform"),
+            nix::unistd::Uid::effective().as_raw(),
+            &env,
+        )
+        .expect("resolve fixture paths");
+        pohunek_cli::service::context::default_supervisor_dir(&paths, Some(&self.home))
+            .expect("supervisor directory")
     }
 
     /// `service lock` and `service check` calls, in order.

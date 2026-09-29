@@ -51,7 +51,7 @@ futures = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 libc = { workspace = true }
-nix = { workspace = true }
+nix = { workspace = true, features = ["signal"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 time = { workspace = true }

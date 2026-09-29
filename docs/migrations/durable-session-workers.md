@@ -129,7 +129,9 @@ such command can start until the run ends, and the final `pohunek service
 install|upgrade` adopts the same lock with the holder token
 `pohunek service lock` passes in `POHUNEK_SERVICE_LOCK_TOKEN` (it records
 itself and that token in `$XDG_STATE_HOME/pohunek/service-install.lock.holder`
-and keeps the lock itself until the run ends). A `pohunek service` command
+and keeps the lock itself until the run ends; a command that adopted the
+lock holds `$XDG_STATE_HOME/pohunek/service-install.lock.adopted` shared, and
+the lock is released only after every such command ended). A `pohunek service` command
 started from elsewhere during the retirement is refused instead of racing it,
 and no process the run leaves behind can hold or adopt the lock afterwards.
 

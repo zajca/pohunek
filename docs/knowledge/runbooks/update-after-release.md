@@ -201,9 +201,15 @@ service command is refused with `service_transaction_in_progress` until the
 command exits. Adoption requires the lock to be held, the holder record to
 carry the same token, and the recorded holder process to still run; anything
 else fails with `service_inherited_lock_invalid`, never with a lock of its
-own. The holder removes its record and releases the lock as soon as the
-command exits, so a background process the command left behind neither keeps
-the lock nor adopts it later. `pohunek service check [--prefix <dir>] [--json]`
+own. Each adopting command also holds
+`~/.local/state/pohunek/service-install.lock.adopted` shared for its whole
+run. When the command exits, the holder waits until every adopter it left
+running has finished, then removes its record and releases the lock; a
+command that tries to adopt only after that is refused. If the holder dies
+first, adopters still running keep every other transaction out with
+`service_transaction_in_progress` until they end. `SIGTERM`, `SIGINT`, and
+`SIGHUP` sent to the lock process are forwarded to its command; one
+received while it waits for adopters ends that wait. `pohunek service check [--prefix <dir>] [--json]`
 runs, without changing anything, every check the install (while an install is
 pending or nothing is installed) or upgrade of this version makes before its
 first effect — `HOME` and the XDG roots, the prefix, every directory it writes,

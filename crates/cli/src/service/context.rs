@@ -1,6 +1,6 @@
 //! Host facts every `pohunek service` operation starts from.
 
-// Rust guideline compliant 2026-09-28
+// Rust guideline compliant 2026-09-29
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -241,17 +241,29 @@ impl Context {
     }
 }
 
+/// Returns where the daemon definition goes for `paths` and `home`.
+///
+/// This is the systemd user unit directory `$XDG_CONFIG_HOME/systemd/user`
+/// on Linux and `$HOME/Library/LaunchAgents` on macOS, as
+/// [`Context::resolve`] picks it.
+///
+/// # Errors
+///
+/// Returns [`Error::MissingEnv`] on macOS when `home` is `None`.
 #[cfg(target_os = "linux")]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "one signature for both targets; macOS needs HOME"
-)]
-fn default_supervisor_dir(paths: &BasePaths, _home: Option<&Path>) -> Result<PathBuf, Error> {
+pub fn default_supervisor_dir(paths: &BasePaths, _home: Option<&Path>) -> Result<PathBuf, Error> {
     Ok(paths.config_home.join(SYSTEMD_USER_UNITS))
 }
 
+/// Returns where the daemon definition goes for `paths` and `home`.
+///
+/// See the Linux variant; on macOS this is `$HOME/Library/LaunchAgents`.
+///
+/// # Errors
+///
+/// Returns [`Error::MissingEnv`] when `home` is `None`.
 #[cfg(target_os = "macos")]
-fn default_supervisor_dir(_paths: &BasePaths, home: Option<&Path>) -> Result<PathBuf, Error> {
+pub fn default_supervisor_dir(_paths: &BasePaths, home: Option<&Path>) -> Result<PathBuf, Error> {
     home.map(|home| home.join(LAUNCH_AGENTS))
         .ok_or_else(|| Error::MissingEnv {
             var: HOME.to_owned(),

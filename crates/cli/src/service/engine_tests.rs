@@ -2346,8 +2346,8 @@ async fn an_untrusted_unit_directory_fails_before_anything_changes() {
     let context = Context::new(
         harness.context.paths().clone(),
         harness.context.uid(),
-        None,
-        None,
+        Some(harness.root.join("home")),
+        Some(harness.root.join("run")),
         open.join("systemd/user"),
         PathBuf::from("/usr/bin/pohunek"),
     );
@@ -2479,7 +2479,7 @@ fn inherit(harness: &Harness, holder: &TransactionLock) -> (record::Handoff, Tra
 async fn transactions_run_under_an_inherited_lock_while_others_are_refused() {
     let harness = Harness::new();
     let holder = harness.engine().store.lock().await.expect("hold the lock");
-    let (handoff, _adopted) = inherit(&harness, &holder);
+    let (handoff, adopted) = inherit(&harness, &holder);
     let inherited = || {
         let lock = harness
             .engine()
@@ -2527,6 +2527,14 @@ async fn transactions_run_under_an_inherited_lock_while_others_are_refused() {
         harness.engine().store.adopt(&token),
         "no process holds the transaction lock",
     );
+    // An adopter that outlives its holder still keeps every other
+    // transaction out until it ends.
+    let refused = harness
+        .install(V1)
+        .await
+        .expect_err("an adopter still runs");
+    assert_eq!(refused.code(), "service_transaction_in_progress");
+    drop(adopted);
     harness
         .install(V1)
         .await
