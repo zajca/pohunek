@@ -142,6 +142,24 @@ class ParseVersionTests(unittest.TestCase):
             (0, 9, 150),
         )
 
+    def test_prerelease_of_the_minimum_is_below_it(self):
+        minimum = dev_bootstrap.parse_version("0.9.115")
+        for text, below in (
+            ("cargo-nextest 0.9.115-rc.1", True),
+            ("cargo-nextest 0.9.115", False),
+            ("cargo-nextest 0.9.116-rc.1", False),
+            ("cargo-nextest 0.9.114", True),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    dev_bootstrap.below_minimum(
+                        dev_bootstrap.parse_version(text),
+                        dev_bootstrap.is_prerelease(text),
+                        minimum,
+                    ),
+                    below,
+                )
+
     def test_leading_blank_lines_are_skipped(self):
         self.assertEqual(
             dev_bootstrap.parse_version("\n\nhyperfine 1.9.0\n"), (1, 9, 0)
@@ -291,6 +309,17 @@ class CheckTests(DevBootstrapCase):
         status, output = self.run_main(FakeHost(cargo=False))
         self.assertEqual(status, 1, output)
         self.assertIn("`cargo` is not on PATH", output)
+
+    def test_current_cargo_home_copy_shadowed_by_old_path_copy(self):
+        tools = dict(CURRENT)
+        tools["bacon"] = "bacon 2.0.0\n"
+        host = FakeHost(on_path=tools, in_cargo_bin={"bacon": CURRENT["bacon"]})
+        status, output = self.run_main(host, "--install", "--strict")
+        self.assertEqual(status, 1, output)
+        self.assertIn("bacon 3.25.0 is shadowed by", output)
+        self.assertIn(f'export PATH="{CARGO_BIN}:$PATH"', output)
+        # A PATH-order problem is a manual step: reinstalling cannot fix it.
+        self.assertEqual(host.installs, [])
 
     def test_binary_only_in_cargo_home_is_reported_off_path(self):
         tools = dict(CURRENT)

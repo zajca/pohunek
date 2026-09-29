@@ -61,7 +61,8 @@ MOLD_MIN_VERSION = (2, 30, 0)
 # Upper bound for one `--version` call; a tool that hangs longer is broken.
 VERSION_TIMEOUT_SECONDS = 30
 
-VERSION_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
+# `X.Y[.Z]` plus an optional SemVer pre-release suffix (`-rc.1`).
+VERSION_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?(-[0-9A-Za-z.-]+)?")
 
 MANUAL_PYTHON = (
     "install Python >= 3.11 with your distribution's package manager, e.g. "
@@ -137,8 +138,22 @@ def parse_version(text):
             match = VERSION_RE.search(line)
             if match is None:
                 return None
-            return tuple(int(part or 0) for part in match.groups())
+            return tuple(int(part or 0) for part in match.groups()[:3])
     return None
+
+
+def is_prerelease(text):
+    """Whether the version `parse_version` reads from `text` has a `-pre` suffix."""
+    for line in text.splitlines():
+        if line.strip():
+            match = VERSION_RE.search(line)
+            return match is not None and match.group(4) is not None
+    return False
+
+
+def below_minimum(version, prerelease, minimum):
+    """SemVer order: a pre-release of the minimum is older than the minimum."""
+    return version < minimum or (version == minimum and prerelease)
 
 
 def nextest_min_version(root):
@@ -253,6 +268,29 @@ def check_tool(tool, which, runner, cargo_bin):
         return Result(tool, OFF_PATH, path=in_cargo_bin)
     else:
         argv = [path, *tool.version_args]
+    result = version_result(tool, argv, path, runner)
+    if (
+        result.status in (TOO_OLD, UNKNOWN_VERSION)
+        and not tool.cargo_subcommand
+        and in_cargo_bin is not None
+        and in_cargo_bin != path
+    ):
+        # A current copy in $CARGO_HOME/bin (where `--install` puts it) is
+        # shadowed by the failing one on PATH; reporting only the PATH copy
+        # would make `--install` reinstall forever.
+        cargo_copy = version_result(
+            tool, [in_cargo_bin, *tool.version_args], in_cargo_bin, runner
+        )
+        if cargo_copy.status == OK:
+            return Result(
+                tool, OFF_PATH, version=cargo_copy.version, path=in_cargo_bin,
+                detail=f"shadowed by {path} on PATH",
+            )
+    return result
+
+
+def version_result(tool, argv, path, runner):
+    """Run one version command and compare it with the tool's minimum."""
     try:
         output = runner(argv)
     except (OSError, subprocess.SubprocessError) as error:
@@ -264,7 +302,7 @@ def check_tool(tool, which, runner, cargo_bin):
             tool, UNKNOWN_VERSION, path=path,
             detail=f"unparseable version output {first!r}",
         )
-    if version < tool.min_version:
+    if below_minimum(version, is_prerelease(output), tool.min_version):
         return Result(tool, TOO_OLD, version=version, path=path)
     return Result(tool, OK, version=version, path=path)
 
@@ -277,8 +315,9 @@ def check_all(tool_list, which, runner, cargo_bin):
 def fix_hint(result, cargo_bin):
     """The exact command or manual step that fixes one failing row."""
     if result.status == OFF_PATH:
+        where = result.detail or "not on PATH"
         return (
-            f"found at {result.path} but not on PATH; add it: "
+            f"found at {result.path} but {where}; put it first: "
             f"export PATH=\"{cargo_bin}:$PATH\""
         )
     if result.tool.install is not None:
@@ -305,7 +344,10 @@ def describe(result, strict, cargo_bin):
             f"{minimum}"
         )
     elif result.status == OFF_PATH:
-        what = f"{tool.name} is not on PATH"
+        what = (
+            f"{tool.name} {format_version(result.version)} is {result.detail}"
+            if result.detail else f"{tool.name} is not on PATH"
+        )
     else:
         what = f"{tool.name} version unknown: {result.detail}"
     return (
