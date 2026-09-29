@@ -48,6 +48,8 @@ pub(crate) enum InspectStep {
     Race,
     /// The supervisor cannot be reached.
     Unavailable,
+    /// The inspection never completes, as a wedged service manager.
+    Block,
 }
 
 /// Scripted, sticky answer for one service ID, taking precedence over the
@@ -337,6 +339,7 @@ impl Supervisor for ScriptedSupervisor {
                     operation: "inspect",
                     source: Box::new(std::io::Error::other("scripted manager outage")),
                 }),
+                Some(InspectStep::Block) => std::future::pending().await,
                 None => match &self.delegate {
                     Some(delegate) => delegate.inspect(id).await,
                     None => Err(SupervisorError::NotFound(id.clone())),
@@ -892,7 +895,9 @@ async fn an_unavailable_inspection_kills_nothing() {
 
 #[tokio::test]
 async fn races_are_retried_and_never_read_as_absent() {
-    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    // Each race retry waits one poll interval, so the connect deadline must
+    // outlast both retries for the settled absence to be observed.
+    let harness = Harness::scripted(GENEROUS, INITIALIZE);
     harness.supervisor.script_inspects([
         InspectStep::Race,
         InspectStep::Race,
@@ -1624,6 +1629,11 @@ async fn a_new_generation_below_the_base_environment_protocol_is_retired_uniniti
             std::process::id(),
         ),
     );
+    // The job runs while its worker (the fake) serves the socket.
+    harness.supervisor.script_inspects([InspectStep::Present {
+        state: ServiceState::Running,
+        process: true,
+    }]);
     let fake = serve_version_five_worker(
         &harness
             .runtime_root
@@ -1643,13 +1653,8 @@ async fn a_new_generation_below_the_base_environment_protocol_is_retired_uniniti
         matches!(&failure, LaunchFailure::Cleaned(error) if error.code == WORKER_PROTOCOL_OUTDATED),
         "{failure:?}"
     );
-    assert_eq!(
-        harness.supervisor.calls(),
-        [
-            Call::Start(generation.service_id()),
-            Call::Retire(generation.service_id()),
-        ]
-    );
+    assert_eq!(harness.supervisor.started(), [generation.service_id()]);
+    assert_eq!(harness.supervisor.retired(), [generation.service_id()]);
     let after_lease = tokio::time::timeout(GENEROUS, fake)
         .await
         .expect("controller connection closed")
@@ -1841,4 +1846,56 @@ async fn a_worker_socket_that_cannot_be_bound_is_refused_before_its_job_starts()
         "{failure:?}"
     );
     assert!(harness.supervisor.calls().is_empty(), "no job was started");
+}
+
+#[tokio::test]
+async fn a_worker_is_adopted_while_its_job_inspection_is_wedged() {
+    let harness = Harness::over_worker(GENEROUS, GENEROUS);
+    harness
+        .supervisor
+        .script_starts([StartStep::AcceptLate(CONNECT * 2)]);
+    harness.supervisor.script_inspects([InspectStep::Block]);
+    let generation = harness.generation("s-1");
+
+    let worker = tokio::time::timeout(GENEROUS, harness.lifecycle().launch(&generation))
+        .await
+        .expect("a wedged inspection must not stall the socket attempts")
+        .expect("the late worker is adopted");
+
+    let journal = read_journal(
+        &harness.state_root,
+        "s-1",
+        worker.worker_id().await.as_str(),
+    )
+    .expect("worker journal");
+    assert_eq!(journal.generation, generation.generation());
+    assert!(harness.supervisor.retired().is_empty());
+    harness
+        .lifecycle()
+        .retire(&generation)
+        .await
+        .expect("retire test worker");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wedged_job_inspection_never_extends_the_connect_deadline() {
+    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    harness.supervisor.script_inspects([InspectStep::Block]);
+    let generation = harness.generation("s-1");
+    let started = Instant::now();
+    let deadline = started + CONNECT;
+
+    let outcome = tokio::time::timeout(
+        GENEROUS,
+        harness.lifecycle().connect_until(&generation, deadline),
+    )
+    .await
+    .expect("the wait ends at the connect deadline");
+
+    assert!(matches!(outcome, Err(NotReady::Elapsed)), "{outcome:?}");
+    assert_eq!(
+        Instant::now(),
+        deadline,
+        "the wait ends exactly at the connect deadline"
+    );
 }

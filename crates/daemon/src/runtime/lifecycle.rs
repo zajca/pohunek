@@ -890,28 +890,77 @@ impl Lifecycle<'_> {
 
     /// Connects to the generation's socket until `deadline`.
     ///
-    /// Between attempts the job is inspected, so a job that provably ended
-    /// (absent, or no process in a state that cannot produce one) ends the
-    /// wait at once. A job whose inspection fails or proves nothing keeps
-    /// the wait bounded by `deadline` alone.
+    /// Socket attempts and job inspections run concurrently, each bounded by
+    /// `deadline`, so a slow or unavailable supervisor never delays an
+    /// attempt and never extends the wait. A job that provably ended (absent,
+    /// or no process in a state that cannot produce one) ends the wait at
+    /// once, after one last socket attempt; a job whose inspection fails,
+    /// stalls, or proves nothing leaves the wait to the socket attempts, the
+    /// last of which starts no later than `deadline`.
     async fn connect_until(
         &self,
         generation: &Generation,
         deadline: Instant,
     ) -> Result<Worker, NotReady> {
+        let end = tokio::select! {
+            // A worker that answered wins over a simultaneous end report.
+            biased;
+            worker = self.connect_attempts(generation, deadline) => {
+                return worker.ok_or(NotReady::Elapsed);
+            }
+            end = self.watch_end(generation, deadline) => end,
+        };
+        // The end report may have cut an attempt short; a worker serving the
+        // socket of this generation is still adopted rather than abandoned.
+        match self.try_connect(generation, deadline).await {
+            Some(worker) => Ok(worker),
+            None => Err(NotReady::Ended(end)),
+        }
+    }
+
+    /// Retries the generation's socket every poll interval until `deadline`.
+    ///
+    /// Every attempt is bounded by `deadline`; the last one starts no later
+    /// than it, so a worker that became ready just before it is adopted.
+    async fn connect_attempts(&self, generation: &Generation, deadline: Instant) -> Option<Worker> {
         loop {
             if let Some(worker) = self.try_connect(generation, deadline).await {
-                return Ok(worker);
-            }
-            if let Some(end) = self.job_end(generation).await {
-                return Err(NotReady::Ended(end));
+                return Some(worker);
             }
             let now = Instant::now();
             if now >= deadline {
-                return Err(NotReady::Elapsed);
+                return None;
             }
-            tokio::time::sleep(SUPERVISION_POLL_INTERVAL.min(deadline - now)).await;
+            tokio::time::sleep_until((now + SUPERVISION_POLL_INTERVAL).min(deadline)).await;
         }
+    }
+
+    /// Inspects the generation's job every poll interval and returns once it
+    /// provably ended.
+    ///
+    /// Each inspection is cut off at `deadline`; after it, this never
+    /// completes, so the socket attempts alone decide the outcome.
+    async fn watch_end(&self, generation: &Generation, deadline: Instant) -> JobEnd {
+        loop {
+            match tokio::time::timeout_at(deadline, self.job_end(generation)).await {
+                Ok(Some(end)) => return end,
+                Ok(None) => {}
+                Err(_elapsed) => {
+                    tracing::debug!(
+                        session_id = generation.session_id(),
+                        worker.generation = generation.generation(),
+                        "worker job inspection did not finish before the connect deadline"
+                    );
+                    break;
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            tokio::time::sleep_until((now + SUPERVISION_POLL_INTERVAL).min(deadline)).await;
+        }
+        std::future::pending().await
     }
 
     /// Returns how the generation's job ended, or `None` while it may still
@@ -958,17 +1007,15 @@ impl Lifecycle<'_> {
         )
     }
 
-    /// Makes one bounded attempt to adopt the generation's worker.
-    async fn try_connect(&self, generation: &Generation, deadline: Instant) -> Option<Worker> {
+    /// Makes one attempt to adopt the generation's worker, abandoned at
+    /// `until`.
+    async fn try_connect(&self, generation: &Generation, until: Instant) -> Option<Worker> {
         let socket = self
             .runtime_root
             .join(generation.session_id())
             .join(pohunek_paths::WORKER_SOCKET_NAME);
-        let budget = deadline
-            .saturating_duration_since(Instant::now())
-            .max(SUPERVISION_POLL_INTERVAL);
-        let worker = match tokio::time::timeout(
-            budget,
+        let worker = match tokio::time::timeout_at(
+            until,
             Worker::connect(&socket, generation.session_id(), self.daemon_instance_id),
         )
         .await
@@ -1044,7 +1091,10 @@ impl Lifecycle<'_> {
                 None => started + self.config.worker_initialize,
             };
             if observation.process.is_some() {
-                if let Some(worker) = self.try_connect(generation, give_up_at).await {
+                // Every settle attempt gets at least one poll interval, even
+                // at the initialization deadline.
+                let until = give_up_at.max(Instant::now() + SUPERVISION_POLL_INTERVAL);
+                if let Some(worker) = self.try_connect(generation, until).await {
                     tracing::info!(
                         session_id = generation.session_id(),
                         worker.generation = generation.generation(),
