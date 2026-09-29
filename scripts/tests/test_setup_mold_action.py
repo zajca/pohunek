@@ -32,7 +32,7 @@ RELEASE_URL_PREFIX = "https://github.com/rui314/mold/releases/download/"
 # Flags that only make sense against the real HTTPS release CDN.
 TLS_FLAGS_WITH_VALUE = {"--proto"}
 TLS_FLAGS = {"--tlsv1.2"}
-# Upper bound for one script run; the retry delay is overridden to 0.
+# Upper bound for one script run; with a delay of 0 curl uses its own short backoff.
 SCRIPT_TIMEOUT_SECONDS = 60
 # How often the server loop re-checks its stop flag while waiting for a client.
 ACCEPT_POLL_SECONDS = 0.05
