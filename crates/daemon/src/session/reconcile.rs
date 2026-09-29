@@ -9258,6 +9258,48 @@ while os.getppid() == parent:
             server_task.abort();
         }
 
+        /// A process-table scan that aborts after the replayed stop (a task
+        /// mid-fork or mid-exit on a loaded host) proves no marked process
+        /// gone, so the session waits as `runtime_supervision_ambiguous` with
+        /// its removal intent and nothing deleted, and the re-check finishes
+        /// the removal once the table reads.
+        #[tokio::test]
+        async fn replayed_removal_keeps_its_intent_until_the_sweep_is_confirmed() {
+            let inspector = Arc::new(RetryInspector::default());
+            let fixture =
+                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+            let runtime_root = fixture.root.join("runtime/workers");
+            let (controller, runtime_id, _child_pid, server_task) =
+                spawn_initialized_worker(&fixture.root, &runtime_root, "s-382", "worker-s-382")
+                    .await;
+            let record = persist_removal_intent(&fixture.root, "s-382", Some(runtime_id.as_str()));
+            seed_removal_leftovers(&fixture.root, &record);
+            drop(controller);
+            fixture.supervisor.script_job(
+                service_id("s-382", TEST_GENERATION),
+                present(ServiceState::Running, None),
+            );
+            inspector.fail_enumeration(true);
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            assert_removal_waits_for_the_sweep(&fixture, "s-382").await;
+            assert!(
+                std::fs::read_dir(fixture.root.join("logs"))
+                    .expect("read log directory")
+                    .next()
+                    .is_some(),
+                "nothing the session owns is deleted before the sweep is confirmed"
+            );
+
+            inspector.fail_enumeration(false);
+            wait_removed(&fixture, "s-382").await;
+            assert_removal_finished(&fixture, "s-382").await;
+            server_task.abort();
+        }
+
         /// Persists a running record of `session_id` (see [`persist_record`])
         /// carrying a durable stop intent, as `stop` writes it before the
         /// daemon went away.
