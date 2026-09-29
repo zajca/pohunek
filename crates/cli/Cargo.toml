@@ -51,7 +51,7 @@ futures = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 libc = { workspace = true }
-nix = { workspace = true, features = ["signal"] }
+nix = { workspace = true, features = ["process", "signal", "term"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 time = { workspace = true }
@@ -64,6 +64,7 @@ workspace = true
 pohunek-cli = { path = ".", features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
+portable-pty = { workspace = true }
 overlay = { workspace = true }
 pohunek-logging = { workspace = true }
 

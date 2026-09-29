@@ -11,6 +11,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -396,28 +397,142 @@ fn an_adopter_keeps_other_transactions_out_after_its_holder_crashed() {
 }
 
 #[test]
-fn a_signal_sent_to_the_lock_process_alone_reaches_its_command() {
+fn a_signal_reaches_the_command_exactly_once() {
     for signal in ["INT", "HUP", "TERM"] {
-        let host = Host::new();
-        let ready = host.root.join("ready");
-        let script = format!(
-            "trap 'exit 9' INT HUP TERM; : > '{}'; while :; do sleep 0.05; done",
-            ready.display()
-        );
-        let mut holder = host.spawn_locked_shell(&script);
-        wait_for_file(&ready);
-        // Only the lock process is signalled, not its process group.
-        let sent = Command::new("kill")
-            .args([format!("-{signal}"), holder.id().to_string()])
-            .status()
-            .expect("run kill");
-        assert!(sent.success(), "{signal}");
-        let status = wait_exit(&mut holder);
-        assert_eq!(
-            status.code(),
-            Some(9),
-            "{signal}: the command did not get it"
-        );
-        assert!(host.lock_is_free(), "{signal}: the lock stayed held");
+        // The lock process alone, and its whole process group, as a
+        // terminal or a `kill -- -<pgid>` addresses the job.
+        for to_group in [false, true] {
+            let case = format!(
+                "{signal} to the {}",
+                if to_group { "group" } else { "process" }
+            );
+            let host = Host::new();
+            let (ready, stop, count) = (
+                host.root.join("ready"),
+                host.root.join("stop"),
+                host.root.join("count"),
+            );
+            let script = format!(
+                "trap 'echo {signal} >> {count}' INT HUP TERM; : > {ready}; \
+                 while [ ! -e {stop} ]; do sleep 0.05; done",
+                count = count.display(),
+                ready = ready.display(),
+                stop = stop.display(),
+            );
+            let mut holder = host
+                .pohunek(&["service", "lock", "--", "sh", "-c", &script])
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start pohunek service lock");
+            wait_for_file(&ready);
+            let target = if to_group {
+                format!("-{}", holder.id())
+            } else {
+                holder.id().to_string()
+            };
+            let sent = Command::new("kill")
+                .args([format!("-{signal}"), "--".to_owned(), target])
+                .status()
+                .expect("run kill");
+            assert!(sent.success(), "{case}");
+            assert_eq!(wait_for_line(&count), signal, "{case}");
+            // A second delivery would land within the trap's next loop turn.
+            std::thread::sleep(Duration::from_millis(300));
+            fs::write(&stop, "").expect("stop the command");
+            assert!(wait_exit(&mut holder).success(), "{case}");
+            assert_eq!(
+                fs::read_to_string(&count).expect("count").lines().count(),
+                1,
+                "{case}: delivered more than once"
+            );
+            assert!(host.lock_is_free(), "{case}: the lock stayed held");
+        }
     }
+}
+
+/// Names the token file `adopted_transaction_probe` adopts with; unset in an
+/// ordinary run, where the probe passes without doing anything.
+const PROBE_DIR_ENV: &str = "POHUNEK_TEST_PROBE_DIR";
+
+/// Child side of `adopted_transactions_under_one_holder_run_one_at_a_time`.
+///
+/// Adopts the lock for a transaction exactly as `pohunek service
+/// install|upgrade|uninstall` does, reports `held` and waits for `stop`, or
+/// writes the refusal's code to `refused`.
+#[test]
+fn adopted_transaction_probe() {
+    use pohunek_cli::service::inherited::Token;
+    use pohunek_cli::service::record::{Adoption, Store};
+
+    let Some(dir) = std::env::var_os(PROBE_DIR_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let token = Token::parse(&std::env::var(LOCK_TOKEN_ENV).expect("token")).expect("token");
+    let state = PathBuf::from(std::env::var_os("XDG_STATE_HOME").expect("state")).join("pohunek");
+    match Store::new(state).adopt(&token, Adoption::Transaction) {
+        Ok(lock) => {
+            fs::write(dir.join("held"), "held\n").expect("report");
+            wait_for_file(&dir.join("stop"));
+            drop(lock);
+            std::process::exit(0);
+        }
+        Err(error) => {
+            fs::write(dir.join("refused"), format!("{}\n", error.code())).expect("report");
+            std::process::exit(3);
+        }
+    }
+}
+
+#[test]
+fn adopted_transactions_under_one_holder_run_one_at_a_time() {
+    let host = Host::new();
+    let probe = std::env::current_exe().expect("test binary");
+    let first = host.root.join("first");
+    let second = host.root.join("second");
+    fs::create_dir(&first).expect("first");
+    fs::create_dir(&second).expect("second");
+    let run = |dir: &Path| {
+        format!(
+            "{PROBE_DIR_ENV}='{}' '{}' --exact adopted_transaction_probe --quiet >/dev/null",
+            dir.display(),
+            probe.display()
+        )
+    };
+    // Two backgrounded transactions under one holder: the second starts
+    // while the first runs and is refused.
+    let script = format!(
+        "{first_run} & while [ ! -e '{held}' ]; do sleep 0.05; done; \
+         {second_run}; : > '{stop}'; wait",
+        first_run = run(&first),
+        held = first.join("held").display(),
+        second_run = run(&second),
+        stop = first.join("stop").display(),
+    );
+    let output = host.locked_shell(&script);
+    assert_code(&output, 0);
+    assert_eq!(
+        wait_for_line(&second.join("refused")),
+        "service_transaction_in_progress"
+    );
+}
+
+#[test]
+fn a_failed_wait_for_adopters_fails_the_lock_and_still_cleans_up() {
+    let host = Host::new();
+    let adopted = host.root.join("state/pohunek/service-install.lock.adopted");
+    // The command breaks the adopters' lock file, so the holder cannot tell
+    // whether an adopter still runs once the command succeeded.
+    let output = host.locked_shell(&format!("chmod 644 '{}'", adopted.display()));
+    assert_code(&output, 1);
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("service-install.lock.adopted"), "{stderr}");
+    assert!(
+        !host.holder_record().exists(),
+        "the holder record outlived the lock"
+    );
+    fs::set_permissions(&adopted, fs::Permissions::from_mode(0o600)).expect("repair");
+    assert!(host.lock_is_free(), "the lock stayed held");
 }

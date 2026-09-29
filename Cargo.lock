@@ -4176,6 +4176,7 @@ dependencies = [
  "pohunek-session-worker",
  "pohunek-terminal",
  "pohunek-worker-protocol",
+ "portable-pty",
  "reqwest",
  "serde",
  "serde_json",

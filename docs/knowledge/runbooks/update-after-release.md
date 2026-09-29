@@ -207,9 +207,19 @@ run. When the command exits, the holder waits until every adopter it left
 running has finished, then removes its record and releases the lock; a
 command that tries to adopt only after that is refused. If the holder dies
 first, adopters still running keep every other transaction out with
-`service_transaction_in_progress` until they end. `SIGTERM`, `SIGINT`, and
-`SIGHUP` sent to the lock process are forwarded to its command; one
-received while it waits for adopters ends that wait. `pohunek service check [--prefix <dir>] [--json]`
+`service_transaction_in_progress` until they end. Adopting commands that run
+a transaction also hold `service-install.lock.inherited` exclusively, so two
+of them under one holder never run at once: the second fails with
+`service_transaction_in_progress`. The command runs in a process group of its
+own and, when the lock process owns the terminal, in the terminal's
+foreground; `SIGTERM`, `SIGINT`, and `SIGHUP` sent to the lock process or its
+group are forwarded to the command's group, so each reaches the command
+exactly once. On a terminal it behaves like a job: `Ctrl-Z` stops the command,
+the lock process takes the terminal back and stops too, so the shell reports
+the job stopped, and `fg` (or `SIGCONT` to the lock process) gives the
+terminal back to the command and continues it. One signal received while the
+lock process waits for adopters ends that wait. If the lock process cannot tell whether an adopter still runs, it
+removes its record, releases the lock, and fails. `pohunek service check [--prefix <dir>] [--json]`
 runs, without changing anything, every check the install (while an install is
 pending or nothing is installed) or upgrade of this version makes before its
 first effect — `HOME` and the XDG roots, the prefix, every directory it writes,
