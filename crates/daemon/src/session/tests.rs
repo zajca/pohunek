@@ -14522,6 +14522,18 @@ async fn reconciled_create_whose_worker_ended_is_retired_then_compensated() {
     )
     .expect("service id");
     supervisor.script_retire_unavailable(service_id.clone());
+    // The create's own connect wait inspects its job too; only calls from the
+    // restarted daemon are asserted below.
+    let created_calls = supervisor.calls();
+    let [crate::runtime::lifecycle::tests::Call::Start(_), created_waits @ ..] =
+        created_calls.as_slice()
+    else {
+        panic!("the create started exactly its job first");
+    };
+    assert!(created_waits
+        .iter()
+        .all(|call| matches!(call, crate::runtime::lifecycle::tests::Call::Inspect(_))));
+    let before_restart = 1 + created_waits.len();
 
     let restarted = SessionRegistry::new_with_launcher_and_inspector(
         daemon.config.clone(),
@@ -14544,9 +14556,8 @@ async fn reconciled_create_whose_worker_ended_is_retired_then_compensated() {
     let calls = supervisor.calls();
     assert!(
         matches!(
-            calls.as_slice(),
+            &calls[before_restart..],
             [
-                crate::runtime::lifecycle::tests::Call::Start(_),
                 crate::runtime::lifecycle::tests::Call::Inspect(_),
                 crate::runtime::lifecycle::tests::Call::Retire(_),
             ]
