@@ -12,3 +12,5 @@ pub(crate) mod policy;
 pub(crate) mod runner;
 pub(crate) mod skill;
 pub(crate) mod target;
+#[cfg(test)]
+pub(crate) mod test_python;

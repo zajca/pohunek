@@ -6,7 +6,6 @@
 
 use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
-#[cfg(target_os = "linux")]
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixListener;
@@ -14,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
+
+#[path = "support/interpreter.rs"]
+mod interpreter;
 
 use protocol::{AgentKind, Request, Response, PROTOCOL_VERSION};
 use serde_json::{json, Value};
@@ -77,8 +79,6 @@ fn set_mode(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("set fixture mode");
 }
 
-// Linux only: used by the system-Python lifecycle test (see issue #101).
-#[cfg(target_os = "linux")]
 fn write_executable(path: &Path, body: &str) {
     fs::write(path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write executable");
     set_mode(path, 0o700);
@@ -92,8 +92,6 @@ fn run(fixture: &Fixture, arguments: &[&str]) -> Output {
         .expect("run pohunek binary")
 }
 
-// Linux only: used by the system-Python lifecycle test (see issue #101).
-#[cfg(target_os = "linux")]
 fn parse_ok(output: &Output) -> Value {
     assert!(
         output.status.success(),
@@ -117,10 +115,6 @@ fn parse_error(output: &Output) -> Value {
     envelope["err"].clone()
 }
 
-// Linux only: the fixture runtime execs the system `/usr/bin/python3`, which on
-// macOS is Python 3.9 while the embedded plugin requires Python 3.10 or newer.
-// The Hermes integration lifecycle on macOS is owned by issue #101.
-#[cfg(target_os = "linux")]
 #[test]
 #[expect(
     clippy::too_many_lines,
@@ -137,7 +131,10 @@ fn binary_hermes_lifecycle_is_isolated_and_model_free() {
     fixture.private_directory("cache");
     let venv_bin = fixture.private_directory("installation/venv/bin");
     let python_bin = fixture.private_directory("installation/python/bin");
-    write_executable(&python_bin.join("python3"), "exec /usr/bin/python3 \"$@\"");
+    write_executable(
+        &python_bin.join("python3"),
+        &format!("exec '{}' \"$@\"", interpreter::python().display()),
+    );
     symlink("../../python/bin/python3", venv_bin.join("python3")).expect("link Python runtime");
 
     let state_file = fixture.root.join("plugin-state");

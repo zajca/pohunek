@@ -34,12 +34,15 @@ from pohunek.redact import diagnostic
 from pohunek.tools import TOOL_SCHEMAS, Tools, _MAX_INPUT_BYTES, _input
 
 
+# `true` lives at this path on both Linux and macOS (`/bin/true` is absent on macOS).
+TRUE_BINARY = "/usr/bin/true"
+
 # Bulk pipe tests verify byte limits, not scheduler latency on shared runners.
 _BULK_COLLECTION_TIMEOUT_MS = 5_000
 
 
 def policy(
-    cli: str = "/bin/true",
+    cli: str = TRUE_BINARY,
     mode: str = "full",
     max_output_bytes: int = 1024,
     max_screen_bytes: int = 1024,
@@ -77,13 +80,13 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaises(PolicyError):
                 load_policy(str(link))
         for host in ("127.0.0.1", "/tmp/socket", "bad\nhost"):
-            raw = {"schema_version": 1, "pohunek_cli": "/bin/true", "protocol_min": 1, "protocol_max": 1, "access_mode": "read_only", "allowed_hosts": [host], "tool_timeout_ms": 2, "request_timeout_ms": 1, "max_output_bytes": 1, "max_screen_bytes": 1, "max_concurrency": 1}
+            raw = {"schema_version": 1, "pohunek_cli": TRUE_BINARY, "protocol_min": 1, "protocol_max": 1, "access_mode": "read_only", "allowed_hosts": [host], "tool_timeout_ms": 2, "request_timeout_ms": 1, "max_output_bytes": 1, "max_screen_bytes": 1, "max_concurrency": 1}
             with mock.patch("pohunek.policy.os.path.isfile", return_value=True), mock.patch("pohunek.policy.os.access", return_value=True):
                 with self.assertRaises(PolicyError):
                     __import__("pohunek.policy", fromlist=["_validate"])._validate(raw)
 
     def test_policy_rejects_boolean_numeric_fields(self) -> None:
-        raw = {"schema_version": 1, "pohunek_cli": "/bin/true", "protocol_min": True, "protocol_max": 1, "access_mode": "read_only", "allowed_hosts": ["local"], "tool_timeout_ms": 2, "request_timeout_ms": 1, "max_output_bytes": 1, "max_screen_bytes": 1, "max_concurrency": 1}
+        raw = {"schema_version": 1, "pohunek_cli": TRUE_BINARY, "protocol_min": True, "protocol_max": 1, "access_mode": "read_only", "allowed_hosts": ["local"], "tool_timeout_ms": 2, "request_timeout_ms": 1, "max_output_bytes": 1, "max_screen_bytes": 1, "max_concurrency": 1}
         with mock.patch("pohunek.policy.os.path.isfile", return_value=True), mock.patch("pohunek.policy.os.access", return_value=True):
             with self.assertRaises(PolicyError):
                 __import__("pohunek.policy", fromlist=["_validate"])._validate(raw)
@@ -260,7 +263,7 @@ class RunnerTests(unittest.TestCase):
         with mock.patch("pohunek.cli.subprocess.Popen", return_value=process) as popen, mock.patch.object(runner, "_collect", return_value=(output, b"")) as collect:
             runner.verify_compatibility()
 
-        self.assertEqual(popen.call_args.args[0], ["/bin/true", "doctor", "--json"])
+        self.assertEqual(popen.call_args.args[0], [TRUE_BINARY, "doctor", "--json"])
         collect.assert_called_once_with(process, b"")
 
     def test_verify_compatibility_rejects_incompatible_malformed_and_failed_cli(self) -> None:
@@ -278,7 +281,7 @@ class RunnerTests(unittest.TestCase):
                     with self.assertRaises(CliError) as raised:
                         runner.verify_compatibility()
                 self.assertEqual(raised.exception.code, expected)
-                self.assertEqual(popen.call_args.args[0], ["/bin/true", "doctor", "--json"])
+                self.assertEqual(popen.call_args.args[0], [TRUE_BINARY, "doctor", "--json"])
 
     def test_validates_protocol_envelope(self) -> None:
         runner = CliRunner(policy())
@@ -397,7 +400,7 @@ class ToolTests(unittest.TestCase):
         runner.verify_compatibility.assert_called_once_with()
 
     def test_wildcard_policy_still_rejects_unsafe_runtime_hosts(self) -> None:
-        wildcard = Policy("/bin/true", 1, 3, "full", frozenset(("*",)), 100, 50, 1024, 1024, 1)
+        wildcard = Policy(TRUE_BINARY, 1, 3, "full", frozenset(("*",)), 100, 50, 1024, 1024, 1)
         tools = Tools(wildcard, None)
         for host in ("127.0.0.1", "/tmp/socket", "bad\nhost", "*"):
             result = json.loads(tools.handlers()["pohunek_sessions"]({"host": host}))

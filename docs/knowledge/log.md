@@ -17,6 +17,8 @@
   and `integration_recovery_required` errors, an absent agent config directory
   reported as informational `not_installed` with recovery `none`, and the macOS
   remediation for symlinked config roots and Darwin socket path limits.
+- Documented that Hermes hook identity reports use the platform's process start
+  identity on Linux and macOS, matching the daemon's derivation.
 - Documented that the managed agent hook scripts run Python in isolated mode, so
   modules in the agent's working directory and `PYTHON*` variables cannot affect
   the hook interpreter's configuration or module resolution.
