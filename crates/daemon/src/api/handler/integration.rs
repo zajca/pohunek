@@ -1,10 +1,12 @@
-//! `integration.install` and `integration.status` agent hook RPC handlers.
+//! `integration.install`, `integration.uninstall`, `integration.status`, and
+//! `integration.doctor` agent hook RPC handlers.
 
 // Rust guideline compliant 2026-08-31
 
 use protocol::{
-    IntegrationInstallParams, IntegrationInstallResult, IntegrationStatusParams,
-    IntegrationStatusResult, ProtocolError, Request, Response,
+    IntegrationDoctorParams, IntegrationDoctorResult, IntegrationInstallParams,
+    IntegrationInstallResult, IntegrationStatusParams, IntegrationStatusResult,
+    IntegrationUninstallParams, IntegrationUninstallResult, ProtocolError, Request, Response,
 };
 
 use super::util::{error_value, parse_optional_params, parse_params};
@@ -16,6 +18,23 @@ pub(super) async fn handle_integration_install(request: &Request) -> Response {
     };
     run_integration_install_blocking(request, move || crate::integration::install(params.agent))
         .await
+}
+
+pub(super) async fn handle_integration_uninstall(request: &Request) -> Response {
+    let params = match parse_params::<IntegrationUninstallParams>(request) {
+        Ok(params) => params,
+        Err(err) => return error_value(request, err),
+    };
+    run_integration_uninstall_blocking(request, move || crate::integration::uninstall(params.agent))
+        .await
+}
+
+pub(super) async fn handle_integration_doctor(request: &Request) -> Response {
+    let params = match parse_optional_params::<IntegrationDoctorParams>(request) {
+        Ok(params) => params,
+        Err(err) => return error_value(request, err),
+    };
+    run_integration_doctor_blocking(request, move || crate::integration::doctor(params)).await
 }
 
 pub(super) async fn handle_integration_status(request: &Request) -> Response {
@@ -55,6 +74,38 @@ where
         op,
         "integration_status_task_panicked",
         "integration status inspection task panicked",
+        Some("retry the request; if it repeats, inspect daemon logs"),
+    )
+    .await
+}
+
+/// Run integration removal off the Tokio request task and map a task panic to
+/// a typed daemon error.
+pub(super) async fn run_integration_uninstall_blocking<F>(request: &Request, op: F) -> Response
+where
+    F: FnOnce() -> Result<IntegrationUninstallResult, ProtocolError> + Send + 'static,
+{
+    super::util::run_blocking(
+        request,
+        op,
+        "integration_uninstall_task_panicked",
+        "integration removal task panicked",
+        Some("retry the request; if it repeats, inspect daemon logs"),
+    )
+    .await
+}
+
+/// Run integration diagnosis off the Tokio request task and map a task panic
+/// to a typed daemon error.
+pub(super) async fn run_integration_doctor_blocking<F>(request: &Request, op: F) -> Response
+where
+    F: FnOnce() -> Result<IntegrationDoctorResult, ProtocolError> + Send + 'static,
+{
+    super::util::run_blocking(
+        request,
+        op,
+        "integration_doctor_task_panicked",
+        "integration diagnosis task panicked",
         Some("retry the request; if it repeats, inspect daemon logs"),
     )
     .await

@@ -11,19 +11,20 @@ use serde::Serialize;
 use crate::{
     AssistantMaterializeParams, AssistantMaterializeResult, DaemonDoctorResult, DaemonHealthResult,
     HostCapabilities, HostDiscoverParams, HostGovernanceStatus, HostRecord,
-    IntegrationInstallParams, IntegrationInstallResult, IntegrationStatusParams,
-    IntegrationStatusResult, NotificationCreateParams, NotificationCreateResult,
-    NotificationDeleteParams, NotificationDeleteResult, NotificationListParams,
-    NotificationListResult, NotificationPolicyParams, NotificationPolicyResult,
-    NotificationRetentionParams, NotificationRetentionResult, NotificationUpdateParams,
-    NotificationUpdateResult, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
-    ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams,
-    ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
-    ProjectShowParams, ProjectShowResult, RuntimeInventoryResult, SessionAttachParams,
-    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
-    SessionDetectionResult, SessionDiffParams, SessionDiffResult, SessionForkParams,
-    SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
+    IntegrationDoctorParams, IntegrationDoctorResult, IntegrationInstallParams,
+    IntegrationInstallResult, IntegrationStatusParams, IntegrationStatusResult,
+    IntegrationUninstallParams, IntegrationUninstallResult, NotificationCreateParams,
+    NotificationCreateResult, NotificationDeleteParams, NotificationDeleteResult,
+    NotificationListParams, NotificationListResult, NotificationPolicyParams,
+    NotificationPolicyResult, NotificationRetentionParams, NotificationRetentionResult,
+    NotificationUpdateParams, NotificationUpdateResult, ProjectActionParams, ProjectActionResult,
+    ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams,
+    ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult,
+    ProjectRenameParams, ProjectShowParams, ProjectShowResult, RuntimeInventoryResult,
+    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
+    SessionDetectionParams, SessionDetectionResult, SessionDiffParams, SessionDiffResult,
+    SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
     SessionOutputResult, SessionPolicyParams, SessionPolicyResult, SessionReadParams,
     SessionReadResult, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
     SessionRenameParams, SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
@@ -403,6 +404,24 @@ method_table!(
     IntegrationStatusResult,
     "IntegrationStatusParams",
     "IntegrationStatusResult";
+
+    /// Remove the managed Codex and Claude hooks, preserving foreign files.
+    IntegrationUninstall,
+    INTEGRATION_UNINSTALL,
+    "integration.uninstall",
+    IntegrationUninstallParams,
+    IntegrationUninstallResult,
+    "IntegrationUninstallParams",
+    "IntegrationUninstallResult";
+
+    /// Diagnose managed Codex and Claude hook installations without mutation.
+    IntegrationDoctor,
+    INTEGRATION_DOCTOR,
+    "integration.doctor",
+    IntegrationDoctorParams,
+    IntegrationDoctorResult,
+    "IntegrationDoctorParams",
+    "IntegrationDoctorResult";
 
     /// Inspect live host capabilities.
     HostInspect,

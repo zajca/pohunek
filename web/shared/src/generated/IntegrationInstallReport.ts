@@ -19,4 +19,10 @@ export type IntegrationInstallReport = {
    * hooks.json / config.toml), in the order they were touched.
    */
   config_paths: Array<string>;
+  /**
+   * Quarantined originals whose deletion did not finish after the install
+   * committed, each with its quarantine path and why. The install itself
+   * succeeded; empty when cleanup completed.
+   */
+  cleanup_incomplete: Array<string>;
 };

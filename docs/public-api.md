@@ -392,8 +392,10 @@ All params and result type names below refer to structs exported by
 | `session.policy.set` | `SessionPolicyParams` | `SessionPolicyResult` | Validates, replaces, and persists the session retention policy at `<data_dir>/session-policy.json`. The running sweep task reloads it on its next cycle, so no daemon restart is needed. |
 | `session.retention.sweep` | `SessionRetentionParams` or `null` | `SessionRetentionResult` | Runs one retention sweep under the current policy TTLs, or reports the selection when `dry_run` is true. It works whether or not automatic sweeps are enabled, never exceeds the policy's own per-sweep removal cap, and never selects an `external` session or one in `conflict`/`incompatible` runtime state. A matched session whose pohunek-owned worktree has an uncommitted change, an untracked file, commits contained in no other branch/remote/tag, or a state git cannot report is **held**, never removed: it is counted in `held`, excluded from `eligible`, and carries the `hold` reason (`worktree_uncommitted`, `worktree_untracked`, `worktree_unpushed`, `worktree_unknown`) on its candidate. One sweep inspects at most 64 checkouts; a matched session beyond that bound is held as `worktree_unknown` and inspected by the next sweep. `worktrees_cleaned` counts only checkouts confirmed gone from disk; a checkout that survived its removal is reported in `worktrees_failed`. The `pohunek session retention sweep` CLI exits non-zero when `failed` or `worktrees_failed` is above zero. |
 | `subscribe` | `null` | `{subscribed: true}` then event stream | Consumes the connection into a one-way event stream. |
-| `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for active-agent state, native session id capture, provider-managed subagent lifecycle, and notifications. |
+| `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for active-agent state, native session id capture, provider-managed subagent lifecycle, and notifications. Each report carries `cleanup_incomplete`, the quarantine paths of replaced originals whose deletion did not finish after the install committed (empty when cleanup completed). |
 | `integration.status` | `IntegrationStatusParams` or `null` | `IntegrationStatusResult` | Returns a read-only per-agent report for managed Codex and Claude hooks: availability, expected and present asset paths, inspected registration paths, installed and expected versions, aggregate health (`not_installed`, `current`, or `outdated`), typed recovery (`none`, `reinstall`, or `repair_configuration`), and non-secret warnings. `null` selects both agents; unknown parameter fields return `bad_request`. `current` requires exact managed executable permissions and exactly one registration under each installer-owned event. Inspection is size-bounded and runs outside the Tokio request task. It never mutates provider configuration. |
+| `integration.uninstall` | `IntegrationUninstallParams` (`agent` required) | `IntegrationUninstallResult` | Removes exactly the assets and registrations the installer owns for Codex and Claude, as one rollback-protected transaction under the installer lock: registration first, then Codex trust records, then marker-carrying scripts. User hooks, the Codex hooks feature flag, the hooks directory, and the lock file are left alone; a symlink, directory, FIFO, or unmarked file at a managed script path is preserved and reported in `preserved_paths`. Each report carries `state` (`removed` or `not_installed`), `removed_paths`, `updated_paths`, `preserved_paths`, and `cleanup_incomplete` (quarantined originals whose deletion did not finish after the removal committed). `agent` names the one agent to remove and is required: a missing agent, unknown fields, and `null` params return `bad_request`, so removal never widens to every agent and a failure cannot leave one agent removed without a report. Ownership is judged on the inode that is deleted, and a provider file whose content, mode, or inode changed since it was read is a collision. The same re-verification runs before any rollback, so a file another writer changed is kept there too rather than replaced by the original. Every rollback or cleanup outcome that leaves data in quarantine is reported with its true path, as `integration_recovery_required` during a rollback and as `cleanup_incomplete` after commit. A registration file the removal wrote that another writer changed before the scripts are removed, or before the removal completes, is also a collision: it is re-verified (inode, mode, complete content), the other version is kept, and the removed scripts are moved back. Collisions, interrupted rollbacks, and concurrent installers return `integration_destination_collision`, `integration_recovery_required`, and `integration_install_in_progress`. |
+| `integration.doctor` | `IntegrationDoctorParams` or `null` | `IntegrationDoctorResult` | Read-only diagnosis of the managed Codex and Claude hooks: per agent `ok`, the status report (absent while an operation is running), and findings with a stable snake_case `code`, `severity` (`info` or `error`), `summary`, and `remediation`. Only the absence expected of a not-installed integration is informational: an unsafe, symlinked, or group-writable config path is an error even when nothing is installed. Codes cover absent agents and hooks, config-root, asset, registration, provider-config, and Codex feature/trust drift, `displaced_original_left_behind` (a quarantined original from an earlier install or removal remains in the agent config directory) and `quarantine_scan_incomplete` (the bounded scan could not cover every entry, so it is an error and the diagnosis is never clean), and `operation_in_progress` (info: another install, uninstall, or doctor holds the installer lock, so nothing is read or scanned for that agent, `status` is absent, and the doctor stays `ok`; the doctor takes the lock non-blocking without creating the file and holds it for its whole inspection, so an installer arriving meanwhile gets `integration_install_in_progress`), `unsafe_installer_lock` (error: the lock file is not a regular owner-private file, so every install and uninstall fails), `install_drift`, and three informational `python3` notes that never fail the doctor or change its exit code, because the daemon cannot know the agent's `PATH`: `hook_runtime_python_found` (the first executable `python3` behind an absolute entry of the daemon's own `PATH`), `hook_runtime_missing` (none found; relative and empty entries are skipped), and `hook_runtime_macos_shim` (the first one is the `/usr/bin/python3` stub, recognized through any alias, with no Command Line Tools or Xcode behind it); the probe never runs an interpreter and the remediation is to verify `python3` on the agent's `PATH`, and `hook_socket_path_invalid` (daemon or worker socket path over the platform limit). The runtime notes apply only to an agent whose hooks are installed. `null` selects both agents; unknown fields return `bad_request`. |
 | `assistant.materialize` | `AssistantMaterializeParams` | `AssistantMaterializeResult` | Materializes the assistant knowledge bundle on the daemon host. |
 | `notification.create` | `NotificationCreateParams` | `NotificationCreateResult` | Creates a host-local notification. Daemon policy is enforced for every producer, including provider hooks and daemon projectors. Dedupe may return `created: false` with an existing or upgraded record. `agent_blocked`/`approval_required` with `attention:<session_id>` and `turn_completed` with `turn:<session_id>` are deferred: the result still reports `created: true` with a minted id, but the record is held pending until `attention_debounce_secs` elapses; see `NotificationPolicy`. |
 | `notification.list` | `NotificationListParams` or `null` | `NotificationListResult` | Lists notification records with exact-match filters and cursor pagination. Deleted records are excluded unless `status: deleted` is requested. |
@@ -1168,12 +1170,20 @@ and executable mode. Claude must also contain every exact managed registration
 in `settings.json`. Codex must contain every exact registration in `hooks.json`,
 have the hooks feature enabled, and retain the position-derived trust hash for
 each managed hook in `config.toml`. The managed Codex trust-key set must be
-exact: stale managed tables make the integration outdated, and reinstallation
-removes them before writing only the currently expected keys. A scalar anywhere
+exact: a trust record is installer-owned when its trusted hash is that of a
+managed command for its event, so a stale managed record at an old position
+makes the integration outdated and reinstallation removes it before writing only
+the currently expected keys, while trust records of a user's own hooks are never
+removed or flagged and follow their hooks: a trust key embeds the group and
+handler index, so when an install, reinstall, or uninstall shifts a user hook's
+position its record moves to the key of the new position (the trusted hash covers
+only the handler and its matcher, so it stays valid). Two claims on one key fail
+closed with `configuration/integration_trust_conflict` and nothing is written. A scalar anywhere
 in the managed trust namespace requires configuration repair, including when
 hook drift temporarily prevents that key from being position-derived.
 
 `not_installed` means no Pohunek-managed asset or registration was detected;
+A missing agent config directory is `available: false` with `not_installed`, recovery `none`, and no warning; a path that exists but is not a directory, has a symlink at any component (live or dangling, which install and uninstall refuse), is refused by the same trusted descriptor walk the installer performs (foreign owner, group/world-writable directory or ancestor), cannot be resolved, or cannot be inspected is `outdated` with `repair_configuration`.
 `current` means the complete contract above matches; `outdated` covers every
 partial, modified, malformed, unreadable, or otherwise unverifiable detected
 installation. A supported agent's path-resolution failure becomes an `outdated`
@@ -1215,9 +1225,19 @@ Before any mutation, installation opens and validates every existing config and
 hook parent as a no-follow, effective-UID-owned real directory without group or
 world write access. An unsafe parent fails with
 `configuration/integration_path_untrusted`. Provider files are prepared in
-memory, then replaced through the already-opened directory descriptor using an
-exclusive temporary file, `fchmod`, and `renameat`; parent or pathname swaps
-cannot redirect the write. Existing safe provider-file modes are preserved,
+memory, then replaced through the already-opened directory descriptor by
+displacement: the original is renamed aside into a private quarantine name
+bound to its inode, its identity, mode, and complete content are verified on
+that inode against what was read, and the new file, written to an exclusive
+temporary file and synchronized, is activated with a no-replace rename. A
+foreign change at any moment is therefore an
+`integration_destination_collision`, and a foreign file created in the gap is
+never overwritten; on any mismatch the original is moved back untouched. The
+originals are deleted only after every file is in place; if that cleanup cannot
+finish, the install still succeeds and `cleanup_incomplete` lists the quarantine
+paths that remain, which `integration.doctor` reports as
+`displaced_original_left_behind`. Parent or pathname swaps cannot redirect the
+write. Existing safe provider-file modes are preserved,
 while new registration files use mode `0600` and managed executable assets use
 mode `0755`. An oversized file is `outdated` with an actionable warning. The CLI
 routes Codex and Claude status to the effective global `--host`; mutating hook
@@ -1303,11 +1323,11 @@ Canonical public codes currently emitted include:
 
 | Class | Codes |
 |---|---|
-| `configuration` | `paths_unavailable`, `netbird_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted` |
+| `configuration` | `paths_unavailable`, `netbird_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted`, `integration_trust_conflict` |
 | `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down` |
 | `transport` | `framing`, `host_unreachable`, `request_timeout` |
 | `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `remote_discovery_failed` |
-| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `migration_manifest_missing`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy` |
+| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `migration_manifest_missing`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required` |
 
 Protocol v3 emits these runtime codes for provider-neutral agent and
 observation behavior: `agent_kind_unsupported`,
@@ -1497,8 +1517,10 @@ pohunek integration doctor --agent hermes --hermes-profile default --json
 
 `--hermes-profile default`, a named `--hermes-profile`, and an absolute
 `--hermes-home` are explicit target selections; a profile and home cannot be
-combined. `doctor`, `update`, and `uninstall` are Hermes-only and return
-`configuration/integration_action_unsupported` for another agent. Hermes status
+combined. `update` is Hermes-only and returns
+`configuration/integration_action_unsupported` for another agent; `doctor`
+and `uninstall` also serve Codex and Claude (`doctor` follows `--host`,
+`uninstall` targets the local daemon and requires `--agent`). Hermes status
 uses the same local target contract; daemon-backed Codex/Claude status uses the
 new RPC without those local Hermes flags, and their install behavior is unchanged:
 
@@ -1507,6 +1529,8 @@ pohunek integration status --json
 pohunek integration status --agent codex --json
 pohunek integration status --agent claude --json
 pohunek integration status --agent hermes --hermes-profile default --json
+pohunek integration doctor --agent codex --json
+pohunek integration uninstall --agent claude --json
 ```
 
 The installation policy is Pohunek-owned, owner-private, and external to the

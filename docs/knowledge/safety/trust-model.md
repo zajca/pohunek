@@ -43,8 +43,10 @@ The assistant must:
   directory if mode enforcement or safe opening fails, never chmods an existing
   real user directory, and rejects unsafe path shapes. Codex trust identity
   covers a canonical single-handler managed group, so sibling handlers cannot
-  inherit the managed trust record. Its managed trust-key set is exact; stale
-  managed tables are removed on reinstall, while scalars anywhere in the
+  inherit the managed trust record. Its managed trust-key set is exact, where a
+  record is managed only when its hash is that of a managed command (a user's
+  own hook records are never touched); stale managed records are removed on
+  reinstall, while scalars anywhere in the
   managed trust namespace require configuration repair.
 - Require `CLAUDE_CONFIG_DIR` and `CODEX_HOME` to resolve to absolute UTF-8 paths
   before registration commands are constructed. Before any integration install
@@ -53,6 +55,15 @@ The assistant must:
   replacement relative to those open directory descriptors so concurrent name
   swaps cannot redirect writes. Preserve safe existing provider-file modes and
   create new registration files as owner-readable and owner-writable only.
+  Serialize installers per agent config directory with an owner-private lock
+  file, commit the hook scripts and registration as one rollback-capable
+  transaction, refuse to overwrite a provider file that changed since it was
+  read, and never quote provider file content (including TOML parse excerpts)
+  in status, doctor, logs, or error responses. Uninstall removes only
+  installer-owned entries (exact managed command strings, managed Codex trust
+  records, and hook scripts that are regular files carrying their ownership
+  marker), never follows or deletes a symlink, directory, or unmarked file at a
+  managed path, and never runs `python3` to diagnose the hook runtime.
 - Avoid weakening owner-only profile checks, name guards, path containment, or
   remote safety gates.
 - Treat host governance inspection as a read-only owner operation. The stable

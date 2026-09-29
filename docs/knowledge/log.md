@@ -2,6 +2,16 @@
 
 ## Unreleased (2026-09-29)
 
+- Documented `pohunek integration doctor` and `pohunek integration uninstall` for
+  Codex and Claude (`integration.doctor` and `integration.uninstall`): stable
+  findings with remediation, the macOS `python3` stub check that never runs the
+  stub, the socket path limit check, and marker-owned, rollback-protected removal.
+- Documented the Claude and Codex integration installer transaction: a
+  per-config-directory lock file, rollback of committed files on failure, the
+  distinct `integration_install_in_progress`, `integration_destination_collision`,
+  and `integration_recovery_required` errors, an absent agent config directory
+  reported as informational `not_installed` with recovery `none`, and the macOS
+  remediation for symlinked config roots and Darwin socket path limits.
 - Documented that the managed agent hook scripts run Python in isolated mode, so
   modules in the agent's working directory and `PYTHON*` variables cannot affect
   the hook interpreter's configuration or module resolution.

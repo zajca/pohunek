@@ -281,6 +281,8 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::ASSISTANT_MATERIALIZE => assistant::handle_assistant_materialize(request).await,
         method::INTEGRATION_INSTALL => integration::handle_integration_install(request).await,
         method::INTEGRATION_STATUS => integration::handle_integration_status(request).await,
+        method::INTEGRATION_UNINSTALL => integration::handle_integration_uninstall(request).await,
+        method::INTEGRATION_DOCTOR => integration::handle_integration_doctor(request).await,
         method::HOST_INSPECT => host::handle_host_inspect(request, &state.health, &state.sessions),
         method::HOST_GOVERNANCE_INSPECT => {
             governance::handle_host_governance_inspect(request, &state.governance).await
@@ -389,7 +391,10 @@ mod tests {
     };
 
     use super::assistant::run_assistant_materialize_blocking;
-    use super::integration::{run_integration_install_blocking, run_integration_status_blocking};
+    use super::integration::{
+        run_integration_doctor_blocking, run_integration_install_blocking,
+        run_integration_status_blocking, run_integration_uninstall_blocking,
+    };
     use super::project::live_sessions;
     use super::util::parse_attach_prelude;
     use super::{handle_request, DaemonState, HealthInfo};
@@ -1097,6 +1102,38 @@ mod tests {
         let err = error_value(response, "integration.status");
         assert_eq!(err.class, protocol::ErrorClass::Daemon);
         assert_eq!(err.code, "integration_status_task_panicked");
+    }
+
+    #[tokio::test]
+    async fn integration_uninstall_blocking_task_panic_returns_daemon_error() {
+        let request = request(
+            "integration-uninstall-panic",
+            method::INTEGRATION_UNINSTALL,
+            serde_json::Value::Null,
+        );
+
+        let response =
+            run_integration_uninstall_blocking(&request, || panic!("integration removal panic"))
+                .await;
+        let err = error_value(response, "integration.uninstall");
+        assert_eq!(err.class, protocol::ErrorClass::Daemon);
+        assert_eq!(err.code, "integration_uninstall_task_panicked");
+    }
+
+    #[tokio::test]
+    async fn integration_doctor_blocking_task_panic_returns_daemon_error() {
+        let request = request(
+            "integration-doctor-panic",
+            method::INTEGRATION_DOCTOR,
+            serde_json::Value::Null,
+        );
+
+        let response =
+            run_integration_doctor_blocking(&request, || panic!("integration diagnosis panic"))
+                .await;
+        let err = error_value(response, "integration.doctor");
+        assert_eq!(err.class, protocol::ErrorClass::Daemon);
+        assert_eq!(err.code, "integration_doctor_task_panicked");
     }
 
     #[tokio::test]

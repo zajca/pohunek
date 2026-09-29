@@ -165,6 +165,207 @@ pub struct IntegrationInstallReport {
     /// Config files the installer created or merged into (settings.json /
     /// hooks.json / config.toml), in the order they were touched.
     pub config_paths: Vec<String>,
+    /// Quarantined originals whose deletion did not finish after the install
+    /// committed, each with its quarantine path and why. The install itself
+    /// succeeded; empty when cleanup completed.
+    #[serde(default)]
+    pub cleanup_incomplete: Vec<String>,
+}
+
+/// Parameters for `integration.uninstall`.
+///
+/// Removal is destructive, so the agent is always named: a request without one
+/// is rejected instead of widening to every agent, and unknown fields are
+/// rejected so a misspelled selector cannot widen a removal either.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "IntegrationUninstallParams.ts")
+)]
+pub struct IntegrationUninstallParams {
+    /// Agent to remove the managed hooks for.
+    pub agent: AgentKind,
+}
+
+/// Outcome of removing one agent's managed hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationUninstallState.ts"))]
+pub enum IntegrationUninstallState {
+    /// At least one managed asset or registration was removed.
+    Removed,
+    /// Nothing owned by the installer was present, so nothing changed.
+    NotInstalled,
+}
+
+/// Per-agent record of what the uninstaller changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "IntegrationUninstallReport.ts")
+)]
+pub struct IntegrationUninstallReport {
+    /// Agent whose managed hooks were removed.
+    pub agent: AgentKind,
+    /// Whether anything was removed.
+    pub state: IntegrationUninstallState,
+    /// Managed hook scripts that were deleted.
+    pub removed_paths: Vec<String>,
+    /// Provider registration files edited to drop only managed entries.
+    pub updated_paths: Vec<String>,
+    /// Entries at managed script paths that the installer does not own (a
+    /// symlink, a non-regular file, or a file without the ownership marker)
+    /// and that were therefore left untouched.
+    pub preserved_paths: Vec<String>,
+    /// Quarantined originals whose deletion did not finish after the removal
+    /// committed, each with its quarantine path and why. The removal itself
+    /// succeeded; empty when cleanup completed.
+    #[serde(default)]
+    pub cleanup_incomplete: Vec<String>,
+}
+
+/// Result returned by `integration.uninstall`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "IntegrationUninstallResult.ts")
+)]
+pub struct IntegrationUninstallResult {
+    /// The report for the agent the removal ran for.
+    pub uninstalled: Vec<IntegrationUninstallReport>,
+}
+
+/// Request parameters for `integration.doctor`.
+///
+/// Unknown fields are rejected so misspelled filters cannot broaden a report.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationDoctorParams.ts"))]
+pub struct IntegrationDoctorParams {
+    /// Restrict the read-only diagnosis to one agent. When omitted, diagnose
+    /// every supported hook agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub agent: Option<AgentKind>,
+}
+
+/// Stable identifier of one doctor finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationFindingCode.ts"))]
+pub enum IntegrationFindingCode {
+    /// The optional agent's config directory does not exist on this host.
+    AgentNotInstalled,
+    /// The agent is present but Pohunek's managed hooks are not installed.
+    HooksNotInstalled,
+    /// The agent config path is unresolvable, not a directory, or unreadable.
+    ConfigRootInvalid,
+    /// A managed hook script is absent.
+    AssetMissing,
+    /// A managed hook script differs from the embedded asset or is unreadable.
+    AssetModified,
+    /// A managed script or its parent has an unsafe owner, mode, or type.
+    AssetUnsafe,
+    /// A registration entry or file is missing, duplicated, or modified.
+    RegistrationDrift,
+    /// A provider configuration file is malformed or has an unusable shape.
+    ProviderConfigInvalid,
+    /// Codex hooks are not enabled in `config.toml`.
+    CodexHooksFeatureDisabled,
+    /// A Codex managed trust record is missing, modified, or stale.
+    CodexTrustDrift,
+    /// Informational: the first `python3` on the daemon's `PATH` and where it is.
+    HookRuntimePythonFound,
+    /// Informational: no `python3` was found on the daemon's `PATH`. The hooks
+    /// run `python3` from the agent's own `PATH`, which the daemon cannot see.
+    HookRuntimeMissing,
+    /// Informational: the first `python3` on the daemon's `PATH` is the macOS
+    /// Command Line Tools stub and no developer tools back it.
+    HookRuntimeMacosShim,
+    /// The daemon's own runtime socket path cannot be bound or reached.
+    HookSocketPathInvalid,
+    /// The installer lock file is not a regular owner-private file, so every
+    /// install and uninstall fails until it is repaired.
+    UnsafeInstallerLock,
+    /// A quarantined original from an earlier install or removal was left in an
+    /// agent config directory.
+    DisplacedOriginalLeftBehind,
+    /// An install or uninstall currently holds the installer lock, so nothing
+    /// was scanned or concluded for this agent; run the doctor again later.
+    OperationInProgress,
+    /// The quarantine scan could not cover every directory entry, so leftover
+    /// originals may exist that were not reported.
+    QuarantineScanIncomplete,
+    /// Drift that no more specific finding describes.
+    InstallDrift,
+}
+
+/// Severity of one doctor finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "IntegrationFindingSeverity.ts")
+)]
+pub enum IntegrationFindingSeverity {
+    /// Informational; never makes the diagnosis fail or changes its exit code.
+    Info,
+    /// The integration cannot work until the finding is remediated.
+    Error,
+}
+
+/// One diagnosed cause with its remediation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationFinding.ts"))]
+pub struct IntegrationFinding {
+    /// Stable cause identifier.
+    pub code: IntegrationFindingCode,
+    /// Whether the finding fails the diagnosis.
+    pub severity: IntegrationFindingSeverity,
+    /// Non-secret description of what was observed.
+    pub summary: String,
+    /// Operator action that resolves the finding, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub remediation: Option<String>,
+}
+
+/// Read-only diagnosis of one managed hook integration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationAgentDoctor.ts"))]
+pub struct IntegrationAgentDoctor {
+    /// Agent the diagnosis describes.
+    pub agent: AgentKind,
+    /// Whether the diagnosis has no error finding.
+    pub ok: bool,
+    /// The read-only status the findings were derived from; absent when an
+    /// install or uninstall held the installer lock and nothing was read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub status: Option<IntegrationAgentStatus>,
+    /// Every observed cause, in a stable order.
+    pub findings: Vec<IntegrationFinding>,
+}
+
+/// Result returned by `integration.doctor`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationDoctorResult.ts"))]
+pub struct IntegrationDoctorResult {
+    /// Whether every diagnosed agent is ok.
+    pub ok: bool,
+    /// One diagnosis per requested (or supported) hook agent.
+    pub agents: Vec<IntegrationAgentDoctor>,
 }
 
 #[cfg(test)]
@@ -215,6 +416,89 @@ mod tests {
                 serde_json::to_string(&recovery).expect("serialize integration recovery"),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn integration_uninstall_and_doctor_params_reject_unknown_fields() {
+        let uninstall = serde_json::from_value::<super::IntegrationUninstallParams>(
+            serde_json::json!({ "agent": "claude", "everything": true }),
+        )
+        .expect_err("unknown uninstall fields must fail");
+        assert!(uninstall.to_string().contains("unknown field `everything`"));
+        let doctor = serde_json::from_value::<super::IntegrationDoctorParams>(
+            serde_json::json!({ "agent": "codex", "deep": true }),
+        )
+        .expect_err("unknown doctor fields must fail");
+        assert!(doctor.to_string().contains("unknown field `deep`"));
+        assert_eq!(super::IntegrationDoctorParams::default().agent, None);
+        for missing in [serde_json::json!({}), serde_json::Value::Null] {
+            assert!(
+                serde_json::from_value::<super::IntegrationUninstallParams>(missing).is_err(),
+                "an uninstall must name its agent"
+            );
+        }
+    }
+
+    #[test]
+    fn integration_finding_enums_use_exact_snake_case_wire_values() {
+        use super::{IntegrationFindingCode as Code, IntegrationFindingSeverity as Severity};
+        for (code, expected) in [
+            (Code::AgentNotInstalled, "\"agent_not_installed\""),
+            (Code::HooksNotInstalled, "\"hooks_not_installed\""),
+            (Code::ConfigRootInvalid, "\"config_root_invalid\""),
+            (Code::AssetMissing, "\"asset_missing\""),
+            (Code::AssetModified, "\"asset_modified\""),
+            (Code::AssetUnsafe, "\"asset_unsafe\""),
+            (Code::RegistrationDrift, "\"registration_drift\""),
+            (Code::ProviderConfigInvalid, "\"provider_config_invalid\""),
+            (
+                Code::CodexHooksFeatureDisabled,
+                "\"codex_hooks_feature_disabled\"",
+            ),
+            (Code::CodexTrustDrift, "\"codex_trust_drift\""),
+            (
+                Code::HookRuntimePythonFound,
+                "\"hook_runtime_python_found\"",
+            ),
+            (Code::HookRuntimeMissing, "\"hook_runtime_missing\""),
+            (Code::HookRuntimeMacosShim, "\"hook_runtime_macos_shim\""),
+            (Code::HookSocketPathInvalid, "\"hook_socket_path_invalid\""),
+            (
+                Code::DisplacedOriginalLeftBehind,
+                "\"displaced_original_left_behind\"",
+            ),
+            (Code::UnsafeInstallerLock, "\"unsafe_installer_lock\""),
+            (Code::OperationInProgress, "\"operation_in_progress\""),
+            (
+                Code::QuarantineScanIncomplete,
+                "\"quarantine_scan_incomplete\"",
+            ),
+            (Code::InstallDrift, "\"install_drift\""),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&code).expect("serialize code"),
+                expected
+            );
+        }
+        for (severity, expected) in [(Severity::Info, "\"info\""), (Severity::Error, "\"error\"")] {
+            assert_eq!(
+                serde_json::to_string(&severity).expect("serialize severity"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn integration_uninstall_state_uses_exact_snake_case_wire_values() {
+        for (state, expected) in [
+            (super::IntegrationUninstallState::Removed, "\"removed\""),
+            (
+                super::IntegrationUninstallState::NotInstalled,
+                "\"not_installed\"",
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&state).expect("serialize"), expected);
         }
     }
 }

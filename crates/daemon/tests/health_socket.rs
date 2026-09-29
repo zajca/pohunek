@@ -25,7 +25,8 @@ use futures::{SinkExt, StreamExt};
 use protocol::{
     event, method, AgentActivity, AgentKind, AssistantMaterializeParams,
     AssistantMaterializeResult, AttachHeader, ErrorClass, Event, HostDiscoverParams, HostRecord,
-    IntegrationInstallState, IntegrationStatusResult, NotificationCreateParams,
+    IntegrationDoctorResult, IntegrationInstallState, IntegrationStatusResult,
+    IntegrationUninstallResult, IntegrationUninstallState, NotificationCreateParams,
     NotificationCreateResult, NotificationDeleteParams, NotificationDeleteResult, NotificationKind,
     NotificationKindPolicy, NotificationListParams, NotificationListResult, NotificationPolicy,
     NotificationPolicyParams, NotificationPolicyResult, NotificationRetentionParams,
@@ -371,6 +372,92 @@ async fn integration_status_rejects_unknown_params_at_daemon_boundary() {
     framed.get_mut().shutdown().await.expect("close client");
     shutdown.send(()).expect("send integration status shutdown");
     server.await.expect("integration status server task");
+}
+
+#[tokio::test]
+async fn integration_uninstall_and_doctor_run_at_daemon_boundary() {
+    let xdg = XdgGuard::set_all("integration-uninstall-doctor-rpc").await;
+    let claude = xdg.home().join(".claude");
+    let codex = xdg.home().join(".codex");
+    std::fs::create_dir_all(&claude).expect("create isolated Claude config");
+    std::fs::create_dir_all(&codex).expect("create isolated Codex config");
+    std::env::set_var("CLAUDE_CONFIG_DIR", &claude);
+    std::env::set_var("CODEX_HOME", &codex);
+    pohunek_daemon::integration::install_claude(&claude).expect("install Claude fixture");
+    pohunek_daemon::integration::install_codex(&codex).expect("install Codex fixture");
+    let socket = temp_socket("integration-uninstall-doctor-rpc");
+    let (shutdown, server) = spawn_server(&socket, "test").await;
+    let mut framed = connect(&socket).await;
+
+    let doctor = Request::make(
+        "integration-doctor",
+        method::INTEGRATION_DOCTOR,
+        serde_json::json!({ "agent": "codex" }),
+    );
+    let doctor: IntegrationDoctorResult =
+        serde_json::from_value(ok_payload(exchange(&mut framed, &doctor).await))
+            .expect("deserialize doctor result");
+    assert_eq!(doctor.agents.len(), 1);
+    assert_eq!(doctor.agents[0].agent, AgentKind::Codex);
+    assert_eq!(
+        doctor.agents[0].status.as_ref().expect("status").state,
+        IntegrationInstallState::Current
+    );
+
+    let unknown = Request::make(
+        "integration-doctor-unknown",
+        method::INTEGRATION_DOCTOR,
+        serde_json::json!({ "unexpected": true }),
+    );
+    assert_eq!(
+        err_payload(exchange(&mut framed, &unknown).await).code,
+        "bad_request"
+    );
+
+    let uninstall = Request::make(
+        "integration-uninstall",
+        method::INTEGRATION_UNINSTALL,
+        serde_json::json!({ "agent": "claude" }),
+    );
+    let removed: IntegrationUninstallResult =
+        serde_json::from_value(ok_payload(exchange(&mut framed, &uninstall).await))
+            .expect("deserialize uninstall result");
+    assert_eq!(removed.uninstalled.len(), 1);
+    assert_eq!(
+        removed.uninstalled[0].state,
+        IntegrationUninstallState::Removed
+    );
+    assert!(!claude.join("hooks").join("pohunek-agent-state.sh").exists());
+    assert!(codex.join("pohunek-agent-state.sh").exists());
+
+    let again = Request::make(
+        "integration-uninstall-again",
+        method::INTEGRATION_UNINSTALL,
+        serde_json::json!({ "agent": "claude" }),
+    );
+    let again: IntegrationUninstallResult =
+        serde_json::from_value(ok_payload(exchange(&mut framed, &again).await))
+            .expect("deserialize repeated uninstall result");
+    assert_eq!(
+        again.uninstalled[0].state,
+        IntegrationUninstallState::NotInstalled
+    );
+
+    for (id, params) in [
+        ("integration-uninstall-null", serde_json::Value::Null),
+        ("integration-uninstall-empty", serde_json::json!({})),
+    ] {
+        let missing_agent = Request::make(id, method::INTEGRATION_UNINSTALL, params);
+        assert_eq!(
+            err_payload(exchange(&mut framed, &missing_agent).await).code,
+            "bad_request",
+            "{id}: an uninstall must name its agent"
+        );
+    }
+
+    framed.get_mut().shutdown().await.expect("close client");
+    shutdown.send(()).expect("send integration shutdown");
+    server.await.expect("integration server task");
 }
 
 fn tree_snapshot(root: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {

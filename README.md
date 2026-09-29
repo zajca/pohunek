@@ -384,8 +384,9 @@ NetBird, never through SSH. `*` needs `--confirm-wildcard`. Use
 to remove only managed assets; add `--confirm-modified` when the ownership
 check reports changed assets. `status`, `doctor`, `update`, and `uninstall` are
 local for Hermes. Codex and Claude expose daemon-backed `integration status`
-on the effective `--host`; `doctor`, `update`, and `uninstall` remain
-Hermes-only and return a typed unsupported-action error for those agents. A
+and `integration doctor` on the effective `--host`, and a local `integration
+uninstall`; `update` remains Hermes-only and returns a typed unsupported-action
+error for those agents. A
 remote status recovery hint names the daemon host where the local-only installer
 must run; `--host` never turns `integration install` into a remote mutation.
 
@@ -450,7 +451,8 @@ port is retained.
 | `pohunek notifications policy / retention` | Per-kind/provider policy (including `hermes`), retention pruning (`--dry-run` / `--apply`). |
 | `pohunek integration install` | Install Codex/Claude hooks, or a selected Hermes profile's managed plugin with explicit access mode and host allowlist. |
 | `pohunek integration status` | Inspect daemon-managed Codex/Claude hooks on the effective `--host`, or one explicitly selected local Hermes target. |
-| `pohunek integration doctor / update / uninstall --agent hermes` | Diagnose, atomically refresh, or safely remove one explicitly selected local Hermes plugin target. |
+| `pohunek integration doctor / uninstall` | Diagnose or remove daemon-managed Codex/Claude hooks (`doctor` follows `--host`; `uninstall` targets the local daemon), or, with `--agent hermes`, one explicitly selected local Hermes plugin target. |
+| `pohunek integration update --agent hermes` | Atomically refresh one explicitly selected local Hermes plugin target. |
 | `pohunek setup [scripts\|config\|sway]` | Install launcher scripts, default config + prompt templates, sway keybindings. |
 | `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
 | `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot. |

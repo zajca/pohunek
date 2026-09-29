@@ -666,11 +666,13 @@ enum IntegrationAction {
         #[arg(long)]
         json: bool,
     },
-    /// Run payload-free diagnostics for the managed Hermes operator plugin.
+    /// Diagnose Codex/Claude hooks through the daemon, or run payload-free
+    /// diagnostics for the managed Hermes operator plugin.
     Doctor {
-        /// Hermes is the only agent with a local integration lifecycle.
-        #[arg(long, value_enum)]
-        agent: commands::integration::HookAgentArg,
+        /// Restrict the diagnosis; Hermes requires an explicit local target.
+        /// Without `--agent`, diagnoses Codex and Claude.
+        #[arg(long, value_enum, requires_if("hermes", HERMES_TARGET_GROUP))]
+        agent: Option<commands::integration::HookAgentArg>,
         #[command(flatten)]
         hermes: HermesDoctorCliOptions,
         /// Emit machine-readable JSON instead of human text.
@@ -679,8 +681,8 @@ enum IntegrationAction {
     },
     /// Atomically update the managed Hermes plugin and its policy.
     Update {
-        /// Hermes is the only agent with a local integration lifecycle.
-        #[arg(long, value_enum)]
+        /// Hermes is the only agent with an update lifecycle.
+        #[arg(long, value_enum, requires_if("hermes", HERMES_TARGET_GROUP))]
         agent: commands::integration::HookAgentArg,
         #[command(flatten)]
         hermes: HermesUpdateCliOptions,
@@ -688,10 +690,11 @@ enum IntegrationAction {
         #[arg(long)]
         json: bool,
     },
-    /// Remove only the marker-owned Hermes plugin and its policy.
+    /// Remove only the marker-owned Codex/Claude hooks, or the marker-owned
+    /// Hermes plugin and its policy.
     Uninstall {
-        /// Hermes is the only agent with a local integration lifecycle.
-        #[arg(long, value_enum)]
+        /// Agent to remove; naming it is required so a removal is never implicit.
+        #[arg(long, value_enum, requires_if("hermes", HERMES_TARGET_GROUP))]
         agent: commands::integration::HookAgentArg,
         #[command(flatten)]
         hermes: HermesUninstallCliOptions,
@@ -765,9 +768,15 @@ impl From<HermesCliOptions> for commands::integration::HermesOptions {
     }
 }
 
-/// Exactly one explicit target for a Hermes-only lifecycle verb.
+/// Clap group id of the Hermes target selectors; `--agent hermes` requires one.
+const HERMES_TARGET_GROUP: &str = "hermes_required_target";
+
+/// One explicit target for a Hermes lifecycle verb.
+///
+/// The group is optional at the clap level because Codex and Claude take no
+/// Hermes target; `--agent hermes` requires it through `requires_if`.
 #[derive(Debug, Args)]
-#[group(required = true, multiple = false)]
+#[group(id = "hermes_required_target", required = false, multiple = false)]
 struct HermesRequiredTarget {
     /// Select the default or one named Hermes profile.
     #[arg(long)]
@@ -2119,12 +2128,27 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     hermes,
                     json,
                 } => {
-                    return run_integration_hermes_action(
-                        commands::integration::HermesAction::Doctor,
-                        agent,
-                        &hermes.into(),
-                        json,
-                    );
+                    let hermes = commands::integration::HermesOptions::from(hermes);
+                    if agent == Some(commands::integration::HookAgentArg::Hermes) {
+                        return run_integration_hermes_action(
+                            commands::integration::HermesAction::Doctor,
+                            commands::integration::HookAgentArg::Hermes,
+                            &hermes,
+                            json,
+                        );
+                    }
+                    if hermes.is_explicit() {
+                        return Err(commands::integration::hermes_options_require_hermes());
+                    }
+                    let paths = Paths::resolve()?;
+                    let host = effective_host(&global_host, None);
+                    let healthy =
+                        commands::integration::run_doctor(&host, &paths, agent, json).await?;
+                    return Ok(if healthy {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    });
                 }
                 IntegrationAction::Update {
                     agent,
@@ -2143,12 +2167,22 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     hermes,
                     json,
                 } => {
-                    return run_integration_hermes_action(
-                        commands::integration::HermesAction::Uninstall,
-                        agent,
-                        &hermes.into(),
-                        json,
-                    );
+                    let hermes = commands::integration::HermesOptions::from(hermes);
+                    if agent == commands::integration::HookAgentArg::Hermes {
+                        return run_integration_hermes_action(
+                            commands::integration::HermesAction::Uninstall,
+                            agent,
+                            &hermes,
+                            json,
+                        );
+                    }
+                    if hermes.is_explicit() {
+                        return Err(commands::integration::hermes_options_require_hermes());
+                    }
+                    // Removing hooks edits this machine's agent config dirs, so it
+                    // is always a local daemon operation regardless of `--host`.
+                    let paths = Paths::resolve()?;
+                    commands::integration::run_uninstall(&paths, agent, json).await?;
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -2683,9 +2717,58 @@ mod tests {
     }
 
     #[test]
+    fn integration_doctor_and_uninstall_accept_daemon_backed_agents() {
+        for agent in ["codex", "claude"] {
+            for action in ["doctor", "uninstall"] {
+                Cli::try_parse_from(["pohunek", "integration", action, "--agent", agent])
+                    .unwrap_or_else(|error| panic!("{action} --agent {agent}: {error}"));
+            }
+        }
+        Cli::try_parse_from(["pohunek", "integration", "doctor"])
+            .expect("bare doctor diagnoses the daemon-backed agents");
+        let missing = Cli::try_parse_from(["pohunek", "integration", "uninstall"])
+            .expect_err("a removal must name its agent");
+        assert_eq!(
+            missing.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        for action in ["doctor", "uninstall", "update"] {
+            let error =
+                Cli::try_parse_from(["pohunek", "integration", action, "--agent", "hermes"])
+                    .expect_err("Hermes still requires an explicit target");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{action}"
+            );
+        }
+        match Cli::try_parse_from([
+            "pohunek",
+            "integration",
+            "uninstall",
+            "--agent",
+            "hermes",
+            "--hermes-profile",
+            "default",
+        ])
+        .expect("explicit Hermes uninstall still parses")
+        .command
+        {
+            Commands::Integration {
+                action:
+                    IntegrationAction::Uninstall {
+                        agent: commands::integration::HookAgentArg::Hermes,
+                        ..
+                    },
+            } => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn integration_rejects_non_hermes_lifecycle_before_dispatch() {
         let error = run_integration_hermes_action(
-            commands::integration::HermesAction::Doctor,
+            commands::integration::HermesAction::Update,
             commands::integration::HookAgentArg::Codex,
             &commands::integration::HermesOptions {
                 profile: None,
