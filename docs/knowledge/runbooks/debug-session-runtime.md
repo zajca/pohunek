@@ -37,6 +37,24 @@ Start with public, non-destructive inspection:
    256 MiB; `pohunek-session-<session-id>.jsonl` plus three rotations retain at
    most 16 MiB across all worker generations for that session.
 
+A `session.new` or fork that fails before any runtime exists reports one of
+these codes instead of a runtime state:
+
+- `worker_socket_path_invalid`: the worker socket below the daemon's runtime
+  directory could never be bound. A worker first binds a staged name
+  (`.s` plus 16 hexadecimal characters) beside `control.sock`, so the message
+  names that longer path and the platform limit (107 bytes on Linux, 103 on
+  macOS). The create is refused before anything is written or launched;
+  restart `pohunekd` with a shorter `XDG_RUNTIME_DIR`.
+- `worker_exited_before_ready`: the worker job ended before it accepted
+  connections. The daemon stops waiting as soon as the service manager shows
+  the job ended, instead of waiting for the worker connect deadline, and
+  retires the job. The message carries the worker's exit status in
+  `--dev-subprocess` mode and the job's final state otherwise. In
+  `--dev-subprocess` mode the worker's stderr (its first 8 KiB) is logged to
+  `pohunekd.jsonl` as a `worker.stderr.captured` event; for a native job read
+  the systemd journal or the launchd job log instead.
+
 Interpret runtime states as follows:
 
 - `live`: the daemon has the current worker controller lease. Attach should use

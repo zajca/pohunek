@@ -222,6 +222,7 @@ impl SessionRegistry {
         let resume_template = binding_resume_template(&binding);
 
         let id = Self::allocate_session_id();
+        self.ensure_worker_socket(&id)?;
         let has_snapshot = !binding.program.is_empty();
         let program = binding_program(&binding);
         let input_rules = if has_snapshot {

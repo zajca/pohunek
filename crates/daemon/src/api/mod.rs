@@ -45,7 +45,7 @@ use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 use tracing::{error, info, warn};
 
 use overlay::OverlayTransport;
-use pohunek_paths::{validate_socket_path, Platform, SocketKind};
+use pohunek_paths::{validate_staged_socket_path, Platform, SocketKind, STAGED_SOCKET_PREFIX};
 use pohunek_platform::filesystem::{
     EntryIdentity, EntryKind, FsError, MoveOutcome, StageOutcome, TrustedDir,
 };
@@ -152,7 +152,7 @@ impl ControlServer {
         state: DaemonState,
     ) -> Result<Self, DaemonError> {
         let platform = Platform::current().map_err(DaemonError::Paths)?;
-        validate_socket_path(socket_path, platform, SocketKind::Daemon)
+        validate_staged_socket_path(socket_path, platform, SocketKind::Daemon)
             .map_err(DaemonError::Paths)?;
         let dir = socket_path.parent().ok_or_else(|| DaemonError::Socket {
             path: socket_path.to_path_buf(),
@@ -172,11 +172,8 @@ impl ControlServer {
         let socket_dir = TrustedDir::open_or_create_absolute(dir, DIR_MODE)?;
         recover_stale_socket(&socket_dir, &socket_name, socket_path).await?;
 
-        let longest_bind_path = dir.join(".s0000000000000000");
-        validate_socket_path(&longest_bind_path, platform, SocketKind::Daemon)
-            .map_err(DaemonError::Paths)?;
         let (bind_name, std_listener, socket_identity) =
-            socket_dir.bind_unix_listener_staged(".s", SOCKET_MODE)?;
+            socket_dir.bind_unix_listener_staged(STAGED_SOCKET_PREFIX, SOCKET_MODE)?;
         let mut pending = PendingSocket::new(&socket_dir, bind_name.clone(), socket_identity);
         let bind_path = dir.join(&bind_name);
         std_listener

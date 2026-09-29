@@ -1743,6 +1743,7 @@ impl SessionRegistry {
         };
 
         let id = Self::allocate_session_id();
+        self.ensure_worker_socket(&id)?;
         // The durable intent, target binding, registration, initial input, and
         // every compensation run as one detached task, so a client dropped
         // after the worktree was bound cannot strand it: the task still

@@ -462,6 +462,24 @@ impl SessionRegistry {
         }
     }
 
+    /// Refuses a session whose worker socket could never be bound, before
+    /// anything of it is written or launched.
+    ///
+    /// A registry without worker roots has no socket to check; launching
+    /// reports that through [`Self::lifecycle`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `worker_socket_path_invalid` naming the path and the limit.
+    pub(super) fn ensure_worker_socket(&self, id: &SessionId) -> Result<(), ProtocolError> {
+        match self.inner.config.worker_runtime_root.as_deref() {
+            Some(runtime_root) => {
+                crate::runtime::lifecycle::worker_socket(runtime_root, &id.0).map(drop)
+            }
+            None => Ok(()),
+        }
+    }
+
     /// Waits for exclusive lifecycle authority over one session.
     pub(super) async fn lock_lifecycle(&self, id: &SessionId) -> LifecycleGuard {
         self.inner.lifecycle_locks.acquire(&id.0).await

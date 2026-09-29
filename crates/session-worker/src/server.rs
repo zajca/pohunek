@@ -253,11 +253,12 @@ impl Server {
         let worker_id = WorkerId::new(&args.worker_id)
             .map_err(|error| WorkerError::Protocol(error.to_string()))?;
         let prepared_socket = prepare_socket(&args.socket_path, platform).await?;
-        let longest_bind_path = prepared_socket.directory.path().join(".s0000000000000000");
+        let longest_bind_path =
+            pohunek_paths::longest_staged_socket_path(prepared_socket.directory.path());
         validate_socket_path(&longest_bind_path, platform, SocketKind::Worker)?;
         let (bind_name, std_listener, socket_identity) = prepared_socket
             .directory
-            .bind_unix_listener_staged(".s", SOCKET_MODE)?;
+            .bind_unix_listener_staged(pohunek_paths::STAGED_SOCKET_PREFIX, SOCKET_MODE)?;
         let mut pending = PendingSocket::new(
             &prepared_socket.directory,
             bind_name.clone(),
