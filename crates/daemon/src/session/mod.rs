@@ -3429,47 +3429,45 @@ impl SessionRegistry {
         if classified == LossClassification::Settled {
             return None;
         }
-        let mut deadline = tokio::time::Instant::now() + self.inner.config.worker_connect_deadline;
+        let connect_deadline = self.inner.config.worker_connect_deadline;
+        let mut deadline = tokio::time::Instant::now() + connect_deadline;
         loop {
             if cancel.is_cancelled() || self.inner.daemon_shutdown_started.load(Ordering::Relaxed) {
                 return None;
             }
-            let connected = tokio::select! {
+            // Each attempt ends at the deadline too: a socket that accepts and
+            // then never answers negotiation or acquisition would otherwise
+            // keep one attempt pending and the loss would never be classified.
+            let attempt = tokio::select! {
                 () = cancel.cancelled() => return None,
-                connected = Worker::connect(socket_path, &id.0, self.daemon_instance_id()) => connected,
+                attempt = tokio::time::timeout_at(
+                    deadline,
+                    Worker::connect(socket_path, &id.0, self.daemon_instance_id()),
+                ) => attempt,
             };
-            match connected {
-                Ok(worker) => match self
-                    .adopt_reconnected_worker(id, expected, worker.clone())
-                    .await
-                {
-                    RuntimeTransitionOutcome::Applied(_) => return Some(worker),
-                    RuntimeTransitionOutcome::IdentityMismatch => return None,
-                    RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
-                    | RuntimeTransitionOutcome::RetryableConcurrentChange => {
-                        tokio::select! {
-                            () = cancel.cancelled() => return None,
-                            () = tokio::time::sleep(WORKER_CONNECT_RETRY) => {}
+            let unreachable = match attempt {
+                Ok(Ok(worker)) => {
+                    match self
+                        .adopt_reconnected_worker(id, expected, worker.clone())
+                        .await
+                    {
+                        RuntimeTransitionOutcome::Applied(_) => return Some(worker),
+                        RuntimeTransitionOutcome::IdentityMismatch => return None,
+                        RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
+                        | RuntimeTransitionOutcome::RetryableConcurrentChange => {
+                            // The worker answered, so the deadline restarts:
+                            // it bounds how long the worker stays unreachable,
+                            // not how long adoption keeps being retried.
+                            deadline = tokio::time::Instant::now() + connect_deadline;
+                            tokio::select! {
+                                () = cancel.cancelled() => return None,
+                                () = tokio::time::sleep(WORKER_CONNECT_RETRY) => {}
+                            }
                         }
                     }
-                },
-                Err(reconnect_error) if tokio::time::Instant::now() >= deadline => {
-                    debug!(
-                        session_id = %id.0,
-                        error = %reconnect_error,
-                        "session worker stayed unreachable for the connect deadline"
-                    );
-                    let classified = tokio::select! {
-                        () = cancel.cancelled() => return None,
-                        classified = self.classify_lost_worker(id, expected, false) => classified,
-                    };
-                    if classified == LossClassification::Settled {
-                        return None;
-                    }
-                    deadline =
-                        tokio::time::Instant::now() + self.inner.config.worker_connect_deadline;
+                    continue;
                 }
-                Err(reconnect_error) => {
+                Ok(Err(reconnect_error)) if tokio::time::Instant::now() < deadline => {
                     debug!(
                         session_id = %id.0,
                         error = %reconnect_error,
@@ -3479,8 +3477,27 @@ impl SessionRegistry {
                         () = cancel.cancelled() => return None,
                         () = tokio::time::sleep(WORKER_CONNECT_RETRY) => {}
                     }
+                    continue;
                 }
+                Ok(Err(reconnect_error)) => reconnect_error.to_string(),
+                Err(_elapsed) => format!(
+                    "worker socket did not answer within {}ms",
+                    connect_deadline.as_millis()
+                ),
+            };
+            debug!(
+                session_id = %id.0,
+                error = %unreachable,
+                "session worker stayed unreachable for the connect deadline"
+            );
+            let classified = tokio::select! {
+                () = cancel.cancelled() => return None,
+                classified = self.classify_lost_worker(id, expected, false) => classified,
+            };
+            if classified == LossClassification::Settled {
+                return None;
             }
+            deadline = tokio::time::Instant::now() + connect_deadline;
         }
     }
 

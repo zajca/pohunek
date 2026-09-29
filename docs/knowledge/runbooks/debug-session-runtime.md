@@ -78,6 +78,8 @@ Interpret runtime states as follows:
   a proven crash is reported `lost` immediately, and a worker that stays
   unreachable is classified after the worker connect deadline (`conflict`
   while its job still runs, `reconnecting` while the manager is unavailable).
+  A socket that accepts but never answers counts as unreachable: each connect
+  attempt ends at the same deadline.
 - `conflict`: multiple or mismatched identities claim the session. Do not stop,
   unlink, or kill either candidate automatically. Preserve the job, journal,
   and socket evidence for diagnosis. `runtime_supervision_ambiguous` means the
