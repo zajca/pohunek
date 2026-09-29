@@ -5,18 +5,28 @@
 # `cargo xtask` target depends on this file, and every job below only re-runs a
 # command that is already documented and usable on its own.
 #
-#   cargo install --locked bacon
+#   cargo install --locked bacon                  # or: scripts/dev-bootstrap --install --strict
 #   bacon                                         # fast unit + integration loop
+#   bacon check                                   # compile errors only, the fastest signal
 #   bacon clippy-fast                             # the CI lint gate
 #   bacon affected                                # fast loop for changed crates only
 #   bacon nextest-fast -- -p pohunek-gui-core      # narrow to one crate
 #   bacon nextest-fast -- some_test_name           # narrow to one test
+#
+# Inside bacon, `e` switches to `check`, `c` to `clippy-fast`, `n` or `t` to
+# `nextest-fast`, and `a` to `affected` (see [keybindings] below).
 #
 # Bacon re-runs the active job when watched sources change, so the fast loops
 # stay inside the two-minute feedback target instead of re-running the full
 # workspace suite.
 
 default_job = "nextest-fast"
+
+# `cargo check` over every target and feature: the same surface clippy-fast
+# lints, without the lint pass or the test run, so a type error shows first.
+[jobs.check]
+command = ["cargo", "check", "--workspace", "--all-targets", "--all-features"]
+need_stdout = false
 
 # `fast` is the cost boundary from .config/nextest.toml: the `ci` profile plus
 # the filter that keeps PTY, PostgreSQL, and Hermes fixtures out of the loop.
@@ -54,3 +64,16 @@ command = [
     "--", "-D", "warnings",
 ]
 need_stdout = false
+
+# Explicit job switches. They override bacon's built-in `a` (`check-all`),
+# `c` (`clippy`), `n` (`nextest`) and `t` (`test`) jobs, which run narrower or
+# unfiltered commands: plain `cargo test` and `nextest` bypass the `fast`
+# profile's cost filter and pull in the PTY, PostgreSQL, and Hermes fixtures.
+# `e` is unbound by default; `k`, `j`, and `g` stay free for bacon's optional
+# vim-style scrolling keys.
+[keybindings]
+e = "job:check"
+c = "job:clippy-fast"
+n = "job:nextest-fast"
+t = "job:nextest-fast"
+a = "job:affected"

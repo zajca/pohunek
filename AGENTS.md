@@ -237,11 +237,25 @@ bun test sdk/test/config.test.ts -t "one case"   # file plus name pattern
 cd sdk && bun run typecheck                      # one package's tsc -b graph
 ```
 
+Local toolchain: `scripts/dev-bootstrap` checks the tools these loops need
+against their minimum versions and prints the exact install command for each
+missing or too-old one. `cargo-nextest` (minimum from `.config/nextest.toml`)
+and `python3` >= 3.11 are required; `bacon`, `hyperfine`
+(`scripts/measure-dev-loop`), and `mold` (CI linker only) fail only with
+`--strict`. It installs nothing unless asked:
+
+```bash
+scripts/dev-bootstrap                      # report; non-zero if a required tool fails
+scripts/dev-bootstrap --install --strict   # run the printed cargo installs for failing tools
+```
+
 Watcher (`bacon.toml` at the repo root; optional tool, no gate depends on it —
-install with `cargo install --locked bacon`):
+install with `cargo install --locked bacon`). Inside bacon, `e` switches to
+`check`, `n`/`t` to `nextest-fast`, `a` to `affected`, and `c` to `clippy-fast`:
 
 ```bash
 bacon                      # default job `nextest-fast`: profile-fast nextest loop
+bacon check                # `cargo check` over all targets and features only
 bacon clippy-fast          # CI lint command
 bacon affected             # `cargo xtask affected` on every save
 bacon nextest-fast -- -p pohunek-gui-core  # narrow the loop to one crate
