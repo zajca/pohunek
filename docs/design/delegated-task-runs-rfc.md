@@ -434,9 +434,16 @@ settles with `completed` (section 12).
     another task acquiring the tree through `worktree_of`, a lifecycle
     operation entering it, or a session of a non-task placing a PTY there —
     additionally requires that the previous occupant's session has ended and
-    its runtime containment scope is empty (the worker's PTY process group
-    and, on Linux, the session's cgroup scope, joined by the worker on stop),
-    otherwise it fails with `task_worktree_busy` naming the task to stop.
+    its runtime containment scope is empty: on Linux the session's cgroup
+    scope (joined by the worker on stop); on a platform without cgroups
+    (macOS) the worker job is retired first and the daemon runs the existing
+    ownership-marker sweep of session reconciliation
+    (`crates/daemon/src/session/reconcile.rs`) over live processes, and
+    only a sweep that finds no marker-carrying process proves the scope
+    empty. A handoff whose scope cannot be proven empty fails with
+    `task_worktree_busy` naming the task to stop (or `check_cleanup_stuck`
+    when a daemon-owned check is the culprit); it never proceeds on an
+    observed-ready agent alone.
     Session end alone never releases occupancy while daemon-owned task
     processes still run in the tree. Rounds on a shared worktree are sequential by daemon
     enforcement, not by convention. A heuristic re-open (section 6.3) that
@@ -567,12 +574,20 @@ old bytes with a fresh timestamp. Transitions derived from replayed bytes
 are marked `reconstructed`: they may confirm a transition already recorded
 for that offset, but they never create a first post-consumption `working`
 and never settle a turn on their own. Hook and provider evidence arrives on
-the worker socket, not in the output stream, so the worker stamps every
-evidence record with the session's current `next_output_offset` at the
-moment it receives the record (section 9.2). The consumption milestone from
-a `UserPromptSubmit` therefore has an output offset, and after a reconnect
-the daemon can decide exactly which replayed or live detection transitions
-lie beyond it. A turn whose only evidence of an
+the worker socket, not in the output stream, and the two channels are not
+ordered against each other: bytes the PTY produced before a hook fired may
+still sit unread in the kernel buffer. The worker therefore stamps every
+evidence record with an **offset range**, not a point: `offset_low` is
+`next_output_offset` when the record arrives, the worker then drains
+everything the PTY currently offers plus one settle read of
+`tasks.evidence_drain_settle_ms`, and `offset_high` is the offset after that
+drain (section 9.2). Bytes in `[offset_low, offset_high)` are **ambiguous**:
+detection never derives a first post-consumption `working`, a settlement or
+a re-open from them, and a consumption milestone is placed at
+`offset_high`. The consumption milestone from
+a `UserPromptSubmit` therefore has an output offset with an explicit
+ambiguous range below it, and after a reconnect the daemon can decide
+exactly which replayed or live detection transitions lie beyond it. A turn whose only evidence of an
 outage interval is reconstructed settles by hook or provider evidence from
 the worker journal (section 9.2) or runs to `timed_out` with
 `evidence_degraded`.
@@ -707,9 +722,10 @@ finalizing, re-open window close time).
 sets it to a few minutes; a request above the ceiling fails validation rather
 than being clamped silently. An omitted `timeout_ms` defaults to
 `min(tasks.max_wait_ms, time until the current phase's deadline)`: the turn
-deadline while `open`, the publication deadline (`tasks.finalize_max_ms`,
-section 12) while `finalizing`, and the window close time while `published`
-waiting for `final`.
+deadline while `open`, the current `deliver_after` plus the turn deadline
+while `queued` (section 8.2), the publication deadline
+(`tasks.finalize_max_ms`, section 12) while `finalizing`, and the window
+close time while `published` waiting for `final`.
 
 The ceiling is deliberately modest. A turn that outlives it is waited out by
 repeated `task.wait` calls, and Goal 10 counts **orchestrator tool calls, not
@@ -1100,10 +1116,14 @@ path:
    evidence record to the worker socket, with the provider identity claim
    rules of the state hooks (`MAX_IDENTITY_CLAIM_TTL_SECS`). The
    prompt-submit hook hashes the canonicalized prompt locally (section 8.1)
-   and sends only the digest and the provider identifier, so prompt text
-   never crosses the hook channel.
-2. The worker stamps each record with the current `next_output_offset`
-   (section 8.2), appends it to a bounded **evidence journal** with a
+   and sends only the digest and the provider identifier over the
+   owner-only worker socket, so prompt text never crosses the hook channel;
+   the worker holds the session's fingerprint key (issued by the daemon at
+   launch, invariant 7) and converts the plain digest into the keyed
+   fingerprint in memory **before** anything is journaled, so no plain
+   digest is ever persisted, not even during a daemon outage.
+2. The worker stamps each record with its offset range (section 8.2),
+   replaces any plain prompt digest by its keyed fingerprint, appends it to a bounded **evidence journal** with a
    per-generation sequence number, and forwards it to the daemon. The daemon
    acknowledges a sequence number only after it has durably recorded the
    evidence record and every settlement change it caused (consumption
@@ -1679,12 +1699,15 @@ therefore never contains a partially-filled `checks` list. `outcome` is
   plus a walk of descendants carrying the launch token, is recorded as
   `containment: process_group`, and the result's `integrity` is capped at
   `suspect`, because a check that calls `setsid`, drops the token and exits
-  its parent cannot be proven gone. For that reason an unconfined check's
-  scope is never treated as provably empty by the cancel-and-join barrier:
-  occupancy is released only after `tasks.unconfined_release_grace_ms` with
-  no further write observed in the tree, and the worktree is never removed
-  automatically while such a check ran in it — removal needs an explicit
-  owner `session.remove { force_unconfined: true }` on the owner path.
+  its parent cannot be proven gone. Three separate rules therefore apply to an
+  unconfined check: the cancel-and-join barrier below applies to the
+  **known** process group and token-carrying descendants, which must be
+  empty (otherwise `check_cleanup_stuck`); once they are, occupancy is
+  released only after `tasks.unconfined_release_grace_ms` with no further
+  write observed in the tree, since an escaped writer cannot be proven
+  absent; and the worktree is never removed automatically while such a
+  check ran in it — removal needs an explicit owner
+  `session.remove { force_unconfined: true }` on the owner path.
 - Finalization has its own deadline, `tasks.finalize_max_ms`, independent of
   the turn deadline (which only bounds the agent's part of the turn). On
   expiry, the running check is killed (`timed_out`), the remaining ones are
@@ -1711,7 +1734,9 @@ therefore never contains a partially-filled `checks` list. `outcome` is
   occupancy (invariant 11) and, for removal, touch the worktree. A process
   scope that cannot be confirmed empty blocks removal of the worktree and
   keeps occupancy, reported as `check_cleanup_stuck` in `task.inspect`,
-  rather than removing a tree still in use.
+  rather than removing a tree still in use; for an unconfined check this
+  test covers its known group and descendants only, and the quiet-grace
+  release above governs what follows.
 - Occupancy (invariant 11) holds until publication.
 
 Checks run in the worktree while the agent is still alive in its session, so
@@ -2311,7 +2336,14 @@ without blocking the rest.
      detached writer is joined before the auditor starts; OpenCode
      `session.fork` refused typed; the auth probe rejects a `404` and a
      missing Basic challenge; fingerprint key rotation keeps old
-     resubmissions comparable and a missing key version fails typed;
+     resubmissions comparable and a missing key version fails typed; a
+     macOS handoff refused until the ownership-marker sweep finds no
+     process; PTY bytes produced before a hook but read after it fall in the
+     ambiguous range and never settle or re-open; the worker journal never
+     contains a plain prompt digest; `task.continue --wait` on a queued turn
+     uses the `deliver_after` plus turn deadline default; an unconfined
+     check with an empty known group releases occupancy only after the quiet
+     grace;
      check definitions: a host definition shadows an in-repo one of the same
      name, an in-repo definition edited in the worktree during the turn is
      not what runs, and `repo_base` checks cap integrity at `suspect`;
@@ -2396,6 +2428,7 @@ present, no detection-only settlement for OpenCode, and the share of
    `tasks.fingerprint_max_read_bytes`, `tasks.fingerprint_max_ms`,
    `tasks.max_reviews_per_result`, `tasks.review_notes_max_bytes`,
    `tasks.store_reserve_bytes`, `tasks.attach_fence_grace_ms`,
+   `tasks.evidence_drain_settle_ms`,
    `tasks.unconfined_release_grace_ms`,
    `tasks.wait_keepalive_idle_ms`,
    `tasks.wait_keepalive_interval_ms`, `tasks.wait_keepalive_count`,

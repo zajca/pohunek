@@ -569,7 +569,7 @@ operation. The relay never mints a second ticket for a record (relay RFC
 section 12.5 forbids replacement tickets after a lost issue
 acknowledgement), so no reconciliation path can start work twice.
 
-| State | Meaning | Holds a `max_active_tasks` slot |
+| State | Meaning | Holds a `max_active_tasks` slot (only when the operation is `task.start`; other operations never hold one) |
 | --- | --- | --- |
 | `reserved` | Counters consumed, request not yet answered by the host | yes |
 | `confirmed` | Host returned a `task_id` (for `task.start`) or accepted the operation | yes, until `ended` |
