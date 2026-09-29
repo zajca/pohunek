@@ -268,7 +268,8 @@ scripts/ci-timings compare --input target/ci-timings/ci-runs.json \
 scripts/ci-timings junit --label "tests (unit, fast)" --run RUN_ID junit-unit.xml
                                   # or: --job-seconds N to supply the job wall
                                   # by hand; --job NAME picks the paired CI job
-scripts/ci-timings cache --run RUN_ID             # sccache JSON + rust-cache hits per job
+scripts/ci-timings cache --run RUN_ID             # rust-cache restores per job, plus sccache
+                                  # JSON where a job runs sccache (release.yml)
 ```
 
 Record the local baseline before and after a change to the dev loop, and
