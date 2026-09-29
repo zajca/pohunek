@@ -947,9 +947,15 @@ A fresh raw attach never requests historical replay. Its v3 `AttachStart`
 contains optional client dimensions. The worker serializes PTY resize, terminal
 model resize, snapshot capture, and live-subscriber registration against PTY
 output parsing. Normal output reads release that ordering gate after a bounded
-batch. Snapshot and resize operations temporarily suspend slave output, drain
-the finite bytes already queued on the master, apply the new geometry, capture
-the snapshot, and resume output on every success or error path. A continuously
+batch, and the master is non-blocking, so a read that finds no bytes ends the
+drain instead of sleeping with the gate held; input writes wait for queue room
+with `poll`. Snapshot and resize operations temporarily suspend slave output,
+drain the finite bytes already queued on the master, apply the new geometry,
+capture the snapshot, and resume output on every success or error path. On
+Darwin a suspended terminal hides its accepted output from the master, so the
+boundary also counts that queue (`TIOCOUTQ`) and reads exactly those bytes
+under the gate before the geometry changes, failing retryably when they do not
+arrive within a bounded settle window (see the macOS support RFC). A continuously
 writing child cannot make one ordering-gate hold unbounded, although acquisition
 fairness remains scheduler-dependent. Once the gate is acquired, no
 old-geometry bytes can cross the snapshot boundary. The worker sends a complete

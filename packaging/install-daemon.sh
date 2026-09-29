@@ -17,6 +17,16 @@
 # The prefix is `POHUNEK_INSTALL_PREFIX` or `$HOME/.local` for an install and
 # the prefix recorded in service.toml for an upgrade, which refuses a
 # different `POHUNEK_INSTALL_PREFIX`.
+#
+# The whole run holds the service transaction lock: the wrapper re-executes
+# itself under `pohunek service lock`, so no other `pohunek service
+# install|upgrade|uninstall` can start between its first query and the final
+# command, and the final command adopts the same lock with the holder token
+# `POHUNEK_SERVICE_LOCK_TOKEN` carries. Before the legacy install is
+# touched, `pohunek service check` runs every check the final command makes
+# before its first effect (HOME and the XDG roots, the prefix, every directory
+# it writes, a pending transaction, the recorded installation), so a host the
+# final command would refuse never has its legacy install retired.
 
 set -eu
 
@@ -58,10 +68,24 @@ for required in pohunek pohunekd pohunek-sessiond; do
     fi
 done
 
+# Everything below runs under the transaction lock. `pohunek service lock`
+# refuses with `service_transaction_in_progress` while another `pohunek
+# service` command holds it, before this script runs again; nothing was
+# changed then. Inside the lock the variable carries the holder's token, and
+# the `service` commands below fail rather than run unlocked when it proves
+# no live holder.
+if [ -z "${POHUNEK_SERVICE_LOCK_TOKEN:-}" ]; then
+    if [ "$accept_runtime_loss" -eq 1 ]; then
+        set -- --accept-runtime-loss
+    fi
+    exec "$archive_dir/pohunek" service lock -- sh "$0" "$@"
+fi
+
 # Asked before anything changes, so a failing query leaves the host untouched.
 # The status report is pretty-printed JSON in which only `pending_transaction`
 # carries an "operation" key. A `--json` failure prints its error document on
-# stdout, so the captured output is forwarded to stderr.
+# stdout, so the captured output is forwarded to stderr. Its
+# `transaction_in_progress` names this run's own lock and is not consulted.
 if ! status_json=$("$archive_dir/pohunek" service status --json); then
     printf '%s\n' "$status_json" >&2
     echo "\`pohunek service status --json\` failed; nothing was changed" >&2
@@ -70,22 +94,6 @@ if ! status_json=$("$archive_dir/pohunek" service status --json); then
 fi
 if ! printf '%s\n' "$status_json" | grep -q '"pending_transaction"'; then
     echo "\`pohunek service status --json\` did not report pending_transaction; nothing was changed" >&2
-    exit 1
-fi
-# A running `pohunek service install|upgrade|uninstall` holds the transaction
-# lock, which status reports as `transaction_in_progress: true`; retiring the
-# legacy service beside it could race its supervisor and prefix changes. The
-# wrapper cannot hold that lock itself, so a transaction that starts after
-# this query is caught only by the lock of the final `service` command.
-if printf '%s\n' "$status_json" \
-    | grep -Eq '"transaction_in_progress"[[:space:]]*:[[:space:]]*true'; then
-    echo "another \`pohunek service install|upgrade|uninstall\` is running; nothing was changed" >&2
-    echo "wait until it finishes and re-run $0" >&2
-    exit 1
-fi
-if ! printf '%s\n' "$status_json" \
-    | grep -Eq '"transaction_in_progress"[[:space:]]*:[[:space:]]*false'; then
-    echo "\`pohunek service status --json\` did not report transaction_in_progress; nothing was changed" >&2
     exit 1
 fi
 pending_install=0
@@ -202,115 +210,25 @@ if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
     fi
 fi
 
-# Every directory this wrapper changes files in, and every directory the
-# final `pohunek service install|upgrade` requires, is checked before the
-# legacy retirement below, which the service command cannot undo: a directory
-# that command would refuse must never have its legacy install removed first.
-#
-# The check mirrors `TrustedDir` in crates/platform/src/filesystem.rs. Each
-# existing component of the absolute path must be a directory, not a
-# symlink, and owned either by this user or by the owner of `/`, without
-# group or other write permission unless it is `/`'s owner's sticky directory
-# (`validate_ancestor`). The existing directory itself must be owned by this
-# user and, for `private`, have mode 0700 exactly (the application roots),
-# otherwise no group or other write permission (`open_absolute_owner_safe`).
-# The first missing component ends the walk, because the service command
-# creates the rest under the last existing, validated directory.
-trusted_uid=$(id -u)
-if ! system_uid=$(ls -dn / | awk 'NR == 1 { print $3 }') || [ -z "$system_uid" ]; then
-    echo "could not read the owner of /; nothing was changed" >&2
+# The legacy retirement below cannot be undone by the final command, so every
+# check that command makes before its first effect runs first, through the
+# same Rust code: `HOME` and the XDG roots the daemon needs, the prefix and
+# every directory the command writes (the prefix, `<prefix>/bin`,
+# `<prefix>/libexec`, the versions directory, the user unit directory the
+# legacy units live in, the directory of service.toml, and the private state
+# and runtime roots), a pending transaction it would refuse, and the recorded
+# installation of an upgrade. The check runs under this run's lock, which its
+# report confirms, so its answer holds until the final command.
+if ! check_json=$("$archive_dir/pohunek" service check --prefix "$prefix" --json); then
+    printf '%s\n' "$check_json" >&2
+    echo "\`pohunek service $service_action\` would refuse this host, so the legacy install was not retired;" >&2
+    echo "nothing was changed; fix the reported problem and re-run $0" >&2
     exit 1
 fi
-refuse_untrusted() {
-    echo "$1" >&2
-    echo "\`pohunek service install|upgrade\` refuses a directory reached through a symlink," >&2
-    echo "owned by another user, or writable by group or others, so the legacy install" >&2
-    echo "is not retired for it; nothing was changed. Fix the directory and re-run $0" >&2
+if ! printf '%s\n' "$check_json" | grep -Eq '"locked"[[:space:]]*:[[:space:]]*true'; then
+    printf '%s\n' "$check_json" >&2
+    echo "\`pohunek service check\` did not run under this run's transaction lock; nothing was changed" >&2
     exit 1
-}
-# Usage: check_trusted_dir <absolute-directory> owner|private
-check_trusted_dir() {
-    trust_policy=$2
-    normalize_prefix "$1" \
-        || refuse_untrusted "not an absolute path without \`.\` or \`..\` components: $1"
-    trust_rest=${normalized_prefix#/}
-    trust_path=
-    while [ -n "$trust_rest" ]; do
-        trust_component=${trust_rest%%/*}
-        case $trust_rest in
-            */*) trust_rest=${trust_rest#*/} ;;
-            *) trust_rest= ;;
-        esac
-        trust_path="$trust_path/$trust_component"
-        if [ -L "$trust_path" ]; then
-            refuse_untrusted "$trust_path is a symbolic link (checking $1)"
-        fi
-        if [ ! -e "$trust_path" ]; then
-            return 0
-        fi
-        if [ ! -d "$trust_path" ]; then
-            refuse_untrusted "$trust_path is not a directory (checking $1)"
-        fi
-        # `ls -n` prints the mode string and the numeric owner first, whatever
-        # the path spells.
-        if ! trust_entry=$(ls -dn -- "$trust_path" | awk 'NR == 1 { print $1, $3 }') \
-            || [ -z "$trust_entry" ]; then
-            refuse_untrusted "could not inspect $trust_path (checking $1)"
-        fi
-        trust_mode=${trust_entry%% *}
-        trust_owner=${trust_entry#* }
-        trust_shared=0
-        case $trust_mode in
-            ?????w*|????????w*) trust_shared=1 ;;
-        esac
-        trust_sticky=0
-        case $trust_mode in
-            ?????????[tT]*) trust_sticky=1 ;;
-        esac
-        if [ "$trust_owner" = "$system_uid" ] && [ "$trust_sticky" -eq 1 ]; then
-            :
-        elif [ "$trust_owner" = "$trusted_uid" ] && [ "$trust_shared" -eq 0 ]; then
-            :
-        elif [ "$trust_owner" = "$system_uid" ] && [ "$trust_shared" -eq 0 ]; then
-            :
-        else
-            refuse_untrusted "$trust_path is owned by uid $trust_owner with mode $trust_mode (checking $1)"
-        fi
-        if [ -z "$trust_rest" ]; then
-            if [ "$trust_owner" != "$trusted_uid" ]; then
-                refuse_untrusted "$trust_path is owned by uid $trust_owner, not by this user (uid $trusted_uid)"
-            fi
-            case $trust_policy in
-                private)
-                    case $trust_mode in
-                        drwx------|drwx------?) ;;
-                        *) refuse_untrusted "$trust_path has mode $trust_mode, not the private 0700 (drwx------)" ;;
-                    esac
-                    ;;
-                *)
-                    if [ "$trust_shared" -eq 1 ]; then
-                        refuse_untrusted "$trust_path is writable by group or others (mode $trust_mode)"
-                    fi
-                    ;;
-            esac
-        fi
-    done
-}
-# The install layout (`<prefix>/bin`, `<prefix>/libexec/pohunek`), the legacy
-# binary directory `<prefix>/libexec`, the user unit directory the legacy
-# units live in and the systemd backend writes, the directory holding
-# service.toml, and the application state and runtime roots, resolved as
-# crates/paths resolves them.
-for trusted_dir in "$prefix" "$prefix/bin" "$prefix/libexec" "$prefix/libexec/pohunek" \
-    "$legacy_unit_dir" "$config_home/pohunek"; do
-    check_trusted_dir "$trusted_dir" owner
-done
-state_home=${XDG_STATE_HOME:-"${HOME:-}/.local/state"}
-case $state_home in
-    /*) check_trusted_dir "$state_home/$POHUNEK_APP_DIR" private ;;
-esac
-if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
-    check_trusted_dir "$XDG_RUNTIME_DIR/$POHUNEK_APP_DIR" private
 fi
 
 # A pre-service install runs `pohunekd.service` from <prefix>/bin with

@@ -852,11 +852,15 @@ mod tests {
         let command = dynamic_command(CompletionContext::default());
         let service = command.find_subcommand("service").expect("service command");
         let names: Vec<_> = service.get_subcommands().map(Command::get_name).collect();
-        assert_eq!(names, ["install", "upgrade", "uninstall", "status"]);
+        assert_eq!(
+            names,
+            ["install", "upgrade", "uninstall", "status", "check", "lock"]
+        );
         for (subcommand, flag) in [
             ("install", "from"),
             ("install", "prefix"),
             ("upgrade", "from"),
+            ("check", "prefix"),
         ] {
             let arg = service
                 .find_subcommand(subcommand)

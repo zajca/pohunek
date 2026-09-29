@@ -42,6 +42,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }
+getrandom = { workspace = true }
+subtle = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-std"] }
 tokio-util = { workspace = true }
@@ -49,7 +51,7 @@ futures = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 libc = { workspace = true }
-nix = { workspace = true }
+nix = { workspace = true, features = ["signal"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 time = { workspace = true }

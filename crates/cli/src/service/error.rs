@@ -1,6 +1,6 @@
 //! Typed failures of `pohunek service`.
 
-// Rust guideline compliant 2026-09-28
+// Rust guideline compliant 2026-09-29
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -392,6 +392,31 @@ pub enum Error {
         path: PathBuf,
     },
 
+    /// `pohunek service check --prefix` names another prefix than the
+    /// installation an upgrade keeps.
+    #[error(
+        "--prefix {} differs from the installed prefix {}; `pohunek service upgrade` keeps the installed prefix",
+        requested.display(),
+        installed.display()
+    )]
+    PrefixMismatch {
+        /// The prefix the caller asked for.
+        requested: PathBuf,
+        /// The prefix `service.toml` records.
+        installed: PathBuf,
+    },
+
+    /// `POHUNEK_SERVICE_LOCK_TOKEN` does not prove a live `pohunek service
+    /// lock` holder of the transaction lock.
+    #[error(
+        "{} does not prove a held `pohunek service` transaction lock: {detail}",
+        super::inherited::LOCK_TOKEN_ENV
+    )]
+    InheritedLock {
+        /// Why the token was refused.
+        detail: String,
+    },
+
     /// A step failed and rolling the transaction back failed too.
     #[error("{original}; rolling the transaction back also failed: {rollback}")]
     RollbackFailed {
@@ -443,6 +468,8 @@ impl Error {
             Self::OrphanWorkers { .. } => "service_orphan_workers",
             Self::Record { .. } => "service_record_invalid",
             Self::TransactionInProgress { .. } => "service_transaction_in_progress",
+            Self::InheritedLock { .. } => "service_inherited_lock_invalid",
+            Self::PrefixMismatch { .. } => "service_prefix_mismatch",
             Self::RollbackFailed { .. } => "service_rollback_failed",
             #[cfg(test)]
             Self::Interrupted(_) => "service_interrupted",
@@ -506,6 +533,12 @@ impl Error {
             Self::TransactionInProgress { .. } => {
                 Some("wait for the other `pohunek service` command to finish, then retry")
             }
+            Self::PrefixMismatch { .. } => {
+                Some("omit --prefix, or pass the installed prefix, to check the upgrade")
+            }
+            Self::InheritedLock { .. } => Some(
+                "run the command under `pohunek service lock -- <command>`, or without POHUNEK_SERVICE_LOCK_TOKEN in its environment",
+            ),
             _ => None,
         }
     }

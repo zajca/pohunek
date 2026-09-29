@@ -4,7 +4,7 @@
 //! the file never depends on a serde default and each number carries its
 //! rationale in one place.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-29
 
 use std::time::Duration;
 
@@ -128,6 +128,12 @@ pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// A status probe releases the lock within microseconds; polling every 50 ms
 /// keeps the wait responsive without spinning.
 pub const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Maximum size of the transaction lock holder record.
+///
+/// The record holds two numbers and a 64-character token; anything larger
+/// is not a record `pohunek service lock` wrote.
+pub const MAX_HOLDER_BYTES: usize = 4 * 1024;
 
 /// Maximum size of the install transaction record.
 ///

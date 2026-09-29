@@ -23,11 +23,15 @@ Current CLI and command surface:
 - `crates/cli/src/commands/assistant/bootstrap.rs`
 - `crates/cli/src/commands/doctor.rs`
 - `crates/cli/src/commands/daemon.rs`
-- `crates/cli/src/commands/service.rs` — `pohunek service install|upgrade|uninstall|status`.
-- `crates/cli/src/service/` — the service transactions: install journal
-  (`record.rs`), versioned layout and GC (`layout.rs`, `usage.rs`), installer
-  values written to `service.toml` (`settings.rs`), and the stable `--json`
-  shapes (`report.rs`).
+- `crates/cli/src/commands/service.rs` — `pohunek service install|upgrade|uninstall|status|check|lock`.
+- `crates/cli/src/service/` — the service transactions: install journal and
+  transaction lock with the holder record `pohunek service lock` publishes
+  (`record.rs`), the holder token its command adopts the lock with through
+  `POHUNEK_SERVICE_LOCK_TOKEN` (`inherited.rs`), versioned
+  layout and GC (`layout.rs`, `usage.rs`), installer values written to
+  `service.toml` (`settings.rs`), the preflight `service check` shares with
+  install and upgrade (`engine.rs`, `mod.rs`), and the stable `--json` shapes
+  (`report.rs`).
 - `crates/cli/src/commands/attach.rs`
 - `crates/cli/src/commands/health.rs`
 - `crates/cli/src/commands/session.rs`
@@ -250,15 +254,18 @@ Release packaging and contributor verification:
 - `.github/workflows/ci.yml`
 - `.github/workflows/release.yml`
 - `README.md`
-- `packaging/install-daemon.sh` — release-archive wrapper that retires a
-  legacy template-unit install in a fail-closed order (refusal while a service
-  transaction runs or a target directory is untrusted, start of a stopped
-  legacy daemon for the snapshot, socket rename barrier,
+- `packaging/install-daemon.sh` — release-archive wrapper that re-executes
+  itself under `pohunek service lock` and retires a legacy template-unit
+  install in a fail-closed order (`pohunek service check` of every check the
+  final install or upgrade makes, start of a stopped legacy daemon for the
+  snapshot, socket rename barrier,
   `migration preflight --socket <moved>`, worker inventory, stop, post-stop
   re-inventory), then runs `pohunek service install|upgrade`:
   `install` while `pohunek service status --json` reports a pending install
   transaction or no `service.toml` exists, `upgrade` otherwise.
 - `crates/cli/tests/daemon_packaging.rs`
+- `crates/cli/tests/service_lock.rs` — `pohunek service lock` and the lock it
+  hands down, through the real binary.
 - `scripts/acceptance/macos-launchd-lifetime` — manual macOS logout/reboot
   lifetime procedure; `scripts/acceptance/launchd_lifetime_evidence.py`
   evaluates its observations (tested by

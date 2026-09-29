@@ -1,13 +1,16 @@
-//! `pohunek service` — install, upgrade, uninstall, and inspect the native service.
+//! `pohunek service` — install, upgrade, uninstall, check, and inspect the
+//! native service, and run a command under its transaction lock.
 //!
 //! The clap surface and human rendering live here; the transactions live in
 //! [`crate::service`]. Every subcommand is local to this machine and ignores
 //! the global `--host`.
 
-// Rust guideline compliant 2026-09-28
+// Rust guideline compliant 2026-09-29
 
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::{Subcommand, ValueHint};
 
@@ -75,6 +78,37 @@ pub(crate) enum Action {
         #[arg(long)]
         json: bool,
     },
+
+    /// Check that this version's install or upgrade would pass its preflight.
+    ///
+    /// Runs the checks `install` (while an install is pending or nothing is
+    /// installed) or `upgrade` makes before their first effect: `HOME` and
+    /// the XDG roots, the prefix, every directory they write, a pending
+    /// transaction, the recorded installation, and the prefix owner. Fails
+    /// with the error that command would fail with; changes nothing.
+    Check {
+        /// Absolute installation prefix of an install [default:
+        /// `$HOME/.local`]; an upgrade keeps the installed prefix.
+        #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
+        prefix: Option<PathBuf>,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run a command while holding the service transaction lock.
+    ///
+    /// No other `pohunek service install`, `upgrade`, or `uninstall` can run
+    /// until the command exits. Those commands, `check`, and a nested `lock`
+    /// started by the command reuse the lock through the holder token in
+    /// `POHUNEK_SERVICE_LOCK_TOKEN`, which is valid only while this process
+    /// runs. Exits with the command's status (128 plus the signal number when
+    /// a signal ended it).
+    Lock {
+        /// The command and its arguments, after `--`.
+        #[arg(last = true, required = true, value_name = "COMMAND")]
+        command: Vec<OsString>,
+    },
 }
 
 impl Action {
@@ -84,18 +118,30 @@ impl Action {
             Self::Install { json, .. }
             | Self::Upgrade { json, .. }
             | Self::Uninstall { json, .. }
+            | Self::Check { json, .. }
             | Self::Status { json } => *json,
+            Self::Lock { .. } => false,
         }
     }
 }
 
-/// Runs one `pohunek service` subcommand.
+/// Runs one `pohunek service` subcommand and returns its exit code.
+///
+/// Every subcommand but `lock` succeeds with status 0; `lock` exits with
+/// its command's status.
 ///
 /// # Errors
 ///
 /// Returns [`CliError::Service`] when the operation fails.
-pub(crate) async fn run(action: Action) -> Result<(), CliError> {
+pub(crate) async fn run(action: Action) -> Result<ExitCode, CliError> {
     match action {
+        Action::Lock { command } => {
+            let (program, arguments) = command
+                .split_first()
+                .expect("clap requires at least one command word");
+            let status = service::lock(program, arguments).await?;
+            return Ok(ExitCode::from(service::exit_code(status)));
+        }
         Action::Install { from, prefix, json } => {
             let report = service::install(from, prefix).await?;
             emit(json, &report, render_install)
@@ -103,6 +149,10 @@ pub(crate) async fn run(action: Action) -> Result<(), CliError> {
         Action::Upgrade { from, json } => {
             let report = service::upgrade(from).await?;
             emit(json, &report, render_upgrade)
+        }
+        Action::Check { prefix, json } => {
+            let report = service::check(prefix).await?;
+            emit(json, &report, render_check)
         }
         Action::Uninstall {
             stop_sessions,
@@ -120,7 +170,8 @@ pub(crate) async fn run(action: Action) -> Result<(), CliError> {
             let report = service::status().await?;
             emit(json, &report, render_status)
         }
-    }
+    }?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn emit<T: serde::Serialize>(
@@ -178,6 +229,39 @@ fn render_upgrade(report: &report::UpgradeReport) -> String {
     }
     if let Some(error) = &report.gc_error {
         let _ = writeln!(text, "warning: old versions were not cleaned up: {error}");
+    }
+    text
+}
+
+fn render_check(report: &report::CheckReport) -> String {
+    let mut text = String::new();
+    let _ = writeln!(
+        text,
+        "{} of pohunek {} would pass its preflight (namespace {}){}",
+        report.operation,
+        report.version,
+        report.namespace,
+        if report.locked {
+            ", checked under the transaction lock"
+        } else {
+            ""
+        }
+    );
+    let _ = writeln!(text, "prefix     {}", report.prefix.display());
+    let _ = writeln!(text, "config     {}", report.config_path.display());
+    if let (Some(pending), Some(action)) = (&report.pending_transaction, report.pending_action) {
+        let _ = writeln!(
+            text,
+            "pending    {} {} stopped after step {} would be {}",
+            pending.operation,
+            pending.version,
+            pending.step,
+            if action == "resume" {
+                "resumed"
+            } else {
+                "rolled back first"
+            }
+        );
     }
     text
 }
@@ -390,6 +474,57 @@ mod tests {
         ));
         Harness::try_parse_from(["service", "upgrade", "--prefix", "/p"])
             .expect_err("upgrade takes no --prefix");
+        assert!(matches!(
+            parse(&["check", "--prefix", "/p", "--json"]),
+            Action::Check { prefix: Some(prefix), json: true } if prefix == Path::new("/p")
+        ));
+        assert!(matches!(
+            parse(&["check"]),
+            Action::Check {
+                prefix: None,
+                json: false
+            }
+        ));
+    }
+
+    #[test]
+    fn lock_takes_the_whole_command_after_the_separator() {
+        let Action::Lock { command } = parse(&["lock", "--", "sh", "-c", "exit 3", "--json"])
+        else {
+            panic!("lock parses");
+        };
+        assert_eq!(command, ["sh", "-c", "exit 3", "--json"]);
+        assert!(!Action::Lock { command }.wants_json());
+        Harness::try_parse_from(["service", "lock"]).expect_err("a command is required");
+        Harness::try_parse_from(["service", "lock", "sh"]).expect_err("the command follows `--`");
+    }
+
+    #[test]
+    fn check_renders_the_transaction_and_its_pending_record() {
+        let text = render_check(&report::CheckReport {
+            operation: "install",
+            version: "1.0.0".to_owned(),
+            prefix: PathBuf::from("/p"),
+            namespace: "ns".to_owned(),
+            config_path: PathBuf::from("/c/pohunek/service.toml"),
+            pending_transaction: Some(report::PendingReport {
+                operation: "upgrade",
+                version: "0.9.0".to_owned(),
+                step: "config",
+            }),
+            pending_action: Some("roll_back"),
+            locked: true,
+        });
+        assert!(
+            text.contains("install of pohunek 1.0.0 would pass its preflight (namespace ns), checked under the transaction lock"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "pending    upgrade 0.9.0 stopped after step config would be rolled back first"
+            ),
+            "{text}"
+        );
     }
 
     #[test]

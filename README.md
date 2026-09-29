@@ -291,7 +291,10 @@ accepting the destructive boundary. An install that still runs the older
 `pohunek-session@` template workers is retired only after the wrapper has
 closed new connections to the legacy daemon, run the migration preflight, and
 re-checked every not-inactive worker state after the daemon stopped; any
-detected worker aborts the installer without removing legacy files. See the
+detected worker aborts the installer without removing legacy files. The whole
+run holds the service transaction lock (`pohunek service lock`), and
+`pohunek service check` first confirms that the final install or upgrade would
+accept `HOME`, the XDG roots, the prefix, and every directory it writes. See the
 [migration guide](docs/migrations/durable-session-workers.md) and
 [operations runbook](docs/runbooks/durable-session-workers.md).
 
@@ -421,6 +424,8 @@ port is retained.
 | `pohunek service upgrade [--from <dir>] [--json]` | Switch to the staged version, restarting only the daemon; live workers keep their PID and PTY, and unreferenced old versions are removed. |
 | `pohunek service uninstall [--stop-sessions] [--purge] [--json]` | Remove the service; refuses while sessions are live unless `--stop-sessions`, and keeps durable metadata unless `--purge`. |
 | `pohunek service status [--json]` | Daemon job, namespace, installed versions, worker jobs per generation, and any interrupted or running install transaction. |
+| `pohunek service check [--prefix <dir>] [--json]` | Run every check the install (or, for an existing service, the upgrade) of this version makes before its first effect — `HOME` and XDG roots, the prefix, every directory it writes, a pending transaction, the recorded installation — without changing anything; fails with the error code that command would. |
+| `pohunek service lock -- <command> [args...]` | Run a command while holding the service transaction lock; `pohunek service` commands it runs reuse the lock with the holder token in `POHUNEK_SERVICE_LOCK_TOKEN`, every other one is refused until it exits; the lock ends with this process, never with a process the command left behind. Exits with the command's status. |
 | `pohunek daemon start [--detach] [--dev-subprocess]` | Run the installed daemon by hand (needs `service.toml`), or with `--dev-subprocess` a development daemon with plain subprocess workers. |
 | `pohunek health` / `status` | Daemon liveness, build, and protocol version. |
 | `pohunek session new` | Start a session: `--agent`, `--name`, `--project`/`--repo`, `--branch`, `--base-branch`, `--cwd`, `--input`, `--request-timeout-ms`, `--meta k=v`. |

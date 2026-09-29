@@ -1,5 +1,20 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-09-28)
+
+- Documented `pohunek service lock -- <command>`, which runs a command under
+  the service transaction lock and lets its `pohunek service` calls adopt
+  the lock with the holder token in `POHUNEK_SERVICE_LOCK_TOKEN`
+  (`service_inherited_lock_invalid` for a token that proves no live holder),
+  and `pohunek service check`, which runs the install or upgrade preflight,
+  including the stale daemon-job check, without changing anything. Adopting
+  commands hold `service-install.lock.adopted` shared, the holder waits for
+  them before it releases the lock, and signals sent to `service lock` reach
+  its command.
+- Documented that `packaging/install-daemon.sh` runs its legacy retirement and
+  final install or upgrade under that lock and runs `service check` before it
+  touches the legacy install.
+
 ## Unreleased (2026-09-27)
 
 - Documented that a failed `session new` whose worktree compensation cannot

@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
-// Rust guideline compliant 2026-09-28
+// Rust guideline compliant 2026-09-29
 
 /// Permission and special-mode bits reported by `stat`.
 const MODE_MASK: u32 = 0o7777;
@@ -350,6 +350,25 @@ pub struct AdvisoryLock {
     _marker: File,
 }
 
+/// How a [`FileLock`] shares its lock file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockKind {
+    /// Any number of shared holders at once, and no exclusive one.
+    Shared,
+    /// One holder, and no shared one.
+    Exclusive,
+}
+
+/// A descriptor-bound advisory lock on one lock file, released on drop.
+///
+/// Unlike [`AdvisoryLock`] it takes no directory lock, so it can be held
+/// beside an [`AdvisoryLock`] of the same directory and shared among
+/// holders.
+#[derive(Debug)]
+pub struct FileLock {
+    _file: File,
+}
+
 /// An entry moved aside and bound to its original inode identity.
 #[derive(Debug)]
 pub struct StagedEntry {
@@ -660,6 +679,71 @@ impl TrustedDir {
             _directory: directory,
             _marker: marker,
         })
+    }
+
+    /// Takes a nonblocking [`LockKind`] lock on the lock file `name` alone.
+    ///
+    /// The file is created with exactly `mode` when missing and opened
+    /// without following symlinks. After the lock is taken the name must
+    /// still refer to the locked inode, so a lock file replaced meanwhile is
+    /// never mistaken for the one others lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FsError::LockContended`] when a conflicting lock is held,
+    /// [`FsError::IdentityChanged`] when the name was replaced, and another
+    /// [`FsError`] when the file is unsafe.
+    pub fn lock_file(
+        &self,
+        name: impl AsRef<OsStr>,
+        mode: u32,
+        kind: LockKind,
+    ) -> FsResult<FileLock> {
+        validate_mode(mode)?;
+        let name = validate_component(name.as_ref())?;
+        let path = self.path.join(name);
+        let (fd, created) = match fs::openat(
+            &self.file,
+            name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            mode_from_raw(mode),
+        ) {
+            Ok(fd) => (fd, true),
+            Err(rustix::io::Errno::EXIST) => (
+                fs::openat(
+                    &self.file,
+                    name,
+                    OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                    Mode::empty(),
+                )
+                .map_err(|source| io_error("open lock file", &path, source))?,
+                false,
+            ),
+            Err(source) => return Err(io_error("create lock file", &path, source)),
+        };
+        let file = File::from(fd);
+        if created {
+            fs::fchmod(&file, mode_from_raw(mode))
+                .map_err(|source| io_error("set lock file mode", &path, source))?;
+        }
+        let operation = match kind {
+            LockKind::Shared => FlockOperation::NonBlockingLockShared,
+            LockKind::Exclusive => FlockOperation::NonBlockingLockExclusive,
+        };
+        match fs::flock(&file, operation) {
+            Ok(()) => {}
+            Err(source) if source == rustix::io::Errno::AGAIN => {
+                return Err(FsError::LockContended { path });
+            }
+            Err(source) => return Err(io_error("acquire advisory lock", &path, source)),
+        }
+        let identity = validate_fd(&file, &path, EntryKind::RegularFile, Some(mode))?;
+        if inspect_entry(&self.file, &path, name, EntryKind::RegularFile, Some(mode))?
+            != Some(identity)
+        {
+            return Err(FsError::IdentityChanged { path });
+        }
+        Ok(FileLock { _file: file })
     }
 
     /// Captures a trusted entry's stable device and inode identity.
@@ -3017,6 +3101,55 @@ mod tests {
         second
             .acquire_lock("state.lock", FILE_MODE)
             .expect("acquire released lock");
+    }
+
+    #[test]
+    fn file_locks_share_or_exclude_and_ignore_the_directory_lock() {
+        let (_temporary, first) = trusted_root();
+        let second = TrustedDir::open_absolute(&first.path, DIRECTORY_MODE)
+            .expect("open second directory descriptor");
+        // An `AdvisoryLock` of the same directory does not conflict.
+        let _directory_lock = first
+            .acquire_lock("main.lock", FILE_MODE)
+            .expect("acquire main lock");
+
+        let shared = first
+            .lock_file("side.lock", FILE_MODE, LockKind::Shared)
+            .expect("first shared lock");
+        let also_shared = second
+            .lock_file("side.lock", FILE_MODE, LockKind::Shared)
+            .expect("second shared lock");
+        assert!(matches!(
+            second.lock_file("side.lock", FILE_MODE, LockKind::Exclusive),
+            Err(FsError::LockContended { .. })
+        ));
+        drop(shared);
+        assert!(matches!(
+            second.lock_file("side.lock", FILE_MODE, LockKind::Exclusive),
+            Err(FsError::LockContended { .. })
+        ));
+        drop(also_shared);
+        let exclusive = second
+            .lock_file("side.lock", FILE_MODE, LockKind::Exclusive)
+            .expect("exclusive once no shared holder remains");
+        assert!(matches!(
+            first.lock_file("side.lock", FILE_MODE, LockKind::Shared),
+            Err(FsError::LockContended { .. })
+        ));
+        drop(exclusive);
+        first
+            .lock_file("side.lock", FILE_MODE, LockKind::Shared)
+            .expect("shared after release");
+
+        fs::set_permissions(
+            first.path.join("side.lock"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .expect("widen lock file");
+        assert!(matches!(
+            first.lock_file("side.lock", FILE_MODE, LockKind::Shared),
+            Err(FsError::UnsafeMode { .. })
+        ));
     }
 
     #[test]

@@ -1723,8 +1723,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         },
         Commands::Service { action } => {
             // Service management is inherently local; `--host` is ignored.
-            commands::service::run(action).await?;
-            Ok(ExitCode::SUCCESS)
+            commands::service::run(action).await
         }
         Commands::Health { json } | Commands::Status { json } => {
             let paths = Paths::resolve()?;

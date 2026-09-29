@@ -70,7 +70,11 @@ the same version and prefix finishes it (`pohunek service uninstall` removes it
 after checking for live sessions instead, even when its `service.toml` is
 already gone). Upgrades use
 `pohunek service upgrade`; `pohunek service status` shows the daemon job,
-versions, and workers. For upgrades, removal, and runtime diagnosis, see
+versions, and workers. `pohunek service check [--prefix DIR]` runs every check
+the install or upgrade would make before changing anything, and changes
+nothing; `pohunek service lock -- <command>` runs a command that no other
+service transaction can interleave with (the archive installer uses both). For
+upgrades, removal, and runtime diagnosis, see
 [update after release](../runbooks/update-after-release.md) and
 [durable session workers](../runbooks/debug-session-runtime.md).
 
