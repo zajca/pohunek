@@ -309,6 +309,23 @@ class CheckTests(DevBootstrapCase):
         self.assertIn("cargo-nextest 0.9.145 is shadowed by an earlier copy on PATH", output)
         self.assertIn(f'export PATH={CARGO_BIN}:"$PATH"', output)
 
+    def test_cargo_failure_that_is_not_an_old_version_keeps_its_report(self):
+        # e.g. a Cargo alias shadowing `nextest`: not a PATH-order problem.
+        tools = dict(CURRENT)
+        tools["cargo-nextest"] = "garbage without a version\n"
+        host = FakeHost(on_path=tools, in_cargo_bin={"cargo-nextest": CURRENT["cargo-nextest"]})
+        host.cargo_prefers_path = True
+        status, output = self.run_main(host)
+        self.assertEqual(status, 1, output)
+        self.assertIn("cargo-nextest version unknown", output)
+        self.assertNotIn("shadowed", output)
+
+    def test_stale_cargo_home_nextest_gets_an_install_pinned_there(self):
+        host = FakeHost(in_cargo_bin={"cargo-nextest": "cargo-nextest 0.9.100\n"})
+        status, output = self.run_main(host)
+        self.assertEqual(status, 1, output)
+        self.assertIn("cargo install --root /fake/cargo-home --locked cargo-nextest", output)
+
     def test_cargo_subcommand_without_cargo_is_a_failure(self):
         status, output = self.run_main(FakeHost(cargo=False))
         self.assertEqual(status, 1, output)
@@ -340,7 +357,7 @@ class CheckTests(DevBootstrapCase):
         status, output = self.run_main(host, "--strict")
         self.assertEqual(status, 1, output)
         self.assertIn("bacon 2.0.0 is older than", output)
-        self.assertIn("cargo install --locked bacon", output)
+        self.assertIn("cargo install --root /fake/cargo-home --locked bacon", output)
         self.assertNotIn("not on PATH", output)
 
     def test_rustc_is_checked_against_the_workspace_msrv(self):

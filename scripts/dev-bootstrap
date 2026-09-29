@@ -294,11 +294,20 @@ def check_tool(tool, which, runner, cargo_bin):
             tool, argv, f"{shlex.join(argv[:2])} (Cargo's resolution)", runner
         )
         home = which(tool.name, path=str(cargo_bin))
-        if result.status == OK or home is None:
+        # Only a copy Cargo reports as too old can be a shadowing problem; any
+        # other failure (an alias, a broken Cargo config) keeps its own report.
+        if result.status != TOO_OLD or home is None:
             return result
+        copy = version_result(tool, [home, *tool.version_args], home, runner)
+        if copy.status != OK:
+            # The outdated copy Cargo runs lives in $CARGO_HOME/bin.
+            return copy
         # Cargo honours the position of $CARGO_HOME/bin when it is already on
         # PATH, so an older copy earlier on PATH can shadow a current one.
-        return shadowed_or(result, tool, home, runner, "an earlier copy on PATH")
+        return Result(
+            tool, OFF_PATH, version=copy.version, path=home,
+            detail="shadowed by an earlier copy on PATH",
+        )
     path = which(tool.name)
     in_cargo_bin = which(tool.name, path=str(cargo_bin))
     if path is None and in_cargo_bin is None:
@@ -368,8 +377,21 @@ def fix_hint(result, cargo_bin):
             f"{path_fix(cargo_bin)}"
         )
     if result.tool.install is not None:
-        return shlex.join(result.tool.install)
+        return shlex.join(install_fix(result, cargo_bin))
     return result.tool.manual
+
+
+def install_fix(result, cargo_bin):
+    """The install argv; pinned to `$CARGO_HOME` when the failing copy lives there.
+
+    `cargo install` honours CARGO_INSTALL_ROOT and `install.root`; a stale
+    copy found in `$CARGO_HOME/bin` is only replaced by installing there.
+    """
+    command = result.tool.install
+    in_home = result.path is not None and Path(result.path).parent == Path(cargo_bin)
+    if in_home and command[:2] == ("cargo", "install"):
+        return (*command[:2], "--root", str(Path(cargo_bin).parent), *command[2:])
+    return command
 
 
 def describe(result, strict, cargo_bin):
