@@ -462,6 +462,8 @@ impl Usage {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::time::Duration;
+
     use pohunek_platform::process::HostInspector;
     use pohunek_platform::supervisor::{DefinitionFacts, ServiceId, ServiceState, WorkerKey};
     use pohunek_session_worker::{JournalRecord, WorkerOrigin};
@@ -755,6 +757,37 @@ pub(crate) mod tests {
             .is_some_and(|reason| reason.contains("older pohunek")));
     }
 
+    /// Longest the test waits for the spawned stand-in to run as its copied image.
+    ///
+    /// The exec finishes within microseconds; the bound only absorbs scheduling on
+    /// a loaded runner, and expiry means the image never changed.
+    const STAND_IN_EXEC_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Poll interval while the stand-in's executable path is read back.
+    const STAND_IN_EXEC_POLL: Duration = Duration::from_millis(2);
+
+    /// Waits until the inspector reports `image` as the executable of `pid`.
+    ///
+    /// `spawn` can return while `execve` is still in flight, when the process
+    /// still runs the parent image; the collector matches processes by
+    /// executable path, so the exec must have taken effect before collecting.
+    fn await_executable(inspector: &dyn ProcessInspector, pid: u32, image: &Path) {
+        let deadline = std::time::Instant::now() + STAND_IN_EXEC_DEADLINE;
+        while inspector
+            .executable(pid)
+            .expect("read executable")
+            .as_deref()
+            != Some(image)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stand-in never executed {}",
+                image.display()
+            );
+            std::thread::sleep(STAND_IN_EXEC_POLL);
+        }
+    }
+
     #[test]
     fn a_running_process_keeps_the_version_it_executes() {
         let (_root, root) = temp_root();
@@ -767,11 +800,13 @@ pub(crate) mod tests {
             .arg("30")
             .spawn()
             .expect("spawn live worker stand-in");
+        let inspector = HostInspector::new();
+        await_executable(&inspector, child.id(), &sleeper);
 
         let usage = Usage::collect(
             &layout,
             &Journals::default(),
-            &HostInspector::new(),
+            &inspector,
             Path::new("/usr/bin/pohunek"),
         );
         child.kill().expect("kill stand-in");
