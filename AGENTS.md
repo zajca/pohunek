@@ -344,7 +344,14 @@ fixture before committing it.
 
 Extra CI jobs (run if your change touches deps/features): `cargo audit`,
 `cargo hack --feature-powerset --workspace clippy --all-targets`,
-`cargo udeps`. Note `knowledge` gates its protocol bridge behind a `protocol`
+`cargo shear --locked --deny-warnings` (stable, seconds; the unused-dependency
+gate on every PR), and
+optionally `cargo +nightly udeps --workspace --all-targets --all-features`
+(CI runs it only on `main`, the weekly sweep and manual dispatch, as the
+backstop for a dependency referenced only in code compiled out for the host).
+Suppress a verified `cargo shear` false positive with
+`[package.metadata.cargo-shear] ignored = ["<crate>"]` and a reason comment.
+Note `knowledge` gates its protocol bridge behind a `protocol`
 feature — `--all-features` only covers the everything-on case.
 
 ## Coding conventions (project-specific)

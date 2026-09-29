@@ -276,8 +276,8 @@ jobs:
           if-no-files-found: warn
 
     # Determine which CI jobs the changed files require. Heavy non-default jobs
-  # (feature-powerset, unused-deps, macOS contracts, Hermes compatibility, and
-  # TS-binding drift) only run when their inputs change or on a schedule; the
+  # (feature-powerset, macOS contracts, Hermes compatibility, and TS-binding
+  # drift) only run when their inputs change or on a schedule; the
   # always-critical jobs (fmt, clippy, fast tests, heavy tests, release build,
   # docs check, relay DB) still run on every push and PR. The workflow file
   # itself forces a relay run so filter edits are always validated.
@@ -289,7 +289,6 @@ jobs:
     outputs:
       relay: ${{ steps.filter.outputs.relay }}
       feature_matrix: ${{ steps.filter.outputs.feature_matrix }}
-      udeps: ${{ steps.filter.outputs.udeps }}
       macos: ${{ steps.filter.outputs.macos }}
       hermes: ${{ steps.filter.outputs.hermes }}
       docs_ts: ${{ steps.filter.outputs.docs_ts }}
@@ -320,19 +319,6 @@ jobs:
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
               - 'crates/**/*.rs'
-            # cargo-udeps needs the nightly toolchain and a full workspace
-            # dependency resolution (issue #125): schedule-only plus Cargo.toml,
-            # Cargo.lock changes, the workflow file, workspace Rust sources (an
-            # unused dependency usually appears by deleting its last use), and
-            # the xtask inputs that configure the unused-dependency scan.
-            udeps:
-              - 'Cargo.toml'
-              - 'crates/**/Cargo.toml'
-              - 'Cargo.lock'
-              - '.github/workflows/ci.yml'
-              - 'crates/**/*.rs'
-              - 'crates/xtask/src/checks.rs'
-              - 'crates/xtask/src/lib.rs'
             # macOS platform, path, private-protocol, session-worker, daemon,
             # CLI, launchd, and Hermes filesystem contracts run on the native
             # arm64 runner (issues #96-#100 and #125): gate on every crate
@@ -1043,14 +1029,15 @@ jobs:
       - name: Check feature powerset
         run: cargo hack --feature-powerset --workspace clippy --all-targets
 
+  # Pull requests get the stable source-level `shear` job below. cargo-udeps
+  # needs the nightly toolchain and a full workspace build, so it runs only on
+  # push to main, the weekly sweep, and manual dispatch. It is the backstop for
+  # what cargo-shear cannot see: a dependency whose only reference sits in code
+  # compiled out for the host (e.g. `#[cfg(target_os = "macos")]` on Linux).
   udeps:
     name: cargo-udeps (unused dependencies)
     runs-on: ubuntu-latest
-    # Needs the nightly toolchain + full workspace resolution (issue #125):
-    # schedule-only, push to main, manual dispatch (always a full run), or
-    # when Cargo.toml / Cargo.lock / CI change.
-    needs: changes
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.udeps == 'true' }}
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -1084,3 +1071,31 @@ jobs:
 
       - name: Check for unused dependencies
         run: cargo udeps --workspace --all-targets --all-features
+
+  # Unused-dependency check for every event, including pull requests. It reads
+  # manifests and sources without compiling, so it needs only stable cargo for
+  # `cargo metadata` and finishes in seconds. It also reports unused
+  # `[workspace.dependencies]` entries and direct dependencies that are loaded
+  # transitively anyway, both of which cargo-udeps misses (issue #173). A false
+  # positive is suppressed per crate with
+  # `[package.metadata.cargo-shear] ignored = ["<crate>"]` plus a reason comment.
+  shear:
+    name: cargo-shear (unused dependencies)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Install cargo-shear
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-shear@1.14.0
+
+      - name: Check for unused dependencies
+        run: cargo shear --locked --deny-warnings --format=github
