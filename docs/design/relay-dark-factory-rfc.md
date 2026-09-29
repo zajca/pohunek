@@ -108,9 +108,10 @@ supported operating mode or an accident.
   - the data classification table (relay RFC section 17.2) gains the rows of
     section 9;
   - the operation-ticket state machine (relay RFC section 12.5) gains a
-    one-shot `awaiting_resubmission` → `begun` transition for a
-    matching-fingerprint `begin` (task RFC section 8.8), with a ticket test
-    for it.
+    repeatable `awaiting_resubmission` → `begun` transition for a
+    matching-fingerprint `begin`, bounded by the host's resubmission window
+    and attempt cap and never after `writing`, expiry or abandonment (task
+    RFC section 8.8), with ticket tests for a first and a second crash.
 - **The delegated task runs RFC is the task substrate.** All settlement,
   causality, result and attention semantics come from there; this RFC never
   redefines them. Section 16 of that RFC is the composition this factory
@@ -838,8 +839,16 @@ the task RFC's CLI workstream lands.
   `run_id`, and never starts a new first-round task while any task of the
   run exists. Second, a **server-side generation fence**: every budgeted
   request carries `run_id` and `run_generation`; the relay stores the highest
-  generation admitted per `(team, run_id)` and refuses a lower one with
-  `factory_run_fenced` before forwarding, so a predecessor that resumes
+  generation admitted per **run owner** — the `(team, principal, run_id)` of
+  the principal whose `task.start` first used that `run_id`, so another
+  principal reusing the string gets its own namespace and can neither fence
+  nor join a run it does not own — and refuses a lower generation with
+  `factory_run_fenced` before forwarding. The generation advances only
+  through an audited `factory.run.failover` action by a team administrator
+  or by the owner account after its credential rotation; a request cannot
+  raise it by itself. `run_id` stays attribution, not authorization: the
+  fence is admission state keyed by the admitting principal. A predecessor
+  that resumes
   after the successor's first admission cannot delegate again even with a
   still-valid credential. The daemon's `if_latest_turn` preconditions and
   `worktree_of` occupancy refuse the stale plan's stops and starts on the
@@ -1064,7 +1073,9 @@ Ordered by dependency; each lands with the tests named:
      restore quarantine for factory admission, an empty human escalation
      target set failing closed, audit coalescing opening a new record per
      `result_id` and authorization generation, a fenced-out predecessor
-     manager refused by credential revocation, by `factory_run_fenced` and
+     manager refused by credential revocation, by `factory_run_fenced`
+     (keyed by run owner, so another principal's `run_id` collision neither
+     fences nor joins the run, and a request cannot raise the generation) and
      by stale preconditions, revocation after an irreversible host commit
      but before response delivery resolved by the failover barrier, the
      last human target's removal refused or suspending turn-opening

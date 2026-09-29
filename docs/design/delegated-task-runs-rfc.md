@@ -423,6 +423,20 @@ settles with `completed` (section 12).
     re-open case above. Orchestrators remove the residual risk by stopping
     finished tasks before the next round (section 16.2).
 
+    The fence covers **every** path that can place a live PTY in the tree,
+    not only input into existing task sessions. The daemon indexes all
+    sessions — task or not — by the canonical identity of their working
+    directory (`root_file_identity`, relay RFC section 12.5), and
+    `session.resume` of a stopped session bound to that tree, `session.fork`
+    with `cwd_mode: "same"`, `session.new` in place in that directory and
+    `task.start` in place all pass through the same occupancy check-and-set
+    and fail with `worktree_busy` while a task occupies the tree. Conversely
+    `task.start` — dedicated or `worktree_of` — fails with
+    `task_worktree_busy` while any live non-task session is bound to that
+    directory, naming it, so a task never starts under a tree another PTY
+    can write to. A non-task session that is stopped stays stopped until
+    occupancy ends.
+
 ## 8. Turns and Waiting
 
 ### 8.1 Delivery
@@ -969,10 +983,15 @@ On the relay path resubmission is an **amendment of the operation-ticket
 state machine** of relay RFC section 12.5, which otherwise lets a repeated
 `operation.begin` with the same ticket and fingerprint only return the
 recorded result or `in_progress`: a ticket whose operation is
-`awaiting_resubmission` accepts exactly one further `begin` with a matching
-fingerprint, CASes from that state to `begun` and executes the delivery;
-every later `begin` for the ticket returns the recorded result as before,
-and an expired or abandoned ticket never re-enters `begun`. The relay dark
+`awaiting_resubmission` accepts a further `begin` with a matching
+fingerprint, CASes from that state to `begun` and executes the delivery.
+The cycle may repeat: each time the host's authoritative delivery state is
+again `awaiting_resubmission` (a second daemon crash between `prepared` and
+dispatch), the same ticket accepts one more matching `begin`, up to
+`tasks.resubmit_max_attempts` within `tasks.resubmit_window_ms`; a ticket
+whose delivery reached `writing` or `written`, or that expired or was
+abandoned, never re-enters `begun`, and a `begin` in any other state returns
+the recorded result as before. The relay dark
 factory RFC lists this amendment (its section 3) and the accepted relay RFC
 gains it together with a one-shot resubmission case in its ticket tests.
 
@@ -1388,17 +1407,28 @@ Rules:
 - Drift is computed by comparing the worktree fingerprint at the start of
   a turn with the fingerprint recorded at the previous settlement. The
   fingerprint is a **complete streaming digest** over HEAD, branch, every
-  tracked path with its content hash and every untracked, non-ignored path
-  with its content hash — linear in the tree like `git status`, never
-  sampled, so no modification can hide from it; the caps
-  `tasks.fingerprint_max_entries` and `tasks.fingerprint_max_bytes` bound
-  only the **detail** the result lists (which paths changed), not the digest.
-  This one digest backs `drift_since_previous_turn`, `modified_during_checks`,
-  the investigate-mode `modified` check (section 11.2) and review staleness
-  (section 13.1). If it cannot be computed completely (an unreadable path,
-  an I/O error), the comparison is `unknown`: `modified`, `drift` and `stale`
-  are reported `unknown`, never clean or current, and `integrity` is at most
-  `suspect`. The fingerprint is the equality check; the snapshots above carry
+  tracked path with its content hash, every untracked non-ignored path with
+  its content hash, and every **ignored** path (except `.git`) with a
+  metadata hash (path, size, mtime, inode) — linear in the tree like
+  `git status`, never sampled, so no modification can hide from it: an
+  overwritten ignored `.env` or build artifact changes the metadata part.
+  Content is hashed up to `tasks.fingerprint_max_file_bytes` per file and
+  by metadata beyond it, and the whole computation runs under a budget
+  (`tasks.fingerprint_max_read_bytes`, `tasks.fingerprint_max_ms`); the
+  caps `tasks.fingerprint_max_entries` and `tasks.fingerprint_max_bytes`
+  bound only the **detail** the result lists. This one digest backs
+  `drift_since_previous_turn`, `modified_during_checks`, the
+  investigate-mode `modified` check (section 11.2) and review staleness
+  (section 13.1), with one distinction: a difference confined to ignored
+  paths is reported as `ignored_only` — `integrity: suspect`, never
+  `violation` or clean — because build caches change legitimately, while a
+  hard read-only guarantee needs the `readonly_mount` enforcement of
+  section 11.2. If the digest cannot be computed completely or within its
+  budget (an unreadable path, an I/O error, an agent-planted multi-gigabyte
+  file), the comparison is `unknown`: `modified`, `drift` and `stale` are
+  reported `unknown`, never clean or current, `integrity` is at most
+  `suspect`, and settlement, checks and occupancy proceed on their own
+  deadlines instead of waiting on the hash. The fingerprint is the equality check; the snapshots above carry
   the content. Drift never
   blocks a turn; it is reported so the orchestrator knows someone else changed
   the tree.
@@ -1427,7 +1457,8 @@ reports it as `enforcement`:
 The daemon verifies after settlement that the complete worktree fingerprint
 (section 10) is unchanged and reports `modified: true` (`integrity:
 violation`, section 10) otherwise, regardless of enforcement; an incomplete
-fingerprint reports `modified: unknown`, never `false`. It never claims isolation beyond the declared
+fingerprint reports `modified: unknown`, never `false`, and a change confined
+to ignored paths reports `modified: ignored_only` with `integrity: suspect`. It never claims isolation beyond the declared
 enforcement. A profile that cannot enforce investigation mode (for example a
 Claude profile without a writable-tool deny configuration) refuses
 `mode: "investigate"` at `task.start` with `task_investigate_unsupported`
@@ -1549,7 +1580,15 @@ therefore never contains a partially-filled `checks` list. `outcome` is
   only after the start time still matches, so a reused pid is never hit.
   (A pre-exec `SIGSTOP` cannot do this: Rust's `Command::spawn` waits for
   the exec to succeed before returning, and the environment is applied at
-  exec.)
+  exec.) The launcher also places the check in a **containment scope** that
+  survives `setsid` and double forks: on Linux a dedicated cgroup v2 scope
+  owned by the daemon (a transient systemd scope where the supervisor of
+  `crates/platform` provides one, otherwise a daemon-owned cgroup subtree),
+  recorded with the identity; `containment: cgroup` appears on the check
+  result. On macOS, where no equivalent exists, containment is the process
+  group plus a walk of descendants carrying the launch token, recorded as
+  `containment: process_group`, and the result's `integrity` is at most
+  `suspect` when the tree could not be proven empty.
 - Finalization has its own deadline, `tasks.finalize_max_ms`, independent of
   the turn deadline (which only bounds the agent's part of the turn). On
   expiry, the running check is killed (`timed_out`), the remaining ones are
@@ -1567,12 +1606,14 @@ therefore never contains a partially-filled `checks` list. `outcome` is
   session worker's, so ending the session does not end them. `task.stop`,
   session stop or removal of a task's session, and the cascade of section
   8.7 first cancel the task's baseline or finalization checks: they send
-  the termination signal to each recorded process group, wait up to
-  `tasks.check_kill_grace_ms`, send `SIGKILL`, and **wait until every
-  recorded process group has exited** (reaped and verified gone). Only then
+  the termination signal to each recorded containment scope, wait up to
+  `tasks.check_kill_grace_ms`, send `SIGKILL` to the whole scope (every
+  process in the cgroup, or the group plus token-carrying descendants), and
+  **wait until the scope is empty** (`cgroup.procs` empty and reaped, or no
+  descendant left). Only then
   do they record the checks as `interrupted`, publish the result, release
   occupancy (invariant 11) and, for removal, touch the worktree. A process
-  group that cannot be confirmed gone blocks removal of the worktree and
+  scope that cannot be confirmed empty blocks removal of the worktree and
   keeps occupancy, reported as `check_cleanup_stuck` in `task.inspect`,
   rather than removing a tree still in use.
 - Occupancy (invariant 11) holds until publication.
@@ -1639,9 +1680,15 @@ verdict is stored with `fingerprint_matches: false`. A stored verdict becomes
 later settlement revision or when the worktree's current fingerprint no
 longer equals the reviewed one. `task.inspect`, `task.result` and the
 `task_reviewed` event report each verdict with `result_id`, fingerprint,
-`stale` and the reason. Several verdicts per result are allowed (for example
-a human after an auditor); each is its own record with its own reviewer
-attribution.
+`stale` and the reason. Several reviewers may judge one result (for
+example a human after an auditor), but each reviewer (`caller_scope` on
+owner paths, principal on the relay path) holds at most **one current
+verdict per `result_id`**: a new `task.review` from the same reviewer
+replaces it and increments `review_revision`; notes are capped by
+`tasks.review_notes_max_bytes`, verdicts per result by
+`tasks.max_reviews_per_result` (`task_review_limit_reached`), the store cap
+applies to `task.review` like any write (`task_store_full`), and
+`task.inspect` pages verdicts like turns.
 
 **Paging.** `task.list` and the turn list in `task.inspect` are paged. Order
 is stable: tasks by `(created_at, task_id)` descending, turns by turn number
@@ -1664,7 +1711,7 @@ Typed errors introduced by this RFC:
 | `task_attention_open` | `task.continue` | The latest turn settled `attention` and was not answered. |
 | `task_agent_busy` | `task.continue` | The agent is still visibly working on an earlier prompt. |
 | `task_worktree_busy` | `task.start`, `task.continue`, `task.answer`, `task.extend` | Another task occupies the worktree (invariant 11). |
-| `worktree_busy` | `session.input`, attach with terminal control | The session's worktree is occupied by another task; only observation is admitted (invariant 11 write fence). |
+| `worktree_busy` | `session.input`, attach with terminal control, `session.resume`, `session.fork` (`cwd_mode: "same"`), in-place `session.new` | The session's worktree is occupied by another task; only observation is admitted (invariant 11 write fence). |
 | `task_worktree_unavailable` | `task.start`, `task.continue` | The shared worktree no longer exists. |
 | `task_worktree_mode_conflict` | `task.start` | `worktree_of` combined with `in_place` or `branch`. |
 | `task_session_unavailable` | `task.continue`, `task.answer` | The task is `ended` or its runtime is not live. |
@@ -1684,7 +1731,8 @@ Typed errors introduced by this RFC:
 | `worktree_in_use` | `session.remove` | Other active tasks use the session's worktree (section 8.7). |
 | `task_result_pending` | `task.result`, `task.continue` | The turn settled but its checks have not finished. |
 | `task_check_not_permitted` | `task.start`, `task.continue` | A requested check is not enabled or not permitted for the caller's origin. |
-| `task_store_full` | `task.start`, `task.continue` | A task store cap (`tasks.store_max_bytes`, `tasks.max_turns_per_task`, `tasks.max_tasks_retained`) would be exceeded (section 14). |
+| `task_store_full` | `task.start`, `task.continue`, `task.review` | A task store cap (`tasks.store_max_bytes`, `tasks.max_turns_per_task`, `tasks.max_tasks_retained`) would be exceeded (section 14). |
+| `task_review_limit_reached` | `task.review` | `tasks.max_reviews_per_result` distinct reviewers already hold a verdict on this result (section 13.1). |
 | `task_waiter_limit_reached` | `task.wait` | The task waiter pool is full. |
 | `task_request_conflict` | all idempotent methods | A reused request key with different parameters. |
 | `task_investigate_unsupported` | `task.start` | The profile cannot enforce investigation mode (section 11.2). |
@@ -2108,7 +2156,16 @@ without blocking the rest.
      detail still changes the complete fingerprint, and an unreadable path
      yields `unknown`, never clean; an in-place baseline reports
      `baseline_on: "worktree"` on a dirty checkout; `--run-id` maps to the
-     `run_id` filter;
+     `run_id` filter; fence coverage: `session.resume`, `session.fork` with
+     `cwd_mode: "same"` and in-place `session.new` refused into an occupied
+     tree, and `task.start` refused under a live non-task session; an
+     overwritten ignored file changes the fingerprint and reports
+     `ignored_only`; a planted multi-gigabyte file yields `unknown` within
+     the budget instead of blocking settlement; a check that double-forks
+     or calls `setsid` is still killed and joined through its containment
+     scope; a second crash between `prepared` and dispatch resubmits again
+     under the same ticket and the attempt cap ends it; review records
+     bounded per reviewer and per result;
      check definitions: a host definition shadows an in-repo one of the same
      name, an in-repo definition edited in the worktree during the turn is
      not what runs, and `repo_base` checks cap integrity at `suspect`;
@@ -2188,7 +2245,10 @@ present, no detection-only settlement for OpenCode, and the share of
    `tasks.finalize_max_ms`, `tasks.snapshot_max_bytes`,
    `tasks.snapshot_max_file_bytes`, `tasks.page_max_items`,
    `tasks.page_max_bytes`, `tasks.cursor_ttl_ms`, `tasks.check_kill_grace_ms`,
-   `tasks.resubmit_window_ms`, `tasks.check_launch_grace_ms`,
+   `tasks.resubmit_window_ms`, `tasks.resubmit_max_attempts`,
+   `tasks.check_launch_grace_ms`, `tasks.fingerprint_max_file_bytes`,
+   `tasks.fingerprint_max_read_bytes`, `tasks.fingerprint_max_ms`,
+   `tasks.max_reviews_per_result`, `tasks.review_notes_max_bytes`,
    `tasks.wait_keepalive_idle_ms`,
    `tasks.wait_keepalive_interval_ms`, `tasks.wait_keepalive_count`,
    `tasks.store_max_bytes`, `tasks.max_turns_per_task`,
