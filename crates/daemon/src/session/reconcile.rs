@@ -19,9 +19,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::supervision::{
-    classify_unreachable, job_identity_mismatch, observe, Cleanup, JobEvidence, JournalWorker,
-    Unreachable, CREATE_COMPENSATION_PENDING, RUNTIME_LOST, RUNTIME_LOST_CLEANUP_UNCONFIRMED,
-    UNSUPERVISED_WORKER,
+    classify_unreachable, describe_unreadable_candidates, job_identity_mismatch, observe, Cleanup,
+    JobEvidence, JournalWorker, Unreachable, CREATE_COMPENSATION_PENDING, RUNTIME_LOST,
+    RUNTIME_LOST_CLEANUP_UNCONFIRMED, UNREADABLE_CANDIDATES_RECOVER, UNSUPERVISED_WORKER,
 };
 use super::{
     current_time_millis, event, event_payload, identity_claim_expiry_is_valid, mpsc,
@@ -41,7 +41,7 @@ use crate::runtime::lifecycle::{
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-29
 
 /// Discovery reason of a worker socket that does not answer.
 const UNREACHABLE_SOCKET: &str = "worker_unavailable";
@@ -1628,10 +1628,22 @@ impl SessionRegistry {
             }
         }
         for (runtime_id, start) in runtimes {
-            if self.sweep_lost_runtime(&id.0, &runtime_id, start).await == Cleanup::Unconfirmed {
-                return Err(ambiguous(format!(
+            let outcome = self
+                .sweep_lost_runtime_detailed(&id.0, &runtime_id, start)
+                .await;
+            if outcome.cleanup == Cleanup::Unconfirmed {
+                let mut error = ambiguous(format!(
                     "processes of runtime {runtime_id} are not proven gone"
-                )));
+                ));
+                if outcome.only_unreadable_candidates_blocked() {
+                    error.msg = format!(
+                        "{}; processes whose environment cannot be read may belong to it: {}",
+                        error.msg,
+                        describe_unreadable_candidates(&outcome.unreadable)
+                    );
+                    error.recover = Some(UNREADABLE_CANDIDATES_RECOVER.to_owned());
+                }
+                return Err(error);
             }
         }
         Ok(())

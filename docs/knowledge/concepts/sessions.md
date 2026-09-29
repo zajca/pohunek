@@ -323,7 +323,12 @@ worker's process group (macOS kills only the group) outlives the stop and the
 job retirement. A sweep that cannot confirm every marked process exited fails
 the removal with `runtime_supervision_ambiguous` and keeps the session listed
 with its removal intent; `session rm` again, or the next daemon start,
-finishes it once the leftover process is gone.
+finishes it once the leftover process is gone. When the only obstacle is
+same-user processes whose environment cannot be read (so they cannot be proven
+foreign to the runtime), the refusal message lists them as `pid N (start S,
+command `name`)`, at most eight and then `and N more`, and its `recover` hint
+says to inspect and end the ones that belong to the session before retrying.
+A refusal for any other reason lists no processes.
 
 Reconciliation joins the service manager's jobs with worker sockets and
 journals for each worker generation. It reports `runtime_lost` when a worker's

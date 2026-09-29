@@ -127,7 +127,11 @@ Interpret runtime states as follows:
   with `runtime_supervision_ambiguous`, keeping the session and its removal
   intent, while that sweep cannot confirm every marked process exited (for
   example one whose environment cannot be read); look for leftover processes
-  of the session with `ps`, stop them, and retry. A removal finished by
+  of the session with `ps`, stop them, and retry. When unreadable same-user
+  processes are the only obstacle, the error message names each as
+  `pid N (start S, command `name`)` (at most eight, then `and N more`) and
+  `recover` says to inspect them, end the ones that belong to the session, and
+  retry; a refusal for another reason lists no processes. A removal finished by
   reconciliation after a daemon restart shows this `conflict` reason while it
   retries on its own.
 - `incompatible`: the worker is alive but private protocol negotiation failed.
