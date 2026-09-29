@@ -175,14 +175,29 @@ the measurement path behind
 `docs/design/test-performance-report.md`.
 
 The loop cost boundary (nextest >= 0.9.131; profiles in `.config/nextest.toml`,
-shard helper requires Python >= 3.11). CI runs four fast matrix shards and one
-heavy job independently of lint/release jobs. The cost boundary is
+shard helper requires Python >= 3.11). CI compiles the workspace test binaries
+once in `build-tests` (`cargo nextest archive --workspace --all-features`) and
+runs four fast matrix shards, the heavy job, and the relay DB job from that
+archive, independently of lint/release jobs. The cost boundary is
 `profile.fast.default-filter`; update it when adding a PTY, DB, Hermes, or other
 costly fixture. The helper takes its exact complement for heavy and verifies
 all discovered tests, including ignored ones, are assigned exactly once. The
 `relay-db` shard needs the real worker binary and disposable PostgreSQL URL
 (`python3 scripts/test-partitions run relay-db`); `cargo t`/`cargo ti` do not.
-`cargo tw` remains unfiltered at four test processes. In CI, the Postgres-backed
+`cargo tw` remains unfiltered at four test processes. Archive jobs install only
+`cargo-nextest` (no rust-cache; the heavy job adds a Clippy toolchain and
+`cargo fetch --locked` for `xtask::dependency_policy`) and call
+`python3 scripts/test-partitions --archive-file A run|check ...`, which
+extracts `A` into the checkout's `target/` and lists or runs without compiling.
+Tests locate binaries and sources through compile-time paths
+(`env!("CARGO_BIN_EXE_*")`, `env!("CARGO_MANIFEST_DIR")`, the worker at
+`<workspace>/target/debug/pohunek-sessiond`), so an archive only runs at the
+absolute workspace path it was built in; the helper refuses any other path.
+`archive.include` in `.config/nextest.toml` makes archive creation fail when
+`pohunek-sessiond` is missing, so daemon tests never run without their worker.
+`build-bins` remains a separate default-feature build for the web and Hermes
+jobs, because the archive's `--all-features` build enables cli's `test-util`.
+In CI, the Postgres-backed
 relay job is gated by a paths filter and does not run (its PostgreSQL service
 never starts) for non-relay changes.
 
@@ -217,6 +232,7 @@ cargo nextest run --profile local -p pohunek-cli some_test_name  # one test
 cargo clippy -p pohunek-daemon --all-targets  # lint one crate
 python3 scripts/test-partitions run cli       # exact CI shard: unit/daemon/relay/cli/relay-db/heavy
 python3 scripts/test-partitions check         # exhaustive, disjoint nextest inventory check
+python3 scripts/test-partitions --archive-file nextest-archive.tar.zst run heavy  # CI mode: no compile
 ```
 
 `cargo ta` (`cargo xtask affected [--base REF] [--print] [-- NEXTEST_ARGS]`)

@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Run disjoint nextest cost shards and verify coverage using nextest itself."""
+"""Run disjoint nextest cost shards and verify coverage using nextest itself.
+
+By default nextest builds the workspace test binaries. With `--archive-file`
+every nextest call instead extracts a prebuilt `cargo nextest archive` into
+this checkout's `target/` and lists or runs from it without compiling, which
+is how CI shares one build across the shard jobs.
+"""
 
 import argparse
 import collections
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -85,28 +92,122 @@ def junit_report(config, profile, root):
     return None
 
 
-def inventory(expression=None):
-    command = [
-        "cargo", "nextest", "list", "--profile", "ci", "--workspace",
-        "--all-features", "--run-ignored", "all", "--message-format", "json",
+class Archive:
+    """A nextest archive, extracted into this checkout by its first use.
+
+    The first nextest call extracts the archive (about 1.4 GB, seconds of
+    work); every later call of the same invocation reuses the extracted
+    binaries through the metadata files the archive carries, so `check`
+    extracts once instead of once per shard.
+    """
+
+    def __init__(self, file):
+        self.file = Path(file)
+        self.extracted = False
+
+    def arguments(self):
+        """The nextest options selecting the build; extracts on the first call."""
+        if not self.extracted:
+            self.extracted = True
+            return [
+                "--archive-file", str(self.file),
+                "--extract-to", str(ROOT), "--extract-overwrite",
+                "--workspace-remap", str(ROOT),
+            ]
+        store = ROOT / "target" / "nextest"
+        return [
+            "--binaries-metadata", str(store / "binaries-metadata.json"),
+            "--cargo-metadata", str(store / "cargo-metadata.json"),
+            "--workspace-remap", str(ROOT),
+            "--target-dir-remap", str(ROOT / "target"),
+        ]
+
+
+def nextest_command(subcommand, profile, archive):
+    """The nextest invocation prefix for `subcommand` (`list` or `run`).
+
+    A build run passes the workspace selection to cargo. An archive run takes
+    its package and feature selection from the archive and maps the workspace
+    root to this checkout. It calls the `cargo-nextest` binary directly when
+    that is on PATH, so CI test jobs need no Rust toolchain; otherwise
+    `cargo nextest` finds it.
+    """
+    if archive is None:
+        return [
+            "cargo", "nextest", subcommand, "--profile", profile, "--workspace",
+            "--all-features",
+        ]
+    direct = shutil.which("cargo-nextest")
+    return [
+        *([direct, "nextest"] if direct else ["cargo", "nextest"]),
+        subcommand, "--profile", profile, *archive.arguments(),
     ]
+
+
+def inventory(expression=None, archive=None):
+    command = nextest_command("list", "ci", archive)
+    command.extend(["--run-ignored", "all", "--message-format", "json"])
     if expression is not None:
         command.extend(["-E", expression])
     result = subprocess.run(command, cwd=ROOT, check=True, stdout=subprocess.PIPE)
     return selected_tests(json.loads(result.stdout))
 
 
+# Member of every nextest archive holding `cargo metadata` of the build.
+ARCHIVE_CARGO_METADATA = "target/nextest/cargo-metadata.json"
+
+
+def require_archive_built_here(archive):
+    """Fail unless `archive` was built in this checkout's absolute path.
+
+    Tests locate binaries and sources through compile-time paths
+    (`env!("CARGO_BIN_EXE_*")`, `env!("CARGO_MANIFEST_DIR")`, the worker at
+    `<workspace>/target/debug/pohunek-sessiond`). Those resolve only when the
+    archive is extracted at the workspace root it was built in; anywhere else
+    dozens of tests fail on missing files, so refuse up front with the cause.
+    """
+    if not Path(archive).is_file():
+        raise ValueError(f"nextest archive not found: {archive}")
+    member = subprocess.run(
+        ["tar", "--zstd", "-xOf", str(archive), ARCHIVE_CARGO_METADATA],
+        check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if member.returncode != 0:
+        raise ValueError(
+            f"cannot read {ARCHIVE_CARGO_METADATA} from {archive}: "
+            f"{member.stderr.decode(errors='replace').strip()}"
+        )
+    built_in = Path(json.loads(member.stdout)["workspace_root"])
+    if built_in != ROOT:
+        raise ValueError(
+            f"archive was built in {built_in} but this checkout is {ROOT}; "
+            "extract and run it at the path it was built in"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("run", "check", "filter"))
     parser.add_argument("shard", nargs="?", choices=SHARDS)
+    parser.add_argument(
+        "--archive-file", type=Path,
+        help="run and check from this `cargo nextest archive` file instead of building; "
+             "extracts into this checkout and requires the archive's build path to match",
+    )
     args = parser.parse_args()
+    archive = None
+    if args.archive_file is not None:
+        try:
+            require_archive_built_here(args.archive_file.resolve())
+        except ValueError as error:
+            parser.error(str(error))
+        archive = Archive(args.archive_file.resolve())
     expressions = filters()
     if args.action == "check":
         if args.shard is not None:
             parser.error("check verifies all shards; do not specify one")
-        universe = inventory()
-        selections = {name: inventory(expressions[name]) for name in SHARDS}
+        universe = inventory(archive=archive)
+        selections = {name: inventory(expressions[name], archive) for name in SHARDS}
         validate_coverage(universe, selections)
         for name, tests in selections.items():
             print(f"{name}: {len(tests)} tests")
@@ -129,10 +230,8 @@ def main():
     # the build fails first; the job summary and upload must see none instead.
     if report is not None:
         report.unlink(missing_ok=True)
-    command = [
-        "cargo", "nextest", "run", "--profile", profile, "--workspace",
-        "--all-features", "-E", expressions[args.shard],
-    ]
+    command = nextest_command("run", profile, archive)
+    command.extend(["-E", expressions[args.shard]])
     sys.exit(subprocess.run(command, cwd=ROOT, check=False).returncode)
 
 

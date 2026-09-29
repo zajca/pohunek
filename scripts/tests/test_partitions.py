@@ -79,6 +79,139 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(expressions["heavy"], f"(not ({fast})) and not ({partitions.RELAY})")
 
 
+class ArchiveModeTests(unittest.TestCase):
+    ARCHIVE = Path("/archives/nextest-archive.tar.zst")
+
+    def test_build_mode_compiles_the_workspace(self):
+        command = partitions.nextest_command("run", "heavy", None)
+        self.assertEqual(command[:3], ["cargo", "nextest", "run"])
+        self.assertIn("--workspace", command)
+        self.assertIn("--all-features", command)
+        self.assertNotIn("--archive-file", command)
+
+    def test_archive_mode_extracts_into_the_checkout_and_never_builds(self):
+        for direct in ("/bin/cargo-nextest", None):
+            with self.subTest(direct=direct), \
+                    mock.patch.object(partitions.shutil, "which", return_value=direct):
+                command = partitions.nextest_command(
+                    "list", "ci", partitions.Archive(self.ARCHIVE)
+                )
+                self.assertEqual(
+                    command[:3], [direct, "nextest", "list"] if direct else ["cargo", "nextest", "list"]
+                )
+                self.assertEqual(command[command.index("--archive-file") + 1], str(self.ARCHIVE))
+                self.assertEqual(command[command.index("--extract-to") + 1], str(partitions.ROOT))
+                self.assertEqual(command[command.index("--workspace-remap") + 1], str(partitions.ROOT))
+                self.assertIn("--extract-overwrite", command)
+                self.assertNotIn("--workspace", command)
+                self.assertNotIn("--all-features", command)
+
+    def test_only_the_first_call_extracts_the_archive(self):
+        archive = partitions.Archive(self.ARCHIVE)
+        calls = [partitions.nextest_command("list", "ci", archive) for _ in range(3)]
+        self.assertEqual([("--extract-to" in c) for c in calls], [True, False, False])
+        self.assertEqual([("--archive-file" in c) for c in calls], [True, False, False])
+        store = partitions.ROOT / "target" / "nextest"
+        for command in calls[1:]:
+            self.assertEqual(
+                command[command.index("--binaries-metadata") + 1],
+                str(store / "binaries-metadata.json"),
+            )
+            self.assertEqual(
+                command[command.index("--cargo-metadata") + 1],
+                str(store / "cargo-metadata.json"),
+            )
+            self.assertEqual(command[command.index("--workspace-remap") + 1], str(partitions.ROOT))
+
+    def test_check_extracts_once_and_still_detects_overlap_and_gaps(self):
+        shards = {name: {(f"bin-{name}", "t")} for name in partitions.SHARDS}
+        universe = set.union(*shards.values())
+
+        def run_check(selections):
+            commands = []
+
+            def fake_run(command, **kwargs):
+                commands.append(command)
+                return subprocess.CompletedProcess(command, 0, stdout=b"{}")
+
+            answers = iter([universe, *[selections[n] for n in partitions.SHARDS]])
+            with mock.patch.object(partitions, "require_archive_built_here"), \
+                    mock.patch.object(partitions.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(partitions, "selected_tests", side_effect=lambda _d: next(answers)), \
+                    mock.patch.object(sys, "argv", [
+                        "test-partitions", "--archive-file", str(self.ARCHIVE), "check",
+                    ]):
+                partitions.main()
+            return commands
+
+        commands = run_check(shards)
+        self.assertEqual(len(commands), 1 + len(partitions.SHARDS))
+        self.assertEqual(sum("--extract-to" in c for c in commands), 1)
+        overlapping = {**shards, "cli": shards["cli"] | shards["unit"]}
+        with self.assertRaisesRegex(ValueError, "overlap="):
+            run_check(overlapping)
+        gapped = {**shards, "heavy": set()}
+        with self.assertRaisesRegex(ValueError, "empty=|missing="):
+            run_check(gapped)
+
+    def test_profile_and_filter_survive_in_archive_mode(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive = Path(root) / "a.tar.zst"
+            config = Path(root) / ".config" / "nextest.toml"
+            config.parent.mkdir()
+            config.write_bytes((SCRIPT.parent.parent / ".config/nextest.toml").read_bytes())
+            seen = []
+
+            def fake_run(command, **kwargs):
+                seen.append(command)
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(partitions, "ROOT", Path(root)), \
+                    mock.patch.object(partitions, "require_archive_built_here"), \
+                    mock.patch.object(partitions.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(sys, "argv", [
+                        "test-partitions", "--archive-file", str(archive), "run", "relay-db",
+                    ]):
+                with self.assertRaises(SystemExit):
+                    partitions.main()
+        command = seen[-1]
+        self.assertEqual(command[command.index("--profile") + 1], "relay-db")
+        self.assertEqual(command[command.index("-E") + 1], partitions.filters()["relay-db"])
+        self.assertIn("--archive-file", command)
+
+    def make_archive(self, root, workspace_root):
+        """A tar.zst holding only the cargo metadata member nextest archives."""
+        member = Path(root) / "src" / partitions.ARCHIVE_CARGO_METADATA
+        member.parent.mkdir(parents=True)
+        member.write_text('{"workspace_root": "%s"}' % workspace_root)
+        archive = Path(root) / "a.tar.zst"
+        subprocess.run(
+            ["tar", "--zstd", "-cf", str(archive), "-C", str(Path(root) / "src"), "target"],
+            check=True,
+        )
+        return archive
+
+    def test_archive_built_in_this_checkout_is_accepted(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive = self.make_archive(root, partitions.ROOT)
+            partitions.require_archive_built_here(archive)
+
+    def test_archive_built_elsewhere_is_refused(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive = self.make_archive(root, "/somewhere/else")
+            with self.assertRaisesRegex(ValueError, "built in /somewhere/else"):
+                partitions.require_archive_built_here(archive)
+
+    def test_missing_or_unreadable_archive_is_refused(self):
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaisesRegex(ValueError, "not found"):
+                partitions.require_archive_built_here(Path(root) / "absent.tar.zst")
+            garbage = Path(root) / "garbage.tar.zst"
+            garbage.write_text("not an archive")
+            with self.assertRaisesRegex(ValueError, "cannot read"):
+                partitions.require_archive_built_here(garbage)
+
+
 if __name__ == "__main__":
     unittest.main()
 
