@@ -751,8 +751,10 @@ When a turn settles `attention`:
    - only human principals are escalation targets. A service account holding
      a `task.answer` grant may observe the attention through the projection
      like any authorized principal, but it is never the escalation target,
-     so a human always learns of the question. That guarantee is enforced,
-     not assumed: the target set is validated to contain at least one active
+     so a human learns of the question whenever a human target exists. That
+     guarantee is fail-closed rather than absolute — an external identity
+     provider can still disable the last human account mid-run — and is
+     enforced as follows: the target set is validated to contain at least one active
      human when a factory is set up on a team (role assignment, share
      approval) and on every membership or credential change; if it would
      become empty, the relay falls back to the team's active human `Owner`s
@@ -769,8 +771,12 @@ When a turn settles `attention`:
      turn-opening operation on the team — `task.start`, `task.continue`,
      `task.extend`, service-account `task.answer` — is suspended with
      `factory_no_escalation_target`, in-flight turns may still settle
-     `attention`, and each such attention is flagged `unescalated` in audit
-     until a human target exists again.
+     `attention`, and each such attention is flagged `unescalated` in audit.
+     Recovery is an operator action: installing a human target (membership
+     change or a new human `Owner`/`Admin`) re-delivers every `unescalated`
+     attention notification to the new target set and lifts the
+     suspension; the run's terminal report lists any attention that parked
+     unescalated.
 2. The turn stays `attention` until answered or explicitly stopped. There is
    no escalation timeout that auto-resolves, auto-approves, or auto-fails.
 3. An authorized principal answers via `task.answer` under section 7.3.
@@ -1030,8 +1036,11 @@ condition fired and the last verified state.
    An approval typed into the terminal comes only from a holder of
    `session.terminal.control`, which a service account holds only through an
    explicit grant (section 7.1); it is audited as terminal control and
-   recorded by the task layer as a terminal resolution. Escalation always
-   reaches a human (section 11).
+   recorded by the task layer as a terminal resolution. Escalation reaches a human whenever one exists and is **fail-closed**
+   otherwise: turn-opening operations are suspended, in-flight attentions are
+   flagged `unescalated`, and operator recovery (installing a human target)
+   re-delivers them (section 11); no silent auto-resolution ever fills the
+   gap.
 4. Budget exhaustion never stops, pauses or mutates running work.
 5. Relay persistence and audit carry no prompt text, results, check logs,
    final messages or terminal content.

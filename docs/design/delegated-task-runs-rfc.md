@@ -296,9 +296,11 @@ cycles, re-opens and late completions together — is likewise capped by
 `tasks.max_settlement_revisions_per_turn`; the store reserve of section 14
 is sized for that many result documents, and the last permitted revision is
 always a terminal one: reaching the cap settles the turn `failed` with
-reason `revision_limit_reached`, cancels any pending attention, and seals
-the turn like `task.stop` does, so the guaranteed terminal writes always
-fit.
+reason `revision_limit_reached` and then performs a full `task.stop`: the
+runtime is stopped and joined, any pending attention is cancelled, the
+task becomes `ended` and sealed, so no provider is left blocked or working
+behind a turn nobody can answer or continue, and the guaranteed terminal
+writes always fit.
 
 `failed`, `exited`, `lost`, `stopped` and `cancelled` are final; `completed` is final when
 its finality is `provider_confirmed` and final unless re-opened when it is
@@ -1040,7 +1042,10 @@ effect and follows the same protocol with the journal states `sending`
 (recorded before the request is issued, with the `attention_id`, the
 provider request or form id and the **keyed fingerprint** of the answer
 value — never the value itself, since the journal holds no input) and
-`sent` (recorded with the provider's response status). Recovery: `absent` — not sent, issue the request; `sent` —
+`sent` (recorded with the provider's response status). Recovery: `absent` while the daemon still holds the answer value in
+memory — not sent, issue the request; `absent` after a daemon restart — the
+value is gone and only its fingerprint remains, so the delivery moves to
+`awaiting_resubmission` exactly like a prompt (below); `sent` —
 record `delivered` from the journaled response; `sending` — the worker asks
 the provider for the request's state: already replied resolves to `delivered` only when the fingerprint of the
 provider's recorded reply equals the journaled fingerprint for that request
@@ -1348,8 +1353,16 @@ Runtime design:
    turn.
 6. A detection manifest still exists for owner-facing activity when the event
    stream is unavailable, with `evidence_degraded` reported.
-7. Credentials are provisioned explicitly. An isolated per-session data
-   directory does not inherit provider logins, so the task profile declares a
+7. The per-session OpenCode **data directory** (`opencode.db` and the
+   server's own state) is owner-private and lives under the daemon state
+   directory as session content (`sessions/<session-id>/opencode/`), never
+   in the worker's runtime directory: it is created and bound in the same
+   session store write that creates the session, survives worker and
+   runtime generations so recovery resumes the same native session, and is
+   removed with the session by `session.remove` and the retention sweep
+   (section 14), so conversations and any imported login never outlive the
+   session's content retention. Credentials are provisioned explicitly. An
+   isolated per-session data directory does not inherit provider logins, so the task profile declares a
    *reference* to a secret (host keyring entry or owner-only file under the
    host configuration) and the worker injects the resolved value only into
    the server child's environment. Secret values never enter task records,
@@ -2368,7 +2381,10 @@ without blocking the rest.
      with `revision_limit_reached` and the reserve still fits; a key
      rotation between two turns of a live session keeps correlation; a stop
      with `require_idle` refused inside a heuristic re-open window and with
-     a queued turn;
+     a queued turn; the OpenCode data directory survives a runtime
+     generation change and is removed with the session; the revision cap
+     stops and joins the runtime; an addressed answer whose value was lost
+     in a daemon restart goes to `awaiting_resubmission`;
      check definitions: a host definition shadows an in-repo one of the same
      name, an in-repo definition edited in the worktree during the turn is
      not what runs, and `repo_base` checks cap integrity at `suspect`;
@@ -2464,7 +2480,10 @@ present, no detection-only settlement for OpenCode, and the share of
    `tasks.check_log_max_bytes`, `tasks.result_max_files`,
    `tasks.result_max_commands`, `tasks.result_max_mismatches`,
    `tasks.attention_max_choices`, `tasks.max_checks_per_turn`,
-   `tasks.max_waiters` and
+   `tasks.max_waiters`, `tasks.max_waiters_per_task`,
+   `tasks.result_max_bytes`, `tasks.final_message_max_bytes`,
+   `tasks.fingerprint_max_entries`, `tasks.fingerprint_max_bytes`,
+   `tasks.turn_deadline` overrides and
    `tasks.metadata_retention`, and whether per-profile overrides may exceed
    the host ceiling. All are required configuration validated at startup.
 3. Whether investigation mode should refuse to start when a profile declares
