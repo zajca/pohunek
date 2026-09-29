@@ -103,8 +103,12 @@ the polling entirely.
   for its lifetime. Session lifecycle, recovery, retention and attach are
   unchanged.
 - **Worktree-per-session is the isolation primitive.** A task on a project
-  defaults to a dedicated worktree; in-place tasks require an explicit flag,
-  matching the skill's existing consent rule. Worktree paths are keyed by
+  defaults to a dedicated worktree on a generated branch `tasks/<task-id>`
+  off the project's default base (the id makes collisions impossible;
+  `branch` and `base` override it; the worktree follows ordinary retention).
+  `session.new` without `branch` runs in place, so `task.start` never
+  forwards an empty branch; in-place tasks require the explicit `in_place`
+  flag, matching the skill's existing consent rule. Worktree paths are keyed by
   session id (`crates/daemon/src/worktree/mod.rs:230-245`) and Git refuses to
   check one branch out twice, so a new session never reaches another session's
   worktree by naming the same branch. Tasks that must share a tree use the
@@ -218,7 +222,7 @@ observed strictly after the turn cursor. Settlement produces exactly one
 | `timed_out` | The turn exceeded the configured turn deadline (section 8.4). |
 | `cancelled` | A queued turn was never delivered because the previous turn re-opened or the task was stopped (section 8.2). |
 
-Settlement is revisable only in four defined ways, every transition is
+Settlement is revisable only in five defined ways, every transition is
 recorded, and each revision increments the turn's `settlement_revision`
 (starting at 1):
 
@@ -244,7 +248,13 @@ recorded, and each revision increments the turn's `settlement_revision`
   `turn_delta` instead of being lost. No `task.extend` is needed, and the
   open-time ceiling does not block it: completion evidence closes a turn,
   it does not keep one open. Uncorrelated late evidence is never applied;
-  it only marks the next result `drift_since_previous_turn`.
+  it only marks the next result `drift_since_previous_turn`;
+- an `attention` turn is **stopped** by `task.stop`: the pending attention
+  is cancelled, the turn is revised to `stopped` as a new
+  `settlement_revision`, the `attention` result is superseded, and any later
+  `task.answer` fails `task_attention_stale`. Together with an answer and a
+  terminal resolution this is the only way out of a settled `attention`, and
+  it is atomic with the session stop.
 
 A resumed or re-opened turn receives a fresh deadline window, but the total
 open time of one turn across all its windows is bounded by
@@ -344,7 +354,11 @@ settles with `completed` (section 12).
    (`task.result`, `task.check_log`; owner clients and, on the relay path,
    holders of `session.terminal.observe`), are never copied into events,
    notifications, projections or audit, and retire with the session.
-   Prompts are stored only as a digest plus that same scrollback.
+   Prompts are persisted only as a **keyed fingerprint** (HMAC under a
+   daemon-local key, so a stored value is no dictionary oracle for short or
+   predictable prompts) plus that same scrollback; the plain canonicalized
+   digest a hook reports is compared in memory and never persisted, logged
+   or audited.
 8. The origin-session guard applies: an agent running inside session S cannot
    continue, answer, extend, stop or review a task whose session is S, and
    cannot start a task whose working directory is S's working directory
@@ -388,6 +402,20 @@ settles with `completed` (section 12).
     finds the worktree occupied by another task marks both tasks' affected
     results `integrity: suspect` instead of waiting, because the provider
     turn is already running.
+
+    Occupancy is also a **write fence** on the other user tasks of the tree.
+    While task A occupies a worktree, the daemon refuses task-layer delivery
+    to every other task sharing it (`task_worktree_busy`) and refuses
+    terminal input into their sessions: `session.input` fails with
+    `worktree_busy` and attach is admitted read-only (observation without
+    terminal control), so no human or client can make an idle agent in
+    another session write into the tree A is working in. The daemon cannot
+    stop a provider from resuming on its own inside a non-occupying session;
+    such a resumption is observed as a working transition there and marks
+    A's current or next result `integrity: suspect` and the resuming task's
+    next result `drift_since_previous_turn`, exactly like the heuristic
+    re-open case above. Orchestrators remove the residual risk by stopping
+    finished tasks before the next round (section 16.2).
 
 ## 8. Turns and Waiting
 
@@ -441,7 +469,15 @@ misattribution remains possible whatever source later settles the turn.
 
 Each agent declares its **turn evidence sources** in its adapter, in priority
 order. The daemon settles on the highest-priority source that produces a
-decisive signal after the cursor:
+decisive signal after the cursor, under one **arbitration rule**: a
+lower-priority source may settle a turn only while every higher-priority
+source the adapter declares is `evidence_degraded` (hook not installed,
+plugin missing, provider server unreachable, journal gap). While a higher
+source is healthy, a lower signal — a detection `idle` before the `Stop`
+arrives, a hook before the OpenCode execution event — is recorded but does
+not settle; the turn waits for the higher source or runs to `timed_out`.
+Lower evidence therefore never publishes a weaker result ahead of the
+authoritative one, and `settled_by` names the source that decided:
 
 | Priority | Source | Examples |
 | --- | --- | --- |
@@ -637,11 +673,15 @@ instead watch their dedicated socket for peer hangup (EOF/`POLLHUP`) and
 release the slot as soon as the client goes away. Hangup is only prompt on
 the local Unix socket; over TCP (the NetBird overlay) a vanished peer sends
 nothing, and without traffic the kernel notices only after its retransmission
-or keepalive timeouts. Task waits therefore write a small progress heartbeat
-frame every `tasks.wait_heartbeat_ms`, and a failed write releases the slot;
-TCP keepalive is enabled on overlay wait connections as a second bound. Slot
-lifetime is thus bounded by the client's liveness plus one heartbeat
-interval (plus the kernel's write timeout), not by `tasks.max_wait_ms`.
+or keepalive timeouts. The control protocol is one request line and one
+response line, and the clients decode the first line as the final response,
+so the daemon sends no application-level heartbeat. Every overlay wait
+connection instead sets per-socket TCP keepalive
+(`tasks.wait_keepalive_idle_ms`, `tasks.wait_keepalive_interval_ms`,
+`tasks.wait_keepalive_count`; supported on Linux and macOS), and a keepalive
+failure or a peer EOF releases the slot. Slot lifetime is thus bounded by
+the client's liveness plus the configured keepalive detection time, not by
+`tasks.max_wait_ms`.
 
 A wait holds no state beyond its slot: a client that disconnects simply
 calls `task.wait` again (invariant 4). A daemon restart drops waiters;
@@ -856,7 +896,8 @@ therefore follows a persisted protocol keyed by a stable **delivery id**
 retry of the same idempotency key:
 
 1. **prepared** — the daemon durably records the operation, its delivery id
-   and the prompt digest in the task store before contacting the worker.
+   and the keyed prompt fingerprint in the task store before contacting the
+   worker.
 2. **dispatched** — the daemon sends the input to the worker tagged with the
    delivery id.
 3. The worker durably records `delivery_id: writing` in its runtime journal
@@ -901,7 +942,7 @@ invariant 3 on both answer paths.
 the client retries the same operation with the same idempotency key (local
 path) or the same operation ticket (relay path, relay RFC section 12.5) **and
 the full original payload**. The daemon checks the payload against the
-stored digest (local path) or the ticket's HMAC fingerprint (relay path); a
+stored keyed fingerprint (local path) or the ticket's HMAC fingerprint (relay path); a
 mismatch fails with `task_payload_mismatch` and dispatches nothing. A read-
 only lookup (`task.inspect` by request key, or `operation.result.get` on the
 relay path) reports `awaiting_resubmission` so the client knows it must
@@ -1138,7 +1179,9 @@ implementation:
 Runtime design:
 
 1. The worker starts a **per-session** `opencode serve --hostname 127.0.0.1
-   --port 0` child inside the session's process group, with the session cwd,
+   --port 0` child as a second supervised child in its **own process group**
+   (the PTY child is a new POSIX session leader under `portable-pty`, so a
+   worker-spawned sibling cannot join its group), with the session cwd,
    `PWD`, and the profile's `OPENCODE_CONFIG_CONTENT`. The server executes
    tools with the owner's authority and a loopback port is reachable by every
    local user, so authentication is mandatory: the worker generates a
@@ -1187,7 +1230,10 @@ Runtime design:
    server URL. Restarting the server alone is never attempted: `--port 0`
    yields a different port on every start and the TUI cannot follow a
    replaced `--server` endpoint. Item 6 covers only an event stream that
-   drops while the server process is alive.
+   drops while the server process is alive. The worker records the server's
+   process-group id beside the PTY child's (`crates/session-worker/src/pty.rs`
+   already tracks and `killpg`s the PTY group), and stop, cleanup and
+   generation end signal and join **both** groups on Linux and macOS.
 
 **Decided runtime shape:** the per-session server and the TUI are two
 children of one worker. This avoids a plugin installation step, gives typed
@@ -1471,9 +1517,18 @@ therefore never contains a partially-filled `checks` list. `outcome` is
 
 **Finalization contract.**
 
-- The daemon owns check processes: each runs in its own process group,
-  recorded (check name, attempt, pid, process-group id, start time) in the
-  task store before it starts.
+- The daemon owns check processes and launches each in two phases, so no
+  crash window leaves an unknown process writing to the tree: (1) it persists
+  a **launch intent** (check name, attempt, a random launch token) in the
+  task store; (2) it spawns the check in its own process group with the token
+  in its environment and the child stopped before `exec` (`SIGSTOP` raised in
+  the pre-exec hook), persists the identity it can now read (pid,
+  process-group id, process start time, token), and only then continues it
+  with `SIGCONT`. Recovery treats an intent without identity as a check that
+  never ran: it looks for a stopped same-UID process carrying the token,
+  kills it when found, and records the attempt `interrupted`. Process
+  identity is always compared with the start time, so a reused pid is never
+  signalled.
 - Finalization has its own deadline, `tasks.finalize_max_ms`, independent of
   the turn deadline (which only bounds the agent's part of the turn). On
   expiry, the running check is killed (`timed_out`), the remaining ones are
@@ -1535,16 +1590,17 @@ and the result says so (`baseline_on: "worktree"` instead of `"base"`).
 | `task.wait` | Block until the turn's result is final (default) or published (`until`), or the timeout elapses (dedicated connection, task waiter pool, section 8.3). |
 | `task.result` | Read a published result by `(turn, settlement_revision?)` without waiting; the revision defaults to the latest and every response states its `result_id` and whether it is superseded. |
 | `task.inspect` | Task record, lifecycle state, evidence sources and degradation, worktree users, and one page of turns (see paging below). Also resolves a task by `(caller_scope, client_request_id)` for delivery reconciliation. |
-| `task.list` | One page of tasks on the host, filterable by project, lifecycle state, outcome, owner task and correlation id (see paging below). |
+| `task.list` | One page of tasks on the host, filterable by project, lifecycle state, outcome, owner task and run id (see paging below). |
 | `task.extend` | Extend an open turn's deadline, or re-open a `timed_out` turn whose work has not visibly ended, within `tasks.turn_open_ceiling_ms` (section 6.3). |
-| `task.stop` | Cancel and join the task's check processes (section 12), stop its session and settle any open turn as `stopped`; on a task without an open turn it is the explicit end of a finished task (section 6.1). Optional preconditions `if_latest_turn` and `require_idle: true` make the stop atomic with a check that the latest turn is exactly that one and has no open turn, pending attention or finalizing result; otherwise it fails with `task_stop_precondition_failed` and changes nothing. On a task that is already `ended`, `task.stop` succeeds as a no-op and returns the recorded end (`already_ended: true`) without evaluating preconditions, so a retried cleanup never fails on its own earlier success. The worktree, metadata and result content survive for `task.result` and `task.review`. Idempotent. |
+| `task.stop` | Cancel and join the task's check processes (section 12), stop its session and settle any open turn — or a settled `attention` turn, as a new revision (section 6.3) — as `stopped`; on a task without an open turn it is the explicit end of a finished task (section 6.1). Optional preconditions `if_latest_turn` and `require_idle: true` make the stop atomic with a check that the latest turn is exactly that one and has no open turn, pending attention or finalizing result; otherwise it fails with `task_stop_precondition_failed` and changes nothing. On a task that is already `ended`, `task.stop` succeeds as a no-op and returns the recorded end (`already_ended: true`) without evaluating preconditions, so a retried cleanup never fails on its own earlier success. The worktree, metadata and result content survive for `task.result` and `task.review`. Idempotent. |
 | `task.review` | Record an external verdict (`accepted`, `changes_requested`, `rejected`) bound to a `result_id` and the `worktree_fingerprint` the reviewer verified, with optional notes and check references (see review binding below). Idempotent per `(task_id, caller_scope, client_request_id)`. |
 | `task.check_log` | Page a check log by reference and byte offset. |
 | `task.retain_worktree` | Set the retain hold on the worktree's owner task after the fact, while the worktree exists (section 8.7). Idempotent. |
 | `task.release_worktree` | Clear the retain hold set by `retain_worktree` on an owner task (section 8.7); the worktree returns to ordinary retention rules. Idempotent. |
 
-`task.start` accepts an optional `correlation_id`: a bounded opaque string
-(printable ASCII, at most 64 characters) stored on the task record, returned
+`task.start` accepts an optional `run_id`: a client-chosen ULID or UUID
+(validated to that syntax, so it can carry no free text or secret and is
+distinct from any transport correlation id) stored on the task record, returned
 by `task.inspect`, filterable in `task.list`, and never an authorization
 input. Orchestrators use it to group the tasks of one objective so a
 restarted orchestrator can find them again (section 16).
@@ -1584,6 +1640,7 @@ Typed errors introduced by this RFC:
 | `task_attention_open` | `task.continue` | The latest turn settled `attention` and was not answered. |
 | `task_agent_busy` | `task.continue` | The agent is still visibly working on an earlier prompt. |
 | `task_worktree_busy` | `task.start`, `task.continue`, `task.answer`, `task.extend` | Another task occupies the worktree (invariant 11). |
+| `worktree_busy` | `session.input`, attach with terminal control | The session's worktree is occupied by another task; only observation is admitted (invariant 11 write fence). |
 | `task_worktree_unavailable` | `task.start`, `task.continue` | The shared worktree no longer exists. |
 | `task_worktree_mode_conflict` | `task.start` | `worktree_of` combined with `in_place` or `branch`. |
 | `task_session_unavailable` | `task.continue`, `task.answer` | The task is `ended` or its runtime is not live. |
@@ -1603,6 +1660,7 @@ Typed errors introduced by this RFC:
 | `worktree_in_use` | `session.remove` | Other active tasks use the session's worktree (section 8.7). |
 | `task_result_pending` | `task.result`, `task.continue` | The turn settled but its checks have not finished. |
 | `task_check_not_permitted` | `task.start`, `task.continue` | A requested check is not enabled or not permitted for the caller's origin. |
+| `task_store_full` | `task.start`, `task.continue` | A task store cap (`tasks.store_max_bytes`, `tasks.max_turns_per_task`, `tasks.max_tasks_retained`) would be exceeded (section 14). |
 | `task_waiter_limit_reached` | `task.wait` | The task waiter pool is full. |
 | `task_request_conflict` | all idempotent methods | A reused request key with different parameters. |
 | `task_investigate_unsupported` | `task.start` | The profile cannot enforce investigation mode (section 11.2). |
@@ -1658,7 +1716,7 @@ round budget is orchestrator policy, never a daemon default), one audit pass
 per round (`mode: "investigate"` task or the round's `checks`), a
 `task.review` verdict recorded before the next round, and fresh-context rounds
 on a shared worktree (`worktree_of`, section 8.7) rather than one
-ever-growing conversation, all tagged with one `correlation_id` per
+ever-growing conversation, all tagged with one `run_id` per
 objective. It tells orchestrators to judge each round by `turn_delta` and to
 treat `provider_hooks_uncorrelated` and `detection` settlements as weaker
 evidence, to treat `finality: heuristic` results as provisional until their
@@ -1691,15 +1749,34 @@ to ship the adapter in the same milestone is an open question (section 19).
   record, each written with the per-record atomic persistence of
   `crates/daemon/src/host_state/persistence.rs` (temp file, fsync, rename,
   bounded record size, `tasks.record_max_bytes`). The unified store holds no
-  task data; the task index (by id, `correlation_id`, request key, worktree)
-  is rebuilt at startup by a bounded directory scan and kept in memory.
-  Mutations that must be atomic across records (for example occupancy
-  check-and-set with task creation) are serialized under the task store
-  lock and ordered so that a crash leaves either the old state or a record
-  that recovery completes deterministically.
+  task data; the task index (by id, `run_id`, request key, worktree)
+  is rebuilt at startup by a bounded directory scan and kept in memory. The
+  store is bounded as a whole: `tasks.store_max_bytes` caps the per-task
+  directories together, `tasks.max_turns_per_task` caps turns per task and
+  `tasks.max_tasks_retained` caps retained task directories; `task.start` and
+  `task.continue` are refused with `task_store_full` when a cap would be
+  exceeded, retention sweeps the oldest retired content first within the
+  caps, a full disk fails the mutation typed and never truncates a record,
+  and the startup scan is bounded by the same caps.
+  Mutations that span records, the session store and external effects
+  follow a persisted **task operation journal** shaped like the relay RFC's
+  ticket journal (section 12.5) and the create intent of #192: `task.start`
+  records `intent` (request key, fingerprint, parameters) before anything
+  else, `session_created` after the session store commit (with the session
+  id), `bound` once the task record and its occupancy, user and hold entries
+  are written, and `delivered` per section 8.8; `task.stop`, cascade
+  removal and hold changes record their own intent and completion. Recovery
+  replays the journal: an `intent` without `session_created` is re-driven
+  only by a client retry with the same key; a `session_created` without
+  `bound` is completed (the session becomes the task's) or, when the task
+  record cannot be written, the session is stopped and removed through the
+  ordinary cleanup stages and the operation ends `failed`; a `bound` without
+  `delivered` is the section 8.8 case. Occupancy, users and holds are
+  derived from `bound` records at startup, never trusted from a partial
+  write. Crash-injection tests cover every journal boundary.
 - Turn records hold cursors, settlement metadata, result documents, check
   references and review verdicts. Prompt text is not stored in task records;
-  a digest identifies it.
+  a keyed fingerprint identifies it.
 - Final messages and check logs are owner-private files under the daemon state
   directory, bounded by `tasks.final_message_max_bytes` and
   `tasks.check_log_max_bytes`. The result document's provider-reported text
@@ -1713,7 +1790,7 @@ to ship the adapter in the same milestone is an open question (section 19).
 - Task **metadata** outlives the session for `tasks.metadata_retention`
   (daemon configuration, validated at startup): task and turn ids, lifecycle
   state, outcomes, `settled_by`, `integrity`, repository summaries, check
-  outcomes (without logs), `correlation_id`, owner task, timings and review
+  outcomes (without logs), `run_id`, owner task, timings and review
   verdicts. This is what lets an orchestrator reconstruct its verified
   picture after its own crash (section 16) even when sessions were already
   swept; `task.result` for such a turn returns the metadata with content
@@ -1732,7 +1809,7 @@ to ship the adapter in the same milestone is an open question (section 19).
 | Late `Stop` from an earlier prompt | Never applied to the open turn: its `prompt_id`/`turn_id` differs from the one bound to it (section 8.2). If it matches a `timed_out` predecessor, that turn completes late (section 6.3); otherwise it is discarded. Without identifiers it is discarded if it precedes the new turn's consumption milestone, otherwise the settlement is marked `provider_hooks_uncorrelated`. |
 | Another `Stop` hook blocks and the agent continues | Work resumes inside `tasks.stop_settle_grace_ms`; the turn stays open. |
 | Task waiter pool full | `task.wait` fails with `task_waiter_limit_reached`; session waits are unaffected. |
-| Client abandons a long `task.wait` | On the Unix socket peer hangup releases the slot at once; over TCP the next failed heartbeat (at most `tasks.wait_heartbeat_ms` plus the kernel write timeout) or TCP keepalive releases it (section 8.3). |
+| Client abandons a long `task.wait` | On the Unix socket peer hangup releases the slot at once; over TCP the per-socket keepalive releases it within the configured detection time (section 8.3). |
 | Daemon down across a heuristic completion's windows | Both windows restart at reconnect; the result is `evidence_degraded` with reason `window_overlapped_outage` (section 8.2). |
 | Second task started on a busy shared worktree | Refused with `task_worktree_busy` (invariant 11). |
 | Provider stalls | Turn deadline settles `timed_out`; agent is untouched. |
@@ -1770,7 +1847,7 @@ primitive:
 
 | Loop role | Pohunek primitive |
 | --- | --- |
-| Manager (persistent task state) | An orchestrating agent in its own session; its task state lives in its own memory or files, never in the daemon; its tasks share a `correlation_id` |
+| Manager (persistent task state) | An orchestrating agent in its own session; its task state lives in its own memory or files, never in the daemon; its tasks share a `run_id` |
 | Subtask contract | `task.start`/`task.continue` prompt with `checks` and `mode` |
 | Executor (fresh context) | A task on the objective's shared worktree: the first round creates it, later rounds use `task.start { worktree_of }` (section 8.7), one round per task; the in-place flag is the explicit-consent fallback |
 | Auditor (read-only verification) | A `mode: "investigate"` task with `worktree_of` the executor's task, so it inspects the executor's uncommitted state (sections 8.7, 11.2), and/or the round's `checks` |
@@ -1871,7 +1948,10 @@ be a client of the public protocol like any other (non-goal, section 5).
 ## 17. Implementation Workstreams and Definition of Done
 
 The scope is intentionally large; it is delivered as one issue per workstream
-under this RFC's epic, each with its own DoD, rather than a single landing.
+under this RFC's epic #182 (#219 protocol, #220 worker, #221–#226 daemon
+slices, #227–#228 adapters, #229 CLI and skill, #230 SDKs and clients, #231
+MCP adapter, #232 validation), each with its own DoD, rather than a single
+landing.
 The order below is dependency order, and workstream 7 (the MCP adapter) is
 deliberately last — it may move to a follow-up issue per open question 1
 without blocking the rest.
@@ -1893,7 +1973,7 @@ without blocking the rest.
    `host_state/persistence.rs`-style per-record files (section 14); evidence
    ingestion from the worker journal and offset-keyed detection evidence
    with `reconstructed` replay transitions (section 8.2); task store with
-   lifecycle state and `correlation_id`,
+   lifecycle state and `run_id`,
    settlement engine with consumption milestones, evidence priority, hook
    correlation, the stop grace window and heuristic re-open with settlement
    revisions, pending-decision vs confirmed attention with attention ids and
@@ -1902,7 +1982,7 @@ without blocking the rest.
    `worktree_of` handoff (including into ended owner tasks) with worktree
    occupancy covering every writing phase, worktree users, retain holds and
    the `worktree_shared` retention hold, queued `task.continue` during
-   re-open windows, `task.wait` `until: "final"` with wait heartbeats, late
+   re-open windows, `task.wait` `until: "final"` with per-socket keepalive, late
    completion of `timed_out` turns, bounded
    drift fingerprints and shadow-repository snapshots for `turn_delta` and
    per-turn diffs, the `finalizing` phase with persisted check processes,
@@ -1987,7 +2067,17 @@ without blocking the rest.
      addressed-answer recovery before, during and after the provider
      request; result lists over their caps publish with `truncated` and
      totals and never block occupancy; provider-reported text never appears
-     in events, notifications or metadata;
+     in events, notifications or metadata; write fence: `session.input` and
+     a controlling attach into a non-occupying user task's session are
+     refused while another task occupies the tree, and a provider resuming
+     there marks results suspect; check launch: a crash between spawn and
+     identity commit leaves a stopped child that recovery kills by token;
+     task operation journal crash-injection at every boundary; evidence
+     arbitration: a detection `idle` never settles a hook agent while its
+     hooks are healthy; `attention` → `stopped` through `task.stop` as a new
+     revision; `task_store_full` on every cap; the generated `tasks/<id>`
+     branch and refusal of an empty branch; keyed prompt fingerprints never
+     equal to a plain digest in any persisted record;
      check definitions: a host definition shadows an in-repo one of the same
      name, an in-repo definition edited in the worktree during the turn is
      not what runs, and `repo_base` checks cap integrity at `suspect`;
@@ -1996,7 +2086,7 @@ without blocking the rest.
      member and holding a clean, fully pushed tree, release, and hold expiry
      never deleting unsaved work; digest
      canonicalization goldens per provider; overlay wait slot released by a
-     failed heartbeat; `task.stop` on an ended task with stale preconditions
+     keepalive failure; `task.stop` on an ended task with stale preconditions
      succeeds as a no-op; stop barrier: `task.stop` and cascade removal during a
      running check wait for the process group to exit before occupancy is
      released or the tree removed, and a stuck group blocks removal;
@@ -2067,7 +2157,10 @@ present, no detection-only settlement for OpenCode, and the share of
    `tasks.finalize_max_ms`, `tasks.snapshot_max_bytes`,
    `tasks.snapshot_max_file_bytes`, `tasks.page_max_items`,
    `tasks.page_max_bytes`, `tasks.cursor_ttl_ms`, `tasks.check_kill_grace_ms`,
-   `tasks.resubmit_window_ms`, `tasks.wait_heartbeat_ms`,
+   `tasks.resubmit_window_ms`, `tasks.wait_keepalive_idle_ms`,
+   `tasks.wait_keepalive_interval_ms`, `tasks.wait_keepalive_count`,
+   `tasks.store_max_bytes`, `tasks.max_turns_per_task`,
+   `tasks.max_tasks_retained`,
    `tasks.worktree_hold_max_age`, `tasks.record_max_bytes`,
    `tasks.check_log_max_bytes`, `tasks.result_max_files`,
    `tasks.result_max_commands`, `tasks.result_max_mismatches`,

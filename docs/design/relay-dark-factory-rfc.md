@@ -89,8 +89,9 @@ supported operating mode or an accident.
   contracts inside them.** Component boundaries (section 7), the trust model
   (section 8), identity (section 13) and the sync algorithm (section 16.2)
   are unchanged. Accepting this RFC does amend these accepted contracts, and
-  each amendment must be reflected in the relay RFC and its issue map
-  (section 23) when accepted:
+  each amendment is owed to the relay RFC text and its issue map (section
+  23) and is tracked by #233; until #233 lands, the relay RFC is stale on
+  exactly these points and this document is the newer decision:
   - `HostShare` policy (relay RFC section 12.2) gains `task.*` operation
     classes, the `allow_delegated_answers` capability and a permitted-check
     list (section 7.1);
@@ -180,7 +181,7 @@ a machine only under an explicit grant (section 7.3).
 One factory objective: a bounded sequence of task rounds (fresh-context tasks
 on a shared worktree via `worktree_of`, or turns within a task) toward one
 goal, with a budget and stop conditions. A run is a client-side record; the
-relay and the daemon know only tasks and the run's opaque `correlation_id`
+relay and the daemon know only tasks and the run's opaque `run_id`
 (task RFC section 13.1), which groups them without making either an
 orchestration authority.
 
@@ -340,7 +341,13 @@ principal created therefore also needs `session.terminal.observe` on those
 sessions, granted explicitly and narrowed to the factory's host shares or
 projects (relay RFC section 13.5 grant scoping); the role template does not
 imply it. Team `Owner`/`Admin` keep the session authority relay RFC section
-14 gives them. Custom roles may compose the same classes.
+14 gives them. Custom roles may compose the same classes, with one exception
+the authorizer enforces by **grant provenance**: for a service account,
+`task.answer` and `session.terminal.control` are honoured only from a direct
+grant to that account, scoped to a named `HostShareId`, with an unexpired
+expiry. Built-in roles, custom roles, group grants, team-wide grants and
+wildcard scopes never confer either to a service account, whatever classes
+they list; tests cover each of those paths.
 
 **Machine answers.** A service account can hold `task.answer` only through a
 dedicated custom grant that names the service account, is scoped to specific
@@ -509,7 +516,16 @@ section 18.1.
 - Budget state is durable at the relay (PostgreSQL, relay RFC section 15.2) so
   a relay restart cannot reset a window mid-period; the admission transaction
   is atomic with the audit record (relay RFC section 17.1: sensitive work is
-  not admitted if its audit cannot be recorded).
+  not admitted if its audit cannot be recorded). A **database restore** is
+  not a restart: budget counters, admission records and the idempotency-key
+  → ticket bindings belong to the recovery manifest of relay RFC section
+  19.1, and after a restore the relay stays in restore quarantine for
+  factory admission — no `task.start`, `task.continue`, `task.extend` or
+  service-account `task.answer` is admitted — until every host's fresh
+  snapshot has been reconciled against the restored records (running tasks
+  unknown to the restored state become `confirmed` records holding slots;
+  unresolved tickets are quarantined) or an operator resolves the remainder
+  through the owner path. Restore and rollback tests cover both.
 - Budget exhaustion is a normal event: the factory's stop condition
   `budget_exhausted` (section 12.4) ends the run cleanly with its state intact
   for resumption in the next window.
@@ -622,19 +638,25 @@ Every mutating `task.*` call on the relay path (`task.start`,
 `task.retain_worktree`, `task.release_worktree`, and cascading
 `session.remove`)
 produces the standard audit record (relay RFC section 17.1) extended with:
-task and turn identifiers, the run correlation identifier (the task's
-`correlation_id`, task RFC section 13.1: printable ASCII, at most 64
-characters), budget decision (admitted/refused and counter name), and — for
+task and turn identifiers, the run identifier (the task's `run_id`, task
+RFC section 13.1: a ULID or UUID, a separate field from the relay's own
+request correlation id), budget decision (admitted/refused and counter name), and — for
 `task.review` — the verdict and `result_id`; for `task.answer` also whether
 the actor is a human or a service account, the `attention_id` and
 `settlement_revision` answered, and `answer_verification`
-(`provider_addressed` or `unverified`, task RFC section 8.5). Prompt digests may appear; prompt text, results,
-check logs, final messages and terminal content never do.
+(`provider_addressed` or `unverified`, task RFC section 8.5). Prompt text,
+prompt digests, results, check logs, final messages and terminal content
+never appear; the retry fingerprint is a keyed HMAC under a relay-local key
+that no audit record, log, trace or API response exposes.
 
 Evidence reads (`task.wait`, `task.result`, `task.check_log`) are audited as
 access decisions like terminal-access open/close (relay RFC section 17.1),
-coalesced to one record per principal, task and turn, so a factory's repeated
-waits do not multiply audit volume. As with every sensitive access, a read is
+coalesced to one record per principal, task, `result_id` (or check log
+reference) and authorization generation, within a bounded access lease
+`factory.audit_access_lease`; a new settlement revision, a different log, an
+ACL or credential change, or lease expiry opens a new record, so repeated
+waits on one result do not multiply audit volume while no access to new
+evidence goes unrecorded. As with every sensitive access, a read is
 not granted if its first access record cannot be written.
 
 Data classification additions to relay RFC section 17.2:
@@ -643,9 +665,9 @@ Data classification additions to relay RFC section 17.2:
 |---|---|---|---|---|
 | Task/turn metadata (ids, lifecycle state, outcomes, `settled_by`, integrity, timings) | Authoritative | Catalog projection (section 10) | IDs, states, decisions | Host: `tasks.metadata_retention`; relay: configured metadata policy |
 | Task results, check logs, final messages | Owner-private host files (task RFC section 14) | Never | Never | Existing host policy (retire with the session) |
-| Prompts | Digest only (task RFC invariant 7) | Digest only if audit carries it | Digest only | Audit policy |
+| Prompts | Keyed fingerprint only (task RFC invariant 7) | Keyed fingerprint on the admission record only | Never | Admission-record retention |
 | Budget counters | No | PostgreSQL | Decision + counter name | Configured policy |
-| Run correlation IDs | Task metadata, attribution only | Catalog projection and audit | Bounded opaque strings | As task metadata / audit policy |
+| Run IDs (`run_id`) | Task metadata, attribution only | Catalog projection and audit | ULID/UUID only, never free text | As task metadata / audit policy |
 
 Task content retires with its session; task metadata survives it for
 `tasks.metadata_retention` (task RFC section 14) so a factory can reconstruct
@@ -661,7 +683,7 @@ A task binds exactly one session and a session belongs to at most one task
 16), not a separate projection. For a relay-origin session on an active share
 that is a task session, the row carries the metadata of the classification
 row in section 9: task id, lifecycle state, open turn, last outcome,
-`settled_by`, integrity, turn count, owner task, `correlation_id` and
+`settled_by`, integrity, turn count, owner task, `run_id` and
 timestamps. Turn-level detail (per-turn results) is not projected; clients
 fetch it through `task.evidence.read` routed calls.
 
@@ -699,7 +721,14 @@ When a turn settles `attention`:
    - only human principals are escalation targets. A service account holding
      a `task.answer` grant may observe the attention through the projection
      like any authorized principal, but it is never the escalation target,
-     so a human always learns of the question.
+     so a human always learns of the question. That guarantee is enforced,
+     not assumed: the target set is validated to contain at least one active
+     human when a factory is set up on a team (role assignment, share
+     approval) and on every membership or credential change; if it would
+     become empty, the relay falls back to the team's active human `Owner`s
+     and `Admin`s, and if none exists it refuses service-account `task.start`
+     on that team with `factory_no_escalation_target` (fail closed) and flags
+     any pending attention in audit.
 2. The turn stays `attention` until answered or explicitly stopped. There is
    no escalation timeout that auto-resolves, auto-approves, or auto-fails.
 3. An authorized principal answers via `task.answer` under section 7.3.
@@ -733,7 +762,7 @@ One round of the Manage-Execute-Audit loop, entirely through public interfaces:
    `retain_worktree: true`, so the tree outlives every task of the run; later
    rounds use `worktree_of`, task RFC sections 8.7 and 16.2) or
    `task.continue`; then `task.wait`. Every task of the run carries the run's
-   `correlation_id`. Budget admission and ACLs are the relay's; settlement
+   `run_id`. Budget admission and ACLs are the relay's; settlement
    is the daemon's.
 3. **Audit**: read the result's verified fields (task RFC section 10),
    judging the round by `turn_delta`; if the round's claims matter, the
@@ -773,7 +802,7 @@ the task RFC's CLI workstream lands.
   its own session, or files it writes. It never enters daemon or relay
   persistence (task RFC section 16.4).
 - **Everything evidential is reconstructible**: `task.list` filtered by the
-  run's `correlation_id`, plus `task.inspect`, `task.result` and the
+  run's `run_id`, plus `task.inspect`, `task.result` and the
   recorded `task.review` verdicts, allow a fresh manager to rebuild the
   verified picture of any run. Task metadata and verdicts outlive swept
   sessions for `tasks.metadata_retention` on the host and for the catalog
@@ -784,6 +813,17 @@ the task RFC's CLI workstream lands.
 - The recommended pattern is therefore checkpoint-shaped: after every round,
   the manager writes its next-step decision where its successor can read it,
   so recovery is a new client process, not a restore.
+- **Single writer per run.** A run has exactly one live manager and one live
+  auditor client, and failover is fenced rather than assumed: before a
+  successor starts, the predecessor's service-account credential is revoked
+  or rotated (relay RFC section 13.3 then cancels its streams and refuses its
+  calls), and the successor records a new **run generation** in its round
+  records; a client that finds a newer generation than its own in the
+  records stops acting. Two managers can therefore never both delegate into
+  one run: the relay refuses the stale credential, and the daemon's
+  `if_latest_turn` preconditions and `worktree_of` occupancy refuse the stale
+  plan's stops and starts. Operators who cannot revoke the old credential
+  must not start a successor.
 - **Cleanup recovery.** Task state alone cannot tell a finished round from
   one that continued: a still-valid verdict on the latest result says
   nothing about a turn opened since, and an auditor task never carries a
@@ -806,7 +846,7 @@ the task RFC's CLI workstream lands.
   finished while its pending-cleanup list is non-empty; if cleanup still
   fails at run end, the terminal report lists the tasks left `active` and
   the reason, so slots never leak silently. `task.stop` is idempotent
-  (including on already-ended tasks), so a repeated cleanup is harmless. `task.list` by `correlation_id` (paged) is used only
+  (including on already-ended tasks), so a repeated cleanup is harmless. `task.list` by `run_id` (paged) is used only
   to find tasks that no round record mentions — work started just before a
   crash — which the resumed loop adopts or, once idle, stops. Worktrees and
   evidence are not affected by this step.
@@ -828,7 +868,7 @@ meanings:
 - **Catalog query (default).** The relay answers from its synchronized
   catalog across all hosts the caller can see: one paged, ACL-filtered
   answer over the task fields of the session projection (section 10),
-  filterable by `correlation_id`, host, lifecycle state and outcome. It
+  filterable by `run_id`, host, lifecycle state and outcome. It
   covers tasks whose catalog entries are current or retained (relay RFC
   section 17.3); a stale host is marked stale in the response, never
   silently omitted. This is the form multi-host runs use to find their
@@ -854,7 +894,7 @@ condition fired and the last verified state.
 | Situation | Behaviour |
 | --- | --- |
 | Relay unavailable | Factory cannot admit or read routed calls and halts; host turns continue and settle (task RFC section 15). Owner paths unaffected. |
-| Relay restart | Budgets and audit restore from PostgreSQL; projections resnapshot; the factory reconnects and reconciles from `task.list` by `correlation_id`. |
+| Relay restart | Budgets and audit restore from PostgreSQL; projections resnapshot; the factory reconnects and reconciles from `task.list` by `run_id`. |
 | Host link down (host still running) | Its projection goes stale and routed calls fail; host turns continue and settle normally; stale active tasks keep counting against `max_active_tasks` (section 8.1). On reconnect the relay resnapshots and the factory reconciles. |
 | Host or worker failure | Runtime-generation loss settles open turns `lost` per the task RFC; the next snapshot reports it. The factory records it and replans. |
 | `HostShare` suspended | Relay-path calls to the share's tasks are refused and its sessions leave snapshots (relay RFC section 12.4); host turns continue. The run parks; on reactivation the tasks become reachable again. |
@@ -898,7 +938,7 @@ condition fired and the last verified state.
    calls and local repair are never budgeted or ACL-blocked (relay RFC
    section 12.3).
 8. Manager/auditor task state lives in clients only; the daemon and relay stay
-   orchestration-free (task RFC section 16.4). `correlation_id` is opaque
+   orchestration-free (task RFC section 16.4). `run_id` is opaque
    attribution metadata, never a scheduling or authorization input.
 9. Task data never widens session access: every task class requires the
    corresponding session class on the task's session (section 7.1), and task
@@ -987,7 +1027,13 @@ Ordered by dependency; each lands with the tests named:
      `session.task.control`, a terminal-control grant to a service account
      requiring administrator creation, share scope and expiry, and an
      unverified `task.answer` refused without `allow_unverified_answers` on
-     the share or without `unverified` in a service account's grant;
+     the share or without `unverified` in a service account's grant, grant
+     provenance (role, group, team-wide and wildcard grants never confer
+     `task.answer` or terminal control on a service account), database
+     restore quarantine for factory admission, an empty human escalation
+     target set failing closed, audit coalescing opening a new record per
+     `result_id` and authorization generation, and a fenced-out predecessor
+     manager refused by credential revocation and stale preconditions;
    - an **unattended benchmark**: the task RFC benchmark run lights-out
      through the relay path (manager + auditor service accounts), reporting
      turns per run, budget headroom consumed, escalations raised and
@@ -1001,12 +1047,11 @@ Definition of done: all gates in `AGENTS.md` pass; every invariant in section
 multi-round, multi-host run with no human input outside `attention` answers,
 records its budget consumption, and leaves reconstructible audit evidence.
 
-**Issues to file on acceptance** (this RFC is a proposal; acceptance is an
-explicit decision recorded on its issue): relay RFC amendments (section 3);
-share policy `task.*` classes, answer capability and check list; relay
-`task.*` authorization and role templates; relay delegation budgets; task
-projection fields; escalation routing; SDK factory loop + skill; unattended
-benchmark.
+**Implementation issues** (filed 2026-09-29 as sub-issues of #185): relay
+RFC amendments #233; share policy `task.*` classes, answer capabilities and
+check list #234; relay `task.*` authorization and role templates #235; relay
+delegation budgets #236; task projection fields #237; escalation routing
+#238; SDK factory loop and skill #239; unattended benchmark #240.
 
 ## 16. Alternatives Considered
 
