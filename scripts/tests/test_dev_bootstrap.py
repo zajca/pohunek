@@ -25,6 +25,7 @@ CARGO_BIN = f"{CARGO_HOME}/bin"
 
 # Real `--version` output shapes of every checked tool.
 CURRENT = {
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\n",
     "cargo-nextest": "cargo-nextest 0.9.145 (00af4550e 2026-09-16)\n"
                      "release: 0.9.145\nhost: x86_64-unknown-linux-gnu\n",
     "python3": "Python 3.13.1\n",
@@ -100,6 +101,10 @@ class DevBootstrapCase(unittest.TestCase):
         self.write_nextest_config(
             '# comment\nnextest-version = { required = "0.9.115" }\n'
         )
+        self.write_manifest('[workspace.package]\nrust-version = "1.96"\n')
+
+    def write_manifest(self, text):
+        (self.root / "Cargo.toml").write_text(text)
 
     def write_nextest_config(self, text):
         config = self.root / ".config" / "nextest.toml"
@@ -342,6 +347,28 @@ class CheckTests(DevBootstrapCase):
         self.assertIn("bacon 2.0.0 is older than", output)
         self.assertIn("cargo install --locked bacon", output)
         self.assertNotIn("not on PATH", output)
+
+    def test_rustc_is_checked_against_the_workspace_msrv(self):
+        for output, expected in (
+            ("rustc 1.95.0 (abc 2026-05-01)\n", 1),
+            (CURRENT["rustc"], 0),
+        ):
+            with self.subTest(output=output):
+                tools = dict(CURRENT)
+                tools["rustc"] = output
+                status, report = self.run_main(FakeHost(on_path=tools))
+                self.assertEqual(status, expected, report)
+        tools = dict(CURRENT)
+        tools.pop("rustc")
+        status, report = self.run_main(FakeHost(on_path=tools))
+        self.assertEqual(status, 1, report)
+        self.assertIn("rustc is missing (needs >= 1.96.0)", report)
+
+    def test_missing_msrv_is_a_configuration_error(self):
+        self.write_manifest("[workspace]\n")
+        status, output = self.run_main(FakeHost())
+        self.assertEqual(status, 2, output)
+        self.assertIn("rust-version", output)
 
     def test_binary_only_in_cargo_home_is_reported_off_path(self):
         tools = dict(CURRENT)

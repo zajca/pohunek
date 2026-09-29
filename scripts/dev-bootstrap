@@ -11,6 +11,7 @@ printed as manual steps and never run by this script.
 Categories:
 
 * required -- a documented fast loop or gate cannot run without it:
+  `rustc` at the workspace MSRV (`[workspace.package] rust-version`),
   `cargo-nextest` (every `cargo t`/`cargo ta` alias and the test gates) and
   `python3` (`scripts/test-partitions` and this script import `tomllib`).
   A missing or too-old required tool makes the run exit non-zero.
@@ -79,6 +80,10 @@ TOO_OLD = "too-old"
 OFF_PATH = "off-path"
 UNKNOWN_VERSION = "unknown-version"
 NO_CARGO = "no-cargo"
+MANUAL_RUST = (
+    "update the Rust toolchain to the workspace MSRV or newer "
+    "(`rustup update stable`, or your distribution's rust package)"
+)
 MANUAL_CARGO = (
     "install the Rust toolchain so `cargo` is on PATH (https://rustup.rs); "
     "then rerun dev-bootstrap"
@@ -161,6 +166,21 @@ def below_minimum(version, prerelease, minimum):
     return version < minimum or (version == minimum and prerelease)
 
 
+def rust_min_version(root):
+    """The workspace MSRV, `[workspace.package] rust-version` in Cargo.toml."""
+    path = Path(root) / "Cargo.toml"
+    try:
+        with path.open("rb") as handle:
+            manifest = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ConfigError(f"cannot read {path}: {error}") from error
+    declared = manifest.get("workspace", {}).get("package", {}).get("rust-version")
+    version = parse_version(declared) if isinstance(declared, str) else None
+    if version is None:
+        raise ConfigError(f"{path} declares no [workspace.package] rust-version")
+    return version
+
+
 def nextest_min_version(root):
     """The `nextest-version` minimum declared in `.config/nextest.toml`.
 
@@ -187,6 +207,13 @@ def nextest_min_version(root):
 def tools(root, system):
     """Every tool checked on `system` (a `platform.system()` value), required first."""
     checked = [
+        Tool(
+            name="rustc",
+            version_args=("--version",),
+            min_version=rust_min_version(root),
+            required=True,
+            manual=MANUAL_RUST,
+        ),
         Tool(
             name="cargo-nextest",
             version_args=("--version",),

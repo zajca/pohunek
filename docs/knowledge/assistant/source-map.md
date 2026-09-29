@@ -215,7 +215,7 @@ Release packaging and contributor verification:
 - `bacon.toml` — optional watcher jobs for the documented fast loops
   (`check`, `nextest-fast` on the `fast` profile, `affected`, `clippy-fast`)
   with explicit `e`/`n`/`a`/`c` job-switch keys; no gate depends on it.
-- `scripts/dev-bootstrap` — local tool check: required `cargo-nextest` (minimum
+- `scripts/dev-bootstrap` — local tool check: required `rustc` (the workspace `rust-version`), `cargo-nextest` (minimum
   read from `.config/nextest.toml`) and `python3` >= 3.11, optional `bacon`,
   `hyperfine`, and on Linux `mold` (fail only with `--strict`); prints the exact fix for
   each missing or too-old tool and installs nothing unless `--install` is
