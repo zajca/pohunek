@@ -79,8 +79,6 @@ TOO_OLD = "too-old"
 OFF_PATH = "off-path"
 UNKNOWN_VERSION = "unknown-version"
 NO_CARGO = "no-cargo"
-# Result detail: an older copy earlier on PATH also shadows $CARGO_HOME/bin.
-SHADOWED_TOO = "possibly also shadowed by another copy on PATH"
 MANUAL_RUST = (
     "update the Rust toolchain to the workspace MSRV or newer "
     "(`rustup update stable`, or your distribution's rust package)"
@@ -121,6 +119,8 @@ class Result:
     version: tuple = None
     path: str = None
     detail: str = None
+    # The first copy on PATH, if any; it decides whether a fix must reorder PATH.
+    on_path: str = None
 
     def counts(self, strict):
         """Whether this row decides the exit status."""
@@ -302,16 +302,6 @@ def check_tool(tool, which, runner, cargo_bin):
             return result
         copy = version_result(tool, [home, *tool.version_args], home, runner)
         if copy.status != OK:
-            on_path = which(tool.name)
-            if on_path is not None and on_path != home:
-                # Another copy sits on PATH, and Cargo may run it (it keeps the
-                # PATH position of $CARGO_HOME/bin when that is on PATH):
-                # updating $CARGO_HOME/bin alone could stay shadowed.
-                return Result(
-                    tool, TOO_OLD, version=result.version, path=home,
-                    detail=SHADOWED_TOO,
-                )
-            # The outdated copy Cargo runs lives in $CARGO_HOME/bin.
             return copy
         # Cargo honours the position of $CARGO_HOME/bin when it is already on
         # PATH, so an older copy earlier on PATH can shadow a current one.
@@ -369,7 +359,10 @@ def version_result(tool, argv, path, runner):
 
 def check_all(tool_list, which, runner, cargo_bin):
     """One result per tool, in tool order."""
-    return [check_tool(tool, which, runner, cargo_bin) for tool in tool_list]
+    return [
+        dataclasses.replace(check_tool(tool, which, runner, cargo_bin), on_path=which(tool.name))
+        for tool in tool_list
+    ]
 
 
 def path_fix(cargo_bin):
@@ -388,24 +381,27 @@ def fix_hint(result, cargo_bin):
             f"{path_fix(cargo_bin)}"
         )
     if result.tool.install is not None:
-        fix = shlex.join(install_fix(result, cargo_bin))
-        if result.detail == SHADOWED_TOO:
-            return f"{fix}; then put it first: {path_fix(cargo_bin)}"
-        return fix
+        return install_fix(result, cargo_bin)
     return result.tool.manual
 
 
 def install_fix(result, cargo_bin):
-    """The install argv; pinned to `$CARGO_HOME` when the failing copy lives there.
+    """Install into `$CARGO_HOME`, then reorder PATH if another copy could win.
 
-    `cargo install` honours CARGO_INSTALL_ROOT and `install.root`; a stale
-    copy found in `$CARGO_HOME/bin` is only replaced by installing there.
+    The fix targets the one location this script checks: `--root` overrides
+    CARGO_INSTALL_ROOT and `install.root`, and any copy on PATH outside
+    `$CARGO_HOME/bin` could keep shadowing the new one (Cargo keeps the PATH
+    position of `$CARGO_HOME/bin` when it is on PATH), so PATH is reordered
+    too. The same rule holds whatever PATH topology produced the failure.
     """
     command = result.tool.install
-    in_home = result.path is not None and Path(result.path).parent == Path(cargo_bin)
-    if in_home and command[:2] == ("cargo", "install"):
-        return (*command[:2], "--root", str(Path(cargo_bin).parent), *command[2:])
-    return command
+    if command[:2] == ("cargo", "install"):
+        command = (*command[:2], "--root", str(Path(cargo_bin).parent), *command[2:])
+    fix = shlex.join(command)
+    outside_home = result.on_path is not None and Path(result.on_path).parent != Path(cargo_bin)
+    if outside_home:
+        return f"{fix}; then put it first: {path_fix(cargo_bin)}"
+    return fix
 
 
 def describe(result, strict, cargo_bin):

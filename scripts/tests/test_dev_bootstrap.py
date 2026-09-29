@@ -238,7 +238,7 @@ class CheckTests(DevBootstrapCase):
         self.assertEqual(status, 1)
         self.assertIn("FAIL     cargo-nextest is missing (needs >= 0.9.115)",
                       output)
-        self.assertIn("fix: cargo install --locked cargo-nextest", output)
+        self.assertIn("fix: cargo install --root /fake/cargo-home --locked cargo-nextest", output)
         self.assertIn("failing: cargo-nextest", output)
 
     def test_too_old_required_tool_fails(self):
@@ -256,7 +256,7 @@ class CheckTests(DevBootstrapCase):
         status, output = self.run_main(FakeHost(on_path=tools))
         self.assertEqual(status, 0)
         self.assertIn("warn     hyperfine is missing", output)
-        self.assertIn("fix: cargo install --locked hyperfine", output)
+        self.assertIn("fix: cargo install --root /fake/cargo-home --locked hyperfine", output)
         self.assertIn("warn     mold is missing", output)
 
     def test_missing_optional_tool_fails_under_strict(self):
@@ -347,6 +347,21 @@ class CheckTests(DevBootstrapCase):
         status, output = self.run_main(host)
         self.assertEqual(status, 1, output)
         self.assertIn("; then put it first: ", output)
+
+    def test_stale_copy_outside_cargo_home_gets_install_and_path_fix(self):
+        # No copy in $CARGO_HOME/bin yet: the new install could still be
+        # shadowed by the stale PATH copy, so PATH is reordered too.
+        for name in ("cargo-nextest", "bacon"):
+            with self.subTest(tool=name):
+                tools = dict(CURRENT)
+                tools[name] = f"{name} 0.0.1\n"
+                status, output = self.run_main(FakeHost(on_path=tools), "--strict")
+                self.assertEqual(status, 1, output)
+                self.assertIn(
+                    f"cargo install --root /fake/cargo-home --locked {name}; then put it first: "
+                    f'export PATH={CARGO_BIN}:"$PATH"',
+                    output,
+                )
 
     def test_cargo_subcommand_without_cargo_is_a_failure(self):
         status, output = self.run_main(FakeHost(cargo=False))
