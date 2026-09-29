@@ -129,6 +129,11 @@ class RenderTests(unittest.TestCase):
         self.assertIn(f"**Warning:** missing JUnit report `{missing}`", markdown)
         self.assertIn("3 test(s) in 1 report(s)", markdown)
 
+    def test_warning_keeps_a_long_path_whole(self):
+        missing = Path("/" + "d" * (summary.MESSAGE_LIMIT * 2)) / "junit.xml"
+        markdown = summary.render("heavy", [missing])
+        self.assertIn(f"**Warning:** missing JUnit report `{missing}`", markdown)
+
     def test_cell_escapes_table_and_html_syntax(self):
         self.assertEqual(summary.cell("a | b\n<c>"), "a \\| b &lt;c&gt;")
 

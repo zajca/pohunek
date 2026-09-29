@@ -86,6 +86,11 @@ def load(path):
     return classify(root), None
 
 
+def inline(text):
+    """Render text safely on one Markdown line, without shortening it."""
+    return html.escape(" ".join(text.split()), quote=False)
+
+
 def cell(text):
     """Render text safely inside one Markdown table cell."""
     text = " ".join(text.split())
@@ -111,7 +116,9 @@ def render(label, paths):
         failed.extend(report_failed)
     lines = [f"### Flaky and failed tests: {cell(label)}", ""]
     for problem in problems:
-        lines.append(f"- **Warning:** {cell(problem)}")
+        # A warning names the report path in full: a shortened path would
+        # hide which report is missing.
+        lines.append(f"- **Warning:** {inline(problem)}")
     if problems:
         lines.append("")
     lines.append(
