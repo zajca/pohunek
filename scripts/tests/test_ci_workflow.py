@@ -119,9 +119,18 @@ class TestArchiveTests(unittest.TestCase):
                 self.assertRegex(block, r"(?m)^    needs: (?:build-tests|\[.*\bbuild-tests\b.*\])$")
                 self.assertIn("name: nextest-archive", block)
                 self.assertIn("--archive-file", block)
-                for forbidden in ("rust-toolchain", "rust-cache", "setup-mold", "cargo build"):
-                    self.assertNotIn(forbidden, block)
+                forbidden = ["rust-cache", "setup-mold", "cargo build"]
+                if job != "integration":
+                    forbidden.append("rust-toolchain")
+                for token in forbidden:
+                    self.assertNotIn(token, block)
                 self.assertNotIn("RUSTFLAGS", block)
+
+    def test_heavy_has_the_toolchain_and_sources_the_dependency_policy_test_needs(self):
+        block = job_block(self.text, "integration")
+        self.assertIn("rust-toolchain", block)
+        self.assertIn("components: clippy", block)
+        self.assertIn("cargo fetch --locked", block)
 
     def test_heavy_checks_partitions_against_the_archive(self):
         block = job_block(self.text, "integration")

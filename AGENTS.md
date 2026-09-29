@@ -185,7 +185,8 @@ all discovered tests, including ignored ones, are assigned exactly once. The
 `relay-db` shard needs the real worker binary and disposable PostgreSQL URL
 (`python3 scripts/test-partitions run relay-db`); `cargo t`/`cargo ti` do not.
 `cargo tw` remains unfiltered at four test processes. Archive jobs install only
-`cargo-nextest` (no Rust toolchain, no rust-cache) and call
+`cargo-nextest` (no rust-cache; the heavy job adds a Clippy toolchain and
+`cargo fetch --locked` for `xtask::dependency_policy`) and call
 `python3 scripts/test-partitions --archive-file A run|check ...`, which
 extracts `A` into the checkout's `target/` and lists or runs without compiling.
 Tests locate binaries and sources through compile-time paths

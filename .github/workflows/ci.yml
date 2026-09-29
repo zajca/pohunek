@@ -40,7 +40,8 @@ env:
   # binaries once (`cargo nextest archive --workspace --all-features`) and
   # uploads the archive. The test jobs (fast shards, heavy, relay DB) download
   # it and run from it via scripts/test-partitions --archive-file; they install
-  # only cargo-nextest, no Rust toolchain and no rust-cache. Tests find binaries
+  # only cargo-nextest, no rust-cache (the heavy job also needs a toolchain with
+  # Clippy and the fetched crate sources for xtask::dependency_policy). Tests find binaries
   # and sources through compile-time paths (`env!("CARGO_BIN_EXE_*")`,
   # `env!("CARGO_MANIFEST_DIR")`, `<workspace>/target/debug/pohunek-sessiond`),
   # so the archive is extracted into the checkout at the same absolute
@@ -480,6 +481,19 @@ jobs:
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-nextest
+
+      # xtask::dependency_policy resolves an isolated fixture with
+      # `cargo tree --offline` and runs Clippy on it, so this job needs a
+      # toolchain with Clippy and the locked crates in the cargo registry. It
+      # compiles nothing else: the test binaries come from the archive.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Fetch locked dependency sources
+        run: cargo fetch --locked
 
       - name: Download test archive
         uses: actions/download-artifact@v4
