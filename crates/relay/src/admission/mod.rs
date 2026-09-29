@@ -1694,6 +1694,34 @@ impl Authority {
         self.management_retry_count.load(Ordering::Relaxed)
     }
 
+    /// Parks management mutations after their store write, before commit.
+    ///
+    /// A parked mutation still holds its transaction's receipt lock; it waits on
+    /// `entered`, then on `release`, until [`Self::clear_mutation_pause`].
+    #[cfg(all(test, feature = "postgres-tests"))]
+    pub(crate) fn set_mutation_pause(
+        &self,
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+    ) -> Result<(), AuthorityError> {
+        *self
+            .mutation_hook
+            .lock()
+            .map_err(|_error| AuthorityError::Cancelled)? =
+            Some(AdmissionHook { entered, release });
+        Ok(())
+    }
+
+    /// Lets management mutations that have not yet reached the pause commit freely.
+    #[cfg(all(test, feature = "postgres-tests"))]
+    pub(crate) fn clear_mutation_pause(&self) -> Result<(), AuthorityError> {
+        *self
+            .mutation_hook
+            .lock()
+            .map_err(|_error| AuthorityError::Cancelled)? = None;
+        Ok(())
+    }
+
     #[cfg(all(test, feature = "postgres-tests"))]
     pub(crate) fn expire_lease_deadline(&self) -> Result<(), AuthorityError> {
         *self
