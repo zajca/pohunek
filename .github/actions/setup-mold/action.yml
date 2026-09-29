@@ -20,6 +20,11 @@ runs:
       env:
         MOLD_VERSION: ${{ inputs.version }}
         MOLD_SHA256: ${{ inputs.sha256 }}
+        # curl retries transient failures (timeouts and HTTP 408/429/500/502/
+        # 503/504) from the GitHub release CDN; permanent errors such as 404
+        # fail at once. The sha256 check below still guards the bytes.
+        DOWNLOAD_RETRIES: "5"
+        DOWNLOAD_RETRY_DELAY_SECONDS: "2"
       run: |
         set -eu
         # GitHub does not enforce `required: true` on composite inputs.
@@ -37,6 +42,7 @@ runs:
         dest="${RUNNER_TEMP:?}/mold"
         mkdir -p "$dest"
         curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+          --retry "$DOWNLOAD_RETRIES" --retry-delay "$DOWNLOAD_RETRY_DELAY_SECONDS" \
           --output "$dest/$archive" \
           "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/${archive}"
         # Fails closed: extraction only runs after the hash matches.
