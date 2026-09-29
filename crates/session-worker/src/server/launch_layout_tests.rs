@@ -1,0 +1,376 @@
+//! Launch-identity selection over macOS-style Node/Bun wrapper layouts.
+//!
+//! The scripted inspector supplies process facts, so no interpreter needs to
+//! be installed and no path has to exist on the host; executable paths are
+//! already the canonical (symlink-resolved) form `proc_pidpath` reports.
+
+// Rust guideline compliant 2026-09-29
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use pohunek_platform::process::{
+    Error, ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity, ProcessInspector,
+    StartIdentity,
+};
+
+use crate::journal::{LaunchIdentity, PendingLaunchClaim};
+use crate::ChildIdentity;
+
+use super::{designated_launch_process_with, verify_launch_claim_with};
+
+const ROOT_PID: Pid = 500;
+const ROOT_START: u64 = 1_000;
+const AGENT_PID: Pid = 501;
+const AGENT_START: u64 = 1_001;
+const WORKER_UNRELATED_PID: Pid = 900;
+
+/// Process table with per-process executable paths and optional PID reuse.
+#[derive(Debug, Default)]
+struct Table {
+    facts: Vec<ProcessFact>,
+    executables: HashMap<Pid, PathBuf>,
+    /// PIDs whose identity lookups start answering with a different start
+    /// identity after the given number of calls (PID reuse mid-inspection).
+    reused_after: HashMap<Pid, (usize, StartIdentity)>,
+    identity_calls: Mutex<HashMap<Pid, usize>>,
+}
+
+impl Table {
+    fn with(mut self, pid: Pid, parent: Pid, start: u64, executable: &str, argv: &[&str]) -> Self {
+        self.facts.push(ProcessFact {
+            pid,
+            pgid: ROOT_PID,
+            ppid: parent,
+            start_identity: StartIdentity::new(start),
+            comm: PathBuf::from(executable)
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or_default()
+                .to_owned(),
+            cmdline: argv.iter().map(|value| (*value).to_owned()).collect(),
+        });
+        self.executables.insert(pid, PathBuf::from(executable));
+        self
+    }
+
+    /// A process of another user: visible in the table, but the same-user
+    /// inspector reports no executable for it.
+    fn with_foreign(mut self, pid: Pid, parent: Pid, start: u64, argv: &[&str]) -> Self {
+        self = self.with(pid, parent, start, "/placeholder", argv);
+        self.executables.remove(&pid);
+        self
+    }
+
+    fn fact(&self, pid: Pid) -> Option<&ProcessFact> {
+        self.facts.iter().find(|fact| fact.pid == pid)
+    }
+}
+
+impl ProcessInspector for Table {
+    fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, Error> {
+        let calls = {
+            let mut calls = self.identity_calls.lock().expect("call counter");
+            let entry = calls.entry(pid).or_default();
+            *entry += 1;
+            *entry
+        };
+        let Some(fact) = self.fact(pid) else {
+            return Ok(None);
+        };
+        let start_identity = match self.reused_after.get(&pid) {
+            Some((after, replacement)) if calls > *after => *replacement,
+            _ => fact.start_identity,
+        };
+        Ok(Some(ProcessIdentity {
+            pid,
+            start_identity,
+        }))
+    }
+
+    fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, Error> {
+        Ok(self.fact(pid).map(|fact| fact.ppid))
+    }
+
+    fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, Error> {
+        Ok(self.fact(pid).cloned())
+    }
+
+    fn same_user_processes(&self) -> Result<Vec<ProcessFact>, Error> {
+        Ok(self.facts.clone())
+    }
+
+    fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, Error> {
+        let mut found: Vec<ProcessFact> = Vec::new();
+        let mut frontier = vec![root];
+        while let Some(parent) = frontier.pop() {
+            for fact in self.facts.iter().filter(|fact| fact.ppid == parent) {
+                if fact.pid != root && !found.iter().any(|seen| seen.pid == fact.pid) {
+                    found.push(fact.clone());
+                    frontier.push(fact.pid);
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    fn cwd(&self, _pid: Pid) -> Result<PathBuf, Error> {
+        Err(Error::Unavailable {
+            operation: "scripted_cwd",
+        })
+    }
+
+    fn executable(&self, pid: Pid) -> Result<Option<PathBuf>, Error> {
+        Ok(self.executables.get(&pid).cloned())
+    }
+
+    fn exit_watch(&self, _identity: ProcessIdentity) -> Result<ExitWatch, Error> {
+        Err(Error::Unavailable {
+            operation: "scripted_exit_watch",
+        })
+    }
+
+    fn ownership_markers(&self, _pid: Pid) -> Result<OwnershipMarkers, Error> {
+        Ok(OwnershipMarkers::default())
+    }
+
+    fn foreground_process_group(&self, _root_pid: Pid) -> Result<Option<Pid>, Error> {
+        Ok(None)
+    }
+}
+
+fn root() -> ProcessIdentity {
+    ProcessIdentity {
+        pid: ROOT_PID,
+        start_identity: StartIdentity::new(ROOT_START),
+    }
+}
+
+/// A shell PTY root with one agent process below it.
+fn table_with_agent(executable: &str, argv: &[&str]) -> Table {
+    Table::default()
+        .with(ROOT_PID, 1, ROOT_START, "/bin/zsh", &["-zsh"])
+        .with(AGENT_PID, ROOT_PID, AGENT_START, executable, argv)
+}
+
+fn selected(table: &Table, provider: &str) -> Option<(Pid, u64)> {
+    designated_launch_process_with(table, root(), provider)
+        .expect("inspection succeeds")
+        .map(|process| (process.pid, process.start_identity))
+}
+
+fn claim(provider: &str, pid: Pid, start: u64) -> PendingLaunchClaim {
+    let child = |pid, start: u64| ChildIdentity {
+        pid,
+        process_group: i32::try_from(ROOT_PID).expect("pid fits"),
+        start_identity: start.to_string(),
+    };
+    PendingLaunchClaim {
+        retry_pending: true,
+        runtime_id: "runtime-a".to_owned(),
+        root: child(ROOT_PID, ROOT_START),
+        identity: LaunchIdentity {
+            provider: provider.to_owned(),
+            process: child(pid, start),
+            reference_kind: "session".to_owned(),
+            native_reference: "ref".to_owned(),
+        },
+        expires_at: "2099-01-01T00:00:00Z".to_owned(),
+    }
+}
+
+/// Layouts whose running image is named for the provider are accepted.
+#[test]
+fn provider_named_images_in_macos_install_prefixes_are_selected() {
+    let layouts: [(&str, &str, &[&str]); 5] = [
+        (
+            "codex",
+            "/opt/homebrew/Caskroom/codex/0.1.0/codex-aarch64-apple-darwin",
+            &["codex"],
+        ),
+        ("codex", "/usr/local/bin/codex", &["codex", "--resume"]),
+        (
+            "codex",
+            "/Users/dev/.bun/install/global/node_modules/@openai/codex/vendor/aarch64-apple-darwin/codex/codex",
+            &["codex"],
+        ),
+        (
+            "codex",
+            "/Users/dev/.nvm/versions/node/v22.1.0/lib/node_modules/@openai/codex/vendor/aarch64-apple-darwin/codex/codex",
+            &["codex"],
+        ),
+        ("hermes", "/opt/homebrew/bin/hermes", &["hermes", "chat"]),
+    ];
+    for (provider, executable, argv) in layouts {
+        let table = table_with_agent(executable, argv);
+        assert_eq!(
+            selected(&table, provider),
+            Some((AGENT_PID, AGENT_START)),
+            "{executable}"
+        );
+    }
+}
+
+/// The interpreter image is never the identity, whatever script it runs.
+#[test]
+fn interpreter_images_are_not_selected_for_any_wrapper_layout() {
+    let layouts: [(&str, &[&str]); 6] = [
+        (
+            "/opt/homebrew/bin/node",
+            &[
+                "node",
+                "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js",
+            ],
+        ),
+        (
+            "/usr/local/bin/node",
+            &[
+                "node",
+                "/usr/local/lib/node_modules/@openai/codex/bin/codex.js",
+            ],
+        ),
+        (
+            "/Users/dev/.bun/bin/bun",
+            &[
+                "bun",
+                "/Users/dev/.bun/install/global/node_modules/@openai/codex/bin/codex.js",
+            ],
+        ),
+        (
+            "/Users/dev/.nvm/versions/node/v22.1.0/bin/node",
+            &["node", "/Users/dev/.nvm/versions/node/v22.1.0/bin/codex"],
+        ),
+        (
+            // `#!/usr/bin/env node` script: the kernel runs node with the
+            // script path as argv[1].
+            "/usr/local/bin/node",
+            &["node", "/usr/local/bin/codex", "--resume"],
+        ),
+        (
+            // npm-global wrapper resolved through `npm exec`.
+            "/opt/homebrew/bin/node",
+            &[
+                "node",
+                "/opt/homebrew/lib/node_modules/npm/bin/npx-cli.js",
+                "@openai/codex",
+            ],
+        ),
+    ];
+    for (executable, argv) in layouts {
+        let table = table_with_agent(executable, argv);
+        assert_eq!(selected(&table, "codex"), None, "{executable} {argv:?}");
+    }
+}
+
+#[test]
+fn a_wrapper_whose_child_image_is_provider_named_selects_only_that_child() {
+    let table = Table::default()
+        .with(ROOT_PID, 1, ROOT_START, "/bin/zsh", &["-zsh"])
+        .with(
+            AGENT_PID,
+            ROOT_PID,
+            AGENT_START,
+            "/opt/homebrew/bin/node",
+            &[
+                "node",
+                "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js",
+            ],
+        )
+        .with(
+            502,
+            AGENT_PID,
+            1_002,
+            "/opt/homebrew/lib/node_modules/@openai/codex/vendor/aarch64-apple-darwin/codex/codex",
+            &["codex"],
+        );
+
+    assert_eq!(selected(&table, "codex"), Some((502, 1_002)));
+}
+
+#[test]
+fn a_different_provider_name_never_selects_a_process() {
+    let table = table_with_agent("/opt/homebrew/bin/hermes", &["hermes"]);
+    assert_eq!(selected(&table, "codex"), None);
+    assert_eq!(selected(&table, "claude"), None);
+}
+
+#[test]
+fn a_same_named_process_outside_the_pty_tree_is_ignored() {
+    let table = table_with_agent("/opt/homebrew/bin/node", &["node", "codex.js"]).with(
+        WORKER_UNRELATED_PID,
+        1,
+        2_000,
+        "/opt/homebrew/bin/codex",
+        &["codex"],
+    );
+    assert_eq!(selected(&table, "codex"), None);
+}
+
+#[test]
+fn a_foreign_user_process_without_an_executable_is_never_selected() {
+    let table = table_with_agent("/opt/homebrew/bin/node", &["node", "codex.js"]).with_foreign(
+        502,
+        AGENT_PID,
+        1_002,
+        &["codex"],
+    );
+    assert_eq!(selected(&table, "codex"), None);
+}
+
+#[test]
+fn pid_reuse_during_inspection_fails_closed() {
+    let mut table = table_with_agent("/opt/homebrew/bin/codex", &["codex"]);
+    // The first identity lookup sees the real generation, the recheck sees a
+    // different process under the same PID.
+    table
+        .reused_after
+        .insert(AGENT_PID, (1, StartIdentity::new(AGENT_START + 77)));
+
+    let error = designated_launch_process_with(&table, root(), "codex")
+        .expect_err("a swapped generation must not be accepted");
+    assert!(
+        error.to_string().contains("launch candidate changed"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn a_retry_claim_for_the_provider_image_verifies() {
+    let table = table_with_agent("/opt/homebrew/bin/codex", &["codex"]);
+    assert!(verify_launch_claim_with(&table, &claim("codex", AGENT_PID, AGENT_START)).unwrap());
+}
+
+#[test]
+fn a_retry_claim_naming_the_interpreter_never_verifies() {
+    let table = table_with_agent(
+        "/opt/homebrew/bin/node",
+        &[
+            "node",
+            "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js",
+        ],
+    );
+    assert!(!verify_launch_claim_with(&table, &claim("codex", AGENT_PID, AGENT_START)).unwrap());
+}
+
+#[test]
+fn a_retry_claim_with_a_stale_start_identity_never_verifies() {
+    let table = table_with_agent("/opt/homebrew/bin/codex", &["codex"]);
+    assert!(
+        !verify_launch_claim_with(&table, &claim("codex", AGENT_PID, AGENT_START + 1)).unwrap()
+    );
+}
+
+#[test]
+fn a_retry_claim_for_another_provider_never_verifies() {
+    let table = table_with_agent("/opt/homebrew/bin/codex", &["codex"]);
+    assert!(!verify_launch_claim_with(&table, &claim("claude", AGENT_PID, AGENT_START)).unwrap());
+}
+
+#[test]
+fn a_retry_claim_for_a_reused_root_pid_never_verifies() {
+    let table = table_with_agent("/opt/homebrew/bin/codex", &["codex"]);
+    let mut stale = claim("codex", AGENT_PID, AGENT_START);
+    stale.root.start_identity = (ROOT_START + 5).to_string();
+    assert!(!verify_launch_claim_with(&table, &stale).unwrap());
+}

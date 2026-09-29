@@ -3292,6 +3292,13 @@ fn known_identity_provider(provider: &str) -> bool {
 }
 
 fn verify_launch_claim(claim: &PendingLaunchClaim) -> Result<bool, WorkerError> {
+    verify_launch_claim_with(&HostInspector::new(), claim)
+}
+
+fn verify_launch_claim_with(
+    inspector: &dyn ProcessInspector,
+    claim: &PendingLaunchClaim,
+) -> Result<bool, WorkerError> {
     let exact_identity = |process: &ChildIdentity| -> Result<OsProcessIdentity, WorkerError> {
         Ok(OsProcessIdentity {
             pid: process.pid,
@@ -3304,7 +3311,7 @@ fn verify_launch_claim(claim: &PendingLaunchClaim) -> Result<bool, WorkerError> 
     let root = exact_identity(&claim.root)?;
     let candidate = exact_identity(&claim.identity.process)?;
     for expected in [root, candidate] {
-        match HostInspector::new().identity(expected.pid) {
+        match inspector.identity(expected.pid) {
             Ok(Some(current)) if current == expected => {}
             Ok(_) | Err(pohunek_platform::process::Error::Race { .. }) => return Ok(false),
             Err(error) => return Err(WorkerError::Protocol(error.to_string())),
@@ -3312,7 +3319,7 @@ fn verify_launch_claim(claim: &PendingLaunchClaim) -> Result<bool, WorkerError> 
     }
     // This probe also rechecks root/candidate generations after executable and
     // ancestry inspection. The stored PID alone never authorizes a retry.
-    let designated = designated_launch_process(root, &claim.identity.provider)?;
+    let designated = designated_launch_process_with(inspector, root, &claim.identity.provider)?;
     Ok(designated.is_some_and(|process| {
         process.pid == candidate.pid
             && process.start_identity.to_string() == candidate.start_identity.to_string()
@@ -4202,14 +4209,15 @@ fn process_start(pid: u32) -> Result<u64, WorkerError> {
         .ok_or_else(|| WorkerError::Protocol("process no longer exists".to_owned()))
 }
 
-fn process_parent(pid: u32) -> Result<u32, WorkerError> {
-    HostInspector::new()
-        .parent_pid(pid)
-        .map_err(|error| WorkerError::Protocol(error.to_string()))?
-        .ok_or_else(|| WorkerError::Protocol("process no longer exists".to_owned()))
+fn is_descendant(pid: u32, root: u32) -> Result<bool, WorkerError> {
+    is_descendant_with(&HostInspector::new(), pid, root)
 }
 
-fn is_descendant(mut pid: u32, root: u32) -> Result<bool, WorkerError> {
+fn is_descendant_with(
+    inspector: &dyn ProcessInspector,
+    mut pid: u32,
+    root: u32,
+) -> Result<bool, WorkerError> {
     for _ in 0..128 {
         if pid == root {
             return Ok(true);
@@ -4217,7 +4225,10 @@ fn is_descendant(mut pid: u32, root: u32) -> Result<bool, WorkerError> {
         if pid <= 1 {
             return Ok(false);
         }
-        let parent = process_parent(pid)?;
+        let parent = inspector
+            .parent_pid(pid)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?
+            .ok_or_else(|| WorkerError::Protocol("process no longer exists".to_owned()))?;
         if parent == pid {
             return Ok(false);
         }
@@ -4226,11 +4237,19 @@ fn is_descendant(mut pid: u32, root: u32) -> Result<bool, WorkerError> {
     Ok(false)
 }
 
-fn designated_launch_process(
+/// Selects the launch process for `provider` among `root` and its descendants.
+///
+/// A process qualifies only when its executable file name contains the provider
+/// name. Interpreters (`node`, `bun`) never qualify by themselves, and neither
+/// does an interpreter's script argument: a wrapper install is accepted only
+/// when the process image that runs is itself named for the provider (a native
+/// binary or a launcher named for it). Anything else yields `None`, which
+/// leaves the claim unaccepted.
+fn designated_launch_process_with(
+    inspector: &dyn ProcessInspector,
     root: OsProcessIdentity,
     provider: &str,
 ) -> Result<Option<WireProcessIdentity>, WorkerError> {
-    let inspector = HostInspector::new();
     let mut processes = inspector
         .descendant_identities(root)
         .map_err(|error| WorkerError::Protocol(error.to_string()))?;
@@ -4282,7 +4301,7 @@ fn designated_launch_process(
             .identity(candidate.pid)
             .map_err(|error| WorkerError::Protocol(error.to_string()))?
             != Some(exact_candidate)
-        || !is_descendant(candidate.pid, root.pid)?
+        || !is_descendant_with(inspector, candidate.pid, root.pid)?
     {
         return Err(WorkerError::Protocol(
             "launch candidate changed ancestry during inspection".to_owned(),
@@ -4368,6 +4387,9 @@ where
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
+
+#[cfg(test)]
+mod launch_layout_tests;
 
 #[cfg(test)]
 mod tests {
