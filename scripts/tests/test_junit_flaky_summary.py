@@ -130,9 +130,17 @@ class RenderTests(unittest.TestCase):
         self.assertIn("3 test(s) in 1 report(s)", markdown)
 
     def test_warning_keeps_a_long_path_whole(self):
-        missing = Path("/" + "d" * (summary.MESSAGE_LIMIT * 2)) / "junit.xml"
+        # Longer than MESSAGE_LIMIT, with every component a valid file name.
+        missing = Path("/", *(["d" * 100] * 4), "junit.xml")
         markdown = summary.render("heavy", [missing])
         self.assertIn(f"**Warning:** missing JUnit report `{missing}`", markdown)
+
+    def test_path_that_cannot_be_inspected_is_reported(self):
+        # One component over NAME_MAX: stat() fails with ENAMETOOLONG.
+        unusable = Path("/", "d" * 300, "junit.xml")
+        markdown = summary.render("heavy", [unusable, FLAKY_FAIL])
+        self.assertIn("**Warning:**", markdown)
+        self.assertIn("3 test(s) in 1 report(s)", markdown)
 
     def test_cell_escapes_table_and_html_syntax(self):
         self.assertEqual(summary.cell("a | b\n<c>"), "a \\| b &lt;c&gt;")

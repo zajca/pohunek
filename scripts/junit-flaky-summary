@@ -77,7 +77,13 @@ def classify(root):
 
 def load(path):
     """Classify one report, or return a problem string for the summary."""
-    if not path.is_file():
+    try:
+        present = path.is_file()
+    except OSError as error:
+        # Python < 3.14 raises here for e.g. an over-long name; the report
+        # is unusable either way and must show up as a warning.
+        return None, f"unreadable JUnit report `{path}`: {error}"
+    if not present:
         return None, f"missing JUnit report `{path}`: the test step wrote no report"
     try:
         root = ElementTree.parse(path).getroot()
