@@ -321,6 +321,28 @@ class CheckTests(DevBootstrapCase):
         # A PATH-order problem is a manual step: reinstalling cannot fix it.
         self.assertEqual(host.installs, [])
 
+    def test_missing_cargo_is_reported_before_a_missing_subcommand(self):
+        tools = dict(CURRENT)
+        tools.pop("cargo-nextest")
+        host = FakeHost(on_path=tools, cargo=False)
+        status, output = self.run_main(host, "--install")
+        self.assertEqual(status, 1, output)
+        self.assertIn("`cargo` is not on PATH", output)
+        self.assertIn("https://rustup.rs", output)
+        self.assertNotIn("cargo install --locked cargo-nextest", output)
+        self.assertEqual(host.installs, [])
+
+    def test_outdated_copy_only_in_cargo_home_keeps_its_install_fix(self):
+        tools = dict(CURRENT)
+        tools.pop("bacon")
+        host = FakeHost(on_path=tools, in_cargo_bin={"bacon": "bacon 2.0.0\n"},
+                        installed_output={"bacon": CURRENT["bacon"]})
+        status, output = self.run_main(host, "--strict")
+        self.assertEqual(status, 1, output)
+        self.assertIn("bacon 2.0.0 is older than", output)
+        self.assertIn("cargo install --locked bacon", output)
+        self.assertNotIn("not on PATH", output)
+
     def test_binary_only_in_cargo_home_is_reported_off_path(self):
         tools = dict(CURRENT)
         bacon = tools.pop("bacon")
