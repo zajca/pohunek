@@ -861,7 +861,7 @@ scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 --current 2026-09-2
     --event pull_request --conclusion success   # reproduce CI timing evidence
 ```
 
-Requires cargo-nextest >= 0.9.115 (profile inheritance) and Python >= 3.11
+Requires cargo-nextest >= 0.9.131 (`flaky-result`) and Python >= 3.11
 for the shard helper. `profile.fast.default-filter` is the cost boundary;
 `scripts/test-partitions` subdivides it by package ownership, with an exact
 complement for heavy tests. Whole fixture-owning modules stay heavy: real

@@ -922,6 +922,17 @@ class JunitTests(unittest.TestCase):
         self.assertEqual(summary["slowest"][0], ("test_gamma", 11.0))
         self.assertEqual(len(summary["suites"]), 2)
 
+    def test_parse_junit_counts_retried_testcases_once(self):
+        # Real nextest report with retries: one flaky test (flaky-result =
+        # "fail") and one test that failed all three attempts. Nested
+        # flakyFailure/rerunFailure elements are attempts, not test cases.
+        report = Path(__file__).resolve().parent / "fixtures/nextest-junit/flaky-result-fail.xml"
+        summary = ci_timings.parse_junit([report])
+        self.assertEqual(summary["cases"], 3)
+        self.assertEqual(summary["failures"], 2)
+        self.assertEqual(summary["errors"], 0)
+        self.assertEqual(len(summary["suites"]), 1)
+
     def test_percentile_uses_nearest_rank(self):
         self.assertIsNone(ci_timings.percentile([], 0.95))
         self.assertEqual(ci_timings.percentile([5.0], 0.95), 5.0)
