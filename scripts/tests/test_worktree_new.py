@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -84,6 +85,8 @@ class FakeExecutor:
         self.add_fails = None
         # When True, `git branch <name> <commit>` fails without creating it.
         self.branch_fails = False
+        # When True, `git worktree remove` fails and leaves the worktree.
+        self.remove_fails = False
         # Registered worktree path -> checked-out branch name.
         self.registered = {}
         # Per-root override of `cargo metadata` target/build directories.
@@ -191,12 +194,12 @@ class FakeExecutor:
         if args[:2] == ["worktree", "move"]:
             return self.worktree_move(Path(args[2]), Path(args[3]))
         if args[:2] == ["worktree", "list"]:
-            lines = [f"worktree {self.common_dir.parent}\nbranch refs/heads/main"]
-            lines += [f"worktree {path}\nbranch refs/heads/{branch}"
-                      for path, branch in sorted(self.registered.items())]
-            return 0, "\n\n".join(lines) + "\n", ""
+            assert args[2:] == ["--porcelain", "-z"], args
+            return 0, self.porcelain_z(), ""
         if args[:2] == ["worktree", "remove"]:
             path = Path(args[-1])
+            if self.remove_fails:
+                return 128, "", f"fatal: cannot remove '{path}'"
             if path not in self.registered:
                 return 128, "", f"fatal: '{path}' is not a working tree"
             shutil.rmtree(path)
@@ -248,6 +251,18 @@ class FakeExecutor:
         source.rename(dest)
         self.registered[dest] = self.registered.pop(source)
         return 0, "", ""
+
+    def porcelain_z(self):
+        """`git worktree list --porcelain -z` as git 2.55 prints it: each
+        attribute ends with NUL and each record with one more NUL."""
+        records = [(self.common_dir.parent, "main")]
+        records += sorted(self.registered.items())
+        out = ""
+        for path, branch in records:
+            out += f"worktree {path}\0HEAD {BASE_COMMIT}\0"
+            out += f"branch refs/heads/{branch}\0" if branch else "detached\0"
+            out += "\0"
+        return out
 
     def temporary_branches(self):
         """Branches that still carry a temporary name."""
@@ -832,6 +847,20 @@ class WorktreeAddFailureTests(RollbackCase):
                          {other: "zajca/issue-1"})
         self.assert_temp_branch_compare_and_deleted()
 
+    def test_failed_worktree_removal_keeps_its_branch(self):
+        self.h.executor.copy_fails_for = "deps"
+        self.h.executor.remove_fails = True
+        code, _, err = self.h.run("issue-1")
+        self.assertEqual(code, 1)
+        (temp,) = self.h.executor.temporary_worktrees()
+        (temp_branch,) = self.h.executor.temporary_branches()
+        self.assertEqual(self.h.executor.registered, {temp: temp_branch})
+        self.assertEqual(self.h.executor.branches[temp_branch], BASE_COMMIT)
+        self.assertEqual(self.h.executor.ref_deletions(), [])
+        self.assertIn(f"remove worktree {temp} manually", err)
+        self.assertIn(f"left branch {temp_branch} in place: worktree {temp} "
+                      "still has it checked out", err)
+
     def test_retry_after_rollback_succeeds(self):
         self.run_failing_add("after-checkout")
         self.h.executor.add_fails = None
@@ -1070,6 +1099,29 @@ class ConcurrencyTests(HarnessCase):
         self.assertIn(worktree, shared.registered)
         self.assertIn("zajca/issue-1", shared.branches)
         self.assertTrue((worktree / "target" / "debug" / "deps").is_dir())
+
+
+class WorktreeListTests(HarnessCase):
+    def test_path_with_a_newline_is_parsed_intact(self):
+        odd = self.h.worktrees / "odd\nworktree issue-1"
+        self.h.executor.registered[odd] = "zajca/odd"
+        self.h.executor.registered[self.h.worktrees / "detached"] = None
+        listed = worktree_new.list_worktrees(self.h.repo, self.h.executor)
+        self.assertEqual(listed[odd.resolve()], "refs/heads/zajca/odd")
+        self.assertIsNone(listed[(self.h.worktrees / "detached").resolve()])
+        self.assertNotIn((self.h.worktrees / "odd").resolve(), listed)
+        self.assertTrue(worktree_new.worktree_registered(
+            odd, self.h.repo, self.h.executor))
+        self.assertFalse(worktree_new.worktree_registered(
+            self.h.worktrees / "issue-1", self.h.repo, self.h.executor))
+
+    def test_real_execute_keeps_carriage_returns_and_newlines(self):
+        # The running interpreter is the only external program used.
+        result = worktree_new.execute(
+            [sys.executable, "-c",
+             "import sys; sys.stdout.buffer.write(b'a\\rb\\nc\\0')"],
+            cwd=self.h.root)
+        self.assertEqual(result.stdout, "a\rb\nc\0")
 
 
 class LockTests(unittest.TestCase):

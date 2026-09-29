@@ -170,20 +170,24 @@ def format_command(command):
 def execute(command, cwd, check=True):
     """Run one git/cargo/cp command and return the completed process.
 
-    With `check`, a non-zero exit raises `WorktreeError` carrying the
-    command's first stderr line.
+    Output is captured as bytes and decoded with `os.fsdecode`: text mode
+    would translate carriage returns inside a path, and the file-system
+    decoding round-trips any byte a path may hold. With `check`, a non-zero exit raises
+    `WorktreeError` carrying the command's first stderr line.
     """
     try:
-        result = subprocess.run(
+        raw = subprocess.run(
             [str(part) for part in command],
             cwd=cwd,
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
         )
     except OSError as error:
         raise WorktreeError(f"cannot run {format_command(command)}: {error}")
+    result = subprocess.CompletedProcess(
+        raw.args, raw.returncode, os.fsdecode(raw.stdout),
+        os.fsdecode(raw.stderr))
     if check and result.returncode != 0:
         detail = (result.stderr or "").strip().splitlines()
         detail = f": {detail[0]}" if detail else ""
@@ -227,10 +231,12 @@ def validate_branch(branch, repo, executor):
 
 def main_checkout(cwd, executor):
     """The main checkout: the directory that owns the shared `.git`."""
+    # Only git's line terminator is dropped: a path may itself end in
+    # whitespace or hold a newline.
     common = executor(
         ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
         cwd=cwd,
-    ).stdout.strip()
+    ).stdout.removesuffix("\n")
     common_dir = Path(common)
     if common_dir.name != ".git":
         raise WorktreeError(
@@ -484,21 +490,32 @@ def seed_target(source_target, dest_target, executor):
                     executor)
 
 
-def worktree_registered(worktree, repo, executor):
-    """True when git lists `worktree` in `git worktree list --porcelain`.
+def list_worktrees(repo, executor):
+    """Map each registered worktree's resolved path to its branch ref.
 
-    Raises when git cannot list them, because callers decide about deletion
-    from this answer.
+    The ref is None for a detached HEAD. `--porcelain -z` ends every
+    attribute with NUL and every record with an empty attribute, so a path
+    holding a newline parses intact. Raises when git cannot list them,
+    because callers decide about deletion from this answer.
     """
     output = executor(
-        ["git", "worktree", "list", "--porcelain"], cwd=repo
+        ["git", "worktree", "list", "--porcelain", "-z"], cwd=repo
     ).stdout
-    listed = {
-        Path(line.removeprefix("worktree ")).resolve()
-        for line in output.splitlines()
-        if line.startswith("worktree ")
-    }
-    return worktree.resolve() in listed
+    worktrees, current = {}, None
+    for field in output.split("\0"):
+        if field.startswith("worktree "):
+            current = Path(field.removeprefix("worktree ")).resolve()
+            worktrees[current] = None
+        elif field.startswith("branch ") and current is not None:
+            worktrees[current] = field.removeprefix("branch ")
+        elif not field:
+            current = None
+    return worktrees
+
+
+def worktree_registered(worktree, repo, executor):
+    """True when git lists `worktree` as a registered worktree."""
+    return worktree.resolve() in list_worktrees(repo, executor)
 
 
 def temporary_names(worktrees_root, slug):
@@ -534,9 +551,18 @@ def delete_owned_branch(branch, commit, repo, executor, removed, problems):
 
     No other process knows the name, and `git update-ref -d <ref> <old>`
     compares and deletes under git's own ref lock, so a ref that changed
-    anyway survives and is reported.
+    anyway survives and is reported. A branch some registered worktree
+    still has checked out (one whose removal failed) is kept, so that
+    worktree's HEAD never points at a deleted ref.
     """
     ref = f"refs/heads/{branch}"
+    users = [path for path, head in list_worktrees(repo, executor).items()
+             if head == ref]
+    if users:
+        problems.append(f"left branch {branch} in place: worktree "
+                        f"{users[0]} still has it checked out; remove both "
+                        "manually")
+        return
     result = executor(["git", "update-ref", "-d", ref, commit], cwd=repo,
                       check=False)
     if result.returncode == 0:
@@ -553,8 +579,10 @@ def rollback(repo, worktree_paths, branch, commit, executor):
 
     `worktree_paths` are the paths that carry this run's temporary name;
     `branch` is its temporary branch and `commit` what that was created
-    at, or None when this run did not create it. Returns (removed artifacts, problems needing manual
-    cleanup). A failure to inspect git is itself such a problem.
+    at, or None when this run did not create it. The branch is deleted
+    only after the worktrees are gone. Returns (removed artifacts, problems
+    needing manual cleanup); a failure to inspect git is itself such a
+    problem.
     """
     removed, problems = [], []
     try:

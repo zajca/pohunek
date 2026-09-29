@@ -279,7 +279,9 @@ Release packaging and contributor verification:
   final name last with `git branch -m`; a failure before that rename
   removes only the worktree at the temporary path and deletes only the
   temporary branch by `git update-ref -d` against the commit it was created
-  at, so plain-git work under the final names is never touched. A failed
+  at, and only once no registered worktree still has it checked out, so
+  plain-git work under the final names is never touched. Worktrees are
+  read from `git worktree list --porcelain -z`, so any path parses intact. A failed
   final rename keeps the worktree on its temporary branch and reports both.
   `--no-seed` skips seeding.
 - `scripts/tests/test_worktree_new.py` — regression checks for its slug and
@@ -289,8 +291,9 @@ Release packaging and contributor verification:
   directory, rollback of partial `git worktree add` failures, races with
   plain `git` creating the same worktree or branch, moving the temporary
   branch, recreating the final branch during rollback, or taking the final
-  name before the rename, the temporary-path lifecycle, and `--no-seed`,
-  with an injected executor.
+  name before the rename, a failed worktree removal keeping its branch,
+  NUL-separated worktree listings with newline paths, the temporary-path
+  lifecycle, and `--no-seed`, with an injected executor.
 - `.github/workflows/ci.yml`
 - `.github/workflows/release.yml`
 - `README.md`
