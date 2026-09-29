@@ -594,35 +594,71 @@ async fn run_worker_attach_bridge<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let version = data.version;
-    let stream_id = data.stream_id.clone();
-    let runtime_id = data.runtime_id.clone();
-    let (mut worker_read, mut worker_write) = tokio::io::split(&mut data.stream);
+    let identity = WorkerFrameIdentity {
+        version: data.version,
+        stream_id: data.stream_id.clone(),
+        runtime_id: data.runtime_id.clone(),
+    };
+    bridge_worker_frames(
+        stream,
+        &mut data.stream,
+        &identity,
+        attach_stream_id,
+        session_id,
+        cancel,
+        initial_input,
+    )
+    .await
+}
+
+/// Frame identity every frame of one worker attach stream carries.
+#[derive(Debug)]
+struct WorkerFrameIdentity {
+    version: pohunek_worker_protocol::Version,
+    stream_id: pohunek_worker_protocol::StreamId,
+    runtime_id: pohunek_worker_protocol::RuntimeId,
+}
+
+/// Copies worker frames to the public stream and public bytes to the worker.
+///
+/// One worker read stays pending across every `select!` iteration (see
+/// [`read_owned_frame`]), so public input arriving while a worker frame is
+/// only partly received never discards the bytes already consumed.
+async fn bridge_worker_frames<S, W>(
+    stream: &mut S,
+    worker: &mut W,
+    identity: &WorkerFrameIdentity,
+    attach_stream_id: &str,
+    session_id: &protocol::SessionId,
+    cancel: &tokio_util::sync::CancellationToken,
+    initial_input: Vec<u8>,
+) -> Result<(), AttachBridgeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    W: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let (worker_read, mut worker_write) = tokio::io::split(worker);
     let mut write_sequence = 1_u64;
     if !initial_input.is_empty() {
-        send_worker_attach_input(
-            &mut worker_write,
-            version,
-            &stream_id,
-            &runtime_id,
-            write_sequence,
-            initial_input,
-        )
-        .await
-        .map_err(AttachBridgeError::worker_stream)?;
+        send_worker_attach_input(&mut worker_write, identity, write_sequence, initial_input)
+            .await
+            .map_err(AttachBridgeError::worker_stream)?;
         write_sequence = next_attach_sequence(write_sequence)?;
     }
     let mut input = [0_u8; 8 * 1024];
     let mut snapshot_started = false;
+    let next_frame = read_owned_frame(worker_read);
+    tokio::pin!(next_frame);
 
     loop {
         tokio::select! {
-            frame = read_frame(&mut worker_read) => {
+            (worker_read, frame) = &mut next_frame => {
+                next_frame.set(read_owned_frame(worker_read));
                 let Some(frame) = frame.map_err(AttachBridgeError::worker_stream)? else {
                     break;
                 };
                 let (header, payload) = frame.into_parts();
-                if header.stream_id != stream_id || header.runtime_id != runtime_id {
+                if header.stream_id != identity.stream_id || header.runtime_id != identity.runtime_id {
                     return Err(AttachBridgeError::worker_message(
                         "worker attach frame identity mismatch",
                     ));
@@ -678,9 +714,7 @@ where
                 }
                 send_worker_attach_input(
                     &mut worker_write,
-                    version,
-                    &stream_id,
-                    &runtime_id,
+                    identity,
                     write_sequence,
                     input[..count].to_vec(),
                 )
@@ -692,6 +726,24 @@ where
         }
     }
     Ok(())
+}
+
+/// Reads one worker frame and hands the reader back with the result.
+///
+/// [`read_frame`] is not cancel-safe: dropping it after part of a frame was
+/// consumed loses those bytes and desynchronizes the stream. Owning the reader
+/// lets the caller keep one read pending across `select!` iterations instead.
+async fn read_owned_frame<R>(
+    mut reader: R,
+) -> (
+    R,
+    Result<Option<DataFrame>, pohunek_worker_protocol::FrameError>,
+)
+where
+    R: AsyncRead + Unpin + Send,
+{
+    let frame = read_frame(&mut reader).await;
+    (reader, frame)
 }
 
 fn next_attach_sequence(sequence: u64) -> Result<u64, AttachBridgeError> {
@@ -766,9 +818,7 @@ impl AttachBridgeError {
 
 async fn send_worker_attach_input<W>(
     writer: &mut W,
-    version: pohunek_worker_protocol::Version,
-    stream_id: &pohunek_worker_protocol::StreamId,
-    runtime_id: &pohunek_worker_protocol::RuntimeId,
+    identity: &WorkerFrameIdentity,
     sequence: u64,
     bytes: Vec<u8>,
 ) -> Result<(), io::Error>
@@ -781,13 +831,13 @@ where
     // concurrent attach to the same session reuses `attach-1` with different
     // content, and the worker's per-runtime input dedup rejects it as a reused
     // write id with conflicting content, closing the stream.
-    let write_id = WriteId::new(format!("attach-{stream_id}-{sequence}"))
+    let write_id = WriteId::new(format!("attach-{}-{sequence}", identity.stream_id))
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let frame = DataFrame::new(
         FrameHeader {
-            version,
-            stream_id: stream_id.clone(),
-            runtime_id: runtime_id.clone(),
+            version: identity.version,
+            stream_id: identity.stream_id.clone(),
+            runtime_id: identity.runtime_id.clone(),
             kind: FrameKind::Input { write_id },
         },
         bytes,
@@ -982,15 +1032,30 @@ mod pending_socket_tests {
 #[cfg(test)]
 mod tests {
     use pohunek_worker_protocol::{
-        ControlCode, ControlError, DataFrame, FrameHeader, FrameKind, RuntimeId, StreamId, Version,
+        CloseReason, ControlCode, ControlError, Cursor, DataFrame, Dimensions, FrameHeader,
+        FrameKind, RuntimeId, StreamId, TerminalSnapshot, Version,
     };
     use protocol::{ProtocolVersion, ProtocolVersionRange, Request};
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
     use tokio_util::sync::CancellationToken;
 
-    use super::{enforce_connection_version, run_worker_attach_bridge, write_frame};
+    use super::{
+        bridge_worker_frames, enforce_connection_version, read_frame, run_worker_attach_bridge,
+        write_frame, WorkerFrameIdentity,
+    };
     use crate::runtime::DataStream;
+
+    /// Worker-side buffering of the partial-frame regression stream.
+    ///
+    /// With one byte of buffering a fake-worker write returns only after the
+    /// bridge has read every earlier byte, which pins the bridge mid-frame.
+    const ONE_BYTE_BUFFER: usize = 1;
+    /// Bytes of the first worker frame sent before public input arrives: the
+    /// four-byte header length plus the opening bytes of its JSON header.
+    const PARTIAL_FRAME_BYTES: usize = 6;
+    /// Buffering of the public side of the partial-frame regression stream.
+    const PUBLIC_BUFFER: usize = 1024;
 
     fn data_stream(stream: UnixStream) -> DataStream {
         DataStream {
@@ -1129,6 +1194,111 @@ mod tests {
             error.msg.contains("ended partway"),
             "worker frame cause must remain visible: {error:?}"
         );
+    }
+
+    /// Public input that arrives while a worker frame is only partly read must
+    /// not discard the consumed bytes: the bridge keeps its pending read and
+    /// still delivers that frame intact after forwarding the input.
+    #[tokio::test]
+    async fn worker_attach_bridge_keeps_a_partly_read_frame_across_public_input() {
+        let identity = WorkerFrameIdentity {
+            version: Version::new(1).expect("version"),
+            stream_id: StreamId::new("a-partial").expect("stream id"),
+            runtime_id: RuntimeId::new("runtime-partial").expect("runtime id"),
+        };
+        let frame = |kind, payload: &[u8]| {
+            DataFrame::new(
+                FrameHeader {
+                    version: identity.version,
+                    stream_id: identity.stream_id.clone(),
+                    runtime_id: identity.runtime_id.clone(),
+                    kind,
+                },
+                payload.to_vec(),
+            )
+            .expect("worker frame")
+        };
+        let mut repaint = Vec::new();
+        write_frame(
+            &mut repaint,
+            &frame(
+                FrameKind::TerminalSnapshot {
+                    snapshot: TerminalSnapshot {
+                        watermark: 0,
+                        dimensions: Dimensions::new(80, 24).expect("dimensions"),
+                        cursor: Cursor {
+                            column: 0,
+                            row: 0,
+                            visible: true,
+                        },
+                        alternate_screen: false,
+                        title: None,
+                        progress: None,
+                        visible_lines: Vec::new(),
+                    },
+                },
+                b"repaint-before-input",
+            ),
+        )
+        .await
+        .expect("encode repaint frame");
+        let mut close = Vec::new();
+        write_frame(
+            &mut close,
+            &frame(
+                FrameKind::Close {
+                    reason: CloseReason::RuntimeExited,
+                },
+                &[],
+            ),
+        )
+        .await
+        .expect("encode close frame");
+
+        let (mut daemon_worker, mut fake_worker) = tokio::io::duplex(ONE_BYTE_BUFFER);
+        let (mut public_stream, mut public_peer) = tokio::io::duplex(PUBLIC_BUFFER);
+        let bridge = tokio::spawn(async move {
+            bridge_worker_frames(
+                &mut public_stream,
+                &mut daemon_worker,
+                &identity,
+                "a-partial",
+                &protocol::SessionId("s-partial".to_owned()),
+                &CancellationToken::new(),
+                Vec::new(),
+            )
+            .await
+        });
+
+        fake_worker
+            .write_all(&repaint[..PARTIAL_FRAME_BYTES])
+            .await
+            .expect("start the worker frame");
+        public_peer
+            .write_all(b"typed-mid-frame")
+            .await
+            .expect("send public input");
+        let input = read_frame(&mut fake_worker)
+            .await
+            .expect("read forwarded input")
+            .expect("bridge forwards public input");
+        assert!(matches!(input.header().kind, FrameKind::Input { .. }));
+        assert_eq!(input.payload(), b"typed-mid-frame");
+        let remainder = fake_worker.write_all(&repaint[PARTIAL_FRAME_BYTES..]).await;
+        let closed = fake_worker.write_all(&close).await;
+
+        bridge
+            .await
+            .expect("bridge task")
+            .expect("a partly read worker frame must survive public input");
+        remainder.expect("finish the worker frame");
+        closed.expect("close the worker stream");
+        let mut delivered = Vec::new();
+        public_peer
+            .read_to_end(&mut delivered)
+            .await
+            .expect("read public output");
+        assert_eq!(delivered, b"repaint-before-input");
     }
 
     #[tokio::test]
