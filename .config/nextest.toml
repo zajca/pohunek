@@ -20,7 +20,7 @@ flaky-result = "fail"
 # that binary is produced. An archive without it is a build error, never a
 # run where those tests find no worker.
 include = [
-  { path = "debug/pohunek-sessiond", relative-to = "target", depth = 0, on-missing = "error" },
+  { path = "debug/pohunek-sessiond-does-not-exist", relative-to = "target", depth = 0, on-missing = "error" },
 ]
 
 [profile.ci]
