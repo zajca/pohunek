@@ -38,6 +38,11 @@ BASE_COMMIT = "1" * 40
 OTHER_COMMIT = "2" * 40
 # Name prefix of a worktree that is still at its temporary path.
 TEMP_PREFIX = ".worktree-new-"
+# Name prefix of this run's temporary branch for the slug `issue-1`.
+TEMP_BRANCH = "zajca/worktree-new-tmp-issue-1-"
+# A predictable name in the worktree parent that belongs to someone else;
+# the reflink probe must never touch it.
+FOREIGN_PROBE_NAME = ".worktree-new-reflink-probe"
 
 
 def flock_is_blocked(path):
@@ -164,6 +169,17 @@ class FakeExecutor:
                 return 128, "", f"fatal: a branch named '{branch}' already exists"
             self.branches[branch] = commit
             return 0, "", ""
+        if args[:2] == ["branch", "-m"]:
+            old, new = args[2], args[3]
+            if old not in self.branches:
+                return 128, "", f"error: refname {old} not found"
+            if new in self.branches:
+                return 128, "", f"fatal: a branch named '{new}' already exists"
+            self.branches[new] = self.branches.pop(old)
+            for path, branch in self.registered.items():
+                if branch == old:
+                    self.registered[path] = new
+            return 0, "", ""
         if args[:2] == ["update-ref", "-d"]:
             branch, expected = args[2].removeprefix("refs/heads/"), args[3]
             if self.branches.get(branch) != expected:
@@ -232,6 +248,14 @@ class FakeExecutor:
         source.rename(dest)
         self.registered[dest] = self.registered.pop(source)
         return 0, "", ""
+
+    def temporary_branches(self):
+        """Branches that still carry a temporary name."""
+        return [b for b in self.branches if b.startswith(TEMP_BRANCH)]
+
+    def ref_deletions(self):
+        """Every `git update-ref -d` the script ran."""
+        return [c for c in self.commands if c[1:3] == ["update-ref", "-d"]]
 
     def temporary_worktrees(self):
         """Registered worktrees that still carry a temporary name."""
@@ -371,14 +395,20 @@ class SeededCreateTests(HarnessCase):
         worktree = self.h.worktrees / "issue-1"
         commands = self.h.executor.commands
         self.assertIn(["git", "fetch", "origin", "main"], commands)
-        self.assertIn(["git", "branch", "--no-track", "zajca/issue-1",
-                       BASE_COMMIT], commands)
+        creates = [c for c in commands if c[1:3] == ["branch", "--no-track"]]
+        self.assertEqual(len(creates), 1)
+        temp_branch = creates[0][3]
+        self.assertTrue(temp_branch.startswith(TEMP_BRANCH), temp_branch)
+        self.assertEqual(creates[0][4:], [BASE_COMMIT])
         adds = [c for c in commands if c[1:3] == ["worktree", "add"]]
         self.assertEqual(len(adds), 1)
         temp = adds[0][3]
-        self.assertEqual(adds[0][4:], ["zajca/issue-1"])
-        self.assertIn(["git", "worktree", "move", temp, str(worktree)],
-                      commands)
+        self.assertEqual(adds[0][4:], [temp_branch])
+        move = ["git", "worktree", "move", temp, str(worktree)]
+        rename = ["git", "branch", "-m", temp_branch, "zajca/issue-1"]
+        self.assertLess(commands.index(move), commands.index(rename))
+        self.assertEqual(commands[-1], rename)
+        self.assertEqual(self.h.executor.temporary_branches(), [])
         self.assertEqual(self.h.executor.registered,
                          {worktree: "zajca/issue-1"})
         debug = worktree / "target" / "debug"
@@ -410,7 +440,8 @@ class SeededCreateTests(HarnessCase):
     def test_probe_and_staging_leave_no_residue(self):
         code, _, err = self.h.run("issue-1")
         self.assertEqual(code, 0, err)
-        self.assertFalse((self.h.worktrees / worktree_new.PROBE_NAME).exists())
+        self.assertEqual(sorted(p.name for p in self.h.worktrees.iterdir()),
+                         ["issue-1"])
         target = self.h.worktrees / "issue-1" / "target"
         self.assertEqual(
             sorted(p.name for p in target.iterdir()),
@@ -451,7 +482,7 @@ class FailClosedTests(HarnessCase):
         self.assert_no_worktree_created()
         copies = [c for c in self.h.executor.commands if c[0] == "cp"]
         self.assertEqual(len(copies), 1, "only the probe may run")
-        self.assertFalse((self.h.worktrees / worktree_new.PROBE_NAME).exists())
+        self.assertEqual(list(self.h.worktrees.iterdir()), [])
 
     def test_missing_source_profile_fails(self):
         shutil.rmtree(self.h.target / "debug")
@@ -611,6 +642,56 @@ class FailClosedTests(HarnessCase):
         self.assert_symlink_refused(err)
         self.assertIn(str(tag), err)
 
+    def test_nested_symlink_in_a_seed_subdir_fails_closed(self):
+        out = self.h.target / "debug" / "build" / "dep-1" / "out"
+        outside = self.h.root / "outside-file"
+        outside.write_text("main checkout data")
+        (out / "generated.rs").symlink_to(outside)
+        code, _, err = self.h.run("issue-1")
+        self.assertEqual(code, 1)
+        self.assert_symlink_refused(err)
+        self.assertIn(str(out / "generated.rs"), err)
+
+    def test_nested_symlinked_dir_fails_closed(self):
+        fingerprint = self.h.target / "debug" / ".fingerprint" / "dep-1"
+        (fingerprint / "linked").symlink_to(self.h.root)
+        code, _, err = self.h.run("issue-1")
+        self.assertEqual(code, 1)
+        self.assert_symlink_refused(err)
+        self.assertIn(str(fingerprint / "linked"), err)
+
+    def test_file_at_a_predictable_probe_path_is_never_touched(self):
+        self.h.worktrees.mkdir()
+        foreign = self.h.worktrees / FOREIGN_PROBE_NAME
+        foreign.write_text("someone else's file")
+        for probe_fails in (True, False):
+            with self.subTest(probe_fails=probe_fails):
+                self.h.executor.probe_fails = probe_fails
+                slug = f"issue-{int(probe_fails)}"
+                code, _, err = self.h.run(slug)
+                self.assertEqual(code, 1 if probe_fails else 0, err)
+                self.assertEqual(foreign.read_text(), "someone else's file")
+        leftovers = [p.name for p in self.h.worktrees.iterdir()
+                     if p.name.startswith(worktree_new.PROBE_DIR_PREFIX)]
+        self.assertEqual(leftovers, [])
+
+    def test_probe_clones_into_a_private_directory(self):
+        seen = []
+
+        def record(source, dest):
+            if not seen:
+                seen.append((dest, dest.parent.stat().st_mode & 0o777))
+
+        self.h.executor.on_copy = record
+        code, _, err = self.h.run("issue-1")
+        self.assertEqual(code, 0, err)
+        dest, mode = seen[0]
+        self.assertTrue(
+            dest.parent.name.startswith(worktree_new.PROBE_DIR_PREFIX))
+        self.assertEqual(dest.parent.parent, self.h.worktrees)
+        self.assertEqual(mode, 0o700)
+        self.assertFalse(dest.parent.exists())
+
     def test_bare_common_dir_is_rejected(self):
         self.h.executor.common_dir = self.h.root / "bare.git"
         code, _, err = self.h.run("issue-1")
@@ -618,11 +699,21 @@ class FailClosedTests(HarnessCase):
         self.assertIn("non-bare main checkout", err)
 
 
-COMPARE_AND_DELETE = ["git", "update-ref", "-d", "refs/heads/zajca/issue-1",
-                      BASE_COMMIT]
 
 
-class RollbackTests(HarnessCase):
+class RollbackCase(HarnessCase):
+    def assert_temp_branch_compare_and_deleted(self):
+        """Rollback deleted exactly one ref: this run's temporary branch,
+        compared against the commit it was created at."""
+        deletions = self.h.executor.ref_deletions()
+        self.assertEqual(len(deletions), 1, deletions)
+        ref, expected = deletions[0][3:]
+        self.assertTrue(ref.startswith(f"refs/heads/{TEMP_BRANCH}"), ref)
+        self.assertEqual(expected, BASE_COMMIT)
+        self.assertEqual(self.h.executor.temporary_branches(), [])
+
+
+class RollbackTests(RollbackCase):
     def assert_nothing_left(self):
         self.assertFalse((self.h.worktrees / "issue-1").exists())
         self.assertNotIn("zajca/issue-1", self.h.executor.branches)
@@ -639,7 +730,7 @@ class RollbackTests(HarnessCase):
         self.assertIn("rolled back", err)
         self.assertNotIn("manually", err)
         self.assert_nothing_left()
-        self.assertIn(COMPARE_AND_DELETE, self.h.executor.commands)
+        self.assert_temp_branch_compare_and_deleted()
 
     def test_worktree_with_overridden_layout_is_rolled_back(self):
         self.h.executor.layouts["temporary"] = (
@@ -668,7 +759,7 @@ class RollbackTests(HarnessCase):
         self.assert_nothing_left()
 
 
-class WorktreeAddFailureTests(HarnessCase):
+class WorktreeAddFailureTests(RollbackCase):
     def run_failing_add(self, mode, *argv, step="git worktree add"):
         self.h.executor.add_fails = mode
         code, _, err = self.h.run(*argv, "issue-1")
@@ -683,7 +774,7 @@ class WorktreeAddFailureTests(HarnessCase):
 
     def test_branch_is_deleted_when_the_add_creates_nothing(self):
         self.run_failing_add("before")
-        self.assertIn(COMPARE_AND_DELETE, self.h.executor.commands)
+        self.assert_temp_branch_compare_and_deleted()
         self.assertFalse(self.h.executor.ran("git", "worktree", "remove"))
 
     def test_worktree_left_by_failed_hook_is_removed(self):
@@ -693,7 +784,7 @@ class WorktreeAddFailureTests(HarnessCase):
                    if c[1:3] == ["worktree", "remove"]]
         self.assertEqual(len(removes), 1)
         self.assertTrue(Path(removes[0][-1]).name.startswith(TEMP_PREFIX))
-        self.assertIn(COMPARE_AND_DELETE, self.h.executor.commands)
+        self.assert_temp_branch_compare_and_deleted()
 
     def test_failure_before_creation_rolls_back_nothing(self):
         self.h.executor.branch_fails = True
@@ -717,19 +808,29 @@ class WorktreeAddFailureTests(HarnessCase):
         self.assertIn("not a registered worktree", problems[0])
         self.assertTrue((worktree / "keep").exists())
 
-    def test_branch_checked_out_elsewhere_is_left_in_place(self):
+    def test_change_between_listing_and_ref_deletion_is_left_alone(self):
+        # Between rollback's last `git worktree list` and its ref deletion,
+        # another process deletes and recreates the final branch name at
+        # the same commit and checks it out in its own worktree.
         other = self.h.worktrees / "someone-else"
-        self.h.executor.branches["zajca/issue-1"] = BASE_COMMIT
-        self.h.executor.registered[other] = "zajca/issue-1"
-        other.mkdir(parents=True)
-        removed, problems = worktree_new.rollback(
-            self.h.repo, (), "zajca/issue-1", BASE_COMMIT, self.h.executor)
-        self.assertEqual(removed, [])
-        self.assertIn("left branch zajca/issue-1 in place: it is checked out",
-                      problems[0])
-        self.assertEqual(self.h.executor.branches["zajca/issue-1"],
+
+        def recreate_branch(command):
+            if command[1:3] == ["update-ref", "-d"]:
+                self.h.executor.branches.pop("zajca/issue-1", None)
+                self.h.executor.branches["zajca/issue-1"] = BASE_COMMIT
+                other.mkdir(parents=True, exist_ok=True)
+                self.h.executor.registered[other] = "zajca/issue-1"
+
+        self.h.executor.before_command = recreate_branch
+        self.h.executor.copy_fails_for = "deps"
+        code, _, err = self.h.run("issue-1")
+        self.assertEqual(code, 1)
+        self.assertIn("seeding failed", err)
+        self.assertEqual(self.h.executor.branches.get("zajca/issue-1"),
                          BASE_COMMIT)
-        self.assertFalse(self.h.executor.ran("git", "update-ref"))
+        self.assertEqual(self.h.executor.registered,
+                         {other: "zajca/issue-1"})
+        self.assert_temp_branch_compare_and_deleted()
 
     def test_retry_after_rollback_succeeds(self):
         self.run_failing_add("after-checkout")
@@ -777,11 +878,10 @@ class PlainGitRaceTests(HarnessCase):
         code, _, err = self.h.run("issue-1")
         self.assertTrue(fired)
         self.assertEqual(code, 1)
-        self.assertIn("already exists", err)
-        self.assertIn("nothing to roll back", err)
+        self.assertIn(f"destination {worktree} appeared during the run", err)
+        self.assertIn("rolled back", err)
         self.assert_other_worktree_untouched(worktree)
-        self.assertFalse(self.h.executor.ran("git", "worktree", "remove"))
-        self.assertFalse(self.h.executor.ran("git", "update-ref"))
+        self.assertEqual(self.h.executor.temporary_branches(), [])
 
     def test_destination_created_before_the_move_is_left_alone(self):
         worktree = self.h.worktrees / "issue-1"
@@ -827,19 +927,42 @@ class PlainGitRaceTests(HarnessCase):
 
     def test_branch_moved_after_creation_is_not_deleted(self):
         def move_branch():
-            self.h.executor.branches["zajca/issue-1"] = OTHER_COMMIT
+            (temp_branch,) = self.h.executor.temporary_branches()
+            self.h.executor.branches[temp_branch] = OTHER_COMMIT
 
         self.act_once_before(lambda c: c[1:3] == ["worktree", "add"],
                              move_branch)
         self.h.executor.add_fails = "before"
         code, _, err = self.h.run("issue-1")
         self.assertEqual(code, 1)
-        self.assertIn("left branch zajca/issue-1 in place: it changed after "
-                      "creation", err)
+        self.assertIn("in place: it changed after creation", err)
+        (temp_branch,) = self.h.executor.temporary_branches()
+        self.assertEqual(self.h.executor.branches[temp_branch], OTHER_COMMIT)
+        self.assertEqual(len(self.h.executor.ref_deletions()), 1)
+        self.assertFalse(self.h.executor.ran("git", "branch", "-D"))
+
+    def test_final_branch_taken_before_the_rename_keeps_the_worktree(self):
+        worktree = self.h.worktrees / "issue-1"
+
+        def take_branch():
+            self.h.executor.branches["zajca/issue-1"] = OTHER_COMMIT
+
+        self.act_once_before(lambda c: c[1:3] == ["branch", "-m"],
+                             take_branch)
+        code, out, err = self.h.run("issue-1")
+        self.assertEqual(code, 1)
+        (temp_branch,) = self.h.executor.temporary_branches()
+        self.assertIn(f"created worktree {worktree} on the temporary branch "
+                      f"{temp_branch}", err)
+        self.assertIn("The worktree is kept", err)
+        self.assertEqual(self.h.executor.registered, {worktree: temp_branch})
+        self.assertTrue((worktree / "target" / "debug" / "deps").is_dir())
         self.assertEqual(self.h.executor.branches["zajca/issue-1"],
                          OTHER_COMMIT)
-        self.assertIn(COMPARE_AND_DELETE, self.h.executor.commands)
-        self.assertFalse(self.h.executor.ran("git", "branch", "-D"))
+        self.assertEqual(self.h.executor.branches[temp_branch], BASE_COMMIT)
+        self.assertFalse(self.h.executor.ran("git", "worktree", "remove"))
+        self.assertEqual(self.h.executor.ref_deletions(), [])
+        self.assertEqual(out, "")
 
 
 class TemporaryPathTests(HarnessCase):
@@ -856,21 +979,27 @@ class TemporaryPathTests(HarnessCase):
                          {worktree: "zajca/issue-1"})
         self.assertEqual(sorted(p.name for p in self.h.worktrees.iterdir()),
                          ["issue-1"])
+        self.assertEqual(self.h.executor.temporary_branches(), [])
         temp_name = f"{TEMP_PREFIX}issue-1-{os.getpid()}-"
         seeded = [d for d in seen
                   if any(p.name.startswith(temp_name) for p in d.parents)]
         self.assertTrue(seeded, "the seed must land in the temporary path")
 
     def test_temporary_names_are_unique(self):
-        names = {worktree_new.temporary_worktree_path(self.h.worktrees, "a")
-                 for _ in range(2)}
-        self.assertEqual(len(names), 2)
+        first = worktree_new.temporary_names(self.h.worktrees, "a")
+        second = worktree_new.temporary_names(self.h.worktrees, "a")
+        self.assertNotEqual(first[0], second[0])
+        self.assertNotEqual(first[1], second[1])
+        # One token names both the path and the branch.
+        self.assertEqual(first[0].name.removeprefix(TEMP_PREFIX),
+                         first[1].removeprefix("zajca/worktree-new-tmp-"))
 
     def test_failure_leaves_no_temporary_worktree(self):
         self.h.executor.copy_fails_for = "incremental"
         code, _, err = self.h.run("issue-1")
         self.assertEqual(code, 1)
         self.assertEqual(self.h.executor.temporary_worktrees(), [])
+        self.assertEqual(self.h.executor.temporary_branches(), [])
         self.assertEqual(self.h.executor.registered, {})
         self.assertEqual(list(self.h.worktrees.iterdir()), [])
 

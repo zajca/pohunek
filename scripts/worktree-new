@@ -29,15 +29,21 @@ Fail-closed rules:
   runs under an exclusive, non-blocking `flock` on
   `<git-common-dir>/worktree-new.lock`, so a second run fails at once;
 * ownership is proven by construction, never inferred from a name, because
-  plain `git` commands from other processes ignore that lock. The branch is
-  created with `git branch --no-track <branch> <base-commit>`, which fails
-  if it exists, and rollback deletes it only through the compare-and-delete
-  `git update-ref -d refs/heads/<branch> <base-commit>`, and only while no
-  other worktree has it checked out; a branch that moved is left in place.
-  The worktree is added and seeded at a temporary sibling path
-  `.worktree-new-<slug>-<pid>-<random>` that no other process knows, then
-  renamed into place with `git worktree move`. Rollback removes only a
-  worktree registered at that temporary name, never the destination;
+  plain `git` commands from other processes ignore that lock. Everything
+  is built under names only this run knows (pid plus a random token): the
+  branch `zajca/worktree-new-tmp-<slug>-<pid>-<random>`, created with
+  `git branch --no-track` at the resolved base commit, and the worktree at
+  the sibling path `.worktree-new-<slug>-<pid>-<random>`. Rollback removes
+  only a worktree registered at that temporary path and deletes only that
+  temporary branch, through the compare-and-delete `git update-ref -d
+  refs/heads/<temp-branch> <base-commit>`; it never touches the
+  destination or the final branch name;
+* the final names are taken last: `git worktree move` renames the seeded
+  worktree into place, then `git branch -m <temp-branch> <branch>` renames
+  the branch, which git refuses when `<branch>` exists and which updates
+  the worktree's HEAD. When that rename fails, the finished worktree and
+  its temporary branch are kept and both are reported: deleting a seeded
+  worktree at the last step would cost more than renaming it by hand;
 * `git worktree move` fails when the destination is a file or a symlink,
   but moves the worktree *into* a destination that is an existing
   directory. The destination is re-checked just before the move and the
@@ -45,12 +51,14 @@ Fail-closed rules:
   nested by a directory created in between is rolled back from its nested
   path, which still carries this run's temporary name;
 * no symlink is ever cloned: the source profile dir, each seeded
-  subdirectory, and each seeded target-root file must be real, so the new
-  worktree can never write through a link into the main checkout's cache.
-  A checkout that already holds a `target` entry fails the seed as well;
+  target-root file, and every entry anywhere inside each seeded
+  subdirectory must be real, so the new worktree can never write through a
+  link into the main checkout's cache. The full walk runs under the Cargo
+  locks; a checkout that already holds a `target` entry fails the seed too;
 * the seed is a real reflink or nothing: a probe clone of the source's
-  `CACHEDIR.TAG` into the worktree parent must succeed first, and there is
-  no fallback to a full copy; `--no-seed` accepts a cold build instead;
+  `CACHEDIR.TAG` into a private directory under the worktree parent
+  (`mkdtemp`: unpredictable name, mode 0700) must succeed first, and there
+  is no fallback to a full copy; `--no-seed` accepts a cold build instead;
 * the main checkout's profile dir is validated and copied only while this
   script holds every Cargo lock file there exclusively, so a running build
   (or `cargo check` from an editor) is never snapshotted half-written. A
@@ -61,11 +69,12 @@ Fail-closed rules:
   `build_directory` equal to `<root>/target` per `cargo metadata`); a
   `CARGO_TARGET_DIR`, `build.target-dir`, or `build.build-dir` override
   would make the seed dead weight or copy the wrong tree;
-* a failure after the branch exists (in `git worktree add`, which can fail
-  after a full checkout when a hook fails, the seed, or the move) rolls
-  back this run's worktree and branch as above, so a failed run leaves
-  nothing behind and can be retried; anything it cannot prove is its own
-  is reported for manual cleanup, never deleted.
+* a failure after the temporary branch exists and before the final branch
+  rename (in `git worktree add`, which can fail after a full checkout when
+  a hook fails, the seed, or the move) rolls back this run's worktree and
+  branch as above, so a failed run leaves nothing behind and can be
+  retried; anything it cannot prove is its own is reported for manual
+  cleanup, never deleted.
 """
 
 import argparse
@@ -77,8 +86,10 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 
 # Branch namespace of the repository's workflow skills (`milestone`,
 # `deliver-issue`): every agent branch is `zajca/<slug>`.
@@ -130,13 +141,19 @@ REPO_LOCK_NAME = "worktree-new.lock"
 # an interrupted copy never leaves a half-populated `target/debug` whose
 # fingerprints Cargo would trust.
 STAGING_NAME = f"{PROFILE}.worktree-new-partial"
-# Probe file cloned into the worktree parent to prove reflink support.
-PROBE_NAME = ".worktree-new-reflink-probe"
+# Prefix of the private `mkdtemp` directory the reflink probe clones into.
+PROBE_DIR_PREFIX = ".worktree-new-probe-"
+# Name of the probe clone inside that directory.
+PROBE_FILE_NAME = "probe"
 # Prefix of the temporary sibling path a worktree is built at before it is
 # moved to its slug. The name also carries the pid and a random token, so
 # no other process can create or guess it.
 TEMP_WORKTREE_PREFIX = ".worktree-new-"
-# Random bytes in that token: 64 bits make a collision or a guess
+# Branch name component the temporary branch starts with, under
+# BRANCH_PREFIX; git refuses a ref component starting with '.', so the
+# worktree prefix cannot be reused here.
+TEMP_BRANCH_PREFIX = "worktree-new-tmp-"
+# Random bytes in the shared token: 64 bits make a collision or a guess
 # practically impossible.
 TEMP_TOKEN_BYTES = 8
 
@@ -308,6 +325,26 @@ def refuse_symlink(path):
         )
 
 
+def find_symlink(top):
+    """The first symlink anywhere under directory `top`, or None.
+
+    `DirEntry.is_symlink()` answers from the directory entry type without a
+    stat call (it falls back to `lstat` when the filesystem reports no
+    type), which keeps a walk over ~290k entries near 0.1 s. Symlinked
+    directories are reported, never descended into, and a read error
+    propagates instead of being skipped.
+    """
+    pending = [top]
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                if entry.is_symlink():
+                    return Path(entry.path)
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(entry.path)
+    return None
+
+
 def check_seed_source(target):
     """The main target dir must hold a usable profile cache to clone."""
     profile = target / PROFILE
@@ -316,6 +353,10 @@ def check_seed_source(target):
         raise missing_profile_error(profile)
     for name in SEED_SUBDIRS:
         refuse_symlink(profile / name)
+        if (profile / name).is_dir():
+            nested = find_symlink(profile / name)
+            if nested is not None:
+                refuse_symlink(nested)
     for name in TARGET_ROOT_FILES:
         refuse_symlink(target / name)
     for name in REQUIRED_SEED_SUBDIRS:
@@ -339,15 +380,16 @@ def reflink(source, dest, cwd, executor):
 
 
 def probe_reflink(source_file, dest_dir, executor):
-    """Prove that a clone from the source filesystem into `dest_dir` works."""
-    probe = dest_dir / PROBE_NAME
-    if probe.exists() or probe.is_symlink():
-        raise WorktreeError(
-            f"{probe} already exists (left by an interrupted worktree-new "
-            "run): remove it and retry"
-        )
+    """Prove that a clone from the source filesystem into `dest_dir` works.
+
+    The clone lands in a directory `mkdtemp` creates atomically with mode
+    0700 under an unpredictable name, so only that directory, which this
+    run created, is ever removed. `shutil.rmtree` unlinks symlinks inside
+    it without following them.
+    """
+    probe_dir = Path(tempfile.mkdtemp(prefix=PROBE_DIR_PREFIX, dir=dest_dir))
     try:
-        reflink(source_file, probe, dest_dir, executor)
+        reflink(source_file, probe_dir / PROBE_FILE_NAME, dest_dir, executor)
     except WorktreeError as error:
         raise WorktreeError(
             f"reflink is not supported from {source_file.parent} to "
@@ -356,8 +398,7 @@ def probe_reflink(source_file, dest_dir, executor):
             "--no-seed to accept a cold build."
         )
     finally:
-        if probe.exists() or probe.is_symlink():
-            probe.unlink()
+        shutil.rmtree(probe_dir)
 
 
 def open_lock_file(path):
@@ -443,34 +484,31 @@ def seed_target(source_target, dest_target, executor):
                     executor)
 
 
-def list_worktrees(repo, executor):
-    """Map each registered worktree's resolved path to its checked-out ref.
+def worktree_registered(worktree, repo, executor):
+    """True when git lists `worktree` in `git worktree list --porcelain`.
 
-    The ref is None for a detached HEAD. Raises when git cannot list them,
-    because every caller decides about deletion from this answer.
+    Raises when git cannot list them, because callers decide about deletion
+    from this answer.
     """
     output = executor(
         ["git", "worktree", "list", "--porcelain"], cwd=repo
     ).stdout
-    worktrees, current = {}, None
-    for line in output.splitlines():
-        if line.startswith("worktree "):
-            current = Path(line.removeprefix("worktree ")).resolve()
-            worktrees[current] = None
-        elif line.startswith("branch ") and current is not None:
-            worktrees[current] = line.removeprefix("branch ")
-    return worktrees
+    listed = {
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in output.splitlines()
+        if line.startswith("worktree ")
+    }
+    return worktree.resolve() in listed
 
 
-def worktree_registered(worktree, repo, executor):
-    """True when git lists `worktree` in `git worktree list --porcelain`."""
-    return worktree.resolve() in list_worktrees(repo, executor)
+def temporary_names(worktrees_root, slug):
+    """The worktree path and branch only this run knows.
 
-
-def temporary_worktree_path(worktrees_root, slug):
-    """A sibling path only this run knows: slug, pid, and a random token."""
-    token = secrets.token_hex(TEMP_TOKEN_BYTES)
-    return worktrees_root / f"{TEMP_WORKTREE_PREFIX}{slug}-{os.getpid()}-{token}"
+    Both carry the slug, the pid, and one random token.
+    """
+    suffix = f"{slug}-{os.getpid()}-{secrets.token_hex(TEMP_TOKEN_BYTES)}"
+    return (worktrees_root / f"{TEMP_WORKTREE_PREFIX}{suffix}",
+            f"{BRANCH_PREFIX}{TEMP_BRANCH_PREFIX}{suffix}")
 
 
 def remove_owned_worktree(path, repo, executor, removed, problems):
@@ -492,22 +530,13 @@ def remove_owned_worktree(path, repo, executor, removed, problems):
 
 
 def delete_owned_branch(branch, commit, repo, executor, removed, problems):
-    """Delete `branch` only while it still points at the commit it got.
+    """Delete this run's temporary `branch` while it points at `commit`.
 
-    `git update-ref -d <ref> <old>` compares and deletes under git's own ref
-    lock, so a branch another process moved survives. A branch checked out
-    in some worktree is left too: this run's worktree is gone by now, so
-    that checkout belongs to someone else.
+    No other process knows the name, and `git update-ref -d <ref> <old>`
+    compares and deletes under git's own ref lock, so a ref that changed
+    anyway survives and is reported.
     """
     ref = f"refs/heads/{branch}"
-    checked_out = [
-        path for path, head in list_worktrees(repo, executor).items()
-        if head == ref
-    ]
-    if checked_out:
-        problems.append(f"left branch {branch} in place: it is checked out "
-                        f"in {checked_out[0]}")
-        return
     result = executor(["git", "update-ref", "-d", ref, commit], cwd=repo,
                       check=False)
     if result.returncode == 0:
@@ -523,8 +552,8 @@ def rollback(repo, worktree_paths, branch, commit, executor):
     """Remove this run's worktree and branch, and nothing else.
 
     `worktree_paths` are the paths that carry this run's temporary name;
-    `commit` is what the branch was created at, or None when this run did
-    not create it. Returns (removed artifacts, problems needing manual
+    `branch` is its temporary branch and `commit` what that was created
+    at, or None when this run did not create it. Returns (removed artifacts, problems needing manual
     cleanup). A failure to inspect git is itself such a problem.
     """
     removed, problems = [], []
@@ -554,9 +583,9 @@ def create_locked(args, repo, executor, out):
     validate_branch(branch, repo, executor)
     worktrees_root = repo.parent / WORKTREES_DIR_NAME
     worktree = worktrees_root / args.slug
-    # Early, friendly checks only: `git branch` below refuses an existing
-    # branch atomically, and the destination is re-checked before the move
-    # and verified after it.
+    # Early, friendly checks only: `git branch -m` refuses an existing
+    # branch atomically at the end, and the destination is re-checked
+    # before the move and verified after it.
     if worktree.exists() or worktree.is_symlink():
         raise WorktreeError(f"destination {worktree} already exists")
     if branch_exists(branch, repo, executor):
@@ -570,7 +599,8 @@ def create_locked(args, repo, executor, out):
         refuse_symlink(source_target / PROFILE)
     base_ref, base_commit = resolve_base(args.base_ref, repo, executor)
     worktrees_root.mkdir(parents=True, exist_ok=True)
-    temp = temporary_worktree_path(worktrees_root, args.slug)
+    temp, temp_branch = temporary_names(worktrees_root, args.slug)
+    validate_branch(temp_branch, repo, executor)
     # Where `git worktree move` puts the worktree when the destination
     # became a directory after the last check.
     nested = worktree / temp.name
@@ -590,13 +620,13 @@ def create_locked(args, repo, executor, out):
         step = "git branch"
         created_commit = None
         try:
-            executor(["git", "branch", "--no-track", branch, base_commit],
-                     cwd=repo)
+            executor(["git", "branch", "--no-track", temp_branch,
+                      base_commit], cwd=repo)
             created_commit = base_commit
             step = "git worktree add"
             if temp.exists() or temp.is_symlink():
                 raise WorktreeError(f"temporary path {temp} already exists")
-            executor(["git", "worktree", "add", temp, branch], cwd=repo)
+            executor(["git", "worktree", "add", temp, temp_branch], cwd=repo)
             if args.seed:
                 step = "seeding"
                 dest_target = default_target_dir(temp, executor)
@@ -611,7 +641,7 @@ def create_locked(args, repo, executor, out):
                     f"destination {worktree} appeared as a directory during "
                     "the move, so git moved the worktree inside it")
         except (OSError, WorktreeError, KeyboardInterrupt) as error:
-            removed, problems = rollback(repo, (temp, nested), branch,
+            removed, problems = rollback(repo, (temp, nested), temp_branch,
                                          created_commit, executor)
             notes = problems[:]
             if removed:
@@ -619,6 +649,22 @@ def create_locked(args, repo, executor, out):
             cleanup = "; " + "; ".join(notes or ["nothing to roll back"])
             reason = str(error) or type(error).__name__
             raise WorktreeError(f"{step} failed: {reason}{cleanup}")
+
+    # The finished worktree is kept whatever happens here: renaming its
+    # branch by hand is cheaper than rebuilding a seeded worktree.
+    rename = executor(["git", "branch", "-m", temp_branch, branch], cwd=repo,
+                      check=False)
+    if rename.returncode != 0:
+        detail = (rename.stderr or "").strip().splitlines()
+        detail = f" ({detail[0]})" if detail else ""
+        raise WorktreeError(
+            f"created worktree {worktree} on the temporary branch "
+            f"{temp_branch}, but renaming that branch to {branch} failed"
+            f"{detail}. The worktree is kept: run `git branch -m "
+            f"{temp_branch} <name>` with a free name, or remove both with "
+            f"`git worktree remove {shlex.quote(str(worktree))}` and "
+            f"`git branch -D {temp_branch}`"
+        )
 
     print(f"created worktree {worktree}", file=out)
     print(f"  branch {branch} from {base_ref}", file=out)

@@ -236,12 +236,15 @@ crates that differ, not every registry dependency. It needs the main
 checkout's `target/` and the worktree on one reflink-capable filesystem
 (btrfs/XFS; never `/tmp`), fails closed otherwise, while a Cargo build holds
 the main checkout's lock, while another `worktree-new` run is in progress, or
-when a seeded source entry is a symlink, and never falls back to a full copy;
-`--no-seed` accepts a cold build. It builds the worktree at a temporary sibling
-path and `git worktree move`s it into place, so a failed run rolls back only
-the worktree and branch it provably created (the branch by compare-and-delete)
-and never touches ones another process made under the same name. The seed helps in proportion to how recently the main
-checkout was built at a similar `Cargo.lock`.
+when any entry of the seeded source trees is a symlink, and never falls back to
+a full copy; `--no-seed` accepts a cold build. It builds the worktree at a
+temporary sibling path on a temporary branch, both named with a random token,
+then `git worktree move`s it into place and renames the branch last, so a
+failed run rolls back only what it provably created and never touches work
+another process made under the final names. If only that last rename fails,
+the finished worktree is kept on its temporary branch and both are reported.
+The seed helps in proportion to how recently the main checkout was built at a
+similar `Cargo.lock`.
 
 Web (run inside `web/`):
 
