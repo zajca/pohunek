@@ -80,7 +80,7 @@ OFF_PATH = "off-path"
 UNKNOWN_VERSION = "unknown-version"
 NO_CARGO = "no-cargo"
 # Result detail: an older copy earlier on PATH also shadows $CARGO_HOME/bin.
-SHADOWED_TOO = "also shadowed by an older copy earlier on PATH"
+SHADOWED_TOO = "possibly also shadowed by another copy on PATH"
 MANUAL_RUST = (
     "update the Rust toolchain to the workspace MSRV or newer "
     "(`rustup update stable`, or your distribution's rust package)"
@@ -302,9 +302,11 @@ def check_tool(tool, which, runner, cargo_bin):
             return result
         copy = version_result(tool, [home, *tool.version_args], home, runner)
         if copy.status != OK:
-            if copy.version is not None and copy.version != result.version:
-                # Cargo ran a different, older copy earlier on PATH: updating
-                # $CARGO_HOME/bin alone would stay shadowed.
+            on_path = which(tool.name)
+            if on_path is not None and on_path != home:
+                # Another copy sits on PATH, and Cargo may run it (it keeps the
+                # PATH position of $CARGO_HOME/bin when that is on PATH):
+                # updating $CARGO_HOME/bin alone could stay shadowed.
                 return Result(
                     tool, TOO_OLD, version=result.version, path=home,
                     detail=SHADOWED_TOO,

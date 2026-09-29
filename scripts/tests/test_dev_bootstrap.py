@@ -339,6 +339,15 @@ class CheckTests(DevBootstrapCase):
             output,
         )
 
+    def test_two_equally_stale_nextest_copies_get_install_and_path_fix(self):
+        tools = dict(CURRENT)
+        tools["cargo-nextest"] = "cargo-nextest 0.9.100\n"
+        host = FakeHost(on_path=tools, in_cargo_bin={"cargo-nextest": "cargo-nextest 0.9.100\n"})
+        host.cargo_prefers_path = True
+        status, output = self.run_main(host)
+        self.assertEqual(status, 1, output)
+        self.assertIn("; then put it first: ", output)
+
     def test_cargo_subcommand_without_cargo_is_a_failure(self):
         status, output = self.run_main(FakeHost(cargo=False))
         self.assertEqual(status, 1, output)
