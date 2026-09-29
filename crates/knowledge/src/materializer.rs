@@ -4,6 +4,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::assistant::embedded_bundle;
 
@@ -11,6 +12,10 @@ const KNOWLEDGE_DIR: &str = "knowledge";
 const COMPLETE_MARKER: &str = ".complete";
 
 /// Extract the embedded knowledge bundle into a versioned cache directory.
+///
+/// Concurrent calls for the same version, from threads or processes, are safe:
+/// each builds the bundle in its own exclusively created temp dir and renames
+/// it into place, so the version directory only ever appears complete.
 ///
 /// On every successful materialization, stale version directories are pruned
 /// (best-effort) so the cache does not grow unbounded as the binary version
@@ -37,24 +42,38 @@ fn extract_into_knowledge_dir(knowledge_dir: &Path, version_hash: &str) -> io::R
 
     fs::create_dir_all(knowledge_dir)?;
     let temp = temporary_dir(knowledge_dir, version_hash);
-    remove_path_if_exists(&temp)?;
-    fs::create_dir_all(&temp)?;
-    embedded_bundle().extract(&temp)?;
+    publish_through(&temp, &target)?;
+    Ok(target)
+}
+
+/// Build the bundle in `temp` and rename it onto `target`.
+///
+/// `temp` is created exclusively, so a directory owned by a concurrent
+/// materializer is never reused or removed; a name clash fails closed with
+/// [`io::ErrorKind::AlreadyExists`]. The temp dir is removed on any later error.
+fn publish_through(temp: &Path, target: &Path) -> io::Result<()> {
+    fs::create_dir(temp)?;
+    let result = fill_and_rename(temp, target);
+    if result.is_err() {
+        // The original error is the one worth reporting; a leftover temp dir is
+        // skipped by GC and harmless to later materializations.
+        let _ = remove_path_if_exists(temp);
+    }
+    result
+}
+
+fn fill_and_rename(temp: &Path, target: &Path) -> io::Result<()> {
+    embedded_bundle().extract(temp)?;
     fs::write(temp.join(COMPLETE_MARKER), b"complete\n")?;
 
-    match fs::rename(&temp, &target) {
-        Ok(()) => {}
-        Err(_) if matches!(target_state(&target)?, TargetState::Complete) => {
-            remove_path_if_exists(&temp)?;
-            return Ok(target);
+    match fs::rename(temp, target) {
+        Ok(()) => Ok(()),
+        // A concurrent materializer published the same version first.
+        Err(_) if matches!(target_state(target)?, TargetState::Complete) => {
+            remove_path_if_exists(temp)
         }
-        Err(error) => {
-            let _ = remove_path_if_exists(&temp);
-            return Err(error);
-        }
+        Err(error) => Err(error),
     }
-
-    Ok(target)
 }
 
 /// Remove stale materialized knowledge versions under the cache knowledge dir.
@@ -107,9 +126,17 @@ fn validate_version_hash(version_hash: &str) -> io::Result<()> {
     }
 }
 
+/// Name a per-attempt temp dir unique within the host and process.
+///
+/// Threads of one process share the pid and can read the same clock
+/// nanosecond, so the process-wide sequence keeps their names apart. The
+/// sequence only makes clashes rare; exclusive creation in [`publish_through`]
+/// keeps a clash safe, so correctness does not depend on this static.
 fn temporary_dir(knowledge_dir: &Path, version_hash: &str) -> PathBuf {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     knowledge_dir.join(format!(
-        ".tmp-{version_hash}-{}-{}",
+        ".tmp-{version_hash}-{}-{}-{sequence}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -173,5 +200,54 @@ fn remove_path_if_exists(path: &Path) -> io::Result<()> {
         Ok(_) => fs::remove_file(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pohunek-knowledge-unit-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[test]
+    fn publish_leaves_temp_dir_owned_by_another_materializer_untouched() {
+        let knowledge_dir = scratch_dir("foreign-temp");
+        let target = knowledge_dir.join("sha256:test-foreign-temp");
+        let temp = knowledge_dir.join(".tmp-sha256:test-foreign-temp-1-2-3");
+        fs::create_dir(&temp).expect("create foreign temp dir");
+        fs::write(temp.join("in-flight.md"), "partial").expect("write in-flight file");
+
+        let error =
+            publish_through(&temp, &target).expect_err("foreign temp dir must not be reused");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(temp.join("in-flight.md")).expect("in-flight file remains"),
+            "partial"
+        );
+        assert!(!temp.join(COMPLETE_MARKER).exists());
+        assert!(matches!(target_state(&target), Ok(TargetState::Missing)));
+        fs::remove_dir_all(&knowledge_dir).expect("remove scratch dir");
+    }
+
+    #[test]
+    fn temporary_dir_names_differ_within_one_process() {
+        let knowledge_dir = Path::new("knowledge");
+
+        let first = temporary_dir(knowledge_dir, "sha256:same");
+        let second = temporary_dir(knowledge_dir, "sha256:same");
+
+        assert_ne!(first, second);
     }
 }
