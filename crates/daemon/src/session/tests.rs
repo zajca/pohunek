@@ -9989,8 +9989,9 @@ async fn reconnect_persistence_failure_retries_without_orphaning_live_handle() {
     let _ = registry.stop(&created.id).await;
 }
 
-/// Connect deadline of the unanswered-socket reconnect test; short so the
-/// timed-out attempt reaches classification quickly.
+/// Connect deadline of the unanswered-socket reconnect attempt; short so the
+/// timed-out attempt reaches classification quickly. The healthy session keeps
+/// the registry's default launch budget.
 const UNANSWERED_CONNECT_DEADLINE: Duration = Duration::from_millis(300);
 /// Bound on the whole unanswered-socket reconnect. It only fails a hung loop:
 /// a correct loop returns after about one connect deadline.
@@ -10001,7 +10002,6 @@ async fn reconnect_classifies_a_worker_socket_that_accepts_and_never_answers() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         stop_grace: Duration::from_millis(50),
         store_path: Some(temp_store_path("reconnect-unanswered")),
-        worker_connect_deadline: UNANSWERED_CONNECT_DEADLINE,
         ..SessionRegistryConfig::default()
     });
     let created = registry.create(params()).await.expect("create session");
@@ -10031,6 +10031,7 @@ async fn reconnect_classifies_a_worker_socket_that_accepts_and_never_answers() {
             &socket,
             &tokio_util::sync::CancellationToken::new(),
             &WorkerError::Protocol("test disconnect".to_owned()),
+            UNANSWERED_CONNECT_DEADLINE,
         ),
     )
     .await

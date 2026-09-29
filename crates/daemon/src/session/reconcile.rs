@@ -3986,6 +3986,7 @@ mod tests {
         ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessFact,
         ProcessIdentity as OsProcessIdentity, ProcessInspector,
     };
+    use crate::runtime::lifecycle::DEV_WORKER_CONNECT;
     use crate::session::SessionRegistryConfig;
     use crate::store::{
         DesiredState, NativeIdentityOrdering, ResumeBinding, RuntimeRecord, SessionRecord,
@@ -6185,12 +6186,35 @@ while os.getppid() == parent:
         assert!(slots.is_empty());
     }
 
+    /// Connect deadline of the discovery fixtures; short so a probe of a
+    /// socket that never answers settles quickly. It also bounds every
+    /// launch, so a fixture that creates a healthy session uses
+    /// [`launching_registry`] instead.
+    const DISCOVERY_CONNECT_DEADLINE: Duration = Duration::from_millis(300);
+
     fn empty_registry(root: &std::path::Path, runtime_root: &std::path::Path) -> SessionRegistry {
+        registry_within(root, runtime_root, DISCOVERY_CONNECT_DEADLINE)
+    }
+
+    /// An [`empty_registry`] that launches healthy in-process workers within
+    /// the dev/test connect contract, which covers their durable startup I/O.
+    fn launching_registry(
+        root: &std::path::Path,
+        runtime_root: &std::path::Path,
+    ) -> SessionRegistry {
+        registry_within(root, runtime_root, DEV_WORKER_CONNECT)
+    }
+
+    fn registry_within(
+        root: &std::path::Path,
+        runtime_root: &std::path::Path,
+        worker_connect_deadline: Duration,
+    ) -> SessionRegistry {
         SessionRegistry::new(SessionRegistryConfig {
             store_path: Some(root.join("data/metadata.jsonl")),
             worker_runtime_root: Some(runtime_root.to_path_buf()),
             worker_state_root: Some(root.join("state/workers")),
-            worker_connect_deadline: Duration::from_millis(300),
+            worker_connect_deadline,
             ..SessionRegistryConfig::default()
         })
     }
@@ -7440,7 +7464,7 @@ while os.getppid() == parent:
         store
             .record_resume(&legacy_binding("s-legacy"))
             .expect("persist legacy resume binding");
-        let registry = empty_registry(&root, &root.join("runtime/workers"));
+        let registry = launching_registry(&root, &root.join("runtime/workers"));
         Box::pin(registry.reconcile_workers())
             .await
             .expect("the daemon starts without a manifest");
@@ -7487,7 +7511,7 @@ while os.getppid() == parent:
             &[],
         );
         write_legacy_manifest(&data_dir, &manifest);
-        let restarted = empty_registry(&root, &root.join("runtime/workers"));
+        let restarted = launching_registry(&root, &root.join("runtime/workers"));
         Box::pin(restarted.reconcile_workers())
             .await
             .expect("the daemon imports the manifest");

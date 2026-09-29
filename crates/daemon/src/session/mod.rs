@@ -3388,7 +3388,14 @@ impl SessionRegistry {
                     }
                     Err(error) => {
                         let Some(reconnected) = registry
-                            .reconnect_worker(&id, &expected, &socket_path, &cancel, &error)
+                            .reconnect_worker(
+                                &id,
+                                &expected,
+                                &socket_path,
+                                &cancel,
+                                &error,
+                                registry.inner.config.worker_connect_deadline,
+                            )
                             .await
                         else {
                             return;
@@ -3404,6 +3411,12 @@ impl SessionRegistry {
         });
     }
 
+    /// Reconnects a lost worker, classifying the loss whenever the socket
+    /// stays unreachable for `connect_deadline`.
+    ///
+    /// The deadline is a parameter so the unanswered-socket test can bound
+    /// this attempt without shortening the launch budget of its healthy
+    /// session; the watcher passes the configured `worker_connect_deadline`.
     async fn reconnect_worker(
         &self,
         id: &SessionId,
@@ -3411,6 +3424,7 @@ impl SessionRegistry {
         socket_path: &Path,
         cancel: &CancellationToken,
         error: &WorkerError,
+        connect_deadline: Duration,
     ) -> Option<Worker> {
         // A cancelled watcher no longer owns the runtime, and a daemon that is
         // shutting down leaves every worker runtime to the next daemon's
@@ -3430,7 +3444,6 @@ impl SessionRegistry {
         if classified == LossClassification::Settled {
             return None;
         }
-        let connect_deadline = self.inner.config.worker_connect_deadline;
         let mut deadline = tokio::time::Instant::now() + connect_deadline;
         loop {
             if cancel.is_cancelled() || self.inner.daemon_shutdown_started.load(Ordering::Relaxed) {
