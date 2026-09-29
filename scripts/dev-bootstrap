@@ -345,6 +345,24 @@ def check_all(tool_list, which, runner, cargo_bin):
     return [check_tool(tool, which, runner, cargo_bin) for tool in tool_list]
 
 
+def install_command(tool, cargo_bin):
+    """The tool's install argv, pinned to the `$CARGO_HOME` this script checks.
+
+    `cargo install` otherwise honours CARGO_INSTALL_ROOT and `install.root`,
+    so a successful install could land where the re-check never looks.
+    """
+    if tool.install is None:
+        return None
+    if tool.install[:2] == ("cargo", "install"):
+        return (*tool.install[:2], "--root", str(Path(cargo_bin).parent), *tool.install[2:])
+    return tool.install
+
+
+def path_fix(cargo_bin):
+    """A pasteable `export PATH=...` that puts `cargo_bin` first, shell-quoted."""
+    return f'export PATH={shlex.quote(str(cargo_bin))}:"$PATH"'
+
+
 def fix_hint(result, cargo_bin):
     """The exact command or manual step that fixes one failing row."""
     if result.status == NO_CARGO:
@@ -353,10 +371,10 @@ def fix_hint(result, cargo_bin):
         where = result.detail or "not on PATH"
         return (
             f"found at {result.path} but {where}; put it first: "
-            f"export PATH=\"{cargo_bin}:$PATH\""
+            f"{path_fix(cargo_bin)}"
         )
     if result.tool.install is not None:
-        return shlex.join(result.tool.install)
+        return shlex.join(install_command(result.tool, cargo_bin))
     return result.tool.manual
 
 
@@ -406,7 +424,7 @@ def report(results, strict, cargo_bin, out):
     return True
 
 
-def install(results, strict, executor, out):
+def install(results, strict, executor, cargo_bin, out):
     """Run the install command of every failing row that has one.
 
     Returns False when any command fails or a failing row needs a manual
@@ -424,9 +442,10 @@ def install(results, strict, executor, out):
             )
             succeeded = False
             continue
-        print(f"+ {shlex.join(result.tool.install)}", file=out, flush=True)
+        command = install_command(result.tool, cargo_bin)
+        print(f"+ {shlex.join(command)}", file=out, flush=True)
         try:
-            status = executor(list(result.tool.install))
+            status = executor(list(command))
         except OSError as error:
             print(
                 f"dev-bootstrap: install of {result.tool.name} could not "
@@ -491,7 +510,7 @@ def main(
     passed = report(results, args.strict, cargo_bin, out)
     if passed or not args.install:
         return 0 if passed else 1
-    installed = install(results, args.strict, executor, out)
+    installed = install(results, args.strict, executor, cargo_bin, out)
     print("dev-bootstrap: re-checking after install", file=out)
     results = check_all(tool_list, which, runner, cargo_bin)
     passed = report(results, args.strict, cargo_bin, out)

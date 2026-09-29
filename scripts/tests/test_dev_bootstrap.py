@@ -251,7 +251,7 @@ class CheckTests(DevBootstrapCase):
         self.assertEqual(status, 1)
         self.assertIn("FAIL     cargo-nextest is missing (needs >= 0.9.115)",
                       output)
-        self.assertIn("fix: cargo install --locked cargo-nextest", output)
+        self.assertIn("fix: cargo install --root /fake/cargo-home --locked cargo-nextest", output)
         self.assertIn("failing: cargo-nextest", output)
 
     def test_too_old_required_tool_fails(self):
@@ -269,7 +269,7 @@ class CheckTests(DevBootstrapCase):
         status, output = self.run_main(FakeHost(on_path=tools))
         self.assertEqual(status, 0)
         self.assertIn("warn     hyperfine is missing", output)
-        self.assertIn("fix: cargo install --locked hyperfine", output)
+        self.assertIn("fix: cargo install --root /fake/cargo-home --locked hyperfine", output)
         self.assertIn("warn     mold is missing", output)
 
     def test_missing_optional_tool_fails_under_strict(self):
@@ -322,7 +322,7 @@ class CheckTests(DevBootstrapCase):
         status, output = self.run_main(host, "--install", "--strict")
         self.assertEqual(status, 1, output)
         self.assertIn("bacon 3.25.0 is shadowed by", output)
-        self.assertIn(f'export PATH="{CARGO_BIN}:$PATH"', output)
+        self.assertIn(f'export PATH={CARGO_BIN}:"$PATH"', output)
         # A PATH-order problem is a manual step: reinstalling cannot fix it.
         self.assertEqual(host.installs, [])
 
@@ -334,7 +334,7 @@ class CheckTests(DevBootstrapCase):
         self.assertEqual(status, 1, output)
         self.assertIn("`cargo` is not on PATH", output)
         self.assertIn("https://rustup.rs", output)
-        self.assertNotIn("cargo install --locked cargo-nextest", output)
+        self.assertNotIn("cargo install --root /fake/cargo-home --locked cargo-nextest", output)
         self.assertEqual(host.installs, [])
 
     def test_outdated_copy_only_in_cargo_home_keeps_its_install_fix(self):
@@ -345,7 +345,7 @@ class CheckTests(DevBootstrapCase):
         status, output = self.run_main(host, "--strict")
         self.assertEqual(status, 1, output)
         self.assertIn("bacon 2.0.0 is older than", output)
-        self.assertIn("cargo install --locked bacon", output)
+        self.assertIn("cargo install --root /fake/cargo-home --locked bacon", output)
         self.assertNotIn("not on PATH", output)
 
     def test_rustc_is_checked_against_the_workspace_msrv(self):
@@ -370,6 +370,20 @@ class CheckTests(DevBootstrapCase):
         self.assertEqual(status, 2, output)
         self.assertIn("rust-version", output)
 
+    def test_path_fix_quotes_shell_metacharacters(self):
+        fix = dev_bootstrap.path_fix('/home/a $(b)`c`"d/bin')
+        self.assertEqual(fix, "export PATH='/home/a $(b)`c`\"d/bin':\"$PATH\"")
+
+    def test_install_is_pinned_to_the_checked_cargo_home(self):
+        tools = dict(CURRENT)
+        tools.pop("bacon")
+        host = FakeHost(on_path=tools, installed_output={"bacon": CURRENT["bacon"]})
+        self.run_main(host, "--install", "--strict")
+        self.assertEqual(
+            host.installs,
+            [["cargo", "install", "--root", CARGO_HOME, "--locked", "bacon"]],
+        )
+
     def test_binary_only_in_cargo_home_is_reported_off_path(self):
         tools = dict(CURRENT)
         bacon = tools.pop("bacon")
@@ -377,7 +391,7 @@ class CheckTests(DevBootstrapCase):
         status, output = self.run_main(host, "--strict")
         self.assertEqual(status, 1)
         self.assertIn("bacon is not on PATH", output)
-        self.assertIn(f'export PATH="{CARGO_BIN}:$PATH"', output)
+        self.assertIn(f'export PATH={CARGO_BIN}:"$PATH"', output)
 
     def test_unrunnable_tool_is_a_failure_not_a_pass(self):
         tools = dict(
@@ -415,9 +429,9 @@ class InstallTests(DevBootstrapCase):
         self.assertEqual(status, 0)
         # hyperfine is optional and not strict: reported, never installed.
         self.assertEqual(
-            host.installs, [["cargo", "install", "--locked", "cargo-nextest"]]
+            host.installs, [["cargo", "install", "--root", CARGO_HOME, "--locked", "cargo-nextest"]]
         )
-        self.assertIn("+ cargo install --locked cargo-nextest", output)
+        self.assertIn("+ cargo install --root /fake/cargo-home --locked cargo-nextest", output)
         self.assertLess(output.index("+ cargo install"),
                         output.index("re-checking after install"))
 
@@ -434,8 +448,8 @@ class InstallTests(DevBootstrapCase):
         self.assertEqual(status, 0)
         self.assertEqual(
             host.installs,
-            [["cargo", "install", "--locked", "bacon"],
-             ["cargo", "install", "--locked", "hyperfine"]],
+            [["cargo", "install", "--root", CARGO_HOME, "--locked", "bacon"],
+             ["cargo", "install", "--root", CARGO_HOME, "--locked", "hyperfine"]],
         )
 
     def test_install_that_cannot_start_is_reported_not_raised(self):
