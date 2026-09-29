@@ -11,5 +11,4 @@ ignore = [
     # trusted Wayland protocol XML at build time. Remove these ignores once
     # wayland-scanner accepts quick-xml >= 0.41.0.
     "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
 ]
