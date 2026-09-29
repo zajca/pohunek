@@ -1,6 +1,6 @@
 //! Typed failures of `pohunek service`.
 
-// Rust guideline compliant 2026-09-28
+// Rust guideline compliant 2026-09-29
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -406,14 +406,14 @@ pub enum Error {
         installed: PathBuf,
     },
 
-    /// `POHUNEK_SERVICE_LOCK_FD` does not name a descriptor holding the
-    /// transaction lock.
+    /// `POHUNEK_SERVICE_LOCK_TOKEN` does not prove a live `pohunek service
+    /// lock` holder of the transaction lock.
     #[error(
-        "{} does not name a held `pohunek service` transaction lock: {detail}",
-        super::inherited::LOCK_FD_ENV
+        "{} does not prove a held `pohunek service` transaction lock: {detail}",
+        super::inherited::LOCK_TOKEN_ENV
     )]
     InheritedLock {
-        /// Why the descriptor was refused.
+        /// Why the token was refused.
         detail: String,
     },
 
@@ -537,7 +537,7 @@ impl Error {
                 Some("omit --prefix, or pass the installed prefix, to check the upgrade")
             }
             Self::InheritedLock { .. } => Some(
-                "run the command under `pohunek service lock -- <command>`, or without POHUNEK_SERVICE_LOCK_FD in its environment",
+                "run the command under `pohunek service lock -- <command>`, or without POHUNEK_SERVICE_LOCK_TOKEN in its environment",
             ),
             _ => None,
         }
@@ -619,9 +619,6 @@ pub(crate) fn fs_error(operation: &'static str, source: FsError) -> Error {
             detail: "an extended ACL grants other users access".to_owned(),
             fix: writable_fix(&path),
             path,
-        },
-        FsError::LockNotHeld { detail, .. } => Error::InheritedLock {
-            detail: detail.to_owned(),
         },
         source => Error::Filesystem { operation, source },
     }

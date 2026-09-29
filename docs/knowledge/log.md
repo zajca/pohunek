@@ -3,10 +3,11 @@
 ## Unreleased (2026-09-28)
 
 - Documented `pohunek service lock -- <command>`, which runs a command under
-  the service transaction lock and hands the lock to its `pohunek service`
-  calls through `POHUNEK_SERVICE_LOCK_FD` (`service_inherited_lock_invalid`
-  for a descriptor that holds no lock), and `pohunek service check`, which
-  runs the install or upgrade preflight without changing anything.
+  the service transaction lock and lets its `pohunek service` calls adopt
+  the lock with the holder token in `POHUNEK_SERVICE_LOCK_TOKEN`
+  (`service_inherited_lock_invalid` for a token that proves no live holder),
+  and `pohunek service check`, which runs the install or upgrade preflight,
+  including the stale daemon-job check, without changing anything.
 - Documented that `packaging/install-daemon.sh` runs its legacy retirement and
   final install or upgrade under that lock and runs `service check` before it
   touches the legacy install.

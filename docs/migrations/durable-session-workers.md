@@ -126,9 +126,12 @@ The whole installer run holds the service transaction lock
 `service_transaction_in_progress`, before anything changes, while another
 `pohunek service install|upgrade|uninstall` holds the lock. From then on no
 such command can start until the run ends, and the final `pohunek service
-install|upgrade` adopts the same lock through the inherited descriptor
-`POHUNEK_SERVICE_LOCK_FD` names. A `pohunek service` command started from
-elsewhere during the retirement is refused instead of racing it.
+install|upgrade` adopts the same lock with the holder token
+`pohunek service lock` passes in `POHUNEK_SERVICE_LOCK_TOKEN` (it records
+itself and that token in `$XDG_STATE_HOME/pohunek/service-install.lock.holder`
+and keeps the lock itself until the run ends). A `pohunek service` command
+started from elsewhere during the retirement is refused instead of racing it,
+and no process the run leaves behind can hold or adopt the lock afterwards.
 
 Before the first of the steps above, the installer runs
 `pohunek service check --prefix <prefix> --json`, which makes every check the
@@ -144,12 +147,15 @@ user (or, for an ancestor, by the owner of `/`), and not writable by group or
 others, and the application state and runtime roots (`$XDG_STATE_HOME/pohunek`,
 `$XDG_RUNTIME_DIR/pohunek`) of mode `0700` exactly; a pending transaction the
 command would refuse (`service_install_pending`) refuses; an upgrade's
-recorded installation must describe this user and these XDG roots; and the
-prefix must not belong to another installation (`service_prefix_owned`). A
+recorded installation must describe this user and these XDG roots; the
+prefix must not belong to another installation (`service_prefix_owned`); and
+an install that starts over must find no daemon job registered without
+`service.toml` (`service_daemon_job_present`), which the check asks the
+service manager last. A
 failed check prints the error document, with the code the final command would
 fail with, and refuses the run with the legacy install untouched. The check
 also confirms it ran under the run's lock (`"locked": true`); a
-`POHUNEK_SERVICE_LOCK_FD` that names no held lock fails with
+`POHUNEK_SERVICE_LOCK_TOKEN` that proves no live holder fails with
 `service_inherited_lock_invalid` rather than running unlocked.
 
 Every legacy file the installer removes lies under one validated install

@@ -191,19 +191,26 @@ automatically, so rerunning the command is always safe.
 
 `pohunek service lock -- <command> [args...]` holds that lock while it runs
 `<command>` and exits with the command's status (128 plus the signal number
-when a signal ended it). The command inherits a descriptor of the lock, named
-by `POHUNEK_SERVICE_LOCK_FD`; every `pohunek service install`, `upgrade`,
-`uninstall`, `check`, or nested `lock` it runs adopts that lock instead of
-waiting for it, while any other service command is refused with
-`service_transaction_in_progress` until the command exits. A
-`POHUNEK_SERVICE_LOCK_FD` that does not name a descriptor holding the lock
-fails those commands with `service_inherited_lock_invalid`; they never fall
-back to a lock of their own. `pohunek service check [--prefix <dir>] [--json]`
+when a signal ended it). The lock stays with that process: it records itself
+and a fresh random token in the owner-private
+`~/.local/state/pohunek/service-install.lock.holder` and passes the command
+only the token, in `POHUNEK_SERVICE_LOCK_TOKEN`. Every `pohunek service
+install`, `upgrade`, `uninstall`, `check`, or nested `lock` the command runs
+adopts the lock with that token instead of waiting for it, while any other
+service command is refused with `service_transaction_in_progress` until the
+command exits. Adoption requires the lock to be held, the holder record to
+carry the same token, and the recorded holder process to still run; anything
+else fails with `service_inherited_lock_invalid`, never with a lock of its
+own. The holder removes its record and releases the lock as soon as the
+command exits, so a background process the command left behind neither keeps
+the lock nor adopts it later. `pohunek service check [--prefix <dir>] [--json]`
 runs, without changing anything, every check the install (while an install is
 pending or nothing is installed) or upgrade of this version makes before its
 first effect — `HOME` and the XDG roots, the prefix, every directory it writes,
-a pending transaction it would refuse, the recorded installation, and the
-prefix owner — and fails with the error and code that command would fail with.
+a pending transaction it would refuse, the recorded installation, the prefix
+owner, and, for an install that starts over, a daemon job registered without
+`service.toml` (`service_daemon_job_present`) — and fails with the error and
+code that command would fail with.
 `packaging/install-daemon.sh` runs its whole legacy retirement and the final
 `service install|upgrade` under `pohunek service lock -- <installer>`, and runs
 `service check` before it touches the legacy install.

@@ -19,10 +19,9 @@
 //! assemble those pieces explicitly instead, for example to point the
 //! systemd backend at another unit directory.
 
-// Rust guideline compliant 2026-09-28
+// Rust guideline compliant 2026-09-29
 
 use std::ffi::{OsStr, OsString};
-use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
@@ -122,46 +121,66 @@ pub async fn uninstall(options: UninstallOptions) -> Result<report::UninstallRep
 /// `prefix` is the install prefix, `$HOME/.local` by default; for an upgrade
 /// it must be omitted or equal the installed prefix. The checks run in the
 /// same functions install and upgrade call before their first effect, so
-/// their rules cannot drift apart.
+/// their rules cannot drift apart. An install that would start over also
+/// asks the service manager whether a daemon job is registered, last, after
+/// every local check passed.
 ///
 /// # Errors
 ///
 /// Returns the error install or upgrade would return before its first
 /// effect, [`Error::PrefixMismatch`], or [`Error::InheritedLock`] when
-/// `POHUNEK_SERVICE_LOCK_FD` names no held transaction lock.
-pub fn check(prefix: Option<PathBuf>) -> Result<report::CheckReport, Error> {
+/// `POHUNEK_SERVICE_LOCK_TOKEN` proves no live lock holder.
+pub async fn check(prefix: Option<PathBuf>) -> Result<report::CheckReport, Error> {
     let context = Context::resolve()?;
     let inherited = inherited_lock(&context)?;
-    check_of(&context, prefix, VERSION, inherited.is_some())
+    let checked = check_local(&context, prefix, VERSION, inherited.is_some())?;
+    if checked.fresh_install {
+        let namespace = context.namespace()?;
+        let backend = Backend::connect(&context, &namespace, settings::LAUNCHCTL_COMMAND).await?;
+        engine::ensure_no_daemon_job(&backend).await?;
+    }
+    Ok(checked.report)
 }
 
 /// Runs `program` with `arguments` while holding the transaction lock.
 ///
 /// The lock is taken like install takes it, or adopted from a `pohunek
-/// service lock` ancestor, and handed to the child as an inherited
-/// descriptor named by [`inherited::LOCK_FD_ENV`]. It is released once the
-/// child exits, never earlier: `SIGINT` and `SIGHUP` are left to the child,
-/// which shares the terminal's process group, and `SIGTERM` is forwarded to
-/// it.
+/// service lock` ancestor. This process keeps it; the child only receives
+/// the holder token in [`inherited::LOCK_TOKEN_ENV`], with which it and the
+/// `pohunek service` commands it runs adopt the lock (see
+/// [`record::Store::hand_off`]). Once the child exits the holder record is
+/// removed and the lock released, so a background process the child left
+/// behind can neither keep nor adopt the lock. `SIGINT` and `SIGHUP` are
+/// left to the child, which shares the terminal's process group, and
+/// `SIGTERM` is forwarded to it.
 ///
 /// # Errors
 ///
 /// Returns [`Error::TransactionInProgress`] while another command holds the
-/// lock, [`Error::InheritedLock`] for an invalid inherited descriptor, and
-/// [`Error::Io`] when the child cannot be spawned or waited for.
+/// lock, [`Error::InheritedLock`] for a token that proves no live holder,
+/// [`Error::Io`] when the child cannot be spawned or waited for, and a
+/// filesystem error when the holder record cannot be written or removed.
 pub async fn lock(program: &OsStr, arguments: &[OsString]) -> Result<ExitStatus, Error> {
     let context = Context::resolve()?;
     let store = record::Store::new(context.paths().state_dir.clone());
     let lock = match inherited::take()? {
-        Some(marker) => store.adopt(marker)?,
+        Some(token) => store.adopt(&token)?,
         None => store.lock().await?,
     };
-    run_locked(&lock, program, arguments).await
+    let handoff = store.hand_off(&lock)?;
+    let status = run_locked(handoff.token(), program, arguments).await;
+    // The record goes before the lock, so no command can adopt the lock
+    // with this token once it is free.
+    let released = handoff.release();
+    drop(lock);
+    let status = status?;
+    released?;
+    Ok(status)
 }
 
-/// Runs the child of [`lock`] with `lock` handed down.
+/// Runs the child of [`lock`] with the holder `token`.
 async fn run_locked(
-    lock: &record::TransactionLock,
+    token: &inherited::Token,
     program: &OsStr,
     arguments: &[OsString],
 ) -> Result<ExitStatus, Error> {
@@ -171,14 +190,11 @@ async fn run_locked(
     let mut terminate = signals(SignalKind::terminate())?;
     let mut interrupt = signals(SignalKind::interrupt())?;
     let mut hangup = signals(SignalKind::hangup())?;
-    let inheritable = lock.inheritable()?;
-    let spawned = tokio::process::Command::new(program)
+    let mut child = tokio::process::Command::new(program)
         .args(arguments)
-        .env(inherited::LOCK_FD_ENV, inheritable.as_raw_fd().to_string())
-        .spawn();
-    // Only the child may inherit the duplicate; it holds its own copy now.
-    drop(inheritable);
-    let mut child = spawned.map_err(error::io_error("run", program))?;
+        .env(inherited::LOCK_TOKEN_ENV, token.as_str())
+        .spawn()
+        .map_err(error::io_error("run", program))?;
     loop {
         tokio::select! {
             status = child.wait() => return status.map_err(error::io_error("wait for", program)),
@@ -221,15 +237,15 @@ pub fn exit_code(status: ExitStatus) -> u8 {
         .unwrap_or(UNKNOWN_EXIT)
 }
 
-/// Adopts the transaction lock a `pohunek service lock` ancestor handed down.
+/// Adopts the transaction lock of a `pohunek service lock` ancestor.
 ///
 /// # Errors
 ///
-/// Returns [`Error::InheritedLock`] when `POHUNEK_SERVICE_LOCK_FD` was set
-/// but names no descriptor holding `context`'s transaction lock.
+/// Returns [`Error::InheritedLock`] when `POHUNEK_SERVICE_LOCK_TOKEN` was set
+/// but proves no live holder of `context`'s transaction lock.
 fn inherited_lock(context: &Context) -> Result<Option<record::TransactionLock>, Error> {
     inherited::take()?
-        .map(|marker| record::Store::new(context.paths().state_dir.clone()).adopt(marker))
+        .map(|token| record::Store::new(context.paths().state_dir.clone()).adopt(&token))
         .transpose()
 }
 
@@ -245,7 +261,17 @@ fn engine<'a>(
     }
 }
 
-/// Runs [`check`] for `context` and `version`.
+/// The local part of [`check`], and whether its daemon-job check applies.
+#[derive(Debug)]
+pub(crate) struct Checked {
+    /// The report a passing check returns.
+    pub(crate) report: report::CheckReport,
+    /// Whether install would start over and must find no daemon job
+    /// ([`engine::ensure_no_daemon_job`]).
+    pub(crate) fresh_install: bool,
+}
+
+/// Runs the checks of [`check`] that need no service manager.
 ///
 /// The checks are the ones install or upgrade make before any effect, in
 /// the same functions: [`engine::install_preflight`] or
@@ -259,12 +285,12 @@ fn engine<'a>(
 /// # Errors
 ///
 /// See [`check`].
-pub(crate) fn check_of(
+pub(crate) fn check_local(
     context: &Context,
     prefix: Option<PathBuf>,
     version: &str,
     locked: bool,
-) -> Result<report::CheckReport, Error> {
+) -> Result<Checked, Error> {
     let prefix = prefix
         .map(|prefix| absolute("--prefix", prefix))
         .transpose()?;
@@ -307,7 +333,9 @@ pub(crate) fn check_of(
             plan,
         )
     };
-    Ok(report::CheckReport {
+    let fresh_install =
+        operation == record::Operation::Install && !matches!(plan, engine::Plan::Resume(_));
+    let report = report::CheckReport {
         operation: operation.as_str(),
         version: version.to_owned(),
         prefix,
@@ -320,7 +348,31 @@ pub(crate) fn check_of(
             engine::Plan::RollBack(_) => Some("roll_back"),
         },
         locked,
+    };
+    Ok(Checked {
+        report,
+        fresh_install,
     })
+}
+
+/// Runs [`check`] for `context` and `version` against `backend`.
+///
+/// # Errors
+///
+/// See [`check`].
+#[cfg(test)]
+pub(crate) async fn check_with(
+    context: &Context,
+    backend: &Backend,
+    prefix: Option<PathBuf>,
+    version: &str,
+    locked: bool,
+) -> Result<report::CheckReport, Error> {
+    let checked = check_local(context, prefix, version, locked)?;
+    if checked.fresh_install {
+        engine::ensure_no_daemon_job(backend).await?;
+    }
+    Ok(checked.report)
 }
 
 /// Reports the installation.
@@ -663,38 +715,95 @@ mod tests {
         }
     }
 
+    /// Names the state directory `inherited_lock_probe` adopts the lock in;
+    /// unset in an ordinary test run, where the probe passes without checking.
+    const PROBE_STATE_ENV: &str = "POHUNEK_TEST_PROBE_STATE_DIR";
+
+    /// Probe exit status: the token adopted the lock.
+    const PROBE_ADOPTED: u8 = 7;
+
+    /// Probe exit status: the token did not adopt the lock.
+    const PROBE_REFUSED: i32 = 3;
+
+    /// Child side of `lock_runs_the_command_with_a_token_that_adopts_the_lock`.
+    ///
+    /// Adopts the lock in the state directory the parent names with the token
+    /// [`inherited::LOCK_TOKEN_ENV`] carries, exactly as a `pohunek service`
+    /// command under the lock does.
+    #[test]
+    fn inherited_lock_probe() {
+        let Some(state_dir) = std::env::var_os(PROBE_STATE_ENV) else {
+            return;
+        };
+        let adopted = std::env::var(inherited::LOCK_TOKEN_ENV)
+            .ok()
+            .and_then(|token| inherited::Token::parse(&token).ok())
+            .is_some_and(|token| {
+                record::Store::new(PathBuf::from(state_dir))
+                    .adopt(&token)
+                    .is_ok()
+            });
+        std::process::exit(if adopted {
+            i32::from(PROBE_ADOPTED)
+        } else {
+            PROBE_REFUSED
+        });
+    }
+
     fn shell(script: String) -> [OsString; 2] {
         [OsString::from("-c"), OsString::from(script)]
     }
 
-    #[tokio::test]
-    async fn lock_runs_the_command_with_the_lock_handed_down() {
-        let (_temp, root) = temp_root();
-        let store = record::Store::new(root.join("state/pohunek"));
-        let lock = store.lock().await.expect("take the lock");
-        let lock_file = store.path().with_file_name(record::LOCK_NAME);
-        let ran = root.join("ran");
+    /// A shell script that runs `inherited_lock_probe` against `state_dir`.
+    fn probe_script(state_dir: &Path) -> String {
+        let probe = std::env::current_exe().expect("test binary");
+        format!(
+            "{PROBE_STATE_ENV}='{}' exec '{}' --exact service::tests::inherited_lock_probe --quiet",
+            state_dir.display(),
+            probe.display()
+        )
+    }
 
-        // The child inherits a descriptor of the lock file under the
-        // documented variable, and its status is passed through.
-        let script = format!(
-            "[ \"/dev/fd/${}\" -ef '{}' ] && : > '{}' && exit 7",
-            inherited::LOCK_FD_ENV,
-            lock_file.display(),
-            ran.display()
+    #[tokio::test]
+    async fn lock_runs_the_command_with_a_token_that_adopts_the_lock() {
+        let (_temp, root) = temp_root();
+        let state_dir = root.join("state/pohunek");
+        let store = record::Store::new(state_dir.clone());
+        let lock = store.lock().await.expect("take the lock");
+        let handoff = store.hand_off(&lock).expect("publish the holder record");
+
+        // The child receives only the token, and adopts the lock with it.
+        let status = run_locked(
+            handoff.token(),
+            OsStr::new("sh"),
+            &shell(probe_script(&state_dir)),
+        )
+        .await
+        .expect("run the command");
+        assert_eq!(
+            exit_code(status),
+            PROBE_ADOPTED,
+            "the child adopts the lock"
         );
-        let status = run_locked(&lock, OsStr::new("sh"), &shell(script))
+
+        // Once the record is gone, the same token adopts nothing.
+        let token = handoff.token().clone();
+        handoff.release().expect("remove the holder record");
+        let status = run_locked(&token, OsStr::new("sh"), &shell(probe_script(&state_dir)))
             .await
             .expect("run the command");
-        assert_eq!(exit_code(status), 7);
-        assert!(ran.exists(), "the child saw the inherited lock descriptor");
+        assert_eq!(exit_code(status), 3, "a released token adopts nothing");
 
-        let status = run_locked(&lock, OsStr::new("sh"), &shell("kill -TERM $$".to_owned()))
+        let status = run_locked(&token, OsStr::new("sh"), &shell("exit 42".to_owned()))
+            .await
+            .expect("run the command");
+        assert_eq!(exit_code(status), 42);
+        let status = run_locked(&token, OsStr::new("sh"), &shell("kill -TERM $$".to_owned()))
             .await
             .expect("run the command");
         assert_eq!(exit_code(status), 128 + 15, "a signal maps like a shell's");
 
-        let error = run_locked(&lock, OsStr::new("/nonexistent/command"), &[])
+        let error = run_locked(&token, OsStr::new("/nonexistent/command"), &[])
             .await
             .expect_err("a missing command");
         assert!(
@@ -707,6 +816,7 @@ mod tests {
             ),
             "{error:?}"
         );
+        drop(lock);
     }
 
     #[tokio::test]
@@ -714,13 +824,14 @@ mod tests {
         let (_temp, root) = temp_root();
         let store = record::Store::new(root.join("state/pohunek"));
         let lock = store.lock().await.expect("take the lock");
+        let handoff = store.hand_off(&lock).expect("publish the holder record");
         let stop = root.join("stop");
         let script = format!(
             "while [ ! -e '{}' ]; do sleep 0.05; done; exit 3",
             stop.display()
         );
         let arguments = shell(script);
-        let child = run_locked(&lock, OsStr::new("sh"), &arguments);
+        let child = run_locked(handoff.token(), OsStr::new("sh"), &arguments);
         let competitor = async {
             let refused = store.lock().await;
             std::fs::write(&stop, "").expect("release the child");
@@ -732,6 +843,7 @@ mod tests {
             matches!(refused, Err(Error::TransactionInProgress { .. })),
             "{refused:?}"
         );
+        handoff.release().expect("remove the holder record");
         drop(lock);
         store
             .lock()

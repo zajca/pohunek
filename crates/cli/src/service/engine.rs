@@ -119,7 +119,7 @@
 //! cannot stop those workers, so the uninstall names them instead of
 //! waiting on them.
 
-// Rust guideline compliant 2026-09-28
+// Rust guideline compliant 2026-09-29
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -298,15 +298,7 @@ impl<'a> Engine<'a> {
             if file_exists(&config_path)? {
                 return Err(Error::AlreadyInstalled { path: config_path });
             }
-            match self.backend.daemon().inspect().await {
-                Err(supervisor::Error::NotFound(_)) => {}
-                Ok(observation) => {
-                    return Err(Error::DaemonJobPresent {
-                        id: observation.id.to_string(),
-                    });
-                }
-                Err(source) => return Err(supervisor_error("inspect daemon", source)),
-            }
+            ensure_no_daemon_job(self.backend).await?;
         }
         let config = initial_config(self.context, prefix, version)?;
         let namespace = config.namespace();
@@ -1433,6 +1425,26 @@ pub(crate) fn check_layout_dirs(context: &Context, layout: &InstallLayout) -> Re
         layout::check_trusted(directory)?;
     }
     Ok(())
+}
+
+/// Refuses an install that starts over while a daemon job is registered.
+///
+/// Without `service.toml` nothing describes such a job, so registering
+/// another daemon beside it could never be undone safely. Install runs this
+/// before registering anything, and `pohunek service check` runs it too.
+///
+/// # Errors
+///
+/// Returns [`Error::DaemonJobPresent`] for a registered daemon job and
+/// [`Error::Supervisor`] when the service manager cannot be asked.
+pub(crate) async fn ensure_no_daemon_job(backend: &Backend) -> Result<(), Error> {
+    match backend.daemon().inspect().await {
+        Err(supervisor::Error::NotFound(_)) => Ok(()),
+        Ok(observation) => Err(Error::DaemonJobPresent {
+            id: observation.id.to_string(),
+        }),
+        Err(source) => Err(supervisor_error("inspect daemon", source)),
+    }
 }
 
 /// Decides what an install of `version` into `prefix` does with `pending`.

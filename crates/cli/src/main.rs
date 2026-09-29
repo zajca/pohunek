@@ -1,9 +1,9 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    // SAFETY: this is the first statement of `main`: no thread has started
-    // and this process has opened no descriptor yet.
-    unsafe { pohunek_cli::service::inherited::capture() };
+    // Runs before the async runtime starts its threads, so removing the
+    // variable from the environment races no reader.
+    pohunek_cli::service::inherited::capture();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

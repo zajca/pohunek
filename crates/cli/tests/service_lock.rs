@@ -1,23 +1,31 @@
 //! `pohunek service lock` and the lock it hands down, through the real binary.
 //!
-//! Every run uses an isolated `HOME` and XDG layout below a temporary root and
-//! a cleared environment, so the tests never see the operator's installation
-//! or a `POHUNEK_*` variable of the calling shell. Nothing here installs a
-//! service: `service check` only reads, and the lock itself touches only the
-//! application state directory.
+//! Every run uses an isolated `HOME` and XDG layout below a canonical
+//! temporary root and a cleared environment, so the tests never see the
+//! operator's installation, a service manager, or a `POHUNEK_*` variable of
+//! the calling shell. Nothing here installs a service or needs `/dev/fd` or
+//! `/proc`: the lock touches only the application state directory, and
+//! adoption is observed through the commands' own results.
 
-// Rust guideline compliant 2026-09-28
+// Rust guideline compliant 2026-09-29
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 /// The real CLI under test.
 const POHUNEK: &str = env!("CARGO_BIN_EXE_pohunek");
 
-/// Variable the lock names its handed-down descriptor in.
-const LOCK_FD_ENV: &str = "POHUNEK_SERVICE_LOCK_FD";
+/// Variable the lock passes its holder token in.
+const LOCK_TOKEN_ENV: &str = "POHUNEK_SERVICE_LOCK_TOKEN";
+
+/// Bound on waiting for a helper process to report.
+const WAIT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Poll interval of that wait.
+const POLL: Duration = Duration::from_millis(20);
 
 /// An isolated user environment.
 struct Host {
@@ -37,10 +45,6 @@ impl Host {
                 .expect("make directory private");
         }
         Self { _temp: temp, root }
-    }
-
-    fn prefix(&self) -> PathBuf {
-        self.root.join("home/.local")
     }
 
     /// `pohunek` with `args` in this host's environment.
@@ -72,8 +76,8 @@ impl Host {
             .expect("run pohunek service lock")
     }
 
-    fn lock_file(&self) -> PathBuf {
-        self.root.join("state/pohunek/service-install.lock")
+    fn holder_record(&self) -> PathBuf {
+        self.root.join("state/pohunek/service-install.lock.holder")
     }
 }
 
@@ -91,27 +95,98 @@ fn assert_code(output: &Output, code: i32) {
     );
 }
 
+/// Waits until `path` holds a line and returns it.
+fn wait_for_line(path: &Path) -> String {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    loop {
+        if let Ok(text) = fs::read_to_string(path) {
+            if text.ends_with('\n') {
+                return text.trim_end().to_owned();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
+        std::thread::sleep(POLL);
+    }
+}
+
 #[test]
 fn the_locked_command_runs_its_own_service_commands_under_the_lock() {
     let host = Host::new();
-    let prefix = host.prefix().display().to_string();
-    let output = host.locked_shell(&format!(
-        "\"$POHUNEK\" service check --prefix '{prefix}' --json"
-    ));
-    assert_code(&output, 0);
-    let stdout = text(&output.stdout);
-    assert!(stdout.contains("\"locked\": true"), "{stdout}");
-    assert!(stdout.contains("\"operation\": \"install\""), "{stdout}");
-    assert!(
-        stdout.contains(&format!("\"prefix\": \"{prefix}\"")),
-        "{stdout}"
+    // A nested lock adopts the held lock with the token instead of waiting
+    // for it, and hands the same token on.
+    let output = host.locked_shell(
+        "\"$POHUNEK\" service lock -- sh -c '\"$POHUNEK\" service lock -- sh -c \"exit 5\"'",
     );
-    assert!(!host.prefix().exists(), "check created the prefix");
-    assert!(!host.root.join("config/pohunek/service.toml").exists());
-
-    // A nested lock reuses the handed-down lock instead of waiting for it.
-    let output = host.locked_shell("\"$POHUNEK\" service lock -- sh -c 'exit 5'");
     assert_code(&output, 5);
+
+    // `service check` adopts the lock before its own checks, so under the
+    // lock it reaches the prefix validation, and outside it a forged token
+    // fails first.
+    let output = host.locked_shell("\"$POHUNEK\" service check --prefix relative --json");
+    assert_code(&output, 1);
+    assert!(
+        text(&output.stdout).contains("\"cli_usage\""),
+        "{}",
+        text(&output.stdout)
+    );
+    let output = host
+        .pohunek(&["service", "check", "--prefix", "relative", "--json"])
+        .env(LOCK_TOKEN_ENV, "0".repeat(64))
+        .output()
+        .expect("run check");
+    assert_code(&output, 1);
+    assert!(
+        text(&output.stdout).contains("service_inherited_lock_invalid"),
+        "{}",
+        text(&output.stdout)
+    );
+    assert!(
+        !host.holder_record().exists(),
+        "the holder record outlived the lock"
+    );
+}
+
+#[test]
+fn a_background_descendant_neither_keeps_nor_adopts_the_lock() {
+    let host = Host::new();
+    let adopted = host.root.join("adopted");
+    let released = host.root.join("released");
+    // The command leaves a process behind that retries `service lock` with
+    // the token once the holder is gone; its own stdio must not keep the
+    // test's pipes open.
+    let script = format!(
+        "( while [ ! -e '{released}' ]; do sleep 0.05; done; \
+           \"$POHUNEK\" service lock -- true; echo \"$?\" > '{adopted}' ) \
+           </dev/null >/dev/null 2>'{adopted}.err' & exit 0",
+        released = released.display(),
+        adopted = adopted.display(),
+    );
+    let output = host.locked_shell(&script);
+    assert_code(&output, 0);
+    assert!(
+        !host.holder_record().exists(),
+        "the holder record outlived the lock"
+    );
+
+    // The lock is free although the descendant still runs.
+    let output = host
+        .pohunek(&["service", "lock", "--", "true"])
+        .output()
+        .expect("lock after the holder exited");
+    assert_code(&output, 0);
+
+    fs::write(&released, "").expect("release the descendant");
+    assert_eq!(
+        wait_for_line(&adopted),
+        "1",
+        "the descendant adopted the lock"
+    );
+    let stderr = fs::read_to_string(host.root.join("adopted.err")).expect("descendant stderr");
+    assert!(stderr.contains(LOCK_TOKEN_ENV), "{stderr}");
 }
 
 #[test]
@@ -120,7 +195,7 @@ fn another_transaction_is_refused_while_the_command_runs_and_starts_after() {
     // The competitor opens its own description of the lock file, like any
     // `pohunek service` command started from elsewhere.
     let output = host.locked_shell(&format!(
-        "(unset {LOCK_FD_ENV}; exec \"$POHUNEK\" service lock -- true); echo \"competitor=$?\""
+        "(unset {LOCK_TOKEN_ENV}; exec \"$POHUNEK\" service lock -- true); echo \"competitor=$?\""
     ));
     assert_code(&output, 0);
     assert!(
@@ -156,7 +231,7 @@ fn the_command_status_is_the_lock_status() {
 }
 
 #[test]
-fn a_variable_that_names_no_held_lock_fails_instead_of_locking_anew() {
+fn a_token_that_proves_no_live_holder_fails_instead_of_locking_anew() {
     let host = Host::new();
     let assert_refused = |output: &Output, case: &str| {
         assert_code(output, 1);
@@ -167,71 +242,33 @@ fn a_variable_that_names_no_held_lock_fails_instead_of_locking_anew() {
             text(&output.stderr)
         );
     };
-    // Create the state directory and its lock file first.
-    assert_code(
-        &host
-            .pohunek(&["service", "lock", "--", "true"])
-            .output()
-            .expect("lock"),
-        0,
-    );
-
-    for value in ["not-a-number", "1", "97"] {
+    // Nothing holds the lock yet, then a lock with no holder record.
+    let token = "ab".repeat(32);
+    for value in ["not-a-token", token.as_str()] {
         let output = host
             .pohunek(&["service", "check", "--json"])
-            .env(LOCK_FD_ENV, value)
+            .env(LOCK_TOKEN_ENV, value)
             .output()
             .expect("run check");
         assert_refused(&output, value);
     }
 
-    // An open descriptor of an unrelated file, and one of the lock file
-    // itself that no process holds.
-    let unrelated = host.root.join("unrelated");
-    fs::write(&unrelated, "").expect("write unrelated file");
-    for (case, file) in [
-        ("unrelated file", unrelated.as_path()),
-        ("unlocked lock file", host.lock_file().as_path()),
-    ] {
-        let output = open_as_fd_7(&host, file, &["service", "check", "--json"]);
-        assert_refused(&output, case);
-    }
-
-    // A descriptor of the lock file while another process holds it.
+    // Another holder's token: a second, unrelated holder runs, and the
+    // command below it presents a token of its own making.
+    let script = format!("{LOCK_TOKEN_ENV}='{token}' \"$POHUNEK\" service check --json");
+    let output = host.locked_shell(&script);
+    assert_refused(&output, "foreign token");
+    // The holder's own record is gone once it exits, so its token is dead.
     let script = format!(
-        "exec 7<'{}'; {LOCK_FD_ENV}=7 \"$POHUNEK\" service check --json",
-        host.lock_file().display()
+        "echo \"${LOCK_TOKEN_ENV}\" > '{}'",
+        host.root.join("token").display()
     );
+    assert_code(&host.locked_shell(&script), 0);
+    let stale = fs::read_to_string(host.root.join("token")).expect("token");
     let output = host
-        .pohunek(&[
-            "service",
-            "lock",
-            "--",
-            "sh",
-            "-c",
-            &format!("unset {LOCK_FD_ENV}; {script}"),
-        ])
-        .env("POHUNEK", POHUNEK)
+        .pohunek(&["service", "check", "--json"])
+        .env(LOCK_TOKEN_ENV, stale.trim_end())
         .output()
-        .expect("run check beside the holder");
-    assert_refused(&output, "foreign description");
-}
-
-/// Runs `pohunek args` with `file` open read-only as descriptor 7 and named
-/// in the lock variable.
-fn open_as_fd_7(host: &Host, file: &Path, args: &[&str]) -> Output {
-    let words: Vec<String> = args.iter().map(|arg| format!("'{arg}'")).collect();
-    let script = format!(
-        "exec 7<'{}'; exec \"$POHUNEK\" {}",
-        file.display(),
-        words.join(" ")
-    );
-    let mut command = Command::new("sh");
-    command.args(["-c", &script]);
-    host.isolate(&mut command);
-    command
-        .env("POHUNEK", POHUNEK)
-        .env(LOCK_FD_ENV, "7")
-        .output()
-        .expect("run pohunek with an inherited descriptor")
+        .expect("run check");
+    assert_refused(&output, "stale token");
 }

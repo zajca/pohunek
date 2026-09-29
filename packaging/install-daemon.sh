@@ -21,8 +21,8 @@
 # The whole run holds the service transaction lock: the wrapper re-executes
 # itself under `pohunek service lock`, so no other `pohunek service
 # install|upgrade|uninstall` can start between its first query and the final
-# command, and the final command adopts the same lock through the inherited
-# descriptor `POHUNEK_SERVICE_LOCK_FD` names. Before the legacy install is
+# command, and the final command adopts the same lock with the holder token
+# `POHUNEK_SERVICE_LOCK_TOKEN` carries. Before the legacy install is
 # touched, `pohunek service check` runs every check the final command makes
 # before its first effect (HOME and the XDG roots, the prefix, every directory
 # it writes, a pending transaction, the recorded installation), so a host the
@@ -71,10 +71,10 @@ done
 # Everything below runs under the transaction lock. `pohunek service lock`
 # refuses with `service_transaction_in_progress` while another `pohunek
 # service` command holds it, before this script runs again; nothing was
-# changed then. Inside the lock the variable names the inherited descriptor,
-# and the `service` commands below fail rather than run unlocked when it does
-# not hold the lock.
-if [ -z "${POHUNEK_SERVICE_LOCK_FD:-}" ]; then
+# changed then. Inside the lock the variable carries the holder's token, and
+# the `service` commands below fail rather than run unlocked when it proves
+# no live holder.
+if [ -z "${POHUNEK_SERVICE_LOCK_TOKEN:-}" ]; then
     if [ "$accept_runtime_loss" -eq 1 ]; then
         set -- --accept-runtime-loss
     fi

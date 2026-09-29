@@ -5,7 +5,7 @@
 //! [`crate::service`]. Every subcommand is local to this machine and ignores
 //! the global `--host`.
 
-// Rust guideline compliant 2026-09-28
+// Rust guideline compliant 2026-09-29
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -100,9 +100,10 @@ pub(crate) enum Action {
     ///
     /// No other `pohunek service install`, `upgrade`, or `uninstall` can run
     /// until the command exits. Those commands, `check`, and a nested `lock`
-    /// started by the command reuse the lock through the inherited descriptor
-    /// named in `POHUNEK_SERVICE_LOCK_FD`. Exits with the command's status
-    /// (128 plus the signal number when a signal ended it).
+    /// started by the command reuse the lock through the holder token in
+    /// `POHUNEK_SERVICE_LOCK_TOKEN`, which is valid only while this process
+    /// runs. Exits with the command's status (128 plus the signal number when
+    /// a signal ended it).
     Lock {
         /// The command and its arguments, after `--`.
         #[arg(last = true, required = true, value_name = "COMMAND")]
@@ -150,7 +151,7 @@ pub(crate) async fn run(action: Action) -> Result<ExitCode, CliError> {
             emit(json, &report, render_upgrade)
         }
         Action::Check { prefix, json } => {
-            let report = service::check(prefix)?;
+            let report = service::check(prefix).await?;
             emit(json, &report, render_check)
         }
         Action::Uninstall {

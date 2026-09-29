@@ -25,8 +25,9 @@ Current CLI and command surface:
 - `crates/cli/src/commands/daemon.rs`
 - `crates/cli/src/commands/service.rs` — `pohunek service install|upgrade|uninstall|status|check|lock`.
 - `crates/cli/src/service/` — the service transactions: install journal and
-  transaction lock (`record.rs`), the lock a `pohunek service lock` ancestor
-  hands down through `POHUNEK_SERVICE_LOCK_FD` (`inherited.rs`), versioned
+  transaction lock with the holder record `pohunek service lock` publishes
+  (`record.rs`), the holder token its command adopts the lock with through
+  `POHUNEK_SERVICE_LOCK_TOKEN` (`inherited.rs`), versioned
   layout and GC (`layout.rs`, `usage.rs`), installer values written to
   `service.toml` (`settings.rs`), the preflight `service check` shares with
   install and upgrade (`engine.rs`, `mod.rs`), and the stable `--json` shapes

@@ -1616,7 +1616,7 @@ fn a_failed_or_unlocked_check_stops_the_run_before_anything_changes() {
         &[
             ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
             ("POHUNEK_TEST_REAL_CHECK", "1"),
-            ("POHUNEK_SERVICE_LOCK_FD", "97"),
+            ("POHUNEK_SERVICE_LOCK_TOKEN", "not-a-token"),
         ],
     );
     assert_eq!(output.status.code(), Some(1), "{output:?}");
@@ -1766,7 +1766,7 @@ if [ "$1" = service ] && { [ "$2" = lock ] || [ "$2" = check ]; }; then
     if [ "$2" = lock ] || [ "${POHUNEK_TEST_REAL_CHECK:-0}" = 1 ]; then
         exec "$POHUNEK_TEST_REAL_CLI" "$@"
     fi
-    if [ -z "${POHUNEK_SERVICE_LOCK_FD:-}" ]; then
+    if [ -z "${POHUNEK_SERVICE_LOCK_TOKEN:-}" ]; then
         printf '{\n  "err": {\n    "code": "service_inherited_lock_invalid"\n  }\n}\n'
         exit 1
     fi
@@ -1788,7 +1788,7 @@ if [ "$1" = migration ]; then
     fi
     if [ "${POHUNEK_TEST_COMPETITOR:-0}" = 1 ]; then
         competitor=0
-        (unset POHUNEK_SERVICE_LOCK_FD; exec "$POHUNEK_TEST_REAL_CLI" service lock -- true) \
+        (unset POHUNEK_SERVICE_LOCK_TOKEN; exec "$POHUNEK_TEST_REAL_CLI" service lock -- true) \
             || competitor=$?
         printf '%s\n' "$competitor" > "$POHUNEK_TEST_COMPETITOR_STATUS"
     fi
