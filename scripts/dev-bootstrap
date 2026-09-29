@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""Check the local tools the pohunek fast loops depend on (stdlib only).
+
+Every tool is looked up on `PATH`, run with its version flag, and compared
+with a minimum version. Each row prints what is missing or too old and the
+exact command that fixes it. The script never installs anything: where a
+tool goes (CARGO_INSTALL_ROOT, `install.root`, a distribution package) is the
+developer's choice, so the fix is printed for them to run.
+
+Categories:
+
+* required -- a documented fast loop or gate cannot run without it:
+  `rustc` at the workspace MSRV (`[workspace.package] rust-version`),
+  `cargo-nextest` (every `cargo t`/`cargo ta` alias and the test gates) and
+  `python3` (`scripts/test-partitions` and this script import `tomllib`).
+  A missing or too-old required tool makes the run exit non-zero.
+* optional -- a convenience or measurement tool no gate depends on: `bacon`
+  (the watcher over `bacon.toml`), `hyperfine` (`scripts/measure-dev-loop`)
+  and, on Linux only, `mold` (the CI linker, set through CI `RUSTFLAGS` only;
+  `.cargo/config.toml` configures no linker; macOS jobs link with the
+  default linker). They are reported, and fail the run only under `--strict`.
+
+Exit status: 0 when every tool that counts passes, 1 otherwise, 2 on a
+configuration error (an unreadable `.config/nextest.toml`).
+"""
+
+import argparse
+import dataclasses
+import os
+import platform
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    sys.exit(
+        "dev-bootstrap: Python >= 3.11 is required (tomllib); install a newer "
+        "python3 with your distribution's package manager"
+    )
+
+ROOT = Path(__file__).resolve().parents[1]
+NEXTEST_CONFIG = Path(".config") / "nextest.toml"
+
+# `scripts/test-partitions` and this script import `tomllib`, added in 3.11.
+PYTHON_MIN_VERSION = (3, 11, 0)
+# bacon 3.13.0 parses the nextest >= 0.9.95 output format; older releases
+# mis-read the `nextest-fast` and `affected` jobs under the required nextest.
+BACON_MIN_VERSION = (3, 13, 0)
+# `scripts/measure-dev-loop` reads `median` from `--export-json` (hyperfine
+# 1.6.0) and relies on `--prepare` also running before warmup runs (1.9.0).
+HYPERFINE_MIN_VERSION = (1, 9, 0)
+# mold 2.30 (the Ubuntu 24.04 package) is the oldest release this workspace
+# has been linked with in CI; CI itself pins a newer release (`MOLD_VERSION`
+# in .github/workflows/ci.yml). A local mold is optional and only links.
+MOLD_MIN_VERSION = (2, 30, 0)
+# Longest diagnostic line quoted from a failing version command.
+DETAIL_LIMIT = 200
+# Upper bound for one `--version` call; a tool that hangs longer is broken.
+VERSION_TIMEOUT_SECONDS = 30
+
+# `X.Y[.Z]` plus an optional SemVer pre-release suffix (`-rc.1`).
+VERSION_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?(-[0-9A-Za-z.-]+)?")
+
+MANUAL_PYTHON = (
+    "install Python >= 3.11 with your distribution's package manager, e.g. "
+    "`sudo apt-get install python3` or `sudo pacman -S python`"
+)
+MANUAL_MOLD = (
+    "install mold with your distribution's package manager, e.g. "
+    "`sudo apt-get install mold` or `sudo pacman -S mold`"
+)
+
+OK = "ok"
+MISSING = "missing"
+TOO_OLD = "too-old"
+OFF_PATH = "off-path"
+UNKNOWN_VERSION = "unknown-version"
+NO_CARGO = "no-cargo"
+MANUAL_RUST = (
+    "update the Rust toolchain to the workspace MSRV or newer "
+    "(`rustup update stable`, or your distribution's rust package)"
+)
+MANUAL_CARGO = (
+    "install the Rust toolchain so `cargo` is on PATH (https://rustup.rs); "
+    "then rerun dev-bootstrap"
+)
+
+
+class ConfigError(Exception):
+    """A repository input the check depends on is missing or malformed."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Tool:
+    """One tool the check looks for."""
+
+    name: str
+    version_args: tuple
+    min_version: tuple
+    required: bool
+    # Printed install command, or None when only a manual step fixes it.
+    install: tuple = None
+    manual: str = None
+    # Checked through `cargo <sub> --version`: Cargo prefers
+    # `$CARGO_HOME/bin/cargo-<sub>` over `PATH`, so only Cargo itself reports
+    # the copy that `cargo t` runs.
+    cargo_subcommand: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class Result:
+    """The outcome of checking one tool."""
+
+    tool: Tool
+    status: str
+    version: tuple = None
+    path: str = None
+    detail: str = None
+    # The first copy on PATH, if any; it decides whether a fix must reorder PATH.
+    on_path: str = None
+
+    def counts(self, strict):
+        """Whether this row decides the exit status."""
+        return self.tool.required or strict
+
+    def failed(self, strict):
+        """Whether this row fails the run."""
+        return self.status != OK and self.counts(strict)
+
+
+def format_version(version):
+    """`(0, 9, 115)` -> `0.9.115`."""
+    return ".".join(str(part) for part in version)
+
+
+def parse_version(text):
+    """The first `X.Y[.Z]` of the first non-empty output line, or None.
+
+    Tools print their name first (`cargo-nextest 0.9.145 (00af4550e
+    2026-09-16)`, `mold 2.42.1 (hash; compatible with GNU ld)`), so the first
+    dotted number of that line is the release; later hashes and dates are
+    ignored.
+    """
+    for line in text.splitlines():
+        if line.strip():
+            match = VERSION_RE.search(line)
+            if match is None:
+                return None
+            return tuple(int(part or 0) for part in match.groups()[:3])
+    return None
+
+
+def is_prerelease(text):
+    """Whether the version `parse_version` reads from `text` has a `-pre` suffix."""
+    for line in text.splitlines():
+        if line.strip():
+            match = VERSION_RE.search(line)
+            return match is not None and match.group(4) is not None
+    return False
+
+
+def below_minimum(version, prerelease, minimum):
+    """SemVer order: a pre-release of the minimum is older than the minimum."""
+    return version < minimum or (version == minimum and prerelease)
+
+
+def rust_min_version(root):
+    """The workspace MSRV, `[workspace.package] rust-version` in Cargo.toml."""
+    path = Path(root) / "Cargo.toml"
+    try:
+        with path.open("rb") as handle:
+            manifest = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ConfigError(f"cannot read {path}: {error}") from error
+    declared = manifest.get("workspace", {}).get("package", {}).get("rust-version")
+    version = parse_version(declared) if isinstance(declared, str) else None
+    if version is None:
+        raise ConfigError(f"{path} declares no [workspace.package] rust-version")
+    return version
+
+
+def nextest_min_version(root):
+    """The `nextest-version` minimum declared in `.config/nextest.toml`.
+
+    nextest accepts either a bare version string or a table with a
+    `required` key; both are read, and anything else is a config error.
+    """
+    path = Path(root) / NEXTEST_CONFIG
+    try:
+        with path.open("rb") as handle:
+            config = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ConfigError(f"cannot read {path}: {error}") from error
+    declared = config.get("nextest-version")
+    if isinstance(declared, dict):
+        declared = declared.get("required")
+    if not isinstance(declared, str):
+        raise ConfigError(f"{path} declares no nextest-version requirement")
+    version = parse_version(declared)
+    if version is None:
+        raise ConfigError(f"{path}: unparseable nextest-version {declared!r}")
+    return version
+
+
+def tools(root, system):
+    """Every tool checked on `system` (a `platform.system()` value), required first."""
+    checked = [
+        Tool(
+            name="rustc",
+            version_args=("--version",),
+            min_version=rust_min_version(root),
+            required=True,
+            manual=MANUAL_RUST,
+        ),
+        Tool(
+            name="cargo-nextest",
+            version_args=("--version",),
+            min_version=nextest_min_version(root),
+            required=True,
+            install=("cargo", "install", "--locked", "cargo-nextest"),
+            cargo_subcommand=True,
+        ),
+        Tool(
+            name="python3",
+            version_args=("--version",),
+            min_version=PYTHON_MIN_VERSION,
+            required=True,
+            manual=MANUAL_PYTHON,
+        ),
+        Tool(
+            name="bacon",
+            version_args=("--version",),
+            min_version=BACON_MIN_VERSION,
+            required=False,
+            install=("cargo", "install", "--locked", "bacon"),
+        ),
+        Tool(
+            name="hyperfine",
+            version_args=("--version",),
+            min_version=HYPERFINE_MIN_VERSION,
+            required=False,
+            install=("cargo", "install", "--locked", "hyperfine"),
+        ),
+        Tool(
+            name="mold",
+            version_args=("--version",),
+            min_version=MOLD_MIN_VERSION,
+            required=False,
+            manual=MANUAL_MOLD,
+        ),
+    ]
+    # mold is a Linux ELF linker; nothing in this workspace uses it elsewhere.
+    return [tool for tool in checked if tool.name != "mold" or system == "Linux"]
+
+
+def cargo_bin_dir(environ):
+    """`$CARGO_HOME/bin`, with cargo's own `~/.cargo` default for CARGO_HOME."""
+    cargo_home = environ.get("CARGO_HOME")
+    if cargo_home:
+        return Path(cargo_home) / "bin"
+    return Path.home() / ".cargo" / "bin"
+
+
+def run_version(argv):
+    """Output of one `--version` call; raises when the tool cannot run."""
+    completed = subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=VERSION_TIMEOUT_SECONDS,
+    )
+    return completed.stdout if completed.stdout.strip() else completed.stderr
+
+
+def check_tool(tool, which, runner, cargo_bin):
+    """Locate, version, and compare one tool.
+
+    Every copy that is found is versioned before it is recommended: a copy
+    off PATH or shadowed on PATH is reported as a PATH problem only when it
+    passes the minimum, otherwise the row keeps its install fix.
+    """
+    if tool.cargo_subcommand:
+        # Cargo runs the subcommand, so it must exist first.
+        cargo = which("cargo")
+        if cargo is None:
+            return Result(tool, NO_CARGO)
+        if which(tool.name) is None and which(tool.name, path=str(cargo_bin)) is None:
+            return Result(tool, MISSING)
+        subcommand = tool.name.removeprefix("cargo-")
+        argv = [cargo, subcommand, *tool.version_args]
+        result = version_result(
+            tool, argv, f"{shlex.join(argv[:2])} (Cargo's resolution)", runner
+        )
+        home = which(tool.name, path=str(cargo_bin))
+        # Only a copy Cargo reports as too old can be a shadowing problem; any
+        # other failure (an alias, a broken Cargo config) keeps its own report.
+        if result.status != TOO_OLD or home is None:
+            return result
+        copy = version_result(tool, [home, *tool.version_args], home, runner)
+        if copy.status != OK:
+            return copy
+        # Cargo honours the position of $CARGO_HOME/bin when it is already on
+        # PATH, so an older copy earlier on PATH can shadow a current one.
+        return Result(
+            tool, OFF_PATH, version=copy.version, path=home,
+            detail="shadowed by an earlier copy on PATH",
+        )
+    path = which(tool.name)
+    in_cargo_bin = which(tool.name, path=str(cargo_bin))
+    if path is None and in_cargo_bin is None:
+        return Result(tool, MISSING)
+    if path is None:
+        home = version_result(tool, [in_cargo_bin, *tool.version_args], in_cargo_bin, runner)
+        if home.status != OK:
+            return home
+        return Result(tool, OFF_PATH, version=home.version, path=in_cargo_bin)
+    result = version_result(tool, [path, *tool.version_args], path, runner)
+    if result.status == OK or in_cargo_bin is None or in_cargo_bin == path:
+        return result
+    return shadowed_or(result, tool, in_cargo_bin, runner, path)
+
+
+def shadowed_or(result, tool, home, runner, shadow):
+    """`result`, unless the `$CARGO_HOME/bin` copy passes: then a PATH-order row.
+
+    Reinstalling into `$CARGO_HOME/bin` cannot fix a current copy that an
+    older one earlier on PATH shadows; only reordering PATH can.
+    """
+    copy = version_result(tool, [home, *tool.version_args], home, runner)
+    if copy.status != OK:
+        return result
+    return Result(
+        tool, OFF_PATH, version=copy.version, path=home,
+        detail=f"shadowed by {shadow} on PATH",
+    )
+
+
+def failure_detail(error):
+    """The error plus the command's first diagnostic line, bounded."""
+    detail = str(error)
+    for stream in (getattr(error, "stderr", None), getattr(error, "stdout", None)):
+        if isinstance(stream, bytes):
+            stream = stream.decode(errors="replace")
+        lines = [line.strip() for line in (stream or "").splitlines() if line.strip()]
+        if lines:
+            return f"{detail}: {lines[0][:DETAIL_LIMIT]}"
+    return detail
+
+
+def version_result(tool, argv, path, runner):
+    """Run one version command and compare it with the tool's minimum."""
+    try:
+        output = runner(argv)
+    except (OSError, subprocess.SubprocessError) as error:
+        return Result(tool, UNKNOWN_VERSION, path=path, detail=failure_detail(error))
+    version = parse_version(output)
+    if version is None:
+        first = output.strip().splitlines()[0] if output.strip() else ""
+        return Result(
+            tool, UNKNOWN_VERSION, path=path,
+            detail=f"unparseable version output {first!r}",
+        )
+    if below_minimum(version, is_prerelease(output), tool.min_version):
+        return Result(tool, TOO_OLD, version=version, path=path)
+    return Result(tool, OK, version=version, path=path)
+
+
+def check_all(tool_list, which, runner, cargo_bin):
+    """One result per tool, in tool order."""
+    return [
+        dataclasses.replace(check_tool(tool, which, runner, cargo_bin), on_path=which(tool.name))
+        for tool in tool_list
+    ]
+
+
+def path_fix(cargo_bin):
+    """A pasteable `export PATH=...` that puts `cargo_bin` first, shell-quoted."""
+    return f'export PATH={shlex.quote(str(cargo_bin))}:"$PATH"'
+
+
+def fix_hint(result, cargo_bin):
+    """The exact command or manual step that fixes one failing row."""
+    if result.status == NO_CARGO:
+        return MANUAL_CARGO
+    if result.status == OFF_PATH:
+        where = result.detail or "not on PATH"
+        return (
+            f"found at {result.path} but {where}; put it first: "
+            f"{path_fix(cargo_bin)}"
+        )
+    if result.status == UNKNOWN_VERSION:
+        # The tool exists but its version command failed or printed nothing
+        # usable (an alias, a broken config, a damaged binary): reinstalling
+        # fixes only the last case, so the reported error comes first.
+        reinstall = install_fix(result, cargo_bin) if result.tool.install else result.tool.manual
+        return f"resolve the error above; if the binary itself is broken: {reinstall}"
+    if result.tool.install is not None:
+        return install_fix(result, cargo_bin)
+    return result.tool.manual
+
+
+def install_fix(result, cargo_bin):
+    """Install into `$CARGO_HOME`, then reorder PATH if another copy could win.
+
+    The fix targets the one location this script checks: `--root` overrides
+    CARGO_INSTALL_ROOT and `install.root`, and any copy on PATH outside
+    `$CARGO_HOME/bin` could keep shadowing the new one (Cargo keeps the PATH
+    position of `$CARGO_HOME/bin` when it is on PATH), so PATH is reordered
+    too. The same rule holds whatever PATH topology produced the failure.
+    """
+    command = result.tool.install
+    if command[:2] == ("cargo", "install"):
+        command = (*command[:2], "--root", str(Path(cargo_bin).parent), *command[2:])
+    fix = shlex.join(command)
+    outside_home = result.on_path is not None and Path(result.on_path).parent != Path(cargo_bin)
+    if outside_home:
+        return f"{fix}; then put it first: {path_fix(cargo_bin)}"
+    return fix
+
+
+def describe(result, strict, cargo_bin):
+    """One report line."""
+    tool = result.tool
+    kind = "required" if tool.required else "optional"
+    minimum = format_version(tool.min_version)
+    if result.status == OK:
+        return (
+            f"  ok       {tool.name} {format_version(result.version)} "
+            f">= {minimum} ({kind})"
+        )
+    label = "FAIL" if result.failed(strict) else "warn"
+    if result.status == MISSING:
+        what = f"{tool.name} is missing (needs >= {minimum})"
+    elif result.status == TOO_OLD:
+        what = (
+            f"{tool.name} {format_version(result.version)} is older than "
+            f"{minimum}"
+        )
+    elif result.status == NO_CARGO:
+        what = f"`cargo` is not on PATH, so {tool.name} cannot run"
+    elif result.status == OFF_PATH:
+        what = (
+            f"{tool.name} {format_version(result.version)} is {result.detail}"
+            if result.detail else f"{tool.name} is not on PATH"
+        )
+    else:
+        what = f"{tool.name} version unknown: {result.detail}"
+    return (
+        f"  {label:<8} {what} ({kind})\n"
+        f"           fix: {fix_hint(result, cargo_bin)}"
+    )
+
+
+def report(results, strict, cargo_bin, out):
+    """Print every row and return whether the run passes."""
+    for result in results:
+        print(describe(result, strict, cargo_bin), file=out)
+    failing = [result for result in results if result.failed(strict)]
+    if failing:
+        names = ", ".join(result.tool.name for result in failing)
+        print(f"dev-bootstrap: failing: {names}", file=out)
+        return False
+    print("dev-bootstrap: all checked tools that count are ready", file=out)
+    return True
+
+
+def parse_args(argv):
+    """Command-line flags."""
+    parser = argparse.ArgumentParser(
+        prog="dev-bootstrap",
+        description=(
+            "Check the local tools the pohunek fast loops depend on and print "
+            "the exact install command for anything missing or too old."
+        ),
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="fail on optional tools as well",
+    )
+    return parser.parse_args(argv)
+
+
+def main(
+    argv=None,
+    which=shutil.which,
+    runner=run_version,
+    root=ROOT,
+    environ=os.environ,
+    out=sys.stdout,
+    system=platform.system(),
+):
+    """Check every tool and print the fixes; the process exit status."""
+    args = parse_args(argv)
+    try:
+        tool_list = tools(root, system)
+    except ConfigError as error:
+        print(f"dev-bootstrap: {error}", file=out)
+        return 2
+    cargo_bin = cargo_bin_dir(environ)
+    mode = "strict" if args.strict else "required tools only fail the run"
+    print(f"dev-bootstrap: local tool check ({mode})", file=out)
+    results = check_all(tool_list, which, runner, cargo_bin)
+    passed = report(results, args.strict, cargo_bin, out)
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

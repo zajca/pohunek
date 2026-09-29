@@ -213,8 +213,17 @@ Release packaging and contributor verification:
   is separate from the approximately two-minute fast-feedback target.
 - `scripts/tests/test_partitions.py` — regression checks for coverage validation.
 - `bacon.toml` — optional watcher jobs for the documented fast loops
-  (`nextest-fast` on the `fast` profile, `affected`, `clippy-fast`); no gate
-  depends on it.
+  (`check`, `nextest-fast` on the `fast` profile, `affected`, `clippy-fast`)
+  with explicit `e`/`n`/`a`/`c` job-switch keys; no gate depends on it.
+- `scripts/dev-bootstrap` — local tool check: required `rustc` (the workspace `rust-version`), `cargo-nextest` (minimum
+  read from `.config/nextest.toml`) and `python3` >= 3.11, optional `bacon`,
+  `hyperfine`, and on Linux `mold` (fail only with `--strict`); prints the exact fix for
+  each missing or too-old tool (a shadowed or off-PATH copy gets the
+  shell-quoted `export PATH` fix) and never installs anything itself.
+- `scripts/tests/test_dev_bootstrap.py` — regression checks for version
+  parsing, the config-derived nextest minimum, required vs. optional and
+  `--strict` exit status, MSRV and missing-`cargo` handling, and shadowed
+  copies; `which` and version calls are injected.
 - `scripts/ci-timings` — reproduction of CI timing evidence from `gh` run
   data: per-job wall clock and workflow medians (`runs`, `compare`), per-shard
   nextest JUnit summaries (`junit`), sccache/rust-cache
