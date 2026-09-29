@@ -37,6 +37,11 @@ const STAT_STATE_FIELD: usize = 3;
 const STAT_TPGID_FIELD: usize = 8;
 /// `/proc/<pid>/stat` process start-time field number (`starttime`).
 const STAT_STARTTIME_FIELD: usize = 22;
+/// Upper bound on consecutive `/proc/<pid>/stat` reads while the kernel reports
+/// placeholder fields (`ppid` 0 with `pgrp` -1) for a task being forked or torn
+/// down. The window closes within microseconds, so a few reads settle it; a
+/// higher value only delays failing closed on a task that never settles.
+const STAT_TRANSIENT_MAX_READS: usize = 4;
 /// First `/proc/<pid>/stat` field that appears after the parenthesized command.
 ///
 /// Kernel numbering starts at field 1 (`pid`), but the parser removes fields 1–2
@@ -279,25 +284,65 @@ fn process_is_running_at(root: &Path, identity: ProcessIdentity, euid: u32) -> i
 }
 
 fn read_process_stat_at(root: &Path, process_id: Pid) -> io::Result<Option<StatFact>> {
-    let stat = match fs::read_to_string(proc_path_at(root, process_id).join("stat")) {
-        Ok(stat) => stat,
-        Err(err) if is_process_race(&err) => return Ok(None),
-        Err(err) => return Err(err),
-    };
+    let stat_path = proc_path_at(root, process_id).join("stat");
+    read_settled_stat(|| fs::read_to_string(&stat_path))
+}
+
+/// Result of parsing one `/proc/<pid>/stat` sample.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StatSample {
+    Settled(StatFact),
+    /// The kernel's placeholder values for a task that is being created or
+    /// torn down.
+    Transient,
+}
+
+/// Reads a stat sample, resampling while the kernel reports placeholder values.
+///
+/// A vanished process is a race (`Ok(None)`). A sample that stays transient
+/// through [`STAT_TRANSIENT_MAX_READS`] reads fails closed with `InvalidData`,
+/// and a malformed sample fails immediately.
+fn read_settled_stat(
+    mut read_stat: impl FnMut() -> io::Result<String>,
+) -> io::Result<Option<StatFact>> {
+    for _ in 0..STAT_TRANSIENT_MAX_READS {
+        let stat = match read_stat() {
+            Ok(stat) => stat,
+            Err(err) if is_process_race(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        match parse_stat_sample(&stat)? {
+            StatSample::Settled(fact) => return Ok(Some(fact)),
+            StatSample::Transient => {}
+        }
+    }
+    Err(invalid_process_stat_error())
+}
+
+fn parse_stat_sample(stat: &str) -> io::Result<StatSample> {
     let command_start = stat.find('(').ok_or_else(invalid_process_stat_error)?;
     let command_end = stat.rfind(')').ok_or_else(invalid_process_stat_error)?;
     let comm = stat
         .get(command_start + 1..command_end)
         .ok_or_else(invalid_process_stat_error)?
         .to_owned();
-    let state = parse_stat_field(&stat, STAT_STATE_FIELD).ok_or_else(invalid_process_stat_error)?;
-    let parent_id =
-        parse_stat_pid_field(&stat, STAT_PPID_FIELD).ok_or_else(invalid_process_stat_error)?;
-    let pgid =
-        parse_stat_pid_field(&stat, STAT_PGRP_FIELD).ok_or_else(invalid_process_stat_error)?;
+    let state = parse_stat_field(stat, STAT_STATE_FIELD).ok_or_else(invalid_process_stat_error)?;
+    let raw_parent_id: i32 =
+        parse_stat_field(stat, STAT_PPID_FIELD).ok_or_else(invalid_process_stat_error)?;
+    let raw_pgid: i32 =
+        parse_stat_field(stat, STAT_PGRP_FIELD).ok_or_else(invalid_process_stat_error)?;
+    if raw_parent_id == 0 && raw_pgid == -1 {
+        return Ok(StatSample::Transient);
+    }
+    let parent_id = Pid::try_from(raw_parent_id)
+        .ok()
+        .ok_or_else(invalid_process_stat_error)?;
+    let pgid = Pid::try_from(raw_pgid)
+        .ok()
+        .ok_or_else(invalid_process_stat_error)?;
     let start_identity =
-        parse_stat_field(&stat, STAT_STARTTIME_FIELD).ok_or_else(invalid_process_stat_error)?;
-    Ok(Some(StatFact {
+        parse_stat_field(stat, STAT_STARTTIME_FIELD).ok_or_else(invalid_process_stat_error)?;
+    Ok(StatSample::Settled(StatFact {
         comm,
         state,
         parent_id,
@@ -891,6 +936,106 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn stat_text(ppid: i32, pgrp: i32) -> String {
+        format!(
+            "123 (agent) S {ppid} {pgrp} {pgrp} 0 {pgrp} 4227084 0 0 0 0 0 0 0 0 20 0 1 0 987654"
+        )
+    }
+
+    #[test]
+    fn transient_stat_sample_resolves_on_resample() {
+        let mut samples = VecDeque::from([stat_text(0, -1), stat_text(0, -1), stat_text(7, 456)]);
+        let mut reads = 0;
+        let fact = read_settled_stat(|| {
+            reads += 1;
+            Ok(samples.pop_front().expect("no more samples than reads"))
+        })
+        .expect("stat read")
+        .expect("settled stat");
+
+        assert_eq!(reads, 3);
+        assert_eq!((fact.parent_id, fact.pgid), (7, 456));
+        assert_eq!(fact.start_identity, StartIdentity::new(987_654));
+    }
+
+    #[test]
+    fn transient_stat_sample_of_a_vanished_process_is_a_race() {
+        let mut reads = 0;
+        let fact = read_settled_stat(|| {
+            reads += 1;
+            if reads == 1 {
+                Ok(stat_text(0, -1))
+            } else {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            }
+        })
+        .expect("vanished process is not an error");
+
+        assert_eq!(fact, None);
+        assert_eq!(reads, 2);
+    }
+
+    #[test]
+    fn persistently_transient_stat_sample_fails_closed_after_the_bound() {
+        let mut reads = 0;
+        let error = read_settled_stat(|| {
+            reads += 1;
+            Ok(stat_text(0, -1))
+        })
+        .expect_err("a task that never settles must stay visible");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(reads, STAT_TRANSIENT_MAX_READS);
+    }
+
+    #[test]
+    fn malformed_stat_sample_fails_without_resampling() {
+        let mut reads = 0;
+        let error = read_settled_stat(|| {
+            reads += 1;
+            Ok("123 (truncated) S 7".to_owned())
+        })
+        .expect_err("malformed stat must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn negative_pgrp_with_a_parent_is_malformed_not_transient() {
+        let mut reads = 0;
+        let error = read_settled_stat(|| {
+            reads += 1;
+            Ok(stat_text(7, -1))
+        })
+        .expect_err("only the ppid 0 / pgrp -1 pair is a placeholder");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn process_without_a_parent_reads_as_settled() {
+        let fact = read_settled_stat(|| Ok(stat_text(0, 1)))
+            .expect("stat read")
+            .expect("settled stat");
+
+        assert_eq!((fact.parent_id, fact.pgid), (0, 1));
+    }
+
+    #[test]
+    fn stat_file_reader_resolves_a_transient_sample_from_procfs_layout() {
+        let root = tempfile::tempdir().expect("temporary proc root");
+        let process_dir = root.path().join("123");
+        fs::create_dir(&process_dir).expect("process directory");
+        fs::write(process_dir.join("stat"), stat_text(7, 456)).expect("stat");
+
+        let fact = read_process_stat_at(root.path(), 123)
+            .expect("stat read")
+            .expect("settled stat");
+        assert_eq!((fact.parent_id, fact.pgid), (7, 456));
     }
 
     #[test]
