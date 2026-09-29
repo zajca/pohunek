@@ -228,7 +228,7 @@ not require terminal control.
 | `task.metadata.read` | `task.inspect`, `task.list` | `session.metadata.read` |
 | `task.execute` | `task.start`, `task.continue`, `task.extend` | `session.task.control` (for `task.continue`/`task.extend`; the creator receives it by default) |
 | `task.investigate` | `task.start` with `mode: "investigate"` only | — (on the new task); see `worktree_of` below |
-| `task.evidence.read` | `task.wait`, `task.result`, `task.check_log` | `session.terminal.observe` |
+| `task.evidence.read` | `task.wait`, `task.result`, `task.check_log`, `session.diff` with `turn` | `session.terminal.observe` |
 | `task.answer` | `task.answer` | `session.task.control` |
 | `task.review` | `task.review` | `session.metadata.read` |
 
@@ -338,8 +338,9 @@ role template grants task classes, and the session grants come from session
 creation (the creator's defaults, without terminal control for service
 accounts), explicit session grants, or team `Owner`/`Admin` authority
 (relay RFC section 14). An auditor service account auditing tasks another
-principal created therefore also needs `session.terminal.observe` on those
-sessions, granted explicitly and narrowed to the factory's host shares or
+principal created therefore also needs `session.terminal.observe` **and**
+`session.metadata.read` on those sessions (for `task.inspect`, `task.list`
+and the mandatory `task.review`), granted explicitly and narrowed to the factory's host shares or
 projects (relay RFC section 13.5 grant scoping); the role template does not
 imply it. Team `Owner`/`Admin` keep the session authority relay RFC section
 14 gives them. Custom roles may compose the same classes, with one exception
@@ -486,8 +487,9 @@ section 18.1.
   operation ticket, one **request fingerprint**. The relay computes the
   fingerprint over the canonical request — method, target host and share,
   `task_id` (for non-start methods), turn and attention identity (for
-  `task.answer`), every parameter, and the payload digest — and stores it on
-  the admission record. A retry with the same client key **and the same
+  `task.answer`), every parameter except `run_generation`, and the payload
+  digest — and stores it on the admission record; `run_generation` is fence
+  input, not request identity. A retry with the same client key **and the same
   fingerprint** consumes nothing, is never refused by exhaustion, and is
   resumed through the same ticket, so a lost response cannot make one
   logical start cost twice or be refused after it is already running. The
@@ -526,7 +528,17 @@ section 18.1.
   snapshot has been reconciled against the restored records (running tasks
   unknown to the restored state become `confirmed` records holding slots;
   unresolved tickets are quarantined) or an operator resolves the remainder
-  through the owner path. Restore and rollback tests cover both.
+  through the owner path. Because a fresh snapshot cannot reconstruct
+  refused starts, earlier `continue`/`extend`/`answer` charges or lost key →
+  ticket bindings, every admission decision (key, fingerprint, ticket id,
+  counter deltas, run owner and generation) is also appended to a
+  monotonic **admission ledger** in the witness-protected storage of relay
+  RFC section 19.1 before the database transaction commits; after a
+  restore the ledger supplies counter floors and the key → ticket bindings,
+  and admission stays closed until the ledger and the database agree. If
+  the ledger itself is unavailable, admission stays closed until every
+  ticket that could exist has expired and every affected budget window has
+  reset. Restore and rollback tests cover both.
 - Budget exhaustion is a normal event: the factory's stop condition
   `budget_exhausted` (section 12.4) ends the run cleanly with its state intact
   for resumption in the next window.
@@ -650,7 +662,8 @@ prompt digests, results, check logs, final messages and terminal content
 never appear; the retry fingerprint is a keyed HMAC under a relay-local key
 that no audit record, log, trace or API response exposes.
 
-Evidence reads (`task.wait`, `task.result`, `task.check_log`) are audited as
+Evidence reads (`task.wait`, `task.result`, `task.check_log`, `session.diff`
+with `turn`) are audited as
 access decisions like terminal-access open/close (relay RFC section 17.1),
 coalesced to one record per principal, task, `result_id` (or check log
 reference) and authorization generation, within a bounded access lease
@@ -743,8 +756,12 @@ When a turn settles `attention`:
    no escalation timeout that auto-resolves, auto-approves, or auto-fails.
 3. An authorized principal answers via `task.answer` under section 7.3.
    Being an escalation target grants nothing: the target also needs the
-   `task.answer` class and `session.task.control` on the task's session
+   `task.answer` class and `session.task.control` on the task's session,
+   and — because attention text and choices travel only on the evidence
+   path, never in the notification — `task.evidence.read` and
+   `session.terminal.observe` to read the question before answering
    (section 7.1), or team `Owner`/`Admin` authority (relay RFC section 14).
+   The target validation of step 1 checks all four.
    Team administrators configuring the escalation role must grant those, and
    the notification states when a target lacks them. The answer is
    attributable to that principal in audit, distinct from the factory's own
@@ -825,29 +842,45 @@ the task RFC's CLI workstream lands.
   so recovery is a new client process, not a restore.
 - **Single writer per run.** A run has exactly one live manager and one live
   auditor client, and failover is fenced rather than assumed: before a
-  successor starts, the predecessor's service-account credential is revoked
-  or rotated (relay RFC section 13.3 then cancels its streams and refuses its
-  calls), and the successor records a new **run generation** in its round
+  successor starts, the predecessor's service-account credential is **revoked or expired** — a rotation whose overlap keeps the
+  old credential valid is not enough (relay RFC section 13.3 then cancels
+  its streams and refuses its calls) — and the successor records a new **run generation** in its round
   records; a client that finds a newer generation than its own in the
   records stops acting. Revocation alone cannot undo an operation whose
   host-side irreversible commit already won before the response was lost,
   so two further rules close that window. First, a **failover barrier**:
   before its first mutating call the successor resolves every admission
-  record of the account for the run's `run_id` that is not terminal
-  (`reserved`, `uncertain`, `awaiting_resubmission`) through
-  `operation.result.get`, adopts every task the catalog lists under that
-  `run_id`, and never starts a new first-round task while any task of the
-  run exists. Second, a **server-side generation fence**: every budgeted
+  record of the run that is not terminal — `reserved`, `uncertain`,
+  `awaiting_resubmission` **and** `quarantined` — through the relay's
+  `factory.run.reconcile { run_id }` method, which the run owner or a team
+  administrator may call: admission records carry `run_id` and
+  `run_generation` as indexed fields, and the method returns them paged
+  with their current state (resolving `reserved`/`uncertain` through
+  `operation.result.get` on the way). The barrier is closed server-side:
+  `factory.run.failover` succeeds only once no non-terminal record remains,
+  and a `quarantined` record is resolved only by the explicit administrative
+  action of section 8.3 — the successor cannot proceed past it. The
+  successor then adopts every task the catalog lists under that `run_id`
+  and never starts a new first-round task while any task of the run
+  exists. Second, a **server-side generation fence**: every budgeted
   request carries `run_id` and `run_generation`; the relay stores the highest
   generation admitted per **run owner** — the `(team, principal, run_id)` of
   the principal whose `task.start` first used that `run_id`, so another
   principal reusing the string gets its own namespace and can neither fence
   nor join a run it does not own — and refuses a lower generation with
-  `factory_run_fenced` before forwarding. The generation advances only
+  `factory_run_fenced` before forwarding; the fence applies to **every**
+  run-scoped mutation — `task.stop`, `task.review`, `task.retain_worktree`,
+  `task.release_worktree` and cascading `session.remove` as well as the
+  budgeted calls — so a predecessor cannot stop, review or remove the
+  successor's work either. The generation advances only
   through an audited `factory.run.failover` action by a team administrator
   or by the owner account after its credential rotation; a request cannot
   raise it by itself. `run_id` stays attribution, not authorization: the
-  fence is admission state keyed by the admitting principal. A predecessor
+  fence is admission state keyed by the admitting principal. A same-key,
+  same-fingerprint retry of an existing admission record — the write-ahead
+  resubmission below — is resolved **before** the fence and is never refused
+  by it, so a successor can finish the predecessor's `awaiting_resubmission`
+  operation under the original ticket. A predecessor
   that resumes
   after the successor's first admission cannot delegate again even with a
   still-valid credential. The daemon's `if_latest_turn` preconditions and
@@ -1075,7 +1108,13 @@ Ordered by dependency; each lands with the tests named:
      `result_id` and authorization generation, a fenced-out predecessor
      manager refused by credential revocation, by `factory_run_fenced`
      (keyed by run owner, so another principal's `run_id` collision neither
-     fences nor joins the run, and a request cannot raise the generation) and
+     fences nor joins the run, a request cannot raise the generation, a
+     same-key retry passes it, and it also covers `task.stop`, `task.review`
+     and worktree holds), `factory.run.failover` refused while a
+     `quarantined` record remains, a rotation with overlap refused as a
+     failover precondition, a restore reconciled from the admission ledger,
+     an escalation target lacking evidence rights rejected at setup, an
+     auditor without `session.metadata.read` unable to review, and
      by stale preconditions, revocation after an irreversible host commit
      but before response delivery resolved by the failover barrier, the
      last human target's removal refused or suspending turn-opening

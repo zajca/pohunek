@@ -178,9 +178,12 @@ the task follows the session.
 
 A task has a coarse lifecycle state: `active` while its session is not in a
 terminal lifecycle state, `ended` once the session is stopped, exited or
-removed (including through `task.stop`). `ended` is final: resuming the
-session later does not revive the task, and continuing the work is a new
-`task.start` with `worktree_of` (section 8.7). Admission
+removed (including through `task.stop`). `ended` is final, and the session of an `ended` task can no longer be
+revived outside the task layer: `session.resume`, `session.fork` and
+explicit recovery of that session are refused with `task_session_ended`, so
+no agent ever runs in a task's tree outside `active` accounting, occupancy
+and budgets. Continuing the work is a new `task.start` with `worktree_of`
+(section 8.7). Admission
 controls that count concurrent tasks, such as relay delegation budgets, count
 `active` tasks.
 
@@ -703,6 +706,14 @@ failure or a peer EOF releases the slot. Slot lifetime is thus bounded by
 the client's liveness plus the configured keepalive detection time, not by
 `tasks.max_wait_ms`.
 
+Relay-path waits arrive multiplexed over the long-lived host link, whose
+socket stays up when a public client disconnects, so socket liveness cannot
+release them. Every routed `task.wait` therefore carries a relay request id,
+and the relay sends `operation.cancel { request_id }` on the host link when
+the public client disconnects, when its principal is revoked or its
+credential expires, and on relay shutdown; the daemon releases the slot on
+cancel, and the relay additionally bounds concurrent waits per principal.
+
 A wait holds no state beyond its slot: a client that disconnects simply
 calls `task.wait` again (invariant 4). A daemon restart drops waiters;
 settlement state is persisted, so the next `task.wait` returns immediately if
@@ -952,10 +963,12 @@ effect and follows the same protocol with the journal states `sending`
 provider request or form id) and `sent` (recorded with the provider's
 response). Recovery: `absent` — not sent, issue the request; `sent` —
 record `delivered` from the journaled response; `sending` — the worker asks
-the provider for the request's state: already replied resolves to
-`delivered` (the provider also rejects a duplicate reply for an id it has
-answered, which resolves the same way), still pending re-issues the request,
-gone resolves to `task_attention_stale`. `task.answer` therefore keeps
+the provider for the request's state: already replied resolves to `delivered` only when the provider's recorded
+reply equals the journaled answer value for that request id; a different
+recorded reply means someone else answered and resolves to
+`resolved_elsewhere` (the attention marked so, this answer not delivered); a
+reply the provider cannot report resolves to `delivery_uncertain`; still
+pending re-issues the request; gone resolves to `task_attention_stale`. `task.answer` therefore keeps
 invariant 3 on both answer paths.
 
 **Resubmission.** A delivery in `awaiting_resubmission` resumes only when
@@ -1354,7 +1367,10 @@ Rules:
   lower bound and `integrity` is at most `suspect`.
 - The full diff is not inlined. The result carries only the summary;
   historical per-turn patches come from the snapshots below through
-  `session diff` with a new `turn` selector. Without the selector,
+  `session diff` with a new `turn` selector, which is task evidence: on the
+  relay path it requires `task.evidence.read` plus `session.terminal.observe`
+  and is audited like `task.result` (relay dark factory RFC sections 7.1,
+  9). Without the selector,
   `session diff` keeps reading the current worktree
   (`crates/daemon/src/session/diff.rs:119`).
 - **Worktree snapshots.** A fingerprint of names and digests cannot
@@ -1419,16 +1435,23 @@ Rules:
   bound only the **detail** the result lists. This one digest backs
   `drift_since_previous_turn`, `modified_during_checks`, the
   investigate-mode `modified` check (section 11.2) and review staleness
-  (section 13.1), with one distinction: a difference confined to ignored
-  paths is reported as `ignored_only` — `integrity: suspect`, never
-  `violation` or clean — because build caches change legitimately, while a
-  hard read-only guarantee needs the `readonly_mount` enforcement of
-  section 11.2. If the digest cannot be computed completely or within its
+  (section 13.1), with two rules about coverage. A difference confined to
+  ignored paths is reported as `ignored_only` — `integrity: suspect`, never
+  `violation` — because build caches change legitimately. And a metadata
+  hash is not a content hash: a same-size overwrite that preserves mtime
+  and inode is invisible to it, so the result reports
+  `fingerprint_coverage` (paths hashed by content, paths covered by
+  metadata only), and `modified: false`, `drift: false` and `stale: false`
+  are asserted only when every path was content-hashed; otherwise the
+  comparison is `unknown` with the metadata-only count, never clean. A hard
+  read-only guarantee for an auditor on a tree with large ignored content
+  needs the `readonly_mount` enforcement of section 11.2. If the digest cannot be computed completely or within its
   budget (an unreadable path, an I/O error, an agent-planted multi-gigabyte
   file), the comparison is `unknown`: `modified`, `drift` and `stale` are
   reported `unknown`, never clean or current, `integrity` is at most
   `suspect`, and settlement, checks and occupancy proceed on their own
-  deadlines instead of waiting on the hash. The fingerprint is the equality check; the snapshots above carry
+  deadlines instead of waiting on the hash. The fingerprint is the equality
+  check; the snapshots above carry
   the content. Drift never
   blocks a turn; it is reported so the orchestrator knows someone else changed
   the tree.
@@ -1551,7 +1574,13 @@ owner-private log files under the daemon state directory, capped by
 `tasks.check_log_max_bytes`.
 
 `task.start` and `task.continue` accept `checks: [name...]`; the profile or
-project may declare defaults. Checks run sequentially after a `completed`
+project may declare defaults. A `mode: "investigate"` task accepts neither
+`checks` nor `checks_baseline` and ignores profile or project defaults
+(`task_investigate_no_checks`): checks execute arbitrary commands as the
+daemon user and a baseline runs before the first fingerprint, so a read-only
+auditor would otherwise gain an execution surface and a way to alter the
+tree before the `modified` check. Auditors rely on the executor's checks and
+their own read-only tools. Checks run sequentially after a `completed`
 settlement and before the result is published. Settlement and publication are
 distinct moments: the turn is in the persisted phase **`finalizing`** (section
 8.3) until every check has an outcome, `task.result` returns
@@ -1585,10 +1614,14 @@ therefore never contains a partially-filled `checks` list. `outcome` is
   owned by the daemon (a transient systemd scope where the supervisor of
   `crates/platform` provides one, otherwise a daemon-owned cgroup subtree),
   recorded with the identity; `containment: cgroup` appears on the check
-  result. On macOS, where no equivalent exists, containment is the process
-  group plus a walk of descendants carrying the launch token, recorded as
-  `containment: process_group`, and the result's `integrity` is at most
-  `suspect` when the tree could not be proven empty.
+  result. On a platform without kernel-enforced containment (macOS today)
+  checks are **refused** with `task_check_unconfined` unless the project's
+  host configuration sets `checks.allow_unconfined: true` (owner-only,
+  default `false`): with that opt-in the check runs under the process group
+  plus a walk of descendants carrying the launch token, is recorded as
+  `containment: process_group`, and the result's `integrity` is capped at
+  `suspect`, because a check that calls `setsid`, drops the token and exits
+  its parent cannot be proven gone.
 - Finalization has its own deadline, `tasks.finalize_max_ms`, independent of
   the turn deadline (which only bounds the agent's part of the turn). On
   expiry, the running check is killed (`timed_out`), the remaining ones are
@@ -1684,8 +1717,10 @@ longer equals the reviewed one. `task.inspect`, `task.result` and the
 example a human after an auditor), but each reviewer (`caller_scope` on
 owner paths, principal on the relay path) holds at most **one current
 verdict per `result_id`**: a new `task.review` from the same reviewer
-replaces it and increments `review_revision`; notes are capped by
-`tasks.review_notes_max_bytes`, verdicts per result by
+replaces it and increments `review_revision`; notes are content, not metadata:
+capped by `tasks.review_notes_max_bytes`, stored owner-private like a final
+message, never carried in events, projections or audit, and retired with the
+session while the verdict and its state survive (section 14); verdicts per result by
 `tasks.max_reviews_per_result` (`task_review_limit_reached`), the store cap
 applies to `task.review` like any write (`task_store_full`), and
 `task.inspect` pages verdicts like turns.
@@ -1714,6 +1749,7 @@ Typed errors introduced by this RFC:
 | `worktree_busy` | `session.input`, attach with terminal control, `session.resume`, `session.fork` (`cwd_mode: "same"`), in-place `session.new` | The session's worktree is occupied by another task; only observation is admitted (invariant 11 write fence). |
 | `task_worktree_unavailable` | `task.start`, `task.continue` | The shared worktree no longer exists. |
 | `task_worktree_mode_conflict` | `task.start` | `worktree_of` combined with `in_place` or `branch`. |
+| `task_session_ended` | `session.resume`, `session.fork`, session recovery | The session belongs to an `ended` task; continue through `task.start { worktree_of }` (section 6.1). |
 | `task_session_unavailable` | `task.continue`, `task.answer` | The task is `ended` or its runtime is not live. |
 | `task_turn_queued` | `task.extend` | The turn is queued behind a re-open window and has no deadline yet (section 8.2). |
 | `task_worktree_via_investigate` | `task.start` | An executor `worktree_of` start named an investigate-mode task (section 8.7). |
@@ -1730,11 +1766,13 @@ Typed errors introduced by this RFC:
 | `task_cursor_expired` | `task.list`, `task.inspect` | The paging cursor is too old or from another daemon epoch. |
 | `worktree_in_use` | `session.remove` | Other active tasks use the session's worktree (section 8.7). |
 | `task_result_pending` | `task.result`, `task.continue` | The turn settled but its checks have not finished. |
+| `task_check_unconfined` | `task.start`, `task.continue` | The platform offers no kernel-enforced containment for checks and `checks.allow_unconfined` is not set (section 12). |
 | `task_check_not_permitted` | `task.start`, `task.continue` | A requested check is not enabled or not permitted for the caller's origin. |
 | `task_store_full` | `task.start`, `task.continue`, `task.review` | A task store cap (`tasks.store_max_bytes`, `tasks.max_turns_per_task`, `tasks.max_tasks_retained`) would be exceeded (section 14). |
 | `task_review_limit_reached` | `task.review` | `tasks.max_reviews_per_result` distinct reviewers already hold a verdict on this result (section 13.1). |
 | `task_waiter_limit_reached` | `task.wait` | The task waiter pool is full. |
 | `task_request_conflict` | all idempotent methods | A reused request key with different parameters. |
+| `task_investigate_no_checks` | `task.start`, `task.continue` | `checks` or `checks_baseline` requested for an investigate-mode task (section 12). |
 | `task_investigate_unsupported` | `task.start` | The profile cannot enforce investigation mode (section 11.2). |
 
 Events on `subscribe`: `task_turn_opened`, `task_result_published` (emitted at publication, after finalization, not at settlement), `task_result_final` (when a heuristic result's re-open window closes),
@@ -1833,13 +1871,18 @@ to ship the adapter in the same milestone is an open question (section 19).
   Mutations that span records, the session store and external effects
   follow a persisted **task operation journal** shaped like the relay RFC's
   ticket journal (section 12.5) and the create intent of #192: `task.start`
-  records `intent` (request key, fingerprint, parameters) before anything
-  else, `session_created` after the session store commit (with the session
-  id), `bound` once the task record and its occupancy, user and hold entries
+  records `intent` (request key, fingerprint, parameters, and the task id
+  and session id it will use, both minted here) before anything else; the
+  session store commit then writes the session record carrying
+  `task_binding_pending: <task_id>` in the same atomic write, so a crash
+  between that commit and the next journal record leaves a session that
+  recovery finds by the intent's session id and adopts, never a duplicate;
+  `session_created` follows, `bound` once the task record and its occupancy, user and hold entries
   are written, and `delivered` per section 8.8; `task.stop`, cascade
   removal and hold changes record their own intent and completion. Recovery
-  replays the journal: an `intent` without `session_created` is re-driven
-  only by a client retry with the same key; a `session_created` without
+  replays the journal: an `intent` whose session id is absent from the session store is re-driven
+  only by a client retry with the same key, and one whose session exists
+  (pending binding) is completed as if `session_created` had been written; a `session_created` without
   `bound` is completed (the session becomes the task's) or, when the task
   record cannot be written, the session is stopped and removed through the
   ordinary cleanup stages and the operation ends `failed`; a `bound` without
@@ -1863,7 +1906,7 @@ to ship the adapter in the same milestone is an open question (section 19).
   (daemon configuration, validated at startup): task and turn ids, lifecycle
   state, outcomes, `settled_by`, `integrity`, repository summaries, check
   outcomes (without logs), `run_id`, owner task, timings and review
-  verdicts. This is what lets an orchestrator reconstruct its verified
+  verdicts (their notes `retired`). This is what lets an orchestrator reconstruct its verified
   picture after its own crash (section 16) even when sessions were already
   swept; `task.result` for such a turn returns the metadata with content
   fields marked `retired`.
@@ -2165,7 +2208,15 @@ without blocking the rest.
      or calls `setsid` is still killed and joined through its containment
      scope; a second crash between `prepared` and dispatch resubmits again
      under the same ticket and the attempt cap ends it; review records
-     bounded per reviewer and per result;
+     bounded per reviewer and per result; `session.resume` and fork of an
+     `ended` task's session refused; investigate tasks refuse `checks` and a
+     baseline; checks refused on an unconfined platform without the owner
+     opt-in; a crash between the session store commit and the journal
+     record adopts the pending session instead of creating a second one;
+     a provider reply that differs from the journaled answer resolves to
+     `resolved_elsewhere`; `session diff --turn` refused without evidence
+     rights on the relay path; metadata-only coverage never yields
+     `modified: false`; review notes retire with the session;
      check definitions: a host definition shadows an in-repo one of the same
      name, an in-repo definition edited in the worktree during the turn is
      not what runs, and `repo_base` checks cap integrity at `suspect`;

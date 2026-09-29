@@ -59,6 +59,8 @@ The following invariants span both domains:
 | Locally approved `HostShare` and relay-side session ACLs | Accepted, not implemented | [#82](https://github.com/zajca/pohunek/issues/82), [#83](https://github.com/zajca/pohunek/issues/83) |
 | Atomic snapshot/watermark synchronization without replay | Accepted, not implemented | [#84](https://github.com/zajca/pohunek/issues/84) |
 | Relay routing, aggregation, attach proxy, host/team API, and team clients | Accepted, not implemented; the bounded foundation HTTPS API is not a host or team surface | [#71](https://github.com/zajca/pohunek/issues/71), [#86](https://github.com/zajca/pohunek/issues/86), [#87](https://github.com/zajca/pohunek/issues/87) |
+| Delegated task layer (`task.*`, causal settlement, worker evidence journal, checks, OpenCode adapter) | Accepted, not implemented; design in `docs/design/delegated-task-runs-rfc.md` | [#182](https://github.com/zajca/pohunek/issues/182) and its sub-issues #219–#232 |
+| Relay dark factory (task ACLs, delegation budgets, escalation, factory client contract) | Accepted, not implemented; design in `docs/design/relay-dark-factory-rfc.md`; amends the relay RFC via [#233](https://github.com/zajca/pohunek/issues/233) | [#185](https://github.com/zajca/pohunek/issues/185) and its sub-issues #233–#240 |
 
 ## Goals
 
@@ -79,7 +81,10 @@ The following invariants span both domains:
   state derived from OSC terminal titles first, screen-content pattern matching
   as fallback, and PTY activity for the working signal. Hooks capture only the
   native session ID for resume (Codex/Claude Code do not report live state via
-  hooks).
+  hooks). The accepted delegated task runs RFC extends this for task
+  sessions: managed task-evidence hooks report bounded, field-allowlisted
+  turn evidence to the worker socket (accepted, not implemented;
+  [#182](https://github.com/zajca/pohunek/issues/182)).
 - Be agent-operable: an operator agent can drive the whole tool through the same
   `--json` CLI and subscription API a human uses.
 - Add an optional multi-team relay whose authority never exceeds locally
@@ -960,8 +965,13 @@ or explicit local environment files that are not committed.
 The worker journal contains runtime identity, process identity, dimensions,
 phase, terminal outcome, sanitized identity claims, and output offsets. It does
 not contain environment values, prompts, input bytes, terminal bytes, rendered
-screens, tokens, or notification bodies. Live output history and terminal
-screens remain bounded in worker memory.
+screens, tokens, or notification bodies. The accepted task layer adds a
+separate owner-only **evidence journal** beside it, trimmed on daemon
+acknowledgement, that may briefly hold provider-reported text such as a final
+assistant message under the same posture as scrollback (accepted, not
+implemented; [#182](https://github.com/zajca/pohunek/issues/182), worker part
+[#220](https://github.com/zajca/pohunek/issues/220)). Live output history and
+terminal screens remain bounded in worker memory.
 
 ## Security Model
 
