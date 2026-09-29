@@ -29,7 +29,7 @@ pub mod systemd;
 #[doc(inline)]
 pub use namespace::{Namespace, WorkerKey};
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-28
 
 /// Longest accepted service identifier.
 ///
@@ -135,6 +135,25 @@ pub enum ServiceState {
     Failed,
     /// The native backend returned a state without a portable equivalent.
     Unknown,
+}
+
+/// How a job's main process ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum JobExit {
+    /// The process exited with this status code.
+    Code(i32),
+    /// A signal with this number terminated the process.
+    Signal(i32),
+}
+
+impl std::fmt::Display for JobExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Code(code) => write!(f, "exit code {code}"),
+            Self::Signal(signal) => write!(f, "signal {signal}"),
+        }
+    }
 }
 
 /// How the native manager treats a job whose process exits.
@@ -426,6 +445,17 @@ pub trait Supervisor: std::fmt::Debug + Send + Sync {
 
     /// Stops and unregisters one job; an absent job is [`Error::NotFound`].
     fn retire<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, ()>;
+
+    /// Reports how one job's main process ended, where the backend retains
+    /// it.
+    ///
+    /// Diagnostic evidence only: `Ok(None)` means the backend holds no exit
+    /// record for the job, never that its process still runs; liveness comes
+    /// from [`Supervisor::inspect`]. A backend that keeps records reports an
+    /// absent job as [`Error::NotFound`]; the default keeps none.
+    fn exit_status<'a>(&'a self, _id: &'a ServiceId) -> Operation<'a, Option<JobExit>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Manages the single long-lived daemon job of one installation.

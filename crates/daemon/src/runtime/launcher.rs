@@ -8,23 +8,27 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub use pohunek_platform::supervisor::{
     Error as WorkerLaunchError, Operation as WorkerLaunchFuture,
 };
 use pohunek_platform::supervisor::{
-    JobDefinition, ServiceId, ServiceObservation, ServiceState, Supervisor, WorkerKey,
+    JobDefinition, JobExit, ServiceId, ServiceObservation, ServiceState, Supervisor, WorkerKey,
 };
 use pohunek_platform::{
     filesystem::TrustedDir,
     process::{HostInspector, ProcessInspector},
 };
-use tokio::process::{Child, Command};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, ChildStderr, Command};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tracing::{event, Level};
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-28
 
 /// XDG bases whose application directory the subprocess supervisor prepares.
 ///
@@ -38,6 +42,24 @@ const PREPARED_XDG_BASES: [&str; 5] = [
     "XDG_CACHE_HOME",
 ];
 
+/// Most bytes of one worker's stderr the subprocess supervisor keeps.
+///
+/// A worker writes to stderr only when it cannot start: one fatal line
+/// naming its error chain and the paths involved, well below 1 KiB. 8 KiB
+/// keeps several such lines while bounding daemon memory per worker; later
+/// bytes are read and counted but dropped, so the worker never blocks on a
+/// full pipe.
+const MAX_WORKER_STDERR_BYTES: usize = 8 * 1024;
+
+/// How long [`SubprocessWorkerLauncher`]'s exit report waits for the capture
+/// of an exited worker's stderr to finish.
+///
+/// The pipe reaches end-of-file as soon as the worker exits, so the capture
+/// is logged before the exit is reported. Only a descendant that inherited
+/// stderr keeps it open longer; the report never waits more than this for
+/// one, and that capture is logged once the descendant closes it.
+const STDERR_CAPTURE_GRACE: Duration = Duration::from_secs(1);
+
 /// Daemon-facing durable worker supervisor.
 pub trait WorkerLauncher: Supervisor {}
 
@@ -48,15 +70,19 @@ impl<T: Supervisor + ?Sized> WorkerLauncher for T {}
 struct SupervisedChild {
     child: Child,
     definition: JobDefinition,
+    /// Task capturing and logging the child's stderr until end-of-file.
+    stderr: Option<JoinHandle<()>>,
 }
 
 /// Dev/test supervisor running each worker generation as a direct child.
 ///
 /// It spawns exactly the definition's executable and arguments with a cleared
 /// environment plus the definition's bootstrap variables, in a fresh process
-/// group. Dropping the launcher kills its workers, but dropping a daemon server
-/// or registry does not because the launcher is independently reference
-/// counted by the harness.
+/// group. Each worker's stderr is captured, bounded to its first 8 KiB, and
+/// logged as a `worker.stderr.captured`
+/// event once the pipe closes; stdout is discarded. Dropping the launcher
+/// kills its workers, but dropping a daemon server or registry does not
+/// because the launcher is independently reference counted by the harness.
 #[derive(Debug, Clone, Default)]
 pub struct SubprocessWorkerLauncher {
     children: Arc<Mutex<HashMap<ServiceId, SupervisedChild>>>,
@@ -160,17 +186,22 @@ impl Supervisor for SubprocessWorkerLauncher {
                 .current_dir(definition.working_directory())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .kill_on_drop(true);
             std::os::unix::process::CommandExt::process_group(command.as_std_mut(), 0);
-            let child = command
+            let mut child = command
                 .spawn()
                 .map_err(|source| operation("spawn", source))?;
+            let stderr = child
+                .stderr
+                .take()
+                .map(|stderr| tokio::spawn(log_stderr(id.clone(), stderr)));
             children.insert(
                 id.clone(),
                 SupervisedChild {
                     child,
                     definition: definition.clone(),
+                    stderr,
                 },
             );
             Ok(())
@@ -225,6 +256,118 @@ impl Supervisor for SubprocessWorkerLauncher {
                 .map_err(|source| operation("retire_wait", source))?;
             Ok(())
         })
+    }
+
+    /// Reports the exited child's status once its stderr capture was logged.
+    ///
+    /// Waits at most [`STDERR_CAPTURE_GRACE`] for the capture, so the
+    /// worker's own diagnostics precede whatever the caller reports next.
+    fn exit_status<'a>(&'a self, id: &'a ServiceId) -> WorkerLaunchFuture<'a, Option<JobExit>> {
+        Box::pin(async move {
+            let (status, capture) = {
+                let mut children = self.children.lock().await;
+                let supervised = children
+                    .get_mut(id)
+                    .ok_or_else(|| WorkerLaunchError::NotFound(id.clone()))?;
+                let Some(status) = supervised
+                    .child
+                    .try_wait()
+                    .map_err(|source| operation("exit_status", source))?
+                else {
+                    return Ok(None);
+                };
+                (status, supervised.stderr.take())
+            };
+            if let Some(capture) = capture {
+                if tokio::time::timeout(STDERR_CAPTURE_GRACE, capture)
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!(
+                        service_id = %id,
+                        "worker stderr is still open after the worker exited; it is logged once closed"
+                    );
+                }
+            }
+            Ok(job_exit(status))
+        })
+    }
+}
+
+/// Maps a terminated child's status to its portable exit.
+fn job_exit(status: ExitStatus) -> Option<JobExit> {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    status
+        .code()
+        .map(JobExit::Code)
+        .or_else(|| status.signal().map(JobExit::Signal))
+}
+
+/// Captures one worker's stderr and logs it as `worker.stderr.captured`.
+async fn log_stderr(id: ServiceId, stderr: ChildStderr) {
+    let capture = capture_bounded(stderr, MAX_WORKER_STDERR_BYTES).await;
+    if capture.total_bytes == 0 {
+        return;
+    }
+    let text = String::from_utf8_lossy(&capture.kept);
+    event!(
+        name: "worker.stderr.captured",
+        Level::WARN,
+        service_id = %id,
+        stderr.bytes = capture.total_bytes,
+        stderr.truncated = capture.truncated(),
+        stderr.text = ?text.trim_end(),
+        stderr.read_error = capture.read_error.as_ref().map(tracing::field::display),
+        "worker {{service_id}} wrote {{stderr.bytes}} bytes to stderr: {{stderr.text}}",
+    );
+}
+
+/// Bytes read from one stream, of which at most a bounded prefix is kept.
+#[derive(Debug, Default)]
+struct Capture {
+    /// The first bytes read, at most the capture bound.
+    kept: Vec<u8>,
+    /// Every byte read until end-of-file or a read error.
+    total_bytes: usize,
+    /// The read error that ended the capture before end-of-file.
+    read_error: Option<std::io::Error>,
+}
+
+impl Capture {
+    /// Whether bytes beyond the kept prefix were dropped.
+    fn truncated(&self) -> bool {
+        self.total_bytes > self.kept.len()
+    }
+}
+
+/// Size of one read from a captured stream.
+///
+/// One memory page: a worker writes single short lines, so larger reads
+/// would only grow the task's stack buffer.
+const CAPTURE_READ_BYTES: usize = 4 * 1024;
+
+/// Reads `stream` to end-of-file, keeping at most `limit` bytes.
+///
+/// Bytes past the bound are still read so the writer never blocks on a full
+/// pipe; they are counted and dropped.
+async fn capture_bounded(mut stream: impl AsyncRead + Unpin, limit: usize) -> Capture {
+    let mut capture = Capture::default();
+    let mut buffer = [0_u8; CAPTURE_READ_BYTES];
+    loop {
+        match stream.read(&mut buffer).await {
+            Ok(0) => return capture,
+            Ok(read) => {
+                let room = limit.saturating_sub(capture.kept.len());
+                capture.kept.extend_from_slice(&buffer[..read.min(room)]);
+                capture.total_bytes = capture.total_bytes.saturating_add(read);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                capture.read_error = Some(error);
+                return capture;
+            }
+        }
     }
 }
 
@@ -474,10 +617,10 @@ mod tests {
     use std::time::Duration;
 
     use pohunek_platform::supervisor::{
-        Error, JobDefinition, JobSpec, RestartPolicy, ServiceId, ServiceState, Supervisor,
+        Error, JobDefinition, JobExit, JobSpec, RestartPolicy, ServiceId, ServiceState, Supervisor,
     };
 
-    use super::SubprocessWorkerLauncher;
+    use super::{capture_bounded, SubprocessWorkerLauncher, MAX_WORKER_STDERR_BYTES};
 
     /// Bounds the regression test while allowing a loaded CI runner to reap the
     /// deliberately short-lived child.
@@ -589,6 +732,61 @@ mod tests {
         assert!(launcher.kill_worker("s-42").await.expect("kill second"));
         wait_stopped(&launcher, &second).await;
         launcher.retire(&second).await.expect("retire ended job");
+    }
+
+    #[tokio::test]
+    async fn subprocess_reports_the_exit_status_only_of_an_ended_child() {
+        let root = pohunek_test_support::tempdir().expect("temporary worker root");
+        let launcher = SubprocessWorkerLauncher::new();
+        let exited = service_id();
+        let running = ServiceId::parse("s-42.efgh2345").expect("valid service id");
+
+        launcher
+            .start(
+                &exited,
+                &definition(root.path(), "/bin/sh", &["-c", "exit 7"]),
+            )
+            .await
+            .expect("exiting child starts");
+        launcher
+            .start(&running, &definition(root.path(), "/bin/sleep", &["30"]))
+            .await
+            .expect("running child starts");
+        wait_stopped(&launcher, &exited).await;
+
+        assert_eq!(
+            launcher.exit_status(&exited).await.expect("exit status"),
+            Some(JobExit::Code(7))
+        );
+        assert_eq!(
+            launcher.exit_status(&running).await.expect("no exit yet"),
+            None
+        );
+        assert!(matches!(
+            launcher
+                .exit_status(&ServiceId::parse("s-43.abcd2345").expect("valid service id"))
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        launcher.retire(&exited).await.expect("retire exited");
+        launcher.retire(&running).await.expect("retire running");
+    }
+
+    #[tokio::test]
+    async fn stderr_capture_keeps_a_bounded_prefix_and_drains_the_rest() {
+        let mut written = b"fatal: ".to_vec();
+        written.resize(written.len() + 3 * MAX_WORKER_STDERR_BYTES, b'x');
+
+        let capture = capture_bounded(written.as_slice(), MAX_WORKER_STDERR_BYTES).await;
+
+        assert_eq!(capture.kept, written[..MAX_WORKER_STDERR_BYTES]);
+        assert_eq!(capture.total_bytes, written.len());
+        assert!(capture.truncated());
+        assert!(capture.read_error.is_none());
+
+        let short = capture_bounded(b"fatal: short".as_slice(), MAX_WORKER_STDERR_BYTES).await;
+        assert_eq!(short.kept, b"fatal: short");
+        assert!(!short.truncated());
     }
 
     #[tokio::test]

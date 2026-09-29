@@ -370,6 +370,15 @@ impl Supervisor for ScriptedSupervisor {
             }
         })
     }
+
+    fn exit_status<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, Option<JobExit>> {
+        Box::pin(async move {
+            match &self.delegate {
+                Some(delegate) => delegate.exit_status(id).await,
+                None => Ok(None),
+            }
+        })
+    }
 }
 
 fn scripted_observation(id: &ServiceId, script: &JobScript) -> Option<ServiceObservation> {
@@ -747,10 +756,11 @@ async fn start_failure_with_an_absent_job_cleans_only_its_definition() {
 }
 
 #[tokio::test]
-async fn an_absent_job_after_the_connect_deadline_is_cleaned_up() {
-    let harness = Harness::scripted(CONNECT, INITIALIZE);
+async fn an_absent_job_ends_the_connect_wait_and_is_cleaned_up() {
+    let harness = Harness::scripted(GENEROUS, INITIALIZE);
     harness.supervisor.script_inspects([InspectStep::NotFound]);
     let generation = harness.generation("s-1");
+    let started = Instant::now();
 
     let failure = harness
         .lifecycle()
@@ -759,7 +769,16 @@ async fn an_absent_job_after_the_connect_deadline_is_cleaned_up() {
         .expect_err("no worker");
 
     assert!(
-        matches!(&failure, LaunchFailure::Cleaned(error) if error.code == "worker_connect_failed"),
+        started.elapsed() < GENEROUS,
+        "an absent job cannot produce a worker; waited {:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(
+            &failure,
+            LaunchFailure::Cleaned(error) if error.code == WORKER_EXITED_BEFORE_READY
+                && error.msg.contains("no longer registered")
+        ),
         "{failure:?}"
     );
     assert_eq!(harness.supervisor.retired(), [generation.service_id()]);
@@ -795,12 +814,13 @@ async fn a_present_job_is_retired_by_exact_generation_only_after_its_initialize_
 
 #[tokio::test]
 async fn a_job_that_ended_without_a_process_is_retired_immediately() {
-    let harness = Harness::scripted(CONNECT, GENEROUS);
+    let harness = Harness::scripted(GENEROUS, GENEROUS);
     harness.supervisor.script_inspects([InspectStep::Present {
         state: ServiceState::Failed,
         process: false,
     }]);
     let generation = harness.generation("s-1");
+    let started = Instant::now();
 
     let failure = harness
         .lifecycle()
@@ -808,7 +828,19 @@ async fn a_job_that_ended_without_a_process_is_retired_immediately() {
         .await
         .expect_err("worker failed");
 
-    assert!(matches!(failure, LaunchFailure::Cleaned(_)), "{failure:?}");
+    assert!(
+        started.elapsed() < GENEROUS,
+        "an ended job ends the connect wait; waited {:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(
+            &failure,
+            LaunchFailure::Cleaned(error) if error.code == WORKER_EXITED_BEFORE_READY
+                && error.msg.contains("state Failed")
+        ),
+        "{failure:?}"
+    );
     assert_eq!(harness.supervisor.retired(), [generation.service_id()]);
 }
 
@@ -874,14 +906,19 @@ async fn races_are_retried_and_never_read_as_absent() {
         .await
         .expect_err("job settles absent");
 
-    assert!(matches!(failure, LaunchFailure::Cleaned(_)), "{failure:?}");
+    assert!(
+        matches!(&failure, LaunchFailure::Cleaned(error) if error.code == WORKER_EXITED_BEFORE_READY),
+        "{failure:?}"
+    );
     let inspections = harness
         .supervisor
         .calls()
         .into_iter()
         .filter(|call| matches!(call, Call::Inspect(_)))
         .count();
-    assert_eq!(inspections, 3);
+    // Three while the socket is awaited (two races, then the absence) and
+    // one more while the ended job is settled.
+    assert_eq!(inspections, 4);
 
     let racing = Harness::scripted(CONNECT, INITIALIZE);
     racing.supervisor.script_inspects([InspectStep::Race]);
@@ -1644,4 +1681,164 @@ async fn a_live_version_five_worker_stays_adoptable_by_reconnection() {
     );
     drop(worker);
     fake.await.expect("fake worker task");
+}
+
+/// Connect deadline that a worker which already exited must never wait for.
+const NEVER: Duration = Duration::from_secs(600);
+
+/// Fatal line the exiting fake worker writes to stderr.
+const FAKE_WORKER_FATAL: &str = "pohunek-sessiond: fatal: scripted startup failure";
+
+/// Exit code of the exiting fake worker.
+const FAKE_WORKER_EXIT_CODE: i32 = 3;
+
+/// Writes an executable that prints [`FAKE_WORKER_FATAL`] to stderr and
+/// exits with [`FAKE_WORKER_EXIT_CODE`] before binding any socket.
+pub(crate) fn write_exiting_worker(directory: &Path) -> PathBuf {
+    let path = directory.join("exiting-sessiond");
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o700)
+        .open(&path)
+        .expect("create fake worker");
+    std::io::Write::write_all(
+        &mut file,
+        format!("#!/bin/sh\necho '{FAKE_WORKER_FATAL}' >&2\nexit {FAKE_WORKER_EXIT_CODE}\n")
+            .as_bytes(),
+    )
+    .expect("write fake worker");
+    file.sync_all().expect("flush fake worker");
+    drop(file);
+    path
+}
+
+/// Collects formatted log output of the test's default subscriber.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LogCapture(Arc<StdMutex<Vec<u8>>>);
+
+impl LogCapture {
+    /// Installs a capturing subscriber as this thread's default.
+    pub(crate) fn install(&self) -> tracing::subscriber::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(self.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    /// Returns everything logged so far.
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("log capture")).into_owned()
+    }
+}
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log capture").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn a_subprocess_worker_that_exits_at_once_ends_the_wait_with_its_status_and_stderr() {
+    let logs = LogCapture::default();
+    let _subscriber = logs.install();
+    let roots = Roots::new();
+    let runtime_root = roots.base.join("r");
+    let state_root = roots.base.join("s");
+    let executable = write_exiting_worker(&roots.base);
+    let config = SubprocessWorkerEnvironment {
+        runtime_home: runtime_root.clone(),
+        state_home: state_root.clone(),
+        data_home: state_root.clone(),
+        config_home: state_root.clone(),
+        cache_home: state_root.clone(),
+        home: roots.base.clone(),
+        daemon_socket: runtime_root.join("daemon.sock"),
+    }
+    .supervision(executable.clone());
+    let supervisor = ScriptedSupervisor::over(crate::runtime::SubprocessWorkerLauncher::new());
+    let inspector = HostInspector::new();
+    let lifecycle = Lifecycle {
+        supervisor: &supervisor,
+        config: &config,
+        runtime_root: &runtime_root,
+        state_root: &state_root,
+        daemon_instance_id: "lifecycle-test",
+        connect_deadline: NEVER,
+        inspector: &inspector,
+    };
+    let generation = Generation::mint("s-1", executable).expect("mint");
+
+    let failure = tokio::time::timeout(GENEROUS, lifecycle.launch(&generation))
+        .await
+        .expect("an exited worker ends the wait long before the connect deadline")
+        .expect_err("the worker never serves");
+
+    assert!(
+        matches!(
+            &failure,
+            LaunchFailure::Cleaned(error) if error.code == WORKER_EXITED_BEFORE_READY
+                && error.msg.contains(&format!("exit code {FAKE_WORKER_EXIT_CODE}"))
+        ),
+        "{failure:?}"
+    );
+    assert_eq!(supervisor.retired(), [generation.service_id()]);
+    let logged = logs.text();
+    assert!(
+        logged.contains(FAKE_WORKER_FATAL) && logged.contains("stderr.bytes"),
+        "the worker's fatal message reaches the daemon log: {logged}"
+    );
+}
+
+#[tokio::test]
+async fn a_worker_socket_that_cannot_be_bound_is_refused_before_its_job_starts() {
+    let harness = Harness::scripted(GENEROUS, INITIALIZE);
+    let limit = Platform::current()
+        .expect("supported test platform")
+        .socket_path_max_bytes();
+    let published_tail = format!("/s-1/{}", pohunek_paths::WORKER_SOCKET_NAME);
+    let base = harness.runtime_root.as_os_str().len();
+    // The published socket sits exactly at the limit, so only the longer
+    // staged bind path is over it.
+    let runtime_root = harness
+        .runtime_root
+        .join("p".repeat(limit - base - published_tail.len() - 1));
+    let lifecycle = Lifecycle {
+        runtime_root: &runtime_root,
+        ..harness.lifecycle()
+    };
+    let generation = harness.generation("s-1");
+
+    let failure = lifecycle
+        .launch(&generation)
+        .await
+        .expect_err("the worker could never bind its socket");
+
+    let staged = pohunek_paths::longest_staged_socket_path(&runtime_root.join("s-1"));
+    assert!(
+        matches!(
+            &failure,
+            LaunchFailure::Cleaned(error) if error.code == WORKER_SOCKET_PATH_INVALID
+                && error.class == ErrorClass::Configuration
+                && error.msg.contains(&staged.display().to_string())
+                && error.msg.contains(&limit.to_string())
+        ),
+        "{failure:?}"
+    );
+    assert!(harness.supervisor.calls().is_empty(), "no job was started");
 }

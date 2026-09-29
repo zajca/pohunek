@@ -16,6 +16,8 @@ const MODE_MASK: u32 = 0o7777;
 const STAGING_NAME_ATTEMPTS: usize = 16;
 /// Random bytes encoded in internal staging names.
 const STAGING_RANDOM_BYTES: usize = 8;
+// Socket path validation measures staged binds by this suffix length.
+const _: () = assert!(STAGING_RANDOM_BYTES * 2 == pohunek_paths::STAGED_SOCKET_SUFFIX_CHARS);
 /// Link counts a validated regular file may have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Links {

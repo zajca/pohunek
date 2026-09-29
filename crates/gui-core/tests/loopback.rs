@@ -2108,7 +2108,7 @@ impl LoopbackDaemon {
 /// `<runtime_home>/pohunek/workers/<session_id>/control.sock`, and a
 /// nanosecond-stamped, test-name-embedding prefix pushes that path past the
 /// `SUN_LEN` (108-byte) limit on Unix domain socket paths, which surfaces as
-/// a `worker_connect_failed` protocol error instead of a clean session.
+/// a `worker_socket_path_invalid` protocol error instead of a clean session.
 fn worker_backed_registry(mut config: SessionRegistryConfig) -> SessionRegistry {
     let worker_home = std::env::temp_dir().join(format!(
         "pw-g-{}-{}",

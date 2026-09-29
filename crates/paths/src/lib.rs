@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-28
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -33,6 +33,19 @@ pub const ASSISTANT_RUNTIME_SUBDIR: &str = "assistant";
 pub const WORKERS_SUBDIR: &str = "workers";
 /// Worker control socket filename.
 pub const WORKER_SOCKET_NAME: &str = "control.sock";
+/// Name prefix of every staged Unix socket bind.
+///
+/// Daemon and worker listeners bind `<dir>/<prefix><random hex>` and then
+/// rename the socket to its published name, so the staged pathname, not the
+/// published one, is the longest one `bind(2)` sees. Pass it to
+/// `TrustedDir::bind_unix_listener_staged` of `pohunek-platform`.
+pub const STAGED_SOCKET_PREFIX: &str = ".s";
+/// Hexadecimal characters in the random suffix of a staged socket name.
+///
+/// Two per random byte of the platform's staging names; `pohunek-platform`
+/// asserts the pairing at compile time, so a longer staging name cannot
+/// silently outgrow [`validate_staged_socket_path`].
+pub const STAGED_SOCKET_SUFFIX_CHARS: usize = 16;
 /// Owner-private durable host-state subdirectory under [`BasePaths::state_dir`].
 pub const HOST_STATE_SUBDIR: &str = "host";
 /// Stable host identity record filename.
@@ -411,15 +424,16 @@ impl BasePaths {
     }
 
     /// Resolves one managed session's worker control socket.
+    ///
+    /// Returns `Ok(None)` for a session ID that cannot name a worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PathError`] when the published socket or the longest staged
+    /// bind path beside it exceeds the platform limit
+    /// ([`worker_socket_path`]).
     pub fn worker_socket(&self, session_id: &str) -> Result<Option<PathBuf>, PathError> {
-        let Some(socket) = self
-            .worker_runtime_dir(session_id)
-            .map(|dir| dir.join(WORKER_SOCKET_NAME))
-        else {
-            return Ok(None);
-        };
-        validate_socket_path(&socket, self.platform, SocketKind::Worker)?;
-        Ok(Some(socket))
+        worker_socket_path(&self.worker_runtime_root(), session_id, self.platform)
     }
 
     /// Resolves one worker's durable journal path.
@@ -712,6 +726,70 @@ pub fn validate_socket_path(
         });
     }
     Ok(())
+}
+
+/// Returns the longest pathname a staged socket bind in `dir` can use.
+///
+/// Staged names are [`STAGED_SOCKET_PREFIX`] followed by
+/// [`STAGED_SOCKET_SUFFIX_CHARS`] hexadecimal characters.
+#[must_use]
+pub fn longest_staged_socket_path(dir: &Path) -> PathBuf {
+    let mut name = String::with_capacity(STAGED_SOCKET_PREFIX.len() + STAGED_SOCKET_SUFFIX_CHARS);
+    name.push_str(STAGED_SOCKET_PREFIX);
+    name.extend(std::iter::repeat_n('0', STAGED_SOCKET_SUFFIX_CHARS));
+    dir.join(name)
+}
+
+/// Validates a socket's published path and the longest staged bind path in
+/// its directory.
+///
+/// A listener binds a staged name before publishing the socket, so a
+/// published path that fits can still be unbindable when the staged name is
+/// longer than the published file name.
+///
+/// # Errors
+///
+/// Returns [`PathError`] for the published path as
+/// [`validate_socket_path`] does, then [`PathError::SocketPathTooLong`]
+/// naming the staged path when only that one exceeds the limit.
+pub fn validate_staged_socket_path(
+    path: impl AsRef<Path>,
+    platform: Platform,
+    kind: SocketKind,
+) -> Result<(), PathError> {
+    let path = path.as_ref();
+    validate_socket_path(path, platform, kind)?;
+    // An absolute path without a parent is the root itself; its staged
+    // sibling is then measured below the root.
+    let dir = path.parent().unwrap_or(path);
+    validate_socket_path(longest_staged_socket_path(dir), platform, kind)
+}
+
+/// Resolves one managed session's worker control socket below
+/// `runtime_root`, the directory [`BasePaths::worker_runtime_root`] names.
+///
+/// The worker binds its socket through a staged name, so this validates the
+/// published path and the longest staged bind path exactly as the worker
+/// does before binding ([`validate_staged_socket_path`]). The daemon uses it
+/// to refuse a session whose worker could never bind.
+///
+/// Returns `Ok(None)` for a session ID that cannot name a worker.
+///
+/// # Errors
+///
+/// Returns [`PathError`] when either path exceeds the platform limit or is
+/// otherwise not a valid socket path.
+pub fn worker_socket_path(
+    runtime_root: &Path,
+    session_id: &str,
+    platform: Platform,
+) -> Result<Option<PathBuf>, PathError> {
+    let Some(session_id) = valid_worker_session_id(session_id) else {
+        return Ok(None);
+    };
+    let socket = runtime_root.join(session_id).join(WORKER_SOCKET_NAME);
+    validate_staged_socket_path(&socket, platform, SocketKind::Worker)?;
+    Ok(Some(socket))
 }
 
 fn resolve_runtime_dir(

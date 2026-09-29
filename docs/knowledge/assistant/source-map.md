@@ -314,7 +314,8 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/session/procwatch.rs`
 - `crates/daemon/src/runtime/`
 - `crates/daemon/src/runtime/lifecycle.rs` — worker generation lifecycle
-  engine: commit points, per-session locks, post-timeout reconciliation.
+  engine: commit points, per-session locks, worker socket path refusal, an
+  ended job ending the connect wait, post-timeout reconciliation.
 - `crates/daemon/src/notify.rs`
 - `crates/daemon/src/external/mod.rs`
 - `crates/daemon/tests/procwatch.rs`

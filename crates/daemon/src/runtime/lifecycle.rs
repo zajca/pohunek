@@ -27,11 +27,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use pohunek_paths::Platform;
 use pohunek_platform::filesystem::TrustedDir;
 use pohunek_platform::process::{ProcessIdentity, ProcessInspector, StartIdentity};
 use pohunek_platform::supervisor::{
-    Error as SupervisorError, JobDefinition, JobLogs, JobSpec, Namespace, RestartPolicy, ServiceId,
-    ServiceObservation, ServiceState, WorkerKey,
+    Error as SupervisorError, JobDefinition, JobExit, JobLogs, JobSpec, Namespace, RestartPolicy,
+    ServiceId, ServiceObservation, ServiceState, WorkerKey,
 };
 use protocol::{ErrorClass, ProtocolError};
 use serde::Deserialize;
@@ -41,7 +42,7 @@ use tokio::time::Instant;
 use super::{Worker, WorkerLauncher};
 use crate::store::RuntimeRecord;
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-28
 
 /// Reason recorded while the native supervisor cannot be inspected.
 ///
@@ -64,6 +65,20 @@ pub const IDENTITY_MISMATCH: &str = "runtime_identity_mismatch";
 /// cannot would give its agent the service manager's environment. Such a
 /// generation is never initialized and is retired by exact generation.
 pub const WORKER_PROTOCOL_OUTDATED: &str = "worker_protocol_outdated";
+
+/// Error code for a session whose worker socket could never be bound.
+///
+/// The worker binds its socket through a longer staged name before
+/// publishing it; when either pathname exceeds the platform's `sun_path`
+/// limit the create is refused before any worker is launched.
+pub const WORKER_SOCKET_PATH_INVALID: &str = "worker_socket_path_invalid";
+
+/// Error code for a new generation whose job ended before its worker
+/// accepted connections.
+///
+/// The message carries the exit status where the supervisor retains it
+/// (subprocess mode) and the job's final state otherwise.
+pub const WORKER_EXITED_BEFORE_READY: &str = "worker_exited_before_ready";
 
 /// Worker socket negotiation bound of the dev/test subprocess contract.
 ///
@@ -584,6 +599,8 @@ impl Lifecycle<'_> {
 
     /// Commit points 2 and 3 without the protocol check of [`Self::launch`].
     async fn start_and_connect(&self, generation: &Generation) -> Result<Worker, LaunchFailure> {
+        worker_socket(self.runtime_root, generation.session_id())
+            .map_err(LaunchFailure::Cleaned)?;
         let definition = job_definition(self.config, generation).map_err(|error| {
             LaunchFailure::Cleaned(lifecycle_error(
                 "worker_definition_invalid",
@@ -596,14 +613,15 @@ impl Lifecycle<'_> {
             Ok(()) => {
                 let deadline = started + self.connect_deadline;
                 match self.connect_until(generation, deadline).await {
-                    Some(worker) => return Ok(worker),
-                    None => lifecycle_error(
+                    Ok(worker) => return Ok(worker),
+                    Err(NotReady::Elapsed) => lifecycle_error(
                         "worker_connect_failed",
                         format!(
                             "worker generation {id} did not accept connections within {:?}",
                             self.connect_deadline
                         ),
                     ),
+                    Err(NotReady::Ended(end)) => self.exited_before_ready(&id, end).await,
                 }
             }
             Err(
@@ -871,17 +889,73 @@ impl Lifecycle<'_> {
     }
 
     /// Connects to the generation's socket until `deadline`.
-    async fn connect_until(&self, generation: &Generation, deadline: Instant) -> Option<Worker> {
+    ///
+    /// Between attempts the job is inspected, so a job that provably ended
+    /// (absent, or no process in a state that cannot produce one) ends the
+    /// wait at once. A job whose inspection fails or proves nothing keeps
+    /// the wait bounded by `deadline` alone.
+    async fn connect_until(
+        &self,
+        generation: &Generation,
+        deadline: Instant,
+    ) -> Result<Worker, NotReady> {
         loop {
             if let Some(worker) = self.try_connect(generation, deadline).await {
-                return Some(worker);
+                return Ok(worker);
+            }
+            if let Some(end) = self.job_end(generation).await {
+                return Err(NotReady::Ended(end));
             }
             let now = Instant::now();
             if now >= deadline {
-                return None;
+                return Err(NotReady::Elapsed);
             }
             tokio::time::sleep(SUPERVISION_POLL_INTERVAL.min(deadline - now)).await;
         }
+    }
+
+    /// Returns how the generation's job ended, or `None` while it may still
+    /// produce a worker or cannot be inspected.
+    async fn job_end(&self, generation: &Generation) -> Option<JobEnd> {
+        match self.inspect(generation).await {
+            Ok(None) => Some(JobEnd::Absent),
+            Ok(Some(observation)) if !observation_live(&observation) => {
+                Some(JobEnd::Ended(observation.state))
+            }
+            Ok(Some(_)) => None,
+            Err(error) => {
+                tracing::debug!(
+                    session_id = generation.session_id(),
+                    worker.generation = generation.generation(),
+                    error = %error,
+                    "worker job cannot be inspected while its socket is awaited"
+                );
+                None
+            }
+        }
+    }
+
+    /// Builds the error of a job that ended before its worker was ready,
+    /// with the exit status where the supervisor retains it.
+    async fn exited_before_ready(&self, id: &ServiceId, end: JobEnd) -> ProtocolError {
+        let exit = match self.supervisor.exit_status(id).await {
+            Ok(exit) => exit,
+            Err(error) => {
+                tracing::debug!(
+                    service_id = %id,
+                    error = %error,
+                    "exit status of an ended worker job is unavailable"
+                );
+                None
+            }
+        };
+        lifecycle_error(
+            WORKER_EXITED_BEFORE_READY,
+            format!(
+                "worker generation {id} ended before accepting connections ({})",
+                end.describe(exit)
+            ),
+        )
     }
 
     /// Makes one bounded attempt to adopt the generation's worker.
@@ -1034,6 +1108,81 @@ impl Lifecycle<'_> {
         }
     }
 }
+
+/// Why waiting for a new generation's socket produced no worker.
+#[derive(Debug)]
+enum NotReady {
+    /// The connect deadline elapsed while the job could still produce one.
+    Elapsed,
+    /// The job provably ended first.
+    Ended(JobEnd),
+}
+
+/// Evidence that a started job ended before its worker was ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobEnd {
+    /// The supervisor no longer knows the job.
+    Absent,
+    /// The job has no process in a state that cannot produce one.
+    Ended(ServiceState),
+}
+
+impl JobEnd {
+    /// Describes the end, preferring the process's exit status.
+    fn describe(self, exit: Option<JobExit>) -> String {
+        match (exit, self) {
+            (Some(exit), _) => format!("worker process ended with {exit}"),
+            (None, Self::Absent) => "its job is no longer registered".to_owned(),
+            (None, Self::Ended(state)) => {
+                format!("its job ended in state {state:?} without a process")
+            }
+        }
+    }
+}
+
+/// Resolves a session's worker control socket below `runtime_root`.
+///
+/// Refuses a socket the worker could never bind: the published path and the
+/// longest staged bind path beside it must both fit the platform limit
+/// ([`pohunek_paths::worker_socket_path`]).
+///
+/// # Errors
+///
+/// Returns [`WORKER_SOCKET_PATH_INVALID`] naming the path and the limit, or
+/// `invalid_worker_identity` for a session ID that cannot name a worker.
+pub(crate) fn worker_socket(
+    runtime_root: &Path,
+    session_id: &str,
+) -> Result<PathBuf, ProtocolError> {
+    let platform = Platform::current().map_err(|error| {
+        ProtocolError::new(
+            ErrorClass::Configuration,
+            WORKER_SOCKET_PATH_INVALID,
+            error.to_string(),
+            None,
+        )
+    })?;
+    match pohunek_paths::worker_socket_path(runtime_root, session_id, platform) {
+        Ok(Some(socket)) => Ok(socket),
+        Ok(None) => Err(lifecycle_error(
+            "invalid_worker_identity",
+            format!("session {session_id} cannot name a worker"),
+        )),
+        Err(error) => Err(ProtocolError::new(
+            ErrorClass::Configuration,
+            WORKER_SOCKET_PATH_INVALID,
+            format!("session {session_id} cannot bind its worker socket: {error}"),
+            Some(WORKER_SOCKET_RECOVERY.to_owned()),
+        )),
+    }
+}
+
+/// Recovery hint of [`WORKER_SOCKET_PATH_INVALID`].
+///
+/// Worker sockets live below the daemon's runtime directory, which
+/// `XDG_RUNTIME_DIR` selects; nothing else in the path is operator-chosen.
+const WORKER_SOCKET_RECOVERY: &str =
+    "start pohunekd with a shorter XDG_RUNTIME_DIR so worker socket paths fit the platform limit";
 
 /// Returns why a present job is not exactly `generation`'s job, if it is not.
 ///

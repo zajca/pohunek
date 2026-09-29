@@ -14098,6 +14098,160 @@ async fn daemon_shutdown_drains_an_in_flight_create() {
     assert_eq!(daemon.bindings().len(), 1, "its worktree stays owned");
 }
 
+/// Connect deadline and drain timeout an already-exited worker must never
+/// wait for.
+const NEVER: Duration = Duration::from_secs(600);
+
+/// Bound on a create or drain that must not wait for [`NEVER`].
+const PROMPT: Duration = Duration::from_secs(20);
+
+/// A registry whose workers run as direct children of an executable that
+/// exits before binding its socket.
+fn exiting_worker_registry(
+    tag: &str,
+) -> (
+    SessionRegistry,
+    Arc<crate::runtime::lifecycle::tests::ScriptedSupervisor>,
+    PathBuf,
+) {
+    let store_path = temp_store_path(tag);
+    let mut config = SessionRegistryConfig {
+        store_path: Some(store_path.clone()),
+        worker_connect_deadline: NEVER,
+        create_drain_timeout: NEVER,
+        ..SessionRegistryConfig::default()
+    };
+    let (runtime_root, state_root) = super::test_worker_roots(&config);
+    let executable = crate::runtime::lifecycle::tests::write_exiting_worker(
+        store_path.parent().expect("store directory"),
+    );
+    config.worker_runtime_root = Some(runtime_root.clone());
+    config.worker_state_root = Some(state_root.clone());
+    config.supervision = Some(
+        crate::runtime::SubprocessWorkerEnvironment {
+            runtime_home: runtime_root.clone(),
+            state_home: state_root.clone(),
+            data_home: state_root.clone(),
+            config_home: state_root.clone(),
+            cache_home: state_root.clone(),
+            home: state_root,
+            daemon_socket: runtime_root.join("test-daemon.sock"),
+        }
+        .supervision(executable),
+    );
+    let supervisor = Arc::new(crate::runtime::lifecycle::tests::ScriptedSupervisor::over(
+        crate::runtime::SubprocessWorkerLauncher::new(),
+    ));
+    let registry = SessionRegistry::new_with_launcher_and_inspector(
+        config,
+        Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
+        Arc::new(ReadableHost::new()),
+    );
+    (registry, supervisor, store_path)
+}
+
+#[tokio::test]
+async fn daemon_shutdown_does_not_wait_the_connect_deadline_for_an_exited_worker() {
+    let (registry, supervisor, store_path) = exiting_worker_registry("drain-exited");
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    supervisor.hold_start(gate.clone());
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.create(params()).await }
+    });
+    gate.entered.notified().await;
+
+    registry.begin_daemon_shutdown();
+    let mut drain = Box::pin(registry.drain_creates());
+    assert!(
+        futures::poll!(drain.as_mut()).is_pending(),
+        "the drain waits for the in-flight create"
+    );
+    gate.release.notify_one();
+    let started = Instant::now();
+
+    assert!(
+        tokio::time::timeout(PROMPT, drain)
+            .await
+            .expect("shutdown does not wait the worker connect deadline"),
+        "the create settled before the drain timeout"
+    );
+    assert!(
+        started.elapsed() < PROMPT,
+        "shutdown latency {:?} must not depend on the {NEVER:?} connect deadline",
+        started.elapsed()
+    );
+    let error = creating
+        .await
+        .expect("create task joins")
+        .expect_err("the worker never serves");
+    assert_eq!(
+        error.code,
+        crate::runtime::lifecycle::WORKER_EXITED_BEFORE_READY
+    );
+    assert!(error.msg.contains("exit code 3"), "{}", error.msg);
+    assert_eq!(supervisor.retired(), supervisor.started());
+    assert!(
+        crate::store::Store::new(store_path)
+            .load_sessions()
+            .expect("load session records")
+            .is_empty(),
+        "the failed create is compensated"
+    );
+}
+
+#[tokio::test]
+async fn create_refuses_a_worker_socket_that_cannot_be_bound_before_writing_anything() {
+    let store_path = temp_store_path("socket-too-long");
+    let limit = pohunek_paths::Platform::current()
+        .expect("supported test platform")
+        .socket_path_max_bytes();
+    let base = pohunek_test_support::temp_root();
+    // Allocated session IDs are `s-` plus a 26-character ULID.
+    let published_tail = format!(
+        "/s-{}/{}",
+        "0".repeat(26),
+        pohunek_paths::WORKER_SOCKET_NAME
+    );
+    // The published socket sits exactly at the limit, so only the longer
+    // staged bind path is over it.
+    let runtime_root =
+        base.join("p".repeat(limit - base.as_os_str().len() - published_tail.len() - 1));
+    let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+        store_path: Some(store_path.clone()),
+        worker_runtime_root: Some(runtime_root.clone()),
+        ..SessionRegistryConfig::default()
+    });
+
+    let error = registry
+        .create(params())
+        .await
+        .expect_err("the worker could never bind its socket");
+
+    assert_eq!(
+        error.code,
+        crate::runtime::lifecycle::WORKER_SOCKET_PATH_INVALID
+    );
+    assert_eq!(error.class, ErrorClass::Configuration);
+    assert!(
+        error.msg.contains(&runtime_root.display().to_string()),
+        "{}",
+        error.msg
+    );
+    assert!(error.msg.contains(".s0000000000000000"), "{}", error.msg);
+    assert!(error.msg.contains(&limit.to_string()), "{}", error.msg);
+    assert!(error.recover.is_some(), "{error:?}");
+    assert!(supervisor.calls().is_empty(), "no worker was launched");
+    assert!(
+        !store_path.exists(),
+        "the create is refused before its intent record is written"
+    );
+}
+
 #[tokio::test]
 async fn create_drain_gives_up_at_its_deadline() {
     let daemon = RestartableDaemon::new("wt-drain-deadline");

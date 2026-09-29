@@ -3,11 +3,13 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use pohunek_paths::{
-    validate_socket_path, BasePaths, InvalidPathReason, PathEnv, PathError, Platform, SocketKind,
+    longest_staged_socket_path, validate_socket_path, validate_staged_socket_path,
+    worker_socket_path, BasePaths, InvalidPathReason, PathEnv, PathError, Platform, SocketKind,
+    STAGED_SOCKET_PREFIX, STAGED_SOCKET_SUFFIX_CHARS, WORKERS_SUBDIR, WORKER_SOCKET_NAME,
 };
 use serde::Deserialize;
 
-// Rust guideline compliant 2026-09-19
+// Rust guideline compliant 2026-09-28
 
 const CONTRACT: &str = include_str!("../fixtures/runtime-paths.json");
 
@@ -181,6 +183,99 @@ fn worker_socket_is_validated_after_safe_id_derivation() {
         })
     ));
     assert_eq!(paths.worker_socket("../unsafe").expect("invalid ID"), None);
+}
+
+/// Returns a runtime base whose worker socket for `session_id` is exactly
+/// `final_bytes` long in the resolved runtime layout.
+fn runtime_base_for_worker_socket(session_id: &str, final_bytes: usize) -> String {
+    let tail = format!("/pohunek/{WORKERS_SUBDIR}/{session_id}/{WORKER_SOCKET_NAME}");
+    format!("/{}", "r".repeat(final_bytes - tail.len() - 1))
+}
+
+#[test]
+fn worker_socket_refuses_a_fitting_final_path_whose_staged_bind_path_does_not_fit() {
+    let session_id = "s-42";
+    let staged_extra =
+        STAGED_SOCKET_PREFIX.len() + STAGED_SOCKET_SUFFIX_CHARS - WORKER_SOCKET_NAME.len();
+    assert!(staged_extra > 0, "the staged name is the longer one");
+    for platform in [Platform::Linux, Platform::MacOs] {
+        let limit = platform.socket_path_max_bytes();
+        let env_for = |base: String| PathEnv {
+            xdg_runtime_dir: Some(base.into()),
+            xdg_data_home: Some("/data".into()),
+            xdg_state_home: Some("/state".into()),
+            xdg_cache_home: Some("/cache".into()),
+            xdg_config_home: Some("/config".into()),
+            home: None,
+        };
+
+        // The published socket is exactly at the limit, so only the staged
+        // bind path is over it.
+        let overlong = BasePaths::resolve_for(
+            platform,
+            501,
+            &env_for(runtime_base_for_worker_socket(session_id, limit)),
+        )
+        .expect("daemon socket fits");
+        let published = overlong
+            .worker_runtime_root()
+            .join(session_id)
+            .join(WORKER_SOCKET_NAME);
+        assert_eq!(published.as_os_str().len(), limit);
+        validate_socket_path(&published, platform, SocketKind::Worker)
+            .expect("the published worker socket alone fits");
+        let staged = longest_staged_socket_path(published.parent().expect("socket directory"));
+        let refused = overlong
+            .worker_socket(session_id)
+            .expect_err("the staged bind path does not fit");
+        assert!(
+            matches!(
+                &refused,
+                PathError::SocketPathTooLong {
+                    kind: SocketKind::Worker,
+                    platform: refused_platform,
+                    path,
+                    actual_bytes,
+                    max_bytes,
+                } if *refused_platform == platform
+                    && *path == staged
+                    && *actual_bytes == limit + staged_extra
+                    && *max_bytes == limit
+            ),
+            "{refused:?}"
+        );
+        let message = refused.to_string();
+        assert!(message.contains(&staged.display().to_string()), "{message}");
+        assert!(message.contains(&limit.to_string()), "{message}");
+        assert_eq!(
+            worker_socket_path(&overlong.worker_runtime_root(), session_id, platform),
+            Err(refused)
+        );
+
+        // The largest runtime root whose staged bind path is exactly at the
+        // limit is accepted.
+        let boundary = BasePaths::resolve_for(
+            platform,
+            501,
+            &env_for(runtime_base_for_worker_socket(
+                session_id,
+                limit - staged_extra,
+            )),
+        )
+        .expect("daemon socket fits");
+        let socket = boundary
+            .worker_socket(session_id)
+            .expect("the staged bind path fits at the limit")
+            .expect("valid session ID");
+        assert_eq!(
+            longest_staged_socket_path(socket.parent().expect("socket directory"))
+                .as_os_str()
+                .len(),
+            limit
+        );
+        validate_staged_socket_path(&socket, platform, SocketKind::Worker)
+            .expect("boundary-sized staged path");
+    }
 }
 
 #[test]
