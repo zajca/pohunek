@@ -14,6 +14,15 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # a linked issue and a reason next to it (see AGENTS.md "Flaky tests").
 flaky-result = "fail"
 
+[profile.default.archive]
+# Daemon and gui-core tests spawn the real durable worker by path
+# (`target/debug/pohunek-sessiond`), and nothing in a nextest build guarantees
+# that binary is produced. An archive without it is a build error, never a
+# run where those tests find no worker.
+include = [
+  { path = "debug/pohunek-sessiond", relative-to = "target", depth = 0, on-missing = "error" },
+]
+
 [profile.ci]
 test-threads = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 3 }

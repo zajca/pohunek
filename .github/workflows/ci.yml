@@ -36,6 +36,20 @@ env:
   # artifacts before persisting anyway, so producing them only wastes time.
   # Kept explicit (issue #124) so every job benefits even before restore.
   CARGO_INCREMENTAL: "0"
+  # Test binaries (issue #170): job `build-tests` compiles the workspace test
+  # binaries once (`cargo nextest archive --workspace --all-features`) and
+  # uploads the archive. The test jobs (fast shards, heavy, relay DB) download
+  # it and run from it via scripts/test-partitions --archive-file; they install
+  # only cargo-nextest, no Rust toolchain and no rust-cache. Tests find binaries
+  # and sources through compile-time paths (`env!("CARGO_BIN_EXE_*")`,
+  # `env!("CARGO_MANIFEST_DIR")`, `<workspace>/target/debug/pohunek-sessiond`),
+  # so the archive is extracted into the checkout at the same absolute
+  # workspace path it was built in; scripts/test-partitions refuses any other
+  # path. `.config/nextest.toml` archive.include makes the archive build fail
+  # when pohunek-sessiond is missing, so a test never runs without its worker.
+  # Job `build-bins` stays a separate default-feature build: the archive
+  # compiles with --all-features, which enables cli's `test-util` seams, and
+  # the web e2e and Hermes compatibility jobs must exercise shipped binaries.
   # Compile cache (issue #164): Swatinem/rust-cache is the only compile-cache
   # layer. Each Rust job restores the entry of its job type (`shared-key`:
   # clippy, test-debug, bins, release, xtask, docs, hack, nightly-udeps,
@@ -225,15 +239,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features
 
-  fast-tests:
-    name: tests (${{ matrix.shard }}, fast)
+  # Compiles every workspace test binary exactly once for the fast shards, the
+  # heavy job, and the relay DB job (issue #170). Designated `test-debug`
+  # saver; the same `--workspace --all-features` build also warms doctests.
+  build-tests:
+    name: build tests (nextest archive)
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [unit, daemon, relay, cli]
     steps:
       - uses: actions/checkout@v4
 
@@ -250,12 +263,54 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Restore only: the heavy job saves `test-debug`.
           shared-key: test-debug
-          save-if: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-nextest
+
+      # The archive holds the test binaries, the runnable bins the tests spawn,
+      # and pohunek-sessiond (archive.include in .config/nextest.toml, an error
+      # when absent). It is kept outside target/ so rust-cache never saves it.
+      - name: Archive workspace test binaries
+        run: cargo nextest archive --profile ci --workspace --all-features --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
+
+      - name: Report archive size
+        run: |
+          size="$(stat -c %s "$RUNNER_TEMP/nextest-archive.tar.zst")"
+          echo "nextest archive: ${size} bytes" >> "$GITHUB_STEP_SUMMARY"
+
+      # The archive is already zstd-compressed: store it as is (level 0).
+      - name: Upload test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest-archive.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  fast-tests:
+    name: tests (${{ matrix.shard }}, fast)
+    needs: build-tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [unit, daemon, relay, cli]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-nextest
+
+      - name: Download test archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest-archive
 
       - name: Check script regressions
         if: matrix.shard == 'unit'
@@ -263,7 +318,7 @@ jobs:
 
       # No dependency on Clippy, PostgreSQL, PTYs, or the release build.
       - name: Run fast shard
-        run: python3 scripts/test-partitions run "${{ matrix.shard }}"
+        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run "${{ matrix.shard }}"
 
       - name: Summarize flaky tests
         if: always()
@@ -416,49 +471,30 @@ jobs:
 
   integration:
     name: tests (heavy, PTY + Hermes)
+    needs: build-tests
     runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install mold linker
-        uses: ./.github/actions/setup-mold
-        with:
-          version: ${{ env.MOLD_VERSION }}
-          sha256: ${{ env.MOLD_SHA256 }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          # Designated `test-debug` saver: the same `nextest --workspace
-          # --all-features` build as the fast shards and relay-db, plus
-          # pohunek-sessiond, so it holds the superset of what they restore.
-          shared-key: test-debug
-          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-nextest
 
-      # The daemon socket tests spawn the real durable worker by path
-      # (`target/debug/pohunek-sessiond`). Nextest only builds test harnesses,
-      # never the runnable binary, so build it explicitly first.
-      - name: Build session worker for daemon tests
-        run: cargo build -p pohunek-session-worker --bin pohunek-sessiond
+      - name: Download test archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest-archive
 
+      # The daemon socket tests spawn the real durable worker by path
+      # (`target/debug/pohunek-sessiond`); it comes out of the archive, which
+      # cannot be built without it.
       - name: Verify exhaustive disjoint test partitions
-        run: python3 scripts/test-partitions check
+        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" check
 
       - name: Heavy tests (bounded nextest concurrency)
-        run: python3 scripts/test-partitions run heavy
+        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run heavy
 
       - name: Summarize flaky tests
         if: always()
@@ -550,11 +586,9 @@ jobs:
   # never start the Postgres service.
   integration-relay:
     name: tests (relay DB, PostgreSQL)
-    needs: changes
+    needs: [changes, build-tests]
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.relay == 'true' }}
     runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     services:
       postgres:
         image: postgres:17-alpine
@@ -571,31 +605,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install mold linker
-        uses: ./.github/actions/setup-mold
-        with:
-          version: ${{ env.MOLD_VERSION }}
-          sha256: ${{ env.MOLD_SHA256 }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          # Restore only: the heavy job saves `test-debug`.
-          shared-key: test-debug
-          save-if: false
-
       - name: Install cargo-nextest
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-nextest
 
+      - name: Download test archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest-archive
+
       - name: Relay database tests (bounded nextest concurrency)
-        run: python3 scripts/test-partitions run relay-db
+        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run relay-db
         env:
           # Resolved at step level: the `job` context is not available in
           # job-level `env`, where it makes the whole workflow invalid.
@@ -632,7 +654,7 @@ jobs:
           toolchain: stable
 
       # Doctests link the debug library builds that the `test-debug` saver
-      # (`integration`) persists; this job only restores them.
+      # (`build-tests`) persists; this job only restores them.
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:

@@ -82,5 +82,65 @@ class ReleaseGatingTests(unittest.TestCase):
         self.assertNotIn("release-check", self.text)
 
 
+ARCHIVE_CONSUMERS = ("fast-tests", "integration", "integration-relay")
+
+
+class TestArchiveTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.text = WORKFLOW.read_text()
+
+    def test_build_tests_archives_the_whole_workspace_once(self):
+        block = job_block(self.text, "build-tests")
+        self.assertIn(
+            "cargo nextest archive --profile ci --workspace --all-features --archive-file", block
+        )
+        self.assertIn("name: nextest-archive", block)
+        self.assertIn("if-no-files-found: error", block)
+        self.assertNotRegex(block, r"(?m)^    needs:")
+        self.assertNotRegex(block, r"(?m)^    if:")
+
+    def test_build_tests_is_the_only_test_debug_saver(self):
+        saver = "save-if: ${{ github.ref == 'refs/heads/main' }}"
+        blocks = {
+            name: job_block(self.text, name)
+            for name in re.findall(r"(?m)^  ([a-z][a-z0-9-]*):\n    (?:name|needs|if):", self.text)
+        }
+        savers = [
+            name for name, block in blocks.items()
+            if "shared-key: test-debug" in block and saver in block
+        ]
+        self.assertEqual(savers, ["build-tests"])
+
+    def test_archive_consumers_run_from_the_archive_without_a_toolchain(self):
+        for job in ARCHIVE_CONSUMERS:
+            with self.subTest(job=job):
+                block = job_block(self.text, job)
+                self.assertRegex(block, r"(?m)^    needs: (?:build-tests|\[.*\bbuild-tests\b.*\])$")
+                self.assertIn("name: nextest-archive", block)
+                self.assertIn("--archive-file", block)
+                for forbidden in ("rust-toolchain", "rust-cache", "setup-mold", "cargo build"):
+                    self.assertNotIn(forbidden, block)
+                self.assertNotIn("RUSTFLAGS", block)
+
+    def test_heavy_checks_partitions_against_the_archive(self):
+        block = job_block(self.text, "integration")
+        self.assertRegex(block, r"test-partitions --archive-file \S+ check")
+        self.assertRegex(block, r"test-partitions --archive-file \S+ run heavy")
+
+    def test_relay_db_keeps_its_changes_gate(self):
+        block = job_block(self.text, "integration-relay")
+        condition = re.search(r"^    if: (.*)$", block, re.M)
+        self.assertIsNotNone(condition)
+        self.assertIn("needs.changes.outputs.relay == 'true'", condition.group(1))
+        self.assertRegex(block, r"needs: \[changes, build-tests\]")
+
+    def test_default_feature_binaries_still_come_from_build_bins(self):
+        block = job_block(self.text, "build-bins")
+        self.assertIn("cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli", block)
+        self.assertIn("name: pohunek-bins", block)
+        self.assertIn("build-bins", job_block(self.text, "hermes-compatibility"))
+
+
 if __name__ == "__main__":
     unittest.main()
