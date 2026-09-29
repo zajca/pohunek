@@ -59,6 +59,34 @@ def validate_coverage(universe, selections):
         )
 
 
+def junit_report(config, profile, target_dir):
+    """The JUnit file nextest writes for `profile`, or None when it writes none.
+
+    `junit.path` is inherited along `inherits`, ending at `default`, like every
+    other nextest profile setting.
+    """
+    profiles = config.get("profile", {})
+    name = profile
+    seen = set()
+    while name is not None and name not in seen:
+        seen.add(name)
+        settings = profiles.get(name, {})
+        path = settings.get("junit", {}).get("path")
+        if path is not None:
+            return Path(target_dir) / "nextest" / profile / path
+        name = settings.get("inherits", "default" if name != "default" else None)
+    return None
+
+
+def target_directory():
+    """Cargo's resolved target directory (honours CARGO_TARGET_DIR and config)."""
+    result = subprocess.run(
+        ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+        cwd=ROOT, check=True, stdout=subprocess.PIPE,
+    )
+    return json.loads(result.stdout)["target_directory"]
+
+
 def inventory(expression=None):
     command = [
         "cargo", "nextest", "list", "--profile", "ci", "--workspace",
@@ -96,6 +124,13 @@ def main():
     profile = {"heavy": "heavy", "relay-db": "relay-db"}.get(args.shard, "ci")
     # CI uploads each job's report under its shard name. Local fast shard runs
     # share the ci report path; copy it before starting the next run if needed.
+    with (ROOT / ".config/nextest.toml").open("rb") as config:
+        report = junit_report(tomllib.load(config), profile, target_directory())
+    # nextest writes the report only when a run completes, so a report left by
+    # an earlier run (or restored with target/) would pass for this one when
+    # the build fails first; the job summary and upload must see none instead.
+    if report is not None:
+        report.unlink(missing_ok=True)
     command = [
         "cargo", "nextest", "run", "--profile", profile, "--workspace",
         "--all-features", "-E", expressions[args.shard],

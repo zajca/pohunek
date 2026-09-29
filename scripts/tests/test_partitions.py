@@ -3,7 +3,12 @@
 import importlib.machinery
 import importlib.util
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import tomllib
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "test-partitions"
 LOADER = importlib.machinery.SourceFileLoader("partitions", str(SCRIPT))
@@ -76,3 +81,44 @@ class CoverageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JunitReportTests(unittest.TestCase):
+    def setUp(self):
+        with (SCRIPT.parent.parent / ".config/nextest.toml").open("rb") as config:
+            self.config = tomllib.load(config)
+
+    def test_report_paths_follow_profile_inheritance(self):
+        cases = {
+            "ci": Path("t/nextest/ci/junit.xml"),
+            "fast": Path("t/nextest/fast/junit.xml"),
+            "heavy": Path("t/nextest/heavy/junit.xml"),
+            "relay-db": Path("t/nextest/relay-db/junit.xml"),
+            "local": None,
+        }
+        for profile, expected in cases.items():
+            with self.subTest(profile=profile):
+                self.assertEqual(partitions.junit_report(self.config, profile, "t"), expected)
+
+    def test_inheritance_cycle_ends(self):
+        config = {"profile": {"a": {"inherits": "b"}, "b": {"inherits": "a"}}}
+        self.assertIsNone(partitions.junit_report(config, "a", "t"))
+
+    def test_run_removes_a_stale_report_before_nextest_starts(self):
+        with tempfile.TemporaryDirectory() as target:
+            stale = Path(target) / "nextest" / "heavy" / "junit.xml"
+            stale.parent.mkdir(parents=True)
+            stale.write_text("<testsuites/>")
+            seen = []
+
+            def fake_run(command, **kwargs):
+                seen.append(stale.exists())
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(partitions, "target_directory", return_value=target), \
+                    mock.patch.object(partitions.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(sys, "argv", ["test-partitions", "run", "heavy"]):
+                with self.assertRaises(SystemExit) as exit_:
+                    partitions.main()
+            self.assertEqual(exit_.exception.code, 0)
+            self.assertEqual(seen, [False])
