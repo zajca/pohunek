@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use pohunek_client::ClientError;
 use pohunek_paths::BasePaths;
-use pohunek_platform::process::{ProcessIdentity, StartIdentity};
+use pohunek_platform::process::{
+    Error as ProcessError, ExitWatch, OwnershipMarkers, ProcessFact, ProcessIdentity, StartIdentity,
+};
 use pohunek_platform::supervisor::{DaemonSupervisor, Operation as Pending, ServiceId, Supervisor};
 use pohunek_session_worker::RuntimePhase;
 use protocol::{
@@ -59,6 +61,77 @@ enum Registration {
     /// The job is registered but the call reports failure, like a D-Bus or
     /// `launchctl` timeout after the service manager accepted the job.
     FailsAfterRegistering,
+}
+
+/// Process observer whose process table is this test process and its
+/// descendants, so no verdict depends on unrelated host processes.
+///
+/// Identity lookups answer for this process only; every other PID, such as the
+/// one a stale journal names, is an exited process.
+#[derive(Debug, Default)]
+struct OwnProcesses(HostInspector);
+
+impl OwnProcesses {
+    fn own_pid() -> Pid {
+        std::process::id()
+    }
+}
+
+impl ProcessInspector for OwnProcesses {
+    fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, ProcessError> {
+        if pid == Self::own_pid() {
+            self.0.identity(pid)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, ProcessError> {
+        self.0.parent_pid(pid)
+    }
+
+    fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, ProcessError> {
+        self.0.process(pid)
+    }
+
+    fn same_user_processes(&self) -> Result<Vec<ProcessFact>, ProcessError> {
+        let mut processes: Vec<ProcessFact> =
+            self.0.process(Self::own_pid())?.into_iter().collect();
+        processes.extend(self.0.descendants(Self::own_pid())?);
+        Ok(processes)
+    }
+
+    fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, ProcessError> {
+        self.0.descendants(root)
+    }
+
+    fn cwd(&self, pid: Pid) -> Result<PathBuf, ProcessError> {
+        self.0.cwd(pid)
+    }
+
+    fn executable(&self, pid: Pid) -> Result<Option<PathBuf>, ProcessError> {
+        self.0.executable(pid)
+    }
+
+    fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, ProcessError> {
+        self.0.exit_watch(identity)
+    }
+
+    fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, ProcessError> {
+        self.0.ownership_markers(pid)
+    }
+
+    fn foreground_process_group(&self, root_pid: Pid) -> Result<Option<Pid>, ProcessError> {
+        self.0.foreground_process_group(root_pid)
+    }
+}
+
+/// An engine over `context` and `backend` that observes only this test's
+/// own processes.
+fn engine_over<'a>(context: &'a Context, backend: &'a Backend) -> Engine<'a> {
+    let mut engine = Engine::new(context, backend);
+    engine.inspector = Box::new(OwnProcesses::default());
+    engine
 }
 
 #[derive(Debug, Default)]
@@ -441,7 +514,7 @@ impl Harness {
     }
 
     fn engine(&self) -> Engine<'_> {
-        let mut engine = Engine::new(&self.context, &self.backend);
+        let mut engine = engine_over(&self.context, &self.backend);
         engine.ready_timeout = Duration::from_millis(500);
         engine.stop_timeout = Duration::from_secs(2);
         engine
@@ -507,6 +580,32 @@ impl Harness {
         );
         assert_eq!(self.pending(), None, "no transaction is pending");
     }
+}
+
+#[test]
+fn the_test_process_table_holds_only_this_process_and_its_descendants() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn descendant");
+    let observer = OwnProcesses::default();
+    let mut pids: Vec<Pid> = observer
+        .same_user_processes()
+        .expect("process table")
+        .iter()
+        .map(|process| process.pid)
+        .collect();
+    pids.sort_unstable();
+    let mut expected = vec![OwnProcesses::own_pid(), child.id()];
+    expected.sort_unstable();
+    let own = observer.identity(OwnProcesses::own_pid());
+    let foreign = observer.identity(child.id());
+    child.kill().expect("kill descendant");
+    child.wait().expect("reap descendant");
+
+    assert_eq!(pids, expected);
+    assert!(own.expect("inspect").is_some(), "this process is running");
+    assert_eq!(foreign.expect("inspect"), None, "any other PID has exited");
 }
 
 #[tokio::test]
@@ -716,7 +815,7 @@ async fn a_root_the_daemon_definition_cannot_carry_is_refused_before_any_rollbac
         harness.context.supervisor_dir().to_path_buf(),
         harness.context.cli_executable().to_path_buf(),
     );
-    let engine = Engine::new(&broken, &harness.backend);
+    let engine = engine_over(&broken, &harness.backend);
 
     let error = engine
         .install(&harness.staged(V2), &harness.prefix(), V2)
@@ -799,7 +898,7 @@ async fn an_unusable_home_is_refused_before_a_fresh_install_changes_anything() {
     let harness = Harness::new();
     for (case, home) in unusable_homes(&harness) {
         let context = context_with_home(&harness, home);
-        let error = Engine::new(&context, &harness.backend)
+        let error = engine_over(&context, &harness.backend)
             .install(&harness.staged(V1), &harness.prefix(), V1)
             .await
             .expect_err("unusable HOME");
@@ -816,7 +915,7 @@ async fn an_unusable_home_is_refused_before_any_rollback() {
     let record = pending_install_at_config(&harness).await;
     for (case, home) in unusable_homes(&harness) {
         let context = context_with_home(&harness, home);
-        let engine = Engine::new(&context, &harness.backend);
+        let engine = engine_over(&context, &harness.backend);
         let error = engine
             .install(&harness.staged(V2), &harness.prefix(), V2)
             .await
@@ -834,7 +933,7 @@ async fn an_unusable_home_is_refused_before_any_rollback() {
 
     // Removing an installation needs no worker working directory.
     let context = context_with_home(&harness, None);
-    let report = Engine::new(&context, &harness.backend)
+    let report = engine_over(&context, &harness.backend)
         .uninstall(UninstallOptions::default())
         .await
         .expect("uninstall without HOME");
@@ -2351,7 +2450,7 @@ async fn an_untrusted_unit_directory_fails_before_anything_changes() {
         open.join("systemd/user"),
         PathBuf::from("/usr/bin/pohunek"),
     );
-    let error = Engine::new(&context, &harness.backend)
+    let error = engine_over(&context, &harness.backend)
         .install(&harness.staged(V1), &harness.prefix(), V1)
         .await
         .expect_err("untrusted");
@@ -2748,7 +2847,7 @@ async fn install_with(
     context: &Context,
     prefix: &Path,
 ) -> Result<InstallReport, Error> {
-    Engine::new(context, &harness.backend)
+    engine_over(context, &harness.backend)
         .install(&harness.staged(V1), prefix, V1)
         .await
 }

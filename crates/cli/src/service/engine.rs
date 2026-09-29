@@ -125,7 +125,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use pohunek_paths::InstallLayout;
-use pohunek_platform::process::{HostInspector, Pid};
+use pohunek_platform::process::{HostInspector, Pid, ProcessInspector};
 use pohunek_platform::supervisor::{
     self, JobDefinition, Namespace, ServiceObservation, ServiceState, WorkerKey,
 };
@@ -176,7 +176,9 @@ pub struct UninstallOptions {
 pub struct Engine<'a> {
     context: &'a Context,
     backend: &'a Backend,
-    inspector: HostInspector,
+    /// Observes worker and version-referencing processes; the host's process
+    /// table in production.
+    inspector: Box<dyn ProcessInspector>,
     store: Store,
     /// Transaction lock an ancestor `pohunek service lock` handed down; every
     /// transaction of this engine runs under it instead of a lock of its own.
@@ -196,7 +198,7 @@ impl<'a> Engine<'a> {
         Self {
             context,
             backend,
-            inspector: HostInspector::new(),
+            inspector: Box::new(HostInspector::new()),
             store: Store::new(context.paths().state_dir.clone()),
             inherited: None,
             ready_timeout: settings::DAEMON_READY_TIMEOUT,
@@ -1016,7 +1018,7 @@ impl<'a> Engine<'a> {
                 paths: journals.unreadable,
             });
         }
-        let outdated = journals.outdated_live(&self.inspector);
+        let outdated = journals.outdated_live(&*self.inspector);
         if !outdated.is_empty() {
             return Err(Error::OutdatedJournals {
                 workers: outdated
@@ -1042,7 +1044,7 @@ impl<'a> Engine<'a> {
                 workers.push(observation.id.to_string());
             }
         }
-        for journal in journals.live(&self.inspector) {
+        for journal in journals.live(&*self.inspector) {
             let label = format!("{}.{}", journal.session_id, journal.generation);
             if !covered(&journal.session_id) && !workers.contains(&label) {
                 workers.push(label);
@@ -1277,7 +1279,7 @@ impl<'a> Engine<'a> {
         let mut usage = Usage::collect(
             layout,
             journals,
-            &self.inspector,
+            &*self.inspector,
             self.context.cli_executable(),
         );
         usage.note_jobs(layout, discovered);
