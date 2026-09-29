@@ -283,7 +283,7 @@ jobs:
           zstd -dc "$RUNNER_TEMP/nextest-archive.tar.zst" | tar -x -C "$RUNNER_TEMP/repack"
           test -f "$RUNNER_TEMP/repack/target/debug/pohunek-sessiond"
           rm "$RUNNER_TEMP/repack/target/debug/pohunek-sessiond"
-          tar -C "$RUNNER_TEMP/repack" -cf - . | zstd -q -o "$RUNNER_TEMP/nextest-archive.tar.zst" -f
+          tar -C "$RUNNER_TEMP/repack" -cf - target | zstd -q -o "$RUNNER_TEMP/nextest-archive.tar.zst" -f
 
       - name: Report archive size
         run: |
