@@ -9986,6 +9986,79 @@ async fn reconnect_persistence_failure_retries_without_orphaning_live_handle() {
     let _ = registry.stop(&created.id).await;
 }
 
+/// Connect deadline of the unanswered-socket reconnect test; short so the
+/// timed-out attempt reaches classification quickly.
+const UNANSWERED_CONNECT_DEADLINE: Duration = Duration::from_millis(300);
+/// Bound on the whole unanswered-socket reconnect. It only fails a hung loop:
+/// a correct loop returns after about one connect deadline.
+const UNANSWERED_RECONNECT_BOUND: Duration = Duration::from_secs(20);
+
+#[tokio::test]
+async fn reconnect_classifies_a_worker_socket_that_accepts_and_never_answers() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(temp_store_path("reconnect-unanswered")),
+        worker_connect_deadline: UNANSWERED_CONNECT_DEADLINE,
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (_worker, expected) = live_worker_and_identity(&registry, &created.id).await;
+    let socket = temp_dir("unanswered").join("w.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).expect("bind unanswered socket");
+    let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Accepts every connection and keeps it open without ever writing, so a
+    // connect attempt stays pending in negotiation.
+    let silent = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+            if accepted_tx.send(()).is_err() {
+                break;
+            }
+        }
+        held
+    });
+
+    let started = Instant::now();
+    let reconnected = tokio::time::timeout(
+        UNANSWERED_RECONNECT_BOUND,
+        registry.reconnect_worker(
+            &created.id,
+            &expected,
+            &socket,
+            &tokio_util::sync::CancellationToken::new(),
+            &WorkerError::Protocol("test disconnect".to_owned()),
+        ),
+    )
+    .await
+    .expect("the reconnect loop classifies an unanswered worker instead of hanging");
+
+    assert!(reconnected.is_none(), "nothing is adopted");
+    assert!(
+        started.elapsed() >= UNANSWERED_CONNECT_DEADLINE,
+        "an unproven loss is classified only after the connect deadline"
+    );
+    assert!(
+        accepted_rx.try_recv().is_ok(),
+        "the attempt reached a socket that accepted it"
+    );
+    let runtime = registry
+        .inspect(&created.id)
+        .await
+        .expect("session stays visible")
+        .runtime
+        .expect("runtime");
+    assert_eq!(runtime.state, RuntimeState::Conflict);
+    // The worker that served the session is still running, so the loss is
+    // unproven and the runtime waits in conflict for the supervision retry.
+    assert_eq!(
+        runtime.loss_reason.as_deref(),
+        Some(crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS)
+    );
+    silent.abort();
+    let _ = registry.stop(&created.id).await;
+}
+
 #[tokio::test]
 async fn lost_transition_retries_precommit_failure_before_single_event() {
     let registry = SessionRegistry::new(SessionRegistryConfig {

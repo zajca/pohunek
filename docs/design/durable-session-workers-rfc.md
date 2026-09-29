@@ -565,7 +565,7 @@ bound every new queue:
 | Setting | Initial default | Rationale |
 |---------|-----------------|-----------|
 | worker bootstrap/initialize deadline | 45 seconds (`service.toml` `worker_initialize_ms`) | allows a loaded service manager to start while bounding an abandoned job |
-| daemon worker-connect deadline | 10 seconds (`service.toml` `worker_connect_ms`) | matches an interactive create operation without hiding a broken job; also bounds each reconciliation probe (connect, controller acquisition, and inspection together), so a silent socket cannot stall startup or a held lifecycle lock |
+| daemon worker-connect deadline | 10 seconds (`service.toml` `worker_connect_ms`) | matches an interactive create operation without hiding a broken job; also bounds each reconciliation probe (connect, controller acquisition, and inspection together) and each reconnect attempt of a running session, so a silent socket cannot stall startup, a held lifecycle lock, or loss classification |
 | raw output history | 10,000,000 bytes | preserves the current per-session history budget |
 | one subscriber queue | 1,000,000 bytes | absorbs repaint bursts without allowing one client to consume the history budget |
 | worker data payload | 64 KiB | bounds allocation while efficiently carrying PTY and prompt fragments |
@@ -1215,7 +1215,10 @@ lock: a proven crash (row 14's evidence) is swept, retired, and marked `lost`
 at once. A journal scan that fails, or an unreadable or mismatched journal file
 in the session's journal directory, is `conflict` with
 `runtime_supervision_ambiguous` and re-checked through rows 1a and 8. Otherwise the daemon keeps reconnecting until the worker connect
-deadline, and a worker that answers in that window is adopted again. At the
+deadline, and a worker that answers in that window is adopted again. Each
+connect attempt also ends at that deadline, so a socket that accepts and then
+never finishes negotiation or controller acquisition reaches the deadline
+classification like one that refuses the connection. At the
 deadline, rows 12 to 16 apply to the exact generation: `lost` with
 `runtime_lost` or `runtime_lost_cleanup_unconfirmed` after a proven crash,
 `conflict` with `runtime_supervision_ambiguous` (re-checked in the background)
