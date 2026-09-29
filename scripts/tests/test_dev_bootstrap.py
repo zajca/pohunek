@@ -44,15 +44,19 @@ class FakeHost:
     """
 
     def __init__(self, on_path=None, in_cargo_bin=None, install_status=0,
-                 installed_output=None):
+                 installed_output=None, cargo=True, install_error=None):
         self.on_path = dict(CURRENT if on_path is None else on_path)
         self.in_cargo_bin = dict(in_cargo_bin or {})
         self.install_status = install_status
         self.installed_output = dict(installed_output or {})
+        self.cargo = cargo
+        self.install_error = install_error
         self.version_calls = []
         self.installs = []
 
     def which(self, name, path=None):
+        if name == "cargo" and path is None:
+            return f"{PATH_DIR}/cargo" if self.cargo else None
         if path is None:
             return f"{PATH_DIR}/{name}" if name in self.on_path else None
         if path == CARGO_BIN and name in self.in_cargo_bin:
@@ -62,6 +66,16 @@ class FakeHost:
     def runner(self, argv):
         self.version_calls.append(argv)
         directory, name = argv[0].rsplit("/", 1)
+        if name == "cargo":
+            # Cargo's own order: `$CARGO_HOME/bin` before `PATH`.
+            sub = f"cargo-{argv[1]}"
+            for source in (self.in_cargo_bin, self.on_path):
+                if sub in source:
+                    output = source[sub]
+                    if isinstance(output, Exception):
+                        raise output
+                    return output
+            raise subprocess.CalledProcessError(101, argv)
         source = self.on_path if directory == PATH_DIR else self.in_cargo_bin
         output = source[name]
         if isinstance(output, Exception):
@@ -70,6 +84,8 @@ class FakeHost:
 
     def executor(self, argv):
         self.installs.append(argv)
+        if self.install_error is not None:
+            raise self.install_error
         crate = argv[-1]
         if self.install_status == 0 and crate in self.installed_output:
             self.on_path[crate] = self.installed_output[crate]
@@ -103,17 +119,6 @@ class DevBootstrapCase(unittest.TestCase):
             system=system,
         )
         return status, out.getvalue()
-
-    def test_mold_is_checked_only_on_linux(self):
-        on_path = {name: output for name, output in CURRENT.items() if name != "mold"}
-        status, output = self.run_main(FakeHost(on_path=on_path), "--strict", system="Darwin")
-        self.assertEqual(status, 0, output)
-        self.assertNotIn("mold", output)
-
-        status, output = self.run_main(FakeHost(on_path=on_path), "--strict", system="Linux")
-        self.assertEqual(status, 1, output)
-        self.assertIn("mold", output)
-
 
 class ParseVersionTests(unittest.TestCase):
     def test_real_outputs(self):
@@ -199,6 +204,16 @@ class NextestConfigTests(DevBootstrapCase):
 
 
 class CheckTests(DevBootstrapCase):
+    def test_mold_is_checked_only_on_linux(self):
+        on_path = {name: output for name, output in CURRENT.items() if name != "mold"}
+        status, output = self.run_main(FakeHost(on_path=on_path), "--strict", system="Darwin")
+        self.assertEqual(status, 0, output)
+        self.assertNotIn("mold", output)
+
+        status, output = self.run_main(FakeHost(on_path=on_path), "--strict", system="Linux")
+        self.assertEqual(status, 1, output)
+        self.assertIn("mold", output)
+
     def test_everything_current_passes(self):
         status, output = self.run_main(FakeHost())
         self.assertEqual(status, 0)
@@ -255,10 +270,27 @@ class CheckTests(DevBootstrapCase):
         host = FakeHost(on_path=tools, in_cargo_bin={"cargo-nextest": nextest})
         status, output = self.run_main(host)
         self.assertEqual(status, 0)
-        self.assertIn(
-            [f"{CARGO_BIN}/cargo-nextest", "nextest", "--version"],
-            host.version_calls,
-        )
+        self.assertIn([f"{PATH_DIR}/cargo", "nextest", "--version"], host.version_calls)
+
+    def test_cargo_subcommand_version_is_the_one_cargo_runs(self):
+        # Cargo prefers $CARGO_HOME/bin over PATH: an old home-bin copy fails
+        # the check even when a current one is on PATH, and vice versa.
+        old = "cargo-nextest 0.9.100\n"
+        host = FakeHost(in_cargo_bin={"cargo-nextest": old})
+        status, output = self.run_main(host)
+        self.assertEqual(status, 1, output)
+        self.assertIn("cargo-nextest 0.9.100 is older than", output)
+
+        tools = dict(CURRENT)
+        tools["cargo-nextest"] = old
+        host = FakeHost(on_path=tools, in_cargo_bin={"cargo-nextest": CURRENT["cargo-nextest"]})
+        status, output = self.run_main(host)
+        self.assertEqual(status, 0, output)
+
+    def test_cargo_subcommand_without_cargo_is_a_failure(self):
+        status, output = self.run_main(FakeHost(cargo=False))
+        self.assertEqual(status, 1, output)
+        self.assertIn("`cargo` is not on PATH", output)
 
     def test_binary_only_in_cargo_home_is_reported_off_path(self):
         tools = dict(CURRENT)
@@ -327,6 +359,14 @@ class InstallTests(DevBootstrapCase):
             [["cargo", "install", "--locked", "bacon"],
              ["cargo", "install", "--locked", "hyperfine"]],
         )
+
+    def test_install_that_cannot_start_is_reported_not_raised(self):
+        tools = dict(CURRENT)
+        tools.pop("bacon")
+        host = FakeHost(on_path=tools, install_error=FileNotFoundError("cargo"))
+        status, output = self.run_main(host, "--install", "--strict")
+        self.assertEqual(status, 1, output)
+        self.assertIn("install of bacon could not start", output)
 
     def test_manual_steps_are_never_run(self):
         tools = dict(CURRENT)

@@ -94,7 +94,9 @@ class Tool:
     # argv run by `--install`, or None when only a manual step can fix it.
     install: tuple = None
     manual: str = None
-    # Cargo finds `cargo-<sub>` in `$CARGO_HOME/bin` even off `PATH`.
+    # Checked through `cargo <sub> --version`: Cargo prefers
+    # `$CARGO_HOME/bin/cargo-<sub>` over `PATH`, so only Cargo itself reports
+    # the copy that `cargo t` runs.
     cargo_subcommand: bool = False
 
 
@@ -167,7 +169,7 @@ def tools(root, system):
     checked = [
         Tool(
             name="cargo-nextest",
-            version_args=("nextest", "--version"),
+            version_args=("--version",),
             min_version=nextest_min_version(root),
             required=True,
             install=("cargo", "install", "--locked", "cargo-nextest"),
@@ -234,15 +236,25 @@ def run_install(argv):
 def check_tool(tool, which, runner, cargo_bin):
     """Locate, version, and compare one tool."""
     path = which(tool.name)
-    if path is None:
-        in_cargo_bin = which(tool.name, path=str(cargo_bin))
-        if in_cargo_bin is None:
-            return Result(tool, MISSING)
-        if not tool.cargo_subcommand:
-            return Result(tool, OFF_PATH, path=in_cargo_bin)
-        path = in_cargo_bin
+    in_cargo_bin = which(tool.name, path=str(cargo_bin))
+    if path is None and in_cargo_bin is None:
+        return Result(tool, MISSING)
+    if tool.cargo_subcommand:
+        cargo = which("cargo")
+        if cargo is None:
+            return Result(
+                tool, UNKNOWN_VERSION, path=path or in_cargo_bin,
+                detail="`cargo` is not on PATH, so Cargo cannot run it",
+            )
+        subcommand = tool.name.removeprefix("cargo-")
+        argv = [cargo, subcommand, *tool.version_args]
+        path = f"{shlex.join(argv[:2])} (Cargo's resolution)"
+    elif path is None:
+        return Result(tool, OFF_PATH, path=in_cargo_bin)
+    else:
+        argv = [path, *tool.version_args]
     try:
-        output = runner([path, *tool.version_args])
+        output = runner(argv)
     except (OSError, subprocess.SubprocessError) as error:
         return Result(tool, UNKNOWN_VERSION, path=path, detail=str(error))
     version = parse_version(output)
@@ -334,7 +346,16 @@ def install(results, strict, executor, out):
             succeeded = False
             continue
         print(f"+ {shlex.join(result.tool.install)}", file=out, flush=True)
-        status = executor(list(result.tool.install))
+        try:
+            status = executor(list(result.tool.install))
+        except OSError as error:
+            print(
+                f"dev-bootstrap: install of {result.tool.name} could not "
+                f"start: {error}",
+                file=out,
+            )
+            succeeded = False
+            continue
         if status != 0:
             print(
                 f"dev-bootstrap: install of {result.tool.name} exited "
