@@ -29,6 +29,7 @@ use crate::detect::{ActivityTransition, DetectorConfig, ManifestRegion, MatchCon
 use crate::external::{external_session_id, TranscriptIndex};
 use crate::integration::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
+    HOOK_TIMEOUT_SECS,
 };
 use crate::procwatch::readable_host::ReadableHost;
 use crate::procwatch::{
@@ -5803,7 +5804,9 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
     });
     let created = registry.create(params()).await.expect("create session");
 
-    let observed = tokio::time::timeout(Duration::from_secs(5), async {
+    // The hook interpreter starts under whatever load the host has, so the wait
+    // gets the budget the agent grants the hook, not a stricter literal.
+    let observed = tokio::time::timeout(Duration::from_secs(HOOK_TIMEOUT_SECS), async {
         loop {
             let info = registry
                 .inspect(&created.id)

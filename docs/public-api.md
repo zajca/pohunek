@@ -940,8 +940,9 @@ The result is exactly `{"recorded":true}` or `{"recorded":false}`.
 `pid` is the OS process id for the active nested agent. When present, the daemon
 binds the active claim to that process and clears the claim when procwatch sees
 the process exit. The shipped integration state hooks use
-`POHUNEK_INTEGRATION_VERSION=6`, read provider JSON through a bounded direct
-pipe without staging it on disk, and send the hook process's parent PID on
+`POHUNEK_INTEGRATION_VERSION=7`, run their interpreter in isolated mode (`-I`,
+so the session working directory never shadows the standard library), read
+provider JSON through a bounded direct pipe without staging it on disk, and send the hook process's parent PID on
 `SessionStart`.
 
 `session.release_agent` accepts the same `source`/`agent` identity plus an

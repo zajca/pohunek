@@ -3,7 +3,7 @@
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # POHUNEK_INTEGRATION_ID=claude
-# POHUNEK_INTEGRATION_VERSION=6
+# POHUNEK_INTEGRATION_VERSION=7
 #
 # Claude notification hook. Fire-and-forget: any missing handshake env, missing
 # python3, invalid input, or socket failure is a silent no-op (exit 0) so the
@@ -36,7 +36,7 @@ head -c "$MAX_HOOK_INPUT_BYTES" >"$hook_input_file" 2>/dev/null || true
 POHUNEK_HOOK_INPUT_FILE="$hook_input_file" \
 POHUNEK_HOOK_ACTION="$action" \
 POHUNEK_HOOK_MATCHER="$matcher" \
-python3 - >/dev/null 2>&1 <<'PY' || exit 0
+python3 -I - >/dev/null 2>&1 <<'PY' || exit 0
 import json
 import os
 import socket

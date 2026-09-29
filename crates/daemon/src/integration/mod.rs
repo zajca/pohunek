@@ -74,8 +74,10 @@ const UNIX_MODE_MASK: u32 = 0o7777;
 /// Group/other write bits violate the owner-private executable path boundary.
 #[cfg(unix)]
 const GROUP_OR_OTHER_WRITE_MASK: u32 = 0o022;
-/// Per-hook timeout (seconds) recorded in the agent's hook config.
-const HOOK_TIMEOUT_SECS: u64 = 10;
+/// Per-hook timeout (seconds) recorded in the agent's hook config. The agent
+/// kills a hook that outlives it, so it is the longest a hook can take to
+/// deliver a report.
+pub(crate) const HOOK_TIMEOUT_SECS: u64 = 10;
 /// Action argument passed to the hook script for the `SessionStart` event.
 const HOOK_ACTION: &str = "session";
 /// Action argument passed to the hook script for the `SessionEnd` event.
@@ -2507,7 +2509,7 @@ mod tests {
     /// State-hook requests expected from a successful release callback.
     const STATE_RELEASE_REQUEST_COUNT: usize = 1;
     /// Integration asset version expected after bounded in-memory state hooks ship.
-    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=6";
+    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=7";
     /// Writable inheritable ACL used to prove mode bits alone are insufficient on macOS.
     #[cfg(target_os = "macos")]
     const WRITABLE_INHERITABLE_ACL: &str = "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit";
@@ -2599,6 +2601,26 @@ mod tests {
         socket_available: bool,
         expected_requests: usize,
     ) -> (std::process::ExitStatus, String, String, Vec<Value>) {
+        run_state_asset_in(
+            agent,
+            args,
+            input,
+            socket_available,
+            expected_requests,
+            None,
+        )
+    }
+
+    /// Runs the state hook with `cwd` as its working directory (the test's own
+    /// when `None`).
+    fn run_state_asset_in(
+        agent: &str,
+        args: &[&str],
+        input: &Value,
+        socket_available: bool,
+        expected_requests: usize,
+        cwd: Option<&Path>,
+    ) -> (std::process::ExitStatus, String, String, Vec<Value>) {
         let asset_path = state_asset(agent);
         assert!(
             asset_path.is_file(),
@@ -2665,6 +2687,9 @@ mod tests {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
         let mut child = command.spawn().expect("spawn state hook");
         if let Some(mut stdin) = child.stdin.take() {
             stdin
@@ -3326,7 +3351,7 @@ mod tests {
             // abnormal interpreter exit (OOM, hook timeout kill) under `set -e`
             // never propagates a non-zero status that could break the agent.
             assert!(
-                asset.contains("python3 - 3<&0 <<'PY' || exit 0"),
+                asset.contains("python3 -I - 3<&0 <<'PY' || exit 0"),
                 "the python heredoc must be guarded with `|| exit 0`"
             );
             assert!(
@@ -3347,6 +3372,65 @@ mod tests {
             CLAUDE_HOOK_ASSET.contains(STATE_RELEASE_ACTION),
             "Claude state hook must accept the release action"
         );
+    }
+
+    /// Every managed hook runs its interpreter in isolated mode.
+    #[test]
+    fn hook_assets_run_python_in_isolated_mode() {
+        for agent in ["claude", "codex"] {
+            for asset in [state_asset(agent), notification_asset(agent)] {
+                let script = fs::read_to_string(&asset).expect("read hook asset");
+                assert!(
+                    script.contains("python3 -I -"),
+                    "{} must start python3 with -I",
+                    asset.display()
+                );
+            }
+        }
+    }
+
+    /// The hook runs in the agent's working directory, which must neither slow
+    /// the interpreter's imports nor shadow the standard library.
+    #[test]
+    fn state_hooks_ignore_modules_in_the_working_directory() {
+        for agent in ["claude", "codex"] {
+            let workdir = temp_dir(&format!("{agent}-shadowed-cwd"));
+            let marker = workdir.join("shadow-imported");
+            for module in ["json", "os", "socket", "time", "datetime"] {
+                fs::write(
+                    workdir.join(format!("{module}.py")),
+                    format!("open({marker:?}, 'w').close()\nraise ImportError('shadowed')\n"),
+                )
+                .expect("write shadow module");
+            }
+            let input = json!({
+                "session_id": format!("{agent}-native"),
+                "transcript_path": format!("/tmp/{agent}-transcript.jsonl"),
+            });
+
+            let (status, _stdout, stderr, requests) = run_state_asset_in(
+                agent,
+                &[STATE_SESSION_ACTION],
+                &input,
+                true,
+                STATE_SESSION_REQUEST_COUNT,
+                Some(&workdir),
+            );
+
+            assert!(
+                status.success(),
+                "{agent} state hook exited with {status}: {stderr}"
+            );
+            assert!(
+                !marker.exists(),
+                "{agent} state hook imported a module from its working directory"
+            );
+            assert_eq!(
+                requests.len(),
+                STATE_SESSION_REQUEST_COUNT,
+                "{agent} state hook must still report from a shadowed working directory"
+            );
+        }
     }
 
     #[test]
