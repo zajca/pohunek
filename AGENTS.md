@@ -96,7 +96,7 @@ cargo clippy --workspace --all-targets --all-features   # must be clean under -D
 cargo build -p pohunek-session-worker --bin pohunek-sessiond  # daemon tests spawn it by path
 cargo nextest run --profile ci --test-threads 4 --workspace --all-features
 cargo test --doc --workspace --all-features              # nextest excludes doctests
-cargo build --workspace --release                        # release profile must build
+cargo build --workspace --release                        # release profile must build (CI: see below)
 cargo xtask docs check                                   # schema/drift/source-map/secrets/runbooks
 cargo xtask hermes compatibility --pohunek-bin ABS       # pinned, model-free Hermes CLI/golden gate
 ```
@@ -185,6 +185,14 @@ all discovered tests, including ignored ones, are assigned exactly once. The
 `cargo tw` remains unfiltered at four test processes. In CI, the Postgres-backed
 relay job is gated by a paths filter and does not run (its PostgreSQL service
 never starts) for non-relay changes.
+
+Doctests and the release build: the `doctests` job runs on
+every pull request. The release build (`release-build` job) runs on push to
+`main`, the weekly schedule, and manual dispatch, and on a pull request only
+when it touches a `release` filter input in `ci.yml` (`Cargo.toml`,
+`crates/**/Cargo.toml`, `Cargo.lock`, `.cargo/**`, toolchain pins, the CI and
+release workflows, `scripts/release`, `packaging/**`); run the release build
+locally before declaring such a change done.
 
 Flaky tests: `.config/nextest.toml` sets `flaky-result = "fail"` in
 `profile.default`, so every profile inherits it. Only `heavy` and `relay-db`
