@@ -2971,6 +2971,19 @@ pub(crate) mod tests {
         .expect("valid explicit authentication limits")
     }
 
+    /// Returns a whole-second expiry that exceeds `lifetime` from now by a further `lifetime`.
+    ///
+    /// The relay measures a requested expiry against its own later PostgreSQL clock, so an
+    /// expiry only marginally past the maximum becomes acceptable after a scheduling stall.
+    /// The extra full lifetime (minutes) outlasts nextest's per-test termination bound in
+    /// `.config/nextest.toml`, so no completed run can stall back inside the maximum.
+    pub(crate) fn expiry_beyond_lifetime(lifetime: Duration) -> time::OffsetDateTime {
+        let lifetime = time::Duration::try_from(lifetime).expect("representable lifetime");
+        (time::OffsetDateTime::now_utc() + lifetime + lifetime)
+            .replace_nanosecond(0)
+            .expect("whole-second expiry beyond lifetime")
+    }
+
     fn revoke_request() -> RevokeCredentialRequest {
         RevokeCredentialRequest {
             idempotency: relay_protocol::Idempotency {
@@ -3524,9 +3537,7 @@ pub(crate) mod tests {
                 correlation_id: Uuid::now_v7(),
                 idempotency_key: Uuid::now_v7(),
             },
-            expires_at: (time::OffsetDateTime::now_utc() + time::Duration::seconds(901))
-                .replace_nanosecond(0)
-                .expect("whole-second excessive-lifetime expiry"),
+            expires_at: expiry_beyond_lifetime(limits().human_credential_lifetime()),
         };
         assert!(matches!(
             service
@@ -3550,9 +3561,13 @@ pub(crate) mod tests {
                 correlation_id: Uuid::now_v7(),
                 idempotency_key: Uuid::now_v7(),
             },
-            expires_at: (time::OffsetDateTime::now_utc() + time::Duration::seconds(5))
-                .replace_nanosecond(0)
-                .expect("whole-second insufficient-overlap expiry"),
+            // Half the maximum lifetime keeps the requested expiry valid across any stall a
+            // completed run can observe, so only the old credential's remaining lifetime rejects.
+            expires_at: (time::OffsetDateTime::now_utc()
+                + time::Duration::try_from(limits().human_credential_lifetime() / 2)
+                    .expect("representable half lifetime"))
+            .replace_nanosecond(0)
+            .expect("whole-second insufficient-overlap expiry"),
         };
         assert!(matches!(
             service
