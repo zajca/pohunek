@@ -759,9 +759,12 @@ When a turn settles `attention`:
      and `Admin`s, and if none exists it refuses service-account `task.start`
      on that team with `factory_no_escalation_target` (fail closed) and flags
      any pending attention in audit. While any service-account task on the
-     team is `active`, a membership or credential change that would remove
-     the last active human target is refused unless the same change installs
-     a replacement; if the set still empties through a path the relay does
+     team is `active`, a membership change that would remove the last active human target is
+     refused unless the same change installs a replacement, while a
+     **credential revocation is always allowed** — a compromised credential
+     must never wait on factory work — and, when it removes the last human
+     target, atomically switches the team into the
+     `factory_no_escalation_target` mode described next; if the set still empties through a path the relay does
      not control (an identity provider disabling the last account), every
      turn-opening operation on the team — `task.start`, `task.continue`,
      `task.extend`, service-account `task.answer` — is suspended with
@@ -1140,7 +1143,8 @@ Ordered by dependency; each lands with the tests named:
      and worktree holds), `factory.run.failover` refused while a
      `quarantined` record remains, a rotation with overlap refused as a
      failover precondition, a restore reconciled from the admission ledger,
-     an escalation target lacking evidence rights rejected at setup, an
+     an escalation target lacking evidence rights rejected at setup, a
+     credential revocation never blocked by active factory work, an
      auditor without `session.metadata.read` unable to review, a non-member
      principal refused under a colliding `run_id`, the auditor member fenced
      by the manager's failover, `factory.run.failover` succeeding with

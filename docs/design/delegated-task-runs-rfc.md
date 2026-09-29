@@ -291,7 +291,14 @@ in fact working throughout it. Once the ceiling is reached,
 `task.extend` is refused with `task_turn_ceiling_reached` and the turn can
 only be answered (if `attention`), stopped, or followed by a new turn once
 the agent is ready. No sequence of answers and extensions keeps a turn open
-indefinitely.
+indefinitely. The number of settlement revisions of one turn — attention
+cycles, re-opens and late completions together — is likewise capped by
+`tasks.max_settlement_revisions_per_turn`; the store reserve of section 14
+is sized for that many result documents, and the last permitted revision is
+always a terminal one: reaching the cap settles the turn `failed` with
+reason `revision_limit_reached`, cancels any pending attention, and seals
+the turn like `task.stop` does, so the guaranteed terminal writes always
+fit.
 
 `failed`, `exited`, `lost`, `stopped` and `cancelled` are final; `completed` is final when
 its finality is `provider_confirmed` and final unless re-opened when it is
@@ -387,7 +394,13 @@ settles with `completed` (section 12).
    id>`), created and fsynced before the first record that depends on it;
    every stored fingerprint names its key id, rotation is an explicit owner
    command that mints a new version and keeps the old ones readable until
-   every fingerprint under them has left `tasks.metadata_retention`, and a
+   every fingerprint under them has left `tasks.metadata_retention`; a key
+   version is **pinned per runtime generation** — the worker receives its
+   session's key at launch, every delivery frame names the key id it was
+   fingerprinted with, the daemon fingerprints deliveries into an existing
+   generation with that generation's key, and a rotation takes effect only
+   for generations started after it, so hook correlation never degrades
+   mid-session — and a
    missing key version fails the comparison typed (`task_fingerprint_key_missing`)
    instead of treating a valid resubmission as a mismatch; the plain canonicalized
    digest a hook reports is compared in memory and never persisted, logged
@@ -931,9 +944,15 @@ only way two tasks share a tree; naming the same branch does not do it
     tasks. Under the task store lock the daemon compares it with the
     recorded set and, on any difference, fails with
     `worktree_users_changed` and changes nothing. From that check until
-    the removal finishes the worktree is marked `removal_pending`, and any
-    `task.start { worktree_of }` into it fails with `task_worktree_busy`, so
-    the set cannot grow underneath the cascade.
+    the removal finishes or is rolled back the worktree is marked
+    `removal_pending`, and that mark is part of the same occupancy
+    check-and-set every path that can place a process in the tree passes
+    (invariant 11): `task.start { worktree_of }` fails with
+    `task_worktree_busy`, and `session.resume`, `session.fork` with
+    `cwd_mode: "same"` and in-place `session.new` fail with `worktree_busy`,
+    so neither the user set nor the set of live PTYs can grow underneath the
+    cascade, including in the gap between stopping the users and removing
+    the tree.
   - Authority must cover **every** stopped session, not only the owner.
     Local owner clients have it over all sessions. On the relay path the
     relay authorizes `session.lifecycle.control` on each named task's
@@ -1778,7 +1797,7 @@ the result says so (`baseline_on: "worktree"`).
 | `task.inspect` | Task record, lifecycle state, evidence sources and degradation, worktree users, and one page of turns (see paging below). Also resolves a task by `(caller_scope, client_request_id)` for delivery reconciliation. |
 | `task.list` | One page of tasks on the host, filterable by project, lifecycle state, outcome, owner task and run id (see paging below). |
 | `task.extend` | Extend an open turn's deadline, or re-open a `timed_out` turn whose work has not visibly ended, within `tasks.turn_open_ceiling_ms` (section 6.3). |
-| `task.stop` | Cancel and join the task's check processes (section 12), stop its session and settle any open turn — or a settled `attention` turn, as a new revision (section 6.3) — as `stopped`, and seal every other settlement against later revision (section 6.3); on a task without an open turn it is the explicit end of a finished task (section 6.1). Optional preconditions `if_latest_turn` and `require_idle: true` make the stop atomic with a check that the latest turn is exactly that one and has no open turn, pending attention or finalizing result; otherwise it fails with `task_stop_precondition_failed` and changes nothing. On a task that is already `ended`, `task.stop` succeeds as a no-op and returns the recorded end (`already_ended: true`) without evaluating preconditions, so a retried cleanup never fails on its own earlier success. The worktree, metadata and result content survive for `task.result` and `task.review`. Idempotent. |
+| `task.stop` | Cancel and join the task's check processes (section 12), stop its session and settle any open turn — or a settled `attention` turn, as a new revision (section 6.3) — as `stopped`, and seal every other settlement against later revision (section 6.3); on a task without an open turn it is the explicit end of a finished task (section 6.1). Optional preconditions `if_latest_turn` and `require_idle: true` make the stop atomic with a check that the latest turn is exactly that one, is settled **and final** (a heuristic `completed` inside its re-open window is provisional and does not count), has no open or queued turn, no pending attention and no finalizing result, and that the agent satisfies the same readiness condition occupancy release uses (invariant 11); otherwise it fails with `task_stop_precondition_failed` and changes nothing. On a task that is already `ended`, `task.stop` succeeds as a no-op and returns the recorded end (`already_ended: true`) without evaluating preconditions, so a retried cleanup never fails on its own earlier success. The worktree, metadata and result content survive for `task.result` and `task.review`. Idempotent. |
 | `task.review` | Record an external verdict (`accepted`, `changes_requested`, `rejected`) bound to a `result_id` and the `worktree_fingerprint` the reviewer verified, with optional notes and check references (see review binding below). Idempotent per `(task_id, caller_scope, client_request_id)`. |
 | `task.check_log` | Page a check log by reference and byte offset. |
 | `task.retain_worktree` | Set the retain hold on the worktree's owner task after the fact, while the worktree exists (section 8.7). Idempotent. |
@@ -1958,8 +1977,9 @@ to ship the adapter in the same milestone is an open question (section 19).
   exceeded, retention sweeps the oldest retired content first within the
   caps, and the startup scan is bounded by the same caps. Admission
   reserves the task's worst-case **terminal capacity**
-  (`tasks.store_reserve_bytes`: the result revisions, evidence, check
-  metadata and stop records one turn can still need) against
+  (`tasks.store_reserve_bytes`: `tasks.max_settlement_revisions_per_turn`
+  result documents, evidence, check metadata and stop records one turn can
+  still need) against
   `tasks.store_max_bytes`, so settlement and `task.stop` always have room
   once a turn was admitted. A full disk is a different failure: terminal
   records (settlement, stop intent and completion, check `interrupted`)
@@ -2343,7 +2363,12 @@ without blocking the rest.
      contains a plain prompt digest; `task.continue --wait` on a queued turn
      uses the `deliver_after` plus turn deadline default; an unconfined
      check with an empty known group releases occupancy only after the quiet
-     grace;
+     grace; `session.resume`, same-cwd fork and in-place `session.new`
+     refused while `removal_pending`; the revision cap settles `failed`
+     with `revision_limit_reached` and the reserve still fits; a key
+     rotation between two turns of a live session keeps correlation; a stop
+     with `require_idle` refused inside a heuristic re-open window and with
+     a queued turn;
      check definitions: a host definition shadows an in-repo one of the same
      name, an in-repo definition edited in the worktree during the turn is
      not what runs, and `repo_base` checks cap integrity at `suspect`;
@@ -2427,7 +2452,8 @@ present, no detection-only settlement for OpenCode, and the share of
    `tasks.check_launch_grace_ms`, `tasks.fingerprint_max_file_bytes`,
    `tasks.fingerprint_max_read_bytes`, `tasks.fingerprint_max_ms`,
    `tasks.max_reviews_per_result`, `tasks.review_notes_max_bytes`,
-   `tasks.store_reserve_bytes`, `tasks.attach_fence_grace_ms`,
+   `tasks.store_reserve_bytes`, `tasks.max_settlement_revisions_per_turn`,
+   `tasks.attach_fence_grace_ms`,
    `tasks.evidence_drain_settle_ms`,
    `tasks.unconfined_release_grace_ms`,
    `tasks.wait_keepalive_idle_ms`,
