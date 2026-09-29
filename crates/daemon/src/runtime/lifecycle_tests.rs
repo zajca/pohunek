@@ -976,11 +976,16 @@ async fn a_late_worker_of_the_right_generation_is_adopted() {
 async fn a_worker_serving_another_generation_is_never_adopted() {
     let harness = Harness::over_worker(CONNECT, INITIALIZE);
     let running = harness.generation("s-1");
-    harness
-        .lifecycle()
-        .launch(&running)
-        .await
-        .expect("first generation runs");
+    // The healthy first generation gets the dev/test connect contract: its
+    // budget covers the worker's durable startup I/O inside `start`. Only
+    // `other` is meant to exhaust the short deadline.
+    Lifecycle {
+        connect_deadline: DEV_WORKER_CONNECT,
+        ..harness.lifecycle()
+    }
+    .launch(&running)
+    .await
+    .expect("first generation runs");
     let other = harness.generation("s-1");
     // The job of `other` is reported present, but the session socket keeps
     // serving the running generation, whose journal names another token.
