@@ -174,7 +174,7 @@ JUnit execution time, and sccache/rust-cache hit rates from `gh` run data) are
 the measurement path behind
 `docs/design/test-performance-report.md`.
 
-The loop cost boundary (nextest >= 0.9.115; profiles in `.config/nextest.toml`,
+The loop cost boundary (nextest >= 0.9.131; profiles in `.config/nextest.toml`,
 shard helper requires Python >= 3.11). CI runs four fast matrix shards and one
 heavy job independently of lint/release jobs. The cost boundary is
 `profile.fast.default-filter`; update it when adding a PTY, DB, Hermes, or other
@@ -185,6 +185,18 @@ all discovered tests, including ignored ones, are assigned exactly once. The
 `cargo tw` remains unfiltered at four test processes. In CI, the Postgres-backed
 relay job is gated by a paths filter and does not run (its PostgreSQL service
 never starts) for non-relay changes.
+
+Flaky tests: `.config/nextest.toml` sets `flaky-result = "fail"` in
+`profile.default`, so every profile inherits it. Only `heavy` and `relay-db`
+retry (`count = 2`, fixed 1s delay): PTY, socket, worker-process, and
+PostgreSQL fixtures. `ci`/`fast` never retry, because a fast test that fails
+intermittently is a bug. A test that passes only on a retry is reported as
+`FLKY-FL` in the log and stays a `<failure>` in `junit.xml`, and the run still
+fails. Retries only tell "fails every time" apart from "fails sometimes". Each
+CI test job runs `scripts/junit-flaky-summary` with `if: always()`, which lists
+flaky and failed tests in the job summary. A FLAKY result means opening a bug issue with
+the root cause. A per-test `flaky-result = "pass"` override is allowed only
+with a linked issue and a reason in a comment next to it.
 
 Rust:
 

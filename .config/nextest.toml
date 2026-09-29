@@ -1,15 +1,25 @@
-# Custom profile inheritance was introduced in this version.
-nextest-version = { required = "0.9.115" }
+# `flaky-result` (profile.default below) was introduced in this version; older
+# nextest would reject the key, so this also covers profile inheritance (0.9.115).
+nextest-version = { required = "0.9.131" }
 
 [profile.default]
 # Process-level parallelism; keep full-suite and heavy local runs bounded.
 test-threads = 4
 slow-timeout = { period = "60s", terminate-after = 3 }
+# Flaky-test policy, inherited by every profile: a test that fails and then
+# passes on a retry is reported as FLAKY and still fails the run (and stays a
+# <failure> in JUnit). Retries only tell "fails every time" apart from "fails
+# sometimes"; they never turn a failure green. A FLAKY result means a bug
+# issue with the root cause. A per-test `flaky-result = "pass"` override needs
+# a linked issue and a reason next to it (see AGENTS.md "Flaky tests").
+flaky-result = "fail"
 
 [profile.ci]
 test-threads = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 3 }
 fail-fast = false
+# No retries: `ci` and the fast shards that run under it are deterministic
+# (no PTYs, real sockets, or databases), so a single failure is the signal.
 
 [profile.ci.junit]
 path = "junit.xml"
@@ -24,6 +34,8 @@ slow-timeout = { period = "30s" }
 # Ordinary file, mock-socket, and short CLI integration tests remain fast.
 [profile.fast]
 inherits = "ci"
+# No retries (inherited from ci): fast tests own no timing-sensitive fixture,
+# so any intermittent failure here is a bug to fix, not to retry.
 default-filter = '''
 not (
   (package(=pohunek-daemon) and
@@ -41,6 +53,11 @@ not (
 [profile.heavy]
 inherits = "ci"
 test-threads = 4
+# PTY, real-socket, and worker-process tests are timing-sensitive. Retries
+# classify a failure as FLAKY or persistent for diagnosis; flaky-result =
+# "fail" (profile.default) keeps a FLAKY test failing the run. The fixed delay
+# lets a transient resource (port, PTY, child process teardown) settle.
+retries = { backoff = "fixed", count = 2, delay = "1s" }
 # The heavy filter is the exact complement of profile.fast, supplied by
 # scripts/test-partitions. Keep `ci` and `local` unfiltered full-suite profiles.
 
@@ -49,6 +66,9 @@ inherits = "ci"
 # Relay PostgreSQL tests each open dedicated schema-scoped pools; unbounded
 # num-cpus concurrency exhausts the fixture server's connection limit.
 test-threads = 4
+# Same diagnostic-only retry policy as profile.heavy: a FLAKY PostgreSQL test
+# still fails the run through flaky-result = "fail" (profile.default).
+retries = { backoff = "fixed", count = 2, delay = "1s" }
 
 [profile.relay-db.junit]
 path = "junit.xml"

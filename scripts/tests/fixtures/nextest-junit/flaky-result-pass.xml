@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="2" skipped="0" failures="0" errors="0" uuid="bf8aac2c-ec96-49c8-8bca-7fa7c9894f83" timestamp="2026-09-28T22:07:14.963+02:00" time="1.050">
+    <testsuite name="pohunek-paths::zz_flaky_sample" tests="2" skipped="0" errors="0" failures="0">
+        <testcase name="always_passes" classname="pohunek-paths::zz_flaky_sample" timestamp="2026-09-28T22:07:14.969+02:00" time="0.009"/>
+        <testcase name="flaky_first_attempt" classname="pohunek-paths::zz_flaky_sample" timestamp="2026-09-28T22:07:15.975+02:00" time="0.038">
+            <flakyFailure timestamp="2026-09-28T22:07:14.969+02:00" time="0.006" message="thread &apos;flaky_first_attempt&apos; (1706877) panicked at crates/paths/tests/zz_flaky_sample.rs:5:5" type="test failure with exit code 101">thread &apos;flaky_first_attempt&apos; (1706877) panicked at crates/paths/tests/zz_flaky_sample.rs:5:5:
+deliberate failure on attempt 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+                <system-out>
+running 1 test
+attempt 1
+test flaky_first_attempt ... FAILED
+
+failures:
+
+failures:
+    flaky_first_attempt
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+</system-out>
+                <system-err>
+thread &apos;flaky_first_attempt&apos; (1706877) panicked at crates/paths/tests/zz_flaky_sample.rs:5:5:
+deliberate failure on attempt 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+            </flakyFailure>
+        </testcase>
+    </testsuite>
+</testsuites>
