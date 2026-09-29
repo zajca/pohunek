@@ -15,13 +15,32 @@ readonly PRIVATE_DIRECTORY_MODE=700
 readonly ISOLATED_PATH="/usr/bin:/bin"
 readonly ISOLATED_LOCALE="C"
 readonly NO_COLOR_VALUE="1"
-readonly ENV_EXECUTABLE="/usr/bin/env"
-readonly MKTEMP_EXECUTABLE="/usr/bin/mktemp"
-readonly MKDIR_EXECUTABLE="/usr/bin/mkdir"
-readonly CHMOD_EXECUTABLE="/usr/bin/chmod"
-readonly RM_EXECUTABLE="/usr/bin/rm"
 readonly DEFAULT_TEMP_PARENT="/tmp"
 readonly FALLBACK_TEMP_PARENT="/var/tmp"
+
+# Absolute utility paths differ by platform (`rm` is /bin/rm on macOS and
+# Linux, `mktemp` and `env` are /usr/bin on macOS). Each utility is resolved
+# from these fixed directories, never from the caller's PATH.
+readonly UTILITY_DIRECTORIES=(/bin /usr/bin)
+
+resolve_utility() {
+  local name="$1" directory
+  for directory in "${UTILITY_DIRECTORIES[@]}"; do
+    if [[ -x "$directory/$name" && ! -d "$directory/$name" ]]; then
+      printf '%s/%s\n' "$directory" "$name"
+      return 0
+    fi
+  done
+  printf '%s: required utility not found in /bin or /usr/bin: %s\n' "$SCRIPT_NAME" "$name" >&2
+  exit 2
+}
+
+ENV_EXECUTABLE="$(resolve_utility env)"
+MKTEMP_EXECUTABLE="$(resolve_utility mktemp)"
+MKDIR_EXECUTABLE="$(resolve_utility mkdir)"
+CHMOD_EXECUTABLE="$(resolve_utility chmod)"
+RM_EXECUTABLE="$(resolve_utility rm)"
+readonly ENV_EXECUTABLE MKTEMP_EXECUTABLE MKDIR_EXECUTABLE CHMOD_EXECUTABLE RM_EXECUTABLE
 
 usage() {
   printf 'usage: %s /absolute/path/to/release/pohunek /absolute/path/to/pinned/hermes\n' "$SCRIPT_NAME" >&2
@@ -57,15 +76,26 @@ run_isolated() {
     "$@"
 }
 
+# Prints the symlink-free form of the writable directory $1 when neither it nor
+# any ancestor holds a `.git` entry. Symlinked candidates are resolved rather
+# than rejected because macOS reaches /tmp and /var/tmp through symlinks; the
+# ancestry check runs on the resolved path, so a link into a repository is
+# still refused.
 safe_temp_parent() {
   local candidate="$1"
   if [[ "$candidate" != /* || "$candidate" == "/" || ! -d "$candidate" || ! -w "$candidate" ]]; then
     return 1
   fi
 
-  local current="$candidate"
+  local canonical
+  canonical="$(cd -- "$candidate" && pwd -P)" || return 1
+  if [[ "$canonical" != /* || "$canonical" == "/" ]]; then
+    return 1
+  fi
+
+  local current="$canonical"
   while true; do
-    if [[ -L "$current" || -e "$current/.git" || -L "$current/.git" ]]; then
+    if [[ -e "$current/.git" || -L "$current/.git" ]]; then
       return 1
     fi
     if [[ "$current" == "/" ]]; then
@@ -77,16 +107,14 @@ safe_temp_parent() {
     fi
   done
 
-  local canonical
-  canonical="$(cd -- "$candidate" && pwd -P)"
-  [[ "$candidate" == "$canonical" ]]
+  printf '%s\n' "$canonical"
 }
 
 select_temp_parent() {
-  local candidate
+  local candidate resolved
   for candidate in "$@"; do
-    if safe_temp_parent "$candidate"; then
-      printf '%s\n' "$candidate"
+    if resolved="$(safe_temp_parent "$candidate")"; then
+      printf '%s\n' "$resolved"
       return 0
     fi
   done
@@ -164,8 +192,10 @@ run_isolated "$release_pohunek" integration install --agent hermes \
   --allow-host local \
   --json
 
-test -f "$release_smoke_hermes_home/plugins/operators/pohunek/plugin.yaml"
-test -f "$release_smoke_hermes_home/plugins/operators/pohunek/skills/pohunek/SKILL.md"
+# The installed files can only come from assets embedded in the release binary:
+# the working directory and every profile path are fresh empty directories.
+test -s "$release_smoke_hermes_home/plugins/operators/pohunek/plugin.yaml"
+test -s "$release_smoke_hermes_home/plugins/operators/pohunek/skills/pohunek/SKILL.md"
 
 # The selected pinned executable must see the managed plugin through its normal
 # profile semantics. This command does not start a model turn.

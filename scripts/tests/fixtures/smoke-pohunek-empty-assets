@@ -29,8 +29,8 @@ plugin_root="$HERMES_HOME/plugins/operators/pohunek"
 case "$2" in
   install)
     mkdir -p "$plugin_root/skills/pohunek"
-    printf '%s\n' 'name: pohunek' >"$plugin_root/plugin.yaml"
-    printf '%s\n' '# pohunek' >"$plugin_root/skills/pohunek/SKILL.md"
+    : > "$plugin_root/plugin.yaml"
+    : > "$plugin_root/skills/pohunek/SKILL.md"
     ;;
   status|doctor)
     test -f "$plugin_root/plugin.yaml"
