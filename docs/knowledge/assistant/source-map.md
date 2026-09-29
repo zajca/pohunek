@@ -264,16 +264,20 @@ Release packaging and contributor verification:
 - `scripts/worktree-new` — creates `../pohunek-worktrees/<slug>` on
   `zajca/<slug>` and seeds the worktree's own `target/debug` caches
   (`.fingerprint`, `build`, `deps`, `incremental`, plus `CACHEDIR.TAG`) from
-  the main checkout with `cp -a --reflink=always`; a real probe clone must
-  succeed first, the main checkout's Cargo locks are held exclusively during
-  the copy, both checkouts must use the default target layout per
-  `cargo metadata`, uplifted binaries are not seeded, and a failing
-  `git worktree add` or seed rolls back whichever of the new worktree and
-  branch exist. `--no-seed` skips seeding.
+  the main checkout with `cp -a --reflink=always`; one run at a time holds
+  an exclusive lock on `<git-common-dir>/worktree-new.lock` from the
+  existence checks through any rollback, a real probe clone must succeed
+  first, the main checkout's three Cargo lock files are created if absent
+  and held exclusively while the source is validated and copied, both
+  checkouts must use the default target layout per `cargo metadata`,
+  uplifted binaries are not seeded, and a failing `git worktree add` or
+  seed rolls back whichever of the new worktree and branch exist.
+  `--no-seed` skips seeding.
 - `scripts/tests/test_worktree_new.py` — regression checks for its slug and
-  argument validation, fail-closed reflink probe, lock contention, layout
-  checks, rollback of partial `git worktree add` failures, and `--no-seed`,
-  with an injected executor.
+  argument validation, fail-closed reflink probe, Cargo and repository lock
+  contention (including two concurrent runs for one slug), layout checks,
+  rollback of partial `git worktree add` failures, and `--no-seed`, with an
+  injected executor.
 - `.github/workflows/ci.yml`
 - `.github/workflows/release.yml`
 - `README.md`

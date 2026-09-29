@@ -2,8 +2,8 @@
 
 No test reaches a real git, cargo, or cp subprocess and none needs btrfs:
 the executor is injected everywhere and emulates those commands inside a
-temporary directory. Cargo lock contention is exercised with real `flock`
-calls on temporary files.
+temporary directory. Cargo and repository lock contention is exercised with
+real `flock` calls on temporary files.
 """
 
 import contextlib
@@ -12,10 +12,12 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "worktree-new"
@@ -26,6 +28,26 @@ LOADER.exec_module(worktree_new)
 
 # Error text of GNU cp when FICLONE crosses filesystems (tmpfs, other btrfs).
 CROSS_DEVICE = "cp: failed to clone: Invalid cross-device link"
+# Upper bound for a cross-thread handshake in the concurrency tests; it only
+# bounds a hang when the code under test deadlocks, a passing run never
+# waits for it.
+HANDSHAKE_TIMEOUT_SECONDS = 10
+
+
+def flock_is_blocked(path):
+    """True when an exclusive non-blocking `flock` on `path` is refused.
+
+    The file is opened here, so the attempt uses its own open file
+    description, as a separate Cargo or worktree-new process would.
+    """
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(descriptor)
+    return False
 
 
 class FakeExecutor:
@@ -45,6 +67,8 @@ class FakeExecutor:
         self.registered = set()
         # Per-root override of `cargo metadata` target/build directories.
         self.layouts = {}
+        # Called with (source, dest) before every emulated `cp`.
+        self.on_copy = None
 
     def ran(self, *prefix):
         """True when some command starts with `prefix`."""
@@ -98,6 +122,10 @@ class FakeExecutor:
             branch, path = args[3], Path(args[4])
             if self.add_fails == "before":
                 return 128, "", "fatal: invalid reference"
+            if branch in self.branches:
+                return 128, "", f"fatal: a branch named '{branch}' already exists"
+            if path.exists():
+                return 128, "", f"fatal: '{path}' already exists"
             self.branches.add(branch)
             if self.add_fails == "after-branch":
                 return 128, "", "fatal: could not create work tree dir"
@@ -128,6 +156,8 @@ class FakeExecutor:
     def cp(self, args):
         assert args[:2] == ["-a", "--reflink=always"], args
         source, dest = Path(args[2]), Path(args[3])
+        if self.on_copy is not None:
+            self.on_copy(source, dest)
         if self.probe_fails:
             return 1, "", CROSS_DEVICE
         if self.copy_fails_for is not None and source.name == self.copy_fails_for:
@@ -165,7 +195,7 @@ class Harness:
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         self.repo = self.root / "pohunek"
-        self.repo.mkdir()
+        (self.repo / ".git").mkdir(parents=True)
         self.target = make_main_target(self.repo)
         self.worktrees = self.root / worktree_new.WORKTREES_DIR_NAME
         self.executor = FakeExecutor(self.repo)
@@ -409,6 +439,50 @@ class FailClosedTests(HarnessCase):
         self.assertIn("a Cargo process holds", err)
         self.assert_no_worktree_created()
 
+    def test_lock_file_absent_at_start_is_created_and_held_during_seed(self):
+        debug = self.h.target / "debug"
+        for lock in worktree_new.CARGO_LOCK_FILES:
+            (debug / lock).unlink()
+        observed = {}
+
+        def probe_locks(source, dest):
+            for lock in worktree_new.CARGO_LOCK_FILES:
+                observed.setdefault(lock, []).append(
+                    flock_is_blocked(debug / lock))
+
+        self.h.executor.on_copy = probe_locks
+        code, _, err = self.h.run("issue-1")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(set(observed), set(worktree_new.CARGO_LOCK_FILES))
+        for lock, blocked in observed.items():
+            self.assertTrue(all(blocked), f"{lock} was not held: {blocked}")
+        for lock in worktree_new.CARGO_LOCK_FILES:
+            self.assertFalse(flock_is_blocked(debug / lock), lock)
+
+    def test_symlinked_cargo_lock_file_is_refused(self):
+        outside = self.h.root / "outside"
+        lock = self.h.target / "debug" / ".cargo-lock"
+        lock.unlink()
+        lock.symlink_to(outside)
+        code, _, err = self.h.run("issue-1")
+        self.assertEqual(code, 1)
+        self.assertIn(".cargo-lock", err)
+        self.assertFalse(outside.exists())
+        self.assert_no_worktree_created()
+
+    def test_held_repository_lock_fails_before_any_check(self):
+        lock = self.h.repo / ".git" / worktree_new.REPO_LOCK_NAME
+        with open(lock, "wb") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            code, _, err = self.h.run("issue-1")
+        self.assertEqual(code, 1)
+        self.assertIn(f"another worktree-new run holds {lock}", err)
+        self.assertEqual(
+            self.h.executor.commands,
+            [["git", "rev-parse", "--path-format=absolute",
+              "--git-common-dir"]],
+        )
+
     def test_bare_common_dir_is_rejected(self):
         self.h.executor.common_dir = self.h.root / "bare.git"
         code, _, err = self.h.run("issue-1")
@@ -508,11 +582,86 @@ class NoSeedTests(HarnessCase):
         self.assertEqual(code, 0, err)
 
 
+class ConcurrencyTests(HarnessCase):
+    def test_concurrent_run_for_the_same_slug_never_touches_the_winner(self):
+        # Run A stops inside `git fetch`, after its existence checks and
+        # before its `git worktree add`; run B starts in that window.
+        a_in_fetch, release_a = threading.Event(), threading.Event()
+        shared = self.h.executor
+
+        def gated(command, cwd, check=True):
+            if [str(part) for part in command[:2]] == ["git", "fetch"]:
+                a_in_fetch.set()
+                release_a.wait(HANDSHAKE_TIMEOUT_SECONDS)
+            return shared(command, cwd, check)
+
+        outcome = {}
+
+        def run_a():
+            try:
+                outcome["a"] = worktree_new.main(
+                    ["issue-1"], cwd=self.h.repo, executor=gated)
+            finally:
+                a_in_fetch.set()
+
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            thread_a = threading.Thread(target=run_a)
+            thread_a.start()
+            self.assertTrue(a_in_fetch.wait(HANDSHAKE_TIMEOUT_SECONDS))
+            args = worktree_new.build_parser().parse_args(["issue-1"])
+            try:
+                worktree_new.create(args, self.h.repo, shared, io.StringIO())
+            except worktree_new.WorktreeError as error:
+                outcome["b"] = str(error)
+            else:
+                outcome["b"] = "succeeded"
+            release_a.set()
+            thread_a.join(HANDSHAKE_TIMEOUT_SECONDS)
+        self.assertFalse(thread_a.is_alive())
+
+        lock = self.h.repo / ".git" / worktree_new.REPO_LOCK_NAME
+        self.assertIn(f"another worktree-new run holds {lock}", outcome["b"])
+        self.assertEqual(outcome["a"], 0)
+        self.assertFalse(shared.ran("git", "worktree", "remove"))
+        self.assertFalse(shared.ran("git", "branch", "-D"))
+        adds = [c for c in shared.commands if c[1:3] == ["worktree", "add"]]
+        self.assertEqual(len(adds), 1)
+        worktree = self.h.worktrees / "issue-1"
+        self.assertIn(worktree, shared.registered)
+        self.assertIn("zajca/issue-1", shared.branches)
+        self.assertTrue((worktree / "target" / "debug" / "deps").is_dir())
+
+
 class LockTests(unittest.TestCase):
-    def test_missing_lock_files_are_skipped(self):
+    def test_missing_lock_files_are_created_and_held(self):
         with tempfile.TemporaryDirectory() as tmp:
             with worktree_new.hold_cargo_locks(Path(tmp)):
-                pass
+                for lock in worktree_new.CARGO_LOCK_FILES:
+                    self.assertTrue(flock_is_blocked(Path(tmp) / lock), lock)
+            for lock in worktree_new.CARGO_LOCK_FILES:
+                self.assertFalse(flock_is_blocked(Path(tmp) / lock), lock)
+
+    def test_missing_profile_dir_is_a_seed_source_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(worktree_new.WorktreeError) as caught:
+                with worktree_new.hold_cargo_locks(Path(tmp) / "debug"):
+                    pass
+            self.assertIn("no seed source", str(caught.exception))
+            self.assertFalse((Path(tmp) / "debug").exists())
+
+    def test_repository_lock_is_exclusive_and_released(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = Path(tmp) / worktree_new.REPO_LOCK_NAME
+            with worktree_new.hold_repo_lock(Path(tmp)) as held:
+                self.assertEqual(held, lock)
+                self.assertTrue(flock_is_blocked(lock))
+                with self.assertRaises(worktree_new.WorktreeError) as caught:
+                    with worktree_new.hold_repo_lock(Path(tmp)):
+                        pass
+                self.assertIn("another worktree-new run holds",
+                              str(caught.exception))
+            self.assertFalse(flock_is_blocked(lock))
 
     def test_locks_are_held_exclusively_and_released(self):
         with tempfile.TemporaryDirectory() as tmp:

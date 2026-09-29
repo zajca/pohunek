@@ -234,9 +234,9 @@ fetch) and seeds its own `target/debug` caches from the main checkout with
 `cp --reflink=always`, so the first build recompiles only the workspace
 crates that differ, not every registry dependency. It needs the main
 checkout's `target/` and the worktree on one reflink-capable filesystem
-(btrfs/XFS; never `/tmp`), fails closed otherwise or while a Cargo build holds
-the main checkout's lock, and never falls back to a full copy; `--no-seed`
-accepts a cold build. The seed helps in proportion to how recently the main
+(btrfs/XFS; never `/tmp`), fails closed otherwise, while a Cargo build holds
+the main checkout's lock, or while another `worktree-new` run is in progress,
+and never falls back to a full copy; `--no-seed` accepts a cold build. The seed helps in proportion to how recently the main
 checkout was built at a similar `Cargo.lock`.
 
 Web (run inside `web/`):

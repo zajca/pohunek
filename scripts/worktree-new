@@ -24,12 +24,23 @@ those units in the worktree.
 
 Fail-closed rules:
 
+* one run at a time per repository: every step from the existence checks
+  of the destination and branch through `git worktree add`, the seed, and
+  any rollback runs under an exclusive, non-blocking `flock` on
+  `<git-common-dir>/worktree-new.lock`; a second run fails at once instead
+  of racing the first for the same slug. Under that lock a worktree or
+  branch that was absent at the check was created by this run, which is
+  what makes the rollback safe. Plain `git` commands run by hand outside
+  this script are not serialized by it;
 * the seed is a real reflink or nothing: a probe clone of the source's
   `CACHEDIR.TAG` into the worktree parent must succeed first, and there is
   no fallback to a full copy; `--no-seed` accepts a cold build instead;
-* the main checkout's profile dir is copied only while this script holds
-  every Cargo lock file there exclusively, so a running build (or
-  `cargo check` from an editor) is never snapshotted half-written;
+* the main checkout's profile dir is validated and copied only while this
+  script holds every Cargo lock file there exclusively, so a running build
+  (or `cargo check` from an editor) is never snapshotted half-written. A
+  lock file that does not exist yet is created and locked, so a Cargo
+  process that starts during the copy waits for it instead of creating an
+  unlocked lock file of its own;
 * both checkouts must use Cargo's default layout (`target_directory` and
   `build_directory` equal to `<root>/target` per `cargo metadata`); a
   `CARGO_TARGET_DIR`, `build.target-dir`, or `build.build-dir` override
@@ -82,11 +93,21 @@ REQUIRED_SEED_SUBDIRS = (".fingerprint", "deps")
 # seed must carry it; `.rustc_info.json` only caches `rustc -vV` probes.
 CACHEDIR_TAG = "CACHEDIR.TAG"
 TARGET_ROOT_FILES = (CACHEDIR_TAG, ".rustc_info.json")
-# Lock files Cargo (1.98) holds while it builds in a profile dir: the build
-# and artifact locks exclusively, `.cargo-lock` shared. Lock state lives in
-# the open file description, never in the (empty) file, so cloning the
-# files copies no lock.
+# Lock files Cargo holds while it builds in a profile dir. Verified against
+# Cargo 1.98.1 with lock files this script created itself: an exclusive
+# `flock` on any one of them makes `cargo build` block ("Blocking waiting
+# for file lock on artifact directory" for `.cargo-lock` and
+# `.cargo-artifact-lock`, "... on build directory" for `.cargo-build-lock`),
+# so all three are held. Lock state lives in the open file description,
+# never in the (empty) file, so cloning the files copies no lock.
 CARGO_LOCK_FILES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
+# Permission bits of a lock file this script creates; Cargo creates its own
+# lock files as 0644 (before the umask).
+LOCK_FILE_MODE = 0o644
+# Per-repository lock serializing worktree-new runs. It lives in the git
+# common dir, which every worktree of the repository shares and git never
+# commits; the name matches no file git itself uses there.
+REPO_LOCK_NAME = "worktree-new.lock"
 # Name the profile dir is cloned under before it is renamed into place, so
 # an interrupted copy never leaves a half-populated `target/debug` whose
 # fingerprints Cargo would trust.
@@ -234,15 +255,20 @@ def default_target_dir(root, executor):
     return expected
 
 
+def missing_profile_error(profile):
+    """The error for a main checkout that has no profile dir to seed from."""
+    return WorktreeError(
+        f"no seed source: {profile} does not exist. Build the main "
+        "checkout once (`cargo build --workspace --all-targets "
+        "--all-features`), or pass --no-seed for a cold build."
+    )
+
+
 def check_seed_source(target):
     """The main target dir must hold a usable profile cache to clone."""
     profile = target / PROFILE
     if not profile.is_dir():
-        raise WorktreeError(
-            f"no seed source: {profile} does not exist. Build the main "
-            "checkout once (`cargo build --workspace --all-targets "
-            "--all-features`), or pass --no-seed for a cold build."
-        )
+        raise missing_profile_error(profile)
     for name in REQUIRED_SEED_SUBDIRS:
         if not (profile / name).is_dir():
             raise WorktreeError(
@@ -268,8 +294,8 @@ def probe_reflink(source_file, dest_dir, executor):
     probe = dest_dir / PROBE_NAME
     if probe.exists() or probe.is_symlink():
         raise WorktreeError(
-            f"{probe} already exists (another worktree-new run, or a "
-            "leftover): remove it and retry"
+            f"{probe} already exists (left by an interrupted worktree-new "
+            "run): remove it and retry"
         )
     try:
         reflink(source_file, probe, dest_dir, executor)
@@ -285,23 +311,55 @@ def probe_reflink(source_file, dest_dir, executor):
             probe.unlink()
 
 
+def open_lock_file(path):
+    """Open (creating if absent) a lock file and return its descriptor.
+
+    `O_NOFOLLOW` refuses a symlink planted in place of the lock file, so the
+    create can never land outside the intended directory.
+    """
+    return os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+        LOCK_FILE_MODE,
+    )
+
+
+@contextlib.contextmanager
+def hold_repo_lock(common_dir):
+    """Hold the per-repository worktree-new lock, failing if it is taken."""
+    path = common_dir / REPO_LOCK_NAME
+    descriptor = open_lock_file(path)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise WorktreeError(
+                f"another worktree-new run holds {path}: wait for it to "
+                "finish and retry"
+            )
+        yield path
+    finally:
+        os.close(descriptor)
+
+
 @contextlib.contextmanager
 def hold_cargo_locks(profile_dir):
     """Hold every Cargo lock in `profile_dir` exclusively, without waiting.
 
-    Missing lock files are skipped: Cargo creates them on first use, and a
-    profile dir without them has no build running in it.
+    A lock file that does not exist yet is created and locked: skipping it
+    would let a Cargo process that starts mid-copy create it, lock it, and
+    rewrite the profile dir while it is being cloned.
     """
-    handles = []
+    descriptors = []
     try:
         for name in CARGO_LOCK_FILES:
             path = profile_dir / name
-            if not path.is_file():
-                continue
-            handle = open(path, "rb")
-            handles.append(handle)
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                descriptors.append(open_lock_file(path))
+            except FileNotFoundError:
+                raise missing_profile_error(profile_dir)
+            try:
+                fcntl.flock(descriptors[-1], fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise WorktreeError(
                     f"a Cargo process holds {path} (a build, test run, or "
@@ -310,8 +368,8 @@ def hold_cargo_locks(profile_dir):
                 )
         yield
     finally:
-        for handle in handles:
-            handle.close()
+        for descriptor in descriptors:
+            os.close(descriptor)
 
 
 def seed_target(source_target, dest_target, executor):
@@ -348,9 +406,10 @@ def worktree_registered(worktree, repo, executor):
 def rollback(repo, worktree, branch, executor):
     """Remove whatever part of the worktree and branch this run created.
 
-    `create` proves before `git worktree add` that neither existed, so any
-    that exists here is this run's artifact; one that was never created
-    (a failure before or during the add) is skipped, not reported. Returns
+    `create` proves before `git worktree add` that neither existed and holds
+    the repository lock from that check through this rollback, so any that
+    exists here is this run's artifact; one that was never created (a
+    failure before or during the add) is skipped, not reported. Returns
     (removed artifacts, problems needing manual cleanup).
     """
     removed, problems = [], []
@@ -383,6 +442,12 @@ def create(args, cwd, executor=execute, out=None):
     out = out or sys.stdout
     validate_slug(args.slug)
     repo = main_checkout(cwd, executor)
+    with hold_repo_lock(repo / ".git"):
+        return create_locked(args, repo, executor, out)
+
+
+def create_locked(args, repo, executor, out):
+    """The body of `create`, run while the repository lock is held."""
     branch = args.branch if args.branch is not None else BRANCH_PREFIX + args.slug
     validate_branch(branch, repo, executor)
     worktrees_root = repo.parent / WORKTREES_DIR_NAME
@@ -395,15 +460,18 @@ def create(args, cwd, executor=execute, out=None):
     source_target = None
     if args.seed:
         source_target = default_target_dir(repo, executor)
-        check_seed_source(source_target)
     base_ref = resolve_base(args.base_ref, repo, executor)
     worktrees_root.mkdir(parents=True, exist_ok=True)
-    if args.seed:
-        probe_reflink(source_target / CACHEDIR_TAG, worktrees_root, executor)
 
+    # The Cargo locks are taken before the source is validated, so the
+    # validated profile dir is the one that is copied.
     locks = (hold_cargo_locks(source_target / PROFILE) if args.seed
              else contextlib.nullcontext())
     with locks:
+        if args.seed:
+            check_seed_source(source_target)
+            probe_reflink(source_target / CACHEDIR_TAG, worktrees_root,
+                          executor)
         # Every step from here on creates state, so each failure rolls back
         # what exists: `git worktree add -b` can fail after creating the
         # branch, or after a full checkout when a post-checkout hook fails.
