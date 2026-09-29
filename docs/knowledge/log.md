@@ -9,8 +9,11 @@
   and `pohunek service check`, which runs the install or upgrade preflight,
   including the stale daemon-job check, without changing anything. Adopting
   commands hold `service-install.lock.adopted` shared, the holder waits for
-  them before it releases the lock, and signals sent to `service lock` reach
-  its command.
+  them before it releases the lock, adopted transactions are serialized by
+  `service-install.lock.inherited`, and the command runs in its own process
+  group (in the terminal's foreground when `service lock` owns it) so each
+  signal reaches it exactly once; `Ctrl-Z` stops and `fg` resumes the lock
+  and its command together, like a job.
 - Documented that `packaging/install-daemon.sh` runs its legacy retirement and
   final install or upgrade under that lock and runs `service check` before it
   touches the legacy install.

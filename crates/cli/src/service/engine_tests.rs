@@ -2471,7 +2471,9 @@ async fn a_record_left_by_a_crashed_holder_is_resumed_under_a_fresh_lock() {
 fn inherit(harness: &Harness, holder: &TransactionLock) -> (record::Handoff, TransactionLock) {
     let store = harness.engine().store;
     let handoff = store.hand_off(holder).expect("publish the holder record");
-    let adopted = store.adopt(handoff.token()).expect("adopt the held lock");
+    let adopted = store
+        .adopt(handoff.token(), record::Adoption::Relay)
+        .expect("adopt the held lock");
     (handoff, adopted)
 }
 
@@ -2484,7 +2486,7 @@ async fn transactions_run_under_an_inherited_lock_while_others_are_refused() {
         let lock = harness
             .engine()
             .store
-            .adopt(handoff.token())
+            .adopt(handoff.token(), record::Adoption::Transaction)
             .expect("adopt the held lock");
         harness.engine().with_inherited_lock(lock)
     };
@@ -2524,7 +2526,10 @@ async fn transactions_run_under_an_inherited_lock_while_others_are_refused() {
     handoff.release().expect("remove the holder record");
     drop(holder);
     assert_refused(
-        harness.engine().store.adopt(&token),
+        harness
+            .engine()
+            .store
+            .adopt(&token, record::Adoption::Transaction),
         "no process holds the transaction lock",
     );
     // An adopter that outlives its holder still keeps every other
@@ -2541,11 +2546,41 @@ async fn transactions_run_under_an_inherited_lock_while_others_are_refused() {
         .expect("install after the release");
 }
 
+#[tokio::test]
+async fn adopted_transactions_of_one_holder_run_one_at_a_time() {
+    let harness = Harness::new();
+    let holder = harness.engine().store.lock().await.expect("hold the lock");
+    let store = harness.engine().store;
+    let handoff = store.hand_off(&holder).expect("publish the holder record");
+    let first = store
+        .adopt(handoff.token(), record::Adoption::Transaction)
+        .expect("the first adopter");
+    let refused = store
+        .adopt(handoff.token(), record::Adoption::Transaction)
+        .expect_err("a second adopted transaction");
+    assert_eq!(refused.code(), "service_transaction_in_progress");
+
+    // A relay, such as a nested `service lock`, runs no transaction itself
+    // and adopts beside it.
+    drop(
+        store
+            .adopt(handoff.token(), record::Adoption::Relay)
+            .expect("a relay"),
+    );
+
+    drop(first);
+    store
+        .adopt(handoff.token(), record::Adoption::Transaction)
+        .expect("the next adopter once the first ended");
+    drop(handoff);
+    drop(holder);
+}
+
 fn inherited_lock(harness: &Harness, handoff: &record::Handoff) -> TransactionLock {
     harness
         .engine()
         .store
-        .adopt(handoff.token())
+        .adopt(handoff.token(), record::Adoption::Relay)
         .expect("adopt the held lock")
 }
 
@@ -2583,20 +2618,29 @@ async fn a_token_that_proves_no_live_holder_is_refused() {
     let token = Token::generate().expect("token");
 
     // No state directory, then no lock held.
-    assert_refused(store.adopt(&token), "the state directory does not exist");
+    assert_refused(
+        store.adopt(&token, record::Adoption::Transaction),
+        "the state directory does not exist",
+    );
     drop(store.lock().await.expect("create the state directory"));
-    assert_refused(store.adopt(&token), "no process holds the transaction lock");
+    assert_refused(
+        store.adopt(&token, record::Adoption::Transaction),
+        "no process holds the transaction lock",
+    );
 
     // The lock is held, but by a transaction that published no record.
     let holder = store.lock().await.expect("hold the lock");
     assert_refused(
-        store.adopt(&token),
+        store.adopt(&token, record::Adoption::Transaction),
         "no `pohunek service lock` holds the lock",
     );
 
     // A record of this holder with another token.
     let handoff = store.hand_off(&holder).expect("publish");
-    assert_refused(store.adopt(&token), "the token is not the lock holder's");
+    assert_refused(
+        store.adopt(&token, record::Adoption::Transaction),
+        "the token is not the lock holder's",
+    );
     handoff.release().expect("remove the record");
 
     // The recorded holder no longer runs: an exited process, and this
@@ -2616,19 +2660,24 @@ async fn a_token_that_proves_no_live_holder_is_refused() {
     ] {
         write_holder(&harness, pid, start, &token);
         assert_refused(
-            store.adopt(&token),
+            store.adopt(&token, record::Adoption::Transaction),
             "the recorded lock holder no longer runs",
         );
     }
 
     // The live holder with the right token adopts.
     write_holder(&harness, own.pid, own.start_identity.get(), &token);
-    store.adopt(&token).expect("the live holder's token adopts");
+    store
+        .adopt(&token, record::Adoption::Transaction)
+        .expect("the live holder's token adopts");
 
     // A record that is not one.
     let path = harness.context.paths().state_dir.join(record::HOLDER_NAME);
     std::fs::write(&path, "{}").expect("overwrite");
-    assert_refused(store.adopt(&token), "the lock holder record is malformed");
+    assert_refused(
+        store.adopt(&token, record::Adoption::Transaction),
+        "the lock holder record is malformed",
+    );
     drop(holder);
 }
 

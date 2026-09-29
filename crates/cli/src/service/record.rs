@@ -51,6 +51,13 @@ pub const HOLDER_NAME: &str = "service-install.lock.holder";
 /// requires it free (see [`Store::adopt`]).
 pub const ADOPTED_NAME: &str = "service-install.lock.adopted";
 
+/// File name of the lock that serializes adopted transactions.
+///
+/// Adopters of one `pohunek service lock` holder share its transaction lock,
+/// so each one that runs a transaction also holds this file exclusively;
+/// two adopted transactions never run at once (see [`Store::adopt`]).
+pub const INHERITED_NAME: &str = "service-install.lock.inherited";
+
 /// Version of the holder record schema; any other version is refused.
 const HOLDER_SCHEMA_VERSION: u32 = 1;
 
@@ -194,7 +201,21 @@ enum Held {
         token: Token,
         /// Keeps the ancestor from releasing the lock until dropped.
         _shared: FileLock,
+        /// Serializes this transaction against the ancestor's other
+        /// adopters; `None` for [`Adoption::Relay`].
+        _serial: Option<FileLock>,
     },
+}
+
+/// What an adopter does under the adopted lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Adoption {
+    /// Runs a transaction (or reads its state, like `service check`), which
+    /// excludes every other adopted transaction.
+    Transaction,
+    /// Only passes the lock on to a command, like a nested `service lock`;
+    /// the transactions that command runs serialize themselves.
+    Relay,
 }
 
 /// The holder record a `pohunek service lock` process publishes.
@@ -438,12 +459,18 @@ impl Store {
     /// the lock, and a crashed holder's record names a process that no longer
     /// runs.
     ///
+    /// Adopters share the transaction lock, so an [`Adoption::Transaction`]
+    /// also holds [`INHERITED_NAME`] exclusively while it lives: a second
+    /// adopted transaction, such as another backgrounded `service install`
+    /// under the same holder, is refused instead of running beside it.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::InheritedLock`] when any of those conditions fails,
-    /// and a filesystem error when the state directory or the record is
-    /// unsafe.
-    pub fn adopt(&self, token: &Token) -> Result<TransactionLock, Error> {
+    /// [`Error::TransactionInProgress`] while another adopted transaction
+    /// runs, and a filesystem error when the state directory, the record, or
+    /// a lock file is unsafe.
+    pub fn adopt(&self, token: &Token, adoption: Adoption) -> Result<TransactionLock, Error> {
         let directory = self
             .open(false)?
             .ok_or_else(|| refuse("the state directory does not exist"))?;
@@ -458,10 +485,27 @@ impl Store {
         // The holder may have finished between the first validation and the
         // shared lock; once the shared lock is held it cannot finish anymore.
         validate_holder(&directory, token)?;
+        let serial = match adoption {
+            Adoption::Relay => None,
+            Adoption::Transaction => {
+                match directory.lock_file(INHERITED_NAME, FILE_MODE, LockKind::Exclusive) {
+                    Ok(serial) => Some(serial),
+                    Err(FsError::LockContended { .. }) => {
+                        return Err(Error::TransactionInProgress {
+                            path: self.state_dir.join(INHERITED_NAME),
+                        });
+                    }
+                    Err(source) => {
+                        return Err(fs_error("serialize the adopted transaction", source));
+                    }
+                }
+            }
+        };
         Ok(TransactionLock {
             held: Held::Adopted {
                 token: token.clone(),
                 _shared: shared,
+                _serial: serial,
             },
         })
     }

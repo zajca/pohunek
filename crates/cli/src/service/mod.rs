@@ -169,22 +169,28 @@ pub async fn lock(program: &OsStr, arguments: &[OsString]) -> Result<ExitStatus,
     let store = record::Store::new(context.paths().state_dir.clone());
     let mut signals = Signals::new(program)?;
     let lock = match inherited::take()? {
-        Some(token) => store.adopt(&token)?,
+        Some(token) => store.adopt(&token, record::Adoption::Relay)?,
         None => store.lock().await?,
     };
     let handoff = store.hand_off(&lock)?;
     let status = run_locked(handoff.token(), program, arguments, &mut signals).await;
-    let excluded = if lock.is_adopted() {
-        Ok(None)
+    let (excluded, waited) = if lock.is_adopted() {
+        (None, Ok(()))
     } else {
-        wait_for_adopters(&store, &mut signals).await
+        match wait_for_adopters(&store, &mut signals).await {
+            Ok(excluded) => (excluded, Ok(())),
+            // Whether an adopter still runs is unknown; any that does keeps
+            // its shared lock, which refuses every other transaction.
+            Err(error) => (None, Err(error)),
+        }
     };
-    // The record goes before the lock, so no command can adopt the lock
-    // with this token once it is free.
+    // The record goes while adopters are still excluded and before the lock,
+    // so no command can adopt the lock with this token once it is free.
     let released = handoff.release();
     drop(excluded);
     drop(lock);
     let status = status?;
+    waited?;
     released?;
     Ok(status)
 }
@@ -221,22 +227,202 @@ impl Signals {
 }
 
 /// Runs the child of [`lock`] with the holder `token`, forwarding `signals`.
+///
+/// The child runs in a process group of its own, so a signal meant for the
+/// command reaches it exactly once: a signal sent to this process (alone or
+/// to its group) is forwarded to the child's group, and when this process
+/// runs in the foreground of the terminal on stdin, the terminal's
+/// foreground passes to the child's group for the child's lifetime, as a
+/// shell hands it to a job. Terminal signals such as `Ctrl-C` then reach the
+/// child's group directly and not this process, and the child can still read
+/// from the terminal.
+///
+/// With the terminal handed over, a stopped child (`Ctrl-Z`, or a read
+/// from the terminal in the background) stops this process too, the way a
+/// job stops: the foreground returns to this process's group, which then
+/// stops itself so the shell that runs it sees the job stopped. When the
+/// shell continues it, the foreground goes back to the child's group if
+/// this process got it back (`fg`), and the child's group is continued.
 async fn run_locked(
     token: &inherited::Token,
     program: &OsStr,
     arguments: &[OsString],
     signals: &mut Signals,
 ) -> Result<ExitStatus, Error> {
-    let mut child = tokio::process::Command::new(program)
+    use std::os::unix::process::CommandExt as _;
+
+    let child = std::process::Command::new(program)
         .args(arguments)
         .env(inherited::LOCK_TOKEN_ENV, token.as_str())
+        .process_group(0)
         .spawn()
         .map_err(error::io_error("run", program))?;
-    loop {
+    let pid = i32::try_from(child.id())
+        .map(nix::unistd::Pid::from_raw)
+        .map_err(|_overflow| {
+            error::io_error("wait for", program)(std::io::ErrorKind::InvalidData.into())
+        })?;
+    // The child's PID is its group ID, and stays valid until the waiter
+    // below reaps it.
+    let group = pid;
+    let (events, mut changes) = tokio::sync::mpsc::unbounded_channel();
+    let waiter = std::thread::spawn(move || watch(pid, &events));
+    let terminal = Foreground::hand_to(group);
+    let status = loop {
         tokio::select! {
-            status = child.wait() => return status.map_err(error::io_error("wait for", program)),
-            signal = signals.recv() => forward(child.id(), signal),
+            change = changes.recv() => match change {
+                Some(Change::Stopped) => {
+                    if let Some(terminal) = &terminal {
+                        terminal.suspend();
+                    }
+                }
+                Some(Change::Exited(status)) => break status,
+                None => break Err(std::io::Error::other("the child waiter ended early")),
+            },
+            signal = signals.recv() => forward(Some(group), signal),
         }
+    };
+    drop(terminal);
+    let _ = waiter.join();
+    // `child` is reaped already; dropping it neither waits nor kills.
+    drop(child);
+    status.map_err(error::io_error("wait for", program))
+}
+
+/// A state change of the child `watch` reports.
+#[derive(Debug)]
+enum Change {
+    /// The child was stopped by a signal.
+    Stopped,
+    /// The child ended with this status, or waiting for it failed.
+    Exited(std::io::Result<ExitStatus>),
+}
+
+/// Reports `pid`'s stops and its end to `events`, reaping it.
+///
+/// Runs on a thread of its own: `waitpid` with `WUNTRACED` is the portable
+/// way to learn that a child stopped, which the async runtime's wait does not
+/// report.
+fn watch(pid: nix::unistd::Pid, events: &tokio::sync::mpsc::UnboundedSender<Change>) {
+    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+    use std::os::unix::process::ExitStatusExt as _;
+
+    /// Wait-status encoding shared by Linux and macOS: the exit code in the
+    /// second byte, a terminating signal in the low seven bits.
+    const EXIT_CODE_SHIFT: u32 = 8;
+    /// Wait-status flag of a core dump.
+    const CORE_DUMPED: i32 = 0x80;
+
+    loop {
+        let change = match waitpid(pid, Some(WaitPidFlag::WUNTRACED)) {
+            Ok(WaitStatus::Stopped(..)) => Change::Stopped,
+            Ok(WaitStatus::Exited(_, code)) => {
+                Change::Exited(Ok(ExitStatus::from_raw(code << EXIT_CODE_SHIFT)))
+            }
+            Ok(WaitStatus::Signaled(_, signal, core)) => Change::Exited(Ok(ExitStatus::from_raw(
+                signal as i32 | if core { CORE_DUMPED } else { 0 },
+            ))),
+            Ok(_) | Err(nix::errno::Errno::EINTR) => continue,
+            Err(errno) => Change::Exited(Err(errno.into())),
+        };
+        let exited = matches!(change, Change::Exited(_));
+        if events.send(change).is_err() || exited {
+            return;
+        }
+    }
+}
+
+/// The terminal's foreground, handed to the child's process group.
+///
+/// Dropping it hands the foreground back to this process's group, when the
+/// child's group still has it.
+#[derive(Debug)]
+struct Foreground {
+    /// This process's group, which had the foreground.
+    own: nix::unistd::Pid,
+    /// The child's group.
+    child: nix::unistd::Pid,
+}
+
+impl Foreground {
+    /// Hands the terminal on stdin to `child` when this process owns it.
+    ///
+    /// Returns `None`, changing nothing, when stdin is no terminal or this
+    /// process runs in its background.
+    fn hand_to(child: nix::unistd::Pid) -> Option<Self> {
+        use std::os::fd::AsRawFd as _;
+
+        let stdin = std::io::stdin();
+        if !nix::unistd::isatty(stdin.as_raw_fd()).unwrap_or(false) {
+            return None;
+        }
+        let own = nix::unistd::getpgrp();
+        if nix::unistd::tcgetpgrp(&stdin).ok()? != own {
+            return None;
+        }
+        let terminal = Self { own, child };
+        terminal.give().then_some(terminal)
+    }
+
+    /// Gives the foreground to the child's group, which then continues.
+    ///
+    /// Only this process's group may give it away; returns whether it did.
+    fn give(&self) -> bool {
+        let stdin = std::io::stdin();
+        if nix::unistd::tcgetpgrp(&stdin).ok() != Some(self.own)
+            || nix::unistd::tcsetpgrp(&stdin, self.child).is_err()
+        {
+            return false;
+        }
+        // A child that read the terminal before it owned it was stopped by
+        // `SIGTTIN`; it continues now that it may read.
+        let _ = nix::sys::signal::killpg(self.child, nix::sys::signal::Signal::SIGCONT);
+        true
+    }
+
+    /// Takes the foreground back from the child's group, if it has it.
+    ///
+    /// This process is in the terminal's background then, and changing the
+    /// foreground from there raises `SIGTTOU`, which would stop it; the
+    /// signal is blocked on this thread for the call, which both Linux and
+    /// macOS honor for `tcsetpgrp`. The foreground is only taken while the
+    /// child's group holds it, never from a shell that took it meanwhile.
+    fn take_back(&self) {
+        use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow, Signal};
+
+        let stdin = std::io::stdin();
+        if nix::unistd::tcgetpgrp(&stdin).ok() != Some(self.child) {
+            return;
+        }
+        let mut ttou = SigSet::empty();
+        ttou.add(Signal::SIGTTOU);
+        let mut previous = SigSet::empty();
+        if pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&ttou), Some(&mut previous)).is_ok() {
+            let _ = nix::unistd::tcsetpgrp(&stdin, self.own);
+            let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&previous), None);
+        }
+    }
+
+    /// Stops this process with its stopped child, and resumes the child with it.
+    ///
+    /// `SIGSTOP` cannot be caught or ignored, so this process stops even in
+    /// an orphaned process group; `kill` returns once it was continued.
+    fn suspend(&self) {
+        use nix::sys::signal::{kill, killpg, Signal};
+
+        self.take_back();
+        let _ = kill(nix::unistd::getpid(), Signal::SIGSTOP);
+        // Continued in the foreground (`fg`): the child's group gets the
+        // terminal again. In the background (`bg`) it only continues.
+        if !self.give() {
+            let _ = killpg(self.child, Signal::SIGCONT);
+        }
+    }
+}
+
+impl Drop for Foreground {
+    fn drop(&mut self) {
+        self.take_back();
     }
 }
 
@@ -258,14 +444,11 @@ async fn wait_for_adopters(
     }
 }
 
-/// Sends `signal` to the child `pid`, which is not reaped yet.
-fn forward(pid: Option<u32>, signal: nix::sys::signal::Signal) {
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
-
-    if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
-        // A child that exits meanwhile is reported by `wait` next.
-        let _ = kill(Pid::from_raw(pid), signal);
+/// Sends `signal` to the child's process `group`, whose leader is not reaped yet.
+fn forward(group: Option<nix::unistd::Pid>, signal: nix::sys::signal::Signal) {
+    if let Some(group) = group {
+        // A child that exits meanwhile is reported by the waiter next.
+        let _ = nix::sys::signal::killpg(group, signal);
     }
 }
 
@@ -298,7 +481,10 @@ pub fn exit_code(status: ExitStatus) -> u8 {
 /// but proves no live holder of `context`'s transaction lock.
 fn inherited_lock(context: &Context) -> Result<Option<record::TransactionLock>, Error> {
     inherited::take()?
-        .map(|token| record::Store::new(context.paths().state_dir.clone()).adopt(&token))
+        .map(|token| {
+            record::Store::new(context.paths().state_dir.clone())
+                .adopt(&token, record::Adoption::Transaction)
+        })
         .transpose()
 }
 
@@ -793,7 +979,7 @@ mod tests {
             .and_then(|token| inherited::Token::parse(&token).ok())
             .is_some_and(|token| {
                 record::Store::new(PathBuf::from(state_dir))
-                    .adopt(&token)
+                    .adopt(&token, record::Adoption::Transaction)
                     .is_ok()
             });
         std::process::exit(if adopted {
