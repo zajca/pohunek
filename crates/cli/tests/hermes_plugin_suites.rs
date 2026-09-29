@@ -1,18 +1,16 @@
 //! Exercises the embedded Hermes plugin suites through their native runtimes.
 //!
-//! Linux only: both suites run the system `/usr/bin/python3` or `/usr/bin/bash`.
-//! On macOS the system Python is 3.9 while the embedded plugin requires Python
-//! 3.10 or newer, and `/usr/bin/bash` does not exist. The Hermes integration
-//! lifecycle on macOS is owned by issue #101.
-#![cfg(target_os = "linux")]
+//! The interpreter and Bash come from `support/interpreter.rs`, which accepts
+//! any Python 3.10+ with `PyYAML` on `PATH` (or `POHUNEK_PYTHON_BIN`).
 
 // Rust guideline compliant 2026-08-07
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const BASH: &str = "/usr/bin/bash";
-const PYTHON: &str = "/usr/bin/python3";
+#[path = "support/interpreter.rs"]
+mod interpreter;
+
 const LOCALE: &str = "C";
 const SYSTEM_PATH: &str = "/usr/bin:/bin";
 const SMOKE_SUCCESS: &str = "controlled Hermes release-plugin smoke passed";
@@ -32,7 +30,7 @@ fn repository_root() -> PathBuf {
 #[test]
 fn embedded_plugin_runtime_suite_passes() {
     let suite = manifest_dir().join("src/hermes_integration/assets/tests/test_plugin_runtime.py");
-    let output = Command::new(PYTHON)
+    let output = Command::new(interpreter::python())
         .args(["-I", "-B"])
         .arg(&suite)
         .current_dir("/")
@@ -53,7 +51,7 @@ fn embedded_plugin_runtime_suite_passes() {
 #[test]
 fn release_plugin_smoke_self_test_passes() {
     let suite = repository_root().join("scripts/tests/smoke-hermes-plugin-release.sh");
-    let output = Command::new(BASH)
+    let output = Command::new(interpreter::bash())
         .arg(&suite)
         .current_dir("/")
         .env_clear()

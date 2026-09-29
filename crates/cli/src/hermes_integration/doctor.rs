@@ -4,7 +4,7 @@
 //! fixed local runner. It neither reads Hermes state databases nor contacts an
 //! allowed remote host.
 
-// Rust guideline compliant 2026-08-28
+// Rust guideline compliant 2026-09-29
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Read as _;
@@ -374,6 +374,7 @@ mod tests {
     use super::*;
     use crate::hermes_integration::assets;
     use crate::hermes_integration::target::{ProfileName, TargetContext, TargetSelection};
+    use crate::hermes_integration::test_python;
 
     const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
     const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -418,7 +419,10 @@ mod tests {
         let runtime = installation.join("python/bin/python3");
         create_private_directory_tree(&root, &venv_bin);
         create_private_directory_tree(&root, runtime.parent().expect("runtime parent"));
-        write_executable(&runtime, "exec /usr/bin/python3 \"$@\"");
+        write_executable(
+            &runtime,
+            &format!("exec '{}' \"$@\"", test_python::interpreter().display()),
+        );
         symlink("../../python/bin/python3", venv_bin.join("python3"))
             .expect("private internal runtime link");
         let hermes_body = format!(

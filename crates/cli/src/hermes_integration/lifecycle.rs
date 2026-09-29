@@ -4,7 +4,7 @@
 //! this module. This module never launches Hermes; `HermesControl` is the
 //! narrow boundary the fixed runner implements later.
 
-// Rust guideline compliant 2026-09-20
+// Rust guideline compliant 2026-09-29
 
 #![expect(
     clippy::map_err_ignore,
@@ -1145,9 +1145,7 @@ fn restore_moves(
     let mut durability_uncertain = false;
     for move_record in moves.iter().rev() {
         let parent = move_record.source.parent().ok_or(Error::RecoveryRequired)?;
-        if !parent.exists() {
-            ensure_private_parent(parent)?;
-        }
+        ensure_restore_parent(parent)?;
         if !path_exists(&move_record.destination)? {
             return Err(Error::RecoveryRequired);
         }
@@ -1268,6 +1266,17 @@ fn ensure_private_parent(path: &Path) -> Result<(), Error> {
     TrustedDir::open_or_create_absolute(path, PRIVATE_DIRECTORY_MODE)
         .map(|_| ())
         .map_err(|_| Error::UnsafePolicyPath)
+}
+
+/// Opens the restore destination's parent without following symlinks and
+/// creates it privately when missing, in one descriptor-relative walk.
+fn ensure_restore_parent(path: &Path) -> Result<(), Error> {
+    if !path.is_absolute() {
+        return Err(Error::UnsafeTarget);
+    }
+    TrustedDir::open_or_create_absolute(path, PRIVATE_DIRECTORY_MODE)
+        .map(|_| ())
+        .map_err(|_| Error::UnsafeTarget)
 }
 
 fn ensure_private_tree(base: &Path, leaf: &Path) -> Result<(), Error> {
@@ -1397,6 +1406,7 @@ fn remove_owned_file(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2567,6 +2577,123 @@ esac"#,
             b"transaction copy"
         );
         assert!(trash.exists());
+    }
+
+    fn restore_fixture(tag: &str) -> (Fixture, PathBuf, PathBuf, PathBuf) {
+        let root = fixture(tag);
+        let trash = root.0.join("trash");
+        fs::create_dir(&trash).expect("trash");
+        fs::set_permissions(&trash, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+            .expect("private trash");
+        let destination = trash.join("asset");
+        fs::write(&destination, b"transaction copy").expect("transaction copy");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+            .expect("private file");
+        let source_parent = root.0.join("source");
+        (root, trash, destination, source_parent)
+    }
+
+    #[test]
+    fn restore_recreates_a_missing_parent_privately_before_the_no_replace_move() {
+        let (_root, trash, destination, source_parent) = restore_fixture("restore-missing-parent");
+        let source = source_parent.join("asset");
+        restore_moves(
+            &mut NativeFileOps,
+            &[MoveRecord {
+                source: source.clone(),
+                destination,
+            }],
+            &trash,
+        )
+        .expect("restore into recreated parent");
+        assert_eq!(fs::read(&source).expect("restored"), b"transaction copy");
+        assert_eq!(
+            fs::metadata(&source_parent)
+                .expect("recreated parent")
+                .permissions()
+                .mode()
+                & 0o777,
+            PRIVATE_DIRECTORY_MODE
+        );
+        assert!(!trash.exists());
+    }
+
+    #[test]
+    fn restore_rejects_symlinked_and_dangling_parents_and_preserves_the_transaction_copy() {
+        let (root, trash, destination, source_parent) = restore_fixture("restore-link-parent");
+        let elsewhere = root.0.join("elsewhere");
+        fs::create_dir(&elsewhere).expect("elsewhere");
+        fs::set_permissions(
+            &elsewhere,
+            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+        )
+        .expect("private elsewhere");
+        for link_target in [elsewhere.clone(), root.0.join("does-not-exist")] {
+            symlink(&link_target, &source_parent).expect("parent link");
+            assert_eq!(
+                restore_moves(
+                    &mut NativeFileOps,
+                    &[MoveRecord {
+                        source: source_parent.join("asset"),
+                        destination: destination.clone(),
+                    }],
+                    &trash,
+                ),
+                Err(Error::UnsafeTarget)
+            );
+            fs::remove_file(&source_parent).expect("remove parent link");
+            assert_eq!(
+                fs::read(&destination).expect("transaction copy survives"),
+                b"transaction copy"
+            );
+            assert!(fs::read_dir(&elsewhere)
+                .expect("elsewhere")
+                .next()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn install_writes_exactly_the_embedded_assets_below_the_isolated_target() {
+        let (root, target, policy_path, policy) = setup("embedded-install");
+        install(
+            &mut ControlledHermes::default(),
+            &InstallRequest::new(&target, &policy_path, &policy, false),
+        )
+        .expect("install from embedded assets");
+        let rendered = assets::render(&policy_path).expect("embedded assets");
+        let mut expected: BTreeMap<String, Vec<u8>> = rendered
+            .iter()
+            .map(|asset| (asset.path().to_owned(), asset.bytes().to_vec()))
+            .collect();
+        let ownership =
+            assets::ownership(target.hermes_home(), &policy_path, &rendered).expect("ownership");
+        expected.insert(
+            MARKER_NAME.to_owned(),
+            assets::marker_bytes(&ownership).expect("marker"),
+        );
+        let mut installed = BTreeMap::new();
+        collect_files(target.plugin_root(), target.plugin_root(), &mut installed);
+        assert_eq!(installed, expected);
+        assert!(target.plugin_root().starts_with(&root.0));
+        assert!(policy_path.starts_with(&root.0));
+    }
+
+    fn collect_files(base: &Path, current: &Path, output: &mut BTreeMap<String, Vec<u8>>) {
+        for entry in fs::read_dir(current).expect("read plugin directory") {
+            let path = entry.expect("plugin entry").path();
+            if fs::symlink_metadata(&path).expect("entry type").is_dir() {
+                collect_files(base, &path, output);
+            } else {
+                output.insert(
+                    path.strip_prefix(base)
+                        .expect("relative path")
+                        .to_string_lossy()
+                        .into_owned(),
+                    fs::read(&path).expect("plugin file"),
+                );
+            }
+        }
     }
 
     #[test]
