@@ -105,7 +105,11 @@ supported operating mode or an accident.
     fields (section 10), which re-opens the snapshot budgets of relay RFC
     section 18.1 for re-measurement;
   - the data classification table (relay RFC section 17.2) gains the rows of
-    section 9.
+    section 9;
+  - the operation-ticket state machine (relay RFC section 12.5) gains a
+    one-shot `awaiting_resubmission` → `begun` transition for a
+    matching-fingerprint `begin` (task RFC section 8.8), with a ticket test
+    for it.
 - **The delegated task runs RFC is the task substrate.** All settlement,
   causality, result and attention semantics come from there; this RFC never
   redefines them. Section 16 of that RFC is the composition this factory
@@ -725,7 +729,8 @@ One round of the Manage-Execute-Audit loop, entirely through public interfaces:
 
 1. **Manage**: pick the next subtask from client-side task state; compose a
    bounded contract (prompt, `checks`, `mode`, deadline override).
-2. **Execute**: `task.start` (the first round creates the worktree; later
+2. **Execute**: `task.start` (the first round creates the worktree with
+   `retain_worktree: true`, so the tree outlives every task of the run; later
    rounds use `worktree_of`, task RFC sections 8.7 and 16.2) or
    `task.continue`; then `task.wait`. Every task of the run carries the run's
    `correlation_id`. Budget admission and ACLs are the relay's; settlement
@@ -750,8 +755,10 @@ One round of the Manage-Execute-Audit loop, entirely through public interfaces:
    the sessions it created (relay RFC section 14), and the manager holds
    none on the auditor's sessions (section 7.2). Stopping ends the tasks and
    releases their `max_active_tasks` slots through the admission records
-   (section 8.3); the shared worktree stays with the owner task, which is
-   stopped only when the run ends. Without this step a sequential run
+   (section 8.3). The owner task (the first executor) is stopped after its
+   round like any other; the shared worktree survives on its retain hold,
+   which the manager releases with `task.release_worktree` in the run's
+   terminal step. Without this step a sequential run
    accumulates live sessions and eventually exhausts `max_active_tasks`,
    which a new period does not reset.
 
@@ -827,9 +834,12 @@ meanings:
   silently omitted. This is the form multi-host runs use to find their
   tasks.
 - **Routed per-host query (`host` set).** Forwarded to one daemon and
-  answered from its task store, including task metadata the host retains
-  under `tasks.metadata_retention` after the catalog entry retired, subject
-  to the same ACL rules (section 7.1).
+  answered from its task store, subject to the same ACL rules (section 7.1):
+  it returns only tasks whose catalog entries are current or retained,
+  because the relay holds no authorization record for a retired entry. Task
+  metadata the host keeps beyond catalog retirement under
+  `tasks.metadata_retention` is reachable on the owner path only; the routed
+  form neither lists nor reveals it (identical filtering).
 
 ### 12.4 Stop conditions
 

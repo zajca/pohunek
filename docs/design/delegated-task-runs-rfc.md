@@ -334,9 +334,17 @@ settles with `completed` (section 12).
    task base. Pre-existing changes are reported, never attributed to the agent.
 6. Metrics are either complete for every provider message in the turn or
    `unknown`. Partial sums are never reported as totals.
-7. No secret enters task records, events or logs. Prompts are stored only as a
-   digest plus the owner-private scrollback that already exists; the final agent
-   message is stored owner-private under the same rule as scrollback.
+7. No secret enters daemon or worker logs, task events, notifications, relay
+   persistence or audit. Provider-reported text — the final message,
+   `commands`, attention text and choices, `claim_mismatches` paths — and
+   check logs are **owner-private session content** under the same rule, ACL
+   and retention as scrollback (section 14): they may contain whatever the
+   agent or a command printed, including credentials, so they live only in
+   owner-only files, are served only on paths that may serve scrollback
+   (`task.result`, `task.check_log`; owner clients and, on the relay path,
+   holders of `session.terminal.observe`), are never copied into events,
+   notifications, projections or audit, and retire with the session.
+   Prompts are stored only as a digest plus that same scrollback.
 8. The origin-session guard applies: an agent running inside session S cannot
    continue, answer, extend, stop or review a task whose session is S, and
    cannot start a task whose working directory is S's working directory
@@ -876,6 +884,19 @@ the worker for the delivery id's journal state and resolves:
 | `writing` (crash mid-write) | **Uncertain**: part of the prompt may have reached the agent. The turn settles `failed` with `reason: delivery_uncertain`; nothing is re-sent, and the orchestrator decides after inspecting the session. |
 | runtime generation changed | The previous PTY is gone. An unacknowledged delivery settles the turn `lost`; nothing is re-sent into the new generation. |
 
+**Addressed answers.** An OpenCode answer (section 8.5) is a provider API
+call rather than a PTY write, but it is the same kind of external side
+effect and follows the same protocol with the journal states `sending`
+(recorded before the request is issued, with the `attention_id` and the
+provider request or form id) and `sent` (recorded with the provider's
+response). Recovery: `absent` — not sent, issue the request; `sent` —
+record `delivered` from the journaled response; `sending` — the worker asks
+the provider for the request's state: already replied resolves to
+`delivered` (the provider also rejects a duplicate reply for an id it has
+answered, which resolves the same way), still pending re-issues the request,
+gone resolves to `task_attention_stale`. `task.answer` therefore keeps
+invariant 3 on both answer paths.
+
 **Resubmission.** A delivery in `awaiting_resubmission` resumes only when
 the client retries the same operation with the same idempotency key (local
 path) or the same operation ticket (relay path, relay RFC section 12.5) **and
@@ -896,6 +917,17 @@ A retried call with the same idempotency key follows the same resolution
 instead of creating a new delivery. Tests cover a crash before dispatch,
 after `writing`, after `written` before the acknowledgement, and across a
 lease change.
+
+On the relay path resubmission is an **amendment of the operation-ticket
+state machine** of relay RFC section 12.5, which otherwise lets a repeated
+`operation.begin` with the same ticket and fingerprint only return the
+recorded result or `in_progress`: a ticket whose operation is
+`awaiting_resubmission` accepts exactly one further `begin` with a matching
+fingerprint, CASes from that state to `begun` and executes the delivery;
+every later `begin` for the ticket returns the recorded result as before,
+and an expired or abandoned ticket never re-enters `begun`. The relay dark
+factory RFC lists this amendment (its section 3) and the accepted relay RFC
+gains it together with a one-shot resubmission case in its ticket tests.
 
 ## 9. Provider Turn Evidence
 
@@ -946,8 +978,14 @@ path:
    never crosses the hook channel.
 2. The worker stamps each record with the current `next_output_offset`
    (section 8.2), appends it to a bounded **evidence journal** with a
-   per-generation sequence number, and forwards it to the daemon; the daemon
-   acknowledges by sequence. The journal can briefly hold owner-private
+   per-generation sequence number, and forwards it to the daemon. The daemon
+   acknowledges a sequence number only after it has durably recorded the
+   evidence record and every settlement change it caused (consumption
+   milestone, pending decision, settlement revision) in the task store, so an
+   acknowledgement is a commit point and a crash before it leaves the record
+   in the worker journal for replay; replayed records are idempotent by
+   `(runtime_generation, sequence)`, and a record the daemon already applied
+   is acknowledged again without effect. The journal can briefly hold owner-private
    content such as `last_assistant_message`; it lives in the worker's
    owner-only runtime directory under the same posture as scrollback, never
    in logs, and each record is deleted from the journal once acknowledged. On reconnect the daemon asks for records after
@@ -1143,6 +1181,13 @@ Runtime design:
    the host Unix-account boundary (#88). A profile whose secret reference
    cannot be resolved fails at launch with a typed error instead of starting a
    server that cannot authenticate.
+8. The server and the TUI form **one runtime generation**. If either child
+   exits, the worker ends the generation and stops the other child; recovery
+   starts both again, the TUI resumed with `--session <id>` against the new
+   server URL. Restarting the server alone is never attempted: `--port 0`
+   yields a different port on every start and the TUI cannot follow a
+   replaced `--server` endpoint. Item 6 covers only an event stream that
+   drops while the server process is alive.
 
 **Decided runtime shape:** the per-session server and the TUI are two
 children of one worker. This avoids a plugin installation step, gives typed
@@ -1211,6 +1256,20 @@ Rules:
   decimal string and the currency exactly as the provider reports it; if
   the provider does not state a currency, `cost` is `null` rather than
   assumed.
+- **Bounded lists.** Every list in the result has a configured cap and a
+  deterministic truncation: `repository.diff.files` and `turn_delta.files`
+  keep the first `tasks.result_max_files` paths in byte order;
+  `commands` keeps the first `tasks.result_max_commands` in provider order;
+  `claim_mismatches` keeps the first `tasks.result_max_mismatches`;
+  attention `choices` keep the first `tasks.attention_max_choices`;
+  `checks` is bounded by `tasks.max_checks_per_turn` at request time and is
+  never truncated. A truncated list carries `truncated: true` and its total
+  count; the full file lists stay reachable through `session diff --turn`
+  and full check output through `task.check_log`. The caps are validated at
+  startup to fit within `tasks.result_max_bytes` together with the string
+  limits, so publication never blocks occupancy on an oversized result.
+  List truncation never changes `integrity`; only snapshot truncation does
+  (`turn_delta.complete`).
 - `settlement_revision`, `superseded`, `finality` and
   `reopen_window_closes_at` identify and qualify this result (sections 6.3,
   6.4, 8.2). `worktree_fingerprint` is the fingerprint at publication; a
@@ -1643,7 +1702,10 @@ to ship the adapter in the same milestone is an open question (section 19).
   a digest identifies it.
 - Final messages and check logs are owner-private files under the daemon state
   directory, bounded by `tasks.final_message_max_bytes` and
-  `tasks.check_log_max_bytes`.
+  `tasks.check_log_max_bytes`. The result document's provider-reported text
+  fields (`commands`, attention text and choices, `claim_mismatches`) are
+  content under the same rule (invariant 7): the metadata copy that outlives
+  the session (below) carries them as `retired`, never their text.
 - Task content follows session retention: removing a session removes its
   final messages, check logs, result documents and worktree snapshots
   (section 10). `session.retention.sweep` covers both, and never removes a
@@ -1686,7 +1748,7 @@ to ship the adapter in the same milestone is an open question (section 19).
 | `PermissionRequest` resolved by another hook or rule | Pending decision discarded; no attention is settled (section 8.5). |
 | Owner session of a shared worktree removed | Refused with `worktree_in_use` while user tasks are active; with `stop_worktree_users` they are stopped first (section 8.7). |
 | Human or another client writes into the task session mid-turn | Turn marked `steered`; settlement unchanged; result records it (section 8.6). |
-| OpenCode server child dies while the TUI lives | Evidence degrades to detection; `task.inspect` reports the failed source; the worker restarts the server child only under the same generation rules as the PTY child. |
+| OpenCode server child dies while the TUI lives | The TUI is bound to the dead server's ephemeral `--server` URL and has no reconnect contract, so the worker ends the runtime generation exactly as for a PTY-child exit: the TUI is stopped, an open turn settles `lost`, and explicit recovery starts a new generation with a fresh server and a TUI resumed on the stored OpenCode session (`--session <id>`, section 9.3 item 8). Evidence never silently degrades to detection while a TUI points at a dead server. |
 | Check hangs | Check timeout, process-group kill, `timed_out` outcome; the turn result still publishes. |
 
 ## 16. Composition: Manager/Auditor Loops and the Relay Dark Factory
@@ -1746,12 +1808,16 @@ recording a round's verdict, each finished task is stopped by a client that
 has lifecycle authority over it — the executor by the manager that created
 it, the auditor task by the auditor that created it — using `task.stop` with
 `if_latest_turn` and `require_idle` (section 13.1), so a stop can never hit a
-turn that started after the client decided. The shared worktree survives
-because it belongs to the owner task's session and carries a
-`worktree_shared` hold while any user task is active. The manager stops the
-owner task only when the objective is done and the worktree's result has
-been merged or discarded by explicit orchestrator policy — stopping a
-session never removes its worktree.
+turn that started after the client decided. The first round's executor is
+also the worktree's owner task and is stopped after its round like every
+other executor: the manager sets `retain_worktree: true` on that first
+`task.start`, so the tree carries a retain hold that outlives every task
+(section 8.7) and no session has to stay alive between rounds. The manager
+calls `task.release_worktree` only when the objective is done and the
+worktree's result has been merged or discarded by explicit orchestrator
+policy — stopping a session never removes its worktree, and an unreleased
+hold expires after `tasks.worktree_hold_max_age` into the ordinary retention
+rules.
 
 Recovery cannot infer "this round is finished" from task state alone: a
 still-valid verdict on the latest result says nothing about a turn opened
@@ -1915,6 +1981,13 @@ without blocking the rest.
      is down is journaled by the worker and settles the turn after
      reconnect, replayed output never creates a first post-consumption
      `working`, and a journal overflow marks the turn `evidence_degraded`;
+     a daemon crash after receiving but before acknowledging an evidence
+     record replays and applies it exactly once; an OpenCode server child
+     exit ends the generation and settles the open turn `lost`;
+     addressed-answer recovery before, during and after the provider
+     request; result lists over their caps publish with `truncated` and
+     totals and never block occupancy; provider-reported text never appears
+     in events, notifications or metadata;
      check definitions: a host definition shadows an in-repo one of the same
      name, an in-repo definition edited in the worktree during the turn is
      not what runs, and `repo_base` checks cap integrity at `suspect`;
@@ -1996,7 +2069,10 @@ present, no detection-only settlement for OpenCode, and the share of
    `tasks.page_max_bytes`, `tasks.cursor_ttl_ms`, `tasks.check_kill_grace_ms`,
    `tasks.resubmit_window_ms`, `tasks.wait_heartbeat_ms`,
    `tasks.worktree_hold_max_age`, `tasks.record_max_bytes`,
-   `tasks.check_log_max_bytes`, `tasks.max_waiters` and
+   `tasks.check_log_max_bytes`, `tasks.result_max_files`,
+   `tasks.result_max_commands`, `tasks.result_max_mismatches`,
+   `tasks.attention_max_choices`, `tasks.max_checks_per_turn`,
+   `tasks.max_waiters` and
    `tasks.metadata_retention`, and whether per-profile overrides may exceed
    the host ceiling. All are required configuration validated at startup.
 3. Whether investigation mode should refuse to start when a profile declares
