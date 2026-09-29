@@ -5,7 +5,7 @@
 # `cargo xtask` target depends on this file, and every job below only re-runs a
 # command that is already documented and usable on its own.
 #
-#   cargo install --locked bacon                  # or: scripts/dev-bootstrap --install --strict
+#   cargo install --locked bacon                  # scripts/dev-bootstrap --strict checks it
 #   bacon                                         # fast unit + integration loop
 #   bacon check                                   # compile errors only, the fastest signal
 #   bacon clippy-fast                             # the CI lint gate

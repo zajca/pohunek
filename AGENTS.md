@@ -242,11 +242,11 @@ against their minimum versions and prints the exact install command for each
 missing or too-old one. `rustc` (the workspace `rust-version`), `cargo-nextest` (minimum from `.config/nextest.toml`)
 and `python3` >= 3.11 are required; `bacon`, `hyperfine`
 (`scripts/measure-dev-loop`), and `mold` (CI linker only; checked on Linux only) fail only with
-`--strict`. It installs nothing unless asked:
+`--strict`. It never installs anything; run the printed fixes yourself:
 
 ```bash
-scripts/dev-bootstrap                      # report; non-zero if a required tool fails
-scripts/dev-bootstrap --install --strict   # run the printed cargo installs for failing tools
+scripts/dev-bootstrap            # report; non-zero if a required tool fails
+scripts/dev-bootstrap --strict   # optional tools fail the run too
 ```
 
 Watcher (`bacon.toml` at the repo root; optional tool, no gate depends on it —

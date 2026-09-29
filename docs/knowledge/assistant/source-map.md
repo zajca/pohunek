@@ -218,12 +218,12 @@ Release packaging and contributor verification:
 - `scripts/dev-bootstrap` — local tool check: required `rustc` (the workspace `rust-version`), `cargo-nextest` (minimum
   read from `.config/nextest.toml`) and `python3` >= 3.11, optional `bacon`,
   `hyperfine`, and on Linux `mold` (fail only with `--strict`); prints the exact fix for
-  each missing or too-old tool and installs nothing unless `--install` is
-  given, never running root-level package-manager steps.
+  each missing or too-old tool (a shadowed or off-PATH copy gets the
+  shell-quoted `export PATH` fix) and never installs anything itself.
 - `scripts/tests/test_dev_bootstrap.py` — regression checks for version
   parsing, the config-derived nextest minimum, required vs. optional and
-  `--strict` exit status, and `--install` running only failing installs;
-  `which`, version, and install calls are injected.
+  `--strict` exit status, MSRV and missing-`cargo` handling, and shadowed
+  copies; `which` and version calls are injected.
 - `scripts/ci-timings` — reproduction of CI timing evidence from `gh` run
   data: per-job wall clock and workflow medians (`runs`, `compare`), per-shard
   nextest JUnit summaries (`junit`), sccache/rust-cache

@@ -3,10 +3,9 @@
 
 Every tool is looked up on `PATH`, run with its version flag, and compared
 with a minimum version. Each row prints what is missing or too old and the
-exact command that fixes it. Nothing is ever installed unless `--install` is
-given, and then only the printed commands for failing tools are run, each
-echoed before it starts. Commands that need root (distribution packages) are
-printed as manual steps and never run by this script.
+exact command that fixes it. The script never installs anything: where a
+tool goes (CARGO_INSTALL_ROOT, `install.root`, a distribution package) is the
+developer's choice, so the fix is printed for them to run.
 
 Categories:
 
@@ -102,7 +101,7 @@ class Tool:
     version_args: tuple
     min_version: tuple
     required: bool
-    # argv run by `--install`, or None when only a manual step can fix it.
+    # Printed install command, or None when only a manual step fixes it.
     install: tuple = None
     manual: str = None
     # Checked through `cargo <sub> --version`: Cargo prefers
@@ -275,11 +274,6 @@ def run_version(argv):
     return completed.stdout if completed.stdout.strip() else completed.stderr
 
 
-def run_install(argv):
-    """Run one install command with the terminal attached; its exit status."""
-    return subprocess.run(argv, check=False).returncode
-
-
 def check_tool(tool, which, runner, cargo_bin):
     """Locate, version, and compare one tool.
 
@@ -288,7 +282,7 @@ def check_tool(tool, which, runner, cargo_bin):
     passes the minimum, otherwise the row keeps its install fix.
     """
     if tool.cargo_subcommand:
-        # Cargo runs the subcommand and installs it, so it must exist first.
+        # Cargo runs the subcommand, so it must exist first.
         cargo = which("cargo")
         if cargo is None:
             return Result(tool, NO_CARGO)
@@ -296,9 +290,15 @@ def check_tool(tool, which, runner, cargo_bin):
             return Result(tool, MISSING)
         subcommand = tool.name.removeprefix("cargo-")
         argv = [cargo, subcommand, *tool.version_args]
-        return version_result(
+        result = version_result(
             tool, argv, f"{shlex.join(argv[:2])} (Cargo's resolution)", runner
         )
+        home = which(tool.name, path=str(cargo_bin))
+        if result.status == OK or home is None:
+            return result
+        # Cargo honours the position of $CARGO_HOME/bin when it is already on
+        # PATH, so an older copy earlier on PATH can shadow a current one.
+        return shadowed_or(result, tool, home, runner, "an earlier copy on PATH")
     path = which(tool.name)
     in_cargo_bin = which(tool.name, path=str(cargo_bin))
     if path is None and in_cargo_bin is None:
@@ -311,14 +311,21 @@ def check_tool(tool, which, runner, cargo_bin):
     result = version_result(tool, [path, *tool.version_args], path, runner)
     if result.status == OK or in_cargo_bin is None or in_cargo_bin == path:
         return result
-    # A current copy in $CARGO_HOME/bin (where `--install` puts it) shadowed by
-    # the failing PATH copy: reinstalling cannot fix the PATH order.
-    home = version_result(tool, [in_cargo_bin, *tool.version_args], in_cargo_bin, runner)
-    if home.status != OK:
+    return shadowed_or(result, tool, in_cargo_bin, runner, path)
+
+
+def shadowed_or(result, tool, home, runner, shadow):
+    """`result`, unless the `$CARGO_HOME/bin` copy passes: then a PATH-order row.
+
+    Reinstalling into `$CARGO_HOME/bin` cannot fix a current copy that an
+    older one earlier on PATH shadows; only reordering PATH can.
+    """
+    copy = version_result(tool, [home, *tool.version_args], home, runner)
+    if copy.status != OK:
         return result
     return Result(
-        tool, OFF_PATH, version=home.version, path=in_cargo_bin,
-        detail=f"shadowed by {path} on PATH",
+        tool, OFF_PATH, version=copy.version, path=home,
+        detail=f"shadowed by {shadow} on PATH",
     )
 
 
@@ -345,19 +352,6 @@ def check_all(tool_list, which, runner, cargo_bin):
     return [check_tool(tool, which, runner, cargo_bin) for tool in tool_list]
 
 
-def install_command(tool, cargo_bin):
-    """The tool's install argv, pinned to the `$CARGO_HOME` this script checks.
-
-    `cargo install` otherwise honours CARGO_INSTALL_ROOT and `install.root`,
-    so a successful install could land where the re-check never looks.
-    """
-    if tool.install is None:
-        return None
-    if tool.install[:2] == ("cargo", "install"):
-        return (*tool.install[:2], "--root", str(Path(cargo_bin).parent), *tool.install[2:])
-    return tool.install
-
-
 def path_fix(cargo_bin):
     """A pasteable `export PATH=...` that puts `cargo_bin` first, shell-quoted."""
     return f'export PATH={shlex.quote(str(cargo_bin))}:"$PATH"'
@@ -374,7 +368,7 @@ def fix_hint(result, cargo_bin):
             f"{path_fix(cargo_bin)}"
         )
     if result.tool.install is not None:
-        return shlex.join(install_command(result.tool, cargo_bin))
+        return shlex.join(result.tool.install)
     return result.tool.manual
 
 
@@ -397,7 +391,7 @@ def describe(result, strict, cargo_bin):
             f"{minimum}"
         )
     elif result.status == NO_CARGO:
-        what = f"`cargo` is not on PATH, so {tool.name} can neither run nor install"
+        what = f"`cargo` is not on PATH, so {tool.name} cannot run"
     elif result.status == OFF_PATH:
         what = (
             f"{tool.name} {format_version(result.version)} is {result.detail}"
@@ -424,46 +418,6 @@ def report(results, strict, cargo_bin, out):
     return True
 
 
-def install(results, strict, executor, cargo_bin, out):
-    """Run the install command of every failing row that has one.
-
-    Returns False when any command fails or a failing row needs a manual
-    step, so `--install` never reports success it did not achieve.
-    """
-    succeeded = True
-    for result in results:
-        if not result.failed(strict):
-            continue
-        if result.status in (OFF_PATH, NO_CARGO) or result.tool.install is None:
-            print(
-                f"dev-bootstrap: {result.tool.name} needs a manual step "
-                "(see fix above); not run",
-                file=out,
-            )
-            succeeded = False
-            continue
-        command = install_command(result.tool, cargo_bin)
-        print(f"+ {shlex.join(command)}", file=out, flush=True)
-        try:
-            status = executor(list(command))
-        except OSError as error:
-            print(
-                f"dev-bootstrap: install of {result.tool.name} could not "
-                f"start: {error}",
-                file=out,
-            )
-            succeeded = False
-            continue
-        if status != 0:
-            print(
-                f"dev-bootstrap: install of {result.tool.name} exited "
-                f"{status}",
-                file=out,
-            )
-            succeeded = False
-    return succeeded
-
-
 def parse_args(argv):
     """Command-line flags."""
     parser = argparse.ArgumentParser(
@@ -474,14 +428,9 @@ def parse_args(argv):
         ),
     )
     parser.add_argument(
-        "--install",
-        action="store_true",
-        help="run the printed install commands for failing tools only",
-    )
-    parser.add_argument(
         "--strict",
         action="store_true",
-        help="fail (and with --install, install) optional tools as well",
+        help="fail on optional tools as well",
     )
     return parser.parse_args(argv)
 
@@ -490,13 +439,12 @@ def main(
     argv=None,
     which=shutil.which,
     runner=run_version,
-    executor=run_install,
     root=ROOT,
     environ=os.environ,
     out=sys.stdout,
     system=platform.system(),
 ):
-    """Check, optionally install and re-check; the process exit status."""
+    """Check every tool and print the fixes; the process exit status."""
     args = parse_args(argv)
     try:
         tool_list = tools(root, system)
@@ -508,13 +456,7 @@ def main(
     print(f"dev-bootstrap: local tool check ({mode})", file=out)
     results = check_all(tool_list, which, runner, cargo_bin)
     passed = report(results, args.strict, cargo_bin, out)
-    if passed or not args.install:
-        return 0 if passed else 1
-    installed = install(results, args.strict, executor, cargo_bin, out)
-    print("dev-bootstrap: re-checking after install", file=out)
-    results = check_all(tool_list, which, runner, cargo_bin)
-    passed = report(results, args.strict, cargo_bin, out)
-    return 0 if passed and installed else 1
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":

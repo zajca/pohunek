@@ -1,7 +1,7 @@
 """Regression checks for the local tool check (stdlib only).
 
 No test looks at the host PATH or runs a real tool: `which`, the version
-runner, and the install executor are injected, and the nextest config is a
+runner are injected, and the nextest config is a
 temporary file.
 """
 
@@ -39,21 +39,16 @@ CURRENT = {
 class FakeHost:
     """Injected lookups over an in-memory set of installed tools.
 
-    `on_path` and `in_cargo_bin` map tool names to their `--version` output;
-    `executor` records install commands and, for `cargo install`, places the
-    tool into `$CARGO_HOME/bin` at `installed_output`.
+    `on_path` and `in_cargo_bin` map tool names to their `--version` output.
     """
 
-    def __init__(self, on_path=None, in_cargo_bin=None, install_status=0,
-                 installed_output=None, cargo=True, install_error=None):
+    def __init__(self, on_path=None, in_cargo_bin=None, cargo=True):
         self.on_path = dict(CURRENT if on_path is None else on_path)
         self.in_cargo_bin = dict(in_cargo_bin or {})
-        self.install_status = install_status
-        self.installed_output = dict(installed_output or {})
         self.cargo = cargo
-        self.install_error = install_error
+        # Cargo prefers $CARGO_HOME/bin unless it already sits later on PATH.
+        self.cargo_prefers_path = False
         self.version_calls = []
-        self.installs = []
 
     def which(self, name, path=None):
         if name == "cargo" and path is None:
@@ -70,7 +65,8 @@ class FakeHost:
         if name == "cargo":
             # Cargo's own order: `$CARGO_HOME/bin` before `PATH`.
             sub = f"cargo-{argv[1]}"
-            for source in (self.in_cargo_bin, self.on_path):
+            order = (self.on_path, self.in_cargo_bin) if self.cargo_prefers_path else (self.in_cargo_bin, self.on_path)
+            for source in order:
                 if sub in source:
                     output = source[sub]
                     if isinstance(output, Exception):
@@ -83,14 +79,6 @@ class FakeHost:
             raise output
         return output
 
-    def executor(self, argv):
-        self.installs.append(argv)
-        if self.install_error is not None:
-            raise self.install_error
-        crate = argv[-1]
-        if self.install_status == 0 and crate in self.installed_output:
-            self.on_path[crate] = self.installed_output[crate]
-        return self.install_status
 
 
 class DevBootstrapCase(unittest.TestCase):
@@ -117,8 +105,7 @@ class DevBootstrapCase(unittest.TestCase):
             list(args),
             which=host.which,
             runner=host.runner,
-            executor=host.executor,
-            root=self.root,
+                        root=self.root,
             environ={"CARGO_HOME": CARGO_HOME},
             out=out,
             system=system,
@@ -251,7 +238,7 @@ class CheckTests(DevBootstrapCase):
         self.assertEqual(status, 1)
         self.assertIn("FAIL     cargo-nextest is missing (needs >= 0.9.115)",
                       output)
-        self.assertIn("fix: cargo install --root /fake/cargo-home --locked cargo-nextest", output)
+        self.assertIn("fix: cargo install --locked cargo-nextest", output)
         self.assertIn("failing: cargo-nextest", output)
 
     def test_too_old_required_tool_fails(self):
@@ -269,7 +256,7 @@ class CheckTests(DevBootstrapCase):
         status, output = self.run_main(FakeHost(on_path=tools))
         self.assertEqual(status, 0)
         self.assertIn("warn     hyperfine is missing", output)
-        self.assertIn("fix: cargo install --root /fake/cargo-home --locked hyperfine", output)
+        self.assertIn("fix: cargo install --locked hyperfine", output)
         self.assertIn("warn     mold is missing", output)
 
     def test_missing_optional_tool_fails_under_strict(self):
@@ -310,6 +297,18 @@ class CheckTests(DevBootstrapCase):
         status, output = self.run_main(host)
         self.assertEqual(status, 0, output)
 
+    def test_current_cargo_home_nextest_shadowed_on_path_is_a_path_problem(self):
+        # Cargo keeps the PATH position of $CARGO_HOME/bin when it is on PATH:
+        # `cargo nextest` then runs the old PATH copy.
+        tools = dict(CURRENT)
+        tools["cargo-nextest"] = "cargo-nextest 0.9.100\n"
+        host = FakeHost(on_path=tools, in_cargo_bin={"cargo-nextest": CURRENT["cargo-nextest"]})
+        host.cargo_prefers_path = True
+        status, output = self.run_main(host)
+        self.assertEqual(status, 1, output)
+        self.assertIn("cargo-nextest 0.9.145 is shadowed by an earlier copy on PATH", output)
+        self.assertIn(f'export PATH={CARGO_BIN}:"$PATH"', output)
+
     def test_cargo_subcommand_without_cargo_is_a_failure(self):
         status, output = self.run_main(FakeHost(cargo=False))
         self.assertEqual(status, 1, output)
@@ -319,33 +318,29 @@ class CheckTests(DevBootstrapCase):
         tools = dict(CURRENT)
         tools["bacon"] = "bacon 2.0.0\n"
         host = FakeHost(on_path=tools, in_cargo_bin={"bacon": CURRENT["bacon"]})
-        status, output = self.run_main(host, "--install", "--strict")
+        status, output = self.run_main(host, "--strict")
         self.assertEqual(status, 1, output)
         self.assertIn("bacon 3.25.0 is shadowed by", output)
         self.assertIn(f'export PATH={CARGO_BIN}:"$PATH"', output)
-        # A PATH-order problem is a manual step: reinstalling cannot fix it.
-        self.assertEqual(host.installs, [])
 
     def test_missing_cargo_is_reported_before_a_missing_subcommand(self):
         tools = dict(CURRENT)
         tools.pop("cargo-nextest")
         host = FakeHost(on_path=tools, cargo=False)
-        status, output = self.run_main(host, "--install")
+        status, output = self.run_main(host)
         self.assertEqual(status, 1, output)
         self.assertIn("`cargo` is not on PATH", output)
         self.assertIn("https://rustup.rs", output)
-        self.assertNotIn("cargo install --root /fake/cargo-home --locked cargo-nextest", output)
-        self.assertEqual(host.installs, [])
+        self.assertNotIn("cargo install --locked cargo-nextest", output)
 
     def test_outdated_copy_only_in_cargo_home_keeps_its_install_fix(self):
         tools = dict(CURRENT)
         tools.pop("bacon")
-        host = FakeHost(on_path=tools, in_cargo_bin={"bacon": "bacon 2.0.0\n"},
-                        installed_output={"bacon": CURRENT["bacon"]})
+        host = FakeHost(on_path=tools, in_cargo_bin={"bacon": "bacon 2.0.0\n"})
         status, output = self.run_main(host, "--strict")
         self.assertEqual(status, 1, output)
         self.assertIn("bacon 2.0.0 is older than", output)
-        self.assertIn("cargo install --root /fake/cargo-home --locked bacon", output)
+        self.assertIn("cargo install --locked bacon", output)
         self.assertNotIn("not on PATH", output)
 
     def test_rustc_is_checked_against_the_workspace_msrv(self):
@@ -374,16 +369,6 @@ class CheckTests(DevBootstrapCase):
         fix = dev_bootstrap.path_fix('/home/a $(b)`c`"d/bin')
         self.assertEqual(fix, "export PATH='/home/a $(b)`c`\"d/bin':\"$PATH\"")
 
-    def test_install_is_pinned_to_the_checked_cargo_home(self):
-        tools = dict(CURRENT)
-        tools.pop("bacon")
-        host = FakeHost(on_path=tools, installed_output={"bacon": CURRENT["bacon"]})
-        self.run_main(host, "--install", "--strict")
-        self.assertEqual(
-            host.installs,
-            [["cargo", "install", "--root", CARGO_HOME, "--locked", "bacon"]],
-        )
-
     def test_binary_only_in_cargo_home_is_reported_off_path(self):
         tools = dict(CURRENT)
         bacon = tools.pop("bacon")
@@ -408,87 +393,6 @@ class CheckTests(DevBootstrapCase):
         self.assertEqual(status, 1)
         self.assertIn("unparseable version output 'cargo-nextest dev'",
                       output)
-
-
-class InstallTests(DevBootstrapCase):
-    def test_without_flag_nothing_is_installed(self):
-        tools = dict(CURRENT)
-        del tools["cargo-nextest"]
-        host = FakeHost(on_path=tools)
-        self.assertEqual(self.run_main(host)[0], 1)
-        self.assertEqual(host.installs, [])
-
-    def test_install_runs_only_failing_commands_then_rechecks(self):
-        tools = dict(CURRENT, **{"cargo-nextest": "cargo-nextest 0.9.100\n"})
-        del tools["hyperfine"]
-        host = FakeHost(
-            on_path=tools,
-            installed_output={"cargo-nextest": CURRENT["cargo-nextest"]},
-        )
-        status, output = self.run_main(host, "--install")
-        self.assertEqual(status, 0)
-        # hyperfine is optional and not strict: reported, never installed.
-        self.assertEqual(
-            host.installs, [["cargo", "install", "--root", CARGO_HOME, "--locked", "cargo-nextest"]]
-        )
-        self.assertIn("+ cargo install --root /fake/cargo-home --locked cargo-nextest", output)
-        self.assertLess(output.index("+ cargo install"),
-                        output.index("re-checking after install"))
-
-    def test_install_strict_includes_optional_tools(self):
-        tools = dict(CURRENT)
-        del tools["bacon"]
-        del tools["hyperfine"]
-        host = FakeHost(
-            on_path=tools,
-            installed_output={"bacon": CURRENT["bacon"],
-                              "hyperfine": CURRENT["hyperfine"]},
-        )
-        status, _ = self.run_main(host, "--install", "--strict")
-        self.assertEqual(status, 0)
-        self.assertEqual(
-            host.installs,
-            [["cargo", "install", "--root", CARGO_HOME, "--locked", "bacon"],
-             ["cargo", "install", "--root", CARGO_HOME, "--locked", "hyperfine"]],
-        )
-
-    def test_install_that_cannot_start_is_reported_not_raised(self):
-        tools = dict(CURRENT)
-        tools.pop("bacon")
-        host = FakeHost(on_path=tools, install_error=FileNotFoundError("cargo"))
-        status, output = self.run_main(host, "--install", "--strict")
-        self.assertEqual(status, 1, output)
-        self.assertIn("install of bacon could not start", output)
-
-    def test_manual_steps_are_never_run(self):
-        tools = dict(CURRENT)
-        del tools["mold"]
-        host = FakeHost(on_path=tools)
-        status, output = self.run_main(host, "--install", "--strict")
-        self.assertEqual(status, 1)
-        self.assertEqual(host.installs, [])
-        self.assertIn("mold needs a manual step", output)
-
-    def test_failed_install_command_fails_the_run(self):
-        tools = dict(CURRENT)
-        del tools["cargo-nextest"]
-        host = FakeHost(on_path=tools, install_status=101)
-        status, output = self.run_main(host, "--install")
-        self.assertEqual(status, 1)
-        self.assertIn("install of cargo-nextest exited 101", output)
-
-    def test_install_that_leaves_tool_too_old_fails_recheck(self):
-        tools = dict(CURRENT, bacon="bacon 3.0.0\n")
-        host = FakeHost(on_path=tools,
-                        installed_output={"bacon": "bacon 3.1.0\n"})
-        status, output = self.run_main(host, "--install", "--strict")
-        self.assertEqual(status, 1)
-        self.assertIn("bacon 3.1.0 is older than 3.13.0", output)
-
-    def test_passing_check_installs_nothing(self):
-        host = FakeHost()
-        self.assertEqual(self.run_main(host, "--install", "--strict")[0], 0)
-        self.assertEqual(host.installs, [])
 
 
 if __name__ == "__main__":
