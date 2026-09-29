@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""List flaky and failed tests from nextest JUnit reports as a Markdown summary.
+
+The table is appended to the file named by `$GITHUB_STEP_SUMMARY` (the
+GitHub Actions job summary), or printed with `--stdout`. CI runs this with
+`if: always()` after each nextest step, so FLAKY tests are visible on the run
+page without reading logs.
+
+nextest JUnit shapes this reads (verified against nextest 0.9.145):
+
+* flaky test: `<testcase>` with one `<flakyFailure>`/`<flakyError>` per failed
+  attempt. Under `flaky-result = "fail"` it also carries a terminal
+  `<failure type="flaky failure">`; under `"pass"` it does not.
+* persistent failure: `<testcase>` with `<failure>`/`<error>` for the first
+  attempt plus one `<rerunFailure>`/`<rerunError>` per retry.
+
+The exit status reflects only this script's own usage errors; the nextest
+step's exit status is what fails the job. A missing or unreadable report is
+written into the summary instead of being skipped.
+"""
+
+import argparse
+import html
+import os
+from pathlib import Path
+import sys
+import xml.etree.ElementTree as ElementTree
+
+SUMMARY_ENV = "GITHUB_STEP_SUMMARY"
+FAILURE_TAGS = ("failure", "error")
+FLAKY_TAGS = ("flakyFailure", "flakyError")
+RERUN_TAGS = ("rerunFailure", "rerunError")
+# Failure messages are single panic locations in practice; the cap keeps one
+# pathological message from bloating the job summary (1 MiB per step limit).
+MESSAGE_LIMIT = 200
+
+
+def children(case, tags):
+    """Direct children of `case` whose tag is one of `tags`."""
+    return [child for child in case if child.tag in tags]
+
+
+def test_name(case):
+    """The test as nextest prints it: `<binary id> <test name>`."""
+    return f"{case.get('classname') or '?'} {case.get('name') or '?'}"
+
+
+def classify(root):
+    """Split one JUnit document into (total, flaky, failed) test records."""
+    total = 0
+    flaky = []
+    failed = []
+    for case in root.iter("testcase"):
+        total += 1
+        terminal = children(case, FAILURE_TAGS)
+        earlier = children(case, FLAKY_TAGS)
+        reruns = children(case, RERUN_TAGS)
+        if earlier:
+            flaky.append(
+                {
+                    "name": test_name(case),
+                    "attempts": len(earlier) + 1,
+                    "fails_run": bool(terminal),
+                    "message": earlier[0].get("message") or "",
+                }
+            )
+        elif terminal:
+            failed.append(
+                {
+                    "name": test_name(case),
+                    "attempts": len(reruns) + 1,
+                    "message": terminal[0].get("message") or "",
+                }
+            )
+    return total, flaky, failed
+
+
+def load(path):
+    """Classify one report, or return a problem string for the summary."""
+    try:
+        present = path.is_file()
+    except OSError as error:
+        # Python < 3.14 raises here for e.g. an over-long name; the report
+        # is unusable either way and must show up as a warning.
+        return None, f"unreadable JUnit report `{path}`: {error}"
+    if not present:
+        return None, f"missing JUnit report `{path}`: the test step wrote no report"
+    try:
+        root = ElementTree.parse(path).getroot()
+    except (ElementTree.ParseError, OSError) as error:
+        return None, f"unreadable JUnit report `{path}`: {error}"
+    return classify(root), None
+
+
+def inline(text):
+    """Render text safely on one Markdown line, without shortening it."""
+    return html.escape(" ".join(text.split()), quote=False)
+
+
+def cell(text):
+    """Render text safely inside one Markdown table cell."""
+    text = " ".join(text.split())
+    if len(text) > MESSAGE_LIMIT:
+        text = text[: MESSAGE_LIMIT - 1] + "…"
+    return html.escape(text, quote=False).replace("|", "\\|")
+
+
+def render(label, paths):
+    """Build the Markdown summary for all `paths`."""
+    total = 0
+    flaky = []
+    failed = []
+    problems = []
+    for path in paths:
+        result, problem = load(path)
+        if problem is not None:
+            problems.append(problem)
+            continue
+        count, report_flaky, report_failed = result
+        total += count
+        flaky.extend(report_flaky)
+        failed.extend(report_failed)
+    lines = [f"### Flaky and failed tests: {cell(label)}", ""]
+    for problem in problems:
+        # A warning names the report path in full: a shortened path would
+        # hide which report is missing.
+        lines.append(f"- **Warning:** {inline(problem)}")
+    if problems:
+        lines.append("")
+    lines.append(
+        f"{total} test(s) in {len(paths) - len(problems)} report(s): "
+        f"{len(flaky)} flaky, {len(failed)} failed."
+    )
+    if flaky:
+        lines += [
+            "",
+            "FLAKY tests passed only on a retry. Open a bug issue with the root "
+            "cause; a `flaky-result = \"pass\"` override needs a linked issue "
+            "and a reason (AGENTS.md, \"Flaky tests\").",
+            "",
+            "| Flaky test | Passed on attempt | Counted as | First failure |",
+            "| --- | --- | --- | --- |",
+        ]
+        for record in flaky:
+            outcome = "failure" if record["fails_run"] else "pass"
+            lines.append(
+                f"| {cell(record['name'])} | {record['attempts']} | {outcome} | "
+                f"{cell(record['message'])} |"
+            )
+    if failed:
+        lines += [
+            "",
+            "| Failed test | Attempts | First failure |",
+            "| --- | --- | --- |",
+        ]
+        for record in failed:
+            lines.append(
+                f"| {cell(record['name'])} | {record['attempts']} | "
+                f"{cell(record['message'])} |"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("reports", nargs="+", type=Path, help="nextest JUnit XML files")
+    parser.add_argument(
+        "--label", required=True, help="heading for this summary, e.g. the CI shard"
+    )
+    parser.add_argument(
+        "--stdout", action="store_true", help=f"print instead of appending to ${SUMMARY_ENV}"
+    )
+    return parser
+
+
+def main(argv=None, environ=None):
+    """Write the summary and return the process exit code."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    environ = os.environ if environ is None else environ
+    markdown = render(args.label, args.reports)
+    if args.stdout:
+        sys.stdout.write(markdown)
+        return 0
+    target = environ.get(SUMMARY_ENV)
+    if not target:
+        parser.error(f"${SUMMARY_ENV} is not set; pass --stdout to print instead")
+    with open(target, "a", encoding="utf-8") as summary:
+        summary.write(markdown)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

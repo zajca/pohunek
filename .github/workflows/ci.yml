@@ -32,12 +32,19 @@ env:
   # artifacts before persisting anyway, so producing them only wastes time.
   # Kept explicit (issue #124) so every job benefits even before restore.
   CARGO_INCREMENTAL: "0"
-  # NOTE (issue #124): SCCACHE_GHA_ENABLED/RUSTC_WRAPPER and the mold
-  # -C link-arg=-fuse-ld=mold RUSTFLAGS live in each Rust job's `env`, not
-  # here. Workflow-level RUSTC_WRAPPER would also wrap jobs that never run
-  # the sccache-action step (e.g. the audit and docs jobs), which fails
-  # with "could not execute process `sccache ...` (never executed)".
-  # .github/actions/setup-mold puts mold on PATH without touching
+  # Compile cache (issue #164): Swatinem/rust-cache is the only compile-cache
+  # layer. Each Rust job restores the entry of its job type (`shared-key`:
+  # clippy, test-debug, bins, release, xtask, docs, hack, nightly-udeps,
+  # platform-contracts). The full key also hashes the toolchain, the
+  # RUST*/CARGO* environment (RUSTFLAGS included), and the Cargo manifests.
+  # rust-cache saves only on a key miss and the first finisher wins, so each
+  # key has exactly one designated saver, the job that builds the superset
+  # of the key's artifacts; every other job in the group sets `save-if:
+  # false`. The saver saves only for refs/heads/main (push, schedule, and
+  # dispatch on main): PR runs restore main's entries and never evict them.
+  # The mold -C link-arg=-fuse-ld=mold RUSTFLAGS live in each Linux Rust
+  # job's `env`, not here, because the macOS and docs jobs do not install
+  # mold. .github/actions/setup-mold puts mold on PATH without touching
   # /usr/bin/ld: only those RUSTFLAGS select mold.
   # Pinned mold release for .github/actions/setup-mold. MOLD_SHA256 is the
   # sha256 GitHub publishes for the release asset
@@ -56,8 +63,6 @@ jobs:
     needs: changes
     runs-on: macos-15
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       # Compile against the oldest supported macOS SDK contract. Runtime
       # acceptance on macOS 14 remains an explicit release milestone.
       MACOSX_DEPLOYMENT_TARGET: "14.0"
@@ -76,15 +81,11 @@ jobs:
           toolchain: stable
           components: clippy
 
-      # sccache runs on macOS too (content-keyed GHA backend); mold stays
-      # Linux-only via the job-level RUSTFLAGS override above.
-      - name: Enable sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: ci-
+          shared-key: platform-contracts
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check shared platform contracts
         run: cargo check --locked -p pohunek-platform --all-targets
@@ -187,8 +188,6 @@ jobs:
     name: fmt + clippy
     runs-on: ubuntu-latest
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
@@ -205,13 +204,11 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - name: Enable sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: ci-
+          shared-key: clippy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
@@ -228,8 +225,6 @@ jobs:
     name: tests (${{ matrix.shard }}, fast)
     runs-on: ubuntu-latest
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     strategy:
       fail-fast: false
@@ -248,13 +243,12 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Enable sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: ci-
+          # Restore only: the heavy job saves `test-debug`.
+          shared-key: test-debug
+          save-if: false
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-nextest
@@ -267,6 +261,10 @@ jobs:
       - name: Run fast shard
         run: python3 scripts/test-partitions run "${{ matrix.shard }}"
 
+      - name: Summarize flaky tests
+        if: always()
+        run: python3 scripts/junit-flaky-summary --label "fast ${{ matrix.shard }}" target/nextest/ci/junit.xml
+
       - name: Upload shard timing report
         if: always()
         uses: actions/upload-artifact@v4
@@ -276,8 +274,8 @@ jobs:
           if-no-files-found: warn
 
     # Determine which CI jobs the changed files require. Heavy non-default jobs
-  # (feature-powerset, unused-deps, macOS contracts, Hermes compatibility, and
-  # TS-binding drift) only run when their inputs change or on a schedule; the
+  # (feature-powerset, macOS contracts, Hermes compatibility, and TS-binding
+  # drift) only run when their inputs change or on a schedule; the
   # always-critical jobs (fmt, clippy, fast tests, heavy tests, release build,
   # docs check, relay DB) still run on every push and PR. The workflow file
   # itself forces a relay run so filter edits are always validated.
@@ -289,7 +287,6 @@ jobs:
     outputs:
       relay: ${{ steps.filter.outputs.relay }}
       feature_matrix: ${{ steps.filter.outputs.feature_matrix }}
-      udeps: ${{ steps.filter.outputs.udeps }}
       macos: ${{ steps.filter.outputs.macos }}
       hermes: ${{ steps.filter.outputs.hermes }}
       docs_ts: ${{ steps.filter.outputs.docs_ts }}
@@ -320,19 +317,6 @@ jobs:
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
               - 'crates/**/*.rs'
-            # cargo-udeps needs the nightly toolchain and a full workspace
-            # dependency resolution (issue #125): schedule-only plus Cargo.toml,
-            # Cargo.lock changes, the workflow file, workspace Rust sources (an
-            # unused dependency usually appears by deleting its last use), and
-            # the xtask inputs that configure the unused-dependency scan.
-            udeps:
-              - 'Cargo.toml'
-              - 'crates/**/Cargo.toml'
-              - 'Cargo.lock'
-              - '.github/workflows/ci.yml'
-              - 'crates/**/*.rs'
-              - 'crates/xtask/src/checks.rs'
-              - 'crates/xtask/src/lib.rs'
             # macOS platform, path, private-protocol, session-worker, daemon,
             # CLI, launchd, and Hermes filesystem contracts run on the native
             # arm64 runner (issues #96-#100 and #125): gate on every crate
@@ -412,8 +396,6 @@ jobs:
     name: tests (heavy, PTY + Hermes)
     runs-on: ubuntu-latest
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
@@ -430,13 +412,14 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - name: Enable sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: ci-
+          # Designated `test-debug` saver: the same `nextest --workspace
+          # --all-features` build as the fast shards and relay-db, plus
+          # pohunek-sessiond, so it holds the superset of what they restore.
+          shared-key: test-debug
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
@@ -454,6 +437,10 @@ jobs:
 
       - name: Heavy tests (bounded nextest concurrency)
         run: python3 scripts/test-partitions run heavy
+
+      - name: Summarize flaky tests
+        if: always()
+        run: python3 scripts/junit-flaky-summary --label heavy target/nextest/heavy/junit.xml
 
       # Per-test timing evidence for the test-performance work (JUnit `time`
       # attributes). Nextest writes the report under its own storage directory.
@@ -474,8 +461,6 @@ jobs:
     name: real systemd supervision
     runs-on: ubuntu-latest
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
       POHUNEK_SYSTEMD_E2E: "1"
     steps:
@@ -492,13 +477,13 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Enable sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: ci-
+          # Designated `bins` saver: the build-bins binaries plus the test
+          # builds of the ignored systemd suites, a superset of build-bins.
+          shared-key: bins
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Require a running systemd user manager
         run: |
@@ -547,8 +532,6 @@ jobs:
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.relay == 'true' }}
     runs-on: ubuntu-latest
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     services:
       postgres:
@@ -577,13 +560,12 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Enable sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: ci-
+          # Restore only: the heavy job saves `test-debug`.
+          shared-key: test-debug
+          save-if: false
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
@@ -597,6 +579,10 @@ jobs:
           # job-level `env`, where it makes the whole workflow invalid.
           POHUNEK_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/pohunek_test
 
+      - name: Summarize flaky tests
+        if: always()
+        run: python3 scripts/junit-flaky-summary --label relay-db target/nextest/relay-db/junit.xml
+
       - name: Upload relay DB test report
         if: always()
         uses: actions/upload-artifact@v4
@@ -609,8 +595,6 @@ jobs:
     name: doctests + release build
     runs-on: ubuntu-latest
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
@@ -625,13 +609,11 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Enable sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: ci-
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Nextest does not execute rustdoc tests; preserve the cargo test gate.
       - name: Documentation tests
@@ -650,8 +632,6 @@ jobs:
     needs: changes
     if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.docs_ts == 'true' }}
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
@@ -667,13 +647,13 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Enable sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: ci-
+          # Designated `xtask` saver: the xtask binary plus the ts-rs export
+          # test builds, a superset of what hermes-compatibility restores.
+          shared-key: xtask
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: TS binding drift
         run: cargo xtask ts check
@@ -686,8 +666,6 @@ jobs:
     needs: [build-bins, changes]
     if: ${{ needs.build-bins.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.hermes == 'true') }}
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     timeout-minutes: 30
     steps:
@@ -738,13 +716,12 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Enable sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: ci-
+          # Restore only: ts-drift saves `xtask`.
+          shared-key: xtask
+          save-if: false
 
       - name: Check fail-closed Hermes provisioning
         run: scripts/tests/provision-hermes-compat.sh
@@ -817,8 +794,6 @@ jobs:
     name: build bins (pohunekd + pohunek-sessiond + pohunek)
     runs-on: ubuntu-latest
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
@@ -834,13 +809,12 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Enable sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: ci-
+          # Restore only: systemd-supervision saves `bins`.
+          shared-key: bins
+          save-if: false
 
       # The real daemon spawns `pohunek-sessiond` by path, and the Hermes plugin
       # e2e drives the real `pohunek` CLI, so all three binaries are needed.
@@ -923,8 +897,8 @@ jobs:
 
       # The real daemon spawns `pohunek-sessiond` by path, and the Hermes plugin
       # e2e drives the real `pohunek` CLI, so all three binaries must be present.
-      # They come from the build-bins artifact (issue #122): no Rust toolchain,
-      # sccache, or cargo cache is needed in this job.
+      # They come from the build-bins artifact (issue #122): no Rust toolchain
+      # or cargo cache is needed in this job.
       - name: Download built binaries
         uses: actions/download-artifact@v4
         with:
@@ -990,7 +964,10 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: docs
+          # Its own key: the docs job builds without the mold RUSTFLAGS, and
+          # RUSTFLAGS is part of the rust-cache key, so it cannot share `xtask`.
+          shared-key: docs
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: docs check
         run: cargo xtask docs check
@@ -1006,8 +983,6 @@ jobs:
     needs: changes
     if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.feature_matrix == 'true' }}
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
@@ -1024,13 +999,11 @@ jobs:
           toolchain: stable
           components: clippy
 
-      - name: Enable sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: ci-
+          shared-key: hack
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-hack
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
@@ -1043,17 +1016,16 @@ jobs:
       - name: Check feature powerset
         run: cargo hack --feature-powerset --workspace clippy --all-targets
 
+  # Pull requests get the stable source-level `shear` job below. cargo-udeps
+  # needs the nightly toolchain and a full workspace build, so it runs only on
+  # push to main, the weekly sweep, and manual dispatch. It is the backstop for
+  # what cargo-shear cannot see: a dependency whose only reference sits in code
+  # compiled out for the host (e.g. `#[cfg(target_os = "macos")]` on Linux).
   udeps:
     name: cargo-udeps (unused dependencies)
     runs-on: ubuntu-latest
-    # Needs the nightly toolchain + full workspace resolution (issue #125):
-    # schedule-only, push to main, manual dispatch (always a full run), or
-    # when Cargo.toml / Cargo.lock / CI change.
-    needs: changes
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.udeps == 'true' }}
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
@@ -1069,13 +1041,11 @@ jobs:
         with:
           toolchain: nightly
 
-      - name: Enable sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: ci-
+          shared-key: nightly-udeps
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-udeps
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
@@ -1084,3 +1054,31 @@ jobs:
 
       - name: Check for unused dependencies
         run: cargo udeps --workspace --all-targets --all-features
+
+  # Unused-dependency check for every event, including pull requests. It reads
+  # manifests and sources without compiling, so it needs only stable cargo for
+  # `cargo metadata` and finishes in seconds. It also reports unused
+  # `[workspace.dependencies]` entries and direct dependencies that are loaded
+  # transitively anyway, both of which cargo-udeps misses (issue #173). A false
+  # positive is suppressed per crate with
+  # `[package.metadata.cargo-shear] ignored = ["<crate>"]` plus a reason comment.
+  shear:
+    name: cargo-shear (unused dependencies)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Install cargo-shear
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-shear@1.14.0
+
+      - name: Check for unused dependencies
+        run: cargo shear --locked --deny-warnings --format=github

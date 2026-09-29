@@ -169,7 +169,7 @@ POHUNEK_E2E=1 POHUNEK_DAEMON_BIN=<abs>/target/debug/pohunekd \
 - When the change touches dependencies or feature flags, also run the extra
   CI jobs: `cargo audit`,
   `cargo hack --feature-powerset --workspace clippy --all-targets`,
-  `cargo udeps`.
+  `cargo shear --locked --deny-warnings`.
 - `cargo xtask ts check` is required when the change touches the wire
   protocol or generated TypeScript types (regenerate with
   `cargo xtask ts generate`); it is otherwise optional.

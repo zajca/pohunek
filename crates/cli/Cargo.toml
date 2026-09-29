@@ -28,7 +28,6 @@ uuid.workspace = true
 zeroize.workspace = true
 pohunek-hostcheck = { workspace = true }
 pohunek-protocol = { workspace = true }
-pohunek-netbird = { workspace = true }
 pohunek-paths = { workspace = true }
 pohunek-platform = { workspace = true }
 pohunek-service-config = { workspace = true }
@@ -52,7 +51,6 @@ clap = { workspace = true }
 clap_complete = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true, features = ["process", "signal", "term"] }
-toml = { workspace = true }
 tracing = { workspace = true }
 time = { workspace = true }
 

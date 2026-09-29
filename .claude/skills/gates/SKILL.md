@@ -83,7 +83,8 @@ any gate above.
 ```bash
 cargo audit
 cargo hack --feature-powerset --workspace clippy --all-targets
-cargo udeps --workspace --all-targets --all-features   # needs nightly
+cargo shear --locked --deny-warnings                           # stable; PR gate
+cargo +nightly udeps --workspace --all-targets --all-features  # optional; CI: main/weekly
 ```
 
 Note: `knowledge` gates its protocol bridge behind a `protocol` feature, so

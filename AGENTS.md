@@ -174,7 +174,7 @@ JUnit execution time, and sccache/rust-cache hit rates from `gh` run data) are
 the measurement path behind
 `docs/design/test-performance-report.md`.
 
-The loop cost boundary (nextest >= 0.9.115; profiles in `.config/nextest.toml`,
+The loop cost boundary (nextest >= 0.9.131; profiles in `.config/nextest.toml`,
 shard helper requires Python >= 3.11). CI runs four fast matrix shards and one
 heavy job independently of lint/release jobs. The cost boundary is
 `profile.fast.default-filter`; update it when adding a PTY, DB, Hermes, or other
@@ -185,6 +185,18 @@ all discovered tests, including ignored ones, are assigned exactly once. The
 `cargo tw` remains unfiltered at four test processes. In CI, the Postgres-backed
 relay job is gated by a paths filter and does not run (its PostgreSQL service
 never starts) for non-relay changes.
+
+Flaky tests: `.config/nextest.toml` sets `flaky-result = "fail"` in
+`profile.default`, so every profile inherits it. Only `heavy` and `relay-db`
+retry (`count = 2`, fixed 1s delay): PTY, socket, worker-process, and
+PostgreSQL fixtures. `ci`/`fast` never retry, because a fast test that fails
+intermittently is a bug. A test that passes only on a retry is reported as
+`FLKY-FL` in the log and stays a `<failure>` in `junit.xml`, and the run still
+fails. Retries only tell "fails every time" apart from "fails sometimes". Each
+CI test job runs `scripts/junit-flaky-summary` with `if: always()`, which lists
+flaky and failed tests in the job summary. A FLAKY result means opening a bug issue with
+the root cause. A per-test `flaky-result = "pass"` override is allowed only
+with a linked issue and a reason in a comment next to it.
 
 Rust:
 
@@ -268,7 +280,8 @@ scripts/ci-timings compare --input target/ci-timings/ci-runs.json \
 scripts/ci-timings junit --label "tests (unit, fast)" --run RUN_ID junit-unit.xml
                                   # or: --job-seconds N to supply the job wall
                                   # by hand; --job NAME picks the paired CI job
-scripts/ci-timings cache --run RUN_ID             # sccache JSON + rust-cache hits per job
+scripts/ci-timings cache --run RUN_ID             # rust-cache restores per job, plus sccache
+                                  # JSON where a job runs sccache (release.yml)
 ```
 
 Record the local baseline before and after a change to the dev loop, and
@@ -344,7 +357,14 @@ fixture before committing it.
 
 Extra CI jobs (run if your change touches deps/features): `cargo audit`,
 `cargo hack --feature-powerset --workspace clippy --all-targets`,
-`cargo udeps`. Note `knowledge` gates its protocol bridge behind a `protocol`
+`cargo shear --locked --deny-warnings` (stable, seconds; the unused-dependency
+gate on every PR), and
+optionally `cargo +nightly udeps --workspace --all-targets --all-features`
+(CI runs it only on `main`, the weekly sweep and manual dispatch, as the
+backstop for a dependency referenced only in code compiled out for the host).
+Suppress a verified `cargo shear` false positive with
+`[package.metadata.cargo-shear] ignored = ["<crate>"]` and a reason comment.
+Note `knowledge` gates its protocol bridge behind a `protocol`
 feature — `--all-features` only covers the everything-on case.
 
 ## Coding conventions (project-specific)

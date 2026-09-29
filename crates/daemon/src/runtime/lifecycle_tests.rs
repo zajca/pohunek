@@ -1548,10 +1548,45 @@ fn serve_version_five_worker(
     session_id: &str,
     worker_id: &str,
 ) -> tokio::task::JoinHandle<Vec<String>> {
+    serve_gated_version_five_worker(socket, session_id, worker_id, None)
+}
+
+/// Holds a fake worker's `ControllerAcquired` reply until released.
+#[derive(Debug, Clone, Default)]
+struct AcquireGate {
+    /// Notified once the controller request arrived.
+    entered: Arc<Notify>,
+    /// Releases the held reply.
+    release: Arc<Notify>,
+}
+
+/// [`serve_version_five_worker`] whose controller reply waits for `gate`.
+fn serve_gated_version_five_worker(
+    socket: &Path,
+    session_id: &str,
+    worker_id: &str,
+    gate: Option<AcquireGate>,
+) -> tokio::task::JoinHandle<Vec<String>> {
+    serve_fake_version_five_worker(socket, session_id, worker_id, gate, 0).0
+}
+
+/// Serves controller connections as a version-five worker, rejecting the
+/// controller request of the first `busy` connections with
+/// `ControllerBusy`.
+///
+/// Returns the task, which ends with the request kinds received after the
+/// lease of the first served connection, and the count of busy rejections.
+fn serve_fake_version_five_worker(
+    socket: &Path,
+    session_id: &str,
+    worker_id: &str,
+    gate: Option<AcquireGate>,
+    busy: usize,
+) -> (tokio::task::JoinHandle<Vec<String>>, Arc<AtomicU64>) {
     use pohunek_worker_protocol::{
-        Capability, ControlMessage, ControlReader, ControlResponse, ControlWriter, LeaseChallenge,
-        LeaseId, ProcessIdentity as WireProcess, RequestKind, ResponseKind, RuntimePhase,
-        SessionId, Version, VersionRange, WorkerId,
+        Capability, ControlError, ControlMessage, ControlReader, ControlResponse, ControlWriter,
+        LeaseChallenge, LeaseId, ProcessIdentity as WireProcess, RequestKind, ResponseKind,
+        RuntimePhase, SessionId, Version, VersionRange, WorkerId,
     };
 
     std::fs::DirBuilder::new()
@@ -1561,57 +1596,84 @@ fn serve_version_five_worker(
     let listener = tokio::net::UnixListener::bind(socket).expect("bind fake worker");
     let session_id = SessionId::new(session_id).expect("session id");
     let worker_id = WorkerId::new(worker_id).expect("worker id");
-    tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept controller");
-        let (read_half, write_half) = stream.into_split();
-        let mut reader = ControlReader::new(read_half);
-        let mut writer = ControlWriter::new(write_half);
-        let five = Version::new(5).expect("version five");
-        let mut after_lease = Vec::new();
-        while let Some(message) = reader
-            .read::<ControlMessage>()
-            .await
-            .expect("read control message")
-        {
-            let ControlMessage::Request(request) = message else {
-                panic!("daemon sent a non-request message");
-            };
-            let kind = match request.kind {
-                RequestKind::Negotiate { .. } => ResponseKind::Negotiated {
-                    selected_version: five,
-                    supported_range: VersionRange::new(Version::new(4).expect("v4"), five)
-                        .expect("range"),
-                    session_id: session_id.clone(),
-                    worker_id: worker_id.clone(),
-                    runtime_id: None,
-                    worker_process: WireProcess {
-                        pid: std::process::id(),
-                        start_identity: 1,
+    let rejections = Arc::new(AtomicU64::new(0));
+    let rejected = Arc::clone(&rejections);
+    let task = tokio::spawn(async move {
+        let mut connection = 0_usize;
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept controller");
+            let reject_busy = connection < busy;
+            connection = connection.saturating_add(1);
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = ControlReader::new(read_half);
+            let mut writer = ControlWriter::new(write_half);
+            let five = Version::new(5).expect("version five");
+            let mut after_lease = Vec::new();
+            // A client that saw a rejection closes its connection, which
+            // ends this loop with an error or EOF.
+            while let Ok(Some(message)) = reader.read::<ControlMessage>().await {
+                let ControlMessage::Request(request) = message else {
+                    panic!("daemon sent a non-request message");
+                };
+                let kind = match request.kind {
+                    RequestKind::Negotiate { .. } => ResponseKind::Negotiated {
+                        selected_version: five,
+                        supported_range: VersionRange::new(Version::new(4).expect("v4"), five)
+                            .expect("range"),
+                        session_id: session_id.clone(),
+                        worker_id: worker_id.clone(),
+                        runtime_id: None,
+                        worker_process: WireProcess {
+                            pid: std::process::id(),
+                            start_identity: 1,
+                        },
+                        phase: RuntimePhase::Uninitialized,
+                        capabilities: vec![Capability::AtomicReplay],
+                        challenge: LeaseChallenge::new("challenge-v5").expect("challenge"),
                     },
-                    phase: RuntimePhase::Uninitialized,
-                    capabilities: vec![Capability::AtomicReplay],
-                    challenge: LeaseChallenge::new("challenge-v5").expect("challenge"),
-                },
-                RequestKind::AcquireController { .. } => ResponseKind::ControllerAcquired {
-                    lease_id: LeaseId::new("lease-v5").expect("lease"),
-                    capabilities: Vec::new(),
-                },
-                other => {
-                    after_lease.push(format!("{other:?}"));
-                    continue;
+                    RequestKind::AcquireController { .. } if reject_busy => {
+                        rejected.fetch_add(1, Ordering::Relaxed);
+                        ResponseKind::Error {
+                            error: ControlError {
+                                code: ControlCode::ControllerBusy,
+                                message: "another controller holds the lease".to_owned(),
+                                retryable: true,
+                            },
+                        }
+                    }
+                    RequestKind::AcquireController { .. } => {
+                        if let Some(gate) = &gate {
+                            gate.entered.notify_one();
+                            gate.release.notified().await;
+                        }
+                        ResponseKind::ControllerAcquired {
+                            lease_id: LeaseId::new("lease-v5").expect("lease"),
+                            capabilities: Vec::new(),
+                        }
+                    }
+                    other => {
+                        after_lease.push(format!("{other:?}"));
+                        continue;
+                    }
+                };
+                if writer
+                    .write(&ControlMessage::Response(ControlResponse {
+                        request_id: request.request_id,
+                        kind,
+                    }))
+                    .await
+                    .is_err()
+                    || writer.flush().await.is_err()
+                {
+                    break;
                 }
-            };
-            writer
-                .write(&ControlMessage::Response(ControlResponse {
-                    request_id: request.request_id,
-                    kind,
-                }))
-                .await
-                .expect("write response");
-            writer.flush().await.expect("flush response");
+            }
+            if !reject_busy {
+                return after_lease;
+            }
         }
-        after_lease
-    })
+    });
+    (task, rejections)
 }
 
 #[tokio::test]
@@ -1898,4 +1960,209 @@ async fn a_wedged_job_inspection_never_extends_the_connect_deadline() {
         deadline,
         "the wait ends exactly at the connect deadline"
     );
+}
+
+#[tokio::test]
+async fn an_end_report_never_cancels_a_connect_the_worker_is_answering() {
+    let harness = Harness::scripted(GENEROUS, INITIALIZE);
+    // The job reads as absent from the first inspection on.
+    harness.supervisor.script_inspects([InspectStep::NotFound]);
+    let generation = harness.generation("s-1");
+    harness.write_journal(
+        "s-1",
+        "worker-v5",
+        &journal(
+            "s-1",
+            "worker-v5",
+            generation.generation(),
+            "bootstrap",
+            std::process::id(),
+        ),
+    );
+    let gate = AcquireGate::default();
+    // The fake accepts one connection only, so a replacement attempt after a
+    // cancelled one could never be adopted.
+    let fake = serve_gated_version_five_worker(
+        &harness
+            .runtime_root
+            .join("s-1")
+            .join(pohunek_paths::WORKER_SOCKET_NAME),
+        "s-1",
+        "worker-v5",
+        Some(gate.clone()),
+    );
+
+    let lifecycle = harness.lifecycle();
+    let connecting = lifecycle.connect_until(&generation, Instant::now() + GENEROUS);
+    tokio::pin!(connecting);
+    tokio::select! {
+        outcome = &mut connecting => panic!("the held controller reply cannot complete: {outcome:?}"),
+        () = gate.entered.notified() => {}
+    }
+    assert!(
+        harness
+            .supervisor
+            .calls()
+            .contains(&Call::Inspect(generation.service_id())),
+        "the job end was reported while the controller reply is held"
+    );
+    gate.release.notify_one();
+
+    let worker = connecting
+        .await
+        .expect("the answering worker is adopted despite the end report");
+    assert_eq!(worker.worker_id().await.as_str(), "worker-v5");
+    drop(worker);
+    tokio::time::timeout(GENEROUS, fake)
+        .await
+        .expect("controller connection closed")
+        .expect("fake worker task");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_job_end_at_the_connect_deadline_outranks_the_deadline() {
+    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    let live = InspectStep::Present {
+        state: ServiceState::Running,
+        process: true,
+    };
+    // Inspections run at 0 and 100 ms, then at the 150 ms deadline, which is
+    // also when the last socket attempt fails.
+    harness
+        .supervisor
+        .script_inspects([live, live, InspectStep::NotFound]);
+    let generation = harness.generation("s-1");
+    let deadline = Instant::now() + CONNECT;
+
+    let outcome = harness
+        .lifecycle()
+        .connect_until(&generation, deadline)
+        .await;
+
+    assert_eq!(
+        Instant::now(),
+        deadline,
+        "both outcomes fall on the deadline"
+    );
+    assert!(
+        matches!(outcome, Err(NotReady::Ended(JobEnd::Absent))),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_busy_controller_lease_is_retried_until_the_worker_is_adopted() {
+    let harness = Harness::scripted(GENEROUS, INITIALIZE);
+    let generation = harness.generation("s-1");
+    harness.write_journal(
+        "s-1",
+        "worker-v5",
+        &journal(
+            "s-1",
+            "worker-v5",
+            generation.generation(),
+            "bootstrap",
+            std::process::id(),
+        ),
+    );
+    let (fake, rejections) = serve_fake_version_five_worker(
+        &harness
+            .runtime_root
+            .join("s-1")
+            .join(pohunek_paths::WORKER_SOCKET_NAME),
+        "s-1",
+        "worker-v5",
+        None,
+        1,
+    );
+
+    // One attempt, as after a job-end report, must outlast the busy lease.
+    let worker = harness
+        .lifecycle()
+        .try_connect(&generation, Instant::now() + GENEROUS, None)
+        .await
+        .expect("the worker is adopted once its lease is free");
+
+    assert_eq!(worker.worker_id().await.as_str(), "worker-v5");
+    assert_eq!(rejections.load(Ordering::Relaxed), 1);
+    drop(worker);
+    tokio::time::timeout(GENEROUS, fake)
+        .await
+        .expect("controller connection closed")
+        .expect("fake worker task");
+}
+
+#[tokio::test]
+async fn a_controller_lease_busy_until_the_deadline_ends_with_the_deadline() {
+    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    let generation = harness.generation("s-1");
+    let (fake, rejections) = serve_fake_version_five_worker(
+        &harness
+            .runtime_root
+            .join("s-1")
+            .join(pohunek_paths::WORKER_SOCKET_NAME),
+        "s-1",
+        "worker-v5",
+        None,
+        usize::MAX,
+    );
+    let started = Instant::now();
+
+    let outcome = tokio::time::timeout(
+        GENEROUS,
+        harness
+            .lifecycle()
+            .try_connect(&generation, started + CONNECT, None),
+    )
+    .await
+    .expect("a busy lease never extends the attempt deadline");
+
+    assert!(
+        outcome.is_none(),
+        "a lease busy until the deadline adopts nothing"
+    );
+    assert!(started.elapsed() >= CONNECT, "{:?}", started.elapsed());
+    assert!(
+        rejections.load(Ordering::Relaxed) >= 2,
+        "the busy lease was retried within the deadline"
+    );
+    fake.abort();
+}
+
+#[tokio::test]
+async fn an_ended_job_stops_the_busy_lease_retries_after_the_first_refusal() {
+    let harness = Harness::scripted(NEVER, INITIALIZE);
+    // The job reads as absent from the first inspection on.
+    harness.supervisor.script_inspects([InspectStep::NotFound]);
+    let generation = harness.generation("s-1");
+    let (fake, rejections) = serve_fake_version_five_worker(
+        &harness
+            .runtime_root
+            .join("s-1")
+            .join(pohunek_paths::WORKER_SOCKET_NAME),
+        "s-1",
+        "worker-v5",
+        None,
+        usize::MAX,
+    );
+
+    let outcome = tokio::time::timeout(
+        GENEROUS,
+        harness
+            .lifecycle()
+            .connect_until(&generation, Instant::now() + NEVER),
+    )
+    .await
+    .expect("an ended job does not wait out a busy lease until the connect deadline");
+
+    assert!(
+        matches!(outcome, Err(NotReady::Ended(JobEnd::Absent))),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        rejections.load(Ordering::Relaxed),
+        1,
+        "the attempt in flight completed, and no retry followed the end report"
+    );
+    fake.abort();
 }

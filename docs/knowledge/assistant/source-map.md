@@ -194,7 +194,9 @@ Shipped host-local identity and governance:
 
 Release packaging and contributor verification:
 
-- `.config/nextest.toml` — shared fast cost boundary and bounded heavy profile.
+- `.config/nextest.toml` — shared fast cost boundary, bounded heavy profile,
+  and the flaky-test policy (`flaky-result = "fail"`; retries on `heavy` and
+  `relay-db` only).
 - `.cargo/config.toml` — `cargo t`/`cargo ti` select fast unit and integration
   tests; `cargo tw` keeps the full suite; `cargo ta` runs `cargo xtask
   affected`. Fast loops do not replace full gates.
@@ -229,6 +231,14 @@ Release packaging and contributor verification:
   `docs/design/test-performance-report.md`.
 - `scripts/tests/test_ci_timings.py` — regression checks for the timing
   helper's parsing, medians, and markdown renderers.
+- `scripts/junit-flaky-summary` — lists flaky (failed, then passed on a
+  retry) and persistently failed tests from nextest JUnit reports as a
+  Markdown table in `$GITHUB_STEP_SUMMARY` (or stdout with `--stdout`); a
+  missing or unreadable report is written into the summary. CI runs it with
+  `if: always()` after the fast, heavy, and relay-db nextest steps.
+- `scripts/tests/test_junit_flaky_summary.py` — regression checks for that
+  summary against real nextest JUnit captures in
+  `scripts/tests/fixtures/nextest-junit/`.
 - `scripts/measure-dev-loop` — the local dev-loop baseline measurement
   (issue #163): the `cold`, `warm`, and `incremental` time cases timed
   with hyperfine or `time.monotonic` in a dedicated, marker-guarded
