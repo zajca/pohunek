@@ -809,8 +809,11 @@ One round of the Manage-Execute-Audit loop, entirely through public interfaces:
    is the daemon's.
 3. **Audit**: read the result's verified fields (task RFC section 10),
    judging the round by `turn_delta`; if the round's claims matter, the
-   auditor principal runs a `mode: "investigate"` task with `worktree_of` the
-   executor's task, so it inspects the executor's actual uncommitted state,
+   manager first stops the executor task (`if_latest_turn`, `require_idle`)
+   because the daemon hands a shared tree to another task only once the
+   previous occupant's runtime is stopped and joined (task RFC invariant
+   11), and the auditor principal then runs a `mode: "investigate"` task
+   with `worktree_of` the executor's task, so it inspects the executor's actual uncommitted state,
    or relies on the round's `checks`; record `task.review` bound to the
    executor result's `result_id` and the verified `worktree_fingerprint`
    (task RFC section 13.1). A `finality: heuristic` result is audited only

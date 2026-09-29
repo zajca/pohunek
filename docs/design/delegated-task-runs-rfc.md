@@ -248,13 +248,17 @@ recorded, and each revision increments the turn's `settlement_revision`
   the bound execution) arrives after the deadline and before any later turn
   was delivered. Every occupancy acquisition increments a persisted
   **worktree generation**, and a `timed_out` settlement records the
-  generation current at that moment. Late finalization first
+  generation current at that moment together with the complete worktree
+  fingerprint (section 10) taken then. Late finalization first
   **re-acquires occupancy** through the same check-and-set as a delivery
-  (invariant 11) and compares generations: when the tree is free **and** the
-  generation is unchanged since the timeout, the turn is revised to `completed` (or `failed`) with the usual
+  (invariant 11) and compares both: when the tree is free, the generation
+  is unchanged since the timeout **and** the current fingerprint equals the
+  one recorded at the timeout (so no owner-path edit, detached process or
+  external tool touched the tree meanwhile), the turn is revised to `completed` (or `failed`) with the usual
   finality rules, snapshots and checks, so the work appears in its
-  `turn_delta` instead of being lost; when another task occupies the tree, or any
-  other task held it since the timeout (generation advanced), no snapshot
+  `turn_delta` instead of being lost; when another task occupies the tree, any other
+  task held it since the timeout (generation advanced), or the fingerprint
+  differs (something else wrote), no snapshot
   or check runs, the turn is revised with `integrity: suspect` and reason
   `late_completion_conflict`, the occupant's current or next result is
   marked suspect too, and the changes are attributed to nobody. No `task.extend` is needed, and the
@@ -268,8 +272,11 @@ recorded, and each revision increments the turn's `settlement_revision`
   terminal resolution this is the only way out of a settled `attention`, and
   it is atomic with the session stop.
 
-`task.stop` also **seals** the task: it records a stop fence (the session
-stop plus a task-level generation), after which no settlement of that task
+Every transition of a task to `ended` **seals** it — `task.stop`, a direct
+`session.stop`, session removal, and the agent's own exit (`exited` or a
+failed exit) — by recording a stop fence (the session's terminal lifecycle
+state plus a task-level generation) atomically before any teardown, after
+which no settlement of that task
 is revisable — a `timed_out` turn can no longer complete late, a heuristic
 `completed` turn can no longer re-open, and no queued delivery runs. Evidence
 that arrives after the fence is recorded on the turn as `ignored_after_stop`
@@ -375,7 +382,14 @@ settles with `completed` (section 12).
    notifications, projections or audit, and retire with the session.
    Prompts are persisted only as a **keyed fingerprint** (HMAC under a
    daemon-local key, so a stored value is no dictionary oracle for short or
-   predictable prompts) plus that same scrollback; the plain canonicalized
+   predictable prompts) plus that same scrollback. The key is a versioned
+   owner-private secret under the daemon state directory (`tasks/hmac/<key
+   id>`), created and fsynced before the first record that depends on it;
+   every stored fingerprint names its key id, rotation is an explicit owner
+   command that mints a new version and keeps the old ones readable until
+   every fingerprint under them has left `tasks.metadata_retention`, and a
+   missing key version fails the comparison typed (`task_fingerprint_key_missing`)
+   instead of treating a valid resubmission as a mismatch; the plain canonicalized
    digest a hook reports is compared in memory and never persisted, logged
    or audited.
 8. The origin-session guard applies: an agent running inside session S cannot
@@ -414,9 +428,17 @@ settles with `completed` (section 12).
     alive — `task.stop` and session removal cancel and join them first
     (section 12); no turn is open, no attention is pending and no result is
     finalizing; the heuristic re-open window of the latest turn has elapsed;
-    and either the session has ended or the agent is observed ready. Session
-    end alone never releases occupancy while daemon-owned task processes
-    still run in the tree. Rounds on a shared worktree are sequential by daemon
+    and either the session has ended or the agent is observed ready. An
+    agent observed ready proves nothing about processes it detached, so that
+    release is good only for the **same** task's next turn; a **handoff** —
+    another task acquiring the tree through `worktree_of`, a lifecycle
+    operation entering it, or a session of a non-task placing a PTY there —
+    additionally requires that the previous occupant's session has ended and
+    its runtime containment scope is empty (the worker's PTY process group
+    and, on Linux, the session's cgroup scope, joined by the worker on stop),
+    otherwise it fails with `task_worktree_busy` naming the task to stop.
+    Session end alone never releases occupancy while daemon-owned task
+    processes still run in the tree. Rounds on a shared worktree are sequential by daemon
     enforcement, not by convention. A heuristic re-open (section 6.3) that
     finds the worktree occupied by another task marks both tasks' affected
     results `integrity: suspect` instead of waiting, because the provider
@@ -1224,9 +1246,15 @@ implementation:
   is only imported once by a legacy migration.
 - **Resume and fork.** The TUI accepts `--session <id>` to resume; it has
   **no** `--fork` flag (only `run` and `mini` do, and they require
-  `--continue` or `--session`). Forking for the TUI therefore goes through
-  the server API (`/api/session/{sessionID}/fork`) followed by
-  `--session <new-id>`.
+  `--continue` or `--session`). The server API's fork
+  (`/api/session/{sessionID}/fork`) creates the new native session inside
+  the **source** server's `opencode.db`; with one isolated server and data
+  directory per pohunek session (below) nothing moves that session to the
+  destination worker, so fork is **not supported** for OpenCode task
+  sessions in this design: `session.fork` fails with
+  `task_fork_unsupported`, and a new task on the same tree uses
+  `worktree_of` with a fresh context instead. Resume (`--session <id>`
+  against the same data directory) is supported.
 - **No activity in the terminal title.** The TUI sets only `OpenCode` or
   `OC | <title>`, so title-based detection (used for Claude) is unavailable.
 - **Typed events.** The server defines `session.execution.started`,
@@ -1255,9 +1283,13 @@ Runtime design:
    the server's stdout and otherwise discards that stream; it is never
    written to logs, scrollback or evidence. `--port 0` avoids per-session
    port allocation races. The worker verifies before starting the TUI that
-   an unauthenticated `/api` request is refused; if it is not (an OpenCode
-   version without authentication), the adapter refuses to launch rather
-   than exposing an unauthenticated tool-executing port. A Unix socket would
+   a known data-bearing route (the session list under `/api`) answers an
+   unauthenticated request with exactly `401` and a `www-authenticate:
+   Basic` challenge, and that the same route succeeds with the generated
+   credentials; a `404`, any `2xx`, or a missing challenge (an OpenCode
+   version without authentication, or one that moved the route) makes the
+   adapter refuse to launch rather than expose an unauthenticated
+   tool-executing port. A Unix socket would
    be preferable but is not available through the 2.0.14 CLI; the adapter
    adopts it when a pinned version exposes it.
 2. The PTY runs the OpenCode TUI attached to that server (`--server <url>`,
@@ -1268,9 +1300,10 @@ Runtime design:
    emitted during a daemon outage are replayed after reconnect. Raw event
    payloads are not stored; only the fields named above.
 4. Native session identity comes from the server, so no hook or plugin is
-   needed for resume, fork or settlement. Resume is TUI `--session <id>`;
-   fork is a server API call followed by `--session <new-id>` (the TUI has no
-   `--fork`).
+   needed for resume or settlement. Resume is TUI `--session <id>` against
+   the session's own data directory; fork is unsupported (above), and a
+   later pinned OpenCode that offers session export/import may lift that in
+   a follow-up.
 5. Final message and per-message usage are read from the server's session API
    after settlement, filtered to the assistant messages observed during the
    turn.
@@ -1801,8 +1834,10 @@ Typed errors introduced by this RFC:
 | `task_store_full` | `task.start`, `task.continue`, `task.review` | A task store cap (`tasks.store_max_bytes`, `tasks.max_turns_per_task`, `tasks.max_tasks_retained`) would be exceeded (section 14). |
 | `task_review_limit_reached` | `task.review` | `tasks.max_reviews_per_result` distinct reviewers already hold a verdict on this result (section 13.1). |
 | `task_waiter_limit_reached` | `task.wait` | The task waiter pool is full. |
+| `task_fingerprint_key_missing` | retried `task.start`, `task.continue`, `task.answer` | The key version a stored fingerprint names is unavailable; the comparison is not attempted (invariant 7). |
 | `task_request_conflict` | all idempotent methods | A reused request key with different parameters. |
 | `task_investigate_no_checks` | `task.start`, `task.continue` | `checks` or `checks_baseline` requested for an investigate-mode task (section 12). |
+| `task_fork_unsupported` | `session.fork` | The task's agent cannot fork its native session across per-session servers (OpenCode, section 9.3). |
 | `task_investigate_unsupported` | `task.start` | The profile cannot enforce investigation mode (section 11.2). |
 
 Events on `subscribe`: `task_turn_opened`, `task_result_published` (emitted at publication, after finalization, not at settlement), `task_result_final` (when a heuristic result's re-open window closes),
@@ -2032,9 +2067,14 @@ external ones; `task.continue` remains for short steering within a round.
 The rationale is empirical: fresh-context execution with audited state
 raises the failure floor on multi-step work, while long conversations rot
 and compound errors.
-**Round cleanup.** A finished round is not a finished task: `completed`
-leaves the executor's and auditor's sessions running (section 6.1). After
-recording a round's verdict, each finished task is stopped by a client that
+**Round order and cleanup.** The executor is stopped **before** the
+auditor's `worktree_of` task starts: invariant 11 refuses the handoff
+while the executor's session lives, because an agent observed ready may
+have left a detached writer behind, and only a stopped, joined runtime
+proves the tree quiet. The manager therefore records the executor's result,
+stops the executor with `if_latest_turn` and `require_idle`, then asks for
+the audit; a `completed` turn by itself leaves sessions running (section
+6.1). After recording a round's verdict, each finished task is stopped by a client that
 has lifecycle authority over it — the executor by the manager that created
 it, the auditor task by the auditor that created it — using `task.stop` with
 `if_latest_turn` and `require_idle` (section 13.1), so a stop can never hit a
@@ -2147,7 +2187,7 @@ without blocking the rest.
    metadata retention.
 4. **Adapters:** OpenCode adapter (launch, authenticated loopback server
    child on an ephemeral port with stdout discarded after the listen line,
-   fork through the server API, event mapping, capabilities, manifest,
+   fork refused with `task_fork_unsupported`, event mapping, capabilities, manifest,
    compatibility lock and goldens); Claude and Codex `UserPromptSubmit`
    digest hooks with pinned prompt canonicalization, a Claude
    `PermissionRequest` hook, and task-evidence hooks for `Stop`/`StopFailure`/
@@ -2263,7 +2303,15 @@ without blocking the rest.
      value; an unconfined check never lets the worktree be auto-removed;
      evidence after `task.stop` is `ignored_after_stop` and never re-opens a
      turn; settlement and stop succeed with the store at its cap through the
-     reserve, and on a full disk through the emergency journal;
+     reserve, and on a full disk through the emergency journal; a late
+     completion after an owner-path edit (fingerprint differs) reports
+     `late_completion_conflict`; evidence after a direct `session.stop`,
+     removal or agent exit never revises a settlement; a handoff is refused
+     while the previous occupant's runtime scope is non-empty and a
+     detached writer is joined before the auditor starts; OpenCode
+     `session.fork` refused typed; the auth probe rejects a `404` and a
+     missing Basic challenge; fingerprint key rotation keeps old
+     resubmissions comparable and a missing key version fails typed;
      check definitions: a host definition shadows an in-repo one of the same
      name, an in-repo definition edited in the worktree during the turn is
      not what runs, and `repo_base` checks cap integrity at `suspect`;
