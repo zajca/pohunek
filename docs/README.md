@@ -60,6 +60,15 @@ multi-team control plane without replacing either owner path.
   — milestone split and reconciled decisions for the browser control center
   (thin owner gateway + browser-side aggregation in `web/client-core`).
 
+- [Delegated task runs RFC](design/delegated-task-runs-rfc.md) — accepted:
+  task and turn records over ordinary sessions, causal turn settlement, blocking
+  `task.wait`, typed results with repository evidence and checks, OpenCode
+  2.x as the first provider with structured turn evidence, and
+  manager/auditor composition above the daemon (the relay dark factory).
+- [Relay dark factory RFC](design/relay-dark-factory-rfc.md) — accepted:
+  relay authorization, budgets, audit, task projections and escalation for
+  unattended manager/auditor delegation over the team relay; the factory is a
+  client, never relay or daemon logic.
 - [Universal Pohunek Assistant](design/universal-assistant.md) - one ordinary
   session-backed assistant, steered by intent and a live snapshot, for setup,
   project configuration, updates, troubleshooting, and general help.
