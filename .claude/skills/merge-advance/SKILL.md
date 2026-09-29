@@ -48,10 +48,16 @@ green (see the `milestone` and `milestone-review` skills).
 3. **Delete the branch and prune the worktree.** Everything should now live in
    `main`:
 
+   Worktrees live in `pohunek-worktrees/` beside the primary checkout, so
+   derive that from git instead of a relative path, which resolves only from
+   the primary checkout. Run this from any checkout except the one being
+   removed (or pass the absolute path `scripts/worktree-new` printed):
+
    ```bash
-   git worktree remove ../pohunek-worktrees/<milestone-slug>
-   git branch -d zajca/<milestone-slug>
-   git worktree prune
+   primary=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+   git -C "$primary" worktree remove "$(dirname "$primary")/pohunek-worktrees/<milestone-slug>"
+   git -C "$primary" branch -d zajca/<milestone-slug>
+   git -C "$primary" worktree prune
    ```
 
    If the user asks to "vyčisti worktrees, všechno by mělo být v main", verify

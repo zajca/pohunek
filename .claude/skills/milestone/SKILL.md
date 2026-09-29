@@ -27,7 +27,8 @@ The issue is the spec — there is no `NEXT.md`.
    their stable IDs — these are the testable success criteria. If they are
    ambiguous, resolve the ambiguity before implementation; do not invent scope.
 2. **Create a worktree off `main`.** Use the script, which fetches
-   `origin/main`, creates `../pohunek-worktrees/<milestone-slug>` on
+   `origin/main`, creates `pohunek-worktrees/<milestone-slug>` beside the
+   primary checkout (from any checkout; it prints the absolute path) on
    `zajca/<milestone-slug>`, and reflink-seeds its `target/` from the main
    checkout so the first build compiles only workspace crates:
 

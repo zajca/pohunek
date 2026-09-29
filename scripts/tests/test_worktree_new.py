@@ -85,8 +85,6 @@ class FakeExecutor:
         self.add_fails = None
         # When True, `git branch <name> <commit>` fails without creating it.
         self.branch_fails = False
-        # When True, `git worktree remove` fails and leaves the worktree.
-        self.remove_fails = False
         # Registered worktree path -> checked-out branch name.
         self.registered = {}
         # Per-root override of `cargo metadata` target/build directories.
@@ -198,10 +196,11 @@ class FakeExecutor:
             return 0, self.porcelain_z(), ""
         if args[:2] == ["worktree", "remove"]:
             path = Path(args[-1])
-            if self.remove_fails:
-                return 128, "", f"fatal: cannot remove '{path}'"
             if path not in self.registered:
                 return 128, "", f"fatal: '{path}' is not a working tree"
+            if "--force" not in args and self.untracked_files(path):
+                return 128, "", (f"fatal: '{path}' contains modified or "
+                                 "untracked files, use --force to delete it")
             shutil.rmtree(path)
             del self.registered[path]
             return 0, "", ""
@@ -251,6 +250,14 @@ class FakeExecutor:
         source.rename(dest)
         self.registered[dest] = self.registered.pop(source)
         return 0, "", ""
+
+    @staticmethod
+    def untracked_files(worktree):
+        """Files git would count as untracked: the emulated checkout tracks
+        only `Cargo.toml` and ignores `target/`."""
+        return [p for p in worktree.rglob("*")
+                if p.is_file() and p.name != "Cargo.toml"
+                and "target" not in p.relative_to(worktree).parts]
 
     def porcelain_z(self):
         """`git worktree list --porcelain -z` as git 2.55 prints it: each
@@ -847,19 +854,63 @@ class WorktreeAddFailureTests(RollbackCase):
                          {other: "zajca/issue-1"})
         self.assert_temp_branch_compare_and_deleted()
 
-    def test_failed_worktree_removal_keeps_its_branch(self):
+    def after_add(self, action):
+        """Run `action(temp path)` right after `git worktree add`."""
+        def hook(command):
+            if command[1:3] == ["worktree", "add"]:
+                action(Path(command[3]))
+        self.h.executor.after_command = hook
+
+    def test_refused_plain_removal_keeps_files_and_branch(self):
+        # Something wrote an untracked file into the temporary worktree:
+        # the plain remove refuses, and nothing is deleted.
+        self.after_add(lambda temp: (temp / "notes.txt").write_text("work"))
         self.h.executor.copy_fails_for = "deps"
-        self.h.executor.remove_fails = True
         code, _, err = self.h.run("issue-1")
         self.assertEqual(code, 1)
         (temp,) = self.h.executor.temporary_worktrees()
         (temp_branch,) = self.h.executor.temporary_branches()
+        self.assertEqual((temp / "notes.txt").read_text(), "work")
         self.assertEqual(self.h.executor.registered, {temp: temp_branch})
         self.assertEqual(self.h.executor.branches[temp_branch], BASE_COMMIT)
         self.assertEqual(self.h.executor.ref_deletions(), [])
-        self.assertIn(f"remove worktree {temp} manually", err)
-        self.assertIn(f"left branch {temp_branch} in place: worktree {temp} "
-                      "still has it checked out", err)
+        self.assertIn(f"remove worktree {temp} manually (fatal: '{temp}' "
+                      "contains modified or untracked files", err)
+        self.assertIn(f"left branch {temp_branch} in place", err)
+
+    def test_other_branch_at_the_temporary_path_is_left_alone(self):
+        def swap_branch(temp):
+            self.h.executor.branches["zajca/other"] = OTHER_COMMIT
+            self.h.executor.registered[temp] = "zajca/other"
+
+        self.after_add(swap_branch)
+        self.h.executor.copy_fails_for = "deps"
+        code, _, err = self.h.run("issue-1")
+        self.assertEqual(code, 1)
+        (temp,) = self.h.executor.temporary_worktrees()
+        (temp_branch,) = self.h.executor.temporary_branches()
+        self.assertIn(f"left worktree {temp} in place: git lists it with "
+                      f"refs/heads/zajca/other checked out, not {temp_branch}",
+                      err)
+        self.assertIn(f"left branch {temp_branch} in place", err)
+        self.assertFalse(self.h.executor.ran("git", "worktree", "remove"))
+        self.assertEqual(self.h.executor.ref_deletions(), [])
+        self.assertEqual(self.h.executor.registered, {temp: "zajca/other"})
+        self.assertTrue(temp.is_dir())
+
+    def test_rollback_never_forces_a_removal(self):
+        for mode in ("after-checkout", None):
+            with self.subTest(mode=mode):
+                self.h.executor.add_fails = mode
+                self.h.executor.copy_fails_for = None if mode else "deps"
+                code, _, err = self.h.run("issue-1")
+                self.assertEqual(code, 1)
+                self.assertIn("rolled back worktree", err)
+        removes = [c for c in self.h.executor.commands
+                   if c[1:3] == ["worktree", "remove"]]
+        self.assertEqual(len(removes), 2)
+        for command in self.h.executor.commands:
+            self.assertNotIn("--force", command)
 
     def test_retry_after_rollback_succeeds(self):
         self.run_failing_add("after-checkout")

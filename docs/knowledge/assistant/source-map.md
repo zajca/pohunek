@@ -261,7 +261,8 @@ Release packaging and contributor verification:
 - `scripts/tests/test_cargo_sweep_targets.py` — regression checks for that
   helper's destructive guards; the CI script-regression step runs
   `python3 -m unittest discover -s scripts/tests -p 'test_*.py'`.
-- `scripts/worktree-new` — creates `../pohunek-worktrees/<slug>` on
+- `scripts/worktree-new` — creates `pohunek-worktrees/<slug>` beside the
+  primary checkout (whichever checkout it runs from) on
   `zajca/<slug>` and seeds the worktree's own `target/debug` caches
   (`.fingerprint`, `build`, `deps`, `incremental`, plus `CACHEDIR.TAG`) from
   the main checkout with `cp -a --reflink=always`; one run at a time holds
@@ -277,8 +278,9 @@ Release packaging and contributor verification:
   the worktree is added and seeded at the matching temporary sibling path,
   then `git worktree move`d to its slug, and the branch is renamed to its
   final name last with `git branch -m`; a failure before that rename
-  removes only the worktree at the temporary path and deletes only the
-  temporary branch by `git update-ref -d` against the commit it was created
+  removes only the worktree at the temporary path, only while git lists it
+  on the temporary branch, and never with `--force` (so modified or
+  untracked files survive), and deletes only the temporary branch by `git update-ref -d` against the commit it was created
   at, and only once no registered worktree still has it checked out, so
   plain-git work under the final names is never touched. Worktrees are
   read from `git worktree list --porcelain -z`, so any path parses intact. A failed

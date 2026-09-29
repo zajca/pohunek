@@ -37,7 +37,10 @@ Fail-closed rules:
   only a worktree registered at that temporary path and deletes only that
   temporary branch, through the compare-and-delete `git update-ref -d
   refs/heads/<temp-branch> <base-commit>`; it never touches the
-  destination or the final branch name;
+  destination or the final branch name. The worktree is removed only while
+  git lists it with the temporary branch checked out, and never with
+  `--force`, so modified or untracked files always survive; the branch is
+  deleted only once no worktree uses it;
 * the final names are taken last: `git worktree move` renames the seeded
   worktree into place, then `git branch -m <temp-branch> <branch>` renames
   the branch, which git refuses when `<branch>` exists and which updates
@@ -528,22 +531,37 @@ def temporary_names(worktrees_root, slug):
             f"{BRANCH_PREFIX}{TEMP_BRANCH_PREFIX}{suffix}")
 
 
-def remove_owned_worktree(path, repo, executor, removed, problems):
-    """Remove the worktree at `path`, which carries this run's unique name."""
-    if worktree_registered(path, repo, executor):
-        result = executor(
-            ["git", "worktree", "remove", "--force", path],
-            cwd=repo,
-            check=False,
-        )
-        if result.returncode == 0:
-            removed.append(f"worktree {path}")
-        else:
-            problems.append(f"remove worktree {path} manually")
-    elif path.exists() or path.is_symlink():
-        # Present on disk but unknown to git: never delete it blindly.
-        problems.append(f"remove {path} manually (not a registered "
-                        "worktree)")
+def remove_owned_worktree(path, branch, repo, executor, removed, problems):
+    """Remove the worktree at `path`, which carries this run's unique name.
+
+    It is removed only while git lists it with this run's temporary
+    `branch` checked out, and without `--force`: plain `git worktree
+    remove` deletes ignored files such as the seeded `target/` but refuses
+    modified or untracked ones, so no race on the registration can cost
+    anyone's work. Returns False when the worktree is kept in a state this
+    run cannot vouch for, so the caller keeps the branch as well.
+    """
+    head = list_worktrees(repo, executor).get(path.resolve(), False)
+    if head is False:
+        if path.exists() or path.is_symlink():
+            # Present on disk but unknown to git: never delete it blindly.
+            problems.append(f"remove {path} manually (not a registered "
+                            "worktree)")
+        return True
+    if head != f"refs/heads/{branch}":
+        problems.append(f"left worktree {path} in place: git lists it with "
+                        f"{head or 'a detached HEAD'} checked out, not "
+                        f"{branch}; inspect and remove it manually")
+        return False
+    result = executor(["git", "worktree", "remove", path], cwd=repo,
+                      check=False)
+    if result.returncode == 0:
+        removed.append(f"worktree {path}")
+        return True
+    detail = (result.stderr or "").strip().splitlines()
+    detail = f" ({detail[0]})" if detail else ""
+    problems.append(f"remove worktree {path} manually{detail}")
+    return False
 
 
 def delete_owned_branch(branch, commit, repo, executor, removed, problems):
@@ -586,9 +604,14 @@ def rollback(repo, worktree_paths, branch, commit, executor):
     """
     removed, problems = [], []
     try:
+        vouched = True
         for path in worktree_paths:
-            remove_owned_worktree(path, repo, executor, removed, problems)
-        if commit is not None:
+            vouched &= remove_owned_worktree(path, branch, repo, executor,
+                                             removed, problems)
+        if commit is not None and not vouched:
+            problems.append(f"left branch {branch} in place with that "
+                            "worktree")
+        elif commit is not None:
             delete_owned_branch(branch, commit, repo, executor, removed,
                                 problems)
     except WorktreeError as error:

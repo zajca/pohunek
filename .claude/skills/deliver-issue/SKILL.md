@@ -65,7 +65,9 @@ the review loop, CI triage, and the merge decision. Where a step below says
 ## Phase 3 — implement through subagents
 
 Create the worktree per `milestone` step 2 with `scripts/worktree-new
-<slug>`: it lands in `<repo>/../pohunek-worktrees/<slug>` (**never under
+<slug>`: it lands in `pohunek-worktrees/<slug>` beside the primary checkout
+(the parent of `git rev-parse --path-format=absolute --git-common-dir`)
+whichever checkout it runs from, and prints that absolute path (**never under
 `/tmp`**, a small RAM tmpfs) with a reflink-seeded `target/`. Then, per
 slice:
 
