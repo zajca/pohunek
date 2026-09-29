@@ -85,7 +85,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: platform-contracts
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
 
       - name: Check shared platform contracts
         run: cargo check --locked -p pohunek-platform --all-targets
@@ -208,7 +208,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: clippy
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
@@ -429,7 +429,7 @@ jobs:
           # --all-features` build as the fast shards and relay-db, plus
           # pohunek-sessiond, so it holds the superset of what they restore.
           shared-key: test-debug
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
@@ -489,7 +489,7 @@ jobs:
           # Designated `bins` saver: the build-bins binaries plus the test
           # builds of the ignored systemd suites, a superset of build-bins.
           shared-key: bins
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
 
       - name: Require a running systemd user manager
         run: |
@@ -615,7 +615,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: release
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
 
       # Nextest does not execute rustdoc tests; preserve the cargo test gate.
       - name: Documentation tests
@@ -655,7 +655,7 @@ jobs:
           # Designated `xtask` saver: the xtask binary plus the ts-rs export
           # test builds, a superset of what hermes-compatibility restores.
           shared-key: xtask
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
 
       - name: TS binding drift
         run: cargo xtask ts check
@@ -969,7 +969,7 @@ jobs:
           # Its own key: the docs job builds without the mold RUSTFLAGS, and
           # RUSTFLAGS is part of the rust-cache key, so it cannot share `xtask`.
           shared-key: docs
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
 
       - name: docs check
         run: cargo xtask docs check
@@ -1005,7 +1005,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: hack
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
 
       - name: Install cargo-hack
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
@@ -1046,7 +1046,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: nightly-udeps
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
 
       - name: Install cargo-udeps
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
