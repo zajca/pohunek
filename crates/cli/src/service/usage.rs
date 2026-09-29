@@ -462,6 +462,8 @@ impl Usage {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::io::BufRead as _;
+
     use pohunek_platform::process::HostInspector;
     use pohunek_platform::supervisor::{DefinitionFacts, ServiceId, ServiceState, WorkerKey};
     use pohunek_session_worker::{JournalRecord, WorkerOrigin};
@@ -755,18 +757,36 @@ pub(crate) mod tests {
             .is_some_and(|reason| reason.contains("older pohunek")));
     }
 
+    /// Line the stand-in prints once it runs as the copied image.
+    ///
+    /// `spawn` can return while `execve` is still in flight, when
+    /// `/proc/<pid>/exe` still names the parent image. Output from the new
+    /// image is the only point at which the exec has provably completed.
+    const STAND_IN_READY: &str = "ready\n";
+
+    /// Prints the readiness line, then blocks reading the piped stdin until
+    /// the test kills it.
+    const STAND_IN_SCRIPT: &str = "echo ready; read -r _";
+
     #[test]
     fn a_running_process_keeps_the_version_it_executes() {
         let (_root, root) = temp_root();
         let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
         let dir = layout.version_dir("1.0.0").expect("dir");
         std::fs::create_dir_all(&dir).expect("version dir");
-        let sleeper = dir.join("pohunek-sessiond");
-        std::fs::copy("/bin/sleep", &sleeper).expect("copy sleep");
-        let mut child = std::process::Command::new(&sleeper)
-            .arg("30")
+        let stand_in = dir.join("pohunek-sessiond");
+        std::fs::copy("/bin/sh", &stand_in).expect("copy shell");
+        let mut child = std::process::Command::new(&stand_in)
+            .args(["-c", STAND_IN_SCRIPT])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn live worker stand-in");
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("stand-in stdout"))
+            .read_line(&mut ready)
+            .expect("read stand-in readiness");
+        assert_eq!(ready, STAND_IN_READY);
 
         let usage = Usage::collect(
             &layout,
