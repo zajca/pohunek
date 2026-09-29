@@ -2,7 +2,11 @@ name: CI
 
 # Test everything on every push to main and on every pull request: formatting,
 # lints (warnings are errors), the full test suite, and a release build of both
-# binaries so a broken release profile is caught before tagging.
+# binaries so a broken release profile is caught before tagging. Doctests run on
+# every pull request. The release build (job `release-build`) runs on push to
+# main, the weekly schedule, and manual dispatch, and on pull requests only when
+# the `release` paths filter matches (manifests, lockfile, .cargo, toolchain
+# pins, the release/CI workflows, scripts/release, packaging).
 on:
   push:
     branches: [main]
@@ -276,8 +280,9 @@ jobs:
     # Determine which CI jobs the changed files require. Heavy non-default jobs
   # (feature-powerset, macOS contracts, Hermes compatibility, and TS-binding
   # drift) only run when their inputs change or on a schedule; the
-  # always-critical jobs (fmt, clippy, fast tests, heavy tests, release build,
-  # docs check, relay DB) still run on every push and PR. The workflow file
+  # always-critical jobs (fmt, clippy, fast tests, heavy tests, doctests,
+  # docs check, relay DB) still run on every push and PR. The release build
+  # is gated by the `release` filter. The workflow file
   # itself forces a relay run so filter edits are always validated.
   changes:
     name: required jobs (paths filter)
@@ -290,6 +295,7 @@ jobs:
       macos: ${{ steps.filter.outputs.macos }}
       hermes: ${{ steps.filter.outputs.hermes }}
       docs_ts: ${{ steps.filter.outputs.docs_ts }}
+      release: ${{ steps.filter.outputs.release }}
     steps:
       # Push events (after merge to main) resolve the filter with git commands
       # against the previous commit, which needs more than a depth-1 checkout.
@@ -391,6 +397,22 @@ jobs:
               - 'web/shared/fixtures/**'
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
+            # The release build catches a broken release profile before
+            # tagging. That is caused by profile/manifest, lockfile, Cargo
+            # configuration, toolchain, or packaging changes; ordinary source
+            # edits already compile in the debug jobs. The root manifest
+            # carries `[profile.release]`.
+            release:
+              - 'Cargo.toml'
+              - 'crates/**/Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'rust-toolchain'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/release.yml'
+              - 'scripts/release'
+              - 'packaging/**'
 
   integration:
     name: tests (heavy, PTY + Hermes)
@@ -591,9 +613,43 @@ jobs:
           path: target/nextest/relay-db/junit.xml
           if-no-files-found: warn
 
-  release-check:
-    name: doctests + release build
+  doctests:
+    name: doctests
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mold linker
+        uses: ./.github/actions/setup-mold
+        with:
+          version: ${{ env.MOLD_VERSION }}
+          sha256: ${{ env.MOLD_SHA256 }}
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      # Doctests link the debug library builds that the `test-debug` saver
+      # (`integration`) persists; this job only restores them.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test-debug
+          save-if: false
+
+      # Nextest does not execute rustdoc tests; preserve the cargo test gate.
+      - name: Documentation tests
+        run: cargo test --doc --workspace --all-features
+
+  # Full release build: schedule, push to main, manual dispatch, or a pull
+  # request that changes a `release` filter input.
+  release-build:
+    name: release build
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.release == 'true' }}
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
@@ -614,10 +670,6 @@ jobs:
         with:
           shared-key: release
           save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      # Nextest does not execute rustdoc tests; preserve the cargo test gate.
-      - name: Documentation tests
-        run: cargo test --doc --workspace --all-features
 
       - name: Release build
         run: cargo build --workspace --release
