@@ -90,7 +90,7 @@ class DevBootstrapCase(unittest.TestCase):
         config.parent.mkdir(parents=True, exist_ok=True)
         config.write_text(text)
 
-    def run_main(self, host, *args):
+    def run_main(self, host, *args, system="Linux"):
         out = io.StringIO()
         status = dev_bootstrap.main(
             list(args),
@@ -100,8 +100,19 @@ class DevBootstrapCase(unittest.TestCase):
             root=self.root,
             environ={"CARGO_HOME": CARGO_HOME},
             out=out,
+            system=system,
         )
         return status, out.getvalue()
+
+    def test_mold_is_checked_only_on_linux(self):
+        on_path = {name: output for name, output in CURRENT.items() if name != "mold"}
+        status, output = self.run_main(FakeHost(on_path=on_path), "--strict", system="Darwin")
+        self.assertEqual(status, 0, output)
+        self.assertNotIn("mold", output)
+
+        status, output = self.run_main(FakeHost(on_path=on_path), "--strict", system="Linux")
+        self.assertEqual(status, 1, output)
+        self.assertIn("mold", output)
 
 
 class ParseVersionTests(unittest.TestCase):

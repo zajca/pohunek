@@ -217,7 +217,7 @@ Release packaging and contributor verification:
   with explicit `e`/`n`/`a`/`c` job-switch keys; no gate depends on it.
 - `scripts/dev-bootstrap` — local tool check: required `cargo-nextest` (minimum
   read from `.config/nextest.toml`) and `python3` >= 3.11, optional `bacon`,
-  `hyperfine`, and `mold` (fail only with `--strict`); prints the exact fix for
+  `hyperfine`, and on Linux `mold` (fail only with `--strict`); prints the exact fix for
   each missing or too-old tool and installs nothing unless `--install` is
   given, never running root-level package-manager steps.
 - `scripts/tests/test_dev_bootstrap.py` — regression checks for version

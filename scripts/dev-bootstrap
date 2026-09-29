@@ -16,9 +16,9 @@ Categories:
   A missing or too-old required tool makes the run exit non-zero.
 * optional -- a convenience or measurement tool no gate depends on: `bacon`
   (the watcher over `bacon.toml`), `hyperfine` (`scripts/measure-dev-loop`)
-  and `mold` (the CI linker, set through CI `RUSTFLAGS` only;
-  `.cargo/config.toml` configures no linker). They are reported, and fail the
-  run only under `--strict`.
+  and, on Linux only, `mold` (the CI linker, set through CI `RUSTFLAGS` only;
+  `.cargo/config.toml` configures no linker; macOS jobs link with the
+  default linker). They are reported, and fail the run only under `--strict`.
 
 Exit status: 0 when every tool that counts passes, 1 otherwise, 2 on a
 configuration error (an unreadable `.config/nextest.toml`).
@@ -27,6 +27,7 @@ configuration error (an unreadable `.config/nextest.toml`).
 import argparse
 import dataclasses
 import os
+import platform
 from pathlib import Path
 import re
 import shlex
@@ -161,9 +162,9 @@ def nextest_min_version(root):
     return version
 
 
-def tools(root):
-    """Every checked tool, required ones first."""
-    return [
+def tools(root, system):
+    """Every tool checked on `system` (a `platform.system()` value), required first."""
+    checked = [
         Tool(
             name="cargo-nextest",
             version_args=("nextest", "--version"),
@@ -201,6 +202,8 @@ def tools(root):
             manual=MANUAL_MOLD,
         ),
     ]
+    # mold is a Linux ELF linker; nothing in this workspace uses it elsewhere.
+    return [tool for tool in checked if tool.name != "mold" or system == "Linux"]
 
 
 def cargo_bin_dir(environ):
@@ -372,11 +375,12 @@ def main(
     root=ROOT,
     environ=os.environ,
     out=sys.stdout,
+    system=platform.system(),
 ):
     """Check, optionally install and re-check; the process exit status."""
     args = parse_args(argv)
     try:
-        tool_list = tools(root)
+        tool_list = tools(root, system)
     except ConfigError as error:
         print(f"dev-bootstrap: {error}", file=out)
         return 2

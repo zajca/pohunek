@@ -241,7 +241,7 @@ Local toolchain: `scripts/dev-bootstrap` checks the tools these loops need
 against their minimum versions and prints the exact install command for each
 missing or too-old one. `cargo-nextest` (minimum from `.config/nextest.toml`)
 and `python3` >= 3.11 are required; `bacon`, `hyperfine`
-(`scripts/measure-dev-loop`), and `mold` (CI linker only) fail only with
+(`scripts/measure-dev-loop`), and `mold` (CI linker only; checked on Linux only) fail only with
 `--strict`. It installs nothing unless asked:
 
 ```bash
