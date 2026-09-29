@@ -3,7 +3,12 @@
 import importlib.machinery
 import importlib.util
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import tomllib
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "test-partitions"
 LOADER = importlib.machinery.SourceFileLoader("partitions", str(SCRIPT))
@@ -76,3 +81,53 @@ class CoverageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JunitReportTests(unittest.TestCase):
+    def setUp(self):
+        with (SCRIPT.parent.parent / ".config/nextest.toml").open("rb") as config:
+            self.config = tomllib.load(config)
+
+    def test_report_paths_follow_profile_inheritance(self):
+        cases = {
+            "ci": Path("r/target/nextest/ci/junit.xml"),
+            "fast": Path("r/target/nextest/fast/junit.xml"),
+            "heavy": Path("r/target/nextest/heavy/junit.xml"),
+            "relay-db": Path("r/target/nextest/relay-db/junit.xml"),
+            "local": None,
+        }
+        for profile, expected in cases.items():
+            with self.subTest(profile=profile):
+                self.assertEqual(partitions.junit_report(self.config, profile, "r"), expected)
+
+    def test_store_dir_setting_moves_reports(self):
+        config = {"store": {"dir": "out/nx"}, "profile": {"ci": {"junit": {"path": "j.xml"}}}}
+        self.assertEqual(partitions.junit_report(config, "ci", "r"), Path("r/out/nx/ci/j.xml"))
+
+    def test_inheritance_cycle_ends(self):
+        config = {"profile": {"a": {"inherits": "b"}, "b": {"inherits": "a"}}}
+        self.assertIsNone(partitions.junit_report(config, "a", "r"))
+
+    def test_run_removes_a_stale_report_before_nextest_starts(self):
+        with tempfile.TemporaryDirectory() as root:
+            # CARGO_TARGET_DIR does not move nextest's store; the root does.
+            stale = Path(root) / "target" / "nextest" / "heavy" / "junit.xml"
+            stale.parent.mkdir(parents=True)
+            stale.write_text("<testsuites/>")
+            config = Path(root) / ".config" / "nextest.toml"
+            config.parent.mkdir()
+            config.write_bytes((SCRIPT.parent.parent / ".config/nextest.toml").read_bytes())
+            seen = []
+
+            def fake_run(command, **kwargs):
+                seen.append(stale.exists())
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(partitions, "ROOT", Path(root)), \
+                    mock.patch.dict("os.environ", {"CARGO_TARGET_DIR": str(Path(root) / "elsewhere")}), \
+                    mock.patch.object(partitions.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(sys, "argv", ["test-partitions", "run", "heavy"]):
+                with self.assertRaises(SystemExit) as exit_:
+                    partitions.main()
+            self.assertEqual(exit_.exception.code, 0)
+            self.assertEqual(seen, [False])
