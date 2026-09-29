@@ -243,9 +243,15 @@ recorded, and each revision increments the turn's `settlement_revision`
 - a `timed_out` turn **completes late** when correlated turn-end evidence
   for it (the same `prompt_id`/`turn_id`, or an OpenCode execution end for
   the bound execution) arrives after the deadline and before any later turn
-  was delivered. The turn is revised to `completed` (or `failed`) with the
-  usual finality rules, snapshots and checks, so the work appears in its
-  `turn_delta` instead of being lost. No `task.extend` is needed, and the
+  was delivered. Late finalization first **re-acquires occupancy** through
+  the same check-and-set as a delivery (invariant 11): when the tree is
+  free, the turn is revised to `completed` (or `failed`) with the usual
+  finality rules, snapshots and checks, so the work appears in its
+  `turn_delta` instead of being lost; when another task already occupies
+  the tree, no snapshot or check runs, the turn is revised with
+  `integrity: suspect` and reason `late_completion_conflict`, the occupant's
+  current or next result is marked suspect too, and the changes are
+  attributed to nobody. No `task.extend` is needed, and the
   open-time ceiling does not block it: completion evidence closes a turn,
   it does not keep one open. Uncorrelated late evidence is never applied;
   it only marks the next result `drift_since_previous_turn`;
@@ -1379,13 +1385,21 @@ Rules:
   replacement for them.
 - `settled_by` is one of the values defined in section 8.2; `outcome` is one
   of the values in section 6.3.
-- Drift is computed by comparing a bounded worktree fingerprint at the start of
-  a turn with the fingerprint recorded at the previous settlement: HEAD,
-  branch, tracked diff, and untracked names with content digests capped by
-  `tasks.fingerprint_max_entries` and `tasks.fingerprint_max_bytes` (overflow
-  marks the fingerprint `suspect` rather than hashing unboundedly). The
-  fingerprint is the cheap equality check; the snapshots above carry the
-  content. Drift never
+- Drift is computed by comparing the worktree fingerprint at the start of
+  a turn with the fingerprint recorded at the previous settlement. The
+  fingerprint is a **complete streaming digest** over HEAD, branch, every
+  tracked path with its content hash and every untracked, non-ignored path
+  with its content hash — linear in the tree like `git status`, never
+  sampled, so no modification can hide from it; the caps
+  `tasks.fingerprint_max_entries` and `tasks.fingerprint_max_bytes` bound
+  only the **detail** the result lists (which paths changed), not the digest.
+  This one digest backs `drift_since_previous_turn`, `modified_during_checks`,
+  the investigate-mode `modified` check (section 11.2) and review staleness
+  (section 13.1). If it cannot be computed completely (an unreadable path,
+  an I/O error), the comparison is `unknown`: `modified`, `drift` and `stale`
+  are reported `unknown`, never clean or current, and `integrity` is at most
+  `suspect`. The fingerprint is the equality check; the snapshots above carry
+  the content. Drift never
   blocks a turn; it is reported so the orchestrator knows someone else changed
   the tree.
 
@@ -1410,9 +1424,10 @@ reports it as `enforcement`:
 | `provider_rules` | Provider tool permissions deny writes and shell (e.g. OpenCode `permissions`: `* deny`, `read`/`glob`/`grep` allow, `external_directory` deny). |
 | `provider_rules+readonly_mount` | Additionally, the profile wraps the agent in a read-only filesystem view (e.g. bubblewrap) declared by the operator. |
 
-The daemon verifies after settlement that the worktree fingerprint is unchanged
-and reports `modified: true` (`integrity: violation`, section 10) otherwise,
-regardless of enforcement. It never claims isolation beyond the declared
+The daemon verifies after settlement that the complete worktree fingerprint
+(section 10) is unchanged and reports `modified: true` (`integrity:
+violation`, section 10) otherwise, regardless of enforcement; an incomplete
+fingerprint reports `modified: unknown`, never `false`. It never claims isolation beyond the declared
 enforcement. A profile that cannot enforce investigation mode (for example a
 Claude profile without a writable-tool deny configuration) refuses
 `mode: "investigate"` at `task.start` with `task_investigate_unsupported`
@@ -1517,18 +1532,24 @@ therefore never contains a partially-filled `checks` list. `outcome` is
 
 **Finalization contract.**
 
-- The daemon owns check processes and launches each in two phases, so no
-  crash window leaves an unknown process writing to the tree: (1) it persists
-  a **launch intent** (check name, attempt, a random launch token) in the
-  task store; (2) it spawns the check in its own process group with the token
-  in its environment and the child stopped before `exec` (`SIGSTOP` raised in
-  the pre-exec hook), persists the identity it can now read (pid,
-  process-group id, process start time, token), and only then continues it
-  with `SIGCONT`. Recovery treats an intent without identity as a check that
-  never ran: it looks for a stopped same-UID process carrying the token,
-  kills it when found, and records the attempt `interrupted`. Process
-  identity is always compared with the start time, so a reused pid is never
-  signalled.
+- The daemon owns check processes and launches each through an exec'd
+  **launcher handshake**, so no crash window leaves an unknown process
+  writing to the tree: (1) it persists a **launch intent** (check name,
+  attempt, a random launch token) in the task store; (2) it spawns the
+  daemon binary in launcher mode with the token as an argument; the
+  launcher puts itself in a new process group, reports its identity (pid,
+  process-group id, process start time, token) over an inherited pipe and
+  blocks waiting for a release byte; (3) the daemon persists that identity
+  and only then writes the release, after which the launcher execs the
+  check argv in the recorded group. A launcher that receives no release
+  within `tasks.check_launch_grace_ms` exits without running anything, so a
+  daemon crash between spawn and identity commit never starts a check.
+  Recovery treats an intent without identity as a check that never ran and
+  records the attempt `interrupted`; an intent with identity is signalled
+  only after the start time still matches, so a reused pid is never hit.
+  (A pre-exec `SIGSTOP` cannot do this: Rust's `Command::spawn` waits for
+  the exec to succeed before returning, and the environment is applied at
+  exec.)
 - Finalization has its own deadline, `tasks.finalize_max_ms`, independent of
   the turn deadline (which only bounds the agent's part of the turn). On
   expiry, the running check is killed (`timed_out`), the remaining ones are
@@ -1574,9 +1595,12 @@ the same checks on the task base before turn 1, so results can distinguish
 pre-existing failures from regressions. Turn 1 is delivered only after the
 baseline finishes; its duration is reported separately and does not count
 against the turn deadline. The baseline occupies the worktree (invariant 11),
-is bounded by `tasks.finalize_max_ms`, and follows the same restart rules. With `worktree_of` (section 8.7) the baseline runs
-on the current state of the shared worktree, not on the owner task's base,
-and the result says so (`baseline_on: "worktree"` instead of `"base"`).
+is bounded by `tasks.finalize_max_ms`, and follows the same restart rules.
+`baseline_on: "base"` is only ever true for a dedicated worktree, which
+starts at the base revision. With `worktree_of` (section 8.7) and for
+in-place tasks (whose checkout may be dirty and must never be reset by the
+daemon) the baseline runs on the current state of the tree as it is, and
+the result says so (`baseline_on: "worktree"`).
 
 ## 13. Protocol, CLI, SDK and Adapters
 
@@ -1687,7 +1711,7 @@ pohunek task wait t-01... --timeout 10m [--until published] --json
 pohunek task extend t-01... --by 10m --json
 pohunek task show t-01... [--turns-cursor ...] --json      # task.inspect
 pohunek task result t-01... --turn 2 [--revision 1] --json
-pohunek task list [--correlation-id ...] [--cursor ...] --json
+pohunek task list [--run-id ...] [--cursor ...] --json
 pohunek task check-log t-01... <log-ref> [--offset N] --json
 pohunek task review t-01... --result t-01.../2@1 --fingerprint sha256:... accepted --json
 pohunek task stop t-01... [--if-latest-turn 2 --require-idle] --json
@@ -2077,7 +2101,14 @@ without blocking the rest.
      hooks are healthy; `attention` → `stopped` through `task.stop` as a new
      revision; `task_store_full` on every cap; the generated `tasks/<id>`
      branch and refusal of an empty branch; keyed prompt fingerprints never
-     equal to a plain digest in any persisted record;
+     equal to a plain digest in any persisted record; late completion
+     against a new occupant marks both results suspect and runs no check;
+     launcher handshake crashes before and after identity commit and a
+     launcher timing out without release; a modification outside the listed
+     detail still changes the complete fingerprint, and an unreadable path
+     yields `unknown`, never clean; an in-place baseline reports
+     `baseline_on: "worktree"` on a dirty checkout; `--run-id` maps to the
+     `run_id` filter;
      check definitions: a host definition shadows an in-repo one of the same
      name, an in-repo definition edited in the worktree during the turn is
      not what runs, and `repo_base` checks cap integrity at `suspect`;
@@ -2157,7 +2188,8 @@ present, no detection-only settlement for OpenCode, and the share of
    `tasks.finalize_max_ms`, `tasks.snapshot_max_bytes`,
    `tasks.snapshot_max_file_bytes`, `tasks.page_max_items`,
    `tasks.page_max_bytes`, `tasks.cursor_ttl_ms`, `tasks.check_kill_grace_ms`,
-   `tasks.resubmit_window_ms`, `tasks.wait_keepalive_idle_ms`,
+   `tasks.resubmit_window_ms`, `tasks.check_launch_grace_ms`,
+   `tasks.wait_keepalive_idle_ms`,
    `tasks.wait_keepalive_interval_ms`, `tasks.wait_keepalive_count`,
    `tasks.store_max_bytes`, `tasks.max_turns_per_task`,
    `tasks.max_tasks_retained`,

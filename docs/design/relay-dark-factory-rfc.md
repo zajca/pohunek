@@ -728,7 +728,16 @@ When a turn settles `attention`:
      become empty, the relay falls back to the team's active human `Owner`s
      and `Admin`s, and if none exists it refuses service-account `task.start`
      on that team with `factory_no_escalation_target` (fail closed) and flags
-     any pending attention in audit.
+     any pending attention in audit. While any service-account task on the
+     team is `active`, a membership or credential change that would remove
+     the last active human target is refused unless the same change installs
+     a replacement; if the set still empties through a path the relay does
+     not control (an identity provider disabling the last account), every
+     turn-opening operation on the team — `task.start`, `task.continue`,
+     `task.extend`, service-account `task.answer` — is suspended with
+     `factory_no_escalation_target`, in-flight turns may still settle
+     `attention`, and each such attention is flagged `unescalated` in audit
+     until a human target exists again.
 2. The turn stays `attention` until answered or explicitly stopped. There is
    no escalation timeout that auto-resolves, auto-approves, or auto-fails.
 3. An authorized principal answers via `task.answer` under section 7.3.
@@ -819,11 +828,23 @@ the task RFC's CLI workstream lands.
   or rotated (relay RFC section 13.3 then cancels its streams and refuses its
   calls), and the successor records a new **run generation** in its round
   records; a client that finds a newer generation than its own in the
-  records stops acting. Two managers can therefore never both delegate into
-  one run: the relay refuses the stale credential, and the daemon's
-  `if_latest_turn` preconditions and `worktree_of` occupancy refuse the stale
-  plan's stops and starts. Operators who cannot revoke the old credential
-  must not start a successor.
+  records stops acting. Revocation alone cannot undo an operation whose
+  host-side irreversible commit already won before the response was lost,
+  so two further rules close that window. First, a **failover barrier**:
+  before its first mutating call the successor resolves every admission
+  record of the account for the run's `run_id` that is not terminal
+  (`reserved`, `uncertain`, `awaiting_resubmission`) through
+  `operation.result.get`, adopts every task the catalog lists under that
+  `run_id`, and never starts a new first-round task while any task of the
+  run exists. Second, a **server-side generation fence**: every budgeted
+  request carries `run_id` and `run_generation`; the relay stores the highest
+  generation admitted per `(team, run_id)` and refuses a lower one with
+  `factory_run_fenced` before forwarding, so a predecessor that resumes
+  after the successor's first admission cannot delegate again even with a
+  still-valid credential. The daemon's `if_latest_turn` preconditions and
+  `worktree_of` occupancy refuse the stale plan's stops and starts on the
+  host. Operators who cannot revoke the old credential must not start a
+  successor.
 - **Cleanup recovery.** Task state alone cannot tell a finished round from
   one that continued: a still-valid verdict on the latest result says
   nothing about a turn opened since, and an auditor task never carries a
@@ -838,6 +859,16 @@ the task RFC's CLI workstream lands.
   its closed-audit records. No record is shared between the two clients,
   and no record is ever written inside the objective's worktree, where it
   would pollute `turn_delta` and be visible to the executor.
+- **Write-ahead record before every mutating request.** Recovery from
+  `awaiting_resubmission` needs the exact idempotency key, target,
+  parameters and full payload, and the relay keeps only a fingerprint
+  (section 8.3). Each client therefore persists an owner-private
+  write-ahead record with all of those before it sends any `task.start`,
+  `task.continue`, `task.extend` or `task.answer`, and deletes it only after
+  the operation is `confirmed` or `refused`. A successor resubmits from
+  these records; without one, a reserved or quarantined admission holds its
+  slot until ticket expiry or operator repair, exactly as section 8.3
+  states. Tests cover a crash at every pre-confirmation boundary.
 - **Cleanup is retried, not abandoned.** A `task_stop_precondition_failed`
   means work continued after the round closed; the task is left running and
   put on the client's **pending-cleanup list** with its new latest turn.
@@ -1032,8 +1063,13 @@ Ordered by dependency; each lands with the tests named:
      `task.answer` or terminal control on a service account), database
      restore quarantine for factory admission, an empty human escalation
      target set failing closed, audit coalescing opening a new record per
-     `result_id` and authorization generation, and a fenced-out predecessor
-     manager refused by credential revocation and stale preconditions;
+     `result_id` and authorization generation, a fenced-out predecessor
+     manager refused by credential revocation, by `factory_run_fenced` and
+     by stale preconditions, revocation after an irreversible host commit
+     but before response delivery resolved by the failover barrier, the
+     last human target's removal refused or suspending turn-opening
+     operations, and a successor resubmitting from a client write-ahead
+     record;
    - an **unattended benchmark**: the task RFC benchmark run lights-out
      through the relay path (manager + auditor service accounts), reporting
      turns per run, budget headroom consumed, escalations raised and
