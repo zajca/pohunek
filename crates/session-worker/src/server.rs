@@ -24,8 +24,8 @@ use pohunek_worker_protocol as protocol;
 use protocol::{
     ActiveIdentityClaim, AttachStart, Capability, CloseReason, ControlCode, ControlError,
     ControlEvent, ControlMessage, ControlReader, ControlRequest, ControlResponse, ControlWriter,
-    Cursor, DaemonId, DataFrame, DataToken, Dimensions, EventKind, ExitStatus, FrameHeader,
-    FrameKind, Initialize, InspectSnapshot, LeaseChallenge, LeaseId, OutputGap,
+    Cursor, DaemonId, DataFrame, DataToken, Dimensions, EventKind, ExitStatus, FrameError,
+    FrameHeader, FrameKind, Initialize, InspectSnapshot, LeaseChallenge, LeaseId, OutputGap,
     ProcessIdentity as WireProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
     RequestKind, ResponseKind, RuntimeId, RuntimePhase as WireRuntimePhase, RuntimeScope,
     SessionId, StreamId, StreamMode, SubagentPhase as WireSubagentPhase, SubagentSnapshot,
@@ -50,8 +50,8 @@ use crate::launch::{self, LaunchClaimStatus};
 use crate::output::OutputCompletion;
 use crate::{
     Command, ControllerLease, EnvBase, Exit, InputFragment, InputPlan, Journal, LeaseError,
-    LeaseOwner, OutputChunk, OutputEvent, ProcessIdentity, PtyError, PtyOwner, WorkerConfig,
-    WorkerError,
+    LeaseOwner, OutputChunk, OutputEvent, OutputSubscriber, ProcessIdentity, PtyError, PtyOwner,
+    WorkerConfig, WorkerError,
 };
 
 /// How long an idle leased control connection may go unverified.
@@ -2014,7 +2014,7 @@ async fn mark_runtime_faulted_at_offset(
 
 #[expect(
     clippy::too_many_lines,
-    reason = "the bidirectional data-stream select loop keeps lease, output, and input ordering in one place"
+    reason = "opening redeems the token and captures the stream's start state in one authenticated sequence"
 )]
 async fn serve_data(
     shared: Arc<Shared>,
@@ -2097,7 +2097,7 @@ async fn serve_data(
         )
         .await;
     }
-    let mut subscriber = if let Some(attach) = attach {
+    let subscriber = if let Some(attach) = attach {
         let dimensions = attach
             .dimensions
             .map(|dimensions| (dimensions.columns(), dimensions.rows()));
@@ -2134,12 +2134,61 @@ async fn serve_data(
         pty.subscribe_output(after_offset)
             .map_err(|error| WorkerError::Protocol(error.to_string()))?
     };
-    let version = header.version;
-    let stream_id = header.stream_id;
-    let runtime_id = header.runtime_id;
+    serve_stream_data(
+        &shared,
+        &pty,
+        read_half,
+        &mut write_half,
+        header.version,
+        &header.stream_id,
+        &header.runtime_id,
+        mode,
+        subscriber,
+        grant.lease_epoch,
+        &mut lease_epoch,
+        &peer,
+        &grant.lease_owner,
+    )
+    .await
+}
+
+/// Streams live output and, on an attach stream, accepts framed input.
+///
+/// One input read stays pending across every `select!` iteration (see
+/// [`read_owned_frame`]), so output that becomes ready while an input frame
+/// is only partly received never discards the bytes already consumed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stream framing keeps authenticated stream identity and lease explicit"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the bidirectional data-stream select loop keeps lease, output, and input ordering in one place"
+)]
+async fn serve_stream_data<R, W>(
+    shared: &Shared,
+    pty: &PtyOwner,
+    reader: R,
+    writer: &mut W,
+    version: Version,
+    stream_id: &StreamId,
+    runtime_id: &RuntimeId,
+    mode: StreamMode,
+    mut subscriber: OutputSubscriber,
+    expected_lease_epoch: u64,
+    lease_epoch: &mut watch::Receiver<u64>,
+    peer: &PeerContext,
+    owner: &LeaseOwner,
+) -> Result<(), WorkerError>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
     let mut next_input_sequence = 1_u64;
     let mut root_exit = pty.exit_receiver();
     let mut pending_output_exit = None;
+    let next_input = read_owned_frame(reader);
+    tokio::pin!(next_input);
 
     loop {
         tokio::select! {
@@ -2148,10 +2197,10 @@ async fn serve_data(
                     return Ok(());
                 }
                 write_data_frame(
-                    &mut write_half,
+                    writer,
                     version,
-                    &stream_id,
-                    &runtime_id,
+                    stream_id,
+                    runtime_id,
                     FrameKind::Close { reason: CloseReason::LeaseReleased },
                     Vec::new(),
                 ).await?;
@@ -2163,15 +2212,15 @@ async fn serve_data(
                     let output = pending_output_exit
                         .take()
                         .expect("guarded pending PTY EOF");
-                    if *lease_epoch.borrow() != grant.lease_epoch {
+                    if *lease_epoch.borrow() != expected_lease_epoch {
                         return Ok(());
                     }
-                    authorize_data_frame(&shared, &peer, &grant.lease_owner)?;
+                    authorize_data_frame(shared, peer, owner)?;
                     write_runtime_output_event(
-                        &mut write_half,
+                        writer,
                         version,
-                        &stream_id,
-                        &runtime_id,
+                        stream_id,
+                        runtime_id,
                         shared.config.data_payload_bytes,
                         output,
                         pty.output_forced_closed(),
@@ -2188,38 +2237,39 @@ async fn serve_data(
                     pending_output_exit = Some(output);
                     continue;
                 }
-                authorize_data_frame(&shared, &peer, &grant.lease_owner)?;
+                authorize_data_frame(shared, peer, owner)?;
                 write_runtime_output_event(
-                    &mut write_half,
+                    writer,
                     version,
-                    &stream_id,
-                    &runtime_id,
+                    stream_id,
+                    runtime_id,
                     shared.config.data_payload_bytes,
                     output,
                     pty.output_forced_closed(),
                 ).await?;
             }
-            input = protocol::read_frame(&mut read_half) => {
+            (reader, input) = &mut next_input => {
+                next_input.set(read_owned_frame(reader));
                 let input = match input {
                     Ok(Some(input)) => input,
                     Ok(None) => return Ok(()),
                     Err(error) => {
                         return write_data_error(
-                            &mut write_half,
+                            writer,
                             version,
-                            &stream_id,
-                            &runtime_id,
+                            stream_id,
+                            runtime_id,
                             control_error(ControlCode::InvalidRequest, error, false),
                         ).await;
                     }
                 };
-                authorize_data_frame(&shared, &peer, &grant.lease_owner)?;
+                authorize_data_frame(shared, peer, owner)?;
                 if mode != StreamMode::Attach {
                     return write_data_error(
-                        &mut write_half,
+                        writer,
                         version,
-                        &stream_id,
-                        &runtime_id,
+                        stream_id,
+                        runtime_id,
                         control_error_message(
                             ControlCode::InvalidRequest,
                             "output data stream received a client frame",
@@ -2230,10 +2280,10 @@ async fn serve_data(
                 let (input_header, bytes) = input.into_parts();
                 let FrameKind::Input { write_id } = input_header.kind else {
                     return write_data_error(
-                        &mut write_half,
+                        writer,
                         version,
-                        &stream_id,
-                        &runtime_id,
+                        stream_id,
+                        runtime_id,
                         control_error_message(
                             ControlCode::InvalidRequest,
                             "attach data stream received a non-input frame",
@@ -2241,23 +2291,23 @@ async fn serve_data(
                         ),
                     ).await;
                 };
-                if input_header.runtime_id != runtime_id || input_header.stream_id != stream_id {
+                if input_header.runtime_id != *runtime_id || input_header.stream_id != *stream_id {
                     return write_data_error(
-                        &mut write_half,
+                        writer,
                         version,
-                        &stream_id,
-                        &runtime_id,
+                        stream_id,
+                        runtime_id,
                         identity_mismatch(),
                     ).await;
                 }
                 if let Err(error) =
-                    validate_attach_write_id(&write_id, &stream_id, next_input_sequence)
+                    validate_attach_write_id(&write_id, stream_id, next_input_sequence)
                 {
                     return write_data_error(
-                        &mut write_half,
+                        writer,
                         version,
-                        &stream_id,
-                        &runtime_id,
+                        stream_id,
+                        runtime_id,
                         error,
                     ).await;
                 }
@@ -2267,18 +2317,18 @@ async fn serve_data(
                         delay_after: Duration::ZERO,
                     }]).await {
                     return write_data_error(
-                        &mut write_half,
+                        writer,
                         version,
-                        &stream_id,
-                        &runtime_id,
+                        stream_id,
+                        runtime_id,
                         input_control_error(error),
                     ).await;
                 }
                 write_data_frame(
-                    &mut write_half,
+                    writer,
                     version,
-                    &stream_id,
-                    &runtime_id,
+                    stream_id,
+                    runtime_id,
                     FrameKind::InputAck {
                         write_id,
                         bytes_written: byte_count,
@@ -2289,10 +2339,10 @@ async fn serve_data(
                     Some(sequence) => sequence,
                     None => {
                         return write_data_error(
-                            &mut write_half,
+                            writer,
                             version,
-                            &stream_id,
-                            &runtime_id,
+                            stream_id,
+                            runtime_id,
                             control_error_message(
                                 ControlCode::InvalidRequest,
                                 "attach input sequence was exhausted",
@@ -2304,6 +2354,20 @@ async fn serve_data(
             }
         }
     }
+}
+
+/// Reads one client frame and hands the reader back with the result.
+///
+/// [`protocol::read_frame`] is not cancel-safe: dropping it after part of a
+/// frame was consumed loses those bytes and desynchronizes the stream. Owning
+/// the reader lets the caller keep one read pending across `select!`
+/// iterations instead.
+async fn read_owned_frame<R>(mut reader: R) -> (R, Result<Option<DataFrame>, FrameError>)
+where
+    R: AsyncRead + Unpin + Send,
+{
+    let frame = protocol::read_frame(&mut reader).await;
+    (reader, frame)
 }
 
 #[expect(
@@ -4313,12 +4377,13 @@ mod tests {
         authorize_control_request, await_observation_page, capabilities, control_input_id,
         event_visible_to_connection, identity_sequence_is_fresh, known_identity_provider,
         mark_running_subagents_lost, observation_timed_out, random_value, redeem_data_grant,
-        signal_number, start_subagent, stop_subagent, valid_identity_expiry,
+        serve_stream_data, signal_number, start_subagent, stop_subagent, valid_identity_expiry,
         validate_attach_write_id, validate_data_start, validate_observation_request,
         validate_terminal_snapshot_dimensions, validate_terminal_snapshot_response,
         write_data_error, write_observation_page, write_output_chunks, write_runtime_output_event,
         write_terminal_chunks, Connection, ControlInputId, DataGrant, ObservationGrant,
         ObservationWaitOutcome, PrefixStream, TokenState, WireTerminalSnapshot,
+        ATTACH_INPUT_PREFIX,
     };
     use pohunek_worker_protocol::{
         self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
@@ -4335,6 +4400,16 @@ mod tests {
 
     /// Extra bytes force exactly one partial frame after a full wire payload.
     const OVERSIZED_PAYLOAD_EXTRA: usize = 257;
+    /// Client-to-worker buffering of the partial-input regression stream.
+    ///
+    /// With one byte of buffering a client write returns only after the worker
+    /// has read every earlier byte, which pins the worker mid-frame.
+    const ONE_BYTE_BUFFER: usize = 1;
+    /// Bytes of the input frame sent before output becomes ready: the
+    /// four-byte header length plus the opening bytes of its JSON header.
+    const PARTIAL_FRAME_BYTES: usize = 6;
+    /// Worker-to-client buffering of the partial-input regression stream.
+    const CLIENT_BUFFER: usize = 4096;
 
     struct BarrierDirectory(std::path::PathBuf);
 
@@ -5500,6 +5575,104 @@ mod tests {
             "expected a lease-owner mismatch, got {error:?}"
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Output that becomes ready while an attach input frame is only partly
+    /// received must not discard the consumed input bytes: the worker keeps its
+    /// pending read and still accepts the complete input frame afterwards.
+    #[tokio::test]
+    async fn attach_input_frame_survives_output_during_its_partial_read() {
+        let owner = crate::LeaseOwner {
+            daemon_id: "daemon-partial-input".to_owned(),
+            peer_pid: std::process::id(),
+            peer_start_identity: "7400".to_owned(),
+        };
+        let (server, pty, directory) = launch_claim_fixture().await;
+        let output = crate::OutputHub::new(64, 64, 2, 10).expect("output hub");
+        let subscriber = output.subscribe(Some(0)).expect("live output subscriber");
+        let stream_id = StreamId::new("a-partial").expect("stream id");
+        let runtime_id = RuntimeId::new("runtime-claim").expect("runtime id");
+        let write_id =
+            WriteId::new(format!("{ATTACH_INPUT_PREFIX}{stream_id}-1")).expect("write id");
+        let typed = b"typed-mid-frame";
+        let mut input = Vec::new();
+        protocol::write_frame(
+            &mut input,
+            &protocol::DataFrame::new(
+                FrameHeader {
+                    version: CURRENT_VERSION,
+                    stream_id: stream_id.clone(),
+                    runtime_id: runtime_id.clone(),
+                    kind: FrameKind::Input {
+                        write_id: write_id.clone(),
+                    },
+                },
+                typed.to_vec(),
+            )
+            .expect("input frame"),
+        )
+        .await
+        .expect("encode input frame");
+
+        let (worker_in, mut client_in) = tokio::io::duplex(ONE_BYTE_BUFFER);
+        let (mut worker_out, mut client_out) = tokio::io::duplex(CLIENT_BUFFER);
+        let (_lease_tx, mut lease_rx) = watch::channel(0_u64);
+        let served_pty = pty.clone();
+        let served_owner = owner.clone();
+        let stream = tokio::spawn(async move {
+            serve_stream_data(
+                &server.shared,
+                &served_pty,
+                worker_in,
+                &mut worker_out,
+                CURRENT_VERSION,
+                &stream_id,
+                &runtime_id,
+                StreamMode::Attach,
+                subscriber,
+                0,
+                &mut lease_rx,
+                &owner_peer(&served_owner),
+                &served_owner,
+            )
+            .await
+        });
+
+        client_in
+            .write_all(&input[..PARTIAL_FRAME_BYTES])
+            .await
+            .expect("start the input frame");
+        output.push(b"live-output").expect("live output");
+        let live = protocol::read_frame(&mut client_out)
+            .await
+            .expect("read live output")
+            .expect("worker streams live output");
+        assert!(matches!(live.header().kind, FrameKind::Output { .. }));
+        assert_eq!(live.payload(), b"live-output");
+        let remainder = client_in.write_all(&input[PARTIAL_FRAME_BYTES..]).await;
+        let acknowledged = protocol::read_frame(&mut client_out)
+            .await
+            .expect("read input acknowledgement")
+            .expect("worker answers the input frame");
+        assert_eq!(
+            acknowledged.header().kind,
+            FrameKind::InputAck {
+                write_id,
+                bytes_written: u64::try_from(typed.len()).expect("input length"),
+            },
+            "a partly read input frame must survive racing output"
+        );
+        remainder.expect("finish the input frame");
+
+        drop(client_in);
+        stream
+            .await
+            .expect("stream task")
+            .expect("client EOF ends the stream cleanly");
+        pty.stop("test-cleanup", Duration::from_millis(100))
+            .await
+            .expect("stop fixture PTY");
+        std::fs::remove_dir_all(directory).expect("remove fixture directory");
     }
 
     /// An observation stream proves its peer again after it stops waiting.
