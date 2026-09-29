@@ -39,7 +39,11 @@ use serde::Deserialize;
 use tokio::sync::OwnedMutexGuard;
 use tokio::time::Instant;
 
-use super::{Worker, WorkerLauncher};
+use futures::FutureExt as _;
+use pohunek_worker_protocol::ControlCode;
+use tokio_util::sync::CancellationToken;
+
+use super::{Worker, WorkerError, WorkerLauncher};
 use crate::store::RuntimeRecord;
 
 // Rust guideline compliant 2026-09-28
@@ -893,45 +897,66 @@ impl Lifecycle<'_> {
     /// Socket attempts and job inspections run concurrently, each bounded by
     /// `deadline`, so a slow or unavailable supervisor never delays an
     /// attempt and never extends the wait. A job that provably ended (absent,
-    /// or no process in a state that cannot produce one) ends the wait at
-    /// once, after one last socket attempt; a job whose inspection fails,
-    /// stalls, or proves nothing leaves the wait to the socket attempts, the
-    /// last of which starts no later than `deadline`.
+    /// or no process in a state that cannot produce one) stops further
+    /// attempts, but an attempt already in flight always runs to completion:
+    /// cancelling it could leave the controller lease held by a connection
+    /// the worker has not yet seen close. Outcomes rank as a worker that
+    /// answered, then a proven end, then the elapsed deadline, also when they
+    /// coincide.
     async fn connect_until(
         &self,
         generation: &Generation,
         deadline: Instant,
     ) -> Result<Worker, NotReady> {
-        let end = tokio::select! {
-            // A worker that answered wins over a simultaneous end report.
-            biased;
-            worker = self.connect_attempts(generation, deadline) => {
-                return worker.ok_or(NotReady::Elapsed);
+        let stop = CancellationToken::new();
+        let attempts = self.connect_attempts(generation, deadline, &stop);
+        let watch = self.watch_end(generation, deadline);
+        tokio::pin!(attempts, watch);
+        let mut end = None;
+        loop {
+            tokio::select! {
+                biased;
+                worker = &mut attempts => {
+                    if let Some(worker) = worker {
+                        return Ok(worker);
+                    }
+                    // An end reported at the same instant as the deadline
+                    // still outranks the deadline.
+                    let end = end.or_else(|| (&mut watch).now_or_never());
+                    return Err(end.map_or(NotReady::Elapsed, NotReady::Ended));
+                }
+                reported = &mut watch, if end.is_none() => {
+                    end = Some(reported);
+                    stop.cancel();
+                }
             }
-            end = self.watch_end(generation, deadline) => end,
-        };
-        // The end report may have cut an attempt short; a worker serving the
-        // socket of this generation is still adopted rather than abandoned.
-        match self.try_connect(generation, deadline).await {
-            Some(worker) => Ok(worker),
-            None => Err(NotReady::Ended(end)),
         }
     }
 
-    /// Retries the generation's socket every poll interval until `deadline`.
+    /// Retries the generation's socket every poll interval until `deadline`
+    /// or until `stop` is cancelled.
     ///
-    /// Every attempt is bounded by `deadline`; the last one starts no later
-    /// than it, so a worker that became ready just before it is adopted.
-    async fn connect_attempts(&self, generation: &Generation, deadline: Instant) -> Option<Worker> {
+    /// Every attempt is bounded by `deadline` and never interrupted by
+    /// `stop`; the last one starts no later than `deadline`, so a worker that
+    /// became ready just before it is adopted.
+    async fn connect_attempts(
+        &self,
+        generation: &Generation,
+        deadline: Instant,
+        stop: &CancellationToken,
+    ) -> Option<Worker> {
         loop {
             if let Some(worker) = self.try_connect(generation, deadline).await {
                 return Some(worker);
             }
             let now = Instant::now();
-            if now >= deadline {
+            if now >= deadline || stop.is_cancelled() {
                 return None;
             }
-            tokio::time::sleep_until((now + SUPERVISION_POLL_INTERVAL).min(deadline)).await;
+            tokio::select! {
+                () = tokio::time::sleep_until((now + SUPERVISION_POLL_INTERVAL).min(deadline)) => {}
+                () = stop.cancelled() => return None,
+            }
         }
     }
 
@@ -1009,17 +1034,48 @@ impl Lifecycle<'_> {
 
     /// Makes one attempt to adopt the generation's worker, abandoned at
     /// `until`.
+    ///
+    /// A `ControllerBusy` rejection is retried every poll interval until
+    /// `until`: the worker releases a lease only once it has processed the
+    /// previous controller connection's close.
     async fn try_connect(&self, generation: &Generation, until: Instant) -> Option<Worker> {
         let socket = self
             .runtime_root
             .join(generation.session_id())
             .join(pohunek_paths::WORKER_SOCKET_NAME);
-        let worker = match tokio::time::timeout_at(
-            until,
-            Worker::connect(&socket, generation.session_id(), self.daemon_instance_id),
-        )
-        .await
-        {
+        let worker = loop {
+            let attempt = tokio::time::timeout_at(
+                until,
+                Worker::connect(&socket, generation.session_id(), self.daemon_instance_id),
+            )
+            .await;
+            match attempt {
+                Ok(Err(
+                    error @ WorkerError::Rejected {
+                        code: ControlCode::ControllerBusy,
+                        ..
+                    },
+                )) => {
+                    let now = Instant::now();
+                    if now >= until {
+                        tracing::debug!(
+                            session_id = generation.session_id(),
+                            error = %error,
+                            "worker controller lease stayed busy until the attempt deadline"
+                        );
+                        return None;
+                    }
+                    tracing::debug!(
+                        session_id = generation.session_id(),
+                        error = %error,
+                        "waiting for the previous controller lease to close"
+                    );
+                    tokio::time::sleep_until((now + SUPERVISION_POLL_INTERVAL).min(until)).await;
+                }
+                other => break other,
+            }
+        };
+        let worker = match worker {
             Ok(Ok(worker)) => worker,
             Ok(Err(error)) => {
                 tracing::debug!(
