@@ -63,11 +63,22 @@ enum Registration {
     FailsAfterRegistering,
 }
 
-/// Process observer whose process table is this test process and its
-/// descendants, so no verdict depends on unrelated host processes.
+/// PIDs of the stand-in processes tests started through [`spawn_tracked`].
+static TRACKED: Mutex<Vec<Pid>> = Mutex::new(Vec::new());
+
+/// Spawns a stand-in process that [`OwnProcesses`] lists in its process table.
+fn spawn_tracked(command: &mut std::process::Command) -> std::process::Child {
+    let child = command.spawn().expect("spawn stand-in");
+    TRACKED.lock().expect("tracked lock").push(child.id());
+    child
+}
+
+/// Process observer whose process table is this test process plus the
+/// stand-ins registered with [`spawn_tracked`].
 ///
-/// Identity lookups answer for this process only; every other PID, such as the
-/// one a stale journal names, is an exited process.
+/// No verdict depends on unrelated host processes, and the host process table
+/// is never enumerated. Identity lookups answer for this process only; every
+/// other PID, such as the one a stale journal names, is an exited process.
 #[derive(Debug, Default)]
 struct OwnProcesses(HostInspector);
 
@@ -97,7 +108,10 @@ impl ProcessInspector for OwnProcesses {
     fn same_user_processes(&self) -> Result<Vec<ProcessFact>, ProcessError> {
         let mut processes: Vec<ProcessFact> =
             self.0.process(Self::own_pid())?.into_iter().collect();
-        processes.extend(self.0.descendants(Self::own_pid())?);
+        let tracked = TRACKED.lock().expect("tracked lock").clone();
+        for pid in tracked {
+            processes.extend(self.0.process(pid)?);
+        }
         Ok(processes)
     }
 
@@ -583,27 +597,34 @@ impl Harness {
 }
 
 #[test]
-fn the_test_process_table_holds_only_this_process_and_its_descendants() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .expect("spawn descendant");
+fn the_test_process_table_holds_this_process_and_its_tracked_stand_ins() {
+    let mut child = spawn_tracked(std::process::Command::new("sleep").arg("30"));
     let observer = OwnProcesses::default();
-    let mut pids: Vec<Pid> = observer
+    let pids: Vec<Pid> = observer
         .same_user_processes()
         .expect("process table")
         .iter()
         .map(|process| process.pid)
         .collect();
-    pids.sort_unstable();
-    let mut expected = vec![OwnProcesses::own_pid(), child.id()];
-    expected.sort_unstable();
+    let tracked = TRACKED.lock().expect("tracked lock").clone();
     let own = observer.identity(OwnProcesses::own_pid());
     let foreign = observer.identity(child.id());
-    child.kill().expect("kill descendant");
-    child.wait().expect("reap descendant");
+    child.kill().expect("kill stand-in");
+    child.wait().expect("reap stand-in");
 
-    assert_eq!(pids, expected);
+    assert!(pids.contains(&OwnProcesses::own_pid()));
+    assert!(pids.contains(&child.id()));
+    // Stand-ins of concurrent tests may be listed; nothing else is.
+    assert!(
+        pids.iter()
+            .all(|pid| *pid == OwnProcesses::own_pid() || tracked.contains(pid)),
+        "{pids:?}"
+    );
+    assert!(!pids.contains(&1), "init is not in the table");
+    assert!(
+        !pids.contains(&std::os::unix::process::parent_id()),
+        "the parent of the test process is not in the table"
+    );
     assert!(own.expect("inspect").is_some(), "this process is running");
     assert_eq!(foreign.expect("inspect"), None, "any other PID has exited");
 }
@@ -2413,10 +2434,7 @@ async fn a_prefix_reached_through_a_symlink_is_refused_before_any_version_is_del
     std::os::unix::fs::symlink(&moved, harness.prefix()).expect("symlink prefix");
     let sleeper = moved.join("libexec/pohunek").join(V1).join("sleeper");
     std::fs::copy("/bin/sleep", &sleeper).expect("copy sleep");
-    let mut child = std::process::Command::new(&sleeper)
-        .arg("30")
-        .spawn()
-        .expect("spawn stand-in");
+    let mut child = spawn_tracked(std::process::Command::new(&sleeper).arg("30"));
 
     let upgrade = harness.upgrade(V2).await;
     let uninstall = harness
