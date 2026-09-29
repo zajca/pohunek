@@ -107,6 +107,8 @@ supported operating mode or an accident.
     section 18.1 for re-measurement;
   - the data classification table (relay RFC section 17.2) gains the rows of
     section 9;
+  - catalog retirement (relay RFC section 17.3) is deferred for a session
+    row projecting `retain_hold: true` (section 7.1);
   - the v4 host link gains an idempotent `operation.cancel { request_id }`
     frame for routed waits (task RFC section 8.3) and the relay methods
     `factory.run.open`, `factory.run.add_member`, `factory.run.reconcile`
@@ -285,7 +287,12 @@ relay RFC section 14's identical-filtering rule. For a task whose session has
 ended or was removed on the host, the relay authorizes against the ACL of the
 retained catalog entry (relay RFC section 17.3); once that entry retires,
 relay-path access to the task's metadata ends even if the host still retains
-it under `tasks.metadata_retention`.
+it under `tasks.metadata_retention`. One exception keeps holds releasable:
+the owner task's session row projects `retain_hold: true` while a retain
+hold is set (section 10), and catalog retirement of that row is deferred
+for as long as the hold exists (an amendment to relay RFC section 17.3
+listed in section 3), so `task.release_worktree` can always be authorized
+over the relay before the host's `tasks.worktree_hold_max_age` lapses.
 
 `task.*` classes grant nothing over session sharing: changing a task
 session's ACL still requires `session.share.manage`, and removing it
@@ -714,7 +721,7 @@ row in section 9: task id, immutable `mode` (`execute` or `investigate`,
 which the relay needs to authorize `task.stop` for `task.investigate`
 holders and to refuse an executor `worktree_of` through an investigate task
 before forwarding), lifecycle state, open turn, last outcome, `settled_by`,
-integrity, turn count, owner task, `run_id` and timestamps. Turn-level detail (per-turn results) is not projected; clients
+integrity, turn count, owner task, `retain_hold`, `run_id` and timestamps. Turn-level detail (per-turn results) is not projected; clients
 fetch it through `task.evidence.read` routed calls.
 
 - Folding tasks into the session row keeps the snapshot coordinator's
@@ -905,10 +912,16 @@ the task RFC's CLI workstream lands.
   run; catalog recovery adopts only tasks whose admission records belong to
   the run record, never bare `run_id` matches. The relay refuses a lower
   generation from any member with `factory_run_fenced` before forwarding; the fence applies to **every**
-  run-scoped mutation — `task.stop`, `task.review`, `task.retain_worktree`,
-  `task.release_worktree` and cascading `session.remove` as well as the
-  budgeted calls — so a predecessor cannot stop, review or remove the
-  successor's work either. The generation advances only
+  run-scoped mutation by a run owner or member — `task.stop`,
+  `task.review`, `task.retain_worktree`, `task.release_worktree` and
+  cascading `session.remove` as well as the budgeted calls — so a
+  predecessor cannot stop, review or remove the successor's work either.
+  Two classes of callers are outside the fence and the membership check by
+  design, each audited with a `fence_bypass` marker: a **human** escalation
+  target answering through `task.answer` under section 11
+  (`human_escalation`), and a team `Owner`/`Admin` performing the
+  administrative cleanup of section 12.2 or the resolution of section 8.3
+  (`admin_cleanup`). Neither needs to know or advance `run_generation`. The generation advances only
   through an audited `factory.run.failover` action by a team administrator
   or by the owner account after its credential rotation; a request cannot
   raise it by itself. `run_id` stays attribution, not authorization: the
@@ -1153,7 +1166,10 @@ Ordered by dependency; each lands with the tests named:
      `quarantined` record remains, a rotation with overlap refused as a
      failover precondition, a restore reconciled from the admission ledger,
      an escalation target lacking evidence rights rejected at setup, a
-     credential revocation never blocked by active factory work, an
+     credential revocation never blocked by active factory work, a human
+     escalation answer and an administrative cleanup passing the run fence
+     with an audited `fence_bypass`, a retained worktree's owner row
+     surviving catalog retirement until release, an
      auditor without `session.metadata.read` unable to review, a non-member
      principal refused under a colliding `run_id`, the auditor member fenced
      by the manager's failover, `factory.run.failover` succeeding with

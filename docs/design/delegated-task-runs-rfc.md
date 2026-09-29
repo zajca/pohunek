@@ -1067,10 +1067,16 @@ mismatch fails with `task_payload_mismatch` and dispatches nothing. A read-
 only lookup (`task.inspect` by request key, or `operation.result.get` on the
 relay path) reports `awaiting_resubmission` so the client knows it must
 resend rather than wait. The turn stays open and unarmed meanwhile; if no
-valid resubmission arrives within `tasks.resubmit_window_ms`, the turn
-settles `failed` with `reason: delivery_abandoned`, which ends the
-operation for good — a later resubmission is refused as stale, never
-executed. Automatic reconciliation therefore only ever **observes**
+valid resubmission arrives within `tasks.resubmit_window_ms`, the
+**prompt** delivery settles the turn `failed` with `reason:
+delivery_abandoned`, which ends the operation for good — a later
+resubmission is refused as stale, never executed. An abandoned **answer**
+delivery is different, because the provider request is still pending and
+the agent still waits: the answer operation ends `failed` with the same
+reason, but the turn returns to `attention` as a new settlement revision
+with a fresh `attention_id` for the same provider request, the attention
+notification is re-delivered, and any answer naming the old id is refused
+`task_attention_stale`; a caller that cannot answer stops the task. Automatic reconciliation therefore only ever **observes**
 outcomes; re-sending a prompt always requires the client to present it
 again.
 
@@ -1324,8 +1330,11 @@ Runtime design:
    `OPENCODE_SERVER_PASSWORD` and to the TUI as `OPENCODE_PASSWORD`, and never
    records it. The worker always supplies the password, because without one
    2.0.14 generates and prints its own. The worker reads the listen URL from
-   the server's stdout and otherwise discards that stream; it is never
-   written to logs, scrollback or evidence. `--port 0` avoids per-session
+   the server's stdout and otherwise discards that stream, and redirects
+   the server's stderr to a size-capped owner-private file inside the
+   session's OpenCode data directory (item 7); neither stream ever reaches
+   the worker or daemon process logs, scrollback or evidence, and a canary
+   test proves a secret printed by the server never appears in any log. `--port 0` avoids per-session
    port allocation races. The worker verifies before starting the TUI that
    a known data-bearing route (the session list under `/api`) answers an
    unauthenticated request with exactly `401` and a `www-authenticate:
@@ -1996,9 +2005,16 @@ to ship the adapter in the same milestone is an open question (section 19).
   `tasks.store_max_bytes`, so settlement and `task.stop` always have room
   once a turn was admitted. A full disk is a different failure: terminal
   records (settlement, stop intent and completion, check `interrupted`)
-  are written through a small pre-allocated **emergency journal** so the
-  daemon never leaves a process, occupancy or stop half-recorded; any other
-  mutation fails typed and never truncates a record.
+  are written through a pre-allocated **emergency journal** whose physical
+  size (`tasks.emergency_journal_bytes`, allocated and fsynced at startup)
+  covers the worst-case terminal records of `tasks.max_active_tasks`
+  concurrently active tasks — a host-level cap the daemon enforces at
+  `task.start` with `task_store_full` — so concurrent settlements and stops
+  under ENOSPC always fit; entries are compacted into the ordinary store
+  once space returns and a task's entries are released when it ends. The
+  daemon therefore never leaves a process, occupancy or stop
+  half-recorded; any other mutation fails typed and never truncates a
+  record.
   Mutations that span records, the session store and external effects
   follow a persisted **task operation journal** shaped like the relay RFC's
   ticket journal (section 12.5) and the create intent of #192: `task.start`
@@ -2384,7 +2400,11 @@ without blocking the rest.
      a queued turn; the OpenCode data directory survives a runtime
      generation change and is removed with the session; the revision cap
      stops and joins the runtime; an addressed answer whose value was lost
-     in a daemon restart goes to `awaiting_resubmission`;
+     in a daemon restart goes to `awaiting_resubmission`; an abandoned
+     answer restores the attention with a fresh id and re-notifies;
+     concurrent settlements and stops under ENOSPC all land in the
+     emergency journal; a secret printed on the OpenCode server's stderr
+     never appears in a log;
      check definitions: a host definition shadows an in-repo one of the same
      name, an in-repo definition edited in the worktree during the turn is
      not what runs, and `repo_base` checks cap integrity at `suspect`;
@@ -2469,6 +2489,7 @@ present, no detection-only settlement for OpenCode, and the share of
    `tasks.fingerprint_max_read_bytes`, `tasks.fingerprint_max_ms`,
    `tasks.max_reviews_per_result`, `tasks.review_notes_max_bytes`,
    `tasks.store_reserve_bytes`, `tasks.max_settlement_revisions_per_turn`,
+   `tasks.max_active_tasks`, `tasks.emergency_journal_bytes`,
    `tasks.attach_fence_grace_ms`,
    `tasks.evidence_drain_settle_ms`,
    `tasks.unconfined_release_grace_ms`,
