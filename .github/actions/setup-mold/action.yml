@@ -1,0 +1,47 @@
+name: Setup mold
+description: >-
+  Download a pinned mold release, verify its sha256 before extracting, and put
+  its bin directory on PATH. /usr/bin/ld is left untouched: only jobs that pass
+  `-C link-arg=-fuse-ld=mold` link with mold (gcc resolves `ld.mold` via PATH).
+
+inputs:
+  version:
+    description: mold release version without the leading `v` (e.g. 2.42.1).
+    required: true
+  sha256:
+    description: Expected sha256 of mold-<version>-x86_64-linux.tar.gz.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install mold linker
+      shell: bash
+      env:
+        MOLD_VERSION: ${{ inputs.version }}
+        MOLD_SHA256: ${{ inputs.sha256 }}
+      run: |
+        set -eu
+        # GitHub does not enforce `required: true` on composite inputs.
+        if [ -z "$MOLD_VERSION" ] || [ -z "$MOLD_SHA256" ]; then
+          echo "::error::setup-mold: inputs 'version' and 'sha256' are required" >&2
+          exit 1
+        fi
+        # The release only ships this asset for x86_64; fail rather than
+        # download a binary for the wrong architecture.
+        if [ "$(uname -m)" != x86_64 ]; then
+          echo "::error::setup-mold: unsupported architecture $(uname -m)" >&2
+          exit 1
+        fi
+        archive="mold-${MOLD_VERSION}-x86_64-linux.tar.gz"
+        dest="${RUNNER_TEMP:?}/mold"
+        mkdir -p "$dest"
+        curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+          --output "$dest/$archive" \
+          "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/${archive}"
+        # Fails closed: extraction only runs after the hash matches.
+        (cd "$dest" && printf '%s  %s\n' "$MOLD_SHA256" "$archive" | sha256sum -c -)
+        tar -xzf "$dest/$archive" -C "$dest" --strip-components=1
+        rm -f "$dest/$archive"
+        echo "$dest/bin" >> "$GITHUB_PATH"
+        "$dest/bin/mold" --version
