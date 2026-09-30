@@ -615,6 +615,17 @@ pub fn check_private_dir(name: &str, label: &str, dir: &Path) -> DoctorCheck {
 /// may be readable by others (macOS creates it `0755`) but not writable.
 const AGENTS_DIR_FORBIDDEN_BITS: u32 = 0o022;
 
+/// Names of the checks that apply only to a native launchd service.
+///
+/// The CLI drops its own copies of these when the daemon that answers reports a
+/// subprocess supervision (its report contains none of them).
+pub const LAUNCHD_CHECKS: [&str; 4] = [
+    "launchd_domain",
+    "launchd_definitions_dir",
+    "launchd_log_dir",
+    "launchd_agents_dir",
+];
+
 /// Home-relative `LaunchAgents` directory the daemon agent is installed into.
 const LAUNCH_AGENTS_RELATIVE: [&str; 2] = ["Library", "LaunchAgents"];
 
@@ -681,8 +692,10 @@ pub fn check_launch_agents_dir(home: Option<&Path>) -> DoctorCheck {
 ///
 /// Startup creates the state root owner-private and then the log directory
 /// below it, tolerating an existing real log directory (it resets its mode).
-/// The state root is validated like any private directory; an existing log
-/// directory must be a real directory and is write-probed.
+/// The state root is validated like any private directory. An existing log
+/// directory is judged by the conditions startup imposes: a real directory
+/// (not a symlink) owned by the effective user. Its mode is repaired by
+/// startup, so no write is required before that reset.
 #[must_use]
 pub fn check_log_dir(log_dir: &Path) -> DoctorCheck {
     check_log_dir_as(log_dir, rustix::process::geteuid().as_raw())
@@ -716,18 +729,16 @@ fn check_log_dir_as(log_dir: &Path, effective_uid: u32) -> DoctorCheck {
                 ),
             )
         }
-        Ok(meta) if meta.file_type().is_dir() => match crate::write_probe(log_dir) {
-            Ok(()) => DoctorCheck::new(
-                NAME,
-                DoctorStatus::Ok,
-                format!("writable: {}", log_dir.display()),
+        // Startup (`prepare_dir`) resets an owned real directory to 0700 before
+        // it writes anything, so a mode such as 0500 is repaired, not fatal.
+        Ok(meta) if meta.file_type().is_dir() => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!(
+                "{LABEL} {} is a real directory you own; startup resets its mode to 0700",
+                log_dir.display()
             ),
-            Err(error) => DoctorCheck::new(
-                NAME,
-                DoctorStatus::Fail,
-                format!("{LABEL} {} is not writable: {error}", log_dir.display()),
-            ),
-        },
+        ),
         Ok(_) => DoctorCheck::new(
             NAME,
             DoctorStatus::Fail,
@@ -1588,7 +1599,30 @@ mod tests {
         assert_eq!(check_log_dir(&logs).status, DoctorStatus::Ok);
         std::fs::create_dir(&logs).unwrap();
         assert_eq!(check_log_dir(&logs).status, DoctorStatus::Ok);
-        assert!(entry_names(&logs).is_empty(), "the probe file is removed");
+        assert!(entry_names(&logs).is_empty(), "no probe file is written");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_log_dir_startup_would_repair_is_not_fatal() {
+        // `prepare_dir` resets an owned real log directory to 0700 before it
+        // writes, so a read-only mode is repaired at startup.
+        let base = temp_dir("log-repair");
+        let root = base.join("state");
+        let logs = root.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        set_mode(&root, 0o700);
+        set_mode(&logs, 0o500);
+
+        let check = check_log_dir(&logs);
+
+        set_mode(&logs, 0o700);
+        assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail);
+        assert!(
+            check.detail.contains("resets its mode to 0700"),
+            "{}",
+            check.detail
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -106,7 +106,10 @@ pub(crate) async fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
         checks.push(launchd_job_check(job_status, connected, supervision));
     }
     match remote {
-        Some(remote) => merge_daemon_checks(&mut checks, remote),
+        Some(remote) => {
+            reconcile_launchd_checks(&mut checks, &remote);
+            merge_daemon_checks(&mut checks, remote);
+        }
         None => checks.push(unavailable_daemon_check()),
     }
     let report = Report::from_checks(checks);
@@ -212,7 +215,7 @@ fn launchd_job_findings(
     status: Result<StatusReport, crate::service::Error>,
     daemon_reachable: bool,
 ) -> DoctorCheck {
-    const NAME: &str = "launchd_job";
+    const NAME: &str = LAUNCHD_JOB_CHECK;
     let report = match status {
         Ok(report) => report,
         Err(error) => {
@@ -290,6 +293,28 @@ fn launchd_job_findings(
         .collect::<Vec<_>>()
         .join("; ");
     DoctorCheck::new(NAME, overall, detail)
+}
+
+/// Name of the CLI-only daemon job check.
+const LAUNCHD_JOB_CHECK: &str = "launchd_job";
+
+/// Drop the local launchd checks when the daemon that answered does not run
+/// under launchd.
+///
+/// The daemon runs the same platform list with its real supervision, so a
+/// `--dev-subprocess` daemon reports none of the launchd checks even when a
+/// `service.toml` is installed and the CLI inferred a native service. A native
+/// daemon reports them, and both results are then merged.
+fn reconcile_launchd_checks(checks: &mut Vec<DoctorCheck>, remote: &[DoctorCheck]) {
+    let daemon_native = remote
+        .iter()
+        .any(|check| hostcheck::LAUNCHD_CHECKS.contains(&check.name.as_str()));
+    if !daemon_native {
+        checks.retain(|check| {
+            check.name != LAUNCHD_JOB_CHECK
+                && !hostcheck::LAUNCHD_CHECKS.contains(&check.name.as_str())
+        });
+    }
 }
 
 /// Add the daemon's checks to the local ones.
@@ -485,6 +510,37 @@ mod tests {
             launchd_job_check(Ok(pending), false, Supervision::Native).status,
             Status::Warn
         );
+    }
+
+    #[test]
+    fn a_subprocess_daemon_removes_the_local_launchd_checks() {
+        // An installed service.toml made the CLI infer a native service, but the
+        // answering daemon is a `--dev-subprocess` one on a host without a
+        // `gui/<uid>` domain (for example over SSH).
+        let local = || {
+            vec![
+                DoctorCheck::new("bin:git", Status::Ok, "found"),
+                DoctorCheck::new("launchd_domain", Status::Fail, "no gui domain"),
+                DoctorCheck::new("launchd_agents_dir", Status::Warn, "x"),
+                DoctorCheck::new("launchd_job", Status::Fail, "not running"),
+            ]
+        };
+        let subprocess_daemon = vec![DoctorCheck::new("bin:git", Status::Ok, "found")];
+
+        let mut checks = local();
+        reconcile_launchd_checks(&mut checks, &subprocess_daemon);
+        merge_daemon_checks(&mut checks, subprocess_daemon);
+        assert_eq!(checks.len(), 1);
+        assert_ne!(Report::from_checks(checks).overall, Status::Fail);
+
+        // A native daemon reports the launchd checks itself: keep and merge.
+        let native_daemon = vec![DoctorCheck::new("launchd_domain", Status::Ok, "reachable")];
+        let mut checks = local();
+        reconcile_launchd_checks(&mut checks, &native_daemon);
+        merge_daemon_checks(&mut checks, native_daemon);
+        assert_eq!(checks.len(), 4);
+        let domain = checks.iter().find(|c| c.name == "launchd_domain").unwrap();
+        assert_eq!(domain.status, Status::Fail, "the worse result wins");
     }
 
     #[test]
