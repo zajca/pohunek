@@ -27,9 +27,10 @@ Stale seeds: a seed clones the main checkout's build of whatever
 rebuilds the changed dependencies anyway and a seeded first build can be
 slower than a cold one. The script therefore skips the seed by itself, says
 why, and seeds anyway with `--force-seed`. The seed is stale when the
-committer time of the last commit touching `Cargo.lock` on the resolved base
-(`git log -1 --format=%ct <base> -- Cargo.lock`) is newer than the newest
-build activity in the seed profile dir, the later of the mtimes of its
+time the last `Cargo.lock` change landed on the resolved base's first-parent
+history (`git log -1 --first-parent --format=%ct <base> -- Cargo.lock`: the
+merge commit's time for a merged branch, not the branch commit's) is newer
+than the newest build activity in the seed profile dir, the later of the mtimes of its
 `.fingerprint` and `deps` directories. The signal is content-anchored on
 purpose: the `Cargo.lock` file mtime changes on every checkout. When the
 signal cannot be read (no commit touches `Cargo.lock`, unparsable output, a
@@ -409,10 +410,13 @@ def check_seed_source(target):
 
 
 def lockfile_commit_time(base_commit, repo, executor):
-    """Committer time (epoch seconds) of the last `Cargo.lock` commit on
-    `base_commit`, or None when git cannot tell."""
+    """Committer time (epoch seconds) at which the last `Cargo.lock` change
+    landed on `base_commit`'s first-parent history, or None when git cannot
+    tell. A merged branch counts from its merge commit, the moment a
+    checkout following the base first receives the change."""
     result = executor(
-        ["git", "log", "-1", "--format=%ct", base_commit, "--", LOCKFILE],
+        ["git", "log", "-1", "--first-parent", "--format=%ct", base_commit,
+         "--", LOCKFILE],
         cwd=repo,
         check=False,
     )

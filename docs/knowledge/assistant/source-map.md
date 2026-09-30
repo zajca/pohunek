@@ -297,7 +297,7 @@ Release packaging and contributor verification:
   read from `git worktree list --porcelain -z`, so any path parses intact. A failed
   final rename keeps the worktree on its temporary branch and reports both.
   `--no-seed` skips seeding. A stale seed is skipped too: when the last
-  commit touching `Cargo.lock` on the base is newer than the seed profile's
+  `Cargo.lock` change landed on the base's mainline after the seed profile's
   newest `.fingerprint`/`deps` mtime, the run seeds nothing, takes no Cargo
   locks or probe, and prints a line starting `not seeded (stale seed`;
   `--force-seed` seeds regardless and cannot be combined with `--no-seed`,

@@ -83,7 +83,7 @@ class FakeExecutor:
         # Commit-ish -> commit id.
         self.refs = {"origin/main": BASE_COMMIT, "HEAD": BASE_COMMIT}
         self.probe_fails = False
-        # stdout of `git log -1 --format=%ct <base> -- Cargo.lock`; empty
+        # stdout of `git log -1 --first-parent --format=%ct <base> -- Cargo.lock`; empty
         # when no commit touches the lockfile.
         self.lockfile_log = f"{OLD_EPOCH}\n"
         self.copy_fails_for = None
@@ -195,8 +195,8 @@ class FakeExecutor:
                 return 1, "", f"error: cannot lock ref '{args[2]}'"
             del self.branches[branch]
             return 0, "", ""
-        if args[:3] == ["log", "-1", "--format=%ct"]:
-            assert args[4:] == ["--", "Cargo.lock"], args
+        if args[:4] == ["log", "-1", "--first-parent", "--format=%ct"]:
+            assert args[5:] == ["--", "Cargo.lock"], args
             return 0, self.lockfile_log, ""
         if args[:2] == ["worktree", "add"]:
             return self.worktree_add(args[2:])
@@ -1136,7 +1136,8 @@ class StaleSeedTests(HarnessCase):
     def test_fresh_seed_is_seeded(self):
         self.assert_seeded(*self.h.run("issue-1"))
         self.assertTrue(self.h.executor.ran(
-            "git", "log", "-1", "--format=%ct", BASE_COMMIT, "--",
+            "git", "log", "-1", "--first-parent", "--format=%ct", BASE_COMMIT,
+            "--",
             "Cargo.lock"))
 
     def test_lockfile_commit_time_equal_to_build_time_is_fresh(self):
@@ -1226,6 +1227,45 @@ class StaleSeedTests(HarnessCase):
         self.assertEqual(code, 0, err)
         self.assertFalse(self.h.executor.ran("git", "log"))
         self.assertIn("not seeded (--no-seed)", out)
+
+
+class LockfileCommitTimeRealGitTests(unittest.TestCase):
+    """`lockfile_commit_time` against a real repository."""
+
+    T0, T1, T3 = 1_600_000_000, 1_600_001_000, 1_600_009_000
+
+    def git(self, repo, *args, when):
+        env = dict(os.environ, GIT_COMMITTER_DATE=f"{when} +0000",
+                   GIT_AUTHOR_DATE=f"{when} +0000",
+                   GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+        command = ["git", "-c", "commit.gpgsign=false",
+                   "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                   *args]
+        return subprocess.run(command, cwd=repo, env=env, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def test_merged_lockfile_change_counts_from_the_merge_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            lock = repo / "Cargo.lock"
+            self.git(repo, "init", "-q", "-b", "main", when=self.T0)
+            lock.write_text("v0\n")
+            self.git(repo, "add", "Cargo.lock", when=self.T0)
+            self.git(repo, "commit", "-q", "-m", "initial", when=self.T0)
+            self.git(repo, "checkout", "-q", "-b", "feature", when=self.T1)
+            lock.write_text("v1\n")
+            self.git(repo, "commit", "-q", "-am", "lock", when=self.T1)
+            self.git(repo, "checkout", "-q", "main", when=self.T1)
+            (repo / "other.txt").write_text("x\n")
+            self.git(repo, "add", "other.txt", when=self.T1)
+            self.git(repo, "commit", "-q", "-m", "other", when=self.T1)
+            self.git(repo, "merge", "-q", "--no-ff", "-m", "merge", "feature",
+                     when=self.T3)
+            tip = self.git(repo, "rev-parse", "HEAD", when=self.T3)
+            self.assertEqual(
+                worktree_new.lockfile_commit_time(
+                    tip, repo, worktree_new.execute), self.T3)
 
 
 class ConcurrencyTests(HarnessCase):
