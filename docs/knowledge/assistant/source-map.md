@@ -381,6 +381,10 @@ Daemon, sessions, integrations, and project state:
   ended job ending the connect wait, post-timeout reconciliation.
 - `crates/daemon/src/notify.rs`
 - `crates/daemon/src/external/mod.rs`
+- `crates/daemon/src/external/watch.rs`
+- `crates/daemon/src/external/inotify.rs`
+- `crates/daemon/src/external/fsevents.rs`
+- `crates/daemon/src/external/unsupported.rs`
 - `crates/daemon/tests/procwatch.rs`
 - `crates/daemon/src/procwatch/mod.rs`
 - `crates/daemon/src/project/mod.rs`

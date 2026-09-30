@@ -49,6 +49,11 @@ time = { workspace = true }
 ulid = { workspace = true }
 zeroize = { workspace = true }
 
+# FSEvents backend for live transcript watching on macOS. Default features are
+# disabled so only the FSEvents backend is compiled in (no kqueue/mio fallback).
+[target.'cfg(target_os = "macos")'.dependencies]
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+
 [dev-dependencies]
 pohunek-session-worker = { workspace = true }
 # `test-util` enables tokio's paused clock (`start_paused`) so the attention

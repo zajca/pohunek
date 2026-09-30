@@ -430,6 +430,36 @@ the watch, so a reused process id never completes a watch for the process it
 replaced, and a registration failure is reported as a failure rather than as an
 exit.
 
+The observer also indexes provider transcripts so a newly started external agent
+is enriched without waiting for the next process sweep. It watches only the
+Claude (`projects`) and Codex (`sessions`) transcript roots, never their parents
+or `$HOME`. The transcript index is converged by a bounded reconciliation pass
+that runs every 30 seconds, on a lost-event or directory-change hint, and after a
+watcher restart, whether or not the live watcher (inotify on Linux, FSEvents on
+macOS) is healthy. Each pass re-resolves the configured roots (symlinked or
+aliased roots are scanned once, a nested root owns its own transcripts), registers
+them with the watcher, and scans them, dropping indexed transcripts it no longer
+sees. A pass that could not finish drops nothing. The watcher only reduces
+latency: a file notification is a hint that schedules one debounced, bounded
+parse of that transcript, its failure is only logged because the next pass
+repairs it, and process-backed identity checks are unchanged. A stream that
+silently stopped delivering therefore delays enrichment by at most one pass.
+
+Every pass is bounded to 100000 directory entries, 8192 directories and 20000
+transcript parses per root, and unchanged transcripts (same size and modification
+time) are not parsed again. A provider tree beyond these bounds is visibly
+degraded with `scan_incomplete`, never silently partial. Watcher health is logged
+with stable machine-readable causes: `external_transcript_watcher_unavailable`
+(`inotify_open_failed`, `fsevents_open_failed`, `unsupported_target`,
+`watcher_backend_failed`) when no live watcher runs, and
+`external_transcript_watcher_degraded` (`roots_missing`, `registration_failed`,
+`scan_incomplete`) when the watcher runs but a root is missing, could not be
+registered (denied directory, exhausted OS watch limit), or could not be scanned
+completely (unreadable directory or a tree beyond the bounds). The registration
+diagnostic names the transcript root, never the transcript contents. A failed
+watcher is restarted with backoff, and the reconciliation passes and the process
+sweep keep running in every state.
+
 Workers live for the operating-system login session. Closing a terminal,
 detaching, or locking the screen does not stop a session. Logging out or
 rebooting ends every worker; after the next login the daemon reports those

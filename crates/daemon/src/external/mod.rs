@@ -5,12 +5,14 @@
 //! controls external processes; it only publishes read-only `SessionInfo`
 //! snapshots for UI and CLI visibility.
 
-// Rust guideline compliant 2026-09-14
+// Rust guideline compliant 2026-09-29
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{self, File};
+use std::future::Future;
 use std::io::{self, BufRead, BufReader, Read};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,11 +24,32 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use watch::{RootScan, TranscriptSink, WatchBackend, WatcherHandle};
+
 use crate::procwatch::{Pid, ProcessFact, ProcessIdentity};
 use crate::session::SessionRegistry;
 
+#[cfg(target_os = "macos")]
+mod fsevents;
 #[cfg(target_os = "linux")]
 mod inotify;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod unsupported;
+mod watch;
+
+#[cfg(target_os = "macos")]
+use fsevents as platform;
+#[cfg(target_os = "linux")]
+use inotify as platform;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+use unsupported as platform;
+
+#[cfg(target_os = "macos")]
+use fsevents::FsEventsBackend as PlatformBackend;
+#[cfg(target_os = "linux")]
+use inotify::InotifyBackend as PlatformBackend;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+use unsupported::UnsupportedBackend as PlatformBackend;
 
 /// Prefix for synthetic session ids assigned to external processes.
 pub(crate) const EXTERNAL_SESSION_ID_PREFIX: &str = "ext-";
@@ -61,6 +84,39 @@ const CLAUDE_TRANSCRIPT_SUBDIR: &str = "projects";
 const CODEX_TRANSCRIPT_SUBDIR: &str = "sessions";
 /// JSONL transcript extension.
 const JSONL_EXTENSION: &str = "jsonl";
+
+/// Maximum number of directory entries one tree walk inspects.
+///
+/// Both the reconciliation scan and the backends' registration walks stop here,
+/// because they run repeatedly (tree changes, overflow, restarts, periodic
+/// reconcile) and a large or fast-growing provider tree must not turn each run
+/// into unbounded I/O. A walk that stops early is reported as partial or
+/// incomplete and the remainder is reached by live events.
+const MAX_WALK_ENTRIES: usize = 100_000;
+/// Maximum number of directories one tree walk visits or watches.
+///
+/// Bounds the walk's queue memory and the OS watch budget a backend consumes.
+const MAX_WALK_DIRECTORIES: usize = 8192;
+/// Maximum number of transcripts one reconciliation scan parses per root.
+///
+/// Each parse reads at most `TRANSCRIPT_SCAN_BYTE_LIMIT` bytes, so this bounds the
+/// bytes a scan reads.
+const MAX_SCANNED_TRANSCRIPTS: usize = 20_000;
+
+/// Work bounds for scanning one root.
+#[derive(Debug, Clone, Copy)]
+struct ScanLimits {
+    entries: usize,
+    directories: usize,
+    transcripts: usize,
+}
+
+/// Bounds applied to every production scan.
+const SCAN_LIMITS: ScanLimits = ScanLimits {
+    entries: MAX_WALK_ENTRIES,
+    directories: MAX_WALK_DIRECTORIES,
+    transcripts: MAX_SCANNED_TRANSCRIPTS,
+};
 
 /// In-memory external session store and observer signals.
 #[derive(Debug, Clone)]
@@ -129,6 +185,36 @@ pub(crate) struct TranscriptCandidate {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TranscriptIndex {
     inner: Arc<Mutex<HashMap<PathBuf, TranscriptCandidate>>>,
+    /// Signature of every transcript parsed, with or without a resulting
+    /// candidate, so an unchanged file is not parsed again by a scan.
+    parsed: Arc<Mutex<HashMap<PathBuf, FileSignature>>>,
+    #[cfg(test)]
+    parses: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Identity and state a transcript had when it was last parsed: size,
+/// modification time, device and inode, and status-change time. An atomic
+/// replacement that keeps size and mtime still changes the inode and the ctime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileSignature {
+    len: u64,
+    modified: Option<SystemTime>,
+    dev: u64,
+    ino: u64,
+    changed: (i64, i64),
+}
+
+impl FileSignature {
+    fn read(path: &Path) -> Option<Self> {
+        let metadata = fs::metadata(path).ok()?;
+        Some(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
 }
 
 impl ExternalSessions {
@@ -158,7 +244,7 @@ impl ExternalSessions {
         });
     }
 
-    /// Stops the observer loop and inotify watcher.
+    /// Stops the observer loop and the transcript watcher.
     pub(crate) fn shutdown(&self) {
         self.inner.shutdown.cancel();
     }
@@ -169,7 +255,6 @@ impl ExternalSessions {
     }
 
     /// Wakes the observer for an immediate sweep.
-    #[cfg(target_os = "linux")]
     pub(crate) fn notify_rescan(&self) {
         self.inner.rescan.notify_one();
     }
@@ -332,42 +417,81 @@ impl ExternalObserverConfig {
 }
 
 impl TranscriptIndex {
-    /// Scans every configured root once.
-    pub(crate) async fn scan_roots(&self, roots: Vec<TranscriptRoot>) {
+    /// Reconciles the index with every configured root and returns one result
+    /// per root, in order.
+    ///
+    /// Transcripts that no longer exist are dropped from the index; transcripts
+    /// that cannot be read or were not reached within `SCAN_LIMITS` are kept. The
+    /// scan runs on the blocking pool and stops early once `cancel` fires.
+    pub(crate) async fn scan_roots(
+        &self,
+        roots: Vec<TranscriptRoot>,
+        cancel: CancellationToken,
+    ) -> Vec<RootScan> {
         let index = self.clone();
-        if let Err(err) = tokio::task::spawn_blocking(move || {
-            for root in roots {
-                if let Err(err) = index.scan_root(&root) {
-                    debug!(
-                        agent = ?root.agent_base,
-                        error = %err,
-                        "failed to scan external transcript root"
-                    );
-                }
-            }
+        let count = roots.len();
+        match tokio::task::spawn_blocking(move || {
+            roots
+                .iter()
+                .map(|root| index.scan_root(root, &roots, SCAN_LIMITS, &cancel))
+                .collect::<Vec<_>>()
         })
         .await
         {
-            warn!(error = %err, "external transcript scan task panicked");
+            Ok(scans) => scans,
+            Err(err) => {
+                warn!(error = %err, "external transcript scan task panicked");
+                vec![RootScan::Incomplete; count]
+            }
         }
     }
 
     /// Parses one transcript path and updates the candidate index.
+    ///
+    /// A path that is gone or is no longer a regular file (removed, replaced by
+    /// a directory, or below a parent replaced by a file) drops its candidate; the
+    /// existence check is repeated under the lock so a transcript recreated
+    /// meanwhile is kept.
     pub(crate) fn upsert_path(&self, agent_base: AgentKind, path: &Path) -> io::Result<bool> {
-        if let Some(candidate) = parse_transcript(agent_base, path)? {
-            let mut inner = self.inner.lock().unwrap_or_else(MutexError::into_inner);
+        let gone = transcript_is_gone(path);
+        let signature = if gone {
+            None
+        } else {
+            FileSignature::read(path)
+        };
+        let candidate = if gone {
+            None
+        } else {
+            #[cfg(test)]
+            self.parses
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match parse_transcript(agent_base, path) {
+                Ok(candidate) => candidate,
+                Err(_err) if transcript_is_gone(path) => None,
+                Err(err) => return Err(err),
+            }
+        };
+        {
+            let mut parsed = self.parsed.lock().unwrap_or_else(MutexError::into_inner);
+            match signature {
+                Some(signature) => {
+                    parsed.insert(path.to_path_buf(), signature);
+                }
+                None => {
+                    parsed.remove(path);
+                }
+            }
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(MutexError::into_inner);
+        if let Some(candidate) = candidate {
             let changed = inner.get(path) != Some(&candidate);
             inner.insert(path.to_path_buf(), candidate);
-            Ok(changed)
-        } else {
-            let removed = self
-                .inner
-                .lock()
-                .unwrap_or_else(MutexError::into_inner)
-                .remove(path)
-                .is_some();
-            Ok(removed)
+            return Ok(changed);
         }
+        if gone && !transcript_is_gone(path) {
+            return Ok(false);
+        }
+        Ok(inner.remove(path).is_some())
     }
 
     /// Finds the best transcript candidate for `fact` and `cwd`.
@@ -387,32 +511,316 @@ impl TranscriptIndex {
             .cloned()
     }
 
-    fn scan_root(&self, root: &TranscriptRoot) -> io::Result<()> {
-        if !root.path.is_dir() {
-            return Ok(());
+    /// Scans one root and, when the pass covered it completely, drops the entries
+    /// it owns that the pass did not see.
+    ///
+    /// A pass that ends early (an unreadable directory, an exhausted bound,
+    /// cancellation) prunes nothing: what it did not inspect stays as it is, and
+    /// only an explicit hint for a gone path removes a single candidate. A root
+    /// that does not exist prunes everything it owned.
+    fn scan_root(
+        &self,
+        root: &TranscriptRoot,
+        all_roots: &[TranscriptRoot],
+        limits: ScanLimits,
+        cancel: &CancellationToken,
+    ) -> RootScan {
+        let canonical = canonical_roots(all_roots);
+        let (scan, visited) = match fs::metadata(&root.path) {
+            Ok(metadata) if metadata.is_dir() => {
+                self.scan_existing_root(root, all_roots, &canonical, limits, cancel)
+            }
+            Ok(_) => (RootScan::Missing, HashSet::new()),
+            Err(err) if is_absent_error(&err) => (RootScan::Missing, HashSet::new()),
+            Err(err) => {
+                debug!(
+                    agent = ?root.agent_base,
+                    error = %err,
+                    "failed to inspect external transcript root"
+                );
+                (RootScan::Incomplete, HashSet::new())
+            }
+        };
+        if scan != RootScan::Incomplete {
+            let unseen = |path: &Path| {
+                owning_root(all_roots, &canonical, path)
+                    .is_some_and(|owner| owner.path == root.path)
+                    && !visited.contains(path)
+            };
+            self.inner
+                .lock()
+                .unwrap_or_else(MutexError::into_inner)
+                .retain(|path, _candidate| !unseen(path));
+            self.parsed
+                .lock()
+                .unwrap_or_else(MutexError::into_inner)
+                .retain(|path, _signature| !unseen(path));
         }
+        scan
+    }
+
+    /// Walks one existing root within `limits`, indexing new and changed
+    /// transcripts, and returns the transcripts it saw.
+    ///
+    /// Transcripts whose size and modification time are unchanged since they
+    /// were parsed cost only an entry visit, so repeated passes spend the parse
+    /// budget on new and changed files. A tree beyond the limits ends the pass as
+    /// incomplete; the pass restarts from the root every time.
+    fn scan_existing_root(
+        &self,
+        root: &TranscriptRoot,
+        all_roots: &[TranscriptRoot],
+        canonical: &[PathBuf],
+        limits: ScanLimits,
+        cancel: &CancellationToken,
+    ) -> (RootScan, HashSet<PathBuf>) {
+        let root_canonical = all_roots
+            .iter()
+            .position(|other| other.path == root.path)
+            .and_then(|index| canonical.get(index))
+            .cloned()
+            .unwrap_or_else(|| root.path.clone());
+        let mut incomplete = false;
+        let mut visited = HashSet::new();
+        let mut entries_left = limits.entries;
+        let mut directories_left = limits.directories;
+        let mut transcripts_left = limits.transcripts;
         let mut queue = VecDeque::from([root.path.clone()]);
-        while let Some(dir) = queue.pop_front() {
-            for entry in fs::read_dir(&dir)? {
+        'walk: while let Some(dir) = queue.pop_front() {
+            if cancel.is_cancelled() {
+                incomplete = true;
+                break;
+            }
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(err) if is_absent_error(&err) => continue,
+                Err(err) => {
+                    debug!(
+                        agent = ?root.agent_base,
+                        error = %err,
+                        "failed to list a directory below an external transcript root"
+                    );
+                    incomplete = true;
+                    continue;
+                }
+            };
+            for entry in entries {
+                if entries_left == 0 {
+                    incomplete = true;
+                    break 'walk;
+                }
+                entries_left -= 1;
                 let entry = match entry {
                     Ok(entry) => entry,
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-                    Err(err) => return Err(err),
+                    Err(err) if is_absent_error(&err) => continue,
+                    Err(_err) => {
+                        incomplete = true;
+                        continue;
+                    }
                 };
                 let path = entry.path();
                 let file_type = match entry.file_type() {
                     Ok(file_type) => file_type,
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-                    Err(err) => return Err(err),
+                    Err(err) if is_absent_error(&err) => continue,
+                    Err(_err) => {
+                        incomplete = true;
+                        continue;
+                    }
                 };
                 if file_type.is_dir() {
+                    // A nested provider root, however it is spelled, is scanned as
+                    // its own root so its transcripts carry its own agent kind.
+                    let resolved =
+                        root_canonical.join(path.strip_prefix(&root.path).unwrap_or(&path));
+                    if canonical
+                        .iter()
+                        .zip(all_roots)
+                        .any(|(other_canonical, other)| {
+                            *other_canonical == resolved && other.path != root.path
+                        })
+                    {
+                        continue;
+                    }
+                    if directories_left == 0 {
+                        incomplete = true;
+                        break 'walk;
+                    }
+                    directories_left -= 1;
                     queue.push_back(path);
                 } else if is_jsonl_path(&path) {
-                    self.upsert_path(root.agent_base.clone(), &path)?;
+                    if !self.is_unchanged(&path) {
+                        if transcripts_left == 0 {
+                            incomplete = true;
+                            break 'walk;
+                        }
+                        transcripts_left -= 1;
+                        if let Err(err) = self.upsert_path(root.agent_base.clone(), &path) {
+                            debug!(
+                                agent = ?root.agent_base,
+                                error = %err,
+                                "failed to parse external transcript candidate"
+                            );
+                            incomplete = true;
+                        }
+                    }
+                    visited.insert(path);
                 }
             }
         }
+        let scan = if incomplete {
+            RootScan::Incomplete
+        } else {
+            RootScan::Complete
+        };
+        (scan, visited)
+    }
+
+    /// Whether `path` has the size and modification time it had when parsed.
+    fn is_unchanged(&self, path: &Path) -> bool {
+        let Some(signature) = FileSignature::read(path) else {
+            return false;
+        };
+        self.parsed
+            .lock()
+            .unwrap_or_else(MutexError::into_inner)
+            .get(path)
+            == Some(&signature)
+    }
+}
+
+/// Whether an indexed transcript no longer exists as a regular file.
+///
+/// A parent replaced by a file (`ENOTDIR`) or the transcript replaced by a
+/// directory or other non-regular file also count as gone; any other error
+/// keeps the candidate.
+fn transcript_is_gone(path: &Path) -> bool {
+    match fs::metadata(path) {
+        Ok(metadata) => !metadata.is_file(),
+        Err(err) => is_absent_error(&err),
+    }
+}
+
+/// The canonical directory of every root, in order; a root that cannot be
+/// resolved keeps its configured path.
+fn canonical_roots(roots: &[TranscriptRoot]) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .map(|root| fs::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone()))
+        .collect()
+}
+
+/// Finds the root that owns `path` by resolved identity: the path is mapped
+/// through the configured root that spells it to its canonical location, and the
+/// root with the longest canonical prefix owns it. A root reached through a
+/// symlink into another root's tree therefore owns its own transcripts, and every
+/// canonical file has exactly one owner. `canonical` holds `canonical_roots`.
+fn owning_root<'a>(
+    roots: &'a [TranscriptRoot],
+    canonical: &[PathBuf],
+    path: &Path,
+) -> Option<&'a TranscriptRoot> {
+    let (spelled_by, _) = roots
+        .iter()
+        .enumerate()
+        .filter(|(_, root)| path.starts_with(&root.path))
+        .max_by_key(|(_, root)| root.path.components().count())?;
+    let resolved = canonical[spelled_by].join(path.strip_prefix(&roots[spelled_by].path).ok()?);
+    canonical
+        .iter()
+        .zip(roots)
+        .filter(|(root_canonical, _)| resolved.starts_with(root_canonical))
+        .max_by_key(|(root_canonical, _)| root_canonical.components().count())
+        .map(|(_, root)| root)
+}
+
+/// Whether a filesystem error proves the path does not exist.
+fn is_absent_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
+/// Platform backend that may not be open yet, so a failed open is retried by the
+/// runner's restart loop like any later backend failure.
+struct ReopenableBackend {
+    inner: Option<PlatformBackend>,
+}
+
+fn backend_not_open() -> io::Error {
+    io::Error::other("transcript watcher backend is not open")
+}
+
+impl WatchBackend for ReopenableBackend {
+    fn register_root(
+        &mut self,
+        root: &Path,
+        cancel: &CancellationToken,
+    ) -> watch::RootRegistration {
+        match &mut self.inner {
+            Some(backend) => backend.register_root(root, cancel),
+            None => watch::RootRegistration::Failed(backend_not_open()),
+        }
+    }
+
+    fn watch_new_directory(
+        &mut self,
+        dir: &Path,
+        out: &mut Vec<watch::WatchEvent>,
+        cancel: &CancellationToken,
+    ) {
+        if let Some(backend) = &mut self.inner {
+            backend.watch_new_directory(dir, out, cancel);
+        }
+    }
+
+    fn restart(&mut self) -> io::Result<()> {
+        self.inner = Some(PlatformBackend::open()?);
         Ok(())
+    }
+
+    fn unregister_all(&mut self) {
+        if let Some(backend) = &mut self.inner {
+            backend.unregister_all();
+        }
+    }
+
+    async fn next_events(&mut self, out: &mut Vec<watch::WatchEvent>) -> io::Result<()> {
+        match &mut self.inner {
+            Some(backend) => backend.next_events(out).await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// Production sink: parses into the shared index and wakes the observer.
+struct IndexSink {
+    index: TranscriptIndex,
+    sessions: ExternalSessions,
+}
+
+impl TranscriptSink for IndexSink {
+    fn upsert(
+        &self,
+        agent_base: AgentKind,
+        path: PathBuf,
+    ) -> impl Future<Output = io::Result<bool>> + Send {
+        let index = self.index.clone();
+        async move {
+            tokio::task::spawn_blocking(move || index.upsert_path(agent_base, &path))
+                .await
+                .map_err(io::Error::other)?
+        }
+    }
+
+    fn reconcile(&self, roots: Vec<TranscriptRoot>) -> impl Future<Output = Vec<RootScan>> + Send {
+        let index = self.index.clone();
+        let shutdown = self.sessions.shutdown_token();
+        async move { index.scan_roots(roots, shutdown).await }
+    }
+
+    fn index_changed(&self) {
+        self.sessions.notify_rescan();
     }
 }
 
@@ -421,7 +829,7 @@ async fn run_observer(
     sessions: ExternalSessions,
     config: ExternalObserverConfig,
 ) {
-    let (index, _watch) = start_transcript_index(&config.roots, &sessions).await;
+    let (index, _watcher) = start_transcript_index(&config.roots, &sessions).await;
 
     let mut tick = tokio::time::interval(config.sweep_interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -434,103 +842,38 @@ async fn run_observer(
     }
 }
 
-/// Stable reason reported whenever live transcript watching is not running.
-///
-/// The observer then relies on its startup scan of the transcript roots and
-/// the periodic process sweep.
-pub(crate) const TRANSCRIPT_WATCHER_UNAVAILABLE: &str = "external_transcript_watcher_unavailable";
-
-/// Whether new transcripts are indexed as they are written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TranscriptWatch {
-    /// A live watcher follows the transcript roots.
-    #[cfg(target_os = "linux")]
-    Active,
-    /// Transcripts are indexed only by the startup scan.
-    Unavailable(WatcherUnavailable),
-}
-
-/// Why live transcript watching is not running.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WatcherUnavailable {
-    /// The Linux inotify watcher could not be opened.
-    #[cfg(target_os = "linux")]
-    OpenFailed,
-    /// The target has no live transcript watcher.
-    #[cfg(not(target_os = "linux"))]
-    UnsupportedTarget,
-}
-
-impl WatcherUnavailable {
-    /// Stable machine-readable cause.
-    const fn cause(self) -> &'static str {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::OpenFailed => "inotify_open_failed",
-            #[cfg(not(target_os = "linux"))]
-            Self::UnsupportedTarget => "unsupported_target",
-        }
-    }
-}
-
-/// Starts transcript watching, reports its availability, and indexes the
-/// transcripts that already exist.
+/// Starts transcript watching, reports its health, and indexes the transcripts
+/// that already exist.
 async fn start_transcript_index(
     roots: &[TranscriptRoot],
     sessions: &ExternalSessions,
-) -> (TranscriptIndex, TranscriptWatch) {
+) -> (TranscriptIndex, WatcherHandle) {
     let index = TranscriptIndex::default();
     if roots.is_empty() {
         debug!("external observer has no transcript roots to watch");
     }
-    let watch = spawn_transcript_watcher(roots, &index, sessions);
-    index.scan_roots(roots.to_vec()).await;
-    (index, watch)
-}
-
-fn report_watcher_unavailable(
-    cause: WatcherUnavailable,
-    error: Option<&io::Error>,
-) -> TranscriptWatch {
-    warn!(
-        name: "external.transcript_watcher.unavailable",
-        reason = TRANSCRIPT_WATCHER_UNAVAILABLE,
-        cause = cause.cause(),
-        error = error.map(tracing::field::display),
-        "external transcript watcher unavailable ({{cause}}); startup scan and process sweep still run"
-    );
-    TranscriptWatch::Unavailable(cause)
-}
-
-/// Watches transcript roots so new transcripts are indexed as they are written.
-#[cfg(target_os = "linux")]
-fn spawn_transcript_watcher(
-    roots: &[TranscriptRoot],
-    index: &TranscriptIndex,
-    sessions: &ExternalSessions,
-) -> TranscriptWatch {
-    match inotify::InotifyWatcher::open(roots) {
-        Ok(watcher) => {
-            let roots = roots.to_vec();
-            let index = index.clone();
-            let sessions = sessions.clone();
-            tokio::spawn(async move { watcher.run(roots, index, sessions).await });
-            TranscriptWatch::Active
-        }
-        Err(error) => report_watcher_unavailable(WatcherUnavailable::OpenFailed, Some(&error)),
-    }
-}
-
-/// Live transcript watching exists only on Linux; issue #101 owns it on macOS.
-/// Until then the observer reports it unavailable and relies on the startup
-/// scan plus the process sweep.
-#[cfg(not(target_os = "linux"))]
-fn spawn_transcript_watcher(
-    _roots: &[TranscriptRoot],
-    _index: &TranscriptIndex,
-    _sessions: &ExternalSessions,
-) -> TranscriptWatch {
-    report_watcher_unavailable(WatcherUnavailable::UnsupportedTarget, None)
+    let sink = Arc::new(IndexSink {
+        index: index.clone(),
+        sessions: sessions.clone(),
+    });
+    let (backend, open_error) = match PlatformBackend::open() {
+        Ok(backend) => (
+            ReopenableBackend {
+                inner: Some(backend),
+            },
+            None,
+        ),
+        Err(error) => (ReopenableBackend { inner: None }, Some(error)),
+    };
+    let watcher = watch::start(
+        backend,
+        roots.to_vec(),
+        sink,
+        sessions.shutdown_token(),
+        open_error,
+    )
+    .await;
+    (index, watcher)
 }
 
 fn external_info_matches(existing: &SessionInfo, incoming: &SessionInfo) -> bool {
@@ -568,7 +911,7 @@ fn transcript_matches_process(
 fn parse_transcript(agent_base: AgentKind, path: &Path) -> io::Result<Option<TranscriptCandidate>> {
     let file = match File::open(path) {
         Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) if is_absent_error(&err) => return Ok(None),
         Err(err) => return Err(err),
     };
     let mut native_session_id = None;
@@ -768,6 +1111,9 @@ mod tests {
     }
 }
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod live_tests;
+
 #[cfg(test)]
 mod observer_tests {
     use std::path::PathBuf;
@@ -777,12 +1123,8 @@ mod observer_tests {
 
     use protocol::AgentKind;
 
-    #[cfg(not(target_os = "linux"))]
-    use super::WatcherUnavailable;
-    use super::{
-        start_transcript_index, ExternalObserverConfig, ExternalSessions, TranscriptRoot,
-        TranscriptWatch,
-    };
+    use super::watch::{TranscriptWatch, WatcherUnavailable};
+    use super::{start_transcript_index, ExternalObserverConfig, ExternalSessions, TranscriptRoot};
     use crate::procwatch::{
         Error, ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity,
         ProcessInspector,
@@ -859,14 +1201,14 @@ mod observer_tests {
         (root, transcript)
     }
 
-    #[cfg(target_os = "linux")]
-    fn expected_watch() -> TranscriptWatch {
-        TranscriptWatch::Active
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn expected_watch() -> TranscriptWatch {
-        TranscriptWatch::Unavailable(WatcherUnavailable::UnsupportedTarget)
+    /// Targets with a live backend report it active; the others report the open
+    /// failure and rely on scans.
+    fn expected_watch_state() -> TranscriptWatch {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            TranscriptWatch::Active
+        } else {
+            TranscriptWatch::Unavailable(WatcherUnavailable::OpenFailed)
+        }
     }
 
     #[tokio::test]
@@ -878,9 +1220,9 @@ mod observer_tests {
         }];
         let sessions = ExternalSessions::new();
 
-        let (index, watch) = start_transcript_index(&roots, &sessions).await;
+        let (index, watcher) = start_transcript_index(&roots, &sessions).await;
 
-        assert_eq!(watch, expected_watch());
+        assert_eq!(watcher.state(), expected_watch_state());
         let indexed = index.inner.lock().expect("index").contains_key(&transcript);
         assert!(indexed, "the startup scan indexes existing transcripts");
 
@@ -904,5 +1246,445 @@ mod observer_tests {
         .await
         .expect("the process sweep keeps running");
         sessions.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use protocol::AgentKind;
+    use tokio_util::sync::CancellationToken;
+
+    use super::watch::RootScan;
+    use super::{ScanLimits, TranscriptIndex, TranscriptRoot, SCAN_LIMITS};
+
+    const GENEROUS: ScanLimits = SCAN_LIMITS;
+
+    fn write_transcript(path: &Path, session_id: &str) {
+        fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        fs::write(
+            path,
+            format!("{{\"session_id\":\"{session_id}\",\"cwd\":\"/tmp\"}}\n"),
+        )
+        .expect("write transcript");
+    }
+
+    fn root(path: &Path) -> TranscriptRoot {
+        TranscriptRoot {
+            agent_base: AgentKind::Claude,
+            path: path.to_path_buf(),
+        }
+    }
+
+    fn scan(index: &TranscriptIndex, root: &TranscriptRoot, limits: ScanLimits) -> RootScan {
+        index.scan_root(
+            root,
+            std::slice::from_ref(root),
+            limits,
+            &CancellationToken::new(),
+        )
+    }
+
+    fn indexed(index: &TranscriptIndex, path: &Path) -> bool {
+        index.inner.lock().expect("index").contains_key(path)
+    }
+
+    /// Two project directories, each with one transcript, already indexed.
+    fn indexed_tree() -> (tempfile::TempDir, TranscriptIndex, PathBuf, PathBuf) {
+        let dir = pohunek_test_support::tempdir().expect("root");
+        let first = dir.path().join("a/s1.jsonl");
+        let second = dir.path().join("b/s2.jsonl");
+        write_transcript(&first, "one");
+        write_transcript(&second, "two");
+        let index = TranscriptIndex::default();
+        assert_eq!(
+            scan(&index, &root(dir.path()), GENEROUS),
+            RootScan::Complete
+        );
+        assert!(indexed(&index, &first) && indexed(&index, &second));
+        (dir, index, first, second)
+    }
+
+    #[test]
+    fn an_entry_limit_ends_the_scan_incomplete_and_keeps_uninspected_candidates() {
+        let (dir, index, first, second) = indexed_tree();
+        let fresh = dir.path().join("b/new.jsonl");
+        write_transcript(&fresh, "fresh");
+
+        let scan = scan(
+            &index,
+            &root(dir.path()),
+            ScanLimits {
+                entries: 1,
+                ..GENEROUS
+            },
+        );
+
+        assert_eq!(scan, RootScan::Incomplete);
+        assert!(indexed(&index, &first) && indexed(&index, &second));
+        assert!(
+            !indexed(&index, &fresh),
+            "the uninspected part is untouched"
+        );
+    }
+
+    #[test]
+    fn a_directory_limit_ends_the_scan_incomplete() {
+        let (dir, index, first, second) = indexed_tree();
+
+        let scan = scan(
+            &index,
+            &root(dir.path()),
+            ScanLimits {
+                directories: 1,
+                ..GENEROUS
+            },
+        );
+
+        assert_eq!(scan, RootScan::Incomplete);
+        assert!(indexed(&index, &first) && indexed(&index, &second));
+    }
+
+    #[test]
+    fn a_transcript_limit_bounds_the_parses_of_one_scan() {
+        let dir = pohunek_test_support::tempdir().expect("root");
+        for name in ["a", "b", "c", "d"] {
+            write_transcript(&dir.path().join(format!("{name}/s.jsonl")), name);
+        }
+        let index = TranscriptIndex::default();
+
+        let scan = scan(
+            &index,
+            &root(dir.path()),
+            ScanLimits {
+                transcripts: 2,
+                ..GENEROUS
+            },
+        );
+
+        assert_eq!(scan, RootScan::Incomplete);
+        assert_eq!(index.inner.lock().expect("index").len(), 2);
+    }
+
+    #[test]
+    fn a_cancelled_scan_stops_without_touching_the_index() {
+        let (dir, index, first, second) = indexed_tree();
+        let fresh = dir.path().join("a/new.jsonl");
+        write_transcript(&fresh, "fresh");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let root = root(dir.path());
+
+        let scan = index.scan_root(&root, std::slice::from_ref(&root), GENEROUS, &cancel);
+
+        assert_eq!(scan, RootScan::Incomplete);
+        assert!(indexed(&index, &first) && indexed(&index, &second));
+        assert!(!indexed(&index, &fresh));
+    }
+
+    /// Scans until a pass reaches the end of the tree, returning the pass count.
+    fn passes_to_complete(
+        index: &TranscriptIndex,
+        root: &TranscriptRoot,
+        limits: ScanLimits,
+    ) -> usize {
+        for pass in 1..=MAX_PASSES {
+            if scan(index, root, limits) == RootScan::Complete {
+                return pass;
+            }
+        }
+        panic!("the scan did not converge within {MAX_PASSES} passes");
+    }
+
+    /// Upper bound on passes any convergence test may need.
+    const MAX_PASSES: usize = 40;
+
+    fn nested_tree(dir: &Path, count: usize) {
+        for index in 0..count {
+            write_transcript(
+                &dir.join(format!("d{}/sub/s{index}.jsonl", index % 6)),
+                &format!("session-{index}"),
+            );
+        }
+    }
+
+    fn parses(index: &TranscriptIndex) -> usize {
+        index.parses.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn repeated_passes_under_a_parse_limit_cover_a_tree_larger_than_the_limit() {
+        let dir = pohunek_test_support::tempdir().expect("root");
+        nested_tree(dir.path(), 23);
+        let index = TranscriptIndex::default();
+
+        let passes = passes_to_complete(
+            &index,
+            &root(dir.path()),
+            ScanLimits {
+                transcripts: 5,
+                ..GENEROUS
+            },
+        );
+
+        assert_eq!(passes, 5, "23 transcripts at 5 per pass");
+        assert_eq!(index.inner.lock().expect("index").len(), 23);
+        assert_eq!(parses(&index), 23, "no transcript is parsed twice");
+    }
+
+    #[test]
+    fn a_directory_moved_in_after_convergence_is_covered_without_reparsing_the_rest() {
+        let dir = pohunek_test_support::tempdir().expect("root");
+        nested_tree(dir.path(), 23);
+        let index = TranscriptIndex::default();
+        let limits = ScanLimits {
+            transcripts: 5,
+            ..GENEROUS
+        };
+        passes_to_complete(&index, &root(dir.path()), limits);
+        let staging = pohunek_test_support::tempdir().expect("staging");
+        for number in 0..12 {
+            write_transcript(
+                &staging.path().join(format!("x/y{number}.jsonl")),
+                &format!("moved-{number}"),
+            );
+        }
+        fs::rename(staging.path().join("x"), dir.path().join("moved")).expect("move in");
+
+        passes_to_complete(&index, &root(dir.path()), limits);
+
+        assert_eq!(index.inner.lock().expect("index").len(), 35);
+        assert_eq!(parses(&index), 35, "only the moved-in files were parsed");
+    }
+
+    #[test]
+    fn an_unchanged_transcript_is_not_parsed_again_but_a_changed_one_is() {
+        let (dir, index, first, _second) = indexed_tree();
+        let before = parses(&index);
+        assert_eq!(
+            scan(&index, &root(dir.path()), GENEROUS),
+            RootScan::Complete
+        );
+        assert_eq!(parses(&index), before, "unchanged files are skipped");
+
+        write_transcript(&first, "changed-and-longer");
+        assert_eq!(
+            scan(&index, &root(dir.path()), GENEROUS),
+            RootScan::Complete
+        );
+
+        assert_eq!(parses(&index), before + 1);
+    }
+
+    #[test]
+    fn an_incomplete_scan_prunes_nothing_even_for_files_that_are_gone() {
+        let (dir, index, first, second) = indexed_tree();
+        fs::remove_file(&first).expect("remove");
+
+        let scan = scan(
+            &index,
+            &root(dir.path()),
+            ScanLimits {
+                entries: 1,
+                ..GENEROUS
+            },
+        );
+
+        assert_eq!(scan, RootScan::Incomplete);
+        assert!(indexed(&index, &first) && indexed(&index, &second));
+    }
+
+    #[test]
+    fn a_complete_scan_prunes_what_it_did_not_see() {
+        let (dir, index, first, second) = indexed_tree();
+        fs::remove_file(&first).expect("remove");
+
+        assert_eq!(
+            scan(&index, &root(dir.path()), GENEROUS),
+            RootScan::Complete
+        );
+
+        assert!(!indexed(&index, &first));
+        assert!(indexed(&index, &second));
+        assert!(
+            !index.parsed.lock().expect("parsed").contains_key(&first),
+            "the parse signature goes with it"
+        );
+    }
+
+    #[test]
+    fn a_missing_root_prunes_everything_it_owned() {
+        let (dir, index, first, second) = indexed_tree();
+        let missing = dir.path().join("gone-root");
+        let ghost = missing.join("s.jsonl");
+        let candidate = index_candidate(&first, &index);
+        index
+            .inner
+            .lock()
+            .expect("index")
+            .insert(ghost.clone(), candidate);
+
+        assert_eq!(scan(&index, &root(&missing), GENEROUS), RootScan::Missing);
+
+        assert!(!indexed(&index, &ghost));
+        assert!(indexed(&index, &first) && indexed(&index, &second));
+    }
+
+    fn index_candidate(path: &Path, index: &TranscriptIndex) -> super::TranscriptCandidate {
+        index
+            .inner
+            .lock()
+            .expect("index")
+            .get(path)
+            .expect("indexed")
+            .clone()
+    }
+
+    #[test]
+    fn a_complete_scan_of_an_outer_root_leaves_a_nested_roots_entries_alone() {
+        let dir = pohunek_test_support::tempdir().expect("root");
+        let outer = root(dir.path());
+        let inner_path = dir.path().join("codex");
+        let inner = TranscriptRoot {
+            agent_base: AgentKind::Codex,
+            path: inner_path.clone(),
+        };
+        let outer_file = dir.path().join("p/c.jsonl");
+        let inner_file = inner_path.join("x/s.jsonl");
+        write_transcript(&outer_file, "claude");
+        write_transcript(&inner_file, "codex");
+        let both = [outer.clone(), inner.clone()];
+        let index = TranscriptIndex::default();
+        let token = CancellationToken::new();
+        for root in &both {
+            index.scan_root(root, &both, GENEROUS, &token);
+        }
+        assert!(indexed(&index, &outer_file) && indexed(&index, &inner_file));
+
+        assert_eq!(
+            index.scan_root(&outer, &both, GENEROUS, &token),
+            RootScan::Complete
+        );
+
+        assert!(indexed(&index, &inner_file), "owned by the nested root");
+        assert!(indexed(&index, &outer_file));
+    }
+
+    #[test]
+    fn an_atomic_replacement_keeping_size_and_mtime_is_parsed_again() {
+        let dir = pohunek_test_support::tempdir().expect("root");
+        let path = dir.path().join("p/s.jsonl");
+        write_transcript(&path, "aaaa");
+        let index = TranscriptIndex::default();
+        assert_eq!(
+            scan(&index, &root(dir.path()), GENEROUS),
+            RootScan::Complete
+        );
+        let before = parses(&index);
+        let mtime = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .expect("mtime");
+
+        let staged = dir.path().join("p/s.tmp");
+        write_transcript(&staged, "bbbb");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&staged)
+            .and_then(|file| file.set_modified(mtime))
+            .expect("copy mtime");
+        fs::rename(&staged, &path).expect("replace atomically");
+        assert_eq!(
+            fs::metadata(&path).map(|metadata| metadata.len()).ok(),
+            Some(u64::try_from("{\"session_id\":\"aaaa\",\"cwd\":\"/tmp\"}\n".len()).expect("len")),
+            "the replacement has the same size"
+        );
+
+        assert_eq!(
+            scan(&index, &root(dir.path()), GENEROUS),
+            RootScan::Complete
+        );
+
+        assert_eq!(parses(&index), before + 1);
+        let session = index
+            .inner
+            .lock()
+            .expect("index")
+            .get(&path)
+            .and_then(|candidate| candidate.native_session_id.clone());
+        assert_eq!(session.as_deref(), Some("bbbb"));
+    }
+
+    #[test]
+    fn a_root_that_is_a_symlink_into_another_roots_tree_owns_its_own_transcripts() {
+        let dir = pohunek_test_support::tempdir().expect("root");
+        let claude_dir = dir.path().join("claude");
+        let claude_file = claude_dir.join("p/c.jsonl");
+        let real_codex_file = claude_dir.join("codex/x/s.jsonl");
+        write_transcript(&claude_file, "claude-session");
+        write_transcript(&real_codex_file, "codex-session");
+        let link = dir.path().join("codex-link");
+        std::os::unix::fs::symlink(claude_dir.join("codex"), &link).expect("symlink");
+        let claude = root(&claude_dir);
+        let codex = TranscriptRoot {
+            agent_base: AgentKind::Codex,
+            path: link.clone(),
+        };
+        let both = [claude.clone(), codex.clone()];
+        let index = TranscriptIndex::default();
+        let token = CancellationToken::new();
+
+        // The outer root is scanned last so it cannot be repaired by a later
+        // prune of the nested root.
+        for root in [&codex, &claude] {
+            assert_eq!(
+                index.scan_root(root, &both, GENEROUS, &token),
+                RootScan::Complete
+            );
+        }
+
+        assert!(indexed(&index, &claude_file));
+        assert!(
+            !indexed(&index, &real_codex_file),
+            "the outer walk leaves the nested root's files to it"
+        );
+        let agent = index
+            .inner
+            .lock()
+            .expect("index")
+            .get(&link.join("x/s.jsonl"))
+            .map(|candidate| candidate.agent_base.clone());
+        assert_eq!(agent, Some(AgentKind::Codex));
+    }
+
+    #[test]
+    fn ownership_follows_canonical_identity_not_the_spelling_of_the_path() {
+        let dir = pohunek_test_support::tempdir().expect("root");
+        let claude_dir = dir.path().join("claude");
+        fs::create_dir_all(claude_dir.join("codex")).expect("tree");
+        let link = dir.path().join("codex-link");
+        std::os::unix::fs::symlink(claude_dir.join("codex"), &link).expect("symlink");
+        let roots = [
+            root(&claude_dir),
+            TranscriptRoot {
+                agent_base: AgentKind::Codex,
+                path: link.clone(),
+            },
+        ];
+        let canonical = super::canonical_roots(&roots);
+        let owner = |path: &Path| {
+            super::owning_root(&roots, &canonical, path).map(|root| root.agent_base.clone())
+        };
+
+        assert_eq!(
+            owner(&claude_dir.join("codex/x/s.jsonl")),
+            Some(AgentKind::Codex)
+        );
+        assert_eq!(owner(&link.join("x/s.jsonl")), Some(AgentKind::Codex));
+        assert_eq!(
+            owner(&claude_dir.join("p/c.jsonl")),
+            Some(AgentKind::Claude)
+        );
     }
 }

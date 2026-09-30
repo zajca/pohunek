@@ -2,6 +2,11 @@
 
 ## Unreleased (2026-09-29)
 
+- Documented transcript indexing for external observation: a bounded
+  reconciliation pass every 30 seconds (and on lost-event hints) converges the
+  index independently of the inotify or FSEvents watcher, which only reduces
+  latency; the per-pass scan bounds; and the `external_transcript_watcher_unavailable`
+  and `external_transcript_watcher_degraded` causes.
 - Documented `pohunek integration doctor` and `pohunek integration uninstall` for
   Codex and Claude (`integration.doctor` and `integration.uninstall`): stable
   findings with remediation, the macOS `python3` stub check that never runs the
