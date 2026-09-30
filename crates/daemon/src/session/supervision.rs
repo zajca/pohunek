@@ -83,6 +83,31 @@ pub(super) const UNREADABLE_CANDIDATES_RECOVER: &str =
 /// hostile or oversized name from inflating the message.
 const MAX_LISTED_COMM_CHARS: usize = 32;
 
+/// Renders a kernel command name for an operator-facing message.
+///
+/// The name is chosen by the process, so it is untrusted text. Only ASCII
+/// letters, digits, space and `._-+:@/` pass through; every other character
+/// (backticks, separators, control and bidirectional-formatting characters,
+/// non-ASCII) becomes a `\u{..}` escape, which keeps the name from closing its
+/// own quoting or imitating another list entry. At most
+/// [`MAX_LISTED_COMM_CHARS`] characters are kept, and an ellipsis marks
+/// a shortened name.
+fn escape_command_name(comm: &str) -> String {
+    let mut escaped = String::new();
+    let mut chars = comm.chars();
+    for c in chars.by_ref().take(MAX_LISTED_COMM_CHARS) {
+        if c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '+' | ':' | '@' | '/') {
+            escaped.push(c);
+        } else {
+            escaped.extend(c.escape_unicode());
+        }
+    }
+    if chars.next().is_some() {
+        escaped.push_str("...");
+    }
+    escaped
+}
+
 /// Renders candidates as `pid 42 (start 7, comm `name`)` entries joined by
 /// commas, at most [`MAX_LISTED_UNREADABLE_CANDIDATES`] of them, then a
 /// trailing `and N more`. Carries no environment or command-line content.
@@ -93,14 +118,7 @@ pub(super) fn describe_unreadable_candidates(candidates: &[UnreadableCandidate])
         .map(|candidate| {
             let comm = candidate.comm.as_deref().map_or_else(
                 || "command name unavailable".to_owned(),
-                |comm| {
-                    let clean: String = comm
-                        .chars()
-                        .take(MAX_LISTED_COMM_CHARS)
-                        .map(|c| if c.is_control() { '?' } else { c })
-                        .collect();
-                    format!("command `{clean}`")
-                },
+                |comm| format!("command `{}`", escape_command_name(comm)),
             );
             format!(
                 "pid {} (start {}, {comm})",
@@ -1178,6 +1196,45 @@ fn stale_orphan(id: &ServiceId) -> RuntimeInventoryEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_names_are_escaped_before_reaching_a_refusal() {
+        // A backtick would close the quoting, a newline or comma could open a
+        // fake list entry, and U+202E reverses the text that follows.
+        assert_eq!(
+            escape_command_name("agent `, pid 1"),
+            "agent \\u{60}\\u{2c} pid 1"
+        );
+        assert_eq!(escape_command_name("a\nb\u{202e}c"), "a\\u{a}b\\u{202e}c");
+        assert_eq!(escape_command_name("Web Content-1.2"), "Web Content-1.2");
+    }
+
+    #[test]
+    fn long_command_names_are_shortened_with_an_ellipsis() {
+        let long = "x".repeat(MAX_LISTED_COMM_CHARS + 5);
+        let shown = escape_command_name(&long);
+        assert_eq!(shown, format!("{}...", "x".repeat(MAX_LISTED_COMM_CHARS)));
+        assert_eq!(
+            escape_command_name(&"y".repeat(MAX_LISTED_COMM_CHARS)),
+            "y".repeat(MAX_LISTED_COMM_CHARS)
+        );
+    }
+
+    #[test]
+    fn the_refusal_list_quotes_an_escaped_command_name() {
+        let candidate = UnreadableCandidate {
+            identity: ProcessIdentity {
+                pid: 7,
+                start_identity: StartIdentity::new(9),
+            },
+            comm: Some("evil`, pid 1 (start 1".to_owned()),
+        };
+        let listed = describe_unreadable_candidates(&[candidate]);
+        assert_eq!(
+            listed,
+            "pid 7 (start 9, command `evil\\u{60}\\u{2c} pid 1 \\u{28}start 1`)"
+        );
+    }
     use crate::session::SessionRegistryConfig;
 
     /// Bound on observing the retry task end.
