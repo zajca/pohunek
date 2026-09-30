@@ -152,8 +152,10 @@ fn worker_candidate_from(
 
 /// Map the native service status to the `launchd_job` check.
 ///
-/// A missing service is a `warn` (a manually started daemon is valid); only a
-/// job the service manager reports as failed is a `fail`.
+/// Every applicable finding is reported and the worst status wins, so a failed
+/// daemon job is never hidden by a pending transaction or an unreadable job
+/// state. A missing service is a `warn` (a manually started daemon is valid);
+/// only a job the service manager reports as failed is a `fail`.
 fn launchd_job_check(status: Result<StatusReport, crate::service::Error>) -> DoctorCheck {
     const NAME: &str = "launchd_job";
     let report = match status {
@@ -166,54 +168,61 @@ fn launchd_job_check(status: Result<StatusReport, crate::service::Error>) -> Doc
             );
         }
     };
+    let mut findings: Vec<(Status, String)> = Vec::new();
     if !report.installed {
-        return DoctorCheck::new(
-            NAME,
+        findings.push((
             Status::Warn,
             "native service is not installed; run 'pohunek service install' to supervise \
-             sessions with launchd",
-        );
+             sessions with launchd"
+                .to_owned(),
+        ));
     }
     if report.pending_transaction.is_some() {
-        return DoctorCheck::new(
-            NAME,
+        findings.push((
             Status::Warn,
-            "a service install or upgrade is pending; rerun it to completion",
-        );
+            "a service install or upgrade is pending; rerun it to completion".to_owned(),
+        ));
     }
-    if let Some(error) = report.daemon_error {
-        return DoctorCheck::new(
-            NAME,
+    if let Some(error) = &report.daemon_error {
+        findings.push((
             Status::Warn,
             format!("daemon job state is unavailable: {error}"),
-        );
+        ));
     }
-    match report.daemon {
-        None => DoctorCheck::new(
-            NAME,
-            Status::Warn,
-            "the daemon job is not registered with launchd; run 'pohunek service upgrade'",
-        ),
-        Some(job) if job.state == JOB_RUNNING => DoctorCheck::new(
-            NAME,
-            Status::Ok,
-            format!("daemon job {} is running", job.service_id),
-        ),
-        Some(job) if job.state == JOB_FAILED => DoctorCheck::new(
-            NAME,
-            Status::Fail,
-            format!(
-                "daemon job {} failed; inspect the launchd log under the state directory and \
-                 run 'pohunek service status'",
-                job.service_id
+    if report.installed && report.daemon_error.is_none() {
+        findings.push(match &report.daemon {
+            None => (
+                Status::Warn,
+                "the daemon job is not registered with launchd; run 'pohunek service upgrade'"
+                    .to_owned(),
             ),
-        ),
-        Some(job) => DoctorCheck::new(
-            NAME,
-            Status::Warn,
-            format!("daemon job {} is {}", job.service_id, job.state),
-        ),
+            Some(job) if job.state == JOB_RUNNING => (
+                Status::Ok,
+                format!("daemon job {} is running", job.service_id),
+            ),
+            Some(job) if job.state == JOB_FAILED => (
+                Status::Fail,
+                format!(
+                    "daemon job {} failed; inspect the launchd log under the state directory and \
+                     run 'pohunek service status'",
+                    job.service_id
+                ),
+            ),
+            Some(job) => (
+                Status::Warn,
+                format!("daemon job {} is {}", job.service_id, job.state),
+            ),
+        });
     }
+    let overall = findings
+        .iter()
+        .fold(Status::Ok, |overall, (status, _)| worse(overall, *status));
+    let detail = findings
+        .into_iter()
+        .map(|(_, detail)| detail)
+        .collect::<Vec<_>>()
+        .join("; ");
+    DoctorCheck::new(NAME, overall, detail)
 }
 
 /// Add the daemon's checks to the local ones.
@@ -391,6 +400,31 @@ mod tests {
             step: "bootstrap",
         });
         assert_eq!(launchd_job_check(Ok(pending)).status, Status::Warn);
+    }
+
+    #[test]
+    fn a_failed_job_is_reported_even_with_a_pending_transaction_or_state_error() {
+        let pending = || crate::service::report::PendingReport {
+            operation: "upgrade",
+            version: "1.0.0".to_owned(),
+            step: "bootstrap",
+        };
+        let mut failed = status(true, Some(job("failed")));
+        failed.pending_transaction = Some(pending());
+
+        let check = launchd_job_check(Ok(failed));
+
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.detail.contains("failed"), "{}", check.detail);
+        assert!(check.detail.contains("pending"), "{}", check.detail);
+
+        // A running job with a pending transaction stays a warning and says both.
+        let mut running = status(true, Some(job("running")));
+        running.pending_transaction = Some(pending());
+        let check = launchd_job_check(Ok(running));
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("is running"), "{}", check.detail);
+        assert!(check.detail.contains("pending"), "{}", check.detail);
     }
 
     #[test]

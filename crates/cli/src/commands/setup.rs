@@ -569,8 +569,8 @@ fn next_steps(platform: Platform, paths: &Paths) -> Vec<String> {
                 "Review {}/launcher.conf — set 'linear_cli' if you use Linear.",
                 paths.config_dir.display()
             ),
-            "Install the daemon as a launchd service with `pohunek service install`, or start \
-             `pohunekd` yourself."
+            "Install the daemon as a launchd service with `pohunek service install`, or for \
+             development run `pohunek daemon start --dev-subprocess --detach`."
                 .to_owned(),
             "Run `pohunek doctor` to check the runtime directory, worker executable, launchd \
              domain and optional desktop capabilities."
@@ -759,6 +759,11 @@ mod tests {
         assert!(!steps.contains("swaymsg reload"), "{steps}");
         assert!(steps.contains("pohunek doctor"));
         assert!(steps.contains("pohunek service install"));
+        assert!(steps.contains("pohunek daemon start --dev-subprocess"));
+        assert!(
+            !steps.contains("`pohunekd`"),
+            "pohunekd needs a supervision flag"
+        );
     }
 
     #[test]

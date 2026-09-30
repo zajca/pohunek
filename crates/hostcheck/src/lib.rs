@@ -268,7 +268,7 @@ pub fn terminal() -> DoctorCheck {
 /// creating it and writing a probe file (see [`write_probe`]).
 #[must_use]
 pub fn dir_writable(name: &str, dir: &Path, label: &str) -> DoctorCheck {
-    if let Err(err) = std::fs::create_dir_all(dir) {
+    if let Err(err) = create_private_dirs(dir) {
         return DoctorCheck::new(
             name,
             DoctorStatus::Fail,
@@ -289,12 +289,29 @@ pub fn dir_writable(name: &str, dir: &Path, label: &str) -> DoctorCheck {
     }
 }
 
+/// Mode of a directory created by the writability probe.
+///
+/// The daemon requires its state and runtime directories to be exactly
+/// owner-private, so a directory created here with the default umask (`0755`)
+/// would be refused at startup.
+const CREATED_DIR_MODE: u32 = 0o700;
+
+/// Create `dir` and any missing parents owner-private.
+fn create_private_dirs(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(CREATED_DIR_MODE)
+        .create(dir)
+}
+
 /// Create, write and remove one probe file in `dir`.
 ///
 /// The file has a random name and is created with `O_CREAT | O_EXCL`, which
 /// never follows a symlink at the final component, so a pre-planted link cannot
 /// redirect the write. Only the file this call created is removed.
-fn write_probe(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn write_probe(dir: &Path) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -472,6 +489,23 @@ mod tests {
         assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
         let entries = std::fs::read_dir(&dir).unwrap().count();
         assert_eq!(entries, 1, "only the planted link remains");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dir_writable_creates_missing_directories_owner_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = unique_temp_dir();
+        let dir = base.join("a").join("b");
+
+        let check = dir_writable("probe_dir", &dir, "probe directory");
+
+        assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail);
+        for created in [&dir, dir.parent().unwrap()] {
+            let mode = std::fs::metadata(created).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, CREATED_DIR_MODE, "{}", created.display());
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

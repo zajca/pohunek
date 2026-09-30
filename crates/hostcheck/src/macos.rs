@@ -377,20 +377,34 @@ fn parse_launcher_terminal(contents: &str) -> Option<String> {
 /// readiness is reported by `pohunek integration doctor`.
 #[must_use]
 pub fn standard_checks(inputs: &StandardCheckInputs<'_>, facts: &MacosFacts) -> Vec<DoctorCheck> {
-    let runtime_private = check_runtime_dir_private(inputs.socket_dir);
+    let state_root = state_root(inputs.log_dir);
     vec![
         binary_with_path("git", true, facts.path_var.as_deref(), ""),
         agent_binary("codex", facts),
         agent_binary("claude", facts),
-        runtime_private.clone(),
+        check_runtime_dir_private(inputs.socket_dir),
         check_socket_path_length(inputs.socket_dir),
-        check_socket_dir_writable(inputs.socket_dir, &runtime_private),
-        crate::dir_writable(
-            "state_dir_writable",
-            inputs.state_dir,
-            "state data directory",
+        check_private_dir(
+            "socket_dir_writable",
+            "control socket directory",
+            inputs.socket_dir,
         ),
-        crate::dir_writable("log_dir_writable", inputs.log_dir, "log directory"),
+        check_private_dir(
+            "state_dir_writable",
+            "state data directory",
+            inputs.state_dir,
+        ),
+        check_log_dir(inputs.log_dir),
+        check_private_dir(
+            "worker_runtime_root",
+            "worker runtime root",
+            &inputs.socket_dir.join(WORKERS_SUBDIR),
+        ),
+        check_private_dir(
+            "worker_state_root",
+            "worker state root",
+            &state_root.join(WORKERS_SUBDIR),
+        ),
         check_filesystem_access(inputs),
         netbird(),
         DoctorCheck::new(
@@ -460,38 +474,140 @@ pub fn check_runtime_dir_private(dir: &Path) -> DoctorCheck {
     }
 }
 
-/// Check that the runtime directory is writable, creating it owner-private.
+/// The state root: the parent of the log directory.
 ///
-/// A directory that failed `privacy` is never touched: nothing is created in
-/// it and no probe is written. Otherwise the directory is opened or created
-/// with the daemon's own startup primitive (which revalidates a directory it
-/// just created), and the probe is a randomly named exclusive file created
-/// relative to that descriptor and removed by inode identity.
+/// `BasePaths` places the log directory directly below the state root
+/// (`<state>/logs`), and the daemon also keeps the worker journals there.
+fn state_root(log_dir: &Path) -> &Path {
+    log_dir.parent().unwrap_or(log_dir)
+}
+
+/// Check a directory the daemon creates owner-private, without creating it.
+///
+/// The doctor never creates a directory: a directory made here with the
+/// default umask would be `0755`, which startup then refuses. An existing
+/// directory must pass [`TrustedDir::open_absolute`] with mode `0700`, the same
+/// validation startup applies (real directory, owned by you, exact mode, no
+/// ACL beyond the mode, no symlinked component), and is then write-probed with
+/// a randomly named exclusive file relative to the opened descriptor. A missing
+/// directory is `ok` when startup could create it (see [`creatable_below`]).
 #[must_use]
-pub fn check_socket_dir_writable(dir: &Path, privacy: &DoctorCheck) -> DoctorCheck {
-    const NAME: &str = "socket_dir_writable";
-    const LABEL: &str = "control socket directory";
-    if privacy.status == DoctorStatus::Fail {
-        return DoctorCheck::new(
+pub fn check_private_dir(name: &str, label: &str, dir: &Path) -> DoctorCheck {
+    match TrustedDir::open_absolute(dir, RUNTIME_DIR_MODE) {
+        Ok(trusted) => probe_trusted_dir(name, label, dir, &trusted),
+        Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => {
+            match creatable_below(dir) {
+                Ok(ancestor) => DoctorCheck::new(
+                    name,
+                    DoctorStatus::Ok,
+                    format!(
+                        "{label} {} does not exist yet; startup creates it with mode 0700 below {}",
+                        dir.display(),
+                        ancestor.display()
+                    ),
+                ),
+                Err(reason) => DoctorCheck::new(
+                    name,
+                    DoctorStatus::Fail,
+                    format!("{label} {} cannot be created: {reason}", dir.display()),
+                ),
+            }
+        }
+        Err(error) => DoctorCheck::new(
+            name,
+            DoctorStatus::Fail,
+            format!(
+                "{label} {} fails the owner-private directory validation the daemon applies at \
+                 startup: {error}. It must be a real directory you own with mode 0700 and no \
+                 symlinked path components; nothing was written to it",
+                dir.display()
+            ),
+        ),
+    }
+}
+
+/// Check the log directory without creating anything.
+///
+/// Startup creates the state root owner-private and then the log directory
+/// below it, tolerating an existing real log directory (it resets its mode).
+/// The state root is validated like any private directory; an existing log
+/// directory must be a real directory and is write-probed.
+#[must_use]
+pub fn check_log_dir(log_dir: &Path) -> DoctorCheck {
+    const NAME: &str = "log_dir_writable";
+    const LABEL: &str = "log directory";
+    let root = state_root(log_dir);
+    let root_check = check_private_dir(NAME, "state root", root);
+    if root_check.status != DoctorStatus::Ok || !root.exists() {
+        return root_check;
+    }
+    match std::fs::symlink_metadata(log_dir) {
+        Ok(meta) if meta.file_type().is_dir() => match crate::write_probe(log_dir) {
+            Ok(()) => DoctorCheck::new(
+                NAME,
+                DoctorStatus::Ok,
+                format!("writable: {}", log_dir.display()),
+            ),
+            Err(error) => DoctorCheck::new(
+                NAME,
+                DoctorStatus::Fail,
+                format!("{LABEL} {} is not writable: {error}", log_dir.display()),
+            ),
+        },
+        Ok(_) => DoctorCheck::new(
             NAME,
             DoctorStatus::Fail,
             format!(
-                "{LABEL} {} was not probed because it failed the runtime_dir_private check; fix \
-                 that first",
-                dir.display()
+                "{LABEL} {} is not a real directory (a symlink or file is refused); remove it",
+                log_dir.display()
             ),
-        );
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!(
+                "{LABEL} {} does not exist yet; startup creates it",
+                log_dir.display()
+            ),
+        ),
+        Err(error) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Fail,
+            format!("cannot inspect {LABEL} {}: {error}", log_dir.display()),
+        ),
     }
-    let trusted = match TrustedDir::open_or_create_absolute(dir, RUNTIME_DIR_MODE) {
-        Ok(trusted) => trusted,
-        Err(error) => {
-            return DoctorCheck::new(
-                NAME,
-                DoctorStatus::Fail,
-                format!("cannot open {LABEL} {}: {error}", dir.display()),
-            );
-        }
-    };
+}
+
+/// Decide, without creating anything, whether startup could create `dir`.
+///
+/// Startup creates missing components with `open_or_create_absolute`, which
+/// needs the nearest existing ancestor to pass the ancestor policy
+/// ([`TrustedDir::open_absolute_ancestor`]) and to be writable and searchable
+/// by the effective user. Returns that ancestor, or the reason it fails.
+fn creatable_below(dir: &Path) -> Result<PathBuf, String> {
+    let ancestor = dir
+        .ancestors()
+        .skip(1)
+        .find(|candidate| std::fs::symlink_metadata(candidate).is_ok())
+        .ok_or_else(|| "no existing ancestor directory".to_owned())?;
+    TrustedDir::open_absolute_ancestor(ancestor).map_err(|error| error.to_string())?;
+    rustix::fs::accessat(
+        rustix::fs::CWD,
+        ancestor,
+        rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK,
+        rustix::fs::AtFlags::EACCESS,
+    )
+    .map_err(|error| {
+        format!(
+            "its nearest existing ancestor {} is not writable and searchable by you ({error})",
+            ancestor.display()
+        )
+    })?;
+    Ok(ancestor.to_path_buf())
+}
+
+/// Write-probe an already validated directory through its descriptor.
+fn probe_trusted_dir(name: &str, label: &str, dir: &Path, trusted: &TrustedDir) -> DoctorCheck {
     for _ in 0..crate::PROBE_NAME_ATTEMPTS {
         let probe = crate::probe_file_name();
         match trusted.create_file(&probe, b"probe", PROBE_FILE_MODE) {
@@ -503,7 +619,7 @@ pub fn check_socket_dir_writable(dir: &Path, privacy: &DoctorCheck) -> DoctorChe
                     let _ = entry.remove();
                 }
                 return DoctorCheck::new(
-                    NAME,
+                    name,
                     DoctorStatus::Ok,
                     format!("writable: {}", dir.display()),
                 );
@@ -511,18 +627,18 @@ pub fn check_socket_dir_writable(dir: &Path, privacy: &DoctorCheck) -> DoctorChe
             Err(error) if error.io_kind() == Some(std::io::ErrorKind::AlreadyExists) => {}
             Err(error) => {
                 return DoctorCheck::new(
-                    NAME,
+                    name,
                     DoctorStatus::Fail,
-                    format!("{LABEL} {} is not writable: {error}", dir.display()),
+                    format!("{label} {} is not writable: {error}", dir.display()),
                 );
             }
         }
     }
     DoctorCheck::new(
-        NAME,
+        name,
         DoctorStatus::Fail,
         format!(
-            "{LABEL} {} rejected every probe file name; inspect it for unexpected entries",
+            "{label} {} rejected every probe file name; inspect it for unexpected entries",
             dir.display()
         ),
     )
@@ -1013,8 +1129,22 @@ mod tests {
 
     // --- runtime directory ---------------------------------------------------
 
-    fn ok_privacy() -> DoctorCheck {
-        DoctorCheck::new("runtime_dir_private", DoctorStatus::Ok, "")
+    /// Every path below `dir` with its mode, sorted, to prove nothing changed.
+    fn tree(dir: &Path) -> Vec<(PathBuf, u32)> {
+        fn walk(dir: &Path, out: &mut Vec<(PathBuf, u32)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                out.push((path.clone(), meta.permissions().mode() & 0o7777));
+                if meta.is_dir() {
+                    walk(&path, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, &mut out);
+        out.sort();
+        out
     }
 
     fn entry_names(dir: &Path) -> Vec<String> {
@@ -1110,21 +1240,72 @@ mod tests {
     }
 
     #[test]
-    fn socket_dir_probe_creates_a_private_dir_and_leaves_it_empty() {
+    fn a_missing_directory_is_reported_but_never_created() {
         let base = temp_dir("rt-create");
         let dir = base.join("a").join("b");
+        let before = tree(&base);
 
-        let check = check_socket_dir_writable(&dir, &ok_privacy());
+        let check = check_private_dir("socket_dir_writable", "control socket directory", &dir);
 
         assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail);
-        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
-        assert!(entry_names(&dir).is_empty(), "the probe file is removed");
+        assert!(
+            check.detail.contains("startup creates it"),
+            "{}",
+            check.detail
+        );
+        assert_eq!(tree(&base), before, "the doctor must not create anything");
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn a_dir_that_failed_the_privacy_check_is_never_written() {
+    fn a_missing_directory_below_an_unsafe_ancestor_cannot_be_created() {
+        let base = temp_dir("rt-unsafe-parent");
+        let open = base.join("open");
+        std::fs::create_dir(&open).unwrap();
+        set_mode(&open, 0o777);
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&open, &link).unwrap();
+
+        for parent in [&open, &link] {
+            let check = check_private_dir(
+                "state_dir_writable",
+                "state data directory",
+                &parent.join("state"),
+            );
+            assert_eq!(check.status, DoctorStatus::Fail, "{}", check.detail);
+        }
+        assert!(!open.join("state").exists());
+        set_mode(&open, 0o700);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_missing_directory_below_a_read_only_ancestor_cannot_be_created() {
+        let base = temp_dir("rt-readonly-parent");
+        let parent = base.join("readonly");
+        std::fs::create_dir(&parent).unwrap();
+        set_mode(&parent, 0o500);
+
+        let check = check_private_dir(
+            "state_dir_writable",
+            "state data directory",
+            &parent.join("state"),
+        );
+
+        set_mode(&parent, 0o700);
+        if !rustix::process::geteuid().is_root() {
+            assert_eq!(check.status, DoctorStatus::Fail, "{}", check.detail);
+            assert!(
+                check.detail.contains("cannot be created"),
+                "{}",
+                check.detail
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_dir_that_fails_startup_validation_is_never_written() {
         let base = temp_dir("rt-planted");
         let victim = base.join("victim");
         std::fs::write(&victim, b"precious").unwrap();
@@ -1132,21 +1313,19 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         set_mode(&dir, 0o777);
         std::os::unix::fs::symlink(&victim, dir.join(crate::PROBE_FILE)).unwrap();
-        let before = entry_names(&dir);
+        let before = tree(&base);
 
-        let privacy = check_runtime_dir_private(&dir);
-        assert_eq!(privacy.status, DoctorStatus::Fail);
-        let skipped = check_socket_dir_writable(&dir, &privacy);
-        assert_eq!(skipped.status, DoctorStatus::Fail);
-        assert!(skipped.detail.contains("not probed"), "{}", skipped.detail);
+        assert_eq!(check_runtime_dir_private(&dir).status, DoctorStatus::Fail);
+        let refused = check_private_dir("socket_dir_writable", "control socket directory", &dir);
 
-        // Even when a caller passes a stale `ok`, the startup validation
-        // refuses the directory before anything is created in it.
-        let refused = check_socket_dir_writable(&dir, &ok_privacy());
         assert_eq!(refused.status, DoctorStatus::Fail, "{}", refused.detail);
-
+        assert!(
+            refused.detail.contains("nothing was written"),
+            "{}",
+            refused.detail
+        );
         assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
-        assert_eq!(entry_names(&dir), before, "nothing was created or removed");
+        assert_eq!(tree(&base), before, "nothing was created or removed");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1160,12 +1339,82 @@ mod tests {
         set_mode(&dir, 0o700);
         std::os::unix::fs::symlink(&victim, dir.join(crate::PROBE_FILE)).unwrap();
 
-        let check = check_socket_dir_writable(&dir, &ok_privacy());
+        let check = check_private_dir("socket_dir_writable", "control socket directory", &dir);
 
         assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail);
         assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
         assert_eq!(entry_names(&dir), [crate::PROBE_FILE]);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn worker_roots_need_a_real_owner_private_directory() {
+        // A directory owned by another account cannot be constructed without
+        // chown, so the foreign-owner rule is covered by the platform crate's
+        // `TrustedDir` tests this check delegates to.
+        let base = temp_dir("worker-roots");
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let check =
+            |dir: &Path| check_private_dir("worker_runtime_root", "worker runtime root", dir);
+
+        set_mode(&real, 0o755);
+        assert_eq!(check(&real).status, DoctorStatus::Fail, "wrong mode");
+        set_mode(&real, 0o700);
+        assert_eq!(check(&real).status, DoctorStatus::Ok);
+        assert_eq!(check(&link).status, DoctorStatus::Fail, "symlink");
+        assert_eq!(check(&base.join("absent")).status, DoctorStatus::Ok);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_log_dir_check_validates_the_state_root_and_never_creates() {
+        let base = temp_dir("log-dir");
+        let root = base.join("state");
+        let logs = root.join("logs");
+
+        // Absent state root and log dir: creatable, nothing made.
+        let before = tree(&base);
+        assert_eq!(check_log_dir(&logs).status, DoctorStatus::Ok);
+        assert_eq!(tree(&base), before);
+
+        // A state root with the default umask mode is refused, as at startup.
+        std::fs::create_dir(&root).unwrap();
+        set_mode(&root, 0o755);
+        assert_eq!(check_log_dir(&logs).status, DoctorStatus::Fail);
+
+        set_mode(&root, 0o700);
+        assert_eq!(check_log_dir(&logs).status, DoctorStatus::Ok);
+        std::fs::create_dir(&logs).unwrap();
+        assert_eq!(check_log_dir(&logs).status, DoctorStatus::Ok);
+        assert!(entry_names(&logs).is_empty(), "the probe file is removed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_full_list_creates_no_directory_even_with_a_default_umask_tree() {
+        let base = temp_dir("no-create");
+        let bin = temp_dir("no-create-bin");
+        write_exec(&bin, "git", 0o755);
+        let before = tree(&base);
+
+        let checks = assembled(&base, OsString::from(bin.as_os_str()), None);
+
+        assert_eq!(tree(&base), before, "the doctor must not create anything");
+        for name in [
+            "socket_dir_writable",
+            "state_dir_writable",
+            "log_dir_writable",
+            "worker_runtime_root",
+            "worker_state_root",
+        ] {
+            let check = checks.iter().find(|c| c.name == name).expect(name);
+            assert_eq!(check.status, DoctorStatus::Ok, "{name}: {}", check.detail);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&bin);
     }
 
     // --- socket path length --------------------------------------------------
@@ -1567,8 +1816,9 @@ mod tests {
         let config_dir = base.join("config");
         let inputs = StandardCheckInputs {
             socket_dir: &base.join("runtime"),
-            state_dir: &base.join("state"),
-            log_dir: &base.join("logs"),
+            state_dir: &base.join("data"),
+            // `BasePaths` puts the log directory directly below the state root.
+            log_dir: &base.join("state").join("logs"),
             launcher_bin_dir: &base.join("bin"),
             sway_config_dir: &base.join("sway"),
             config_dir: &config_dir,
@@ -1604,6 +1854,8 @@ mod tests {
                 "socket_dir_writable",
                 "state_dir_writable",
                 "log_dir_writable",
+                "worker_runtime_root",
+                "worker_state_root",
                 "filesystem_access",
                 "netbird_cli",
                 "schema_version",
