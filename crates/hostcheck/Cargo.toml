@@ -13,6 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 pohunek-protocol = { workspace = true }
 pohunek-netbird = { workspace = true }
+pohunek-paths = { workspace = true }
 
 [lints]
 workspace = true

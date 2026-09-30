@@ -12,6 +12,14 @@ intents: [setup, debug, help]
 The launcher integration is local filesystem setup. It writes scripts, default
 configuration, and an optional sway drop-in.
 
+The rofi/sway launcher is a Linux capability. On macOS `pohunek setup` writes
+only the config and templates and reports the scripts and the sway drop-in as
+skipped, `pohunek setup sway` succeeds without writing anything, and
+`pohunek doctor` does not probe rofi, swaymsg, `timeout`, `$TERMINAL`, the
+launcher scripts or the sway include. The optional `terminal=` key in
+`launcher.conf` is still read: on macOS `pohunek doctor` checks that its first
+word resolves to an executable.
+
 Use the split setup commands when diagnosing or applying changes:
 
 1. `pohunek setup scripts` materializes launcher scripts into the data directory

@@ -13,16 +13,33 @@
 //! - `setup completions` delegates to the completion module and writes one
 //!   shell's generated script into its conventional per-user directory.
 //! - `setup` (no subcommand) runs all three and prints next steps.
+//!
+//! sway and rofi are Linux capabilities. On macOS `setup` (no subcommand)
+//! writes only the platform-neutral config and templates and reports the
+//! launcher scripts and sway drop-in as skipped; an explicit `setup sway`
+//! succeeds without writing anything and says why.
 
 use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use hostcheck::Platform;
 use serde::Serialize;
 
 use crate::error::CliError;
 use crate::paths::Paths;
+
+// Rust guideline compliant 2026-09-30
+
+/// Why the launcher scripts are not installed by a full `setup` on macOS.
+const SCRIPTS_SKIPPED_REASON: &str =
+    "the rofi launcher scripts need rofi and sway, which are Linux \
+capabilities; run 'pohunek setup scripts' to install them anyway";
+
+/// Why the sway drop-in is not written on macOS.
+const SWAY_SKIPPED_REASON: &str =
+    "sway and rofi are optional Linux capabilities; nothing is installed for them on macOS";
 
 /// Mode the launcher scripts are written with: owner rwx, group/other r-x. They
 /// are invoked directly (sway keybind, rofi spawn), so they must be executable.
@@ -189,12 +206,34 @@ struct SwayResult {
     include_present: bool,
 }
 
+/// A setup step that does not apply on this platform.
+#[derive(Debug, Serialize)]
+struct SkippedStep {
+    step: &'static str,
+    reason: &'static str,
+}
+
+/// Result of an explicit `setup sway` on a platform without sway.
+#[derive(Debug, Serialize)]
+struct SwaySkippedResult {
+    skipped: bool,
+    step: &'static str,
+    reason: &'static str,
+}
+
 /// Aggregated result of the full `setup` (no subcommand).
+///
+/// `scripts` and `sway` are absent, and listed in `skipped`, on platforms
+/// without the sway/rofi launcher.
 #[derive(Debug, Serialize)]
 struct AllResult {
-    scripts: ScriptsResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scripts: Option<ScriptsResult>,
     config: ConfigResult,
-    sway: SwayResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sway: Option<SwayResult>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skipped: Vec<SkippedStep>,
     next_steps: Vec<String>,
 }
 
@@ -243,6 +282,39 @@ pub(crate) fn run_sway(
     issue_keybind: &str,
     json: bool,
 ) -> Result<(), CliError> {
+    run_sway_for(
+        hostcheck::current_platform(),
+        paths,
+        print,
+        keybind,
+        issue_keybind,
+        json,
+    )
+}
+
+/// [`run_sway`] for an explicit platform. Platforms without sway report a
+/// skipped step and write nothing.
+fn run_sway_for(
+    platform: Platform,
+    paths: &Paths,
+    print: bool,
+    keybind: &str,
+    issue_keybind: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    if !platform_has_sway(platform) {
+        let result = SwaySkippedResult {
+            skipped: true,
+            step: "sway",
+            reason: SWAY_SKIPPED_REASON,
+        };
+        if json {
+            print!("{}", crate::commands::render_json(&result)?);
+        } else {
+            println!("skipped sway: {}", result.reason);
+        }
+        return Ok(());
+    }
     let result = install_sway(paths, print, keybind, issue_keybind)?;
     if json {
         print!("{}", crate::commands::render_json(&result)?);
@@ -252,43 +324,97 @@ pub(crate) fn run_sway(
     Ok(())
 }
 
-/// Run the full setup: scripts + config + sway drop-in.
+/// Whether the sway/rofi launcher integration exists on `platform`.
+fn platform_has_sway(platform: Platform) -> bool {
+    platform != Platform::MacOs
+}
+
+/// Run the full setup: scripts + config + sway drop-in on Linux, config only on
+/// macOS.
 ///
 /// # Errors
 ///
 /// Returns [`CliError::Io`] from any of the underlying steps.
 pub(crate) fn run_all(paths: &Paths, json: bool) -> Result<(), CliError> {
-    let scripts = install_scripts(paths)?;
-    // `force=false`: the full setup must never clobber a user-edited config.
-    let config = install_config(paths, false)?;
-    // `print=false`: write the drop-in as part of materializing the integration.
-    let sway = install_sway(
-        paths,
-        false,
-        DEFAULT_SWAY_KEYBIND,
-        DEFAULT_SWAY_ISSUE_KEYBIND,
-    )?;
-    let next_steps = next_steps(paths);
-    let result = AllResult {
-        scripts,
-        config,
-        sway,
-        next_steps,
-    };
+    run_all_for(hostcheck::current_platform(), paths, json)
+}
 
+/// [`run_all`] for an explicit platform.
+fn run_all_for(platform: Platform, paths: &Paths, json: bool) -> Result<(), CliError> {
+    let result = collect_all(platform, paths)?;
     if json {
         print!("{}", crate::commands::render_json(&result)?);
     } else {
-        print!("{}", render_scripts_human(&result.scripts));
-        print!("{}", render_config_human(&result.config));
-        print!("{}", render_sway_human(paths, &result.sway));
-        println!();
-        println!("Next steps:");
-        for (idx, step) in result.next_steps.iter().enumerate() {
-            println!("  {}. {step}", idx + 1);
-        }
+        print!("{}", render_all_human(paths, &result));
     }
     Ok(())
+}
+
+/// Perform the setup steps that apply on `platform`.
+fn collect_all(platform: Platform, paths: &Paths) -> Result<AllResult, CliError> {
+    let has_sway = platform_has_sway(platform);
+    let scripts = if has_sway {
+        Some(install_scripts(paths)?)
+    } else {
+        None
+    };
+    // `force=false`: the full setup must never clobber a user-edited config.
+    let config = install_config(paths, false)?;
+    // `print=false`: write the drop-in as part of materializing the integration.
+    let sway = if has_sway {
+        Some(install_sway(
+            paths,
+            false,
+            DEFAULT_SWAY_KEYBIND,
+            DEFAULT_SWAY_ISSUE_KEYBIND,
+        )?)
+    } else {
+        None
+    };
+    let skipped = if has_sway {
+        Vec::new()
+    } else {
+        vec![
+            SkippedStep {
+                step: "scripts",
+                reason: SCRIPTS_SKIPPED_REASON,
+            },
+            SkippedStep {
+                step: "sway",
+                reason: SWAY_SKIPPED_REASON,
+            },
+        ]
+    };
+    let next_steps = next_steps(platform, paths);
+    Ok(AllResult {
+        scripts,
+        config,
+        sway,
+        skipped,
+        next_steps,
+    })
+}
+
+/// Render the full-setup result as human lines. Kept identical in content to
+/// the JSON result: every JSON field has a line here.
+fn render_all_human(paths: &Paths, result: &AllResult) -> String {
+    let mut out = String::new();
+    if let Some(scripts) = &result.scripts {
+        out.push_str(&render_scripts_human(scripts));
+    }
+    out.push_str(&render_config_human(&result.config));
+    if let Some(sway) = &result.sway {
+        out.push_str(&render_sway_human(paths, sway));
+    }
+    for step in &result.skipped {
+        let _ = writeln!(out, "skipped {}: {}", step.step, step.reason);
+    }
+    out.push('\n');
+    out.push_str("Next steps:\n");
+    for (idx, step) in result.next_steps.iter().enumerate() {
+        let _ = writeln!(out, "  {}. {step}", idx + 1);
+    }
+    out
 }
 
 // --- core (filesystem) logic ------------------------------------------------
@@ -436,7 +562,24 @@ fn main_config_includes_dropin(paths: &Paths) -> Result<bool, CliError> {
 
 /// The ordered next-step lines printed (human) or emitted (json) after a full
 /// setup. Built once so both renderings stay identical.
-fn next_steps(paths: &Paths) -> Vec<String> {
+fn next_steps(platform: Platform, paths: &Paths) -> Vec<String> {
+    if !platform_has_sway(platform) {
+        return vec![
+            format!(
+                "Review {}/launcher.conf — set 'linear_cli' if you use Linear.",
+                paths.config_dir.display()
+            ),
+            "Install the daemon as a launchd service with `pohunek service install`, or start \
+             `pohunekd` yourself."
+                .to_owned(),
+            "Run `pohunek doctor` to check the runtime directory, worker executable, launchd \
+             domain and optional desktop capabilities."
+                .to_owned(),
+            "sway and rofi are optional Linux capabilities; `pohunek setup sway` is skipped on \
+             macOS."
+                .to_owned(),
+        ];
+    }
     let sway_dir = paths.sway_config_dir();
     vec![
         format!(
@@ -563,6 +706,108 @@ mod tests {
             !dir.join("pohunek-session-banner").exists(),
             "banner is rendered by `pohunek attach`, not a setup script"
         );
+    }
+
+    #[test]
+    fn full_setup_on_macos_writes_only_config_and_skips_sway_and_scripts() {
+        let tp = temp_paths();
+
+        let result = collect_all(Platform::MacOs, &tp.paths).expect("macOS setup succeeds");
+
+        assert!(result.scripts.is_none());
+        assert!(result.sway.is_none());
+        assert_eq!(result.config.created.len(), 4);
+        let skipped = result
+            .skipped
+            .iter()
+            .map(|step| step.step)
+            .collect::<Vec<_>>();
+        assert_eq!(skipped, ["scripts", "sway"]);
+        assert!(
+            !tp.paths.launcher_bin_dir().exists(),
+            "no launcher scripts written"
+        );
+        assert!(
+            !tp.paths.sway_config_dir().exists(),
+            "no sway drop-in written"
+        );
+        assert!(tp.paths.config_dir.join("launcher.conf").is_file());
+
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert!(json.get("scripts").is_none());
+        assert!(json.get("sway").is_none());
+        assert_eq!(json["skipped"].as_array().map(Vec::len), Some(2));
+        assert!(json["next_steps"]
+            .as_array()
+            .is_some_and(|steps| !steps.is_empty()));
+
+        let human = render_all_human(&tp.paths, &result);
+        assert!(human.contains("skipped sway:"));
+        assert!(human.contains("skipped scripts:"));
+        for step in &result.next_steps {
+            assert!(human.contains(step.as_str()), "human output lacks: {step}");
+        }
+    }
+
+    #[test]
+    fn macos_next_steps_do_not_mention_sway_configuration_as_needed() {
+        let tp = temp_paths();
+
+        let steps = next_steps(Platform::MacOs, &tp.paths).join("\n");
+
+        assert!(!steps.contains("include"), "{steps}");
+        assert!(!steps.contains("swaymsg reload"), "{steps}");
+        assert!(steps.contains("pohunek doctor"));
+        assert!(steps.contains("pohunek service install"));
+    }
+
+    #[test]
+    fn full_setup_on_linux_keeps_scripts_sway_and_json_shape() {
+        let tp = temp_paths();
+
+        let result = collect_all(Platform::Linux, &tp.paths).expect("linux setup succeeds");
+
+        assert!(result.scripts.is_some());
+        assert!(result.sway.is_some());
+        assert!(result.skipped.is_empty());
+        let json = serde_json::to_value(&result).expect("serialize");
+        let mut keys = json
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, ["config", "next_steps", "scripts", "sway"]);
+        assert!(tp
+            .paths
+            .sway_config_dir()
+            .join("config.d")
+            .join(SWAY_DROPIN_FILE)
+            .is_file());
+        let human = render_all_human(&tp.paths, &result);
+        assert!(human.contains("wrote sway drop-in:"));
+        assert!(!human.contains("skipped"));
+    }
+
+    #[test]
+    fn explicit_sway_setup_on_macos_succeeds_without_writing() {
+        let tp = temp_paths();
+
+        run_sway_for(Platform::MacOs, &tp.paths, false, "$mod+p", "$mod+i", true)
+            .expect("skipped outcome is a success");
+        run_sway_for(Platform::MacOs, &tp.paths, true, "$mod+p", "$mod+i", false)
+            .expect("skipped outcome is a success in human mode");
+
+        assert!(!tp.paths.sway_config_dir().exists());
+        let json = serde_json::to_value(SwaySkippedResult {
+            skipped: true,
+            step: "sway",
+            reason: SWAY_SKIPPED_REASON,
+        })
+        .expect("serialize");
+        assert_eq!(json["skipped"], true);
+        assert_eq!(json["step"], "sway");
     }
 
     #[test]

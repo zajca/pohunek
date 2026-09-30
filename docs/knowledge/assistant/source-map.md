@@ -22,6 +22,9 @@ Current CLI and command surface:
 - `crates/cli/src/commands/assistant/mod.rs`
 - `crates/cli/src/commands/assistant/bootstrap.rs`
 - `crates/cli/src/commands/doctor.rs`
+- `crates/hostcheck/src/lib.rs` — shared doctor probe list (Linux) and platform dispatch.
+- `crates/hostcheck/src/macos.rs` — macOS doctor checks and the bounded `launchctl` domain probe.
+- `crates/hostcheck/src/executable.rs` — exec-bit-aware executable resolution.
 - `crates/cli/src/commands/daemon.rs`
 - `crates/cli/src/commands/service.rs` — `pohunek service install|upgrade|uninstall|status|check|lock`.
 - `crates/cli/src/service/` — the service transactions: install journal and

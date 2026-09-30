@@ -4,7 +4,10 @@
 //! `hostcheck` crate; this module only selects which checks to run on the host
 //! that owns the agent runtime and assembles them into a [`DoctorReport`].
 
-use hostcheck::StandardCheckInputs;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+use hostcheck::{StandardCheckInputs, WorkerCandidate};
 use protocol::{DoctorCheck, DoctorReport, DoctorStatus, QuarantineReason};
 
 use crate::governance::{HostGovernanceDiagnostic, HostGovernanceService};
@@ -35,16 +38,50 @@ pub async fn report(
     Ok(DoctorReport::from_checks(checks))
 }
 
+/// Environment variable overriding the worker executable path.
+const WORKER_BIN_ENV: &str = "POHUNEK_WORKER_BIN";
+
 fn standard_checks(paths: &Paths) -> Vec<DoctorCheck> {
     let launcher_bin_dir = paths.launcher_bin_dir();
     let sway_config_dir = paths.sway_config_dir();
+    let home_dir = std::env::var_os(pohunek_paths::HOME).map(PathBuf::from);
+    let executable = std::env::current_exe().ok();
+    let worker = worker_candidate(
+        &paths.config_dir,
+        std::env::var_os(WORKER_BIN_ENV),
+        executable.as_deref().and_then(Path::parent),
+    );
     hostcheck::standard_checks(StandardCheckInputs {
         socket_dir: &paths.runtime_dir,
         state_dir: &paths.data_dir,
         log_dir: &paths.log_dir,
         launcher_bin_dir: &launcher_bin_dir,
         sway_config_dir: &sway_config_dir,
+        config_dir: &paths.config_dir,
+        home_dir: home_dir.as_deref(),
+        effective_uid: nix::unistd::Uid::effective().as_raw(),
+        worker: worker.as_ref(),
+        access_dirs: &[],
     })
+}
+
+/// The worker executable this daemon launches.
+///
+/// An installed `service.toml` names the versioned worker (native
+/// supervision); otherwise the `POHUNEK_WORKER_BIN` override, then
+/// `pohunek-sessiond` next to the daemon executable. An unloadable
+/// `service.toml` is left to `pohunek service status`.
+fn worker_candidate(
+    config_dir: &Path,
+    env_override: Option<OsString>,
+    executable_dir: Option<&Path>,
+) -> Option<WorkerCandidate> {
+    let service_worker = pohunek_service_config::ServiceConfig::load(
+        &config_dir.join(pohunek_service_config::FILE_NAME),
+    )
+    .ok()
+    .map(|config| config.worker_executable());
+    hostcheck::resolve_worker_candidate(service_worker, env_override, executable_dir)
 }
 
 fn governance_checks(diagnostic: HostGovernanceDiagnostic) -> [DoctorCheck; 6] {
@@ -150,8 +187,6 @@ fn check(name: &'static str, status: DoctorStatus, detail: &str) -> DoctorCheck 
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
-
     use base64::prelude::{Engine as _, BASE64_URL_SAFE_NO_PAD};
 
     use super::*;
@@ -179,6 +214,30 @@ mod tests {
                 .expect("system clock is after unix epoch")
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn worker_candidate_prefers_override_over_sibling_and_ignores_unloadable_service_config() {
+        let root = temp_dir("worker");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::write(config_dir.join("service.toml"), "not = [valid").expect("write");
+        let executable_dir = Path::new("/opt/pohunek/bin");
+
+        let overridden = worker_candidate(
+            &config_dir,
+            Some(OsString::from("/custom/pohunek-sessiond")),
+            Some(executable_dir),
+        )
+        .expect("override candidate");
+        assert_eq!(overridden.source, hostcheck::WorkerSource::Environment);
+
+        let sibling =
+            worker_candidate(&config_dir, None, Some(executable_dir)).expect("sibling candidate");
+        assert_eq!(sibling.source, hostcheck::WorkerSource::Sibling);
+        assert_eq!(sibling.path, executable_dir.join("pohunek-sessiond"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

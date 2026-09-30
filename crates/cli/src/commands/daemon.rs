@@ -120,7 +120,7 @@ fn locate_daemon() -> Result<PathBuf, CliError> {
     if let Ok(current) = std::env::current_exe() {
         if let Some(dir) = current.parent() {
             let sibling = dir.join(DAEMON_BIN);
-            if sibling.is_file() {
+            if hostcheck::is_executable_file(&sibling) {
                 return Ok(sibling);
             }
         }
@@ -133,16 +133,9 @@ fn locate_daemon() -> Result<PathBuf, CliError> {
     )))
 }
 
-/// Minimal dependency-free `which` (same approach as the doctor command).
+/// Resolve a binary on `PATH` to an executable file.
 fn which_on_path(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    hostcheck::which_on_path(name)
 }
 
 #[cfg(test)]
@@ -150,6 +143,30 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
+
+    #[test]
+    fn non_executable_daemon_binary_on_path_is_not_resolved() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir =
+            std::env::temp_dir().join(format!("pohunek-locate-daemon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let plain = dir.join(DAEMON_BIN);
+        std::fs::write(&plain, b"#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        assert_eq!(
+            hostcheck::resolve_executable(DAEMON_BIN, Some(dir.as_os_str())),
+            None
+        );
+
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(
+            hostcheck::resolve_executable(DAEMON_BIN, Some(dir.as_os_str())),
+            Some(plain)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn service_mode_passes_only_the_service_config() {

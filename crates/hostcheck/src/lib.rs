@@ -9,23 +9,44 @@
 //! once and produces [`protocol::DoctorCheck`] values that both callers embed
 //! into a [`protocol::DoctorReport`].
 //!
+//! The probe list is platform specific. Linux keeps the optional sway/rofi
+//! launcher probes; macOS replaces them with runtime-path, worker, `launchd`,
+//! terminal, filesystem-privacy and optional desktop probes (see [`macos`]).
+//! Platform selection is explicit input to the pure builders ([`linux_checks`],
+//! [`macos::standard_checks`]) so both are testable on any host;
+//! [`standard_checks`] passes the current platform.
+//!
 //! Functions take concrete directory paths rather than a `Paths` struct so this
 //! crate does not depend on either binary's path resolution (the CLI and daemon
 //! deliberately resolve paths separately).
 
 #![forbid(unsafe_code)]
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use protocol::{DoctorCheck, DoctorStatus};
+
+pub mod executable;
+pub mod macos;
+
+// Rust guideline compliant 2026-09-30
+
+pub use executable::{is_executable_file, resolve_executable};
+pub use macos::{
+    resolve_worker_candidate, AccessDir, DomainProbe, MacosFacts, ProcessRunner, RunOutcome,
+    Runner, WorkerCandidate, WorkerSource,
+};
+pub use pohunek_paths::Platform;
 
 const PROBE_FILE: &str = ".pohunek-doctor-probe";
 
 /// Inputs for the standard pohunek host checks.
 ///
 /// Callers keep owning path resolution because the CLI and daemon intentionally
-/// resolve paths in their own crates. This type carries only the concrete
-/// directories needed by the shared probe list.
+/// resolve paths in their own crates. This type carries the concrete
+/// directories and process facts the shared probe lists need; fields used only
+/// by one platform's list are ignored by the other.
 #[derive(Debug, Clone, Copy)]
 pub struct StandardCheckInputs<'a> {
     /// Directory where the daemon binds its control socket.
@@ -38,15 +59,51 @@ pub struct StandardCheckInputs<'a> {
     pub launcher_bin_dir: &'a Path,
     /// Directory containing the user's sway configuration.
     pub sway_config_dir: &'a Path,
+    /// pohunek's config directory holding `launcher.conf` (macOS terminal probe).
+    pub config_dir: &'a Path,
+    /// The user's home directory, used to recognize privacy-protected folders.
+    pub home_dir: Option<&'a Path>,
+    /// Effective user id of the probing process.
+    pub effective_uid: u32,
+    /// Worker executable the daemon is expected to launch (macOS worker probe).
+    pub worker: Option<&'a WorkerCandidate>,
+    /// Extra directories that must be readable, such as the working directory.
+    pub access_dirs: &'a [AccessDir<'a>],
+}
+
+/// The platform the binary was compiled for.
+///
+/// Anything other than macOS uses the Linux probe list.
+#[must_use]
+pub const fn current_platform() -> Platform {
+    if cfg!(target_os = "macos") {
+        Platform::MacOs
+    } else {
+        Platform::Linux
+    }
 }
 
 /// Build the standard pohunek host probe list.
 ///
 /// The CLI-local doctor command and `daemon.doctor` RPC use this same ordered
 /// list so drift in warnings, required checks, and launcher probes is visible in
-/// one place.
+/// one place. The list is selected by [`current_platform`]; on macOS this runs
+/// the bounded `launchctl` domain probe.
 #[must_use]
 pub fn standard_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
+    match current_platform() {
+        Platform::MacOs => {
+            let facts = MacosFacts::collect(&inputs, &ProcessRunner::launchctl());
+            macos::standard_checks(&inputs, &facts)
+        }
+        _ => linux_checks(inputs),
+    }
+}
+
+/// The Linux probe list: agents, directories, `NetBird`, and the optional
+/// sway/rofi launcher assets.
+#[must_use]
+pub fn linux_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
     vec![
         binary("git", true),
         binary("codex", false),
@@ -81,17 +138,11 @@ pub fn standard_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
 /// Resolve a binary name against the `PATH` environment variable.
 ///
 /// A small dependency-free `which`: splits `PATH`, joins the name, and returns
-/// the first entry that exists and is a regular file.
+/// the first entry that is a regular file with an execute bit
+/// ([`resolve_executable`]).
 #[must_use]
 pub fn which_on_path(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    resolve_executable(name, std::env::var_os("PATH").as_deref())
 }
 
 /// Check whether a binary is resolvable on `PATH`.
@@ -99,7 +150,21 @@ pub fn which_on_path(name: &str) -> Option<PathBuf> {
 /// `required` controls whether absence is reported as `fail` or `warn`.
 #[must_use]
 pub fn binary(name: &str, required: bool) -> DoctorCheck {
-    if let Some(path) = which_on_path(name) {
+    binary_with_path(name, required, std::env::var_os("PATH").as_deref(), "")
+}
+
+/// [`binary`] against an explicit `PATH` value.
+///
+/// `missing_hint` is appended to the not-found detail (for example a
+/// platform-specific remediation); it is empty for the Linux list.
+#[must_use]
+pub fn binary_with_path(
+    name: &str,
+    required: bool,
+    path_var: Option<&OsStr>,
+    missing_hint: &str,
+) -> DoctorCheck {
+    if let Some(path) = resolve_executable(name, path_var) {
         DoctorCheck::new(
             format!("bin:{name}"),
             DoctorStatus::Ok,
@@ -114,7 +179,7 @@ pub fn binary(name: &str, required: bool) -> DoctorCheck {
         DoctorCheck::new(
             format!("bin:{name}"),
             status,
-            format!("'{name}' not found on PATH"),
+            format!("'{name}' not found on PATH{missing_hint}"),
         )
     }
 }
@@ -178,7 +243,19 @@ pub fn terminal() -> DoctorCheck {
 /// creating it and writing a probe file.
 #[must_use]
 pub fn dir_writable(name: &str, dir: &Path, label: &str) -> DoctorCheck {
-    if let Err(err) = std::fs::create_dir_all(dir) {
+    dir_writable_with(name, dir, label, |dir| std::fs::create_dir_all(dir))
+}
+
+/// [`dir_writable`] with an explicit directory-creation strategy, for
+/// directories that must be created with a specific mode.
+#[must_use]
+pub fn dir_writable_with(
+    name: &str,
+    dir: &Path,
+    label: &str,
+    create: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> DoctorCheck {
+    if let Err(err) = create(dir) {
         return DoctorCheck::new(
             name,
             DoctorStatus::Fail,
@@ -335,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn standard_checks_keeps_single_ordered_probe_contract() {
+    fn linux_checks_keeps_single_ordered_probe_contract() {
         let base = unique_temp_dir();
         let socket_dir = base.join("runtime");
         let state_dir = base.join("data");
@@ -343,12 +420,18 @@ mod tests {
         let launcher_bin_dir = base.join("bin");
         let sway_config_dir = base.join("sway");
 
-        let checks = standard_checks(StandardCheckInputs {
+        let config_dir = base.join("config");
+        let checks = linux_checks(StandardCheckInputs {
             socket_dir: &socket_dir,
             state_dir: &state_dir,
             log_dir: &log_dir,
             launcher_bin_dir: &launcher_bin_dir,
             sway_config_dir: &sway_config_dir,
+            config_dir: &config_dir,
+            home_dir: None,
+            effective_uid: 0,
+            worker: None,
+            access_dirs: &[],
         });
         let names = checks
             .iter()

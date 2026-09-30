@@ -12,7 +12,8 @@ intents: [setup, help]
 Start with structured inspection:
 
 1. Run `pohunek doctor --json` to check local binaries, socket paths, and
-   writable state directories.
+   writable state directories. The check list depends on the platform; see
+   [Doctor checks by platform](#doctor-checks-by-platform).
 2. Run `pohunek service status --json` to see whether the daemon is installed
    as a login service. If `installed` is false, install it with
    `pohunek service install` (see below). For development only,
@@ -90,6 +91,47 @@ completion:
 - `pohunek setup config`
 - `pohunek setup sway`
 - `pohunek setup completions <bash|zsh|fish>`
+
+sway and rofi are optional Linux capabilities. On macOS a bare `pohunek setup`
+writes only the platform-neutral `launcher.conf` and prompt templates, reports
+the launcher scripts and the sway drop-in as skipped (`skipped` array in
+`--json`, `skipped <step>: <reason>` lines in human output), and prints macOS
+next steps (`pohunek service install`, `pohunek doctor`). An explicit
+`pohunek setup sway` on macOS exits successfully without writing anything and
+returns `{"skipped": true, "step": "sway", "reason": ...}` with `--json`.
+`pohunek setup scripts` still installs the scripts when asked. On Linux the
+output is unchanged.
+
+## Doctor checks by platform
+
+`pohunek doctor` and the `daemon.doctor` RPC share one probe list (crate
+`hostcheck`). Each check has a stable `name` (the code) and a `detail` that
+carries the remediation. Overall status is `fail` only when a required check
+fails; optional capabilities are at most `warn`.
+
+Linux: `bin:git` (required), `bin:codex`, `bin:claude`, the socket, state and
+log directory writability checks, `netbird_cli`, `schema_version`, and the
+optional launcher probes `bin:rofi`, `bin:swaymsg`, `bin:python3`,
+`bin:timeout`, `terminal` (`$TERMINAL`), `launcher_scripts` and `sway_include`.
+Executables count only when they are regular files with an execute bit.
+
+macOS omits the Linux-only launcher probes (rofi, swaymsg, `timeout`,
+`$TERMINAL`, launcher scripts, sway include) and `bin:python3` (hook
+interpreter readiness is reported by `pohunek integration doctor`), and adds:
+
+| Check | Failure status | Meaning and remediation |
+| --- | --- | --- |
+| `runtime_dir_private` | `fail` | The runtime root (default `/private/tmp/pohunek-<uid>`) exists but is a symlink or file, is owned by another uid, or is accessible to group/other. Remove it or `chmod 700`. An absent directory is `ok`; doctor never creates it with a looser mode. |
+| `socket_path_length` | `fail` | The daemon socket, or the longest worker socket including staged bind names, exceeds Darwin's 103-byte `sockaddr_un` limit. Set a shorter `XDG_RUNTIME_DIR`. |
+| `filesystem_access` | `fail` | A required directory (config, data, and the CLI's current directory) is denied. `EPERM`, or any denial below Documents, Desktop, Downloads, iCloud Drive, `Library/CloudStorage` or `/Volumes`, is a Privacy & Security (TCC) denial: grant the app that started the process (your terminal app, or the `pohunekd`/`pohunek-sessiond` executables when launchd runs them) access under System Settings > Privacy & Security > Files and Folders, or keep projects outside protected folders. Full Disk Access is not required and not recommended by default. Other denials point at ownership and mode. |
+| `worker_executable` | `fail` | `pohunek-sessiond` is missing, not absolute, or not executable. Resolved like the daemon: installed `service.toml`, then `POHUNEK_WORKER_BIN`, then next to the running executable; the detail names the source. |
+| `launchd_domain` | `fail` when absent, `warn` when inconclusive | `launchctl print gui/<uid>` (fixed `/bin/launchctl`, argv only, 10 s deadline) reports whether the graphical domain exists. A bare SSH session without a console login has none. |
+| `launchd_job` | `fail` only for a failed job, else `warn` | CLI doctor only: the installed daemon job's state from `pohunek service status`. Not installed is a `warn`; a manually started daemon is valid. |
+| `bin:codex`, `bin:claude` | `warn` | Optional agents. A daemon started by launchd does not read shell startup files, so use an absolute agent profile `program` or fix the service PATH. |
+| `login_shell` | `warn` | `$SHELL` must be an absolute executable listed in `/etc/shells`. |
+| `terminal` | `warn` | The stock `/System/Applications/Utilities/Terminal.app`, plus the optional `terminal=` command in `launcher.conf` (first word must resolve). |
+| `desktop_notifications` | `warn` only when `osascript` is missing | Reports `/usr/bin/osascript`; delivery and user denial cannot be confirmed for an unbundled binary. If banners do not appear, allow notifications for the sending app in System Settings > Notifications. |
+| `keychain` | `warn` | Presence of `/usr/bin/security` and the login keychain file only. No secret is read and lock state is not probed; a locked keychain is reported when a provider credential is first requested. |
 
 Completion installation is idempotent and does not edit shell startup files.
 The default script is static and performs no runtime lookup. Add `--dynamic`

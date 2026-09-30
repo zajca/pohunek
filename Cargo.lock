@@ -4372,6 +4372,7 @@ name = "pohunek-hostcheck"
 version = "0.31.6"
 dependencies = [
  "pohunek-netbird",
+ "pohunek-paths",
  "pohunek-protocol",
 ]
 
