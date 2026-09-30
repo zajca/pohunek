@@ -3082,7 +3082,7 @@ mod tests {
     }
 
     fn daemon_manifest_asset(agent: &str, script: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+        pohunek_test_support::manifest_dir()
             .join("src/integration/assets")
             .join(agent)
             .join(script)

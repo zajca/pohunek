@@ -1,6 +1,6 @@
 //! Headless GUI-core harness against in-process loopback daemons.
 
-// Rust guideline compliant 2026-08-04
+// Rust guideline compliant 2026-09-30
 #![forbid(unsafe_code)]
 
 use std::ffi::OsString;
@@ -36,6 +36,7 @@ use pohunek_gui_core::{
     ReviewSide, ReviewSource, ReviewStatus, ReviewStore, Selection, SessionLinkKind,
     SessionLinkProvider, TreeNodeId, UiState, WindowSize, Workspace,
 };
+use pohunek_test_support::worker_binary;
 use protocol::{
     method, AgentActivity, AgentKind, ErrorClass, NotificationPolicyParams, ProcessStartIdentity,
     ProjectActionParams, ProjectActionResult, ProjectActionsParams, ProjectAddParams,
@@ -2133,27 +2134,6 @@ fn worker_backed_registry(mut config: SessionRegistryConfig) -> SessionRegistry 
         launcher,
         Arc::new(HostInspector::new()),
     )
-}
-
-/// Locate the built `pohunek-sessiond` worker binary, mirroring
-/// `worker_binary` in `crates/daemon/tests/health_socket.rs`.
-fn worker_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("POHUNEK_WORKER_BIN") {
-        return PathBuf::from(path);
-    }
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("gui-core crate is inside workspace")
-        .to_path_buf();
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map_or_else(|| workspace.join("target"), PathBuf::from);
-    let binary = target.join("debug/pohunek-sessiond");
-    assert!(
-        binary.is_file(),
-        "build the real worker first with `cargo build -p pohunek-session-worker --bin pohunek-sessiond`, or set POHUNEK_WORKER_BIN"
-    );
-    binary
 }
 
 struct NotificationListErrorDaemon {

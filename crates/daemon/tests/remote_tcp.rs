@@ -40,6 +40,7 @@ use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::procwatch::HostInspector;
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
+use pohunek_test_support::worker_binary;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -169,26 +170,6 @@ async fn spawn_dual_servers(
     });
     (addr, socket, tx, handle)
 }
-
-fn worker_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("POHUNEK_WORKER_BIN") {
-        return PathBuf::from(path);
-    }
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("daemon crate is inside workspace")
-        .to_path_buf();
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map_or_else(|| workspace.join("target"), PathBuf::from);
-    let binary = target.join("debug/pohunek-sessiond");
-    assert!(
-        binary.is_file(),
-        "build the real worker first with `cargo build -p pohunek-session-worker --bin pohunek-sessiond`, or set POHUNEK_WORKER_BIN"
-    );
-    binary
-}
-
 /// Fan one shutdown receiver out to two, mirroring the daemon binary's wiring.
 fn oneshot_fanout(rx: oneshot::Receiver<()>) -> (oneshot::Receiver<()>, oneshot::Receiver<()>) {
     let (a_tx, a_rx) = oneshot::channel::<()>();

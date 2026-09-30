@@ -2,9 +2,11 @@
 
 use std::process::Command;
 
+use pohunek_test_support::bin_exe;
+
 #[test]
 fn version_prints_the_binary_name_and_version_with_a_cleared_environment() {
-    let output = Command::new(env!("CARGO_BIN_EXE_pohunek-sessiond"))
+    let output = Command::new(bin_exe("pohunek-sessiond"))
         .arg("--version")
         .env_clear()
         .output()
@@ -20,7 +22,7 @@ fn version_prints_the_binary_name_and_version_with_a_cleared_environment() {
 
 #[test]
 fn version_combined_with_other_arguments_is_rejected() {
-    let output = Command::new(env!("CARGO_BIN_EXE_pohunek-sessiond"))
+    let output = Command::new(bin_exe("pohunek-sessiond"))
         .args(["--session-id", "s-1", "--version"])
         .env_clear()
         .output()

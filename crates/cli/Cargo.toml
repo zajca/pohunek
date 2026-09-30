@@ -65,6 +65,7 @@ tempfile.workspace = true
 portable-pty = { workspace = true }
 overlay = { workspace = true }
 pohunek-logging = { workspace = true }
+pohunek-test-support = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { workspace = true, features = ["async-secret-service", "tokio", "crypto-rust"] }

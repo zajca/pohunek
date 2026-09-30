@@ -213,7 +213,7 @@ Release packaging and contributor verification:
   consumers) run in a CI job gated by a paths filter on relay-relevant files,
   so non-relay changes never start the Postgres service. The shards run from
   one nextest archive built once by the `build-tests` CI job
-  (`--archive-file`, extracted at the workspace path it was built in) and
+  (`--archive-file`, extracted at any path) and
   retain per-shard JUnit timing evidence. Cold compilation
   is separate from the approximately two-minute fast-feedback target.
 - `scripts/tests/test_partitions.py` — regression checks for coverage validation.

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Test-only fixture roots that satisfy the trusted filesystem and Unix socket limits on every supported host."
+description = "Test-only helpers: fixture roots that satisfy the trusted filesystem and Unix socket limits, and runtime resolution of test binaries, manifests and the session worker."
 publish = false
 
 [dependencies]

@@ -49,6 +49,7 @@ use pohunek_daemon::procwatch::{HostInspector, ProcessInspector};
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_paths::WORKER_SOCKET_NAME;
+use pohunek_test_support::worker_binary;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -97,28 +98,6 @@ fn write_executable(path: &Path, body: &str) {
         .permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(path, permissions).expect("chmod test script");
-}
-
-/// Resolve the real `pohunek-sessiond` binary, mirroring
-/// `health_socket.rs::worker_binary` — this test drives an actual worker
-/// process, not a fake, so the privacy scan covers real production code.
-fn worker_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("POHUNEK_WORKER_BIN") {
-        return PathBuf::from(path);
-    }
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("daemon crate is inside workspace")
-        .to_path_buf();
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map_or_else(|| workspace.join("target"), PathBuf::from);
-    let binary = target.join("debug/pohunek-sessiond");
-    assert!(
-        binary.is_file(),
-        "build the real worker first with `cargo build -p pohunek-session-worker --bin pohunek-sessiond`, or set POHUNEK_WORKER_BIN"
-    );
-    binary
 }
 
 /// Connect a line-framed client to the daemon's control socket.

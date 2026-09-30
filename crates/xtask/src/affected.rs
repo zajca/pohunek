@@ -23,7 +23,7 @@
 //!
 //! This is an inner-loop accelerator. It never replaces the full gate set.
 
-// Rust guideline compliant 2026-09-28
+// Rust guideline compliant 2026-09-30
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -1112,7 +1112,7 @@ mod tests {
 
     #[test]
     fn rules_name_only_real_workspace_packages() {
-        let packages = repo_packages(&crate::repo_root());
+        let packages = repo_packages(&pohunek_test_support::workspace_root());
         plan(&BTreeSet::new(), &packages).expect("every rule names a workspace package");
     }
 
@@ -1151,7 +1151,7 @@ mod tests {
     /// [`RULES`] by review.
     #[test]
     fn every_escaping_include_is_covered() {
-        let root = crate::repo_root();
+        let root = pohunek_test_support::workspace_root();
         let packages = repo_packages(&root);
         let include =
             regex::Regex::new(r#"include_(?:str|bytes)!\(\s*"([^"$]+)""#).expect("include pattern");

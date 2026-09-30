@@ -15,9 +15,9 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 flaky-result = "fail"
 
 [profile.default.archive]
-# Daemon and gui-core tests spawn the real durable worker by path
-# (`target/debug/pohunek-sessiond`), and nothing in a nextest build guarantees
-# that binary is produced. An archive without it is a build error, never a
+# Daemon and gui-core tests spawn the real durable worker from the profile
+# directory of their own test binaries (`target/debug/pohunek-sessiond`), and
+# nothing in a nextest build guarantees that binary is produced. An archive without it is a build error, never a
 # run where those tests find no worker.
 include = [
   { path = "debug/pohunek-sessiond", relative-to = "target", depth = 0, on-missing = "error" },

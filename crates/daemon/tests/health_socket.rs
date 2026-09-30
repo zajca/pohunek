@@ -60,6 +60,7 @@ use pohunek_paths::{
     APP_DIR, HOST_APPROVAL_KEY_NAME, HOST_GOVERNANCE_NAME, HOST_IDENTITY_NAME,
     HOST_STATE_LOCK_NAME, HOST_STATE_SUBDIR, LOGS_SUBDIR, WORKERS_SUBDIR,
 };
+use pohunek_test_support::{bin_exe, worker_binary};
 
 static PATH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static XDG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -569,25 +570,6 @@ async fn spawn_server_with_config(
             .await;
     });
     (tx, handle)
-}
-
-fn worker_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("POHUNEK_WORKER_BIN") {
-        return PathBuf::from(path);
-    }
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("daemon crate is inside workspace")
-        .to_path_buf();
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map_or_else(|| workspace.join("target"), PathBuf::from);
-    let binary = target.join("debug/pohunek-sessiond");
-    assert!(
-        binary.is_file(),
-        "build the real worker first with `cargo build -p pohunek-session-worker --bin pohunek-sessiond`, or set POHUNEK_WORKER_BIN"
-    );
-    binary
 }
 
 fn notification_data_dir(socket: &std::path::Path) -> PathBuf {
@@ -1309,7 +1291,7 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
         .expect("make XDG state home ordinary owner-readable");
     assert_mode(&state_home, 0o755);
 
-    let daemon = PathBuf::from(env!("CARGO_BIN_EXE_pohunekd"));
+    let daemon = bin_exe("pohunekd");
     let mut child = tokio::process::Command::new(daemon)
         .env("POHUNEK_WORKER_LAUNCHER", "subprocess")
         .env("POHUNEK_WORKER_BIN", worker_binary())

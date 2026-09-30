@@ -5794,7 +5794,7 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    let hook_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let hook_path = pohunek_test_support::manifest_dir()
         .join("src/integration/assets/codex/pohunek-agent-state.sh");
     let payload = serde_json::json!({
         "session_id": "native-parent",
@@ -15644,25 +15644,6 @@ async fn stale_undelivered_create_conversion_stops_and_cleans_nothing() {
     );
 }
 
-/// Path of the real worker binary the subprocess launcher spawns.
-fn subprocess_worker_binary() -> PathBuf {
-    if let Some(binary) = std::env::var_os("POHUNEK_WORKER_BIN") {
-        return PathBuf::from(binary);
-    }
-    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("daemon crate is inside the workspace");
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map_or_else(|| workspace.join("target"), |target| workspace.join(target));
-    let binary = target.join("debug/pohunek-sessiond");
-    assert!(
-        binary.is_file(),
-        "build the real worker first with `cargo build -p pohunek-session-worker --bin pohunek-sessiond`, or set POHUNEK_WORKER_BIN"
-    );
-    binary
-}
-
 /// Stop grace of the commit-failure fixture: longer than
 /// [`COMMIT_FAILURE_KILL_DELAY`], so the worker kill lands while the stop of
 /// the half-launched runtime is still in flight.
@@ -15706,7 +15687,7 @@ async fn failed_commit_stop_and_retire_keep_the_session_reconnecting() {
         home: root.clone(),
         daemon_socket: root.join("daemon.sock"),
     };
-    let mut supervision = environment.supervision(subprocess_worker_binary());
+    let mut supervision = environment.supervision(pohunek_test_support::worker_binary());
     supervision.sweep_grace = Duration::from_secs(5);
     let launcher = crate::runtime::SubprocessWorkerLauncher::new();
     let supervisor = Arc::new(crate::runtime::lifecycle::tests::ScriptedSupervisor::over(

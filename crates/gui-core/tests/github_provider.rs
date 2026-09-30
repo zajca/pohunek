@@ -1,11 +1,11 @@
 //! GitHub provider client tests.
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-09-30
 #![forbid(unsafe_code)]
 
 use std::future::Future;
 #[cfg(unix)]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -648,7 +648,7 @@ async fn command_runner_missing_gh_is_typed() {
 
 #[cfg(unix)]
 fn fake_gh_script(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    pohunek_test_support::manifest_dir()
         .join("tests")
         .join("assets")
         .join(name)

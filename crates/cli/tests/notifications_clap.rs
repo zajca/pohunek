@@ -3,7 +3,7 @@
 use std::process::Command;
 
 fn pohunek() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_pohunek"))
+    Command::new(pohunek_test_support::bin_exe("pohunek"))
 }
 
 #[test]

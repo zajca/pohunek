@@ -44,7 +44,7 @@ fn discover_and_list_json_need_cache_and_netbird_but_not_runtime_socket() {
     let path = format!("{}:{inherited_path}", bin.display());
 
     for command in ["discover", "list"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_pohunek"))
+        let output = Command::new(pohunek_test_support::bin_exe("pohunek"))
             .args(["host", command, "--json"])
             .env("PATH", &path)
             .env("XDG_CACHE_HOME", root.join("cache"))

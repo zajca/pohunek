@@ -15,8 +15,8 @@ const LOCALE: &str = "C";
 const SYSTEM_PATH: &str = "/usr/bin:/bin";
 const SMOKE_SUCCESS: &str = "controlled Hermes release-plugin smoke passed";
 
-fn manifest_dir() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+fn manifest_dir() -> PathBuf {
+    pohunek_test_support::manifest_dir()
 }
 
 fn repository_root() -> PathBuf {

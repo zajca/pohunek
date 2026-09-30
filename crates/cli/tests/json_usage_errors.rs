@@ -1,6 +1,6 @@
 //! End-to-end: clap argument-parse failures honor `--json`.
 //!
-//! These drive the real `pohunek` binary (via Cargo's `CARGO_BIN_EXE_*`) at
+//! These drive the real `pohunek` binary (located through `pohunek_test_support::bin_exe`) at
 //! the argument-parsing layer only. Every command here fails to parse — or is a
 //! `--help` display — *before* any daemon connection or filesystem access, so
 //! the tests are hermetic: no socket, no state directory, no env setup.
@@ -18,7 +18,7 @@ const MAX_STDIN_INPUT_BYTES: usize = 256 * 1024;
 
 /// A `Command` for the built `pohunek` binary under test.
 fn pohunek() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_pohunek"))
+    Command::new(pohunek_test_support::bin_exe("pohunek"))
 }
 
 #[test]

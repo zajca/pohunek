@@ -10663,11 +10663,12 @@ while os.getppid() == parent:
     /// kills, and the PTY runs a hangup-ignoring marked descendant.
     mod running_loss {
         use std::os::unix::fs::PermissionsExt;
-        use std::path::{Path, PathBuf};
+        use std::path::PathBuf;
         use std::sync::Arc;
         use std::time::Duration;
 
         use pohunek_platform::supervisor::{ServiceId, ServiceState};
+        use pohunek_test_support::worker_binary;
         use protocol::{RuntimeState, SessionId, SessionInfo};
 
         use super::super::super::supervision::RUNTIME_LOST;
@@ -10688,29 +10689,6 @@ while os.getppid() == parent:
         const SWEEP_GRACE: Duration = Duration::from_millis(300);
         /// Bound on observing an asynchronous classification or exit.
         const EFFECT_DEADLINE: Duration = Duration::from_secs(20);
-        /// Cargo's workspace-local output directory without an override.
-        const DEFAULT_CARGO_TARGET_DIRECTORY: &str = "target";
-
-        fn worker_binary() -> PathBuf {
-            if let Some(binary) = std::env::var_os("POHUNEK_WORKER_BIN") {
-                return PathBuf::from(binary);
-            }
-            let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .and_then(Path::parent)
-                .expect("daemon crate is inside the workspace");
-            let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
-                || workspace.join(DEFAULT_CARGO_TARGET_DIRECTORY),
-                |target| workspace.join(target),
-            );
-            let binary = target.join("debug/pohunek-sessiond");
-            assert!(
-                binary.is_file(),
-                "build the real worker first with `cargo build -p pohunek-session-worker --bin pohunek-sessiond`, or set POHUNEK_WORKER_BIN"
-            );
-            binary
-        }
-
         struct Fixture {
             root: PathBuf,
             registry: SessionRegistry,

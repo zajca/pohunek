@@ -28,7 +28,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 fn run_prompt_link(provider: &str, item_id: &str, url: &str, context_json: &str) -> String {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pohunek"))
+    let mut child = Command::new(pohunek_test_support::bin_exe("pohunek"))
         .args([
             "prompt",
             "link",
@@ -95,7 +95,7 @@ fn gui_prompt_preview_is_byte_identical_to_pohunek_prompt_render() {
     )
     .expect("render GUI preview");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pohunek"))
+    let mut child = Command::new(pohunek_test_support::bin_exe("pohunek"))
         .args([
             "prompt",
             "render",
@@ -155,7 +155,7 @@ fn gui_github_pr_preview_is_byte_identical_to_pohunek_prompt_render() {
     )
     .expect("render GUI preview");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pohunek"))
+    let mut child = Command::new(pohunek_test_support::bin_exe("pohunek"))
         .args([
             "prompt",
             "render",
