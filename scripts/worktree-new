@@ -34,7 +34,7 @@ than the newest build activity in the seed profile dir, the later of the mtimes 
 `.fingerprint` and `deps` directories. The signal is content-anchored on
 purpose: the `Cargo.lock` file mtime changes on every checkout. When the
 signal cannot be read (no commit touches `Cargo.lock`, unparsable output, a
-missing directory) the seed is kept, because staleness costs only
+missing directory, an out-of-range time) the seed is kept, because staleness costs only
 wall-clock time, never correctness: it is a performance heuristic, not a
 safety gate, and every fail-closed rule below still applies to a run that
 seeds. The check runs before any Cargo lock file or probe directory is
@@ -441,19 +441,29 @@ def newest_build_time(profile):
     return max(times)
 
 
+def format_epoch(seconds):
+    """UTC `YYYY-MM-DDTHH:MM:SSZ` rendering of an epoch time; raises
+    OSError, OverflowError or ValueError for a time outside the platform's
+    range."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(seconds))
+
+
 def stale_seed_times(source_target, base_commit, repo, executor):
-    """(lockfile commit time, seed build time) when the seed is stale, else
-    None. An unreadable signal counts as fresh: see the module docstring."""
+    """(lockfile time, seed build time) rendered as UTC text when the seed
+    is stale, else None. An unreadable or out-of-range time counts as fresh
+    (see the module docstring); rendering both times here keeps the later
+    skip message from failing after the worktree exists."""
     locked = lockfile_commit_time(base_commit, repo, executor)
     built = newest_build_time(source_target / PROFILE)
-    if locked is None or built is None or locked <= built:
+    if locked is None or built is None:
         return None
-    return locked, built
-
-
-def format_epoch(seconds):
-    """UTC `YYYY-MM-DDTHH:MM:SSZ` rendering of an epoch time."""
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(seconds))
+    try:
+        locked_text, built_text = format_epoch(locked), format_epoch(built)
+    except (OSError, OverflowError, ValueError):
+        return None
+    if locked <= built:
+        return None
+    return locked_text, built_text
 
 
 def reflink(source, dest, cwd, executor):
@@ -804,8 +814,8 @@ def create_locked(args, repo, executor, out):
     elif stale is not None:
         locked, built = stale
         print(f"  not seeded (stale seed: {LOCKFILE} last changed on "
-              f"{base_ref} at {format_epoch(locked)}, the newest build in "
-              f"{source_target / PROFILE} is from {format_epoch(built)}): "
+              f"{base_ref} at {locked}, the newest build in "
+              f"{source_target / PROFILE} is from {built}): "
               "a seeded first build would rebuild the changed dependencies "
               "anyway. Pass --force-seed to seed anyway", file=out)
     else:

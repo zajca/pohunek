@@ -46,6 +46,8 @@ TEMP_BRANCH = "zajca/worktree-new-tmp-issue-1-"
 # seed is fresh by default, stale when the lockfile commit is newer.
 OLD_EPOCH = 1_000_000_000
 NEW_EPOCH = 1_700_000_000
+# A time far beyond what `time.gmtime` renders.
+OUT_OF_RANGE_EPOCH = 10 ** 18
 # A predictable name in the worktree parent that belongs to someone else;
 # the reflink probe must never touch it.
 FOREIGN_PROBE_NAME = ".worktree-new-reflink-probe"
@@ -1193,6 +1195,21 @@ class StaleSeedTests(HarnessCase):
                 self.make_stale()
                 self.h.executor.lockfile_log = output
                 self.assert_seeded(*self.h.run("issue-1"))
+
+    def test_out_of_range_lockfile_time_keeps_the_seed(self):
+        set_build_time(self.h.target, OLD_EPOCH)
+        self.h.executor.lockfile_log = f"{OUT_OF_RANGE_EPOCH}\n"
+        self.assert_seeded(*self.h.run("issue-1"))
+
+    def test_out_of_range_build_time_keeps_the_seed(self):
+        self.h.executor.lockfile_log = f"{NEW_EPOCH}\n"
+        for name in worktree_new.BUILD_ACTIVITY_DIRS:
+            path = self.h.target / worktree_new.PROFILE / name
+            try:
+                os.utime(path, (OUT_OF_RANGE_EPOCH, OUT_OF_RANGE_EPOCH))
+            except (OSError, OverflowError) as error:
+                self.skipTest(f"platform rejects the mtime: {error}")
+        self.assert_seeded(*self.h.run("issue-1"))
 
     def test_missing_activity_dir_keeps_the_seed_path(self):
         self.make_stale()
