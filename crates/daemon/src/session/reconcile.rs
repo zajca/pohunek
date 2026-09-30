@@ -20,10 +20,10 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::supervision::{
-    classify_unreachable, describe_unreadable_candidates, job_identity_mismatch, observe, Cleanup,
-    JobEvidence, JournalWorker, Unreachable, CREATE_COMPENSATION_PENDING,
-    MAX_ACCEPTED_UNCONFIRMED_PROCESSES, RUNTIME_LOST, RUNTIME_LOST_CLEANUP_UNCONFIRMED,
-    UNREADABLE_CANDIDATES_RECOVER, UNSUPERVISED_WORKER,
+    classify_unreachable, describe_unreadable_candidates, job_identity_mismatch, observe,
+    record_accepted_process, Cleanup, JobEvidence, JournalWorker, Unreachable,
+    CREATE_COMPENSATION_PENDING, MAX_ACCEPTED_UNCONFIRMED_PROCESSES, RUNTIME_LOST,
+    RUNTIME_LOST_CLEANUP_UNCONFIRMED, UNREADABLE_CANDIDATES_RECOVER, UNSUPERVISED_WORKER,
 };
 use super::{
     current_time_millis, event, event_payload, identity_claim_expiry_is_valid, mpsc,
@@ -1649,11 +1649,7 @@ impl SessionRegistry {
             if cleanup == UnconfirmedCleanup::Accept && outcome.only_unreadable_candidates_blocked()
             {
                 for candidate in &outcome.unreadable {
-                    let process = candidate.to_unconfirmed_process();
-                    // Runtimes of one session can list the same process.
-                    if !accepted.iter().any(|(known, _)| *known == process) {
-                        accepted.push((process, runtime_id.clone()));
-                    }
+                    record_accepted_process(&mut accepted, candidate, &runtime_id);
                 }
                 if accepted.len() > MAX_ACCEPTED_UNCONFIRMED_PROCESSES {
                     let mut error = ambiguous(format!(

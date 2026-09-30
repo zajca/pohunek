@@ -358,6 +358,26 @@ impl UnreadableCandidate {
     }
 }
 
+/// Adds `candidate` to `accepted` unless the same process instance is already
+/// there.
+///
+/// Runtimes of one session can list the same process. The instance is its PID
+/// plus start identity; the command name is a snapshot that can change
+/// between reads, so it does not take part, and the first snapshot stays.
+pub(super) fn record_accepted_process(
+    accepted: &mut Vec<(UnconfirmedProcess, String)>,
+    candidate: &UnreadableCandidate,
+    runtime_id: &str,
+) {
+    if accepted.iter().any(|(known, _)| {
+        known.pid == candidate.identity.pid
+            && known.start_identity.get() == candidate.identity.start_identity.get()
+    }) {
+        return;
+    }
+    accepted.push((candidate.to_unconfirmed_process(), runtime_id.to_owned()));
+}
+
 /// The verdict of a lost-runtime sweep together with what blocked it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SweepOutcome {
@@ -1246,6 +1266,37 @@ mod tests {
         assert_eq!(process.pid, 7);
         assert_eq!(process.start_identity, ProcessStartIdentity::new(9));
         assert_eq!(process.command.as_deref(), Some("x\\u{1b}\\u{5b}2J"));
+    }
+
+    #[test]
+    fn one_process_seen_by_several_runtimes_is_accepted_once_whatever_its_name() {
+        let identity = ProcessIdentity {
+            pid: 7,
+            start_identity: StartIdentity::new(9),
+        };
+        let renamed = UnreadableCandidate {
+            identity,
+            comm: Some("renamed".to_owned()),
+        };
+        let unnamed = UnreadableCandidate {
+            identity,
+            comm: None,
+        };
+        let restarted = UnreadableCandidate {
+            identity: ProcessIdentity {
+                pid: 7,
+                start_identity: StartIdentity::new(10),
+            },
+            comm: Some("renamed".to_owned()),
+        };
+        let mut accepted = Vec::new();
+        record_accepted_process(&mut accepted, &renamed, "r-1");
+        record_accepted_process(&mut accepted, &unnamed, "r-2");
+        record_accepted_process(&mut accepted, &restarted, "r-2");
+        assert_eq!(accepted.len(), 2, "{accepted:?}");
+        assert_eq!(accepted[0].0.command.as_deref(), Some("renamed"));
+        assert_eq!(accepted[0].1, "r-1", "the first runtime that listed it");
+        assert_eq!(accepted[1].0.start_identity, ProcessStartIdentity::new(10));
     }
 
     #[test]
