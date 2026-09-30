@@ -33,8 +33,8 @@ Highest priority first:
    `/usr/bin/printenv`. It is never interactive (`-i` is not used), reads a
    null stdin, starts from an empty environment plus `HOME`, `USER`, `LOGNAME`,
    `TERM=dumb`, and a baseline `PATH`, and runs in its own process group. One
-   deadline (10 s) covers the whole discovery: executable checks, the probe, and
-   the filesystem validation; output above 64 KiB kills the probe too. The
+   deadline (10 s) covers the fallback-directory validation, the executable
+   checks, the probe, and the validation of the printed directories; output above 64 KiB kills the probe too. The
    group is killed as soon as the shell exits, so a background job left by a
    startup file cannot hold the output open. User startup output before or
    after the sentinels is ignored, and a decoy line cannot spoof the random
@@ -55,8 +55,11 @@ by group or others. `/tmp`, other sticky world-writable directories, anything
 below a writable ancestor, and group-writable directories (such as an
 admin-group Intel `/usr/local/bin`, which is out of scope) are refused,
 because another local account could plant an agent executable there. The entry
-is recorded as listed, not as its canonical path, so a profile or dotfile
-symlink keeps following its target. Empty, relative, `.`-style, duplicate, and
+is recorded as listed, so a profile or dotfile symlink keeps following its
+target, but only when every symlink on the way (targets included) is owned by
+the user or root and sits in a directory others cannot write; otherwise another
+account could retarget the link, so the validated canonical path is recorded
+instead and reported as `canonicalized`. Empty, relative, `.`-style, duplicate, and
 missing entries are ignored; a `PATH` containing a control character is
 garbage and fails the probe.
 
@@ -93,7 +96,8 @@ The install result reports how the path was obtained: `search_path.source`
 (`login_shell`, `fallback`, `recorded` for a resumed install, or `unmanaged`),
 the recorded `entries`, `shell_used` and `shell_defaulted`, the typed
 `login_shell_failure` when the fallback list was used, and `dropped`, the
-directories refused as untrusted with a reason. The human output prints a
+directories refused as untrusted with a reason, and `canonicalized`, the
+directories recorded as their canonical path. The human output prints a
 `warning:` line for a failed login shell and for each refused directory. This
 is the only place the outcome is visible, so read it after installing.
 

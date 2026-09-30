@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
 use thiserror::Error;
 
-use super::search_path::{DroppedEntry, SanitizedPath, SearchPath, SearchPathError};
+use super::search_path::{
+    CanonicalizedEntry, DroppedEntry, SanitizedPath, SearchPath, SearchPathError,
+};
 
 /// Executable printing the environment `PATH` of the login shell.
 ///
@@ -78,6 +80,9 @@ pub struct LoginShellSpec {
 pub struct LoginShellDiscovery {
     /// The sanitized directories.
     pub path: SearchPath,
+    /// Entries recorded as their canonical path, see
+    /// [`SanitizedPath::canonicalized`].
+    pub canonicalized: Vec<CanonicalizedEntry>,
     /// Existing directories refused as untrusted, with the reason.
     pub untrusted: Vec<DroppedEntry>,
     /// Entries ignored without concern (empty, relative, duplicate, missing).
@@ -175,26 +180,77 @@ where
     B: FnOnce() + Send + 'static,
     F: FnOnce(&str) -> Result<SanitizedPath, SearchPathError> + Send + 'static,
 {
+    discover_staged(
+        spec,
+        before_checks,
+        || Err(SearchPathError::NoUsableDirectories),
+        sanitize,
+    )
+    .and_then(|staged| staged.login)
+}
+
+/// The fallback validation and the login-shell discovery of one deadline.
+pub(super) struct StagedDiscovery {
+    /// The fallback directories, validated before the probe started.
+    pub(super) fallback: Result<SanitizedPath, SearchPathError>,
+    /// The login-shell outcome; a timeout after the fallback stage is an error
+    /// here, not of the whole call.
+    pub(super) login: Result<LoginShellDiscovery, LoginShellError>,
+}
+
+/// Runs the fallback validation and the discovery under one deadline.
+///
+/// Everything runs on one helper thread in this order: `before_checks`,
+/// `fallback` (a filesystem walk that may stall on a network mount), the
+/// executable checks, the probe, and the validation of the printed directories.
+/// The fallback result is handed over as soon as it exists, so a probe that
+/// later times out still leaves the caller a usable fallback path.
+///
+/// # Errors
+///
+/// Returns [`LoginShellError::Timeout`] when the deadline passes before the
+/// fallback stage ends; a later timeout is reported in
+/// [`StagedDiscovery::login`].
+pub(super) fn discover_staged<B, G, F>(
+    spec: &LoginShellSpec,
+    before_checks: B,
+    fallback: G,
+    sanitize: F,
+) -> Result<StagedDiscovery, LoginShellError>
+where
+    B: FnOnce() + Send + 'static,
+    G: FnOnce() -> Result<SanitizedPath, SearchPathError> + Send + 'static,
+    F: FnOnce(&str) -> Result<SanitizedPath, SearchPathError> + Send + 'static,
+{
     let deadline = Instant::now() + spec.timeout;
     let timeout = spec.timeout;
     let owned = spec.clone();
     let cancel = Arc::new(AtomicBool::new(false));
     let pipeline_cancel = Arc::clone(&cancel);
-    let (sender, receiver) = mpsc::channel();
+    let (fallback_tx, fallback_rx) = mpsc::channel();
+    let (login_tx, login_rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("shell-env-discovery".to_owned())
         .spawn(move || {
             before_checks();
+            // The receivers are gone once the deadline passed; nothing to report.
+            drop(fallback_tx.send(fallback()));
             let result = discovery_pipeline(&owned, deadline, &pipeline_cancel, sanitize);
-            // The receiver is gone once the deadline passed; nothing to report.
-            drop(sender.send(result));
+            drop(login_tx.send(result));
         })
         .map_err(LoginShellError::Io)?;
-    let outcome = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()));
-    if outcome.is_err() {
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+    let Ok(fallback) = fallback_rx.recv_timeout(remaining()) else {
         cancel.store(true, Ordering::SeqCst);
-    }
-    outcome.map_err(|_elapsed| LoginShellError::Timeout { timeout })?
+        return Err(LoginShellError::Timeout { timeout });
+    };
+    let login = login_rx
+        .recv_timeout(remaining())
+        .unwrap_or_else(|_elapsed| {
+            cancel.store(true, Ordering::SeqCst);
+            Err(LoginShellError::Timeout { timeout })
+        });
+    Ok(StagedDiscovery { fallback, login })
 }
 
 /// Whether the caller gave up or the deadline passed.
@@ -265,6 +321,7 @@ where
     }
     Ok(LoginShellDiscovery {
         path: sanitized.path,
+        canonicalized: sanitized.canonicalized,
         untrusted: sanitized.untrusted,
         ignored: sanitized.ignored,
     })

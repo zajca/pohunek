@@ -4,8 +4,11 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use super::login_shell::{discover_login_shell_path, LoginShellError, LoginShellSpec};
-use super::search_path::{fallback_search_path, DroppedEntry, SearchPath, SearchPathError};
+use super::login_shell::{discover_staged, LoginShellError, LoginShellSpec};
+use super::search_path::{
+    fallback_search_path, CanonicalizedEntry, DroppedEntry, SanitizedPath, SearchPath,
+    SearchPathError,
+};
 
 /// Inputs of [`resolve_search_path`].
 #[derive(Debug, Clone, Copy)]
@@ -62,6 +65,9 @@ pub struct PathResolution {
     pub login_shell_failure: Option<LoginShellError>,
     /// Existing directories refused as untrusted, from every tier consulted.
     pub untrusted: Vec<DroppedEntry>,
+    /// Entries recorded as their canonical path because a symlink on the way
+    /// could be retargeted by another account.
+    pub canonicalized: Vec<CanonicalizedEntry>,
     /// Entries ignored without concern (empty, relative, duplicate, missing).
     pub ignored: usize,
 }
@@ -73,6 +79,10 @@ pub enum ResolveError {
     /// The fallback list holds no trusted directory, so nothing can run.
     #[error("no discovered or fallback directory is usable")]
     NoUsableDirectories(#[source] SearchPathError),
+    /// The filesystem validation that precedes the probe did not finish within
+    /// the discovery deadline, or the helper could not start.
+    #[error("the directory validation could not finish within the discovery deadline")]
+    Discovery(#[source] LoginShellError),
 }
 
 /// Resolves the executable search path by the documented tier order.
@@ -86,11 +96,35 @@ pub enum ResolveError {
 /// [`PathResolution::login_shell_failure`]. Every tier keeps only trusted
 /// directories; refused ones are reported in [`PathResolution::untrusted`].
 ///
+/// With a login shell, the fallback validation and the discovery share the one
+/// [`LoginShellSpec::timeout`], because both walk the filesystem (a home on a
+/// stalled network mount would otherwise block the caller). Without one, the
+/// fallback validation runs on the calling thread.
+///
 /// # Errors
 ///
 /// Returns [`ResolveError::NoUsableDirectories`] when discovery failed and the
-/// fallback list has no trusted directory either.
+/// fallback list has no trusted directory either, and
+/// [`ResolveError::Discovery`] when the deadline passed during the fallback
+/// validation.
 pub fn resolve_search_path(policy: &PathPolicy<'_>) -> Result<PathResolution, ResolveError> {
+    let table: Vec<String> = policy
+        .fallback_directories
+        .iter()
+        .map(|entry| (*entry).to_owned())
+        .collect();
+    let home = policy.home.map(Path::to_path_buf);
+    resolve_with(policy, move || {
+        let refs: Vec<&str> = table.iter().map(String::as_str).collect();
+        fallback_search_path(&refs, home.as_deref())
+    })
+}
+
+/// [`resolve_search_path`] with an injectable fallback validation.
+fn resolve_with<G>(policy: &PathPolicy<'_>, fallback: G) -> Result<PathResolution, ResolveError>
+where
+    G: FnOnce() -> Result<SanitizedPath, SearchPathError> + Send + 'static,
+{
     if let Some(configured) = policy.configured.filter(|path| !path.is_empty()) {
         return Ok(PathResolution {
             path: configured.clone(),
@@ -98,42 +132,59 @@ pub fn resolve_search_path(policy: &PathPolicy<'_>) -> Result<PathResolution, Re
             shell: None,
             login_shell_failure: None,
             untrusted: Vec::new(),
+            canonicalized: Vec::new(),
             ignored: 0,
         });
     }
-    let fallback = fallback_search_path(policy.fallback_directories, policy.home);
     let shell = policy.login_shell.map(|spec| spec.shell.clone());
-    let mut failure = None;
-    if let Some(spec) = policy.login_shell {
-        match discover_login_shell_path(spec) {
-            Ok(discovery) => {
-                let mut untrusted = discovery.untrusted;
-                let mut ignored = discovery.ignored;
-                let path = match fallback {
-                    Ok(extra) => {
-                        for dropped in extra.untrusted {
-                            // One report per directory, even when both lists name it.
-                            if !untrusted.iter().any(|known| known.entry == dropped.entry) {
-                                untrusted.push(dropped);
-                            }
+    let Some(spec) = policy.login_shell else {
+        return fallback_only(fallback(), shell, None);
+    };
+    let staged = discover_staged(
+        spec,
+        || {},
+        fallback,
+        |value| SearchPath::sanitize(value, true),
+    )
+    .map_err(ResolveError::Discovery)?;
+    match staged.login {
+        Ok(discovery) => {
+            let mut untrusted = discovery.untrusted;
+            let mut canonicalized = discovery.canonicalized;
+            let mut ignored = discovery.ignored;
+            let path = match staged.fallback {
+                Ok(extra) => {
+                    for dropped in extra.untrusted {
+                        // One report per directory, even when both lists name it.
+                        if !untrusted.iter().any(|known| known.entry == dropped.entry) {
+                            untrusted.push(dropped);
                         }
-                        ignored += extra.ignored;
-                        discovery.path.with_appended(extra.path.entries())
                     }
-                    Err(_no_fallback) => discovery.path,
-                };
-                return Ok(PathResolution {
-                    path,
-                    source: PathSource::LoginShell,
-                    shell,
-                    login_shell_failure: None,
-                    untrusted,
-                    ignored,
-                });
-            }
-            Err(error) => failure = Some(error),
+                    canonicalized.extend(extra.canonicalized);
+                    ignored += extra.ignored;
+                    discovery.path.with_appended(extra.path.entries())
+                }
+                Err(_no_fallback) => discovery.path,
+            };
+            Ok(PathResolution {
+                path,
+                source: PathSource::LoginShell,
+                shell,
+                login_shell_failure: None,
+                untrusted,
+                canonicalized,
+                ignored,
+            })
         }
+        Err(error) => fallback_only(staged.fallback, shell, Some(error)),
     }
+}
+
+fn fallback_only(
+    fallback: Result<SanitizedPath, SearchPathError>,
+    shell: Option<PathBuf>,
+    failure: Option<LoginShellError>,
+) -> Result<PathResolution, ResolveError> {
     let fallback = fallback.map_err(ResolveError::NoUsableDirectories)?;
     Ok(PathResolution {
         path: fallback.path,
@@ -141,6 +192,7 @@ pub fn resolve_search_path(policy: &PathPolicy<'_>) -> Result<PathResolution, Re
         shell,
         login_shell_failure: failure,
         untrusted: fallback.untrusted,
+        canonicalized: fallback.canonicalized,
         ignored: fallback.ignored,
     })
 }
@@ -343,5 +395,58 @@ mod tests {
         let error = resolve_search_path(&policy(None, &[missing.as_str()], None))
             .expect_err("no directory");
         assert!(matches!(error, ResolveError::NoUsableDirectories(_)));
+    }
+
+    #[test]
+    fn a_stalled_fallback_validation_is_bounded_and_the_shell_never_starts() {
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        let dir = fixture();
+        let marker = dir.path().join("shell-ran");
+        let mut spec = shell(dir.path(), &format!("touch '{}'", marker.display()));
+        spec.timeout = Duration::from_millis(500);
+        // Stands in for canonicalize on a stalled network mount: it announces
+        // itself, then blocks until the test releases it.
+        let (entered_tx, entered) = mpsc::channel::<()>();
+        let (release, blocked) = mpsc::channel::<()>();
+        let started = Instant::now();
+        let error = resolve_with(&policy(Some(&spec), &[], None), move || {
+            entered_tx.send(()).expect("announce");
+            let _ = blocked.recv();
+            Err(SearchPathError::NoUsableDirectories)
+        })
+        .expect_err("must time out");
+        assert!(
+            matches!(
+                &error,
+                ResolveError::Discovery(LoginShellError::Timeout { .. })
+            ),
+            "{error:?}"
+        );
+        entered.try_recv().expect("the fallback stage was entered");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        drop(release);
+        // The abandoned pipeline must not spawn the shell once released.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            assert!(!marker.exists(), "the abandoned resolve spawned the shell");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn a_probe_that_times_out_after_the_fallback_stage_still_yields_the_fallback() {
+        let dir = fixture();
+        let (home, table, expected) = fake_host(dir.path());
+        let mut spec = shell(dir.path(), "exec sleep 300");
+        spec.timeout = Duration::from_millis(500);
+        let resolution = resolve_search_path(&policy(Some(&spec), &refs(&table), Some(&home)))
+            .expect("resolution");
+        assert_eq!(resolution.path.entries(), expected);
+        assert!(matches!(
+            resolution.login_shell_failure,
+            Some(LoginShellError::Timeout { .. })
+        ));
     }
 }

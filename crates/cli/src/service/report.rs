@@ -50,6 +50,9 @@ pub struct SearchPathReport {
     pub login_shell_failure: Option<String>,
     /// Existing directories refused as untrusted.
     pub dropped: Vec<DroppedPath>,
+    /// Directories recorded as their canonical path because a symlink on the
+    /// way could be retargeted by another account.
+    pub canonicalized: Vec<CanonicalizedPath>,
 }
 
 impl SearchPathReport {
@@ -57,8 +60,19 @@ impl SearchPathReport {
     /// the path, or a directory was refused.
     #[must_use]
     pub fn needs_warning(&self) -> bool {
-        self.login_shell_failure.is_some() || !self.dropped.is_empty()
+        self.login_shell_failure.is_some()
+            || !self.dropped.is_empty()
+            || !self.canonicalized.is_empty()
     }
+}
+
+/// A directory recorded as its canonical path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CanonicalizedPath {
+    /// The directory as listed.
+    pub path: String,
+    /// The canonical path recorded instead.
+    pub recorded: String,
 }
 
 /// A directory refused when the search path was resolved.

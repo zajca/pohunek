@@ -95,11 +95,25 @@ pub struct DroppedEntry {
     pub reason: &'static str,
 }
 
+/// One directory recorded as its canonical path instead of as listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalizedEntry {
+    /// The entry as it was listed.
+    pub entry: String,
+    /// The canonical path recorded instead.
+    pub recorded: String,
+}
+
 /// Outcome of sanitizing an untrusted `PATH` value or a fallback table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SanitizedPath {
-    /// The usable directories in their original order, as listed.
+    /// The usable directories in their original order. An entry is recorded as
+    /// listed when its whole symlink chain is owner-controlled, and as its
+    /// canonical path otherwise (see [`SanitizedPath::canonicalized`]).
     pub path: SearchPath,
+    /// Entries recorded as their canonical path because a symlink on the way
+    /// could be retargeted by another account; callers report these.
+    pub canonicalized: Vec<CanonicalizedEntry>,
     /// Existing directories refused as untrusted; callers report these.
     pub untrusted: Vec<DroppedEntry>,
     /// Entries ignored without concern: empty, relative, `.`-style, duplicate,
@@ -128,9 +142,9 @@ pub enum TrustError {
 /// world-writable directories such as `/tmp` and group-writable setups such as
 /// an admin-group `/usr/local/bin` (out of scope).
 ///
-/// Returns the canonical path the checks ran against. Callers record the entry
-/// as listed, not this path, so a dotfile or profile symlink keeps following
-/// its target; the target is checked when the path is resolved.
+/// Returns the canonical path the checks ran against. A caller may record the
+/// entry as listed only when [`owner_controlled_chain`] holds, so a dotfile or
+/// profile symlink keeps following its target; otherwise it records this path.
 ///
 /// # Errors
 ///
@@ -154,6 +168,79 @@ pub fn trusted_directory(entry: &Path) -> Result<PathBuf, TrustError> {
         TrustError::Refused("a path component is foreign-owned or writable by others")
     })?;
     Ok(canonical)
+}
+
+/// Whether every symlink on the way to `entry`, targets included, is
+/// controlled by the effective user or root.
+///
+/// The path is resolved component by component. Each symlink must be owned by
+/// the effective user or root, and the canonical directory that holds it must be
+/// owned by one of them and not writable by group or others; a sticky
+/// world-writable directory such as `/tmp` does not qualify. Only then can no
+/// other account retarget a link and redirect a recorded entry.
+#[must_use]
+pub fn owner_controlled_chain(entry: &Path) -> bool {
+    use std::ffi::OsString;
+    use std::os::unix::fs::MetadataExt as _;
+
+    /// Symlinks followed before the path is treated as a loop.
+    const MAX_LINKS: usize = 40;
+    /// Group and other write permission bits.
+    const GROUP_OTHER_WRITE: u32 = 0o022;
+
+    let Ok(root) = std::fs::metadata("/") else {
+        return false;
+    };
+    let root_uid = root.uid();
+    let effective_uid = rustix::process::geteuid().as_raw();
+    let controlled = |uid: u32| uid == effective_uid || uid == root_uid;
+
+    let mut pending: std::collections::VecDeque<OsString> = entry
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => None,
+            other => Some(other.as_os_str().to_owned()),
+        })
+        .collect();
+    let mut resolved = PathBuf::from("/");
+    let mut links = 0_usize;
+    while let Some(name) = pending.pop_front() {
+        if name == ".." {
+            resolved.pop();
+            continue;
+        }
+        let next = resolved.join(&name);
+        let Ok(metadata) = std::fs::symlink_metadata(&next) else {
+            return false;
+        };
+        if !metadata.file_type().is_symlink() {
+            resolved = next;
+            continue;
+        }
+        links += 1;
+        if links > MAX_LINKS || !controlled(metadata.uid()) {
+            return false;
+        }
+        let Ok(holder) = std::fs::metadata(&resolved) else {
+            return false;
+        };
+        if !controlled(holder.uid()) || holder.mode() & GROUP_OTHER_WRITE != 0 {
+            return false;
+        }
+        let Ok(target) = std::fs::read_link(&next) else {
+            return false;
+        };
+        if target.is_absolute() {
+            resolved = PathBuf::from("/");
+        }
+        for component in target.components().rev() {
+            match component {
+                std::path::Component::RootDir | std::path::Component::CurDir => {}
+                other => pending.push_front(other.as_os_str().to_owned()),
+            }
+        }
+    }
+    true
 }
 
 /// Validates one search directory entry.
@@ -310,6 +397,7 @@ impl SearchPath {
 struct Kept {
     entries: Vec<PathBuf>,
     canonical: Vec<PathBuf>,
+    canonicalized: Vec<CanonicalizedEntry>,
     untrusted: Vec<DroppedEntry>,
     ignored: usize,
 }
@@ -320,9 +408,19 @@ impl Kept {
             self.ignored += 1;
             return;
         }
+        let mut entry = entry;
         let identity = if trusted_only {
             match trusted_directory(&entry) {
-                Ok(canonical) => canonical,
+                Ok(canonical) => {
+                    if !owner_controlled_chain(&entry) && canonical != entry {
+                        self.canonicalized.push(CanonicalizedEntry {
+                            entry: entry.to_string_lossy().into_owned(),
+                            recorded: canonical.to_string_lossy().into_owned(),
+                        });
+                        entry.clone_from(&canonical);
+                    }
+                    canonical
+                }
                 Err(TrustError::Missing) => {
                     self.ignored += 1;
                     return;
@@ -352,6 +450,7 @@ impl Kept {
         }
         Ok(SanitizedPath {
             path: SearchPath::new(self.entries)?,
+            canonicalized: self.canonicalized,
             untrusted: self.untrusted,
             ignored: self.ignored,
         })
@@ -523,6 +622,89 @@ mod tests {
         );
         let only_untrusted = SearchPath::sanitize(&group_writable.display().to_string(), true);
         assert_eq!(only_untrusted, Err(SearchPathError::NoUsableDirectories));
+    }
+
+    /// A world-writable directory (not sticky) standing in for `/tmp`.
+    fn wild_dir(root: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let wild = root.join(name);
+        make_dir(root, &wild);
+        fs::set_permissions(&wild, fs::Permissions::from_mode(0o777)).expect("chmod");
+        wild
+    }
+
+    #[test]
+    fn a_symlink_in_an_untrusted_directory_is_recorded_as_its_canonical_path() {
+        let dir = fixture();
+        let root = dir.path();
+        let good = root.join("good/bin");
+        make_dir(root, &good);
+        let wild = wild_dir(root, "wild");
+        let link = wild.join("tools");
+        std::os::unix::fs::symlink(&good, &link).expect("symlink");
+        assert!(!owner_controlled_chain(&link));
+        let sanitized = SearchPath::sanitize(&link.display().to_string(), true).expect("ok");
+        assert_eq!(sanitized.path.entries(), std::slice::from_ref(&good));
+        assert_eq!(
+            sanitized.canonicalized,
+            [CanonicalizedEntry {
+                entry: link.display().to_string(),
+                recorded: good.display().to_string(),
+            }]
+        );
+        // Retargeting the link afterwards cannot change the recorded entry.
+        let evil = root.join("evil/bin");
+        make_dir(root, &evil);
+        fs::remove_file(&link).expect("unlink");
+        std::os::unix::fs::symlink(&evil, &link).expect("retarget");
+        assert_eq!(sanitized.path.entries(), [good]);
+    }
+
+    #[test]
+    fn a_symlink_in_an_owner_only_directory_is_recorded_as_listed() {
+        let dir = fixture();
+        let root = dir.path();
+        let good = root.join("profile-1/bin");
+        make_dir(root, &good);
+        let home = root.join("home");
+        make_dir(root, &home);
+        let link = home.join("current");
+        std::os::unix::fs::symlink(root.join("profile-1"), &link).expect("symlink");
+        let entry = link.join("bin");
+        assert!(owner_controlled_chain(&entry));
+        let sanitized = SearchPath::sanitize(&entry.display().to_string(), true).expect("ok");
+        assert_eq!(sanitized.path.entries(), [entry]);
+        assert!(sanitized.canonicalized.is_empty());
+    }
+
+    #[test]
+    fn an_untrusted_symlink_behind_a_trusted_one_is_found_through_its_target() {
+        let dir = fixture();
+        let root = dir.path();
+        let good = root.join("good/bin");
+        make_dir(root, &good);
+        let wild = wild_dir(root, "wild");
+        let inner = wild.join("inner");
+        std::os::unix::fs::symlink(&good, &inner).expect("inner link");
+        // Owner-only directory, but its link points at a link others control.
+        let home = root.join("home");
+        make_dir(root, &home);
+        let outer = home.join("outer");
+        std::os::unix::fs::symlink(&inner, &outer).expect("outer link");
+        assert!(!owner_controlled_chain(&outer));
+        let sanitized = SearchPath::sanitize(&outer.display().to_string(), true).expect("ok");
+        assert_eq!(sanitized.path.entries(), [good]);
+        assert_eq!(sanitized.canonicalized.len(), 1);
+    }
+
+    #[test]
+    fn a_symlink_loop_is_not_owner_controlled() {
+        let dir = fixture();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::os::unix::fs::symlink(&b, &a).expect("a");
+        std::os::unix::fs::symlink(&a, &b).expect("b");
+        assert!(!owner_controlled_chain(&a));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use pohunek_platform::shell_env::{
 use pohunek_platform::supervisor::{self, Namespace};
 
 use super::error::{fs_error, io_error, Error};
-use super::report::{DroppedPath, SearchPathReport};
+use super::report::{CanonicalizedPath, DroppedPath, SearchPathReport};
 use super::settings;
 
 /// Mode of the application state and runtime roots.
@@ -229,6 +229,7 @@ impl Context {
                     shell_defaulted: false,
                     login_shell_failure: None,
                     dropped: Vec::new(),
+                    canonicalized: Vec::new(),
                 },
             ));
         };
@@ -253,6 +254,14 @@ impl Context {
                 .map(|dropped| DroppedPath {
                     path: dropped.entry,
                     reason: dropped.reason,
+                })
+                .collect(),
+            canonicalized: resolution
+                .canonicalized
+                .into_iter()
+                .map(|entry| CanonicalizedPath {
+                    path: entry.entry,
+                    recorded: entry.recorded,
                 })
                 .collect(),
         };
@@ -390,8 +399,7 @@ pub fn managed_path_discovery(
 /// A `HOME`, `USER`, or `LOGNAME` that is set but not UTF-8 fails instead of
 /// being left out, because the shell would then read another user's startup
 /// files; `$SHELL` is validated by [`managed_path_discovery`]. The lookup is
-/// injected so the validation runs in unit tests on every target.
-#[cfg(any(target_os = "macos", test))]
+/// injected so the validation is type-checked and tested on every target.
 fn managed_discovery_from_env(
     lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Result<PathDiscovery, Error> {
@@ -409,19 +417,16 @@ fn managed_discovery_from_env(
 }
 
 /// Builds the host's discovery policy: login-shell probing on macOS only.
-#[cfg(target_os = "macos")]
+///
+/// The target is chosen at run time, not with `#[cfg]`, so every branch is
+/// type-checked on every host. systemd hands the user manager's environment to
+/// the daemon job, so other targets record no `PATH`.
 fn host_path_discovery() -> Result<PathDiscovery, Error> {
-    managed_discovery_from_env(std::env::var_os)
-}
-
-/// systemd hands the user manager's environment to the daemon job.
-#[cfg(not(target_os = "macos"))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "one signature for both targets; only macOS reads the environment"
-)]
-fn host_path_discovery() -> Result<PathDiscovery, Error> {
-    Ok(PathDiscovery::Unmanaged)
+    if cfg!(target_os = "macos") {
+        managed_discovery_from_env(|name| std::env::var_os(name))
+    } else {
+        Ok(PathDiscovery::Unmanaged)
+    }
 }
 
 /// Returns where the daemon definition goes for `paths` and `home`.

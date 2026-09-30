@@ -74,7 +74,7 @@ pub use login_shell::{
 pub use policy::{resolve_search_path, PathPolicy, PathResolution, PathSource, ResolveError};
 #[doc(inline)]
 pub use search_path::{
-    fallback_search_path, trusted_directory, validate_search_directory, DroppedEntry,
-    SanitizedPath, SearchPath, SearchPathError, TrustError, DARWIN_FALLBACK_DIRECTORIES,
-    MAX_SEARCH_PATH_BYTES,
+    fallback_search_path, owner_controlled_chain, trusted_directory, validate_search_directory,
+    CanonicalizedEntry, DroppedEntry, SanitizedPath, SearchPath, SearchPathError, TrustError,
+    DARWIN_FALLBACK_DIRECTORIES, MAX_SEARCH_PATH_BYTES,
 };

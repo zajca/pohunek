@@ -914,7 +914,8 @@ outcome in an additive `search_path` object: `source` (`login_shell`,
 `fallback`, `recorded`, `unmanaged`), `entries`, `shell_used`,
 `shell_defaulted`, `login_shell_failure` (the rendered typed reason when the
 fallback list was used), and `dropped` (`[{path, reason}]`, directories refused
-as untrusted); the human output prints a `warning:` line for a failed login
+as untrusted), and `canonicalized` (`[{path, recorded}]`, directories recorded
+as their canonical path because a symlink on the way is not owner-controlled); the human output prints a `warning:` line for a failed login
 shell and for each dropped directory. A set but relative `$SHELL`, or a
 non-UTF-8 `HOME`, `USER`, or `LOGNAME`, fails the install
 (`service_environment_invalid`, `service_environment_not_utf8`). When the
