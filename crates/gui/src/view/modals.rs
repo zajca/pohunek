@@ -144,20 +144,15 @@ fn multiline_binding(
     key_press: text_editor::KeyPress,
     submit: Message,
 ) -> Option<text_editor::Binding<Message>> {
-    if is_ctrl_enter(&key_press.key, key_press.modifiers) {
+    if crate::keyboard::is_submit_chord(
+        &key_press.key,
+        key_press.modifiers,
+        cfg!(target_os = "macos"),
+    ) {
         Some(text_editor::Binding::Custom(submit))
     } else {
         text_editor::Binding::from_key_press(key_press)
     }
-}
-
-fn is_ctrl_enter(key: &iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> bool {
-    matches!(
-        key.as_ref(),
-        iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter)
-    ) && modifiers.control()
-        && !modifiers.alt()
-        && !modifiers.logo()
 }
 
 pub(crate) fn keymap_modal_content(app: &PohunekApp) -> Element<'_, Message> {
@@ -242,16 +237,39 @@ pub(crate) fn toast_view(toast: &Toast) -> Element<'_, Message> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn ctrl_enter_submits_multiline_forms() {
+        use iced::keyboard::Modifiers;
         let enter = iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
-        assert!(is_ctrl_enter(&enter, iced::keyboard::Modifiers::CTRL));
-        assert!(!is_ctrl_enter(&enter, iced::keyboard::Modifiers::empty()));
-        assert!(!is_ctrl_enter(
+        assert!(crate::keyboard::is_submit_chord(
             &enter,
-            iced::keyboard::Modifiers::CTRL | iced::keyboard::Modifiers::ALT
+            Modifiers::CTRL,
+            false
+        ));
+        assert!(crate::keyboard::is_submit_chord(
+            &enter,
+            Modifiers::CTRL,
+            true
+        ));
+        assert!(!crate::keyboard::is_submit_chord(
+            &enter,
+            Modifiers::empty(),
+            true
+        ));
+        assert!(!crate::keyboard::is_submit_chord(
+            &enter,
+            Modifiers::CTRL | Modifiers::ALT,
+            true
+        ));
+        assert!(crate::keyboard::is_submit_chord(
+            &enter,
+            Modifiers::COMMAND,
+            true
+        ));
+        assert!(!crate::keyboard::is_submit_chord(
+            &enter,
+            Modifiers::LOGO,
+            false
         ));
     }
 }

@@ -278,7 +278,7 @@ impl KeyChord {
             match part.as_str() {
                 "shift" => set_modifier(&mut modifiers.shift, "shift")?,
                 "ctrl" | "control" => set_modifier(&mut modifiers.control, "ctrl")?,
-                "alt" => set_modifier(&mut modifiers.alt, "alt")?,
+                "alt" | "option" | "opt" => set_modifier(&mut modifiers.alt, "alt")?,
                 "logo" | "super" | "meta" | "cmd" | "command" => {
                     set_modifier(&mut modifiers.logo, "logo")?;
                 }
@@ -380,11 +380,18 @@ impl ChordModifiers {
     }
 
     fn from_iced(context: KeyContext, key: &ChordKey, modifiers: Modifiers) -> Self {
+        // Modal bindings ignore Ctrl/Alt, but a Command chord is never a modal
+        // binding: Cmd+C/V/X/A/K belong to the focused text input or the OS, so
+        // the logo flag always survives and matches no modal binding.
         if context == KeyContext::Modal && !matches!(key, ChordKey::Named(Named::Enter)) {
-            Self::empty()
+            Self {
+                logo: modifiers.logo(),
+                ..Self::empty()
+            }
         } else if context == KeyContext::Modal {
             Self {
                 shift: modifiers.shift(),
+                logo: modifiers.logo(),
                 ..Self::empty()
             }
         } else {
@@ -942,16 +949,33 @@ pub(crate) fn form_select_key_message(
     }
 }
 
+/// Whether `key` with `modifiers` is the launch-form submit chord.
+///
+/// Ctrl+Enter submits on every platform. On macOS, where Command is the
+/// platform-native modifier, Command+Enter submits as well. Alt never combines
+/// with either, and Ctrl+Command together is not a submit chord.
+pub(crate) fn is_submit_chord(key: &Key, modifiers: Modifiers, macos: bool) -> bool {
+    matches!(key.as_ref(), Key::Named(Named::Enter))
+        && !modifiers.alt()
+        && ((modifiers.control() && !modifiers.logo())
+            || (macos && modifiers.logo() && !modifiers.control()))
+}
+
 pub(crate) fn form_submit_message(
     app: &PohunekApp,
     key: &Key,
     modifiers: Modifiers,
 ) -> Option<Message> {
-    if !matches!(key.as_ref(), Key::Named(Named::Enter))
-        || !modifiers.control()
-        || modifiers.alt()
-        || modifiers.logo()
-    {
+    form_submit_message_for(app, key, modifiers, cfg!(target_os = "macos"))
+}
+
+fn form_submit_message_for(
+    app: &PohunekApp,
+    key: &Key,
+    modifiers: Modifiers,
+    macos: bool,
+) -> Option<Message> {
+    if !is_submit_chord(key, modifiers, macos) {
         return None;
     }
     match app.modal {
@@ -1277,6 +1301,121 @@ mod tests {
             form_select_key_message(&app, &escape, Modifiers::empty()),
             Some(Message::CloseFormSelect)
         ));
+    }
+
+    #[test]
+    fn command_enter_submits_launch_forms_on_macos_only() {
+        let mut app = PohunekApp::test_default();
+        app.modal = ModalView::Start;
+        let enter = Key::Named(Named::Enter);
+
+        assert!(matches!(
+            form_submit_message_for(&app, &enter, Modifiers::COMMAND, true),
+            Some(Message::CreateSession)
+        ));
+        assert!(form_submit_message_for(&app, &enter, Modifiers::LOGO, false).is_none());
+        // Ctrl+Enter keeps working on macOS.
+        assert!(matches!(
+            form_submit_message_for(&app, &enter, Modifiers::CTRL, true),
+            Some(Message::CreateSession)
+        ));
+        assert!(
+            form_submit_message_for(&app, &enter, Modifiers::LOGO | Modifiers::CTRL, true)
+                .is_none()
+        );
+        assert!(
+            form_submit_message_for(&app, &enter, Modifiers::LOGO | Modifiers::ALT, true).is_none()
+        );
+        assert!(form_submit_message_for(&app, &enter, Modifiers::empty(), true).is_none());
+
+        app.modal = ModalView::Assistant;
+        assert!(matches!(
+            form_submit_message_for(&app, &enter, Modifiers::LOGO, true),
+            Some(Message::LaunchAssistant)
+        ));
+    }
+
+    #[test]
+    fn command_tab_is_not_form_focus_traversal() {
+        let mut app = PohunekApp::test_default();
+        app.modal = ModalView::Start;
+
+        assert_eq!(
+            form_focus_direction(&app, &Key::Named(Named::Tab), Modifiers::LOGO),
+            None
+        );
+    }
+
+    #[test]
+    fn option_is_an_alias_of_alt_and_round_trips_through_the_label() {
+        let option = KeyChord::parse("option+left").expect("option alias");
+        let alt = KeyChord::parse("alt+left").expect("alt");
+        assert_eq!(option, alt);
+        assert_eq!(
+            KeyChord::parse(&option.label()).expect("round trip"),
+            option
+        );
+        assert_eq!(
+            KeyChord::parse("opt+x").expect("opt alias"),
+            KeyChord::parse("alt+x").expect("alt")
+        );
+        for name in ["cmd", "command", "super", "meta", "logo"] {
+            let chord = KeyChord::parse(&format!("{name}+k")).expect("logo alias");
+            assert_eq!(KeyChord::parse(&chord.label()).expect("round trip"), chord);
+        }
+    }
+
+    #[test]
+    fn command_chords_bind_globally_and_never_match_modal_bindings() {
+        let keymap = KeyMap::default();
+        let chord = |context, key: &str, modifiers| {
+            KeyChord::from_key(context, &Key::Character(key.into()), modifiers)
+        };
+
+        // A user can bind Command+i globally; plain `i` still works.
+        let mut raw = BTreeMap::new();
+        raw.insert("open_inbox".to_owned(), "cmd+i".to_owned());
+        let custom = KeyMap::from_config(&raw).expect("cmd binding");
+        assert_eq!(
+            custom.action_for(
+                KeyContext::Global,
+                &chord(KeyContext::Global, "i", Modifiers::LOGO)
+            ),
+            Some(KeyAction::OpenInbox)
+        );
+        assert_eq!(
+            keymap.action_for(
+                KeyContext::Global,
+                &chord(KeyContext::Global, "i", Modifiers::LOGO)
+            ),
+            None
+        );
+
+        // Command-modified keys in a modal never collapse to the plain binding.
+        for key in ["o", "j", "k", "a", "c", "v", "x"] {
+            assert_eq!(
+                keymap.action_for(
+                    KeyContext::Modal,
+                    &chord(KeyContext::Modal, key, Modifiers::LOGO)
+                ),
+                None,
+                "Cmd+{key} must reach the text input"
+            );
+        }
+        assert!(keymap
+            .action_for(
+                KeyContext::Modal,
+                &chord(KeyContext::Modal, "o", Modifiers::empty())
+            )
+            .is_some());
+        let enter = Key::Named(Named::Enter);
+        assert_eq!(
+            keymap.action_for(
+                KeyContext::Modal,
+                &KeyChord::from_key(KeyContext::Modal, &enter, Modifiers::LOGO)
+            ),
+            None
+        );
     }
 
     #[test]

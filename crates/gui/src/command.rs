@@ -25,7 +25,7 @@ use protocol::{
     SessionScreenParams, SessionSetMetadataParams, SessionWaitParams, MAX_SESSION_WAIT_MS,
 };
 
-use crate::attach::{attach_task, spawn_notification, window_dimension_to_u32};
+use crate::attach::{attach_task, window_dimension_to_u32};
 use crate::config::AppConfig;
 use crate::keyboard;
 use crate::message::{
@@ -33,6 +33,7 @@ use crate::message::{
     ModalView, NotificationAction, ResolvedTemplate, StartForm, TemplateRecipe,
     ASSISTANT_AUTO_AGENT_LABEL, BLANK_TEMPLATE_LABEL,
 };
+use crate::notify::{apply_outcome, NotificationOutcome};
 use crate::runtime;
 use crate::selection::{
     connection_options, host_config, optional_field, required_field, save_ui_state_task,
@@ -545,7 +546,12 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 Err(err) => err,
             });
         }
-        Message::NotificationSent(result) | Message::UiStateSaved(result) => {
+        Message::NotificationSent(outcome) => {
+            if let Some(status) = apply_outcome(&mut app.notification_health, &outcome) {
+                app.status = Some(status);
+            }
+        }
+        Message::UiStateSaved(result) => {
             if let Err(err) = result {
                 app.status = Some(err);
             }
@@ -684,9 +690,12 @@ fn notification_tasks(app: &mut PohunekApp) -> Task<Message> {
     let intents = app.workspace.notification_intents[app.notified_intents..].to_vec();
     app.notified_intents = app.workspace.notification_intents.len();
     Task::batch(intents.into_iter().map(|intent| {
-        let command = config.notification_command.clone();
+        let notifier = config.notification.clone();
         Task::perform(
-            async move { spawn_notification(&command, &intent) },
+            runtime::perform_blocking_or(
+                move || notifier.notify(&intent.title, &intent.body),
+                NotificationOutcome::Unavailable,
+            ),
             Message::NotificationSent,
         )
     }))
@@ -1539,6 +1548,7 @@ mod tests {
             state_dir: None,
             status: None,
             notified_intents: 0,
+            notification_health: crate::notify::NotificationHealth::default(),
         }
     }
 
@@ -1651,12 +1661,30 @@ mod tests {
         );
         app.hosts = vec![local_host.clone()];
         app.config = Ok(AppConfig {
-            attach_command: "attach {host} {id}".to_owned(),
+            attach: crate::config::AttachSelection::Command {
+                template: "attach {host} {id}".to_owned(),
+                mode: crate::config::AttachCommandMode::Shell,
+            },
             pohunek_bin: "pohunek".to_owned(),
+            launch: crate::config::LaunchSettings {
+                open_timeout: std::time::Duration::from_secs(1),
+                login_shell_timeout: std::time::Duration::from_secs(1),
+                login_shell_max_output_bytes: 1024,
+                notification_timeout: std::time::Duration::from_secs(1),
+            },
+            bin_resolver: std::sync::Arc::new(crate::bin_resolver::BinResolver::with_discovery(
+                "pohunek",
+                || Err(crate::bin_resolver::BinError::SearchPath("test".to_owned())),
+            )),
             local_host,
             connection_options: ConnectionOptions::default(),
             terminal_size: crate::config::TerminalSize::default(),
-            notification_command: "notify-send".to_owned(),
+            notification: crate::notify::Notifier {
+                backend: crate::notify::NotificationBackend::Osascript {
+                    executable: "/nonexistent/osascript".into(),
+                },
+                timeout: std::time::Duration::from_secs(1),
+            },
             keymap: keyboard::KeyMap::default(),
         });
         app

@@ -248,7 +248,7 @@ pub(crate) enum Message {
     MoveListSelection(ListDirection),
     CoreCommandCompleted(Result<CoreEvent, String>),
     AttachSpawned(Result<(), String>),
-    NotificationSent(Result<(), String>),
+    NotificationSent(crate::notify::NotificationOutcome),
     WindowResized(Size),
     UiStateSaved(Result<(), String>),
     KeyPressed {

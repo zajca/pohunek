@@ -1,0 +1,282 @@
+#!/bin/sh
+# Acceptance check for issue #102: pohunek-gui started the way Finder starts an
+# app, next to a real daemon and session worker, on macOS.
+#
+# Verified here (no app bundle needed):
+#   1. The real pohunek-gui starts from a Finder-like environment (`env -i`,
+#      HOME/USER/LOGNAME only, PATH=/usr/bin:/bin:/usr/sbin:/sbin) with an
+#      isolated config, runtime, and state directory, and stays running for a
+#      bounded interval without exiting or writing to stderr.
+#   2. Ending the GUI (SIGTERM) leaves the daemon, the session worker, and the
+#      session's child process untouched: same PIDs and process start times
+#      before and after, and the session is still live.
+#   3. The attach launcher code paths that a session-row click runs (argv mode
+#      with difficult host/session values, the private self-deleting .command
+#      script, the fake `open` invocation, `pohunek_bin` resolution) pass their
+#      tests on this macOS host, using the real /bin/sh.
+#
+# NOT verified here, because no headless driver exists:
+#   - clicking a session row (the GUI cannot be driven without Accessibility
+#     automation), so the attach argv is proven by step 3's tests, not by a
+#     click;
+#   - Terminal.app itself and double-clicking an app icon, which need the .app
+#     bundle from issue #104.
+#
+# The GUI needs a window server. Outside a GUI (Aqua) login session, for example
+# over SSH or in a service session, the script fails loudly and prints the
+# manual Finder procedure; it never reports success without starting the GUI.
+#
+# Environment (all optional unless stated):
+#   GUI_ACCEPT_BIN_DIR   Directory holding pohunek, pohunekd, pohunek-sessiond,
+#                        and pohunek-gui (required).
+#   GUI_ACCEPT_UP_S      Seconds the GUI must stay up (default 8).
+#   GUI_ACCEPT_SKIP_UNIT_TESTS
+#                        Set to `yes` only when the attach tests already ran in
+#                        the same job; the step is then reported as not run,
+#                        never as passed.
+#   GUI_ACCEPT_KEEP      Set to `yes` to keep the work directory as evidence.
+#   GUI_ACCEPT_PYTHON    Python 3 for JSON parsing (default /usr/bin/python3).
+#
+# Exit status: 0 all checks passed, 1 a check failed, 2 the environment cannot
+# run the check (no macOS, no window server).
+
+set -eu
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd -P)
+helper="$script_dir/launchd_lifetime_evidence.py"
+
+# Seconds the GUI must survive; long enough for window creation and the first
+# connection attempts, short enough for CI.
+up_s=${GUI_ACCEPT_UP_S:-8}
+# Upper bound on the wait for the daemon and for the session to become live.
+daemon_timeout_s=60
+live_timeout_s=60
+# Upper bound on the wait for a process to exit after a signal.
+exit_timeout_s=15
+poll_s=1
+# The minimal PATH launchd gives a Finder-launched app.
+finder_path=/usr/bin:/bin:/usr/sbin:/sbin
+python_bin=${GUI_ACCEPT_PYTHON:-/usr/bin/python3}
+# Test filters covering the attach launchers and their difficult host/id values.
+attach_tests='attach::tests terminal::tests'
+
+work=
+daemon_pid=
+gui_pid=
+
+say() {
+  printf '\n==> %s\n' "$*"
+}
+
+die() {
+  printf 'macos-gui-launch: FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+manual_steps() {
+  cat >&2 <<EOF
+
+Manual Finder procedure (needs the .app bundle from issue #104 for step 3):
+  1. Log in at the Mac's GUI and run: pohunek service install
+     Confirm with: pohunek service status
+  2. Create ~/.config/pohunek/gui.toml with, for example:
+       pohunek_bin = "pohunek"
+       attach_terminal = "terminal-app"
+  3. Double-click the pohunek-gui app in Finder (bundle only). Without the
+     bundle, run: open -a Terminal <path-to>/pohunek-gui   or start the binary
+     from Finder's "Open With > Terminal".
+  4. Confirm the window opens, the local host appears, and no configuration
+     error is shown in the status line.
+  5. Start a session, click Open, and confirm Terminal.app opens attached to it.
+  6. Quit the GUI (Command-Q) and confirm the session keeps running:
+       pohunek session list
+EOF
+}
+
+cleanup() {
+  status=$?
+  trap - EXIT
+  [ -z "$gui_pid" ] || kill "$gui_pid" 2>/dev/null || true
+  [ -z "$daemon_pid" ] || kill "$daemon_pid" 2>/dev/null || true
+  if [ -n "$work" ] && [ -d "$work" ]; then
+    if [ "${GUI_ACCEPT_KEEP:-no}" = yes ]; then
+      printf 'Evidence kept in %s\n' "$work"
+    else
+      rm -rf -- "$work"
+    fi
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+[ "$(uname -s)" = Darwin ] || {
+  printf 'macos-gui-launch: this check runs on macOS only\n' >&2
+  manual_steps
+  exit 2
+}
+
+bin_dir=${GUI_ACCEPT_BIN_DIR:-}
+[ -n "$bin_dir" ] || die "GUI_ACCEPT_BIN_DIR is required (directory with the pohunek binaries)"
+for name in pohunek pohunekd pohunek-sessiond pohunek-gui; do
+  [ -x "$bin_dir/$name" ] || die "$bin_dir/$name is not an executable file"
+done
+[ -x "$python_bin" ] || die "$python_bin is required for JSON parsing"
+case "$up_s" in '' | *[!0-9]*) die "GUI_ACCEPT_UP_S must be a number" ;; esac
+[ "$up_s" -ge 1 ] || die "GUI_ACCEPT_UP_S must be at least 1"
+
+# A GUI (Aqua) launchd session is what gives an app a window server.
+manager=$(/bin/launchctl managername 2>/dev/null || printf unknown)
+if [ "$manager" != Aqua ]; then
+  printf 'macos-gui-launch: no window server: launchd session is "%s", not "Aqua".\n' "$manager" >&2
+  printf 'Run this from a Terminal window in a logged-in GUI session.\n' >&2
+  manual_steps
+  exit 2
+fi
+
+user=$(id -un)
+# Unix socket paths are limited to 103 bytes on macOS: keep the root short.
+work=$(mktemp -d /tmp/pgl.XXXXXX)
+chmod 700 "$work"
+home="$work/h"
+mkdir -p "$home/.config" "$work/run" "$work/state" "$work/data" "$work/cache" "$work/ev"
+chmod 700 "$work/run"
+recorder="$work/recorder"
+
+# Runs one command with the Finder-like environment. The XDG variables are the
+# single deviation from a real Finder launch: they isolate the run from the
+# operator's own pohunek installation.
+finder_env() {
+  env -i \
+    HOME="$home" USER="$user" LOGNAME="$user" PATH="$finder_path" \
+    XDG_CONFIG_HOME="$home/.config" XDG_RUNTIME_DIR="$work/run" \
+    XDG_STATE_HOME="$work/state" XDG_DATA_HOME="$work/data" \
+    XDG_CACHE_HOME="$work/cache" "$@"
+}
+
+# `pohunek_bin` is a bare name on purpose: an attach must resolve it through
+# the shell environment policy (login shell, then the fallback directories such
+# as the isolated ~/.local/bin below), not through the minimal PATH. Startup
+# only parses this file; the resolution itself runs on a click and is covered by
+# the launcher tests.
+mkdir -p "$home/.local/bin" "$home/.config/pohunek"
+ln -s "$bin_dir/pohunek" "$home/.local/bin/pohunek"
+cat >"$recorder" <<'EOF'
+#!/bin/sh
+printf '%s\0' "$@" >>"$0.argv"
+EOF
+chmod 755 "$recorder"
+cat >"$home/.config/pohunek/gui.toml" <<EOF
+pohunek_bin = "pohunek"
+attach_command_mode = "argv"
+attach_command = "$recorder {bin} --host={host} attach -- {id}"
+EOF
+
+say "Starting an isolated daemon (subprocess workers)"
+finder_env "$bin_dir/pohunek" daemon start --dev-subprocess >"$work/ev/daemon.log" 2>&1 &
+daemon_pid=$!
+waited=0
+until finder_env "$bin_dir/pohunek" health --json >/dev/null 2>&1; do
+  kill -0 "$daemon_pid" 2>/dev/null || die "the daemon exited early; see $work/ev/daemon.log"
+  [ "$waited" -lt "$daemon_timeout_s" ] || die "the daemon did not answer within ${daemon_timeout_s}s"
+  sleep "$poll_s"
+  waited=$((waited + poll_s))
+done
+
+say "Starting a real shell session"
+finder_env "$bin_dir/pohunek" session new --agent shell --cwd "$home" --json >"$work/ev/new.json"
+session_id=$("$python_bin" "$helper" session-id "$work/ev/new.json")
+[ -n "$session_id" ] || die "no session id in the session new result"
+waited=0
+while :; do
+  finder_env "$bin_dir/pohunek" session list --json >"$work/ev/list-live.json"
+  state=$("$python_bin" "$helper" states "$work/ev/list-live.json" "$session_id" | awk '{ print $2 }')
+  [ "$state" = live ] && break
+  [ "$waited" -lt "$live_timeout_s" ] || die "session $session_id is '$state' after ${live_timeout_s}s"
+  sleep "$poll_s"
+  waited=$((waited + poll_s))
+done
+
+# Identity of the worker and the session child: pid plus process start time, so
+# a recycled pid cannot pass as the same process.
+identity() {
+  finder_env "$bin_dir/pohunek" session list --json >"$1.list.json"
+  child_pid=$("$python_bin" - "$1.list.json" "$session_id" <<'EOF'
+import json, sys
+payload = json.load(open(sys.argv[1]))["ok"]
+for entry in payload:
+    if entry.get("id") == sys.argv[2]:
+        print(entry.get("pid") or "")
+EOF
+)
+  [ -n "$child_pid" ] || die "the session list has no child pid for $session_id"
+  worker_lines=$(ps -axww -o pid=,lstart=,command= | grep "pohunek-sessiond" | grep -F -- "$session_id" | grep -v grep || true)
+  [ -n "$worker_lines" ] || die "no pohunek-sessiond process for $session_id"
+  child_line=$(ps -o pid=,lstart=,command= -p "$child_pid" || true)
+  [ -n "$child_line" ] || die "session child $child_pid is not running"
+  daemon_line=$(ps -o pid=,lstart= -p "$daemon_pid" || true)
+  [ -n "$daemon_line" ] || die "the daemon is not running"
+  {
+    printf 'daemon: %s\n' "$daemon_line"
+    printf 'worker: %s\n' "$worker_lines"
+    printf 'child: %s\n' "$child_line"
+  } >"$1"
+}
+identity "$work/ev/before.txt"
+say "Identity before the GUI starts"
+cat "$work/ev/before.txt"
+
+say "Starting pohunek-gui with a Finder-like environment"
+finder_env "$bin_dir/pohunek-gui" >"$work/ev/gui.out" 2>"$work/ev/gui.err" &
+gui_pid=$!
+elapsed=0
+while [ "$elapsed" -lt "$up_s" ]; do
+  kill -0 "$gui_pid" 2>/dev/null || {
+    cat "$work/ev/gui.err" >&2 || true
+    manual_steps
+    die "pohunek-gui exited within ${elapsed}s of starting (no window server, or a startup error)"
+  }
+  sleep "$poll_s"
+  elapsed=$((elapsed + poll_s))
+done
+kill -0 "$gui_pid" 2>/dev/null || die "pohunek-gui is not running after ${up_s}s"
+[ ! -s "$work/ev/gui.err" ] || {
+  cat "$work/ev/gui.err" >&2
+  die "pohunek-gui wrote to stderr while starting"
+}
+printf 'pohunek-gui pid %s stayed up for %ss\n' "$gui_pid" "$up_s"
+
+say "Ending the GUI with SIGTERM"
+kill -TERM "$gui_pid"
+waited=0
+while kill -0 "$gui_pid" 2>/dev/null; do
+  [ "$waited" -lt "$exit_timeout_s" ] || die "pohunek-gui did not exit within ${exit_timeout_s}s of SIGTERM"
+  sleep "$poll_s"
+  waited=$((waited + poll_s))
+done
+gui_pid=
+
+say "Identity after the GUI exited"
+identity "$work/ev/after.txt"
+cat "$work/ev/after.txt"
+cmp -s "$work/ev/before.txt" "$work/ev/after.txt" ||
+  die "daemon, worker, or session child changed while the GUI ran; diff $work/ev/before.txt $work/ev/after.txt"
+finder_env "$bin_dir/pohunek" session list --json >"$work/ev/list-after.json"
+state=$("$python_bin" "$helper" states "$work/ev/list-after.json" "$session_id" | awk '{ print $2 }')
+[ "$state" = live ] || die "session $session_id is '$state' after the GUI exited"
+printf 'worker and child unchanged; session %s still live\n' "$session_id"
+
+if [ "${GUI_ACCEPT_SKIP_UNIT_TESTS:-no}" = yes ]; then
+  say "Attach launcher tests: NOT RUN (GUI_ACCEPT_SKIP_UNIT_TESTS=yes); this is not a pass"
+else
+  say "Attach launcher tests on this host (real /bin/sh)"
+  command -v cargo >/dev/null 2>&1 || die "cargo is required for the attach launcher tests"
+  # Test selection is unquoted on purpose: one filter per word.
+  # shellcheck disable=SC2086
+  (cd "$repo_root" && cargo test -p pohunek-gui --bin pohunek-gui -- $attach_tests) ||
+    die "attach launcher tests failed"
+fi
+
+printf '\nmacos-gui-launch: all checks passed\n'
+printf 'Not verified here: a session-row click and Terminal.app (need a driver or the .app bundle, issue #104).\n'

@@ -4335,11 +4335,15 @@ name = "pohunek-gui"
 version = "0.31.6"
 dependencies = [
  "futures",
+ "getrandom 0.2.17",
  "iced",
  "pohunek-gui-core",
  "pohunek-paths",
+ "pohunek-platform",
  "pohunek-protocol",
+ "rustix 1.1.4",
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "toml",
