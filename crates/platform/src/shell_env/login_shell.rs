@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
 use thiserror::Error;
 
-use super::search_path::{SearchPath, SearchPathError};
+use super::search_path::{SanitizedPath, SearchPath, SearchPathError};
 
 /// Executable printing the environment `PATH` of the login shell.
 ///
@@ -132,6 +132,18 @@ pub enum LoginShellError {
 /// through an absolute path. The probe is a separate process group killed on
 /// timeout or oversized output.
 ///
+/// [`LoginShellSpec::timeout`] bounds the whole discovery: the executable
+/// checks, the probe, and the filesystem validation of the printed
+/// directories. That work runs on a helper thread; when the deadline passes the
+/// caller gets [`LoginShellError::Timeout`] and the thread is abandoned. A
+/// filesystem call stuck in an uninterruptible state (a stalled network mount)
+/// cannot be cancelled, only abandoned, and it stays blocked until the kernel
+/// returns; the abandoned thread starts nothing further, and the installer falls
+/// back per policy.
+///
+/// Printed directories are kept only when they are trusted: see
+/// [`SearchPath::sanitize`].
+///
 /// # Errors
 ///
 /// Returns [`LoginShellError`] for an unusable shell, a spawn failure, a
@@ -141,6 +153,41 @@ pub enum LoginShellError {
 pub fn discover_login_shell_path(
     spec: &LoginShellSpec,
 ) -> Result<LoginShellDiscovery, LoginShellError> {
+    discover_with(spec, |value| SearchPath::sanitize(value, true))
+}
+
+/// Runs the discovery pipeline under one deadline, with an injectable sanitizer.
+fn discover_with<F>(
+    spec: &LoginShellSpec,
+    sanitize: F,
+) -> Result<LoginShellDiscovery, LoginShellError>
+where
+    F: FnOnce(&str) -> Result<SanitizedPath, SearchPathError> + Send + 'static,
+{
+    let deadline = Instant::now() + spec.timeout;
+    let timeout = spec.timeout;
+    let owned = spec.clone();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("shell-env-discovery".to_owned())
+        .spawn(move || {
+            // The receiver is gone once the deadline passed; nothing to report.
+            drop(sender.send(discovery_pipeline(&owned, deadline, sanitize)));
+        })
+        .map_err(LoginShellError::Io)?;
+    receiver
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|_elapsed| LoginShellError::Timeout { timeout })?
+}
+
+fn discovery_pipeline<F>(
+    spec: &LoginShellSpec,
+    deadline: Instant,
+    sanitize: F,
+) -> Result<LoginShellDiscovery, LoginShellError>
+where
+    F: FnOnce(&str) -> Result<SanitizedPath, SearchPathError>,
+{
     require_executable(&spec.shell)?;
     require_executable(&spec.printenv)?;
     let sentinel = random_sentinel().map_err(LoginShellError::Io)?;
@@ -173,14 +220,15 @@ pub fn discover_login_shell_path(
     for (name, value) in &spec.environment {
         command.env(name, value);
     }
-    let output = run_bounded(command, spec.timeout, spec.max_output_bytes)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let output = run_bounded(command, remaining, spec.max_output_bytes)?;
     if !output.status.success() {
         return Err(LoginShellError::Failed {
             status: describe(output.status),
         });
     }
     let value = delimited_value(&output.stdout, &sentinel)?;
-    let sanitized = SearchPath::sanitize(value, true).map_err(LoginShellError::UnusablePath)?;
+    let sanitized = sanitize(value).map_err(LoginShellError::UnusablePath)?;
     Ok(LoginShellDiscovery {
         path: sanitized.path,
         dropped: sanitized.dropped,
@@ -547,6 +595,35 @@ mod tests {
             assert!(Instant::now() < deadline, "background child survived");
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn a_stalled_directory_validation_is_bounded_by_the_overall_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).expect("bin");
+        let shell = fake_shell(dir.path(), "", &bin.display().to_string());
+        let mut bounded = spec(shell);
+        bounded.timeout = Duration::from_millis(500);
+        // The sanitizer stands in for a filesystem call that never returns:
+        // it blocks until the test releases it.
+        let (release, blocked) = mpsc::channel::<()>();
+        let started = Instant::now();
+        let error = discover_with(&bounded, move |_value| {
+            let _ = blocked.recv();
+            Err(SearchPathError::NoUsableDirectories)
+        })
+        .expect_err("must time out");
+        assert!(
+            matches!(error, LoginShellError::Timeout { .. }),
+            "{error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "discovery outlived its deadline: {:?}",
+            started.elapsed()
+        );
+        drop(release);
     }
 
     #[test]

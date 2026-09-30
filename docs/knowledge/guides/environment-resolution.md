@@ -44,6 +44,16 @@ Highest priority first:
    system directories. Only existing directories are kept; no single Homebrew
    prefix is assumed.
 
+Login-shell output and the fallback table are untrusted input, so a directory
+is kept only when it is trusted: symlinks are resolved, every component of the
+canonical path is owned by the user or root and not writable by others (the
+platform's trusted-ancestor rules), and the directory itself is not writable
+by group or others. `/tmp`, other sticky world-writable directories, and
+anything below a writable ancestor are dropped and counted, because another
+local account could plant an agent executable there. The 10 s deadline covers
+the whole discovery, including these filesystem checks; a stalled mount
+produces a timeout and the fallback list applies.
+
 Every tier yields absolute, normalized, control-character-free, deduplicated
 directories. Login-shell output and the fallback table keep existing
 directories only, and entries that are empty, relative, `.`-style, duplicated,

@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::filesystem::TrustedDir;
+
 /// Longest accepted joined `PATH` value in bytes.
 ///
 /// Equal to the supervisor's job value limit, because the value becomes an
@@ -93,6 +95,30 @@ pub struct SanitizedPath {
     pub dropped: usize,
 }
 
+/// Returns the canonical path of `entry` when it is safe to search for programs.
+///
+/// Another local account able to write into a searched directory could plant
+/// an agent executable that later runs as the owner, so the rules are strict:
+/// symlinks are resolved first; every component of the canonical path must
+/// pass the platform's trusted-ancestor policy (effective-user-owned
+/// components are not group- or world-writable, root-owned ones are
+/// non-writable or sticky, no foreign owners); and the final directory itself
+/// must not be writable by group or others, which also refuses sticky
+/// world-writable directories such as `/tmp`. A missing or non-directory
+/// entry is refused too.
+#[must_use]
+pub fn trusted_directory(entry: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    /// Group and other write permission bits.
+    const GROUP_OTHER_WRITE: u32 = 0o022;
+
+    let canonical = std::fs::canonicalize(entry).ok()?;
+    TrustedDir::open_absolute_ancestor(&canonical).ok()?;
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    (metadata.is_dir() && metadata.mode() & GROUP_OTHER_WRITE == 0).then_some(canonical)
+}
+
 /// Validates one search directory entry.
 ///
 /// # Errors
@@ -169,9 +195,11 @@ impl SearchPath {
 
     /// Sanitizes an untrusted `PATH` value such as a login shell printed.
     ///
-    /// Entries that are empty, relative, `.`-style, duplicated, or (with
-    /// `existing_only`) not existing directories are dropped and counted. A
-    /// directory that is a symlink to a directory counts as existing.
+    /// Entries that are empty, relative, `.`-style, or duplicated are dropped
+    /// and counted. With `trusted_only`, an entry must also be a trusted
+    /// directory, see [`trusted_directory`]; the kept entry is then its
+    /// canonical path, and any other entry is dropped and counted rather than
+    /// accepted.
     ///
     /// # Errors
     ///
@@ -179,21 +207,29 @@ impl SearchPath {
     /// control character at all (the value is then garbage, not a `PATH`),
     /// [`SearchPathError::NoUsableDirectories`] when nothing survives, and
     /// [`SearchPathError::TooLong`] when the survivors exceed the bound.
-    pub fn sanitize(value: &str, existing_only: bool) -> Result<SanitizedPath, SearchPathError> {
+    pub fn sanitize(value: &str, trusted_only: bool) -> Result<SanitizedPath, SearchPathError> {
         if value.chars().any(char::is_control) {
             return Err(SearchPathError::ControlCharacter);
         }
         let mut entries: Vec<PathBuf> = Vec::new();
         let mut dropped = 0_usize;
         for raw in value.split(SEPARATOR) {
-            let entry = PathBuf::from(raw);
-            let usable = validate_search_directory(&entry).is_ok()
-                && !entries.contains(&entry)
-                && (!existing_only || entry.is_dir());
-            if usable {
-                entries.push(entry);
-            } else {
+            let mut entry = PathBuf::from(raw);
+            if validate_search_directory(&entry).is_err() {
                 dropped += 1;
+                continue;
+            }
+            if trusted_only {
+                let Some(canonical) = trusted_directory(&entry) else {
+                    dropped += 1;
+                    continue;
+                };
+                entry = canonical;
+            }
+            if entries.contains(&entry) {
+                dropped += 1;
+            } else {
+                entries.push(entry);
             }
         }
         if entries.is_empty() {
@@ -235,7 +271,8 @@ impl SearchPath {
 /// Builds the search path of the existing directories in `table`.
 ///
 /// `~/` entries expand against `home`; without a home they are skipped.
-/// Missing directories and entries failing validation are skipped.
+/// Missing or untrusted directories (see [`trusted_directory`]) and entries
+/// failing validation are skipped; kept entries are canonical paths.
 ///
 /// # Errors
 ///
@@ -253,9 +290,13 @@ pub fn fallback_search_path(
             },
             None => PathBuf::from(item),
         };
-        if validate_search_directory(&entry).is_ok() && entry.is_dir() && !entries.contains(&entry)
-        {
-            entries.push(entry);
+        if validate_search_directory(&entry).is_err() {
+            continue;
+        }
+        if let Some(canonical) = trusted_directory(&entry) {
+            if !entries.contains(&canonical) {
+                entries.push(canonical);
+            }
         }
     }
     if entries.is_empty() {
@@ -310,13 +351,31 @@ mod tests {
         assert!(SearchPath::empty().is_empty());
     }
 
+    /// Creates `path` and its ancestors below the temporary root with mode
+    /// 0755 regardless of the process umask.
+    fn make_dir(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::create_dir_all(path).expect("dir");
+        let root = std::env::temp_dir();
+        for directory in path
+            .ancestors()
+            .take_while(|dir| dir.starts_with(&root) && *dir != root)
+        {
+            // The temporary directory itself is 0700 and stays so.
+            if directory.parent() != Some(root.as_path()) {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).expect("chmod");
+            }
+        }
+    }
+
     #[test]
     fn sanitize_drops_bad_entries_and_counts_them() {
         let dir = tempfile::tempdir().expect("tempdir");
         let bin = dir.path().join("b in");
-        fs::create_dir(&bin).expect("bin");
+        make_dir(&bin);
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&bin, &link).expect("symlink");
+        let canonical = fs::canonicalize(&bin).expect("canonical");
         let value = format!(
             "{}::.:rel:{}:{}:{}",
             bin.display(),
@@ -325,10 +384,79 @@ mod tests {
             dir.path().join("gone").display()
         );
         let sanitized = SearchPath::sanitize(&value, true).expect("sanitize");
-        assert_eq!(sanitized.path.entries(), [bin.clone(), link]);
-        assert_eq!(sanitized.dropped, 5);
+        // The symlink resolves to the same directory and is a duplicate.
+        assert_eq!(sanitized.path.entries(), [canonical]);
+        assert_eq!(sanitized.dropped, 6);
         let unchecked = SearchPath::sanitize("/no/such/dir", false).expect("unchecked");
         assert_eq!(unchecked.path.to_env_value(), "/no/such/dir");
+    }
+
+    #[test]
+    fn untrusted_directories_are_dropped_and_counted() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let good = root.join("opt/homebrew/bin");
+        make_dir(&good);
+        let mode = |path: &Path, bits: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(bits)).expect("chmod");
+        };
+        let group_writable = root.join("group-writable");
+        make_dir(&group_writable);
+        mode(&group_writable, 0o775);
+        let world_writable = root.join("world-writable");
+        // An entry below a writable ancestor is refused although it is 0755.
+        let below = world_writable.join("inner");
+        make_dir(&below);
+        mode(&world_writable, 0o777);
+        let sticky = root.join("sticky");
+        make_dir(&sticky);
+        mode(&sticky, 0o1777);
+        // A symlink to a writable directory resolves to it and is refused.
+        let link = root.join("link-into-writable");
+        std::os::unix::fs::symlink(&world_writable, &link).expect("symlink");
+        let value = [
+            &good,
+            &group_writable,
+            &world_writable,
+            &sticky,
+            &link,
+            &below,
+        ]
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+        let sanitized = SearchPath::sanitize(&value, true).expect("sanitize");
+        assert_eq!(
+            sanitized.path.entries(),
+            [fs::canonicalize(&good).expect("canonical")]
+        );
+        assert_eq!(sanitized.dropped, 5);
+        assert!(
+            trusted_directory(Path::new("/tmp")).is_none(),
+            "sticky /tmp"
+        );
+        let untrusted_only = SearchPath::sanitize(&group_writable.display().to_string(), true);
+        assert_eq!(untrusted_only, Err(SearchPathError::NoUsableDirectories));
+    }
+
+    #[test]
+    fn a_mode_0755_directory_of_ours_is_trusted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("bin");
+        make_dir(&bin);
+        assert_eq!(
+            trusted_directory(&bin),
+            Some(fs::canonicalize(&bin).expect("canonical"))
+        );
+        assert_eq!(trusted_directory(&dir.path().join("missing")), None);
+        let file = dir.path().join("file");
+        fs::write(&file, "x").expect("file");
+        assert_eq!(trusted_directory(&file), None);
     }
 
     #[test]

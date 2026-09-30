@@ -28,7 +28,8 @@
 //!
 //! Every tier yields a [`SearchPath`]: absolute, normalized, control-character
 //! free, deduplicated directories. Discovery and the fallback list keep only
-//! directories that exist. A shell is never used to run commands; the only
+//! trusted directories ([`trusted_directory`]): existing, owned by the user or
+//! root, and not writable by group or others along the whole canonical path. A shell is never used to run commands; the only
 //! shell invocation is the discovery above, as the installing user.
 //!
 //! # Examples
@@ -67,6 +68,6 @@ pub use login_shell::{
 pub use policy::{resolve_search_path, PathPolicy, PathResolution, PathSource, ResolveError};
 #[doc(inline)]
 pub use search_path::{
-    fallback_search_path, validate_search_directory, SanitizedPath, SearchPath, SearchPathError,
-    DARWIN_FALLBACK_DIRECTORIES, MAX_SEARCH_PATH_BYTES,
+    fallback_search_path, trusted_directory, validate_search_directory, SanitizedPath, SearchPath,
+    SearchPathError, DARWIN_FALLBACK_DIRECTORIES, MAX_SEARCH_PATH_BYTES,
 };

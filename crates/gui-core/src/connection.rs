@@ -652,15 +652,22 @@ fn scan_shell_template(text: &str) -> Result<Vec<(usize, Placeholder)>, AttachTe
     let mut state = ScanState::Unquoted;
     let mut hazard: Option<&'static str> = None;
     let mut word_start = true;
+    let mut has_content = false;
+    let mut param_depth = 0_usize;
     let mut index = 0;
     let unsafe_at = |context| AttachTemplateError::UnsafePlaceholderContext { context };
     while index < bytes.len() {
         let byte = bytes[index];
         if let Some(placeholder) = Placeholder::at(&bytes[index..]) {
+            let after_dollar = state == ScanState::Unquoted && follows_parameter(bytes, index);
+            if param_depth > 0 || after_dollar {
+                return Err(unsafe_at("a parameter expansion"));
+            }
             if let Some(context) = state.refusal().or(hazard) {
                 return Err(unsafe_at(context));
             }
             sites.push((index, placeholder));
+            has_content = true;
             index += placeholder.token().len();
             word_start = false;
             continue;
@@ -669,6 +676,16 @@ fn scan_shell_template(text: &str) -> Result<Vec<(usize, Placeholder)>, AttachTe
         match state {
             ScanState::Unquoted => {
                 index += 1;
+                if param_depth > 0 {
+                    match byte {
+                        b'{' => param_depth += 1,
+                        b'}' => param_depth -= 1,
+                        _ => {}
+                    }
+                    continue;
+                }
+                has_content |=
+                    !matches!(byte, b' ' | b'\t' | b'\n') && (byte != b'#' || !word_start);
                 match byte {
                     b'\\' => match next {
                         None => return Err(AttachTemplateError::UnterminatedQuote),
@@ -688,6 +705,16 @@ fn scan_shell_template(text: &str) -> Result<Vec<(usize, Placeholder)>, AttachTe
                     b'$' if next == Some(b'\'') => {
                         state = ScanState::AnsiC;
                         index += 1;
+                    }
+                    b'$' if next == Some(b'{') => {
+                        if Placeholder::at(&bytes[index..]).is_some() {
+                            return Err(unsafe_at("a parameter expansion"));
+                        }
+                        param_depth = 1;
+                        index += 1;
+                    }
+                    b'$' if next == Some(b'(') && bytes.get(index + 1) == Some(&b'(') => {
+                        hazard = hazard.or(Some("an arithmetic expansion"));
                     }
                     b'$' if next == Some(b'(') => {
                         hazard = hazard.or(Some("a command substitution"));
@@ -759,7 +786,20 @@ fn scan_shell_template(text: &str) -> Result<Vec<(usize, Placeholder)>, AttachTe
     ) {
         return Err(AttachTemplateError::UnterminatedQuote);
     }
+    if !has_content {
+        return Err(AttachTemplateError::EmptyCommand);
+    }
     Ok(sites)
+}
+
+/// Whether the text before `index` is `$` or `$name`, so a value would extend
+/// the parameter name instead of standing alone.
+fn follows_parameter(bytes: &[u8], index: usize) -> bool {
+    let mut start = index;
+    while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+        start -= 1;
+    }
+    start > 0 && bytes[start - 1] == b'$'
 }
 
 /// Length of the UTF-8 character starting with `lead`, so escapes skip whole characters.
@@ -1126,6 +1166,12 @@ mod attach_template_tests {
             ("echo $(true) {host}", "a command substitution"),
             ("echo `true` {host}", "a command substitution"),
             ("echo \\{host}", "an escaped placeholder"),
+            ("echo ${id}", "a parameter expansion"),
+            ("echo $x{host}", "a parameter expansion"),
+            ("echo ${x:-{host}}", "a parameter expansion"),
+            ("echo ${x:-${id}}", "a parameter expansion"),
+            ("echo $(({id}))", "an arithmetic expansion"),
+            ("echo $({bin})", "a command substitution"),
         ] {
             let expected = Err(AttachTemplateError::UnsafePlaceholderContext { context });
             assert_eq!(
@@ -1216,6 +1262,35 @@ mod attach_template_tests {
                 "{hostile:?}"
             );
         }
+    }
+
+    #[test]
+    fn templates_without_executable_content_are_empty_commands() {
+        for template in ["", "   ", "\n\t ", "# only a comment", "  # note\n  # more"] {
+            assert_eq!(
+                validate_attach_shell_template(template),
+                Err(AttachTemplateError::EmptyCommand),
+                "{template:?}"
+            );
+        }
+        // A comment after real content, and real content after a comment.
+        assert_eq!(validate_attach_shell_template("true # note"), Ok(()));
+        assert_eq!(validate_attach_shell_template("# note\ntrue"), Ok(()));
+    }
+
+    #[test]
+    fn a_parameter_expansion_closed_before_a_placeholder_is_fine() {
+        let values = AttachTemplateValues {
+            bin: "b".to_owned(),
+            host: "h".to_owned(),
+            id: "s-7".to_owned(),
+        };
+        assert_eq!(
+            render_attach_command("echo ${HOME}/x {id}", &values).expect("render"),
+            "echo ${HOME}/x s-7"
+        );
+        // Without the guard `${id}` would render `$s-7`, which sh expands as `$s`.
+        render_attach_command("echo ${id}", &values).expect_err("refused");
     }
 
     #[test]
