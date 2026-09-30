@@ -655,12 +655,18 @@ fn fake_gh_script(name: &str) -> PathBuf {
 }
 
 /// Creates a unique temporary directory for one fake GitHub CLI fixture.
+///
+/// The base is canonicalized: on macOS `temp_dir()` sits under the `/var`
+/// symlink, while a script's `pwd` reports the resolved `/private/var` path.
 #[cfg(unix)]
 fn fake_gh_dir(name: &str) -> PathBuf {
+    let base = std::env::temp_dir()
+        .canonicalize()
+        .expect("canonicalize temp dir");
     loop {
         // The counter reserves names only; it does not synchronize fixture data.
         let sequence = NEXT_FAKE_GH_DIR.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        let path = base.join(format!(
             "pohunek-gui-core-{name}-{}-{sequence}",
             std::process::id()
         ));
