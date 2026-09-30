@@ -126,11 +126,25 @@ pub(crate) fn locate_daemon() -> Result<PathBuf, CliError> {
         }
     }
     if let Some(found) = which_on_path(DAEMON_BIN) {
-        return Ok(found);
+        return absolute(&found);
     }
     Err(CliError::Spawn(format!(
         "could not find '{DAEMON_BIN}' next to the CLI or on PATH"
     )))
+}
+
+/// Make a located binary path absolute without touching the filesystem.
+///
+/// A relative `PATH` entry yields a relative match; the spawned daemon sees its
+/// own absolute `current_exe()`, and everything derived from the located path
+/// (such as the sibling worker) must agree with that.
+fn absolute(path: &Path) -> Result<PathBuf, CliError> {
+    std::path::absolute(path).map_err(|error| {
+        CliError::Spawn(format!(
+            "could not make '{}' absolute: {error}",
+            path.display()
+        ))
+    })
 }
 
 /// Resolve a binary on `PATH` to an executable file.
@@ -143,6 +157,26 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
+
+    #[test]
+    fn a_relative_path_match_becomes_absolute() {
+        let located = absolute(Path::new("bin/pohunekd")).expect("absolute path");
+
+        assert!(located.is_absolute(), "{}", located.display());
+        assert!(located.ends_with("bin/pohunekd"));
+        assert_eq!(
+            located
+                .parent()
+                .map(|dir| dir.join("pohunek-sessiond"))
+                .map(|worker| worker.is_absolute()),
+            Some(true),
+            "the derived sibling worker path is absolute too"
+        );
+        assert_eq!(
+            absolute(Path::new("/opt/bin/pohunekd")).unwrap(),
+            Path::new("/opt/bin/pohunekd")
+        );
+    }
 
     #[test]
     fn non_executable_daemon_binary_on_path_is_not_resolved() {

@@ -3599,11 +3599,14 @@ mod tests {
     #[test]
     fn ancestor_validation_accepts_a_private_directory_and_creates_nothing() {
         let temporary = tempfile::tempdir().expect("create fixture root");
-        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(DIRECTORY_MODE))
+        // Canonical: the macOS temporary directory sits below the `/var` symlink,
+        // which the ancestor policy refuses.
+        let root = fs::canonicalize(temporary.path()).expect("canonicalize fixture root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(DIRECTORY_MODE))
             .expect("set fixture root mode");
-        let missing = temporary.path().join("missing");
+        let missing = root.join("missing");
 
-        TrustedDir::open_absolute_ancestor(temporary.path()).expect("private ancestor");
+        TrustedDir::open_absolute_ancestor(&root).expect("private ancestor");
         let error = TrustedDir::open_absolute_ancestor(&missing).expect_err("missing");
 
         assert_eq!(error.io_kind(), Some(io::ErrorKind::NotFound));
@@ -3616,13 +3619,16 @@ mod tests {
     #[test]
     fn ancestor_validation_rejects_writable_and_symlinked_directories() {
         let temporary = tempfile::tempdir().expect("create fixture root");
-        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(DIRECTORY_MODE))
+        // Canonical: the macOS temporary directory sits below the `/var` symlink,
+        // which the ancestor policy refuses.
+        let root = fs::canonicalize(temporary.path()).expect("canonicalize fixture root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(DIRECTORY_MODE))
             .expect("set fixture root mode");
-        let open = temporary.path().join("open");
+        let open = root.join("open");
         fs::create_dir(&open).expect("create directory");
         fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).expect("make world-writable");
-        let link = temporary.path().join("link");
-        std::os::unix::fs::symlink(temporary.path(), &link).expect("create symlink");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&root, &link).expect("create symlink");
 
         assert!(matches!(
             TrustedDir::open_absolute_ancestor(&open),

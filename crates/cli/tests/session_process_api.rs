@@ -113,13 +113,15 @@ impl TestHome {
         ] {
             fs::create_dir_all(root.join(directory)).expect("create isolated test directory");
         }
-        // The daemon creates its runtime directory owner-private; doctor's
-        // `runtime_dir_private` check rejects any group/other access.
-        fs::set_permissions(
-            root.join("run/pohunek"),
-            fs::Permissions::from_mode(RUNTIME_DIR_MODE),
-        )
-        .expect("make the runtime directory owner-private");
+        // The daemon creates these directories owner-private, and doctor
+        // validates them like startup does: exact mode 0700.
+        for directory in PRIVATE_DIRECTORIES {
+            fs::set_permissions(
+                root.join(directory),
+                fs::Permissions::from_mode(PRIVATE_DIR_MODE),
+            )
+            .expect("make the directory owner-private");
+        }
         // Doctor's `worker_executable` check requires an executable
         // `pohunek-sessiond` on macOS; a scripted stand-in satisfies it.
         let worker = root.join("bin-worker");
@@ -159,8 +161,12 @@ impl Drop for TestHome {
 /// fixture: it may fail on a host without a graphical session.
 const HOST_SESSION_CHECK: &str = "launchd_domain";
 
-/// Mode of the runtime directory the daemon creates.
-const RUNTIME_DIR_MODE: u32 = 0o700;
+/// Mode of every directory the daemon creates privately.
+const PRIVATE_DIR_MODE: u32 = 0o700;
+
+/// Fixture directories the daemon would create owner-private: the runtime
+/// root, the state root, and the log directory below it.
+const PRIVATE_DIRECTORIES: [&str; 3] = ["run/pohunek", "state/pohunek", "state/pohunek/logs"];
 
 #[test]
 fn doctor_process_redacts_an_unavailable_local_daemon_in_human_and_json_output() {

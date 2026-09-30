@@ -148,7 +148,9 @@ pub struct WorkerCandidate {
 ///
 /// An installed `service.toml` wins (native supervision), then the
 /// `POHUNEK_WORKER_BIN` override, then `pohunek-sessiond` in
-/// `executable_dir`. An empty override is ignored.
+/// `executable_dir`. Like the daemon's `resolve_worker_binary`, any present
+/// override is used as is, an empty value included; the worker check then
+/// rejects a path that is empty or not absolute instead of falling back.
 #[must_use]
 pub fn resolve_worker_candidate(
     service_worker: Option<PathBuf>,
@@ -161,7 +163,7 @@ pub fn resolve_worker_candidate(
             source: WorkerSource::ServiceConfig,
         });
     }
-    if let Some(value) = env_override.filter(|value| !value.is_empty()) {
+    if let Some(value) = env_override {
         return Some(WorkerCandidate {
             path: PathBuf::from(value),
             source: WorkerSource::Environment,
@@ -700,7 +702,8 @@ pub fn check_worker_executable(candidate: Option<&WorkerCandidate>) -> DoctorChe
             NAME,
             DoctorStatus::Fail,
             format!(
-                "worker path {} (from {source}) is not absolute; use an absolute path",
+                "worker path '{}' (from {source}) is not absolute (an empty value is rejected too); \
+                 use an absolute path",
                 candidate.path.display()
             ),
         );
@@ -1078,7 +1081,17 @@ mod tests {
             resolve_worker_candidate(None, Some(OsString::from("/env/worker")), Some(dir)).unwrap();
         assert_eq!(env.source, WorkerSource::Environment);
 
-        let sibling = resolve_worker_candidate(None, Some(OsString::new()), Some(dir)).unwrap();
+        // The daemon uses any present override, an empty one included, and then
+        // rejects a non-absolute path; it never falls back to the sibling.
+        let empty = resolve_worker_candidate(None, Some(OsString::new()), Some(dir)).unwrap();
+        assert_eq!(empty.source, WorkerSource::Environment);
+        assert_eq!(empty.path, PathBuf::new());
+        assert_eq!(
+            check_worker_executable(Some(&empty)).status,
+            DoctorStatus::Fail
+        );
+
+        let sibling = resolve_worker_candidate(None, None, Some(dir)).unwrap();
         assert_eq!(sibling.source, WorkerSource::Sibling);
         assert_eq!(sibling.path, dir.join("pohunek-sessiond"));
 
@@ -1391,6 +1404,73 @@ mod tests {
         assert_eq!(check_log_dir(&logs).status, DoctorStatus::Ok);
         assert!(entry_names(&logs).is_empty(), "the probe file is removed");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_daemon_free_process_fixture_layout_passes_every_host_check() {
+        // The layout `crates/cli/tests/session_process_api.rs` builds: XDG
+        // directories pre-created with the default umask, then the ones the
+        // daemon creates privately chmod'ed to 0700.
+        let root = temp_dir("fx");
+        let bin = temp_dir("fx-bin");
+        write_exec(&bin, "git", 0o755);
+        let worker = WorkerCandidate {
+            path: write_exec(&bin, "pohunek-sessiond", 0o755),
+            source: WorkerSource::Environment,
+        };
+        for dir in [
+            "run/pohunek",
+            "state/pohunek/logs",
+            "data",
+            "config",
+            "cache",
+            "home",
+            "logs",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for dir in ["run/pohunek", "state/pohunek", "state/pohunek/logs"] {
+            set_mode(&root.join(dir), 0o700);
+        }
+        let mut f = facts();
+        f.path_var = Some(OsString::from(bin.as_os_str()));
+        let config_dir = root.join("config").join("pohunek");
+        let runtime = root.join("run/pohunek");
+        let data = root.join("data/pohunek");
+        let logs = root.join("state/pohunek/logs");
+        let home = root.join("home");
+        let inputs = StandardCheckInputs {
+            socket_dir: &runtime,
+            state_dir: &data,
+            log_dir: &logs,
+            launcher_bin_dir: &root,
+            sway_config_dir: &root,
+            config_dir: &config_dir,
+            home_dir: Some(&home),
+            effective_uid: std::fs::metadata(&root).unwrap().uid(),
+            worker: Some(&worker),
+            access_dirs: &[],
+        };
+
+        let checks = standard_checks(&inputs, &f);
+
+        let failing = failing_names(&checks);
+        assert!(failing.is_empty(), "{checks:?}");
+        for name in [
+            "runtime_dir_private",
+            "socket_path_length",
+            "socket_dir_writable",
+            "state_dir_writable",
+            "log_dir_writable",
+            "worker_runtime_root",
+            "worker_state_root",
+            "worker_executable",
+        ] {
+            let check = checks.iter().find(|c| c.name == name).expect(name);
+            assert_eq!(check.status, DoctorStatus::Ok, "{name}: {}", check.detail);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&bin);
     }
 
     #[test]

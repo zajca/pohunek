@@ -72,16 +72,26 @@ pub(crate) async fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
     });
     let platform = hostcheck::current_platform();
     checks.extend(working_directory_check(platform, &working_dir));
-    if platform == Platform::MacOs {
-        checks.push(launchd_job_check(crate::service::status().await));
-    }
+    let job_status = if platform == Platform::MacOs {
+        Some(crate::service::status().await)
+    } else {
+        None
+    };
 
-    match Client::connect("local", paths).await {
-        Ok(mut client) => match client.daemon_doctor().await {
-            Ok(remote) => merge_daemon_checks(&mut checks, remote.checks),
-            Err(_error) => checks.push(unavailable_daemon_check()),
-        },
-        Err(_error) => checks.push(unavailable_daemon_check()),
+    let remote = match Client::connect("local", paths).await {
+        Ok(mut client) => client
+            .daemon_doctor()
+            .await
+            .ok()
+            .map(|report| report.checks),
+        Err(_error) => None,
+    };
+    if let Some(job_status) = job_status {
+        checks.push(launchd_job_check(job_status, remote.is_some()));
+    }
+    match remote {
+        Some(remote) => merge_daemon_checks(&mut checks, remote),
+        None => checks.push(unavailable_daemon_check()),
     }
     let report = Report::from_checks(checks);
 
@@ -154,9 +164,17 @@ fn worker_candidate_from(
 ///
 /// Every applicable finding is reported and the worst status wins, so a failed
 /// daemon job is never hidden by a pending transaction or an unreadable job
-/// state. A missing service is a `warn` (a manually started daemon is valid);
-/// only a job the service manager reports as failed is a `fail`.
-fn launchd_job_check(status: Result<StatusReport, crate::service::Error>) -> DoctorCheck {
+/// state. A missing service is a `warn` (a manually started daemon is valid).
+///
+/// The launchd backend never reports a failed job: a loaded label is `running`
+/// (its process exists) or `unknown` (no process), and launchd records no exit
+/// for it. A loaded job without a process whose daemon also does not answer
+/// the doctor's control connection (`daemon_reachable`) is therefore the
+/// failure signal, next to a backend-reported `failed` state (systemd).
+pub(crate) fn launchd_job_check(
+    status: Result<StatusReport, crate::service::Error>,
+    daemon_reachable: bool,
+) -> DoctorCheck {
     const NAME: &str = "launchd_job";
     let report = match status {
         Ok(report) => report,
@@ -208,9 +226,21 @@ fn launchd_job_check(status: Result<StatusReport, crate::service::Error>) -> Doc
                     job.service_id
                 ),
             ),
-            Some(job) => (
+            Some(job) if daemon_reachable => (
                 Status::Warn,
-                format!("daemon job {} is {}", job.service_id, job.state),
+                format!(
+                    "daemon job {} is {} but a daemon answers on the control socket",
+                    job.service_id, job.state
+                ),
+            ),
+            Some(job) => (
+                Status::Fail,
+                format!(
+                    "daemon job {} is loaded but not running ({}) and the daemon does not answer \
+                     on the control socket; inspect the launchd log under the state directory and \
+                     run 'pohunek service status'",
+                    job.service_id, job.state
+                ),
             ),
         });
     }
@@ -374,8 +404,9 @@ mod tests {
     }
 
     #[test]
-    fn launchd_job_check_is_fatal_only_for_a_failed_job() {
-        let run = |report| launchd_job_check(Ok(report)).status;
+    fn launchd_job_check_is_fatal_for_a_failed_or_unreachable_unstarted_job() {
+        let run = |report| launchd_job_check(Ok(report), true).status;
+        let run_unreachable = |report| launchd_job_check(Ok(report), false).status;
 
         assert_eq!(run(status(true, Some(job("running")))), Status::Ok);
         assert_eq!(run(status(true, Some(job("failed")))), Status::Fail);
@@ -383,13 +414,26 @@ mod tests {
         assert_eq!(run(status(true, Some(job("starting")))), Status::Warn);
         assert_eq!(run(status(true, None)), Status::Warn);
         assert_eq!(run(status(false, None)), Status::Warn);
+
+        // The macOS backend reports a loaded job without a process as `unknown`:
+        // fatal only when no daemon answers either.
+        assert_eq!(run(status(true, Some(job("unknown")))), Status::Warn);
+        assert_eq!(
+            run_unreachable(status(true, Some(job("unknown")))),
+            Status::Fail
+        );
+        assert_eq!(
+            run_unreachable(status(true, Some(job("running")))),
+            Status::Ok
+        );
+        assert_eq!(run_unreachable(status(false, None)), Status::Warn);
     }
 
     #[test]
     fn launchd_job_check_reports_daemon_errors_and_pending_transactions_as_warnings() {
         let mut with_error = status(true, Some(job("running")));
         with_error.daemon_error = Some("launchctl exited with status 5".to_owned());
-        let check = launchd_job_check(Ok(with_error));
+        let check = launchd_job_check(Ok(with_error), false);
         assert_eq!(check.name, "launchd_job");
         assert_eq!(check.status, Status::Warn);
 
@@ -399,7 +443,7 @@ mod tests {
             version: "1.0.0".to_owned(),
             step: "bootstrap",
         });
-        assert_eq!(launchd_job_check(Ok(pending)).status, Status::Warn);
+        assert_eq!(launchd_job_check(Ok(pending), false).status, Status::Warn);
     }
 
     #[test]
@@ -412,7 +456,7 @@ mod tests {
         let mut failed = status(true, Some(job("failed")));
         failed.pending_transaction = Some(pending());
 
-        let check = launchd_job_check(Ok(failed));
+        let check = launchd_job_check(Ok(failed), false);
 
         assert_eq!(check.status, Status::Fail);
         assert!(check.detail.contains("failed"), "{}", check.detail);
@@ -421,7 +465,7 @@ mod tests {
         // A running job with a pending transaction stays a warning and says both.
         let mut running = status(true, Some(job("running")));
         running.pending_transaction = Some(pending());
-        let check = launchd_job_check(Ok(running));
+        let check = launchd_job_check(Ok(running), false);
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("is running"), "{}", check.detail);
         assert!(check.detail.contains("pending"), "{}", check.detail);
@@ -432,7 +476,7 @@ mod tests {
         let error = crate::service::Error::NotInstalled {
             path: PathBuf::from("/cfg/service.toml"),
         };
-        let check = launchd_job_check(Err(error));
+        let check = launchd_job_check(Err(error), false);
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("pohunek service status"));
     }
