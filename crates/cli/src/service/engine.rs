@@ -134,13 +134,15 @@ use protocol::{RuntimeState, SessionInfo, SessionState};
 
 use super::backend::Backend;
 use super::context::Context;
-use super::definition::{daemon_definition, identity_config, initial_config, with_version};
+use super::definition::{
+    daemon_definition, identity_config, initial_config_reported, with_version,
+};
 use super::error::{supervisor_error, Error, LiveSession, OutdatedWorker};
 use super::layout::{self, Staged};
 use super::record::{self, Operation, Record, Step, Store, TransactionLock};
 use super::report::{
-    state_name, InstallReport, JobReport, KeptVersion, PendingReport, StatusReport,
-    UninstallReport, UpgradeReport, VersionReport, WorkerReport,
+    state_name, InstallReport, JobReport, KeptVersion, PendingReport, SearchPathReport,
+    StatusReport, UninstallReport, UpgradeReport, VersionReport, WorkerReport,
 };
 use super::settings;
 use super::usage::{Journals, Usage};
@@ -303,12 +305,22 @@ impl<'a> Engine<'a> {
             ensure_no_daemon_job(self.backend).await?;
         }
         // Once `service.toml` is written it is the installation's record, so a
-        // resume past that step reads it instead of probing the host again.
-        let config = match &resume {
+        // resume past that step reads it instead of probing the host again,
+        // after proving it still describes this installation.
+        let (config, search_path_report) = match &resume {
             Some(record) if record.step >= Step::Config => {
-                ServiceConfig::load(&self.context.config_path())?
+                let config = self.verified_resume_config(prefix, version)?;
+                let report = SearchPathReport {
+                    source: "recorded",
+                    entries: config.search_path().entries().to_vec(),
+                    shell_used: None,
+                    shell_defaulted: false,
+                    login_shell_failure: None,
+                    dropped: Vec::new(),
+                };
+                (config, report)
             }
-            _ => initial_config(self.context, prefix, version)?,
+            _ => initial_config_reported(self.context, prefix, version)?,
         };
         let namespace = config.namespace();
         let claimed = layout::claim_prefix(&layout, &namespace)?;
@@ -359,7 +371,35 @@ impl<'a> Engine<'a> {
             daemon_executable: config.daemon_executable(),
             resumed,
             rolled_back,
+            search_path: search_path_report,
         })
+    }
+
+    /// Reads `service.toml` for an install resumed past the config step.
+    ///
+    /// The file is proven to describe this installation before any further
+    /// effect: its prefix, version, and namespace inputs must equal those of
+    /// the interrupted install and of the current user. A mismatch is an error;
+    /// the file is never overwritten here.
+    fn verified_resume_config(&self, prefix: &Path, version: &str) -> Result<ServiceConfig, Error> {
+        let config = ServiceConfig::load(&self.context.config_path())?;
+        let (state_root, runtime_root) = self.context.roots()?;
+        config.verify_installation(self.context.uid(), &state_root, &runtime_root)?;
+        if config.prefix() != prefix {
+            return Err(Error::ResumeConfigMismatch {
+                key: "prefix",
+                recorded: config.prefix().display().to_string(),
+                expected: prefix.display().to_string(),
+            });
+        }
+        if config.active_version() != version {
+            return Err(Error::ResumeConfigMismatch {
+                key: "active_version",
+                recorded: config.active_version().to_owned(),
+                expected: version.to_owned(),
+            });
+        }
+        Ok(config)
     }
 
     /// Upgrades the installation to `version` from the binaries in `from`.

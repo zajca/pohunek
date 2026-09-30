@@ -901,16 +901,28 @@ values never reach agent code. The `[environment]` table of `service.toml` also
 requires a `search_path` list: the absolute, normalized, non-repeating
 directories the installer resolved and hands to the daemon job as its `PATH`
 (an empty list keeps the service manager's own `PATH`; the joined value is
-bounded). Upgrades preserve the recorded list; it reaches the daemon job only when the
-installer writes the job definition (install, or an upgrade to a different
-version), so a manual edit needs a reinstall or such an upgrade to take effect
-(an in-place refresh is tracked in #319). This key
+bounded). Directories are recorded as listed and were trusted when resolved
+(owned by the user or root, not writable by group or others). The path is
+recorded at install and reaches the daemon job only when the installer writes
+the job definition (install, or an upgrade to a different version); upgrades
+reuse the recorded list, so a manual edit takes effect only at the next
+version-changing upgrade, and an in-place refresh is tracked in #319. This key
 raised the `service.toml` `schema_version` to 2; a version 1 file is refused
 with a message to uninstall with the pohunek that wrote it and install again,
-because there is no migration. When the
+because there is no migration. `pohunek service install --json` reports the
+outcome in an additive `search_path` object: `source` (`login_shell`,
+`fallback`, `recorded`, `unmanaged`), `entries`, `shell_used`,
+`shell_defaulted`, `login_shell_failure` (the rendered typed reason when the
+fallback list was used), and `dropped` (`[{path, reason}]`, directories refused
+as untrusted); the human output prints a `warning:` line for a failed login
+shell and for each dropped directory. A set but relative `$SHELL`, or a
+non-UTF-8 `HOME`, `USER`, or `LOGNAME`, fails the install
+(`service_environment_invalid`, `service_environment_not_utf8`). When the
 installer cannot resolve the search path, `pohunek service` fails with the CLI
 error code `service_search_path_unavailable`; an invalid list in an existing
-file is `service_config_invalid`. See
+file is `service_config_invalid`; resuming an interrupted install whose
+`service.toml` names another prefix or version fails with
+`service_resume_config_mismatch`. See
 [environment resolution](knowledge/guides/environment-resolution.md). A worker kept
 running across an upgrade from the previous private protocol version keeps
 starting its session's children from its own sanitized environment until that

@@ -14,23 +14,27 @@
 //! 1. **A configured absolute executable.** A program name containing a `/`
 //!    must be absolute and is used as is; no search happens
 //!    ([`resolve_executable`]).
-//! 2. **A profile or service environment `PATH`.** A validated, explicitly
-//!    configured [`SearchPath`] is authoritative: no discovery runs and no
-//!    lower tier is consulted for it.
+//! 2. **An explicitly supplied environment `PATH`.** A validated
+//!    [`SearchPath`] passed by the caller (a GUI launched from a shell hands
+//!    over its inherited one) is authoritative: no discovery runs. The
+//!    installer supplies none.
 //! 3. **Bounded login-shell discovery** ([`discover_login_shell_path`]). One
 //!    non-interactive login shell (`$SHELL -l -c`, never `-i`) prints `PATH`
-//!    between random sentinels. It runs with a null stdin, a hard deadline,
-//!    a process-group kill, and an output bound, and only when the caller
-//!    supplies a [`LoginShellSpec`].
+//!    between random sentinels. It runs with a null stdin, one hard deadline
+//!    over the whole discovery, a process-group kill, and an output bound, and
+//!    only when the caller supplies a [`LoginShellSpec`]. A login shell reads
+//!    profile files but not interactive ones (`.zshrc`), so the trusted
+//!    fallback directories it lacks are appended after the discovered ones.
 //! 4. **A fixed fallback directory list** ([`DARWIN_FALLBACK_DIRECTORIES`]),
-//!    used when tier 3 is disabled or fails. The failure is reported in
+//!    used alone when tier 3 is disabled or fails. The failure is reported in
 //!    [`PathResolution::login_shell_failure`] instead of being hidden.
 //!
 //! Every tier yields a [`SearchPath`]: absolute, normalized, control-character
 //! free, deduplicated directories. Discovery and the fallback list keep only
 //! trusted directories ([`trusted_directory`]): existing, owned by the user or
-//! root, and not writable by group or others along the whole canonical path. A shell is never used to run commands; the only
-//! shell invocation is the discovery above, as the installing user.
+//! root, and not writable by group or others along the whole canonical path.
+//! A shell is never used to run commands; the only shell invocation is the
+//! discovery above, as the installing user.
 //!
 //! # Examples
 //!
@@ -55,6 +59,8 @@ mod executable;
 mod login_shell;
 mod policy;
 mod search_path;
+#[cfg(test)]
+mod test_support;
 
 #[doc(inline)]
 pub use executable::{resolve_executable, ExecutableError};
@@ -68,6 +74,7 @@ pub use login_shell::{
 pub use policy::{resolve_search_path, PathPolicy, PathResolution, PathSource, ResolveError};
 #[doc(inline)]
 pub use search_path::{
-    fallback_search_path, trusted_directory, validate_search_directory, SanitizedPath, SearchPath,
-    SearchPathError, DARWIN_FALLBACK_DIRECTORIES, MAX_SEARCH_PATH_BYTES,
+    fallback_search_path, trusted_directory, validate_search_directory, DroppedEntry,
+    SanitizedPath, SearchPath, SearchPathError, TrustError, DARWIN_FALLBACK_DIRECTORIES,
+    MAX_SEARCH_PATH_BYTES,
 };

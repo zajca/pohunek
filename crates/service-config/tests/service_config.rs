@@ -139,6 +139,7 @@ fn spec() -> ConfigSpec {
             daemon_restart_throttle: Duration::from_secs(5),
         },
         environment_allowlist: vec!["PATH".to_owned(), "LC_*".to_owned()],
+        search_path: SearchPath::empty(),
         sweep_grace: Duration::from_secs(5),
         open_files: 8192,
     }
@@ -1126,6 +1127,7 @@ fn arb_spec() -> impl Strategy<Value = ConfigSpec> {
                     daemon_restart_throttle: throttle,
                 },
                 environment_allowlist: allowlist.into_iter().collect(),
+                search_path: SearchPath::empty(),
                 sweep_grace,
                 open_files,
             },
@@ -1156,9 +1158,12 @@ fn search_path_round_trips_through_write_and_load() {
         PathBuf::from("/usr/bin"),
     ])
     .expect("search path");
-    let config = ServiceConfig::new(spec())
-        .expect("valid spec")
-        .with_search_path(search.clone());
+    let config = ServiceConfig::new(ConfigSpec {
+        search_path: search.clone(),
+        ..spec()
+    })
+    .expect("valid spec");
+    assert_eq!(config.to_spec().search_path, search);
     config.write(&fixture.path()).expect("write config");
     let loaded = ServiceConfig::load(&fixture.path()).expect("load config");
     assert_eq!(loaded.search_path(), &search);

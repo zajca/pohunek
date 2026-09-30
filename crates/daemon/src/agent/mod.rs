@@ -8,6 +8,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use pohunek_platform::shell_env::{self, SearchPath};
 use protocol::{AgentActivity, ErrorClass, ProtocolError};
 use serde::{Deserialize, Serialize};
 
@@ -67,39 +68,12 @@ pub(crate) struct ValidatedLaunchProgram(PathBuf);
 impl ValidatedLaunchProgram {
     /// Resolve one configured program and canonicalize its first executable match.
     pub(crate) fn resolve(program: &str) -> Option<Self> {
-        let cwd = std::env::current_dir().ok()?;
         let path = std::env::var_os("PATH");
-        Self::resolve_with_path(program, path.as_deref(), &cwd)
+        Self::resolve_with_path(program, path.as_deref())
     }
 
-    fn resolve_with_path(program: &str, path: Option<&OsStr>, cwd: &Path) -> Option<Self> {
-        let configured = Path::new(program);
-        let candidate = if configured.is_absolute()
-            || configured
-                .parent()
-                .is_some_and(|parent| !parent.as_os_str().is_empty())
-        {
-            if configured.is_absolute() {
-                configured.to_owned()
-            } else {
-                cwd.join(configured)
-            }
-        } else {
-            std::env::split_paths(path?).find_map(|entry| {
-                let directory = if entry.as_os_str().is_empty() {
-                    cwd.to_owned()
-                } else if entry.is_absolute() {
-                    entry
-                } else {
-                    cwd.join(entry)
-                };
-                let candidate = directory.join(configured);
-                is_executable_file(&candidate).then_some(candidate)
-            })?
-        };
-        if !is_executable_file(&candidate) {
-            return None;
-        }
+    fn resolve_with_path(program: &str, path: Option<&OsStr>) -> Option<Self> {
+        let candidate = resolve_program(program, path)?;
         let canonical = candidate.canonicalize().ok()?;
         (canonical.is_absolute() && canonical.to_str().is_some()).then_some(Self(canonical))
     }
@@ -594,53 +568,36 @@ pub(crate) fn agent_fork_unsupported() -> ProtocolError {
     ProtocolError::agent_fork_unsupported()
 }
 
-fn resolve_binary(name: &str) -> Result<String, ProtocolError> {
-    let path = std::env::var_os("PATH").ok_or_else(|| missing_binary(name))?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if is_executable_file(&candidate) {
-            return Ok(candidate.to_string_lossy().into_owned());
-        }
-    }
+/// Resolve `program` with the shared executable policy of
+/// [`pohunek_platform::shell_env`].
+///
+/// A program containing `/` must be absolute; a bare name is searched in the
+/// absolute, non-empty, normalized entries of `path` in order, and a candidate
+/// the effective user cannot execute is skipped. Relative and empty `PATH`
+/// entries are never resolved against the working directory.
+fn resolve_program(program: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    let search = path
+        .and_then(OsStr::to_str)
+        .and_then(|value| SearchPath::sanitize(value, false).ok())
+        .map(|sanitized| sanitized.path)
+        .unwrap_or_default();
+    shell_env::resolve_executable(OsStr::new(program), &search).ok()
+}
 
-    Err(missing_binary(name))
+fn resolve_binary(name: &str) -> Result<String, ProtocolError> {
+    let path = std::env::var_os("PATH");
+    resolve_program(name, path.as_deref())
+        .and_then(|resolved| resolved.to_str().map(str::to_owned))
+        .ok_or_else(|| missing_binary(name))
 }
 
 /// Resolve `name` to the first **executable** match on `PATH`, for capability
-/// probing (`host.inspect`). Uses the same executable-bit check as
-/// [`resolve_binary`], so "available" in a capability snapshot agrees with what
-/// the launch path would actually accept — unlike a bare `is_file` probe. Returns
-/// the resolved path, or `None` when nothing executable matches.
+/// probing (`host.inspect`). Uses the same resolver as [`resolve_binary`], so
+/// "available" in a capability snapshot agrees with what the launch path would
+/// accept. Returns the resolved path, or `None` when nothing executable matches.
 pub(crate) fn which_executable(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if is_executable_file(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-pub(crate) fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        metadata.permissions().mode() & 0o111 != 0
-    }
-
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    let path = std::env::var_os("PATH");
+    resolve_program(name, path.as_deref())
 }
 
 fn missing_binary(name: &str) -> ProtocolError {
@@ -666,9 +623,9 @@ mod tests {
 
     use super::{
         base_capabilities, base_resume_template, build_pty_command, fork_pty_command_from_template,
-        resume_pty_command_from_template, AgentAdapter, ClaudeAdapter, CodexAdapter, ForkMode,
-        ForkTemplate, HermesAdapter, LaunchOpts, ResumeMode, ResumeTemplate, SessionRef,
-        SessionRefKind, ShellAdapter, ValidatedLaunchProgram,
+        resolve_binary, resume_pty_command_from_template, which_executable, AgentAdapter,
+        ClaudeAdapter, CodexAdapter, ForkMode, ForkTemplate, HermesAdapter, LaunchOpts, ResumeMode,
+        ResumeTemplate, SessionRef, SessionRefKind, ShellAdapter, ValidatedLaunchProgram,
     };
     use crate::detect::{ManifestRegion, MatchContext};
 
@@ -812,36 +769,113 @@ mod tests {
     }
 
     #[test]
-    fn validated_program_absolutizes_relative_and_empty_path_entries_once() {
+    fn validated_program_refuses_relative_and_empty_path_entries() {
         let cwd = temp_dir("validated-relative-path");
         let relative_dir = cwd.join("relative-bin");
         fs::create_dir(&relative_dir).expect("create relative bin");
-        let relative_hermes = write_executable(&relative_dir, "hermes");
-        let relative = ValidatedLaunchProgram::resolve_with_path(
-            "hermes",
-            Some(OsStr::new("relative-bin")),
-            &cwd,
-        )
-        .expect("resolve relative PATH entry");
-        assert_eq!(
-            relative.as_path(),
-            relative_hermes
-                .canonicalize()
-                .expect("canonical relative fixture")
-        );
+        write_executable(&relative_dir, "hermes");
+        write_executable(&cwd, "hermes");
+        let _cwd_guard = ENV_LOCK.lock().expect("env lock");
+        let old_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&cwd).expect("enter fixture cwd");
+        let results = [
+            // A relative entry, an empty entry (the working directory), and `.`
+            // are never searched; neither is a relative program path.
+            ValidatedLaunchProgram::resolve_with_path("hermes", Some(OsStr::new("relative-bin"))),
+            ValidatedLaunchProgram::resolve_with_path("hermes", Some(OsStr::new(""))),
+            ValidatedLaunchProgram::resolve_with_path("hermes", Some(OsStr::new("."))),
+            ValidatedLaunchProgram::resolve_with_path("./hermes", Some(OsStr::new("/usr/bin"))),
+            ValidatedLaunchProgram::resolve_with_path(
+                "relative-bin/hermes",
+                Some(OsStr::new("/usr/bin")),
+            ),
+        ];
+        std::env::set_current_dir(old_cwd).expect("restore cwd");
+        for (index, result) in results.iter().enumerate() {
+            assert!(result.is_none(), "case {index}: {result:?}");
+        }
+    }
 
-        let cwd_hermes = write_executable(&cwd, "hermes");
-        let empty = ValidatedLaunchProgram::resolve_with_path("hermes", Some(OsStr::new("")), &cwd)
-            .expect("resolve empty PATH entry as cwd");
-        let expected = cwd_hermes.canonicalize().expect("canonical cwd fixture");
-        assert_eq!(empty.as_path(), expected);
+    #[test]
+    fn validated_program_pins_the_canonical_absolute_match() {
+        let bin = temp_dir("validated-absolute");
+        let hermes = write_executable(&bin, "hermes");
+        let validated = ValidatedLaunchProgram::resolve_with_path("hermes", Some(bin.as_os_str()))
+            .expect("resolve on an absolute PATH entry");
+        let expected = hermes.canonicalize().expect("canonical fixture");
+        assert_eq!(validated.as_path(), expected);
+        let by_absolute =
+            ValidatedLaunchProgram::resolve_with_path(hermes.to_str().expect("utf-8"), None)
+                .expect("an absolute program needs no PATH");
+        assert_eq!(by_absolute.as_path(), expected);
 
-        let mut opts = launch_opts(cwd);
-        opts.validated_program = Some(empty);
+        let mut opts = launch_opts(temp_dir("validated-cwd"));
+        opts.validated_program = Some(validated);
         let command = build_pty_command("must-not-be-resolved", vec!["chat".to_owned()], &opts)
             .expect("build from validated program");
         assert_eq!(command.program, expected.display().to_string());
         assert_eq!(command.args, vec!["chat"]);
+    }
+
+    #[test]
+    fn an_unusable_first_candidate_does_not_shadow_a_later_one() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let first = temp_dir("shadow-first");
+        let second = temp_dir("shadow-second");
+        // No execute bit at all: refused for every user, root included.
+        let unusable = first.join("agent");
+        fs::write(&unusable, "#!/bin/sh\nexit 0\n").expect("write");
+        fs::set_permissions(&unusable, fs::Permissions::from_mode(0o644)).expect("chmod");
+        let usable = write_executable(&second, "agent");
+        let path = std::env::join_paths([&first, &second]).expect("join");
+        let resolved = with_path(Path::new(&path), || {
+            (
+                which_executable("agent"),
+                resolve_binary("agent").expect("launch path resolves"),
+                ValidatedLaunchProgram::resolve("agent"),
+            )
+        });
+        assert_eq!(resolved.0.as_deref(), Some(usable.as_path()));
+        assert_eq!(resolved.1, usable.display().to_string());
+        assert_eq!(
+            resolved.2.expect("validated").as_path(),
+            usable.canonicalize().expect("canonical")
+        );
+    }
+
+    #[test]
+    fn the_launch_path_refuses_relative_programs_and_path_entries() {
+        let cwd = temp_dir("launch-relative");
+        let relative_dir = cwd.join("bin");
+        fs::create_dir(&relative_dir).expect("create bin");
+        write_executable(&relative_dir, "agent");
+        write_executable(&cwd, "agent");
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let old_cwd = std::env::current_dir().expect("cwd");
+        let old_path = std::env::var_os("PATH");
+        std::env::set_current_dir(&cwd).expect("enter fixture cwd");
+        let refused = [
+            ("bin", "agent"),
+            ("", "agent"),
+            (".", "agent"),
+            ("/usr/bin", "./agent"),
+            ("/usr/bin", "bin/agent"),
+        ]
+        .map(|(path, program)| {
+            std::env::set_var("PATH", path);
+            (
+                resolve_binary(program).is_err(),
+                which_executable(program).is_none(),
+            )
+        });
+        match old_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        std::env::set_current_dir(old_cwd).expect("restore cwd");
+        for (index, (launch, probe)) in refused.iter().enumerate() {
+            assert!(*launch && *probe, "case {index}");
+        }
     }
 
     #[test]

@@ -223,6 +223,9 @@ pub struct ConfigSpec {
     pub deadlines: Deadlines,
     /// Environment names or trailing-`*` prefixes a worker may forward.
     pub environment_allowlist: Vec<String>,
+    /// Executable search path handed to the daemon job; empty keeps the
+    /// service manager's own `PATH`.
+    pub search_path: SearchPath,
     /// Delay between SIGTERM and SIGKILL when sweeping orphaned processes.
     pub sweep_grace: Duration,
     /// Open-file limit applied to supervised jobs.
@@ -314,22 +317,10 @@ impl ServiceConfig {
             namespace,
             deadlines,
             environment_allowlist: spec.environment_allowlist,
-            search_path: SearchPath::empty(),
+            search_path: spec.search_path,
             sweep_grace: spec.sweep_grace,
             open_files: spec.open_files,
         })
-    }
-
-    /// Returns this configuration with `search_path` as the daemon job `PATH`.
-    ///
-    /// [`ConfigSpec`] carries no search path, so a value rebuilt through
-    /// [`to_spec`](Self::to_spec) and [`new`](Self::new) starts with an empty
-    /// one; callers that keep it re-apply it here. The type already guarantees
-    /// a valid list.
-    #[must_use]
-    pub fn with_search_path(mut self, search_path: SearchPath) -> Self {
-        self.search_path = search_path;
-        self
     }
 
     /// Loads and validates the configuration at an absolute `path`.
@@ -436,8 +427,7 @@ impl ServiceConfig {
     /// Returns the values this configuration was built from.
     ///
     /// Useful to change one value, such as the active version on upgrade, and
-    /// revalidate through [`ServiceConfig::new`]. The search path is not part
-    /// of the spec; see [`with_search_path`](Self::with_search_path).
+    /// revalidate through [`ServiceConfig::new`].
     #[must_use]
     pub fn to_spec(&self) -> ConfigSpec {
         ConfigSpec {
@@ -448,6 +438,7 @@ impl ServiceConfig {
             runtime_root: self.runtime_root.clone(),
             deadlines: self.deadlines,
             environment_allowlist: self.environment_allowlist.clone(),
+            search_path: self.search_path.clone(),
             sweep_grace: self.sweep_grace,
             open_files: self.open_files,
         }
@@ -672,7 +663,7 @@ fn parse(path: &Path, text: &str) -> Result<ServiceConfig, ConfigError> {
     .map_err(|source| ConfigError::InvalidSearchPath {
         detail: source.to_string(),
     })?;
-    let config = ServiceConfig::new(ConfigSpec {
+    ServiceConfig::new(ConfigSpec {
         prefix: PathBuf::from(raw.prefix),
         active_version: raw.active_version,
         uid: raw.namespace.uid,
@@ -689,10 +680,10 @@ fn parse(path: &Path, text: &str) -> Result<ServiceConfig, ConfigError> {
             ),
         },
         environment_allowlist: raw.environment.allowlist,
+        search_path,
         sweep_grace: Duration::from_millis(raw.sweep.grace_ms),
         open_files: raw.limits.open_files,
-    })?;
-    Ok(config.with_search_path(search_path))
+    })
 }
 
 /// Sanitized diagnostic for one TOML parse failure over `text`.

@@ -59,7 +59,11 @@ with `service_prefix_owned`; pick another `--prefix`, or uninstall the owning
 installation first, which releases the prefix. An existing version directory
 is reused only when it and its binaries are exactly what the installer creates
 (owned by you, mode `0755`, no symbolic links, no extra hard links); otherwise
-the install fails with `service_version_untrusted`.
+the install fails with `service_version_untrusted`. On macOS the install also
+resolves the daemon's `PATH` (login-shell discovery plus a trusted fallback
+directory list) and prints a `path` line, with a `warning:` line for a failed
+login shell or a refused directory; see
+[environment resolution](environment-resolution.md).
 Session workers are not installed: the daemon starts one systemd transient unit
 or one launchd job per worker generation, and the daemon and workers are
 siblings, so restarting the daemon never stops a worker. The release archive's

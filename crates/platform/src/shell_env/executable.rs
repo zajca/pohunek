@@ -99,6 +99,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
+    use crate::shell_env::test_support::{fixture, make_dir};
 
     fn executable(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
@@ -109,11 +110,11 @@ mod tests {
 
     #[test]
     fn a_bare_name_resolves_in_search_order() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = fixture();
         let first = dir.path().join("first bin");
         let second = dir.path().join("zwei\u{e9}");
-        fs::create_dir_all(&first).expect("first");
-        fs::create_dir_all(&second).expect("second");
+        make_dir(dir.path(), &first);
+        make_dir(dir.path(), &second);
         let winner = executable(&first, "agent");
         executable(&second, "agent");
         let only_second = executable(&second, "only-second");
@@ -130,7 +131,7 @@ mod tests {
 
     #[test]
     fn names_with_spaces_quotes_and_unicode_resolve_verbatim() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = fixture();
         for name in [
             "my agent",
             "it's",
@@ -149,7 +150,7 @@ mod tests {
 
     #[test]
     fn a_configured_absolute_path_skips_the_search() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = fixture();
         let path = executable(dir.path(), "agent");
         let search = SearchPath::empty();
         assert_eq!(
@@ -170,7 +171,7 @@ mod tests {
 
     #[test]
     fn non_executable_and_missing_programs_are_reported() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = fixture();
         let plain = dir.path().join("plain");
         fs::write(&plain, "data").expect("plain");
         let search = SearchPath::new(vec![dir.path().to_path_buf()]).expect("search");
@@ -196,34 +197,40 @@ mod tests {
 
     #[test]
     fn a_file_the_user_cannot_execute_is_skipped_along_the_search() {
-        // Root passes the execute check for any file with an execute bit.
-        if rustix::process::geteuid().is_root() {
-            return;
-        }
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = fixture();
         let first = dir.path().join("first");
         let second = dir.path().join("second");
-        fs::create_dir_all(&first).expect("first");
-        fs::create_dir_all(&second).expect("second");
-        // Executable by group and others only: the owner is refused.
-        let unusable = first.join("agent");
-        fs::write(&unusable, "#!/bin/sh\n").expect("write");
-        fs::set_permissions(&unusable, fs::Permissions::from_mode(0o011)).expect("chmod");
+        make_dir(dir.path(), &first);
+        make_dir(dir.path(), &second);
         let usable = executable(&second, "agent");
-        let search = SearchPath::new(vec![first, second]).expect("search");
+        let search = SearchPath::new(vec![first.clone(), second]).expect("search");
+        // No execute bit at all: refused for every user, root included.
+        let no_bits = first.join("agent");
+        fs::write(&no_bits, "#!/bin/sh\n").expect("write");
+        fs::set_permissions(&no_bits, fs::Permissions::from_mode(0o644)).expect("chmod");
         assert_eq!(
             resolve_executable(OsStr::new("agent"), &search).expect("agent"),
             usable
         );
         assert_eq!(
-            resolve_executable(unusable.as_os_str(), &search),
+            resolve_executable(no_bits.as_os_str(), &search),
             Err(ExecutableError::NotExecutable)
+        );
+        // Executable by group and others only: the owner is refused by the
+        // kernel, but root may run any file that has an execute bit.
+        let others_only = first.join("others-only");
+        fs::write(&others_only, "#!/bin/sh\n").expect("write");
+        fs::set_permissions(&others_only, fs::Permissions::from_mode(0o011)).expect("chmod");
+        let owner_refused = !rustix::process::geteuid().is_root();
+        assert_eq!(
+            resolve_executable(others_only.as_os_str(), &search).is_err(),
+            owner_refused
         );
     }
 
     #[test]
     fn owner_only_execute_permission_counts() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = fixture();
         let path = dir.path().join("agent");
         fs::write(&path, "#!/bin/sh\n").expect("write");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("chmod");

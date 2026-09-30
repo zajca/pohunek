@@ -8,12 +8,13 @@ use std::path::{Path, PathBuf};
 use pohunek_paths::{BasePaths, PathEnv, HOME, XDG_RUNTIME_DIR};
 use pohunek_platform::filesystem::TrustedDir;
 use pohunek_platform::shell_env::{
-    resolve_search_path, LoginShellSpec, PathPolicy, PathResolution, SearchPath,
-    DARWIN_FALLBACK_DIRECTORIES, PRINTENV_EXECUTABLE,
+    resolve_search_path, LoginShellSpec, PathPolicy, SearchPath, DARWIN_FALLBACK_DIRECTORIES,
+    PRINTENV_EXECUTABLE,
 };
 use pohunek_platform::supervisor::{self, Namespace};
 
 use super::error::{fs_error, io_error, Error};
+use super::report::{DroppedPath, SearchPathReport};
 use super::settings;
 
 /// Mode of the application state and runtime roots.
@@ -49,6 +50,9 @@ pub enum PathDiscovery {
     Managed {
         /// Login-shell probe to run first, or `None` to use the fallback list.
         login_shell: Option<LoginShellSpec>,
+        /// Whether the probe shell is the built-in default because `$SHELL`
+        /// was unset.
+        shell_defaulted: bool,
         /// Fallback directory table, see [`DARWIN_FALLBACK_DIRECTORIES`].
         fallback_directories: Vec<String>,
     },
@@ -118,7 +122,7 @@ impl Context {
         let cli_executable = std::env::current_exe()
             .and_then(std::fs::canonicalize)
             .map_err(io_error("locate", "the running pohunek executable"))?;
-        let path_discovery = host_path_discovery();
+        let path_discovery = host_path_discovery()?;
         Ok(Self::new(
             paths,
             nix::unistd::Uid::effective().as_raw(),
@@ -203,18 +207,30 @@ impl Context {
     ///
     /// Empty for [`PathDiscovery::Unmanaged`]. Otherwise the tier order of
     /// [`pohunek_platform::shell_env`] applies; a failed login-shell probe
-    /// falls back to the directory list and is logged with its typed reason.
+    /// falls back to the directory list. The report carries the source, the
+    /// failure, and every refused directory, so the caller can show them.
     ///
     /// # Errors
     ///
     /// Returns [`Error::SearchPath`] when no tier yields a usable directory.
-    pub fn install_search_path(&self) -> Result<SearchPath, Error> {
+    pub fn install_search_path(&self) -> Result<(SearchPath, SearchPathReport), Error> {
         let PathDiscovery::Managed {
             login_shell,
+            shell_defaulted,
             fallback_directories,
         } = &self.path_discovery
         else {
-            return Ok(SearchPath::empty());
+            return Ok((
+                SearchPath::empty(),
+                SearchPathReport {
+                    source: "unmanaged",
+                    entries: Vec::new(),
+                    shell_used: None,
+                    shell_defaulted: false,
+                    login_shell_failure: None,
+                    dropped: Vec::new(),
+                },
+            ));
         };
         let fallback: Vec<&str> = fallback_directories.iter().map(String::as_str).collect();
         let resolution = resolve_search_path(&PathPolicy {
@@ -223,8 +239,24 @@ impl Context {
             fallback_directories: &fallback,
             home: self.home.as_deref(),
         })?;
-        report_resolution(&resolution);
-        Ok(resolution.path)
+        let report = SearchPathReport {
+            source: resolution.source.as_str(),
+            entries: resolution.path.entries().to_vec(),
+            shell_used: resolution.shell,
+            shell_defaulted: *shell_defaulted && login_shell.is_some(),
+            login_shell_failure: resolution
+                .login_shell_failure
+                .map(|error| error.to_string()),
+            dropped: resolution
+                .untrusted
+                .into_iter()
+                .map(|dropped| DroppedPath {
+                    path: dropped.entry,
+                    reason: dropped.reason,
+                })
+                .collect(),
+        };
+        Ok((resolution.path, report))
     }
 
     /// Returns the bootstrap environment for the daemon's job definition.
@@ -303,40 +335,33 @@ impl Context {
     }
 }
 
-/// Logs which tier produced the daemon `PATH` and why discovery fell back.
-fn report_resolution(resolution: &PathResolution) {
-    let source = resolution.source.as_str();
-    if let Some(error) = &resolution.login_shell_failure {
-        tracing::warn!(
-            search_path.source = source,
-            search_path.entries = resolution.path.entries().len(),
-            error.message = %error,
-            "login shell PATH discovery failed; using the fallback directory list"
-        );
-    } else {
-        tracing::info!(
-            search_path.source = source,
-            search_path.entries = resolution.path.entries().len(),
-            search_path.dropped = resolution.dropped,
-            "resolved the daemon executable search path"
-        );
-    }
-}
-
 /// Builds the managed discovery policy for a user whose login shell is `shell`.
 ///
-/// A `shell` that is unset or not absolute falls back to
-/// [`settings::DEFAULT_LOGIN_SHELL`]. `environment` holds the non-secret
-/// variables the shell needs to find its startup files.
-#[must_use]
+/// An unset `shell` selects [`settings::DEFAULT_LOGIN_SHELL`], which the report
+/// says. `environment` holds the non-secret variables the shell needs to find
+/// its startup files.
+///
+/// # Errors
+///
+/// Returns [`Error::UnusableEnv`] for a `shell` that is not absolute: a set but
+/// unusable `$SHELL` is refused instead of replaced by a guess.
 pub fn managed_path_discovery(
     shell: Option<PathBuf>,
     environment: Vec<(String, String)>,
-) -> PathDiscovery {
-    let shell = shell
-        .filter(|shell| shell.is_absolute())
-        .unwrap_or_else(|| PathBuf::from(settings::DEFAULT_LOGIN_SHELL));
-    PathDiscovery::Managed {
+) -> Result<PathDiscovery, Error> {
+    let shell_defaulted = shell.is_none();
+    let shell = match shell {
+        Some(shell) if shell.is_absolute() => shell,
+        Some(shell) => {
+            return Err(unusable(
+                "SHELL",
+                &shell,
+                "it is not an absolute path".to_owned(),
+            ));
+        }
+        None => PathBuf::from(settings::DEFAULT_LOGIN_SHELL),
+    };
+    Ok(PathDiscovery::Managed {
         login_shell: Some(LoginShellSpec {
             shell,
             printenv: PathBuf::from(PRINTENV_EXECUTABLE),
@@ -344,31 +369,42 @@ pub fn managed_path_discovery(
             timeout: settings::LOGIN_SHELL_TIMEOUT,
             max_output_bytes: settings::LOGIN_SHELL_OUTPUT,
         }),
+        shell_defaulted,
         fallback_directories: DARWIN_FALLBACK_DIRECTORIES
             .iter()
             .map(|directory| (*directory).to_owned())
             .collect(),
-    }
+    })
 }
 
 /// Builds the host's discovery policy: login-shell probing on macOS only.
+///
+/// A `HOME`, `USER`, or `LOGNAME` that is set but not UTF-8 fails instead of
+/// being left out, because the shell would then read another user's startup
+/// files.
 #[cfg(target_os = "macos")]
-fn host_path_discovery() -> PathDiscovery {
-    let environment = ["HOME", "USER", "LOGNAME"]
-        .into_iter()
-        .filter_map(|name| {
-            std::env::var(name)
-                .ok()
-                .map(|value| (name.to_owned(), value))
-        })
-        .collect();
+fn host_path_discovery() -> Result<PathDiscovery, Error> {
+    let mut environment = Vec::new();
+    for name in ["HOME", "USER", "LOGNAME"] {
+        if let Some(value) = std::env::var_os(name) {
+            let text = value.into_string().map_err(|value| Error::NonUtf8Env {
+                var: name,
+                path: PathBuf::from(value),
+            })?;
+            environment.push((name.to_owned(), text));
+        }
+    }
     managed_path_discovery(std::env::var_os("SHELL").map(PathBuf::from), environment)
 }
 
 /// systemd hands the user manager's environment to the daemon job.
 #[cfg(not(target_os = "macos"))]
-fn host_path_discovery() -> PathDiscovery {
-    PathDiscovery::Unmanaged
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "one signature for both targets; only macOS reads the environment"
+)]
+fn host_path_discovery() -> Result<PathDiscovery, Error> {
+    Ok(PathDiscovery::Unmanaged)
 }
 
 /// Returns where the daemon definition goes for `paths` and `home`.
@@ -437,6 +473,21 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().expect("temp dir");
         let path = std::fs::canonicalize(root.path()).expect("canonical temp dir");
         (root, path)
+    }
+
+    /// Creates `path` below `root`, every new component with mode 0755
+    /// regardless of the process umask, as the path trust checks require.
+    pub(crate) fn make_dirs(root: &Path, path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut current = root.to_path_buf();
+        for component in path.strip_prefix(root).expect("below root").components() {
+            current.push(component);
+            if !current.exists() {
+                std::fs::create_dir(&current).expect("create directory");
+                std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod directory");
+            }
+        }
     }
 
     /// Resolves application paths below `root` without touching the process environment.

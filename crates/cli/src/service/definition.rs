@@ -11,6 +11,7 @@ use pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST;
 
 use super::context::Context;
 use super::error::{supervisor_error, Error};
+use super::report::SearchPathReport;
 use super::settings;
 
 /// Daemon argument naming the service configuration file.
@@ -33,8 +34,22 @@ pub fn initial_config(
     prefix: &Path,
     version: &str,
 ) -> Result<ServiceConfig, Error> {
-    let search_path = context.install_search_path()?;
-    config_with_search_path(context, prefix, version, search_path)
+    initial_config_reported(context, prefix, version).map(|(config, _report)| config)
+}
+
+/// Like [`initial_config`], and also returns how the `PATH` was resolved.
+///
+/// # Errors
+///
+/// See [`initial_config`].
+pub fn initial_config_reported(
+    context: &Context,
+    prefix: &Path,
+    version: &str,
+) -> Result<(ServiceConfig, SearchPathReport), Error> {
+    let (search_path, report) = context.install_search_path()?;
+    let config = config_with_search_path(context, prefix, version, search_path)?;
+    Ok((config, report))
 }
 
 /// Builds the configuration of an installation that is only identified, not
@@ -62,7 +77,7 @@ fn config_with_search_path(
     search_path: SearchPath,
 ) -> Result<ServiceConfig, Error> {
     let (state_root, runtime_root) = context.roots()?;
-    let config = ServiceConfig::new(ConfigSpec {
+    Ok(ServiceConfig::new(ConfigSpec {
         prefix: prefix.to_path_buf(),
         active_version: version.to_owned(),
         uid: context.uid(),
@@ -80,10 +95,10 @@ fn config_with_search_path(
             .iter()
             .map(|pattern| (*pattern).to_owned())
             .collect(),
+        search_path,
         sweep_grace: settings::SWEEP_GRACE,
         open_files: settings::OPEN_FILES,
-    })?;
-    Ok(config.with_search_path(search_path))
+    })?)
 }
 
 /// Returns `config` with only its active version changed.
@@ -96,7 +111,7 @@ fn config_with_search_path(
 pub fn with_version(config: &ServiceConfig, version: &str) -> Result<ServiceConfig, Error> {
     let mut spec = config.to_spec();
     version.clone_into(&mut spec.active_version);
-    Ok(ServiceConfig::new(spec)?.with_search_path(config.search_path().clone()))
+    Ok(ServiceConfig::new(spec)?)
 }
 
 /// Builds the daemon's job definition for `config`.
@@ -179,8 +194,8 @@ fn daemon_logs(
 mod tests {
     use super::*;
     use crate::service::context::managed_path_discovery;
-    use crate::service::context::tests::context;
     use crate::service::context::tests::temp_root;
+    use crate::service::context::tests::{context, make_dirs};
     use crate::service::context::PathDiscovery;
 
     #[test]
@@ -257,7 +272,7 @@ mod tests {
 
     /// A context whose discovery runs `shell` and falls back to `fallback`.
     fn managed_context(root: &Path, shell: std::path::PathBuf, fallback: &[String]) -> Context {
-        let discovery = managed_path_discovery(Some(shell), Vec::new());
+        let discovery = managed_path_discovery(Some(shell), Vec::new()).expect("discovery");
         let PathDiscovery::Managed {
             login_shell: Some(mut login_shell),
             ..
@@ -268,6 +283,7 @@ mod tests {
         login_shell.timeout = std::time::Duration::from_millis(500);
         context(root).with_path_discovery(PathDiscovery::Managed {
             login_shell: Some(login_shell),
+            shell_defaulted: false,
             fallback_directories: fallback.to_vec(),
         })
     }
@@ -293,7 +309,7 @@ mod tests {
         let local = root.join("home/.local/bin");
         let project = root.join("Projekty \u{10d}esk\u{e9}/it's \"a\" app/bin");
         for dir in [&brew, &local, &project] {
-            std::fs::create_dir_all(dir).expect("dir");
+            make_dirs(root, dir);
         }
         let value = format!(
             "{}:{}:{}",
@@ -340,7 +356,7 @@ mod tests {
         let brew = root.join("opt/homebrew/bin");
         let cargo = root.join("home/.cargo/bin");
         for dir in [&brew, &cargo] {
-            std::fs::create_dir_all(dir).expect("dir");
+            make_dirs(root, dir);
         }
         let fallback = vec![
             "~/.cargo/bin".to_owned(),
@@ -392,11 +408,13 @@ mod tests {
     fn the_managed_policy_uses_the_documented_defaults() {
         let PathDiscovery::Managed {
             login_shell: Some(spec),
+            shell_defaulted,
             fallback_directories,
-        } = managed_path_discovery(Some(std::path::PathBuf::from("relative/zsh")), Vec::new())
+        } = managed_path_discovery(None, Vec::new()).expect("discovery")
         else {
             panic!("managed discovery");
         };
+        assert!(shell_defaulted, "an unset $SHELL is reported as defaulted");
         assert_eq!(spec.shell, Path::new(settings::DEFAULT_LOGIN_SHELL));
         assert_eq!(spec.timeout, settings::LOGIN_SHELL_TIMEOUT);
         assert_eq!(spec.max_output_bytes, settings::LOGIN_SHELL_OUTPUT);
@@ -404,11 +422,67 @@ mod tests {
         assert!(fallback_directories.contains(&"/usr/local/bin".to_owned()));
         let PathDiscovery::Managed {
             login_shell: Some(spec),
+            shell_defaulted,
             ..
         } = managed_path_discovery(Some(std::path::PathBuf::from("/bin/fish")), Vec::new())
+            .expect("discovery")
         else {
             panic!("managed discovery");
         };
+        assert!(!shell_defaulted);
         assert_eq!(spec.shell, Path::new("/bin/fish"));
+    }
+
+    #[test]
+    fn a_relative_shell_is_refused_instead_of_replaced() {
+        for shell in ["relative/zsh", "zsh", ""] {
+            let error = managed_path_discovery(Some(std::path::PathBuf::from(shell)), Vec::new())
+                .expect_err(shell);
+            assert_eq!(error.code(), "service_environment_invalid", "{shell:?}");
+        }
+    }
+
+    #[test]
+    fn the_report_names_the_source_the_failure_and_refused_directories() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_root, root) = temp_root();
+        let root = root.as_path();
+        let good = root.join("home/.local/bin");
+        let loose = root.join("opt/homebrew/bin");
+        make_dirs(root, &good);
+        make_dirs(root, &loose);
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o775)).expect("chmod");
+        let fallback = vec!["~/.local/bin".to_owned(), loose.display().to_string()];
+        let value = format!("{}:{}", good.display(), loose.display());
+        let value_file = root.join("path-value");
+        std::fs::write(&value_file, &value).expect("value");
+
+        // A successful probe: its untrusted directory is refused and reported.
+        let shell = fake_shell(
+            root,
+            &format!(
+                "PATH=\"$(cat '{}')\"; export PATH\nexec /bin/sh -c \"$3\"",
+                value_file.display()
+            ),
+        );
+        let context = managed_context(root, shell, &fallback);
+        let (path, report) = context.install_search_path().expect("resolve");
+        assert_eq!(path.entries(), std::slice::from_ref(&good));
+        assert_eq!(report.source, "login_shell");
+        assert!(report.login_shell_failure.is_none());
+        assert_eq!(report.dropped.len(), 1, "{:?}", report.dropped);
+        assert_eq!(report.dropped[0].path, loose.display().to_string());
+        assert!(report.needs_warning());
+
+        // A failing probe: the fallback list is used and the reason is reported.
+        let shell = fake_shell(root, "exit 3");
+        let context = managed_context(root, shell.clone(), &fallback);
+        let (path, report) = context.install_search_path().expect("resolve");
+        assert_eq!(path.entries(), [good]);
+        assert_eq!(report.source, "fallback");
+        assert_eq!(report.shell_used.as_deref(), Some(shell.as_path()));
+        assert!(!report.shell_defaulted);
+        let failure = report.login_shell_failure.expect("failure");
+        assert!(failure.contains("exit code 3"), "{failure}");
     }
 }

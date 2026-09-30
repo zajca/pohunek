@@ -24,6 +24,7 @@ use protocol::{
 use super::*;
 use crate::service::backend::{Call, Control, Health};
 use crate::service::context::tests::{context, temp_root};
+use crate::service::definition::initial_config;
 use crate::service::inherited::Token;
 use crate::service::layout::tests::stage_dir;
 use crate::service::layout::CLI_NAME;
@@ -749,7 +750,7 @@ fn discovering(
     dir: &std::path::Path,
 ) -> Context {
     use std::os::unix::fs::PermissionsExt as _;
-    std::fs::create_dir_all(dir).expect("discovered dir");
+    crate::service::context::tests::make_dirs(root, dir);
     let shell = root.join(name);
     std::fs::write(
         &shell,
@@ -760,12 +761,24 @@ fn discovering(
     )
     .expect("write shell");
     std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let discovery = crate::service::context::managed_path_discovery(Some(shell), Vec::new())
+        .expect("discovery");
+    let crate::service::context::PathDiscovery::Managed {
+        login_shell,
+        shell_defaulted,
+        ..
+    } = discovery
+    else {
+        panic!("managed discovery");
+    };
+    // No fallback directories, so the recorded path is what the shell printed.
     context
         .clone()
-        .with_path_discovery(crate::service::context::managed_path_discovery(
-            Some(shell),
-            Vec::new(),
-        ))
+        .with_path_discovery(crate::service::context::PathDiscovery::Managed {
+            login_shell,
+            shell_defaulted,
+            fallback_directories: Vec::new(),
+        })
 }
 
 #[tokio::test]
@@ -792,6 +805,42 @@ async fn a_resumed_install_keeps_the_path_recorded_in_service_toml() {
     assert_eq!(recorded, first.display().to_string());
     let registered = harness.fake.world().registered.clone().expect("registered");
     assert_eq!(registered.environment().get("PATH"), Some(&recorded));
+}
+
+#[tokio::test]
+async fn a_resume_refuses_a_service_toml_of_another_installation() {
+    for (key, edit) in [("prefix", 0_u8), ("active_version", 1_u8)] {
+        let harness = Harness::new();
+        let mut engine = harness.engine();
+        engine.interrupt_after = Some(Step::Registering);
+        engine
+            .install(&harness.staged(V1), &harness.prefix(), V1)
+            .await
+            .expect_err("interrupted");
+        let mut spec = harness.config().expect("config").to_spec();
+        if edit == 0 {
+            spec.prefix = harness.root.join("elsewhere");
+        } else {
+            spec.active_version = "9.9.9".to_owned();
+        }
+        let edited = ServiceConfig::new(spec).expect("valid edited config");
+        edited.write(&harness.context.config_path()).expect("write");
+        let before = std::fs::read(harness.context.config_path()).expect("read");
+
+        let error = harness.install(V1).await.expect_err("mismatch");
+        assert!(
+            matches!(&error, Error::ResumeConfigMismatch { key: found, .. } if *found == key),
+            "{key}: {error:?}"
+        );
+        assert_eq!(error.code(), "service_resume_config_mismatch");
+        // Nothing was overwritten and the record stays for an operator.
+        assert_eq!(
+            std::fs::read(harness.context.config_path()).expect("read"),
+            before,
+            "{key}"
+        );
+        assert!(harness.pending().is_some(), "{key}");
+    }
 }
 
 #[tokio::test]

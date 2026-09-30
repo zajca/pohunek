@@ -20,45 +20,44 @@ result so every later start is deterministic.
 Highest priority first:
 
 1. **A configured absolute executable.** A program name containing `/` must be
-   absolute and executable; it is used as is and no search happens.
-2. **A profile or service environment `PATH`.** A non-empty
-   `[environment] search_path` in `service.toml` is authoritative: no discovery
-   runs and no lower tier is consulted for it. Upgrades carry the recorded list
-   forward. A fresh install has no `service.toml` yet, so this tier applies
-   only to an existing installation. The daemon does not read the file at run
-   time: the list reaches the launchd job only when a job definition is
-   written (see "Where the result goes").
+   absolute and executable; a relative one (`./agent`, `bin/agent`) is refused
+   and no search happens. The daemon resolves agent programs (capability
+   detection, create, resume) through this same resolver and launches the exact
+   canonical path it probed.
+2. **An explicitly supplied environment `PATH`.** A caller that already has a
+   validated `PATH` (the GUI, launched from a shell, passes its inherited one)
+   uses it without discovery. `pohunek service install` supplies none.
 3. **Bounded login-shell discovery (macOS only).** One `$SHELL -l -c` probe
    prints `PATH` between two random sentinel lines through the absolute
    `/usr/bin/printenv`. It is never interactive (`-i` is not used), reads a
    null stdin, starts from an empty environment plus `HOME`, `USER`, `LOGNAME`,
-   `TERM=dumb`, and a baseline `PATH`, and runs in its own process group. A hard
-   deadline (10 s) kills the group; output above 64 KiB kills it too. User
-   startup output before or after the sentinels is ignored, and a decoy line
-   cannot spoof the random sentinel.
-4. **A fallback directory list.** Used when tier 3 is unavailable or failed.
-   The list is one table in `pohunek_platform::shell_env`
+   `TERM=dumb`, and a baseline `PATH`, and runs in its own process group. One
+   deadline (10 s) covers the whole discovery: executable checks, the probe, and
+   the filesystem validation; output above 64 KiB kills the probe too. The
+   group is killed as soon as the shell exits, so a background job left by a
+   startup file cannot hold the output open. User startup output before or
+   after the sentinels is ignored, and a decoy line cannot spoof the random
+   sentinel. A login shell reads profile files but not `.zshrc`, so the trusted
+   fallback directories it lacks are appended after the discovered ones.
+4. **A fallback directory list.** Used alone when tier 3 is unavailable or
+   failed. The list is one table in `pohunek_platform::shell_env`
    (`DARWIN_FALLBACK_DIRECTORIES`): `~/.local/bin`, `~/.cargo/bin`,
    `~/.bun/bin`, `/opt/homebrew/{bin,sbin}` (Apple Silicon Homebrew),
    `/usr/local/{bin,sbin}` (Intel Homebrew and vendor installers), then the
-   system directories. Only existing directories are kept; no single Homebrew
-   prefix is assumed.
+   system directories. No single Homebrew prefix is assumed.
 
 Login-shell output and the fallback table are untrusted input, so a directory
 is kept only when it is trusted: symlinks are resolved, every component of the
 canonical path is owned by the user or root and not writable by others (the
 platform's trusted-ancestor rules), and the directory itself is not writable
-by group or others. `/tmp`, other sticky world-writable directories, and
-anything below a writable ancestor are dropped and counted, because another
-local account could plant an agent executable there. The 10 s deadline covers
-the whole discovery, including these filesystem checks; a stalled mount
-produces a timeout and the fallback list applies.
-
-Every tier yields absolute, normalized, control-character-free, deduplicated
-directories. Login-shell output and the fallback table keep existing
-directories only, and entries that are empty, relative, `.`-style, duplicated,
-or missing are dropped. A `PATH` containing a control character is garbage and
-fails the probe.
+by group or others. `/tmp`, other sticky world-writable directories, anything
+below a writable ancestor, and group-writable directories (such as an
+admin-group Intel `/usr/local/bin`, which is out of scope) are refused,
+because another local account could plant an agent executable there. The entry
+is recorded as listed, not as its canonical path, so a profile or dotfile
+symlink keeps following its target. Empty, relative, `.`-style, duplicate, and
+missing entries are ignored; a `PATH` containing a control character is
+garbage and fails the probe.
 
 ## Failure handling
 
@@ -71,30 +70,39 @@ Discovery fails closed and never invents a value for required configuration:
 | Prints nothing or junk without the sentinels | `MalformedOutput`, fallback list used |
 | Exits non-zero | `Failed`, fallback list used |
 | Prints a `PATH` with no usable directory | `UnusablePath`, fallback list used |
+| `$SHELL` is set but not absolute | `pohunek service install` fails (`service_environment_invalid`) |
+| `$SHELL` is unset | `/bin/zsh` is used and the report says so |
 
-The fallback is an optional platform default and its use is logged with the
-typed reason (`login shell PATH discovery failed; using the fallback directory
-list`). If not even one fallback directory exists, `pohunek service install`
+If not even one trusted fallback directory exists, `pohunek service install`
 fails with `service_search_path_unavailable` instead of starting a daemon with
-an empty search path.
+an empty search path. A `HOME`, `USER`, or `LOGNAME` that is set but not UTF-8
+fails the install rather than being left out of the probe environment.
 
 ## Where the result goes
 
-`pohunek service install` records the resolved directories in
-`service.toml` under `[environment] search_path` and hands their `:`-joined
-value to the daemon job as `PATH` (the launchd plist `EnvironmentVariables`).
-The daemon forwards `PATH` to workers and agents through the existing
-`[environment] allowlist`, which stays the only channel: no other variable is
-added, and no secret or interactive environment is captured. Linux and systemd
-keep `search_path = []`: the daemon inherits the user manager's environment and
-no `PATH` is written.
+`pohunek service install` records the resolved directories in `service.toml`
+under `[environment] search_path` and hands their `:`-joined value to the daemon
+job as `PATH` (the launchd plist `EnvironmentVariables`). The daemon forwards
+`PATH` to workers and agents through the existing `[environment] allowlist`,
+which stays the only channel: no other variable is added, and no secret or
+interactive environment is captured. Linux and systemd keep `search_path = []`:
+the daemon inherits the user manager's environment and no `PATH` is written.
 
-Upgrades and rollbacks reuse the recorded `search_path` and never run a login
-shell. The job definition is written only at install and at an upgrade to a
-different version, so an edit of `search_path` in `service.toml` takes effect
-only after a reinstall (uninstall, then install) or an upgrade to a different
-version; a same-version upgrade returns before it replaces the job. A command
-that refreshes the path in place is tracked in #319.
+The install result reports how the path was obtained: `search_path.source`
+(`login_shell`, `fallback`, `recorded` for a resumed install, or `unmanaged`),
+the recorded `entries`, `shell_used` and `shell_defaulted`, the typed
+`login_shell_failure` when the fallback list was used, and `dropped`, the
+directories refused as untrusted with a reason. The human output prints a
+`warning:` line for a failed login shell and for each refused directory. This
+is the only place the outcome is visible, so read it after installing.
+
+The path is recorded at install. The job definition is written only at install
+and at an upgrade to a different version, and upgrades reuse the recorded list
+without running a login shell, so an edit of `search_path` in `service.toml`
+takes effect only at the next version-changing upgrade; a same-version upgrade
+returns before it replaces the job. To pick up a newly installed prefix,
+uninstall and install again. A command that refreshes the path in place is
+tracked in #319.
 
 ## Safety rules
 
@@ -105,6 +113,9 @@ that refreshes the path in place is tracked in #319.
   absolute `printenv` path; no untrusted value is interpolated into it.
 - Discovery output is bounded, validated, and never logged verbatim; errors
   carry reasons, not the printed value.
+- An abandoned discovery (deadline passed) starts no shell and validates no
+  further output; a filesystem call already stuck in the kernel cannot be
+  cancelled, only abandoned.
 
 ## Attach command templates
 
@@ -112,17 +123,25 @@ The GUI attach template uses `{bin}`, `{host}`, and `{id}`. It can be rendered i
 one of two ways, both in `pohunek-gui-core`:
 
 - **Shell string**: `render_attach_command` renders one string for `sh -c`.
-  Substitution is a single pass, and a placeholder is accepted only where the
-  shell reads it as an unquoted word; its value is escaped as exactly one such
-  word. A value containing quotes, `$()`, backticks, newlines, `;`, spaces,
-  Unicode, or another placeholder therefore never changes the command's
-  structure. A POSIX quote state machine finds the positions. A placeholder
-  inside `'...'`, `"..."`, `$'...'`, a comment, after a heredoc operator, line
-  continuation, or command substitution, or right after a backslash, is refused
-  with `AttachTemplateError::UnsafePlaceholderContext` (an unclosed quote is
-  `UnterminatedQuote`). To run a nested script, pass the values as positional
+  Substitution is a single pass, and a placeholder is accepted only as an
+  unquoted word; its value is escaped as exactly one such word, so a value
+  containing quotes, `$()`, backticks, newlines, `;`, spaces, Unicode, or
+  another placeholder never changes the command's structure. The template is
+  not parsed as shell. When it holds a placeholder it must fit an allowlist
+  grammar: outside single quotes, no backtick, parenthesis, bracket, `<`, `>`,
+  literal brace, `#` comment, line continuation, or `$` other than a plain
+  `$NAME`; double-quoted text may hold no `$` construct or backtick;
+  single-quoted text is opaque. Anything else, a placeholder inside quotes, or a
+  placeholder right after `$`, is refused with
+  `AttachTemplateError::UnsafePlaceholderContext` (an unclosed quote is
+  `UnterminatedQuote`, a template with no command `EmptyCommand`). Values are
+  data for the launched program: a shell builtin that evaluates its arguments
+  (`let`, `eval`, arithmetic) can still interpret one, so never pass a value to
+  such a builtin. To run a nested script, pass the values as positional
   parameters instead of quoting them into the script:
   `attach_command = "$TERMINAL -e sh -c 'exec \"$@\"' sh {bin} attach --host {host} {id}"`.
+  Bare words exclude `,` and `=` and a leading `-`, so values never take
+  brace-expansion, assignment-word, or option shapes.
 - **Argument vector**: `render_attach_argv` renders an argument vector without a shell.
   Only the template is split (POSIX quoting, no expansion, only space, tab, and
   newline separate words); values are inserted after splitting as data in
