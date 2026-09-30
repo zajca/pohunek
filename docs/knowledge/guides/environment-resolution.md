@@ -93,25 +93,27 @@ shell. To pick up a newly installed prefix, edit `search_path` in
 
 ## Attach command templates
 
-The GUI attach template uses `{bin}`, `{host}`, and `{id}`. Two renderers exist
-in `pohunek-gui-core`:
+The GUI attach template uses `{bin}`, `{host}`, and `{id}`. It runs in one of two
+modes (`attach_command_mode`), both in `pohunek-gui-core`:
 
-- `render_attach_command` renders one shell string for `sh -c`. Substitution is
-  a single pass, and each value is escaped for the quoting context of its
-  placeholder, tracked by a POSIX quote state machine: unquoted placeholders
-  get one shell-escaped word; placeholders inside `'...'` or `"..."` (the
-  documented `sh -c '... {host} ...'` form) are escaped for the nested shell
-  and then for the enclosing quote. A value containing quotes, `$()`,
-  backticks, newlines, `;`, spaces, Unicode, or another placeholder therefore
-  never changes the command's structure. A placeholder in ANSI-C quoting
-  (`$'...'`), a comment, after a heredoc operator, line continuation, or
-  command substitution, right after a backslash, or in a quoted script with
-  its own quoting is refused with `AttachTemplateError::UnsafePlaceholderContext`,
-  and an unclosed quote with `UnterminatedQuote`. The GUI validates the
-  template at config load so such an error surfaces at startup.
-- `render_attach_argv` renders an argument vector without a shell. Only the
-  template is split (POSIX quoting, no expansion); values are inserted after
-  splitting as parts of single arguments. An unterminated quote is
-  `AttachTemplateError::UnterminatedQuote`.
+- **`shell`** (default): `render_attach_command` renders one string for `sh -c`.
+  Substitution is a single pass, and a placeholder is accepted only where the
+  shell reads it as an unquoted word; its value is escaped as exactly one such
+  word. A value containing quotes, `$()`, backticks, newlines, `;`, spaces,
+  Unicode, or another placeholder therefore never changes the command's
+  structure. A POSIX quote state machine finds the positions. A placeholder
+  inside `'...'`, `"..."`, `$'...'`, a comment, after a heredoc operator, line
+  continuation, or command substitution, or right after a backslash, is refused
+  with `AttachTemplateError::UnsafePlaceholderContext` (an unclosed quote is
+  `UnterminatedQuote`). To run a nested script, pass the values as positional
+  parameters instead of quoting them into the script:
+  `attach_command = "$TERMINAL -e sh -c 'exec \"$@\"' sh {bin} attach --host {host} {id}"`.
+- **`argv`**: `render_attach_argv` renders an argument vector without a shell.
+  Only the template is split (POSIX quoting, no expansion, only space, tab, and
+  newline separate words); values are inserted after splitting as data in
+  exactly one argument each, so a quoted placeholder such as
+  `terminal -- "{bin}"` is fine and a path with spaces stays one argument.
+  This is the recommended mode for any launcher that needs no shell features.
 
-Prefer the argv form for any launcher that does not need shell features.
+The GUI validates the template at config load, so a refused template fails at
+startup instead of at the first attach.

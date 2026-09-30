@@ -18,7 +18,7 @@ use proptest::prelude::*;
 use tempfile::TempDir;
 
 /// The schema example from the crate contract.
-const GOLDEN: &str = r#"schema_version = 1
+const GOLDEN: &str = r#"schema_version = 2
 prefix = "/home/u/.local"
 active_version = "0.31.6"
 
@@ -433,14 +433,14 @@ fn other_schema_versions_are_rejected_before_their_keys() {
     let fixture = Fixture::new();
     let newer = replace(
         GOLDEN,
-        "schema_version = 1",
-        "schema_version = 2\nfuture_key = true",
+        "schema_version = 2",
+        "schema_version = 3\nfuture_key = true",
     );
     assert!(matches!(
         fixture.load(&newer),
-        Err(ConfigError::UnsupportedSchema { found: 2 })
+        Err(ConfigError::UnsupportedSchema { found: 3 })
     ));
-    let zero = replace(GOLDEN, "schema_version = 1", "schema_version = 0");
+    let zero = replace(GOLDEN, "schema_version = 2", "schema_version = 0");
     assert!(matches!(
         fixture.load(&zero),
         Err(ConfigError::UnsupportedSchema { found: 0 })
@@ -1208,4 +1208,28 @@ fn invalid_search_paths_are_rejected_without_quoting_the_value() {
             other => panic!("{entries}: expected InvalidSearchPath, got {other:?}"),
         }
     }
+}
+
+/// A file written before `environment.search_path` existed is refused up front
+/// with an actionable message instead of a missing-field parse error.
+#[test]
+fn a_schema_one_file_is_rejected_with_an_actionable_error() {
+    let fixture = Fixture::new();
+    let without_search_path = GOLDEN
+        .replacen("schema_version = 2", "schema_version = 1", 1)
+        .lines()
+        .filter(|line| !line.starts_with("search_path = "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let error = fixture
+        .load(&without_search_path)
+        .expect_err("schema 1 is unsupported");
+    assert!(
+        matches!(error, ConfigError::UnsupportedSchema { found: 1 }),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("pohunek service uninstall"), "{message}");
+    assert!(message.contains("pohunek service install"), "{message}");
+    assert!(!message.contains("missing field"), "{message}");
 }

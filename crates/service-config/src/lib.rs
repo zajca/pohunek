@@ -10,7 +10,7 @@
 //! # Schema
 //!
 //! ```toml
-//! schema_version = 1
+//! schema_version = 2
 //! prefix = "/home/u/.local"                       # absolute install prefix
 //! active_version = "0.31.6"                       # <prefix>/libexec/pohunek/<version>
 //!
@@ -108,8 +108,10 @@ pub use error::ConfigError;
 /// The only schema version this crate reads and writes.
 ///
 /// A file with any other value is rejected before its keys are interpreted,
-/// so an older binary never half-understands a newer installation.
-pub const SCHEMA_VERSION: u32 = 1;
+/// so an older binary never half-understands a newer installation and a newer
+/// binary never reads a file that lacks keys it requires. Version 2 added
+/// `environment.search_path`; there is no migration.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// File name of the configuration inside the application config directory.
 pub const FILE_NAME: &str = "service.toml";

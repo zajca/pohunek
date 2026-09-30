@@ -82,7 +82,11 @@ pub enum ConfigError {
         message: String,
     },
     /// `schema_version` is not [`SCHEMA_VERSION`].
-    #[error("service config schema_version {found} is unsupported; expected {SCHEMA_VERSION}")]
+    #[error(
+        "service config schema_version {found} is unsupported; expected {SCHEMA_VERSION}; \
+         uninstall with the pohunek version that wrote it (`pohunek service uninstall`), \
+         then run `pohunek service install` to write a current file"
+    )]
     UnsupportedSchema {
         /// The recorded schema version.
         found: i64,

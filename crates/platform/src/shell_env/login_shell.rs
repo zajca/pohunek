@@ -4,10 +4,11 @@ use std::fmt::Write as _;
 use std::io::{self, Read as _};
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
 use thiserror::Error;
 
 use super::search_path::{SearchPath, SearchPathError};
@@ -245,21 +246,36 @@ struct Captured {
 
 enum Event {
     Output(io::Result<(Vec<u8>, bool)>),
-    Exit(io::Result<ExitStatus>),
+    Exited(io::Result<()>),
 }
 
 /// Runs `command` with piped stdout under a deadline and an output bound.
 ///
-/// The child must lead its own process group, which is killed on every return
-/// path. Reader and waiter threads are detached on failure: killing the group
-/// closes the pipe and reaps the child.
+/// The child must lead its own process group. Its exit is observed with
+/// `waitid(WEXITED | WNOWAIT)`, which leaves the leader unreaped, so its pid
+/// (the group id) cannot be recycled while the group is killed. Every return
+/// path kills the group first and reaps the leader afterwards; the observer
+/// threads end once the group is dead.
 fn run_bounded(
     mut command: Command,
     timeout: Duration,
     max_output_bytes: usize,
 ) -> Result<Captured, LoginShellError> {
     let mut child = command.spawn().map_err(LoginShellError::Io)?;
-    let pid = child.id();
+    let group = Pid::from_child(&child);
+    let observed = observe(&mut child, group, timeout, max_output_bytes);
+    kill_group(group);
+    let status = child.wait().map_err(LoginShellError::Io)?;
+    observed.map(|stdout| Captured { status, stdout })
+}
+
+/// Collects the child's stdout and waits for its exit within the deadline.
+fn observe(
+    child: &mut Child,
+    pid: Pid,
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> Result<Vec<u8>, LoginShellError> {
     let mut stdout = child
         .stdout
         .take()
@@ -280,70 +296,58 @@ fn run_bounded(
             // The receiver is gone once the probe failed; nothing to report.
             drop(reader_sender.send(Event::Output(result)));
         })
-        .map_err(|source| {
-            kill_group(pid);
-            LoginShellError::Io(source)
-        })?;
+        .map_err(LoginShellError::Io)?;
     std::thread::Builder::new()
         .name("shell-env-waiter".to_owned())
         .spawn(move || {
-            drop(sender.send(Event::Exit(child.wait())));
+            let exited = waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+            )
+            .map(drop)
+            .map_err(io::Error::from);
+            drop(sender.send(Event::Exited(exited)));
         })
-        .map_err(|source| {
-            kill_group(pid);
-            LoginShellError::Io(source)
-        })?;
+        .map_err(LoginShellError::Io)?;
 
     let deadline = Instant::now() + timeout;
     let mut stdout_bytes: Option<Vec<u8>> = None;
-    let mut status: Option<ExitStatus> = None;
-    while stdout_bytes.is_none() || status.is_none() {
+    let mut exited = false;
+    while stdout_bytes.is_none() || !exited {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match receiver.recv_timeout(remaining) {
             Ok(Event::Output(Ok((bytes, truncated)))) => {
                 if truncated {
-                    kill_group(pid);
                     return Err(LoginShellError::OutputTooLarge {
                         limit: max_output_bytes,
                     });
                 }
                 stdout_bytes = Some(bytes);
             }
-            Ok(Event::Exit(Ok(observed))) => status = Some(observed),
-            Ok(Event::Output(Err(source)) | Event::Exit(Err(source))) => {
-                kill_group(pid);
+            Ok(Event::Exited(Ok(()))) => exited = true,
+            Ok(Event::Output(Err(source)) | Event::Exited(Err(source))) => {
                 return Err(LoginShellError::Io(source));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                kill_group(pid);
                 return Err(LoginShellError::Timeout { timeout });
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                kill_group(pid);
                 return Err(LoginShellError::Io(io::Error::other(
                     "probe observers ended early",
                 )));
             }
         }
     }
-    // Startup files may leave background children behind, even with their
-    // stdout redirected; the probe owns its group, so nothing of it survives.
-    // The group stays valid for the kill: a leftover member keeps its id
-    // taken, and without one the signal finds no process.
-    kill_group(pid);
-    match (status, stdout_bytes) {
-        (Some(status), Some(stdout)) => Ok(Captured { status, stdout }),
-        _ => Err(LoginShellError::MalformedOutput),
-    }
+    stdout_bytes.ok_or(LoginShellError::MalformedOutput)
 }
 
-/// Kills the probe's process group; an already gone group is fine.
-fn kill_group(pid: u32) {
-    let Ok(raw) = i32::try_from(pid) else { return };
-    if let Some(group) = rustix::process::Pid::from_raw(raw) {
-        // ESRCH means the group already exited.
-        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-    }
+/// Kills the probe's process group, whose leader is still unreaped.
+///
+/// Startup files may leave background children behind, even with their stdout
+/// redirected; the probe owns its group, so nothing of it survives. An already
+/// gone group (`ESRCH`) is fine.
+fn kill_group(group: Pid) {
+    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
 }
 
 #[cfg(test)]

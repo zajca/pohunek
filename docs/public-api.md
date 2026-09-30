@@ -901,7 +901,10 @@ values never reach agent code. The `[environment]` table of `service.toml` also
 requires a `search_path` list: the absolute, normalized, non-repeating
 directories the installer resolved and hands to the daemon job as its `PATH`
 (an empty list keeps the service manager's own `PATH`; the joined value is
-bounded). The file is the override point and upgrades preserve it. When the
+bounded). The file is the override point and upgrades preserve it. This key
+raised the `service.toml` `schema_version` to 2; a version 1 file is refused
+with a message to uninstall with the pohunek that wrote it and install again,
+because there is no migration. When the
 installer cannot resolve the search path, `pohunek service` fails with the CLI
 error code `service_search_path_unavailable`; an invalid list in an existing
 file is `service_config_invalid`. See
