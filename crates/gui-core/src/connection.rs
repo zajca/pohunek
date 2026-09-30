@@ -533,7 +533,8 @@ fn substitute_placeholders(text: &str, bin: &str, host: &str, id: &str) -> Strin
 ///
 /// # Errors
 ///
-/// Returns [`AttachTemplateError::UnterminatedQuote`] for an unclosed quote or
+/// Returns [`AttachTemplateError::NulByte`] for a NUL in the template or a value,
+/// [`AttachTemplateError::UnterminatedQuote`] for an unclosed quote or
 /// trailing backslash, [`AttachTemplateError::EmptyCommand`] for a template with
 /// no command, and [`AttachTemplateError::UnsafePlaceholderContext`] for a
 /// template outside the grammar above or a placeholder that is not an unquoted
@@ -560,6 +561,12 @@ pub fn render_attach_command(
     values: &AttachTemplateValues,
 ) -> Result<String, AttachTemplateError> {
     let sites = scan_shell_template(template)?;
+    if [&values.bin, &values.host, &values.id]
+        .iter()
+        .any(|value| value.contains('\0'))
+    {
+        return Err(AttachTemplateError::NulByte);
+    }
     let mut output = String::with_capacity(template.len());
     let mut cursor = 0;
     for (offset, placeholder) in sites {
@@ -642,6 +649,9 @@ enum ScanState {
     reason = "one explicit quote-state scan; splitting it would scatter the shared cursor and word state"
 )]
 fn scan_shell_template(text: &str) -> Result<Vec<(usize, Placeholder)>, AttachTemplateError> {
+    if text.contains('\0') {
+        return Err(AttachTemplateError::NulByte);
+    }
     let bytes = text.as_bytes();
     let strict = [PLACEHOLDER_BIN, PLACEHOLDER_HOST, PLACEHOLDER_ID]
         .iter()
@@ -1351,6 +1361,36 @@ mod attach_template_tests {
             render_attach_command("true '~' {host}", &values).expect("render"),
             "true '~' root"
         );
+    }
+
+    #[test]
+    fn a_nul_byte_in_the_template_or_a_value_is_refused_in_shell_mode() {
+        let clean = AttachTemplateValues {
+            bin: "b".to_owned(),
+            host: "h".to_owned(),
+            id: "i".to_owned(),
+        };
+        assert_eq!(
+            render_attach_command("echo \0 {host}", &clean),
+            Err(AttachTemplateError::NulByte)
+        );
+        assert_eq!(
+            validate_attach_shell_template("echo \0 {host}"),
+            Err(AttachTemplateError::NulByte)
+        );
+        for slot in 0..3 {
+            let mut values = clean.clone();
+            match slot {
+                0 => values.bin = "a\0b".to_owned(),
+                1 => values.host = "a\0b".to_owned(),
+                _ => values.id = "a\0b".to_owned(),
+            }
+            assert_eq!(
+                render_attach_command("echo {bin} {host} {id}", &values),
+                Err(AttachTemplateError::NulByte),
+                "slot {slot}"
+            );
+        }
     }
 
     #[test]

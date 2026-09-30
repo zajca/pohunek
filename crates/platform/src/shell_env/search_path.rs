@@ -187,12 +187,10 @@ pub fn validate_search_directory(entry: &Path) -> Result<(), SearchPathError> {
             reason: "not absolute",
         });
     }
-    if text
-        .split('/')
-        .any(|segment| segment == "." || segment == "..")
-    {
+    // One spelling per path: no `.`, `..`, repeated, or trailing `/`.
+    if !pohunek_paths::is_normalized_absolute(entry) {
         return Err(SearchPathError::InvalidEntry {
-            reason: "contains a `.` or `..` segment",
+            reason: "not normalized (`.`, `..`, or a repeated or trailing `/`)",
         });
     }
     Ok(())
@@ -321,7 +319,14 @@ struct Kept {
 
 impl Kept {
     fn consider(&mut self, entry: PathBuf, trusted_only: bool) {
-        if validate_search_directory(&entry).is_err() {
+        // A trusted entry is recorded as its canonical path, which has the one
+        // normalized spelling, so a listed `/usr/bin/` or `/usr//bin` is fine.
+        let acceptable = if trusted_only {
+            entry.is_absolute() && entry.to_str().is_some()
+        } else {
+            validate_search_directory(&entry).is_ok()
+        };
+        if !acceptable {
             self.ignored += 1;
             return;
         }
@@ -329,6 +334,10 @@ impl Kept {
         let identity = if trusted_only {
             match trusted_directory(&entry) {
                 Ok(canonical) => {
+                    if validate_search_directory(&canonical).is_err() {
+                        self.ignored += 1;
+                        return;
+                    }
                     entry.clone_from(&canonical);
                     canonical
                 }
@@ -413,6 +422,9 @@ mod tests {
             ("bin", false),
             ("/usr/./bin", false),
             ("/usr/../bin", false),
+            ("//usr/bin", false),
+            ("/usr//bin", false),
+            ("/usr/bin/", false),
             ("/a:b", false),
             ("/a\nb", false),
             ("/a\0b", false),
@@ -522,6 +534,23 @@ mod tests {
     }
 
     #[test]
+    fn a_trusted_entry_with_an_odd_spelling_is_recorded_normalized() {
+        let dir = fixture();
+        let bin = dir.path().join("bin");
+        make_dir(dir.path(), &bin);
+        let text = bin.display().to_string();
+        let odd = format!("{text}/:{}", text.replacen('/', "//", 1));
+        let sanitized = SearchPath::sanitize(&odd, true).expect("ok");
+        // Both spellings name one directory, recorded once in canonical form.
+        assert_eq!(sanitized.path.entries(), [bin]);
+        // Untrusted input is judged on its spelling as listed.
+        assert_eq!(
+            SearchPath::sanitize(&odd, false),
+            Err(SearchPathError::NoUsableDirectories)
+        );
+    }
+
+    #[test]
     fn a_symlink_entry_is_recorded_as_its_canonical_target() {
         let dir = fixture();
         let root = dir.path();
@@ -570,7 +599,9 @@ mod tests {
         // `new` and `sanitize` are the only ways to build a non-empty path, and
         // `with_appended` accepts only another validated path, so a rejected
         // form can never reach the joined value.
-        for bad in ["", ".", "rel", "/a:b", "/a\u{1}", "/a/../b"] {
+        for bad in [
+            "", ".", "rel", "/a:b", "/a\u{1}", "/a/../b", "//a", "/a//b", "/a/", "/a/./b",
+        ] {
             assert!(
                 SearchPath::new(vec![PathBuf::from(bad)]).is_err(),
                 "{bad:?}"

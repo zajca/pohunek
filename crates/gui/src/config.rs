@@ -56,7 +56,7 @@ impl AppConfig {
         let raw_gui = raw.gui.unwrap_or_default();
         Ok(Self {
             attach_command: validated_attach_command(raw.attach_command)?,
-            pohunek_bin: raw.pohunek_bin,
+            pohunek_bin: validated_pohunek_bin(raw.pohunek_bin)?,
             local_host: HostConfig::local("local", local_socket_path()?),
             connection_options: raw_gui.connection_options()?,
             terminal_size: raw_gui.terminal_size()?,
@@ -76,6 +76,17 @@ fn validated_attach_command(template: String) -> Result<String, ConfigError> {
         message: source.to_string(),
     })?;
     Ok(template)
+}
+
+/// Rejects a `pohunek_bin` no process can receive (a NUL byte), at config load.
+fn validated_pohunek_bin(bin: String) -> Result<String, ConfigError> {
+    if bin.contains('\0') {
+        return Err(ConfigError::Invalid {
+            field: "pohunek_bin",
+            message: "contains a NUL byte".to_owned(),
+        });
+    }
+    Ok(bin)
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,6 +270,39 @@ mod tests {
 
     use super::*;
     use crate::keyboard::{KeyAction, KeyChord, KeyContext};
+
+    #[test]
+    fn a_nul_byte_in_the_template_or_binary_fails_at_config_load() {
+        // TOML accepts an escaped NUL, which no process argument can hold.
+        let raw: RawConfig =
+            toml::from_str("attach_command = \"foot \\u0000 {bin}\"\npohunek_bin = \"p\"")
+                .expect("TOML accepts the escape");
+        let error = validated_attach_command(raw.attach_command).expect_err("NUL template");
+        assert!(
+            matches!(
+                &error,
+                ConfigError::Invalid {
+                    field: "attach_command",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        let raw: RawConfig =
+            toml::from_str("attach_command = \"foot {bin}\"\npohunek_bin = \"a\\u0000b\"")
+                .expect("TOML accepts the escape");
+        let error = validated_pohunek_bin(raw.pohunek_bin).expect_err("NUL binary");
+        assert!(
+            matches!(
+                &error,
+                ConfigError::Invalid {
+                    field: "pohunek_bin",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
 
     #[test]
     fn an_unsafe_attach_template_fails_at_config_load() {
