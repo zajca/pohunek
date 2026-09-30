@@ -343,8 +343,12 @@ impl MacosFacts {
 
 /// Read the `terminal=` value from `<config_dir>/launcher.conf`.
 ///
-/// Lines are `key=value`; `#` starts a comment; the last non-empty assignment
-/// wins. An unreadable or absent file yields `None`.
+/// Mirrors the launcher's `pohunek_config_get` (`scripts/lib.sh`): lines are
+/// stripped, blank and `#` lines are skipped, keys and values are stripped, and
+/// the last `terminal=` assignment wins even when empty (an empty value means
+/// unset, so the launcher falls back to `$TERMINAL`). A non-comment line
+/// without `=` makes the launcher's lookup fail, which reads as unset. An
+/// unreadable or absent file yields `None`.
 #[must_use]
 pub fn read_launcher_terminal(config_dir: &Path) -> Option<String> {
     let contents = std::fs::read_to_string(config_dir.join("launcher.conf")).ok()?;
@@ -352,15 +356,17 @@ pub fn read_launcher_terminal(config_dir: &Path) -> Option<String> {
 }
 
 fn parse_launcher_terminal(contents: &str) -> Option<String> {
-    contents
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with('#'))
-        .filter_map(|line| line.split_once('='))
-        .filter(|(key, _)| key.trim() == "terminal")
-        .map(|(_, value)| value.trim())
-        .rfind(|value| !value.is_empty())
-        .map(str::to_owned)
+    let mut value = None;
+    for line in contents.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, item) = line.split_once('=')?;
+        if key.trim() == "terminal" {
+            value = Some(item.trim());
+        }
+    }
+    value.filter(|value| !value.is_empty()).map(str::to_owned)
 }
 
 /// The ordered macOS probe list.
@@ -664,15 +670,17 @@ fn shell_listed(listing: &str, shell: &Path) -> bool {
 /// Check the attach terminal: the stock Terminal application and the optional
 /// `terminal=` command from `launcher.conf`.
 ///
-/// The configured terminal is optional; a configured but unresolvable command
-/// is a `warn`, as is a host with neither the stock app nor a working
-/// configured command.
+/// The configured terminal is optional. The launcher runs the whole `terminal=`
+/// value as one executable name (`"$terminal_bin" -e ...`), so the value is
+/// resolved as a single program, never split into words; a value such as
+/// `kitty -e` is unresolvable. A configured but unresolvable command is a
+/// `warn`, as is a host with neither the stock app nor a working configured
+/// command.
 #[must_use]
 pub fn check_terminal(facts: &MacosFacts) -> DoctorCheck {
     const NAME: &str = "terminal";
     let configured = facts.launcher_terminal.as_deref().map(|command| {
-        let program = command.split_whitespace().next().unwrap_or(command);
-        let resolved = resolve_executable(program, facts.path_var.as_deref());
+        let resolved = resolve_executable(command, facts.path_var.as_deref());
         (command, resolved.is_some())
     });
     match (facts.terminal_app_present, configured) {
@@ -690,8 +698,9 @@ pub fn check_terminal(facts: &MacosFacts) -> DoctorCheck {
             NAME,
             DoctorStatus::Warn,
             format!(
-                "configured terminal '{command}' (launcher.conf) does not resolve to an executable; \
-                 fix or remove the 'terminal=' key"
+                "configured terminal '{command}' (launcher.conf) does not resolve to one executable; \
+                 the launcher runs the whole value as a single program name, so put arguments in a \
+                 wrapper script, or fix or remove the 'terminal=' key"
             ),
         ),
         (false, Some((command, true))) => DoctorCheck::new(
@@ -1235,17 +1244,46 @@ mod tests {
     }
 
     #[test]
-    fn launcher_terminal_takes_the_last_non_empty_assignment() {
+    fn launcher_terminal_mirrors_the_launcher_parser() {
         assert_eq!(parse_launcher_terminal("# terminal=x\n"), None);
         assert_eq!(parse_launcher_terminal("terminal=\n"), None);
         assert_eq!(
             parse_launcher_terminal("terminal=kitty\n  terminal = wezterm start \n"),
             Some("wezterm start".to_owned())
         );
+        // The last assignment wins even when empty: the launcher then falls
+        // back to $TERMINAL, so the earlier value is not in effect.
         assert_eq!(
-            parse_launcher_terminal("host=local\nterminal=alacritty -e\nterminal=\n"),
-            Some("alacritty -e".to_owned())
+            parse_launcher_terminal("host=local\nterminal=alacritty\nterminal=\n"),
+            None
         );
+        // A non-comment line without `=` makes the launcher's lookup fail.
+        assert_eq!(
+            parse_launcher_terminal("terminal=kitty\nbroken line\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_terminal_value_with_arguments_is_not_one_executable() {
+        let dir = temp_dir("term-args");
+        write_exec(&dir, "kitty", 0o755);
+        let mut f = facts();
+        f.path_var = Some(OsString::from(dir.as_os_str()));
+
+        f.launcher_terminal = Some("kitty".to_owned());
+        assert_eq!(check_terminal(&f).status, DoctorStatus::Ok);
+
+        // The launcher runs the whole value as one program name.
+        f.launcher_terminal = Some("kitty -e".to_owned());
+        let with_args = check_terminal(&f);
+        assert_eq!(with_args.status, DoctorStatus::Warn, "{}", with_args.detail);
+        assert!(
+            with_args.detail.contains("single program"),
+            "{}",
+            with_args.detail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1258,7 +1296,7 @@ mod tests {
         f.path_var = Some(path);
         assert_eq!(check_terminal(&f).status, DoctorStatus::Ok);
 
-        f.launcher_terminal = Some("kitty -e".to_owned());
+        f.launcher_terminal = Some("kitty".to_owned());
         let configured = check_terminal(&f);
         assert_eq!(configured.status, DoctorStatus::Ok);
         assert!(configured.detail.contains("kitty"));

@@ -50,7 +50,7 @@ pub(crate) async fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
     let sway_config_dir = paths.sway_config_dir();
     let home_dir = std::env::var_os(pohunek_paths::HOME).map(PathBuf::from);
     let worker = worker_candidate(&paths.config_dir);
-    let working_dir = std::env::current_dir().ok();
+    let working_dir = std::env::current_dir();
     let access_dirs: Vec<AccessDir<'_>> = working_dir
         .iter()
         .map(|path| AccessDir {
@@ -70,7 +70,9 @@ pub(crate) async fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
         worker: worker.as_ref(),
         access_dirs: &access_dirs,
     });
-    if hostcheck::current_platform() == Platform::MacOs {
+    let platform = hostcheck::current_platform();
+    checks.extend(working_directory_check(platform, &working_dir));
+    if platform == Platform::MacOs {
         checks.push(launchd_job_check(crate::service::status().await));
     }
 
@@ -90,6 +92,30 @@ pub(crate) async fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
     }
 
     Ok(report.overall != Status::Fail)
+}
+
+/// Report a current directory that cannot be determined.
+///
+/// The `filesystem_access` probe reads the current directory on macOS, where
+/// projects live below privacy-protected folders; a removed or unreadable
+/// directory must not silently skip that probe. Other platforms do not probe it,
+/// so they report nothing.
+fn working_directory_check(
+    platform: Platform,
+    working_dir: &std::io::Result<PathBuf>,
+) -> Option<DoctorCheck> {
+    if platform != Platform::MacOs {
+        return None;
+    }
+    let error = working_dir.as_ref().err()?;
+    Some(DoctorCheck::new(
+        "working_directory",
+        Status::Fail,
+        format!(
+            "the current directory cannot be determined: {error}; run 'pohunek doctor' from an \
+             existing directory you can read"
+        ),
+    ))
 }
 
 /// The worker executable the daemon would launch on this host.
@@ -192,10 +218,17 @@ fn launchd_job_check(status: Result<StatusReport, crate::service::Error>) -> Doc
 
 /// Add the daemon's checks to the local ones.
 ///
-/// A local check wins a name collision, except the worker executable: the
-/// daemon knows the worker its active supervision launches (a `--dev-subprocess`
-/// or `--service-config` daemon may differ from what the CLI derives), so its
-/// result replaces the CLI's derivation.
+/// Both processes probe the same list, but from different contexts: a
+/// terminal-launched CLI and a launchd-launched daemon differ in `PATH`,
+/// privacy grants and working directory. A name collision therefore keeps both
+/// results in one check: the worse status wins, and the details are joined as
+/// `local: ...; daemon: ...` unless they are identical. Human and JSON output
+/// render the same merged list.
+///
+/// The worker executable is the exception: the daemon knows the worker its
+/// active supervision launches (a `--dev-subprocess` or `--service-config`
+/// daemon may differ from what the CLI derives), so its result replaces the
+/// CLI's derivation.
 fn merge_daemon_checks(checks: &mut Vec<DoctorCheck>, remote: Vec<DoctorCheck>) {
     for check in remote {
         match checks
@@ -203,9 +236,26 @@ fn merge_daemon_checks(checks: &mut Vec<DoctorCheck>, remote: Vec<DoctorCheck>) 
             .find(|existing| existing.name == check.name)
         {
             Some(existing) if check.name == hostcheck::WORKER_EXECUTABLE_CHECK => *existing = check,
-            Some(_) => {}
+            Some(existing) => merge_collision(existing, &check),
             None => checks.push(check),
         }
+    }
+}
+
+/// Fold a daemon result into the local check of the same name.
+fn merge_collision(local: &mut DoctorCheck, remote: &DoctorCheck) {
+    if local.detail != remote.detail {
+        local.detail = format!("local: {}; daemon: {}", local.detail, remote.detail);
+    }
+    local.status = worse(local.status, remote.status);
+}
+
+/// The more severe of two statuses (`fail` over `warn` over `ok`).
+fn worse(left: Status, right: Status) -> Status {
+    match (left, right) {
+        (Status::Fail, _) | (_, Status::Fail) => Status::Fail,
+        (Status::Warn, _) | (_, Status::Warn) => Status::Warn,
+        (Status::Ok, Status::Ok) => Status::Ok,
     }
 }
 
@@ -405,11 +455,12 @@ mod tests {
         assert_eq!(checks.len(), 2);
         assert_eq!(checks[0].status, Status::Ok);
         assert_eq!(checks[0].detail, "active supervision");
-        assert_eq!(checks[1].detail, "local", "other local checks still win");
+        assert_eq!(checks[1].status, Status::Fail, "other collisions merge");
+        assert_eq!(checks[1].detail, "local: local; daemon: remote");
     }
 
     #[test]
-    fn merge_does_not_duplicate_local_host_checks() {
+    fn a_daemon_failure_is_never_hidden_by_a_local_ok() {
         let mut checks = vec![DoctorCheck::new("state_dir_writable", Status::Ok, "local")];
         merge_daemon_checks(
             &mut checks,
@@ -418,9 +469,54 @@ mod tests {
                 DoctorCheck::new("host_identity_stable", Status::Ok, "remote"),
             ],
         );
-        assert_eq!(checks.len(), 2);
-        assert_eq!(checks[0].detail, "local");
+
+        assert_eq!(checks.len(), 2, "one merged check per name");
+        assert_eq!(checks[0].name, "state_dir_writable");
+        assert_eq!(checks[0].status, Status::Fail);
+        assert_eq!(checks[0].detail, "local: local; daemon: remote");
         assert_eq!(checks[1].name, "host_identity_stable");
+        assert_eq!(Report::from_checks(checks).overall, Status::Fail);
+    }
+
+    #[test]
+    fn identical_results_collapse_and_the_worse_status_wins_either_way() {
+        let mut checks = vec![
+            DoctorCheck::new("bin:git", Status::Ok, "found at /usr/bin/git"),
+            DoctorCheck::new("filesystem_access", Status::Fail, "denied"),
+            DoctorCheck::new("bin:codex", Status::Warn, "missing"),
+        ];
+        merge_daemon_checks(
+            &mut checks,
+            vec![
+                DoctorCheck::new("bin:git", Status::Ok, "found at /usr/bin/git"),
+                DoctorCheck::new("filesystem_access", Status::Ok, "readable"),
+                DoctorCheck::new("bin:codex", Status::Ok, "found"),
+            ],
+        );
+
+        assert_eq!(checks[0].detail, "found at /usr/bin/git");
+        assert_eq!(checks[0].status, Status::Ok);
+        assert_eq!(checks[1].status, Status::Fail);
+        assert!(checks[1].detail.contains("local: denied; daemon: readable"));
+        assert_eq!(checks[2].status, Status::Warn);
+    }
+
+    #[test]
+    fn an_unreadable_working_directory_is_an_explicit_macos_failure() {
+        let error: std::io::Result<PathBuf> = Err(std::io::Error::from_raw_os_error(2));
+
+        let check = working_directory_check(Platform::MacOs, &error).expect("a failing check");
+        assert_eq!(check.name, "working_directory");
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check.detail.contains("existing directory"),
+            "{}",
+            check.detail
+        );
+
+        assert!(working_directory_check(Platform::Linux, &error).is_none());
+        let ok: std::io::Result<PathBuf> = Ok(PathBuf::from("/tmp"));
+        assert!(working_directory_check(Platform::MacOs, &ok).is_none());
     }
 
     #[test]

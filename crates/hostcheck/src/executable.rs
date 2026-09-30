@@ -1,30 +1,34 @@
 //! Executable resolution shared by every host probe.
 //!
 //! A file counts as an executable only when it is a regular file (after
-//! following symlinks) with at least one execute permission bit. Resolution
+//! following symlinks) that the kernel says the effective user can execute:
+//! owner, group, ACL and search permission on every parent directory all
+//! count. A candidate the user cannot execute is skipped, exactly as a shell
+//! skips it, so it neither resolves nor stops the `PATH` search. Resolution
 //! takes the `PATH` value as an argument so tests never mutate the process
 //! environment.
 
 use std::ffi::OsStr;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 // Rust guideline compliant 2026-09-30
 
-/// Execute permission bits (owner, group, other) of a Unix mode.
+/// Whether `path` is a regular file the effective user can execute.
 ///
-/// Any of the three makes the file a candidate; the exact effective-user
-/// decision is left to the kernel when the program is launched.
-const EXECUTE_BITS: u32 = 0o111;
-
-/// Whether `path` is a regular file with an execute bit set.
-///
-/// Symlinks are followed, so a link to an executable qualifies and a link to a
-/// data file or a directory does not.
+/// Uses `faccessat(X_OK, AT_EACCESS)`, the kernel's own answer for the
+/// effective user and group. Symlinks are followed, so a link to an executable
+/// qualifies and a link to a data file or a directory does not. The file is
+/// never run.
 #[must_use]
 pub fn is_executable_file(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & EXECUTE_BITS != 0)
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
+        && rustix::fs::accessat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::Access::EXEC_OK,
+            rustix::fs::AtFlags::EACCESS,
+        )
+        .is_ok()
 }
 
 /// Resolve `program` to an executable file.
@@ -50,6 +54,7 @@ pub fn resolve_executable(program: &str, path_var: Option<&OsStr>) -> Option<Pat
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
 
@@ -78,6 +83,41 @@ mod tests {
 
         assert_eq!(resolve_executable("tool", Some(&path_var)), Some(tool));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn execute_permission_is_decided_for_the_effective_user() {
+        let dir = tempfile_dir("owner-bits");
+        // Owner-only execute: executable for the owner running this test.
+        let owner_only = write_file(&dir, "owner-only", 0o100);
+        // Group/other execute without the owner bit: the kernel denies the
+        // owner, unlike a check of "any execute bit".
+        let others_only = write_file(&dir, "others-only", 0o011);
+
+        assert!(is_executable_file(&owner_only));
+        if !rustix::process::geteuid().is_root() {
+            assert!(!is_executable_file(&others_only));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unexecutable_entry_does_not_stop_the_search() {
+        let first = tempfile_dir("eacces-a");
+        let second = tempfile_dir("eacces-b");
+        write_file(&first, "tool", 0o011);
+        let tool = write_file(&second, "tool", 0o755);
+        let path_var = std::env::join_paths([&first, &second]).unwrap();
+
+        let resolved = resolve_executable("tool", Some(&path_var));
+
+        if rustix::process::geteuid().is_root() {
+            assert!(resolved.is_some());
+        } else {
+            assert_eq!(resolved, Some(tool));
+        }
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
     }
 
     #[test]

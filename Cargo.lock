@@ -4376,6 +4376,7 @@ dependencies = [
  "pohunek-platform",
  "pohunek-protocol",
  "pohunek-test-support",
+ "rustix 1.1.4",
 ]
 
 [[package]]
