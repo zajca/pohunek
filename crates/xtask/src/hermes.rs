@@ -2746,7 +2746,8 @@ fn wait_for_evidence(
     evidence: &Evidence,
     timeout: Duration,
 ) -> Result<bool, XtaskError> {
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
     let mut panel_observer = match evidence {
         Evidence::AssistantPanel(expected) => Some(AssistantPanelObserver::new(expected)),
         _ => None,
@@ -2778,7 +2779,9 @@ fn wait_for_evidence(
         if Instant::now() >= deadline {
             if let Some(observer) = panel_observer {
                 return Err(fail(format!(
-                    "Hermes PTY scenario `{scenario_id}` did not reach required assistant-panel evidence within its time limit (occurrences: {}, progress: {:?}, invalid: {}, visible events: {:?})",
+                    "Hermes PTY scenario `{scenario_id}` did not reach required assistant-panel evidence within its time limit (waited {} ms, {} PTY output bytes, occurrences: {}, progress: {:?}, invalid: {}, visible events: {:?})",
+                    started.elapsed().as_millis(),
+                    bytes.len(),
                     observer.occurrence_count,
                     observer.progress,
                     observer.invalid,
@@ -4003,8 +4006,8 @@ mod tests {
         classic_scenarios, compatibility_summary, compatibility_with, fail, finish_mocked_pty,
         has_alternate_screen, has_one_submitted_user_turn, load_golden_manifest, load_lock,
         mock_scenario, normalized_assistant_panel, observe_assistant_panels,
-        raw_terminal_transcript, refresh_with, require_safe_pohunek_binary,
-        run_pohunek_integration_action, run_process, sanitize_output, sanitized_pty_tail,
+        raw_terminal_transcript, require_safe_pohunek_binary, run_pohunek_integration_action,
+        run_process, sanitize_output, sanitized_pty_tail,
         select_production_integration_temp_parent, sensitive_paths, strip_terminal_controls,
         submitted_user_turn_count, terminal_transcript, validate_classic_capture,
         validate_classic_transcript, validate_golden_manifest, validate_safe_fixture,
@@ -4022,6 +4025,25 @@ mod tests {
         isolation_root_budget, DAEMON_SOCKET_RELATIVE_PATH, DARWIN_SOCKET_PATH_MAX_BYTES,
         ISOLATED_RUNTIME_DIRECTORY, LINUX_SOCKET_PATH_MAX_BYTES, PRODUCTION_ISOLATION_PREFIX,
     };
+
+    /// Serializes PTY refresh scenarios within the test process.
+    ///
+    /// Every scenario drives a shell fixture that starts Python and an HTTP
+    /// round trip per turn, all inside `fast_limits` budgets of one second.
+    /// Running them concurrently lets CPU contention on a small runner (three
+    /// macOS cores) starve the fixture of its budget, so the tests take turns.
+    static PTY_SCENARIOS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn refresh_with(
+        repo: &Path,
+        hermes_bin: &Path,
+        limits: Limits,
+    ) -> Result<super::RefreshSummary, super::XtaskError> {
+        let _turn = PTY_SCENARIOS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::refresh_with(repo, hermes_bin, limits)
+    }
 
     fn fast_limits() -> Limits {
         Limits {
