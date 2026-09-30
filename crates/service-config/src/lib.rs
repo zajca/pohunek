@@ -40,6 +40,14 @@
 //! This crate validates allowlist patterns only syntactically; which names
 //! the installer allowlists by default is decided by its caller.
 //!
+//! `environment.search_path` is the executable search path the installer
+//! resolved (see `pohunek_platform::shell_env`) and hands to the daemon job as
+//! its `PATH`. Each entry is an absolute, normalized directory without `:` or
+//! control characters, no entry repeats, and the joined value stays within
+//! [`MAX_SEARCH_PATH_BYTES`]. An empty list means the job keeps the service
+//! manager's own `PATH`. The file is the override point: an operator may edit
+//! the list, and upgrades preserve it.
+//!
 //! # File trust
 //!
 //! The file must be a regular `0600` file owned by the effective user, with a
@@ -73,7 +81,7 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-30
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -86,6 +94,7 @@ use pohunek_paths::{
     MAX_INSTALL_VERSION_BYTES,
 };
 use pohunek_platform::filesystem::{FsError, TrustedDir};
+use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::{
     Namespace, MAX_JOB_TIMEOUT, MAX_JOB_VALUE_BYTES, MAX_OPEN_FILES, MIN_OPEN_FILES,
 };
@@ -135,6 +144,12 @@ pub const MAX_ALLOWLIST_ENTRIES: usize = 256;
 ///
 /// Matches the worker protocol's bound on base-environment key length.
 pub const MAX_PATTERN_BYTES: usize = 128;
+
+/// Longest accepted joined `environment.search_path` in bytes.
+///
+/// Equal to the supervisor's job value limit, because the list becomes the
+/// daemon job's `PATH` environment value.
+pub const MAX_SEARCH_PATH_BYTES: usize = pohunek_platform::shell_env::MAX_SEARCH_PATH_BYTES;
 
 /// Owner-only mode required of the configuration file.
 const FILE_MODE: u32 = 0o600;
@@ -225,6 +240,7 @@ pub struct ServiceConfig {
     namespace: Namespace,
     deadlines: Deadlines,
     environment_allowlist: Vec<String>,
+    search_path: SearchPath,
     sweep_grace: Duration,
     open_files: u64,
 }
@@ -295,9 +311,22 @@ impl ServiceConfig {
             namespace,
             deadlines,
             environment_allowlist: spec.environment_allowlist,
+            search_path: SearchPath::empty(),
             sweep_grace: spec.sweep_grace,
             open_files: spec.open_files,
         })
+    }
+
+    /// Returns this configuration with `search_path` as the daemon job `PATH`.
+    ///
+    /// [`ConfigSpec`] carries no search path, so a value rebuilt through
+    /// [`to_spec`](Self::to_spec) and [`new`](Self::new) starts with an empty
+    /// one; callers that keep it re-apply it here. The type already guarantees
+    /// a valid list.
+    #[must_use]
+    pub fn with_search_path(mut self, search_path: SearchPath) -> Self {
+        self.search_path = search_path;
+        self
     }
 
     /// Loads and validates the configuration at an absolute `path`.
@@ -381,6 +410,12 @@ impl ServiceConfig {
                 daemon_restart_throttle_ms: millis(self.deadlines.daemon_restart_throttle),
             },
             environment: RawEnvironment {
+                search_path: self
+                    .search_path
+                    .entries()
+                    .iter()
+                    .map(|entry| utf8(entry).to_owned())
+                    .collect(),
                 allowlist: self.environment_allowlist.clone(),
             },
             sweep: RawSweep {
@@ -398,7 +433,8 @@ impl ServiceConfig {
     /// Returns the values this configuration was built from.
     ///
     /// Useful to change one value, such as the active version on upgrade, and
-    /// revalidate through [`ServiceConfig::new`].
+    /// revalidate through [`ServiceConfig::new`]. The search path is not part
+    /// of the spec; see [`with_search_path`](Self::with_search_path).
     #[must_use]
     pub fn to_spec(&self) -> ConfigSpec {
         ConfigSpec {
@@ -521,6 +557,14 @@ impl ServiceConfig {
         &self.environment_allowlist
     }
 
+    /// Returns the executable search path recorded for the daemon job.
+    ///
+    /// Empty when the job keeps the service manager's own `PATH`.
+    #[must_use]
+    pub fn search_path(&self) -> &SearchPath {
+        &self.search_path
+    }
+
     /// Returns the orphan-sweep grace period between SIGTERM and SIGKILL.
     #[must_use]
     pub fn sweep_grace(&self) -> Duration {
@@ -577,6 +621,7 @@ struct RawDeadlines {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawEnvironment {
+    search_path: Vec<String>,
     allowlist: Vec<String>,
 }
 
@@ -614,7 +659,17 @@ fn parse(path: &Path, text: &str) -> Result<ServiceConfig, ConfigError> {
             found: i64::from(raw.schema_version),
         });
     }
-    ServiceConfig::new(ConfigSpec {
+    let search_path = SearchPath::new(
+        raw.environment
+            .search_path
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
+    )
+    .map_err(|source| ConfigError::InvalidSearchPath {
+        detail: source.to_string(),
+    })?;
+    let config = ServiceConfig::new(ConfigSpec {
         prefix: PathBuf::from(raw.prefix),
         active_version: raw.active_version,
         uid: raw.namespace.uid,
@@ -633,7 +688,8 @@ fn parse(path: &Path, text: &str) -> Result<ServiceConfig, ConfigError> {
         environment_allowlist: raw.environment.allowlist,
         sweep_grace: Duration::from_millis(raw.sweep.grace_ms),
         open_files: raw.limits.open_files,
-    })
+    })?;
+    Ok(config.with_search_path(search_path))
 }
 
 /// Sanitized diagnostic for one TOML parse failure over `text`.

@@ -897,7 +897,15 @@ variables (`NOTIFY_SOCKET`, `WATCHDOG_*`, `INVOCATION_ID`, `JOURNAL_STREAM`,
 `__CFBundleIdentifier`, `LaunchInstanceID`) and the worker-authentication
 tokens `POHUNEK_CONTROLLER_TOKEN` and `POHUNEK_BOOTSTRAP_TOKEN` are always
 removed, even when a profile or an allowlist would supply them; the token
-values never reach agent code. A worker kept
+values never reach agent code. The `[environment]` table of `service.toml` also
+requires a `search_path` list: the absolute, normalized, non-repeating
+directories the installer resolved and hands to the daemon job as its `PATH`
+(an empty list keeps the service manager's own `PATH`; the joined value is
+bounded). The file is the override point and upgrades preserve it. When the
+installer cannot resolve the search path, `pohunek service` fails with the CLI
+error code `service_search_path_unavailable`; an invalid list in an existing
+file is `service_config_invalid`. See
+[environment resolution](knowledge/guides/environment-resolution.md). A worker kept
 running across an upgrade from the previous private protocol version keeps
 starting its session's children from its own sanitized environment until that
 session gets a new worker generation.

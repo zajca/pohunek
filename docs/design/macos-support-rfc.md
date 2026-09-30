@@ -245,7 +245,11 @@ Workers receive only an allowlisted base environment from the daemon
 (`service.toml` `[environment] allowlist`) and strip launchd variables
 (`XPC_SERVICE_NAME`, `XPC_FLAGS`, `__CFBundleIdentifier`, `LaunchInstanceID`), so
 an agent never sees the bare launchd `PATH` or the worker's own supervision
-environment. A better login-shell `PATH` source is #102.
+environment. `pohunek service install` gives the daemon job a `PATH` resolved by
+one policy (configured `service.toml` `[environment] search_path`, then bounded
+non-interactive login-shell discovery, then a fixed fallback directory list) and
+records it in `service.toml`; see the environment-resolution guide in
+`docs/knowledge/guides/environment-resolution.md` (#102).
 
 ### Worker lifetime
 

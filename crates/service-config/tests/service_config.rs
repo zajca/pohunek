@@ -1,6 +1,6 @@
 //! Public-API tests for loading, validating, writing, and verifying `service.toml`.
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-30
 
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
@@ -8,10 +8,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use pohunek_platform::filesystem::FsError;
+use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::Namespace;
 use pohunek_service_config::{
     ConfigError, ConfigSpec, Deadlines, ServiceConfig, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES,
-    MAX_DEADLINE, MAX_PATTERN_BYTES,
+    MAX_DEADLINE, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
 };
 use proptest::prelude::*;
 use tempfile::TempDir;
@@ -35,6 +36,7 @@ daemon_exit_timeout_ms = 30000
 daemon_restart_throttle_ms = 5000
 
 [environment]
+search_path = ["/opt/homebrew/bin", "/Users/u/.local/bin", "/usr/bin"]
 allowlist = ["PATH","HOME","USER","LOGNAME","SHELL","LANG","LC_*","TMPDIR",
   "SSH_AUTH_SOCK","DISPLAY","WAYLAND_DISPLAY","DBUS_SESSION_BUS_ADDRESS","XDG_*"]
 
@@ -46,7 +48,7 @@ open_files = 8192
 "#;
 
 /// Every required key and the `namespace` table, as a missing-field diagnostic names them.
-const REQUIRED_KEYS: [&str; 16] = [
+const REQUIRED_KEYS: [&str; 17] = [
     "schema_version",
     "prefix",
     "active_version",
@@ -59,6 +61,7 @@ const REQUIRED_KEYS: [&str; 16] = [
     "worker_exit_timeout_ms",
     "daemon_exit_timeout_ms",
     "daemon_restart_throttle_ms",
+    "search_path",
     "allowlist",
     "grace_ms",
     "open_files",
@@ -184,6 +187,14 @@ fn golden_example_parses_into_typed_values() {
     );
     assert_eq!(config.runtime_root(), Path::new("/run/user/1000/pohunek"));
     assert_eq!(config.deadlines(), spec().deadlines);
+    assert_eq!(
+        config.search_path().entries(),
+        [
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/Users/u/.local/bin"),
+            PathBuf::from("/usr/bin"),
+        ]
+    );
     assert_eq!(config.environment_allowlist().len(), 13);
     assert_eq!(config.environment_allowlist()[6], "LC_*");
     assert_eq!(config.sweep_grace(), Duration::from_secs(5));
@@ -1133,5 +1144,68 @@ proptest! {
         let loaded = ServiceConfig::load(&fixture.path()).expect("load config");
         prop_assert_eq!(&loaded, &config);
         prop_assert_eq!(loaded.to_toml(), config.to_toml());
+    }
+}
+
+#[test]
+fn search_path_round_trips_through_write_and_load() {
+    let fixture = Fixture::new();
+    let search = SearchPath::new(vec![
+        PathBuf::from("/opt/my tools/bin"),
+        PathBuf::from("/Users/j\u{e9}/it's \"here\""),
+        PathBuf::from("/usr/bin"),
+    ])
+    .expect("search path");
+    let config = ServiceConfig::new(spec())
+        .expect("valid spec")
+        .with_search_path(search.clone());
+    config.write(&fixture.path()).expect("write config");
+    let loaded = ServiceConfig::load(&fixture.path()).expect("load config");
+    assert_eq!(loaded.search_path(), &search);
+    assert_eq!(loaded, config);
+    assert_eq!(loaded.to_toml(), config.to_toml());
+}
+
+#[test]
+fn an_empty_search_path_is_recorded_explicitly() {
+    let fixture = Fixture::new();
+    let config = ServiceConfig::new(spec()).expect("valid spec");
+    assert!(config.search_path().is_empty());
+    assert!(config.to_toml().contains("search_path = []"));
+    config.write(&fixture.path()).expect("write config");
+    assert!(ServiceConfig::load(&fixture.path())
+        .expect("load config")
+        .search_path()
+        .is_empty());
+}
+
+#[test]
+fn invalid_search_paths_are_rejected_without_quoting_the_value() {
+    let fixture = Fixture::new();
+    let secret = SENTINEL_TOKEN;
+    let long = format!("/{}", "x".repeat(MAX_SEARCH_PATH_BYTES));
+    for entries in [
+        format!("\"{secret}\""),
+        "\"\"".to_owned(),
+        "\"/usr/bin\", \".\"".to_owned(),
+        "\"/usr/../bin\"".to_owned(),
+        "\"/a:/b\"".to_owned(),
+        "\"/a\\u001bb\"".to_owned(),
+        "\"/usr/bin\", \"/usr/bin\"".to_owned(),
+        format!("\"{long}\""),
+    ] {
+        let text = replace(
+            GOLDEN,
+            "search_path = [\"/opt/homebrew/bin\", \"/Users/u/.local/bin\", \"/usr/bin\"]",
+            &format!("search_path = [{entries}]"),
+        );
+        match fixture.load(&text) {
+            Err(error @ ConfigError::InvalidSearchPath { .. }) => {
+                let rendered = format!("{error} {error:?}");
+                assert!(!rendered.contains(secret), "{rendered}");
+                assert!(!rendered.contains("/a:/b"), "{rendered}");
+            }
+            other => panic!("{entries}: expected InvalidSearchPath, got {other:?}"),
+        }
     }
 }

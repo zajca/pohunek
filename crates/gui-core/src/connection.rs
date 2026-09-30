@@ -1,5 +1,7 @@
 //! Reconnecting host transport: event streams, wire parsing, and attach spawn.
 
+// Rust guideline compliant 2026-09-30
+
 use std::time::Duration;
 
 use futures::{stream, StreamExt};
@@ -434,19 +436,210 @@ pub trait AttachCommandSpawner {
     fn spawn(&mut self, command: &str) -> Result<(), String>;
 }
 
-/// Render the configured attach command.
+/// Placeholder names an attach template may use.
+const PLACEHOLDER_BIN: &str = "{bin}";
+const PLACEHOLDER_HOST: &str = "{host}";
+const PLACEHOLDER_ID: &str = "{id}";
+
+/// Reports why an attach template cannot become an argument vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum AttachTemplateError {
+    /// A quote or trailing backslash in the template is never closed.
+    #[error("attach command template has an unterminated quote or escape")]
+    UnterminatedQuote,
+    /// The template holds no command word.
+    #[error("attach command template is empty")]
+    EmptyCommand,
+    /// The program word is empty after placeholder substitution.
+    #[error("attach command program is empty after substitution")]
+    EmptyProgram,
+    /// A substituted argument contains a NUL byte, which no process can receive.
+    #[error("attach command argument contains a NUL byte")]
+    NulByte,
+}
+
+/// Replaces `{bin}`, `{host}`, and `{id}` in `text` in one left-to-right pass.
 ///
-/// Replaces `{bin}`, `{host}`, and `{id}` with shell-escaped values because the
-/// GUI shell spawner executes the rendered command through `sh -c`.
+/// Inserted values are never rescanned, so a value that itself contains a
+/// placeholder cannot be substituted again. Other brace sequences stay
+/// literal.
+fn substitute_placeholders(text: &str, bin: &str, host: &str, id: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('{') {
+        output.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let (value, length) = if tail.starts_with(PLACEHOLDER_BIN) {
+            (Some(bin), PLACEHOLDER_BIN.len())
+        } else if tail.starts_with(PLACEHOLDER_HOST) {
+            (Some(host), PLACEHOLDER_HOST.len())
+        } else if tail.starts_with(PLACEHOLDER_ID) {
+            (Some(id), PLACEHOLDER_ID.len())
+        } else {
+            (None, '{'.len_utf8())
+        };
+        match value {
+            Some(value) => output.push_str(value),
+            None => output.push('{'),
+        }
+        rest = &tail[length..];
+    }
+    output.push_str(rest);
+    output
+}
+
+/// Render the configured attach command as one shell string.
+///
+/// Replaces `{bin}`, `{host}`, and `{id}` in a single pass with shell-escaped
+/// values, so no value can change the command's structure: a value holding
+/// quotes, `$()`, backticks, newlines, `;`, spaces, Unicode, or another
+/// placeholder reaches the shell as one literal word. The GUI shell spawner
+/// executes the rendered command through `sh -c`; launchers that must not use a
+/// shell call [`render_attach_argv`] instead.
+///
+/// # Examples
+///
+/// ```
+/// use pohunek_gui_core::{render_attach_command, AttachTemplateValues};
+///
+/// let command = render_attach_command(
+///     "pohunek --host {host} attach {id}",
+///     &AttachTemplateValues {
+///         bin: "pohunek".to_owned(),
+///         host: "my host".to_owned(),
+///         id: "s1".to_owned(),
+///     },
+/// );
+/// assert_eq!(command, "pohunek --host 'my host' attach s1");
+/// ```
 #[must_use]
 pub fn render_attach_command(template: &str, values: &AttachTemplateValues) -> String {
-    let bin = shell_escape(&values.bin);
-    let host = shell_escape(&values.host);
-    let id = shell_escape(&values.id);
-    template
-        .replace("{bin}", &bin)
-        .replace("{host}", &host)
-        .replace("{id}", &id)
+    substitute_placeholders(
+        template,
+        &shell_escape(&values.bin),
+        &shell_escape(&values.host),
+        &shell_escape(&values.id),
+    )
+}
+
+/// Render the configured attach command as an argument vector without a shell.
+///
+/// Only the template is split, with POSIX-shell word rules: whitespace
+/// separates words, `'...'` is literal, `"..."` honors `\"`, `\\`, `\$`,
+/// and `` \` ``, and an unquoted backslash escapes the next character. No
+/// expansion happens: `$VAR`, `~`, globs, and command substitution stay
+/// literal text. After splitting, `{bin}`, `{host}`, and `{id}` are replaced
+/// in one pass inside each word, so every value stays part of exactly one
+/// argument and is never split again. The first element is the program.
+///
+/// # Examples
+///
+/// ```
+/// use pohunek_gui_core::{render_attach_argv, AttachTemplateValues};
+///
+/// let argv = render_attach_argv(
+///     "open -a Terminal --args {bin} attach {id}",
+///     &AttachTemplateValues {
+///         bin: "/opt/My Tools/pohunek".to_owned(),
+///         host: String::new(),
+///         id: "s 1".to_owned(),
+///     },
+/// )?;
+/// assert_eq!(argv[4], "/opt/My Tools/pohunek");
+/// assert_eq!(argv[6], "s 1");
+/// # Ok::<(), pohunek_gui_core::AttachTemplateError>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns [`AttachTemplateError::UnterminatedQuote`] for an unclosed quote or
+/// trailing backslash, [`AttachTemplateError::EmptyCommand`] for a template
+/// without words, [`AttachTemplateError::EmptyProgram`] when the program word
+/// is empty after substitution, and [`AttachTemplateError::NulByte`] when an
+/// argument contains a NUL byte.
+pub fn render_attach_argv(
+    template: &str,
+    values: &AttachTemplateValues,
+) -> Result<Vec<String>, AttachTemplateError> {
+    let words = split_template_words(template)?;
+    if words.is_empty() {
+        return Err(AttachTemplateError::EmptyCommand);
+    }
+    let argv: Vec<String> = words
+        .iter()
+        .map(|word| substitute_placeholders(word, &values.bin, &values.host, &values.id))
+        .collect();
+    if argv.iter().any(|argument| argument.contains('\0')) {
+        return Err(AttachTemplateError::NulByte);
+    }
+    if argv[0].is_empty() {
+        return Err(AttachTemplateError::EmptyProgram);
+    }
+    Ok(argv)
+}
+
+/// Splits `template` into words by POSIX-shell quoting rules, without expansion.
+fn split_template_words(template: &str) -> Result<Vec<String>, AttachTemplateError> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut characters = template.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\'' => {
+                in_word = true;
+                loop {
+                    match characters.next() {
+                        Some('\'') => break,
+                        Some(inner) => current.push(inner),
+                        None => return Err(AttachTemplateError::UnterminatedQuote),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match characters.next() {
+                        Some('"') => break,
+                        Some('\\') => match characters.next() {
+                            Some(escaped @ ('"' | '\\' | '$' | '`')) => current.push(escaped),
+                            Some('\n') => {}
+                            Some(other) => {
+                                current.push('\\');
+                                current.push(other);
+                            }
+                            None => return Err(AttachTemplateError::UnterminatedQuote),
+                        },
+                        Some(inner) => current.push(inner),
+                        None => return Err(AttachTemplateError::UnterminatedQuote),
+                    }
+                }
+            }
+            '\\' => match characters.next() {
+                Some('\n') => {}
+                Some(escaped) => {
+                    in_word = true;
+                    current.push(escaped);
+                }
+                None => return Err(AttachTemplateError::UnterminatedQuote),
+            },
+            whitespace if whitespace.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            other => {
+                in_word = true;
+                current.push(other);
+            }
+        }
+    }
+    if in_word {
+        words.push(current);
+    }
+    Ok(words)
 }
 
 fn shell_escape(value: &str) -> String {
@@ -502,4 +695,232 @@ where
     let command = render_attach_command(template, values);
     spawner.spawn(&command)?;
     Ok(AttachSpawnIntent { command })
+}
+
+#[cfg(test)]
+mod attach_template_tests {
+    use std::process::Command;
+
+    use super::*;
+
+    /// Values that break naive quoting or re-substitution.
+    fn difficult_values() -> Vec<String> {
+        [
+            "plain",
+            "with space",
+            "it's",
+            "say \"hi\"",
+            "$(echo INJECTED)",
+            "`echo INJECTED`",
+            "a;echo INJECTED",
+            "a&&echo INJECTED",
+            "line one\nline two",
+            "tab\there",
+            "back\\slash",
+            "\u{10d}esk\u{fd} projekt \u{65e5}\u{672c}\u{8a9e} \u{1f980}",
+            "{bin}",
+            "{host}",
+            "{id}",
+            "{host};echo INJECTED",
+            "x{id}y",
+            "'{id}'",
+            "$HOME ~ * ?",
+            "--flag=value",
+            "",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    /// Runs `command` through a real `sh -c` and splits its NUL-terminated output.
+    ///
+    /// Injected `echo INJECTED` payloads would add output and break equality.
+    fn run_sh(command: &str) -> Vec<Vec<u8>> {
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .expect("run sh");
+        assert!(output.status.success(), "sh failed for {command:?}");
+        let mut fields: Vec<Vec<u8>> = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .map(<[u8]>::to_vec)
+            .collect();
+        assert_eq!(fields.pop(), Some(Vec::new()), "output ends with a NUL");
+        fields
+    }
+
+    #[test]
+    fn shell_form_round_trips_difficult_values_through_a_real_shell() {
+        let template = "printf '%s\\0' {bin} {host} {id}";
+        let values = difficult_values();
+        for bin in &values {
+            for host in &values {
+                let id = "sess ion;id";
+                let command = render_attach_command(
+                    template,
+                    &AttachTemplateValues {
+                        bin: bin.clone(),
+                        host: host.clone(),
+                        id: id.to_owned(),
+                    },
+                );
+                let fields = run_sh(&command);
+                assert_eq!(
+                    fields,
+                    [bin.as_bytes(), host.as_bytes(), id.as_bytes()],
+                    "bin={bin:?} host={host:?} rendered={command:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shell_form_does_not_resubstitute_inserted_values() {
+        let values = AttachTemplateValues {
+            bin: "{host}".to_owned(),
+            host: "x' ; echo INJECTED ; echo '".to_owned(),
+            id: "{bin}".to_owned(),
+        };
+        let rendered = render_attach_command("{bin} {host} {id}", &values);
+        assert_eq!(
+            rendered,
+            format!(
+                "{} {} {}",
+                shell_escape(&values.bin),
+                shell_escape(&values.host),
+                shell_escape(&values.id)
+            )
+        );
+    }
+
+    #[test]
+    fn shell_form_keeps_unknown_braces_literal() {
+        let values = AttachTemplateValues {
+            bin: "b".to_owned(),
+            host: "h".to_owned(),
+            id: "i".to_owned(),
+        };
+        assert_eq!(
+            render_attach_command("{bin} {other} {} { id} {host", &values),
+            "b {other} {} { id} {host"
+        );
+    }
+
+    #[test]
+    fn argv_form_keeps_every_value_a_single_byte_exact_argument() {
+        let values = difficult_values();
+        for bin in &values {
+            for host in &values {
+                let argv = render_attach_argv(
+                    "launcher --host {host} --id={id} {bin}",
+                    &AttachTemplateValues {
+                        bin: bin.clone(),
+                        host: host.clone(),
+                        id: "sess ion;id".to_owned(),
+                    },
+                )
+                .expect("argv");
+                assert_eq!(
+                    argv,
+                    [
+                        "launcher".to_owned(),
+                        "--host".to_owned(),
+                        host.clone(),
+                        "--id=sess ion;id".to_owned(),
+                        bin.clone(),
+                    ],
+                    "bin={bin:?} host={host:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn argv_form_splits_only_the_template() {
+        let values = AttachTemplateValues {
+            bin: "/opt/My Tools/pohunek".to_owned(),
+            host: "a b 'c' \"d\"".to_owned(),
+            id: "1".to_owned(),
+        };
+        let argv = render_attach_argv(
+            r#"open -a "Some App" --args '{bin}' attach\ --host={host} "" {id}"#,
+            &values,
+        )
+        .expect("argv");
+        assert_eq!(
+            argv,
+            [
+                "open",
+                "-a",
+                "Some App",
+                "--args",
+                "/opt/My Tools/pohunek",
+                "attach --host=a b 'c' \"d\"",
+                "",
+                "1"
+            ]
+        );
+    }
+
+    #[test]
+    fn argv_form_double_quotes_follow_posix_escape_rules() {
+        let values = AttachTemplateValues {
+            bin: "b".to_owned(),
+            host: "h".to_owned(),
+            id: "i".to_owned(),
+        };
+        let argv = render_attach_argv(r#"x "a\"b\\c\$d\e" 'q\n'"#, &values).expect("argv");
+        assert_eq!(argv, ["x", "a\"b\\c$d\\e", "q\\n"]);
+    }
+
+    #[test]
+    fn argv_form_performs_no_expansion() {
+        let values = AttachTemplateValues {
+            bin: "b".to_owned(),
+            host: "h".to_owned(),
+            id: "i".to_owned(),
+        };
+        let argv = render_attach_argv("x $HOME ~ * $(id) `id`", &values).expect("argv");
+        assert_eq!(argv, ["x", "$HOME", "~", "*", "$(id)", "`id`"]);
+    }
+
+    #[test]
+    fn argv_form_rejects_unterminated_quotes_and_escapes() {
+        let values = AttachTemplateValues {
+            bin: "b".to_owned(),
+            host: "h".to_owned(),
+            id: "i".to_owned(),
+        };
+        for template in ["x 'open", "x \"open", "x open\\", "x \"open\\"] {
+            assert_eq!(
+                render_attach_argv(template, &values),
+                Err(AttachTemplateError::UnterminatedQuote),
+                "{template:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_form_rejects_empty_commands_and_nul_values() {
+        let values = AttachTemplateValues {
+            bin: String::new(),
+            host: "h\0x".to_owned(),
+            id: "i".to_owned(),
+        };
+        assert_eq!(
+            render_attach_argv("   ", &values),
+            Err(AttachTemplateError::EmptyCommand)
+        );
+        assert_eq!(
+            render_attach_argv("{bin} attach", &values),
+            Err(AttachTemplateError::EmptyProgram)
+        );
+        assert_eq!(
+            render_attach_argv("tool {host}", &values),
+            Err(AttachTemplateError::NulByte)
+        );
+    }
 }

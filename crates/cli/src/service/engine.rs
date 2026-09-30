@@ -134,7 +134,7 @@ use protocol::{RuntimeState, SessionInfo, SessionState};
 
 use super::backend::Backend;
 use super::context::Context;
-use super::definition::{daemon_definition, initial_config, with_version};
+use super::definition::{daemon_definition, identity_config, initial_config, with_version};
 use super::error::{supervisor_error, Error, LiveSession, OutdatedWorker};
 use super::layout::{self, Staged};
 use super::record::{self, Operation, Record, Step, Store, TransactionLock};
@@ -481,7 +481,7 @@ impl<'a> Engine<'a> {
             // missing file was removed afterwards; the record still names the
             // installation, and its daemon may still run live workers.
             (None, Some(pending)) => {
-                initial_config(self.context, &pending.prefix, &pending.version)?
+                identity_config(self.context, &pending.prefix, &pending.version)?
             }
             // The rolled back install never registered its daemon, so nothing
             // of it remains; `--purge` still removes the durable metadata.

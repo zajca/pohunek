@@ -1,10 +1,11 @@
 //! `service.toml` contents and the daemon's job definition.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-30
 
 use std::path::Path;
 
-use pohunek_platform::supervisor::{JobDefinition, JobSpec, RestartPolicy};
+use pohunek_platform::shell_env::SearchPath;
+use pohunek_platform::supervisor::{JobDefinition, JobSpec, RestartPolicy, SEARCH_PATH_VARIABLE};
 use pohunek_service_config::{ConfigSpec, Deadlines, ServiceConfig};
 use pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST;
 
@@ -19,19 +20,49 @@ const SERVICE_CONFIG_FLAG: &str = "--service-config";
 ///
 /// Every value comes from a documented constant in
 /// [`settings`](super::settings); the namespace inputs are the effective UID
-/// and the canonical application roots.
+/// and the canonical application roots. The daemon `PATH` is resolved by
+/// [`Context::install_search_path`], which may run the user's login shell.
 ///
 /// # Errors
 ///
-/// Returns a filesystem error when a root is unsafe and
+/// Returns a filesystem error when a root is unsafe,
+/// [`Error::SearchPath`] when no `PATH` can be resolved, and
 /// [`Error::Config`] when a value fails validation.
 pub fn initial_config(
     context: &Context,
     prefix: &Path,
     version: &str,
 ) -> Result<ServiceConfig, Error> {
+    let search_path = context.install_search_path()?;
+    config_with_search_path(context, prefix, version, search_path)
+}
+
+/// Builds the configuration of an installation that is only identified, not
+/// installed, such as when an interrupted install is uninstalled.
+///
+/// The search path stays empty: no daemon starts from this value, so no login
+/// shell runs.
+///
+/// # Errors
+///
+/// Returns a filesystem error when a root is unsafe and [`Error::Config`]
+/// when a value fails validation.
+pub fn identity_config(
+    context: &Context,
+    prefix: &Path,
+    version: &str,
+) -> Result<ServiceConfig, Error> {
+    config_with_search_path(context, prefix, version, SearchPath::empty())
+}
+
+fn config_with_search_path(
+    context: &Context,
+    prefix: &Path,
+    version: &str,
+    search_path: SearchPath,
+) -> Result<ServiceConfig, Error> {
     let (state_root, runtime_root) = context.roots()?;
-    Ok(ServiceConfig::new(ConfigSpec {
+    let config = ServiceConfig::new(ConfigSpec {
         prefix: prefix.to_path_buf(),
         active_version: version.to_owned(),
         uid: context.uid(),
@@ -51,10 +82,13 @@ pub fn initial_config(
             .collect(),
         sweep_grace: settings::SWEEP_GRACE,
         open_files: settings::OPEN_FILES,
-    })?)
+    })?;
+    Ok(config.with_search_path(search_path))
 }
 
 /// Returns `config` with only its active version changed.
+///
+/// The recorded search path is kept, so an upgrade never re-runs discovery.
 ///
 /// # Errors
 ///
@@ -62,14 +96,15 @@ pub fn initial_config(
 pub fn with_version(config: &ServiceConfig, version: &str) -> Result<ServiceConfig, Error> {
     let mut spec = config.to_spec();
     version.clone_into(&mut spec.active_version);
-    Ok(ServiceConfig::new(spec)?)
+    Ok(ServiceConfig::new(spec)?.with_search_path(config.search_path().clone()))
 }
 
 /// Builds the daemon's job definition for `config`.
 ///
 /// The daemon runs the versioned `pohunekd --service-config <file>`, restarts
 /// only after a failure (throttled), starts in the application state root,
-/// and receives the bootstrap XDG environment. On macOS launchd writes its
+/// and receives the bootstrap XDG environment plus the recorded `PATH` when
+/// [`ServiceConfig::search_path`] is not empty. On macOS launchd writes its
 /// stdout and stderr below `<log_dir>/launchd`.
 ///
 /// # Errors
@@ -82,6 +117,13 @@ pub fn daemon_definition(
 ) -> Result<JobDefinition, Error> {
     let config_path = context.config_path();
     let deadlines = config.deadlines();
+    let mut environment = context.bootstrap_environment()?;
+    if !config.search_path().is_empty() {
+        environment.insert(
+            SEARCH_PATH_VARIABLE.to_owned(),
+            config.search_path().to_env_value(),
+        );
+    }
     JobDefinition::new(JobSpec {
         executable: config.daemon_executable(),
         arguments: vec![
@@ -94,7 +136,7 @@ pub fn daemon_definition(
                 })?
                 .to_owned(),
         ],
-        environment: context.bootstrap_environment()?,
+        environment,
         working_directory: config.state_root().to_path_buf(),
         logs: daemon_logs(context, config),
         start_timeout: settings::DAEMON_START_TIMEOUT,
@@ -136,8 +178,10 @@ fn daemon_logs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::context::managed_path_discovery;
     use crate::service::context::tests::context;
     use crate::service::context::tests::temp_root;
+    use crate::service::context::PathDiscovery;
 
     #[test]
     fn initial_config_writes_the_documented_values() {
@@ -199,5 +243,172 @@ mod tests {
         );
         assert_eq!(definition.working_directory(), config.state_root());
         assert_eq!(definition.open_files(), settings::OPEN_FILES);
+    }
+
+    /// Writes an executable fake login shell and returns its path.
+    fn fake_shell(dir: &Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("fake-shell");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write shell");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod shell");
+        path
+    }
+
+    /// A context whose discovery runs `shell` and falls back to `fallback`.
+    fn managed_context(root: &Path, shell: std::path::PathBuf, fallback: &[String]) -> Context {
+        let discovery = managed_path_discovery(Some(shell), Vec::new());
+        let PathDiscovery::Managed {
+            login_shell: Some(mut login_shell),
+            ..
+        } = discovery
+        else {
+            panic!("managed discovery");
+        };
+        login_shell.timeout = std::time::Duration::from_millis(500);
+        context(root).with_path_discovery(PathDiscovery::Managed {
+            login_shell: Some(login_shell),
+            fallback_directories: fallback.to_vec(),
+        })
+    }
+
+    #[test]
+    fn an_unmanaged_context_records_no_path() {
+        let (_root, root) = temp_root();
+        let context = context(root.as_path());
+        let config =
+            initial_config(&context, &root.as_path().join("prefix"), "1.2.3").expect("config");
+        assert!(config.search_path().is_empty());
+        let definition = daemon_definition(&context, &config).expect("definition");
+        assert!(!definition.environment().contains_key("PATH"));
+    }
+
+    #[test]
+    fn the_login_shell_path_reaches_the_daemon_job_and_service_toml() {
+        let (_root, root) = temp_root();
+        let root = root.as_path();
+        // Apple Silicon Homebrew, a user-local install, and directories with
+        // spaces, quotes, and Unicode.
+        let brew = root.join("opt/homebrew/bin");
+        let local = root.join("home/.local/bin");
+        let project = root.join("Projekty \u{10d}esk\u{e9}/it's \"a\" app/bin");
+        for dir in [&brew, &local, &project] {
+            std::fs::create_dir_all(dir).expect("dir");
+        }
+        let value = format!(
+            "{}:{}:{}",
+            brew.display(),
+            local.display(),
+            project.display()
+        );
+        let value_file = root.join("path-value");
+        std::fs::write(&value_file, &value).expect("value");
+        let shell = fake_shell(
+            root,
+            &format!(
+                "echo 'banner from .zshrc'\nPATH=\"$(cat '{}')\"; export PATH\nexec /bin/sh -c \"$3\"",
+                value_file.display()
+            ),
+        );
+        let context = managed_context(root, shell, &[]);
+        let config = initial_config(&context, &root.join("prefix"), "1.2.3").expect("config");
+        assert_eq!(config.search_path().to_env_value(), value);
+        let definition = daemon_definition(&context, &config).expect("definition");
+        assert_eq!(definition.environment().get("PATH"), Some(&value));
+        // The XDG roots stay alongside the PATH entry.
+        assert!(definition.environment().contains_key("HOME"));
+
+        let written = root.join("service.toml");
+        config.write(&written).expect("write service.toml");
+        let loaded = ServiceConfig::load(&written).expect("load service.toml");
+        assert_eq!(loaded.search_path(), config.search_path());
+        let upgraded = with_version(&loaded, "1.2.4").expect("upgrade");
+        assert_eq!(upgraded.search_path(), config.search_path());
+        assert_eq!(
+            daemon_definition(&context, &upgraded)
+                .expect("definition")
+                .environment()
+                .get("PATH"),
+            Some(&value)
+        );
+    }
+
+    #[test]
+    fn a_broken_login_shell_falls_back_to_the_directory_list() {
+        let (_root, root) = temp_root();
+        let root = root.as_path();
+        let brew = root.join("opt/homebrew/bin");
+        let cargo = root.join("home/.cargo/bin");
+        for dir in [&brew, &cargo] {
+            std::fs::create_dir_all(dir).expect("dir");
+        }
+        let fallback = vec![
+            "~/.cargo/bin".to_owned(),
+            brew.display().to_string(),
+            root.join("usr/local/bin").display().to_string(),
+        ];
+        for body in [
+            "exit 1",
+            "echo junk before the sentinel",
+            "exit 0",
+            "exec sleep 300",
+        ] {
+            let shell = fake_shell(root, body);
+            let context = managed_context(root, shell, &fallback);
+            let config = initial_config(&context, &root.join("prefix"), "1.2.3").expect(body);
+            assert_eq!(
+                config.search_path().entries(),
+                [cargo.clone(), brew.clone()],
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_usable_directory_fails_the_install_instead_of_inventing_a_path() {
+        let (_root, root) = temp_root();
+        let root = root.as_path();
+        let shell = fake_shell(root, "exit 1");
+        let context = managed_context(root, shell, &[root.join("missing").display().to_string()]);
+        let error =
+            initial_config(&context, &root.join("prefix"), "1.2.3").expect_err("no directory");
+        assert_eq!(error.code(), "service_search_path_unavailable");
+    }
+
+    #[test]
+    fn identity_config_never_runs_the_login_shell() {
+        let (_root, root) = temp_root();
+        let root = root.as_path();
+        let marker = root.join("ran");
+        let shell = fake_shell(root, &format!("touch '{}'", marker.display()));
+        let context = managed_context(root, shell, &[]);
+        let config =
+            identity_config(&context, &root.join("prefix"), "1.2.3").expect("identity config");
+        assert!(config.search_path().is_empty());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn the_managed_policy_uses_the_documented_defaults() {
+        let PathDiscovery::Managed {
+            login_shell: Some(spec),
+            fallback_directories,
+        } = managed_path_discovery(Some(std::path::PathBuf::from("relative/zsh")), Vec::new())
+        else {
+            panic!("managed discovery");
+        };
+        assert_eq!(spec.shell, Path::new(settings::DEFAULT_LOGIN_SHELL));
+        assert_eq!(spec.timeout, settings::LOGIN_SHELL_TIMEOUT);
+        assert_eq!(spec.max_output_bytes, settings::LOGIN_SHELL_OUTPUT);
+        assert!(fallback_directories.contains(&"/opt/homebrew/bin".to_owned()));
+        assert!(fallback_directories.contains(&"/usr/local/bin".to_owned()));
+        let PathDiscovery::Managed {
+            login_shell: Some(spec),
+            ..
+        } = managed_path_discovery(Some(std::path::PathBuf::from("/bin/fish")), Vec::new())
+        else {
+            panic!("managed discovery");
+        };
+        assert_eq!(spec.shell, Path::new("/bin/fish"));
     }
 }

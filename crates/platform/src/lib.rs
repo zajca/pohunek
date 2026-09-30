@@ -12,10 +12,11 @@
 #![cfg_attr(not(target_os = "macos"), forbid(unsafe_code))]
 #![cfg_attr(target_os = "macos", deny(unsafe_code))]
 
-// Rust guideline compliant 2026-09-22
+// Rust guideline compliant 2026-09-30
 
 #[cfg(unix)]
 pub mod filesystem;
 pub mod peer;
 pub mod process;
+pub mod shell_env;
 pub mod supervisor;

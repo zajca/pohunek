@@ -2,6 +2,9 @@
 
 ## Unreleased (2026-09-29)
 
+- Documented the executable search-path policy: the `service.toml`
+  `[environment] search_path` key, the `service_search_path_unavailable` error
+  code, and the environment-resolution guide.
 - Documented macOS platform diagnostics and setup: the platform-specific
   `pohunek doctor` and `daemon.doctor` check lists (Linux-only launcher probes
   omitted on macOS; `runtime_dir_private`, `socket_path_length`,
