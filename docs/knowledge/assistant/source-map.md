@@ -296,12 +296,13 @@ Release packaging and contributor verification:
   plain-git work under the final names is never touched. Worktrees are
   read from `git worktree list --porcelain -z`, so any path parses intact. A failed
   final rename keeps the worktree on its temporary branch and reports both.
-  `--no-seed` skips seeding. A stale seed is skipped too: when the last
+  `--no-seed` skips seeding. A stale seed is skipped too: when the base's
+  `Cargo.lock` blob differs from the main checkout's own, or the last
   `Cargo.lock` change landed on the base's mainline after the seed profile's
   newest `.fingerprint`/`deps` mtime, the run seeds nothing, takes no Cargo
   locks or probe, and prints a line starting `not seeded (stale seed`;
   `--force-seed` seeds regardless and cannot be combined with `--no-seed`,
-  and an unreadable staleness signal keeps the seed.
+  and a staleness signal that cannot be read keeps the seed.
 - `scripts/tests/test_worktree_new.py` — regression checks for its slug and
   argument validation, fail-closed reflink probe, Cargo and repository lock
   contention (including two concurrent runs for one slug), layout checks,

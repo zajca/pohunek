@@ -26,16 +26,22 @@ Stale seeds: a seed clones the main checkout's build of whatever
 `Cargo.lock` it last built at, so when the lockfile changed since, cargo
 rebuilds the changed dependencies anyway and a seeded first build can be
 slower than a cold one. The script therefore skips the seed by itself, says
-why, and seeds anyway with `--force-seed`. The seed is stale when the
+why, and seeds anyway with `--force-seed`. The seed is stale when either
+rule holds. Content rule: the blob id of `Cargo.lock` on the resolved base
+(`git rev-parse <base>:Cargo.lock`) differs from the blob id of the main
+checkout's own `Cargo.lock` (`git hash-object`), so the main cache was built
+for another dependency set than the base needs; this matters for an explicit
+`<base-ref>` whose lockfile diverges from the main checkout's. Time rule: the
 time the last `Cargo.lock` change landed on the resolved base's first-parent
 history (`git log -1 --first-parent --format=%ct <base> -- Cargo.lock`: the
 merge commit's time for a merged branch, not the branch commit's) is newer
-than the newest build activity in the seed profile dir, the later of the mtimes of its
-`.fingerprint` and `deps` directories. The signal is content-anchored on
-purpose: the `Cargo.lock` file mtime changes on every checkout. When the
-signal cannot be read (no commit touches `Cargo.lock`, unparsable output, a
-missing directory, an out-of-range time) the seed is kept, because staleness costs only
-wall-clock time, never correctness: it is a performance heuristic, not a
+than the newest build activity in the seed profile dir, the later of the
+mtimes of its `.fingerprint` and `deps` directories. Both rules avoid the
+`Cargo.lock` file mtime, which changes on every checkout. When a signal
+cannot be read (no commit touches `Cargo.lock`, a lockfile missing on either
+side, unparsable output, a missing directory, an out-of-range time) that
+rule says nothing, and when neither rule fires the seed is kept, because
+staleness costs only wall-clock time, never correctness: it is a performance heuristic, not a
 safety gate, and every fail-closed rule below still applies to a run that
 seeds. The check runs before any Cargo lock file or probe directory is
 created, so a skipped seed leaves the main target dir untouched.
@@ -156,9 +162,13 @@ CARGO_LOCK_FILES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
 # Permission bits of a lock file this script creates; Cargo creates its own
 # lock files as 0644 (before the umask).
 LOCK_FILE_MODE = 0o644
-# Lockfile whose last change on the base commit is compared with the seed's
-# newest build activity to decide whether the seed is stale.
+# Lockfile compared between the base commit and the main checkout, and whose
+# last landing on the base is compared with the seed's newest build activity,
+# to decide whether the seed is stale.
 LOCKFILE = "Cargo.lock"
+# A git object id as printed by `git rev-parse` and `git hash-object`
+# (SHA-1, or SHA-256 repositories).
+BLOB_ID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 # Profile subdirectories that Cargo touches on every build; the later of
 # their mtimes is the seed's newest build activity.
 BUILD_ACTIVITY_DIRS = (".fingerprint", "deps")
@@ -448,11 +458,39 @@ def format_epoch(seconds):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(seconds))
 
 
-def stale_seed_times(source_target, base_commit, repo, executor):
-    """(lockfile time, seed build time) rendered as UTC text when the seed
-    is stale, else None. An unreadable or out-of-range time counts as fresh
-    (see the module docstring); rendering both times here keeps the later
-    skip message from failing after the worktree exists."""
+def blob_id(command, repo, executor):
+    """The object id a git command prints, or None when it fails or prints
+    anything but one hexadecimal id."""
+    result = executor(command, cwd=repo, check=False)
+    text = result.stdout.strip()
+    if result.returncode != 0 or not BLOB_ID_PATTERN.fullmatch(text):
+        return None
+    return text
+
+
+def lockfile_differs(base_commit, repo, executor):
+    """True when the lockfile blob on `base_commit` differs from the main
+    checkout's own, False when they match, None when either is unreadable."""
+    base = blob_id(["git", "rev-parse", "--verify", "--quiet",
+                    f"{base_commit}:{LOCKFILE}"], repo, executor)
+    main = blob_id(["git", "hash-object", "--", LOCKFILE], repo, executor)
+    if base is None or main is None:
+        return None
+    return base != main
+
+
+def stale_seed_reason(source_target, base_ref, base_commit, repo, executor):
+    """Pre-rendered reason text when the seed is stale, else None.
+
+    The content rule is checked before the time rule. Unreadable or
+    out-of-range signals say nothing (see the module docstring); rendering
+    the reason here keeps the later skip message from failing after the
+    worktree exists.
+    """
+    if lockfile_differs(base_commit, repo, executor):
+        return (f"{LOCKFILE} on {base_ref} differs from the main "
+                f"checkout's, so {source_target / PROFILE} was built for "
+                "another dependency set")
     locked = lockfile_commit_time(base_commit, repo, executor)
     built = newest_build_time(source_target / PROFILE)
     if locked is None or built is None:
@@ -463,7 +501,8 @@ def stale_seed_times(source_target, base_commit, repo, executor):
         return None
     if locked <= built:
         return None
-    return locked_text, built_text
+    return (f"{LOCKFILE} landed on {base_ref} at {locked_text}, after the "
+            f"newest build in {source_target / PROFILE} from {built_text}")
 
 
 def reflink(source, dest, cwd, executor):
@@ -736,7 +775,8 @@ def create_locked(args, repo, executor, out):
     seed = args.seed
     stale = None
     if seed and not args.force_seed:
-        stale = stale_seed_times(source_target, base_commit, repo, executor)
+        stale = stale_seed_reason(source_target, base_ref, base_commit, repo,
+                                  executor)
         seed = stale is None
     worktrees_root.mkdir(parents=True, exist_ok=True)
     temp, temp_branch = temporary_names(worktrees_root, args.slug)
@@ -812,10 +852,7 @@ def create_locked(args, repo, executor, out):
         print(f"  seeded {worktree / 'target' / PROFILE} from "
               f"{source_target / PROFILE} (reflink, shared extents)", file=out)
     elif stale is not None:
-        locked, built = stale
-        print(f"  not seeded (stale seed: {LOCKFILE} last changed on "
-              f"{base_ref} at {locked}, the newest build in "
-              f"{source_target / PROFILE} is from {built}): "
+        print(f"  not seeded (stale seed: {stale}): "
               "a seeded first build would rebuild the changed dependencies "
               "anyway. Pass --force-seed to seed anyway", file=out)
     else:

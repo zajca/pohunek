@@ -270,10 +270,11 @@ failed run rolls back only what it provably created and never touches work
 another process made under the final names. If only that last rename fails,
 the finished worktree is kept on its temporary branch and both are reported.
 The seed helps in proportion to how recently the main checkout was built at a
-similar `Cargo.lock`, so a stale seed is skipped automatically: when the last
-`Cargo.lock` change landed on the base's mainline after the newest mtime of the
-seed's `.fingerprint` and `deps` dirs, a seeded first build would rebuild the
-changed dependencies anyway, so the script seeds nothing and prints `not seeded
+similar `Cargo.lock`, so a stale seed is skipped automatically: when the base's `Cargo.lock`
+differs from the main checkout's (an explicit `<base-ref>` can carry another
+dependency set), or the last `Cargo.lock` change landed on the base's mainline
+after the newest mtime of the seed's `.fingerprint` and `deps` dirs, a seeded
+first build would rebuild the changed dependencies anyway, so the script seeds nothing and prints `not seeded
 (stale seed ...)` with the reason. `--force-seed` seeds anyway (mutually
 exclusive with `--no-seed`), and a staleness signal that cannot be read keeps
 the seed. Refreshing the main checkout's `target/` is a plain `cargo build
