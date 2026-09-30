@@ -142,12 +142,22 @@ impl TranscriptSink for FakeSink {
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(active, Ordering::SeqCst);
         self.upserts.lock().expect("upserts").push(path);
-        let failing = self
-            .fail_next
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                left.checked_sub(1)
-            })
-            .is_ok();
+        // A compare-exchange loop: `fetch_update` is deprecated on newer toolchains.
+        let mut left = self.fail_next.load(Ordering::SeqCst);
+        let failing = loop {
+            if left == 0 {
+                break false;
+            }
+            match self.fail_next.compare_exchange(
+                left,
+                left - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break true,
+                Err(actual) => left = actual,
+            }
+        };
         if failing {
             self.active.fetch_sub(1, Ordering::SeqCst);
             return Err(io::Error::other("scripted parse failure"));
