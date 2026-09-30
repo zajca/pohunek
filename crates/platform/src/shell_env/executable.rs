@@ -150,8 +150,82 @@ impl Owners {
 /// skipped as well. The path is returned as found, not canonicalized, so a
 /// multi-call binary keeps the name it was invoked by; group-writable
 /// executables (an admin-group Intel Homebrew) are out of scope.
+///
+/// A path-based exec cannot be made atomic with the check, so the directories
+/// the lookup passes through must also be owner-controlled
+/// ([`lookup_chain_is_owner_controlled`]): then nobody else can rename or
+/// retarget an entry after the check.
 pub(super) fn is_executable_file(path: &Path) -> bool {
     is_trusted_executable(path, Owners::current())
+}
+
+/// Whether every directory the lookup of `path` passes through is
+/// owner-controlled, symlink targets included.
+///
+/// The path is resolved component by component, and each directory searched on
+/// the way (the canonical directory holding the next entry, including the final
+/// file's directory) must pass the platform's trusted-ancestor policy
+/// ([`TrustedDir::open_absolute_ancestor`](crate::filesystem::TrustedDir)):
+/// effective-user-owned components are not group- or world-writable and
+/// root-owned ones are non-writable or sticky, so no other account can rename
+/// an entry on either the lexical or the canonical chain.
+fn lookup_chain_is_owner_controlled(path: &Path) -> bool {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::Component;
+
+    /// Symlinks followed before the lookup is treated as a loop.
+    const MAX_LINKS: usize = 40;
+
+    let mut pending: VecDeque<OsString> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::RootDir | Component::CurDir => None,
+            other => Some(other.as_os_str().to_owned()),
+        })
+        .collect();
+    let mut directory = PathBuf::from("/");
+    let mut searched: Vec<PathBuf> = Vec::new();
+    let mut links = 0_usize;
+    while let Some(name) = pending.pop_front() {
+        if name == ".." {
+            directory.pop();
+            continue;
+        }
+        if !searched.contains(&directory) {
+            searched.push(directory.clone());
+        }
+        let next = directory.join(&name);
+        let Ok(metadata) = std::fs::symlink_metadata(&next) else {
+            return false;
+        };
+        if !metadata.file_type().is_symlink() {
+            directory = next;
+            continue;
+        }
+        links += 1;
+        let Ok(target) = std::fs::read_link(&next) else {
+            return false;
+        };
+        if links > MAX_LINKS {
+            return false;
+        }
+        if target.is_absolute() {
+            directory = PathBuf::from("/");
+        }
+        for component in target.components().rev() {
+            match component {
+                Component::RootDir | Component::CurDir => {}
+                other => pending.push_front(other.as_os_str().to_owned()),
+            }
+        }
+    }
+    // The filesystem root has no components for the ancestor policy to judge;
+    // renaming below it needs write access to a directory that is judged.
+    searched
+        .iter()
+        .filter(|dir| dir.as_path() != Path::new("/"))
+        .all(|dir| crate::filesystem::TrustedDir::open_absolute_ancestor(dir).is_ok())
 }
 
 fn is_trusted_executable(path: &Path, owners: Owners) -> bool {
@@ -176,6 +250,7 @@ fn is_trusted_executable(path: &Path, owners: Owners) -> bool {
         && owners.allows(stat.st_uid)
         && !mode.intersects(Mode::WGRP | Mode::WOTH)
         && crate::filesystem::validate_private_acl(&file, &target).is_ok()
+        && lookup_chain_is_owner_controlled(path)
         && rustix::fs::accessat(
             rustix::fs::CWD,
             &target,
@@ -501,5 +576,69 @@ mod tests {
             resolve_executable(OsStr::new("agent"), &search),
             Err(ExecutableError::NotFound)
         );
+    }
+
+    /// A world-writable directory (not sticky): anyone may rename its entries.
+    fn wild_dir(root: &Path, name: &str) -> PathBuf {
+        let wild = root.join(name);
+        make_dir(root, &wild);
+        fs::set_permissions(&wild, fs::Permissions::from_mode(0o777)).expect("chmod");
+        wild
+    }
+
+    #[test]
+    fn a_trusted_file_in_a_directory_others_can_write_is_refused() {
+        let dir = fixture();
+        let wild = wild_dir(dir.path(), "wild");
+        let tight = dir.path().join("tight");
+        make_dir(dir.path(), &tight);
+        // The file is 0755 and ours; only its directory is the problem.
+        executable(&wild, "agent");
+        let trusted = executable(&tight, "agent");
+        let search = SearchPath::new(vec![wild.clone(), tight]).expect("search");
+        assert_eq!(
+            resolve_executable(OsStr::new("agent"), &search),
+            Ok(trusted)
+        );
+        assert_eq!(
+            resolve_executable(wild.join("agent").as_os_str(), &search),
+            Err(ExecutableError::NotExecutable)
+        );
+        // A directory below a writable one is refused as well.
+        let below = wild.join("below");
+        make_dir(dir.path(), &below);
+        executable(&below, "agent");
+        assert_eq!(
+            resolve_executable(below.join("agent").as_os_str(), &search),
+            Err(ExecutableError::NotExecutable)
+        );
+    }
+
+    #[test]
+    fn a_symlink_whose_lookup_directory_is_writable_is_refused() {
+        let dir = fixture();
+        let cellar = dir.path().join("Cellar");
+        make_dir(dir.path(), &cellar);
+        let real = executable(&cellar, "tool");
+        let wild = wild_dir(dir.path(), "wild");
+        std::os::unix::fs::symlink(&real, wild.join("tool")).expect("symlink");
+        let search = SearchPath::new(vec![wild]).expect("search");
+        // The target is trusted; the directory holding the link is not.
+        assert_eq!(
+            resolve_executable(OsStr::new("tool"), &search),
+            Err(ExecutableError::NotFound)
+        );
+    }
+
+    #[test]
+    fn a_trusted_chain_under_a_sticky_root_owned_temporary_root_is_accepted() {
+        // `fixture` lives in a private 0700 directory below the sticky,
+        // world-writable, root-owned temporary root.
+        let dir = fixture();
+        let bin = dir.path().join("bin");
+        make_dir(dir.path(), &bin);
+        let agent = executable(&bin, "agent");
+        let search = SearchPath::new(vec![bin]).expect("search");
+        assert_eq!(resolve_executable(OsStr::new("agent"), &search), Ok(agent));
     }
 }

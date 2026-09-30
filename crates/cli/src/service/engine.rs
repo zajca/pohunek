@@ -293,6 +293,13 @@ impl<'a> Engine<'a> {
         // The discovery environment is judged, and discovery run, before a
         // foreign pending transaction is rolled back, so a hostile environment
         // fails the install with nothing changed.
+        // An existing installation or job wins over discovery for a fresh plan,
+        // so re-running install neither starts the login shell nor masks
+        // `service_already_installed`.
+        let config_path = self.context.config_path();
+        if matches!(plan, Plan::Fresh) {
+            self.ensure_not_installed(&config_path).await?;
+        }
         let discovered = discover_for_plan(self.context, &plan)?;
         let (resume, rolled_back) = match plan {
             Plan::Fresh => (None, None),
@@ -303,12 +310,10 @@ impl<'a> Engine<'a> {
                 (None, Some(report))
             }
         };
-        let config_path = self.context.config_path();
-        if resume.is_none() {
-            if file_exists(&config_path)? {
-                return Err(Error::AlreadyInstalled { path: config_path });
-            }
-            ensure_no_daemon_job(self.backend).await?;
+        // The rollback removed the foreign transaction's files; what is left
+        // must not be an installation.
+        if rolled_back.is_some() {
+            self.ensure_not_installed(&config_path).await?;
         }
         // Once `service.toml` is written it is the installation's record, so a
         // resume past that step reads it instead of probing the host again,
@@ -386,6 +391,16 @@ impl<'a> Engine<'a> {
             rolled_back,
             search_path: search_path_report,
         })
+    }
+
+    /// Fails when `service.toml` or a daemon job of this namespace exists.
+    async fn ensure_not_installed(&self, config_path: &Path) -> Result<(), Error> {
+        if file_exists(config_path)? {
+            return Err(Error::AlreadyInstalled {
+                path: config_path.to_path_buf(),
+            });
+        }
+        ensure_no_daemon_job(self.backend).await
     }
 
     /// Reads `service.toml` for an install resumed past the config step.
@@ -1468,13 +1483,17 @@ pub(crate) fn discover_for_plan(
     context: &Context,
     plan: &Plan,
 ) -> Result<Option<(SearchPath, SearchPathReport)>, Error> {
-    let writes_config = match plan {
-        Plan::Fresh | Plan::RollBack(_) => true,
-        Plan::Resume(record) => record.step < Step::Config,
-    };
-    writes_config
+    plan_discovers(plan)
         .then(|| context.install_search_path())
         .transpose()
+}
+
+/// Whether `plan` writes `service.toml` and so resolves the daemon `PATH`.
+pub(crate) fn plan_discovers(plan: &Plan) -> bool {
+    match plan {
+        Plan::Fresh | Plan::RollBack(_) => true,
+        Plan::Resume(record) => record.step < Step::Config,
+    }
 }
 
 /// Everything upgrade checks before it reads `service.toml`.

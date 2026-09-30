@@ -893,6 +893,42 @@ async fn a_hostile_discovery_environment_fails_install_and_check_before_a_foreig
 }
 
 #[tokio::test]
+async fn an_existing_installation_wins_over_discovery_and_never_starts_the_probe() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let marker = harness.root.join("probe-ran");
+    let shell = harness.root.join("marker-shell");
+    std::fs::write(
+        &shell,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    )
+    .expect("write shell");
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let discovery = crate::service::context::managed_path_discovery(Some(shell), Vec::new())
+        .expect("discovery");
+    let probing = harness.context.clone().with_path_discovery(discovery);
+    let hostile = with_hostile_discovery_environment(&harness.context);
+    for context in [probing, hostile] {
+        harness.context = context;
+        let error = harness.install(V1).await.expect_err("already installed");
+        assert_eq!(error.code(), "service_already_installed");
+        let checked = crate::service::check_with(
+            &harness.context,
+            &harness.backend,
+            Some(harness.prefix()),
+            V2,
+            false,
+        )
+        .await;
+        // `check` would upgrade; it never discovers for an installed service.
+        assert!(checked.is_ok(), "{checked:?}");
+    }
+    assert!(!marker.exists(), "the login shell must never start");
+}
+
+#[tokio::test]
 async fn a_resume_refuses_a_service_toml_of_another_installation() {
     for (key, edit) in [("prefix", 0_u8), ("active_version", 1_u8)] {
         let harness = Harness::new();

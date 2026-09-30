@@ -57,8 +57,15 @@ ACL that grants access (macOS), and the kernel must agree the user can run it.
 A candidate that fails is skipped and the search goes on, like one the shell
 cannot execute. The path is returned as found, not canonicalized, so a
 multi-call binary (`sh` linked to `bash` or `busybox`) keeps the name it was
-started by. Group-writable executables, such as an admin-group Intel Homebrew,
-are out of scope.
+started by. The directories the lookup passes through must also be
+owner-controlled, on the lexical chain and on the canonical chain of a symlink
+target: every component passes the platform's trusted-ancestor policy (user-owned
+components not group- or world-writable, root-owned ones non-writable or
+sticky), so no other account can rename or retarget an entry after the check. A
+path-based exec cannot be made atomic with the check; the chain check removes
+the attacker's ability to change what the path names. A private 0700 directory
+below the sticky root-owned `/tmp` passes. Group-writable executables or
+directories, such as an admin-group Intel Homebrew, are out of scope.
 
 Login-shell output and the fallback table are untrusted input, so a directory
 is kept only when it is trusted: symlinks are resolved, every component of the

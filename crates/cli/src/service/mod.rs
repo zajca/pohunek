@@ -139,6 +139,9 @@ pub async fn check(prefix: Option<PathBuf>) -> Result<report::CheckReport, Error
         let backend = Backend::connect(&context, &namespace, settings::LAUNCHCTL_COMMAND).await?;
         engine::ensure_no_daemon_job(&backend).await?;
     }
+    if checked.needs_discovery {
+        context.install_search_path()?;
+    }
     Ok(checked.report)
 }
 
@@ -508,6 +511,10 @@ pub(crate) struct Checked {
     /// Whether install would start over and must find no daemon job
     /// ([`engine::ensure_no_daemon_job`]).
     pub(crate) fresh_install: bool,
+    /// Whether install would resolve the daemon `PATH`; the caller validates
+    /// that after the job check, in install's order
+    /// ([`engine::discover_for_plan`]).
+    pub(crate) needs_discovery: bool,
 }
 
 /// Runs the checks of [`check`] that need no service manager.
@@ -545,8 +552,6 @@ pub(crate) fn check_local(
         };
         let layout = engine::install_preflight(context, &prefix)?;
         let plan = engine::install_plan(pending, &prefix, version)?;
-        // The same discovery validation install runs before its first effect.
-        engine::discover_for_plan(context, &plan)?;
         // A rollback of the pending record removes the `service.toml` it wrote.
         if matches!(plan, engine::Plan::Fresh) && exists(&config_path)? {
             return Err(Error::AlreadyInstalled { path: config_path });
@@ -593,6 +598,7 @@ pub(crate) fn check_local(
     Ok(Checked {
         report,
         fresh_install,
+        needs_discovery: operation == record::Operation::Install && engine::plan_discovers(&plan),
     })
 }
 
@@ -612,6 +618,9 @@ pub(crate) async fn check_with(
     let checked = check_local(context, prefix, version, locked)?;
     if checked.fresh_install {
         engine::ensure_no_daemon_job(backend).await?;
+    }
+    if checked.needs_discovery {
+        context.install_search_path()?;
     }
     Ok(checked.report)
 }
