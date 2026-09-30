@@ -224,9 +224,9 @@ with a linked issue and a reason in a comment next to it.
 Rust:
 
 ```bash
-cargo ta                                      # inner loop: fast tests of changed crates + dependents
+cargo t                                       # default inner loop: cost-filtered fast unit + integration tests
+cargo ta                                      # CPU-saving loop: fast tests of changed crates + dependents
 cargo ta --print                              # per-file reasons and the command; runs nothing
-cargo t                                       # cost-filtered fast unit + integration loop
 cargo t -p pohunek-gui-core                   # fast tests in one crate (alias takes -p)
 cargo nextest run --profile local -p pohunek-cli some_test_name  # one test
 cargo clippy -p pohunek-daemon --all-targets  # lint one crate
@@ -236,9 +236,14 @@ python3 scripts/test-partitions --archive-file nextest-archive.tar.zst run heavy
 ```
 
 `cargo ta` (`cargo xtask affected [--base REF] [--print] [-- NEXTEST_ARGS]`)
-is the inner-loop command. It diffs against the merge base with `origin/main`
-(else `main`, else it fails; `--base` overrides) and adds staged, unstaged,
-and untracked files. Each file selects the package whose directory contains it;
+is the CPU-saving alternative to `cargo t`. It adds about 3 s of xtask start
+and gives no wall-clock gain on an idle host, because the build is identical
+and test time is bounded by the slowest selected test. It runs fewer tests,
+which saves CPU when several agents or worktrees share the host, so prefer it
+there; prefer `cargo t` on an otherwise idle host or for a wide change.
+It diffs against the merge base with `origin/main` (else `main`, else it
+fails; `--base` overrides) and adds staged, unstaged, and untracked files.
+Each file selects the package whose directory contains it;
 paths that crates embed or their tests read from outside their own directory
 (`docs/knowledge`, `compat/`, `scripts/`, `packaging/`, the release workflow)
 select those crates. It then runs `cargo t -E 'rdeps(=a) | ...'`, so dependents
