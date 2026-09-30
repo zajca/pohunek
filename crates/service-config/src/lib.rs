@@ -27,8 +27,9 @@
 //! daemon_exit_timeout_ms = 30000
 //! daemon_restart_throttle_ms = 5000
 //!
-//! [environment]                                    # names or trailing-`*` prefixes
-//! allowlist = ["PATH", "HOME", "LANG", "LC_*", "XDG_*"]
+//! [environment]
+//! search_path = ["/opt/homebrew/bin", "/usr/bin"]  # absolute normalized directories; may be empty
+//! allowlist = ["PATH", "HOME", "LANG", "LC_*", "XDG_*"]   # names or trailing-`*` prefixes
 //!
 //! [sweep]
 //! grace_ms = 5000                                  # 1..=600000
@@ -962,6 +963,24 @@ fn utf8(path: &Path) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The schema example in the module documentation must load as written.
+    #[test]
+    fn the_documented_schema_example_parses() {
+        let source = include_str!("lib.rs");
+        let example: String = source
+            .lines()
+            .skip_while(|line| *line != "//! ```toml")
+            .skip(1)
+            .take_while(|line| *line != "//! ```")
+            .map(|line| line.trim_start_matches("//!").trim_start_matches(' '))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(example.contains("schema_version = 2"), "{example}");
+        let config = parse(Path::new("/fixture/pohunek/service.toml"), &example)
+            .expect("the documented example is a valid configuration");
+        assert_eq!(config.search_path().entries().len(), 2);
+    }
 
     #[test]
     fn redaction_masks_only_closed_quoted_values() {

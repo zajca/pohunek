@@ -4360,7 +4360,6 @@ dependencies = [
  "pohunek-protocol",
  "pohunek-test-support",
  "reqwest",
- "security-framework 3.7.0",
  "serde",
  "serde_json",
  "tempfile",
