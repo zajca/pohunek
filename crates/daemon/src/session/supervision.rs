@@ -76,6 +76,15 @@ const MAX_SWEEP_PASSES: usize = 3;
 /// non-dumpable helpers (agents, keyrings) a desktop session typically has.
 pub(super) const MAX_LISTED_UNREADABLE_CANDIDATES: usize = 8;
 
+/// Most unreadable-marker processes one removal may accept.
+///
+/// The accepted processes are returned in the `session.remove` result, which
+/// is built after the destructive cleanup, so the list must always fit one
+/// response line (the client frames lines at 1 MiB). 64 entries of pid, start
+/// identity and a bounded command name take a few kilobytes; a removal with
+/// more candidates than this is refused before anything is deleted.
+pub(super) const MAX_ACCEPTED_UNCONFIRMED_PROCESSES: usize = 64;
+
 /// Recovery hint of a removal refused because of unreadable-marker processes.
 pub(super) const UNREADABLE_CANDIDATES_RECOVER: &str =
     "inspect the listed processes and end the ones that belong to this session, then retry the removal";

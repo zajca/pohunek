@@ -13465,6 +13465,44 @@ async fn accepted_unconfirmed_cleanup_removes_a_session_blocked_only_by_unreadab
     assert!(!worktree.exists(), "the checkout is deleted");
 }
 
+/// The accepted processes travel in a result built after the cleanup, so a
+/// removal with more candidates than fit one response is refused before
+/// anything is deleted; exactly the maximum is still accepted.
+#[tokio::test]
+async fn accepted_unconfirmed_cleanup_is_bounded_before_anything_is_deleted() {
+    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+        "remove-accept-bounded",
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
+    let repo = init_git_repo("remove-accept-bounded");
+    let session = record_only_session_in(&registry, Some(&repo)).await;
+    let worktree = session.worktree_path.clone().expect("session worktree");
+    let cap = super::supervision::MAX_ACCEPTED_UNCONFIRMED_PROCESSES;
+
+    inspector.set_candidates(cap + 1);
+    let refused = registry
+        .remove_with(&session.id, super::UnconfirmedCleanup::Accept)
+        .await
+        .expect_err("more candidates than one result can list refuse the removal");
+    assert_eq!(
+        refused.code,
+        crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS,
+        "{refused:?}"
+    );
+    assert!(refused.recover.is_some(), "{refused:?}");
+    assert_eq!(session_ids(&registry).await, vec![session.id.0.clone()]);
+    assert!(worktree.exists(), "a refused removal deletes nothing");
+
+    inspector.set_candidates(cap);
+    let removed = registry
+        .remove_with(&session.id, super::UnconfirmedCleanup::Accept)
+        .await
+        .expect("exactly the maximum is accepted");
+    assert_eq!(removed.accepted_unconfirmed_processes.len(), cap);
+    assert!(session_ids(&registry).await.is_empty());
+}
+
 /// A removal that needs no consent reports no accepted processes even when
 /// the caller consented.
 #[tokio::test]

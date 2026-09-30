@@ -337,7 +337,8 @@ removal proceeds past the unreadable candidates without signalling them, logs
 each at `warn`, and lists every one in the result as
 `accepted_unconfirmed_processes` (human output prints `pid N (start S, command
 name)` lines after the `removed=` line, with the process-chosen command name
-escaped; `--json` carries the array). It changes
+escaped; `--json` carries the array). A removal with more than 64 candidates is
+refused before anything is deleted, so the result always fits one response. It changes
 nothing else: a signalled process that is still running, a sweep error, or a
 missing supervision configuration still refuses. The trade-off is that an
 accepted process that does carry the runtime marker keeps running unsupervised
