@@ -55,6 +55,10 @@ live_timeout_s=60
 # Upper bound on the wait for a process to exit after a signal.
 exit_timeout_s=15
 poll_s=1
+# Most lines of each evidence log printed when the run fails.
+log_tail_lines=200
+# Longest accepted daemon socket path; the Darwin sockaddr_un limit is 103.
+socket_path_max=100
 # The minimal PATH launchd gives a Finder-launched app.
 finder_path=/usr/bin:/bin:/usr/sbin:/sbin
 python_bin=${GUI_ACCEPT_PYTHON:-/usr/bin/python3}
@@ -94,9 +98,29 @@ Manual Finder procedure (needs the .app bundle from issue #104 for step 3):
 EOF
 }
 
+# Prints the tail of one evidence log to stderr. The daemon and GUI logs hold
+# tracing lines and error text only: the daemon reads its environment through
+# an allowlist and never logs values.
+dump_log() {
+  [ -f "$1" ] || return 0
+  printf '\n----- %s (last %s lines) -----\n' "$1" "$log_tail_lines" >&2
+  tail -n "$log_tail_lines" "$1" >&2 || true
+}
+
+dump_evidence() {
+  [ -n "$work" ] && [ -d "$work" ] || return 0
+  printf '\nmacos-gui-launch: evidence logs follow\n' >&2
+  dump_log "$work/ev/daemon.log"
+  dump_log "$work/ev/gui.err"
+  dump_log "$work/ev/gui.out"
+  find "$work/state" -type f \( -name '*.jsonl' -o -name '*.log' \) 2>/dev/null |
+    while IFS= read -r file; do dump_log "$file"; done
+}
+
 cleanup() {
   status=$?
   trap - EXIT
+  [ "$status" -eq 0 ] || dump_evidence
   [ -z "$gui_pid" ] || kill "$gui_pid" 2>/dev/null || true
   [ -z "$daemon_pid" ] || kill "$daemon_pid" 2>/dev/null || true
   if [ -n "$work" ] && [ -d "$work" ]; then
@@ -139,6 +163,12 @@ user=$(id -un)
 # Unix socket paths are limited to 103 bytes on macOS: keep the root short.
 work=$(mktemp -d /tmp/pgl.XXXXXX)
 chmod 700 "$work"
+# /tmp is a symlink to /private/tmp on macOS, and the daemon opens every path
+# component without following symlinks, so the root must be the physical path.
+work=$(CDPATH='' cd -- "$work" && pwd -P)
+socket_path="$work/run/pohunek/daemon.sock"
+[ "${#socket_path}" -le "$socket_path_max" ] ||
+  die "socket path is ${#socket_path} bytes, over the $socket_path_max byte limit: $socket_path"
 home="$work/h"
 mkdir -p "$home/.config" "$work/run" "$work/state" "$work/data" "$work/cache" "$work/ev"
 chmod 700 "$work/run"
@@ -174,6 +204,9 @@ attach_command = "$recorder {bin} --host={host} attach -- {id}"
 EOF
 
 say "Starting an isolated daemon (subprocess workers)"
+printf 'command: %s daemon start --dev-subprocess (pohunekd is exec'"'"'d beside it)\n' "$bin_dir/pohunek"
+printf 'environment names: HOME USER LOGNAME PATH XDG_CONFIG_HOME XDG_RUNTIME_DIR XDG_STATE_HOME XDG_DATA_HOME XDG_CACHE_HOME (POHUNEK_WORKER_LAUNCHER is set by the CLI)\n'
+printf 'runtime dir: %s (mode %s)\n' "$work/run" "$(stat -f '%Lp' "$work/run" 2>/dev/null || stat -c '%a' "$work/run")"
 finder_env "$bin_dir/pohunek" daemon start --dev-subprocess >"$work/ev/daemon.log" 2>&1 &
 daemon_pid=$!
 waited=0
