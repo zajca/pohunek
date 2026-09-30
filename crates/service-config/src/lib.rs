@@ -45,8 +45,9 @@
 //! its `PATH`. Each entry is an absolute, normalized directory without `:` or
 //! control characters, no entry repeats, and the joined value stays within
 //! [`MAX_SEARCH_PATH_BYTES`]. An empty list means the job keeps the service
-//! manager's own `PATH`. The file is the override point: an operator may edit
-//! the list, and upgrades preserve it.
+//! manager's own `PATH`. Upgrades preserve the recorded list. The daemon does
+//! not read it from the file: it reaches the job definition only when the
+//! installer writes one (install, or an upgrade to a different version).
 //!
 //! # File trust
 //!

@@ -23,9 +23,11 @@ Highest priority first:
    absolute and executable; it is used as is and no search happens.
 2. **A profile or service environment `PATH`.** A non-empty
    `[environment] search_path` in `service.toml` is authoritative: no discovery
-   runs and no lower tier is consulted. Upgrades preserve it, so it is the
-   operator's override point. A fresh install has no `service.toml` yet, so this
-   tier takes effect for upgrades and hand edits.
+   runs and no lower tier is consulted for it. Upgrades carry the recorded list
+   forward. A fresh install has no `service.toml` yet, so this tier applies
+   only to an existing installation. The daemon does not read the file at run
+   time: the list reaches the launchd job only when a job definition is
+   written (see "Where the result goes").
 3. **Bounded login-shell discovery (macOS only).** One `$SHELL -l -c` probe
    prints `PATH` between two random sentinel lines through the absolute
    `/usr/bin/printenv`. It is never interactive (`-i` is not used), reads a
@@ -78,8 +80,11 @@ keep `search_path = []`: the daemon inherits the user manager's environment and
 no `PATH` is written.
 
 Upgrades and rollbacks reuse the recorded `search_path` and never run a login
-shell. To pick up a newly installed prefix, edit `search_path` in
-`service.toml` or reinstall.
+shell. The job definition is written only at install and at an upgrade to a
+different version, so an edit of `search_path` in `service.toml` takes effect
+only after a reinstall (uninstall, then install) or an upgrade to a different
+version; a same-version upgrade returns before it replaces the job. A command
+that refreshes the path in place is tracked in #319.
 
 ## Safety rules
 
@@ -93,10 +98,10 @@ shell. To pick up a newly installed prefix, edit `search_path` in
 
 ## Attach command templates
 
-The GUI attach template uses `{bin}`, `{host}`, and `{id}`. It runs in one of two
-modes (`attach_command_mode`), both in `pohunek-gui-core`:
+The GUI attach template uses `{bin}`, `{host}`, and `{id}`. It can be rendered in
+one of two ways, both in `pohunek-gui-core`:
 
-- **`shell`** (default): `render_attach_command` renders one string for `sh -c`.
+- **Shell string**: `render_attach_command` renders one string for `sh -c`.
   Substitution is a single pass, and a placeholder is accepted only where the
   shell reads it as an unquoted word; its value is escaped as exactly one such
   word. A value containing quotes, `$()`, backticks, newlines, `;`, spaces,
@@ -108,7 +113,7 @@ modes (`attach_command_mode`), both in `pohunek-gui-core`:
   `UnterminatedQuote`). To run a nested script, pass the values as positional
   parameters instead of quoting them into the script:
   `attach_command = "$TERMINAL -e sh -c 'exec \"$@\"' sh {bin} attach --host {host} {id}"`.
-- **`argv`**: `render_attach_argv` renders an argument vector without a shell.
+- **Argument vector**: `render_attach_argv` renders an argument vector without a shell.
   Only the template is split (POSIX quoting, no expansion, only space, tab, and
   newline separate words); values are inserted after splitting as data in
   exactly one argument each, so a quoted placeholder such as

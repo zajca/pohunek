@@ -901,7 +901,10 @@ values never reach agent code. The `[environment]` table of `service.toml` also
 requires a `search_path` list: the absolute, normalized, non-repeating
 directories the installer resolved and hands to the daemon job as its `PATH`
 (an empty list keeps the service manager's own `PATH`; the joined value is
-bounded). The file is the override point and upgrades preserve it. This key
+bounded). Upgrades preserve the recorded list; it reaches the daemon job only when the
+installer writes the job definition (install, or an upgrade to a different
+version), so a manual edit needs a reinstall or such an upgrade to take effect
+(an in-place refresh is tracked in #319). This key
 raised the `service.toml` `schema_version` to 2; a version 1 file is refused
 with a message to uninstall with the pohunek that wrote it and install again,
 because there is no migration. When the

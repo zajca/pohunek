@@ -597,7 +597,7 @@ selected host.
 
 ```toml
 pohunek_bin = "/usr/local/bin/pohunek"
-attach_command = "$TERMINAL -e sh -c 'exec {bin} attach --host {host} {id}'"
+attach_command = "$TERMINAL -e sh -c 'exec \"$@\"' sh {bin} attach --host {host} {id}"
 notification_command = "notify-send"
 ```
 

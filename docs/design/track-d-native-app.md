@@ -145,7 +145,7 @@ Shared with the sway scripts (D-09). New GUI file `gui.toml`:
 ```toml
 # Attach delegation (D-03). {bin} {host} {id} are substituted; {host} is empty
 # for the local daemon. The GUI spawns this verbatim and does not track the child.
-attach_command = "$TERMINAL -e sh -c 'printf \"\\033]0;pohunek:%s\\007\" \"{id}\"; exec {bin} attach --host {host} {id}'"
+attach_command = "$TERMINAL -e sh -c 'printf \"\\033]0;pohunek:%s\\007\" \"$5\"; exec \"$@\"' sh {bin} attach --host {host} {id}"
 
 [gui]
 connect_timeout_ms = 2000

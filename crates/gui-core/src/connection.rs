@@ -459,8 +459,10 @@ pub enum AttachTemplateError {
     NulByte,
     /// A placeholder sits where the shell quoting cannot be proven safe.
     #[error(
-        "attach command placeholder cannot be used with {context}; write it unquoted, or set \
-         `attach_command_mode = \"argv\"` to quote it"
+        "attach command placeholder cannot be used with {context}; write the placeholder \
+         unquoted and pass values as positional parameters, for example \
+         `sh -c 'exec \"$@\"' sh {{bin}} attach {{host}} {{id}}`, or render the template \
+         as an argument vector"
     )]
     UnsafePlaceholderContext {
         /// The construct that prevents a safe substitution.
@@ -523,8 +525,8 @@ fn substitute_placeholders(text: &str, bin: &str, host: &str, id: &str) -> Strin
 /// A placeholder inside `'...'`, `"..."`, `$'...'`, a comment, after a heredoc
 /// operator, a line continuation, or a command substitution, or right after a
 /// backslash, is refused. Write the placeholder unquoted, or use
-/// `attach_command_mode = "argv"` ([`render_attach_argv`]), which accepts
-/// quoted placeholders and passes values as data. To run a nested script, pass
+/// [`render_attach_argv`], which accepts quoted placeholders and passes values
+/// as data. To run a nested script, pass
 /// the values as positional parameters:
 /// `sh -c 'exec "$@"' sh {bin} attach --host {host} {id}`.
 ///
@@ -1140,7 +1142,8 @@ mod attach_template_tests {
         let message = render_attach_command("echo '{host}'", &values)
             .expect_err("quoted")
             .to_string();
-        assert!(message.contains("attach_command_mode"), "{message}");
+        assert!(message.contains("positional parameters"), "{message}");
+        assert!(!message.contains("attach_command_mode"), "{message}");
         for template in [
             "echo {host} 'x",
             "echo {host} \"x",
@@ -1212,6 +1215,17 @@ mod attach_template_tests {
                 ],
                 "{hostile:?}"
             );
+        }
+    }
+
+    #[test]
+    fn the_documented_attach_templates_validate() {
+        for template in [
+            "$TERMINAL -e sh -c 'exec \"$@\"' sh {bin} attach --host {host} {id}",
+            "$TERMINAL -e sh -c 'printf \"\\033]0;pohunek:%s\\007\" \"$5\"; exec \"$@\"' sh {bin} attach --host {host} {id}",
+            "kitty -e {bin} --host={host} attach -- {id}",
+        ] {
+            assert_eq!(validate_attach_shell_template(template), Ok(()), "{template}");
         }
     }
 
