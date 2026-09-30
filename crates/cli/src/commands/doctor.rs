@@ -16,7 +16,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use hostcheck::{AccessDir, Platform, StandardCheckInputs, WorkerCandidate};
+use hostcheck::{AccessDir, Platform, StandardCheckInputs, Supervision, WorkerCandidate};
 use protocol::{DoctorCheck, DoctorReport as Report, DoctorStatus as Status};
 
 use crate::client::Client;
@@ -50,6 +50,7 @@ pub(crate) async fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
     let sway_config_dir = paths.sway_config_dir();
     let home_dir = std::env::var_os(pohunek_paths::HOME).map(PathBuf::from);
     let worker = worker_candidate(&paths.config_dir);
+    let supervision = supervision_mode(&paths.config_dir);
     let working_dir = std::env::current_dir();
     let access_dirs: Vec<AccessDir<'_>> = working_dir
         .iter()
@@ -69,6 +70,7 @@ pub(crate) async fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
         effective_uid: nix::unistd::Uid::effective().as_raw(),
         worker: worker.as_ref(),
         access_dirs: &access_dirs,
+        supervision,
     });
     let platform = hostcheck::current_platform();
     checks.extend(working_directory_check(platform, &working_dir));
@@ -80,22 +82,28 @@ pub(crate) async fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
 
     // The daemon's bounded probes (a wedged `launchctl` waits up to
     // `PROBE_BUDGET`) must be able to finish before the client gives up.
-    let remote = match Client::connect_with_request_timeout(
+    let (connected, remote) = match Client::connect_with_request_timeout(
         "local",
         paths,
         hostcheck::doctor_request_timeout(),
     )
     .await
     {
-        Ok(mut client) => client
-            .daemon_doctor()
-            .await
-            .ok()
-            .map(|report| report.checks),
-        Err(_error) => None,
+        Ok(mut client) => (
+            true,
+            client
+                .daemon_doctor()
+                .await
+                .ok()
+                .map(|report| report.checks),
+        ),
+        Err(_error) => (false, None),
     };
     if let Some(job_status) = job_status {
-        checks.push(launchd_job_check(job_status, remote.is_some()));
+        // Reachability is the control connection, not the doctor RPC: a daemon
+        // that accepts the connection but fails or times out `daemon.doctor`
+        // still answers.
+        checks.push(launchd_job_check(job_status, connected, supervision));
     }
     match remote {
         Some(remote) => merge_daemon_checks(&mut checks, remote),
@@ -134,6 +142,19 @@ fn working_directory_check(
              existing directory you can read"
         ),
     ))
+}
+
+/// The supervision mode this process can infer for the daemon.
+///
+/// An installed `service.toml` means `pohunek daemon start` runs the native
+/// service; without it the daemon may be a `--dev-subprocess` one or not yet
+/// installed, which the CLI cannot tell apart.
+fn supervision_mode(config_dir: &Path) -> Supervision {
+    if config_dir.join(pohunek_service_config::FILE_NAME).exists() {
+        Supervision::Native
+    } else {
+        Supervision::Unknown
+    }
 }
 
 /// The worker executable the daemon would launch on this host.
@@ -180,6 +201,14 @@ fn worker_candidate_from(
 /// the doctor's control connection (`daemon_reachable`) is therefore the
 /// failure signal, next to a backend-reported `failed` state (systemd).
 pub(crate) fn launchd_job_check(
+    status: Result<StatusReport, crate::service::Error>,
+    daemon_reachable: bool,
+    supervision: Supervision,
+) -> DoctorCheck {
+    hostcheck::apply_supervision(supervision, launchd_job_findings(status, daemon_reachable))
+}
+
+fn launchd_job_findings(
     status: Result<StatusReport, crate::service::Error>,
     daemon_reachable: bool,
 ) -> DoctorCheck {
@@ -413,8 +442,9 @@ mod tests {
 
     #[test]
     fn launchd_job_check_is_fatal_for_a_failed_or_unreachable_unstarted_job() {
-        let run = |report| launchd_job_check(Ok(report), true).status;
-        let run_unreachable = |report| launchd_job_check(Ok(report), false).status;
+        let run = |report| launchd_job_check(Ok(report), true, Supervision::Native).status;
+        let run_unreachable =
+            |report| launchd_job_check(Ok(report), false, Supervision::Native).status;
 
         assert_eq!(run(status(true, Some(job("running")))), Status::Ok);
         assert_eq!(run(status(true, Some(job("failed")))), Status::Fail);
@@ -441,7 +471,7 @@ mod tests {
     fn launchd_job_check_reports_daemon_errors_and_pending_transactions_as_warnings() {
         let mut with_error = status(true, Some(job("running")));
         with_error.daemon_error = Some("launchctl exited with status 5".to_owned());
-        let check = launchd_job_check(Ok(with_error), false);
+        let check = launchd_job_check(Ok(with_error), false, Supervision::Native);
         assert_eq!(check.name, "launchd_job");
         assert_eq!(check.status, Status::Warn);
 
@@ -451,7 +481,33 @@ mod tests {
             version: "1.0.0".to_owned(),
             step: "bootstrap",
         });
-        assert_eq!(launchd_job_check(Ok(pending), false).status, Status::Warn);
+        assert_eq!(
+            launchd_job_check(Ok(pending), false, Supervision::Native).status,
+            Status::Warn
+        );
+    }
+
+    #[test]
+    fn an_unknown_supervision_mode_softens_a_job_failure() {
+        let report = || status(true, Some(job("unknown")));
+
+        let native = launchd_job_check(Ok(report()), false, Supervision::Native);
+        let unknown = launchd_job_check(Ok(report()), false, Supervision::Unknown);
+
+        assert_eq!(native.status, Status::Fail);
+        assert_eq!(unknown.status, Status::Warn);
+        assert!(unknown.detail.contains("supervision mode unknown"));
+    }
+
+    #[test]
+    fn the_supervision_mode_needs_an_installed_service_config() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).expect("create config dir");
+
+        assert_eq!(supervision_mode(&base), Supervision::Unknown);
+        std::fs::write(base.join("service.toml"), "x").expect("write service.toml");
+        assert_eq!(supervision_mode(&base), Supervision::Native);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -464,7 +520,7 @@ mod tests {
         let mut failed = status(true, Some(job("failed")));
         failed.pending_transaction = Some(pending());
 
-        let check = launchd_job_check(Ok(failed), false);
+        let check = launchd_job_check(Ok(failed), false, Supervision::Native);
 
         assert_eq!(check.status, Status::Fail);
         assert!(check.detail.contains("failed"), "{}", check.detail);
@@ -473,7 +529,7 @@ mod tests {
         // A running job with a pending transaction stays a warning and says both.
         let mut running = status(true, Some(job("running")));
         running.pending_transaction = Some(pending());
-        let check = launchd_job_check(Ok(running), false);
+        let check = launchd_job_check(Ok(running), false, Supervision::Native);
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("is running"), "{}", check.detail);
         assert!(check.detail.contains("pending"), "{}", check.detail);
@@ -484,7 +540,7 @@ mod tests {
         let error = crate::service::Error::NotInstalled {
             path: PathBuf::from("/cfg/service.toml"),
         };
-        let check = launchd_job_check(Err(error), false);
+        let check = launchd_job_check(Err(error), false, Supervision::Native);
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("pohunek service status"));
     }

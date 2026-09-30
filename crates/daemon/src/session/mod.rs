@@ -91,6 +91,7 @@ use input::{build_input_writes, InputSubmission};
 use input::{input_rules_for_agent, plan_initial_input_delivery};
 use lag::{log_lag_warn, LagWarnThrottle};
 use resume::ResumeSnapshot;
+pub(crate) use target::ActiveSupervision;
 use target::{build_launch_command, LaunchCommandPlan, PtySessionSpec, TargetResolution};
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);

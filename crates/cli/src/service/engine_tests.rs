@@ -2575,7 +2575,7 @@ async fn doctor_status(harness: &Harness, reachable: bool) -> protocol::DoctorSt
         .status(config.as_ref())
         .await
         .expect("status");
-    launchd_job_check(Ok(status), reachable).status
+    launchd_job_check(Ok(status), reachable, hostcheck::Supervision::Native).status
 }
 
 #[tokio::test]

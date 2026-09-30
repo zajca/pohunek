@@ -33,10 +33,10 @@ pub mod macos;
 // Rust guideline compliant 2026-09-30
 
 pub use executable::{is_executable_file, resolve_executable};
-pub use macos::{doctor_request_timeout, PROBE_BUDGET, REPLY_HEADROOM};
+pub use macos::{apply_supervision, doctor_request_timeout, PROBE_BUDGET, REPLY_HEADROOM};
 pub use macos::{
     resolve_worker_candidate, AccessDir, DomainProbe, MacosFacts, ProcessRunner, RunOutcome,
-    Runner, WorkerCandidate, WorkerSource, WORKER_EXECUTABLE_CHECK,
+    Runner, Supervision, WorkerCandidate, WorkerSource, WORKER_EXECUTABLE_CHECK,
 };
 pub use pohunek_paths::Platform;
 
@@ -95,6 +95,8 @@ pub struct StandardCheckInputs<'a> {
     pub worker: Option<&'a WorkerCandidate>,
     /// Extra directories that must be readable, such as the working directory.
     pub access_dirs: &'a [AccessDir<'a>],
+    /// How the daemon supervises workers (macOS launchd checks).
+    pub supervision: Supervision,
 }
 
 /// The platform the binary was compiled for.
@@ -541,6 +543,7 @@ mod tests {
             effective_uid: 0,
             worker: None,
             access_dirs: &[],
+            supervision: Supervision::Unknown,
         });
         let names = checks
             .iter()

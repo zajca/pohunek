@@ -249,14 +249,19 @@ fn production_registry_rejects_missing_durable_worker_backend() {
 }
 
 #[test]
-fn registry_reports_the_active_supervision_worker_executable() {
+fn registry_reports_the_active_supervision() {
     let supervision = production_supervision();
     let expected = supervision.worker_executable.clone();
     let supervised = SessionRegistry::new(SessionRegistryConfig {
         supervision: Some(supervision),
         ..SessionRegistryConfig::default()
     });
-    assert_eq!(supervised.worker_executable(), Some(expected));
+
+    let active = supervised.active_supervision().expect("supervision");
+
+    assert_eq!(active.worker_executable, expected);
+    // `production_supervision` carries no `--service-config`: direct children.
+    assert!(!active.native);
 }
 
 #[test]

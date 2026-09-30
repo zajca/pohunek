@@ -133,6 +133,22 @@ const PROBE_FILE_MODE: u32 = 0o600;
 /// Prefix of the quarantine name a probe file is moved to before removal.
 const PROBE_QUARANTINE_PREFIX: &str = ".pohunek-doctor-stale-";
 
+/// How the daemon supervises session workers, which decides whether the
+/// launchd checks apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Supervision {
+    /// Workers run as launchd jobs (`--service-config`): every launchd check
+    /// is required.
+    Native,
+    /// Workers run as direct children (`--dev-subprocess`), for example over
+    /// SSH without a `gui/<uid>` domain: the launchd checks do not apply and
+    /// are omitted.
+    Subprocess,
+    /// The mode is not known to this process: the launchd checks are reported,
+    /// but a failure is at most a `warn`.
+    Unknown,
+}
+
 /// Where a resolved worker executable path came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerSource {
@@ -329,7 +345,9 @@ pub struct MacosFacts {
     /// Value of `PATH`.
     pub path_var: Option<OsString>,
     /// Result of the `gui/<uid>` domain probe.
-    pub launchd_domain: DomainProbe,
+    /// Result of the `gui/<uid>` domain probe; `None` when the probe was
+    /// skipped because launchd is not used.
+    pub launchd_domain: Option<DomainProbe>,
     /// Whether `/usr/bin/osascript` is executable.
     pub osascript_present: bool,
     /// Whether `/usr/bin/security` is executable.
@@ -357,7 +375,8 @@ impl MacosFacts {
             terminal_app_present: Path::new(TERMINAL_APP).is_dir(),
             launcher_terminal: read_launcher_terminal(inputs.config_dir),
             path_var: std::env::var_os("PATH"),
-            launchd_domain: probe_launchd_domain(runner, inputs.effective_uid, LAUNCHCTL_DEADLINE),
+            launchd_domain: (inputs.supervision != Supervision::Subprocess)
+                .then(|| probe_launchd_domain(runner, inputs.effective_uid, LAUNCHCTL_DEADLINE)),
             osascript_present: is_executable_file(Path::new(OSASCRIPT)),
             security_tool_present: is_executable_file(Path::new(SECURITY_TOOL)),
             login_keychain_present,
@@ -402,7 +421,7 @@ fn parse_launcher_terminal(contents: &str) -> Option<String> {
 #[must_use]
 pub fn standard_checks(inputs: &StandardCheckInputs<'_>, facts: &MacosFacts) -> Vec<DoctorCheck> {
     let state_root = state_root(inputs.log_dir);
-    vec![
+    let mut checks = vec![
         binary_with_path("git", true, facts.path_var.as_deref(), ""),
         agent_binary("codex", facts),
         agent_binary("claude", facts),
@@ -429,17 +448,6 @@ pub fn standard_checks(inputs: &StandardCheckInputs<'_>, facts: &MacosFacts) -> 
             "worker state root",
             &state_root.join(WORKERS_SUBDIR),
         ),
-        check_private_dir(
-            "launchd_definitions_dir",
-            "launchd worker definitions directory",
-            &state_root.join(LAUNCHD_SUBDIR),
-        ),
-        check_private_dir(
-            "launchd_log_dir",
-            "launchd worker log directory",
-            &inputs.log_dir.join(LAUNCHD_SUBDIR),
-        ),
-        check_launch_agents_dir(inputs.home_dir),
         check_filesystem_access(inputs),
         netbird(),
         DoctorCheck::new(
@@ -450,10 +458,50 @@ pub fn standard_checks(inputs: &StandardCheckInputs<'_>, facts: &MacosFacts) -> 
         check_worker_executable(inputs.worker),
         check_login_shell(facts),
         check_terminal(facts),
-        check_launchd_domain(facts.launchd_domain, inputs.effective_uid),
         check_desktop_notifications(facts),
         check_keychain(facts),
-    ]
+    ];
+    let launchd = [
+        facts
+            .launchd_domain
+            .map(|probe| check_launchd_domain(probe, inputs.effective_uid)),
+        Some(check_private_dir(
+            "launchd_definitions_dir",
+            "launchd worker definitions directory",
+            &state_root.join(LAUNCHD_SUBDIR),
+        )),
+        Some(check_private_dir(
+            "launchd_log_dir",
+            "launchd worker log directory",
+            &inputs.log_dir.join(LAUNCHD_SUBDIR),
+        )),
+        Some(check_launch_agents_dir(inputs.home_dir)),
+    ];
+    if inputs.supervision != Supervision::Subprocess {
+        checks.extend(
+            launchd
+                .into_iter()
+                .flatten()
+                .map(|check| apply_supervision(inputs.supervision, check)),
+        );
+    }
+    checks
+}
+
+/// Soften a launchd check when the supervision mode is not known.
+///
+/// A launchd failure only breaks a native service; without knowing the mode it
+/// is reported as a `warn`.
+#[must_use]
+pub fn apply_supervision(supervision: Supervision, mut check: DoctorCheck) -> DoctorCheck {
+    if supervision == Supervision::Unknown && check.status == DoctorStatus::Fail {
+        check.status = DoctorStatus::Warn;
+        check.detail = format!(
+            "{}; only a native launchd service needs this (supervision mode unknown)",
+            check.detail
+        );
+    }
+    check
 }
 
 /// Optional agent program probe with a launchd-aware hint.
@@ -637,6 +685,17 @@ pub fn check_launch_agents_dir(home: Option<&Path>) -> DoctorCheck {
 /// directory must be a real directory and is write-probed.
 #[must_use]
 pub fn check_log_dir(log_dir: &Path) -> DoctorCheck {
+    check_log_dir_as(log_dir, rustix::process::geteuid().as_raw())
+}
+
+/// [`check_log_dir`] for an explicit effective user id.
+///
+/// Startup resets the log directory's mode with `set_permissions`, which fails
+/// for a directory the effective user does not own even when it is writable,
+/// so an existing directory must be owned by `effective_uid`.
+fn check_log_dir_as(log_dir: &Path, effective_uid: u32) -> DoctorCheck {
+    use std::os::unix::fs::MetadataExt as _;
+
     const NAME: &str = "log_dir_writable";
     const LABEL: &str = "log directory";
     let root = state_root(log_dir);
@@ -645,6 +704,18 @@ pub fn check_log_dir(log_dir: &Path) -> DoctorCheck {
         return root_check;
     }
     match std::fs::symlink_metadata(log_dir) {
+        Ok(meta) if meta.file_type().is_dir() && meta.uid() != effective_uid => {
+            DoctorCheck::new(
+                NAME,
+                DoctorStatus::Fail,
+                format!(
+                    "{LABEL} {} is owned by uid {} but pohunek runs as uid {effective_uid}; startup \
+                     cannot reset its mode. Remove it or point XDG_STATE_HOME at a directory you own",
+                    log_dir.display(),
+                    meta.uid()
+                ),
+            )
+        }
         Ok(meta) if meta.file_type().is_dir() => match crate::write_probe(log_dir) {
             Ok(()) => DoctorCheck::new(
                 NAME,
@@ -1038,6 +1109,12 @@ pub fn check_keychain(facts: &MacosFacts) -> DoctorCheck {
 
 /// Check the directories pohunek must read, classifying macOS privacy denials.
 ///
+/// The probe runs in the privacy context of the calling process. The CLI's run
+/// covers its own terminal context (including the current directory); the
+/// daemon's run covers only the config and data roots in the launchd context.
+/// Neither proves a project directory is readable by the other context, and the
+/// detail says so.
+///
 /// A denial is a `fail`. `EPERM`, or any denial below a Privacy & Security
 /// protected folder, is explained as a TCC consent problem with the exact grant
 /// to make; Full Disk Access is deliberately not the default remedy.
@@ -1056,9 +1133,13 @@ pub fn check_filesystem_access(inputs: &StandardCheckInputs<'_>) -> DoctorCheck 
     ];
     let mut denials = Vec::new();
     let mut probed = 0_usize;
+    let mut labels = Vec::new();
     for dir in dirs.iter().chain(inputs.access_dirs.iter()) {
         match std::fs::read_dir(dir.path) {
-            Ok(_) => probed += 1,
+            Ok(_) => {
+                probed += 1;
+                labels.push(dir.label);
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => denials.push(describe_denial(dir, &err, inputs.home_dir)),
         }
@@ -1067,7 +1148,11 @@ pub fn check_filesystem_access(inputs: &StandardCheckInputs<'_>) -> DoctorCheck 
         DoctorCheck::new(
             NAME,
             DoctorStatus::Ok,
-            format!("{probed} required directories are readable"),
+            format!(
+                "readable by this process ({probed}: {}); other process contexts, such as a \
+                 launchd-run daemon or its workers, are not verified",
+                labels.join(", ")
+            ),
         )
     } else {
         DoctorCheck::new(NAME, DoctorStatus::Fail, denials.join("; "))
@@ -1153,7 +1238,7 @@ mod tests {
             terminal_app_present: true,
             launcher_terminal: None,
             path_var: None,
-            launchd_domain: DomainProbe::Ready,
+            launchd_domain: Some(DomainProbe::Ready),
             osascript_present: true,
             security_tool_present: true,
             login_keychain_present: true,
@@ -1551,6 +1636,7 @@ mod tests {
             effective_uid: std::fs::metadata(&root).unwrap().uid(),
             worker: Some(&worker),
             access_dirs: &[],
+            supervision: Supervision::Native,
         };
 
         let checks = standard_checks(&inputs, &f);
@@ -1617,6 +1703,137 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn launchd_checks_depend_on_the_supervision_mode() {
+        let base = temp_dir("supervision");
+        let bin = temp_dir("supervision-bin");
+        write_exec(&bin, "git", 0o755);
+        let path = OsString::from(bin.as_os_str());
+        let names = |checks: &[DoctorCheck]| -> Vec<String> {
+            checks
+                .iter()
+                .filter(|c| c.name.starts_with("launchd_"))
+                .map(|c| c.name.clone())
+                .collect()
+        };
+        let mut missing_domain = facts();
+        missing_domain.path_var = Some(path);
+        missing_domain.launchd_domain = Some(DomainProbe::Missing);
+        let run = |supervision: Supervision| {
+            let config_dir = base.join("config");
+            let inputs = StandardCheckInputs {
+                socket_dir: &base.join("runtime"),
+                state_dir: &base.join("data"),
+                log_dir: &base.join("state").join("logs"),
+                launcher_bin_dir: &base,
+                sway_config_dir: &base,
+                config_dir: &config_dir,
+                home_dir: Some(&base),
+                effective_uid: 0,
+                worker: None,
+                access_dirs: &[],
+                supervision,
+            };
+            let mut facts = missing_domain.clone();
+            if supervision == Supervision::Subprocess {
+                facts.launchd_domain = None;
+            }
+            standard_checks(&inputs, &facts)
+        };
+
+        let native = run(Supervision::Native);
+        let domain = native.iter().find(|c| c.name == "launchd_domain").unwrap();
+        assert_eq!(
+            domain.status,
+            DoctorStatus::Fail,
+            "native requires the domain"
+        );
+        assert_eq!(names(&native).len(), 4);
+
+        let unknown = run(Supervision::Unknown);
+        let domain = unknown.iter().find(|c| c.name == "launchd_domain").unwrap();
+        assert_eq!(
+            domain.status,
+            DoctorStatus::Warn,
+            "unknown is at most a warning"
+        );
+        assert!(domain.detail.contains("supervision mode unknown"));
+        assert_eq!(names(&unknown).len(), 4);
+
+        // A dev-subprocess daemon (for example over SSH) has no launchd checks.
+        assert!(names(&run(Supervision::Subprocess)).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn a_subprocess_daemon_does_not_probe_launchd() {
+        struct Panicking;
+        impl Runner for Panicking {
+            fn run(&self, _arguments: &[&str], _deadline: Duration) -> RunOutcome {
+                panic!("launchctl must not run for a subprocess daemon");
+            }
+        }
+        let base = temp_dir("no-probe");
+        let inputs = access_inputs(&base, None, &[]);
+        let subprocess = StandardCheckInputs {
+            supervision: Supervision::Subprocess,
+            ..inputs
+        };
+
+        let collected = MacosFacts::collect(&subprocess, &Panicking);
+
+        assert_eq!(collected.launchd_domain, None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_log_dir_must_be_owned_by_the_effective_user() {
+        let base = temp_dir("log-owner");
+        let root = base.join("state");
+        let logs = root.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        set_mode(&root, 0o700);
+        let uid = std::fs::metadata(&logs).unwrap().uid();
+
+        assert_eq!(check_log_dir_as(&logs, uid).status, DoctorStatus::Ok);
+        // A directory owned by another account cannot be built without chown, so
+        // the ownership predicate is exercised with an injected effective uid.
+        let foreign = check_log_dir_as(&logs, uid.wrapping_add(1));
+        assert_eq!(foreign.status, DoctorStatus::Fail, "{}", foreign.detail);
+        assert!(
+            foreign.detail.contains("cannot reset its mode"),
+            "{}",
+            foreign.detail
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn filesystem_access_states_which_process_context_it_verified() {
+        let base = temp_dir("fs-label");
+        let dirs = [AccessDir {
+            label: "current directory",
+            path: &base,
+        }];
+
+        let check = check_filesystem_access(&access_inputs(&base, None, &dirs));
+
+        assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail);
+        assert!(
+            check.detail.contains("readable by this process"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("current directory"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("not verified"), "{}", check.detail);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1937,6 +2154,7 @@ mod tests {
             effective_uid: 0,
             worker: None,
             access_dirs,
+            supervision: Supervision::Native,
         }
     }
 
@@ -2092,6 +2310,7 @@ mod tests {
             effective_uid: std::fs::metadata(base).unwrap().uid(),
             worker,
             access_dirs: &[],
+            supervision: Supervision::Native,
         };
         standard_checks(&inputs, &f)
     }
@@ -2122,18 +2341,18 @@ mod tests {
                 "log_dir_writable",
                 "worker_runtime_root",
                 "worker_state_root",
-                "launchd_definitions_dir",
-                "launchd_log_dir",
-                "launchd_agents_dir",
                 "filesystem_access",
                 "netbird_cli",
                 "schema_version",
                 "worker_executable",
                 "login_shell",
                 "terminal",
-                "launchd_domain",
                 "desktop_notifications",
                 "keychain",
+                "launchd_domain",
+                "launchd_definitions_dir",
+                "launchd_log_dir",
+                "launchd_agents_dir",
             ]
         );
         for linux_only in [
