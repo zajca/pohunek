@@ -78,7 +78,15 @@ pub(crate) async fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
         None
     };
 
-    let remote = match Client::connect("local", paths).await {
+    // The daemon's bounded probes (a wedged `launchctl` waits up to
+    // `PROBE_BUDGET`) must be able to finish before the client gives up.
+    let remote = match Client::connect_with_request_timeout(
+        "local",
+        paths,
+        hostcheck::doctor_request_timeout(),
+    )
+    .await
+    {
         Ok(mut client) => client
             .daemon_doctor()
             .await
@@ -535,6 +543,17 @@ mod tests {
         assert_eq!(checks[0].detail, "active supervision");
         assert_eq!(checks[1].status, Status::Fail, "other collisions merge");
         assert_eq!(checks[1].detail, "local: local; daemon: remote");
+    }
+
+    #[test]
+    fn the_daemon_doctor_call_outlasts_the_client_default_and_the_probe_budget() {
+        let timeout = hostcheck::doctor_request_timeout();
+
+        assert!(timeout > hostcheck::PROBE_BUDGET);
+        assert!(
+            timeout > pohunek_client::ClientOptions::default().request_timeout,
+            "the client's default would drop the reply of a slow bounded probe"
+        );
     }
 
     #[test]

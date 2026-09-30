@@ -18,8 +18,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use pohunek_paths::{
-    validate_staged_socket_path, worker_socket_path, Platform, SocketKind, SOCKET_NAME,
-    WORKERS_SUBDIR,
+    validate_staged_socket_path, worker_socket_path, Platform, SocketKind, LAUNCHD_SUBDIR,
+    SOCKET_NAME, WORKERS_SUBDIR,
 };
 use pohunek_platform::filesystem::{StageOutcome, TrustedDir};
 use protocol::{DoctorCheck, DoctorStatus};
@@ -41,6 +41,28 @@ pub const LAUNCHCTL: &str = "/bin/launchctl";
 /// `launchctl` deadline and only guards against a wedged `launchd`. A longer
 /// value makes `pohunek doctor` hang on such a host.
 pub const LAUNCHCTL_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Longest time the deadline-bounded probes of one host-check run can block.
+///
+/// The `launchctl` domain probe is the only such probe; a probe added later
+/// must extend this sum, because [`doctor_request_timeout`] derives the
+/// transport limit from it.
+pub const PROBE_BUDGET: Duration = LAUNCHCTL_DEADLINE;
+
+/// Time a `daemon.doctor` reply needs after the last probe finishes: framing,
+/// serialization and scheduling on the local socket. One second matches the
+/// transport headroom the client adds after other daemon-side deadlines.
+pub const REPLY_HEADROOM: Duration = Duration::from_secs(1);
+
+/// Request timeout for a `daemon.doctor` call.
+///
+/// Strictly longer than [`PROBE_BUDGET`], so the daemon's own bounded result
+/// (such as a timed-out `launchctl`) reaches the caller instead of the client
+/// giving up first at its shorter default.
+#[must_use]
+pub const fn doctor_request_timeout() -> Duration {
+    PROBE_BUDGET.saturating_add(REPLY_HEADROOM)
+}
 
 /// Interval between exit-status polls of the running probe.
 ///
@@ -407,6 +429,17 @@ pub fn standard_checks(inputs: &StandardCheckInputs<'_>, facts: &MacosFacts) -> 
             "worker state root",
             &state_root.join(WORKERS_SUBDIR),
         ),
+        check_private_dir(
+            "launchd_definitions_dir",
+            "launchd worker definitions directory",
+            &state_root.join(LAUNCHD_SUBDIR),
+        ),
+        check_private_dir(
+            "launchd_log_dir",
+            "launchd worker log directory",
+            &inputs.log_dir.join(LAUNCHD_SUBDIR),
+        ),
+        check_launch_agents_dir(inputs.home_dir),
         check_filesystem_access(inputs),
         netbird(),
         DoctorCheck::new(
@@ -522,6 +555,74 @@ pub fn check_private_dir(name: &str, label: &str, dir: &Path) -> DoctorCheck {
                 "{label} {} fails the owner-private directory validation the daemon applies at \
                  startup: {error}. It must be a real directory you own with mode 0700 and no \
                  symlinked path components; nothing was written to it",
+                dir.display()
+            ),
+        ),
+    }
+}
+
+/// Group and other write bits the launchd backend refuses on `LaunchAgents`.
+///
+/// Mirrors `AGENTS_DIR_FORBIDDEN_BITS` of the launchd supervisor: the directory
+/// may be readable by others (macOS creates it `0755`) but not writable.
+const AGENTS_DIR_FORBIDDEN_BITS: u32 = 0o022;
+
+/// Home-relative `LaunchAgents` directory the daemon agent is installed into.
+const LAUNCH_AGENTS_RELATIVE: [&str; 2] = ["Library", "LaunchAgents"];
+
+/// Check `~/Library/LaunchAgents` the way `pohunek service install` opens it,
+/// without creating it.
+///
+/// The installer requires an existing directory to be owned by you and not
+/// group- or world-writable; a missing one is created. Only the native service
+/// needs it, so a problem is a `warn`.
+#[must_use]
+pub fn check_launch_agents_dir(home: Option<&Path>) -> DoctorCheck {
+    const NAME: &str = "launchd_agents_dir";
+    let Some(home) = home else {
+        return DoctorCheck::new(
+            NAME,
+            DoctorStatus::Warn,
+            "HOME is not set, so the LaunchAgents directory cannot be checked",
+        );
+    };
+    let dir = LAUNCH_AGENTS_RELATIVE
+        .iter()
+        .fold(home.to_path_buf(), |path, part| path.join(part));
+    match TrustedDir::open_absolute_owner_safe(&dir, AGENTS_DIR_FORBIDDEN_BITS) {
+        Ok(_) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!(
+                "{} is owned by you and not writable by others",
+                dir.display()
+            ),
+        ),
+        Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => {
+            match creatable_below(&dir) {
+                Ok(ancestor) => DoctorCheck::new(
+                    NAME,
+                    DoctorStatus::Ok,
+                    format!(
+                        "{} does not exist yet; 'pohunek service install' creates it below {}",
+                        dir.display(),
+                        ancestor.display()
+                    ),
+                ),
+                Err(reason) => DoctorCheck::new(
+                    NAME,
+                    DoctorStatus::Warn,
+                    format!("{} cannot be created: {reason}", dir.display()),
+                ),
+            }
+        }
+        Err(error) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Warn,
+            format!(
+                "{} is refused by 'pohunek service install': {error}. It must be a real directory \
+                 you own that group and others cannot write ('chmod go-w {}')",
+                dir.display(),
                 dir.display()
             ),
         ),
@@ -1474,6 +1575,91 @@ mod tests {
     }
 
     #[test]
+    fn launchd_worker_directories_are_validated_like_startup_opens_them() {
+        // `LaunchdSupervisor::start_worker` opens `<state>/launchd` and
+        // `<logs>/launchd` with `open_or_create_absolute(.., 0700)`.
+        let root = temp_dir("launchd-dirs");
+        let bin = temp_dir("launchd-dirs-bin");
+        write_exec(&bin, "git", 0o755);
+        let state = root.join("state");
+        let logs = state.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        set_mode(&state, 0o700);
+        set_mode(&logs, 0o700);
+        let definitions = state.join(pohunek_paths::LAUNCHD_SUBDIR);
+        std::fs::create_dir(&definitions).unwrap();
+        set_mode(&definitions, 0o755);
+        let real = root.join("real-logs");
+        std::fs::create_dir(&real).unwrap();
+        set_mode(&real, 0o700);
+        std::os::unix::fs::symlink(&real, logs.join(pohunek_paths::LAUNCHD_SUBDIR)).unwrap();
+        let path = OsString::from(bin.as_os_str());
+
+        let checks = assembled(&root, path.clone(), None);
+        let by_name = |name: &str| checks.iter().find(|c| c.name == name).unwrap();
+        assert_eq!(
+            by_name("launchd_definitions_dir").status,
+            DoctorStatus::Fail,
+            "wrong mode"
+        );
+        assert_eq!(
+            by_name("launchd_log_dir").status,
+            DoctorStatus::Fail,
+            "symlink"
+        );
+
+        set_mode(&definitions, 0o700);
+        std::fs::remove_file(logs.join(pohunek_paths::LAUNCHD_SUBDIR)).unwrap();
+        let fixed = assembled(&root, path, None);
+        for name in ["launchd_definitions_dir", "launchd_log_dir"] {
+            let check = fixed.iter().find(|c| c.name == name).unwrap();
+            assert_eq!(check.status, DoctorStatus::Ok, "{name}: {}", check.detail);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn the_launch_agents_dir_follows_the_installer_rule() {
+        let home = temp_dir("agents-home");
+        let library = home.join("Library");
+        let agents = library.join("LaunchAgents");
+        std::fs::create_dir_all(&agents).unwrap();
+        set_mode(&library, 0o755);
+        let status = |home: Option<&Path>| check_launch_agents_dir(home).status;
+
+        set_mode(&agents, 0o755);
+        assert_eq!(status(Some(&home)), DoctorStatus::Ok);
+        set_mode(&agents, 0o777);
+        assert_eq!(status(Some(&home)), DoctorStatus::Warn, "others may write");
+        set_mode(&agents, 0o755);
+        std::fs::remove_dir(&agents).unwrap();
+        assert_eq!(
+            status(Some(&home)),
+            DoctorStatus::Ok,
+            "absent is created on install"
+        );
+        let real = home.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &agents).unwrap();
+        assert_eq!(status(Some(&home)), DoctorStatus::Warn, "symlink");
+        assert_eq!(status(None), DoctorStatus::Warn);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_doctor_request_timeout_outlasts_every_bounded_probe() {
+        // A wedged `launchctl` blocks the daemon's probe for up to
+        // `PROBE_BUDGET` (10 s), longer than the client's default 5 s request
+        // timeout; the derived timeout must exceed the budget so the daemon's
+        // own timed-out result is delivered.
+        assert!(PROBE_BUDGET >= LAUNCHCTL_DEADLINE);
+        assert!(doctor_request_timeout() > PROBE_BUDGET);
+        assert_eq!(doctor_request_timeout(), PROBE_BUDGET + REPLY_HEADROOM);
+        assert!(PROBE_BUDGET > Duration::from_secs(5));
+    }
+
+    #[test]
     fn the_full_list_creates_no_directory_even_with_a_default_umask_tree() {
         let base = temp_dir("no-create");
         let bin = temp_dir("no-create-bin");
@@ -1936,6 +2122,9 @@ mod tests {
                 "log_dir_writable",
                 "worker_runtime_root",
                 "worker_state_root",
+                "launchd_definitions_dir",
+                "launchd_log_dir",
+                "launchd_agents_dir",
                 "filesystem_access",
                 "netbird_cli",
                 "schema_version",

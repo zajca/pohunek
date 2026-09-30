@@ -33,6 +33,7 @@ pub mod macos;
 // Rust guideline compliant 2026-09-30
 
 pub use executable::{is_executable_file, resolve_executable};
+pub use macos::{doctor_request_timeout, PROBE_BUDGET, REPLY_HEADROOM};
 pub use macos::{
     resolve_worker_candidate, AccessDir, DomainProbe, MacosFacts, ProcessRunner, RunOutcome,
     Runner, WorkerCandidate, WorkerSource, WORKER_EXECUTABLE_CHECK,
