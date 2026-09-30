@@ -11,29 +11,34 @@ use protocol::{
     DetectionRegionKind, DetectionRegionPreview, DoctorCheck, DoctorReport, DoctorStatus,
     EnrollmentInfo, EnrollmentRevision, EnrollmentStatus, ErrorClass, Event, ForkCwdMode,
     HostApprovalSignature, HostCapabilities, HostGovernanceStatus, HostId, HostOwner,
-    IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult,
-    NotificationCreateParams, NotificationCreateResult, NotificationCreatedEvent,
-    NotificationDeleteParams, NotificationDeleteResult, NotificationDeletedEvent, NotificationId,
-    NotificationKind, NotificationKindPolicy, NotificationListParams, NotificationListResult,
-    NotificationPolicy, NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
-    NotificationRetentionParams, NotificationRetentionPolicy, NotificationRetentionResult,
-    NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
-    NotificationUpdateResult, NotificationUpdatedEvent, ObservationParamsError, OutputOffset,
-    OwnerRevision, PrincipalId, ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId,
-    ProposalNonce, ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind,
-    QuarantineReason, RelayId, ReportSequence, Request, Response, RuntimeGeneration,
-    SessionAttachParams, SessionAttachResult, SessionCapabilities, SessionDetachParams,
-    SessionDetachResult, SessionDetectionParams, SessionDetectionResult, SessionForkParams,
-    SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams, SessionOutputGap,
-    SessionOutputParams, SessionOutputResult, SessionReadFormat, SessionReadParams,
-    SessionReadResult, SessionReadSource, SessionReleaseAgentParams, SessionReleaseAgentResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionRuntimeIdentity,
-    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
-    SessionState, SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult,
-    SessionWarning, SessionWarningKind, ShareSuspensionIntent, SignedTransferOutcome, StateSource,
-    TeamId, TerminalCursor, TerminalDimensions, TerminalWatermark, TransferCoordinates,
+    IntegrationAgentDoctor, IntegrationAgentStatus, IntegrationDoctorParams,
+    IntegrationDoctorResult, IntegrationFinding, IntegrationFindingCode,
+    IntegrationFindingSeverity, IntegrationInstallParams, IntegrationInstallReport,
+    IntegrationInstallResult, IntegrationInstallState, IntegrationRecovery,
+    IntegrationUninstallParams, IntegrationUninstallReport, IntegrationUninstallResult,
+    IntegrationUninstallState, NotificationCreateParams, NotificationCreateResult,
+    NotificationCreatedEvent, NotificationDeleteParams, NotificationDeleteResult,
+    NotificationDeletedEvent, NotificationId, NotificationKind, NotificationKindPolicy,
+    NotificationListParams, NotificationListResult, NotificationPolicy, NotificationPolicyParams,
+    NotificationPolicyResult, NotificationRecord, NotificationRetentionParams,
+    NotificationRetentionPolicy, NotificationRetentionResult, NotificationSeverity,
+    NotificationSource, NotificationStatus, NotificationUpdateParams, NotificationUpdateResult,
+    NotificationUpdatedEvent, ObservationParamsError, OutputOffset, OwnerRevision, PrincipalId,
+    ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId, ProposalNonce, ProtocolError,
+    ProtocolVersion, ProtocolVersionRange, ProviderKind, QuarantineReason, RelayId, ReportSequence,
+    Request, Response, RuntimeGeneration, SessionAttachParams, SessionAttachResult,
+    SessionCapabilities, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
+    SessionDetectionResult, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
+    SessionNewParams, SessionOutputGap, SessionOutputParams, SessionOutputResult,
+    SessionReadFormat, SessionReadParams, SessionReadResult, SessionReadSource,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionRuntimeIdentity, SessionScreenParams,
+    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
+    SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning,
+    SessionWarningKind, ShareSuspensionIntent, SignedTransferOutcome, StateSource, TeamId,
+    TerminalCursor, TerminalDimensions, TerminalWatermark, TransferCoordinates,
     TransferOutcomeCandidate, TransferOutcomeId, TransferProposal, GOVERNANCE_ID_PAYLOAD_BYTES,
     MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES, MAX_RUNTIME_ID_BYTES, MAX_SESSION_ID_BYTES,
     MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
@@ -1828,6 +1833,7 @@ fn integration_install_result_roundtrips() {
                 agent: AgentKind::Claude,
                 hook_path: "/home/user/.claude/hooks/pohunek-agent-state.sh".to_owned(),
                 config_paths: vec!["/home/user/.claude/settings.json".to_owned()],
+                cleanup_incomplete: vec![],
             },
             IntegrationInstallReport {
                 agent: AgentKind::Codex,
@@ -1836,6 +1842,7 @@ fn integration_install_result_roundtrips() {
                     "/home/user/.codex/hooks.json".to_owned(),
                     "/home/user/.codex/config.toml".to_owned(),
                 ],
+                cleanup_incomplete: vec![],
             },
         ],
     };
@@ -1845,6 +1852,97 @@ fn integration_install_result_roundtrips() {
     assert_eq!(back.installed.len(), 2);
     assert_eq!(back.installed[0].agent, AgentKind::Claude);
     assert_eq!(back.installed[1].config_paths.len(), 2);
+}
+
+#[test]
+fn integration_uninstall_and_doctor_method_names_are_stable() {
+    assert_eq!(method::INTEGRATION_UNINSTALL, "integration.uninstall");
+    assert_eq!(method::INTEGRATION_DOCTOR, "integration.doctor");
+}
+
+#[test]
+fn integration_uninstall_params_and_result_roundtrip() {
+    let params = IntegrationUninstallParams {
+        agent: AgentKind::Codex,
+    };
+    assert_eq!(
+        serde_json::to_value(&params).expect("serialize uninstall params"),
+        json!({ "agent": "codex" })
+    );
+    assert_eq!(line_roundtrip(&params), params);
+    assert!(
+        serde_json::from_value::<IntegrationUninstallParams>(json!({})).is_err(),
+        "the agent is required"
+    );
+
+    let result = IntegrationUninstallResult {
+        uninstalled: vec![IntegrationUninstallReport {
+            agent: AgentKind::Claude,
+            state: IntegrationUninstallState::Removed,
+            removed_paths: vec!["/home/user/.claude/hooks/pohunek-agent-state.sh".to_owned()],
+            updated_paths: vec!["/home/user/.claude/settings.json".to_owned()],
+            preserved_paths: vec![],
+            cleanup_incomplete: vec![],
+        }],
+    };
+    assert_eq!(line_roundtrip(&result), result);
+}
+
+#[test]
+fn integration_doctor_params_and_result_roundtrip() {
+    let params = IntegrationDoctorParams {
+        agent: Some(AgentKind::Claude),
+    };
+    assert_eq!(line_roundtrip(&params), params);
+    assert_eq!(
+        serde_json::to_value(IntegrationDoctorParams::default()).expect("serialize"),
+        json!({})
+    );
+
+    let result = IntegrationDoctorResult {
+        ok: false,
+        agents: vec![IntegrationAgentDoctor {
+            agent: AgentKind::Codex,
+            ok: false,
+            status: Some(IntegrationAgentStatus {
+                agent: AgentKind::Codex,
+                available: true,
+                expected_asset_paths: vec!["/h/.codex/pohunek-agent-state.sh".to_owned()],
+                present_asset_paths: vec![],
+                registration_paths: vec!["/h/.codex/hooks.json".to_owned()],
+                installed_version: None,
+                expected_version: protocol::EXPECTED_INTEGRATION_VERSION,
+                state: IntegrationInstallState::Outdated,
+                recovery: IntegrationRecovery::Reinstall,
+                warnings: vec!["managed state hook is missing".to_owned()],
+            }),
+            findings: vec![
+                IntegrationFinding {
+                    code: IntegrationFindingCode::AssetMissing,
+                    severity: IntegrationFindingSeverity::Error,
+                    summary: "managed state hook is missing".to_owned(),
+                    remediation: Some("run `pohunek integration install --agent codex`".to_owned()),
+                },
+                IntegrationFinding {
+                    code: IntegrationFindingCode::AgentNotInstalled,
+                    severity: IntegrationFindingSeverity::Info,
+                    summary: "agent not installed".to_owned(),
+                    remediation: None,
+                },
+            ],
+        }],
+    };
+    let value = serde_json::to_value(&result).expect("serialize doctor result");
+    assert_eq!(
+        value["agents"][0]["findings"][0]["code"],
+        json!("asset_missing")
+    );
+    assert!(value["agents"][0]["findings"][1]
+        .as_object()
+        .expect("finding object")
+        .get("remediation")
+        .is_none());
+    assert_eq!(line_roundtrip(&result), result);
 }
 
 #[test]

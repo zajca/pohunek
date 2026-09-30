@@ -127,8 +127,16 @@ For durable notification issues:
    their metadata and bounded content come from the same descriptor. Codex
    managed trust uses a canonical single-handler group, so a sibling handler is
    drift even when the managed command itself is unchanged. The managed trust
-   key set must also be exact; stale managed tables are reinstallable drift and
-   are removed during reinstall, while a scalar anywhere in the managed trust
+   key set must also be exact. A trust record is installer-owned only when its
+   trusted hash is that of a managed command for that event, so a stale managed
+   record (a managed hash at an old position) is reinstallable drift and is
+   removed during reinstall, while the records of a user's own hooks in the same
+   events are never removed or flagged and follow their hooks: a trust key
+   embeds the group and handler index, so when install, reinstall, or uninstall
+   shifts a user hook's position, its record is re-keyed to the new position
+   (its hash stays valid), and two claims on one key fail closed with
+   `configuration/integration_trust_conflict` without writing anything (review
+   the `[hooks.state]` tables by hand, then repeat the command). A scalar anywhere in the managed trust
    namespace requires configuration repair even when hook drift hides its
    current position. `CLAUDE_CONFIG_DIR` and `CODEX_HOME`
    must resolve to absolute UTF-8 paths, which keeps generated registrations
@@ -142,6 +150,161 @@ For durable notification issues:
    command with drifted handler metadata remain safely reinstallable. Oversized
    and non-regular files are rejected by bounded, nonblocking inspection and
    reported with the applicable recovery.
+   `pohunek integration doctor [--agent <codex-or-claude>] [--json]` is the
+   read-only diagnosis (it follows `--host`, like status, and exits non-zero
+   when any finding is an error). It turns each status warning into a stable
+   finding (`asset_missing`, `asset_modified`, `asset_unsafe`,
+   `registration_drift`, `provider_config_invalid`,
+   `codex_hooks_feature_disabled`, `codex_trust_drift`, `config_root_invalid`)
+   with a remediation, reports a present agent without hooks as
+   `hooks_not_installed` and an absent optional agent as `agent_not_installed`
+   (both informational; only the absence expected of a not-installed
+   integration is muted, so an empty config with an unsafe, symlinked, or
+   group-writable directory is still an error, exactly where a later install would
+   refuse), and checks what status cannot: whether the daemon's
+   runtime socket path, and the longest worker socket path, fit the platform
+   limit (`hook_socket_path_invalid`), and an informational `python3` note. The
+   daemon cannot know the agent's `PATH` or working directory, so the note never
+   fails the doctor or changes its exit code: it reports the first executable
+   `python3` behind an absolute entry of the daemon's own `PATH`
+   (`hook_runtime_python_found`), or that none was found
+   (`hook_runtime_missing`), or that it is the macOS stub with no Command Line
+   Tools or Xcode behind it (`hook_runtime_macos_shim`, recognized through any
+   alias of `/usr/bin/python3`). In every case the hooks run `python3` from the
+   agent's own `PATH`, so verify it there (on macOS check `xcode-select -p` and
+   install the Command Line Tools if they are missing). Relative and empty
+   `PATH` entries are skipped, `python3` is never run, and the note applies only
+   to an agent whose hooks are installed.
+   `pohunek integration uninstall --agent <codex-or-claude> [--json]` (the agent
+   is always named; there is no all-agents removal, so a failure can never leave
+   one agent removed and another unreported) removes
+   exactly what the installer owns, always on the local daemon host: the exact
+   managed commands in `settings.json` or `hooks.json`, the Codex trust records
+   in `config.toml` whose hash is that of a managed command (a user's own hook
+   records stay), and each managed hook script that is a regular
+   file still carrying its `POHUNEK_INTEGRATION_ID` marker line. The
+   registration is edited first, so the agent never references a missing
+   script. User hooks, other settings, `[features] hooks`, the `hooks/`
+   directory, and the lock file are left as they are. A symlink, directory,
+   FIFO, or unmarked file at a managed script path is preserved and listed
+   under `preserved_paths`; the marker is read from the same inode that is then
+   deleted (it is moved aside first and moved back untouched when unmarked), and
+   a provider file whose content, mode, or inode changed since it was read is a
+   collision. Removal runs under the same lock and rollback as
+   install, reports the same `integration_install_in_progress`,
+   `integration_destination_collision`, and `integration_recovery_required`
+   errors, and is idempotent: with nothing installed (or no config directory)
+   it reports `not_installed` and changes nothing.
+   Status itself never repairs or rewrites provider configuration. Installation
+   validates all existing config and hook parents before any mutation and fails
+   unsafe parents with `configuration/integration_path_untrusted`. It performs
+   replacements through already-opened directory descriptors with exclusive
+   temporary files, explicit modes, and descriptor-relative rename, so a
+   concurrent parent-name swap cannot redirect a managed write. Existing safe
+   provider-file modes are preserved; new registration files use `0600`.
+   An agent whose config directory does not exist is optional and simply not
+   installed here: status reports `available: false`, `not_installed`, recovery
+   `none`, and no warning. A config path that exists but is not a directory, or
+   cannot be resolved or inspected, is a failure (`outdated`,
+   `repair_configuration`) with a warning. A symlink at the config path, live or
+   dangling, is such a failure (`config_root_invalid` in the doctor), never an
+   absent agent, and install and uninstall refuse it.
+   Status and doctor validate the config directory with the same read-only,
+   descriptor-relative component walk the installer performs: a symlink at any
+   component (live or dangling), a foreign owner, or a group/world-writable
+   directory or ancestor is `outdated` with `repair_configuration`
+   (`config_root_invalid`), for exactly the paths install and uninstall refuse.
+   Replaced and removed originals are moved aside atomically into a private
+   quarantine name bound to their inode and verified there (identity, mode, and
+   content) against what was read, the new file is activated with a no-replace
+   rename, and the originals are deleted only after every file is in place. A
+   provider file that changed at any moment is a collision and is left intact,
+   and so is a file the operation itself wrote that another writer changed
+   before the operation finished: every written file is re-verified (inode,
+   mode, complete content) before any script is removed and again before the
+   operation completes and before any rollback, the other version is kept, the rest is rolled back
+   without touching it, and the error names where the original stays quarantined;
+   and so is a loaded input the operation leaves unchanged (for example an
+   already-current Codex `config.toml`): it is verified again before any
+   destructive step and right before the registration step;
+   a failed step moves each original back untouched. If the final cleanup cannot
+   delete a quarantined original, the install or removal still succeeds and
+   lists it in `cleanup_incomplete`; the doctor keeps reporting
+   `displaced_original_left_behind` with the paths until you review and delete
+   them (or move one back if an install was interrupted).
+   Every rollback or cleanup step that leaves data in quarantine (a removal
+   refused because the entry changed, a restore that collided, a failed move) is
+   reported with the true quarantine path: as `integration_recovery_required`
+   while the operation is still rolling back, or as a `cleanup_incomplete` entry
+   once it has committed.
+   The doctor takes the installer lock without blocking and never creating the
+   file, and holds it for its whole (short, read-only) inspection. While another
+   install, uninstall, or doctor holds it, the doctor reads and scans nothing and
+   reports only the informational `operation_in_progress` finding for that agent
+   (still `ok`, with no status); run it again afterwards. An installer that
+   arrives during an inspection fails fast with
+   `integration_install_in_progress` ("another integration install, uninstall or
+   doctor holds ..."), which is safe to repeat. A lock file that is a symlink, a
+   directory, has the wrong mode or owner, or was replaced makes every install
+   and uninstall fail, so it is the error finding `unsafe_installer_lock`:
+   delete it when nothing is running (it is recreated with mode 0600) or repair
+   its permissions. If the created `hooks/` directory cannot be removed or moved
+   back after a failed install (the provider recreated `hooks/`), the install
+   reports `integration_recovery_required` with the quarantine path that holds
+   the directory and any files that appeared in it.
+   The doctor recognizes the installer's own quarantine names and every
+   platform staging, parking, and stale prefix (including `.pohunek-restore-*`).
+   Its scan stops after a fixed number of entries per directory, and an
+   incomplete or failed scan is itself an error finding
+   (`quarantine_scan_incomplete`), never a clean result: list the directory by
+   hand for names starting with `.pohunek-`, review them, and remove unrelated
+   files so the scan can finish. It finds these entries through the same no-follow trusted walk, only
+   in a config root and Claude `hooks/` directory that passed validation, so a
+   symlinked root or `hooks/` is never scanned; each directory scan and the
+   listing are bounded, and the finding says when the scan stopped early. A
+   rollback removes only the exact file the failed step activated (its identity
+   is taken from the descriptor that wrote it before the rename), so a file
+   another process put in place afterwards is kept and reported with
+   `integration_recovery_required`, which also names where the original is
+   quarantined. Hints in these errors name the running operation, install or
+   uninstall.
+   Installation is one transaction over the ordered files (hook scripts first,
+   provider registration last) under an exclusive lock file
+   `.pohunek-integration.lock` (mode `0600`) inside the agent config directory,
+   so installers for the same home or profile never interleave and installers
+   for different profiles never contend. Failures are distinct and non-secret:
+   `runtime/integration_install_in_progress` means another installer holds the
+   lock (retry once it finishes); `runtime/integration_destination_collision`
+   means a provider file changed between the installer's read and its write,
+   and nothing was overwritten (rerun the install); `configuration/integration_path_untrusted`
+   means an unsafe path shape (symlinked config root, directory, FIFO, wrong
+   owner, or group/world-writable parent), and the foreign entry is left as it
+   was. Every file already committed is restored from a snapshot when a later
+   step fails, including a displaced managed symlink, and a `hooks/` directory the
+   install created is removed again when the rollback leaves it empty. When that rollback itself
+   cannot restore a file, the error is
+   `runtime/integration_recovery_required` and names each unrestored path: fix
+   those files by hand, then rerun `pohunek integration install`. Managed hook
+   scripts are fully owned by the installer, so a modified or oversized script
+   is reinstall-repairable drift, while provider files are merged and never
+   clobbered. A script too large to snapshot is moved aside under a
+   `.pohunek-integration-displaced-*` name while the new one is written, so a
+   failed install puts back the exact original inode, and an interrupted
+   rollback leaves that quarantined original on disk and reports
+   `integration_recovery_required`. Uninstall never deletes a script it cannot
+   read and verify as owned; it lists it under `preserved_paths`.
+   On macOS the same checks apply. The installer never follows a symlink in the
+   config root path, so a `CLAUDE_CONFIG_DIR` or `CODEX_HOME` that goes through
+   a symlink (a dotfile-managed `~/.claude`, or a path under `/var`, which is a
+   symlink to `/private/var`) fails with `integration_path_untrusted`: point the
+   variable at the canonical directory (`realpath`). Hooks connect to the
+   socket path the daemon injected in `POHUNEK_SOCKET_PATH`; that path is
+   resolved and length-checked by the daemon (103 bytes on Darwin). Hooks stay
+   silent by design, so when a macOS session reports nothing, first check that
+   the daemon started with a short enough `XDG_RUNTIME_DIR` (an overlong worker
+   socket fails with `worker_socket_path_invalid`) before suspecting the hook.
+   Parse errors in provider TOML are reported by position and message only,
+   never by quoting the offending line.
    Status itself never repairs or rewrites provider configuration. Installation
    validates all existing config and hook parents before any mutation and fails
    unsafe parents with `configuration/integration_path_untrusted`. It performs

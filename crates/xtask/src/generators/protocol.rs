@@ -57,6 +57,14 @@ static METHODS: &[MethodDescriptor] = &[
         description: "Inspect managed Codex and Claude hook installations without mutation.",
     },
     MethodDescriptor {
+        wire_name: protocol::method::INTEGRATION_UNINSTALL,
+        description: "Remove the marker-owned Codex and Claude hooks, preserving foreign files and user hooks.",
+    },
+    MethodDescriptor {
+        wire_name: protocol::method::INTEGRATION_DOCTOR,
+        description: "Diagnose Codex and Claude hook installations, runtime, and socket path without mutation.",
+    },
+    MethodDescriptor {
         wire_name: "notification.create",
         description: "Create or dedupe a durable host-local notification record.",
     },

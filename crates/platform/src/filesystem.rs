@@ -274,6 +274,16 @@ pub enum FsError {
 }
 
 impl FsError {
+    /// The location where an entry the failed operation was moving actually
+    /// remains, when the error knows it.
+    #[must_use]
+    pub fn recovery_path(&self) -> Option<&Path> {
+        match self {
+            Self::StagedRecoveryRequired { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
     /// Returns the underlying I/O kind when this failure came from the OS.
     #[must_use]
     pub fn io_kind(&self) -> Option<io::ErrorKind> {
@@ -307,6 +317,64 @@ pub enum AtomicReplaceError {
     /// Rename committed, but the containing directory was not durably synchronized.
     #[error("atomic replacement committed but durability is uncertain: {0}")]
     CommittedDurabilityUncertain(#[source] FsError),
+}
+
+/// What a displacing replacement requires of its destination.
+#[derive(Debug, Clone, Copy)]
+pub enum DestinationExpectation<'a> {
+    /// Displace whatever regular file is there, if any.
+    Any,
+    /// The destination must not exist.
+    Absent,
+    /// The destination must be exactly this inode with exactly this mode and
+    /// content, checked on the moved-aside inode itself.
+    Exact {
+        /// The inode the caller decided about.
+        identity: EntryIdentity,
+        /// The mode the caller observed.
+        mode: u32,
+        /// The complete content the caller observed.
+        content: &'a [u8],
+    },
+}
+
+/// The result of a displacing replacement that activated the new file.
+#[derive(Debug)]
+pub struct ReplacedFile {
+    /// The original, still quarantined; `None` when nothing was displaced.
+    pub displaced: Option<StagedEntry>,
+    /// The identity of the file that was activated, taken from the descriptor
+    /// that wrote it before the rename, never re-read from the path.
+    pub written: EntryIdentity,
+}
+
+/// A failure while replacing a file by displacing the original.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum DisplacingReplaceError {
+    /// The destination was left exactly as found.
+    #[error("replacement failed before commit; the destination is unchanged: {0}")]
+    BeforeCommit(#[source] FsError),
+    /// The new file is active, but directory durability is uncertain.
+    #[error("replacement committed but durability is uncertain: {source}")]
+    CommittedDurabilityUncertain {
+        /// The synchronization failure.
+        #[source]
+        source: FsError,
+        /// The original, still held under its quarantine name.
+        displaced: Option<Box<StagedEntry>>,
+        /// The identity of the file that was activated.
+        written: EntryIdentity,
+    },
+    /// The original could not be moved back and remains quarantined.
+    #[error("replacement failed and the original is quarantined at {}: {source}", quarantine.display())]
+    RecoveryRequired {
+        /// Where the original now lives.
+        quarantine: PathBuf,
+        /// Why it could not be restored.
+        #[source]
+        source: FsError,
+    },
 }
 
 /// A failure while moving an inode-bound staged entry.
@@ -346,8 +414,8 @@ pub struct TrustedDir {
 /// A descriptor-bound exclusive advisory lock.
 #[derive(Debug)]
 pub struct AdvisoryLock {
-    _directory: File,
-    _marker: File,
+    _marker: HeldFlock,
+    _directory: HeldFlock,
 }
 
 /// How a [`FileLock`] shares its lock file.
@@ -366,7 +434,59 @@ pub enum LockKind {
 /// holders.
 #[derive(Debug)]
 pub struct FileLock {
-    _file: File,
+    _file: HeldFlock,
+}
+
+#[cfg(test)]
+impl FileLock {
+    /// A duplicate sharing this lock's open file description, as a forked
+    /// child's inherited copy does until it execs.
+    #[expect(
+        clippy::used_underscore_binding,
+        reason = "the fields exist only to hold the lock; tests duplicate them"
+    )]
+    fn inherited_copy(&self) -> File {
+        self._file.0.try_clone().expect("duplicate lock descriptor")
+    }
+}
+
+#[cfg(test)]
+impl AdvisoryLock {
+    /// Duplicates of the marker and directory descriptors.
+    #[expect(
+        clippy::used_underscore_binding,
+        reason = "the fields exist only to hold the lock; tests duplicate them"
+    )]
+    fn inherited_copies(&self) -> (File, File) {
+        (
+            self._marker
+                .0
+                .try_clone()
+                .expect("duplicate marker descriptor"),
+            self._directory
+                .0
+                .try_clone()
+                .expect("duplicate directory descriptor"),
+        )
+    }
+}
+
+/// A descriptor whose `flock` is released explicitly when it is dropped.
+///
+/// An advisory lock belongs to the open file description, and a forked child
+/// holds a copy of the descriptor until it execs. Closing only this
+/// descriptor would therefore keep the lock held for as long as any child is
+/// between `fork` and `exec`, so the drop unlocks the description first. A
+/// failed unlock leaves the close, which still releases the lock once every
+/// copy is gone. Constructing the guard before validation makes every error
+/// path release the lock as well.
+#[derive(Debug)]
+struct HeldFlock(File);
+
+impl Drop for HeldFlock {
+    fn drop(&mut self) {
+        let _ = fs::flock(&self.0, FlockOperation::Unlock);
+    }
 }
 
 /// An entry moved aside and bound to its original inode identity.
@@ -648,6 +768,7 @@ impl TrustedDir {
             });
         }
         lock_nonblocking(&directory, &path)?;
+        let directory = HeldFlock(directory);
 
         let (fd, created) = match fs::openat(
             &self.file,
@@ -674,10 +795,11 @@ impl TrustedDir {
                 .map_err(|source| io_error("set lock marker mode", &path, source))?;
         }
         lock_nonblocking(&marker, &path)?;
-        validate_fd(&marker, &path, EntryKind::RegularFile, Some(mode))?;
+        let marker = HeldFlock(marker);
+        validate_fd(&marker.0, &path, EntryKind::RegularFile, Some(mode))?;
         Ok(AdvisoryLock {
-            _directory: directory,
             _marker: marker,
+            _directory: directory,
         })
     }
 
@@ -737,13 +859,68 @@ impl TrustedDir {
             }
             Err(source) => return Err(io_error("acquire advisory lock", &path, source)),
         }
-        let identity = validate_fd(&file, &path, EntryKind::RegularFile, Some(mode))?;
+        let file = HeldFlock(file);
+        let identity = validate_fd(&file.0, &path, EntryKind::RegularFile, Some(mode))?;
         if inspect_entry(&self.file, &path, name, EntryKind::RegularFile, Some(mode))?
             != Some(identity)
         {
             return Err(FsError::IdentityChanged { path });
         }
         Ok(FileLock { _file: file })
+    }
+
+    /// Takes a nonblocking [`LockKind`] lock on the lock file `name` only if it
+    /// already exists, never creating it.
+    ///
+    /// This is the read-only way to ask whether a holder is active: a missing
+    /// file means no holder has ever run here and yields `Ok(None)`. The file is
+    /// opened without following symlinks and must still be the locked inode after
+    /// the lock is taken. The lock is released when the returned guard drops.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FsError::LockContended`] when a conflicting lock is held,
+    /// [`FsError::IdentityChanged`] when the name was replaced, and another
+    /// [`FsError`] when the file is unsafe.
+    pub fn lock_existing_file(
+        &self,
+        name: impl AsRef<OsStr>,
+        mode: u32,
+        kind: LockKind,
+    ) -> FsResult<Option<FileLock>> {
+        validate_mode(mode)?;
+        let name = validate_component(name.as_ref())?;
+        let path = self.path.join(name);
+        let fd = match fs::openat(
+            &self.file,
+            name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(source) => return Err(io_error("open lock file", &path, source)),
+        };
+        let file = File::from(fd);
+        let operation = match kind {
+            LockKind::Shared => FlockOperation::NonBlockingLockShared,
+            LockKind::Exclusive => FlockOperation::NonBlockingLockExclusive,
+        };
+        match fs::flock(&file, operation) {
+            Ok(()) => {}
+            Err(source) if source == rustix::io::Errno::AGAIN => {
+                return Err(FsError::LockContended { path });
+            }
+            Err(source) => return Err(io_error("acquire advisory lock", &path, source)),
+        }
+        let file = HeldFlock(file);
+        let identity = validate_fd(&file.0, &path, EntryKind::RegularFile, Some(mode))?;
+        if inspect_entry(&self.file, &path, name, EntryKind::RegularFile, Some(mode))?
+            != Some(identity)
+        {
+            return Err(FsError::IdentityChanged { path });
+        }
+        Ok(Some(FileLock { _file: file }))
     }
 
     /// Captures a trusted entry's stable device and inode identity.
@@ -803,6 +980,33 @@ impl TrustedDir {
             names.push(OsStr::from_bytes(bytes).to_os_string());
         }
         Ok(names)
+    }
+
+    /// Lists at most `limit` names through the retained descriptor.
+    ///
+    /// Names are never resolved, so a symbolic link is listed as a name and
+    /// never followed. The flag is `true` when more entries exist than `limit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FsError`] when descriptor-bound enumeration fails.
+    pub fn entry_names_limited(&self, limit: usize) -> FsResult<(Vec<OsString>, bool)> {
+        let entries = fs::Dir::read_from(&self.file)
+            .map_err(|source| io_error("open trusted directory enumeration", &self.path, source))?;
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry
+                .map_err(|source| io_error("enumerate trusted directory", &self.path, source))?;
+            let bytes = entry.file_name().to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            if names.len() == limit {
+                return Ok((names, true));
+            }
+            names.push(OsStr::from_bytes(bytes).to_os_string());
+        }
+        Ok((names, false))
     }
 
     /// Binds a Unix listener under a collision-resistant staging name with an
@@ -1217,6 +1421,255 @@ impl TrustedDir {
                 error,
             ))
         })
+    }
+
+    /// Replaces one owner-private regular file by displacing the original.
+    ///
+    /// The destination is moved aside atomically into a private quarantine
+    /// name bound to its inode, its identity, mode, and complete content are
+    /// verified on that very inode when `expectation` demands it, and the new
+    /// file is then activated with a no-replace rename. A foreign change made
+    /// at any earlier moment is therefore seen on the moved inode, and a
+    /// foreign file created in the short gap makes the activation fail instead
+    /// of being overwritten. On any mismatch the original is moved back
+    /// without replacing anything. The temporary file and the directory are
+    /// durably synchronized as in [`Self::replace_file`].
+    ///
+    /// On success the displaced original, if there was one, is returned still
+    /// quarantined; the caller decides when to remove it (after the whole
+    /// operation is durable) or to restore it with [`StagedEntry::restore`].
+    ///
+    /// # Errors
+    ///
+    /// [`DisplacingReplaceError::BeforeCommit`] leaves the destination
+    /// unchanged (a mismatch is [`FsError::IdentityChanged`]);
+    /// [`DisplacingReplaceError::RecoveryRequired`] names where the original
+    /// remains when it could not be moved back.
+    pub fn replace_file_displacing(
+        &self,
+        destination: impl AsRef<OsStr>,
+        temporary: impl AsRef<OsStr>,
+        contents: &[u8],
+        mode: u32,
+        expectation: DestinationExpectation<'_>,
+    ) -> Result<ReplacedFile, DisplacingReplaceError> {
+        validate_mode(mode).map_err(DisplacingReplaceError::BeforeCommit)?;
+        let destination = validate_component(destination.as_ref())
+            .map_err(DisplacingReplaceError::BeforeCommit)?;
+        let temporary =
+            validate_component(temporary.as_ref()).map_err(DisplacingReplaceError::BeforeCommit)?;
+        if destination == temporary {
+            return Err(DisplacingReplaceError::BeforeCommit(
+                FsError::InvalidComponent {
+                    name: temporary.to_os_string(),
+                },
+            ));
+        }
+        let destination_path = self.path.join(destination);
+        let temporary_path = self.path.join(temporary);
+        let temporary_identity = self
+            .write_replacement(temporary, &temporary_path, contents, mode)
+            .map_err(DisplacingReplaceError::BeforeCommit)?;
+        let displaced = match self.displace_destination(destination, &destination_path, expectation)
+        {
+            Ok(displaced) => displaced,
+            Err(error) => {
+                self.discard_temporary(temporary, temporary_identity);
+                return Err(error);
+            }
+        };
+        #[cfg(test)]
+        run_displace_hook("gap");
+        let activation = fs::renameat_with(
+            &self.file,
+            temporary,
+            &self.file,
+            destination,
+            RenameFlags::NOREPLACE,
+        );
+        if let Err(source) = activation {
+            self.discard_temporary(temporary, temporary_identity);
+            let cause = match source {
+                rustix::io::Errno::EXIST => FsError::IdentityChanged {
+                    path: destination_path,
+                },
+                rustix::io::Errno::NOSYS | rustix::io::Errno::NOTSUP | rustix::io::Errno::INVAL => {
+                    FsError::AtomicMoveUnsupported {
+                        path: destination_path,
+                        source: source.into(),
+                    }
+                }
+                other => io_error(
+                    "activate replacement without overwriting",
+                    &destination_path,
+                    other,
+                ),
+            };
+            return Err(restore_displaced_after(displaced, destination, cause));
+        }
+        #[cfg(test)]
+        run_displace_hook("activated");
+        let placed = inspect_entry(
+            &self.file,
+            &destination_path,
+            destination,
+            EntryKind::RegularFile,
+            Some(mode),
+        );
+        if placed.as_ref().ok().and_then(Option::as_ref) != Some(&temporary_identity) {
+            return Err(DisplacingReplaceError::CommittedDurabilityUncertain {
+                source: FsError::CommittedDurabilityUncertain {
+                    operation: "validate replaced file",
+                    path: destination_path,
+                    source: io::Error::other(
+                        "replacement destination changed after the atomic rename",
+                    ),
+                },
+                displaced: displaced.map(Box::new),
+                written: temporary_identity,
+            });
+        }
+        match self.sync() {
+            Ok(()) => Ok(ReplacedFile {
+                displaced,
+                written: temporary_identity,
+            }),
+            Err(error) => Err(DisplacingReplaceError::CommittedDurabilityUncertain {
+                source: committed_error("replace file", &destination_path, error),
+                displaced: displaced.map(Box::new),
+                written: temporary_identity,
+            }),
+        }
+    }
+
+    /// Creates, fills, and durably synchronizes the replacement file.
+    fn write_replacement(
+        &self,
+        temporary: &OsStr,
+        temporary_path: &Path,
+        contents: &[u8],
+        mode: u32,
+    ) -> FsResult<EntryIdentity> {
+        let fd = fs::openat(
+            &self.file,
+            temporary,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            mode_from_raw(mode),
+        )
+        .map_err(|source| {
+            io_error(
+                "create atomic replacement temporary file",
+                temporary_path,
+                source,
+            )
+        })?;
+        let mut file = File::from(fd);
+        let prepared = (|| {
+            fs::fchmod(&file, mode_from_raw(mode)).map_err(|source| {
+                io_error("set atomic replacement mode", temporary_path, source)
+            })?;
+            let identity = validate_fd(&file, temporary_path, EntryKind::RegularFile, Some(mode))?;
+            file.write_all(contents)
+                .map_err(|source| io_error("write atomic replacement", temporary_path, source))?;
+            sync_file(&file)?;
+            if inspect_entry(
+                &self.file,
+                temporary_path,
+                temporary,
+                EntryKind::RegularFile,
+                Some(mode),
+            )? != Some(identity)
+            {
+                return Err(FsError::IdentityChanged {
+                    path: temporary_path.to_path_buf(),
+                });
+            }
+            Ok(identity)
+        })();
+        if prepared.is_err() {
+            if let Ok(identity) =
+                validate_fd(&file, temporary_path, EntryKind::RegularFile, Some(mode))
+            {
+                self.discard_temporary(temporary, identity);
+            }
+        }
+        prepared
+    }
+
+    /// Removes an unactivated replacement file if it is still the same inode.
+    fn discard_temporary(&self, temporary: &OsStr, identity: EntryIdentity) {
+        if let Ok(StageOutcome::Staged(entry)) =
+            self.stage_random(temporary, ".pohunek-replace-stale-", identity)
+        {
+            let _ = entry.remove();
+        }
+    }
+
+    /// Moves the destination aside as `expectation` requires and verifies it.
+    fn displace_destination(
+        &self,
+        destination: &OsStr,
+        destination_path: &Path,
+        expectation: DestinationExpectation<'_>,
+    ) -> Result<Option<StagedEntry>, DisplacingReplaceError> {
+        let changed = || {
+            DisplacingReplaceError::BeforeCommit(FsError::IdentityChanged {
+                path: destination_path.to_path_buf(),
+            })
+        };
+        let before = |error| DisplacingReplaceError::BeforeCommit(error);
+        let identity = match expectation {
+            DestinationExpectation::Absent => return Ok(None),
+            DestinationExpectation::Any => {
+                match inspect_entry(
+                    &self.file,
+                    destination_path,
+                    destination,
+                    EntryKind::RegularFile,
+                    None,
+                )
+                .map_err(before)?
+                {
+                    Some(identity) => identity,
+                    None => return Ok(None),
+                }
+            }
+            DestinationExpectation::Exact { identity, .. } => identity,
+        };
+        let staged = match self
+            .stage_random(destination, DISPLACED_ORIGINAL_PREFIX, identity)
+            .map_err(before)?
+        {
+            StageOutcome::Staged(staged) => staged,
+            StageOutcome::Missing if matches!(expectation, DestinationExpectation::Any) => {
+                return Ok(None);
+            }
+            _ => return Err(changed()),
+        };
+        if let DestinationExpectation::Exact { mode, content, .. } = expectation {
+            let matches_decision = staged.path().file_name().is_some_and(|name| {
+                self.read_file(name, mode, content.len())
+                    .is_ok_and(|actual| actual == content)
+            });
+            if !matches_decision {
+                return Err(match staged.restore(destination) {
+                    Ok(MoveOutcome::Moved) => changed(),
+                    Ok(_) => DisplacingReplaceError::RecoveryRequired {
+                        quarantine: staged.path(),
+                        source: FsError::RecoveryConflict {
+                            path: destination_path.to_path_buf(),
+                        },
+                    },
+                    Err(error) => DisplacingReplaceError::RecoveryRequired {
+                        quarantine: error
+                            .recovery_path()
+                            .map_or_else(|| staged.path(), Path::to_path_buf),
+                        source: error,
+                    },
+                });
+            }
+        }
+        Ok(Some(staged))
     }
 
     /// Atomically moves one entry without replacing an existing destination.
@@ -1874,6 +2327,13 @@ impl StagedEntry {
 
     /// Restores the staged entry without replacing an occupied destination.
     ///
+    /// The entry is parked under a private `.pohunek-restore-*` name while its
+    /// identity is verified and then moved to `destination`. Every failure
+    /// after the park is returned as [`FsError::StagedRecoveryRequired`] whose
+    /// path is where the entry really is at that moment (the parking name, or
+    /// the destination when only the final synchronization failed), so callers
+    /// never point an operator at a name that no longer exists.
+    ///
     /// # Errors
     ///
     /// Returns [`FsError`] when the atomic move or synchronization fails.
@@ -1890,54 +2350,91 @@ impl StagedEntry {
             })?,
         };
         let staged_path = self.directory_path.join(&self.name);
-        let quarantine = move_to_random_quarantine(
+        let located = |error: FsError, at: &Path| FsError::StagedRecoveryRequired {
+            path: at.to_path_buf(),
+            source: Box::new(error),
+        };
+        let quarantine = match move_to_random_quarantine(
             &self.directory,
             &self.directory_path,
             &self.name,
-            ".pohunek-restore-",
-        )?
-        .ok_or_else(|| FsError::IdentityChanged {
-            path: staged_path.clone(),
-        })?;
+            RESTORE_PREFIX,
+        ) {
+            Ok(Some(quarantine)) => quarantine,
+            Ok(None) => {
+                return Err(FsError::IdentityChanged {
+                    path: staged_path.clone(),
+                });
+            }
+            // The rename committed; only its synchronization is uncertain.
+            Err(error @ FsError::CommittedDurabilityUncertain { .. }) => {
+                let parked = match &error {
+                    FsError::CommittedDurabilityUncertain { path, .. } => path.clone(),
+                    _ => staged_path.clone(),
+                };
+                return Err(located(error, &parked));
+            }
+            Err(error) => return Err(error),
+        };
         let quarantine_path = self.directory_path.join(&quarantine);
-        if inspect_entry(
+        let destination_path = self.directory_path.join(destination);
+        // A failed move back is located by what the failure says: a committed
+        // rename left the entry at its original staging name.
+        let move_back = || match directory.move_no_replace(&quarantine, &directory, &self.name) {
+            Ok(MoveOutcome::Moved) => Ok(()),
+            Ok(MoveOutcome::DestinationExists) => Err(located(
+                FsError::RecoveryConflict {
+                    path: staged_path.clone(),
+                },
+                &quarantine_path,
+            )),
+            Err(error @ FsError::CommittedDurabilityUncertain { .. }) => {
+                Err(located(error, &staged_path))
+            }
+            Err(error) => Err(located(error, &quarantine_path)),
+        };
+        match inspect_entry(
             &self.directory,
             &quarantine_path,
             &quarantine,
             self.identity.kind,
             None,
-        )? != Some(self.identity)
-        {
-            match directory.move_no_replace(&quarantine, &directory, &self.name)? {
-                MoveOutcome::Moved => {}
-                MoveOutcome::DestinationExists => {
-                    return Err(FsError::RecoveryConflict { path: staged_path });
-                }
+        ) {
+            Ok(Some(found)) if found == self.identity => {}
+            Ok(_) => {
+                move_back()?;
+                return Err(FsError::IdentityChanged { path: staged_path });
             }
-            return Err(FsError::IdentityChanged { path: staged_path });
+            Err(error) => return Err(located(error, &quarantine_path)),
         }
-        let outcome = directory.move_no_replace(&quarantine, &directory, destination)?;
+        let outcome = match directory.move_no_replace(&quarantine, &directory, destination) {
+            Ok(outcome) => outcome,
+            Err(error @ FsError::CommittedDurabilityUncertain { .. }) => {
+                return Err(located(error, &destination_path));
+            }
+            Err(error) => return Err(located(error, &quarantine_path)),
+        };
         if outcome == MoveOutcome::Moved {
-            let destination_path = self.directory_path.join(destination);
-            if inspect_entry(
+            match inspect_entry(
                 &self.directory,
                 &destination_path,
                 destination,
                 self.identity.kind,
                 None,
-            )? != Some(self.identity)
-            {
-                return Err(FsError::IdentityChanged {
-                    path: destination_path,
-                });
+            ) {
+                Ok(Some(found)) if found == self.identity => {}
+                Ok(_) => {
+                    return Err(located(
+                        FsError::IdentityChanged {
+                            path: destination_path.clone(),
+                        },
+                        &destination_path,
+                    ));
+                }
+                Err(error) => return Err(located(error, &destination_path)),
             }
         } else {
-            match directory.move_no_replace(&quarantine, &directory, &self.name)? {
-                MoveOutcome::Moved => {}
-                MoveOutcome::DestinationExists => {
-                    return Err(FsError::RecoveryConflict { path: staged_path });
-                }
-            }
+            move_back()?;
         }
         Ok(outcome)
     }
@@ -2823,6 +3320,72 @@ fn file_type_name(kind: FileType) -> &'static str {
     }
 }
 
+/// Quarantine prefix of an original displaced by [`TrustedDir::replace_file_displacing`].
+const DISPLACED_ORIGINAL_PREFIX: &str = ".pohunek-displaced-";
+
+/// Moves a displaced original back after a failed activation and reports the
+/// failure with the entry's true final location when it cannot be restored.
+fn restore_displaced_after(
+    displaced: Option<StagedEntry>,
+    destination: &OsStr,
+    cause: FsError,
+) -> DisplacingReplaceError {
+    let Some(staged) = displaced else {
+        return DisplacingReplaceError::BeforeCommit(cause);
+    };
+    match staged.restore(destination) {
+        Ok(MoveOutcome::Moved) => DisplacingReplaceError::BeforeCommit(cause),
+        Ok(_) => DisplacingReplaceError::RecoveryRequired {
+            quarantine: staged.path(),
+            source: cause,
+        },
+        Err(error) => DisplacingReplaceError::RecoveryRequired {
+            quarantine: error
+                .recovery_path()
+                .map_or_else(|| staged.path(), Path::to_path_buf),
+            source: error,
+        },
+    }
+}
+
+/// Quarantine name of an entry parked while [`StagedEntry::restore`] verifies it.
+const RESTORE_PREFIX: &str = ".pohunek-restore-";
+
+/// Every name prefix the primitives in this module give to a quarantined,
+/// staged, or stale entry, so tools can recognize leftovers of an interrupted
+/// operation. A test keeps this list equal to the prefixes used in the source.
+pub const QUARANTINE_NAME_PREFIXES: &[&str] = &[
+    ".pohunek-dir-",
+    ".pohunek-socket-stale-",
+    ".pohunek-file-stale-",
+    ".pohunek-replace-stale-",
+    ".pohunek-remove-",
+    ".pohunek-restore-",
+    ".pohunek-move-",
+    ".pohunek-displaced-",
+];
+
+/// Test hook called with the seam's name.
+#[cfg(test)]
+type DisplaceHook = Box<dyn FnMut(&str)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam run at the `"gap"` between the displacement and the activation
+    /// rename, and at `"activated"` right after the rename.
+    static DISPLACE_HOOK: std::cell::RefCell<Option<DisplaceHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_displace_hook(point: &str) {
+    DISPLACE_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(point);
+        }
+    });
+}
+
 fn lock_nonblocking(file: &File, path: &Path) -> FsResult<()> {
     match fs::flock(file, FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => Ok(()),
@@ -3085,6 +3648,9 @@ mod tests {
         assert!(!temporary.path().join("child").exists());
     }
 
+    /// Seconds the inheriting child sleeps; it is killed as soon as the check ends.
+    const CHILD_HOLD_SECONDS: &str = "30";
+
     #[test]
     fn lock_is_exclusive_across_separate_directory_descriptors() {
         let (_temporary, first) = trusted_root();
@@ -3101,6 +3667,437 @@ mod tests {
         second
             .acquire_lock("state.lock", FILE_MODE)
             .expect("acquire released lock");
+    }
+
+    /// A duplicate of a lock descriptor shares its open file description, as a
+    /// forked child's inherited copy does until it execs.
+    #[test]
+    fn dropping_a_lock_releases_it_while_a_duplicate_descriptor_stays_open() {
+        let (_temporary, first) = trusted_root();
+        let second = TrustedDir::open_absolute(&first.path, DIRECTORY_MODE)
+            .expect("open second directory descriptor");
+
+        let file_lock = first
+            .lock_file("dup.lock", FILE_MODE, LockKind::Exclusive)
+            .expect("acquire file lock");
+        let inherited = file_lock.inherited_copy();
+        drop(file_lock);
+        second
+            .lock_file("dup.lock", FILE_MODE, LockKind::Exclusive)
+            .expect("a surviving duplicate must not keep the released file lock held");
+        drop(inherited);
+
+        let directory_lock = first
+            .acquire_lock("dup-dir.lock", FILE_MODE)
+            .expect("acquire directory lock");
+        let inherited = directory_lock.inherited_copies();
+        drop(directory_lock);
+        second
+            .acquire_lock("dup-dir.lock", FILE_MODE)
+            .expect("surviving duplicates must not keep the released directory lock held");
+        drop(inherited);
+    }
+
+    /// A real child that inherited the lock descriptor and is still running.
+    #[test]
+    fn dropping_a_lock_releases_it_while_a_child_process_holds_an_inherited_copy() {
+        let (_temporary, first) = trusted_root();
+        let lock = first
+            .lock_file("child.lock", FILE_MODE, LockKind::Exclusive)
+            .expect("acquire file lock");
+        let mut child = std::process::Command::new("sleep")
+            .arg(CHILD_HOLD_SECONDS)
+            .stdin(std::process::Stdio::from(lock.inherited_copy()))
+            .spawn()
+            .expect("spawn child that inherits the lock descriptor");
+        drop(lock);
+
+        let reacquired = first.lock_file("child.lock", FILE_MODE, LockKind::Exclusive);
+
+        child.kill().expect("stop the child");
+        child.wait().expect("reap the child");
+        reacquired.expect("a running child's inherited copy must not keep the lock held");
+    }
+
+    /// The decision a caller takes about `name`: its identity, mode, and content.
+    fn decided(root: &TrustedDir, name: &str, mode: u32) -> (EntryIdentity, Vec<u8>) {
+        let identity = root
+            .entry_identity(name, EntryKind::RegularFile)
+            .expect("inspect")
+            .expect("exists");
+        let content = root.read_file(name, mode, 1024).expect("read");
+        (identity, content)
+    }
+
+    fn quarantined(root: &TrustedDir) -> Vec<String> {
+        root.entry_names()
+            .expect("list")
+            .into_iter()
+            .filter_map(|name| name.into_string().ok())
+            .filter(|name| name.starts_with(".pohunek-"))
+            .collect()
+    }
+
+    fn replace_exact(
+        root: &TrustedDir,
+        identity: EntryIdentity,
+        content: &[u8],
+    ) -> Result<ReplacedFile, DisplacingReplaceError> {
+        root.replace_file_displacing(
+            "target",
+            ".target.tmp",
+            b"new",
+            FILE_MODE,
+            DestinationExpectation::Exact {
+                identity,
+                mode: FILE_MODE,
+                content,
+            },
+        )
+    }
+
+    #[test]
+    fn displacing_replacement_activates_the_new_file_and_hands_back_the_original() {
+        let (_temporary, root) = trusted_root();
+        root.create_file("target", b"first", FILE_MODE)
+            .expect("create");
+        let (identity, content) = decided(&root, "target", FILE_MODE);
+
+        let replaced =
+            replace_exact(&root, identity, &content).expect("the decided file is replaced");
+        assert_eq!(
+            Some(replaced.written),
+            root.entry_identity("target", EntryKind::RegularFile)
+                .expect("inspect"),
+            "the reported identity is the activated file's"
+        );
+        let displaced = replaced.displaced.expect("the original is displaced");
+
+        assert_eq!(
+            root.read_file("target", FILE_MODE, 16).expect("read"),
+            b"new"
+        );
+        assert_eq!(
+            quarantined(&root).len(),
+            1,
+            "the original waits under a quarantine name"
+        );
+        assert!(matches!(displaced.remove(), Ok(RemoveOutcome::Removed)));
+        assert!(quarantined(&root).is_empty());
+
+        let created = root
+            .replace_file_displacing(
+                "fresh",
+                ".fresh.tmp",
+                b"created",
+                FILE_MODE,
+                DestinationExpectation::Any,
+            )
+            .expect("an absent destination is created");
+        assert!(created.displaced.is_none());
+        assert!(matches!(
+            root.replace_file_displacing(
+                "target",
+                ".target.tmp",
+                b"again",
+                FILE_MODE,
+                DestinationExpectation::Absent,
+            ),
+            Err(DisplacingReplaceError::BeforeCommit(
+                FsError::IdentityChanged { .. }
+            ))
+        ));
+        assert_eq!(
+            root.read_file("target", FILE_MODE, 16).expect("read"),
+            b"new"
+        );
+    }
+
+    #[test]
+    fn displacing_replacement_refuses_every_foreign_change_after_the_decision() {
+        type Foreign = fn(&TrustedDir);
+        let changes: [(&str, Foreign, &[u8]); 3] = [
+            (
+                "in-place write to the same inode",
+                |root| {
+                    fs::write(root.path.join("target"), b"other").expect("write in place");
+                },
+                b"other",
+            ),
+            (
+                "permission change only",
+                |root| {
+                    fs::set_permissions(
+                        root.path.join("target"),
+                        std::os::unix::fs::PermissionsExt::from_mode(0o640),
+                    )
+                    .expect("chmod");
+                },
+                b"first",
+            ),
+            (
+                "atomic swap to another inode with the same content and mode",
+                |root| {
+                    fs::write(root.path.join("swap"), b"first").expect("write swap");
+                    fs::set_permissions(
+                        root.path.join("swap"),
+                        std::os::unix::fs::PermissionsExt::from_mode(FILE_MODE),
+                    )
+                    .expect("chmod swap");
+                    fs::rename(root.path.join("swap"), root.path.join("target")).expect("swap");
+                },
+                b"first",
+            ),
+        ];
+        for (name, change, expected_content) in changes {
+            let (_temporary, root) = trusted_root();
+            root.create_file("target", b"first", FILE_MODE)
+                .expect("create");
+            let (identity, content) = decided(&root, "target", FILE_MODE);
+            change(&root);
+            let foreign_identity = root
+                .entry_identity("target", EntryKind::RegularFile)
+                .expect("inspect")
+                .expect("exists");
+
+            let refused = replace_exact(&root, identity, &content);
+
+            assert!(
+                matches!(
+                    refused,
+                    Err(DisplacingReplaceError::BeforeCommit(
+                        FsError::IdentityChanged { .. }
+                    ))
+                ),
+                "{name}"
+            );
+            assert_eq!(
+                root.entry_identity("target", EntryKind::RegularFile)
+                    .expect("inspect")
+                    .expect("exists"),
+                foreign_identity,
+                "{name}: the foreign inode is back in place"
+            );
+            assert_eq!(
+                fs::read(root.path.join("target")).expect("read"),
+                expected_content,
+                "{name}: the foreign change is intact"
+            );
+            assert!(quarantined(&root).is_empty(), "{name}: no residue");
+        }
+    }
+
+    #[test]
+    fn the_reported_identity_is_the_activated_file_even_if_the_path_is_swapped_after_the_rename() {
+        let (_temporary, root) = trusted_root();
+        root.create_file("target", b"first", FILE_MODE)
+            .expect("create");
+        let (identity, content) = decided(&root, "target", FILE_MODE);
+        let path = root.path.join("target");
+        DISPLACE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |point| {
+                if point == "activated" {
+                    let swap = path.with_extension("swap");
+                    fs::write(&swap, b"foreign").expect("write foreign file");
+                    fs::set_permissions(
+                        &swap,
+                        std::os::unix::fs::PermissionsExt::from_mode(FILE_MODE),
+                    )
+                    .expect("chmod foreign file");
+                    fs::rename(&swap, &path).expect("swap the destination after activation");
+                }
+            }));
+        });
+
+        let outcome = replace_exact(&root, identity, &content);
+        DISPLACE_HOOK.with(|hook| *hook.borrow_mut() = None);
+
+        let Err(DisplacingReplaceError::CommittedDurabilityUncertain {
+            written, displaced, ..
+        }) = outcome
+        else {
+            panic!("a swap right after activation must be reported as uncertain");
+        };
+        let foreign = root
+            .entry_identity("target", EntryKind::RegularFile)
+            .expect("inspect")
+            .expect("exists");
+        assert_ne!(
+            written, foreign,
+            "the foreign inode is not recorded as written"
+        );
+        assert!(displaced.is_some(), "the original is still held");
+    }
+
+    #[test]
+    fn limited_entry_listing_stops_at_the_bound_without_following_symlinks() {
+        let (_temporary, root) = trusted_root();
+        for index in 0..6 {
+            root.create_file(format!("f{index}"), b"", FILE_MODE)
+                .expect("create");
+        }
+        std::os::unix::fs::symlink("/", root.path.join("link")).expect("symlink");
+
+        let (all, truncated_all) = root.entry_names_limited(100).expect("list");
+        assert_eq!(all.len(), 7);
+        assert!(!truncated_all);
+        let (some, truncated) = root.entry_names_limited(3).expect("list");
+        assert_eq!(some.len(), 3);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn quarantine_prefix_list_covers_every_prefix_the_primitives_use() {
+        let source = include_str!("filesystem.rs");
+        let mut seen = 0;
+        for literal in source.split('"').filter(|piece| {
+            piece.starts_with(".pohunek-")
+                && piece.len() > ".pohunek-".len()
+                && piece.ends_with('-')
+                && piece
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-' || byte == b'.')
+        }) {
+            seen += 1;
+            assert!(
+                QUARANTINE_NAME_PREFIXES.contains(&literal),
+                "{literal} is not in QUARANTINE_NAME_PREFIXES"
+            );
+        }
+        assert!(seen >= QUARANTINE_NAME_PREFIXES.len());
+    }
+
+    /// Stages `source` and returns the staged entry.
+    fn stage_source(root: &TrustedDir) -> StagedEntry {
+        root.create_file("source", b"original", FILE_MODE)
+            .expect("create");
+        let identity = root
+            .entry_identity("source", EntryKind::RegularFile)
+            .expect("inspect")
+            .expect("exists");
+        let StageOutcome::Staged(staged) = root
+            .stage("source", ".pohunek-staged-fixture", identity)
+            .expect("stage")
+        else {
+            panic!("source must be staged");
+        };
+        staged
+    }
+
+    #[test]
+    fn a_failed_restore_reports_where_the_entry_really_is() {
+        // A failed second rename leaves the entry under the parking name.
+        let (_temporary, root) = trusted_root();
+        let staged = stage_source(&root);
+        NEXT_MOVE_FAILURE.with(|slot| *slot.borrow_mut() = Some(io::ErrorKind::PermissionDenied));
+        let error = staged
+            .restore("target")
+            .expect_err("the move is injected to fail");
+        let location = error
+            .recovery_path()
+            .expect("a located failure")
+            .to_path_buf();
+        assert!(
+            location
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with(".pohunek-restore-")),
+            "{location:?}"
+        );
+        assert_eq!(
+            fs::read(&location).expect("the entry is at the reported path"),
+            b"original"
+        );
+        assert_ne!(location, staged.path(), "the staged name no longer exists");
+        assert!(!staged.path().exists());
+    }
+
+    #[test]
+    fn every_failed_restore_step_names_an_existing_location_holding_the_original() {
+        for failing_sync in 0..4 {
+            let (_temporary, root) = trusted_root();
+            let staged = stage_source(&root);
+            NEXT_SYNC_FAILURE.with(|slot| {
+                *slot.borrow_mut() = Some((failing_sync, io::ErrorKind::Other));
+            });
+
+            let outcome = staged.restore("target");
+            NEXT_SYNC_FAILURE.with(|slot| *slot.borrow_mut() = None);
+
+            let Err(error) = outcome else { continue };
+            let location = error
+                .recovery_path()
+                .map_or_else(|| staged.path(), Path::to_path_buf);
+            assert_eq!(
+                fs::read(&location).unwrap_or_default(),
+                b"original",
+                "sync #{failing_sync}: {error} points at {location:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_foreign_file_created_in_the_gap_is_never_overwritten() {
+        let (_temporary, root) = trusted_root();
+        root.create_file("target", b"first", FILE_MODE)
+            .expect("create");
+        let (identity, content) = decided(&root, "target", FILE_MODE);
+        let path = root.path.join("target");
+        DISPLACE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |point| {
+                if point == "gap" {
+                    fs::write(&path, b"foreign").expect("create foreign file in the gap");
+                }
+            }));
+        });
+
+        let refused = replace_exact(&root, identity, &content);
+        DISPLACE_HOOK.with(|hook| *hook.borrow_mut() = None);
+
+        let Err(DisplacingReplaceError::RecoveryRequired { quarantine, .. }) = refused else {
+            panic!("a foreign file in the gap must require recovery");
+        };
+        assert_eq!(
+            fs::read(root.path.join("target")).expect("read"),
+            b"foreign"
+        );
+        assert_eq!(
+            fs::read(&quarantine).expect("the original stays quarantined"),
+            b"first"
+        );
+        assert!(
+            !root.path.join(".target.tmp").exists(),
+            "the temporary is discarded"
+        );
+    }
+
+    #[test]
+    fn an_existing_lock_probe_never_creates_the_file_and_sees_a_holder() {
+        let (_temporary, root) = trusted_root();
+        assert!(root
+            .lock_existing_file("probe.lock", FILE_MODE, LockKind::Exclusive)
+            .expect("probe a missing lock")
+            .is_none());
+        assert!(
+            !root.path.join("probe.lock").exists(),
+            "the probe must not create it"
+        );
+
+        let held = root
+            .lock_file("probe.lock", FILE_MODE, LockKind::Exclusive)
+            .expect("hold the lock");
+        assert!(matches!(
+            root.lock_existing_file("probe.lock", FILE_MODE, LockKind::Exclusive),
+            Err(FsError::LockContended { .. })
+        ));
+        drop(held);
+        let idle = root
+            .lock_existing_file("probe.lock", FILE_MODE, LockKind::Exclusive)
+            .expect("probe an idle lock");
+        assert!(idle.is_some());
+        drop(idle);
+        root.lock_file("probe.lock", FILE_MODE, LockKind::Exclusive)
+            .expect("the probe released the lock");
     }
 
     #[test]

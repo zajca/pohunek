@@ -29,8 +29,27 @@ use toml_edit::{value, DocumentMut, Item, Table};
 
 #[cfg(unix)]
 use pohunek_platform::filesystem::{
-    AtomicReplaceError, EntryKind, MoveOutcome, StageOutcome, TrustedDir as PlatformTrustedDir,
+    EntryKind, FsError, LockKind, TrustedDir as PlatformTrustedDir,
 };
+
+#[cfg(unix)]
+mod commit;
+#[cfg(unix)]
+mod doctor;
+#[cfg(unix)]
+mod quarantine;
+#[cfg(unix)]
+mod uninstall;
+#[cfg(unix)]
+pub use doctor::doctor;
+#[cfg(unix)]
+pub use uninstall::{uninstall, uninstall_claude, uninstall_codex};
+#[cfg(all(test, unix))]
+mod lifecycle_tests;
+#[cfg(all(test, unix))]
+mod removal_tests;
+#[cfg(unix)]
+use commit::{Action, Expected, Step, StepGate};
 
 // The agent-handshake env var names are defined once in `protocol` (the shared
 // contract crate) so the daemon (which injects them), the installed hook (which
@@ -151,6 +170,18 @@ const MANAGED_HOOK_DIR_MODE: u32 = 0o700;
 /// Newly created provider registration files are readable only by the owner.
 #[cfg(unix)]
 const NEW_REGISTRATION_MODE: u32 = 0o600;
+/// Lock file inside an agent config directory that serializes installers.
+#[cfg(unix)]
+const INSTALL_LOCK_NAME: &str = ".pohunek-integration.lock";
+/// Quarantine prefix for a rolled-back directory the installer had created.
+#[cfg(unix)]
+const CREATED_DIR_QUARANTINE_PREFIX: &str = ".pohunek-integration-created-";
+/// Owner-private mode of the installer lock file.
+#[cfg(unix)]
+const INSTALL_LOCK_MODE: u32 = 0o600;
+/// Error code for an install that found another installer holding the lock.
+#[cfg(unix)]
+const INSTALL_IN_PROGRESS_CODE: &str = "integration_install_in_progress";
 
 /// Env var overriding Claude's config dir (else `~/.claude`).
 const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
@@ -164,6 +195,9 @@ pub struct InstallPaths {
     pub hook_path: PathBuf,
     /// Config files created or merged into, in the order touched.
     pub config_paths: Vec<PathBuf>,
+    /// Quarantined originals whose deletion did not finish after the install
+    /// committed; empty when cleanup completed.
+    pub cleanup_incomplete: Vec<String>,
 }
 
 /// Install the `SessionStart` hook for the selected agent(s).
@@ -321,7 +355,7 @@ fn status_at(
         .map(|path| path_text(path))
         .collect();
 
-    if let Some((state, warning)) = config_dir_issue(config_dir) {
+    if let Some(issue) = config_dir_issue(config_dir) {
         return IntegrationAgentStatus {
             agent: agent.kind(),
             available: false,
@@ -330,9 +364,9 @@ fn status_at(
             registration_paths: registration_path_strings,
             installed_version: None,
             expected_version: EXPECTED_INTEGRATION_VERSION,
-            state,
-            recovery: IntegrationRecovery::RepairConfiguration,
-            warnings: vec![warning.to_owned()],
+            state: issue.state,
+            recovery: issue.recovery,
+            warnings: issue.warning.map(str::to_owned).into_iter().collect(),
         };
     }
 
@@ -412,21 +446,97 @@ fn status_at(
     }
 }
 
-fn config_dir_issue(config_dir: &Path) -> Option<(IntegrationInstallState, &'static str)> {
-    match fs::metadata(config_dir) {
-        Ok(metadata) if metadata.is_dir() => None,
-        Ok(_metadata) => Some((
-            IntegrationInstallState::Outdated,
-            "agent config path is not a directory",
+/// Why an agent's config directory yields no inspectable install.
+struct ConfigDirIssue {
+    state: IntegrationInstallState,
+    recovery: IntegrationRecovery,
+    warning: Option<&'static str>,
+}
+
+/// What exists at an agent config path, without following a symlink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigPath {
+    Absent,
+    Directory,
+    /// A symlink, live or dangling; the installer never follows one.
+    Symlink,
+    /// A file or another non-directory.
+    Other,
+    /// The path could not be inspected.
+    Unreadable,
+}
+
+/// Classifies `path` component by component, never following a symlink.
+///
+/// A symlink anywhere on the path, live or dangling, is [`ConfigPath::Symlink`]
+/// because the installer's trusted walk refuses it; a missing component is
+/// [`ConfigPath::Absent`].
+fn config_path_kind(path: &Path) -> ConfigPath {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        match component {
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => continue,
+            std::path::Component::Normal(_) => {}
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                return ConfigPath::Unreadable;
+            }
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return ConfigPath::Symlink,
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_metadata) => return ConfigPath::Other,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return ConfigPath::Absent,
+            Err(_error) => return ConfigPath::Unreadable,
+        }
+    }
+    ConfigPath::Directory
+}
+
+/// The error for an agent config path that is a symlink.
+fn config_dir_is_symlink(path: &Path) -> ProtocolError {
+    path_untrusted(
+        path,
+        "agent config path is a symlink; point the provider config directory at the canonical directory",
+    )
+}
+
+/// Classifies the agent config directory.
+///
+/// An absent path means the optional agent is not installed on this host: it is
+/// reported as `not_installed` with no warning and nothing to repair. A symlink
+/// anywhere on the path (even a dangling one), a non-directory, a directory the
+/// trusted walk refuses (foreign owner, group/world-writable), or an
+/// uninspectable path is a failure that needs configuration repair.
+fn config_dir_issue(config_dir: &Path) -> Option<ConfigDirIssue> {
+    let failure = |warning| ConfigDirIssue {
+        state: IntegrationInstallState::Outdated,
+        recovery: IntegrationRecovery::RepairConfiguration,
+        warning: Some(warning),
+    };
+    match config_path_kind(config_dir) {
+        // The same descriptor-relative walk the installer performs, read-only,
+        // so status and doctor refuse exactly the paths install refuses.
+        ConfigPath::Directory => PlatformTrustedDir::open_absolute_owner_safe(
+            config_dir,
+            GROUP_OR_OTHER_WRITE_MASK,
+        )
+        .err()
+        .map(|_error| {
+            failure(
+                "agent config directory failed trusted filesystem validation; repair its ownership and permissions",
+            )
+        }),
+        ConfigPath::Symlink => Some(failure(
+            "agent config path is a symlink; use the canonical directory",
         )),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Some((
-            IntegrationInstallState::NotInstalled,
-            "agent config directory does not exist",
-        )),
-        Err(_error) => Some((
-            IntegrationInstallState::Outdated,
-            "agent config directory could not be inspected",
-        )),
+        ConfigPath::Other => Some(failure("agent config path is not a directory")),
+        ConfigPath::Absent => Some(ConfigDirIssue {
+            state: IntegrationInstallState::NotInstalled,
+            recovery: IntegrationRecovery::None,
+            warning: None,
+        }),
+        ConfigPath::Unreadable => Some(failure("agent config directory could not be inspected")),
     }
 }
 
@@ -1297,10 +1407,11 @@ fn inspect_codex_config(
         .and_then(Item::as_table)
         .and_then(|hooks| hooks.get("state"))
         .and_then(Item::as_table);
+    let owned_hashes = spec_trust_hashes(specs);
     let actual_keys = trust_state
         .into_iter()
         .flat_map(|state| state.iter())
-        .filter(|(key, _item)| is_managed_trust_key(key, &trust_prefix))
+        .filter(|(key, item)| is_owned_trust_record(key, item, &trust_prefix, &owned_hashes))
         .map(|(key, _item)| key.to_owned())
         .collect::<BTreeSet<_>>();
     let footprint = !actual_keys.is_empty();
@@ -1342,6 +1453,19 @@ fn inspect_codex_config(
         trust_current = false;
     }
     (footprint, hooks_enabled && trust_current)
+}
+
+/// The trusted hashes of the managed hooks described by `specs`.
+fn spec_trust_hashes(specs: &[HookSpec]) -> OwnedTrustHashes {
+    specs
+        .iter()
+        .filter_map(|spec| {
+            let trust_event = spec.trust_event?;
+            codex_command_hook_trusted_hash(trust_event, &spec.command, HOOK_TIMEOUT_SECS, None)
+                .ok()
+                .map(|hash| (trust_event, hash))
+        })
+        .collect()
 }
 
 fn codex_config_structure_valid(document: &DocumentMut, trust_prefix: &str) -> bool {
@@ -1473,10 +1597,16 @@ fn registration_metadata_current(
 fn install_all_present() -> Result<Vec<IntegrationInstallReport>, ProtocolError> {
     let mut installed = Vec::new();
     let claude_dir = claude_config_dir()?;
+    if config_path_kind(&claude_dir) == ConfigPath::Symlink {
+        return Err(config_dir_is_symlink(&claude_dir));
+    }
     if claude_dir.is_dir() {
         installed.push(report(AgentKind::Claude, &install_claude(&claude_dir)?));
     }
     let codex_dir = codex_config_dir()?;
+    if config_path_kind(&codex_dir) == ConfigPath::Symlink {
+        return Err(config_dir_is_symlink(&codex_dir));
+    }
     if codex_dir.is_dir() {
         installed.push(report(AgentKind::Codex, &install_codex(&codex_dir)?));
     }
@@ -1504,6 +1634,7 @@ fn report(agent: AgentKind, paths: &InstallPaths) -> IntegrationInstallReport {
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
+        cleanup_incomplete: paths.cleanup_incomplete.clone(),
     }
 }
 
@@ -1529,12 +1660,24 @@ pub fn codex_config_dir() -> Result<PathBuf, ProtocolError> {
 /// Fails fast if `claude_dir` is absent, if `settings.json` is malformed, or on
 /// any I/O error.
 pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> {
+    install_claude_gated(claude_dir, &mut |_index, _name| Ok(()))
+}
+
+/// [`install_claude`] with a gate run before each committed file.
+fn install_claude_gated(
+    claude_dir: &Path,
+    gate: StepGate<'_>,
+) -> Result<InstallPaths, ProtocolError> {
     validate_config_dir(claude_dir.to_path_buf(), "Claude config directory")?;
+    if config_path_kind(claude_dir) == ConfigPath::Symlink {
+        return Err(config_dir_is_symlink(claude_dir));
+    }
     if !claude_dir.is_dir() {
         return Err(config_dir_missing(&AgentKind::Claude, claude_dir));
     }
 
     let config_root = TrustedDir::open(claude_dir, "Claude config directory")?;
+    let _install_lock = config_root.lock_installer()?;
     let hooks_dir = claude_dir.join("hooks");
     let trusted_hooks = config_root.open_child("hooks", "Claude hooks directory")?;
     let hook_path = hooks_dir.join(STATE_HOOK_INSTALL_NAME);
@@ -1549,15 +1692,95 @@ pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> 
         settings_file.as_ref().map(|file| file.content.as_str()),
         &settings_path,
     )?;
-    let hooks = ensure_hooks_object(&mut settings, &settings_path)?;
+    merge_claude_hooks(&mut settings, &settings_path, &hook_path, &notify_hook_path)?;
+    let settings_body = json_pretty(&settings_path, &settings)?;
+
+    let created_hooks = trusted_hooks.is_none();
+    let trusted_hooks = match trusted_hooks {
+        Some(hooks) => hooks,
+        None => {
+            config_root.create_child("hooks", "Claude hooks directory", MANAGED_HOOK_DIR_MODE)?
+        }
+    };
+    let steps = [
+        Step {
+            dir: &trusted_hooks,
+            name: STATE_HOOK_INSTALL_NAME,
+            label: "Claude state hook",
+            action: Action::Write {
+                body: CLAUDE_HOOK_ASSET,
+                mode: MANAGED_HOOK_MODE,
+            },
+            expected: Expected::Any,
+        },
+        Step {
+            dir: &trusted_hooks,
+            name: NOTIFY_HOOK_INSTALL_NAME,
+            label: "Claude notification hook",
+            action: Action::Write {
+                body: CLAUDE_NOTIFY_HOOK_ASSET,
+                mode: MANAGED_HOOK_MODE,
+            },
+            expected: Expected::Any,
+        },
+        Step {
+            dir: &config_root,
+            name: "settings.json",
+            label: "Claude settings.json",
+            action: Action::Write {
+                body: &settings_body,
+                mode: settings_mode,
+            },
+            expected: Expected::Loaded(settings_file.as_ref()),
+        },
+    ];
+    let committed = commit::commit(&steps, gate, commit::Operation::Install);
+    if let Err(error) = &committed {
+        // A directory this install created is removed again once the rollback
+        // left it empty; after an incomplete rollback it stays for inspection.
+        if created_hooks && error.code != commit::RECOVERY_REQUIRED_CODE {
+            if let Err(quarantine) = config_root.remove_created_empty_child("hooks", &trusted_hooks)
+            {
+                return Err(commit::recovery_required(
+                    &[format!(
+                        "{} (the created hooks directory and any files in it stay at {})",
+                        hooks_dir.display(),
+                        quarantine.display()
+                    )],
+                    Some(&error.code),
+                    commit::Operation::Install,
+                ));
+            }
+        }
+    }
+    let committed = committed?;
+
+    Ok(InstallPaths {
+        hook_path,
+        config_paths: vec![settings_path],
+        cleanup_incomplete: committed.cleanup_incomplete,
+    })
+}
+
+/// Merges the managed Claude hook registrations into `settings`.
+///
+/// Only commands this installer wrote are stripped before the managed set is
+/// added, so reinstalling never duplicates them and never touches user hooks.
+fn merge_claude_hooks(
+    settings: &mut Value,
+    settings_path: &Path,
+    hook_path: &Path,
+    notify_hook_path: &Path,
+) -> Result<(), ProtocolError> {
+    let hooks = ensure_hooks_object(settings, settings_path)?;
     let state_hook_commands = [
-        hook_command(&hook_path, HOOK_ACTION),
-        hook_command(&hook_path, HOOK_RELEASE_ACTION),
-        hook_command(&hook_path, SUBAGENT_START_ACTION),
-        hook_command(&hook_path, SUBAGENT_STOP_ACTION),
+        hook_command(hook_path, HOOK_ACTION),
+        hook_command(hook_path, HOOK_RELEASE_ACTION),
+        hook_command(hook_path, SUBAGENT_START_ACTION),
+        hook_command(hook_path, SUBAGENT_STOP_ACTION),
     ];
     remove_owned_command_hooks(hooks, &state_hook_commands);
-    remove_owned_command_hooks(hooks, &claude_notify_hook_commands(&notify_hook_path));
+    remove_owned_command_hooks(hooks, &claude_notify_hook_commands(notify_hook_path));
     ensure_command_hook(
         hooks,
         SESSION_START_EVENT,
@@ -1581,46 +1804,23 @@ pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> 
         ensure_command_hook(
             hooks,
             CLAUDE_NOTIFICATION_EVENT,
-            &hook_command_with_args(&notify_hook_path, &[NOTIFICATION_ACTION, matcher]),
+            &hook_command_with_args(notify_hook_path, &[NOTIFICATION_ACTION, matcher]),
             Some(matcher),
         )?;
     }
     ensure_command_hook(
         hooks,
         CLAUDE_STOP_EVENT,
-        &hook_command(&notify_hook_path, STOP_ACTION),
+        &hook_command(notify_hook_path, STOP_ACTION),
         Some("*"),
     )?;
     ensure_command_hook(
         hooks,
         CLAUDE_STOP_FAILURE_EVENT,
-        &hook_command(&notify_hook_path, STOP_FAILURE_ACTION),
+        &hook_command(notify_hook_path, STOP_FAILURE_ACTION),
         Some("*"),
     )?;
-    let settings_body = json_pretty(&settings_path, &settings)?;
-
-    let trusted_hooks = match trusted_hooks {
-        Some(hooks) => hooks,
-        None => {
-            config_root.create_child("hooks", "Claude hooks directory", MANAGED_HOOK_DIR_MODE)?
-        }
-    };
-    trusted_hooks.replace(
-        STATE_HOOK_INSTALL_NAME,
-        CLAUDE_HOOK_ASSET,
-        MANAGED_HOOK_MODE,
-    )?;
-    trusted_hooks.replace(
-        NOTIFY_HOOK_INSTALL_NAME,
-        CLAUDE_NOTIFY_HOOK_ASSET,
-        MANAGED_HOOK_MODE,
-    )?;
-    config_root.replace("settings.json", &settings_body, settings_mode)?;
-
-    Ok(InstallPaths {
-        hook_path,
-        config_paths: vec![settings_path],
-    })
+    Ok(())
 }
 
 /// Install the Codex hooks into `codex_dir`.
@@ -1633,17 +1833,29 @@ pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> 
 ///
 /// Fails fast if `codex_dir` is absent, if `hooks.json` is malformed, or on any
 /// I/O error.
+pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
+    install_codex_gated(codex_dir, &mut |_index, _name| Ok(()))
+}
+
+/// [`install_codex`] with a gate run before each committed file.
 #[expect(
     clippy::too_many_lines,
     reason = "Codex hook and trust registration is one atomic configuration transaction"
 )]
-pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
+fn install_codex_gated(
+    codex_dir: &Path,
+    gate: StepGate<'_>,
+) -> Result<InstallPaths, ProtocolError> {
     validate_config_dir(codex_dir.to_path_buf(), "Codex config directory")?;
+    if config_path_kind(codex_dir) == ConfigPath::Symlink {
+        return Err(config_dir_is_symlink(codex_dir));
+    }
     if !codex_dir.is_dir() {
         return Err(config_dir_missing(&AgentKind::Codex, codex_dir));
     }
 
     let config_root = TrustedDir::open(codex_dir, "Codex config directory")?;
+    let _install_lock = config_root.lock_installer()?;
     let hook_path = codex_dir.join(STATE_HOOK_INSTALL_NAME);
     let notify_hook_path = codex_dir.join(NOTIFY_HOOK_INSTALL_NAME);
 
@@ -1657,6 +1869,7 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
         &hooks_path,
     )?;
     let hooks = ensure_hooks_object(&mut hooks_file, &hooks_path)?;
+    let hooks_before = hooks.clone();
     remove_owned_command_hooks(
         hooks,
         &[
@@ -1668,36 +1881,11 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
     remove_owned_command_hooks(hooks, &codex_notify_hook_commands(&notify_hook_path));
     // Codex exposes `Stop` for turn completion, not session/process exit. Do
     // not wire state release to it; procwatch is the lifecycle backstop.
-    let codex_hooks = [
-        CodexManagedHook {
-            event: SESSION_START_EVENT,
-            trust_event: CODEX_SESSION_START_TRUST_EVENT,
-            command: hook_command(&hook_path, HOOK_ACTION),
-        },
-        CodexManagedHook {
-            event: SUBAGENT_START_EVENT,
-            trust_event: CODEX_SUBAGENT_START_TRUST_EVENT,
-            command: hook_command(&hook_path, SUBAGENT_START_ACTION),
-        },
-        CodexManagedHook {
-            event: SUBAGENT_STOP_EVENT,
-            trust_event: CODEX_SUBAGENT_STOP_TRUST_EVENT,
-            command: hook_command(&hook_path, SUBAGENT_STOP_ACTION),
-        },
-        CodexManagedHook {
-            event: CODEX_PERMISSION_REQUEST_EVENT,
-            trust_event: CODEX_PERMISSION_REQUEST_TRUST_EVENT,
-            command: hook_command(&notify_hook_path, PERMISSION_REQUEST_ACTION),
-        },
-        CodexManagedHook {
-            event: CODEX_STOP_EVENT,
-            trust_event: CODEX_STOP_TRUST_EVENT,
-            command: hook_command(&notify_hook_path, STOP_ACTION),
-        },
-    ];
+    let codex_hooks = codex_managed_hooks(&hook_path, &notify_hook_path);
     for managed in &codex_hooks {
         ensure_command_hook(hooks, managed.event, &managed.command, None)?;
     }
+    let trust_moves = trust_rekeys(&hooks_path, &hooks_before, hooks, &codex_hooks)?;
     let mut trust_entries = Vec::with_capacity(codex_hooks.len());
     for managed in &codex_hooks {
         let (group_index, handler_index) =
@@ -1732,23 +1920,83 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
             codex_command_hook_trusted_hash(trust_event, &command, HOOK_TIMEOUT_SECS, None)?;
         trust_states.push((trust_key, trusted_hash));
     }
-    let updated = update_codex_config_toml(existing, &trust_states, &config_path, &hooks_path)?;
+    let owned_hashes = owned_trust_hashes(&codex_hooks)?;
+    let updated = update_codex_config_toml(
+        existing,
+        &trust_states,
+        &config_path,
+        &hooks_path,
+        &owned_hashes,
+        &trust_moves,
+    )?;
     let hooks_body = json_pretty(&hooks_path, &hooks_file)?;
 
-    config_root.replace(STATE_HOOK_INSTALL_NAME, CODEX_HOOK_ASSET, MANAGED_HOOK_MODE)?;
-    config_root.replace(
-        NOTIFY_HOOK_INSTALL_NAME,
-        CODEX_NOTIFY_HOOK_ASSET,
-        MANAGED_HOOK_MODE,
-    )?;
-    config_root.replace("hooks.json", &hooks_body, hooks_mode)?;
-    if updated != existing {
-        config_root.replace("config.toml", &updated, config_mode)?;
+    // An unchanged config.toml is still an input of this install's decisions, so
+    // it is verified before any destructive step and again right before the
+    // registration step; a changed one is written with its exact expectation.
+    let config_unchanged = updated == existing;
+    let verify_config = || Step {
+        dir: &config_root,
+        name: "config.toml",
+        label: "Codex config.toml",
+        action: Action::Verify,
+        expected: Expected::Loaded(config_source.as_ref()),
+    };
+    let mut steps = Vec::new();
+    if config_unchanged {
+        steps.push(verify_config());
     }
+    steps.push(Step {
+        dir: &config_root,
+        name: STATE_HOOK_INSTALL_NAME,
+        label: "Codex state hook",
+        action: Action::Write {
+            body: CODEX_HOOK_ASSET,
+            mode: MANAGED_HOOK_MODE,
+        },
+        expected: Expected::Any,
+    });
+    steps.push(Step {
+        dir: &config_root,
+        name: NOTIFY_HOOK_INSTALL_NAME,
+        label: "Codex notification hook",
+        action: Action::Write {
+            body: CODEX_NOTIFY_HOOK_ASSET,
+            mode: MANAGED_HOOK_MODE,
+        },
+        expected: Expected::Any,
+    });
+    if config_unchanged {
+        steps.push(verify_config());
+    }
+    steps.push(Step {
+        dir: &config_root,
+        name: "hooks.json",
+        label: "Codex hooks.json",
+        action: Action::Write {
+            body: &hooks_body,
+            mode: hooks_mode,
+        },
+        expected: Expected::Loaded(hooks_source.as_ref()),
+    });
+    if !config_unchanged {
+        steps.push(Step {
+            dir: &config_root,
+            name: "config.toml",
+            label: "Codex config.toml",
+            action: Action::Write {
+                body: &updated,
+                mode: config_mode,
+            },
+            expected: Expected::Loaded(config_source.as_ref()),
+        });
+    }
+    let committed = commit::commit(&steps, gate, commit::Operation::Install)?;
 
     Ok(InstallPaths {
         hook_path,
         config_paths: vec![hooks_path, config_path],
+        cleanup_incomplete: committed.cleanup_incomplete,
     })
 }
 
@@ -1756,6 +2004,86 @@ struct CodexManagedHook {
     event: &'static str,
     trust_event: &'static str,
     command: String,
+}
+
+/// The five hooks the Codex installer registers, in registration order.
+fn codex_managed_hooks(hook_path: &Path, notify_hook_path: &Path) -> [CodexManagedHook; 5] {
+    [
+        CodexManagedHook {
+            event: SESSION_START_EVENT,
+            trust_event: CODEX_SESSION_START_TRUST_EVENT,
+            command: hook_command(hook_path, HOOK_ACTION),
+        },
+        CodexManagedHook {
+            event: SUBAGENT_START_EVENT,
+            trust_event: CODEX_SUBAGENT_START_TRUST_EVENT,
+            command: hook_command(hook_path, SUBAGENT_START_ACTION),
+        },
+        CodexManagedHook {
+            event: SUBAGENT_STOP_EVENT,
+            trust_event: CODEX_SUBAGENT_STOP_TRUST_EVENT,
+            command: hook_command(hook_path, SUBAGENT_STOP_ACTION),
+        },
+        CodexManagedHook {
+            event: CODEX_PERMISSION_REQUEST_EVENT,
+            trust_event: CODEX_PERMISSION_REQUEST_TRUST_EVENT,
+            command: hook_command(notify_hook_path, PERMISSION_REQUEST_ACTION),
+        },
+        CodexManagedHook {
+            event: CODEX_STOP_EVENT,
+            trust_event: CODEX_STOP_TRUST_EVENT,
+            command: hook_command(notify_hook_path, STOP_ACTION),
+        },
+    ]
+}
+
+/// The `(trust event, trusted hash)` pairs of the managed hooks.
+///
+/// A trust record is installer-owned only when its hash is one of these: the
+/// key alone is derived from a position, and a user's own hook in the same
+/// event can occupy any position.
+type OwnedTrustHashes = BTreeSet<(&'static str, String)>;
+
+fn owned_trust_hashes(hooks: &[CodexManagedHook]) -> Result<OwnedTrustHashes, ProtocolError> {
+    hooks
+        .iter()
+        .map(|hook| {
+            codex_command_hook_trusted_hash(
+                hook.trust_event,
+                &hook.command,
+                HOOK_TIMEOUT_SECS,
+                None,
+            )
+            .map(|hash| (hook.trust_event, hash))
+        })
+        .collect()
+}
+
+/// Whether a `hooks.state` entry is a trust record of a managed hook.
+///
+/// It must sit in the managed key namespace of `trust_prefix` and carry the
+/// exact trusted hash of one of the managed commands for that event, at any
+/// position. Records for a user's own hooks never match.
+fn is_owned_trust_record(
+    key: &str,
+    item: &Item,
+    trust_prefix: &str,
+    owned: &OwnedTrustHashes,
+) -> bool {
+    let Some(suffix) = key.strip_prefix(trust_prefix) else {
+        return false;
+    };
+    let Some(event) = CODEX_MANAGED_TRUST_EVENTS.iter().find(|event| {
+        suffix
+            .strip_prefix(**event)
+            .is_some_and(|rest| rest.starts_with(':'))
+    }) else {
+        return false;
+    };
+    item.as_table()
+        .and_then(|table| table.get("trusted_hash"))
+        .and_then(Item::as_str)
+        .is_some_and(|hash| owned.contains(&(*event, hash.to_owned())))
 }
 
 fn command_hook_position(
@@ -2044,9 +2372,17 @@ fn update_codex_config_toml(
     trust_states: &[(String, String)],
     path: &Path,
     hooks_path: &Path,
+    owned: &OwnedTrustHashes,
+    moves: &[(String, String)],
 ) -> Result<String, ProtocolError> {
     let mut doc = content.parse::<DocumentMut>().map_err(|err| {
-        settings_invalid(path, &format!("invalid TOML in Codex config.toml: {err}"))
+        settings_invalid(
+            path,
+            &format!(
+                "invalid TOML in Codex config.toml: {}",
+                toml_error_summary(content, &err)
+            ),
+        )
     })?;
 
     ensure_table(doc.as_table_mut(), "features", path)?.insert("hooks", value(true));
@@ -2064,17 +2400,144 @@ fn update_codex_config_toml(
     }
     let stale_keys = state
         .iter()
-        .filter(|(key, _item)| is_managed_trust_key(key, &trust_prefix))
+        .filter(|(key, item)| is_owned_trust_record(key, item, &trust_prefix, owned))
         .map(|(key, _item)| key.to_owned())
         .collect::<Vec<_>>();
     for stale_key in stale_keys {
         state.remove(&stale_key);
     }
+    apply_trust_moves(state, moves, path)?;
     for (trust_key, trusted_hash) in trust_states {
         ensure_table(state, trust_key, path)?.insert("trusted_hash", value(trusted_hash.as_str()));
     }
 
     Ok(doc.to_string())
+}
+
+/// Error code for trust records that cannot be re-keyed without choosing between
+/// two claims on one key.
+const TRUST_CONFLICT_CODE: &str = "integration_trust_conflict";
+
+fn trust_conflict(path: &Path, detail: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Configuration,
+        TRUST_CONFLICT_CODE,
+        format!(
+            "{}: cannot keep the trust records of your own hooks: {detail}",
+            path.display()
+        ),
+        Some(
+            "review the [hooks.state] tables in config.toml by hand so each hook has at most one record at its current position, then repeat the command"
+                .to_owned(),
+        ),
+    )
+}
+
+/// Positions `(group, handler)` of the user's own handlers in `event`: every
+/// handler whose command is not one of `owned`, in file order.
+fn user_handler_positions(
+    hooks: &Map<String, Value>,
+    event: &str,
+    owned: &[String],
+) -> Vec<(usize, usize)> {
+    let Some(groups) = hooks.get(event).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut positions = Vec::new();
+    for (group_index, group) in groups.iter().enumerate() {
+        let handlers = group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        for (handler_index, handler) in handlers.iter().enumerate() {
+            if !is_owned_command(handler, owned) {
+                positions.push((group_index, handler_index));
+            }
+        }
+    }
+    positions
+}
+
+/// The trust-record moves a change of `hooks.json` from `before` to `after`
+/// requires.
+///
+/// A trust key embeds the group and handler index, so removing or adding a
+/// managed group shifts the keys of the user's own hooks in the same event.
+/// Survivors keep their relative order, so the k-th user handler before is the
+/// k-th after; the returned `(old key, new key)` pairs move each record with
+/// its hook. The trusted hash covers only the handler and its matcher, so it
+/// stays valid at the new position.
+fn trust_rekeys(
+    hooks_path: &Path,
+    before: &Map<String, Value>,
+    after: &Map<String, Value>,
+    managed: &[CodexManagedHook],
+) -> Result<Vec<(String, String)>, ProtocolError> {
+    let owned: Vec<String> = managed.iter().map(|hook| hook.command.clone()).collect();
+    let mut moves = Vec::new();
+    for hook in managed {
+        let old = user_handler_positions(before, hook.event, &owned);
+        let new = user_handler_positions(after, hook.event, &owned);
+        if old.len() != new.len() {
+            return Err(trust_conflict(
+                hooks_path,
+                "the user's hooks in one event changed while their trust records were being kept",
+            ));
+        }
+        for (from, to) in old.into_iter().zip(new) {
+            if from != to {
+                moves.push((
+                    codex_hook_trust_key(hooks_path, hook.trust_event, from.0, from.1),
+                    codex_hook_trust_key(hooks_path, hook.trust_event, to.0, to.1),
+                ));
+            }
+        }
+    }
+    Ok(moves)
+}
+
+/// Moves trust records to their hooks' new keys.
+///
+/// Every source is taken out first, so a move into a slot another move vacates
+/// is fine; a destination still occupied by any other record is a conflict and
+/// nothing is chosen.
+fn apply_trust_moves(
+    state: &mut Table,
+    moves: &[(String, String)],
+    path: &Path,
+) -> Result<(), ProtocolError> {
+    let taken: Vec<(String, Item)> = moves
+        .iter()
+        .filter_map(|(from, to)| state.remove(from).map(|item| (to.clone(), item)))
+        .collect();
+    for (to, item) in taken {
+        if state.contains_key(&to) {
+            return Err(trust_conflict(
+                path,
+                &format!("another trust record already claims the key {to}"),
+            ));
+        }
+        state.insert(&to, item);
+    }
+    Ok(())
+}
+
+/// Describes a TOML parse failure by position and message only.
+///
+/// The parser's `Display` output quotes the offending source line, which may
+/// hold a credential, so it never reaches an error response.
+fn toml_error_summary(content: &str, error: &toml_edit::TomlError) -> String {
+    let Some(span) = error.span() else {
+        return error.message().to_owned();
+    };
+    let consumed = &content.as_bytes()[..span.start.min(content.len())];
+    let line = consumed.split(|byte| *byte == b'\n').count();
+    let line_start = consumed
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let column = consumed.len() - line_start + 1;
+    format!("{} (line {line}, column {column})", error.message())
 }
 
 fn ensure_table<'a>(
@@ -2170,6 +2633,8 @@ struct TrustedDir {
 struct LoadedFile {
     content: String,
     mode: u32,
+    /// The inode `content` was read from.
+    identity: pohunek_platform::filesystem::EntryIdentity,
 }
 
 #[cfg(unix)]
@@ -2224,7 +2689,7 @@ impl TrustedDir {
     }
 
     fn read_optional(&self, name: &str, label: &str) -> Result<Option<LoadedFile>, ProtocolError> {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let path = self.path.join(name);
         let fd = match rustix::fs::openat(
@@ -2257,77 +2722,114 @@ impl TrustedDir {
                 &io::Error::new(io::ErrorKind::InvalidData, error),
             )
         })?;
-        Ok(Some(LoadedFile { content, mode }))
+        let identity = self
+            .trusted
+            .entry_identity(name, EntryKind::RegularFile)
+            .map_err(|error| platform_path_error(&path, label, &error))?
+            .filter(|identity| {
+                identity.device() == metadata.dev() && identity.inode() == metadata.ino()
+            })
+            .ok_or_else(|| path_untrusted(&path, &format!("{label} changed while it was read")))?;
+        Ok(Some(LoadedFile {
+            content,
+            mode,
+            identity,
+        }))
     }
 
-    fn replace(&self, name: &str, body: &str, mode: u32) -> Result<(), ProtocolError> {
-        let path = self.path.join(name);
-        let temp_name = format!(".{name}.{}.tmp", ulid::Ulid::new());
-        let displaced_symlink = match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                let identity = self
-                    .trusted
-                    .entry_identity(name, EntryKind::Symlink)
-                    .map_err(|error| platform_path_error(&path, "managed symlink", &error))?
-                    .ok_or_else(|| path_untrusted(&path, "managed symlink disappeared"))?;
-                match self
-                    .trusted
-                    .stage_random(name, ".pohunek-integration-link-", identity)
-                    .map_err(|error| platform_path_error(&path, "managed symlink", &error))?
-                {
-                    StageOutcome::Staged(staged) => Some(staged),
-                    StageOutcome::Missing | StageOutcome::IdentityChanged => {
-                        return Err(path_untrusted(&path, "managed symlink identity changed"));
-                    }
-                    StageOutcome::DestinationExists => {
-                        return Err(path_untrusted(&path, "managed symlink staging collided"));
-                    }
-                    _ => return Err(path_untrusted(&path, "managed symlink staging failed")),
-                }
-            }
-            Ok(_) | Err(_) => None,
+    /// Removes the directory `name` that the caller created, if it is still
+    /// that same directory and empty.
+    ///
+    /// A directory that cannot be proven identical is left in place untouched,
+    /// because an empty directory is harmless and a wrong removal is not. Once
+    /// the directory has been moved aside it must not stay hidden: any outcome
+    /// that leaves it (or files that appeared in it) in quarantine, whether the
+    /// removal was refused, a restore collided, or a step failed after the
+    /// rename, is the path where it now lives.
+    fn remove_created_empty_child(&self, name: &str, created: &TrustedDir) -> Result<(), PathBuf> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        use quarantine::{Settled, Staging};
+
+        let Ok(Some(identity)) = self.trusted.entry_identity(name, EntryKind::Directory) else {
+            // Nothing was moved: the directory is not there or not provably ours.
+            return Ok(());
         };
-        let result = self
+        let Ok(metadata) = created.file.metadata() else {
+            return Ok(());
+        };
+        if metadata.dev() != identity.device() || metadata.ino() != identity.inode() {
+            return Ok(());
+        }
+        let staged =
+            match quarantine::stage(&self.trusted, name, CREATED_DIR_QUARANTINE_PREFIX, identity) {
+                Ok(Staging::Moved(staged)) => staged,
+                // Nothing was moved, so the directory is exactly where it was.
+                Ok(Staging::Missing | Staging::Refused) => return Ok(()),
+                Err(error) => return created_dir_stage_failure(&error),
+            };
+        commit::race_point("created_dir.staged", name);
+        let empty = created
             .trusted
-            .replace_file(name, temp_name, body.as_bytes(), mode);
-        match result {
-            Ok(()) => {
-                if let Some(staged) = displaced_symlink {
-                    staged
-                        .remove()
-                        .map_err(|error| platform_path_error(&path, "managed symlink", &error))?;
-                }
-                Ok(())
-            }
-            Err(AtomicReplaceError::BeforeCommit(error)) => {
-                if let Some(staged) = displaced_symlink.as_ref() {
-                    match staged.restore(name) {
-                        Ok(MoveOutcome::Moved) => {}
-                        Ok(MoveOutcome::DestinationExists) | Err(_) => {
-                            return Err(path_untrusted(
-                                &path,
-                                "managed symlink recovery conflicted",
-                            ));
-                        }
-                        _ => {
-                            return Err(path_untrusted(&path, "managed symlink recovery failed"));
-                        }
-                    }
-                }
-                Err(platform_path_error(&path, "integration file", &error))
-            }
-            Err(AtomicReplaceError::CommittedDurabilityUncertain(error)) => {
-                if let Some(staged) = displaced_symlink {
-                    let _ = staged.remove();
-                }
-                Err(committed_durability_error(&path, &error))
-            }
-            Err(error) => Err(path_untrusted(
-                &path,
-                &format!("integration file replacement failed: {error}"),
-            )),
+            .entry_names()
+            .is_ok_and(|entries| entries.is_empty());
+        commit::race_point("created_dir.checked", name);
+        let settled = if empty {
+            quarantine::discard(staged)
+        } else {
+            quarantine::put_back(&staged, name)
+        };
+        match settled {
+            Settled::Done | Settled::Unconfirmed(_) => Ok(()),
+            Settled::Left { at, .. } => Err(at),
         }
     }
+
+    /// Takes the exclusive installer lock for this config directory.
+    ///
+    /// The lock file is a regular file inside the directory, so every
+    /// installer that targets the same agent home or profile contends on it
+    /// and installers for different profiles never do.
+    fn lock_installer(&self) -> Result<InstallerLock, ProtocolError> {
+        let path = self.path.join(INSTALL_LOCK_NAME);
+        self.trusted
+            .lock_file(INSTALL_LOCK_NAME, INSTALL_LOCK_MODE, LockKind::Exclusive)
+            .map(|lock| InstallerLock { _lock: lock })
+            .map_err(|error| {
+                match error {
+                FsError::LockContended { .. } => ProtocolError::new(
+                    ErrorClass::Runtime,
+                    INSTALL_IN_PROGRESS_CODE,
+                    format!(
+                        "another integration install, uninstall or doctor holds {}",
+                        path.display()
+                    ),
+                    Some(
+                        "retry once the other integration install, uninstall or doctor has finished"
+                            .to_owned(),
+                    ),
+                ),
+                other => platform_path_error(&path, "integration install lock", &other),
+            }
+            })
+    }
+}
+
+/// The result of a failed attempt to move the created directory aside.
+///
+/// A failure that names where the directory stays left it in quarantine and
+/// must be reported; one that does not left it exactly where it was.
+fn created_dir_stage_failure(error: &FsError) -> Result<(), PathBuf> {
+    error
+        .recovery_path()
+        .map_or(Ok(()), |at| Err(at.to_path_buf()))
+}
+
+/// Exclusive installer lock; released when dropped.
+#[cfg(unix)]
+#[derive(Debug)]
+struct InstallerLock {
+    _lock: pohunek_platform::filesystem::FileLock,
 }
 
 #[cfg(unix)]
@@ -2389,7 +2891,7 @@ fn path_untrusted(path: &Path, detail: &str) -> ProtocolError {
         ErrorClass::Configuration,
         "integration_path_untrusted",
         format!("untrusted integration path {}: {detail}", path.display()),
-        Some("repair path ownership, type, and permissions before reinstalling".to_owned()),
+        Some("repair path ownership, type, and permissions, then repeat the command".to_owned()),
     )
 }
 
@@ -2526,7 +3028,7 @@ mod tests {
     /// Per-process sequence that keeps parallel temp paths collision-free.
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-    fn temp_dir(tag: &str) -> PathBuf {
+    pub(super) fn temp_dir(tag: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
@@ -2540,7 +3042,7 @@ mod tests {
         dir
     }
 
-    fn read_json(path: &Path) -> Value {
+    pub(super) fn read_json(path: &Path) -> Value {
         serde_json::from_str(&fs::read_to_string(path).expect("read json")).expect("parse json")
     }
 
@@ -2590,7 +3092,7 @@ mod tests {
         daemon_manifest_asset(agent, "pohunek-agent-notify.sh")
     }
 
-    fn state_asset(agent: &str) -> PathBuf {
+    pub(super) fn state_asset(agent: &str) -> PathBuf {
         daemon_manifest_asset(agent, "pohunek-agent-state.sh")
     }
 
@@ -2621,6 +3123,33 @@ mod tests {
         expected_requests: usize,
         cwd: Option<&Path>,
     ) -> (std::process::ExitStatus, String, String, Vec<Value>) {
+        let temp = temp_dir(&format!("{agent}-state-run"));
+        let socket_path = temp.join("daemon.sock");
+        run_state_asset_at(
+            agent,
+            args,
+            input,
+            socket_available.then_some(socket_path.as_path()),
+            &socket_path,
+            expected_requests,
+            cwd,
+        )
+    }
+
+    /// Runs the state hook with `POHUNEK_SOCKET_PATH` set to `env_socket_path`.
+    ///
+    /// When `listener_path` is `Some`, a real listener bound there captures
+    /// `expected_requests` requests; it may differ from `env_socket_path` when
+    /// the hook reaches the socket through an alias.
+    pub(super) fn run_state_asset_at(
+        agent: &str,
+        args: &[&str],
+        input: &Value,
+        listener_path: Option<&Path>,
+        env_socket_path: &Path,
+        expected_requests: usize,
+        cwd: Option<&Path>,
+    ) -> (std::process::ExitStatus, String, String, Vec<Value>) {
         let asset_path = state_asset(agent);
         assert!(
             asset_path.is_file(),
@@ -2629,9 +3158,9 @@ mod tests {
         );
 
         let temp = temp_dir(&format!("{agent}-state-run"));
-        let socket_path = temp.join("daemon.sock");
-        let handle = socket_available.then(|| {
-            let listener = UnixListener::bind(&socket_path).expect("bind hook socket");
+        let socket_path = env_socket_path;
+        let handle = listener_path.map(|listener_path| {
+            let listener = UnixListener::bind(listener_path).expect("bind hook socket");
             listener
                 .set_nonblocking(true)
                 .expect("make hook socket nonblocking");
@@ -2677,7 +3206,7 @@ mod tests {
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("TMPDIR", &temp)
             .env(ENV_FLAG, "1")
-            .env(ENV_SOCKET_PATH, &socket_path)
+            .env(ENV_SOCKET_PATH, socket_path)
             .env(ENV_SESSION_ID, "session-123")
             .env(
                 ENV_PROTOCOL_VERSION,
@@ -2783,7 +3312,7 @@ mod tests {
 
     /// Accepts one worker hook request on `worker_socket`, answers it with
     /// `worker_response`, and returns the parsed request.
-    fn capture_worker_hook(
+    pub(super) fn capture_worker_hook(
         worker_socket: &Path,
         worker_response: &'static [u8],
     ) -> thread::JoinHandle<Value> {
@@ -3853,11 +4382,12 @@ mod tests {
                 report.state,
                 protocol::IntegrationInstallState::NotInstalled
             );
-            assert_eq!(
-                report.recovery,
-                protocol::IntegrationRecovery::RepairConfiguration
+            assert_eq!(report.recovery, protocol::IntegrationRecovery::None);
+            assert!(
+                report.warnings.is_empty(),
+                "an agent that is not installed is informational: {:?}",
+                report.warnings
             );
-            assert_eq!(report.warnings.len(), 1);
         }
         assert!(!claude.exists());
         assert!(!codex.exists());
@@ -4099,9 +4629,21 @@ mod tests {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
             .expect("make replacement directory private");
 
-        trusted
-            .replace("sentinel", "trusted\n", 0o600)
-            .expect("replace through opened dirfd");
+        super::commit::commit(
+            &[super::Step {
+                dir: &trusted,
+                name: "sentinel",
+                label: "test file",
+                action: super::Action::Write {
+                    body: "trusted\n",
+                    mode: 0o600,
+                },
+                expected: super::Expected::Any,
+            }],
+            &mut |_index, _name| Ok(()),
+            super::commit::Operation::Install,
+        )
+        .expect("replace through opened dirfd");
 
         assert_eq!(
             fs::read_to_string(moved.join("sentinel")).expect("read dirfd target"),
@@ -4302,8 +4844,12 @@ mod tests {
             );
             assert!(
                 report.warnings.iter().any(|warning| {
-                    warning.contains("managed asset parent")
-                        && warning.contains(&format!("mode {mode:04o}"))
+                    (warning.contains("managed asset parent")
+                        && warning.contains(&format!("mode {mode:04o}")))
+                        // A group/world-writable config root is refused by the same
+                        // trusted walk the installer uses, before assets are inspected.
+                        || (name == "codex config root"
+                            && warning.contains("failed trusted filesystem validation"))
                 }),
                 "{name}: {:?}",
                 report.warnings
@@ -4737,10 +5283,17 @@ mod tests {
         let config_path = codex.join("config.toml");
         let stale_key =
             super::codex_hook_trust_key(&hooks_path, CODEX_SESSION_START_TRUST_EVENT, 99, 99);
+        let managed_hash = codex_command_hook_trusted_hash(
+            CODEX_SESSION_START_TRUST_EVENT,
+            &hook_command(&codex.join(STATE_HOOK_INSTALL_NAME), super::HOOK_ACTION),
+            HOOK_TIMEOUT_SECS,
+            None,
+        )
+        .expect("managed hook trust hash");
         let mut config = fs::read_to_string(&config_path).expect("read Codex config");
         write!(
             config,
-            "\n[hooks.state.{}]\ntrusted_hash = \"sha256:stale\"\n",
+            "\n[hooks.state.{}]\ntrusted_hash = \"{managed_hash}\"\n",
             toml_basic_string(&stale_key)
         )
         .expect("append stale trust table");
@@ -5193,7 +5746,7 @@ mod tests {
         }
     }
 
-    fn with_config_dirs<T>(
+    pub(super) fn with_config_dirs<T>(
         claude_dir: &Path,
         codex_dir: &Path,
         operation: impl FnOnce() -> T,
@@ -5207,7 +5760,7 @@ mod tests {
         )
     }
 
-    fn with_status_env<T>(
+    pub(super) fn with_status_env<T>(
         claude_dir: Option<&Path>,
         codex_dir: Option<&Path>,
         home: Option<&Path>,
@@ -5234,7 +5787,10 @@ mod tests {
         }
     }
 
-    fn explicit_status(config_dir: &Path, agent: AgentKind) -> protocol::IntegrationAgentStatus {
+    pub(super) fn explicit_status(
+        config_dir: &Path,
+        agent: AgentKind,
+    ) -> protocol::IntegrationAgentStatus {
         with_config_dirs(config_dir, config_dir, || {
             super::status(protocol::IntegrationStatusParams { agent: Some(agent) })
         })
@@ -5245,7 +5801,7 @@ mod tests {
         .expect("one agent report")
     }
 
-    fn tree_snapshot(root: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
+    pub(super) fn tree_snapshot(root: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
         fn visit(root: &Path, path: &Path, entries: &mut Vec<(PathBuf, u32, Vec<u8>)>) {
             use std::os::unix::fs::PermissionsExt;
 

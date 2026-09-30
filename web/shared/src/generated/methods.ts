@@ -9,10 +9,14 @@ import type {
   HostDiscoverParams,
   HostGovernanceStatus,
   HostRecord,
+  IntegrationDoctorParams,
+  IntegrationDoctorResult,
   IntegrationInstallParams,
   IntegrationInstallResult,
   IntegrationStatusParams,
   IntegrationStatusResult,
+  IntegrationUninstallParams,
+  IntegrationUninstallResult,
   JsonValue,
   NotificationCreateParams,
   NotificationCreateResult,
@@ -96,8 +100,10 @@ export interface Methods {
   "host.discover": { params: HostDiscoverParams; output: HostRecord[] };
   "host.governance.inspect": { params: null; output: HostGovernanceStatus };
   "host.inspect": { params: null; output: HostCapabilities };
+  "integration.doctor": { params: IntegrationDoctorParams; output: IntegrationDoctorResult };
   "integration.install": { params: IntegrationInstallParams; output: IntegrationInstallResult };
   "integration.status": { params: IntegrationStatusParams; output: IntegrationStatusResult };
+  "integration.uninstall": { params: IntegrationUninstallParams; output: IntegrationUninstallResult };
   "notification.create": { params: NotificationCreateParams; output: NotificationCreateResult };
   "notification.delete": { params: NotificationDeleteParams; output: NotificationDeleteResult };
   "notification.list": { params: NotificationListParams; output: NotificationListResult };

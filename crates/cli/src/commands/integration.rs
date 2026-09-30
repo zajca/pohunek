@@ -1,7 +1,9 @@
 //! `pohunek integration` lifecycle commands.
 //!
-//! Codex and Claude hook installation remains a local daemon RPC. Hermes is an
-//! owner-local plugin lifecycle and deliberately never contacts the daemon.
+//! Codex and Claude hook install, uninstall, status, and doctor are daemon RPCs
+//! (install and uninstall always target the local daemon; status and doctor
+//! follow `--host`). Hermes is an owner-local plugin lifecycle and deliberately
+//! never contacts the daemon.
 
 // Rust guideline compliant 2026-09-19
 
@@ -12,8 +14,11 @@ use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
 use protocol::{
-    method, AgentKind, ErrorClass, IntegrationInstallParams, IntegrationInstallResult,
-    IntegrationInstallState, IntegrationStatusParams, IntegrationStatusResult, ProtocolError,
+    method, AgentKind, ErrorClass, IntegrationDoctorParams, IntegrationDoctorResult,
+    IntegrationFindingSeverity, IntegrationInstallParams, IntegrationInstallResult,
+    IntegrationInstallState, IntegrationStatusParams, IntegrationStatusResult,
+    IntegrationUninstallParams, IntegrationUninstallResult, IntegrationUninstallState,
+    ProtocolError,
 };
 use serde::Serialize;
 
@@ -265,6 +270,61 @@ pub(crate) async fn run_status(
     Ok(())
 }
 
+/// Run the daemon-backed Codex and Claude hook removal.
+///
+/// # Errors
+///
+/// Returns [`CliError`] if the daemon is unreachable, rejects the request, or
+/// returns an unexpected payload.
+pub(crate) async fn run_uninstall(
+    paths: &Paths,
+    agent: HookAgentArg,
+    json: bool,
+) -> Result<(), CliError> {
+    let params = IntegrationUninstallParams {
+        agent: agent.into(),
+    };
+    // Removal edits this machine's agent config dirs, so it always uses the
+    // local transport regardless of any `--host` flag.
+    let mut client = Client::connect(LOCAL_HOST, paths).await?;
+    let result: IntegrationUninstallResult =
+        client.call::<method::IntegrationUninstall>(params).await?;
+
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_uninstall_human(&result));
+    }
+    Ok(())
+}
+
+/// Run the read-only Codex and Claude integration doctor RPC.
+///
+/// Returns whether every diagnosed agent is free of error findings.
+///
+/// # Errors
+///
+/// Returns [`CliError`] if the effective host daemon is unreachable or rejects the call.
+pub(crate) async fn run_doctor(
+    host: &str,
+    paths: &Paths,
+    agent: Option<HookAgentArg>,
+    json: bool,
+) -> Result<bool, CliError> {
+    let params = IntegrationDoctorParams {
+        agent: agent.map(Into::into),
+    };
+    let mut client = Client::connect(host, paths).await?;
+    let result: IntegrationDoctorResult = client.call::<method::IntegrationDoctor>(params).await?;
+
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_doctor_human(&result));
+    }
+    Ok(result.ok)
+}
+
 /// Runs a Hermes lifecycle operation without resolving the daemon runtime path.
 ///
 /// # Errors
@@ -344,7 +404,7 @@ pub(crate) fn unsupported_action(agent: Option<HookAgentArg>) -> CliError {
         ErrorClass::Configuration,
         "integration_action_unsupported",
         format!("integration lifecycle action is supported only for Hermes, not {agent}"),
-        Some("pass `--agent hermes` for status, doctor, update, or uninstall".to_owned()),
+        Some("pass `--agent hermes` for update".to_owned()),
     ))
 }
 
@@ -569,6 +629,63 @@ fn render_install_human(result: &IntegrationInstallResult) -> String {
         );
         for path in &report.config_paths {
             let _ = writeln!(output, "  config: {path}");
+        }
+        for leftover in &report.cleanup_incomplete {
+            let _ = writeln!(output, "  cleanup incomplete: {leftover}");
+        }
+    }
+    output
+}
+
+fn render_uninstall_human(result: &IntegrationUninstallResult) -> String {
+    let mut output = String::new();
+    for report in &result.uninstalled {
+        let agent = agent_label(&report.agent);
+        match report.state {
+            IntegrationUninstallState::NotInstalled => {
+                let _ = writeln!(
+                    output,
+                    "{agent}: no managed hooks installed, nothing removed"
+                );
+            }
+            IntegrationUninstallState::Removed => {
+                let _ = writeln!(output, "{agent}: removed managed hooks");
+            }
+        }
+        for path in &report.removed_paths {
+            let _ = writeln!(output, "  removed: {path}");
+        }
+        for path in &report.updated_paths {
+            let _ = writeln!(output, "  updated registration: {path}");
+        }
+        for path in &report.preserved_paths {
+            let _ = writeln!(output, "  preserved (not installer-owned): {path}");
+        }
+        for leftover in &report.cleanup_incomplete {
+            let _ = writeln!(output, "  cleanup incomplete: {leftover}");
+        }
+    }
+    output
+}
+
+fn render_doctor_human(result: &IntegrationDoctorResult) -> String {
+    let mut output = String::new();
+    for agent in &result.agents {
+        let verdict = if agent.ok { "ok" } else { "needs attention" };
+        let _ = writeln!(output, "{}: {verdict}", agent_label(&agent.agent));
+        for finding in &agent.findings {
+            let severity = match finding.severity {
+                IntegrationFindingSeverity::Info => "info",
+                IntegrationFindingSeverity::Error => "error",
+            };
+            let code = serde_json::to_value(finding.code)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let _ = writeln!(output, "  [{severity}] {code}: {}", finding.summary);
+            if let Some(remediation) = &finding.remediation {
+                let _ = writeln!(output, "    fix: {remediation}");
+            }
         }
     }
     output
@@ -917,7 +1034,8 @@ mod tests {
     use protocol::{AgentKind, IntegrationInstallReport, IntegrationInstallResult};
 
     use super::{
-        agent_name, lifecycle_from_doctor, render_install_human, AccessModeArg, HookAgentArg,
+        agent_name, lifecycle_from_doctor, render_doctor_human, render_install_human,
+        render_uninstall_human, AccessModeArg, HookAgentArg,
     };
     use crate::hermes_integration::doctor;
     use crate::hermes_integration::policy::{
@@ -996,6 +1114,7 @@ mod tests {
                     agent: AgentKind::Claude,
                     hook_path: "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
                     config_paths: vec!["/home/u/.claude/settings.json".to_owned()],
+                    cleanup_incomplete: vec![],
                 },
                 IntegrationInstallReport {
                     agent: AgentKind::Codex,
@@ -1004,6 +1123,7 @@ mod tests {
                         "/home/u/.codex/hooks.json".to_owned(),
                         "/home/u/.codex/config.toml".to_owned(),
                     ],
+                    cleanup_incomplete: vec![],
                 },
             ],
         };
@@ -1097,6 +1217,7 @@ mod tests {
                 agent: AgentKind::Claude,
                 hook_path: "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
                 config_paths: vec!["/home/u/.claude/settings.json".to_owned()],
+                cleanup_incomplete: vec![],
             }],
         };
         let doc = crate::commands::render_json(&result).expect("json doc");
@@ -1383,5 +1504,87 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).expect("parse JSON result");
         assert_eq!(value["ok"]["action"], "status");
         assert!(!json.contains("/private/"));
+    }
+
+    #[test]
+    fn uninstall_human_output_lists_removed_updated_and_preserved_paths() {
+        use protocol::{
+            IntegrationUninstallReport, IntegrationUninstallResult, IntegrationUninstallState,
+        };
+
+        let result = IntegrationUninstallResult {
+            uninstalled: vec![
+                IntegrationUninstallReport {
+                    agent: AgentKind::Claude,
+                    state: IntegrationUninstallState::Removed,
+                    removed_paths: vec!["/c/hooks/state.sh".to_owned()],
+                    updated_paths: vec!["/c/settings.json".to_owned()],
+                    preserved_paths: vec!["/c/hooks/notify.sh".to_owned()],
+                    cleanup_incomplete: vec![],
+                },
+                IntegrationUninstallReport {
+                    agent: AgentKind::Codex,
+                    state: IntegrationUninstallState::NotInstalled,
+                    removed_paths: vec![],
+                    updated_paths: vec![],
+                    preserved_paths: vec![],
+                    cleanup_incomplete: vec![],
+                },
+            ],
+        };
+
+        assert_eq!(
+            render_uninstall_human(&result),
+            "claude: removed managed hooks\n  removed: /c/hooks/state.sh\n  updated registration: /c/settings.json\n  preserved (not installer-owned): /c/hooks/notify.sh\ncodex: no managed hooks installed, nothing removed\n"
+        );
+    }
+
+    #[test]
+    fn doctor_human_output_marks_severity_code_and_fix() {
+        use protocol::{
+            IntegrationAgentDoctor, IntegrationAgentStatus, IntegrationDoctorResult,
+            IntegrationFinding, IntegrationFindingCode, IntegrationFindingSeverity,
+            IntegrationRecovery,
+        };
+
+        let status = IntegrationAgentStatus {
+            agent: AgentKind::Codex,
+            available: true,
+            expected_asset_paths: vec![],
+            present_asset_paths: vec![],
+            registration_paths: vec![],
+            installed_version: None,
+            expected_version: protocol::EXPECTED_INTEGRATION_VERSION,
+            state: protocol::IntegrationInstallState::Outdated,
+            recovery: IntegrationRecovery::Reinstall,
+            warnings: vec![],
+        };
+        let result = IntegrationDoctorResult {
+            ok: false,
+            agents: vec![IntegrationAgentDoctor {
+                agent: AgentKind::Codex,
+                ok: false,
+                status: Some(status),
+                findings: vec![
+                    IntegrationFinding {
+                        code: IntegrationFindingCode::HookRuntimeMacosShim,
+                        severity: IntegrationFindingSeverity::Error,
+                        summary: "stub only".to_owned(),
+                        remediation: Some("run `xcode-select --install`".to_owned()),
+                    },
+                    IntegrationFinding {
+                        code: IntegrationFindingCode::AgentNotInstalled,
+                        severity: IntegrationFindingSeverity::Info,
+                        summary: "absent".to_owned(),
+                        remediation: None,
+                    },
+                ],
+            }],
+        };
+
+        assert_eq!(
+            render_doctor_human(&result),
+            "codex: needs attention\n  [error] hook_runtime_macos_shim: stub only\n    fix: run `xcode-select --install`\n  [info] agent_not_installed: absent\n"
+        );
     }
 }
