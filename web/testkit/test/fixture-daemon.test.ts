@@ -165,6 +165,29 @@ describe("@pohunek/testkit fixture daemon", () => {
     }
   });
 
+  test("session remove takes the params struct and rejects the bare id and unknown fields", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("remove-params") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", { agent: "codex", cols: TEST_COLS, rows: TEST_ROWS });
+
+      await expectProtocolError(client.call("session.remove", created.id as never), "bad_request");
+      await expectProtocolError(
+        client.call("session.remove", { session_id: created.id, force: true } as never),
+        "bad_request",
+      );
+      await expectProtocolError(
+        client.call("session.remove", { session_id: created.id, accept_unconfirmed_cleanup: "yes" } as never),
+        "bad_request",
+      );
+      expect(await client.call("session.remove", { session_id: created.id, accept_unconfirmed_cleanup: true }))
+        .toEqual({ removed: true, stopped: true });
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("session input wait rejects invalid timeout contracts", async () => {
     const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-invalid") } });
     try {
@@ -514,7 +537,7 @@ describe("@pohunek/testkit fixture daemon", () => {
       const mutations = [
         (): Promise<unknown> => client.call("session.stop", futureSession.id),
         (): Promise<unknown> => client.call("session.resume", futureSession.id),
-        (): Promise<unknown> => client.call("session.remove", futureSession.id),
+        (): Promise<unknown> => client.call("session.remove", { session_id: futureSession.id, accept_unconfirmed_cleanup: false }),
         (): Promise<unknown> => client.call("session.fork", {
           session_id: futureSession.id,
           cwd_mode: "same",
@@ -956,7 +979,7 @@ describe("@pohunek/testkit fixture daemon", () => {
       expect(fork.cols).toBe(RESIZED_COLS);
       await client.call("session.stop", created.id);
       expect((await client.call("session.resume", created.id)).session.state).toBe("running");
-      expect(await client.call("session.remove", created.id)).toEqual({ removed: true, stopped: true });
+      expect(await client.call("session.remove", { session_id: created.id, accept_unconfirmed_cleanup: false })).toEqual({ removed: true, stopped: true });
 
       const project = await client.call("project.add", { path: "/tmp/test-project", name: "Test project", base_branch: "main" });
       expect((await client.call("project.show", { reference: project.id })).project.label).toBe("Test project");

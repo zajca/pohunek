@@ -10,13 +10,13 @@ use protocol::{
     SessionDetectionParams, SessionDiffParams, SessionForkParams, SessionForkResult, SessionId,
     SessionInputParams, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
     SessionPolicyParams, SessionPolicyResult, SessionReadParams, SessionReleaseAgentParams,
-    SessionRenameParams, SessionReportAgentParams, SessionReportNativeIdParams,
-    SessionResizeParams, SessionResumeResult, SessionRetentionParams, SessionScreenParams,
-    SessionSetMetadataParams, SessionWaitParams,
+    SessionRemoveParams, SessionRenameParams, SessionReportAgentParams,
+    SessionReportNativeIdParams, SessionResizeParams, SessionResumeResult, SessionRetentionParams,
+    SessionScreenParams, SessionSetMetadataParams, SessionWaitParams,
 };
 
 use super::util::{error_value, ok_value, ok_value_bounded, parse_optional_params, parse_params};
-use crate::session::SessionRegistry;
+use crate::session::{SessionRegistry, UnconfirmedCleanup};
 
 pub(super) async fn handle_session_new(request: &Request, sessions: &SessionRegistry) -> Response {
     let params = match parse_params::<SessionNewParams>(request) {
@@ -122,11 +122,17 @@ pub(super) async fn handle_session_remove(
     request: &Request,
     sessions: &SessionRegistry,
 ) -> Response {
-    let id = match parse_params::<SessionId>(request) {
-        Ok(id) => id,
+    let params = match parse_params::<SessionRemoveParams>(request) {
+        Ok(params) => params,
         Err(err) => return error_value(request, err),
     };
-    match sessions.remove(&id).await {
+    match sessions
+        .remove_with(
+            &params.session_id,
+            UnconfirmedCleanup::from(params.accept_unconfirmed_cleanup),
+        )
+        .await
+    {
         Ok(result) => ok_value(request, &result),
         Err(err) => error_value(request, err),
     }

@@ -27,6 +27,13 @@
   because same-user processes with unreadable environments may belong to the
   runtime now lists them (pid, start identity, command name; at most eight,
   then a count) in the error message and carries a `recover` hint.
+- Documented `pohunek session rm --accept-unconfirmed-cleanup` and the
+  `session.remove` params `{session_id, accept_unconfirmed_cleanup}`: per-call
+  consent to remove a session although only unreadable-environment processes
+  keep its marker sweep unconfirmed. The accepted processes are never
+  signalled and are reported as `accepted_unconfirmed_processes`; reconciliation
+  and the retention sweep never consent, and every other unconfirmed reason
+  still refuses.
 
 - Documented `pohunek service lock -- <command>`, which runs a command under
   the service transaction lock and lets its `pohunek service` calls adopt

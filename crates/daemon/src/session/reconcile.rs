@@ -12,8 +12,9 @@ use pohunek_platform::{
 };
 use pohunek_worker_protocol::{ControlCode, InspectSnapshot, ReleasedIdentityClaim, RuntimePhase};
 use protocol::{
-    AgentActivity, AgentKind, RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus,
-    SessionRuntimeIdentity, SubagentInfo, SubagentLifecycle, SubagentRevision, SubagentStateEvent,
+    AgentActivity, AgentKind, ProcessStartIdentity, RuntimeInventoryEntry, RuntimeInventoryEvent,
+    RuntimeInventoryStatus, SessionRuntimeIdentity, SubagentInfo, SubagentLifecycle,
+    SubagentRevision, SubagentStateEvent, UnconfirmedProcess,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -30,8 +31,8 @@ use super::{
     DesiredState, DetectorConfig, DetectorConfigUpdate, DetectorInputs, DetectorScope, Mutex,
     Notify, ObservedAgent, ProtocolError, ResumeSnapshot, RuntimeHandle, RuntimeState,
     RuntimeWatchIdentity, SessionEntry, SessionId, SessionRecord, SessionRef, SessionRefKind,
-    SessionRegistry, SessionRuntime, SessionState, StateSource, Worker, WorkerError,
-    WorkerMetadataApplyOutcome, WORKER_CONNECT_RETRY,
+    SessionRegistry, SessionRuntime, SessionState, StateSource, UnconfirmedCleanup, Worker,
+    WorkerError, WorkerMetadataApplyOutcome, WORKER_CONNECT_RETRY,
 };
 use crate::procwatch::ProcessInspector;
 use crate::runtime::lifecycle::{
@@ -41,7 +42,7 @@ use crate::runtime::lifecycle::{
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-09-29
+// Rust guideline compliant 2026-09-30
 
 /// Discovery reason of a worker socket that does not answer.
 const UNREACHABLE_SOCKET: &str = "worker_unavailable";
@@ -1564,18 +1565,24 @@ impl SessionRegistry {
     /// once every worker of the generation is proven gone, so no live
     /// worker is still starting marked processes.
     ///
+    /// Under [`UnconfirmedCleanup::Accept`] a runtime whose sweep is
+    /// unconfirmed solely because of unreadable-marker processes does not
+    /// fail the sweep: those processes are returned (all runtimes
+    /// concatenated) and logged at `warn`, and never signalled.
+    ///
     /// # Errors
     ///
     /// Returns `runtime_supervision_ambiguous` when the journals cannot be
     /// scanned or one of them is unreadable, or a sweep cannot confirm that
-    /// every marked process exited. The caller keeps the record and its
-    /// removal intent.
+    /// every marked process exited and `cleanup` does not cover why. The
+    /// caller keeps the record and its removal intent.
     pub(super) async fn sweep_removed_runtimes(
         &self,
         id: &SessionId,
         generation: Option<&super::Generation>,
         runtime_id: Option<&str>,
-    ) -> Result<(), ProtocolError> {
+        cleanup: UnconfirmedCleanup,
+    ) -> Result<Vec<UnconfirmedProcess>, ProtocolError> {
         let ambiguous = |detail: String| {
             ProtocolError::new(
                 protocol::ErrorClass::Runtime,
@@ -1627,11 +1634,34 @@ impl SessionRegistry {
                 runtimes.push((runtime_id.to_owned(), None));
             }
         }
+        let mut accepted = Vec::new();
         for (runtime_id, start) in runtimes {
             let outcome = self
                 .sweep_lost_runtime_detailed(&id.0, &runtime_id, start)
                 .await;
             if outcome.cleanup == Cleanup::Unconfirmed {
+                if cleanup == UnconfirmedCleanup::Accept
+                    && outcome.only_unreadable_candidates_blocked()
+                {
+                    for candidate in &outcome.unreadable {
+                        tracing::warn!(
+                            session_id = %id.0,
+                            runtime_id = %runtime_id,
+                            pid = candidate.identity.pid,
+                            start_identity = %candidate.identity.start_identity,
+                            comm = candidate.comm.as_deref().unwrap_or("unavailable"),
+                            "removal accepted an unreadable-marker process that may belong to the removed runtime"
+                        );
+                        accepted.push(UnconfirmedProcess {
+                            pid: candidate.identity.pid,
+                            start_identity: ProcessStartIdentity::new(
+                                candidate.identity.start_identity.get(),
+                            ),
+                            command: candidate.comm.clone(),
+                        });
+                    }
+                    continue;
+                }
                 let mut error = ambiguous(format!(
                     "processes of runtime {runtime_id} are not proven gone"
                 ));
@@ -1646,7 +1676,7 @@ impl SessionRegistry {
                 return Err(error);
             }
         }
-        Ok(())
+        Ok(accepted)
     }
 
     /// Finishes the durable removal intent of `record` once its runtime is
@@ -1654,7 +1684,10 @@ impl SessionRegistry {
     ///
     /// The exact recorded generation is retired and its workers proven gone,
     /// then [`Self::release_removed_session`] sweeps the session's runtimes
-    /// and deletes everything the session owns, the durable record last.
+    /// and deletes everything the session owns, the durable record last. The
+    /// sweep always refuses on unconfirmed cleanup
+    /// ([`UnconfirmedCleanup::Refuse`]): only an explicit `session.remove`
+    /// call consents to it.
     /// Without a supervisor or a recorded generation there is no job to
     /// retire. Returns whether the removal needs the background re-check: a
     /// generation the supervisor cannot retire keeps the session
@@ -1703,7 +1736,12 @@ impl SessionRegistry {
         }
         let runtime_id = record.runtime.runtime_id.clone();
         match self
-            .release_removed_session(&id, generation, runtime_id.as_deref())
+            .release_removed_session(
+                &id,
+                generation,
+                runtime_id.as_deref(),
+                UnconfirmedCleanup::Refuse,
+            )
             .await
         {
             Ok(_released) => false,

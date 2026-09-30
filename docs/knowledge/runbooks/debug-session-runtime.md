@@ -131,7 +131,15 @@ Interpret runtime states as follows:
   processes are the only obstacle, the error message names each as
   `pid N (start S, command `name`)` (at most eight, then `and N more`) and
   `recover` says to inspect them, end the ones that belong to the session, and
-  retry; a refusal for another reason lists no processes. A removal finished by
+  retry; a refusal for another reason lists no processes. If you have inspected
+  the listed processes and accept that they may keep running, `pohunek session
+  rm <id> --accept-unconfirmed-cleanup` removes the session anyway for that one
+  call: the processes are not signalled, and the result lists them as
+  `accepted_unconfirmed_processes` (`pid N (start S, command `name`)` in human
+  output). One that does carry the runtime marker keeps running unsupervised
+  after the worktree, logs, and record are gone. Any other unconfirmed reason
+  still refuses, and reconciliation and the retention sweep never have the
+  consent. A removal finished by
   reconciliation after a daemon restart shows this `conflict` reason while it
   retries on its own.
 - `incompatible`: the worker is alive but private protocol negotiation failed.

@@ -13272,7 +13272,12 @@ async fn retention_sweep_counts_a_removal_it_could_not_complete() {
 /// is the only evidence of its runtime and its removal sweep has no worker
 /// start bound.
 async fn record_only_session(registry: &SessionRegistry) -> SessionInfo {
-    let session = exited_session(registry, None).await;
+    record_only_session_in(registry, None).await
+}
+
+/// [`record_only_session`] on its own worktree of `repo`, when given.
+async fn record_only_session_in(registry: &SessionRegistry, repo: Option<&PathBuf>) -> SessionInfo {
+    let session = exited_session(registry, repo).await;
     let journals = registry
         .inner
         .config
@@ -13422,6 +13427,185 @@ async fn removal_refusal_from_a_sweep_failure_lists_no_unreadable_process() {
     assert!(!outcome.other_blockers);
     assert_eq!(outcome.unreadable.len(), 1);
     assert!(outcome.only_unreadable_candidates_blocked());
+}
+
+/// Consent lets a removal proceed past unreadable-marker processes only:
+/// it reports them, never signals them, and deletes the session with its
+/// worktree.
+#[tokio::test]
+async fn accepted_unconfirmed_cleanup_removes_a_session_blocked_only_by_unreadable_processes() {
+    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+        "remove-accept-unreadable",
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
+    let repo = init_git_repo("remove-accept-unreadable");
+    let session = record_only_session_in(&registry, Some(&repo)).await;
+    let worktree = session.worktree_path.clone().expect("session worktree");
+    assert!(worktree.exists(), "the session owns a checkout");
+    inspector.set_candidate(true);
+
+    let removed = registry
+        .remove_with(&session.id, super::UnconfirmedCleanup::Accept)
+        .await
+        .expect("consent accepts the unreadable candidate");
+
+    assert!(removed.removed, "{removed:?}");
+    assert_eq!(removed.worktrees_removed, 1, "{removed:?}");
+    assert_eq!(
+        removed.accepted_unconfirmed_processes,
+        vec![protocol::UnconfirmedProcess {
+            pid: UNREADABLE_CANDIDATE_PID,
+            start_identity: protocol::ProcessStartIdentity::new(1),
+            command: Some("unreadable".to_owned()),
+        }],
+        "{removed:?}"
+    );
+    assert!(session_ids(&registry).await.is_empty());
+    assert!(!worktree.exists(), "the checkout is deleted");
+}
+
+/// A removal that needs no consent reports no accepted processes even when
+/// the caller consented.
+#[tokio::test]
+async fn accepted_unconfirmed_cleanup_reports_nothing_when_no_process_was_accepted() {
+    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+        "remove-accept-nothing",
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
+    let session = record_only_session(&registry).await;
+
+    let removed = registry
+        .remove_with(&session.id, super::UnconfirmedCleanup::Accept)
+        .await
+        .expect("a confirmed sweep removes the session");
+
+    assert!(removed.removed, "{removed:?}");
+    assert!(
+        removed.accepted_unconfirmed_processes.is_empty(),
+        "{removed:?}"
+    );
+}
+
+/// Without consent the same candidate refuses, whether the caller passes the
+/// default or names the refusal.
+#[tokio::test]
+async fn unconfirmed_cleanup_is_refused_unless_accepted() {
+    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+        "remove-refuse-unreadable",
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
+    let session = record_only_session(&registry).await;
+    inspector.set_candidate(true);
+
+    for refused in [
+        registry.remove(&session.id).await,
+        registry
+            .remove_with(&session.id, super::UnconfirmedCleanup::Refuse)
+            .await,
+    ] {
+        let error = refused.expect_err("an unreadable candidate refuses without consent");
+        assert_eq!(
+            error.code,
+            crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS,
+            "{error:?}"
+        );
+    }
+    assert_eq!(session_ids(&registry).await, vec![session.id.0.clone()]);
+}
+
+/// Consent covers unreadable candidates only: a sweep that also failed to
+/// inspect the process table stays refused and keeps the session.
+#[tokio::test]
+async fn accepted_unconfirmed_cleanup_still_refuses_another_blocker() {
+    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+        "remove-accept-other-blocker",
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
+    let session = record_only_session(&registry).await;
+    inspector.set_candidate(true);
+    inspector.set_listing_fails(true);
+
+    let refused = registry
+        .remove_with(&session.id, super::UnconfirmedCleanup::Accept)
+        .await
+        .expect_err("a sweep failure is not covered by consent");
+    assert_eq!(
+        refused.code,
+        crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS,
+        "{refused:?}"
+    );
+    assert!(!refused.msg.contains("pid "), "{refused:?}");
+    assert_eq!(session_ids(&registry).await, vec![session.id.0.clone()]);
+}
+
+/// Consent is per call: a refused removal keeps its durable intent, and a
+/// retry with consent completes it.
+#[tokio::test]
+async fn a_refused_removal_is_completed_by_a_retry_with_consent() {
+    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+        "remove-retry-with-consent",
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
+    let session = record_only_session(&registry).await;
+    inspector.set_candidate(true);
+
+    registry
+        .remove(&session.id)
+        .await
+        .expect_err("the first removal is refused");
+    assert_eq!(session_ids(&registry).await, vec![session.id.0.clone()]);
+    registry
+        .remove(&session.id)
+        .await
+        .expect_err("consent from an earlier call is not remembered");
+
+    let removed = registry
+        .remove_with(&session.id, super::UnconfirmedCleanup::Accept)
+        .await
+        .expect("the retry with consent completes the removal");
+    assert!(removed.removed, "{removed:?}");
+    assert_eq!(removed.accepted_unconfirmed_processes.len(), 1);
+    assert!(session_ids(&registry).await.is_empty());
+}
+
+/// The retention sweep never consents: a session it selects but whose sweep
+/// is blocked by an unreadable process counts as failed and stays, and only
+/// an explicit consenting removal deletes it.
+#[tokio::test]
+async fn retention_sweep_never_consents_to_unconfirmed_cleanup() {
+    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+        "sweep-never-consents",
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
+    registry
+        .set_retention_policy(sweep_policy())
+        .await
+        .expect("apply policy");
+    let session = record_only_session(&registry).await;
+    age_terminal(&registry, &session.id, past_ttl()).await;
+    inspector.set_candidate(true);
+
+    let result = registry
+        .sweep_retention(&protocol::SessionRetentionParams::default())
+        .await
+        .expect("sweep");
+
+    assert_eq!(result.eligible, 1, "{result:?}");
+    assert_eq!(result.removed, 0, "{result:?}");
+    assert_eq!(result.failed, 1, "{result:?}");
+    assert_eq!(session_ids(&registry).await, vec![session.id.0.clone()]);
+
+    registry
+        .remove_with(&session.id, super::UnconfirmedCleanup::Accept)
+        .await
+        .expect("an explicit consenting removal deletes the kept session");
+    assert!(session_ids(&registry).await.is_empty());
 }
 
 #[tokio::test]

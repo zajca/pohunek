@@ -54,6 +54,7 @@ import {
   type SessionDetachResult,
   type SessionInfo,
   type SessionInputParams,
+  type SessionRemoveParams,
   type SessionInputResult,
   type SessionListFilter,
   type SessionListParams,
@@ -914,8 +915,16 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
   }
 
   private handleSessionRemove(request: ControlRequest): ControlResponse {
-    if (typeof request.params !== "string") return errResponse(request.id, invalidParams(request.method));
-    const session = this.sessions.get(request.params);
+    const params = readObjectParams<SessionRemoveParams>(request);
+    if (
+      params === undefined
+      || !hasOnlyKeys(params, ["session_id", "accept_unconfirmed_cleanup"])
+      || typeof params.session_id !== "string"
+      || (params.accept_unconfirmed_cleanup !== undefined && typeof params.accept_unconfirmed_cleanup !== "boolean")
+    ) {
+      return errResponse(request.id, invalidParams(request.method));
+    }
+    const session = this.sessions.get(params.session_id);
     if (session === undefined) return okResponse(request.id, { removed: false, stopped: false });
     if (session.external === true) return errResponse(request.id, badRequest("external sessions cannot be removed"));
     const stopped = session.state === "running" || session.state === "starting";
@@ -1920,8 +1929,8 @@ function mutationSessionId(request: ControlRequest): string | undefined {
   switch (request.method) {
     case "session.stop":
     case "session.resume":
-    case "session.remove":
       return typeof request.params === "string" ? request.params : undefined;
+    case "session.remove":
     case "session.fork":
     case "session.resize":
     case "session.set_metadata":

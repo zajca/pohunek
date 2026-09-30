@@ -22,11 +22,11 @@ use protocol::{
     SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
     SessionListFilter, SessionListParams, SessionNewParams, SessionOutputParams,
     SessionPolicyParams, SessionReadFormat, SessionReadParams, SessionReadResult,
-    SessionReadSource, SessionRemoveResult, SessionRenameParams, SessionResizeParams,
-    SessionRetentionParams, SessionRetentionPolicy, SessionRetentionResult, SessionRuntimeIdentity,
-    SessionScreenParams, SessionSetMetadataParams, SessionState, SessionStopResult,
-    SessionWaitParams, SessionWarningKind, StateSource, SubagentLifecycle, TerminalWatermark,
-    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
+    SessionReadSource, SessionRemoveParams, SessionRemoveResult, SessionRenameParams,
+    SessionResizeParams, SessionRetentionParams, SessionRetentionPolicy, SessionRetentionResult,
+    SessionRuntimeIdentity, SessionScreenParams, SessionSetMetadataParams, SessionState,
+    SessionStopResult, SessionWaitParams, SessionWarningKind, StateSource, SubagentLifecycle,
+    TerminalWatermark, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
 };
 
 use crate::client::Client;
@@ -626,6 +626,10 @@ pub(crate) async fn run_fork(
 /// Removal evicts the session from the daemon's registry, stopping it first if
 /// it is still live. Unlike `stop`, the session no longer appears in `list`.
 ///
+/// `accept_unconfirmed_cleanup` is the operator's consent, for this call only,
+/// to remove a session whose runtime processes could not be proven gone solely
+/// because same-user processes with unreadable environments may belong to it.
+///
 /// # Errors
 ///
 /// Returns [`CliError`] if the daemon is unreachable, the host cannot be
@@ -635,11 +639,12 @@ pub(crate) async fn run_remove(
     host: &str,
     paths: &Paths,
     target: &Target,
+    accept_unconfirmed_cleanup: bool,
     json: bool,
 ) -> Result<(), CliError> {
     let mut client = Client::connect(host, paths).await?;
     let removed = client
-        .call::<method::SessionRemove>(SessionId(target.session_id.clone()))
+        .call::<method::SessionRemove>(remove_params(target, accept_unconfirmed_cleanup))
         .await?;
 
     if json {
@@ -1411,11 +1416,21 @@ fn build_stop_request(target: &Target) -> Result<Request, CliError> {
     request_with_params(method::SESSION_STOP, &SessionId(target.session_id.clone()))
 }
 
+fn remove_params(target: &Target, accept_unconfirmed_cleanup: bool) -> SessionRemoveParams {
+    SessionRemoveParams {
+        session_id: SessionId(target.session_id.clone()),
+        accept_unconfirmed_cleanup,
+    }
+}
+
 #[cfg(test)]
-fn build_remove_request(target: &Target) -> Result<Request, CliError> {
+fn build_remove_request(
+    target: &Target,
+    accept_unconfirmed_cleanup: bool,
+) -> Result<Request, CliError> {
     request_with_params(
         method::SESSION_REMOVE,
-        &SessionId(target.session_id.clone()),
+        &remove_params(target, accept_unconfirmed_cleanup),
     )
 }
 
@@ -1867,6 +1882,23 @@ fn render_remove_human(session_id: &str, result: &SessionRemoveResult) -> String
             "  worktrees: removed={} failed={}",
             result.worktrees_removed, result.worktrees_failed
         );
+    }
+    // Each accepted process is listed so the operator can inspect it: it was
+    // not signalled and may still be running unsupervised.
+    if !result.accepted_unconfirmed_processes.is_empty() {
+        output
+            .push_str("  accepted unconfirmed processes (not signalled, may still be running):\n");
+        for process in &result.accepted_unconfirmed_processes {
+            let _ = write!(
+                output,
+                "    pid {} (start {}",
+                process.pid, process.start_identity
+            );
+            if let Some(command) = &process.command {
+                let _ = write!(output, ", command {command}");
+            }
+            output.push_str(")\n");
+        }
     }
     output
 }
@@ -3229,10 +3261,46 @@ mod tests {
                 stopped: true,
                 worktrees_removed: 0,
                 worktrees_failed: 0,
+                accepted_unconfirmed_processes: Vec::new(),
             },
         );
 
         assert_eq!(output, "session s-42: removed=true stopped=true\n");
+    }
+
+    #[test]
+    fn renders_remove_result_lists_every_accepted_unconfirmed_process() {
+        let output = render_remove_human(
+            "s-42",
+            &SessionRemoveResult {
+                removed: true,
+                stopped: false,
+                worktrees_removed: 0,
+                worktrees_failed: 0,
+                accepted_unconfirmed_processes: vec![
+                    protocol::UnconfirmedProcess {
+                        pid: 4242,
+                        start_identity: protocol::ProcessStartIdentity::new(99),
+                        command: Some("gpg-agent".to_owned()),
+                    },
+                    protocol::UnconfirmedProcess {
+                        pid: 7,
+                        start_identity: protocol::ProcessStartIdentity::new(3),
+                        command: None,
+                    },
+                ],
+            },
+        );
+
+        assert_eq!(
+            output,
+            concat!(
+                "session s-42: removed=true stopped=false\n",
+                "  accepted unconfirmed processes (not signalled, may still be running):\n",
+                "    pid 4242 (start 99, command gpg-agent)\n",
+                "    pid 7 (start 3)\n"
+            )
+        );
     }
 
     #[test]
@@ -3244,6 +3312,7 @@ mod tests {
                 stopped: false,
                 worktrees_removed: 1,
                 worktrees_failed: 2,
+                accepted_unconfirmed_processes: Vec::new(),
             },
         );
 
@@ -3320,9 +3389,48 @@ mod tests {
     #[test]
     fn build_remove_request_targets_session_remove_method() {
         let target: Target = "local/s-42".parse().expect("parse target");
-        let request = build_remove_request(&target).expect("build remove request");
+        let request = build_remove_request(&target, false).expect("build remove request");
 
-        assert_request(&request, method::SESSION_REMOVE, serde_json::json!("s-42"));
+        assert_request(
+            &request,
+            method::SESSION_REMOVE,
+            serde_json::json!({"session_id": "s-42", "accept_unconfirmed_cleanup": false}),
+        );
+    }
+
+    #[test]
+    fn build_remove_request_carries_the_unconfirmed_cleanup_consent() {
+        let target: Target = "local/s-42".parse().expect("parse target");
+        let request = build_remove_request(&target, true).expect("build remove request");
+
+        assert_request(
+            &request,
+            method::SESSION_REMOVE,
+            serde_json::json!({"session_id": "s-42", "accept_unconfirmed_cleanup": true}),
+        );
+    }
+
+    #[test]
+    fn remove_json_output_passes_the_accepted_processes_through() {
+        let result = SessionRemoveResult {
+            removed: true,
+            stopped: false,
+            worktrees_removed: 0,
+            worktrees_failed: 0,
+            accepted_unconfirmed_processes: vec![protocol::UnconfirmedProcess {
+                pid: 4242,
+                start_identity: protocol::ProcessStartIdentity::new(99),
+                command: Some("gpg-agent".to_owned()),
+            }],
+        };
+
+        let rendered = crate::commands::render_json(&result).expect("render json");
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid json");
+
+        assert_eq!(
+            value["ok"]["accepted_unconfirmed_processes"],
+            serde_json::json!([{"pid": 4242, "start_identity": "99", "command": "gpg-agent"}])
+        );
     }
 
     #[test]

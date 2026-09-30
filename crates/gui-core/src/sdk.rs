@@ -13,10 +13,10 @@ use protocol::{
     ProjectRemoveResult, ProjectRenameParams, ProjectShowParams, ProjectShowResult,
     SessionDiffParams, SessionDiffResult, SessionForkParams, SessionForkResult, SessionId,
     SessionInfo, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
-    SessionOutputResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
-    SessionResumeResult, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
-    SessionSetMetadataResult, SessionStopResult, SessionWaitParams, SessionWaitResult,
-    WorktreeRemoveParams, WorktreeRemoveResult,
+    SessionOutputResult, SessionRemoveParams, SessionRemoveResult, SessionRenameParams,
+    SessionRenameResult, SessionResumeResult, SessionScreenParams, SessionScreenResult,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult, SessionWaitParams,
+    SessionWaitResult, WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 use crate::connection::connect_client;
@@ -264,7 +264,9 @@ pub async fn stop_session_with_options(
 /// Remove a session from a host through the SDK.
 ///
 /// Removal stops a still-live session first, then evicts it from the daemon's
-/// registry so it stops appearing in `list`.
+/// registry so it stops appearing in `list`. The removal never consents to
+/// unconfirmed cleanup, so a session whose runtime processes cannot be proven
+/// gone is refused rather than deleted.
 pub async fn remove_session(
     config: &HostConfig,
     session_id: &SessionId,
@@ -278,7 +280,16 @@ pub async fn remove_session_with_options(
     session_id: &SessionId,
     options: ConnectionOptions,
 ) -> Result<SessionRemoveResult, CoreError> {
-    call_host::<method::SessionRemove>(config, options, session_id.clone()).await
+    call_host::<method::SessionRemove>(config, options, remove_params(session_id)).await
+}
+
+/// Parameters for a GUI-initiated removal: always the default refusal, since
+/// consent to unconfirmed cleanup is an operator decision made in the CLI.
+fn remove_params(session_id: &SessionId) -> SessionRemoveParams {
+    SessionRemoveParams {
+        session_id: session_id.clone(),
+        accept_unconfirmed_cleanup: false,
+    }
 }
 
 /// Merge or clear session metadata on a host.
@@ -863,4 +874,17 @@ where
     M: protocol::Method,
 {
     Ok(client.call::<M>(params).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sdk_removal_never_consents_to_unconfirmed_cleanup() {
+        let params = remove_params(&SessionId("s-1".to_owned()));
+
+        assert_eq!(params.session_id, SessionId("s-1".to_owned()));
+        assert!(!params.accept_unconfirmed_cleanup);
+    }
 }

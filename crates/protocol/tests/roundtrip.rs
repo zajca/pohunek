@@ -32,17 +32,17 @@ use protocol::{
     SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
     SessionNewParams, SessionOutputGap, SessionOutputParams, SessionOutputResult,
     SessionReadFormat, SessionReadParams, SessionReadResult, SessionReadSource,
-    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionRuntimeIdentity, SessionScreenParams,
-    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
-    SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning,
-    SessionWarningKind, ShareSuspensionIntent, SignedTransferOutcome, StateSource, TeamId,
-    TerminalCursor, TerminalDimensions, TerminalWatermark, TransferCoordinates,
-    TransferOutcomeCandidate, TransferOutcomeId, TransferProposal, GOVERNANCE_ID_PAYLOAD_BYTES,
-    MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES, MAX_RUNTIME_ID_BYTES, MAX_SESSION_ID_BYTES,
-    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
-    MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveParams, SessionRemoveResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionRuntimeIdentity,
+    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
+    SessionState, SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult,
+    SessionWarning, SessionWarningKind, ShareSuspensionIntent, SignedTransferOutcome, StateSource,
+    TeamId, TerminalCursor, TerminalDimensions, TerminalWatermark, TransferCoordinates,
+    TransferOutcomeCandidate, TransferOutcomeId, TransferProposal, UnconfirmedProcess,
+    GOVERNANCE_ID_PAYLOAD_BYTES, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
+    MAX_RUNTIME_ID_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
+    MAX_SESSION_READ_LINES, MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS,
     OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
     SESSION_OUTPUT_METADATA_HEADROOM_BYTES, SUPPORTED_PROTOCOL_VERSIONS,
 };
@@ -5023,4 +5023,87 @@ fn take_signing_bytes<'a>(payload: &'a [u8], cursor: &mut usize, length: usize) 
     let bytes = &payload[*cursor..end];
     *cursor = end;
     bytes
+}
+
+#[test]
+fn session_remove_params_default_to_no_consent_and_reject_unknown_fields() {
+    let bare: SessionRemoveParams =
+        serde_json::from_value(json!({ "session_id": "s-42" })).expect("params without consent");
+    assert_eq!(
+        bare,
+        SessionRemoveParams {
+            session_id: SessionId("s-42".to_owned()),
+            accept_unconfirmed_cleanup: false,
+        }
+    );
+
+    let consenting = SessionRemoveParams {
+        session_id: SessionId("s-42".to_owned()),
+        accept_unconfirmed_cleanup: true,
+    };
+    assert_eq!(
+        serde_json::to_value(&consenting).expect("serialize remove params"),
+        json!({ "session_id": "s-42", "accept_unconfirmed_cleanup": true })
+    );
+    assert_eq!(line_roundtrip(&consenting), consenting);
+
+    serde_json::from_value::<SessionRemoveParams>(json!({
+        "session_id": "s-42",
+        "accept_unconfirmed_cleanup": true,
+        "force": true
+    }))
+    .expect_err("unknown remove field must fail");
+    serde_json::from_value::<SessionRemoveParams>(json!("s-42"))
+        .expect_err("a bare session id is not remove params");
+}
+
+#[test]
+fn session_remove_result_carries_accepted_processes_as_decimal_identities() {
+    let mut result = SessionRemoveResult {
+        removed: true,
+        stopped: false,
+        worktrees_removed: 1,
+        worktrees_failed: 0,
+        accepted_unconfirmed_processes: Vec::new(),
+    };
+    assert_eq!(
+        serde_json::to_value(&result).expect("serialize remove result"),
+        json!({
+            "removed": true,
+            "stopped": false,
+            "worktrees_removed": 1,
+            "worktrees_failed": 0
+        }),
+        "an empty accepted list is omitted"
+    );
+    let omitted: SessionRemoveResult = serde_json::from_value(json!({
+        "removed": true,
+        "stopped": false,
+        "worktrees_removed": 1,
+        "worktrees_failed": 0
+    }))
+    .expect("result without accepted processes");
+    assert_eq!(omitted, result);
+
+    result.accepted_unconfirmed_processes = vec![
+        UnconfirmedProcess {
+            pid: 4_242,
+            start_identity: ProcessStartIdentity::new(9_007_199_254_740_993),
+            command: Some("ssh-agent".to_owned()),
+        },
+        UnconfirmedProcess {
+            pid: 7,
+            start_identity: ProcessStartIdentity::new(1),
+            command: None,
+        },
+    ];
+    assert_eq!(
+        serde_json::to_value(&result).expect("serialize remove result")
+            ["accepted_unconfirmed_processes"],
+        json!([
+            { "pid": 4242, "start_identity": "9007199254740993", "command": "ssh-agent" },
+            { "pid": 7, "start_identity": "1" }
+        ])
+    );
+    assert_eq!(line_roundtrip(&result), result);
 }
