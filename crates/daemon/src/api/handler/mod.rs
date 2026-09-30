@@ -280,7 +280,9 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::SESSION_RELEASE_AGENT => {
             session::handle_session_release_agent(request, &state.sessions).await
         }
-        method::DAEMON_DOCTOR => daemon::handle_daemon_doctor(request, &state.governance).await,
+        method::DAEMON_DOCTOR => {
+            daemon::handle_daemon_doctor(request, &state.governance, &state.sessions).await
+        }
         method::ASSISTANT_MATERIALIZE => assistant::handle_assistant_materialize(request).await,
         method::INTEGRATION_INSTALL => integration::handle_integration_install(request).await,
         method::INTEGRATION_STATUS => integration::handle_integration_status(request).await,

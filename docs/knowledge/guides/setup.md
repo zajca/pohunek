@@ -113,7 +113,7 @@ Linux: `bin:git` (required), `bin:codex`, `bin:claude`, the socket, state and
 log directory writability checks, `netbird_cli`, `schema_version`, and the
 optional launcher probes `bin:rofi`, `bin:swaymsg`, `bin:python3`,
 `bin:timeout`, `terminal` (`$TERMINAL`), `launcher_scripts` and `sway_include`.
-Executables count only when they are regular files with an execute bit.
+Executables count only when they are regular files with an execute bit. The writability probes create a randomly named file exclusively (never following a planted symlink) and remove it.
 
 macOS omits the Linux-only launcher probes (rofi, swaymsg, `timeout`,
 `$TERMINAL`, launcher scripts, sway include) and `bin:python3` (hook
@@ -121,10 +121,10 @@ interpreter readiness is reported by `pohunek integration doctor`), and adds:
 
 | Check | Failure status | Meaning and remediation |
 | --- | --- | --- |
-| `runtime_dir_private` | `fail` | The runtime root (default `/private/tmp/pohunek-<uid>`) exists but is a symlink or file, is owned by another uid, or is accessible to group/other. Remove it or `chmod 700`. An absent directory is `ok`; doctor never creates it with a looser mode. |
+| `runtime_dir_private` | `fail` | The runtime root (default `/private/tmp/pohunek-<uid>`) fails the same owner-private validation the daemon applies at startup: it must be a real directory you own with mode exactly `0700`, no ACL beyond the mode, and no symlinked path component. Remove it or point `XDG_RUNTIME_DIR` at a valid directory. An absent directory is `ok`. A directory that fails this check is never written to: `socket_dir_writable` reports `fail` without probing it. |
 | `socket_path_length` | `fail` | The daemon socket, or the longest worker socket including staged bind names, exceeds Darwin's 103-byte `sockaddr_un` limit. Set a shorter `XDG_RUNTIME_DIR`. |
 | `filesystem_access` | `fail` | A required directory (config, data, and the CLI's current directory) is denied. `EPERM`, or any denial below Documents, Desktop, Downloads, iCloud Drive, `Library/CloudStorage` or `/Volumes`, is a Privacy & Security (TCC) denial: grant the app that started the process (your terminal app, or the `pohunekd`/`pohunek-sessiond` executables when launchd runs them) access under System Settings > Privacy & Security > Files and Folders, or keep projects outside protected folders. Full Disk Access is not required and not recommended by default. Other denials point at ownership and mode. |
-| `worker_executable` | `fail` | `pohunek-sessiond` is missing, not absolute, or not executable. Resolved like the daemon: installed `service.toml`, then `POHUNEK_WORKER_BIN`, then next to the running executable; the detail names the source. |
+| `worker_executable` | `fail` | `pohunek-sessiond` is missing, not absolute, or not executable. `daemon.doctor` reports the worker of the daemon's active supervision (`--service-config` or `--dev-subprocess`), and `pohunek doctor` prefers that result. Without a reachable daemon the CLI derives it like `pohunek daemon start`: installed `service.toml`, then `POHUNEK_WORKER_BIN`, then next to the located `pohunekd`. The detail names the source. |
 | `launchd_domain` | `fail` when absent, `warn` when inconclusive | `launchctl print gui/<uid>` (fixed `/bin/launchctl`, argv only, 10 s deadline) reports whether the graphical domain exists. A bare SSH session without a console login has none. |
 | `launchd_job` | `fail` only for a failed job, else `warn` | CLI doctor only: the installed daemon job's state from `pohunek service status`. Not installed is a `warn`; a manually started daemon is valid. |
 | `bin:codex`, `bin:claude` | `warn` | Optional agents. A daemon started by launchd does not read shell startup files, so use an absolute agent profile `program` or fix the service PATH. |

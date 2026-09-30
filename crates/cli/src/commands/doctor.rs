@@ -95,15 +95,17 @@ pub(crate) async fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
 /// The worker executable the daemon would launch on this host.
 ///
 /// An installed `service.toml` names the versioned worker; otherwise the
-/// `POHUNEK_WORKER_BIN` override, then `pohunek-sessiond` next to this
-/// executable. A `service.toml` that cannot be loaded is left to
-/// `pohunek service status`, which reports it.
+/// `POHUNEK_WORKER_BIN` override, then `pohunek-sessiond` next to the `pohunekd`
+/// that `pohunek daemon start` would run ([`locate_daemon`]). A `service.toml`
+/// that cannot be loaded is left to `pohunek service status`, which reports it.
+///
+/// [`locate_daemon`]: crate::commands::daemon::locate_daemon
 fn worker_candidate(config_dir: &Path) -> Option<WorkerCandidate> {
-    let executable = std::env::current_exe().ok();
+    let daemon = crate::commands::daemon::locate_daemon().ok();
     worker_candidate_from(
         config_dir,
         std::env::var_os(WORKER_BIN_ENV),
-        executable.as_deref().and_then(Path::parent),
+        daemon.as_deref().and_then(Path::parent),
     )
 }
 
@@ -188,10 +190,21 @@ fn launchd_job_check(status: Result<StatusReport, crate::service::Error>) -> Doc
     }
 }
 
+/// Add the daemon's checks to the local ones.
+///
+/// A local check wins a name collision, except the worker executable: the
+/// daemon knows the worker its active supervision launches (a `--dev-subprocess`
+/// or `--service-config` daemon may differ from what the CLI derives), so its
+/// result replaces the CLI's derivation.
 fn merge_daemon_checks(checks: &mut Vec<DoctorCheck>, remote: Vec<DoctorCheck>) {
     for check in remote {
-        if !checks.iter().any(|existing| existing.name == check.name) {
-            checks.push(check);
+        match checks
+            .iter_mut()
+            .find(|existing| existing.name == check.name)
+        {
+            Some(existing) if check.name == hostcheck::WORKER_EXECUTABLE_CHECK => *existing = check,
+            Some(_) => {}
+            None => checks.push(check),
         }
     }
 }
@@ -372,6 +385,27 @@ mod tests {
 
         assert_eq!(candidate.source, hostcheck::WorkerSource::Sibling);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_daemons_worker_check_replaces_the_local_derivation() {
+        let mut checks = vec![
+            DoctorCheck::new("worker_executable", Status::Fail, "derived beside the CLI"),
+            DoctorCheck::new("state_dir_writable", Status::Ok, "local"),
+        ];
+
+        merge_daemon_checks(
+            &mut checks,
+            vec![
+                DoctorCheck::new("worker_executable", Status::Ok, "active supervision"),
+                DoctorCheck::new("state_dir_writable", Status::Fail, "remote"),
+            ],
+        );
+
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].status, Status::Ok);
+        assert_eq!(checks[0].detail, "active supervision");
+        assert_eq!(checks[1].detail, "local", "other local checks still win");
     }
 
     #[test]

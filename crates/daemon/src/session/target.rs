@@ -434,6 +434,16 @@ impl SessionRegistry {
             })?
     }
 
+    /// Returns the worker executable the active supervision launches for every
+    /// new generation, or `None` when this registry cannot launch workers.
+    pub(crate) fn worker_executable(&self) -> Option<PathBuf> {
+        self.inner
+            .config
+            .supervision
+            .as_ref()
+            .map(|supervision| supervision.worker_executable.clone())
+    }
+
     /// Returns the lifecycle engine, or `worker_backend_required` when this
     /// registry cannot launch workers.
     pub(super) fn lifecycle(&self) -> Result<Lifecycle<'_>, ProtocolError> {

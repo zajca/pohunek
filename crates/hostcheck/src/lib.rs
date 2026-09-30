@@ -35,11 +35,36 @@ pub mod macos;
 pub use executable::{is_executable_file, resolve_executable};
 pub use macos::{
     resolve_worker_candidate, AccessDir, DomainProbe, MacosFacts, ProcessRunner, RunOutcome,
-    Runner, WorkerCandidate, WorkerSource,
+    Runner, WorkerCandidate, WorkerSource, WORKER_EXECUTABLE_CHECK,
 };
 pub use pohunek_paths::Platform;
 
+/// Name prefix of the writability probe file.
+///
+/// A random suffix follows it, so a name planted in advance cannot collide
+/// with a probe.
 const PROBE_FILE: &str = ".pohunek-doctor-probe";
+
+/// How many random probe names are tried when one already exists.
+///
+/// A collision needs a 128-bit random name to repeat, so one retry only guards
+/// against a hostile pre-created file; eight bounds the loop.
+const PROBE_NAME_ATTEMPTS: usize = 8;
+
+/// Mode of the writability probe file: owner-only.
+const PROBE_FILE_MODE: u32 = 0o600;
+
+/// A fresh unpredictable probe file name.
+///
+/// Built from two randomly keyed `SipHash` outputs; the probe is also created
+/// exclusively, so predictability is never the only defense.
+pub(crate) fn probe_file_name() -> String {
+    use std::hash::{BuildHasher as _, Hasher as _, RandomState};
+
+    let high = RandomState::new().build_hasher().finish();
+    let low = RandomState::new().build_hasher().finish();
+    format!("{PROBE_FILE}-{high:016x}{low:016x}")
+}
 
 /// Inputs for the standard pohunek host checks.
 ///
@@ -240,45 +265,60 @@ pub fn terminal() -> DoctorCheck {
 }
 
 /// Check that a directory exists (or can be created) and is writable, by
-/// creating it and writing a probe file.
+/// creating it and writing a probe file (see [`write_probe`]).
 #[must_use]
 pub fn dir_writable(name: &str, dir: &Path, label: &str) -> DoctorCheck {
-    dir_writable_with(name, dir, label, |dir| std::fs::create_dir_all(dir))
-}
-
-/// [`dir_writable`] with an explicit directory-creation strategy, for
-/// directories that must be created with a specific mode.
-#[must_use]
-pub fn dir_writable_with(
-    name: &str,
-    dir: &Path,
-    label: &str,
-    create: impl FnOnce(&Path) -> std::io::Result<()>,
-) -> DoctorCheck {
-    if let Err(err) = create(dir) {
+    if let Err(err) = std::fs::create_dir_all(dir) {
         return DoctorCheck::new(
             name,
             DoctorStatus::Fail,
             format!("cannot create {label} {}: {err}", dir.display()),
         );
     }
-    let probe = dir.join(PROBE_FILE);
-    match std::fs::write(&probe, b"probe") {
-        Ok(()) => {
-            // Best-effort cleanup; a leftover probe is harmless.
-            let _ = std::fs::remove_file(&probe);
-            DoctorCheck::new(
-                name,
-                DoctorStatus::Ok,
-                format!("writable: {}", dir.display()),
-            )
-        }
+    match write_probe(dir) {
+        Ok(()) => DoctorCheck::new(
+            name,
+            DoctorStatus::Ok,
+            format!("writable: {}", dir.display()),
+        ),
         Err(err) => DoctorCheck::new(
             name,
             DoctorStatus::Fail,
             format!("{label} {} is not writable: {err}", dir.display()),
         ),
     }
+}
+
+/// Create, write and remove one probe file in `dir`.
+///
+/// The file has a random name and is created with `O_CREAT | O_EXCL`, which
+/// never follows a symlink at the final component, so a pre-planted link cannot
+/// redirect the write. Only the file this call created is removed.
+fn write_probe(dir: &Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut last = None;
+    for _ in 0..PROBE_NAME_ATTEMPTS {
+        let probe = dir.join(probe_file_name());
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(PROBE_FILE_MODE)
+            .open(&probe)
+        {
+            Ok(mut file) => {
+                let written = file.write_all(b"probe");
+                drop(file);
+                // Best-effort cleanup; a leftover probe is harmless.
+                let _ = std::fs::remove_file(&probe);
+                return written;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => last = Some(err),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no probe name attempts")))
 }
 
 /// Check whether the launcher scripts have been materialized by
@@ -406,9 +446,43 @@ mod tests {
 
         let check = dir_writable("probe_dir", &base, "probe directory");
         assert_eq!(check.status, DoctorStatus::Ok);
-        assert!(!base.join(PROBE_FILE).exists());
+        assert_eq!(
+            std::fs::read_dir(&base).unwrap().count(),
+            0,
+            "the probe file is removed"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dir_writable_never_writes_through_a_planted_probe_symlink() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let victim = base.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let dir = base.join("probed");
+        std::fs::create_dir(&dir).unwrap();
+        // The fixed name an earlier release used, and a guess at a random one.
+        std::os::unix::fs::symlink(&victim, dir.join(PROBE_FILE)).unwrap();
+
+        let check = dir_writable("probe_dir", &dir, "probe directory");
+
+        assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        let entries = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(entries, 1, "only the planted link remains");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn probe_names_are_unique_and_prefixed() {
+        let first = probe_file_name();
+        let second = probe_file_name();
+
+        assert_ne!(first, second);
+        assert!(first.starts_with(PROBE_FILE));
+        assert!(first.len() > PROBE_FILE.len() + 16);
     }
 
     #[test]

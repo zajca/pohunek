@@ -249,6 +249,17 @@ fn production_registry_rejects_missing_durable_worker_backend() {
 }
 
 #[test]
+fn registry_reports_the_active_supervision_worker_executable() {
+    let supervision = production_supervision();
+    let expected = supervision.worker_executable.clone();
+    let supervised = SessionRegistry::new(SessionRegistryConfig {
+        supervision: Some(supervision),
+        ..SessionRegistryConfig::default()
+    });
+    assert_eq!(supervised.worker_executable(), Some(expected));
+}
+
+#[test]
 fn production_registry_rejects_invalid_observation_limits() {
     let config = SessionRegistryConfig {
         worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),

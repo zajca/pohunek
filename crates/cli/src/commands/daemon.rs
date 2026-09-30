@@ -116,7 +116,7 @@ fn foreground_exec(mut command: Command) -> Result<(), CliError> {
 }
 
 /// Locate the `pohunekd` binary: sibling of the running CLI, then `PATH`.
-fn locate_daemon() -> Result<PathBuf, CliError> {
+pub(crate) fn locate_daemon() -> Result<PathBuf, CliError> {
     if let Ok(current) = std::env::current_exe() {
         if let Some(dir) = current.parent() {
             let sibling = dir.join(DAEMON_BIN);

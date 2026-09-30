@@ -5,6 +5,7 @@ use protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
 use super::util::{error_value, ok_value};
 use super::HealthInfo;
 use crate::governance::HostGovernanceService;
+use crate::session::SessionRegistry;
 
 /// `daemon.health`: report daemon version + protocol version.
 pub(super) fn handle_health(request: &Request, health: &HealthInfo) -> Response {
@@ -22,6 +23,7 @@ pub(super) fn handle_health(request: &Request, health: &HealthInfo) -> Response 
 pub(super) async fn handle_daemon_doctor(
     request: &Request,
     governance: &HostGovernanceService,
+    sessions: &SessionRegistry,
 ) -> Response {
     if !request.params().is_null() {
         return error_value(
@@ -43,7 +45,7 @@ pub(super) async fn handle_daemon_doctor(
             );
         }
     };
-    match crate::doctor::report(&paths, governance).await {
+    match crate::doctor::report(&paths, governance, sessions.worker_executable()).await {
         Ok(report) => ok_value(request, &protocol::DaemonDoctorResult { report }),
         Err(_error) => error_value(
             request,

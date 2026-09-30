@@ -4,10 +4,9 @@
 //! `hostcheck` crate; this module only selects which checks to run on the host
 //! that owns the agent runtime and assembles them into a [`DoctorReport`].
 
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use hostcheck::{StandardCheckInputs, WorkerCandidate};
+use hostcheck::{StandardCheckInputs, WorkerCandidate, WorkerSource};
 use protocol::{DoctorCheck, DoctorReport, DoctorStatus, QuarantineReason};
 
 use crate::governance::{HostGovernanceDiagnostic, HostGovernanceService};
@@ -26,31 +25,30 @@ pub struct DoctorReportError;
 /// # Errors
 ///
 /// Returns [`DoctorReportError`] when the bounded blocking host-check task fails.
+///
+/// `worker_executable` is the worker the active supervision launches, or
+/// `None` when the daemon has no worker supervision.
 pub async fn report(
     paths: &Paths,
     governance: &HostGovernanceService,
+    worker_executable: Option<PathBuf>,
 ) -> Result<DoctorReport, DoctorReportError> {
     let paths = paths.clone();
-    let mut checks = tokio::task::spawn_blocking(move || standard_checks(&paths))
+    let worker = worker_executable.map(|path| WorkerCandidate {
+        path,
+        source: WorkerSource::Supervision,
+    });
+    let mut checks = tokio::task::spawn_blocking(move || standard_checks(&paths, worker.as_ref()))
         .await
         .map_err(|_error| DoctorReportError)?;
     checks.extend(governance_checks(governance.diagnose().await));
     Ok(DoctorReport::from_checks(checks))
 }
 
-/// Environment variable overriding the worker executable path.
-const WORKER_BIN_ENV: &str = "POHUNEK_WORKER_BIN";
-
-fn standard_checks(paths: &Paths) -> Vec<DoctorCheck> {
+fn standard_checks(paths: &Paths, worker: Option<&WorkerCandidate>) -> Vec<DoctorCheck> {
     let launcher_bin_dir = paths.launcher_bin_dir();
     let sway_config_dir = paths.sway_config_dir();
     let home_dir = std::env::var_os(pohunek_paths::HOME).map(PathBuf::from);
-    let executable = std::env::current_exe().ok();
-    let worker = worker_candidate(
-        &paths.config_dir,
-        std::env::var_os(WORKER_BIN_ENV),
-        executable.as_deref().and_then(Path::parent),
-    );
     hostcheck::standard_checks(StandardCheckInputs {
         socket_dir: &paths.runtime_dir,
         state_dir: &paths.data_dir,
@@ -60,28 +58,9 @@ fn standard_checks(paths: &Paths) -> Vec<DoctorCheck> {
         config_dir: &paths.config_dir,
         home_dir: home_dir.as_deref(),
         effective_uid: nix::unistd::Uid::effective().as_raw(),
-        worker: worker.as_ref(),
+        worker,
         access_dirs: &[],
     })
-}
-
-/// The worker executable this daemon launches.
-///
-/// An installed `service.toml` names the versioned worker (native
-/// supervision); otherwise the `POHUNEK_WORKER_BIN` override, then
-/// `pohunek-sessiond` next to the daemon executable. An unloadable
-/// `service.toml` is left to `pohunek service status`.
-fn worker_candidate(
-    config_dir: &Path,
-    env_override: Option<OsString>,
-    executable_dir: Option<&Path>,
-) -> Option<WorkerCandidate> {
-    let service_worker = pohunek_service_config::ServiceConfig::load(
-        &config_dir.join(pohunek_service_config::FILE_NAME),
-    )
-    .ok()
-    .map(|config| config.worker_executable());
-    hostcheck::resolve_worker_candidate(service_worker, env_override, executable_dir)
 }
 
 fn governance_checks(diagnostic: HostGovernanceDiagnostic) -> [DoctorCheck; 6] {
@@ -187,6 +166,8 @@ fn check(name: &'static str, status: DoctorStatus, detail: &str) -> DoctorCheck 
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use base64::prelude::{Engine as _, BASE64_URL_SAFE_NO_PAD};
 
     use super::*;
@@ -216,37 +197,13 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn worker_candidate_prefers_override_over_sibling_and_ignores_unloadable_service_config() {
-        let root = temp_dir("worker");
-        let config_dir = root.join("config");
-        std::fs::create_dir_all(&config_dir).expect("create config dir");
-        std::fs::write(config_dir.join("service.toml"), "not = [valid").expect("write");
-        let executable_dir = Path::new("/opt/pohunek/bin");
-
-        let overridden = worker_candidate(
-            &config_dir,
-            Some(OsString::from("/custom/pohunek-sessiond")),
-            Some(executable_dir),
-        )
-        .expect("override candidate");
-        assert_eq!(overridden.source, hostcheck::WorkerSource::Environment);
-
-        let sibling =
-            worker_candidate(&config_dir, None, Some(executable_dir)).expect("sibling candidate");
-        assert_eq!(sibling.source, hostcheck::WorkerSource::Sibling);
-        assert_eq!(sibling.path, executable_dir.join("pohunek-sessiond"));
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     #[tokio::test]
     async fn report_contains_writable_daemon_paths_and_governance_checks() {
         let root = temp_dir("report");
         let paths = paths_at(&root);
 
         let service = crate::governance::HostGovernanceService::open_test();
-        let report = report(&paths, &service).await.expect("doctor report");
+        let report = report(&paths, &service, None).await.expect("doctor report");
 
         assert!(report
             .checks

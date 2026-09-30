@@ -13,7 +13,6 @@
 //! required filesystem access); optional capabilities are at most `warn`.
 
 use std::ffi::OsString;
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -22,10 +21,11 @@ use pohunek_paths::{
     validate_staged_socket_path, worker_socket_path, Platform, SocketKind, SOCKET_NAME,
     WORKERS_SUBDIR,
 };
+use pohunek_platform::filesystem::{StageOutcome, TrustedDir};
 use protocol::{DoctorCheck, DoctorStatus};
 
 use crate::executable::{is_executable_file, resolve_executable};
-use crate::{binary_with_path, dir_writable_with, netbird, StandardCheckInputs};
+use crate::{binary_with_path, netbird, StandardCheckInputs};
 
 // Rust guideline compliant 2026-09-30
 
@@ -54,6 +54,12 @@ const LAUNCHCTL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// uid>`; the status table lives with the service supervisor's `launchctl`
 /// runner. Output text is localized and never matched.
 const LAUNCHCTL_NO_SUCH_DOMAIN: i32 = 112;
+
+/// Stable name of the worker executable check.
+///
+/// The CLI doctor prefers the daemon's own result for this check, because the
+/// daemon knows which worker its supervision launches.
+pub const WORKER_EXECUTABLE_CHECK: &str = "worker_executable";
 
 /// Shell registry consulted for the login-shell check.
 const ETC_SHELLS: &str = "/etc/shells";
@@ -95,15 +101,21 @@ const EPERM: i32 = 1;
 /// `errno` value of `EACCES` ("Permission denied").
 const EACCES: i32 = 13;
 
-/// Directory mode of the runtime root: owner-only.
+/// Directory mode of the runtime root: owner-only, the mode the daemon
+/// requires at startup.
 const RUNTIME_DIR_MODE: u32 = 0o700;
 
-/// Group and other permission bits that make the runtime root unsafe.
-const RUNTIME_DIR_FORBIDDEN_BITS: u32 = 0o077;
+/// Mode of the writability probe file inside the runtime root.
+const PROBE_FILE_MODE: u32 = 0o600;
+
+/// Prefix of the quarantine name a probe file is moved to before removal.
+const PROBE_QUARANTINE_PREFIX: &str = ".pohunek-doctor-stale-";
 
 /// Where a resolved worker executable path came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerSource {
+    /// The worker the running daemon's supervision launches.
+    Supervision,
     /// The `worker_executable` recorded in the installed `service.toml`.
     ServiceConfig,
     /// The `POHUNEK_WORKER_BIN` override.
@@ -115,6 +127,7 @@ pub enum WorkerSource {
 impl WorkerSource {
     fn describe(self) -> &'static str {
         match self {
+            Self::Supervision => "the daemon's active supervision",
             Self::ServiceConfig => "service.toml",
             Self::Environment => "POHUNEK_WORKER_BIN",
             Self::Sibling => "next to the running executable",
@@ -358,18 +371,14 @@ fn parse_launcher_terminal(contents: &str) -> Option<String> {
 /// readiness is reported by `pohunek integration doctor`.
 #[must_use]
 pub fn standard_checks(inputs: &StandardCheckInputs<'_>, facts: &MacosFacts) -> Vec<DoctorCheck> {
+    let runtime_private = check_runtime_dir_private(inputs.socket_dir);
     vec![
         binary_with_path("git", true, facts.path_var.as_deref(), ""),
         agent_binary("codex", facts),
         agent_binary("claude", facts),
-        check_runtime_dir_private(inputs.socket_dir, inputs.effective_uid),
+        runtime_private.clone(),
         check_socket_path_length(inputs.socket_dir),
-        dir_writable_with(
-            "socket_dir_writable",
-            inputs.socket_dir,
-            "control socket directory",
-            create_private_dirs,
-        ),
+        check_socket_dir_writable(inputs.socket_dir, &runtime_private),
         crate::dir_writable(
             "state_dir_writable",
             inputs.state_dir,
@@ -404,80 +413,112 @@ fn agent_binary(name: &str, facts: &MacosFacts) -> DoctorCheck {
     )
 }
 
-fn create_private_dirs(dir: &Path) -> std::io::Result<()> {
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(RUNTIME_DIR_MODE)
-        .create(dir)
-}
-
-/// Check the runtime directory's type, owner and mode without creating it.
+/// Check the runtime directory with the validation the daemon applies at
+/// startup, without creating it.
 ///
 /// The default root lives in the world-writable `/private/tmp`, so another
-/// account could pre-create it. An absent directory is `ok`: the daemon
-/// creates it owner-private.
+/// account could pre-create it. [`TrustedDir::open_absolute`] rejects symlinked
+/// path components, a foreign owner, any mode other than `0700`, and (on macOS)
+/// an ACL that grants access beyond the mode bits. An absent directory is `ok`:
+/// the daemon creates it owner-private.
 #[must_use]
-pub fn check_runtime_dir_private(dir: &Path, effective_uid: u32) -> DoctorCheck {
+pub fn check_runtime_dir_private(dir: &Path) -> DoctorCheck {
     const NAME: &str = "runtime_dir_private";
-    let meta = match std::fs::symlink_metadata(dir) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return DoctorCheck::new(
-                NAME,
-                DoctorStatus::Ok,
-                format!(
-                    "{} does not exist yet; the daemon creates it with mode 0700",
-                    dir.display()
-                ),
-            );
-        }
-        Err(err) => {
+    match TrustedDir::open_absolute(dir, RUNTIME_DIR_MODE) {
+        Ok(_) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!(
+                "{} passes the daemon's owner-private directory validation",
+                dir.display()
+            ),
+        ),
+        Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!(
+                "{} does not exist yet; the daemon creates it with mode 0700",
+                dir.display()
+            ),
+        ),
+        Err(error) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Fail,
+            format!(
+                "{} fails the owner-private directory validation the daemon applies at startup: \
+                 {error}. It must be a real directory you own with mode 0700 and no symlinked \
+                 path components; remove it or set XDG_RUNTIME_DIR to such a directory",
+                dir.display()
+            ),
+        ),
+    }
+}
+
+/// Check that the runtime directory is writable, creating it owner-private.
+///
+/// A directory that failed `privacy` is never touched: nothing is created in
+/// it and no probe is written. Otherwise the directory is opened or created
+/// with the daemon's own startup primitive (which revalidates a directory it
+/// just created), and the probe is a randomly named exclusive file created
+/// relative to that descriptor and removed by inode identity.
+#[must_use]
+pub fn check_socket_dir_writable(dir: &Path, privacy: &DoctorCheck) -> DoctorCheck {
+    const NAME: &str = "socket_dir_writable";
+    const LABEL: &str = "control socket directory";
+    if privacy.status == DoctorStatus::Fail {
+        return DoctorCheck::new(
+            NAME,
+            DoctorStatus::Fail,
+            format!(
+                "{LABEL} {} was not probed because it failed the runtime_dir_private check; fix \
+                 that first",
+                dir.display()
+            ),
+        );
+    }
+    let trusted = match TrustedDir::open_or_create_absolute(dir, RUNTIME_DIR_MODE) {
+        Ok(trusted) => trusted,
+        Err(error) => {
             return DoctorCheck::new(
                 NAME,
                 DoctorStatus::Fail,
-                format!("cannot inspect runtime directory {}: {err}", dir.display()),
+                format!("cannot open {LABEL} {}: {error}", dir.display()),
             );
         }
     };
-    if !meta.file_type().is_dir() {
-        return DoctorCheck::new(
-            NAME,
-            DoctorStatus::Fail,
-            format!(
-                "{} is not a real directory (a symlink or file is refused); remove it so the daemon can create it",
-                dir.display()
-            ),
-        );
-    }
-    if meta.uid() != effective_uid {
-        return DoctorCheck::new(
-            NAME,
-            DoctorStatus::Fail,
-            format!(
-                "{} is owned by uid {} but pohunek runs as uid {effective_uid}; remove it or set \
-                 XDG_RUNTIME_DIR to a directory you own",
-                dir.display(),
-                meta.uid()
-            ),
-        );
-    }
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & RUNTIME_DIR_FORBIDDEN_BITS != 0 {
-        return DoctorCheck::new(
-            NAME,
-            DoctorStatus::Fail,
-            format!(
-                "{} has mode {mode:04o}, which lets other accounts reach the control socket; run \
-                 'chmod 700 {}'",
-                dir.display(),
-                dir.display()
-            ),
-        );
+    for _ in 0..crate::PROBE_NAME_ATTEMPTS {
+        let probe = crate::probe_file_name();
+        match trusted.create_file(&probe, b"probe", PROBE_FILE_MODE) {
+            Ok(identity) => {
+                // Best-effort cleanup; a leftover probe is harmless.
+                if let Ok(StageOutcome::Staged(entry)) =
+                    trusted.stage_random(&probe, PROBE_QUARANTINE_PREFIX, identity)
+                {
+                    let _ = entry.remove();
+                }
+                return DoctorCheck::new(
+                    NAME,
+                    DoctorStatus::Ok,
+                    format!("writable: {}", dir.display()),
+                );
+            }
+            Err(error) if error.io_kind() == Some(std::io::ErrorKind::AlreadyExists) => {}
+            Err(error) => {
+                return DoctorCheck::new(
+                    NAME,
+                    DoctorStatus::Fail,
+                    format!("{LABEL} {} is not writable: {error}", dir.display()),
+                );
+            }
+        }
     }
     DoctorCheck::new(
         NAME,
-        DoctorStatus::Ok,
-        format!("{} is owned by you with mode {mode:04o}", dir.display()),
+        DoctorStatus::Fail,
+        format!(
+            "{LABEL} {} rejected every probe file name; inspect it for unexpected entries",
+            dir.display()
+        ),
     )
 }
 
@@ -521,13 +562,14 @@ pub fn check_socket_path_length(runtime_dir: &Path) -> DoctorCheck {
 /// The worker is required: without it no session can start.
 #[must_use]
 pub fn check_worker_executable(candidate: Option<&WorkerCandidate>) -> DoctorCheck {
-    const NAME: &str = "worker_executable";
+    const NAME: &str = WORKER_EXECUTABLE_CHECK;
     let Some(candidate) = candidate else {
         return DoctorCheck::new(
             NAME,
             DoctorStatus::Fail,
-            "no pohunek-sessiond location could be derived; run 'pohunek service install' or set \
-             POHUNEK_WORKER_BIN to its absolute path",
+            "no worker executable is configured; install the service with 'pohunek service install', \
+             or start the daemon with '--service-config' or '--dev-subprocess' (POHUNEK_WORKER_BIN \
+             overrides the path)",
         );
     };
     let source = candidate.source.describe();
@@ -848,6 +890,7 @@ fn is_tcc_protected(path: &Path, home: Option<&Path>) -> bool {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use protocol::DoctorReport;
@@ -961,12 +1004,25 @@ mod tests {
 
     // --- runtime directory ---------------------------------------------------
 
+    fn ok_privacy() -> DoctorCheck {
+        DoctorCheck::new("runtime_dir_private", DoctorStatus::Ok, "")
+    }
+
+    fn entry_names(dir: &Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
     #[test]
     fn runtime_dir_absent_is_ok_without_being_created() {
         let base = temp_dir("rt-absent");
         let dir = base.join("pohunek-1");
 
-        let check = check_runtime_dir_private(&dir, 0);
+        let check = check_runtime_dir_private(&dir);
 
         assert_eq!(check.status, DoctorStatus::Ok);
         assert!(!dir.exists(), "the check must not create the directory");
@@ -974,37 +1030,19 @@ mod tests {
     }
 
     #[test]
-    fn runtime_dir_with_group_or_other_access_fails_with_chmod_remediation() {
+    fn runtime_dir_needs_exactly_mode_0700() {
         let base = temp_dir("rt-mode");
         let dir = base.join("rt");
         std::fs::create_dir(&dir).unwrap();
-        let uid = std::fs::metadata(&dir).unwrap().uid();
 
-        set_mode(&dir, 0o755);
-        let loose = check_runtime_dir_private(&dir, uid);
-        assert_eq!(loose.status, DoctorStatus::Fail);
-        assert!(loose.detail.contains("chmod 700"), "{}", loose.detail);
-
+        for loose in [0o755, 0o770, 0o750, 0o777] {
+            set_mode(&dir, loose);
+            let check = check_runtime_dir_private(&dir);
+            assert_eq!(check.status, DoctorStatus::Fail, "mode {loose:o}");
+            assert!(check.detail.contains("0700"), "{}", check.detail);
+        }
         set_mode(&dir, 0o700);
-        assert_eq!(
-            check_runtime_dir_private(&dir, uid).status,
-            DoctorStatus::Ok
-        );
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn runtime_dir_owned_by_another_uid_fails() {
-        let base = temp_dir("rt-owner");
-        let dir = base.join("rt");
-        std::fs::create_dir(&dir).unwrap();
-        set_mode(&dir, 0o700);
-        let uid = std::fs::metadata(&dir).unwrap().uid();
-
-        let check = check_runtime_dir_private(&dir, uid.wrapping_add(1));
-
-        assert_eq!(check.status, DoctorStatus::Fail);
-        assert!(check.detail.contains("owned by uid"), "{}", check.detail);
+        assert_eq!(check_runtime_dir_private(&dir).status, DoctorStatus::Ok);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1013,26 +1051,21 @@ mod tests {
         let base = temp_dir("rt-link");
         let target = base.join("target");
         std::fs::create_dir(&target).unwrap();
+        set_mode(&target, 0o700);
         let link = base.join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let file = base.join("file");
         std::fs::write(&file, b"x").unwrap();
 
-        assert_eq!(
-            check_runtime_dir_private(&link, 0).status,
-            DoctorStatus::Fail
-        );
-        assert_eq!(
-            check_runtime_dir_private(&file, 0).status,
-            DoctorStatus::Fail
-        );
+        assert_eq!(check_runtime_dir_private(&link).status, DoctorStatus::Fail);
+        assert_eq!(check_runtime_dir_private(&file).status, DoctorStatus::Fail);
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn a_symlinked_parent_is_accepted_but_a_symlinked_runtime_dir_is_refused() {
-        // Contract: only the runtime directory itself must be a real directory;
-        // symlinked ancestors (macOS `/tmp` -> `/private/tmp`) are followed.
+    fn a_symlinked_ancestor_is_refused_like_at_daemon_startup() {
+        // Startup opens the runtime root with `TrustedDir::open_or_create_absolute`,
+        // which rejects a symlinked path component; the doctor applies the same rule.
         let real = temp_dir("rt-parent-real");
         let holder = temp_dir("rt-parent-link");
         let link_root = holder.join("root");
@@ -1040,40 +1073,89 @@ mod tests {
         let dir = real.join("rt");
         std::fs::create_dir(&dir).unwrap();
         set_mode(&dir, 0o700);
-        let uid = std::fs::metadata(&dir).unwrap().uid();
 
+        assert_eq!(check_runtime_dir_private(&dir).status, DoctorStatus::Ok);
         let through_link = link_root.join("rt");
-        assert_eq!(
-            check_runtime_dir_private(&through_link, uid).status,
-            DoctorStatus::Ok
-        );
+        let refused = check_runtime_dir_private(&through_link);
+        assert_eq!(refused.status, DoctorStatus::Fail, "{}", refused.detail);
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_dir_all(&holder);
+    }
 
-        let final_link = holder.join("final");
-        std::os::unix::fs::symlink(&dir, &final_link).unwrap();
-        assert_eq!(
-            check_runtime_dir_private(&final_link, uid).status,
-            DoctorStatus::Fail
-        );
-
+    #[test]
+    fn a_symlinked_ancestor_is_still_readable_for_filesystem_access() {
+        let real = temp_dir("fa-real");
+        let holder = temp_dir("fa-link");
+        let link_root = holder.join("root");
+        std::os::unix::fs::symlink(&real, &link_root).unwrap();
         let dirs = [AccessDir {
             label: "current directory",
-            path: &through_link,
+            path: &link_root,
         }];
+
         let access = check_filesystem_access(&access_inputs(&real, None, &dirs));
+
         assert_eq!(access.status, DoctorStatus::Ok, "{}", access.detail);
         let _ = std::fs::remove_dir_all(&real);
         let _ = std::fs::remove_dir_all(&holder);
     }
 
     #[test]
-    fn private_dir_creation_uses_mode_0700() {
+    fn socket_dir_probe_creates_a_private_dir_and_leaves_it_empty() {
         let base = temp_dir("rt-create");
         let dir = base.join("a").join("b");
 
-        create_private_dirs(&dir).unwrap();
+        let check = check_socket_dir_writable(&dir, &ok_privacy());
 
+        assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail);
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+        assert!(entry_names(&dir).is_empty(), "the probe file is removed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_dir_that_failed_the_privacy_check_is_never_written() {
+        let base = temp_dir("rt-planted");
+        let victim = base.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let dir = base.join("rt");
+        std::fs::create_dir(&dir).unwrap();
+        set_mode(&dir, 0o777);
+        std::os::unix::fs::symlink(&victim, dir.join(crate::PROBE_FILE)).unwrap();
+        let before = entry_names(&dir);
+
+        let privacy = check_runtime_dir_private(&dir);
+        assert_eq!(privacy.status, DoctorStatus::Fail);
+        let skipped = check_socket_dir_writable(&dir, &privacy);
+        assert_eq!(skipped.status, DoctorStatus::Fail);
+        assert!(skipped.detail.contains("not probed"), "{}", skipped.detail);
+
+        // Even when a caller passes a stale `ok`, the startup validation
+        // refuses the directory before anything is created in it.
+        let refused = check_socket_dir_writable(&dir, &ok_privacy());
+        assert_eq!(refused.status, DoctorStatus::Fail, "{}", refused.detail);
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(entry_names(&dir), before, "nothing was created or removed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_planted_probe_symlink_in_a_private_dir_is_not_written_through() {
+        let base = temp_dir("rt-planted-ok");
+        let victim = base.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let dir = base.join("rt");
+        std::fs::create_dir(&dir).unwrap();
+        set_mode(&dir, 0o700);
+        std::os::unix::fs::symlink(&victim, dir.join(crate::PROBE_FILE)).unwrap();
+
+        let check = check_socket_dir_writable(&dir, &ok_privacy());
+
+        assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(entry_names(&dir), [crate::PROBE_FILE]);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1548,7 +1630,7 @@ mod tests {
     }
 
     #[test]
-    fn an_isolated_fixture_with_a_default_umask_runtime_dir_fails_only_that_check() {
+    fn an_isolated_fixture_with_a_default_umask_runtime_dir_fails_and_is_not_probed() {
         let base = temp_dir("umask");
         let bin = temp_dir("umask-bin");
         write_exec(&bin, "git", 0o755);
@@ -1562,7 +1644,10 @@ mod tests {
 
         set_mode(&runtime, 0o755);
         let loose = assembled(&base, path.clone(), Some(&worker));
-        assert_eq!(failing_names(&loose), ["runtime_dir_private"]);
+        assert_eq!(
+            failing_names(&loose),
+            ["runtime_dir_private", "socket_dir_writable"]
+        );
 
         set_mode(&runtime, 0o700);
         let private = assembled(&base, path, Some(&worker));
@@ -1594,27 +1679,5 @@ mod tests {
         assert_eq!(check.status, DoctorStatus::Warn);
         assert!(check.detail.contains("launchd"), "{}", check.detail);
         assert!(!check.detail.contains("/opt/homebrew"));
-    }
-
-    #[test]
-    fn socket_dir_probe_creates_the_runtime_dir_private() {
-        let base = temp_dir("private-create");
-        let bin = temp_dir("private-create-bin");
-        write_exec(&bin, "git", 0o755);
-        let checks = assembled(&base, OsString::from(bin.as_os_str()), None);
-
-        let socket = checks
-            .iter()
-            .find(|c| c.name == "socket_dir_writable")
-            .unwrap();
-        assert_eq!(socket.status, DoctorStatus::Ok);
-        let mode = std::fs::metadata(base.join("runtime"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o700);
-        let _ = std::fs::remove_dir_all(&base);
-        let _ = std::fs::remove_dir_all(&bin);
     }
 }
