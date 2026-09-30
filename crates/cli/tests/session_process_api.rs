@@ -90,20 +90,19 @@ impl RedactedRequestLog {
 
 struct TestHome {
     root: PathBuf,
+    worker: PathBuf,
 }
 
 impl TestHome {
     fn new() -> Self {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        // A short canonical base keeps the fixture daemon socket within the
-        // macOS 103-byte `sun_path` limit; the per-user macOS temporary
-        // directory is too long and sits below the `/var` symlink.
+        // A short canonical base keeps the longest worker socket path
+        // (`run/pohunek/workers/<session>/control.sock`) within the macOS
+        // 103-byte `sun_path` limit; the per-user macOS temporary directory is
+        // too long and sits below the `/var` symlink.
         let root = fs::canonicalize("/tmp")
             .expect("canonical /tmp")
-            .join(format!(
-                "pohunek-cli-process-api-{}-{sequence}",
-                std::process::id()
-            ));
+            .join(format!("pcpa-{}-{sequence}", std::process::id()));
         for directory in [
             "run/pohunek",
             "state/pohunek/logs",
@@ -115,7 +114,20 @@ impl TestHome {
         ] {
             fs::create_dir_all(root.join(directory)).expect("create isolated test directory");
         }
-        Self { root }
+        // The daemon creates its runtime directory owner-private; doctor's
+        // `runtime_dir_private` check rejects any group/other access.
+        fs::set_permissions(
+            root.join("run/pohunek"),
+            fs::Permissions::from_mode(RUNTIME_DIR_MODE),
+        )
+        .expect("make the runtime directory owner-private");
+        // Doctor's `worker_executable` check requires an executable
+        // `pohunek-sessiond` on macOS; a scripted stand-in satisfies it.
+        let worker = root.join("bin-worker");
+        fs::write(&worker, b"#!/bin/sh\nexit 0\n").expect("write worker stand-in");
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o755))
+            .expect("make the worker stand-in executable");
+        Self { root, worker }
     }
 
     fn socket(&self) -> PathBuf {
@@ -131,6 +143,7 @@ impl TestHome {
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("XDG_CACHE_HOME", self.root.join("cache"))
             .env("HOME", self.root.join("home"))
+            .env("POHUNEK_WORKER_BIN", &self.worker)
             .env_remove(protocol::ENV_SESSION_ID)
             .env_remove(protocol::ENV_DAEMON_ID);
         command
@@ -143,6 +156,13 @@ impl Drop for TestHome {
     }
 }
 
+/// Doctor check that reports the host's login session rather than the
+/// fixture: it may fail on a host without a graphical session.
+const HOST_SESSION_CHECK: &str = "launchd_domain";
+
+/// Mode of the runtime directory the daemon creates.
+const RUNTIME_DIR_MODE: u32 = 0o700;
+
 #[test]
 fn doctor_process_redacts_an_unavailable_local_daemon_in_human_and_json_output() {
     let home = TestHome::new();
@@ -150,46 +170,72 @@ fn doctor_process_redacts_an_unavailable_local_daemon_in_human_and_json_output()
     let expected_detail =
         "Daemon governance inspection is unavailable; start the local daemon and retry.";
 
-    let human = home
-        .command()
-        .arg("doctor")
-        .output()
-        .expect("run doctor process");
-    assert!(
-        human.status.success(),
-        "human doctor failed: {}",
-        utf8(&human.stderr)
-    );
-    let human_stdout = utf8(&human.stdout);
-    assert_eq!(
-        human_stdout.matches("host_governance_inspection").count(),
-        1,
-        "human doctor must emit exactly one unavailable-governance check"
-    );
-    assert!(human_stdout.contains("warn"));
-    assert!(human_stdout.contains(expected_detail));
-    assert_redacted_doctor_output(&human_stdout, &socket);
-
     let json = home
         .command()
         .args(["doctor", "--json"])
         .output()
         .expect("run JSON doctor process");
-    assert!(
-        json.status.success(),
-        "JSON doctor failed: {}",
-        utf8(&json.stderr)
-    );
-    let document: Value = serde_json::from_slice(&json.stdout).expect("doctor JSON envelope");
+    let document: Value = serde_json::from_slice(&json.stdout).unwrap_or_else(|error| {
+        panic!("doctor JSON envelope: {error}\n{}", describe(&json));
+    });
     let checks = document["ok"]["checks"].as_array().expect("doctor checks");
+    // The isolated fixture satisfies every required check except the ones that
+    // describe the host session itself: on macOS the `gui/<uid>` launchd domain
+    // exists only inside a graphical login session.
+    let failing = checks
+        .iter()
+        .filter(|check| check["status"] == "fail")
+        .map(|check| check["name"].as_str().unwrap_or("?").to_owned())
+        .filter(|name| name != HOST_SESSION_CHECK)
+        .collect::<Vec<_>>();
+    assert!(
+        failing.is_empty(),
+        "required doctor checks failed: {failing:?}\n{}",
+        describe(&json)
+    );
     let unavailable = checks
         .iter()
         .filter(|check| check["name"] == "host_governance_inspection")
         .collect::<Vec<_>>();
-    assert_eq!(unavailable.len(), 1);
+    assert_eq!(unavailable.len(), 1, "{}", describe(&json));
     assert_eq!(unavailable[0]["status"], "warn");
     assert_eq!(unavailable[0]["detail"], expected_detail);
     assert_redacted_doctor_output(&utf8(&json.stdout), &socket);
+
+    let human = home
+        .command()
+        .arg("doctor")
+        .output()
+        .expect("run doctor process");
+    let host_session_failed = checks
+        .iter()
+        .any(|check| check["status"] == "fail" && check["name"] == HOST_SESSION_CHECK);
+    assert_eq!(
+        human.status.success(),
+        !host_session_failed,
+        "human doctor exit status must follow the same checks as JSON\n{}",
+        describe(&human)
+    );
+    let human_stdout = utf8(&human.stdout);
+    assert_eq!(
+        human_stdout.matches("host_governance_inspection").count(),
+        1,
+        "human doctor must emit exactly one unavailable-governance check\n{}",
+        describe(&human)
+    );
+    assert!(human_stdout.contains("warn"));
+    assert!(human_stdout.contains(expected_detail));
+    assert_redacted_doctor_output(&human_stdout, &socket);
+}
+
+/// Renders a process outcome for assertion messages: status, stdout, stderr.
+fn describe(output: &Output) -> String {
+    format!(
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        utf8(&output.stdout),
+        utf8(&output.stderr)
+    )
 }
 
 fn assert_redacted_doctor_output(output: &str, socket: &Path) {

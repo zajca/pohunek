@@ -1503,6 +1503,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bin);
     }
 
+    fn failing_names(checks: &[DoctorCheck]) -> Vec<&str> {
+        checks
+            .iter()
+            .filter(|check| check.status == DoctorStatus::Fail)
+            .map(|check| check.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn an_isolated_fixture_with_a_default_umask_runtime_dir_fails_only_that_check() {
+        let base = temp_dir("umask");
+        let bin = temp_dir("umask-bin");
+        write_exec(&bin, "git", 0o755);
+        let worker = WorkerCandidate {
+            path: write_exec(&bin, "pohunek-sessiond", 0o755),
+            source: WorkerSource::Environment,
+        };
+        let runtime = base.join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        let path = OsString::from(bin.as_os_str());
+
+        set_mode(&runtime, 0o755);
+        let loose = assembled(&base, path.clone(), Some(&worker));
+        assert_eq!(failing_names(&loose), ["runtime_dir_private"]);
+
+        set_mode(&runtime, 0o700);
+        let private = assembled(&base, path, Some(&worker));
+        assert!(failing_names(&private).is_empty(), "{private:?}");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn a_long_isolated_root_overflows_the_worker_socket_limit() {
+        // Shape of a test fixture root on macOS: canonical /private/tmp plus a
+        // descriptive directory name, with the runtime dir at run/pohunek.
+        let long = Path::new("/private/tmp/pohunek-cli-process-api-12345-0/run/pohunek");
+        let short = Path::new("/private/tmp/pcpa-12345-0/run/pohunek");
+
+        let overflow = check_socket_path_length(long);
+        assert_eq!(overflow.status, DoctorStatus::Fail);
+        assert!(overflow.detail.contains("worker"), "{}", overflow.detail);
+        assert_eq!(check_socket_path_length(short).status, DoctorStatus::Ok);
+    }
+
     #[test]
     fn agent_hint_explains_launchd_path_without_naming_a_homebrew_prefix() {
         let mut f = facts();
