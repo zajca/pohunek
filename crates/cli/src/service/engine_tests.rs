@@ -807,6 +807,58 @@ async fn a_resumed_install_keeps_the_path_recorded_in_service_toml() {
     assert_eq!(registered.environment().get("PATH"), Some(&recorded));
 }
 
+/// A context whose discovery-only variables are unusable.
+fn with_hostile_discovery_environment(context: &Context) -> Context {
+    context.clone().with_environment_discovery(
+        |name| match name {
+            "SHELL" | "ZDOTDIR" | "XDG_CONFIG_HOME" => Some("relative/path".into()),
+            _ => None,
+        },
+        true,
+    )
+}
+
+#[tokio::test]
+async fn unusable_discovery_variables_fail_only_a_fresh_install_before_any_effect() {
+    // A fresh install needs the discovery environment, so it fails first.
+    let mut harness = Harness::new();
+    harness.context = with_hostile_discovery_environment(&harness.context);
+    let error = harness.install(V1).await.expect_err("fresh install");
+    assert_eq!(error.code(), "service_environment_invalid");
+    assert!(harness.config().is_none(), "no config was written");
+    assert!(harness.pending().is_none(), "no transaction started");
+    assert_eq!(harness.fake.world().installs, 0, "no job was registered");
+
+    // Every other command uses the recorded configuration and never reads it.
+    let mut harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.context = with_hostile_discovery_environment(&harness.context);
+    let config = harness.config();
+    harness
+        .engine()
+        .status(config.as_ref())
+        .await
+        .expect("status ignores the discovery environment");
+    harness.upgrade(V2).await.expect("upgrade ignores it");
+    harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect("uninstall ignores it");
+
+    // A resumed install reads the recorded config instead of discovering.
+    let mut harness = Harness::new();
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registering);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+    harness.context = with_hostile_discovery_environment(&harness.context);
+    let report = harness.install(V1).await.expect("resume ignores it");
+    assert!(report.resumed);
+}
+
 #[tokio::test]
 async fn a_resume_refuses_a_service_toml_of_another_installation() {
     for (key, edit) in [("prefix", 0_u8), ("active_version", 1_u8)] {

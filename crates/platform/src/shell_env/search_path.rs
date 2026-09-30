@@ -260,12 +260,15 @@ impl SearchPath {
 
     /// Returns this path followed by the `extra` directories it lacks.
     ///
+    /// `extra` is itself a validated [`SearchPath`], so every appended entry
+    /// already satisfies the entry rules.
+    ///
     /// Directories are appended one by one while the joined value fits
     /// [`MAX_SEARCH_PATH_BYTES`]; the rest are left out.
     #[must_use]
-    pub fn with_appended(&self, extra: &[PathBuf]) -> Self {
+    pub fn with_appended(&self, extra: &Self) -> Self {
         let mut entries = self.entries.clone();
-        for entry in extra {
+        for entry in extra.entries() {
             if entries.contains(entry) {
                 continue;
             }
@@ -555,11 +558,32 @@ mod tests {
     #[test]
     fn appending_skips_present_entries_and_respects_the_bound() {
         let base = SearchPath::new(vec!["/a".into(), "/b".into()]).expect("base");
-        let merged = base.with_appended(&["/b".into(), "/c".into()]);
-        assert_eq!(merged.to_env_value(), "/a:/b:/c");
+        let extra = SearchPath::new(vec!["/b".into(), "/c".into()]).expect("extra");
+        assert_eq!(base.with_appended(&extra).to_env_value(), "/a:/b:/c");
         let long = PathBuf::from(format!("/{}", "x".repeat(MAX_SEARCH_PATH_BYTES - 4)));
-        let bounded = base.with_appended(&[long, "/d".into()]);
-        assert_eq!(bounded.to_env_value(), "/a:/b:/d");
+        let extra = SearchPath::new(vec![long, "/d".into()]).expect("extra");
+        assert_eq!(base.with_appended(&extra).to_env_value(), "/a:/b:/d");
+    }
+
+    #[test]
+    fn every_constructor_enforces_the_entry_rules() {
+        // `new` and `sanitize` are the only ways to build a non-empty path, and
+        // `with_appended` accepts only another validated path, so a rejected
+        // form can never reach the joined value.
+        for bad in ["", ".", "rel", "/a:b", "/a\u{1}", "/a/../b"] {
+            assert!(
+                SearchPath::new(vec![PathBuf::from(bad)]).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(SearchPath::default().is_empty());
+        assert!(SearchPath::empty()
+            .with_appended(&SearchPath::default())
+            .is_empty());
+        let appended =
+            SearchPath::empty().with_appended(&SearchPath::new(vec!["/ok".into()]).expect("path"));
+        assert_eq!(appended.to_env_value(), "/ok");
+        assert!(!appended.to_env_value().ends_with(':'));
     }
 
     #[test]

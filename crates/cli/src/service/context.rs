@@ -58,6 +58,18 @@ pub enum PathDiscovery {
     },
 }
 
+/// Where the install-time `PATH` discovery policy comes from.
+#[derive(Debug, Clone)]
+enum DiscoverySource {
+    /// A policy fixed by the caller.
+    Fixed(PathDiscovery),
+    /// A policy built from the environment only when a fresh install asks.
+    Environment {
+        lookup: fn(&str) -> Option<std::ffi::OsString>,
+        managed: bool,
+    },
+}
+
 /// Paths, identity, and environment of the installing user.
 #[derive(Debug, Clone)]
 pub struct Context {
@@ -67,7 +79,7 @@ pub struct Context {
     runtime_base: Option<PathBuf>,
     supervisor_dir: PathBuf,
     cli_executable: PathBuf,
-    path_discovery: PathDiscovery,
+    path_discovery: DiscoverySource,
 }
 
 impl Context {
@@ -92,14 +104,31 @@ impl Context {
             runtime_base,
             supervisor_dir,
             cli_executable,
-            path_discovery: PathDiscovery::Unmanaged,
+            path_discovery: DiscoverySource::Fixed(PathDiscovery::Unmanaged),
         }
     }
 
     /// Returns this context with `path_discovery` choosing the daemon `PATH`.
     #[must_use]
     pub fn with_path_discovery(mut self, path_discovery: PathDiscovery) -> Self {
-        self.path_discovery = path_discovery;
+        self.path_discovery = DiscoverySource::Fixed(path_discovery);
+        self
+    }
+
+    /// Returns this context reading the discovery environment through `lookup`
+    /// when a fresh install needs it.
+    ///
+    /// Nothing is read or validated before [`Self::install_search_path`], so an
+    /// unusable variable never blocks a command that uses the recorded
+    /// configuration. `managed` selects login-shell discovery; without it the
+    /// service manager's own `PATH` applies.
+    #[must_use]
+    pub fn with_environment_discovery(
+        mut self,
+        lookup: fn(&str) -> Option<std::ffi::OsString>,
+        managed: bool,
+    ) -> Self {
+        self.path_discovery = DiscoverySource::Environment { lookup, managed };
         self
     }
 
@@ -122,7 +151,6 @@ impl Context {
         let cli_executable = std::env::current_exe()
             .and_then(std::fs::canonicalize)
             .map_err(io_error("locate", "the running pohunek executable"))?;
-        let path_discovery = host_path_discovery()?;
         Ok(Self::new(
             paths,
             nix::unistd::Uid::effective().as_raw(),
@@ -131,7 +159,10 @@ impl Context {
             supervisor_dir,
             cli_executable,
         )
-        .with_path_discovery(path_discovery))
+        // Login-shell probing applies on macOS only; systemd hands the user
+        // manager's environment to the daemon job. The target is chosen at run
+        // time, not with `#[cfg]`, so every branch is type-checked everywhere.
+        .with_environment_discovery(|name| std::env::var_os(name), cfg!(target_os = "macos")))
     }
 
     /// Returns the shared application paths.
@@ -214,11 +245,21 @@ impl Context {
     ///
     /// Returns [`Error::SearchPath`] when no tier yields a usable directory.
     pub fn install_search_path(&self) -> Result<(SearchPath, SearchPathReport), Error> {
+        let discovery = match &self.path_discovery {
+            DiscoverySource::Fixed(discovery) => discovery.clone(),
+            DiscoverySource::Environment { lookup, managed } => {
+                if *managed {
+                    managed_discovery_from_env(lookup)?
+                } else {
+                    PathDiscovery::Unmanaged
+                }
+            }
+        };
         let PathDiscovery::Managed {
             login_shell,
             shell_defaulted,
             fallback_directories,
-        } = &self.path_discovery
+        } = &discovery
         else {
             return Ok((
                 SearchPath::empty(),
@@ -431,19 +472,6 @@ fn managed_discovery_from_env(
         environment.push((name.to_owned(), text));
     }
     managed_path_discovery(lookup("SHELL").map(PathBuf::from), environment)
-}
-
-/// Builds the host's discovery policy: login-shell probing on macOS only.
-///
-/// The target is chosen at run time, not with `#[cfg]`, so every branch is
-/// type-checked on every host. systemd hands the user manager's environment to
-/// the daemon job, so other targets record no `PATH`.
-fn host_path_discovery() -> Result<PathDiscovery, Error> {
-    if cfg!(target_os = "macos") {
-        managed_discovery_from_env(|name| std::env::var_os(name))
-    } else {
-        Ok(PathDiscovery::Unmanaged)
-    }
 }
 
 /// Returns where the daemon definition goes for `paths` and `home`.

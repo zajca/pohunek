@@ -612,7 +612,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{LazyLock, Mutex};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     use protocol::{AgentActivity, ErrorClass};
 
@@ -637,16 +637,11 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time is after epoch")
-            .as_nanos();
-        let dir = pohunek_test_support::temp_root().join(format!(
-            "pohunek-agent-test-{tag}-{}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+        // Exclusive creation under a random name; the directory is left behind
+        // like the fixture it replaces.
+        pohunek_test_support::tempdir_with_prefix(&format!("pohunek-agent-test-{tag}-"))
+            .expect("create temp dir")
+            .keep()
     }
 
     fn write_executable(dir: &Path, name: &str) -> PathBuf {

@@ -139,6 +139,7 @@ where
         spec,
         || {},
         fallback,
+        || {},
         |value| SearchPath::sanitize(value, true),
     )
     .map_err(ResolveError::Discovery)?;
@@ -155,7 +156,7 @@ where
                         }
                     }
                     ignored += extra.ignored;
-                    discovery.path.with_appended(extra.path.entries())
+                    discovery.path.with_appended(&extra.path)
                 }
                 Err(_no_fallback) => discovery.path,
             };

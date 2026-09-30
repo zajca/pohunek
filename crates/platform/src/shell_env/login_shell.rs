@@ -179,6 +179,7 @@ where
         spec,
         before_checks,
         || Err(SearchPathError::NoUsableDirectories),
+        || {},
         sanitize,
     )
     .and_then(|staged| staged.login)
@@ -206,15 +207,17 @@ pub(super) struct StagedDiscovery {
 /// Returns [`LoginShellError::Timeout`] when the deadline passes before the
 /// fallback stage ends; a later timeout is reported in
 /// [`StagedDiscovery::login`].
-pub(super) fn discover_staged<B, G, F>(
+pub(super) fn discover_staged<B, G, A, F>(
     spec: &LoginShellSpec,
     before_checks: B,
     fallback: G,
+    after_spawn: A,
     sanitize: F,
 ) -> Result<StagedDiscovery, LoginShellError>
 where
     B: FnOnce() + Send + 'static,
     G: FnOnce() -> Result<SanitizedPath, SearchPathError> + Send + 'static,
+    A: Fn() + Send + 'static,
     F: FnOnce(&str) -> Result<SanitizedPath, SearchPathError> + Send + 'static,
 {
     let deadline = Instant::now() + spec.timeout;
@@ -230,7 +233,8 @@ where
             before_checks();
             // The receivers are gone once the deadline passed; nothing to report.
             drop(fallback_tx.send(fallback()));
-            let result = discovery_pipeline(&owned, deadline, &pipeline_cancel, sanitize);
+            let result =
+                discovery_pipeline(&owned, deadline, &pipeline_cancel, &after_spawn, sanitize);
             drop(login_tx.send(result));
         })
         .map_err(LoginShellError::Io)?;
@@ -257,6 +261,7 @@ fn discovery_pipeline<F>(
     spec: &LoginShellSpec,
     deadline: Instant,
     cancel: &AtomicBool,
+    after_spawn: &dyn Fn(),
     sanitize: F,
 ) -> Result<LoginShellDiscovery, LoginShellError>
 where
@@ -299,8 +304,14 @@ where
     if expired(deadline, cancel) {
         return Err(timed_out());
     }
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let output = run_bounded(command, remaining, spec.max_output_bytes)?;
+    let limits = Limits {
+        deadline,
+        timeout,
+        cancel,
+        after_spawn,
+        max_output_bytes: spec.max_output_bytes,
+    };
+    let output = run_bounded(command, &limits)?;
     if !output.status.success() {
         return Err(LoginShellError::Failed {
             status: describe(output.status),
@@ -383,33 +394,48 @@ enum Event {
     Exited(io::Result<()>),
 }
 
+/// Bounds of one probe: the absolute discovery deadline, the caller's cancel
+/// flag, and the output bound.
+struct Limits<'a> {
+    deadline: Instant,
+    /// The configured duration, reported in a timeout error.
+    timeout: Duration,
+    cancel: &'a AtomicBool,
+    /// Runs right after the spawn returns; tests use it to simulate a slow spawn.
+    after_spawn: &'a dyn Fn(),
+    max_output_bytes: usize,
+}
+
 /// Runs `command` with piped stdout under a deadline and an output bound.
 ///
-/// The child must lead its own process group. Its exit is observed with
-/// `waitid(WEXITED | WNOWAIT)`, which leaves the leader unreaped, so its pid
-/// (the group id) cannot be recycled while the group is killed. Every return
-/// path kills the group first and reaps the leader afterwards; the observer
-/// threads end once the group is dead.
-fn run_bounded(
-    mut command: Command,
-    timeout: Duration,
-    max_output_bytes: usize,
-) -> Result<Captured, LoginShellError> {
+/// The child must lead its own process group. The absolute deadline and the
+/// cancel flag are checked again right after the spawn, so a spawn that stalled
+/// past them kills and reaps the group before the shell does anything. Its exit
+/// is observed with `waitid(WEXITED | WNOWAIT)`, which leaves the leader
+/// unreaped, so its pid (the group id) cannot be recycled while the group is
+/// killed. Every return path kills the group first and reaps the leader
+/// afterwards; the observer threads end once the group is dead.
+fn run_bounded(mut command: Command, limits: &Limits<'_>) -> Result<Captured, LoginShellError> {
     let mut child = command.spawn().map_err(LoginShellError::Io)?;
     let group = Pid::from_child(&child);
-    let observed = observe(&mut child, group, timeout, max_output_bytes);
+    (limits.after_spawn)();
+    let observed = if expired(limits.deadline, limits.cancel) {
+        Err(LoginShellError::Timeout {
+            timeout: limits.timeout,
+        })
+    } else {
+        observe(&mut child, group, limits)
+    };
     kill_group(group);
     let status = child.wait().map_err(LoginShellError::Io)?;
     observed.map(|stdout| Captured { status, stdout })
 }
 
 /// Collects the child's stdout and waits for its exit within the deadline.
-fn observe(
-    child: &mut Child,
-    pid: Pid,
-    timeout: Duration,
-    max_output_bytes: usize,
-) -> Result<Vec<u8>, LoginShellError> {
+fn observe(child: &mut Child, pid: Pid, limits: &Limits<'_>) -> Result<Vec<u8>, LoginShellError> {
+    let max_output_bytes = limits.max_output_bytes;
+    let timeout = limits.timeout;
+    let deadline = limits.deadline;
     let mut stdout = child
         .stdout
         .take()
@@ -444,7 +470,6 @@ fn observe(
         })
         .map_err(LoginShellError::Io)?;
 
-    let deadline = Instant::now() + timeout;
     let mut stdout_bytes: Option<Vec<u8>> = None;
     let mut exited = false;
     while stdout_bytes.is_none() || !exited {
@@ -768,6 +793,37 @@ mod tests {
             !marker.exists(),
             "the abandoned discovery spawned the shell"
         );
+    }
+
+    #[test]
+    fn a_spawn_that_returns_after_the_deadline_kills_the_shell_before_it_acts() {
+        let dir = fixture();
+        let marker = dir.path().join("shell-acted");
+        // The shell would act one second after it starts.
+        let shell = script(
+            dir.path(),
+            "slow-shell",
+            &format!("sleep 1\ntouch '{}'", marker.display()),
+        );
+        let mut bounded = spec(shell);
+        bounded.timeout = Duration::from_millis(300);
+        let staged = discover_staged(
+            &bounded,
+            || {},
+            || Err(SearchPathError::NoUsableDirectories),
+            // A stalled spawn returns only after the deadline has passed.
+            || std::thread::sleep(Duration::from_millis(600)),
+            |value| SearchPath::sanitize(value, true),
+        )
+        .expect("the fallback stage ends in time");
+        assert!(
+            matches!(staged.login, Err(LoginShellError::Timeout { .. })),
+            "{:?}",
+            staged.login.map(|found| found.path)
+        );
+        // Long enough for the shell to have acted had it not been killed.
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(!marker.exists(), "the shell acted after the deadline");
     }
 
     #[test]

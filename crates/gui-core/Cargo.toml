@@ -26,6 +26,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 pohunek-daemon = { workspace = true }
 pohunek-test-support = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
@@ -35,3 +36,6 @@ keyring = { workspace = true, features = ["async-secret-service", "tokio", "cryp
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { workspace = true, features = ["apple-native"] }
+# Same major version as the one keyring links: `credential_store` downcasts
+# keyring's boxed `security_framework::base::Error` to read the OSStatus code.
+security-framework = "3"

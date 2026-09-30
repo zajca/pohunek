@@ -1311,8 +1311,9 @@ mod attach_template_tests {
             "ls * crates/gui"
         );
         // A fixture directory where `{host}*` would expand to several words.
-        let dir = std::env::temp_dir().join(format!("pohunek-glob-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("crates")).expect("fixture dir");
+        let fixture = tempfile::tempdir().expect("private fixture directory");
+        let dir = fixture.path().to_path_buf();
+        std::fs::create_dir(dir.join("crates")).expect("fixture dir");
         for name in ["gui-a", "gui-b"] {
             std::fs::write(dir.join("crates").join(name), "").expect("fixture file");
         }
@@ -1328,7 +1329,6 @@ mod attach_template_tests {
             "it expands"
         );
         render_attach_command("printf '%s\\0' {host}*", &values).expect_err("refused");
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
