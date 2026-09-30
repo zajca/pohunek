@@ -89,7 +89,7 @@ fn end_of_string(bytes: &[u8], start: usize) -> usize {
     bytes.len()
 }
 
-/// Index one past a raw string literal starting at `start` (its `r`), or
+/// Index one past a raw string literal whose `r` is at `start`, or
 /// `None` when `start` does not begin one.
 fn end_of_raw_string(bytes: &[u8], start: usize) -> Option<usize> {
     let mut i = start + 1;
@@ -168,8 +168,14 @@ fn views(text: &str) -> Views {
             let end = end_of_string(bytes, i);
             blank(&mut skeleton, i, end);
             i = end;
-        } else if byte == b'r' && !prev_is_ident {
-            if let Some(end) = end_of_raw_string(bytes, i) {
+        } else if matches!(byte, b'r' | b'b' | b'c') && !prev_is_ident {
+            // `r`, `br` and `cr` open a raw string; `b"`, `c"` and `b'` open
+            // ordinary literals that the quote branches handle on the next byte.
+            let raw_start = if byte == b'r' { i } else { i + 1 };
+            let raw = (bytes.get(raw_start) == Some(&b'r'))
+                .then(|| end_of_raw_string(bytes, raw_start))
+                .flatten();
+            if let Some(end) = raw {
                 blank(&mut skeleton, i, end);
                 i = end;
             } else {
@@ -915,6 +921,121 @@ fn a_double_slash_inside_a_string_does_not_hide_a_lookup() {
             .len(),
         1
     );
+}
+
+#[test]
+fn a_raw_byte_or_c_string_with_quotes_does_not_hide_a_later_lookup() {
+    let literals = [
+        r##"let s = br#"a"{"#;"##,
+        r###"let s = br##"a"#{"##;"###,
+        r##"let s = cr#"a"{"#;"##,
+        r#"let s = br"a{";"#,
+        r#"let s = cr"a{";"#,
+        r#"let s = b"a\"{";"#,
+        r#"let s = c"a\"{";"#,
+        r##"let s = r#"a"{"#;"##,
+    ];
+    for literal in literals {
+        let template =
+            format!("#[cfg(test)]\nmod tests {{\n    fn f() {{ {literal} }}\n    fn g() {{ let p = @; }}\n}}\nfn tool() {{ let p = @; }}\n");
+        assert_eq!(
+            lines_of("crates/demo/src/lib.rs", &template),
+            [4],
+            "{literal}"
+        );
+        let template = format!(
+            "fn tool() {{ let p = @; }}\n#[test]\nfn f() {{\n    {literal}\n    let p = @;\n}}\n"
+        );
+        assert_eq!(
+            lines_of("crates/demo/src/lib.rs", &template),
+            [5],
+            "{literal}"
+        );
+    }
+}
+
+#[test]
+fn a_lookup_inside_a_raw_byte_or_c_string_is_not_a_lookup() {
+    let literals = [
+        r##"let s = br#"@"#;"##,
+        r##"let s = br#"a" @"#;"##,
+        r##"let s = cr#"a" @"#;"##,
+        r###"let s = br##"a"# @"##;"###,
+        r##"let s = cr#"@"#;"##,
+        r###"let s = br##"@"##;"###,
+        r#"let s = br"@";"#,
+        r##"let s = r#"@"#;"##,
+        r#"let s = b"@";"#,
+        r#"let s = c"@";"#,
+    ];
+    for literal in literals {
+        let template = literal.replace('@', "env!(\"CARGO_MANIFEST_DIR\")");
+        assert!(
+            lines_of("crates/demo/tests/run.rs", &format!("{template}\n")).is_empty(),
+            "{literal}"
+        );
+    }
+}
+
+#[test]
+fn identifiers_ending_in_literal_prefixes_do_not_open_raw_strings() {
+    let template = "fn f() {\n    let bar = 1;\n    let c = bar;\n    let p = @;\n}\n#[cfg(test)]\nmod tests {\n    fn g() { let for_c = r#type; let p = @; }\n}\n";
+    assert_eq!(lines_of("crates/demo/src/lib.rs", template), [8]);
+    let template = "#[test]\nfn f() {\n    let aBr = 1;\n    let bbr = aBr;\n    let p = @;\n}\n";
+    assert_eq!(lines_of("crates/demo/src/lib.rs", template), [5]);
+}
+
+#[test]
+fn lexer_handles_nested_comments_lifetimes_chars_and_escapes() {
+    let cases: [(&str, &str, Vec<usize>); 8] = [
+        (
+            "nested block comments",
+            "#[test]\nfn f() {\n    /* a /* } */ } */\n    let p = @;\n}\nfn tool() { let p = @; }\n",
+            vec![4],
+        ),
+        (
+            "lifetimes and brace chars",
+            "#[test]\nfn f<'a>(x: &'a str) {\n    let a = '}';\n    let b = '{';\n    let c = '\"';\n    let p = @;\n}\nfn tool<'a>(x: &'a str) { let p = @; }\n",
+            vec![6],
+        ),
+        (
+            "escaped quote and backslash",
+            "#[test]\nfn f() {\n    let a = \"q\\\" }\";\n    let b = \"back\\\\\";\n    let c = '\\'';\n    let d = '\\\\';\n    let p = @;\n}\nfn tool() { let p = @; }\n",
+            vec![7],
+        ),
+        (
+            "comment markers in strings",
+            "#[test]\nfn f() {\n    let a = \"// }\";\n    let b = \"/* }\";\n    let c = r#\"// } /*\"#;\n    let p = @;\n}\nfn tool() { let p = @; }\n",
+            vec![6],
+        ),
+        (
+            "doc comments with a lookup",
+            "/// let p = @;\n//! let p = @;\n/** let p = @; */\n/*! let p = @; */\n#[test]\nfn f() {}\n",
+            vec![],
+        ),
+        (
+            "byte char braces",
+            "#[test]\nfn f() {\n    let a = b'}';\n    let b = b'\\'';\n    let p = @;\n}\nfn tool() { let p = @; }\n",
+            vec![5],
+        ),
+        (
+            "raw string with hashes and comment markers",
+            "#[test]\nfn f() {\n    let a = r##\"\"# } // /*\"##;\n    let p = @;\n}\nfn tool() { let p = @; }\n",
+            vec![4],
+        ),
+        (
+            "unicode char and string",
+            "#[test]\nfn f() {\n    let a = 'é';\n    let b = \"é}\";\n    let p = @;\n}\nfn tool() { let p = @; }\n",
+            vec![5],
+        ),
+    ];
+    for (name, template, expected) in cases {
+        assert_eq!(
+            lines_of("crates/demo/src/lib.rs", template),
+            expected,
+            "{name}"
+        );
+    }
 }
 
 #[test]
