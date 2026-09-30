@@ -41,6 +41,13 @@ OTHER_COMMIT = "2" * 40
 TEMP_PREFIX = ".worktree-new-"
 # Name prefix of this run's temporary branch for the slug `issue-1`.
 TEMP_BRANCH = "zajca/worktree-new-tmp-issue-1-"
+# Committer time of the last `Cargo.lock` commit on the fake base, and the
+# mtime the tests give the seed profile's build activity directories: the
+# seed is fresh by default, stale when the lockfile commit is newer.
+OLD_EPOCH = 1_000_000_000
+NEW_EPOCH = 1_700_000_000
+# A time far beyond what `time.gmtime` renders.
+OUT_OF_RANGE_EPOCH = 10 ** 18
 # A predictable name in the worktree parent that belongs to someone else;
 # the reflink probe must never touch it.
 FOREIGN_PROBE_NAME = ".worktree-new-reflink-probe"
@@ -78,6 +85,14 @@ class FakeExecutor:
         # Commit-ish -> commit id.
         self.refs = {"origin/main": BASE_COMMIT, "HEAD": BASE_COMMIT}
         self.probe_fails = False
+        # stdout of `git log -1 --first-parent --format=%ct <base> -- Cargo.lock`; empty
+        # when no commit touches the lockfile.
+        self.lockfile_log = f"{OLD_EPOCH}\n"
+        # stdout of `git rev-parse <base>:Cargo.lock` and of
+        # `git hash-object -- Cargo.lock`; equal by default.
+        self.base_blob = f"{'a' * 40}\n"
+        self.main_blob = f"{'a' * 40}\n"
+        self.base_blob_fails = False
         self.copy_fails_for = None
         # How `git worktree add` fails: None (it succeeds), "before" (nothing
         # created), or "after-checkout" (a post-checkout hook failed on a
@@ -157,6 +172,13 @@ class FakeExecutor:
             return (0 if name in self.branches else 1), "", ""
         if args[0] == "fetch":
             return 0, "", ""
+        if args[:3] == ["rev-parse", "--verify", "--quiet"] \
+                and args[3].endswith(":Cargo.lock"):
+            if self.base_blob_fails:
+                return 1, "", ""
+            return 0, self.base_blob, ""
+        if args[:3] == ["hash-object", "--", "Cargo.lock"]:
+            return 0, self.main_blob, ""
         if args[:3] == ["rev-parse", "--verify", "--quiet"]:
             ref = args[3].removesuffix("^{commit}")
             if ref not in self.refs:
@@ -187,6 +209,9 @@ class FakeExecutor:
                 return 1, "", f"error: cannot lock ref '{args[2]}'"
             del self.branches[branch]
             return 0, "", ""
+        if args[:4] == ["log", "-1", "--first-parent", "--format=%ct"]:
+            assert args[5:] == ["--", "Cargo.lock"], args
+            return 0, self.lockfile_log, ""
         if args[:2] == ["worktree", "add"]:
             return self.worktree_add(args[2:])
         if args[:2] == ["worktree", "move"]:
@@ -316,7 +341,14 @@ def make_main_target(repo):
         (debug / lock).write_bytes(b"")
     (target / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n")
     (target / ".rustc_info.json").write_text("{}")
+    set_build_time(target, NEW_EPOCH + 1000)
     return target
+
+
+def set_build_time(target, epoch):
+    """Give the profile's build activity directories the mtime `epoch`."""
+    for name in worktree_new.BUILD_ACTIVITY_DIRS:
+        os.utime(target / worktree_new.PROFILE / name, (epoch, epoch))
 
 
 class Harness:
@@ -1099,6 +1131,246 @@ class NoSeedTests(HarnessCase):
         self.h.executor.probe_fails = True
         code, _, err = self.h.run("--no-seed", "issue-1")
         self.assertEqual(code, 0, err)
+
+
+class StaleSeedTests(HarnessCase):
+    def make_stale(self):
+        """The lockfile changed on the base after the seed's last build."""
+        set_build_time(self.h.target, OLD_EPOCH)
+        self.h.executor.lockfile_log = f"{NEW_EPOCH}\n"
+
+    def assert_seeded(self, code, out, err):
+        self.assertEqual(code, 0, err)
+        self.assertTrue(self.h.executor.ran("cp"))
+        self.assertTrue(
+            (self.h.worktrees / "issue-1/target/debug/deps").is_dir())
+        self.assertIn("seeded ", out)
+        self.assertNotIn("not seeded", out)
+
+    def test_fresh_seed_is_seeded(self):
+        self.assert_seeded(*self.h.run("issue-1"))
+        self.assertTrue(self.h.executor.ran(
+            "git", "log", "-1", "--first-parent", "--format=%ct", BASE_COMMIT,
+            "--",
+            "Cargo.lock"))
+
+    def test_lockfile_commit_time_equal_to_build_time_is_fresh(self):
+        set_build_time(self.h.target, NEW_EPOCH)
+        self.h.executor.lockfile_log = f"{NEW_EPOCH}\n"
+        self.assert_seeded(*self.h.run("issue-1"))
+
+    def test_newest_of_the_two_activity_dirs_counts(self):
+        self.make_stale()
+        os.utime(self.h.target / "debug/deps", (NEW_EPOCH + 5, NEW_EPOCH + 5))
+        self.assert_seeded(*self.h.run("issue-1"))
+
+    def test_stale_seed_is_skipped_with_a_reason(self):
+        self.make_stale()
+        code, out, err = self.h.run("issue-1")
+        self.assertEqual(code, 0, err)
+        executor = self.h.executor
+        self.assertFalse(executor.ran("cp"))
+        # Only the layout check of the main checkout runs; the new worktree
+        # is never inspected for a seed destination.
+        self.assertEqual(
+            [c for c in executor.commands if c[0] == "cargo"],
+            [["cargo", "metadata", "--no-deps", "--format-version", "1"]])
+        self.assertTrue(executor.ran("git", "worktree", "add"))
+        self.assertFalse((self.h.worktrees / "issue-1/target").exists())
+        debug = self.h.target / "debug"
+        for name in worktree_new.CARGO_LOCK_FILES:
+            self.assertEqual((debug / name).read_bytes(), b"")
+        self.assertEqual(sorted(p.name for p in self.h.worktrees.iterdir()),
+                         ["issue-1"])
+        self.assertIn("not seeded (stale seed", out)
+        self.assertIn(worktree_new.format_epoch(NEW_EPOCH), out)
+        self.assertIn(worktree_new.format_epoch(OLD_EPOCH), out)
+        self.assertIn("--force-seed", out)
+        self.assertIn("next:", out)
+        self.assertEqual(executor.registered,
+                         {self.h.worktrees / "issue-1": "zajca/issue-1"})
+
+    def test_stale_skip_creates_no_lock_file_in_the_main_target(self):
+        self.make_stale()
+        for name in worktree_new.CARGO_LOCK_FILES:
+            (self.h.target / "debug" / name).unlink()
+        code, _, err = self.h.run("issue-1")
+        self.assertEqual(code, 0, err)
+        for name in worktree_new.CARGO_LOCK_FILES:
+            self.assertFalse((self.h.target / "debug" / name).exists(), name)
+
+    def test_unknown_staleness_still_seeds(self):
+        self.make_stale()
+        for output in ("", "not-a-number\n"):
+            with self.subTest(output=output):
+                self.setUp()
+                self.make_stale()
+                self.h.executor.lockfile_log = output
+                self.assert_seeded(*self.h.run("issue-1"))
+
+    def test_different_lockfile_blob_skips_a_time_fresh_seed(self):
+        self.h.executor.base_blob = f"{'b' * 40}\n"
+        code, out, err = self.h.run("issue-1")
+        self.assertEqual(code, 0, err)
+        executor = self.h.executor
+        self.assertFalse(executor.ran("cp"))
+        self.assertIn("not seeded (stale seed: Cargo.lock on origin/main "
+                      "differs from the main checkout's", out)
+        self.assertIn("--force-seed", out)
+        self.assertFalse((self.h.worktrees / "issue-1/target").exists())
+        for name in worktree_new.CARGO_LOCK_FILES:
+            self.assertEqual((self.h.target / "debug" / name).read_bytes(),
+                             b"")
+        self.assertEqual(sorted(p.name for p in self.h.worktrees.iterdir()),
+                         ["issue-1"])
+
+    def test_force_seed_overrides_a_different_lockfile_blob(self):
+        self.h.executor.base_blob = f"{'b' * 40}\n"
+        self.assert_seeded(*self.h.run("--force-seed", "issue-1"))
+
+    def test_unreadable_lockfile_blob_keeps_the_seed(self):
+        cases = {
+            "base rev-parse fails": {"base_blob_fails": True},
+            "base output empty": {"base_blob": ""},
+            "base output odd": {"base_blob": "not-an-id\n"},
+            "main output empty": {"main_blob": ""},
+            "main output odd": {"main_blob": "xyz\n"},
+        }
+        for label, settings in cases.items():
+            with self.subTest(label):
+                self.setUp()
+                self.h.executor.base_blob = f"{'b' * 40}\n"
+                for name, value in settings.items():
+                    setattr(self.h.executor, name, value)
+                self.assert_seeded(*self.h.run("issue-1"))
+
+    def test_time_rule_still_applies_when_the_blobs_match(self):
+        self.make_stale()
+        code, out, err = self.h.run("issue-1")
+        self.assertEqual(code, 0, err)
+        self.assertIn("landed on origin/main at", out)
+
+    def test_out_of_range_lockfile_time_keeps_the_seed(self):
+        set_build_time(self.h.target, OLD_EPOCH)
+        self.h.executor.lockfile_log = f"{OUT_OF_RANGE_EPOCH}\n"
+        self.assert_seeded(*self.h.run("issue-1"))
+
+    def test_out_of_range_build_time_keeps_the_seed(self):
+        self.h.executor.lockfile_log = f"{NEW_EPOCH}\n"
+        for name in worktree_new.BUILD_ACTIVITY_DIRS:
+            path = self.h.target / worktree_new.PROFILE / name
+            try:
+                os.utime(path, (OUT_OF_RANGE_EPOCH, OUT_OF_RANGE_EPOCH))
+            except (OSError, OverflowError) as error:
+                self.skipTest(f"platform rejects the mtime: {error}")
+        self.assert_seeded(*self.h.run("issue-1"))
+
+    def test_missing_activity_dir_keeps_the_seed_path(self):
+        self.make_stale()
+        shutil.rmtree(self.h.target / "debug/deps")
+        code, _, err = self.h.run("issue-1")
+        self.assertEqual(code, 1)
+        self.assertIn("no seed source", err)
+        self.assert_no_worktree_created()
+
+    def test_force_seed_seeds_a_stale_seed(self):
+        self.make_stale()
+        code, out, err = self.h.run("--force-seed", "issue-1")
+        self.assert_seeded(code, out, err)
+        self.assertFalse(self.h.executor.ran("git", "log"))
+
+    def test_force_seed_with_no_seed_is_a_usage_error(self):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit) as caught:
+                worktree_new.main(["--force-seed", "--no-seed", "issue-1"],
+                                  cwd=self.h.repo, executor=self.h.executor)
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("not allowed with", err.getvalue())
+        self.assertEqual(self.h.executor.commands, [])
+
+    def test_help_lists_the_flag(self):
+        self.assertIn("--force-seed", worktree_new.build_parser().format_help())
+        self.assertIn("--force-seed", worktree_new.EPILOG)
+
+    def test_no_seed_does_not_read_the_lockfile_history(self):
+        self.make_stale()
+        code, out, err = self.h.run("--no-seed", "issue-1")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(self.h.executor.ran("git", "log"))
+        self.assertIn("not seeded (--no-seed)", out)
+
+
+class LockfileCommitTimeRealGitTests(unittest.TestCase):
+    """`lockfile_commit_time` and `lockfile_differs` against a real
+    repository."""
+
+    T0, T1, T3 = 1_600_000_000, 1_600_001_000, 1_600_009_000
+
+    def git(self, repo, *args, when):
+        env = dict(os.environ, GIT_COMMITTER_DATE=f"{when} +0000",
+                   GIT_AUTHOR_DATE=f"{when} +0000",
+                   GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+        command = ["git", "-c", "commit.gpgsign=false",
+                   "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                   *args]
+        return subprocess.run(command, cwd=repo, env=env, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def test_merged_lockfile_change_counts_from_the_merge_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            lock = repo / "Cargo.lock"
+            self.git(repo, "init", "-q", "-b", "main", when=self.T0)
+            lock.write_text("v0\n")
+            self.git(repo, "add", "Cargo.lock", when=self.T0)
+            self.git(repo, "commit", "-q", "-m", "initial", when=self.T0)
+            self.git(repo, "checkout", "-q", "-b", "feature", when=self.T1)
+            lock.write_text("v1\n")
+            self.git(repo, "commit", "-q", "-am", "lock", when=self.T1)
+            self.git(repo, "checkout", "-q", "main", when=self.T1)
+            (repo / "other.txt").write_text("x\n")
+            self.git(repo, "add", "other.txt", when=self.T1)
+            self.git(repo, "commit", "-q", "-m", "other", when=self.T1)
+            self.git(repo, "merge", "-q", "--no-ff", "-m", "merge", "feature",
+                     when=self.T3)
+            tip = self.git(repo, "rev-parse", "HEAD", when=self.T3)
+            self.assertEqual(
+                worktree_new.lockfile_commit_time(
+                    tip, repo, worktree_new.execute), self.T3)
+
+    def test_divergent_branch_lockfile_differs_from_the_main_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            lock = repo / "Cargo.lock"
+            self.git(repo, "init", "-q", "-b", "main", when=self.T0)
+            lock.write_text("A\n")
+            self.git(repo, "add", "Cargo.lock", when=self.T0)
+            self.git(repo, "commit", "-q", "-m", "initial", when=self.T0)
+            main_tip = self.git(repo, "rev-parse", "HEAD", when=self.T0)
+            self.git(repo, "checkout", "-q", "-b", "other", when=self.T0)
+            lock.write_text("B\n")
+            self.git(repo, "commit", "-q", "-am", "lock B", when=self.T0)
+            other_tip = self.git(repo, "rev-parse", "HEAD", when=self.T0)
+            self.git(repo, "checkout", "-q", "main", when=self.T0)
+            self.assertEqual(lock.read_text(), "A\n")
+            self.assertIs(worktree_new.lockfile_differs(
+                other_tip, repo, worktree_new.execute), True)
+            self.assertIs(worktree_new.lockfile_differs(
+                main_tip, repo, worktree_new.execute), False)
+
+    def test_missing_lockfile_says_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            self.git(repo, "init", "-q", "-b", "main", when=self.T0)
+            (repo / "x").write_text("x\n")
+            self.git(repo, "add", "x", when=self.T0)
+            self.git(repo, "commit", "-q", "-m", "initial", when=self.T0)
+            tip = self.git(repo, "rev-parse", "HEAD", when=self.T0)
+            self.assertIsNone(worktree_new.lockfile_differs(
+                tip, repo, worktree_new.execute))
 
 
 class ConcurrencyTests(HarnessCase):
