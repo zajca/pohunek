@@ -2,7 +2,6 @@
 
 use std::fmt::Write as _;
 use std::io::{self, Read as _};
-use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -193,11 +192,7 @@ fn require_executable(path: &Path) -> Result<(), LoginShellError> {
             reason: "not absolute",
         });
     }
-    let metadata =
-        std::fs::metadata(path).map_err(|_inaccessible| LoginShellError::InvalidExecutable {
-            reason: "not accessible",
-        })?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+    if !super::executable::is_executable_file(path) {
         return Err(LoginShellError::InvalidExecutable {
             reason: "not an executable file",
         });
@@ -255,8 +250,9 @@ enum Event {
 
 /// Runs `command` with piped stdout under a deadline and an output bound.
 ///
-/// The child must lead its own process group. Reader and waiter threads are
-/// detached on failure: killing the group closes the pipe and reaps the child.
+/// The child must lead its own process group, which is killed on every return
+/// path. Reader and waiter threads are detached on failure: killing the group
+/// closes the pipe and reaps the child.
 fn run_bounded(
     mut command: Command,
     timeout: Duration,
@@ -330,6 +326,11 @@ fn run_bounded(
             }
         }
     }
+    // Startup files may leave background children behind, even with their
+    // stdout redirected; the probe owns its group, so nothing of it survives.
+    // The group stays valid for the kill: a leftover member keeps its id
+    // taken, and without one the signal finds no process.
+    kill_group(pid);
     match (status, stdout_bytes) {
         (Some(status), Some(stdout)) => Ok(Captured { status, stdout }),
         _ => Err(LoginShellError::MalformedOutput),
@@ -348,6 +349,7 @@ fn kill_group(pid: u32) {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
 
@@ -507,6 +509,38 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         while process_is_running(pid) {
             assert!(Instant::now() < deadline, "grandchild survived the kill");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn a_background_child_with_redirected_stdout_does_not_outlive_a_successful_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).expect("bin");
+        let marker = dir.path().join("background-pid");
+        // The background child detaches its stdio, so the pipe closes when the
+        // shell exits and only the group kill can end it.
+        let shell = script(
+            dir.path(),
+            "background-shell",
+            &format!(
+                "sleep 300 >/dev/null 2>&1 </dev/null &\necho $! > '{}'\nPATH='{}'; export PATH\nexec /bin/sh -c \"$3\"",
+                marker.display(),
+                bin.display()
+            ),
+        );
+        let found = discover_login_shell_path(&spec(shell)).expect("discovery");
+        assert_eq!(found.path.entries(), [bin]);
+        let pid: i32 = fs::read_to_string(&marker)
+            .expect("marker")
+            .trim()
+            .parse()
+            .expect("pid");
+        let pid = rustix::process::Pid::from_raw(pid).expect("pid");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while process_is_running(pid) {
+            assert!(Instant::now() < deadline, "background child survived");
             std::thread::yield_now();
         }
     }

@@ -302,7 +302,14 @@ impl<'a> Engine<'a> {
             }
             ensure_no_daemon_job(self.backend).await?;
         }
-        let config = initial_config(self.context, prefix, version)?;
+        // Once `service.toml` is written it is the installation's record, so a
+        // resume past that step reads it instead of probing the host again.
+        let config = match &resume {
+            Some(record) if record.step >= Step::Config => {
+                ServiceConfig::load(&self.context.config_path())?
+            }
+            _ => initial_config(self.context, prefix, version)?,
+        };
         let namespace = config.namespace();
         let claimed = layout::claim_prefix(&layout, &namespace)?;
         let resumed = resume.is_some();

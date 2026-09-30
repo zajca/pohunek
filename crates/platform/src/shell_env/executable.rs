@@ -2,7 +2,6 @@
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -78,14 +77,26 @@ pub fn resolve_executable(
         .ok_or(ExecutableError::NotFound)
 }
 
-fn is_executable_file(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+/// Whether `path` is a regular file the effective user can execute.
+///
+/// Asks the kernel with `faccessat(X_OK, AT_EACCESS)`, so owner, group, ACL,
+/// and parent-directory search permission all count. Symlinks are followed.
+/// A candidate the user cannot execute is skipped, as a shell skips it.
+pub(super) fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+        && rustix::fs::accessat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::Access::EXEC_OK,
+            rustix::fs::AtFlags::EACCESS,
+        )
+        .is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
 
@@ -180,6 +191,46 @@ mod tests {
         assert_eq!(
             resolve_executable(OsStr::new("dir"), &search),
             Err(ExecutableError::NotFound)
+        );
+    }
+
+    #[test]
+    fn a_file_the_user_cannot_execute_is_skipped_along_the_search() {
+        // Root passes the execute check for any file with an execute bit.
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        fs::create_dir_all(&first).expect("first");
+        fs::create_dir_all(&second).expect("second");
+        // Executable by group and others only: the owner is refused.
+        let unusable = first.join("agent");
+        fs::write(&unusable, "#!/bin/sh\n").expect("write");
+        fs::set_permissions(&unusable, fs::Permissions::from_mode(0o011)).expect("chmod");
+        let usable = executable(&second, "agent");
+        let search = SearchPath::new(vec![first, second]).expect("search");
+        assert_eq!(
+            resolve_executable(OsStr::new("agent"), &search).expect("agent"),
+            usable
+        );
+        assert_eq!(
+            resolve_executable(unusable.as_os_str(), &search),
+            Err(ExecutableError::NotExecutable)
+        );
+    }
+
+    #[test]
+    fn owner_only_execute_permission_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent");
+        fs::write(&path, "#!/bin/sh\n").expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("chmod");
+        let search = SearchPath::new(vec![dir.path().to_path_buf()]).expect("search");
+        assert_eq!(
+            resolve_executable(OsStr::new("agent"), &search).expect("agent"),
+            path
         );
     }
 }

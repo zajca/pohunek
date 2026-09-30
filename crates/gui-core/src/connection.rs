@@ -525,8 +525,8 @@ pub fn render_attach_command(template: &str, values: &AttachTemplateValues) -> S
 
 /// Render the configured attach command as an argument vector without a shell.
 ///
-/// Only the template is split, with POSIX-shell word rules: whitespace
-/// separates words, `'...'` is literal, `"..."` honors `\"`, `\\`, `\$`,
+/// Only the template is split, with POSIX-shell word rules: space, tab, and
+/// newline separate words (other Unicode spaces are word characters), `'...'` is literal, `"..."` honors `\"`, `\\`, `\$`,
 /// and `` \` ``, and an unquoted backslash escapes the next character. No
 /// expansion happens: `$VAR`, `~`, globs, and command substitution stay
 /// literal text. After splitting, `{bin}`, `{host}`, and `{id}` are replaced
@@ -624,7 +624,7 @@ fn split_template_words(template: &str) -> Result<Vec<String>, AttachTemplateErr
                 }
                 None => return Err(AttachTemplateError::UnterminatedQuote),
             },
-            whitespace if whitespace.is_whitespace() => {
+            ' ' | '\t' | '\n' => {
                 if in_word {
                     words.push(std::mem::take(&mut current));
                     in_word = false;
@@ -874,6 +874,29 @@ mod attach_template_tests {
         };
         let argv = render_attach_argv(r#"x "a\"b\\c\$d\e" 'q\n'"#, &values).expect("argv");
         assert_eq!(argv, ["x", "a\"b\\c$d\\e", "q\\n"]);
+    }
+
+    #[test]
+    fn argv_form_splits_words_like_sh_for_unicode_spaces() {
+        let values = AttachTemplateValues {
+            bin: "b".to_owned(),
+            host: "h".to_owned(),
+            id: "i".to_owned(),
+        };
+        let template = "printf '%s\\0' /opt/My\u{a0}Tools/bin\u{2003}x \u{a0} tab\tend";
+        let argv = render_attach_argv(template, &values).expect("argv");
+        // The real shell agrees on the word boundaries; its `printf` builtin
+        // prints each word NUL-terminated.
+        let shell_words = run_sh(template);
+        assert_eq!(
+            argv[2..]
+                .iter()
+                .map(|word| word.as_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            shell_words
+        );
+        assert_eq!(argv[2], "/opt/My\u{a0}Tools/bin\u{2003}x");
+        assert_eq!(argv[3], "\u{a0}");
     }
 
     #[test]

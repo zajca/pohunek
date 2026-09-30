@@ -741,6 +741,59 @@ async fn an_install_interrupted_after_every_step_resumes_to_one_installation() {
     }
 }
 
+/// A context whose login shell reports `dir` as the whole `PATH`.
+fn discovering(
+    context: &Context,
+    root: &std::path::Path,
+    name: &str,
+    dir: &std::path::Path,
+) -> Context {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::create_dir_all(dir).expect("discovered dir");
+    let shell = root.join(name);
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nPATH='{}'; export PATH\nexec /bin/sh -c \"$3\"\n",
+            dir.display()
+        ),
+    )
+    .expect("write shell");
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    context
+        .clone()
+        .with_path_discovery(crate::service::context::managed_path_discovery(
+            Some(shell),
+            Vec::new(),
+        ))
+}
+
+#[tokio::test]
+async fn a_resumed_install_keeps_the_path_recorded_in_service_toml() {
+    let mut harness = Harness::new();
+    let first = harness.root.join("first-bin");
+    let second = harness.root.join("second-bin");
+    harness.context = discovering(&harness.context, &harness.root, "shell-a", &first);
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registering);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+
+    harness.context = discovering(&harness.context, &harness.root, "shell-b", &second);
+    let report = harness.install(V1).await.expect("resume");
+    assert!(report.resumed);
+    let recorded = harness
+        .config()
+        .expect("config")
+        .search_path()
+        .to_env_value();
+    assert_eq!(recorded, first.display().to_string());
+    let registered = harness.fake.world().registered.clone().expect("registered");
+    assert_eq!(registered.environment().get("PATH"), Some(&recorded));
+}
+
 #[tokio::test]
 async fn an_install_interrupted_before_registration_rolls_back_without_orphans() {
     for step in [Step::Binaries, Step::Config, Step::Definition] {
