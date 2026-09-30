@@ -4,7 +4,7 @@
 //! clears the inherited environment, owns each child process group, and never
 //! retains subprocess output in an error.
 
-// Rust guideline compliant 2026-08-28
+// Rust guideline compliant 2026-09-29
 
 #![expect(
     clippy::map_err_ignore,
@@ -51,8 +51,23 @@ const MAX_STREAM_BYTES: usize = 64 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// File descriptors zero through two are the only handles allowed across exec.
 const FIRST_INHERITED_FD: libc::c_int = 3;
-/// POSIX guarantees at least this fallback when `_SC_OPEN_MAX` is indeterminate.
-const MINIMUM_FD_LIMIT: libc::c_int = 20;
+/// Largest exclusive descriptor bound the fallback `close` loop scans.
+///
+/// The soft `RLIMIT_NOFILE` can be `RLIM_INFINITY` or far above any real
+/// descriptor table. Darwin caps a process at `kern.maxfilesperproc` (well
+/// below this value) and Linux at `fs.nr_open` (default 1 048 576), so no
+/// descriptor number reaches it. A larger value only slows the child's scan; a
+/// smaller one could leave a high inherited descriptor open.
+const MAX_DESCRIPTOR_SCAN: libc::c_int = 1 << 20;
+/// Highest-descriptor value of an open-descriptor listing that found none.
+const NO_OPEN_DESCRIPTOR: libc::c_int = -1;
+/// Slack entries requested beyond the size probe when listing Darwin descriptors.
+///
+/// Another thread may open descriptors between the size probe and the listing;
+/// the listing is retried with a doubled buffer whenever it fills completely,
+/// so this only avoids the common retry.
+#[cfg(target_os = "macos")]
+const DESCRIPTOR_LIST_SLACK: usize = 16;
 /// A deterministic locale makes the pinned human-readable version line stable.
 const RUNNER_LOCALE: &str = "C";
 /// Hermes must not emit colour control sequences into its fixed version output.
@@ -356,8 +371,11 @@ class Audit:
             audit.database = True
             raise RuntimeError("hook database denied")
         original_open = builtins.open
+        # Only Linux reads the process start identity from a file; Darwin uses
+        # a libproc call, so no path is permitted there.
+        allowed_open = f"/proc/{os.getpid()}/stat" if sys.platform.startswith("linux") else None
         def audited_open(path, *args, **kwargs):
-            if os.fspath(path) != f"/proc/{os.getpid()}/stat":
+            if allowed_open is None or os.fspath(path) != allowed_open:
                 audit.database = True
                 raise RuntimeError("hook file access denied")
             return original_open(path, *args, **kwargs)
@@ -739,7 +757,7 @@ impl HermesRunner {
                 }
             }
         }
-        configure_child(&mut command, fallback_fd_limit());
+        configure_child(&mut command, descriptor_scan_bound());
 
         let mut child = command.spawn().map_err(|_| Error::HermesCommand)?;
         let stdout = child.stdout.take().ok_or(Error::HermesCommand)?;
@@ -1065,7 +1083,7 @@ fn validate_private_stage(path: &Path, directory: bool, mode: u32, uid: u32) -> 
     validate_safe_ancestors(path, uid, Error::StagedValidation)
 }
 
-fn validate_runtime(path: &Path, uid: u32) -> Result<(), Error> {
+pub(super) fn validate_runtime(path: &Path, uid: u32) -> Result<(), Error> {
     let metadata = fs::metadata(path).map_err(|_| Error::InvalidHermesRuntime)?;
     let root_uid = filesystem_root_uid(Error::InvalidHermesRuntime)?;
     if !metadata.is_file()
@@ -1095,14 +1113,20 @@ fn validate_safe_ancestors(path: &Path, uid: u32, error: Error) -> Result<(), Er
     Ok(())
 }
 
-fn safe_ancestor(owner: u32, mode: u32, directory: bool, uid: u32, root_uid: u32) -> bool {
+pub(super) fn safe_ancestor(
+    owner: u32,
+    mode: u32,
+    directory: bool,
+    uid: u32,
+    root_uid: u32,
+) -> bool {
     let allowed_owner = owner == uid || owner == root_uid;
     let root_owned_sticky_shared =
         directory && owner == root_uid && mode & STICKY_BIT != 0 && mode & UNSAFE_WRITE_BITS != 0;
     allowed_owner && (mode & UNSAFE_WRITE_BITS == 0 || root_owned_sticky_shared)
 }
 
-fn filesystem_root_uid(error: Error) -> Result<u32, Error> {
+pub(super) fn filesystem_root_uid(error: Error) -> Result<u32, Error> {
     fs::metadata(Path::new("/"))
         .map(|metadata| metadata.uid())
         .map_err(|_| error)
@@ -1175,21 +1199,124 @@ fn target_home(target: &ResolvedTarget) -> Result<&Path, Error> {
     }
 }
 
-/// Captures the descriptor bound before fork, outside the constrained child.
+/// Captures the soft descriptor limit before fork, outside the constrained child.
 #[expect(
     unsafe_code,
-    reason = "sysconf is the libc boundary for the process open-file limit"
+    reason = "getrlimit is the libc boundary for the process open-file limit"
 )]
-fn fallback_fd_limit() -> libc::c_int {
-    // SAFETY: `_SC_OPEN_MAX` takes no pointers and only queries process limits.
-    let limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
-    libc::c_int::try_from(limit)
-        .ok()
-        .filter(|limit| *limit > FIRST_INHERITED_FD)
-        .unwrap_or(MINIMUM_FD_LIMIT)
+fn soft_descriptor_limit() -> Option<libc::rlim_t> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is valid, writable storage for exactly one `rlimit`.
+    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) };
+    (result == 0).then_some(limit.rlim_cur)
 }
 
-fn configure_child(command: &mut Command, fallback_fd_limit: libc::c_int) {
+/// Returns the highest open descriptor number of this process on Darwin.
+///
+/// Darwin has no `close_range`, so the child closes descriptors one by one up
+/// to a bound. The listing covers descriptors above a lowered soft limit.
+/// `None` means the table could not be listed completely; an empty table is
+/// `Some(NO_OPEN_DESCRIPTOR)`.
+#[cfg(target_os = "macos")]
+#[expect(
+    unsafe_code,
+    reason = "proc_pidinfo(PROC_PIDLISTFDS) is the libc boundary for the descriptor table"
+)]
+fn highest_open_descriptor() -> Option<libc::c_int> {
+    let pid = libc::c_int::try_from(std::process::id()).ok()?;
+    let entry_size = std::mem::size_of::<libc::proc_fdinfo>();
+    // SAFETY: a null buffer with zero size only asks for the required byte count.
+    let required =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    let mut capacity = usize::try_from(required).ok()? / entry_size + DESCRIPTOR_LIST_SLACK;
+    loop {
+        let mut entries = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0,
+            };
+            capacity
+        ];
+        let buffer_bytes = libc::c_int::try_from(capacity.checked_mul(entry_size)?).ok()?;
+        // SAFETY: `entries` provides `buffer_bytes` writable bytes of properly
+        // aligned `proc_fdinfo` storage that outlives the call.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                entries.as_mut_ptr().cast(),
+                buffer_bytes,
+            )
+        };
+        let written = usize::try_from(written).ok()?;
+        if written < capacity * entry_size {
+            return Some(
+                entries[..written / entry_size]
+                    .iter()
+                    .map(|entry| entry.proc_fd)
+                    .max()
+                    .unwrap_or(NO_OPEN_DESCRIPTOR),
+            );
+        }
+        // A completely filled buffer may be truncated; retry with more room.
+        capacity = capacity.checked_mul(2)?;
+    }
+}
+
+/// Returns the highest open descriptor number of this process on Linux.
+///
+/// The `close` loop is only the fallback for kernels without `close_range`;
+/// listing `/proc/self/fd` keeps it correct below a lowered soft limit too.
+/// The directory's own descriptor is included, which only raises the bound.
+/// `None` means the directory could not be read completely (for example
+/// `/proc` is not mounted).
+#[cfg(target_os = "linux")]
+fn highest_open_descriptor() -> Option<libc::c_int> {
+    let mut highest = NO_OPEN_DESCRIPTOR;
+    for entry in fs::read_dir("/proc/self/fd").ok()? {
+        let descriptor: libc::c_int = entry.ok()?.file_name().to_str()?.parse().ok()?;
+        highest = highest.max(descriptor);
+    }
+    Some(highest)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn highest_open_descriptor() -> Option<libc::c_int> {
+    None
+}
+
+/// Computes the exclusive descriptor bound for the child's `close` loop.
+///
+/// An unlimited, unreadable, or out-of-range soft limit becomes
+/// [`MAX_DESCRIPTOR_SCAN`]. A successful listing can only raise the bound: a
+/// process may lower its soft limit below descriptors it already holds, and
+/// those must still be closed. When the listing failed, the soft limit is not
+/// trustworthy for the same reason, so the whole [`MAX_DESCRIPTOR_SCAN`] range
+/// is scanned; that is about one million `close` calls in the child, well
+/// under the command timeout, and only happens when no listing is available
+/// (Darwin, or Linux without `close_range` and `/proc`).
+fn descriptor_scan_end(
+    soft_limit: Option<libc::rlim_t>,
+    listing: Option<libc::c_int>,
+) -> libc::c_int {
+    let limit = soft_limit
+        .and_then(|limit| libc::c_int::try_from(limit).ok())
+        .map_or(MAX_DESCRIPTOR_SCAN, |limit| limit.min(MAX_DESCRIPTOR_SCAN));
+    listing.map_or(MAX_DESCRIPTOR_SCAN, |highest| {
+        limit.max(highest.saturating_add(1))
+    })
+}
+
+/// Captures the descriptor bound before fork, outside the constrained child.
+fn descriptor_scan_bound() -> libc::c_int {
+    descriptor_scan_end(soft_descriptor_limit(), highest_open_descriptor())
+}
+
+fn configure_child(command: &mut Command, scan_end: libc::c_int) {
     use std::os::unix::process::CommandExt as _;
 
     // `pgid := child pid`, so timeout cleanup can terminate descendants too.
@@ -1205,7 +1332,7 @@ fn configure_child(command: &mut Command, fallback_fd_limit: libc::c_int) {
         command.pre_exec(move || {
             // This also closes std::process's CLOEXEC exec-error pipe, so exec
             // failures become non-zero child exits; both map to `HermesCommand`.
-            close_inherited_fds(fallback_fd_limit);
+            close_inherited_fds(scan_end);
             Ok(())
         });
     }
@@ -1214,13 +1341,17 @@ fn configure_child(command: &mut Command, fallback_fd_limit: libc::c_int) {
 /// Closes every non-stdio descriptor using only async-signal-safe syscalls.
 ///
 /// Current Linux kernels support one `close_range` call. The bounded `close`
-/// loop is the compatibility fallback for older kernels or restricted syscall
-/// policies; its upper bound was captured with `sysconf` before fork.
-#[expect(
-    unsafe_code,
-    reason = "raw close_range and close calls are required inside pre_exec"
+/// loop is the path on Darwin and the compatibility fallback for older Linux
+/// kernels or restricted syscall policies; its upper bound was captured before
+/// fork by [`descriptor_scan_bound`].
+#[cfg_attr(
+    target_os = "linux",
+    expect(
+        unsafe_code,
+        reason = "the raw close_range syscall is required inside pre_exec"
+    )
 )]
-fn close_inherited_fds(fallback_fd_limit: libc::c_int) {
+fn close_inherited_fds(scan_end: libc::c_int) {
     #[cfg(target_os = "linux")]
     {
         let first = FIRST_INHERITED_FD as libc::c_uint;
@@ -1231,7 +1362,13 @@ fn close_inherited_fds(fallback_fd_limit: libc::c_int) {
             return;
         }
     }
-    for descriptor in FIRST_INHERITED_FD..fallback_fd_limit {
+    close_descriptor_range(FIRST_INHERITED_FD, scan_end);
+}
+
+/// Closes descriptors `first..end` one by one; both bounds are scalars.
+#[expect(unsafe_code, reason = "raw close calls are required inside pre_exec")]
+fn close_descriptor_range(first: libc::c_int, end: libc::c_int) {
+    for descriptor in first..end {
         // SAFETY: close accepts any integer descriptor. EBADF and EINTR are
         // harmless here because the child is about to exec or abort.
         unsafe {
@@ -1389,6 +1526,7 @@ mod tests {
     use super::*;
     use crate::hermes_integration::assets;
     use crate::hermes_integration::target::{ProfileName, TargetContext, TargetSelection};
+    use crate::hermes_integration::test_python;
 
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1413,21 +1551,11 @@ mod tests {
     }
 
     struct StageFixture {
-        // Only the Linux-only system-Python tests read these fields (issue
-        // #101 owns Hermes on macOS); `root` also keeps the fixture alive.
-        #[cfg_attr(
-            not(target_os = "linux"),
-            expect(dead_code, reason = "read only by the Linux-only system-Python tests")
-        )]
         root: Fixture,
         target: ResolvedTarget,
         runner: HermesRunner,
         plugin: PathBuf,
         policy: PathBuf,
-        #[cfg_attr(
-            not(target_os = "linux"),
-            expect(dead_code, reason = "read only by the Linux-only system-Python tests")
-        )]
         runtime: PathBuf,
     }
 
@@ -1589,7 +1717,10 @@ mod tests {
             .join("bin")
             .join("python3");
         create_private_parent(&root.0, runtime_target.parent().expect("runtime parent"));
-        write_executable(&runtime_target, "exec /usr/bin/python3 \"$@\"");
+        write_executable(
+            &runtime_target,
+            &format!("exec '{}' \"$@\"", test_python::interpreter().display()),
+        );
         let runtime = installation_bin.join("python3");
         symlink("../../python/bin/python3", &runtime).expect("internal runtime symlink");
         let runner = HermesRunner::new(&executable).expect("stage runner");
@@ -1910,10 +2041,6 @@ mod tests {
         );
     }
 
-    // Linux only: this test runs the system `/usr/bin/python3`, which on macOS
-    // is Python 3.9 while the embedded plugin requires Python 3.10 or newer.
-    // The Hermes integration lifecycle on macOS is owned by issue #101.
-    #[cfg(target_os = "linux")]
     #[test]
     #[expect(
         clippy::too_many_lines,
@@ -2030,7 +2157,8 @@ mod tests {
 
         let escaped_runtime = stage_fixture("stage-runtime-symlink");
         fs::remove_file(&escaped_runtime.runtime).expect("remove sibling runtime");
-        symlink("/usr/bin/python3", &escaped_runtime.runtime).expect("escaping runtime symlink");
+        symlink(test_python::interpreter(), &escaped_runtime.runtime)
+            .expect("escaping runtime symlink");
         assert_stage_error(&escaped_runtime, Error::InvalidHermesRuntime);
 
         let relative = stage_fixture("stage-relative");
@@ -2159,8 +2287,6 @@ mod tests {
         policy
     }
 
-    // Linux only: its sole caller runs the system Python (see issue #101).
-    #[cfg(target_os = "linux")]
     fn assert_stage_error(stage: &StageFixture, expected: Error) {
         assert_eq!(
             stage
@@ -2170,16 +2296,12 @@ mod tests {
         );
     }
 
-    // Linux only: its sole callers run the system Python (see issue #101).
-    #[cfg(target_os = "linux")]
     fn append_file(path: &Path, suffix: &str) {
         let mut contents = fs::read_to_string(path).expect("read staged file");
         contents.push_str(suffix);
         fs::write(path, contents).expect("append staged file");
     }
 
-    // Linux only: its sole callers run the system Python (see issue #101).
-    #[cfg(target_os = "linux")]
     fn replace_file(path: &Path, needle: &str, replacement: &str) {
         let contents = fs::read_to_string(path).expect("read staged file");
         assert!(contents.contains(needle), "mutation needle is present");
@@ -2262,7 +2384,7 @@ mod tests {
         make_inheritable(descriptor);
         let result = root.0.join("fd-result");
         let body = format!(
-            "if (: >&{descriptor}) 2>/dev/null; then state=inherited; else state=closed; fi\nprintf '%s' \"$state\" > '{}'\nprintf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3)'",
+            "if test -e /dev/fd/{descriptor}; then state=inherited; else state=closed; fi\nprintf '%s' \"$state\" > '{}'\nprintf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3)'",
             result.display()
         );
         runner(&root.0, &body)
@@ -2272,6 +2394,250 @@ mod tests {
             fs::read_to_string(result).expect("descriptor result"),
             "closed"
         );
+    }
+
+    /// Upper cap for the descriptor number the high-descriptor fixtures aim at.
+    const HIGH_DESCRIPTOR_TARGET: libc::rlim_t = 200;
+
+    /// Minimum descriptor number for the high-numbered inherited fixtures.
+    ///
+    /// Half of the live soft limit (capped at [`HIGH_DESCRIPTOR_TARGET`]) keeps
+    /// the duplicate below the limit under any `ulimit -n`, and above the
+    /// low numbers the harness itself holds.
+    fn high_descriptor_floor() -> libc::c_int {
+        let limit = soft_descriptor_limit().map_or(HIGH_DESCRIPTOR_TARGET, |limit| {
+            limit.min(HIGH_DESCRIPTOR_TARGET)
+        });
+        libc::c_int::try_from(limit / 2).expect("bounded descriptor floor")
+    }
+
+    /// Shell fragment printing `open` or `closed` for one descriptor number.
+    ///
+    /// `/dev/fd/N` exists exactly while descriptor N is open and works for any
+    /// number of digits; `dash` cannot redirect to a multi-digit descriptor,
+    /// so a `>&N` probe would report `closed` for every high descriptor.
+    fn descriptor_state(descriptor: libc::c_int) -> String {
+        format!("if test -e /dev/fd/{descriptor}; then printf 'open '; else printf 'closed '; fi;")
+    }
+
+    #[test]
+    fn pre_exec_closes_low_and_high_inherited_descriptors() {
+        let root = fixture("inherited-fds-many");
+        let selected = target(&root.0, TargetSelection::Profile(ProfileName::default()));
+        let low = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(root.0.join("low"))
+            .expect("open low descriptor");
+        make_inheritable(low.as_raw_fd());
+        let high = duplicate_inheritable_from(&low, high_descriptor_floor());
+        let result = root.0.join("fd-result");
+        let body = format!(
+            "{{ {} {} {} }} > '{}'\nprintf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3)'",
+            descriptor_state(low.as_raw_fd()),
+            descriptor_state(high.as_raw_fd()),
+            // Standard output is a positive control that the probe sees open descriptors.
+            descriptor_state(1),
+            result.display()
+        );
+        runner(&root.0, &body)
+            .verify_version(&selected)
+            .expect("fixed version after descriptor checks");
+        assert!(high.as_raw_fd() >= high_descriptor_floor());
+        assert_eq!(
+            fs::read_to_string(result).expect("descriptor result"),
+            "closed closed open "
+        );
+    }
+
+    #[test]
+    fn descriptor_loop_closes_below_the_bound_and_leaves_higher_descriptors() {
+        use std::os::unix::process::CommandExt as _;
+
+        let root = fixture("descriptor-loop");
+        let low = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(root.0.join("low"))
+            .expect("open low descriptor");
+        make_inheritable(low.as_raw_fd());
+        let high = duplicate_inheritable_from(&low, high_descriptor_floor());
+        let end = high.as_raw_fd();
+        let probed = [low.as_raw_fd(), high.as_raw_fd()];
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", ":"]).stdin(Stdio::null());
+        #[expect(
+            unsafe_code,
+            reason = "pre_exec exercises the descriptor loop exactly as production runs it"
+        )]
+        // SAFETY: both closures call only async-signal-safe `close`, `fcntl`, and `write`.
+        unsafe {
+            command
+                .pre_exec(move || {
+                    close_descriptor_range(FIRST_INHERITED_FD, end);
+                    Ok(())
+                })
+                .pre_exec(move || {
+                    for descriptor in probed {
+                        let state: &[u8; 1] = if libc::fcntl(descriptor, libc::F_GETFD) == -1 {
+                            b"c"
+                        } else {
+                            b"o"
+                        };
+                        libc::write(1, state.as_ptr().cast(), 1);
+                    }
+                    Ok(())
+                })
+        };
+        let output = command.output().expect("run descriptor loop child");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("UTF-8 descriptor states"),
+            "co"
+        );
+    }
+
+    #[test]
+    fn descriptor_scan_end_bounds_unlimited_huge_and_narrowed_limits() {
+        let ceiling = MAX_DESCRIPTOR_SCAN;
+        let none_open = Some(NO_OPEN_DESCRIPTOR);
+        // An unreadable or infinite limit still scans the whole bounded table.
+        assert_eq!(descriptor_scan_end(None, none_open), ceiling);
+        assert_eq!(
+            descriptor_scan_end(Some(libc::RLIM_INFINITY), none_open),
+            ceiling
+        );
+        assert_eq!(descriptor_scan_end(Some(u64::MAX - 1), none_open), ceiling);
+        assert_eq!(
+            descriptor_scan_end(Some(u64::from(u32::MAX)), none_open),
+            ceiling
+        );
+        assert_eq!(descriptor_scan_end(Some(u64::MAX / 2), none_open), ceiling);
+        assert_eq!(descriptor_scan_end(Some(20_000_000), none_open), ceiling);
+        // With a complete listing, a real limit below the ceiling is honoured
+        // exactly, including tiny ones.
+        assert_eq!(descriptor_scan_end(Some(10_240), none_open), 10_240);
+        assert_eq!(descriptor_scan_end(Some(2), none_open), 2);
+        // A failed listing is distinct from an empty one: the limit cannot be
+        // trusted, so the whole bounded range is scanned.
+        assert_eq!(descriptor_scan_end(Some(2), None), ceiling);
+        assert_eq!(descriptor_scan_end(Some(10_240), None), ceiling);
+        // The highest open descriptor only raises the bound, never narrows it.
+        assert_eq!(
+            descriptor_scan_end(Some(libc::RLIM_INFINITY), Some(9)),
+            ceiling
+        );
+        assert_eq!(descriptor_scan_end(Some(10_240), Some(9)), 10_240);
+        assert_eq!(descriptor_scan_end(Some(8), Some(9)), 10);
+        // A soft limit lowered below an already-open high descriptor still covers it.
+        assert_eq!(descriptor_scan_end(Some(32), Some(100)), 101);
+        assert_eq!(
+            descriptor_scan_end(Some(32), Some(libc::c_int::MAX)),
+            libc::c_int::MAX
+        );
+    }
+
+    /// Runs the production `close` loop up to `end` in a `pre_exec` child and
+    /// reports whether `descriptor` is closed afterwards.
+    fn descriptor_closed_after_loop(end: libc::c_int, descriptor: libc::c_int) -> bool {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", ":"]).stdin(Stdio::null());
+        #[expect(
+            unsafe_code,
+            reason = "pre_exec exercises the descriptor loop exactly as production runs it"
+        )]
+        // SAFETY: both closures call only async-signal-safe `close`, `fcntl`, and `write`.
+        unsafe {
+            command
+                .pre_exec(move || {
+                    close_descriptor_range(FIRST_INHERITED_FD, end);
+                    Ok(())
+                })
+                .pre_exec(move || {
+                    let state: &[u8; 1] = if libc::fcntl(descriptor, libc::F_GETFD) == -1 {
+                        b"c"
+                    } else {
+                        b"o"
+                    };
+                    libc::write(1, state.as_ptr().cast(), 1);
+                    Ok(())
+                })
+        };
+        command.output().expect("run descriptor loop child").stdout == b"c"
+    }
+
+    #[test]
+    fn descriptor_loop_covers_a_high_descriptor_above_a_lowered_soft_limit() {
+        let root = fixture("lowered-limit");
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(root.0.join("probe"))
+            .expect("open probe descriptor");
+        make_inheritable(file.as_raw_fd());
+        let high = duplicate_inheritable_from(&file, high_descriptor_floor());
+        // A soft limit far below the live high descriptor, as `setrlimit` allows.
+        let lowered = libc::rlim_t::try_from(FIRST_INHERITED_FD).expect("small limit");
+        // Injected outcomes of the descriptor listing: it succeeded, or it failed.
+        for listing in [Some(high.as_raw_fd()), None] {
+            let end = descriptor_scan_end(Some(lowered), listing);
+            assert!(end > high.as_raw_fd(), "listing {listing:?}");
+            assert!(
+                descriptor_closed_after_loop(end, high.as_raw_fd()),
+                "listing {listing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_scan_bound_covers_every_open_descriptor() {
+        let root = fixture("scan-bound");
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(root.0.join("probe"))
+            .expect("open probe descriptor");
+        let high = duplicate_inheritable_from(&file, high_descriptor_floor());
+        assert!(
+            soft_descriptor_limit().is_some(),
+            "RLIMIT_NOFILE is readable"
+        );
+        let bound = descriptor_scan_bound();
+        assert!(
+            bound > high.as_raw_fd(),
+            "bound {bound} covers the highest descriptor"
+        );
+        assert!(bound > file.as_raw_fd());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_descriptor_listing_reports_the_highest_open_descriptor() {
+        let root = fixture("darwin-listing");
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(root.0.join("probe"))
+            .expect("open probe descriptor");
+        let high = duplicate_inheritable_from(&file, high_descriptor_floor());
+        let highest = highest_open_descriptor().expect("descriptor table listing");
+        assert!(highest >= high.as_raw_fd());
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "fcntl(F_DUPFD) builds a controlled high-numbered inheritable descriptor"
+    )]
+    fn duplicate_inheritable_from(file: &fs::File, minimum: libc::c_int) -> std::os::fd::OwnedFd {
+        use std::os::fd::{FromRawFd as _, OwnedFd};
+
+        // SAFETY: F_DUPFD duplicates the live descriptor of `file` to the
+        // lowest free number at or above `minimum` without close-on-exec.
+        let duplicate = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, minimum) };
+        assert!(duplicate >= minimum, "duplicate descriptor above the floor");
+        // SAFETY: `duplicate` is a fresh descriptor owned by nothing else.
+        unsafe { OwnedFd::from_raw_fd(duplicate) }
     }
 
     #[test]
@@ -2285,16 +2651,18 @@ mod tests {
         assert!(!rendered.contains(&root.0.display().to_string()));
     }
 
-    // Linux only: this test runs the system `/usr/bin/python3`, which on macOS
-    // is Python 3.9 while the embedded plugin requires Python 3.10 or newer.
-    // The Hermes integration lifecycle on macOS is owned by issue #101.
+    // Linux only: the fixture copies the interpreter binary beside a hand-written
+    // `pyvenv.cfg`. That relocated copy resolves its libraries only for the
+    // distribution interpreter layout on Linux; Homebrew and uv-managed macOS
+    // builds locate their runtime relative to the original install.
     #[cfg(target_os = "linux")]
     #[test]
     fn staged_runtime_spawns_through_symlinked_venv_with_venv_only_module() {
         let root = fixture("venv-runtime");
         let installation = root.0.join("installation");
         let venv = installation.join("venv");
-        let version_output = Command::new("/usr/bin/python3")
+        let interpreter = test_python::interpreter();
+        let version_output = Command::new(interpreter)
             .args([
                 "-I",
                 "-c",
@@ -2322,7 +2690,13 @@ mod tests {
         create_private_parent(&root.0, &site_packages);
         fs::write(
             venv.join("pyvenv.cfg"),
-            "home = /usr/bin\ninclude-system-site-packages = false\n",
+            format!(
+                "home = {}\ninclude-system-site-packages = false\n",
+                interpreter
+                    .parent()
+                    .expect("interpreter directory")
+                    .display()
+            ),
         )
         .expect("manual isolated venv configuration");
 
@@ -2331,7 +2705,7 @@ mod tests {
             &root.0,
             internal_runtime.parent().expect("internal runtime parent"),
         );
-        fs::copy("/usr/bin/python3", &internal_runtime).expect("copy local base interpreter");
+        fs::copy(interpreter, &internal_runtime).expect("copy local base interpreter");
         fs::set_permissions(
             &internal_runtime,
             fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),

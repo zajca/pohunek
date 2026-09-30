@@ -674,15 +674,27 @@ fn handle(
     state: &Arc<Mutex<State>>,
     hooks: &Hooks,
 ) -> Result<(), MockError> {
+    prepare_stream(stream)?;
+    let request = read_request(stream, hooks)?;
+    let response = accept_request(state, &request)?;
+    write_response(stream, response)
+}
+
+/// Puts an accepted connection into blocking mode with bounded I/O.
+///
+/// BSD-derived systems (macOS) hand out accepted sockets that inherit the
+/// nonblocking flag of the listener, Linux does not; request parsing relies on
+/// blocking reads that end at `CONNECTION_TIMEOUT`.
+fn prepare_stream(stream: &TcpStream) -> Result<(), MockError> {
+    stream
+        .set_nonblocking(false)
+        .map_err(|_error| MockError::new(Failure::Connection))?;
     stream
         .set_read_timeout(Some(CONNECTION_TIMEOUT))
         .map_err(|_error| MockError::new(Failure::Connection))?;
     stream
         .set_write_timeout(Some(CONNECTION_TIMEOUT))
-        .map_err(|_error| MockError::new(Failure::Connection))?;
-    let request = read_request(stream, hooks)?;
-    let response = accept_request(state, &request)?;
-    write_response(stream, response)
+        .map_err(|_error| MockError::new(Failure::Connection))
 }
 
 enum Request {
@@ -1186,15 +1198,46 @@ mod tests {
         raw_request(mock, &encoded_request(body))
     }
 
+    /// Signals end of request. A server that already replied and closed makes
+    /// BSD sockets (macOS) fail the shutdown with `NotConnected`, which is not
+    /// a client error; every other failure still panics.
+    fn half_close(stream: &TcpStream) {
+        match stream.shutdown(std::net::Shutdown::Write) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
+            Err(error) => panic!("finish request: {error}"),
+        }
+    }
+
     fn raw_request(mock: &Mock, request: &[u8]) -> String {
         let mut stream = TcpStream::connect(mock.address).expect("connect mock");
         stream.write_all(request).expect("write request");
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .expect("finish request");
+        half_close(&stream);
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("read response");
         response
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn accepted_connections_are_switched_to_blocking_mode() {
+        use std::net::TcpListener;
+        use std::os::fd::AsRawFd as _;
+
+        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let client = TcpStream::connect(listener.local_addr().expect("address")).expect("connect");
+        let (server, _peer) = listener.accept().expect("accept");
+        server
+            .set_nonblocking(true)
+            .expect("emulate an inherited flag");
+
+        super::prepare_stream(&server).expect("prepare accepted stream");
+
+        let flags = fcntl(server.as_raw_fd(), FcntlArg::F_GETFL).expect("read descriptor flags");
+        assert!(!OFlag::from_bits_truncate(flags).contains(OFlag::O_NONBLOCK));
+        drop(client);
     }
 
     fn response_body(response: &str) -> &str {
@@ -1249,9 +1292,7 @@ mod tests {
             .expect("arm scenario");
         let mut stream = TcpStream::connect(mock.address).expect("connect mock");
         stream.write_all(request).expect("write raw request");
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .expect("finish raw request");
+        half_close(&stream);
         mock.finish()
             .expect_err("raw request must fail")
             .to_string()
@@ -1719,18 +1760,14 @@ mod tests {
         mock.wait_for_test_event(TestEvent::BodyReadPending);
         let mut second = TcpStream::connect(mock.address).expect("connect queued request");
         second.write_all(&encoded).expect("write queued request");
-        second
-            .shutdown(std::net::Shutdown::Write)
-            .expect("finish queued request");
+        half_close(&second);
         let finishing_mock = Arc::clone(&mock);
         let finish_thread = thread::spawn(move || finishing_mock.finish());
         mock.wait_for_test_event(TestEvent::BarrierQueued);
         first
             .write_all(&encoded[split..])
             .expect("complete first request");
-        first
-            .shutdown(std::net::Shutdown::Write)
-            .expect("finish first request");
+        half_close(&first);
         mock.wait_for_test_event(TestEvent::BarrierConnectionAccepted);
 
         let error = finish_thread
@@ -1759,9 +1796,7 @@ mod tests {
         stream
             .write_all(&final_segment)
             .expect("write final body byte and pipelined request together");
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .expect("finish segmented request");
+        half_close(&stream);
 
         let error = mock
             .finish()
@@ -1784,9 +1819,7 @@ mod tests {
         stream
             .write_all(&pipelined)
             .expect("write pipelined requests once");
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .expect("finish pipelined requests");
+        half_close(&stream);
 
         let error = mock
             .finish()

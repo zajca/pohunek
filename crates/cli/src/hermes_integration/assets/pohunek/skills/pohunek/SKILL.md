@@ -231,6 +231,10 @@ resumed native ID, continuation IDs after compaction, working or idle activity,
 owner-approval attention, and final release evidence. `on_session_end` is not a
 process-exit report. Finalization releases agent state when possible; process and
 screen observation remain the daemon's fallback when finalization is absent.
+Identity reports carry the Hermes process's start identity from the platform's
+own process table (the `/proc` start time on Linux, the kernel start time from
+libproc on macOS), the same value the daemon observes, so a recycled PID is not
+mistaken for the reporting process.
 
 Hooks do not start subprocesses, use the network, open a Hermes database, or
 copy prompt, tool, or terminal payloads. They use local bounded reporting only;

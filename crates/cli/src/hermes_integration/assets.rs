@@ -1,6 +1,6 @@
 //! Embedded plugin assets and their explicit ownership contract.
 
-// Rust guideline compliant 2026-08-06
+// Rust guideline compliant 2026-09-29
 
 #![expect(
     clippy::map_err_ignore,
@@ -251,33 +251,25 @@ where
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "linux")]
     use std::fs;
-    #[cfg(target_os = "linux")]
     use std::process::Command;
-    #[cfg(target_os = "linux")]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::hermes_integration::test_python;
 
-    // The scratch-directory helpers serve only the Linux-only system-Python
-    // test below (issue #101 owns Hermes on macOS).
-    #[cfg(target_os = "linux")]
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
-    #[cfg(target_os = "linux")]
     struct TempDir(std::path::PathBuf);
 
-    #[cfg(target_os = "linux")]
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
 
-    #[cfg(target_os = "linux")]
     fn temp_dir() -> TempDir {
-        let path = std::env::temp_dir().join(format!(
+        let path = crate::hermes_integration::target::isolated_test_temp_root().join(format!(
             "pohunek-hermes-assets-{}-{}",
             std::process::id(),
             NEXT_DIR.fetch_add(1, Ordering::Relaxed)
@@ -313,10 +305,6 @@ mod tests {
         );
     }
 
-    // Linux only: this test runs the system `/usr/bin/python3`, which on macOS
-    // is Python 3.9 while the embedded plugin requires Python 3.10 or newer.
-    // The Hermes integration lifecycle on macOS is owned by issue #101.
-    #[cfg(target_os = "linux")]
     #[test]
     fn rendered_init_is_valid_python_for_escaped_absolute_paths() {
         let temp = temp_dir();
@@ -327,7 +315,7 @@ mod tests {
             .expect("init asset");
         let path = temp.0.join("__init__.py");
         fs::write(&path, init.bytes()).expect("write isolated source");
-        let status = Command::new("/usr/bin/python3")
+        let status = Command::new(test_python::interpreter())
             .args([
                 "-I",
                 "-c",
@@ -339,6 +327,71 @@ mod tests {
             .status()
             .expect("start controlled local Python");
         assert!(status.success(), "rendered init must parse and compile");
+    }
+
+    /// Copies the embedded hook and the start-identity suite into an isolated
+    /// tree and runs them on the host interpreter, so the suite never reads the
+    /// source tree.
+    #[test]
+    fn start_identity_suite_passes_on_the_host_interpreter() {
+        let temp = temp_dir();
+        let hooks = ASSETS
+            .iter()
+            .find(|(path, _)| *path == "hooks.py")
+            .expect("embedded hooks asset")
+            .1;
+        for (relative, bytes) in [
+            ("pohunek/hooks.py", hooks),
+            (
+                "tests/test_start_identity.py",
+                include_bytes!("assets/tests/test_start_identity.py").as_slice(),
+            ),
+        ] {
+            let path = temp.0.join(relative);
+            fs::create_dir_all(path.parent().expect("suite parent")).expect("suite directory");
+            fs::write(&path, bytes).expect("write suite file");
+        }
+        let output = Command::new(test_python::interpreter())
+            .args(["-I", "-B"])
+            .arg(temp.0.join("tests/test_start_identity.py"))
+            .current_dir("/")
+            .env_clear()
+            .env("LANG", "C")
+            .output()
+            .expect("start controlled host Python");
+        assert!(
+            output.status.success(),
+            "start identity suite failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Production code embeds assets with `include_bytes!` and never resolves a
+    /// source-tree location at run time.
+    #[test]
+    fn production_code_has_no_runtime_source_tree_lookup() {
+        let sources = [
+            ("assets.rs", include_str!("assets.rs")),
+            ("doctor.rs", include_str!("doctor.rs")),
+            ("error.rs", include_str!("error.rs")),
+            ("lifecycle.rs", include_str!("lifecycle.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            ("policy.rs", include_str!("policy.rs")),
+            ("runner.rs", include_str!("runner.rs")),
+            ("skill.rs", include_str!("skill.rs")),
+            ("target.rs", include_str!("target.rs")),
+        ];
+        for (name, source) in sources {
+            let production = source
+                .rfind("\n#[cfg(test)]\nmod tests")
+                .map_or(source, |end| &source[..end]);
+            for forbidden in ["CARGO_MANIFEST_DIR", "env!(\"CARGO", "option_env!"] {
+                assert!(
+                    !production.contains(forbidden),
+                    "{name} resolves a build-tree location through {forbidden}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Validates the pinned Hermes CLI and refreshes bounded PTY evidence.
 
-// Rust guideline compliant 2026-08-28
+// Rust guideline compliant 2026-09-29
 
 use std::ffi::OsString;
 use std::fs;
@@ -132,12 +132,30 @@ expected_hooks = {
 manager = PluginManager()
 manager.discover_and_load(force=True)
 loaded = manager._plugins.get("operators/pohunek")
-if loaded is None or not loaded.enabled or loaded.error is not None:
-    raise RuntimeError("pinned Hermes did not load the production Pohunek plugin")
+
+
+def registration_state():
+    status = getattr(getattr(loaded, "module", None), "integration_status", None)
+    state = status() if callable(status) else {}
+    return state.get("state") if isinstance(state, dict) else None
+
+
+def inventory_difference(expected, registered):
+    return (
+        f"missing={sorted(expected - set(registered))} "
+        f"unexpected={sorted(set(registered) - expected)} "
+        f"plugin_state={registration_state()!r}"
+    )
+
+
+if loaded is None:
+    raise RuntimeError(f"pinned Hermes did not discover the production Pohunek plugin; known={sorted(manager._plugins)}")
+if not loaded.enabled or loaded.error is not None:
+    raise RuntimeError(f"pinned Hermes did not load the production Pohunek plugin: enabled={loaded.enabled} error={loaded.error!r}")
 if set(loaded.tools_registered) != expected_tools:
-    raise RuntimeError("production Pohunek read-only tool inventory drifted")
+    raise RuntimeError("production Pohunek read-only tool inventory drifted: " + inventory_difference(expected_tools, loaded.tools_registered))
 if set(loaded.hooks_registered) != expected_hooks:
-    raise RuntimeError("production Pohunek hook inventory drifted")
+    raise RuntimeError("production Pohunek hook inventory drifted: " + inventory_difference(expected_hooks, loaded.hooks_registered))
 skill = manager._plugin_skills.get("pohunek:pohunek")
 if skill is None or not isinstance(skill.get("path"), Path) or not skill["path"].is_file():
     raise RuntimeError("production Pohunek skill inventory drifted")
@@ -484,6 +502,55 @@ impl Limits {
     }
 }
 
+/// UTF-8 locale for every isolated child. Linux ships `C.UTF-8`; macOS does not
+/// ship that locale but always ships `en_US.UTF-8`.
+#[cfg(target_os = "macos")]
+const ISOLATED_LOCALE: &str = "en_US.UTF-8";
+/// UTF-8 locale for every isolated child. Linux ships `C.UTF-8`; macOS does not
+/// ship that locale but always ships `en_US.UTF-8`.
+#[cfg(not(target_os = "macos"))]
+const ISOLATED_LOCALE: &str = "C.UTF-8";
+
+/// Longest Unix socket path Darwin accepts, terminator included. Mirrors
+/// `DARWIN_SOCKET_PATH_MAX_BYTES` in `crates/paths/src/lib.rs`.
+const DARWIN_SOCKET_PATH_MAX_BYTES: usize = 103;
+/// Longest Unix socket path Linux accepts, terminator included. Mirrors
+/// `LINUX_SOCKET_PATH_MAX_BYTES` in `crates/paths/src/lib.rs`.
+const LINUX_SOCKET_PATH_MAX_BYTES: usize = 107;
+/// Socket path limit of the platform this harness runs on.
+const SOCKET_PATH_MAX_BYTES: usize = if cfg!(target_os = "macos") {
+    DARWIN_SOCKET_PATH_MAX_BYTES
+} else {
+    LINUX_SOCKET_PATH_MAX_BYTES
+};
+/// Runtime directory below the isolation root that the production CLI resolves
+/// through `XDG_RUNTIME_DIR`.
+const ISOLATED_RUNTIME_DIRECTORY: &str = "xdg-runtime";
+/// Application directory and socket file the CLI appends to `XDG_RUNTIME_DIR`
+/// (`APP_DIR` and `SOCKET_NAME` in `crates/paths/src/lib.rs`).
+const DAEMON_SOCKET_RELATIVE_PATH: &str = "pohunek/daemon.sock";
+/// Prefix of the production isolation directory; short because the daemon
+/// socket path below it must fit the platform limit.
+const PRODUCTION_ISOLATION_PREFIX: &str = "pohunek-hermes-";
+/// Random characters `tempfile` appends to an isolation directory name.
+const ISOLATION_RANDOM_NAME_BYTES: usize = 8;
+/// Short, system-owned temporary parent tried after `std::env::temp_dir()`;
+/// macOS `$TMPDIR` is too long for a daemon socket path.
+const SHORT_TEMP_PARENT: &str = "/tmp";
+
+/// Resolves every symlink in `directory`.
+///
+/// Temporary roots are created below a resolved parent because a child process
+/// reports its working directory in resolved form (macOS `/var` is a symlink to
+/// `/private/var`), and output redaction matches literal path text.
+fn canonical_directory(directory: &Path) -> Result<PathBuf, XtaskError> {
+    fs::canonicalize(directory).map_err(|error| {
+        fail(format!(
+            "failed to resolve the isolated Hermes parent directory: {error}"
+        ))
+    })
+}
+
 #[derive(Debug)]
 struct Isolation {
     _temp: TempDir,
@@ -496,17 +563,15 @@ struct Isolation {
 
 impl Isolation {
     fn new(prefix: &str) -> Result<Self, XtaskError> {
-        let temp = tempfile::Builder::new()
-            .prefix(prefix)
-            .tempdir()
-            .map_err(|error| fail(format!("failed to create isolated Hermes root: {error}")))?;
-        Self::from_temp(temp)
+        Self::new_in(prefix, &std::env::temp_dir())
     }
 
     fn new_in(prefix: &str, parent: &Path) -> Result<Self, XtaskError> {
+        let parent = canonical_directory(parent)?;
         let temp = tempfile::Builder::new()
             .prefix(prefix)
-            .tempdir_in(parent)
+            .rand_bytes(ISOLATION_RANDOM_NAME_BYTES)
+            .tempdir_in(&parent)
             .map_err(|error| fail(format!("failed to create isolated Hermes root: {error}")))?;
         Self::from_temp(temp)
     }
@@ -618,8 +683,8 @@ impl Isolation {
                 OsString::from("PYTHONDONTWRITEBYTECODE"),
                 OsString::from("1"),
             ),
-            (OsString::from("LC_ALL"), OsString::from("C.UTF-8")),
-            (OsString::from("LANG"), OsString::from("C.UTF-8")),
+            (OsString::from("LC_ALL"), OsString::from(ISOLATED_LOCALE)),
+            (OsString::from("LANG"), OsString::from(ISOLATED_LOCALE)),
         ];
         if let Some(path) = std::env::var_os("PATH") {
             env.push((OsString::from("PATH"), path));
@@ -674,28 +739,51 @@ fn production_integration_isolation() -> Result<Isolation, XtaskError> {
     // Prefer the standard temporary root: the production filesystem contract
     // accepts its sticky system ancestry, while a container-provided user
     // runtime can itself sit below foreign-owned non-system mount ancestors.
-    let mut candidates = vec![std::env::temp_dir()];
+    let mut candidates = vec![std::env::temp_dir(), PathBuf::from(SHORT_TEMP_PARENT)];
     if let Some(runtime_directory) = std::env::var_os("XDG_RUNTIME_DIR") {
         candidates.push(PathBuf::from(runtime_directory));
     }
-    let parent = select_production_integration_temp_parent(candidates)?;
-    Isolation::new_in("pohunek-production-plugin-", &parent)
+    let parent = select_production_integration_temp_parent(candidates, SOCKET_PATH_MAX_BYTES)?;
+    Isolation::new_in(PRODUCTION_ISOLATION_PREFIX, &parent)
 }
 
+/// Bytes the isolation root may occupy so that the daemon socket path below it
+/// still fits `socket_limit`.
+fn isolation_root_budget(socket_limit: usize) -> usize {
+    let suffix = format!("/{ISOLATED_RUNTIME_DIRECTORY}/{DAEMON_SOCKET_RELATIVE_PATH}");
+    socket_limit.saturating_sub(suffix.len())
+}
+
+/// Picks the first canonical, Git-free parent whose isolation directory keeps
+/// the daemon socket path within `socket_limit` bytes.
 fn select_production_integration_temp_parent(
     candidates: impl IntoIterator<Item = PathBuf>,
+    socket_limit: usize,
 ) -> Result<PathBuf, XtaskError> {
-    candidates
+    let usable: Vec<PathBuf> = candidates
         .into_iter()
         .filter_map(|candidate| fs::canonicalize(candidate).ok())
-        .find(|candidate| {
+        .filter(|candidate| {
             fs::metadata(candidate).is_ok_and(|metadata| metadata.is_dir())
                 && path_is_outside_git_workspaces(candidate)
         })
+        .collect();
+    if usable.is_empty() {
+        return Err(fail(
+            "no isolated temporary parent outside a Git workspace is available for Pohunek production compatibility",
+        ));
+    }
+    let budget = isolation_root_budget(socket_limit);
+    // Separator plus the fixed-length isolation directory name.
+    let directory_bytes = 1 + PRODUCTION_ISOLATION_PREFIX.len() + ISOLATION_RANDOM_NAME_BYTES;
+    usable
+        .into_iter()
+        .find(|parent| parent.as_os_str().len() + directory_bytes <= budget)
         .ok_or_else(|| {
-            fail(
-                "no isolated temporary parent outside a Git workspace is available for Pohunek production compatibility",
-            )
+            fail(format!(
+                "no isolated temporary parent is short enough for the Pohunek daemon socket: the isolation root may use at most {budget} bytes ({socket_limit} byte socket path limit minus the runtime suffix), so the parent may use at most {} bytes; set TMPDIR to a shorter directory",
+                budget.saturating_sub(directory_bytes)
+            ))
         })
 }
 
@@ -1265,9 +1353,11 @@ fn run_plugin_state_check(
         limits.command_output_bytes,
     )?;
     if !output.status.success() {
-        return Err(fail(format!(
-            "Hermes CLI check `{id}` exited unsuccessfully"
-        )));
+        return Err(bounded_process_failure(
+            &format!("Hermes CLI check `{id}` exited unsuccessfully"),
+            &output,
+            &[&isolation.root, hermes_bin],
+        ));
     }
     let text = combined_text(&output);
     for required in required_text {
@@ -1727,7 +1817,7 @@ fn check_pohunek_integration(
     let hermes_home = isolation.home.join(".hermes");
     let profile_home = hermes_home.join("profiles").join(EXPECTED_NAMED_PROFILE);
     let state_home = isolation.root.join("xdg-state");
-    let runtime_home = isolation.root.join("xdg-runtime");
+    let runtime_home = isolation.root.join(ISOLATED_RUNTIME_DIRECTORY);
     for path in [
         &isolation.home,
         &hermes_home,
@@ -1759,7 +1849,14 @@ fn check_pohunek_integration(
         &env,
         limits,
     )?;
-    run_production_plugin_runtime(hermes_bin, &profile_home, &isolation.work, &env, limits)?;
+    run_production_plugin_runtime(
+        pohunek_bin,
+        hermes_bin,
+        &profile_home,
+        &isolation.work,
+        &env,
+        limits,
+    )?;
     run_pohunek_integration_action(
         pohunek_bin,
         hermes_bin,
@@ -1968,6 +2065,7 @@ fn doctor_is_healthy(report: &PohunekDoctorReport) -> bool {
 }
 
 fn run_production_plugin_runtime(
+    pohunek_bin: &Path,
     hermes_bin: &Path,
     profile_home: &Path,
     cwd: &Path,
@@ -1993,11 +2091,121 @@ fn run_production_plugin_runtime(
     if output.status.code() != Some(0)
         || !String::from_utf8_lossy(&output.stdout).contains(PRODUCTION_PLUGIN_RUNTIME_MARKER)
     {
-        return Err(fail(
+        let paths = [profile_home, cwd, hermes_bin, pohunek_bin];
+        let mut failure = bounded_process_failure(
             "pinned Hermes rejected the production Pohunek plugin registration",
-        ));
+            &output,
+            &paths,
+        )
+        .to_string();
+        if String::from_utf8_lossy(&output.stderr).contains(PLUGIN_CLI_INCOMPATIBLE_STATE) {
+            failure.push('\n');
+            failure.push_str(&plugin_compatibility_probe_report(
+                pohunek_bin,
+                cwd,
+                &runtime_env,
+                limits,
+                &paths,
+            ));
+        }
+        return Err(fail(failure));
     }
     Ok(())
+}
+
+/// Plugin registration state recorded when the installed CLI fails the
+/// plugin's compatibility probe.
+const PLUGIN_CLI_INCOMPATIBLE_STATE: &str = "plugin_state='cli_incompatible'";
+/// Environment names the plugin forwards to the CLI it probes.
+const PLUGIN_FORWARDED_ENV: [&str; 8] = [
+    "HOME",
+    "XDG_RUNTIME_DIR",
+    "XDG_STATE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "LANG",
+    "LC_ALL",
+];
+/// `PATH` the plugin gives the CLI it probes.
+const PLUGIN_CLI_PATH: &str = "/usr/bin:/bin";
+
+/// Re-runs the plugin's compatibility probe (`pohunek doctor --json`) with the
+/// environment the plugin builds for it, and reports its exit status and
+/// sanitized output tail.
+fn plugin_compatibility_probe_report(
+    pohunek_bin: &Path,
+    cwd: &Path,
+    runtime_env: &[(OsString, OsString)],
+    limits: Limits,
+    paths: &[&Path],
+) -> String {
+    let mut probe_env: Vec<(OsString, OsString)> = runtime_env
+        .iter()
+        .filter(|(name, _value)| PLUGIN_FORWARDED_ENV.iter().any(|kept| name == kept))
+        .cloned()
+        .collect();
+    probe_env.push((OsString::from("PATH"), OsString::from(PLUGIN_CLI_PATH)));
+    let args = vec!["doctor".to_owned(), "--json".to_owned()];
+    match run_process(
+        pohunek_bin,
+        &args,
+        cwd,
+        &probe_env,
+        limits.command_timeout,
+        limits.command_output_bytes,
+    ) {
+        Ok(output) => bounded_process_failure(
+            "plugin compatibility probe `pohunek doctor --json` with the plugin's environment",
+            &output,
+            paths,
+        )
+        .to_string(),
+        Err(error) => {
+            format!("plugin compatibility probe `pohunek doctor --json` did not complete: {error}")
+        }
+    }
+}
+
+/// Describes a failed child process with its exit status and the sanitized,
+/// bounded tail of its output.
+///
+/// `paths` and the shared sanitizer redact isolation paths and
+/// credential-shaped text, and the tail is withheld entirely when it still
+/// looks unsafe.
+fn bounded_process_failure(what: &str, output: &ProcessOutput, paths: &[&Path]) -> XtaskError {
+    let mut sensitive = Vec::new();
+    for path in paths {
+        push_path_forms(&mut sensitive, path, "<ISOLATED_PATH>");
+        if let Some(parent) = path.parent() {
+            push_path_forms(&mut sensitive, parent, "<ISOLATED_PARENT>");
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        push_path_forms(&mut sensitive, Path::new(&home), "<USER_HOME>");
+    }
+    sensitive.sort_by_key(|path| std::cmp::Reverse(path.0.len()));
+    let mut combined = output.stderr.clone();
+    combined.push(b'\n');
+    combined.extend_from_slice(&output.stdout);
+    let outcome = exit_description(output.status);
+    with_pty_diagnostic(&fail(format!("{what} ({outcome})")), &combined, &sensitive)
+}
+
+#[cfg(unix)]
+fn exit_description(status: ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("exit status {code}"),
+        (None, Some(signal)) => format!("terminated by signal {signal}"),
+        (None, None) => "unknown exit".to_owned(),
+    }
+}
+
+#[cfg(not(unix))]
+fn exit_description(status: ExitStatus) -> String {
+    format!("exit status {:?}", status.code())
 }
 
 fn string_slice(values: &[String]) -> Vec<&str> {
@@ -3342,27 +3550,41 @@ fn write_goldens(
     })
 }
 
+/// Registers `path` and, when it differs, its symlink-resolved form, because
+/// a child may print either spelling.
+fn push_path_forms(
+    paths: &mut Vec<(String, &'static str)>,
+    path: &Path,
+    placeholder: &'static str,
+) {
+    paths.push((path.display().to_string(), placeholder));
+    if let Ok(resolved) = fs::canonicalize(path) {
+        if resolved != path {
+            paths.push((resolved.display().to_string(), placeholder));
+        }
+    }
+}
+
 fn sensitive_paths(
     repo: &Path,
     hermes_bin: &Path,
     isolation: &Isolation,
     mock_base_url: &str,
 ) -> Vec<(String, &'static str)> {
-    let mut paths = vec![
-        (isolation.root.display().to_string(), "<ISOLATED_ROOT>"),
-        (repo.display().to_string(), "<REPOSITORY>"),
-        (hermes_bin.display().to_string(), "<HERMES_BIN>"),
-        (mock_base_url.to_owned(), "<HERMES_MOCK_ENDPOINT>"),
-        (
-            mock_base_url.trim_end_matches("/v1").to_owned(),
-            "<HERMES_MOCK_PROXY>",
-        ),
-    ];
+    let mut paths = Vec::new();
+    push_path_forms(&mut paths, &isolation.root, "<ISOLATED_ROOT>");
+    push_path_forms(&mut paths, repo, "<REPOSITORY>");
+    push_path_forms(&mut paths, hermes_bin, "<HERMES_BIN>");
+    paths.push((mock_base_url.to_owned(), "<HERMES_MOCK_ENDPOINT>"));
+    paths.push((
+        mock_base_url.trim_end_matches("/v1").to_owned(),
+        "<HERMES_MOCK_PROXY>",
+    ));
     if let Some(parent) = hermes_bin.parent() {
-        paths.push((parent.display().to_string(), "<HERMES_INSTALL_DIR>"));
+        push_path_forms(&mut paths, parent, "<HERMES_INSTALL_DIR>");
     }
     if let Some(home) = std::env::var_os("HOME") {
-        paths.push((PathBuf::from(home).display().to_string(), "<USER_HOME>"));
+        push_path_forms(&mut paths, Path::new(&home), "<USER_HOME>");
     }
     paths.sort_by_key(|path| std::cmp::Reverse(path.0.len()));
     paths
@@ -3770,6 +3992,7 @@ fn fail(message: impl Into<String>) -> XtaskError {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fmt::Write as _;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -3786,12 +4009,18 @@ mod tests {
         submitted_user_turn_count, terminal_transcript, validate_classic_capture,
         validate_classic_transcript, validate_golden_manifest, validate_safe_fixture,
         with_pty_diagnostic, GoldenManifest, GoldenStatus, IntegrationAction, IntegrationState,
-        IntegrationStep, Isolation, Limits, PtyCapture, TerminalCapture, APPROVAL_PROMPT_TEXT,
-        ASSISTANT_PANEL_SECTION, GOLDEN_MANIFEST, GOLDEN_ROOT, INTERRUPTION_PROMPT_TEXT,
-        INTERRUPT_MARKER, LOCK_PATH, MAX_PTY_DIAGNOSTIC_BYTES, MAX_PTY_DIAGNOSTIC_LINES,
-        MULTILINE_PREVIEW, MULTILINE_RESPONSE, PROMPT_READY_MARKER, PTY_COLS,
-        PTY_DIAGNOSTIC_WITHHELD, PTY_SCROLLBACK_ROWS, SHORT_PROMPT_TEXT, SHORT_RESPONSE,
-        USER_TURN_MARKER, USER_TURN_SEPARATOR, WORKING_PROMPT_TEXT,
+        IntegrationStep, Isolation, Limits, ProcessOutput, PtyCapture, TerminalCapture,
+        APPROVAL_PROMPT_TEXT, ASSISTANT_PANEL_SECTION, GOLDEN_MANIFEST, GOLDEN_ROOT,
+        INTERRUPTION_PROMPT_TEXT, INTERRUPT_MARKER, LOCK_PATH, MAX_PTY_DIAGNOSTIC_BYTES,
+        MAX_PTY_DIAGNOSTIC_LINES, MULTILINE_PREVIEW, MULTILINE_RESPONSE, PLUGIN_RUNTIME_MARKERS,
+        PLUGIN_RUNTIME_SMOKE, PRODUCTION_PLUGIN_RUNTIME_MARKER, PRODUCTION_PLUGIN_RUNTIME_SMOKE,
+        PROMPT_READY_MARKER, PTY_COLS, PTY_DIAGNOSTIC_WITHHELD, PTY_SCROLLBACK_ROWS,
+        SHORT_PROMPT_TEXT, SHORT_RESPONSE, USER_TURN_MARKER, USER_TURN_SEPARATOR,
+        WORKING_PROMPT_TEXT,
+    };
+    use super::{
+        isolation_root_budget, DAEMON_SOCKET_RELATIVE_PATH, DARWIN_SOCKET_PATH_MAX_BYTES,
+        ISOLATED_RUNTIME_DIRECTORY, LINUX_SOCKET_PATH_MAX_BYTES, PRODUCTION_ISOLATION_PREFIX,
     };
 
     fn fast_limits() -> Limits {
@@ -3808,8 +4037,18 @@ mod tests {
         }
     }
 
+    /// Temporary directory below a symlink-free parent, so paths handed to the
+    /// harness pass its canonical-path checks where `$TMPDIR` is a symlink
+    /// (macOS `/var/folders` resolves to `/private/var/folders`).
+    fn canonical_tempdir() -> tempfile::TempDir {
+        let parent = fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp dir");
+        tempfile::Builder::new()
+            .tempdir_in(parent)
+            .expect("create canonical temporary directory")
+    }
+
     fn fixture_repo() -> tempfile::TempDir {
-        let repo = tempfile::tempdir().expect("create fixture repo");
+        let repo = canonical_tempdir();
         let lock = repo.path().join(LOCK_PATH);
         let manifest = repo.path().join(GOLDEN_ROOT).join(GOLDEN_MANIFEST);
         fs::create_dir_all(lock.parent().expect("lock parent")).expect("create lock parent");
@@ -4647,6 +4886,366 @@ PY
         }
     }
 
+    /// Time limit for a parent that blocks forever; it only needs to outlast
+    /// the fixture script publishing its descendant pid.
+    const BLOCKED_PARENT_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Generous limit for a parent that exits on its own, so it never fires.
+    const CRASHED_PARENT_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Upper bound for the fixture script to publish its descendant pid.
+    const DESCENDANT_PID_WAIT: Duration = Duration::from_secs(10);
+
+    /// Polls until the fixture script has written a complete descendant pid.
+    fn read_descendant_pid(path: &Path) -> i32 {
+        use std::time::Instant;
+
+        let deadline = Instant::now() + DESCENDANT_PID_WAIT;
+        loop {
+            if let Ok(process_id) = fs::read_to_string(path)
+                .map_err(|_error| ())
+                .and_then(|text| text.trim().parse::<i32>().map_err(|_error| ()))
+            {
+                return process_id;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "controlled descendant never published its pid"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn process_cleanup_kills_descendants_after_timeout() {
+        let root = canonical_tempdir();
+        let executable = script(
+            root.path(),
+            "timeout-holder",
+            "#!/bin/sh\n/bin/sleep 30 &\necho $! > held-child.pid\nwait\n",
+        );
+        let error = run_process(
+            &executable,
+            &[],
+            root.path(),
+            &[],
+            BLOCKED_PARENT_TIMEOUT,
+            1024,
+        )
+        .expect_err("a blocked parent exceeds its time limit");
+
+        assert!(error.to_string().contains("time limit"));
+        assert_process_exited(read_descendant_pid(&root.path().join("held-child.pid")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn process_cleanup_kills_descendants_after_crash() {
+        let root = canonical_tempdir();
+        let executable = script(
+            root.path(),
+            "crash-holder",
+            "#!/bin/sh\n/bin/sleep 30 &\necho $! > held-child.pid\nexit 3\n",
+        );
+        let output = run_process(
+            &executable,
+            &[],
+            root.path(),
+            &[],
+            CRASHED_PARENT_TIMEOUT,
+            1024,
+        )
+        .expect("a crashed parent still cleans up its process group");
+
+        assert_eq!(output.status.code(), Some(3));
+        assert_process_exited(read_descendant_pid(&root.path().join("held-child.pid")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn process_group_guard_kills_descendants_when_dropped() {
+        let root = canonical_tempdir();
+        let executable = script(
+            root.path(),
+            "cancel-holder",
+            "#!/bin/sh\n/bin/sleep 30 &\necho $! > held-child.pid\nwait\n",
+        );
+        let mut command = std::process::Command::new(&executable);
+        command
+            .current_dir(root.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        super::configure_process_group(&mut command);
+        let mut child = command.spawn().expect("start controlled process group");
+        let guard = super::ProcessGroupGuard::new(child.id());
+        let descendant = read_descendant_pid(&root.path().join("held-child.pid"));
+
+        drop(guard);
+
+        let status = child.wait().expect("reap the killed group leader");
+        assert!(!status.success());
+        assert_process_exited(descendant);
+    }
+
+    /// Runs a runtime-smoke script against a stand-in `hermes_cli.plugins`
+    /// whose loaded plugin registers exactly the given inventory.
+    #[cfg(unix)]
+    fn run_smoke_against_stub(
+        smoke: &str,
+        tools: &[&str],
+        hooks: &[&str],
+        kind: &str,
+    ) -> ProcessOutput {
+        let root = canonical_tempdir();
+        let package = root.path().join("hermes_cli");
+        fs::create_dir(&package).expect("create stub package");
+        fs::write(package.join("__init__.py"), "").expect("write stub package marker");
+        let skill = root.path().join("SKILL.md");
+        fs::write(&skill, "skill").expect("write stub skill");
+        fs::write(
+            package.join("plugins.py"),
+            format!(
+                "from pathlib import Path\nclass _Manifest:\n    kind = {kind:?}\nclass _Loaded:\n    enabled = True\n    error = None\n    manifest = _Manifest()\n    module = None\n    tools_registered = {tools:?}\n    hooks_registered = {hooks:?}\nclass PluginManager:\n    def __init__(self):\n        self._plugins = {{'operators/pohunek': _Loaded()}}\n        self._plugin_skills = {{'pohunek:pohunek': {{'path': Path({skill:?})}}}}\n    def discover_and_load(self, force=False):\n        pass\n",
+                skill = skill.display().to_string()
+            ),
+        )
+        .expect("write stub plugin manager");
+        let python = which_python();
+        run_process(
+            &python,
+            &["-c".to_owned(), smoke.to_owned()],
+            root.path(),
+            &[
+                (
+                    OsString::from("PYTHONPATH"),
+                    root.path().as_os_str().to_owned(),
+                ),
+                (
+                    OsString::from("PYTHONDONTWRITEBYTECODE"),
+                    OsString::from("1"),
+                ),
+            ],
+            Duration::from_secs(20),
+            64 * 1024,
+        )
+        .expect("run smoke script")
+    }
+
+    #[cfg(unix)]
+    fn which_python() -> PathBuf {
+        std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+            .map(|directory| directory.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .expect("python3 on PATH")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compatibility_fixture_runtime_smoke_runs_against_the_fixture_inventory() {
+        let output = run_smoke_against_stub(
+            PLUGIN_RUNTIME_SMOKE,
+            &["pohunek_hosts"],
+            &["pre_llm_call"],
+            "standalone",
+        );
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for marker in PLUGIN_RUNTIME_MARKERS {
+            assert!(stdout.contains(marker), "{stdout}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn production_runtime_smoke_runs_against_the_production_inventory() {
+        let output = run_smoke_against_stub(
+            PRODUCTION_PLUGIN_RUNTIME_SMOKE,
+            &[
+                "pohunek_hosts",
+                "pohunek_sessions",
+                "pohunek_session_get",
+                "pohunek_session_screen",
+                "pohunek_session_output",
+                "pohunek_session_wait",
+                "pohunek_session_diff",
+            ],
+            &[
+                "on_session_start",
+                "pre_llm_call",
+                "pre_approval_request",
+                "post_approval_response",
+                "post_llm_call",
+                "on_session_end",
+                "on_session_finalize",
+            ],
+            "standalone",
+        );
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(PRODUCTION_PLUGIN_RUNTIME_MARKER));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn production_runtime_smoke_names_the_drifted_inventory() {
+        let output = run_smoke_against_stub(
+            PRODUCTION_PLUGIN_RUNTIME_SMOKE,
+            &["pohunek_hosts"],
+            &[],
+            "standalone",
+        );
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("tool inventory drifted"), "{stderr}");
+        assert!(
+            stderr.contains("missing=['pohunek_session_diff'"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn production_runtime_failure_reports_status_and_sanitized_tail() {
+        let root = canonical_tempdir();
+        let profile = root.path().join("profile");
+        let python = script(
+            root.path(),
+            "python3",
+            &format!(
+                "#!/bin/sh\necho \"Traceback in {profile}\" >&2\necho \"RuntimeError: tool inventory drifted: missing=['pohunek_hosts'] plugin_state='cli_incompatible'\" >&2\nexit 1\n",
+                profile = profile.display()
+            ),
+        );
+        let pohunek = script(
+            root.path(),
+            "pohunek",
+            "#!/bin/sh\necho \"doctor $* PATH=$PATH HOME=$HOME extra=${POHUNEK_TEST_NOT_FORWARDED:-unset}\"\nexit 1\n",
+        );
+        let hermes = root.path().join("hermes");
+        fs::write(&hermes, "").expect("write hermes placeholder");
+        let error = super::run_production_plugin_runtime(
+            &pohunek,
+            &hermes,
+            &profile,
+            root.path(),
+            &[
+                (OsString::from("HOME"), profile.as_os_str().to_owned()),
+                (
+                    OsString::from("POHUNEK_TEST_NOT_FORWARDED"),
+                    OsString::from("leaked"),
+                ),
+            ],
+            fast_limits(),
+        )
+        .expect_err("a failing probe is rejected");
+        let message = error.to_string();
+
+        assert!(message.contains("exit status 1"), "{message}");
+        assert!(
+            message.contains("plugin_state='cli_incompatible'"),
+            "{message}"
+        );
+        assert!(message.contains("<ISOLATED_PATH>"), "{message}");
+        assert!(
+            !message.contains(&profile.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("pohunek doctor --json"), "{message}");
+        assert!(
+            message.contains(
+                "doctor doctor --json PATH=/usr/bin:/bin HOME=<ISOLATED_PATH> extra=unset"
+            ),
+            "{message}"
+        );
+        drop(python);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn production_runtime_failure_withholds_credential_shaped_output() {
+        let root = canonical_tempdir();
+        script(
+            root.path(),
+            "python3",
+            "#!/bin/sh\necho 'api_key=abcdefghijklmnop1234' >&2\nexit 1\n",
+        );
+        let hermes = root.path().join("hermes");
+        fs::write(&hermes, "").expect("write hermes placeholder");
+        let error = super::run_production_plugin_runtime(
+            &hermes,
+            &hermes,
+            root.path(),
+            root.path(),
+            &[],
+            fast_limits(),
+        )
+        .expect_err("a failing probe is rejected");
+        let message = error.to_string();
+
+        assert!(message.contains(PTY_DIAGNOSTIC_WITHHELD), "{message}");
+        assert!(!message.contains("abcdefghijklmnop1234"), "{message}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn isolation_root_is_symlink_free() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = canonical_tempdir();
+        let real_parent = fixture.path().join("real");
+        fs::create_dir(&real_parent).expect("create real parent");
+        let alias = fixture.path().join("alias");
+        symlink(&real_parent, &alias).expect("create parent alias");
+
+        let isolation = Isolation::new_in("hermes-canonical-", &alias)
+            .expect("create isolation below a symlinked parent");
+
+        assert_eq!(
+            isolation.root,
+            fs::canonicalize(&isolation.root).expect("canonicalize isolation root")
+        );
+        assert!(isolation
+            .root
+            .starts_with(fs::canonicalize(&real_parent).expect("canonicalize real parent")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sensitive_paths_cover_the_resolved_spelling_of_a_symlinked_path() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = canonical_tempdir();
+        let real_repo = fixture.path().join("real-repo");
+        fs::create_dir(&real_repo).expect("create real repository");
+        let alias = fixture.path().join("repo-alias");
+        symlink(&real_repo, &alias).expect("create repository alias");
+        let isolation = Isolation::new("hermes-sensitive-paths-").expect("create isolation");
+
+        let paths = sensitive_paths(
+            &alias,
+            Path::new("/hermes"),
+            &isolation,
+            "http://127.0.0.1:1/v1",
+        );
+
+        let resolved = fs::canonicalize(&real_repo).expect("resolve repository");
+        for spelling in [alias.display().to_string(), resolved.display().to_string()] {
+            assert!(paths
+                .iter()
+                .any(|(text, placeholder)| *text == spelling && *placeholder == "<REPOSITORY>"));
+        }
+    }
+
     #[test]
     #[cfg(unix)]
     fn cli_and_fixture_plugin_accept_pinned_model_free_shape() {
@@ -4719,7 +5318,7 @@ PY
     fn production_integration_temp_parent_skips_git_ancestors_and_canonicalizes_fallback() {
         use std::os::unix::fs::symlink;
 
-        let fixture = tempfile::tempdir().expect("create temporary parent fixture");
+        let fixture = canonical_tempdir();
         let safe_parent = PathBuf::from("/var/tmp");
         let safe_alias = fixture.path().join("safe-alias");
         symlink(&safe_parent, &safe_alias).expect("create safe parent alias");
@@ -4738,24 +5337,113 @@ PY
                     .expect("create controlled Git file marker");
             }
 
-            let selected =
-                select_production_integration_temp_parent(vec![unsafe_parent, safe_alias.clone()])
-                    .expect("select safe fallback after Git workspace candidate");
+            let selected = select_production_integration_temp_parent(
+                vec![unsafe_parent, safe_alias.clone()],
+                LINUX_SOCKET_PATH_MAX_BYTES,
+            )
+            .expect("select safe fallback after Git workspace candidate");
 
             assert_eq!(selected, canonical_safe_parent);
         }
     }
 
+    /// Short fixture root outside `$TMPDIR` and `/tmp`: hosts may keep a Git
+    /// marker in `/tmp`, which the parent selection rightly refuses.
+    fn short_fixture_root() -> tempfile::TempDir {
+        let parent = fs::canonicalize("/var/tmp").expect("canonicalize /var/tmp");
+        tempfile::Builder::new()
+            .tempdir_in(parent)
+            .expect("create short fixture root")
+    }
+
+    /// A directory whose canonical path is longer than any platform budget
+    /// allows for an isolation parent.
+    fn long_parent(fixture: &Path) -> PathBuf {
+        let long = fixture.join("p".repeat(80));
+        fs::create_dir(&long).expect("create long parent");
+        long
+    }
+
+    #[test]
+    fn isolation_budget_reserves_the_fixed_daemon_socket_suffix() {
+        let suffix = format!("/{ISOLATED_RUNTIME_DIRECTORY}/{DAEMON_SOCKET_RELATIVE_PATH}").len();
+
+        assert_eq!(
+            isolation_root_budget(DARWIN_SOCKET_PATH_MAX_BYTES),
+            103 - suffix
+        );
+        assert_eq!(
+            isolation_root_budget(LINUX_SOCKET_PATH_MAX_BYTES),
+            107 - suffix
+        );
+        assert_eq!(isolation_root_budget(DARWIN_SOCKET_PATH_MAX_BYTES), 71);
+    }
+
+    #[test]
+    fn production_isolation_falls_through_to_a_parent_that_fits_the_socket_limit() {
+        let fixture = short_fixture_root();
+        let short = fixture.path().join("s");
+        fs::create_dir(&short).expect("create short parent");
+        let long = long_parent(fixture.path());
+
+        for limit in [DARWIN_SOCKET_PATH_MAX_BYTES, LINUX_SOCKET_PATH_MAX_BYTES] {
+            let selected =
+                select_production_integration_temp_parent(vec![long.clone(), short.clone()], limit)
+                    .expect("select the short parent");
+            assert_eq!(
+                selected,
+                fs::canonicalize(&short).expect("canonical short parent")
+            );
+
+            let isolation = Isolation::new_in(PRODUCTION_ISOLATION_PREFIX, &selected)
+                .expect("create isolation below the short parent");
+            let socket = isolation
+                .root
+                .join(ISOLATED_RUNTIME_DIRECTORY)
+                .join(DAEMON_SOCKET_RELATIVE_PATH);
+            assert!(
+                socket.as_os_str().len() <= limit,
+                "{}",
+                socket.as_os_str().len()
+            );
+        }
+    }
+
+    #[test]
+    fn production_isolation_fails_fast_when_no_parent_fits_the_socket_limit() {
+        let fixture = short_fixture_root();
+        let long = long_parent(fixture.path());
+
+        for limit in [DARWIN_SOCKET_PATH_MAX_BYTES, LINUX_SOCKET_PATH_MAX_BYTES] {
+            let error = select_production_integration_temp_parent(vec![long.clone()], limit)
+                .expect_err("a too-long parent is rejected");
+            let message = error.to_string();
+
+            assert!(
+                message.contains("short enough for the Pohunek daemon socket"),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("at most {} bytes", isolation_root_budget(limit))),
+                "{message}"
+            );
+            assert!(!message.contains(&long.display().to_string()), "{message}");
+        }
+    }
+
     #[test]
     fn production_integration_temp_parent_fails_closed_without_safe_candidate() {
-        let fixture = tempfile::tempdir().expect("create temporary parent fixture");
+        let fixture = canonical_tempdir();
         let workspace = fixture.path().join("workspace");
         let unsafe_parent = workspace.join("nested");
         fs::create_dir_all(&unsafe_parent).expect("create nested workspace directory");
         fs::create_dir(workspace.join(".git")).expect("create controlled Git marker");
 
-        let error = select_production_integration_temp_parent(vec![unsafe_parent])
-            .expect_err("Git workspace ancestry must fail closed");
+        let error = select_production_integration_temp_parent(
+            vec![unsafe_parent],
+            LINUX_SOCKET_PATH_MAX_BYTES,
+        )
+        .expect_err("Git workspace ancestry must fail closed");
 
         assert!(error
             .to_string()
@@ -4769,7 +5457,7 @@ PY
             "../../../compat/hermes/compatibility-lock.json"
         ))
         .expect("parse checked compatibility lock");
-        let isolation = tempfile::tempdir().expect("create integration isolation");
+        let isolation = canonical_tempdir();
         let record = isolation.path().join("actions");
         let pohunek = controlled_pohunek(isolation.path(), &record, ControlledPohunekFailure::None);
         for step in &lock.plugin_contract.integration_lifecycle.steps {
@@ -4798,7 +5486,7 @@ PY
     #[test]
     #[cfg(unix)]
     fn integration_process_rejects_wrong_nonzero_malformed_and_missing_executables() {
-        let isolation = tempfile::tempdir().expect("create integration isolation");
+        let isolation = canonical_tempdir();
         let step = |action, expected_state| IntegrationStep {
             action,
             expected_state,
@@ -4857,7 +5545,7 @@ PY
     #[test]
     #[cfg(unix)]
     fn integration_process_uses_its_dedicated_time_limit() {
-        let isolation = tempfile::tempdir().expect("create integration isolation");
+        let isolation = canonical_tempdir();
         let sleeper = script(isolation.path(), "sleeping-pohunek", "#!/bin/sh\nsleep 5\n");
         let step = IntegrationStep {
             action: IntegrationAction::Install,
@@ -4884,7 +5572,7 @@ PY
     fn compatibility_requires_an_absolute_canonical_safe_pohunek_executable() {
         use std::os::unix::fs::{symlink, PermissionsExt as _};
 
-        let isolation = tempfile::tempdir().expect("create executable isolation");
+        let isolation = canonical_tempdir();
         let executable = script(isolation.path(), "safe-pohunek", "#!/bin/sh\nexit 0\n");
         assert_eq!(
             require_safe_pohunek_binary(&executable).expect("safe executable"),
@@ -5149,7 +5837,7 @@ PY
     #[test]
     #[cfg(unix)]
     fn process_cleanup_kills_descendant_holding_inherited_pipe() {
-        let root = tempfile::tempdir().expect("create process fixture");
+        let root = canonical_tempdir();
         let executable = script(
             root.path(),
             "pipe-holder",

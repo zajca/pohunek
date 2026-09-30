@@ -26,15 +26,29 @@ if [[ "$install_root" != /* || "$install_root" == "/" || -e "$install_root" ]]; 
   fail "install root must be an unused absolute path other than /"
 fi
 
-for executable in git python3 realpath sha256sum uv; do
+for executable in git python3 uv; do
   command -v "$executable" >/dev/null 2>&1 || fail "required executable is unavailable: $executable"
 done
+
+# Prints the lowercase hex SHA-256 of the file in $1. GNU coreutils ships
+# sha256sum; macOS ships shasum instead. Exactly one of them must exist.
+sha256_of() {
+  local digest
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest="$(sha256sum "$1")" || return 1
+  elif command -v shasum >/dev/null 2>&1; then
+    digest="$(shasum -a 256 "$1")" || return 1
+  else
+    fail "required executable is unavailable: sha256sum or shasum"
+  fi
+  printf '%s\n' "${digest%% *}"
+}
+sha256_of "$0" >/dev/null || fail "SHA-256 tool is unusable"
 
 script_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 lock_path="$script_root/$LOCK_RELATIVE_PATH"
 [[ -f "$lock_path" && ! -L "$lock_path" ]] || fail "compatibility lock is missing or is a symlink"
-observed_lock_sha256="$(sha256sum "$lock_path")"
-observed_lock_sha256="${observed_lock_sha256%% *}"
+observed_lock_sha256="$(sha256_of "$lock_path")"
 [[ "$observed_lock_sha256" == "$EXPECTED_LOCK_SHA256" ]] \
   || fail "compatibility lock SHA-256 does not match the reviewed digest"
 
@@ -52,8 +66,9 @@ if sys.version_info.major != 3 or not minimum <= sys.version_info.minor < maximu
     )
 PY
 
-readarray -d '' -t lock_fields < <(
-  "$python_bin" - "$lock_path" <<'PY'
+# The Python programs below are single-quoted `-c` strings rather than heredocs
+# inside `$(...)`, which bash 3.2 (macOS /bin/bash) mis-parses.
+readonly LOCK_READER_PROGRAM='
 import json
 import pathlib
 import sys
@@ -73,8 +88,22 @@ if not all(isinstance(field, str) for field in fields):
 for field in fields:
     sys.stdout.write(field)
     sys.stdout.write("\0")
-PY
-)
+'
+readonly REALPATH_PROGRAM='
+import os
+import sys
+
+resolved = os.path.realpath(sys.argv[1])
+if not os.path.exists(resolved):
+    raise SystemExit(1)
+sys.stdout.write(resolved)
+'
+
+# `read -d ''` keeps this portable to bash 3.2, which has no readarray.
+lock_fields=()
+while IFS= read -r -d '' lock_field; do
+  lock_fields+=("$lock_field")
+done < <("$python_bin" -c "$LOCK_READER_PROGRAM" "$lock_path")
 [[ "${#lock_fields[@]}" -eq 7 ]] || fail "compatibility lock is malformed"
 
 release="${lock_fields[0]}"
@@ -127,8 +156,7 @@ observed_tree="$(git -C "$source_root" rev-parse --verify "$commit^{tree}")"
 [[ "$observed_tree" == "$tree" ]] || fail "locked commit does not contain the locked tree"
 
 git -C "$source_root" archive --format=tar "$commit" >"$archive_path"
-observed_archive_sha256="$(sha256sum "$archive_path")"
-observed_archive_sha256="${observed_archive_sha256%% *}"
+observed_archive_sha256="$(sha256_of "$archive_path")"
 [[ "$observed_archive_sha256" == "$archive_sha256" ]] \
   || fail "canonical source archive SHA-256 does not match the compatibility lock"
 
@@ -150,9 +178,12 @@ UV_CACHE_DIR="$uv_cache_root" \
   UV_PROJECT_ENVIRONMENT="$venv_root" \
   uv sync --extra all --frozen --project "$source_root" >&2
 
-runtime_bin="$(realpath -e "$venv_root/bin/python3")" \
+# Symlink-free install root, so the containment check below also holds when the
+# caller's path crosses a symlink (macOS /var -> /private/var).
+canonical_install_root="$(cd -- "$install_root" && pwd -P)"
+runtime_bin="$("$python_bin" -c "$REALPATH_PROGRAM" "$venv_root/bin/python3")" \
   || fail "locked installation did not produce a Python runtime"
-[[ "$runtime_bin" == "$install_root"/* ]] \
+[[ "$runtime_bin" == "$canonical_install_root"/* ]] \
   || fail "locked Python runtime escaped the isolated installation root"
 hermes_bin="$venv_root/bin/hermes"
 [[ -f "$hermes_bin" && -x "$hermes_bin" && ! -L "$hermes_bin" ]] \

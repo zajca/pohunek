@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import socket
+import struct
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -16,6 +18,21 @@ _MAX_HOOK_TIMEOUT_SECONDS = 1.0
 _DEFAULT_HOOK_TIMEOUT_SECONDS = 0.25
 _MAX_NATIVE_ID_CHARS = 512
 _MAX_FAILURE_COUNT = 1_000_000
+
+# Darwin exposes the kernel process start time through `proc_pidinfo` with the
+# `PROC_PIDTBSDINFO` flavor, which fills a 136-byte `struct proc_bsdinfo`. The
+# Pohunek daemon and CLI derive the same identity from the same struct, encoded
+# as `pbi_start_tvsec * 1_000_000 + pbi_start_tvusec`, so a report from this
+# process matches the generation the daemon observes. The offsets are the
+# kernel ABI: `pbi_pid` is a u32 after three u32 fields, and the start time is
+# two u64 fields after the `pbi_nice` field.
+_DARWIN_LIBSYSTEM = "/usr/lib/libSystem.B.dylib"
+_DARWIN_PROC_PIDTBSDINFO = 3
+_DARWIN_BSDINFO_SIZE = 136
+_DARWIN_BSDINFO_PID_OFFSET = 12
+_DARWIN_BSDINFO_START_OFFSET = 120
+_MICROSECONDS_PER_SECOND = 1_000_000
+_START_IDENTITY_LIMIT = 1 << 64
 
 
 class HookReporter:
@@ -232,12 +249,52 @@ def _deadline(value: str | None) -> float:
 
 
 def _process_start_identity(pid: int) -> int | None:
+    """Return the platform's opaque process-generation value for `pid`."""
+    if sys.platform == "darwin":
+        return _darwin_process_start_identity(pid)
+    return _linux_process_start_identity(pid)
+
+
+def _linux_process_start_identity(pid: int) -> int | None:
     try:
         with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
             fields = handle.read().rsplit(")", 1)[1].split()
         return int(fields[19])
     except (OSError, IndexError, ValueError):
         return None
+
+
+def _darwin_process_start_identity(pid: int) -> int | None:
+    # A libproc call reads no file, so the containment guard needs no path
+    # exception for it.
+    try:
+        import ctypes
+
+        libsystem = ctypes.CDLL(_DARWIN_LIBSYSTEM, use_errno=True)
+        proc_pidinfo = libsystem.proc_pidinfo
+        proc_pidinfo.argtypes = [
+            ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int,
+        ]
+        proc_pidinfo.restype = ctypes.c_int
+        buffer = ctypes.create_string_buffer(_DARWIN_BSDINFO_SIZE)
+        written = proc_pidinfo(pid, _DARWIN_PROC_PIDTBSDINFO, 0, buffer, _DARWIN_BSDINFO_SIZE)
+        if written != _DARWIN_BSDINFO_SIZE:
+            return None
+        return _darwin_start_identity_from_bsdinfo(buffer.raw, pid)
+    except (AttributeError, ImportError, OSError):
+        return None
+
+
+def _darwin_start_identity_from_bsdinfo(raw: bytes, pid: int) -> int | None:
+    """Decode `struct proc_bsdinfo` bytes; reject a struct for another process."""
+    if len(raw) != _DARWIN_BSDINFO_SIZE:
+        return None
+    (reported_pid,) = struct.unpack_from("<I", raw, _DARWIN_BSDINFO_PID_OFFSET)
+    seconds, microseconds = struct.unpack_from("<QQ", raw, _DARWIN_BSDINFO_START_OFFSET)
+    if reported_pid != pid or microseconds >= _MICROSECONDS_PER_SECOND:
+        return None
+    identity = seconds * _MICROSECONDS_PER_SECOND + microseconds
+    return identity if identity < _START_IDENTITY_LIMIT else None
 
 
 def _native_id(args: dict[str, Any] | None, kwargs: dict[str, Any]) -> str | None:
