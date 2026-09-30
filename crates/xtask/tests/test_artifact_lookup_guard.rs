@@ -25,12 +25,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Forbidden compile-time lookups. Assembled with `concat!` so this file does
-/// not contain the literals it searches for.
-const FORBIDDEN_PATTERNS: [&str; 2] = [
-    concat!("env!(", "\"CARGO_BIN_EXE_"),
-    concat!("env!(", "\"CARGO_MANIFEST_DIR\")"),
-];
+/// Compile-time environment macros that bake a build-machine path into a test.
+const LOOKUP_MACROS: [&str; 2] = ["env", "option_env"];
+
+/// Variable that names the package directory at compile time.
+const MANIFEST_DIR_VAR: &str = "CARGO_MANIFEST_DIR";
+
+/// Prefix of the variables that name a package binary at compile time.
+const BIN_EXE_PREFIX: &str = "CARGO_BIN_EXE_";
 
 /// Files allowed to contain a forbidden pattern, as `(workspace-relative path,
 /// reason)`. No file needs an exemption today; an entry must state why the
@@ -42,7 +44,8 @@ const ALLOW_LIST: &[(&str, &str)] = &[];
 struct Violation {
     path: String,
     line: usize,
-    pattern: &'static str,
+    /// The macro and variable that were read, as written in the source.
+    lookup: String,
 }
 
 /// Whether the whole file is test code judged by its path alone.
@@ -493,6 +496,71 @@ fn module_candidates(declaring: &str, module: &ExternalModule) -> Vec<String> {
         .collect()
 }
 
+/// Index of the first non-whitespace byte at or after `from`.
+fn skip_whitespace(bytes: &[u8], mut from: usize) -> usize {
+    while bytes.get(from).is_some_and(u8::is_ascii_whitespace) {
+        from += 1;
+    }
+    from
+}
+
+/// Content of the string literal (plain or raw) starting at `start`.
+fn string_literal_at(code: &str, start: usize) -> Option<&str> {
+    let bytes = code.as_bytes();
+    match bytes.get(start)? {
+        b'"' => {
+            let end = end_of_string(bytes, start);
+            code.get(start + 1..end.checked_sub(1)?)
+        }
+        b'r' => {
+            let end = end_of_raw_string(bytes, start)?;
+            let hashes = bytes[start + 1..]
+                .iter()
+                .take_while(|&&b| b == b'#')
+                .count();
+            code.get(start + 2 + hashes..end.checked_sub(1 + hashes)?)
+        }
+        _ => None,
+    }
+}
+
+/// Finds `env!` and `option_env!` invocations, with any path prefix and any
+/// whitespace or comments between tokens, whose first argument is a string
+/// literal naming `CARGO_MANIFEST_DIR` or a `CARGO_BIN_EXE_*` variable. Macro
+/// names are located in the skeleton so text inside string literals is never
+/// taken for an invocation. Returns the offset of the macro name and a
+/// description of the lookup.
+fn forbidden_lookups(views: &Views) -> Vec<(usize, String)> {
+    let skeleton = views.skeleton.as_bytes();
+    let mut found = Vec::new();
+    for name in LOOKUP_MACROS {
+        for (offset, _) in views.skeleton.match_indices(name) {
+            let end = offset + name.len();
+            if offset > 0 && is_ident(skeleton[offset - 1]) {
+                continue;
+            }
+            let bang = skip_whitespace(skeleton, end);
+            if skeleton.get(bang) != Some(&b'!') {
+                continue;
+            }
+            let open = skip_whitespace(skeleton, bang + 1);
+            if !matches!(skeleton.get(open), Some(b'(' | b'[' | b'{')) {
+                continue;
+            }
+            // The skeleton blanks string literals, so the argument is located in the
+            // comment-free view.
+            let argument = skip_whitespace(views.code.as_bytes(), open + 1);
+            let Some(variable) = string_literal_at(&views.code, argument) else {
+                continue;
+            };
+            if variable == MANIFEST_DIR_VAR || variable.starts_with(BIN_EXE_PREFIX) {
+                found.push((offset, format!("{name}!({variable:?}..)")));
+            }
+        }
+    }
+    found
+}
+
 /// Scans one file. `forced_test` marks the whole file as test code (declared
 /// by a test module elsewhere).
 fn analyze(path: &str, text: &str, forced_test: bool) -> Analysis {
@@ -505,16 +573,14 @@ fn analyze(path: &str, text: &str, forced_test: bool) -> Analysis {
         .map(|item| (item.start, item.end))
         .collect();
     let mut violations = Vec::new();
-    for pattern in FORBIDDEN_PATTERNS {
-        for (offset, _) in views.code.match_indices(pattern) {
-            let in_test = whole_file || test_spans.iter().any(|&(s, e)| s <= offset && offset < e);
-            if in_test {
-                violations.push(Violation {
-                    path: path.to_owned(),
-                    line: text[..offset].matches('\n').count() + 1,
-                    pattern,
-                });
-            }
+    for (offset, lookup) in forbidden_lookups(&views) {
+        let in_test = whole_file || test_spans.iter().any(|&(s, e)| s <= offset && offset < e);
+        if in_test {
+            violations.push(Violation {
+                path: path.to_owned(),
+                line: text[..offset].matches('\n').count() + 1,
+                lookup,
+            });
         }
     }
     violations.sort_by_key(|violation| violation.line);
@@ -592,7 +658,7 @@ fn scan_tree(root: &Path, allow: &[(&str, &str)]) -> Vec<Violation> {
 
 /// The manifest-dir lookup expression the fixtures embed.
 fn lookup() -> &'static str {
-    FORBIDDEN_PATTERNS[1]
+    r#"env!("CARGO_MANIFEST_DIR")"#
 }
 
 /// Fixture source with `@` standing for the forbidden lookup.
@@ -636,14 +702,14 @@ fn allow_list_entries_name_existing_files_and_state_a_reason() {
 
 #[test]
 fn flags_a_bin_exe_lookup_in_an_integration_test() {
-    let text = format!("let c = Command::new({}x\"));\n", FORBIDDEN_PATTERNS[0]);
-    let found = analyze("crates/demo/tests/run.rs", &text, false).violations;
+    let text = "let c = Command::new(env!(\"CARGO_BIN_EXE_tool\"));\n";
+    let found = analyze("crates/demo/tests/run.rs", text, false).violations;
     assert_eq!(
         found,
         [Violation {
             path: "crates/demo/tests/run.rs".into(),
             line: 1,
-            pattern: FORBIDDEN_PATTERNS[0],
+            lookup: "env!(\"CARGO_BIN_EXE_tool\"..)".into(),
         }]
     );
 }
@@ -717,10 +783,59 @@ fn a_file_level_cfg_test_attribute_marks_the_whole_file() {
 #[test]
 fn ignores_comments() {
     let pattern = lookup();
-    let text = format!("// {pattern}\n/* {pattern}\n   {pattern} */\nlet ok = 1; // {pattern}\n");
+    let text = format!(
+        "// {pattern}\n/* {pattern}\n   {pattern} */\nlet ok = 1; // {pattern}\nlet a = env /* c */ ! // c\n ( // c\n \"CARGO_PKG_NAME\");\n"
+    );
     assert!(analyze("crates/demo/tests/run.rs", &text, false)
         .violations
         .is_empty());
+}
+
+#[test]
+fn flags_every_macro_form_that_reads_a_forbidden_variable() {
+    let forms = [
+        r#"let p = env!("CARGO_MANIFEST_DIR", "must be set");"#,
+        r#"let p = option_env!("CARGO_MANIFEST_DIR");"#,
+        "let p = env\n    !\n    (\n        \"CARGO_MANIFEST_DIR\"\n    );",
+        "let p = env /* split */ ! ( // note\n \"CARGO_MANIFEST_DIR\" );",
+        r#"let p = std::env!("CARGO_MANIFEST_DIR");"#,
+        r#"let p = ::core::env!("CARGO_MANIFEST_DIR");"#,
+        r##"let p = env!(r#"CARGO_MANIFEST_DIR"#);"##,
+        r#"let p = env!(r"CARGO_MANIFEST_DIR");"#,
+        r#"let p = env!["CARGO_MANIFEST_DIR"];"#,
+        r#"let p = env!("CARGO_BIN_EXE_pohunek");"#,
+        r#"let p = option_env!("CARGO_BIN_EXE_pohunek-sessiond", "x");"#,
+        r#"let p = std::option_env!("CARGO_BIN_EXE_");"#,
+    ];
+    for form in forms {
+        let text = format!("fn f() {{\n{form}\n}}\n");
+        let found = analyze("crates/demo/tests/run.rs", &text, false).violations;
+        assert_eq!(found.len(), 1, "{form}: {found:?}");
+        assert_eq!(found[0].line, 2, "{form}");
+    }
+}
+
+#[test]
+fn ignores_macros_and_text_that_are_not_forbidden_lookups() {
+    let forms = [
+        r#"let p = env!("CARGO_PKG_NAME");"#,
+        r#"let p = option_env!("CARGO_PKG_VERSION", "x");"#,
+        r#"let p = my_env!("CARGO_MANIFEST_DIR");"#,
+        r#"let p = std::env::var("CARGO_MANIFEST_DIR");"#,
+        r#"let p = env::var_os("CARGO_BIN_EXE_tool");"#,
+        r#"let p = "env!(\"CARGO_MANIFEST_DIR\")";"#,
+        r##"let p = r#"option_env!("CARGO_BIN_EXE_x")"#;"##,
+        r#"let p = format!("{}", "CARGO_MANIFEST_DIR");"#,
+        r#"let p = concat!("CARGO_MANIFEST_DIR");"#,
+        r#"let p = env!(concat!("CARGO_MANIFEST", "_DIR"));"#,
+        r#"let p = env!("NOT_CARGO_MANIFEST_DIR");"#,
+        r#"let p = env!("CARGO_MANIFEST_DIR_EXTRA");"#,
+    ];
+    for form in forms {
+        let text = format!("fn f() {{\n{form}\n}}\n");
+        let found = analyze("crates/demo/tests/run.rs", &text, false).violations;
+        assert!(found.is_empty(), "{form}: {found:?}");
+    }
 }
 
 #[test]
