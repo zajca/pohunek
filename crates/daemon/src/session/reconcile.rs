@@ -1650,14 +1650,15 @@ impl SessionRegistry {
             {
                 for candidate in &outcome.unreadable {
                     record_accepted_process(&mut accepted, candidate, &runtime_id);
-                }
-                if accepted.len() > MAX_ACCEPTED_UNCONFIRMED_PROCESSES {
-                    let mut error = ambiguous(format!(
-                        "{} unreadable processes may belong to its runtimes, more than the {MAX_ACCEPTED_UNCONFIRMED_PROCESSES} one removal can accept",
-                        accepted.len()
-                    ));
-                    error.recover = Some(UNREADABLE_CANDIDATES_RECOVER.to_owned());
-                    return Err(error);
+                    // Stops at the first excess process so the work stays
+                    // bounded however many candidates a host has.
+                    if accepted.len() > MAX_ACCEPTED_UNCONFIRMED_PROCESSES {
+                        let mut error = ambiguous(format!(
+                            "more than the {MAX_ACCEPTED_UNCONFIRMED_PROCESSES} unreadable processes one removal can accept may belong to its runtimes"
+                        ));
+                        error.recover = Some(UNREADABLE_CANDIDATES_RECOVER.to_owned());
+                        return Err(error);
+                    }
                 }
                 continue;
             }
