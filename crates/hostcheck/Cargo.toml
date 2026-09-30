@@ -15,5 +15,8 @@ pohunek-protocol = { workspace = true }
 pohunek-netbird = { workspace = true }
 pohunek-paths = { workspace = true }
 
+[dev-dependencies]
+pohunek-test-support = { workspace = true }
+
 [lints]
 workspace = true

@@ -854,15 +854,15 @@ mod tests {
 
     use super::*;
 
-    /// Scratch directory under `/tmp`.
+    /// Scratch directory under the symlink-free, short fixture root.
     ///
-    /// The Darwin socket limit is 103 bytes, and macOS's per-user temp dir is
-    /// long enough to overflow it, so tests that build a runtime dir stay short.
+    /// On macOS the root is `/private/tmp`: `/tmp` and the per-user temp dir
+    /// are symlinked, and the latter overflows Darwin's 103-byte socket limit.
     fn temp_dir(tag: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            PathBuf::from("/tmp").join(format!("pohunek-hc-{tag}-{}-{n}", std::process::id()));
+        let dir = pohunek_test_support::temp_root()
+            .join(format!("pohunek-hc-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1027,6 +1027,42 @@ mod tests {
             DoctorStatus::Fail
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_symlinked_parent_is_accepted_but_a_symlinked_runtime_dir_is_refused() {
+        // Contract: only the runtime directory itself must be a real directory;
+        // symlinked ancestors (macOS `/tmp` -> `/private/tmp`) are followed.
+        let real = temp_dir("rt-parent-real");
+        let holder = temp_dir("rt-parent-link");
+        let link_root = holder.join("root");
+        std::os::unix::fs::symlink(&real, &link_root).unwrap();
+        let dir = real.join("rt");
+        std::fs::create_dir(&dir).unwrap();
+        set_mode(&dir, 0o700);
+        let uid = std::fs::metadata(&dir).unwrap().uid();
+
+        let through_link = link_root.join("rt");
+        assert_eq!(
+            check_runtime_dir_private(&through_link, uid).status,
+            DoctorStatus::Ok
+        );
+
+        let final_link = holder.join("final");
+        std::os::unix::fs::symlink(&dir, &final_link).unwrap();
+        assert_eq!(
+            check_runtime_dir_private(&final_link, uid).status,
+            DoctorStatus::Fail
+        );
+
+        let dirs = [AccessDir {
+            label: "current directory",
+            path: &through_link,
+        }];
+        let access = check_filesystem_access(&access_inputs(&real, None, &dirs));
+        assert_eq!(access.status, DoctorStatus::Ok, "{}", access.detail);
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_dir_all(&holder);
     }
 
     #[test]

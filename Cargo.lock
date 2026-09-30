@@ -4374,6 +4374,7 @@ dependencies = [
  "pohunek-netbird",
  "pohunek-paths",
  "pohunek-protocol",
+ "pohunek-test-support",
 ]
 
 [[package]]
