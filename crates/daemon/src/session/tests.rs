@@ -13613,7 +13613,7 @@ async fn accepted_processes_are_logged_only_when_the_removal_proceeds() {
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
     );
     let session = record_only_session(&registry).await;
-    let accepted_log = "removal accepted an unreadable-marker process";
+    let accepted_log = "removal proceeds past an unreadable-marker process";
 
     inspector.set_candidates(super::supervision::MAX_ACCEPTED_UNCONFIRMED_PROCESSES + 1);
     registry
@@ -13627,6 +13627,18 @@ async fn accepted_processes_are_logged_only_when_the_removal_proceeds() {
     );
 
     inspector.set_candidate(true);
+    inspector.set_listing_fails(true);
+    registry
+        .remove_with(&session.id, super::UnconfirmedCleanup::Accept)
+        .await
+        .expect_err("another blocker refuses the removal");
+    assert!(
+        !logs.text().contains(accepted_log),
+        "a refusal by another blocker accepted nothing: {}",
+        logs.text()
+    );
+
+    inspector.set_listing_fails(false);
     registry
         .remove_with(&session.id, super::UnconfirmedCleanup::Accept)
         .await
@@ -13634,10 +13646,11 @@ async fn accepted_processes_are_logged_only_when_the_removal_proceeds() {
     assert_eq!(logs.text().matches(accepted_log).count(), 1);
 }
 
-/// A removal that fails after its sweep accepted a candidate keeps the
-/// session and logs no acceptance; the retry that completes logs it once.
+/// A removal that fails after the sweep and after its checkout was deleted
+/// still logged that it proceeded past the candidate; the retry logs again
+/// for its own attempt.
 #[tokio::test]
-async fn a_removal_that_fails_after_the_sweep_logs_no_acceptance() {
+async fn a_removal_that_fails_after_the_sweep_still_logs_that_it_proceeded() {
     let logs = crate::runtime::lifecycle::tests::LogCapture::default();
     let _subscriber = logs.install();
     let inspector = Arc::new(UnreadableCandidateHost::default());
@@ -13645,19 +13658,27 @@ async fn a_removal_that_fails_after_the_sweep_logs_no_acceptance() {
         "remove-accept-late-failure",
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
     );
-    let session = record_only_session(&registry).await;
+    let repo = init_git_repo("remove-accept-late-failure");
+    let session = record_only_session_in(&registry, Some(&repo)).await;
+    let worktree = session.worktree_path.clone().expect("session worktree");
+    assert!(worktree.exists(), "the session owns a checkout");
     inspector.set_candidate(true);
-    let accepted_log = "removal accepted an unreadable-marker process";
+    let proceeds_log = "removal proceeds past an unreadable-marker process";
 
     let failed = registry
         .remove_with(&session.id, super::UnconfirmedCleanup::Accept)
         .await
-        .expect_err("log cleanup fails after the sweep accepted the candidate");
+        .expect_err("log cleanup fails after the checkout was deleted");
     assert_eq!(failed.code, "session_log_cleanup_failed", "{failed:?}");
-    assert_eq!(session_ids(&registry).await, vec![session.id.0.clone()]);
     assert!(
-        !logs.text().contains(accepted_log),
-        "a failed removal accepted nothing: {}",
+        !worktree.exists(),
+        "the checkout was deleted before the failure"
+    );
+    assert_eq!(session_ids(&registry).await, vec![session.id.0.clone()]);
+    assert_eq!(
+        logs.text().matches(proceeds_log).count(),
+        1,
+        "{}",
         logs.text()
     );
 
@@ -13667,7 +13688,7 @@ async fn a_removal_that_fails_after_the_sweep_logs_no_acceptance() {
         .remove_with(&session.id, super::UnconfirmedCleanup::Accept)
         .await
         .expect("the retry completes the removal");
-    assert_eq!(logs.text().matches(accepted_log).count(), 1);
+    assert_eq!(logs.text().matches(proceeds_log).count(), 2);
 }
 
 /// A removal that needs no consent reports no accepted processes even when

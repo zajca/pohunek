@@ -3114,7 +3114,7 @@ impl SessionRegistry {
     /// unconfirmed solely because of unreadable-marker processes does not
     /// refuse the removal: those processes are never signalled and are
     /// returned in [`SessionRemoveResult::accepted_unconfirmed_processes`]
-    /// and logged at `warn` once the removal completed. Every other unconfirmed outcome (a signalled
+    /// and logged at `warn` before any cleanup step. Every other unconfirmed outcome (a signalled
     /// process still running, a sweep error, a missing supervision
     /// configuration) refuses exactly as under [`UnconfirmedCleanup::Refuse`].
     ///
@@ -3231,6 +3231,19 @@ impl SessionRegistry {
         let accepted_unconfirmed = self
             .sweep_removed_runtimes(id, generation, runtime_id, cleanup)
             .await?;
+        // Every runtime is judged and the cap passed, so the removal proceeds
+        // past these processes; logged before the first destructive step so
+        // a later failure still leaves the decision on record.
+        for (process, accepted_runtime_id) in &accepted_unconfirmed {
+            warn!(
+                session_id = %id.0,
+                runtime_id = %accepted_runtime_id,
+                pid = process.pid,
+                start_identity = %process.start_identity,
+                comm = process.command.as_deref().unwrap_or("unavailable"),
+                "removal proceeds past an unreadable-marker process that may belong to the removed runtime"
+            );
+        }
         let (cleanup_warnings, worktrees) = self.cleanup_owned_worktrees_for_removal(id).await?;
         if !cleanup_warnings.is_empty() {
             let mut sessions = self.inner.sessions.lock().await;
@@ -3280,18 +3293,6 @@ impl SessionRegistry {
         }
         if let Some(entry) = &evicted {
             self.emit(event::SESSION_REMOVED, &entry.info);
-        }
-        // Logged only now: an earlier failure keeps the session, so no
-        // acceptance took effect.
-        for (process, accepted_runtime_id) in &accepted_unconfirmed {
-            warn!(
-                session_id = %id.0,
-                runtime_id = %accepted_runtime_id,
-                pid = process.pid,
-                start_identity = %process.start_identity,
-                comm = process.command.as_deref().unwrap_or("unavailable"),
-                "removal accepted an unreadable-marker process that may belong to the removed runtime"
-            );
         }
         let accepted_unconfirmed = accepted_unconfirmed
             .into_iter()

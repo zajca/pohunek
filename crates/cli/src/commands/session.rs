@@ -1424,16 +1424,27 @@ fn build_stop_request(target: &Target) -> Result<Request, CliError> {
     request_with_params(method::SESSION_STOP, &SessionId(target.session_id.clone()))
 }
 
+/// Recovery hint for a daemon that does not know the consent method.
+const CONSENT_METHOD_UPGRADE_HINT: &str =
+    "the daemon predates --accept-unconfirmed-cleanup; upgrade the daemon and retry";
+
 /// Adds an upgrade hint to a `method_not_found` answer for the consent
-/// method, which only daemons that support it accept.
+/// method, which only daemons that support it accept. Errors relayed from a
+/// remote daemon keep their host.
 fn missing_consent_method_hint(error: CliError) -> CliError {
+    let add_hint = |mut source: protocol::ProtocolError| {
+        if source.code == "method_not_found" {
+            source.recover = Some(CONSENT_METHOD_UPGRADE_HINT.to_owned());
+        }
+        source
+    };
     match error {
-        CliError::Protocol(mut source) if source.code == "method_not_found" => {
-            source.recover = Some(
-                "the daemon predates --accept-unconfirmed-cleanup; upgrade the daemon and retry"
-                    .to_owned(),
-            );
-            CliError::Protocol(source)
+        CliError::Protocol(source) => CliError::Protocol(add_hint(source)),
+        CliError::Client(pohunek_client::ClientError::RemoteProtocol { host, source }) => {
+            CliError::Client(pohunek_client::ClientError::RemoteProtocol {
+                host,
+                source: add_hint(source),
+            })
         }
         other => other,
     }
@@ -3433,6 +3444,32 @@ mod tests {
             CliError::Protocol(source) => {
                 assert_eq!(source.code, "method_not_found");
                 assert!(source.recover.expect("hint").contains("upgrade the daemon"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let remote = CliError::Client(pohunek_client::ClientError::RemoteProtocol {
+            host: "peer-a".to_owned(),
+            source: protocol::ProtocolError::method_not_found(
+                "session.remove_accepting_unconfirmed",
+            ),
+        });
+        match missing_consent_method_hint(remote) {
+            CliError::Client(pohunek_client::ClientError::RemoteProtocol { host, source }) => {
+                assert_eq!(host, "peer-a");
+                assert_eq!(source.code, "method_not_found");
+                assert!(source.recover.expect("hint").contains("upgrade the daemon"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let remote_other = CliError::Client(pohunek_client::ClientError::RemoteProtocol {
+            host: "peer-a".to_owned(),
+            source: protocol::ProtocolError::bad_request("x"),
+        });
+        match missing_consent_method_hint(remote_other) {
+            CliError::Client(pohunek_client::ClientError::RemoteProtocol { source, .. }) => {
+                assert!(source.recover.is_none());
             }
             other => panic!("unexpected error: {other:?}"),
         }

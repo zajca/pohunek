@@ -335,7 +335,7 @@ those unreadable processes are the only obstacle. The flag is per call: nothing
 stores it, a retried removal needs it again, and neither the reconciliation that
 finishes an interrupted removal nor the retention sweep ever has it. With it the
 removal proceeds past the unreadable candidates without signalling them,
-logs them at `warn`, and lists
+logs each at `warn` once the sweep lets it proceed (before any cleanup), and lists
 every one in the result as `accepted_unconfirmed_processes` (human output prints `pid N (start S, command
 name)` lines after the `removed=` line, with the process-chosen command name
 escaped; `--json` carries the array). A removal with more than 64 candidates is
