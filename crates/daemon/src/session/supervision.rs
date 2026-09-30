@@ -15,7 +15,8 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use pohunek_platform::process::{
-    sweep_runtime, ProcessIdentity, ProcessInspector, SkipReason, StartIdentity, SweepRequest,
+    sweep_runtime, ProcessIdentity, ProcessInspector, SkipReason, StartIdentity, SweepReport,
+    SweepRequest,
 };
 use pohunek_platform::supervisor::{
     Error as SupervisorError, ServiceId, ServiceObservation, WorkerKey,
@@ -29,7 +30,7 @@ use crate::runtime::lifecycle::{
     SUPERVISION_UNAVAILABLE,
 };
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-29
 
 /// Reason recorded when a generation's worker is proven crashed and the
 /// marker sweep confirmed that no process of its runtime is left.
@@ -64,6 +65,75 @@ pub(crate) const CREATE_COMPENSATION_PENDING: &str = "create_compensation_pendin
 /// short fork chain of a dying PTY tree; a runtime that still yields targets
 /// after that is reported as unconfirmed instead of being swept forever.
 const MAX_SWEEP_PASSES: usize = 3;
+
+/// Most unreadable-marker processes a removal refusal names.
+///
+/// The refusal travels in an error message every client renders, so the list
+/// stays short; the rest is reported as a count. Eight covers the handful of
+/// non-dumpable helpers (agents, keyrings) a desktop session typically has.
+pub(super) const MAX_LISTED_UNREADABLE_CANDIDATES: usize = 8;
+
+/// Recovery hint of a removal refused because of unreadable-marker processes.
+pub(super) const UNREADABLE_CANDIDATES_RECOVER: &str =
+    "inspect the listed processes and end the ones that belong to this session, then retry the removal";
+
+/// Longest command name the refusal repeats, in characters.
+///
+/// The kernel task name is at most 15 bytes on Linux; the bound keeps a
+/// hostile or oversized name from inflating the message.
+const MAX_LISTED_COMM_CHARS: usize = 32;
+
+/// Renders a kernel command name for an operator-facing message.
+///
+/// The name is chosen by the process, so it is untrusted text. Only ASCII
+/// letters, digits, space and `._-+:@/` pass through; every other character
+/// (backticks, separators, control and bidirectional-formatting characters,
+/// non-ASCII) becomes a `\u{..}` escape, which keeps the name from closing its
+/// own quoting or imitating another list entry. At most
+/// [`MAX_LISTED_COMM_CHARS`] characters are kept, and an ellipsis marks
+/// a shortened name.
+fn escape_command_name(comm: &str) -> String {
+    let mut escaped = String::new();
+    let mut chars = comm.chars();
+    for c in chars.by_ref().take(MAX_LISTED_COMM_CHARS) {
+        if c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '+' | ':' | '@' | '/') {
+            escaped.push(c);
+        } else {
+            escaped.extend(c.escape_unicode());
+        }
+    }
+    if chars.next().is_some() {
+        escaped.push_str("...");
+    }
+    escaped
+}
+
+/// Renders candidates as `pid 42 (start 7, comm `name`)` entries joined by
+/// commas, at most [`MAX_LISTED_UNREADABLE_CANDIDATES`] of them, then a
+/// trailing `and N more`. Carries no environment or command-line content.
+pub(super) fn describe_unreadable_candidates(candidates: &[UnreadableCandidate]) -> String {
+    let mut listed: Vec<String> = candidates
+        .iter()
+        .take(MAX_LISTED_UNREADABLE_CANDIDATES)
+        .map(|candidate| {
+            let comm = candidate.comm.as_deref().map_or_else(
+                || "command name unavailable".to_owned(),
+                |comm| format!("command `{}`", escape_command_name(comm)),
+            );
+            format!(
+                "pid {} (start {}, {comm})",
+                candidate.identity.pid, candidate.identity.start_identity
+            )
+        })
+        .collect();
+    if candidates.len() > MAX_LISTED_UNREADABLE_CANDIDATES {
+        listed.push(format!(
+            "and {} more",
+            candidates.len() - MAX_LISTED_UNREADABLE_CANDIDATES
+        ));
+    }
+    listed.join(", ")
+}
 
 /// Liveness polling interval inside one sweep's grace windows.
 ///
@@ -255,6 +325,54 @@ pub(super) enum Cleanup {
     Unconfirmed,
 }
 
+/// A same-user process whose ownership markers could not be read, so the sweep
+/// could not prove it foreign to the runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct UnreadableCandidate {
+    pub(super) identity: ProcessIdentity,
+    /// Kernel command name, when the process table still lists the process.
+    pub(super) comm: Option<String>,
+}
+
+/// The verdict of a lost-runtime sweep together with what blocked it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SweepOutcome {
+    pub(super) cleanup: Cleanup,
+    /// Unreadable-marker processes of the deciding pass; empty unless
+    /// `other_blockers` is false and the cleanup is unconfirmed.
+    pub(super) unreadable: Vec<UnreadableCandidate>,
+    /// Whether anything besides unreadable-marker processes kept the cleanup
+    /// unconfirmed: a signalled process still running, a sweep, inspection or
+    /// signal error, the current process, a missing supervision
+    /// configuration, an invalid request, or a last pass that still
+    /// terminated or killed processes. Meaningful only when unconfirmed.
+    pub(super) other_blockers: bool,
+}
+
+impl SweepOutcome {
+    fn complete() -> Self {
+        Self {
+            cleanup: Cleanup::Complete,
+            unreadable: Vec::new(),
+            other_blockers: false,
+        }
+    }
+
+    fn blocked_by_other() -> Self {
+        Self {
+            cleanup: Cleanup::Unconfirmed,
+            unreadable: Vec::new(),
+            other_blockers: true,
+        }
+    }
+
+    /// Whether the cleanup is unconfirmed solely because of the listed
+    /// unreadable-marker processes, so ending or excluding them settles it.
+    pub(super) fn only_unreadable_candidates_blocked(&self) -> bool {
+        self.cleanup == Cleanup::Unconfirmed && !self.other_blockers && !self.unreadable.is_empty()
+    }
+}
+
 /// Sessions waiting for their supervisor to answer again.
 #[derive(Debug, Default)]
 pub(super) struct SupervisionRetries {
@@ -307,6 +425,19 @@ impl SessionRegistry {
         runtime_id: &str,
         worker_start_identity: Option<StartIdentity>,
     ) -> Cleanup {
+        self.sweep_lost_runtime_detailed(session_id, runtime_id, worker_start_identity)
+            .await
+            .cleanup
+    }
+
+    /// [`Self::sweep_lost_runtime`] with the unreadable-marker processes that
+    /// kept the cleanup unconfirmed and whether anything else did.
+    pub(super) async fn sweep_lost_runtime_detailed(
+        &self,
+        session_id: &str,
+        runtime_id: &str,
+        worker_start_identity: Option<StartIdentity>,
+    ) -> SweepOutcome {
         let Some(grace) = self
             .inner
             .config
@@ -319,7 +450,7 @@ impl SessionRegistry {
                 runtime_id,
                 "lost runtime is not swept without a supervision configuration"
             );
-            return Cleanup::Unconfirmed;
+            return SweepOutcome::blocked_by_other();
         };
         let request = match SweepRequest::new(
             runtime_id,
@@ -330,9 +461,10 @@ impl SessionRegistry {
             Ok(request) => request.with_worker_start_identity(worker_start_identity),
             Err(error) => {
                 tracing::warn!(session_id, runtime_id, error = %error, "lost runtime cannot be swept");
-                return Cleanup::Unconfirmed;
+                return SweepOutcome::blocked_by_other();
             }
         };
+        let mut last_pass = None;
         for pass in 1..=MAX_SWEEP_PASSES {
             let report = match sweep_runtime(self.inner.inspector.as_ref(), &request).await {
                 Ok(report) => report,
@@ -344,7 +476,7 @@ impl SessionRegistry {
                         error = %error,
                         "lost runtime sweep aborted; remaining processes are left alone"
                     );
-                    return Cleanup::Unconfirmed;
+                    return SweepOutcome::blocked_by_other();
                 }
             };
             let unreadable = report
@@ -377,7 +509,7 @@ impl SessionRegistry {
                     runtime_id,
                     "lost runtime sweep could not confirm every process exited"
                 );
-                return Cleanup::Unconfirmed;
+                return SweepOutcome::blocked_by_other();
             }
             // Selected counts every process this pass attributed to the
             // runtime; the sweep repeats until a pass attributes none.
@@ -386,8 +518,9 @@ impl SessionRegistry {
                 + report.unconfirmed.len()
                 + report.skipped.len();
             if selected == 0 {
-                return Cleanup::Complete;
+                return SweepOutcome::complete();
             }
+            last_pass = Some(report);
         }
         tracing::warn!(
             session_id,
@@ -395,7 +528,45 @@ impl SessionRegistry {
             sweep.passes = MAX_SWEEP_PASSES,
             "lost runtime still had marked or unreadable processes after every sweep pass"
         );
-        Cleanup::Unconfirmed
+        match last_pass {
+            Some(report) => self.unreadable_outcome(&report),
+            None => SweepOutcome::blocked_by_other(),
+        }
+    }
+
+    /// The outcome of a sweep whose deciding pass still selected processes.
+    ///
+    /// Only unreadable-marker skips leave the runtime's own processes
+    /// accounted for; anything else the pass signalled or skipped could be a
+    /// live member, so it counts as another blocker.
+    fn unreadable_outcome(&self, report: &SweepReport) -> SweepOutcome {
+        let only_unreadable = report.terminated.is_empty()
+            && report.killed.is_empty()
+            && report
+                .skipped
+                .iter()
+                .all(|skipped| skipped.reason == SkipReason::MarkersUnreadable);
+        if !only_unreadable {
+            return SweepOutcome::blocked_by_other();
+        }
+        let unreadable = report
+            .skipped
+            .iter()
+            .map(|skipped| UnreadableCandidate {
+                identity: skipped.identity,
+                comm: match self.inner.inspector.process(skipped.identity.pid) {
+                    Ok(Some(fact)) if fact.start_identity == skipped.identity.start_identity => {
+                        Some(fact.comm)
+                    }
+                    _ => None,
+                },
+            })
+            .collect();
+        SweepOutcome {
+            cleanup: Cleanup::Unconfirmed,
+            unreadable,
+            other_blockers: false,
+        }
     }
 
     /// Retires ended jobs of generations no durable record names.
@@ -1025,6 +1196,45 @@ fn stale_orphan(id: &ServiceId) -> RuntimeInventoryEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_names_are_escaped_before_reaching_a_refusal() {
+        // A backtick would close the quoting, a newline or comma could open a
+        // fake list entry, and U+202E reverses the text that follows.
+        assert_eq!(
+            escape_command_name("agent `, pid 1"),
+            "agent \\u{60}\\u{2c} pid 1"
+        );
+        assert_eq!(escape_command_name("a\nb\u{202e}c"), "a\\u{a}b\\u{202e}c");
+        assert_eq!(escape_command_name("Web Content-1.2"), "Web Content-1.2");
+    }
+
+    #[test]
+    fn long_command_names_are_shortened_with_an_ellipsis() {
+        let long = "x".repeat(MAX_LISTED_COMM_CHARS + 5);
+        let shown = escape_command_name(&long);
+        assert_eq!(shown, format!("{}...", "x".repeat(MAX_LISTED_COMM_CHARS)));
+        assert_eq!(
+            escape_command_name(&"y".repeat(MAX_LISTED_COMM_CHARS)),
+            "y".repeat(MAX_LISTED_COMM_CHARS)
+        );
+    }
+
+    #[test]
+    fn the_refusal_list_quotes_an_escaped_command_name() {
+        let candidate = UnreadableCandidate {
+            identity: ProcessIdentity {
+                pid: 7,
+                start_identity: StartIdentity::new(9),
+            },
+            comm: Some("evil`, pid 1 (start 1".to_owned()),
+        };
+        let listed = describe_unreadable_candidates(&[candidate]);
+        assert_eq!(
+            listed,
+            "pid 7 (start 9, command `evil\\u{60}\\u{2c} pid 1 \\u{28}start 1`)"
+        );
+    }
     use crate::session::SessionRegistryConfig;
 
     /// Bound on observing the retry task end.

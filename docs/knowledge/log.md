@@ -23,6 +23,11 @@
 
 ## Unreleased (2026-09-28)
 
+- Documented that a `session.remove` refused with `runtime_supervision_ambiguous`
+  because same-user processes with unreadable environments may belong to the
+  runtime now lists them (pid, start identity, command name; at most eight,
+  then a count) in the error message and carries a `recover` hint.
+
 - Documented `pohunek service lock -- <command>`, which runs a command under
   the service transaction lock and lets its `pohunek service` calls adopt
   the lock with the holder token in `POHUNEK_SERVICE_LOCK_TOKEN`

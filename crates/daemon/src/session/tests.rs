@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12895,27 +12895,67 @@ fn retention_registry_over(
     (registry, data_dir, worktree_root)
 }
 
-/// PID of the scripted unreadable candidate of [`UnreadableCandidateHost`].
+/// PID of the first scripted unreadable candidate of
+/// [`UnreadableCandidateHost`]; candidate `n` counts down from it.
 ///
 /// Above every PID Linux (`pid_max` is at most 2^22) or Darwin can assign, so
-/// it never names a real process that could be signalled.
+/// none names a real process that could be signalled.
 const UNREADABLE_CANDIDATE_PID: Pid = Pid::MAX;
 
-/// The [`ReadableHost`] view plus one optional scripted same-user process
-/// whose ownership markers cannot be read.
+/// The [`ReadableHost`] view plus a scripted number of same-user processes
+/// whose ownership markers cannot be read, and an optional process-table
+/// failure.
 #[derive(Debug, Default)]
 struct UnreadableCandidateHost {
     readable: ReadableHost,
-    candidate: AtomicBool,
+    candidates: AtomicUsize,
+    listing_fails: AtomicBool,
 }
 
 impl UnreadableCandidateHost {
     fn set_candidate(&self, present: bool) {
-        self.candidate.store(present, Ordering::Release);
+        self.set_candidates(usize::from(present));
+    }
+
+    fn set_candidates(&self, count: usize) {
+        self.candidates.store(count, Ordering::Release);
+    }
+
+    fn set_listing_fails(&self, fails: bool) {
+        self.listing_fails.store(fails, Ordering::Release);
+    }
+
+    fn candidate_pid(index: usize) -> Pid {
+        UNREADABLE_CANDIDATE_PID - Pid::try_from(index).expect("candidate index fits a pid")
+    }
+
+    /// Command name of scripted candidate `index`.
+    fn candidate_comm(index: usize) -> String {
+        if index == 0 {
+            "unreadable".to_owned()
+        } else {
+            format!("unreadable-{index}")
+        }
+    }
+
+    fn candidate_index(&self, pid: Pid) -> Option<usize> {
+        let index = usize::try_from(UNREADABLE_CANDIDATE_PID.checked_sub(pid)?).ok()?;
+        (index < self.candidates.load(Ordering::Acquire)).then_some(index)
+    }
+
+    fn candidate_fact(index: usize) -> ProcessFact {
+        ProcessFact {
+            pid: Self::candidate_pid(index),
+            pgid: Self::candidate_pid(index),
+            ppid: 1,
+            start_identity: StartIdentity::new(1),
+            comm: Self::candidate_comm(index),
+            cmdline: Vec::new(),
+        }
     }
 
     fn scripts_candidate(&self, pid: Pid) -> bool {
-        pid == UNREADABLE_CANDIDATE_PID && self.candidate.load(Ordering::Acquire)
+        self.candidate_index(pid).is_some()
     }
 }
 
@@ -12923,7 +12963,7 @@ impl ProcessInspector for UnreadableCandidateHost {
     fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, crate::procwatch::Error> {
         // The candidate's start is never proven older than a worker, so only a
         // sweep without a worker bound still counts it as possibly marked.
-        if pid == UNREADABLE_CANDIDATE_PID {
+        if self.scripts_candidate(pid) {
             return Ok(None);
         }
         self.readable.identity(pid)
@@ -12938,20 +12978,22 @@ impl ProcessInspector for UnreadableCandidateHost {
     }
 
     fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, crate::procwatch::Error> {
-        self.readable.process(pid)
+        match self.candidate_index(pid) {
+            Some(index) => Ok(Some(Self::candidate_fact(index))),
+            None => self.readable.process(pid),
+        }
     }
 
     fn same_user_processes(&self) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
+        if self.listing_fails.load(Ordering::Acquire) {
+            return Err(crate::procwatch::Error::from_io(
+                "test_listing",
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ));
+        }
         let mut processes = self.readable.same_user_processes()?;
-        if self.scripts_candidate(UNREADABLE_CANDIDATE_PID) {
-            processes.push(ProcessFact {
-                pid: UNREADABLE_CANDIDATE_PID,
-                pgid: UNREADABLE_CANDIDATE_PID,
-                ppid: 1,
-                start_identity: StartIdentity::new(1),
-                comm: "unreadable".to_owned(),
-                cmdline: Vec::new(),
-            });
+        for index in 0..self.candidates.load(Ordering::Acquire) {
+            processes.push(Self::candidate_fact(index));
         }
         Ok(processes)
     }
@@ -13226,29 +13268,18 @@ async fn retention_sweep_counts_a_removal_it_could_not_complete() {
     );
 }
 
-/// Pins the removal of a runtime that only the record names (no worker
-/// journal, so no worker start bounds its sweep): an unreadable same-user
-/// process may carry its marker, so the removal stays refused until that
-/// process is gone. A journaled runtime dismisses the same process through its
-/// worker's start identity. Issue #190 tracks bounding the record-only case.
-#[tokio::test]
-async fn removal_of_a_record_only_runtime_is_refused_while_an_unreadable_process_remains() {
-    let inspector = Arc::new(UnreadableCandidateHost::default());
-    let (registry, _data_dir, _worktree_root) = retention_registry_over(
-        "remove-record-only",
-        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
-    );
-    let journaled = exited_session(&registry, None).await;
-    let record_only = exited_session(&registry, None).await;
-    // A generation whose worker never journaled leaves the record as the only
-    // evidence of its runtime.
+/// Creates an exited session whose worker journals are deleted, so the record
+/// is the only evidence of its runtime and its removal sweep has no worker
+/// start bound.
+async fn record_only_session(registry: &SessionRegistry) -> SessionInfo {
+    let session = exited_session(registry, None).await;
     let journals = registry
         .inner
         .config
         .worker_state_root
         .as_ref()
         .expect("worker state root")
-        .join(&record_only.id.0);
+        .join(&session.id.0);
     let mut removed_journals = 0;
     for journal in fs::read_dir(&journals).expect("read the session's journals") {
         let journal = journal.expect("journal entry").path();
@@ -13261,6 +13292,23 @@ async fn removal_of_a_record_only_runtime_is_refused_while_an_unreadable_process
         }
     }
     assert!(removed_journals > 0, "the worker journaled its runtime");
+    session
+}
+
+/// Pins the removal of a runtime that only the record names (no worker
+/// journal, so no worker start bounds its sweep): an unreadable same-user
+/// process may carry its marker, so the removal stays refused, names the
+/// process, and completes once that process is gone. A journaled runtime
+/// dismisses the same process through its worker's start identity.
+#[tokio::test]
+async fn removal_of_a_record_only_runtime_is_refused_while_an_unreadable_process_remains() {
+    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+        "remove-record-only",
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
+    let journaled = exited_session(&registry, None).await;
+    let record_only = record_only_session(&registry).await;
     inspector.set_candidate(true);
 
     registry
@@ -13276,6 +13324,21 @@ async fn removal_of_a_record_only_runtime_is_refused_while_an_unreadable_process
         crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS,
         "{refused:?}"
     );
+    assert!(
+        refused
+            .msg
+            .contains(&format!("pid {UNREADABLE_CANDIDATE_PID} ")),
+        "the refusal names the candidate: {refused:?}"
+    );
+    assert!(
+        refused.msg.contains("`unreadable`"),
+        "the refusal names the candidate's command: {refused:?}"
+    );
+    assert_eq!(
+        refused.recover.as_deref(),
+        Some(super::supervision::UNREADABLE_CANDIDATES_RECOVER),
+        "{refused:?}"
+    );
     assert_eq!(
         session_ids(&registry).await,
         vec![record_only.id.0.clone()],
@@ -13288,6 +13351,77 @@ async fn removal_of_a_record_only_runtime_is_refused_while_an_unreadable_process
         .await
         .expect("the removal completes once no unreadable process remains");
     assert!(session_ids(&registry).await.is_empty());
+}
+
+/// The refusal lists at most the documented number of candidates and counts
+/// the rest.
+#[tokio::test]
+async fn removal_refusal_bounds_the_listed_unreadable_processes() {
+    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+        "remove-many-unreadable",
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
+    let record_only = record_only_session(&registry).await;
+    let cap = super::supervision::MAX_LISTED_UNREADABLE_CANDIDATES;
+    let extra = 3;
+    inspector.set_candidates(cap + extra);
+
+    let refused = registry
+        .remove(&record_only.id)
+        .await
+        .expect_err("unreadable processes refuse the removal");
+    let listed = refused.msg.matches("pid ").count();
+    assert_eq!(listed, cap, "{refused:?}");
+    assert!(
+        refused.msg.ends_with(&format!("and {extra} more")),
+        "{refused:?}"
+    );
+    assert!(refused.recover.is_some(), "{refused:?}");
+}
+
+/// A refusal caused by something other than unreadable processes names none
+/// and the detailed outcome reports the other blocker.
+#[tokio::test]
+async fn removal_refusal_from_a_sweep_failure_lists_no_unreadable_process() {
+    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+        "remove-sweep-failure",
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
+    let record_only = record_only_session(&registry).await;
+    inspector.set_candidate(true);
+    inspector.set_listing_fails(true);
+
+    let refused = registry
+        .remove(&record_only.id)
+        .await
+        .expect_err("a failing process listing refuses the removal");
+    assert_eq!(
+        refused.code,
+        crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS,
+        "{refused:?}"
+    );
+    assert!(!refused.msg.contains("pid "), "{refused:?}");
+    assert!(!refused.msg.contains("unreadable"), "{refused:?}");
+    assert_eq!(refused.recover, None, "{refused:?}");
+
+    let outcome = registry
+        .sweep_lost_runtime_detailed(&record_only.id.0, "rt-detail", None)
+        .await;
+    assert_eq!(outcome.cleanup, super::supervision::Cleanup::Unconfirmed);
+    assert!(outcome.other_blockers);
+    assert!(outcome.unreadable.is_empty());
+    assert!(!outcome.only_unreadable_candidates_blocked());
+
+    inspector.set_listing_fails(false);
+    let outcome = registry
+        .sweep_lost_runtime_detailed(&record_only.id.0, "rt-detail", None)
+        .await;
+    assert_eq!(outcome.cleanup, super::supervision::Cleanup::Unconfirmed);
+    assert!(!outcome.other_blockers);
+    assert_eq!(outcome.unreadable.len(), 1);
+    assert!(outcome.only_unreadable_candidates_blocked());
 }
 
 #[tokio::test]
