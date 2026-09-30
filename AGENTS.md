@@ -189,10 +189,11 @@ all discovered tests, including ignored ones, are assigned exactly once. The
 `cargo fetch --locked` for `xtask::dependency_policy`) and call
 `python3 scripts/test-partitions --archive-file A run|check ...`, which
 extracts `A` into the checkout's `target/` and lists or runs without compiling.
-Tests locate binaries and sources through compile-time paths
-(`env!("CARGO_BIN_EXE_*")`, `env!("CARGO_MANIFEST_DIR")`, the worker at
-`<workspace>/target/debug/pohunek-sessiond`), so an archive only runs at the
-absolute workspace path it was built in; the helper refuses any other path.
+Tests resolve binaries and sources at run time through `pohunek-test-support`
+(`CARGO_BIN_EXE_*`, `CARGO_MANIFEST_DIR`, the worker beside the test binaries),
+so an archive runs from any absolute path; never reintroduce
+`env!("CARGO_BIN_EXE_*")` or `env!("CARGO_MANIFEST_DIR")` in test code (an
+xtask scan test enforces it).
 `archive.include` in `.config/nextest.toml` makes archive creation fail when
 `pohunek-sessiond` is missing, so daemon tests never run without their worker.
 `build-bins` remains a separate default-feature build for the web and Hermes

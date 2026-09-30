@@ -41,13 +41,12 @@ env:
   # uploads the archive. The test jobs (fast shards, heavy, relay DB) download
   # it and run from it via scripts/test-partitions --archive-file; they install
   # only cargo-nextest, no rust-cache (the heavy job also needs a toolchain with
-  # Clippy and the fetched crate sources for xtask::dependency_policy). Tests find binaries
-  # and sources through compile-time paths (`env!("CARGO_BIN_EXE_*")`,
-  # `env!("CARGO_MANIFEST_DIR")`, `<workspace>/target/debug/pohunek-sessiond`),
-  # so the archive is extracted into the checkout at the same absolute
-  # workspace path it was built in; scripts/test-partitions refuses any other
-  # path. `.config/nextest.toml` archive.include makes the archive build fail
-  # when pohunek-sessiond is missing, so a test never runs without its worker.
+  # Clippy and the fetched crate sources for xtask::dependency_policy). Tests
+  # resolve binaries and sources at run time (`CARGO_BIN_EXE_*`,
+  # `CARGO_MANIFEST_DIR`, the worker beside the test binaries), so the archive
+  # runs from any absolute path. `.config/nextest.toml` archive.include makes
+  # the archive build fail when pohunek-sessiond is missing, so a test never
+  # runs without its worker.
   # Job `build-bins` stays a separate default-feature build: the archive
   # compiles with --all-features, which enables cli's `test-util` seams, and
   # the web e2e and Hermes compatibility jobs must exercise shipped binaries.
