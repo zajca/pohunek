@@ -637,6 +637,10 @@ enum ScanState {
 /// Anything outside that grammar is refused, so the scanner never has to
 /// follow nested shell syntax it could misread. Quote state is still tracked
 /// for every template so an unclosed quote is always reported.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one explicit quote-state scan; splitting it would scatter the shared cursor and word state"
+)]
 fn scan_shell_template(text: &str) -> Result<Vec<(usize, Placeholder)>, AttachTemplateError> {
     let bytes = text.as_bytes();
     let strict = [PLACEHOLDER_BIN, PLACEHOLDER_HOST, PLACEHOLDER_ID]
@@ -646,6 +650,10 @@ fn scan_shell_template(text: &str) -> Result<Vec<(usize, Placeholder)>, AttachTe
     let mut sites = Vec::new();
     let mut state = ScanState::Unquoted;
     let mut word_start = true;
+    // A word holding both a placeholder and an unquoted `*`, `?`, or leading
+    // `~` could expand to several arguments, so it is refused.
+    let mut word_placeholder = false;
+    let mut word_glob = false;
     let mut index = 0;
     while index < bytes.len() {
         let byte = bytes[index];
@@ -659,6 +667,7 @@ fn scan_shell_template(text: &str) -> Result<Vec<(usize, Placeholder)>, AttachTe
                 return Err(refuse("a parameter expansion"));
             }
             sites.push((index, placeholder));
+            word_placeholder = true;
             index += placeholder.token().len();
             word_start = false;
             continue;
@@ -712,21 +721,36 @@ fn scan_shell_template(text: &str) -> Result<Vec<(usize, Placeholder)>, AttachTe
                 return Err(refuse("parentheses, brackets, braces, or redirection"));
             }
             b'#' if strict && !in_double && word_start => return Err(refuse("a comment")),
+            b'*' | b'?' if strict && !in_double => word_glob = true,
+            b'~' if strict && !in_double && word_start => word_glob = true,
             _ => {}
         }
         if !in_double && state == ScanState::Unquoted {
             word_start = matches!(byte, b' ' | b'\t' | b'\n' | b';' | b'&' | b'|');
+            if word_start {
+                if word_placeholder && word_glob {
+                    return Err(refuse(GLOB_WORD));
+                }
+                word_placeholder = false;
+                word_glob = false;
+            }
         }
         index += 1;
     }
     if state != ScanState::Unquoted {
         return Err(AttachTemplateError::UnterminatedQuote);
     }
+    if word_placeholder && word_glob {
+        return Err(refuse(GLOB_WORD));
+    }
     if !has_shell_content(text) {
         return Err(AttachTemplateError::EmptyCommand);
     }
     Ok(sites)
 }
+
+/// Names the refusal of a placeholder word that could glob or expand `~`.
+const GLOB_WORD: &str = "an unquoted `*`, `?`, or `~` in the same word";
 
 /// Whether some line holds something other than blanks or a `#` comment.
 fn has_shell_content(text: &str) -> bool {
@@ -1101,6 +1125,7 @@ mod attach_template_tests {
         };
         let dollar = "a `$` construct other than a plain $NAME";
         let grouping = "parentheses, brackets, braces, or redirection";
+        let glob = "an unquoted `*`, `?`, or `~` in the same word";
         for (template, context) in [
             ("sh -c 'exec {bin} attach {host}'", "single quotes"),
             ("terminal -- \"{bin}\"", "double quotes"),
@@ -1128,6 +1153,12 @@ mod attach_template_tests {
             ("echo \"$(true)\" {host}", dollar),
             ("echo \"`true`\" {host}", "a backtick"),
             ("echo $1 {host}", dollar),
+            ("printf x {host}*", glob),
+            ("printf x *{id}", glob),
+            ("printf x {bin}?", glob),
+            ("printf x ~{host}", glob),
+            ("printf x a*b{host}c", glob),
+            ("printf x {host}/*", glob),
         ] {
             let expected = Err(AttachTemplateError::UnsafePlaceholderContext { context });
             assert_eq!(
@@ -1259,6 +1290,43 @@ mod attach_template_tests {
         ] {
             assert_eq!(shell_escape(value), escaped, "{value:?}");
         }
+    }
+
+    #[test]
+    fn a_glob_beside_a_placeholder_cannot_expand_but_quoted_or_separate_ones_can() {
+        let values = AttachTemplateValues {
+            bin: "crates".to_owned(),
+            host: "crates/gui".to_owned(),
+            id: "i".to_owned(),
+        };
+        // The literal glob sits in another word or inside quotes.
+        assert_eq!(
+            render_attach_command("printf '%s\\n' {host} '*' \"?\" {id}", &values).expect("render"),
+            "printf '%s\\n' crates/gui '*' \"?\" i"
+        );
+        assert_eq!(
+            render_attach_command("ls * {host}", &values).expect("render"),
+            "ls * crates/gui"
+        );
+        // A fixture directory where `{host}*` would expand to several words.
+        let dir = std::env::temp_dir().join(format!("pohunek-glob-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("crates")).expect("fixture dir");
+        for name in ["gui-a", "gui-b"] {
+            std::fs::write(dir.join("crates").join(name), "").expect("fixture file");
+        }
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg("printf '%s\\0' crates/gui*")
+            .current_dir(&dir)
+            .output()
+            .expect("run sh");
+        assert_eq!(
+            output.stdout.split(|byte| *byte == 0).count(),
+            3,
+            "it expands"
+        );
+        render_attach_command("printf '%s\\0' {host}*", &values).expect_err("refused");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]

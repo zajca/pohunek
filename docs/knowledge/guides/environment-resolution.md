@@ -22,7 +22,8 @@ Highest priority first:
 1. **A configured absolute executable.** A program name containing `/` must be
    absolute and executable; a relative one (`./agent`, `bin/agent`) is refused
    and no search happens. The daemon resolves agent programs (capability
-   detection, create, resume) through this same resolver and launches the exact
+   detection, create, resume) through this same resolver, skipping empty and
+   relative `PATH` entries (a trailing colon is harmless) rather than failing, and launches the exact
    canonical path it probed.
 2. **An explicitly supplied environment `PATH`.** A caller that already has a
    validated `PATH` (the GUI, launched from a shell, passes its inherited one)
@@ -131,7 +132,9 @@ one of two ways, both in `pohunek-gui-core`:
   grammar: outside single quotes, no backtick, parenthesis, bracket, `<`, `>`,
   literal brace, `#` comment, line continuation, or `$` other than a plain
   `$NAME`; double-quoted text may hold no `$` construct or backtick;
-  single-quoted text is opaque. Anything else, a placeholder inside quotes, or a
+  single-quoted text is opaque; a word that holds a placeholder may not also
+  hold an unquoted `*`, `?`, or leading `~` (quote the literal part, or put it in
+  another word). Anything else, a placeholder inside quotes, or a
   placeholder right after `$`, is refused with
   `AttachTemplateError::UnsafePlaceholderContext` (an unclosed quote is
   `UnterminatedQuote`, a template with no command `EmptyCommand`). Values are

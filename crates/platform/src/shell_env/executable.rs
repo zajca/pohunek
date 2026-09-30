@@ -54,6 +54,38 @@ pub fn resolve_executable(
     program: &OsStr,
     search: &SearchPath,
 ) -> Result<PathBuf, ExecutableError> {
+    resolve_in(program, search.entries().iter().map(PathBuf::as_path))
+}
+
+/// Resolves `program` against the raw value of an environment `PATH`.
+///
+/// Same rules as [`resolve_executable`], for a caller that holds the inherited
+/// `PATH` (the daemon's). Entries that are empty or relative are skipped, never
+/// resolved against the working directory, and the search continues with the
+/// rest, so a trailing colon or a `.` entry costs nothing. The value has no
+/// length bound. An absent `PATH` resolves no bare name.
+///
+/// # Errors
+///
+/// See [`resolve_executable`].
+pub fn resolve_executable_in_path_value(
+    program: &OsStr,
+    path: Option<&OsStr>,
+) -> Result<PathBuf, ExecutableError> {
+    let entries: Vec<PathBuf> = path
+        .map(|value| {
+            std::env::split_paths(value)
+                .filter(|entry| entry.is_absolute())
+                .collect()
+        })
+        .unwrap_or_default();
+    resolve_in(program, entries.iter().map(PathBuf::as_path))
+}
+
+fn resolve_in<'a>(
+    program: &OsStr,
+    directories: impl Iterator<Item = &'a Path>,
+) -> Result<PathBuf, ExecutableError> {
     let bytes = program.as_bytes();
     if bytes.is_empty() || bytes.contains(&0) {
         return Err(ExecutableError::InvalidName);
@@ -69,9 +101,7 @@ pub fn resolve_executable(
             Err(ExecutableError::NotExecutable)
         };
     }
-    search
-        .entries()
-        .iter()
+    directories
         .map(|directory| directory.join(program))
         .find(|candidate| is_executable_file(candidate))
         .ok_or(ExecutableError::NotFound)
@@ -238,6 +268,60 @@ mod tests {
         assert_eq!(
             resolve_executable(OsStr::new("agent"), &search).expect("agent"),
             path
+        );
+    }
+
+    #[test]
+    fn an_environment_path_skips_empty_and_relative_entries_and_keeps_searching() {
+        let dir = fixture();
+        let bin = dir.path().join("bin");
+        make_dir(dir.path(), &bin);
+        let agent = executable(&bin, "agent");
+        let cwd_copy = executable(dir.path(), "agent");
+        assert_ne!(cwd_copy, agent);
+        let absolute = bin.display().to_string();
+        for path in [
+            format!("{absolute}:"),
+            format!(":{absolute}"),
+            format!("::{absolute}"),
+            format!("relative-bin:.:{absolute}"),
+            format!("./node_modules/.bin:{absolute}:"),
+        ] {
+            assert_eq!(
+                resolve_executable_in_path_value(OsStr::new("agent"), Some(OsStr::new(&path))),
+                Ok(agent.clone()),
+                "{path}"
+            );
+        }
+        // Only relative or empty entries: nothing resolves, even though the
+        // working directory could hold the program.
+        for path in ["", ":", ".", "relative-bin", "./bin:"] {
+            assert_eq!(
+                resolve_executable_in_path_value(OsStr::new("agent"), Some(OsStr::new(path))),
+                Err(ExecutableError::NotFound),
+                "{path:?}"
+            );
+        }
+        assert_eq!(
+            resolve_executable_in_path_value(OsStr::new("agent"), None),
+            Err(ExecutableError::NotFound)
+        );
+    }
+
+    #[test]
+    fn an_environment_path_has_no_length_bound() {
+        let dir = fixture();
+        let bin = dir.path().join("bin");
+        make_dir(dir.path(), &bin);
+        let agent = executable(&bin, "agent");
+        let filler = format!("/{}", "x".repeat(200));
+        let mut entries: Vec<String> = vec![filler; 40];
+        entries.push(bin.display().to_string());
+        let path = entries.join(":");
+        assert!(path.len() > crate::shell_env::MAX_SEARCH_PATH_BYTES);
+        assert_eq!(
+            resolve_executable_in_path_value(OsStr::new("agent"), Some(OsStr::new(&path))),
+            Ok(agent)
         );
     }
 }

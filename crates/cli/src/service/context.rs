@@ -343,14 +343,22 @@ impl Context {
 ///
 /// # Errors
 ///
-/// Returns [`Error::UnusableEnv`] for a `shell` that is not absolute: a set but
-/// unusable `$SHELL` is refused instead of replaced by a guess.
+/// Returns [`Error::UnusableEnv`] for a `shell` that is not absolute and
+/// [`Error::NonUtf8Env`] for one that is not UTF-8: a set but unusable `$SHELL`
+/// is refused before any install effect instead of replaced by a guess, and the
+/// report that names the shell must stay serializable.
 pub fn managed_path_discovery(
     shell: Option<PathBuf>,
     environment: Vec<(String, String)>,
 ) -> Result<PathDiscovery, Error> {
     let shell_defaulted = shell.is_none();
     let shell = match shell {
+        Some(shell) if shell.to_str().is_none() => {
+            return Err(Error::NonUtf8Env {
+                var: "SHELL",
+                path: shell,
+            });
+        }
         Some(shell) if shell.is_absolute() => shell,
         Some(shell) => {
             return Err(unusable(
@@ -377,16 +385,19 @@ pub fn managed_path_discovery(
     })
 }
 
-/// Builds the host's discovery policy: login-shell probing on macOS only.
+/// Builds the managed policy from an environment lookup.
 ///
 /// A `HOME`, `USER`, or `LOGNAME` that is set but not UTF-8 fails instead of
 /// being left out, because the shell would then read another user's startup
-/// files.
-#[cfg(target_os = "macos")]
-fn host_path_discovery() -> Result<PathDiscovery, Error> {
+/// files; `$SHELL` is validated by [`managed_path_discovery`]. The lookup is
+/// injected so the validation runs in unit tests on every target.
+#[cfg(any(target_os = "macos", test))]
+fn managed_discovery_from_env(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathDiscovery, Error> {
     let mut environment = Vec::new();
     for name in ["HOME", "USER", "LOGNAME"] {
-        if let Some(value) = std::env::var_os(name) {
+        if let Some(value) = lookup(name) {
             let text = value.into_string().map_err(|value| Error::NonUtf8Env {
                 var: name,
                 path: PathBuf::from(value),
@@ -394,7 +405,13 @@ fn host_path_discovery() -> Result<PathDiscovery, Error> {
             environment.push((name.to_owned(), text));
         }
     }
-    managed_path_discovery(std::env::var_os("SHELL").map(PathBuf::from), environment)
+    managed_path_discovery(lookup("SHELL").map(PathBuf::from), environment)
+}
+
+/// Builds the host's discovery policy: login-shell probing on macOS only.
+#[cfg(target_os = "macos")]
+fn host_path_discovery() -> Result<PathDiscovery, Error> {
+    managed_discovery_from_env(std::env::var_os)
 }
 
 /// systemd hands the user manager's environment to the daemon job.
@@ -519,6 +536,47 @@ pub(crate) mod tests {
             root.join("units"),
             PathBuf::from("/usr/bin/pohunek"),
         )
+    }
+
+    #[test]
+    fn a_non_utf8_shell_or_login_variable_fails_before_any_effect() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let non_utf8 = OsString::from_vec(b"/bin/\xff".to_vec());
+        for var in ["SHELL", "HOME", "USER", "LOGNAME"] {
+            let bad = non_utf8.clone();
+            let error = managed_discovery_from_env(|name| {
+                if name == var {
+                    Some(bad.clone())
+                } else if name == "SHELL" {
+                    Some(OsString::from("/bin/zsh"))
+                } else {
+                    None
+                }
+            })
+            .expect_err(var);
+            assert!(
+                matches!(&error, Error::NonUtf8Env { var: found, .. } if *found == var),
+                "{var}: {error:?}"
+            );
+            assert_eq!(error.code(), "service_environment_not_utf8");
+        }
+        // Valid values pass through and an unset SHELL selects the default.
+        let PathDiscovery::Managed {
+            login_shell: Some(spec),
+            shell_defaulted,
+            ..
+        } = managed_discovery_from_env(|name| (name == "HOME").then(|| OsString::from("/home/u")))
+            .expect("discovery")
+        else {
+            panic!("managed discovery");
+        };
+        assert!(shell_defaulted);
+        assert_eq!(
+            spec.environment,
+            [("HOME".to_owned(), "/home/u".to_owned())]
+        );
     }
 
     #[test]

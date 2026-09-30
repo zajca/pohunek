@@ -63,7 +63,7 @@ mod search_path;
 mod test_support;
 
 #[doc(inline)]
-pub use executable::{resolve_executable, ExecutableError};
+pub use executable::{resolve_executable, resolve_executable_in_path_value, ExecutableError};
 #[doc(inline)]
 pub use login_shell::{
     discover_login_shell_path, LoginShellDiscovery, LoginShellError, LoginShellSpec,

@@ -8,7 +8,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use pohunek_platform::shell_env::{self, SearchPath};
+use pohunek_platform::shell_env;
 use protocol::{AgentActivity, ErrorClass, ProtocolError};
 use serde::{Deserialize, Serialize};
 
@@ -572,16 +572,11 @@ pub(crate) fn agent_fork_unsupported() -> ProtocolError {
 /// [`pohunek_platform::shell_env`].
 ///
 /// A program containing `/` must be absolute; a bare name is searched in the
-/// absolute, non-empty, normalized entries of `path` in order, and a candidate
-/// the effective user cannot execute is skipped. Relative and empty `PATH`
-/// entries are never resolved against the working directory.
+/// absolute entries of `path` in order, and a candidate the effective user
+/// cannot execute is skipped. Relative and empty `PATH` entries are skipped, not
+/// resolved against the working directory, and the search goes on.
 fn resolve_program(program: &str, path: Option<&OsStr>) -> Option<PathBuf> {
-    let search = path
-        .and_then(OsStr::to_str)
-        .and_then(|value| SearchPath::sanitize(value, false).ok())
-        .map(|sanitized| sanitized.path)
-        .unwrap_or_default();
-    shell_env::resolve_executable(OsStr::new(program), &search).ok()
+    shell_env::resolve_executable_in_path_value(OsStr::new(program), path).ok()
 }
 
 fn resolve_binary(name: &str) -> Result<String, ProtocolError> {
@@ -841,6 +836,31 @@ mod tests {
             resolved.2.expect("validated").as_path(),
             usable.canonicalize().expect("canonical")
         );
+    }
+
+    #[test]
+    fn empty_and_relative_path_entries_are_skipped_not_fatal() {
+        let bin = temp_dir("skip-entries");
+        let agent = write_executable(&bin, "agent");
+        let absolute = bin.display().to_string();
+        let filler = format!("/{}", "x".repeat(200));
+        let long = format!("{}:{absolute}", vec![filler; 40].join(":"));
+        for path in [
+            format!("{absolute}:"),
+            format!(":{absolute}"),
+            format!("./node_modules/.bin:{absolute}"),
+            long,
+        ] {
+            let resolved = with_path(Path::new(&path), || {
+                (resolve_binary("agent"), which_executable("agent"))
+            });
+            assert_eq!(
+                resolved.0.expect("launch path resolves"),
+                agent.display().to_string(),
+                "{path}"
+            );
+            assert_eq!(resolved.1.as_deref(), Some(agent.as_path()), "{path}");
+        }
     }
 
     #[test]
