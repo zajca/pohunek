@@ -2,7 +2,7 @@ use std::io::Write as _;
 use std::process::{Command, Stdio};
 
 fn pohunek() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_pohunek"))
+    Command::new(pohunek_test_support::bin_exe("pohunek"))
 }
 
 fn run_prompt_link(provider: &str, item_id: &str, url: &str, context_json: &str) -> String {

@@ -13,6 +13,12 @@
 //! create a private, uniquely named directory under it that is removed when
 //! the returned guard drops.
 //!
+//! It also resolves the runtime artifacts tests depend on: [`manifest_dir`],
+//! [`workspace_root`], [`bin_exe`] and [`worker_binary`] read the test
+//! process's environment or its own executable location when called, never
+//! a path baked in at compile time. A nextest archive extracted at a different
+//! absolute path therefore finds its binaries and source files.
+//!
 //! This crate is a development dependency only; production code never picks
 //! its paths from here.
 //!
@@ -24,10 +30,11 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-09-30
 
+use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Resolved, short system temporary directory on macOS.
 ///
@@ -42,6 +49,24 @@ const MACOS_TEMP_ROOT: &str = "/private/tmp";
 /// Kept short because every byte of a fixture root counts against the
 /// `sun_path` limit of the sockets tests bind beneath it.
 const DEFAULT_PREFIX: &str = "ph-";
+
+/// Environment variable Cargo sets to the package directory of the running test.
+const MANIFEST_DIR_VAR: &str = "CARGO_MANIFEST_DIR";
+
+/// Prefix of the per-binary variables Cargo sets for integration tests.
+const BIN_EXE_PREFIX: &str = "CARGO_BIN_EXE_";
+
+/// Environment variable that points tests at an explicit session worker binary.
+const WORKER_OVERRIDE_VAR: &str = "POHUNEK_WORKER_BIN";
+
+/// File name of the session worker inside the Cargo profile directory.
+const WORKER_FILE_NAME: &str = "pohunek-sessiond";
+
+/// Name of the directory Cargo places test binaries in, below the profile directory.
+const DEPS_DIR_NAME: &str = "deps";
+
+/// Command that builds the session worker, quoted in the missing-worker panic.
+const WORKER_BUILD_HINT: &str = "cargo build -p pohunek-session-worker --bin pohunek-sessiond";
 
 /// Mode of every fixture directory.
 ///
@@ -95,11 +120,210 @@ pub fn tempdir_with_prefix(prefix: &str) -> std::io::Result<tempfile::TempDir> {
         .tempdir_in(temp_root())
 }
 
+/// Returns the value of a required variable or a message naming it.
+fn require_var(name: &str, value: Option<OsString>) -> Result<OsString, String> {
+    value.ok_or_else(|| format!("environment variable {name} is not set; run the test through `cargo test` or `cargo nextest run`"))
+}
+
+/// Derives the workspace root from a package directory of the `crates/<name>` layout.
+fn workspace_root_of(manifest_dir: &Path) -> Option<PathBuf> {
+    manifest_dir.parent()?.parent().map(Path::to_path_buf)
+}
+
+/// Derives the Cargo profile directory from the path of a test executable.
+///
+/// Test binaries live at `<profile>/deps/<name>-<hash>`, where `<profile>` is
+/// `target/debug` or `target/<triple>/debug`.
+fn profile_dir_of(exe: &Path) -> Result<PathBuf, String> {
+    let deps = exe
+        .parent()
+        .filter(|dir| dir.file_name().is_some_and(|name| name == DEPS_DIR_NAME));
+    deps.and_then(Path::parent).map(Path::to_path_buf).ok_or_else(|| {
+        format!(
+            "test executable {} is not in a `{DEPS_DIR_NAME}` directory of a Cargo profile; set {WORKER_OVERRIDE_VAR} to the worker binary",
+            exe.display()
+        )
+    })
+}
+
+/// Resolves the worker path: the override when present (unchanged), else the
+/// worker file inside the profile directory of `exe`.
+fn resolve_worker(override_path: Option<OsString>, exe: &Path) -> Result<PathBuf, String> {
+    match override_path {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => profile_dir_of(exe).map(|dir| dir.join(WORKER_FILE_NAME)),
+    }
+}
+
+/// Returns the package directory of the crate whose test is running.
+///
+/// Reads `CARGO_MANIFEST_DIR` from the process environment when called, so the
+/// result follows an extracted nextest archive instead of the build location.
+///
+/// # Panics
+///
+/// Panics when `CARGO_MANIFEST_DIR` is not set, which means the test was not
+/// started through Cargo or nextest.
+///
+/// # Examples
+///
+/// ```
+/// assert!(pohunek_test_support::manifest_dir().join("Cargo.toml").is_file());
+/// ```
+#[must_use]
+pub fn manifest_dir() -> PathBuf {
+    match require_var(MANIFEST_DIR_VAR, std::env::var_os(MANIFEST_DIR_VAR)) {
+        Ok(dir) => PathBuf::from(dir),
+        Err(message) => panic!("{message}"),
+    }
+}
+
+/// Returns the workspace root, two levels above the package directory.
+///
+/// Relies on the `crates/<name>` layout of this workspace.
+///
+/// # Panics
+///
+/// Panics when [`manifest_dir`] panics, or when the derived directory holds no
+/// `Cargo.toml`.
+///
+/// # Examples
+///
+/// ```
+/// assert!(pohunek_test_support::workspace_root().join("Cargo.toml").is_file());
+/// ```
+#[must_use]
+pub fn workspace_root() -> PathBuf {
+    let manifest = manifest_dir();
+    let root = workspace_root_of(&manifest).unwrap_or_else(|| {
+        panic!(
+            "package directory {} has no workspace root two levels up",
+            manifest.display()
+        )
+    });
+    assert!(
+        root.join("Cargo.toml").is_file(),
+        "{} is not a workspace root (no Cargo.toml); expected the crates/<name> layout",
+        root.display()
+    );
+    root
+}
+
+/// Returns the path of a binary of the running test's own package.
+///
+/// Reads `CARGO_BIN_EXE_<name>` when called; Cargo sets it for integration
+/// tests, with `name` spelled as in the `[[bin]]` target (hyphens included).
+///
+/// # Panics
+///
+/// Panics naming the variable when it is not set, for example in a unit test
+/// inside `src/` or for a binary of another package.
+#[must_use]
+pub fn bin_exe(name: &str) -> PathBuf {
+    let var = format!("{BIN_EXE_PREFIX}{name}");
+    match require_var(&var, std::env::var_os(&var)) {
+        Ok(path) => PathBuf::from(path),
+        Err(message) => panic!("{message}"),
+    }
+}
+
+/// Returns the path of the `pohunek-sessiond` session worker binary.
+///
+/// `POHUNEK_WORKER_BIN`, when set, is returned unchanged. Otherwise the worker
+/// is expected beside the test's Cargo profile directory, derived from the
+/// running test executable, so it works in an extracted nextest archive.
+///
+/// # Panics
+///
+/// Panics when the test executable is not under a profile `deps` directory, or
+/// when the derived path is not a file; the message names
+/// `cargo build -p pohunek-session-worker --bin pohunek-sessiond`.
+#[must_use]
+pub fn worker_binary() -> PathBuf {
+    let override_path = std::env::var_os(WORKER_OVERRIDE_VAR);
+    let overridden = override_path.is_some();
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|error| panic!("cannot determine the test executable path: {error}"));
+    let path = resolve_worker(override_path, &exe).unwrap_or_else(|message| panic!("{message}"));
+    assert!(
+        overridden || path.is_file(),
+        "session worker {} does not exist; build it with `{WORKER_BUILD_HINT}`",
+        path.display()
+    );
+    path
+}
+
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
 
-    use super::{temp_root, tempdir, tempdir_with_prefix};
+    use super::{
+        profile_dir_of, require_var, resolve_worker, temp_root, tempdir, tempdir_with_prefix,
+        workspace_root_of,
+    };
+
+    #[test]
+    fn override_is_returned_unchanged_without_a_file_check() {
+        let path = resolve_worker(
+            Some(OsString::from("/nonexistent/relative/../worker")),
+            Path::new("/irrelevant/not-in-deps"),
+        );
+        assert_eq!(path, Ok(PathBuf::from("/nonexistent/relative/../worker")));
+    }
+
+    #[test]
+    fn profile_dir_comes_from_a_host_build() {
+        let exe = Path::new("/x/target/debug/deps/state_authority-0123abcd");
+        assert_eq!(profile_dir_of(exe), Ok(PathBuf::from("/x/target/debug")));
+        assert_eq!(
+            resolve_worker(None, exe),
+            Ok(PathBuf::from("/x/target/debug/pohunek-sessiond"))
+        );
+    }
+
+    #[test]
+    fn profile_dir_comes_from_a_cross_build() {
+        let exe = Path::new("/x/target/aarch64-apple-darwin/debug/deps/cli-0123abcd");
+        assert_eq!(
+            profile_dir_of(exe),
+            Ok(PathBuf::from("/x/target/aarch64-apple-darwin/debug"))
+        );
+    }
+
+    #[test]
+    fn executable_outside_deps_is_an_error_naming_the_override() {
+        let error = profile_dir_of(Path::new("/x/target/debug/cli")).unwrap_err();
+        assert!(error.contains("POHUNEK_WORKER_BIN"), "{error}");
+        resolve_worker(None, Path::new("/x/target/debug/cli")).unwrap_err();
+    }
+
+    #[test]
+    fn missing_variable_error_names_the_variable() {
+        let error = require_var("CARGO_BIN_EXE_some-bin", None).unwrap_err();
+        assert!(error.contains("CARGO_BIN_EXE_some-bin"), "{error}");
+        assert_eq!(
+            require_var("V", Some(OsString::from("/p"))),
+            Ok(OsString::from("/p"))
+        );
+    }
+
+    #[test]
+    fn workspace_root_is_two_levels_above_the_package() {
+        assert_eq!(
+            workspace_root_of(Path::new("/w/crates/daemon")),
+            Some(PathBuf::from("/w"))
+        );
+        assert_eq!(workspace_root_of(Path::new("/w")), None);
+    }
+
+    #[test]
+    fn workspace_root_holds_the_workspace_manifest() {
+        let root = super::workspace_root();
+        assert!(root.join("Cargo.toml").is_file(), "{}", root.display());
+        assert!(root.join("crates/test-support").is_dir());
+    }
 
     /// Darwin's `sun_path` capacity, including the terminating NUL.
     #[cfg(target_os = "macos")]

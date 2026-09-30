@@ -1,4 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+use pohunek_test_support::{manifest_dir, workspace_root};
 
 use knowledge::{
     validate_bundle, BundleValidationError, BundleValidationIssue, ConceptType,
@@ -13,18 +15,11 @@ const COMMITTED_KNOWLEDGE_FILES: usize = 26;
 const COMMITTED_KNOWLEDGE_CONCEPTS: usize = 24;
 
 fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join(name)
+    manifest_dir().join("tests").join("fixtures").join(name)
 }
 
 fn repo_knowledge_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("docs")
-        .join("knowledge")
+    workspace_root().join("docs").join("knowledge")
 }
 
 fn issue_kinds(error: &BundleValidationError) -> Vec<&'static str> {

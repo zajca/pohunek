@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use pohunek_daemon::procwatch::{HostInspector, ProcessInspector};
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
+use pohunek_test_support::worker_binary;
 use protocol::{
     AgentKind, CwdSource, SessionAttachParams, SessionId, SessionInfo, SessionInputParams,
     SessionNewParams, ENV_DAEMON_ID, ENV_SESSION_ID,
@@ -141,26 +142,6 @@ fn worker_backed_registry(mut config: SessionRegistryConfig) -> SessionRegistry 
         launcher,
         Arc::new(HostInspector::new()),
     )
-}
-
-/// Locate the real `pohunek-sessiond` worker binary built alongside this test.
-fn worker_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("POHUNEK_WORKER_BIN") {
-        return PathBuf::from(path);
-    }
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("daemon crate is inside workspace")
-        .to_path_buf();
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map_or_else(|| workspace.join("target"), PathBuf::from);
-    let binary = target.join("debug/pohunek-sessiond");
-    assert!(
-        binary.is_file(),
-        "build the real worker first with `cargo build -p pohunek-session-worker --bin pohunek-sessiond`, or set POHUNEK_WORKER_BIN"
-    );
-    binary
 }
 
 #[tokio::test]

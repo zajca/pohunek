@@ -21,13 +21,13 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// Path of the `pohunek` binary under test, resolved at run time.
+fn real_pohunek() -> PathBuf {
+    pohunek_test_support::bin_exe("pohunek")
+}
+
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates dir")
-        .parent()
-        .expect("repo root")
-        .to_path_buf()
+    pohunek_test_support::workspace_root()
 }
 
 fn script_path(name: &str) -> PathBuf {
@@ -147,7 +147,7 @@ esac
         .arg("7")
         .arg("review-pr")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
-        .env("POHUNEK_TEST_REAL_POHUNEK", env!("CARGO_BIN_EXE_pohunek"))
+        .env("POHUNEK_TEST_REAL_POHUNEK", real_pohunek())
         .env("POHUNEK_TEST_GH_ARGS", &gh_args)
         .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
         .env("POHUNEK_TEST_RECIPE_JSON", recipe)
@@ -246,7 +246,7 @@ esac
         .arg("ui")
         .arg("LIN-123")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
-        .env("POHUNEK_TEST_REAL_POHUNEK", env!("CARGO_BIN_EXE_pohunek"))
+        .env("POHUNEK_TEST_REAL_POHUNEK", real_pohunek())
         .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
         .env("POHUNEK_TEST_RECIPE_JSON", recipe)
         .env("LINEAR_API_KEY", "lin_secret_should_not_leak")
@@ -353,7 +353,7 @@ esac
             .arg(project)
             .arg("LIN-1")
             .env("POHUNEK_CONFIG_DIR", &config_dir)
-            .env("POHUNEK_TEST_REAL_POHUNEK", env!("CARGO_BIN_EXE_pohunek"))
+            .env("POHUNEK_TEST_REAL_POHUNEK", real_pohunek())
             .env("POHUNEK_TEST_POHUNEK_ARGS", args_file)
             .env("POHUNEK_TEST_RECIPE_JSON", recipe)
             .output()
@@ -421,7 +421,7 @@ esac
         .arg("ui")
         .arg("LIN-1")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
-        .env("POHUNEK_TEST_REAL_POHUNEK", env!("CARGO_BIN_EXE_pohunek"))
+        .env("POHUNEK_TEST_REAL_POHUNEK", real_pohunek())
         .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
         .output()
         .expect("run launch-issue");
@@ -483,7 +483,7 @@ esac
         .arg("ui")
         .arg("LIN-1")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
-        .env("POHUNEK_TEST_REAL_POHUNEK", env!("CARGO_BIN_EXE_pohunek"))
+        .env("POHUNEK_TEST_REAL_POHUNEK", real_pohunek())
         .env("POHUNEK_TEST_LINEAR_ARGS", &linear_args)
         .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
         .env("POHUNEK_TEST_RECIPE_JSON", recipe)
@@ -550,7 +550,7 @@ esac
         .arg("ui")
         .arg("7")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
-        .env("POHUNEK_TEST_REAL_POHUNEK", env!("CARGO_BIN_EXE_pohunek"))
+        .env("POHUNEK_TEST_REAL_POHUNEK", real_pohunek())
         .env("POHUNEK_TEST_GH_ARGS", &gh_args)
         .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
         .env("POHUNEK_TEST_RECIPE_JSON", recipe)
@@ -615,7 +615,7 @@ esac
         .arg("ui")
         .arg("LIN-1")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
-        .env("POHUNEK_TEST_REAL_POHUNEK", env!("CARGO_BIN_EXE_pohunek"))
+        .env("POHUNEK_TEST_REAL_POHUNEK", real_pohunek())
         .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
         .env("POHUNEK_TEST_RECIPE_JSON", recipe)
         .output()

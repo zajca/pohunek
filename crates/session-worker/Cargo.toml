@@ -41,6 +41,7 @@ tracing-subscriber = { workspace = true }
 nix = { version = "0.29", features = ["resource"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+pohunek-test-support = { workspace = true }
 
 [lints]
 workspace = true

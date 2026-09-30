@@ -17,7 +17,10 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 /// The real CLI under test.
-const POHUNEK: &str = env!("CARGO_BIN_EXE_pohunek");
+/// Path of the `pohunek` binary under test, resolved at run time.
+fn pohunek_bin() -> std::path::PathBuf {
+    pohunek_test_support::bin_exe("pohunek")
+}
 
 /// Variable the lock passes its holder token in.
 const LOCK_TOKEN_ENV: &str = "POHUNEK_SERVICE_LOCK_TOKEN";
@@ -50,7 +53,7 @@ impl Host {
 
     /// `pohunek` with `args` in this host's environment.
     fn pohunek(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(POHUNEK);
+        let mut command = Command::new(pohunek_bin());
         command.args(args);
         self.isolate(&mut command);
         command
@@ -72,7 +75,7 @@ impl Host {
     /// `pohunek service lock -- sh -c <script>`, with `$POHUNEK` naming the CLI.
     fn locked_shell(&self, script: &str) -> Output {
         self.pohunek(&["service", "lock", "--", "sh", "-c", script])
-            .env("POHUNEK", POHUNEK)
+            .env("POHUNEK", pohunek_bin())
             .output()
             .expect("run pohunek service lock")
     }
@@ -303,7 +306,7 @@ impl Host {
     /// Starts `pohunek service lock -- sh -c <script>` without waiting.
     fn spawn_locked_shell(&self, script: &str) -> Child {
         self.pohunek(&["service", "lock", "--", "sh", "-c", script])
-            .env("POHUNEK", POHUNEK)
+            .env("POHUNEK", pohunek_bin())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

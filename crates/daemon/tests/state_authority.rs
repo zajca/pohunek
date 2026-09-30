@@ -1,9 +1,10 @@
 //! Real-process regression for durable state authority across runtime roots.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
+use pohunek_test_support::{bin_exe, worker_binary};
 use tokio::net::UnixStream;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -19,7 +20,7 @@ fn daemon_command(
 ) -> tokio::process::Command {
     // HOME is the working directory of every worker, so the daemon requires it.
     std::fs::create_dir_all(root.join("home")).expect("create isolated home");
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_pohunekd"));
+    let mut command = tokio::process::Command::new(bin_exe("pohunekd"));
     command
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_STATE_HOME", state_home)
@@ -36,20 +37,6 @@ fn daemon_command(
         .stdout(Stdio::null())
         .kill_on_drop(true);
     command
-}
-
-fn worker_binary() -> PathBuf {
-    let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
-        || {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .and_then(Path::parent)
-                .expect("daemon crate is inside workspace")
-                .join("target")
-        },
-        PathBuf::from,
-    );
-    target.join("debug/pohunek-sessiond")
 }
 
 async fn wait_until_ready(child: &mut tokio::process::Child, socket: &Path) {

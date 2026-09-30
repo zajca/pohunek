@@ -18,7 +18,10 @@ use std::time::{Duration, Instant};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 /// The real CLI under test.
-const POHUNEK: &str = env!("CARGO_BIN_EXE_pohunek");
+/// Path of the `pohunek` binary under test, resolved at run time.
+fn pohunek_bin() -> std::path::PathBuf {
+    pohunek_test_support::bin_exe("pohunek")
+}
 
 /// Bound on waiting for a process to reach an observable state.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -124,7 +127,7 @@ impl Session {
         command.args([dir.join("outer.sh"), dir.clone()]);
         command.env_clear();
         command.env("PATH", std::env::var_os("PATH").expect("PATH"));
-        command.env("POHUNEK", POHUNEK);
+        command.env("POHUNEK", pohunek_bin());
         command.env("HOME", root.join("home"));
         for (var, sub) in [
             ("XDG_CONFIG_HOME", "config"),

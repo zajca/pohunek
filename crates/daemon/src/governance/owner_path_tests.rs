@@ -1,6 +1,6 @@
 //! Owner-path regressions for unavailable relay governance.
 
-// Rust guideline compliant 2026-09-04
+// Rust guideline compliant 2026-09-30
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use base64::prelude::{Engine as _, BASE64_URL_SAFE_NO_PAD};
 use futures::{SinkExt, StreamExt};
+use pohunek_test_support::worker_binary;
 use protocol::{
     method, AttachHeader, EnrollmentStatus, HostGovernanceStatus, HostOwner, PrincipalId,
     ProposalExpiry, ProposalId, ProposalNonce, RelayId, Request, Response, SessionAttachParams,
@@ -45,12 +46,6 @@ const ATTACH_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Isolates test host state and makes the server health response identifiable.
 const TEST_DAEMON_VERSION: &str = "owner-path-governance-test";
-/// Cargo's workspace-local default output directory when no target override is configured.
-const DEFAULT_CARGO_TARGET_DIRECTORY: &str = "target";
-/// The real session worker is built in Cargo's debug profile for these tests.
-const CARGO_DEBUG_DIRECTORY: &str = "debug";
-/// The real worker binary spawned by the owner-path regression suite.
-const WORKER_BINARY_NAME: &str = "pohunek-sessiond";
 
 type TestResult<T> = Result<T, TestError>;
 
@@ -330,93 +325,6 @@ fn worker_backed_registry(socket: &Path, root: &Path) -> SessionRegistry {
         Arc::new(SubprocessWorkerLauncher::new()),
         Arc::new(HostInspector::new()),
     )
-}
-
-fn worker_binary() -> PathBuf {
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("daemon crate is inside the workspace")
-        .to_path_buf();
-    let worker_override = std::env::var_os("POHUNEK_WORKER_BIN").map(PathBuf::from);
-    let binary = resolve_worker_binary(
-        worker_override.as_deref(),
-        std::env::var_os("CARGO_TARGET_DIR")
-            .as_deref()
-            .map(Path::new),
-        &workspace,
-    );
-    if worker_override.is_some() {
-        return binary;
-    }
-    assert!(
-        binary.is_file(),
-        "build the real worker first with `cargo build -p pohunek-session-worker --bin pohunek-sessiond`, or set POHUNEK_WORKER_BIN"
-    );
-    binary
-}
-
-fn resolve_worker_binary(
-    worker_override: Option<&Path>,
-    cargo_target_dir: Option<&Path>,
-    workspace: &Path,
-) -> PathBuf {
-    if let Some(worker_override) = worker_override {
-        return worker_override.to_path_buf();
-    }
-    let target = match cargo_target_dir {
-        Some(target) if target.is_absolute() => target.to_path_buf(),
-        Some(target) => workspace.join(target),
-        None => workspace.join(DEFAULT_CARGO_TARGET_DIRECTORY),
-    };
-    target.join(CARGO_DEBUG_DIRECTORY).join(WORKER_BINARY_NAME)
-}
-
-#[test]
-fn worker_binary_resolver_preserves_an_explicit_worker_path() {
-    let workspace = Path::new("/workspace");
-    let override_path = Path::new("custom/pohunek-sessiond");
-
-    assert_eq!(
-        resolve_worker_binary(
-            Some(override_path),
-            Some(Path::new("target-dir")),
-            workspace
-        ),
-        override_path
-    );
-}
-
-#[test]
-fn worker_binary_resolver_uses_the_workspace_target_by_default() {
-    let workspace = Path::new("/workspace");
-
-    assert_eq!(
-        resolve_worker_binary(None, None, workspace),
-        workspace.join("target/debug/pohunek-sessiond")
-    );
-}
-
-#[test]
-fn worker_binary_resolver_keeps_an_absolute_cargo_target_directory() {
-    let workspace = Path::new("/workspace");
-    let target = Path::new("/isolated/target");
-
-    assert_eq!(
-        resolve_worker_binary(None, Some(target), workspace),
-        target.join("debug/pohunek-sessiond")
-    );
-}
-
-#[test]
-fn worker_binary_resolver_anchors_a_relative_cargo_target_directory_at_the_workspace() {
-    let workspace = Path::new("/workspace");
-    let target = Path::new(".cache/issue81/owner-path-target");
-
-    assert_eq!(
-        resolve_worker_binary(None, Some(target), workspace),
-        workspace.join(target).join("debug/pohunek-sessiond")
-    );
 }
 
 fn confirmation(command: LocalGovernanceCommand) -> LocalGovernanceConfirmation {

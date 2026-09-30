@@ -74,7 +74,7 @@ fn embedded_artifact_covers_required_sections() {
 // --- CLI command output (no daemon running, no filesystem/network access) ----
 
 fn agent_skill_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_pohunek"));
+    let mut command = Command::new(pohunek_test_support::bin_exe("pohunek"));
     command.arg("agent-skill");
     command
 }

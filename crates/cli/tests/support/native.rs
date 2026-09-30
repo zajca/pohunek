@@ -103,7 +103,7 @@ impl Installation {
             Some(root.join("home")),
             Some(root.join("run")),
             supervisor_dir(&root),
-            PathBuf::from(env!("CARGO_BIN_EXE_pohunek")),
+            pohunek_test_support::bin_exe("pohunek"),
         );
         Self {
             root,
@@ -122,7 +122,7 @@ impl Installation {
     pub(crate) fn stage(&self) -> PathBuf {
         let from = self.root.join("archive");
         std::fs::create_dir_all(&from).expect("archive dir");
-        let cli = PathBuf::from(env!("CARGO_BIN_EXE_pohunek"));
+        let cli = pohunek_test_support::bin_exe("pohunek");
         for (name, source) in [
             ("pohunek", cli.clone()),
             ("pohunekd", binary("POHUNEK_DAEMON_BIN", &cli, "pohunekd")),

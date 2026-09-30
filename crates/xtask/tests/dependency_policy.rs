@@ -90,9 +90,9 @@ fn rsa_exception_has_only_the_reviewed_oidc_dependency_parent() {
 
 #[test]
 fn production_clippy_policy_rejects_private_rsa_even_through_aliases_and_local_allow() {
-    use std::{fs, path::Path, process::Command};
+    use std::{fs, process::Command};
 
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = pohunek_test_support::workspace_root();
     let workspace: toml::Value =
         toml::from_str(&fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest"))
             .expect("manifest TOML");

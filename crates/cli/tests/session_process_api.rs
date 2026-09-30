@@ -136,7 +136,7 @@ impl TestHome {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_pohunek"));
+        let mut command = Command::new(pohunek_test_support::bin_exe("pohunek"));
         command
             .env("XDG_RUNTIME_DIR", self.root.join("run"))
             .env("XDG_STATE_HOME", self.root.join("state"))

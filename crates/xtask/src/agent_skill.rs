@@ -4,7 +4,7 @@
 //! keeping the render and parity check here makes source changes fail closed
 //! until the checked artifact is regenerated.
 
-// Rust guideline compliant 2026-09-16
+// Rust guideline compliant 2026-09-30
 
 use std::fs;
 use std::io::Write;
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn repo_rendered_frontmatter_parses_with_expected_name_and_description() {
-        let root = crate::repo_root();
+        let root = pohunek_test_support::workspace_root();
         let rendered = String::from_utf8(render(&root).expect("render repository skill"))
             .expect("rendered skill is UTF-8");
         let parsed = frontmatter_mapping(&rendered);
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn repo_source_covers_required_sections_and_single_trailing_newline() {
-        let root = crate::repo_root();
+        let root = pohunek_test_support::workspace_root();
         let rendered = String::from_utf8(render(&root).expect("render repository skill"))
             .expect("rendered skill is UTF-8");
 
@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn repo_generated_artifact_matches_the_current_render() {
-        let root = crate::repo_root();
+        let root = pohunek_test_support::workspace_root();
         let checked = read_checked(&root)
             .expect("read checked artifact")
             .expect("checked-in agent-skill artifact must exist");

@@ -1,6 +1,6 @@
 //! Validates the pinned Hermes CLI and refreshes bounded PTY evidence.
 
-// Rust guideline compliant 2026-09-29
+// Rust guideline compliant 2026-09-30
 
 use std::ffi::OsString;
 use std::fs;
@@ -4086,9 +4086,7 @@ mod tests {
             include_bytes!("../../../compat/hermes/goldens/manifest.json"),
         )
         .expect("write manifest");
-        let source_goldens = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join(GOLDEN_ROOT);
+        let source_goldens = pohunek_test_support::workspace_root().join(GOLDEN_ROOT);
         let manifest = load_golden_manifest(repo.path()).expect("load fixture manifest");
         for file in manifest
             .records

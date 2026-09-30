@@ -13,12 +13,13 @@
 use std::collections::BTreeMap;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixDatagram;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use pohunek_daemon::runtime::Worker;
+use pohunek_test_support::worker_binary;
 use pohunek_worker_protocol::{
     is_denylisted, BaseEnv, Dimensions, Initialize, InitializeLimits, LaunchIdentity, RuntimePhase,
     SecretEnv, SessionId, StopPolicy, TransactionId, Version, BASE_ENVIRONMENT_VERSION,
@@ -333,18 +334,4 @@ async fn version_five_child_inherits_the_worker_without_service_manager_variable
         assert!(!is_denylisted(name), "{name} leaked to the child");
     }
     assert!(!environment.contains_key("NOTIFY_SOCKET"));
-}
-
-fn worker_binary() -> PathBuf {
-    let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
-        || {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .and_then(Path::parent)
-                .expect("daemon crate is inside workspace")
-                .join("target")
-        },
-        PathBuf::from,
-    );
-    target.join("debug/pohunek-sessiond")
 }

@@ -36,6 +36,7 @@ use pohunek_platform::supervisor::{
     ServiceId, ServiceObservation, Supervisor, WorkerKey,
 };
 use pohunek_service_config::{ConfigSpec, Deadlines, ServiceConfig};
+use pohunek_test_support::{bin_exe, worker_binary};
 use pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST;
 use protocol::{
     method, AgentKind, AttachHeader, CwdSource, RuntimeInventoryResult, RuntimeState,
@@ -1062,20 +1063,12 @@ fn private_dir(path: &Path) {
 ///
 /// `POHUNEK_DAEMON_BIN` and `POHUNEK_WORKER_BIN` name them explicitly (the
 /// Linux CI job exports both); otherwise the daemon is this package's binary
-/// and the worker is the `pohunek-sessiond` built into the same target
+/// and the worker is the `pohunek-sessiond` in the same Cargo profile
 /// directory, which the macOS CI job builds before the test step.
 fn binaries() -> (PathBuf, PathBuf) {
-    let daemon = std::env::var_os("POHUNEK_DAEMON_BIN").map_or_else(
-        || PathBuf::from(env!("CARGO_BIN_EXE_pohunekd")),
-        PathBuf::from,
-    );
-    let worker = std::env::var_os("POHUNEK_WORKER_BIN").map_or_else(
-        || {
-            PathBuf::from(env!("CARGO_BIN_EXE_pohunekd"))
-                .with_file_name(pohunek_paths::WORKER_EXECUTABLE_NAME)
-        },
-        PathBuf::from,
-    );
+    let daemon =
+        std::env::var_os("POHUNEK_DAEMON_BIN").map_or_else(|| bin_exe("pohunekd"), PathBuf::from);
+    let worker = worker_binary();
     for (name, path) in [("daemon", &daemon), ("worker", &worker)] {
         assert!(
             path.is_absolute() && path.is_file(),

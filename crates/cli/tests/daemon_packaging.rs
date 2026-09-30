@@ -2073,7 +2073,10 @@ impl Fixture {
             )
             .env("POHUNEK_TEST_POHUNEK_LOG", &self.pohunek_log)
             .env("POHUNEK_TEST_GUARD_LOG", &self.guard_log)
-            .env("POHUNEK_TEST_REAL_CLI", env!("CARGO_BIN_EXE_pohunek"))
+            .env(
+                "POHUNEK_TEST_REAL_CLI",
+                pohunek_test_support::bin_exe("pohunek"),
+            )
             .env(
                 "POHUNEK_TEST_COMPETITOR_STATUS",
                 self.base().join("competitor-status"),
@@ -2162,7 +2165,7 @@ impl Fixture {
     /// The real CLI with `args` in this fixture's environment.
     fn real_pohunek(&self, args: &[&str]) -> Command {
         let template = self.command(&[], &[]);
-        let mut real = Command::new(env!("CARGO_BIN_EXE_pohunek"));
+        let mut real = Command::new(pohunek_test_support::bin_exe("pohunek"));
         real.args(args);
         for (key, value) in template.get_envs() {
             match value {
@@ -2187,12 +2190,7 @@ fn lines(path: &Path) -> Vec<String> {
 }
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates")
-        .parent()
-        .expect("repository")
-        .to_path_buf()
+    pohunek_test_support::workspace_root()
 }
 
 /// Creates `path` and its missing ancestors without group or other write

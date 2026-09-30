@@ -22,7 +22,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 fn pohunek() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_pohunek"))
+    Command::new(pohunek_test_support::bin_exe("pohunek"))
 }
 
 #[test]
