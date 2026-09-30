@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use pohunek_gui_core::providers::linear::{
     GraphqlTransport, GraphqlTransportError, HttpGraphqlTransport, LinearClient, LinearConfig,
-    LinearError, LinearQuery, TokenError, TokenFuture, TokenSource, TransportFuture,
+    LinearError, LinearQuery, TokenError, TokenErrorKind, TokenFuture, TokenSource,
+    TransportFuture,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -640,4 +641,56 @@ async fn missing_required_issue_field_is_typed() {
             field: "title"
         }
     ));
+}
+
+#[test]
+fn token_error_kind_defaults_to_other_and_keeps_explicit_kind() {
+    assert_eq!(TokenError::new("x").kind(), TokenErrorKind::Other);
+    let locked = TokenError::with_kind(TokenErrorKind::Locked, "store locked");
+    assert_eq!(locked.kind(), TokenErrorKind::Locked);
+    assert_eq!(locked.to_string(), "store locked");
+}
+
+#[tokio::test]
+async fn token_lookup_error_keeps_the_kind_of_its_source() {
+    let tokens = FakeTokenSource::failing("unused");
+    *tokens.result.lock().expect("result") = Err(TokenError::with_kind(
+        TokenErrorKind::NotFound,
+        "no credential named `linear-token-ref`",
+    ));
+    let client = LinearClient::new(
+        config(TOKEN_KEY),
+        tokens,
+        FakeTransport::new(issues_response()),
+    );
+
+    let err = client
+        .list_issues(LinearQuery::default())
+        .await
+        .expect_err("token lookup failure");
+
+    assert!(matches!(
+        err,
+        LinearError::TokenLookup { ref source, .. } if source.kind() == TokenErrorKind::NotFound
+    ));
+}
+
+#[tokio::test]
+async fn timeout_message_carries_unlock_remediation() {
+    let client = LinearClient::new(
+        LinearConfig {
+            token_key: TOKEN_KEY.to_owned(),
+            endpoint: "https://linear.example/graphql".to_owned(),
+            token_lookup_timeout: Duration::from_millis(1),
+        },
+        HangingTokenSource,
+        FakeTransport::new(issues_response()),
+    );
+
+    let err = client
+        .list_issues(LinearQuery::default())
+        .await
+        .expect_err("timeout");
+
+    assert!(err.to_string().contains("unlock the login keychain"));
 }

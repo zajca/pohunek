@@ -299,6 +299,42 @@ jobs:
           cargo check --locked -p pohunek-gui -p pohunek-hostcheck --all-targets
           cargo clippy --locked -p pohunek-gui -p pohunek-hostcheck --all-targets -- -D warnings
 
+      # GUI core: its keyring backend is `apple-native` only here.
+      - name: Check and lint GUI core
+        if: ${{ !cancelled() }}
+        run: |
+          cargo check --locked -p pohunek-gui-core --all-targets
+          cargo clippy --locked -p pohunek-gui-core --all-targets -- -D warnings
+
+      # Throwaway keychain for tests/keychain_macos.rs. It becomes the only
+      # keychain in the user search list and the user default, so the real
+      # keyring backend never sees the runner's login keychain. The password
+      # exists only in this step's shell, is masked, and is never written to
+      # disk or the environment. The 3600 s auto-lock outlasts a cold build
+      # between this step and the test run; the test locks the keychain itself.
+      - name: Create throwaway keychain
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/pohunek-gui-test.keychain-db"
+          security list-keychains -d user > "$RUNNER_TEMP/keychains.orig"
+          security default-keychain -d user > "$RUNNER_TEMP/keychain-default.orig"
+          password="$(openssl rand -hex 24)"
+          echo "::add-mask::$password"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -t 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -d user -s "$keychain"
+          echo "GUI_CORE_TEST_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Test GUI core
+        if: ${{ !cancelled() }}
+        # Every test binary reports, so tests/keychain_macos.rs runs even when an
+        # earlier binary fails.
+        run: cargo test --locked --no-fail-fast -p pohunek-gui-core
+
       - name: Test GUI and host probes
         if: ${{ !cancelled() }}
         # A test waiting on a child process must fail with evidence, never hold
@@ -316,6 +352,34 @@ jobs:
         env:
           GUI_ACCEPT_BIN_DIR: ${{ github.workspace }}/target/debug
         run: scripts/acceptance/macos-gui-launch
+
+      # Restores the runner's original keychain list and default, then removes
+      # the throwaway keychain. The test may already have deleted it.
+      - name: Remove throwaway keychain
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          keychain="$RUNNER_TEMP/pohunek-gui-test.keychain-db"
+          if [[ -f "$RUNNER_TEMP/keychains.orig" ]]; then
+            originals=()
+            while IFS= read -r line; do
+              line="${line#"${line%%[![:space:]]*}"}"
+              line="${line%"${line##*[![:space:]]}"}"
+              line="${line#\"}"
+              line="${line%\"}"
+              [[ -n "$line" ]] && originals+=("$line")
+            done < "$RUNNER_TEMP/keychains.orig"
+            if (( ${#originals[@]} > 0 )); then
+              security list-keychains -d user -s "${originals[@]}"
+            fi
+          fi
+          if [[ -f "$RUNNER_TEMP/keychain-default.orig" ]]; then
+            default="$(tr -d '"' < "$RUNNER_TEMP/keychain-default.orig" | tr -d '[:space:]')"
+            [[ -n "$default" ]] && security default-keychain -d user -s "$default"
+          fi
+          security delete-keychain "$keychain" 2>/dev/null || true
+          rm -f "$keychain"
 
   test:
     name: fmt + clippy
