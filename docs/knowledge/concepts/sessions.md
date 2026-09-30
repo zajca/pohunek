@@ -336,7 +336,8 @@ finishes an interrupted removal nor the retention sweep ever has it. With it the
 removal proceeds past the unreadable candidates without signalling them, logs
 each at `warn`, and lists every one in the result as
 `accepted_unconfirmed_processes` (human output prints `pid N (start S, command
-name)` lines after the `removed=` line; `--json` carries the array). It changes
+name)` lines after the `removed=` line, with the process-chosen command name
+escaped; `--json` carries the array). It changes
 nothing else: a signalled process that is still running, a sweep error, or a
 missing supervision configuration still refuses. The trade-off is that an
 accepted process that does carry the runtime marker keeps running unsupervised

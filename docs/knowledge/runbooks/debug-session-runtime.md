@@ -136,7 +136,7 @@ Interpret runtime states as follows:
   rm <id> --accept-unconfirmed-cleanup` removes the session anyway for that one
   call: the processes are not signalled, and the result lists them as
   `accepted_unconfirmed_processes` (`pid N (start S, command `name`)` in human
-  output). One that does carry the runtime marker keeps running unsupervised
+  output; the command name is escaped because the process chooses it). One that does carry the runtime marker keeps running unsupervised
   after the worktree, logs, and record are gone. Any other unconfirmed reason
   still refuses, and reconciliation and the retention sweep never have the
   consent. A removal finished by

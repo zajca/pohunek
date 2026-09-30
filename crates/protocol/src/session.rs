@@ -2702,6 +2702,11 @@ pub struct UnconfirmedProcess {
     /// PID is not mistaken for this process.
     pub start_identity: ProcessStartIdentity,
     /// Kernel command name, when the process table still listed the process.
+    ///
+    /// The process chooses this name, so the daemon shows only ASCII letters,
+    /// digits, space and `._-+:@/` literally, writes every other character as a
+    /// `\u{..}` escape, and ends a shortened name with `...`. It is safe to
+    /// print to a terminal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub command: Option<String>,

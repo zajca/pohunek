@@ -22,6 +22,11 @@ export type UnconfirmedProcess = {
   start_identity: ProcessStartIdentity;
   /**
    * Kernel command name, when the process table still listed the process.
+   *
+   * The process chooses this name, so the daemon shows only ASCII letters,
+   * digits, space and `._-+:@/` literally, writes every other character as a
+   * `\u{..}` escape, and ends a shortened name with `...`. It is safe to
+   * print to a terminal.
    */
   command?: string;
 };

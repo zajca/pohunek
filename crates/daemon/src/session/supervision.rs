@@ -21,7 +21,10 @@ use pohunek_platform::process::{
 use pohunek_platform::supervisor::{
     Error as SupervisorError, ServiceId, ServiceObservation, WorkerKey,
 };
-use protocol::{RuntimeInventoryEntry, RuntimeInventoryStatus, RuntimeState};
+use protocol::{
+    ProcessStartIdentity, RuntimeInventoryEntry, RuntimeInventoryStatus, RuntimeState,
+    UnconfirmedProcess,
+};
 
 use super::reconcile::JournalEvidence;
 use super::{SessionId, SessionRecord, SessionRegistry, SessionRegistryInner};
@@ -92,7 +95,7 @@ const MAX_LISTED_COMM_CHARS: usize = 32;
 /// own quoting or imitating another list entry. At most
 /// [`MAX_LISTED_COMM_CHARS`] characters are kept, and an ellipsis marks
 /// a shortened name.
-fn escape_command_name(comm: &str) -> String {
+pub(super) fn escape_command_name(comm: &str) -> String {
     let mut escaped = String::new();
     let mut chars = comm.chars();
     for c in chars.by_ref().take(MAX_LISTED_COMM_CHARS) {
@@ -332,6 +335,18 @@ pub(super) struct UnreadableCandidate {
     pub(super) identity: ProcessIdentity,
     /// Kernel command name, when the process table still lists the process.
     pub(super) comm: Option<String>,
+}
+
+impl UnreadableCandidate {
+    /// The wire form of an accepted candidate. The command name is escaped
+    /// ([`escape_command_name`]) because clients print it to a terminal.
+    pub(super) fn to_unconfirmed_process(&self) -> UnconfirmedProcess {
+        UnconfirmedProcess {
+            pid: self.identity.pid,
+            start_identity: ProcessStartIdentity::new(self.identity.start_identity.get()),
+            command: self.comm.as_deref().map(escape_command_name),
+        }
+    }
 }
 
 /// The verdict of a lost-runtime sweep together with what blocked it.
@@ -1207,6 +1222,21 @@ mod tests {
         );
         assert_eq!(escape_command_name("a\nb\u{202e}c"), "a\\u{a}b\\u{202e}c");
         assert_eq!(escape_command_name("Web Content-1.2"), "Web Content-1.2");
+    }
+
+    #[test]
+    fn an_accepted_candidate_reaches_clients_with_an_escaped_command() {
+        let candidate = UnreadableCandidate {
+            identity: ProcessIdentity {
+                pid: 7,
+                start_identity: StartIdentity::new(9),
+            },
+            comm: Some("x\u{1b}[2J".to_owned()),
+        };
+        let process = candidate.to_unconfirmed_process();
+        assert_eq!(process.pid, 7);
+        assert_eq!(process.start_identity, ProcessStartIdentity::new(9));
+        assert_eq!(process.command.as_deref(), Some("x\\u{1b}\\u{5b}2J"));
     }
 
     #[test]

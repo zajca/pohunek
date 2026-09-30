@@ -12,9 +12,9 @@ use pohunek_platform::{
 };
 use pohunek_worker_protocol::{ControlCode, InspectSnapshot, ReleasedIdentityClaim, RuntimePhase};
 use protocol::{
-    AgentActivity, AgentKind, ProcessStartIdentity, RuntimeInventoryEntry, RuntimeInventoryEvent,
-    RuntimeInventoryStatus, SessionRuntimeIdentity, SubagentInfo, SubagentLifecycle,
-    SubagentRevision, SubagentStateEvent, UnconfirmedProcess,
+    AgentActivity, AgentKind, RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus,
+    SessionRuntimeIdentity, SubagentInfo, SubagentLifecycle, SubagentRevision, SubagentStateEvent,
+    UnconfirmedProcess,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -1652,13 +1652,7 @@ impl SessionRegistry {
                             comm = candidate.comm.as_deref().unwrap_or("unavailable"),
                             "removal accepted an unreadable-marker process that may belong to the removed runtime"
                         );
-                        accepted.push(UnconfirmedProcess {
-                            pid: candidate.identity.pid,
-                            start_identity: ProcessStartIdentity::new(
-                                candidate.identity.start_identity.get(),
-                            ),
-                            command: candidate.comm.clone(),
-                        });
+                        accepted.push(candidate.to_unconfirmed_process());
                     }
                     continue;
                 }
