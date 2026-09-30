@@ -12,9 +12,7 @@ use std::time::{Duration, Instant};
 use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
 use thiserror::Error;
 
-use super::search_path::{
-    CanonicalizedEntry, DroppedEntry, SanitizedPath, SearchPath, SearchPathError,
-};
+use super::search_path::{DroppedEntry, SanitizedPath, SearchPath, SearchPathError};
 
 /// Executable printing the environment `PATH` of the login shell.
 ///
@@ -80,9 +78,6 @@ pub struct LoginShellSpec {
 pub struct LoginShellDiscovery {
     /// The sanitized directories.
     pub path: SearchPath,
-    /// Entries recorded as their canonical path, see
-    /// [`SanitizedPath::canonicalized`].
-    pub canonicalized: Vec<CanonicalizedEntry>,
     /// Existing directories refused as untrusted, with the reason.
     pub untrusted: Vec<DroppedEntry>,
     /// Entries ignored without concern (empty, relative, duplicate, missing).
@@ -284,7 +279,7 @@ where
         });
     }
     let script =
-        format!("printf '%s\\n' '{sentinel}'; '{printenv}' PATH; printf '%s\\n' '{sentinel}'");
+        format!("printf '\\n%s\\n' '{sentinel}'; '{printenv}' PATH; printf '%s\\n' '{sentinel}'");
 
     let mut command = Command::new(&spec.shell);
     command
@@ -321,7 +316,6 @@ where
     }
     Ok(LoginShellDiscovery {
         path: sanitized.path,
-        canonicalized: sanitized.canonicalized,
         untrusted: sanitized.untrusted,
         ignored: sanitized.ignored,
     })
@@ -536,6 +530,16 @@ mod tests {
         assert_eq!(found.path.entries(), [brew, local]);
         assert_eq!(found.ignored, 0);
         assert!(found.untrusted.is_empty());
+    }
+
+    #[test]
+    fn a_banner_without_a_trailing_newline_does_not_glue_to_the_sentinel() {
+        let dir = fixture();
+        let bin = dir.path().join("bin");
+        make_dir(dir.path(), &bin);
+        let shell = fake_shell(dir.path(), "printf welcome", &bin.display().to_string());
+        let found = discover_login_shell_path(&spec(shell)).expect("discovery");
+        assert_eq!(found.path.entries(), [bin]);
     }
 
     #[test]

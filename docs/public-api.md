@@ -901,8 +901,8 @@ values never reach agent code. The `[environment]` table of `service.toml` also
 requires a `search_path` list: the absolute, normalized, non-repeating
 directories the installer resolved and hands to the daemon job as its `PATH`
 (an empty list keeps the service manager's own `PATH`; the joined value is
-bounded). Directories are recorded as listed and were trusted when resolved
-(owned by the user or root, not writable by group or others). The path is
+bounded). Each directory is recorded as its canonical path and was trusted when
+resolved (owned by the user or root, not writable by group or others). The path is
 recorded at install and reaches the daemon job only when the installer writes
 the job definition (install, or an upgrade to a different version); upgrades
 reuse the recorded list, so a manual edit takes effect only at the next
@@ -914,8 +914,7 @@ outcome in an additive `search_path` object: `source` (`login_shell`,
 `fallback`, `recorded`, `unmanaged`), `entries`, `shell_used`,
 `shell_defaulted`, `login_shell_failure` (the rendered typed reason when the
 fallback list was used), and `dropped` (`[{path, reason}]`, directories refused
-as untrusted), and `canonicalized` (`[{path, recorded}]`, directories recorded
-as their canonical path because a symlink on the way is not owner-controlled); the human output prints a `warning:` line for a failed login
+as untrusted); the human output prints a `warning:` line for a failed login
 shell and for each dropped directory. A set but relative `$SHELL`, or a
 non-UTF-8 `HOME`, `USER`, or `LOGNAME`, fails the install
 (`service_environment_invalid`, `service_environment_not_utf8`). When the

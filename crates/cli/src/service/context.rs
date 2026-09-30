@@ -14,7 +14,7 @@ use pohunek_platform::shell_env::{
 use pohunek_platform::supervisor::{self, Namespace};
 
 use super::error::{fs_error, io_error, Error};
-use super::report::{CanonicalizedPath, DroppedPath, SearchPathReport};
+use super::report::{DroppedPath, SearchPathReport};
 use super::settings;
 
 /// Mode of the application state and runtime roots.
@@ -229,7 +229,6 @@ impl Context {
                     shell_defaulted: false,
                     login_shell_failure: None,
                     dropped: Vec::new(),
-                    canonicalized: Vec::new(),
                 },
             ));
         };
@@ -254,14 +253,6 @@ impl Context {
                 .map(|dropped| DroppedPath {
                     path: dropped.entry,
                     reason: dropped.reason,
-                })
-                .collect(),
-            canonicalized: resolution
-                .canonicalized
-                .into_iter()
-                .map(|entry| CanonicalizedPath {
-                    path: entry.entry,
-                    recorded: entry.recorded,
                 })
                 .collect(),
         };
@@ -394,12 +385,21 @@ pub fn managed_path_discovery(
     })
 }
 
+/// Variables that name where a login shell reads its profile from.
+///
+/// `ZDOTDIR` moves zsh's startup files and `XDG_CONFIG_HOME` moves fish's and
+/// other shells'; without them a custom profile location is never read and the
+/// probe would succeed with the baseline `PATH`.
+const PROFILE_SELECTORS: [&str; 2] = ["ZDOTDIR", "XDG_CONFIG_HOME"];
+
 /// Builds the managed policy from an environment lookup.
 ///
 /// A `HOME`, `USER`, or `LOGNAME` that is set but not UTF-8 fails instead of
 /// being left out, because the shell would then read another user's startup
-/// files; `$SHELL` is validated by [`managed_path_discovery`]. The lookup is
-/// injected so the validation is type-checked and tested on every target.
+/// files. A set, non-empty profile selector ([`PROFILE_SELECTORS`]) is passed to
+/// the probe and must be UTF-8 and absolute, or the install fails. `$SHELL` is
+/// validated by [`managed_path_discovery`]. The lookup is injected so the
+/// validation is type-checked and tested on every target.
 fn managed_discovery_from_env(
     lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Result<PathDiscovery, Error> {
@@ -412,6 +412,23 @@ fn managed_discovery_from_env(
             })?;
             environment.push((name.to_owned(), text));
         }
+    }
+    for name in PROFILE_SELECTORS {
+        let Some(value) = lookup(name).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let text = value.into_string().map_err(|value| Error::NonUtf8Env {
+            var: name,
+            path: PathBuf::from(value),
+        })?;
+        if !Path::new(&text).is_absolute() {
+            return Err(unusable(
+                name,
+                Path::new(&text),
+                "it is not an absolute path".to_owned(),
+            ));
+        }
+        environment.push((name.to_owned(), text));
     }
     managed_path_discovery(lookup("SHELL").map(PathBuf::from), environment)
 }
@@ -541,6 +558,103 @@ pub(crate) mod tests {
             root.join("units"),
             PathBuf::from("/usr/bin/pohunek"),
         )
+    }
+
+    #[test]
+    fn profile_selectors_reach_the_probe_and_must_be_absolute_utf8() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let env = |pairs: Vec<(&'static str, OsString)>| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.clone())
+            }
+        };
+        let PathDiscovery::Managed {
+            login_shell: Some(spec),
+            ..
+        } = managed_discovery_from_env(env(vec![
+            ("ZDOTDIR", OsString::from("/home/u/.config/zsh")),
+            ("XDG_CONFIG_HOME", OsString::from("")),
+        ]))
+        .expect("discovery")
+        else {
+            panic!("managed discovery");
+        };
+        // An empty selector counts as unset, as shells treat it.
+        assert_eq!(
+            spec.environment,
+            [("ZDOTDIR".to_owned(), "/home/u/.config/zsh".to_owned())]
+        );
+        for (var, value, code) in [
+            (
+                "ZDOTDIR",
+                OsString::from("relative/zsh"),
+                "service_environment_invalid",
+            ),
+            (
+                "XDG_CONFIG_HOME",
+                OsString::from("cfg"),
+                "service_environment_invalid",
+            ),
+            (
+                "ZDOTDIR",
+                OsString::from_vec(b"/z\xff".to_vec()),
+                "service_environment_not_utf8",
+            ),
+        ] {
+            let error = managed_discovery_from_env(env(vec![(var, value)])).expect_err(var);
+            assert_eq!(error.code(), code, "{var}");
+        }
+    }
+
+    #[test]
+    fn a_custom_profile_location_supplies_a_prefix_outside_the_fallback_list() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_root, root) = temp_root();
+        let root = root.as_path();
+        let zdotdir = root.join("zdotdir");
+        let prefix = root.join("nix/profile/bin");
+        make_dirs(root, &zdotdir);
+        make_dirs(root, &prefix);
+        // A fake zsh that reads its PATH from `$ZDOTDIR/path`, as a profile
+        // under `ZDOTDIR` would set it, and ignores everything else.
+        std::fs::write(zdotdir.join("path"), prefix.display().to_string()).expect("profile");
+        let shell = root.join("fake-zsh");
+        std::fs::write(
+            &shell,
+            "#!/bin/sh\n[ -n \"$ZDOTDIR\" ] && PATH=\"$(cat \"$ZDOTDIR/path\")\"; export PATH\nexec /bin/sh -c \"$3\"\n",
+        )
+        .expect("shell");
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let shell_value = OsString::from(shell.as_os_str());
+        let zdotdir_value = OsString::from(zdotdir.as_os_str());
+        let PathDiscovery::Managed {
+            login_shell,
+            shell_defaulted,
+            ..
+        } = managed_discovery_from_env(|name| match name {
+            "SHELL" => Some(shell_value.clone()),
+            "ZDOTDIR" => Some(zdotdir_value.clone()),
+            _ => None,
+        })
+        .expect("discovery")
+        else {
+            panic!("managed discovery");
+        };
+        let context = context(root).with_path_discovery(PathDiscovery::Managed {
+            login_shell,
+            shell_defaulted,
+            fallback_directories: Vec::new(),
+        });
+        let (path, report) = context.install_search_path().expect("resolve");
+        assert_eq!(path.entries(), [prefix]);
+        assert_eq!(report.source, "login_shell");
     }
 
     #[test]

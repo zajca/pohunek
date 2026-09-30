@@ -317,7 +317,6 @@ impl<'a> Engine<'a> {
                     shell_defaulted: false,
                     login_shell_failure: None,
                     dropped: Vec::new(),
-                    canonicalized: Vec::new(),
                 };
                 (config, report)
             }

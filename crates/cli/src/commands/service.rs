@@ -238,13 +238,6 @@ fn render_search_path(text: &mut String, report: &report::SearchPathReport) {
             dropped.path, dropped.reason
         );
     }
-    for entry in &report.canonicalized {
-        let _ = writeln!(
-            text,
-            "warning: PATH directory {} is recorded as {} because a symlink on the way is not owner-controlled",
-            entry.path, entry.recorded
-        );
-    }
 }
 
 fn render_upgrade(report: &report::UpgradeReport) -> String {
@@ -509,7 +502,6 @@ mod tests {
             shell_defaulted: true,
             login_shell_failure: None,
             dropped: Vec::new(),
-            canonicalized: Vec::new(),
         }
     }
 
@@ -535,16 +527,8 @@ mod tests {
             path: "/usr/local/bin".to_owned(),
             reason: "writable by group or others",
         }];
-        path.canonicalized = vec![report::CanonicalizedPath {
-            path: "/tmp/tools".to_owned(),
-            recorded: "/usr/bin".to_owned(),
-        }];
         let install = install_report(path);
         let text = render_install(&install);
-        assert!(
-            text.contains("warning: PATH directory /tmp/tools is recorded as /usr/bin"),
-            "{text}"
-        );
         assert!(
             text.contains(
                 "warning: login shell PATH discovery failed (login shell probe exceeded 10s"
@@ -567,7 +551,6 @@ mod tests {
             search_path["login_shell_failure"],
             "login shell probe exceeded 10s and was killed"
         );
-        assert_eq!(search_path["canonicalized"][0]["recorded"], "/usr/bin");
         assert_eq!(search_path["dropped"][0]["path"], "/usr/local/bin");
         assert_eq!(
             search_path["dropped"][0]["reason"],

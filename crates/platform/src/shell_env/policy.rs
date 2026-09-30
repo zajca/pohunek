@@ -6,8 +6,7 @@ use thiserror::Error;
 
 use super::login_shell::{discover_staged, LoginShellError, LoginShellSpec};
 use super::search_path::{
-    fallback_search_path, CanonicalizedEntry, DroppedEntry, SanitizedPath, SearchPath,
-    SearchPathError,
+    fallback_search_path, DroppedEntry, SanitizedPath, SearchPath, SearchPathError,
 };
 
 /// Inputs of [`resolve_search_path`].
@@ -65,9 +64,6 @@ pub struct PathResolution {
     pub login_shell_failure: Option<LoginShellError>,
     /// Existing directories refused as untrusted, from every tier consulted.
     pub untrusted: Vec<DroppedEntry>,
-    /// Entries recorded as their canonical path because a symlink on the way
-    /// could be retargeted by another account.
-    pub canonicalized: Vec<CanonicalizedEntry>,
     /// Entries ignored without concern (empty, relative, duplicate, missing).
     pub ignored: usize,
 }
@@ -132,7 +128,6 @@ where
             shell: None,
             login_shell_failure: None,
             untrusted: Vec::new(),
-            canonicalized: Vec::new(),
             ignored: 0,
         });
     }
@@ -150,7 +145,6 @@ where
     match staged.login {
         Ok(discovery) => {
             let mut untrusted = discovery.untrusted;
-            let mut canonicalized = discovery.canonicalized;
             let mut ignored = discovery.ignored;
             let path = match staged.fallback {
                 Ok(extra) => {
@@ -160,7 +154,6 @@ where
                             untrusted.push(dropped);
                         }
                     }
-                    canonicalized.extend(extra.canonicalized);
                     ignored += extra.ignored;
                     discovery.path.with_appended(extra.path.entries())
                 }
@@ -172,7 +165,6 @@ where
                 shell,
                 login_shell_failure: None,
                 untrusted,
-                canonicalized,
                 ignored,
             })
         }
@@ -192,7 +184,6 @@ fn fallback_only(
         shell,
         login_shell_failure: failure,
         untrusted: fallback.untrusted,
-        canonicalized: fallback.canonicalized,
         ignored: fallback.ignored,
     })
 }

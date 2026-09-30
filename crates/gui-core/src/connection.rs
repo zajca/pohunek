@@ -650,8 +650,9 @@ fn scan_shell_template(text: &str) -> Result<Vec<(usize, Placeholder)>, AttachTe
     let mut sites = Vec::new();
     let mut state = ScanState::Unquoted;
     let mut word_start = true;
-    // A word holding both a placeholder and an unquoted `*`, `?`, or leading
-    // `~` could expand to several arguments, so it is refused.
+    // A word holding both a placeholder and an unquoted `*`, `?`, or `~` could
+    // expand (a `~` also expands after `=` in an assignment word), so it is
+    // refused.
     let mut word_placeholder = false;
     let mut word_glob = false;
     let mut index = 0;
@@ -721,8 +722,7 @@ fn scan_shell_template(text: &str) -> Result<Vec<(usize, Placeholder)>, AttachTe
                 return Err(refuse("parentheses, brackets, braces, or redirection"));
             }
             b'#' if strict && !in_double && word_start => return Err(refuse("a comment")),
-            b'*' | b'?' if strict && !in_double => word_glob = true,
-            b'~' if strict && !in_double && word_start => word_glob = true,
+            b'*' | b'?' | b'~' if strict && !in_double => word_glob = true,
             _ => {}
         }
         if !in_double && state == ScanState::Unquoted {
@@ -1158,6 +1158,8 @@ mod attach_template_tests {
             ("printf x {bin}?", glob),
             ("printf x ~{host}", glob),
             ("printf x a*b{host}c", glob),
+            ("POHUNEK_HOST=~{host} true", glob),
+            ("true x=~{host}", glob),
             ("printf x {host}/*", glob),
         ] {
             let expected = Err(AttachTemplateError::UnsafePlaceholderContext { context });
@@ -1327,6 +1329,28 @@ mod attach_template_tests {
         );
         render_attach_command("printf '%s\\0' {host}*", &values).expect_err("refused");
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_tilde_after_an_equals_sign_cannot_expand_a_value() {
+        // Real sh expands `~root` after `=` in an assignment word.
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg("H=~root; printf %s \"$H\"")
+            .output()
+            .expect("run sh");
+        assert_ne!(output.stdout, b"~root", "the shell expands the tilde");
+        let values = AttachTemplateValues {
+            bin: "b".to_owned(),
+            host: "root".to_owned(),
+            id: "i".to_owned(),
+        };
+        render_attach_command("POHUNEK_HOST=~{host} true", &values).expect_err("refused");
+        // A quoted tilde in another word is fine.
+        assert_eq!(
+            render_attach_command("true '~' {host}", &values).expect("render"),
+            "true '~' root"
+        );
     }
 
     #[test]

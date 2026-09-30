@@ -31,13 +31,16 @@ Highest priority first:
 3. **Bounded login-shell discovery (macOS only).** One `$SHELL -l -c` probe
    prints `PATH` between two random sentinel lines through the absolute
    `/usr/bin/printenv`. It is never interactive (`-i` is not used), reads a
-   null stdin, starts from an empty environment plus `HOME`, `USER`, `LOGNAME`,
-   `TERM=dumb`, and a baseline `PATH`, and runs in its own process group. One
+   null stdin, starts from an empty environment plus `HOME`, `USER`, `LOGNAME`, the
+   profile selectors `ZDOTDIR` and `XDG_CONFIG_HOME` when set (each must be an
+   absolute UTF-8 path, or the install fails), `TERM=dumb`, and a baseline
+   `PATH`, and runs in its own process group. One
    deadline (10 s) covers the fallback-directory validation, the executable
    checks, the probe, and the validation of the printed directories; output above 64 KiB kills the probe too. The
    group is killed as soon as the shell exits, so a background job left by a
    startup file cannot hold the output open. User startup output before or
-   after the sentinels is ignored, and a decoy line cannot spoof the random
+   after the sentinels is ignored (the first sentinel starts on its own line, so
+   a banner without a trailing newline cannot glue to it), and a decoy line cannot spoof the random
    sentinel. A login shell reads profile files but not `.zshrc`, so the trusted
    fallback directories it lacks are appended after the discovered ones.
 4. **A fallback directory list.** Used alone when tier 3 is unavailable or
@@ -54,12 +57,11 @@ platform's trusted-ancestor rules), and the directory itself is not writable
 by group or others. `/tmp`, other sticky world-writable directories, anything
 below a writable ancestor, and group-writable directories (such as an
 admin-group Intel `/usr/local/bin`, which is out of scope) are refused,
-because another local account could plant an agent executable there. The entry
-is recorded as listed, so a profile or dotfile symlink keeps following its
-target, but only when every symlink on the way (targets included) is owned by
-the user or root and sits in a directory others cannot write; otherwise another
-account could retarget the link, so the validated canonical path is recorded
-instead and reported as `canonicalized`. Empty, relative, `.`-style, duplicate, and
+because another local account could plant an agent executable there. Each kept entry is recorded as its validated canonical path, so validation
+and recording cover the same directory and nothing can be retargeted after the
+check. The trade-off: a profile symlink that later points elsewhere (nix
+generations, a dotfile manager) keeps the recorded target until the path is
+recorded again; #319 tracks the refresh command. Empty, relative, `.`-style, duplicate, and
 missing entries are ignored; a `PATH` containing a control character is
 garbage and fails the probe.
 
@@ -96,8 +98,7 @@ The install result reports how the path was obtained: `search_path.source`
 (`login_shell`, `fallback`, `recorded` for a resumed install, or `unmanaged`),
 the recorded `entries`, `shell_used` and `shell_defaulted`, the typed
 `login_shell_failure` when the fallback list was used, and `dropped`, the
-directories refused as untrusted with a reason, and `canonicalized`, the
-directories recorded as their canonical path. The human output prints a
+directories refused as untrusted with a reason. The human output prints a
 `warning:` line for a failed login shell and for each refused directory. This
 is the only place the outcome is visible, so read it after installing.
 
@@ -137,7 +138,7 @@ one of two ways, both in `pohunek-gui-core`:
   literal brace, `#` comment, line continuation, or `$` other than a plain
   `$NAME`; double-quoted text may hold no `$` construct or backtick;
   single-quoted text is opaque; a word that holds a placeholder may not also
-  hold an unquoted `*`, `?`, or leading `~` (quote the literal part, or put it in
+  hold an unquoted `*`, `?`, or `~` (quote the literal part, or put it in
   another word). Anything else, a placeholder inside quotes, or a
   placeholder right after `$`, is refused with
   `AttachTemplateError::UnsafePlaceholderContext` (an unclosed quote is
