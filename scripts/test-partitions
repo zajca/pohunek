@@ -153,36 +153,15 @@ def inventory(expression=None, archive=None):
     return selected_tests(json.loads(result.stdout))
 
 
-# Member of every nextest archive holding `cargo metadata` of the build.
-ARCHIVE_CARGO_METADATA = "target/nextest/cargo-metadata.json"
+def require_archive_file(archive):
+    """Fail with a clear message unless `archive` is an existing file.
 
-
-def require_archive_built_here(archive):
-    """Fail unless `archive` was built in this checkout's absolute path.
-
-    Tests locate binaries and sources through compile-time paths
-    (`env!("CARGO_BIN_EXE_*")`, `env!("CARGO_MANIFEST_DIR")`, the worker at
-    `<workspace>/target/debug/pohunek-sessiond`). Those resolve only when the
-    archive is extracted at the workspace root it was built in; anywhere else
-    dozens of tests fail on missing files, so refuse up front with the cause.
+    An archive is relocatable: nextest maps the build's workspace root to this
+    checkout (`--workspace-remap`) and tests resolve binaries and sources from
+    their runtime environment, so the path it was built at does not matter.
     """
     if not Path(archive).is_file():
         raise ValueError(f"nextest archive not found: {archive}")
-    member = subprocess.run(
-        ["tar", "--zstd", "-xOf", str(archive), ARCHIVE_CARGO_METADATA],
-        check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    if member.returncode != 0:
-        raise ValueError(
-            f"cannot read {ARCHIVE_CARGO_METADATA} from {archive}: "
-            f"{member.stderr.decode(errors='replace').strip()}"
-        )
-    built_in = Path(json.loads(member.stdout)["workspace_root"])
-    if built_in != ROOT:
-        raise ValueError(
-            f"archive was built in {built_in} but this checkout is {ROOT}; "
-            "extract and run it at the path it was built in"
-        )
 
 
 def main():
@@ -192,13 +171,13 @@ def main():
     parser.add_argument(
         "--archive-file", type=Path,
         help="run and check from this `cargo nextest archive` file instead of building; "
-             "extracts into this checkout and requires the archive's build path to match",
+             "extracts into this checkout, whatever path the archive was built at",
     )
     args = parser.parse_args()
     archive = None
     if args.archive_file is not None:
         try:
-            require_archive_built_here(args.archive_file.resolve())
+            require_archive_file(args.archive_file.resolve())
         except ValueError as error:
             parser.error(str(error))
         archive = Archive(args.archive_file.resolve())

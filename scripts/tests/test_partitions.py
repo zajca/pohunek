@@ -135,7 +135,7 @@ class ArchiveModeTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, stdout=b"{}")
 
             answers = iter([universe, *[selections[n] for n in partitions.SHARDS]])
-            with mock.patch.object(partitions, "require_archive_built_here"), \
+            with mock.patch.object(partitions, "require_archive_file"), \
                     mock.patch.object(partitions.subprocess, "run", side_effect=fake_run), \
                     mock.patch.object(partitions, "selected_tests", side_effect=lambda _d: next(answers)), \
                     mock.patch.object(sys, "argv", [
@@ -167,7 +167,7 @@ class ArchiveModeTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0)
 
             with mock.patch.object(partitions, "ROOT", Path(root)), \
-                    mock.patch.object(partitions, "require_archive_built_here"), \
+                    mock.patch.object(partitions, "require_archive_file"), \
                     mock.patch.object(partitions.subprocess, "run", side_effect=fake_run), \
                     mock.patch.object(sys, "argv", [
                         "test-partitions", "--archive-file", str(archive), "run", "relay-db",
@@ -179,37 +179,16 @@ class ArchiveModeTests(unittest.TestCase):
         self.assertEqual(command[command.index("-E") + 1], partitions.filters()["relay-db"])
         self.assertIn("--archive-file", command)
 
-    def make_archive(self, root, workspace_root):
-        """A tar.zst holding only the cargo metadata member nextest archives."""
-        member = Path(root) / "src" / partitions.ARCHIVE_CARGO_METADATA
-        member.parent.mkdir(parents=True)
-        member.write_text('{"workspace_root": "%s"}' % workspace_root)
-        archive = Path(root) / "a.tar.zst"
-        subprocess.run(
-            ["tar", "--zstd", "-cf", str(archive), "-C", str(Path(root) / "src"), "target"],
-            check=True,
-        )
-        return archive
-
-    def test_archive_built_in_this_checkout_is_accepted(self):
+    def test_archive_built_at_another_path_is_accepted(self):
         with tempfile.TemporaryDirectory() as root:
-            archive = self.make_archive(root, partitions.ROOT)
-            partitions.require_archive_built_here(archive)
+            archive = Path(root) / "a.tar.zst"
+            archive.write_bytes(b"archive built elsewhere")
+            partitions.require_archive_file(archive)
 
-    def test_archive_built_elsewhere_is_refused(self):
-        with tempfile.TemporaryDirectory() as root:
-            archive = self.make_archive(root, "/somewhere/else")
-            with self.assertRaisesRegex(ValueError, "built in /somewhere/else"):
-                partitions.require_archive_built_here(archive)
-
-    def test_missing_or_unreadable_archive_is_refused(self):
+    def test_missing_archive_is_refused(self):
         with tempfile.TemporaryDirectory() as root:
             with self.assertRaisesRegex(ValueError, "not found"):
-                partitions.require_archive_built_here(Path(root) / "absent.tar.zst")
-            garbage = Path(root) / "garbage.tar.zst"
-            garbage.write_text("not an archive")
-            with self.assertRaisesRegex(ValueError, "cannot read"):
-                partitions.require_archive_built_here(garbage)
+                partitions.require_archive_file(Path(root) / "absent.tar.zst")
 
 
 if __name__ == "__main__":
