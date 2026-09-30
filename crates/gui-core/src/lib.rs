@@ -36,7 +36,8 @@ pub use pohunek_prompt::{
 #[doc(inline)]
 pub use connection::{
     discover_hosts, host_subscription_stream, render_attach_argv, render_attach_command,
-    spawn_attach_command, workspace_connection_stream, AttachCommandSpawner, AttachSpawnIntent,
+    spawn_attach_command, validate_attach_argv_template, validate_attach_shell_template,
+    workspace_connection_stream, AttachCommandSpawner, AttachSpawnError, AttachSpawnIntent,
     AttachTemplateError, AttachTemplateValues,
 };
 #[doc(inline)]

@@ -457,6 +457,24 @@ pub enum AttachTemplateError {
     /// A substituted argument contains a NUL byte, which no process can receive.
     #[error("attach command argument contains a NUL byte")]
     NulByte,
+    /// A placeholder sits where the shell quoting cannot be proven safe.
+    #[error("attach command placeholder is in an unsupported shell context: {context}")]
+    UnsafePlaceholderContext {
+        /// The construct that prevents a safe substitution.
+        context: &'static str,
+    },
+}
+
+/// Reports why an attach command could not be rendered and spawned.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum AttachSpawnError {
+    /// The template cannot be rendered safely.
+    #[error(transparent)]
+    Template(#[from] AttachTemplateError),
+    /// The spawner failed to start the rendered command.
+    #[error("{0}")]
+    Spawn(String),
 }
 
 /// Replaces `{bin}`, `{host}`, and `{id}` in `text` in one left-to-right pass.
@@ -491,12 +509,26 @@ fn substitute_placeholders(text: &str, bin: &str, host: &str, id: &str) -> Strin
 
 /// Render the configured attach command as one shell string.
 ///
-/// Replaces `{bin}`, `{host}`, and `{id}` in a single pass with shell-escaped
-/// values, so no value can change the command's structure: a value holding
-/// quotes, `$()`, backticks, newlines, `;`, spaces, Unicode, or another
-/// placeholder reaches the shell as one literal word. The GUI shell spawner
-/// executes the rendered command through `sh -c`; launchers that must not use a
-/// shell call [`render_attach_argv`] instead.
+/// Replaces `{bin}`, `{host}`, and `{id}` in a single pass, escaping each value
+/// for the quoting context the template puts its placeholder in. A POSIX quote
+/// state machine tracks the context, so no value can change the command's
+/// structure whatever it holds (quotes, `$()`, backticks, newlines, `;`,
+/// spaces, Unicode, or another placeholder):
+///
+/// - unquoted: the value becomes one shell-escaped word;
+/// - inside `'...'` or `"..."`: the quoted text is taken to be a script for a
+///   nested shell (`sh -c '... {host} ...'`), so the value is escaped as a
+///   word for that inner shell first and then for the enclosing quote. Values
+///   made of plain characters are inserted unchanged.
+///
+/// # Errors
+///
+/// Returns [`AttachTemplateError::UnterminatedQuote`] for an unclosed quote or
+/// trailing backslash and [`AttachTemplateError::UnsafePlaceholderContext`]
+/// when a placeholder sits in ANSI-C quoting (`$'...'`), a comment, after a
+/// heredoc operator, after a line continuation or command substitution, right
+/// after a backslash, or in a quoted script whose own quoting is not plain.
+/// The launcher never receives a best-effort string.
 ///
 /// # Examples
 ///
@@ -510,17 +542,336 @@ fn substitute_placeholders(text: &str, bin: &str, host: &str, id: &str) -> Strin
 ///         host: "my host".to_owned(),
 ///         id: "s1".to_owned(),
 ///     },
-/// );
+/// )?;
 /// assert_eq!(command, "pohunek --host 'my host' attach s1");
+/// # Ok::<(), pohunek_gui_core::AttachTemplateError>(())
 /// ```
-#[must_use]
-pub fn render_attach_command(template: &str, values: &AttachTemplateValues) -> String {
-    substitute_placeholders(
-        template,
-        &shell_escape(&values.bin),
-        &shell_escape(&values.host),
-        &shell_escape(&values.id),
-    )
+pub fn render_attach_command(
+    template: &str,
+    values: &AttachTemplateValues,
+) -> Result<String, AttachTemplateError> {
+    let scan = scan_shell_template(template)?;
+    let mut output = String::with_capacity(template.len());
+    let mut cursor = 0;
+    for site in &scan.sites {
+        output.push_str(&template[cursor..site.offset]);
+        let value = match site.placeholder {
+            Placeholder::Bin => &values.bin,
+            Placeholder::Host => &values.host,
+            Placeholder::Id => &values.id,
+        };
+        output.push_str(&escape_for_context(template, site, value)?);
+        cursor = site.offset + site.placeholder.token().len();
+    }
+    output.push_str(&template[cursor..]);
+    Ok(output)
+}
+
+/// Checks that a shell-mode attach template can be rendered for any values.
+///
+/// # Errors
+///
+/// Returns the structural errors of [`render_attach_command`].
+pub fn validate_attach_shell_template(template: &str) -> Result<(), AttachTemplateError> {
+    let scan = scan_shell_template(template)?;
+    for site in &scan.sites {
+        escape_for_context(template, site, "")?;
+    }
+    Ok(())
+}
+
+/// Checks that an argv-mode attach template splits into at least a program.
+///
+/// # Errors
+///
+/// Returns the structural errors of [`render_attach_argv`].
+pub fn validate_attach_argv_template(template: &str) -> Result<(), AttachTemplateError> {
+    if split_template_words(template)?.is_empty() {
+        return Err(AttachTemplateError::EmptyCommand);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placeholder {
+    Bin,
+    Host,
+    Id,
+}
+
+impl Placeholder {
+    const fn token(self) -> &'static str {
+        match self {
+            Self::Bin => PLACEHOLDER_BIN,
+            Self::Host => PLACEHOLDER_HOST,
+            Self::Id => PLACEHOLDER_ID,
+        }
+    }
+
+    fn at(bytes: &[u8]) -> Option<Self> {
+        [Self::Bin, Self::Host, Self::Id]
+            .into_iter()
+            .find(|placeholder| bytes.starts_with(placeholder.token().as_bytes()))
+    }
+}
+
+/// Quoting context of one placeholder site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SiteContext {
+    Unquoted,
+    /// Inside `'...'`; the payload is the offset just after the opening quote.
+    Single(usize),
+    /// Inside `"..."`; the payload is the offset just after the opening quote.
+    Double(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Site {
+    offset: usize,
+    placeholder: Placeholder,
+    context: SiteContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanState {
+    Unquoted,
+    Single(usize),
+    Double(usize),
+    AnsiC,
+    Comment,
+}
+
+#[derive(Debug)]
+struct Scan {
+    sites: Vec<Site>,
+    end: ScanState,
+    hazard: Option<&'static str>,
+}
+
+/// Walks `text` with POSIX quoting rules and records every placeholder.
+///
+/// A placeholder in a construct the machine cannot escape for fails the scan;
+/// `hazard` records a construct after which no later placeholder is provable.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one explicit POSIX quote state machine; splitting it would scatter the shared cursor and hazard state"
+)]
+fn scan_shell_template(text: &str) -> Result<Scan, AttachTemplateError> {
+    let bytes = text.as_bytes();
+    let mut sites = Vec::new();
+    let mut state = ScanState::Unquoted;
+    let mut hazard: Option<&'static str> = None;
+    let mut word_start = true;
+    let mut index = 0;
+    let unsafe_at = |context| AttachTemplateError::UnsafePlaceholderContext { context };
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let placeholder = Placeholder::at(&bytes[index..]);
+        match state {
+            ScanState::Unquoted | ScanState::Single(_) | ScanState::Double(_)
+                if placeholder.is_some() =>
+            {
+                let placeholder = placeholder.expect("checked above");
+                if let Some(context) = hazard {
+                    return Err(unsafe_at(context));
+                }
+                let context = match state {
+                    ScanState::Single(start) => SiteContext::Single(start),
+                    ScanState::Double(start) => SiteContext::Double(start),
+                    _ => SiteContext::Unquoted,
+                };
+                sites.push(Site {
+                    offset: index,
+                    placeholder,
+                    context,
+                });
+                index += placeholder.token().len();
+                word_start = false;
+            }
+            ScanState::AnsiC | ScanState::Comment if placeholder.is_some() => {
+                return Err(unsafe_at(if state == ScanState::Comment {
+                    "comment"
+                } else {
+                    "ANSI-C quoting"
+                }));
+            }
+            ScanState::Unquoted => {
+                let next = bytes.get(index + 1).copied();
+                index += 1;
+                match byte {
+                    b'\\' => match next {
+                        None => return Err(AttachTemplateError::UnterminatedQuote),
+                        Some(b'\n') => {
+                            hazard = hazard.or(Some("line continuation"));
+                            index += 1;
+                        }
+                        Some(_) => {
+                            if Placeholder::at(&bytes[index..]).is_some() {
+                                return Err(unsafe_at("escaped placeholder"));
+                            }
+                            index += utf8_len(bytes[index]);
+                        }
+                    },
+                    b'\'' => state = ScanState::Single(index),
+                    b'"' => state = ScanState::Double(index),
+                    b'$' if next == Some(b'\'') => {
+                        state = ScanState::AnsiC;
+                        index += 1;
+                    }
+                    b'$' if next == Some(b'(') => hazard = hazard.or(Some("command substitution")),
+                    b'`' => hazard = hazard.or(Some("command substitution")),
+                    b'<' if next == Some(b'<') => {
+                        hazard = hazard.or(Some("heredoc"));
+                        index += 1;
+                    }
+                    b'#' if word_start => state = ScanState::Comment,
+                    _ => {}
+                }
+                if state == ScanState::Unquoted {
+                    word_start = matches!(
+                        byte,
+                        b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')'
+                    );
+                }
+            }
+            ScanState::Single(_) => {
+                if byte == b'\'' {
+                    state = ScanState::Unquoted;
+                    word_start = false;
+                }
+                index += 1;
+            }
+            ScanState::Double(_) => {
+                match byte {
+                    b'"' => {
+                        state = ScanState::Unquoted;
+                        word_start = false;
+                    }
+                    b'\\' => {
+                        let Some(next) = bytes.get(index + 1).copied() else {
+                            return Err(AttachTemplateError::UnterminatedQuote);
+                        };
+                        if next == b'\n' {
+                            hazard = hazard.or(Some("line continuation"));
+                        }
+                        if Placeholder::at(&bytes[index + 1..]).is_some() {
+                            return Err(unsafe_at("escaped placeholder"));
+                        }
+                        index += 1 + utf8_len(next);
+                        continue;
+                    }
+                    b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                        hazard = hazard.or(Some("command substitution"));
+                    }
+                    b'`' => hazard = hazard.or(Some("command substitution")),
+                    _ => {}
+                }
+                index += 1;
+            }
+            ScanState::AnsiC => {
+                match byte {
+                    b'\'' => state = ScanState::Unquoted,
+                    b'\\' => index += 1,
+                    _ => {}
+                }
+                index += 1;
+            }
+            ScanState::Comment => {
+                if byte == b'\n' {
+                    state = ScanState::Unquoted;
+                    word_start = true;
+                }
+                index += 1;
+            }
+        }
+    }
+    if matches!(
+        state,
+        ScanState::Single(_) | ScanState::Double(_) | ScanState::AnsiC
+    ) {
+        return Err(AttachTemplateError::UnterminatedQuote);
+    }
+    Ok(Scan {
+        sites,
+        end: state,
+        hazard,
+    })
+}
+
+/// Length of the UTF-8 character starting with `lead`, so escapes skip whole characters.
+fn utf8_len(lead: u8) -> usize {
+    match lead {
+        0xF0..=0xFF => 4,
+        0xE0..=0xEF => 3,
+        0xC0..=0xDF => 2,
+        _ => 1,
+    }
+}
+
+/// Returns `value` escaped for the context of `site` in `template`.
+fn escape_for_context(
+    template: &str,
+    site: &Site,
+    value: &str,
+) -> Result<String, AttachTemplateError> {
+    match site.context {
+        SiteContext::Unquoted => Ok(shell_escape(value)),
+        SiteContext::Single(start) => {
+            require_plain_script(&template[start..site.offset])?;
+            Ok(shell_escape(value).replace('\'', "'\\''"))
+        }
+        SiteContext::Double(start) => {
+            require_plain_script(&unescape_double_quoted(&template[start..site.offset]))?;
+            let mut escaped = String::new();
+            for character in shell_escape(value).chars() {
+                if matches!(character, '\\' | '"' | '$' | '`') {
+                    escaped.push('\\');
+                }
+                escaped.push(character);
+            }
+            Ok(escaped)
+        }
+    }
+}
+
+/// Requires the quoted text before a placeholder to be plain nested-shell input.
+///
+/// The placeholder is then an ordinary unquoted word of the inner script, which
+/// [`shell_escape`] protects. Any open quote, comment, or hazard in the inner
+/// text makes that unprovable.
+fn require_plain_script(inner: &str) -> Result<(), AttachTemplateError> {
+    let nested = AttachTemplateError::UnsafePlaceholderContext {
+        context: "quoted script with its own quoting",
+    };
+    let scan = scan_shell_template(inner).map_err(|_unproven| nested)?;
+    if scan.end != ScanState::Unquoted || scan.hazard.is_some() {
+        return Err(nested);
+    }
+    Ok(())
+}
+
+/// Removes the escapes a double-quoted string applies before the shell parses it again.
+fn unescape_double_quoted(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            match characters.peek() {
+                Some(&escaped @ ('$' | '`' | '"' | '\\')) => {
+                    output.push(escaped);
+                    characters.next();
+                    continue;
+                }
+                Some('\n') => {
+                    characters.next();
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        output.push(character);
+    }
+    output
 }
 
 /// Render the configured attach command as an argument vector without a shell.
@@ -684,16 +1035,21 @@ const fn is_shell_safe_byte(byte: u8) -> bool {
 }
 
 /// Resolve and spawn an external attach command.
+///
+/// # Errors
+///
+/// Returns [`AttachSpawnError::Template`] when the template cannot be rendered
+/// safely and [`AttachSpawnError::Spawn`] when the spawner fails.
 pub fn spawn_attach_command<S>(
     spawner: &mut S,
     template: &str,
     values: &AttachTemplateValues,
-) -> Result<AttachSpawnIntent, String>
+) -> Result<AttachSpawnIntent, AttachSpawnError>
 where
     S: AttachCommandSpawner + ?Sized,
 {
-    let command = render_attach_command(template, values);
-    spawner.spawn(&command)?;
+    let command = render_attach_command(template, values)?;
+    spawner.spawn(&command).map_err(AttachSpawnError::Spawn)?;
     Ok(AttachSpawnIntent { command })
 }
 
@@ -766,7 +1122,8 @@ mod attach_template_tests {
                         host: host.clone(),
                         id: id.to_owned(),
                     },
-                );
+                )
+                .expect("render");
                 let fields = run_sh(&command);
                 assert_eq!(
                     fields,
@@ -784,7 +1141,7 @@ mod attach_template_tests {
             host: "x' ; echo INJECTED ; echo '".to_owned(),
             id: "{bin}".to_owned(),
         };
-        let rendered = render_attach_command("{bin} {host} {id}", &values);
+        let rendered = render_attach_command("{bin} {host} {id}", &values).expect("render");
         assert_eq!(
             rendered,
             format!(
@@ -804,8 +1161,153 @@ mod attach_template_tests {
             id: "i".to_owned(),
         };
         assert_eq!(
-            render_attach_command("{bin} {other} {} { id} {host", &values),
+            render_attach_command("{bin} {other} {} { id} {host", &values).expect("render"),
             "b {other} {} { id} {host"
+        );
+    }
+
+    fn hostile_values() -> Vec<&'static str> {
+        vec![
+            "safe; printf INJECTED",
+            "'",
+            "\"",
+            "$(printf INJECTED)",
+            "`printf INJECTED`",
+            "line one\nline two",
+            "{host}",
+            "it's \"mixed\" \\ $HOME",
+            "",
+            "\u{10d}esk\u{fd} \u{65e5}\u{672c}",
+        ]
+    }
+
+    /// Renders `template` for every hostile value in each placeholder slot and
+    /// checks a real shell hands exactly the values to `printf` as arguments.
+    fn assert_recorded(template: &str) {
+        for hostile in hostile_values() {
+            let values = AttachTemplateValues {
+                bin: "pohunek".to_owned(),
+                host: hostile.to_owned(),
+                id: hostile.to_owned(),
+            };
+            let command = render_attach_command(template, &values).expect("render");
+            assert_eq!(
+                run_sh(&command),
+                [
+                    b"pohunek".to_vec(),
+                    hostile.as_bytes().to_vec(),
+                    hostile.as_bytes().to_vec()
+                ],
+                "template={template:?} value={hostile:?} rendered={command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_quote_context_delivers_exact_arguments_and_runs_nothing_else() {
+        // Unquoted, the documented nested `sh -c '...'` form, and its
+        // double-quoted variant.
+        assert_recorded("printf '%s\\0' {bin} {host} {id}");
+        assert_recorded("sh -c 'exec printf \"%s\\0\" {bin} {host} {id}'");
+        assert_recorded("sh -c \"exec printf '%s\\0' {bin} {host} {id}\"");
+        assert_recorded("sh -c 'exec printf %s\\\\0 {bin} {host} {id}'");
+    }
+
+    #[test]
+    fn contexts_can_mix_in_one_template() {
+        assert_recorded("true; printf '%s\\0' {bin} && sh -c 'printf \"%s\\0\" {host}' && sh -c \"printf '%s\\0' {id}\"");
+    }
+
+    #[test]
+    fn unprovable_placeholder_contexts_are_typed_errors() {
+        let values = AttachTemplateValues {
+            bin: "b".to_owned(),
+            host: "h".to_owned(),
+            id: "i".to_owned(),
+        };
+        for (template, context) in [
+            ("echo $'{host}'", "ANSI-C quoting"),
+            ("echo x # {host}", "comment"),
+            ("cat <<EOF; echo {host}", "heredoc"),
+            ("echo \\\n{host}", "line continuation"),
+            ("echo \"\\\n{host}\"", "line continuation"),
+            ("echo $(true) {host}", "command substitution"),
+            ("echo `true` {host}", "command substitution"),
+            ("echo \\{host}", "escaped placeholder"),
+            ("echo \"\\{host}\"", "escaped placeholder"),
+            (
+                "sh -c 'echo \"{host}\"; echo \"'",
+                "quoted script with its own quoting",
+            ),
+            (
+                "sh -c 'echo \"{host}'",
+                "quoted script with its own quoting",
+            ),
+            (
+                "sh -c \"echo '{host}'\"",
+                "quoted script with its own quoting",
+            ),
+            (
+                "sh -c 'echo $(true) {host}'",
+                "quoted script with its own quoting",
+            ),
+        ] {
+            assert_eq!(
+                render_attach_command(template, &values),
+                Err(AttachTemplateError::UnsafePlaceholderContext { context }),
+                "{template:?}"
+            );
+            assert_eq!(
+                validate_attach_shell_template(template),
+                Err(AttachTemplateError::UnsafePlaceholderContext { context }),
+                "{template:?}"
+            );
+        }
+        for template in [
+            "echo '{host}",
+            "echo \"{host}",
+            "echo $'abc",
+            "echo {host}\\",
+        ] {
+            assert_eq!(
+                render_attach_command(template, &values),
+                Err(AttachTemplateError::UnterminatedQuote),
+                "{template:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_constructs_away_from_placeholders_are_accepted() {
+        let values = AttachTemplateValues {
+            bin: "b".to_owned(),
+            host: "h".to_owned(),
+            id: "i".to_owned(),
+        };
+        assert_eq!(
+            render_attach_command("echo $'a\\'b' # comment\necho {host}", &values).expect("render"),
+            "echo $'a\\'b' # comment\necho h"
+        );
+        assert_eq!(
+            render_attach_command(
+                "$TERMINAL -e sh -c 'exec {bin} attach --host {host} {id}'",
+                &values
+            )
+            .expect("render"),
+            "$TERMINAL -e sh -c 'exec b attach --host h i'"
+        );
+    }
+
+    #[test]
+    fn argv_templates_validate_structurally() {
+        assert_eq!(validate_attach_argv_template("kitty -e {bin}"), Ok(()));
+        assert_eq!(
+            validate_attach_argv_template("  "),
+            Err(AttachTemplateError::EmptyCommand)
+        );
+        assert_eq!(
+            validate_attach_argv_template("kitty '"),
+            Err(AttachTemplateError::UnterminatedQuote)
         );
     }
 

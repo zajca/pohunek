@@ -28,7 +28,9 @@ impl AttachCommandSpawner for ShellAttachSpawner {
 
 fn spawn_attach(template: &str, values: &AttachTemplateValues) -> Result<(), String> {
     let mut spawner = ShellAttachSpawner;
-    spawn_attach_command(&mut spawner, template, values).map(|_| ())
+    spawn_attach_command(&mut spawner, template, values)
+        .map(|_| ())
+        .map_err(|err| err.to_string())
 }
 
 /// Build the task that opens a session in a terminal.

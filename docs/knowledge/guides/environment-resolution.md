@@ -97,9 +97,18 @@ The GUI attach template uses `{bin}`, `{host}`, and `{id}`. Two renderers exist
 in `pohunek-gui-core`:
 
 - `render_attach_command` renders one shell string for `sh -c`. Substitution is
-  a single left-to-right pass over the template with shell-escaped values, so
-  a value containing quotes, `$()`, backticks, newlines, `;`, spaces, Unicode,
-  or another placeholder never changes the command's structure.
+  a single pass, and each value is escaped for the quoting context of its
+  placeholder, tracked by a POSIX quote state machine: unquoted placeholders
+  get one shell-escaped word; placeholders inside `'...'` or `"..."` (the
+  documented `sh -c '... {host} ...'` form) are escaped for the nested shell
+  and then for the enclosing quote. A value containing quotes, `$()`,
+  backticks, newlines, `;`, spaces, Unicode, or another placeholder therefore
+  never changes the command's structure. A placeholder in ANSI-C quoting
+  (`$'...'`), a comment, after a heredoc operator, line continuation, or
+  command substitution, right after a backslash, or in a quoted script with
+  its own quoting is refused with `AttachTemplateError::UnsafePlaceholderContext`,
+  and an unclosed quote with `UnterminatedQuote`. The GUI validates the
+  template at config load so such an error surfaces at startup.
 - `render_attach_argv` renders an argument vector without a shell. Only the
   template is split (POSIX quoting, no expansion); values are inserted after
   splitting as parts of single arguments. An unterminated quote is
