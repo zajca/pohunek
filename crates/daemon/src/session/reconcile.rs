@@ -1569,7 +1569,8 @@ impl SessionRegistry {
     /// Under [`UnconfirmedCleanup::Accept`] a runtime whose sweep is
     /// unconfirmed solely because of unreadable-marker processes does not
     /// fail the sweep: those processes are returned (all runtimes
-    /// concatenated) and logged at `warn`, and never signalled.
+    /// concatenated, each with the runtime that first listed it) and never
+    /// signalled.
     ///
     /// # Errors
     ///
@@ -1583,7 +1584,7 @@ impl SessionRegistry {
         generation: Option<&super::Generation>,
         runtime_id: Option<&str>,
         cleanup: UnconfirmedCleanup,
-    ) -> Result<Vec<UnconfirmedProcess>, ProtocolError> {
+    ) -> Result<Vec<(UnconfirmedProcess, String)>, ProtocolError> {
         let ambiguous = |detail: String| {
             ProtocolError::new(
                 protocol::ErrorClass::Runtime,
@@ -1635,9 +1636,8 @@ impl SessionRegistry {
                 runtimes.push((runtime_id.to_owned(), None));
             }
         }
-        // Each accepted process with the runtime that first listed it. Nothing
-        // is logged until every runtime is judged, so a refused removal
-        // reports no acceptance.
+        // Each accepted process with the runtime that first listed it. The
+        // caller logs them once the removal has completed.
         let mut accepted: Vec<(UnconfirmedProcess, String)> = Vec::new();
         for (runtime_id, start) in runtimes {
             let outcome = self
@@ -1675,17 +1675,7 @@ impl SessionRegistry {
             }
             return Err(error);
         }
-        for (process, runtime_id) in &accepted {
-            tracing::warn!(
-                session_id = %id.0,
-                runtime_id = %runtime_id,
-                pid = process.pid,
-                start_identity = %process.start_identity,
-                comm = process.command.as_deref().unwrap_or("unavailable"),
-                "removal accepted an unreadable-marker process that may belong to the removed runtime"
-            );
-        }
-        Ok(accepted.into_iter().map(|(process, _)| process).collect())
+        Ok(accepted)
     }
 
     /// Finishes the durable removal intent of `record` once its runtime is

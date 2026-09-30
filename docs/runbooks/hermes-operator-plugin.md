@@ -69,7 +69,7 @@ worktree preconditions.
 The plugin rejects the origin session for exactly `session.stop`,
 `session.resume`, `session.remove`, `session.fork`, `session.resize`,
 `session.set_metadata`, `session.rename`, and `session.input` before it launches
-the CLI. The daemon repeats that authoritative denial. Only
+the CLI. The daemon repeats that authoritative denial and also denies `session.remove_accepting_unconfirmed`, which the plugin never offers. Only
 `session.report_agent`, `session.release_agent`, and
 `session.report_native_id` may target the origin, and only for lifecycle
 reporting.

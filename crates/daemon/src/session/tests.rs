@@ -12879,20 +12879,55 @@ fn retention_registry_over(
     tag: &str,
     inspector: Arc<dyn ProcessInspector>,
 ) -> (SessionRegistry, PathBuf, PathBuf) {
+    retention_registry_configured(tag, inspector, None)
+}
+
+/// [`retention_registry_over`] with a worker log directory that is a symlink
+/// to a real directory, which log cleanup refuses, so a removal fails after
+/// its marker sweep.
+fn retention_registry_with_unusable_log_dir(
+    tag: &str,
+    inspector: Arc<dyn ProcessInspector>,
+) -> (SessionRegistry, PathBuf, PathBuf) {
     let store = temp_store_path(tag);
     let data_dir = store.parent().expect("store parent").to_path_buf();
-    let worktree_root = data_dir.join("worktrees");
+    let target = data_dir.join("log-target");
+    fs::create_dir_all(&target).expect("create the symlink target");
+    let link = data_dir.join("log-link");
+    std::os::unix::fs::symlink(&target, &link).expect("create the log directory symlink");
+    let (registry, worktree_root) = build_retention_registry(store, inspector, Some(link));
+    (registry, data_dir, worktree_root)
+}
+
+fn retention_registry_configured(
+    tag: &str,
+    inspector: Arc<dyn ProcessInspector>,
+    log_dir: Option<PathBuf>,
+) -> (SessionRegistry, PathBuf, PathBuf) {
+    let store = temp_store_path(tag);
+    let data_dir = store.parent().expect("store parent").to_path_buf();
+    let (registry, worktree_root) = build_retention_registry(store, inspector, log_dir);
+    (registry, data_dir, worktree_root)
+}
+
+fn build_retention_registry(
+    store: PathBuf,
+    inspector: Arc<dyn ProcessInspector>,
+    log_dir: Option<PathBuf>,
+) -> (SessionRegistry, PathBuf) {
+    let worktree_root = store.parent().expect("store parent").join("worktrees");
     let registry = SessionRegistry::new_with_inspector(
         SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "true"]),
             stop_grace: Duration::from_millis(50),
             store_path: Some(store),
             worktree_root: Some(worktree_root.clone()),
+            log_dir,
             ..SessionRegistryConfig::default()
         },
         inspector,
     );
-    (registry, data_dir, worktree_root)
+    (registry, worktree_root)
 }
 
 /// PID of the first scripted unreadable candidate of
@@ -13596,6 +13631,42 @@ async fn accepted_processes_are_logged_only_when_the_removal_proceeds() {
         .remove_with(&session.id, super::UnconfirmedCleanup::Accept)
         .await
         .expect("the removal proceeds");
+    assert_eq!(logs.text().matches(accepted_log).count(), 1);
+}
+
+/// A removal that fails after its sweep accepted a candidate keeps the
+/// session and logs no acceptance; the retry that completes logs it once.
+#[tokio::test]
+async fn a_removal_that_fails_after_the_sweep_logs_no_acceptance() {
+    let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+    let _subscriber = logs.install();
+    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let (registry, data_dir, _worktree_root) = retention_registry_with_unusable_log_dir(
+        "remove-accept-late-failure",
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
+    let session = record_only_session(&registry).await;
+    inspector.set_candidate(true);
+    let accepted_log = "removal accepted an unreadable-marker process";
+
+    let failed = registry
+        .remove_with(&session.id, super::UnconfirmedCleanup::Accept)
+        .await
+        .expect_err("log cleanup fails after the sweep accepted the candidate");
+    assert_eq!(failed.code, "session_log_cleanup_failed", "{failed:?}");
+    assert_eq!(session_ids(&registry).await, vec![session.id.0.clone()]);
+    assert!(
+        !logs.text().contains(accepted_log),
+        "a failed removal accepted nothing: {}",
+        logs.text()
+    );
+
+    fs::remove_file(data_dir.join("log-link")).expect("remove the log directory symlink");
+    fs::create_dir(data_dir.join("log-link")).expect("replace it with a real directory");
+    registry
+        .remove_with(&session.id, super::UnconfirmedCleanup::Accept)
+        .await
+        .expect("the retry completes the removal");
     assert_eq!(logs.text().matches(accepted_log).count(), 1);
 }
 

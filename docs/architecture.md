@@ -711,7 +711,7 @@ profile session operations with exact unique-name resolution. `full` alone
 registers stop and remove. The plugin repeats the daemon's origin-session guard
 before subprocess start: it denies exactly `session.stop`, `session.resume`,
 `session.remove`, `session.fork`, `session.resize`, `session.set_metadata`,
-`session.rename`, and `session.input` when they target the hosting session. The
+`session.rename`, and `session.input` when they target the hosting session. The plugin exposes no consent removal, so it has no counterpart for the daemon's denial of `session.remove_accepting_unconfirmed`. The
 only origin-session exceptions are the lifecycle reports
 `session.report_agent`, `session.release_agent`, and
 `session.report_native_id`; the daemon remains authoritative.
@@ -989,15 +989,15 @@ that remain are cheap, free-by-default, or inherited:
 - **Origin-session guard.** Requests from managed children carry paired
   `origin_session_id` and `origin_daemon_id` envelope markers. When both identify
   the target as the caller's origin, the daemon rejects exactly `session.stop`,
-  `session.resume`, `session.remove`, `session.fork`, `session.resize`,
-  `session.set_metadata`, `session.rename`, and `session.input` with
-  `plugin_self_target_denied`. Read-only observation is allowed. The lifecycle
+  `session.resume`, `session.remove`, `session.remove_accepting_unconfirmed`,
+  `session.fork`, `session.resize`, `session.set_metadata`, `session.rename`,
+  and `session.input` with `plugin_self_target_denied`. Read-only observation is allowed. The lifecycle
   reports `session.report_agent`, `session.release_agent`, and
   `session.report_native_id` are also deliberately allowed: managed hooks must
   report their own session, and the public native-id method is the necessary
   local fallback when the owner-private worker claim cannot be delivered. The
   pair is atomic and is copied to dedicated wait connections. This narrowly
-  prevents an in-session automation client from invoking those eight mutations
+  prevents an in-session automation client from invoking those nine mutations
   against the PTY that hosts it, but it is not authentication: any same-user
   process able to reach the owner socket remains inside the trusted owner-path
   boundary.

@@ -3114,7 +3114,7 @@ impl SessionRegistry {
     /// unconfirmed solely because of unreadable-marker processes does not
     /// refuse the removal: those processes are never signalled and are
     /// returned in [`SessionRemoveResult::accepted_unconfirmed_processes`]
-    /// and logged at `warn`. Every other unconfirmed outcome (a signalled
+    /// and logged at `warn` once the removal completed. Every other unconfirmed outcome (a signalled
     /// process still running, a sweep error, a missing supervision
     /// configuration) refuses exactly as under [`UnconfirmedCleanup::Refuse`].
     ///
@@ -3281,6 +3281,22 @@ impl SessionRegistry {
         if let Some(entry) = &evicted {
             self.emit(event::SESSION_REMOVED, &entry.info);
         }
+        // Logged only now: an earlier failure keeps the session, so no
+        // acceptance took effect.
+        for (process, accepted_runtime_id) in &accepted_unconfirmed {
+            warn!(
+                session_id = %id.0,
+                runtime_id = %accepted_runtime_id,
+                pid = process.pid,
+                start_identity = %process.start_identity,
+                comm = process.command.as_deref().unwrap_or("unavailable"),
+                "removal accepted an unreadable-marker process that may belong to the removed runtime"
+            );
+        }
+        let accepted_unconfirmed = accepted_unconfirmed
+            .into_iter()
+            .map(|(process, _)| process)
+            .collect();
         Ok(ReleasedSession {
             evicted: evicted.is_some(),
             worktrees,

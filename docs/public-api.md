@@ -301,8 +301,9 @@ propagates an explicitly configured `ConnectOptions.origin` to normal,
 subscription, and dedicated connections. When both markers identify the target
 as the caller's own origin session, the daemon returns
 `runtime/plugin_self_target_denied` for exactly `session.stop`,
-`session.resume`, `session.remove`, `session.fork`, `session.resize`,
-`session.set_metadata`, `session.rename`, and `session.input`. Read-only methods,
+`session.resume`, `session.remove`, `session.remove_accepting_unconfirmed`,
+`session.fork`, `session.resize`, `session.set_metadata`, `session.rename`, and
+`session.input`. Read-only methods,
 including observation, remain available. The lifecycle reports
 `session.report_agent`, `session.release_agent`, and `session.report_native_id`
 are explicitly allowed because hooks must report their own session; the public
@@ -1555,7 +1556,7 @@ The plugin never offers raw attach bytes, arbitrary protocol methods, raw argv,
 or force bypasses. It repeats the daemon-authoritative origin denial before a
 subprocess for exactly `session.stop`, `session.resume`, `session.remove`,
 `session.fork`, `session.resize`, `session.set_metadata`, `session.rename`, and
-`session.input`. Exactly three lifecycle reports may target the origin:
+`session.input`. The plugin exposes no consent removal, so it has no counterpart for the daemon's denial of `session.remove_accepting_unconfirmed`. Exactly three lifecycle reports may target the origin:
 `session.report_agent`, `session.release_agent`, and
 `session.report_native_id`.
 

@@ -394,7 +394,7 @@ The plugin is a delegated-tool guardrail, not a sandbox against a same-user
 Hermes process with shell or file-write access. It repeats the daemon's exact
 origin-session denial for `session.stop`, `session.resume`, `session.remove`,
 `session.fork`, `session.resize`, `session.set_metadata`, `session.rename`, and
-`session.input`. Only `session.report_agent`, `session.release_agent`, and
+`session.input` (the daemon also denies `session.remove_accepting_unconfirmed`, which the plugin never offers). Only `session.report_agent`, `session.release_agent`, and
 `session.report_native_id` remain lifecycle-report exceptions. Hooks use
 bounded local reporting, never a subprocess, network connection, or Hermes
 database; if they fail, turns remain usable and daemon process/screen detection
