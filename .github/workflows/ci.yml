@@ -44,9 +44,11 @@ env:
   # Clippy and the fetched crate sources for xtask::dependency_policy). Tests
   # resolve binaries and sources at run time (`CARGO_BIN_EXE_*`,
   # `CARGO_MANIFEST_DIR`, the worker beside the test binaries), so the archive
-  # runs from any absolute path. `.config/nextest.toml` archive.include makes
-  # the archive build fail when pohunek-sessiond is missing, so a test never
-  # runs without its worker.
+  # is relocatable: the test jobs check the repository out into `relocated/`,
+  # a different absolute path than the one `build-tests` compiled at, and every
+  # run proves it. `.config/nextest.toml` archive.include makes the archive
+  # build fail when pohunek-sessiond is missing, so a test never runs without
+  # its worker.
   # Job `build-bins` stays a separate default-feature build: the archive
   # compiles with --all-features, which enables cli's `test-util` seams, and
   # the web e2e and Hermes compatibility jobs must exercise shipped binaries.
@@ -384,8 +386,13 @@ jobs:
       fail-fast: false
       matrix:
         shard: [unit, daemon, relay, cli]
+    defaults:
+      run:
+        working-directory: relocated
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: relocated
 
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
@@ -414,7 +421,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nextest-junit-${{ matrix.shard }}
-          path: target/nextest/ci/junit.xml
+          path: relocated/target/nextest/ci/junit.xml
           if-no-files-found: warn
 
     # Determine which CI jobs the changed files require. Heavy non-default jobs
@@ -564,8 +571,13 @@ jobs:
     name: tests (heavy, PTY + Hermes)
     needs: build-tests
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: relocated
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: relocated
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
@@ -611,7 +623,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nextest-junit-heavy
-          path: target/nextest/heavy/junit.xml
+          path: relocated/target/nextest/heavy/junit.xml
           if-no-files-found: warn
 
   # Issue #100: the ignored real-systemd suites drive the runner's own systemd
@@ -706,8 +718,13 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
+    defaults:
+      run:
+        working-directory: relocated
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: relocated
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
@@ -736,7 +753,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nextest-junit-relay-db
-          path: target/nextest/relay-db/junit.xml
+          path: relocated/target/nextest/relay-db/junit.xml
           if-no-files-found: warn
 
   doctests:

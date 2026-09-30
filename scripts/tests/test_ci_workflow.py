@@ -126,6 +126,14 @@ class TestArchiveTests(unittest.TestCase):
                     self.assertNotIn(token, block)
                 self.assertNotIn("RUSTFLAGS", block)
 
+    def test_archive_consumers_run_at_a_path_other_than_the_build_path(self):
+        for job in ARCHIVE_CONSUMERS:
+            with self.subTest(job=job):
+                block = job_block(self.text, job)
+                self.assertRegex(block, r"uses: actions/checkout@v4\n\s+with:\n\s+path: relocated\n")
+                self.assertRegex(block, r"defaults:\n\s+run:\n\s+working-directory: relocated\n")
+        self.assertNotIn("path: relocated", job_block(self.text, "build-tests"))
+
     def test_heavy_has_the_toolchain_and_sources_the_dependency_policy_test_needs(self):
         block = job_block(self.text, "integration")
         self.assertIn("rust-toolchain", block)
