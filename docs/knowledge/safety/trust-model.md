@@ -99,8 +99,8 @@ The assistant must:
 - Preserve paired `origin_session_id`/`origin_daemon_id` request markers on
   ordinary, subscription, and dedicated SDK connections. The daemon uses them
   to deny exactly `session.stop`, `session.resume`, `session.remove`,
-  `session.fork`, `session.resize`, `session.set_metadata`, `session.rename`, and
-  `session.input` when they target the session hosting the caller. Do not strip
+  `session.remove_accepting_unconfirmed`, `session.fork`, `session.resize`,
+  `session.set_metadata`, `session.rename`, and `session.input` when they target the session hosting the caller. Do not strip
   or forge them to bypass `plugin_self_target_denied`. This is a narrow
   confused-deputy guard within the owner trust boundary, not per-session
   authentication or a general mutation policy. The lifecycle reports
@@ -122,7 +122,7 @@ The assistant must:
   raw attach bytes. Use only the installed typed tool surface, an explicit host
   allowlist, and the selected `read_only`, `manage`, or `full` access mode.
   The plugin policy is an owner-private delegated-tool guardrail, not a
-  same-user sandbox; the daemon's exact eight-method origin-session denial is
+  same-user sandbox; the daemon's exact nine-method origin-session denial is
   authoritative. Ask a human to attach when typed model control is insufficient.
 
 The assistant may write host or repo configuration when that is the requested

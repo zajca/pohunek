@@ -264,7 +264,9 @@ pub async fn stop_session_with_options(
 /// Remove a session from a host through the SDK.
 ///
 /// Removal stops a still-live session first, then evicts it from the daemon's
-/// registry so it stops appearing in `list`.
+/// registry so it stops appearing in `list`. The removal never consents to
+/// unconfirmed cleanup, so a session whose runtime processes cannot be proven
+/// gone is refused rather than deleted.
 pub async fn remove_session(
     config: &HostConfig,
     session_id: &SessionId,

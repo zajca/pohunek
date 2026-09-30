@@ -329,6 +329,24 @@ foreign to the runtime), the refusal message lists them as `pid N (start S,
 command `name`)`, at most eight and then `and N more`, and its `recover` hint
 says to inspect and end the ones that belong to the session before retrying.
 A refusal for any other reason lists no processes.
+`session rm <id> --accept-unconfirmed-cleanup` (the `session.remove_accepting_unconfirmed`
+method; plain `session rm` uses `session.remove`, which always refuses) is the operator's way out when
+those unreadable processes are the only obstacle. The flag is per call: nothing
+stores it, a retried removal needs it again, and neither the reconciliation that
+finishes an interrupted removal nor the retention sweep ever has it. With it the
+removal proceeds past the unreadable candidates without signalling them,
+logs each at `warn` once the sweep lets it proceed (before any cleanup), and lists
+every one in the result as `accepted_unconfirmed_processes` (human output prints `pid N (start S, command
+name)` lines after the `removed=` line, with the process-chosen command name
+escaped; `--json` carries the array). A removal with more than 64 candidates is
+refused before anything is deleted, so the result always fits one response. It changes
+nothing else: a signalled process that is still running, a sweep error, or a
+missing supervision configuration still refuses. The trade-off is that an
+accepted process that does carry the runtime marker keeps running unsupervised
+after the worktree, logs, and record are deleted, so inspect the listed
+processes first. The GUI and web removal only call `session.remove` and so never consent. Against
+a daemon without the method the CLI reports `method_not_found` with an upgrade
+hint.
 
 Reconciliation joins the service manager's jobs with worker sockets and
 journals for each worker generation. It reports `runtime_lost` when a worker's

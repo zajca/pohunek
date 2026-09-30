@@ -16,7 +16,7 @@ use protocol::{
 };
 
 use super::util::{error_value, ok_value, ok_value_bounded, parse_optional_params, parse_params};
-use crate::session::SessionRegistry;
+use crate::session::{SessionRegistry, UnconfirmedCleanup};
 
 pub(super) async fn handle_session_new(request: &Request, sessions: &SessionRegistry) -> Response {
     let params = match parse_params::<SessionNewParams>(request) {
@@ -122,11 +122,28 @@ pub(super) async fn handle_session_remove(
     request: &Request,
     sessions: &SessionRegistry,
 ) -> Response {
+    remove_session(request, sessions, UnconfirmedCleanup::Refuse).await
+}
+
+/// `session.remove_accepting_unconfirmed`: `session.remove` that accepts
+/// unreadable-marker processes as the only reason a sweep is unconfirmed.
+pub(super) async fn handle_session_remove_accepting_unconfirmed(
+    request: &Request,
+    sessions: &SessionRegistry,
+) -> Response {
+    remove_session(request, sessions, UnconfirmedCleanup::Accept).await
+}
+
+async fn remove_session(
+    request: &Request,
+    sessions: &SessionRegistry,
+    cleanup: UnconfirmedCleanup,
+) -> Response {
     let id = match parse_params::<SessionId>(request) {
         Ok(id) => id,
         Err(err) => return error_value(request, err),
     };
-    match sessions.remove(&id).await {
+    match sessions.remove_with(&id, cleanup).await {
         Ok(result) => ok_value(request, &result),
         Err(err) => error_value(request, err),
     }

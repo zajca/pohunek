@@ -184,6 +184,7 @@ export type { TeamId } from "./TeamId";
 export type { TerminalCursor } from "./TerminalCursor";
 export type { TerminalDimensions } from "./TerminalDimensions";
 export type { TerminalWatermark } from "./TerminalWatermark";
+export type { UnconfirmedProcess } from "./UnconfirmedProcess";
 export type { WorktreeRemoveParams } from "./WorktreeRemoveParams";
 export type { WorktreeRemoveResult } from "./WorktreeRemoveResult";
 

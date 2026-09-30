@@ -394,7 +394,7 @@ The plugin is a delegated-tool guardrail, not a sandbox against a same-user
 Hermes process with shell or file-write access. It repeats the daemon's exact
 origin-session denial for `session.stop`, `session.resume`, `session.remove`,
 `session.fork`, `session.resize`, `session.set_metadata`, `session.rename`, and
-`session.input`. Only `session.report_agent`, `session.release_agent`, and
+`session.input` (the daemon also denies `session.remove_accepting_unconfirmed`, which the plugin never offers). Only `session.report_agent`, `session.release_agent`, and
 `session.report_native_id` remain lifecycle-report exceptions. Hooks use
 bounded local reporting, never a subprocess, network connection, or Hermes
 database; if they fail, turns remain usable and daemon process/screen detection
@@ -441,6 +441,7 @@ port is retained.
 | `pohunek session fork <target>` | Fork an agent conversation into a new session when that session advertises fork capability (currently Claude Code). |
 | `pohunek session diff <target> [--base <ref>]` | Unified diff of the session's worktree vs its base. |
 | `pohunek session rename / stop / rm` | Rename, stop, or evict a session. |
+| `pohunek session rm <target> --accept-unconfirmed-cleanup` | Evict a session that `rm` refused with `runtime_supervision_ambiguous` only because same-user processes with unreadable environments may belong to its runtime (the refusal lists them). Those candidates are never signalled and, if one carries the runtime marker, keep running unsupervised after the worktree, logs, and record are deleted. The consent covers one call, is never automatic, and without it the removal stays refused; inspect and end the listed processes, then retry, as the safe path. The result lists the accepted processes; a daemon without the method answers `method_not_found`. |
 | `pohunek project add / list / show / rename / rm` | Manage git-repo-aware project records. |
 | `pohunek project actions / action / prompt` | Resolve per-project launch recipes and prompt templates. |
 | `pohunek host discover / list / inspect` | Find NetBird peers running daemons (standalone cache; `--refresh`) and query live capabilities. |

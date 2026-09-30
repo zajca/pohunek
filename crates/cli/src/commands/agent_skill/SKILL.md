@@ -255,7 +255,11 @@ deletes them too. Stop on truncation and refuse the removal. Remove only after
 the owner's explicit confirmation for deleting the worktree, separate from the
 remove intent, and only with a complete inventory of what will be lost or a
 backup of the files the owner wants to keep. If an operation is denied, keep
-the typed error and report it; do not route around a guard.
+the typed error and report it; do not route around a guard. In particular,
+never add `--accept-unconfirmed-cleanup` to `session rm` on your own: it lets a
+removal proceed past unreadable-environment processes that may still belong to
+the session, without signalling them, and only the owner may grant it after
+inspecting the processes the refusal lists.
 
 ## Blocked agents and approvals
 

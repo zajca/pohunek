@@ -157,6 +157,9 @@ these eight methods when they target the session hosting Hermes:
 `stop`, `resume`, `remove`, `fork`, `resize`, `set_metadata`, `rename`, and
 `input`.
 
+The daemon additionally denies `session.remove_accepting_unconfirmed` for the
+origin session; the plugin never offers that consent removal.
+
 The three lifecycle-report exceptions are exactly `report_agent`,
 `release_agent`, and `report_native_id`. They may report the origin session so
 that lifecycle evidence can reach the daemon; they do not grant any other

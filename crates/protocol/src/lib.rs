@@ -126,7 +126,7 @@ pub use session::{
     SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
     SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning,
     SessionWarningKind, SubagentInfo, SubagentLifecycle, SubagentStateEvent, TerminalCursor,
-    TerminalDimensions, TerminalDimensionsError,
+    TerminalDimensions, TerminalDimensionsError, UnconfirmedProcess,
 };
 #[doc(inline)]
 pub use version::{

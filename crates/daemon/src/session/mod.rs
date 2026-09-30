@@ -21,7 +21,7 @@ use protocol::{
     SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
     SessionRuntime, SessionRuntimeIdentity, SessionSetMetadataResult, SessionState,
     SessionStopResult, SessionWarning, StateSource, SubagentInfo, SubagentLifecycle,
-    SubagentRevision, WorktreeRemoveResult, PROTOCOL_VERSION,
+    SubagentRevision, UnconfirmedProcess, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, Notify};
@@ -722,6 +722,34 @@ struct RuntimeExit {
     success: bool,
 }
 
+/// Whether a removal may proceed when its marker sweep is unconfirmed only
+/// because same-user processes with unreadable environments may belong to the
+/// removed runtimes.
+///
+/// Only an explicit caller request selects [`Self::Accept`], and it covers a
+/// single removal: nothing stores it, so a retried removal, the
+/// reconciliation finalizer, and the retention sweep all use
+/// [`Self::Refuse`]. Every other reason a sweep is unconfirmed refuses under
+/// both variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnconfirmedCleanup {
+    /// Refuse the removal whenever a sweep cannot prove its runtime gone.
+    Refuse,
+    /// Proceed past unreadable-marker candidates, never signalling them, and
+    /// report them to the caller.
+    Accept,
+}
+
+impl From<bool> for UnconfirmedCleanup {
+    fn from(accept: bool) -> Self {
+        if accept {
+            Self::Accept
+        } else {
+            Self::Refuse
+        }
+    }
+}
+
 /// What [`SessionRegistry::release_removed_session`] cleaned up.
 #[derive(Debug)]
 struct ReleasedSession {
@@ -729,6 +757,9 @@ struct ReleasedSession {
     evicted: bool,
     /// The owned worktrees the removal deleted or left behind.
     worktrees: WorktreeCleanup,
+    /// Unreadable-marker processes the removal accepted without proving
+    /// them gone.
+    accepted_unconfirmed: Vec<UnconfirmedProcess>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3074,6 +3105,27 @@ impl SessionRegistry {
     /// listed with its intent, so the removal can be retried (daemon startup
     /// reconciliation also finishes it).
     pub async fn remove(&self, id: &SessionId) -> Result<SessionRemoveResult, ProtocolError> {
+        self.remove_with(id, UnconfirmedCleanup::Refuse).await
+    }
+
+    /// [`Self::remove`] with an explicit decision on unconfirmed cleanup.
+    ///
+    /// With [`UnconfirmedCleanup::Accept`], a runtime whose marker sweep is
+    /// unconfirmed solely because of unreadable-marker processes does not
+    /// refuse the removal: those processes are never signalled and are
+    /// returned in [`SessionRemoveResult::accepted_unconfirmed_processes`]
+    /// and logged at `warn` before any cleanup step. Every other unconfirmed outcome (a signalled
+    /// process still running, a sweep error, a missing supervision
+    /// configuration) refuses exactly as under [`UnconfirmedCleanup::Refuse`].
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::remove`].
+    pub async fn remove_with(
+        &self,
+        id: &SessionId,
+        cleanup: UnconfirmedCleanup,
+    ) -> Result<SessionRemoveResult, ProtocolError> {
         self.ensure_not_external(id).await?;
         let _guard = self.lock_lifecycle(id).await;
         let should_stop = {
@@ -3136,13 +3188,14 @@ impl SessionRegistry {
             )
         };
         let released = self
-            .release_removed_session(id, job.as_ref(), runtime_id.as_deref())
+            .release_removed_session(id, job.as_ref(), runtime_id.as_deref(), cleanup)
             .await?;
         Ok(SessionRemoveResult {
             removed: released.evicted,
             stopped,
             worktrees_removed: u32::try_from(released.worktrees.removed).unwrap_or(u32::MAX),
             worktrees_failed: u32::try_from(released.worktrees.failed).unwrap_or(u32::MAX),
+            accepted_unconfirmed_processes: released.accepted_unconfirmed,
         })
     }
 
@@ -3151,10 +3204,10 @@ impl SessionRegistry {
     /// family, the registry entry, the resume binding, and finally the
     /// durable record.
     ///
-    /// Shared by [`Self::remove`] and the reconciliation that finishes a
+    /// Shared by [`Self::remove_with`] and the reconciliation that finishes a
     /// durable removal intent, so both leave the same state behind. The
     /// marker sweep of every runtime of `generation` and of `runtime_id`
-    /// ([`Self::sweep_removed_runtimes`]) comes first, because nothing
+    /// ([`Self::sweep_removed_runtimes`], governed by `cleanup`) comes first, because nothing
     /// controls a surviving descendant once the record is gone. The record is
     /// deleted even when no entry is listed (startup reconciliation runs
     /// before the session is installed), and `session_removed` is emitted
@@ -3173,9 +3226,24 @@ impl SessionRegistry {
         id: &SessionId,
         generation: Option<&Generation>,
         runtime_id: Option<&str>,
+        cleanup: UnconfirmedCleanup,
     ) -> Result<ReleasedSession, ProtocolError> {
-        self.sweep_removed_runtimes(id, generation, runtime_id)
+        let accepted_unconfirmed = self
+            .sweep_removed_runtimes(id, generation, runtime_id, cleanup)
             .await?;
+        // Every runtime is judged and the cap passed, so the removal proceeds
+        // past these processes; logged before the first destructive step so
+        // a later failure still leaves the decision on record.
+        for (process, accepted_runtime_id) in &accepted_unconfirmed {
+            warn!(
+                session_id = %id.0,
+                runtime_id = %accepted_runtime_id,
+                pid = process.pid,
+                start_identity = %process.start_identity,
+                comm = process.command.as_deref().unwrap_or("unavailable"),
+                "removal proceeds past an unreadable-marker process that may belong to the removed runtime"
+            );
+        }
         let (cleanup_warnings, worktrees) = self.cleanup_owned_worktrees_for_removal(id).await?;
         if !cleanup_warnings.is_empty() {
             let mut sessions = self.inner.sessions.lock().await;
@@ -3226,9 +3294,14 @@ impl SessionRegistry {
         if let Some(entry) = &evicted {
             self.emit(event::SESSION_REMOVED, &entry.info);
         }
+        let accepted_unconfirmed = accepted_unconfirmed
+            .into_iter()
+            .map(|(process, _)| process)
+            .collect();
         Ok(ReleasedSession {
             evicted: evicted.is_some(),
             worktrees,
+            accepted_unconfirmed,
         })
     }
 

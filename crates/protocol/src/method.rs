@@ -216,6 +216,18 @@ method_table!(
     "SessionId",
     "SessionRemoveResult";
 
+    /// Evict a session like `session.remove`, but accept the unreadable-marker
+    /// processes that are the only reason the marker sweep of its runtimes is
+    /// unconfirmed. Those processes are never signalled and are reported in
+    /// the result; any other unconfirmed outcome still refuses the removal.
+    SessionRemoveAcceptingUnconfirmed,
+    SESSION_REMOVE_ACCEPTING_UNCONFIRMED,
+    "session.remove_accepting_unconfirmed",
+    SessionId,
+    SessionRemoveResult,
+    "SessionId",
+    "SessionRemoveResult";
+
     /// Create an attach stream for a session.
     SessionAttach,
     SESSION_ATTACH,

@@ -55,6 +55,7 @@ import {
   type SessionInfo,
   type SessionInputParams,
   type SessionInputResult,
+  type SessionRemoveResult,
   type SessionListFilter,
   type SessionListParams,
   type SessionNewParams,
@@ -685,6 +686,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       case "session.fork":
         return this.handleSessionFork(request);
       case "session.remove":
+      case "session.remove_accepting_unconfirmed":
         return this.handleSessionRemove(request);
       case "session.input":
         return this.handleSessionInput(request);
@@ -916,14 +918,14 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
   private handleSessionRemove(request: ControlRequest): ControlResponse {
     if (typeof request.params !== "string") return errResponse(request.id, invalidParams(request.method));
     const session = this.sessions.get(request.params);
-    if (session === undefined) return okResponse(request.id, { removed: false, stopped: false });
+    if (session === undefined) return okResponse(request.id, { removed: false, stopped: false, worktrees_removed: 0, worktrees_failed: 0 } satisfies SessionRemoveResult);
     if (session.external === true) return errResponse(request.id, badRequest("external sessions cannot be removed"));
     const stopped = session.state === "running" || session.state === "starting";
     this.notifyInputWaiters(session.id, { kind: "removed" });
     this.sessions.delete(session.id);
     this.pty.closeSession(session.id);
     this.emitEvent({ v: PROTOCOL_VERSION, event: EVENT_SESSION_REMOVED, session: cloneValue(session) });
-    return okResponse(request.id, { removed: true, stopped });
+    return okResponse(request.id, { removed: true, stopped, worktrees_removed: 0, worktrees_failed: 0 } satisfies SessionRemoveResult);
   }
 
   private async handleSessionInput(request: ControlRequest): Promise<ControlResponse> {
@@ -1921,6 +1923,7 @@ function mutationSessionId(request: ControlRequest): string | undefined {
     case "session.stop":
     case "session.resume":
     case "session.remove":
+    case "session.remove_accepting_unconfirmed":
       return typeof request.params === "string" ? request.params : undefined;
     case "session.fork":
     case "session.resize":

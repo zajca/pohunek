@@ -3157,6 +3157,7 @@ mod tests {
                 stopped: true,
                 worktrees_removed: 0,
                 worktrees_failed: 0,
+                accepted_unconfirmed_processes: Vec::new(),
             },
         });
 
@@ -3319,6 +3320,7 @@ mod tests {
                 stopped: false,
                 worktrees_removed: 0,
                 worktrees_failed: 0,
+                accepted_unconfirmed_processes: Vec::new(),
             },
         });
 

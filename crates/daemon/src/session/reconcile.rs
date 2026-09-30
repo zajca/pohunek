@@ -14,13 +14,15 @@ use pohunek_worker_protocol::{ControlCode, InspectSnapshot, ReleasedIdentityClai
 use protocol::{
     AgentActivity, AgentKind, RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus,
     SessionRuntimeIdentity, SubagentInfo, SubagentLifecycle, SubagentRevision, SubagentStateEvent,
+    UnconfirmedProcess,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::supervision::{
-    classify_unreachable, describe_unreadable_candidates, job_identity_mismatch, observe, Cleanup,
-    JobEvidence, JournalWorker, Unreachable, CREATE_COMPENSATION_PENDING, RUNTIME_LOST,
+    classify_unreachable, describe_unreadable_candidates, job_identity_mismatch, observe,
+    record_accepted_process, Cleanup, JobEvidence, JournalWorker, Unreachable,
+    CREATE_COMPENSATION_PENDING, MAX_ACCEPTED_UNCONFIRMED_PROCESSES, RUNTIME_LOST,
     RUNTIME_LOST_CLEANUP_UNCONFIRMED, UNREADABLE_CANDIDATES_RECOVER, UNSUPERVISED_WORKER,
 };
 use super::{
@@ -30,8 +32,8 @@ use super::{
     DesiredState, DetectorConfig, DetectorConfigUpdate, DetectorInputs, DetectorScope, Mutex,
     Notify, ObservedAgent, ProtocolError, ResumeSnapshot, RuntimeHandle, RuntimeState,
     RuntimeWatchIdentity, SessionEntry, SessionId, SessionRecord, SessionRef, SessionRefKind,
-    SessionRegistry, SessionRuntime, SessionState, StateSource, Worker, WorkerError,
-    WorkerMetadataApplyOutcome, WORKER_CONNECT_RETRY,
+    SessionRegistry, SessionRuntime, SessionState, StateSource, UnconfirmedCleanup, Worker,
+    WorkerError, WorkerMetadataApplyOutcome, WORKER_CONNECT_RETRY,
 };
 use crate::procwatch::ProcessInspector;
 use crate::runtime::lifecycle::{
@@ -41,7 +43,7 @@ use crate::runtime::lifecycle::{
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-09-29
+// Rust guideline compliant 2026-09-30
 
 /// Discovery reason of a worker socket that does not answer.
 const UNREACHABLE_SOCKET: &str = "worker_unavailable";
@@ -1564,18 +1566,25 @@ impl SessionRegistry {
     /// once every worker of the generation is proven gone, so no live
     /// worker is still starting marked processes.
     ///
+    /// Under [`UnconfirmedCleanup::Accept`] a runtime whose sweep is
+    /// unconfirmed solely because of unreadable-marker processes does not
+    /// fail the sweep: those processes are returned (all runtimes
+    /// concatenated, each with the runtime that first listed it) and never
+    /// signalled.
+    ///
     /// # Errors
     ///
     /// Returns `runtime_supervision_ambiguous` when the journals cannot be
     /// scanned or one of them is unreadable, or a sweep cannot confirm that
-    /// every marked process exited. The caller keeps the record and its
-    /// removal intent.
+    /// every marked process exited and `cleanup` does not cover why. The
+    /// caller keeps the record and its removal intent.
     pub(super) async fn sweep_removed_runtimes(
         &self,
         id: &SessionId,
         generation: Option<&super::Generation>,
         runtime_id: Option<&str>,
-    ) -> Result<(), ProtocolError> {
+        cleanup: UnconfirmedCleanup,
+    ) -> Result<Vec<(UnconfirmedProcess, String)>, ProtocolError> {
         let ambiguous = |detail: String| {
             ProtocolError::new(
                 protocol::ErrorClass::Runtime,
@@ -1627,26 +1636,46 @@ impl SessionRegistry {
                 runtimes.push((runtime_id.to_owned(), None));
             }
         }
+        // Each accepted process with the runtime that first listed it. The
+        // caller logs them once the removal has completed.
+        let mut accepted: Vec<(UnconfirmedProcess, String)> = Vec::new();
         for (runtime_id, start) in runtimes {
             let outcome = self
                 .sweep_lost_runtime_detailed(&id.0, &runtime_id, start)
                 .await;
-            if outcome.cleanup == Cleanup::Unconfirmed {
-                let mut error = ambiguous(format!(
-                    "processes of runtime {runtime_id} are not proven gone"
-                ));
-                if outcome.only_unreadable_candidates_blocked() {
-                    error.msg = format!(
-                        "{}; processes whose environment cannot be read may belong to it: {}",
-                        error.msg,
-                        describe_unreadable_candidates(&outcome.unreadable)
-                    );
-                    error.recover = Some(UNREADABLE_CANDIDATES_RECOVER.to_owned());
-                }
-                return Err(error);
+            if outcome.cleanup != Cleanup::Unconfirmed {
+                continue;
             }
+            if cleanup == UnconfirmedCleanup::Accept && outcome.only_unreadable_candidates_blocked()
+            {
+                for candidate in &outcome.unreadable {
+                    record_accepted_process(&mut accepted, candidate, &runtime_id);
+                    // Stops at the first excess process so the work stays
+                    // bounded however many candidates a host has.
+                    if accepted.len() > MAX_ACCEPTED_UNCONFIRMED_PROCESSES {
+                        let mut error = ambiguous(format!(
+                            "more than the {MAX_ACCEPTED_UNCONFIRMED_PROCESSES} unreadable processes one removal can accept may belong to its runtimes"
+                        ));
+                        error.recover = Some(UNREADABLE_CANDIDATES_RECOVER.to_owned());
+                        return Err(error);
+                    }
+                }
+                continue;
+            }
+            let mut error = ambiguous(format!(
+                "processes of runtime {runtime_id} are not proven gone"
+            ));
+            if outcome.only_unreadable_candidates_blocked() {
+                error.msg = format!(
+                    "{}; processes whose environment cannot be read may belong to it: {}",
+                    error.msg,
+                    describe_unreadable_candidates(&outcome.unreadable)
+                );
+                error.recover = Some(UNREADABLE_CANDIDATES_RECOVER.to_owned());
+            }
+            return Err(error);
         }
-        Ok(())
+        Ok(accepted)
     }
 
     /// Finishes the durable removal intent of `record` once its runtime is
@@ -1654,7 +1683,10 @@ impl SessionRegistry {
     ///
     /// The exact recorded generation is retired and its workers proven gone,
     /// then [`Self::release_removed_session`] sweeps the session's runtimes
-    /// and deletes everything the session owns, the durable record last.
+    /// and deletes everything the session owns, the durable record last. The
+    /// sweep always refuses on unconfirmed cleanup
+    /// ([`UnconfirmedCleanup::Refuse`]): only an explicit `session.remove`
+    /// call consents to it.
     /// Without a supervisor or a recorded generation there is no job to
     /// retire. Returns whether the removal needs the background re-check: a
     /// generation the supervisor cannot retire keeps the session
@@ -1703,7 +1735,12 @@ impl SessionRegistry {
         }
         let runtime_id = record.runtime.runtime_id.clone();
         match self
-            .release_removed_session(&id, generation, runtime_id.as_deref())
+            .release_removed_session(
+                &id,
+                generation,
+                runtime_id.as_deref(),
+                UnconfirmedCleanup::Refuse,
+            )
             .await
         {
             Ok(_released) => false,

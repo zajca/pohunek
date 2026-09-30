@@ -134,6 +134,7 @@ export interface Methods {
   "session.read": { params: SessionReadParams; output: SessionReadResult };
   "session.release_agent": { params: SessionReleaseAgentParams; output: SessionReleaseAgentResult };
   "session.remove": { params: SessionId; output: SessionRemoveResult };
+  "session.remove_accepting_unconfirmed": { params: SessionId; output: SessionRemoveResult };
   "session.rename": { params: SessionRenameParams; output: SessionRenameResult };
   "session.report_agent": { params: SessionReportAgentParams; output: SessionReportAgentResult };
   "session.report_native_id": { params: SessionReportNativeIdParams; output: SessionReportNativeIdResult };

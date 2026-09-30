@@ -626,6 +626,12 @@ pub(crate) async fn run_fork(
 /// Removal evicts the session from the daemon's registry, stopping it first if
 /// it is still live. Unlike `stop`, the session no longer appears in `list`.
 ///
+/// `accept_unconfirmed_cleanup` is the operator's consent, for this call only,
+/// to remove a session whose runtime processes could not be proven gone solely
+/// because same-user processes with unreadable environments may belong to it.
+/// It selects the `session.remove_accepting_unconfirmed` method; without it
+/// the refusing `session.remove` is called.
+///
 /// # Errors
 ///
 /// Returns [`CliError`] if the daemon is unreachable, the host cannot be
@@ -635,12 +641,19 @@ pub(crate) async fn run_remove(
     host: &str,
     paths: &Paths,
     target: &Target,
+    accept_unconfirmed_cleanup: bool,
     json: bool,
 ) -> Result<(), CliError> {
     let mut client = Client::connect(host, paths).await?;
-    let removed = client
-        .call::<method::SessionRemove>(SessionId(target.session_id.clone()))
-        .await?;
+    let session_id = SessionId(target.session_id.clone());
+    let removed = if accept_unconfirmed_cleanup {
+        client
+            .call::<method::SessionRemoveAcceptingUnconfirmed>(session_id)
+            .await
+            .map_err(missing_consent_method_hint)?
+    } else {
+        client.call::<method::SessionRemove>(session_id).await?
+    };
 
     if json {
         print!("{}", crate::commands::render_json(&removed)?);
@@ -1411,12 +1424,43 @@ fn build_stop_request(target: &Target) -> Result<Request, CliError> {
     request_with_params(method::SESSION_STOP, &SessionId(target.session_id.clone()))
 }
 
+/// Recovery hint for a daemon that does not know the consent method.
+const CONSENT_METHOD_UPGRADE_HINT: &str =
+    "the daemon predates --accept-unconfirmed-cleanup; upgrade the daemon and retry";
+
+/// Adds an upgrade hint to a `method_not_found` answer for the consent
+/// method, which only daemons that support it accept. Errors relayed from a
+/// remote daemon keep their host.
+fn missing_consent_method_hint(error: CliError) -> CliError {
+    let add_hint = |mut source: protocol::ProtocolError| {
+        if source.code == "method_not_found" {
+            source.recover = Some(CONSENT_METHOD_UPGRADE_HINT.to_owned());
+        }
+        source
+    };
+    match error {
+        CliError::Protocol(source) => CliError::Protocol(add_hint(source)),
+        CliError::Client(pohunek_client::ClientError::RemoteProtocol { host, source }) => {
+            CliError::Client(pohunek_client::ClientError::RemoteProtocol {
+                host,
+                source: add_hint(source),
+            })
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
-fn build_remove_request(target: &Target) -> Result<Request, CliError> {
-    request_with_params(
-        method::SESSION_REMOVE,
-        &SessionId(target.session_id.clone()),
-    )
+fn build_remove_request(
+    target: &Target,
+    accept_unconfirmed_cleanup: bool,
+) -> Result<Request, CliError> {
+    let method = if accept_unconfirmed_cleanup {
+        method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED
+    } else {
+        method::SESSION_REMOVE
+    };
+    request_with_params(method, &SessionId(target.session_id.clone()))
 }
 
 fn fork_params(target: &Target, name: Option<String>, cols: u16, rows: u16) -> SessionForkParams {
@@ -1867,6 +1911,23 @@ fn render_remove_human(session_id: &str, result: &SessionRemoveResult) -> String
             "  worktrees: removed={} failed={}",
             result.worktrees_removed, result.worktrees_failed
         );
+    }
+    // Each accepted process is listed so the operator can inspect it: it was
+    // not signalled and may still be running unsupervised.
+    if !result.accepted_unconfirmed_processes.is_empty() {
+        output
+            .push_str("  accepted unconfirmed processes (not signalled, may still be running):\n");
+        for process in &result.accepted_unconfirmed_processes {
+            let _ = write!(
+                output,
+                "    pid {} (start {}",
+                process.pid, process.start_identity
+            );
+            if let Some(command) = &process.command {
+                let _ = write!(output, ", command {command}");
+            }
+            output.push_str(")\n");
+        }
     }
     output
 }
@@ -3229,10 +3290,46 @@ mod tests {
                 stopped: true,
                 worktrees_removed: 0,
                 worktrees_failed: 0,
+                accepted_unconfirmed_processes: Vec::new(),
             },
         );
 
         assert_eq!(output, "session s-42: removed=true stopped=true\n");
+    }
+
+    #[test]
+    fn renders_remove_result_lists_every_accepted_unconfirmed_process() {
+        let output = render_remove_human(
+            "s-42",
+            &SessionRemoveResult {
+                removed: true,
+                stopped: false,
+                worktrees_removed: 0,
+                worktrees_failed: 0,
+                accepted_unconfirmed_processes: vec![
+                    protocol::UnconfirmedProcess {
+                        pid: 4242,
+                        start_identity: protocol::ProcessStartIdentity::new(99),
+                        command: Some("gpg-agent".to_owned()),
+                    },
+                    protocol::UnconfirmedProcess {
+                        pid: 7,
+                        start_identity: protocol::ProcessStartIdentity::new(3),
+                        command: None,
+                    },
+                ],
+            },
+        );
+
+        assert_eq!(
+            output,
+            concat!(
+                "session s-42: removed=true stopped=false\n",
+                "  accepted unconfirmed processes (not signalled, may still be running):\n",
+                "    pid 4242 (start 99, command gpg-agent)\n",
+                "    pid 7 (start 3)\n"
+            )
+        );
     }
 
     #[test]
@@ -3244,6 +3341,7 @@ mod tests {
                 stopped: false,
                 worktrees_removed: 1,
                 worktrees_failed: 2,
+                accepted_unconfirmed_processes: Vec::new(),
             },
         );
 
@@ -3320,9 +3418,90 @@ mod tests {
     #[test]
     fn build_remove_request_targets_session_remove_method() {
         let target: Target = "local/s-42".parse().expect("parse target");
-        let request = build_remove_request(&target).expect("build remove request");
+        let request = build_remove_request(&target, false).expect("build remove request");
 
         assert_request(&request, method::SESSION_REMOVE, serde_json::json!("s-42"));
+    }
+
+    #[test]
+    fn build_remove_request_carries_the_unconfirmed_cleanup_consent() {
+        let target: Target = "local/s-42".parse().expect("parse target");
+        let request = build_remove_request(&target, true).expect("build remove request");
+
+        assert_request(
+            &request,
+            method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED,
+            serde_json::json!("s-42"),
+        );
+    }
+
+    #[test]
+    fn a_daemon_without_the_consent_method_gets_an_upgrade_hint() {
+        let missing = CliError::Protocol(protocol::ProtocolError::method_not_found(
+            "session.remove_accepting_unconfirmed",
+        ));
+        match missing_consent_method_hint(missing) {
+            CliError::Protocol(source) => {
+                assert_eq!(source.code, "method_not_found");
+                assert!(source.recover.expect("hint").contains("upgrade the daemon"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let remote = CliError::Client(pohunek_client::ClientError::RemoteProtocol {
+            host: "peer-a".to_owned(),
+            source: protocol::ProtocolError::method_not_found(
+                "session.remove_accepting_unconfirmed",
+            ),
+        });
+        match missing_consent_method_hint(remote) {
+            CliError::Client(pohunek_client::ClientError::RemoteProtocol { host, source }) => {
+                assert_eq!(host, "peer-a");
+                assert_eq!(source.code, "method_not_found");
+                assert!(source.recover.expect("hint").contains("upgrade the daemon"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let remote_other = CliError::Client(pohunek_client::ClientError::RemoteProtocol {
+            host: "peer-a".to_owned(),
+            source: protocol::ProtocolError::bad_request("x"),
+        });
+        match missing_consent_method_hint(remote_other) {
+            CliError::Client(pohunek_client::ClientError::RemoteProtocol { source, .. }) => {
+                assert!(source.recover.is_none());
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let other = CliError::Protocol(protocol::ProtocolError::bad_request("x"));
+        match missing_consent_method_hint(other) {
+            CliError::Protocol(source) => assert!(source.recover.is_none()),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_json_output_passes_the_accepted_processes_through() {
+        let result = SessionRemoveResult {
+            removed: true,
+            stopped: false,
+            worktrees_removed: 0,
+            worktrees_failed: 0,
+            accepted_unconfirmed_processes: vec![protocol::UnconfirmedProcess {
+                pid: 4242,
+                start_identity: protocol::ProcessStartIdentity::new(99),
+                command: Some("gpg-agent".to_owned()),
+            }],
+        };
+
+        let rendered = crate::commands::render_json(&result).expect("render json");
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid json");
+
+        assert_eq!(
+            value["ok"]["accepted_unconfirmed_processes"],
+            serde_json::json!([{"pid": 4242, "start_identity": "99", "command": "gpg-agent"}])
+        );
     }
 
     #[test]

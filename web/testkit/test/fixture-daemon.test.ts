@@ -165,6 +165,24 @@ describe("@pohunek/testkit fixture daemon", () => {
     }
   });
 
+  test("session remove_accepting_unconfirmed removes a session like session.remove with no candidates", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("remove-accepting") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", { agent: "codex", cols: TEST_COLS, rows: TEST_ROWS });
+
+      await expectProtocolError(
+        client.call("session.remove_accepting_unconfirmed", { session_id: created.id } as never),
+        "bad_request",
+      );
+      expect(await client.call("session.remove_accepting_unconfirmed", created.id))
+        .toEqual({ removed: true, stopped: true, worktrees_removed: 0, worktrees_failed: 0 });
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("session input wait rejects invalid timeout contracts", async () => {
     const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-invalid") } });
     try {
@@ -956,7 +974,7 @@ describe("@pohunek/testkit fixture daemon", () => {
       expect(fork.cols).toBe(RESIZED_COLS);
       await client.call("session.stop", created.id);
       expect((await client.call("session.resume", created.id)).session.state).toBe("running");
-      expect(await client.call("session.remove", created.id)).toEqual({ removed: true, stopped: true });
+      expect(await client.call("session.remove", created.id)).toEqual({ removed: true, stopped: true, worktrees_removed: 0, worktrees_failed: 0 });
 
       const project = await client.call("project.add", { path: "/tmp/test-project", name: "Test project", base_branch: "main" });
       expect((await client.call("project.show", { reference: project.id })).project.label).toBe("Test project");

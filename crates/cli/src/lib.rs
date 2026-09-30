@@ -1144,6 +1144,13 @@ enum SessionAction {
     Rm {
         /// Session target: `session-id` or `local/session-id`.
         target: Target,
+        /// Remove the session even when same-user processes with unreadable
+        /// environments prevent proving its runtime gone. Those candidates
+        /// are not signalled and may keep running unsupervised after the
+        /// worktree, logs and record are deleted. Applies to this call only;
+        /// without it the removal is refused.
+        #[arg(long)]
+        accept_unconfirmed_cleanup: bool,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -1821,10 +1828,21 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     let target = commands::session::resolve_target(&host, &paths, &target).await?;
                     commands::session::run_fork(&host, &paths, &target, name, json).await?;
                 }
-                SessionAction::Rm { target, json } => {
+                SessionAction::Rm {
+                    target,
+                    accept_unconfirmed_cleanup,
+                    json,
+                } => {
                     let host = effective_host(&global_host, Some(&target));
                     let target = commands::session::resolve_target(&host, &paths, &target).await?;
-                    commands::session::run_remove(&host, &paths, &target, json).await?;
+                    commands::session::run_remove(
+                        &host,
+                        &paths,
+                        &target,
+                        accept_unconfirmed_cleanup,
+                        json,
+                    )
+                    .await?;
                 }
                 SessionAction::Input {
                     target,
@@ -3736,6 +3754,38 @@ mod tests {
             } => assert_eq!(path, None, "no PATH means the cwd (filled by the command)"),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_rm_consent_flag_defaults_to_refusal_and_is_opt_in() {
+        let default = Cli::try_parse_from(["pohunek", "session", "rm", "s-1"]).expect("parse");
+        assert!(matches!(
+            default.command,
+            Commands::Session {
+                action: SessionAction::Rm {
+                    accept_unconfirmed_cleanup: false,
+                    ..
+                }
+            }
+        ));
+
+        let consented = Cli::try_parse_from([
+            "pohunek",
+            "session",
+            "rm",
+            "s-1",
+            "--accept-unconfirmed-cleanup",
+        ])
+        .expect("parse with consent");
+        assert!(matches!(
+            consented.command,
+            Commands::Session {
+                action: SessionAction::Rm {
+                    accept_unconfirmed_cleanup: true,
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]
