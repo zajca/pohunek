@@ -492,7 +492,7 @@ describe("@pohunek/client-core", () => {
       await waitFor(() => workspace.sessions.snapshot()[hostResourceKey("parity", fork.id)] !== undefined);
       await workspace.actions.sessionStop("parity", created.id);
       await workspace.actions.sessionResume("parity", created.id);
-      await workspace.actions.sessionRemove("parity", { session_id: created.id, accept_unconfirmed_cleanup: false });
+      await workspace.actions.sessionRemove("parity", created.id);
       await waitFor(() => workspace.sessions.snapshot()[hostResourceKey("parity", created.id)] === undefined);
 
       const project = await workspace.actions.projectAdd("parity", { path: "/tmp/project", name: "Project" });

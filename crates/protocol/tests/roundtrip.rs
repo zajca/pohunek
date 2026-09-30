@@ -32,7 +32,7 @@ use protocol::{
     SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
     SessionNewParams, SessionOutputGap, SessionOutputParams, SessionOutputResult,
     SessionReadFormat, SessionReadParams, SessionReadResult, SessionReadSource,
-    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveParams, SessionRemoveResult,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
     SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
     SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionRuntimeIdentity,
     SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
@@ -5026,38 +5026,6 @@ fn take_signing_bytes<'a>(payload: &'a [u8], cursor: &mut usize, length: usize) 
 }
 
 #[test]
-fn session_remove_params_default_to_no_consent_and_reject_unknown_fields() {
-    let bare: SessionRemoveParams =
-        serde_json::from_value(json!({ "session_id": "s-42" })).expect("params without consent");
-    assert_eq!(
-        bare,
-        SessionRemoveParams {
-            session_id: SessionId("s-42".to_owned()),
-            accept_unconfirmed_cleanup: false,
-        }
-    );
-
-    let consenting = SessionRemoveParams {
-        session_id: SessionId("s-42".to_owned()),
-        accept_unconfirmed_cleanup: true,
-    };
-    assert_eq!(
-        serde_json::to_value(&consenting).expect("serialize remove params"),
-        json!({ "session_id": "s-42", "accept_unconfirmed_cleanup": true })
-    );
-    assert_eq!(line_roundtrip(&consenting), consenting);
-
-    serde_json::from_value::<SessionRemoveParams>(json!({
-        "session_id": "s-42",
-        "accept_unconfirmed_cleanup": true,
-        "force": true
-    }))
-    .expect_err("unknown remove field must fail");
-    serde_json::from_value::<SessionRemoveParams>(json!("s-42"))
-        .expect_err("a bare session id is not remove params");
-}
-
-#[test]
 fn session_remove_result_carries_accepted_processes_as_decimal_identities() {
     let mut result = SessionRemoveResult {
         removed: true,
@@ -5106,4 +5074,23 @@ fn session_remove_result_carries_accepted_processes_as_decimal_identities() {
         ])
     );
     assert_eq!(line_roundtrip(&result), result);
+}
+
+#[test]
+fn session_remove_accepting_unconfirmed_is_an_additive_method_with_the_remove_shape() {
+    assert_eq!(
+        method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED,
+        "session.remove_accepting_unconfirmed"
+    );
+    let spec = |name: &str| {
+        method::METHOD_SPECS
+            .iter()
+            .find(|spec| spec.name == name)
+            .unwrap_or_else(|| panic!("method {name} is registered"))
+    };
+    let remove = spec(method::SESSION_REMOVE);
+    let accepting = spec(method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED);
+    assert_eq!(remove.params_ts, "SessionId");
+    assert_eq!(accepting.params_ts, remove.params_ts);
+    assert_eq!(accepting.output_ts, remove.output_ts);
 }

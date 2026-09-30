@@ -70,7 +70,6 @@ import type {
   SessionReadResult,
   SessionReleaseAgentParams,
   SessionReleaseAgentResult,
-  SessionRemoveParams,
   SessionRemoveResult,
   SessionRenameParams,
   SessionRenameResult,
@@ -134,7 +133,8 @@ export interface Methods {
   "session.policy.set": { params: SessionPolicyParams; output: SessionPolicyResult };
   "session.read": { params: SessionReadParams; output: SessionReadResult };
   "session.release_agent": { params: SessionReleaseAgentParams; output: SessionReleaseAgentResult };
-  "session.remove": { params: SessionRemoveParams; output: SessionRemoveResult };
+  "session.remove": { params: SessionId; output: SessionRemoveResult };
+  "session.remove_accepting_unconfirmed": { params: SessionId; output: SessionRemoveResult };
   "session.rename": { params: SessionRenameParams; output: SessionRenameResult };
   "session.report_agent": { params: SessionReportAgentParams; output: SessionReportAgentResult };
   "session.report_native_id": { params: SessionReportNativeIdParams; output: SessionReportNativeIdResult };

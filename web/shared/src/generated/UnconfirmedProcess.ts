@@ -6,8 +6,8 @@ import type { ProcessStartIdentity } from "./ProcessStartIdentity";
  * A process a removal accepted as possibly belonging to the removed
  * session's runtime without proving it gone.
  *
- * Reported by `session.remove` when the caller consented to unconfirmed
- * cleanup. Carries the process identity and kernel command name only, never
+ * Reported by `session.remove_accepting_unconfirmed` when it accepted the
+ * process. Carries the process identity and kernel command name only, never
  * its environment or command line.
  */
 export type UnconfirmedProcess = {

@@ -22,11 +22,11 @@ use protocol::{
     SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
     SessionListFilter, SessionListParams, SessionNewParams, SessionOutputParams,
     SessionPolicyParams, SessionReadFormat, SessionReadParams, SessionReadResult,
-    SessionReadSource, SessionRemoveParams, SessionRemoveResult, SessionRenameParams,
-    SessionResizeParams, SessionRetentionParams, SessionRetentionPolicy, SessionRetentionResult,
-    SessionRuntimeIdentity, SessionScreenParams, SessionSetMetadataParams, SessionState,
-    SessionStopResult, SessionWaitParams, SessionWarningKind, StateSource, SubagentLifecycle,
-    TerminalWatermark, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
+    SessionReadSource, SessionRemoveResult, SessionRenameParams, SessionResizeParams,
+    SessionRetentionParams, SessionRetentionPolicy, SessionRetentionResult, SessionRuntimeIdentity,
+    SessionScreenParams, SessionSetMetadataParams, SessionState, SessionStopResult,
+    SessionWaitParams, SessionWarningKind, StateSource, SubagentLifecycle, TerminalWatermark,
+    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
 };
 
 use crate::client::Client;
@@ -629,6 +629,8 @@ pub(crate) async fn run_fork(
 /// `accept_unconfirmed_cleanup` is the operator's consent, for this call only,
 /// to remove a session whose runtime processes could not be proven gone solely
 /// because same-user processes with unreadable environments may belong to it.
+/// It selects the `session.remove_accepting_unconfirmed` method; without it
+/// the refusing `session.remove` is called.
 ///
 /// # Errors
 ///
@@ -643,9 +645,15 @@ pub(crate) async fn run_remove(
     json: bool,
 ) -> Result<(), CliError> {
     let mut client = Client::connect(host, paths).await?;
-    let removed = client
-        .call::<method::SessionRemove>(remove_params(target, accept_unconfirmed_cleanup))
-        .await?;
+    let session_id = SessionId(target.session_id.clone());
+    let removed = if accept_unconfirmed_cleanup {
+        client
+            .call::<method::SessionRemoveAcceptingUnconfirmed>(session_id)
+            .await
+            .map_err(missing_consent_method_hint)?
+    } else {
+        client.call::<method::SessionRemove>(session_id).await?
+    };
 
     if json {
         print!("{}", crate::commands::render_json(&removed)?);
@@ -1416,10 +1424,18 @@ fn build_stop_request(target: &Target) -> Result<Request, CliError> {
     request_with_params(method::SESSION_STOP, &SessionId(target.session_id.clone()))
 }
 
-fn remove_params(target: &Target, accept_unconfirmed_cleanup: bool) -> SessionRemoveParams {
-    SessionRemoveParams {
-        session_id: SessionId(target.session_id.clone()),
-        accept_unconfirmed_cleanup,
+/// Adds an upgrade hint to a `method_not_found` answer for the consent
+/// method, which only daemons that support it accept.
+fn missing_consent_method_hint(error: CliError) -> CliError {
+    match error {
+        CliError::Protocol(mut source) if source.code == "method_not_found" => {
+            source.recover = Some(
+                "the daemon predates --accept-unconfirmed-cleanup; upgrade the daemon and retry"
+                    .to_owned(),
+            );
+            CliError::Protocol(source)
+        }
+        other => other,
     }
 }
 
@@ -1428,10 +1444,12 @@ fn build_remove_request(
     target: &Target,
     accept_unconfirmed_cleanup: bool,
 ) -> Result<Request, CliError> {
-    request_with_params(
-        method::SESSION_REMOVE,
-        &remove_params(target, accept_unconfirmed_cleanup),
-    )
+    let method = if accept_unconfirmed_cleanup {
+        method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED
+    } else {
+        method::SESSION_REMOVE
+    };
+    request_with_params(method, &SessionId(target.session_id.clone()))
 }
 
 fn fork_params(target: &Target, name: Option<String>, cols: u16, rows: u16) -> SessionForkParams {
@@ -3391,11 +3409,7 @@ mod tests {
         let target: Target = "local/s-42".parse().expect("parse target");
         let request = build_remove_request(&target, false).expect("build remove request");
 
-        assert_request(
-            &request,
-            method::SESSION_REMOVE,
-            serde_json::json!({"session_id": "s-42", "accept_unconfirmed_cleanup": false}),
-        );
+        assert_request(&request, method::SESSION_REMOVE, serde_json::json!("s-42"));
     }
 
     #[test]
@@ -3405,9 +3419,29 @@ mod tests {
 
         assert_request(
             &request,
-            method::SESSION_REMOVE,
-            serde_json::json!({"session_id": "s-42", "accept_unconfirmed_cleanup": true}),
+            method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED,
+            serde_json::json!("s-42"),
         );
+    }
+
+    #[test]
+    fn a_daemon_without_the_consent_method_gets_an_upgrade_hint() {
+        let missing = CliError::Protocol(protocol::ProtocolError::method_not_found(
+            "session.remove_accepting_unconfirmed",
+        ));
+        match missing_consent_method_hint(missing) {
+            CliError::Protocol(source) => {
+                assert_eq!(source.code, "method_not_found");
+                assert!(source.recover.expect("hint").contains("upgrade the daemon"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let other = CliError::Protocol(protocol::ProtocolError::bad_request("x"));
+        match missing_consent_method_hint(other) {
+            CliError::Protocol(source) => assert!(source.recover.is_none()),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]

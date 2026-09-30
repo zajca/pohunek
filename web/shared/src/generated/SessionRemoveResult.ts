@@ -34,7 +34,7 @@ export type SessionRemoveResult = {
   /**
    * Processes the removal accepted without proving them gone, because the
    * caller consented to unconfirmed cleanup
-   * ([`SessionRemoveParams::accept_unconfirmed_cleanup`]). Empty when the
+   * (`session.remove_accepting_unconfirmed`). Empty when the
    * removal needed no consent.
    */
   accepted_unconfirmed_processes?: Array<UnconfirmedProcess>;

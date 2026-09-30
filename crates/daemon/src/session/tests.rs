@@ -13503,6 +13503,102 @@ async fn accepted_unconfirmed_cleanup_is_bounded_before_anything_is_deleted() {
     assert!(session_ids(&registry).await.is_empty());
 }
 
+/// Sends `method` with the bare session id as params through the request
+/// handler and returns the reply.
+async fn remove_over_the_wire(
+    registry: &SessionRegistry,
+    method: &str,
+    id: &SessionId,
+) -> Result<serde_json::Value, protocol::ProtocolError> {
+    let state = DaemonState::new(
+        HealthInfo::new("test"),
+        registry.clone(),
+        Arc::new(crate::governance::HostGovernanceService::open_test()),
+        crate::test_support::overlay_registry(),
+    );
+    let request = Request::new("remove-1", method, serde_json::json!(id)).expect("valid request");
+    crate::api::handle_request(&request, &state)
+        .await
+        .into_result()
+}
+
+/// `session.remove` never consents; `session.remove_accepting_unconfirmed`
+/// takes the same bare id and accepts the unreadable candidate.
+#[tokio::test]
+async fn the_remove_methods_differ_only_in_consent_to_unreadable_processes() {
+    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+        "remove-methods",
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
+    let session = record_only_session(&registry).await;
+    inspector.set_candidate(true);
+
+    let refused = remove_over_the_wire(&registry, protocol::method::SESSION_REMOVE, &session.id)
+        .await
+        .expect_err("session.remove refuses an unreadable candidate");
+    assert_eq!(
+        refused.code,
+        crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS,
+        "{refused:?}"
+    );
+    assert_eq!(session_ids(&registry).await, vec![session.id.0.clone()]);
+
+    let payload = remove_over_the_wire(
+        &registry,
+        protocol::method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED,
+        &session.id,
+    )
+    .await
+    .expect("the accepting method removes the session");
+    let removed: protocol::SessionRemoveResult =
+        serde_json::from_value(payload).expect("remove result");
+    assert!(removed.removed, "{removed:?}");
+    assert_eq!(
+        removed.accepted_unconfirmed_processes.len(),
+        1,
+        "{removed:?}"
+    );
+    assert_eq!(
+        removed.accepted_unconfirmed_processes[0].pid,
+        UNREADABLE_CANDIDATE_PID
+    );
+    assert!(session_ids(&registry).await.is_empty());
+}
+
+/// A removal logs the processes it accepted only once it proceeds; a
+/// refusal logs no acceptance.
+#[tokio::test]
+async fn accepted_processes_are_logged_only_when_the_removal_proceeds() {
+    let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+    let _subscriber = logs.install();
+    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+        "remove-accept-logging",
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
+    let session = record_only_session(&registry).await;
+    let accepted_log = "removal accepted an unreadable-marker process";
+
+    inspector.set_candidates(super::supervision::MAX_ACCEPTED_UNCONFIRMED_PROCESSES + 1);
+    registry
+        .remove_with(&session.id, super::UnconfirmedCleanup::Accept)
+        .await
+        .expect_err("more candidates than one removal can accept refuse it");
+    assert!(
+        !logs.text().contains(accepted_log),
+        "a refused removal accepted nothing: {}",
+        logs.text()
+    );
+
+    inspector.set_candidate(true);
+    registry
+        .remove_with(&session.id, super::UnconfirmedCleanup::Accept)
+        .await
+        .expect("the removal proceeds");
+    assert_eq!(logs.text().matches(accepted_log).count(), 1);
+}
+
 /// A removal that needs no consent reports no accepted processes even when
 /// the caller consented.
 #[tokio::test]

@@ -876,6 +876,33 @@ mod tests {
             .any(|arg| arg.get_id() == "dev_subprocess"));
     }
 
+    /// The consent flag of `session rm` is offered in every shell's static
+    /// script and stays a plain flag with no dynamic value completer.
+    #[test]
+    fn session_rm_offers_the_unconfirmed_cleanup_flag() {
+        for shell in [
+            CompletionShell::Bash,
+            CompletionShell::Zsh,
+            CompletionShell::Fish,
+        ] {
+            let script = String::from_utf8(render_script(shell, false)).expect("UTF-8 script");
+            assert!(
+                script.contains("accept-unconfirmed-cleanup"),
+                "static {shell:?} completion lacks the session rm consent flag"
+            );
+        }
+        let command = dynamic_command(CompletionContext::default());
+        let rm = command
+            .find_subcommand("session")
+            .and_then(|session| session.find_subcommand("rm"))
+            .expect("session rm");
+        let flag = rm
+            .get_arguments()
+            .find(|arg| arg.get_id() == "accept_unconfirmed_cleanup")
+            .expect("consent flag");
+        assert!(flag.get::<ArgValueCompleter>().is_none());
+    }
+
     /// `agent-skill` is a static command with no dynamic completers; it must
     /// still stay present in the dynamic completion tree so completions never
     /// cover fewer commands than the parser accepts.

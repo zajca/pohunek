@@ -26,13 +26,13 @@ use crate::{
     SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
     SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
     SessionOutputResult, SessionPolicyParams, SessionPolicyResult, SessionReadParams,
-    SessionReadResult, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveParams,
-    SessionRemoveResult, SessionRenameParams, SessionRenameResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionResumeResult, SessionRetentionParams,
-    SessionRetentionResult, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
-    SessionSetMetadataResult, SessionStopResult, SessionWaitParams, SessionWaitResult,
-    WorktreeRemoveParams, WorktreeRemoveResult,
+    SessionReadResult, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionRenameParams, SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionResumeResult, SessionRetentionParams, SessionRetentionResult,
+    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
+    SessionStopResult, SessionWaitParams, SessionWaitResult, WorktreeRemoveParams,
+    WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -211,9 +211,21 @@ method_table!(
     SessionRemove,
     SESSION_REMOVE,
     "session.remove",
-    SessionRemoveParams,
+    SessionId,
     SessionRemoveResult,
-    "SessionRemoveParams",
+    "SessionId",
+    "SessionRemoveResult";
+
+    /// Evict a session like `session.remove`, but accept the unreadable-marker
+    /// processes that are the only reason the marker sweep of its runtimes is
+    /// unconfirmed. Those processes are never signalled and are reported in
+    /// the result; any other unconfirmed outcome still refuses the removal.
+    SessionRemoveAcceptingUnconfirmed,
+    SESSION_REMOVE_ACCEPTING_UNCONFIRMED,
+    "session.remove_accepting_unconfirmed",
+    SessionId,
+    SessionRemoveResult,
+    "SessionId",
     "SessionRemoveResult";
 
     /// Create an attach stream for a session.

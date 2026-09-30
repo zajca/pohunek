@@ -245,6 +245,9 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::SESSION_RESUME => session::handle_session_resume(request, &state.sessions).await,
         method::SESSION_FORK => session::handle_session_fork(request, &state.sessions).await,
         method::SESSION_REMOVE => session::handle_session_remove(request, &state.sessions).await,
+        method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED => {
+            session::handle_session_remove_accepting_unconfirmed(request, &state.sessions).await
+        }
         method::SESSION_ATTACH => session::handle_session_attach(request, &state.sessions).await,
         method::SESSION_DETACH => session::handle_session_detach(request, &state.sessions).await,
         method::SESSION_RESIZE => session::handle_session_resize(request, &state.sessions).await,
@@ -338,12 +341,14 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
 fn mutation_target(request: &Request) -> Option<&str> {
     let direct = matches!(
         request.method(),
-        method::SESSION_STOP | method::SESSION_RESUME
+        method::SESSION_STOP
+            | method::SESSION_RESUME
+            | method::SESSION_REMOVE
+            | method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED
     );
     let nested = matches!(
         request.method(),
         method::SESSION_FORK
-            | method::SESSION_REMOVE
             | method::SESSION_RESIZE
             | method::SESSION_SET_METADATA
             | method::SESSION_RENAME
@@ -484,9 +489,10 @@ mod tests {
         let mutations = [
             (method::SESSION_STOP, serde_json::json!(target)),
             (method::SESSION_RESUME, serde_json::json!(target)),
+            (method::SESSION_REMOVE, serde_json::json!(target)),
             (
-                method::SESSION_REMOVE,
-                serde_json::json!({"session_id": target, "accept_unconfirmed_cleanup": true}),
+                method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED,
+                serde_json::json!(target),
             ),
             (
                 method::SESSION_FORK,

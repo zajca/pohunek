@@ -1635,55 +1635,60 @@ impl SessionRegistry {
                 runtimes.push((runtime_id.to_owned(), None));
             }
         }
-        let mut accepted = Vec::new();
+        // Each accepted process with the runtime that first listed it. Nothing
+        // is logged until every runtime is judged, so a refused removal
+        // reports no acceptance.
+        let mut accepted: Vec<(UnconfirmedProcess, String)> = Vec::new();
         for (runtime_id, start) in runtimes {
             let outcome = self
                 .sweep_lost_runtime_detailed(&id.0, &runtime_id, start)
                 .await;
-            if outcome.cleanup == Cleanup::Unconfirmed {
-                if cleanup == UnconfirmedCleanup::Accept
-                    && outcome.only_unreadable_candidates_blocked()
-                {
-                    for candidate in &outcome.unreadable {
-                        tracing::warn!(
-                            session_id = %id.0,
-                            runtime_id = %runtime_id,
-                            pid = candidate.identity.pid,
-                            start_identity = %candidate.identity.start_identity,
-                            comm = candidate.comm.as_deref().unwrap_or("unavailable"),
-                            "removal accepted an unreadable-marker process that may belong to the removed runtime"
-                        );
-                        let process = candidate.to_unconfirmed_process();
-                        // Runtimes of one session can list the same process.
-                        if !accepted.contains(&process) {
-                            accepted.push(process);
-                        }
-                    }
-                    if accepted.len() > MAX_ACCEPTED_UNCONFIRMED_PROCESSES {
-                        let mut error = ambiguous(format!(
-                            "{} unreadable processes may belong to its runtimes, more than the {MAX_ACCEPTED_UNCONFIRMED_PROCESSES} one removal can accept",
-                            accepted.len()
-                        ));
-                        error.recover = Some(UNREADABLE_CANDIDATES_RECOVER.to_owned());
-                        return Err(error);
-                    }
-                    continue;
-                }
-                let mut error = ambiguous(format!(
-                    "processes of runtime {runtime_id} are not proven gone"
-                ));
-                if outcome.only_unreadable_candidates_blocked() {
-                    error.msg = format!(
-                        "{}; processes whose environment cannot be read may belong to it: {}",
-                        error.msg,
-                        describe_unreadable_candidates(&outcome.unreadable)
-                    );
-                    error.recover = Some(UNREADABLE_CANDIDATES_RECOVER.to_owned());
-                }
-                return Err(error);
+            if outcome.cleanup != Cleanup::Unconfirmed {
+                continue;
             }
+            if cleanup == UnconfirmedCleanup::Accept && outcome.only_unreadable_candidates_blocked()
+            {
+                for candidate in &outcome.unreadable {
+                    let process = candidate.to_unconfirmed_process();
+                    // Runtimes of one session can list the same process.
+                    if !accepted.iter().any(|(known, _)| *known == process) {
+                        accepted.push((process, runtime_id.clone()));
+                    }
+                }
+                if accepted.len() > MAX_ACCEPTED_UNCONFIRMED_PROCESSES {
+                    let mut error = ambiguous(format!(
+                        "{} unreadable processes may belong to its runtimes, more than the {MAX_ACCEPTED_UNCONFIRMED_PROCESSES} one removal can accept",
+                        accepted.len()
+                    ));
+                    error.recover = Some(UNREADABLE_CANDIDATES_RECOVER.to_owned());
+                    return Err(error);
+                }
+                continue;
+            }
+            let mut error = ambiguous(format!(
+                "processes of runtime {runtime_id} are not proven gone"
+            ));
+            if outcome.only_unreadable_candidates_blocked() {
+                error.msg = format!(
+                    "{}; processes whose environment cannot be read may belong to it: {}",
+                    error.msg,
+                    describe_unreadable_candidates(&outcome.unreadable)
+                );
+                error.recover = Some(UNREADABLE_CANDIDATES_RECOVER.to_owned());
+            }
+            return Err(error);
         }
-        Ok(accepted)
+        for (process, runtime_id) in &accepted {
+            tracing::warn!(
+                session_id = %id.0,
+                runtime_id = %runtime_id,
+                pid = process.pid,
+                start_identity = %process.start_identity,
+                comm = process.command.as_deref().unwrap_or("unavailable"),
+                "removal accepted an unreadable-marker process that may belong to the removed runtime"
+            );
+        }
+        Ok(accepted.into_iter().map(|(process, _)| process).collect())
     }
 
     /// Finishes the durable removal intent of `record` once its runtime is

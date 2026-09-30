@@ -54,7 +54,6 @@ import {
   type SessionDetachResult,
   type SessionInfo,
   type SessionInputParams,
-  type SessionRemoveParams,
   type SessionInputResult,
   type SessionListFilter,
   type SessionListParams,
@@ -686,6 +685,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       case "session.fork":
         return this.handleSessionFork(request);
       case "session.remove":
+      case "session.remove_accepting_unconfirmed":
         return this.handleSessionRemove(request);
       case "session.input":
         return this.handleSessionInput(request);
@@ -915,16 +915,8 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
   }
 
   private handleSessionRemove(request: ControlRequest): ControlResponse {
-    const params = readObjectParams<SessionRemoveParams>(request);
-    if (
-      params === undefined
-      || !hasOnlyKeys(params, ["session_id", "accept_unconfirmed_cleanup"])
-      || typeof params.session_id !== "string"
-      || (params.accept_unconfirmed_cleanup !== undefined && typeof params.accept_unconfirmed_cleanup !== "boolean")
-    ) {
-      return errResponse(request.id, invalidParams(request.method));
-    }
-    const session = this.sessions.get(params.session_id);
+    if (typeof request.params !== "string") return errResponse(request.id, invalidParams(request.method));
+    const session = this.sessions.get(request.params);
     if (session === undefined) return okResponse(request.id, { removed: false, stopped: false });
     if (session.external === true) return errResponse(request.id, badRequest("external sessions cannot be removed"));
     const stopped = session.state === "running" || session.state === "starting";
@@ -1929,8 +1921,9 @@ function mutationSessionId(request: ControlRequest): string | undefined {
   switch (request.method) {
     case "session.stop":
     case "session.resume":
-      return typeof request.params === "string" ? request.params : undefined;
     case "session.remove":
+    case "session.remove_accepting_unconfirmed":
+      return typeof request.params === "string" ? request.params : undefined;
     case "session.fork":
     case "session.resize":
     case "session.set_metadata":

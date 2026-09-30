@@ -146,7 +146,6 @@ export type { SessionReadResult } from "./SessionReadResult";
 export type { SessionReadSource } from "./SessionReadSource";
 export type { SessionReleaseAgentParams } from "./SessionReleaseAgentParams";
 export type { SessionReleaseAgentResult } from "./SessionReleaseAgentResult";
-export type { SessionRemoveParams } from "./SessionRemoveParams";
 export type { SessionRemoveResult } from "./SessionRemoveResult";
 export type { SessionRenameParams } from "./SessionRenameParams";
 export type { SessionRenameResult } from "./SessionRenameResult";

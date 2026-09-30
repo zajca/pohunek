@@ -126,7 +126,7 @@
 
   async function remove(): Promise<void> {
     await mutate(async (): Promise<void> => {
-      const result = await workspace.actions.sessionRemove(entry.host, { session_id: session.id, accept_unconfirmed_cleanup: false });
+      const result = await workspace.actions.sessionRemove(entry.host, session.id);
       confirmRemove = false;
       addToast("success", result.stopped ? "Session stopped and removed" : "Session removed");
       onremove();

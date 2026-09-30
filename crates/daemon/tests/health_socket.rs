@@ -35,7 +35,7 @@ use protocol::{
     Request as ProtocolRequest, Response, SessionAttachParams, SessionAttachResult,
     SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
     SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionRemoveParams, SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
     SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
     SessionResizeResult, SessionState, SessionStopResult, StateSource, TerminalDimensions,
     PROTOCOL_VERSION,
@@ -3159,16 +3159,6 @@ async fn detector_tick_publishes_debounced_static_osc_title_activity() {
     let _ = handle.await;
 }
 
-/// Wire params of a `session.remove` call that gives no consent to
-/// unconfirmed cleanup.
-fn remove_params_value(id: &SessionId) -> serde_json::Value {
-    serde_json::to_value(SessionRemoveParams {
-        session_id: id.clone(),
-        accept_unconfirmed_cleanup: false,
-    })
-    .expect("serialize remove params")
-}
-
 /// Milestone-8 checkpoint: two sessions on one repository with different
 /// branches get two distinct worktrees and each launches inside its own.
 #[tokio::test]
@@ -3267,7 +3257,7 @@ async fn two_sessions_on_one_repo_get_distinct_worktrees() {
         let remove_req = Request::make(
             "session-remove-worktree",
             method::SESSION_REMOVE,
-            remove_params_value(id),
+            serde_json::to_value(id).expect("serialize id"),
         );
         let removed: SessionRemoveResult =
             serde_json::from_value(ok_payload(exchange(&mut control, &remove_req).await))

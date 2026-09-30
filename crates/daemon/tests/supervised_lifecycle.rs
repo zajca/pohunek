@@ -39,7 +39,7 @@ use pohunek_worker_protocol::{
 };
 use protocol::{
     method, RuntimeInventoryStatus, RuntimeState, SessionId, SessionInputParams,
-    SessionRemoveParams, SessionResizeParams,
+    SessionResizeParams,
 };
 use supervised::{
     backend, contains, counters, eventually, explained, loss_reason, read_until, runtime_state,
@@ -677,10 +677,7 @@ async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
                 .unwrap_or_else(|error| panic!("stop {session}: {error}"));
         }
         client
-            .call::<method::SessionRemove>(SessionRemoveParams {
-                session_id: SessionId(removed.clone()),
-                accept_unconfirmed_cleanup: false,
-            })
+            .call::<method::SessionRemove>(SessionId(removed.clone()))
             .await
             .unwrap_or_else(|error| panic!("remove {removed}: {error}"));
         if round % 2 == 0 {
@@ -709,10 +706,7 @@ async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
         .chain([recovered])
     {
         client
-            .call::<method::SessionRemove>(SessionRemoveParams {
-                session_id: SessionId(session.to_owned()),
-                accept_unconfirmed_cleanup: false,
-            })
+            .call::<method::SessionRemove>(SessionId(session.to_owned()))
             .await
             .unwrap_or_else(|error| panic!("remove {session}: {error}"));
     }

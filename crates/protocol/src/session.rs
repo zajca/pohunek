@@ -2665,31 +2665,11 @@ pub struct SessionResumeResult {
     pub session: SessionInfo,
 }
 
-/// Parameters for `session.remove`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts", ts(export, export_to = "SessionRemoveParams.ts"))]
-pub struct SessionRemoveParams {
-    /// Session to remove.
-    pub session_id: SessionId,
-    /// Consent for this one call to remove the session although the marker
-    /// sweep of its runtime could not prove every marked process gone
-    /// solely because same-user processes with unreadable environments may
-    /// belong to it. The daemon never signals those processes; if one does
-    /// carry the runtime marker it keeps running unsupervised after the
-    /// record and worktree are deleted. Any other reason the sweep is
-    /// unconfirmed still refuses the removal. Consent is neither stored nor
-    /// reused: a retried removal needs it again.
-    #[serde(default)]
-    pub accept_unconfirmed_cleanup: bool,
-}
-
 /// A process a removal accepted as possibly belonging to the removed
 /// session's runtime without proving it gone.
 ///
-/// Reported by `session.remove` when the caller consented to unconfirmed
-/// cleanup. Carries the process identity and kernel command name only, never
+/// Reported by `session.remove_accepting_unconfirmed` when it accepted the
+/// process. Carries the process identity and kernel command name only, never
 /// its environment or command line.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2736,7 +2716,7 @@ pub struct SessionRemoveResult {
     pub worktrees_failed: u32,
     /// Processes the removal accepted without proving them gone, because the
     /// caller consented to unconfirmed cleanup
-    /// ([`SessionRemoveParams::accept_unconfirmed_cleanup`]). Empty when the
+    /// (`session.remove_accepting_unconfirmed`). Empty when the
     /// removal needed no consent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_unconfirmed_processes: Vec<UnconfirmedProcess>,
