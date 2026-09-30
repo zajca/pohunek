@@ -11,6 +11,9 @@
 //! - every item gated by `#[cfg(test)]` or a `cfg(all(test, ..))` predicate
 //!   (module, fn, impl, const, static, use, ...), however its attributes and
 //!   tokens are laid out;
+//! - every item decorated by a test attribute macro (last path segment `test`,
+//!   `rstest`, `test_case` or `bench`, e.g. `#[tokio::test(..)]`), wherever it
+//!   lives;
 //! - the file behind an external `mod name;` that sits in test code, resolved
 //!   through the Rust module rules and `#[path]`, transitively.
 //!
@@ -279,6 +282,26 @@ fn is_test_cfg(attribute: &str) -> bool {
         .is_some_and(is_test_only)
 }
 
+/// Attribute macros, by last path segment, that mark the item they decorate as
+/// a test or benchmark.
+const TEST_ATTRIBUTE_NAMES: [&str; 4] = ["test", "rstest", "test_case", "bench"];
+
+/// Whether the attribute body (text between `[` and `]`) names a test
+/// attribute macro such as `test`, `tokio::test(flavor = "..")`, `rstest`,
+/// `test_case(..)` or `bench`.
+fn is_test_marker(attribute: &str) -> bool {
+    let end = attribute
+        .find(['(', '=', '[', '{'])
+        .unwrap_or(attribute.len());
+    let path: String = attribute[..end]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    path.rsplit("::")
+        .next()
+        .is_some_and(|last| TEST_ATTRIBUTE_NAMES.contains(&last))
+}
+
 /// Extracts the string from a `path = "..."` attribute body read from the
 /// comment-free view.
 fn path_attribute(code_body: &str) -> Option<String> {
@@ -346,7 +369,8 @@ fn attributed_items(views: &Views) -> (Vec<AttributedItem>, bool) {
                             && skeleton.get(cursor + 1) == Some(&b'[')
                         {
                             let close = matching_close(skeleton, cursor + 1);
-                            test_only |= is_test_cfg(&views.skeleton[cursor + 2..close]);
+                            let body = &views.skeleton[cursor + 2..close];
+                            test_only |= is_test_cfg(body) || is_test_marker(body);
                             if path.is_none() {
                                 let body = String::from_utf8_lossy(&code[cursor + 2..close]);
                                 path = path_attribute(&body);
@@ -760,6 +784,50 @@ fn flags_an_attribute_and_item_on_one_line() {
 fn flags_a_cfg_test_item_with_extra_whitespace_and_other_attributes() {
     let template = "#[ cfg ( test ) ]\n\n#[allow(dead_code)]\n#[inline]\nfn helper() {\n    let p = @;\n}\n#[allow(dead_code)]\n#[cfg(test)]\n#[inline]\nfn second() {\n    let p = @;\n}\n";
     assert_eq!(lines_of("crates/demo/src/lib.rs", template), [6, 12]);
+}
+
+#[test]
+fn flags_items_marked_by_a_test_attribute_macro_in_ordinary_source() {
+    let forms = [
+        "#[test]\nfn f() {\n    let p = @;\n}\n",
+        "#[tokio::test(flavor = \"multi_thread\")]\nasync fn f() {\n    let p = @;\n}\n",
+        "#[tokio::test]\nasync fn f() {\n    let p = @;\n}\n",
+        "#[rstest]\nfn f() {\n    let p = @;\n}\n",
+        "#[rstest::rstest]\n#[case(1)]\nfn f(n: u8) {\n    let p = @;\n}\n",
+        "#[test_case(1, 2)]\n#[test_case(3, 4)]\nfn f(a: u8, b: u8) {\n    let p = @;\n}\n",
+        "#[bench]\nfn f(b: &mut Bencher) {\n    let p = @;\n}\n",
+        "#[test]\n#[ignore]\n#[should_panic(expected = \"x\")]\nfn f() {\n    let p = @;\n}\n",
+        "#[ignore]\n/* note */ #[ test ] // trailing\n#[should_panic]\nfn f() {\n    let p = @;\n}\n",
+        "#[ std :: prelude :: v1 :: test ] fn f() { let p = @; }\n",
+    ];
+    for form in forms {
+        let text = format!("{form}fn tool() {{\n    let p = @;\n}}\n");
+        let lines = lines_of("crates/demo/src/lib.rs", &text);
+        assert_eq!(lines.len(), 1, "{form}: {lines:?}");
+        assert!(
+            lines[0] < text.matches('\n').count() - 1,
+            "{form}: {lines:?}"
+        );
+    }
+}
+
+#[test]
+fn ignores_attributes_that_only_resemble_test_markers() {
+    let forms = [
+        "#[derive(Test)]\nstruct S;\nfn f() {\n    let p = @;\n}\n",
+        "#[attr_test]\nfn f() {\n    let p = @;\n}\n",
+        "#[test_helper]\nfn f() {\n    let p = @;\n}\n",
+        "#[tests]\nfn f() {\n    let p = @;\n}\n",
+        "#[doc = \"test\"]\nfn f() {\n    let p = @;\n}\n",
+        "#[cfg(feature = \"test\")]\nfn f() {\n    let p = @;\n}\n",
+        "#[allow(test)]\nfn f() {\n    let p = @;\n}\n",
+    ];
+    for form in forms {
+        assert!(
+            lines_of("crates/demo/src/lib.rs", form).is_empty(),
+            "{form}"
+        );
+    }
 }
 
 #[test]
