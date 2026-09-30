@@ -9,23 +9,72 @@
 //! once and produces [`protocol::DoctorCheck`] values that both callers embed
 //! into a [`protocol::DoctorReport`].
 //!
+//! The probe list is platform specific. Linux keeps the optional sway/rofi
+//! launcher probes; macOS replaces them with runtime-path, worker, `launchd`,
+//! terminal, filesystem-privacy and optional desktop probes (see [`macos`]).
+//! Platform selection is explicit input to the pure builders ([`linux_checks`],
+//! [`macos::standard_checks`]) so both are testable on any host;
+//! [`standard_checks`] passes the current platform.
+//!
 //! Functions take concrete directory paths rather than a `Paths` struct so this
 //! crate does not depend on either binary's path resolution (the CLI and daemon
 //! deliberately resolve paths separately).
 
 #![forbid(unsafe_code)]
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use protocol::{DoctorCheck, DoctorStatus};
 
+pub mod executable;
+pub mod macos;
+
+// Rust guideline compliant 2026-09-30
+
+pub use executable::{is_executable_file, resolve_executable};
+pub use macos::{
+    apply_supervision, doctor_request_timeout, LAUNCHD_CHECKS, PROBE_BUDGET, REPLY_HEADROOM,
+};
+pub use macos::{
+    resolve_worker_candidate, AccessDir, DomainProbe, MacosFacts, ProcessRunner, RunOutcome,
+    Runner, Supervision, WorkerCandidate, WorkerSource, WORKER_EXECUTABLE_CHECK,
+};
+pub use pohunek_paths::Platform;
+
+/// Name prefix of the writability probe file.
+///
+/// A random suffix follows it, so a name planted in advance cannot collide
+/// with a probe.
 const PROBE_FILE: &str = ".pohunek-doctor-probe";
+
+/// How many random probe names are tried when one already exists.
+///
+/// A collision needs a 128-bit random name to repeat, so one retry only guards
+/// against a hostile pre-created file; eight bounds the loop.
+const PROBE_NAME_ATTEMPTS: usize = 8;
+
+/// Mode of the writability probe file: owner-only.
+const PROBE_FILE_MODE: u32 = 0o600;
+
+/// A fresh unpredictable probe file name.
+///
+/// Built from two randomly keyed `SipHash` outputs; the probe is also created
+/// exclusively, so predictability is never the only defense.
+pub(crate) fn probe_file_name() -> String {
+    use std::hash::{BuildHasher as _, Hasher as _, RandomState};
+
+    let high = RandomState::new().build_hasher().finish();
+    let low = RandomState::new().build_hasher().finish();
+    format!("{PROBE_FILE}-{high:016x}{low:016x}")
+}
 
 /// Inputs for the standard pohunek host checks.
 ///
 /// Callers keep owning path resolution because the CLI and daemon intentionally
-/// resolve paths in their own crates. This type carries only the concrete
-/// directories needed by the shared probe list.
+/// resolve paths in their own crates. This type carries the concrete
+/// directories and process facts the shared probe lists need; fields used only
+/// by one platform's list are ignored by the other.
 #[derive(Debug, Clone, Copy)]
 pub struct StandardCheckInputs<'a> {
     /// Directory where the daemon binds its control socket.
@@ -38,15 +87,53 @@ pub struct StandardCheckInputs<'a> {
     pub launcher_bin_dir: &'a Path,
     /// Directory containing the user's sway configuration.
     pub sway_config_dir: &'a Path,
+    /// pohunek's config directory holding `launcher.conf` (macOS terminal probe).
+    pub config_dir: &'a Path,
+    /// The user's home directory, used to recognize privacy-protected folders.
+    pub home_dir: Option<&'a Path>,
+    /// Effective user id of the probing process.
+    pub effective_uid: u32,
+    /// Worker executable the daemon is expected to launch (macOS worker probe).
+    pub worker: Option<&'a WorkerCandidate>,
+    /// Extra directories that must be readable, such as the working directory.
+    pub access_dirs: &'a [AccessDir<'a>],
+    /// How the daemon supervises workers (macOS launchd checks).
+    pub supervision: Supervision,
+}
+
+/// The platform the binary was compiled for.
+///
+/// Anything other than macOS uses the Linux probe list.
+#[must_use]
+pub const fn current_platform() -> Platform {
+    if cfg!(target_os = "macos") {
+        Platform::MacOs
+    } else {
+        Platform::Linux
+    }
 }
 
 /// Build the standard pohunek host probe list.
 ///
 /// The CLI-local doctor command and `daemon.doctor` RPC use this same ordered
 /// list so drift in warnings, required checks, and launcher probes is visible in
-/// one place.
+/// one place. The list is selected by [`current_platform`]; on macOS this runs
+/// the bounded `launchctl` domain probe.
 #[must_use]
 pub fn standard_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
+    match current_platform() {
+        Platform::MacOs => {
+            let facts = MacosFacts::collect(&inputs, &ProcessRunner::launchctl());
+            macos::standard_checks(&inputs, &facts)
+        }
+        _ => linux_checks(inputs),
+    }
+}
+
+/// The Linux probe list: agents, directories, `NetBird`, and the optional
+/// sway/rofi launcher assets.
+#[must_use]
+pub fn linux_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
     vec![
         binary("git", true),
         binary("codex", false),
@@ -81,17 +168,11 @@ pub fn standard_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
 /// Resolve a binary name against the `PATH` environment variable.
 ///
 /// A small dependency-free `which`: splits `PATH`, joins the name, and returns
-/// the first entry that exists and is a regular file.
+/// the first entry that is a regular file with an execute bit
+/// ([`resolve_executable`]).
 #[must_use]
 pub fn which_on_path(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    resolve_executable(name, std::env::var_os("PATH").as_deref())
 }
 
 /// Check whether a binary is resolvable on `PATH`.
@@ -99,7 +180,21 @@ pub fn which_on_path(name: &str) -> Option<PathBuf> {
 /// `required` controls whether absence is reported as `fail` or `warn`.
 #[must_use]
 pub fn binary(name: &str, required: bool) -> DoctorCheck {
-    if let Some(path) = which_on_path(name) {
+    binary_with_path(name, required, std::env::var_os("PATH").as_deref(), "")
+}
+
+/// [`binary`] against an explicit `PATH` value.
+///
+/// `missing_hint` is appended to the not-found detail (for example a
+/// platform-specific remediation); it is empty for the Linux list.
+#[must_use]
+pub fn binary_with_path(
+    name: &str,
+    required: bool,
+    path_var: Option<&OsStr>,
+    missing_hint: &str,
+) -> DoctorCheck {
+    if let Some(path) = resolve_executable(name, path_var) {
         DoctorCheck::new(
             format!("bin:{name}"),
             DoctorStatus::Ok,
@@ -114,7 +209,7 @@ pub fn binary(name: &str, required: bool) -> DoctorCheck {
         DoctorCheck::new(
             format!("bin:{name}"),
             status,
-            format!("'{name}' not found on PATH"),
+            format!("'{name}' not found on PATH{missing_hint}"),
         )
     }
 }
@@ -175,33 +270,77 @@ pub fn terminal() -> DoctorCheck {
 }
 
 /// Check that a directory exists (or can be created) and is writable, by
-/// creating it and writing a probe file.
+/// creating it and writing a probe file (see [`write_probe`]).
 #[must_use]
 pub fn dir_writable(name: &str, dir: &Path, label: &str) -> DoctorCheck {
-    if let Err(err) = std::fs::create_dir_all(dir) {
+    if let Err(err) = create_private_dirs(dir) {
         return DoctorCheck::new(
             name,
             DoctorStatus::Fail,
             format!("cannot create {label} {}: {err}", dir.display()),
         );
     }
-    let probe = dir.join(PROBE_FILE);
-    match std::fs::write(&probe, b"probe") {
-        Ok(()) => {
-            // Best-effort cleanup; a leftover probe is harmless.
-            let _ = std::fs::remove_file(&probe);
-            DoctorCheck::new(
-                name,
-                DoctorStatus::Ok,
-                format!("writable: {}", dir.display()),
-            )
-        }
+    match write_probe(dir) {
+        Ok(()) => DoctorCheck::new(
+            name,
+            DoctorStatus::Ok,
+            format!("writable: {}", dir.display()),
+        ),
         Err(err) => DoctorCheck::new(
             name,
             DoctorStatus::Fail,
             format!("{label} {} is not writable: {err}", dir.display()),
         ),
     }
+}
+
+/// Mode of a directory created by the writability probe.
+///
+/// The daemon requires its state and runtime directories to be exactly
+/// owner-private, so a directory created here with the default umask (`0755`)
+/// would be refused at startup.
+const CREATED_DIR_MODE: u32 = 0o700;
+
+/// Create `dir` and any missing parents owner-private.
+fn create_private_dirs(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(CREATED_DIR_MODE)
+        .create(dir)
+}
+
+/// Create, write and remove one probe file in `dir`.
+///
+/// The file has a random name and is created with `O_CREAT | O_EXCL`, which
+/// never follows a symlink at the final component, so a pre-planted link cannot
+/// redirect the write. Only the file this call created is removed.
+pub(crate) fn write_probe(dir: &Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut last = None;
+    for _ in 0..PROBE_NAME_ATTEMPTS {
+        let probe = dir.join(probe_file_name());
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(PROBE_FILE_MODE)
+            .open(&probe)
+        {
+            Ok(mut file) => {
+                let written = file.write_all(b"probe");
+                drop(file);
+                // Best-effort cleanup; a leftover probe is harmless.
+                let _ = std::fs::remove_file(&probe);
+                return written;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => last = Some(err),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no probe name attempts")))
 }
 
 /// Check whether the launcher scripts have been materialized by
@@ -276,7 +415,7 @@ mod tests {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        std::env::temp_dir().join(format!("pohunek-hostcheck-test-{pid}-{n}"))
+        pohunek_test_support::temp_root().join(format!("pohunek-hostcheck-test-{pid}-{n}"))
     }
 
     #[test]
@@ -329,13 +468,64 @@ mod tests {
 
         let check = dir_writable("probe_dir", &base, "probe directory");
         assert_eq!(check.status, DoctorStatus::Ok);
-        assert!(!base.join(PROBE_FILE).exists());
+        assert_eq!(
+            std::fs::read_dir(&base).unwrap().count(),
+            0,
+            "the probe file is removed"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn standard_checks_keeps_single_ordered_probe_contract() {
+    fn dir_writable_never_writes_through_a_planted_probe_symlink() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let victim = base.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let dir = base.join("probed");
+        std::fs::create_dir(&dir).unwrap();
+        // The fixed name an earlier release used, and a guess at a random one.
+        std::os::unix::fs::symlink(&victim, dir.join(PROBE_FILE)).unwrap();
+
+        let check = dir_writable("probe_dir", &dir, "probe directory");
+
+        assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        let entries = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(entries, 1, "only the planted link remains");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dir_writable_creates_missing_directories_owner_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = unique_temp_dir();
+        let dir = base.join("a").join("b");
+
+        let check = dir_writable("probe_dir", &dir, "probe directory");
+
+        assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail);
+        for created in [&dir, dir.parent().unwrap()] {
+            let mode = std::fs::metadata(created).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, CREATED_DIR_MODE, "{}", created.display());
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn probe_names_are_unique_and_prefixed() {
+        let first = probe_file_name();
+        let second = probe_file_name();
+
+        assert_ne!(first, second);
+        assert!(first.starts_with(PROBE_FILE));
+        assert!(first.len() > PROBE_FILE.len() + 16);
+    }
+
+    #[test]
+    fn linux_checks_keeps_single_ordered_probe_contract() {
         let base = unique_temp_dir();
         let socket_dir = base.join("runtime");
         let state_dir = base.join("data");
@@ -343,12 +533,19 @@ mod tests {
         let launcher_bin_dir = base.join("bin");
         let sway_config_dir = base.join("sway");
 
-        let checks = standard_checks(StandardCheckInputs {
+        let config_dir = base.join("config");
+        let checks = linux_checks(StandardCheckInputs {
             socket_dir: &socket_dir,
             state_dir: &state_dir,
             log_dir: &log_dir,
             launcher_bin_dir: &launcher_bin_dir,
             sway_config_dir: &sway_config_dir,
+            config_dir: &config_dir,
+            home_dir: None,
+            effective_uid: 0,
+            worker: None,
+            access_dirs: &[],
+            supervision: Supervision::Unknown,
         });
         let names = checks
             .iter()

@@ -18,9 +18,7 @@ use std::time::{Duration, Instant};
 use protocol::{AgentKind, AgentRuntime, HostCapabilities, ProtocolError, PROTOCOL_VERSION};
 use serde::Deserialize;
 
-use crate::agent::{
-    default_program, is_executable_file, which_executable, ProfileRegistry, ValidatedLaunchProgram,
-};
+use crate::agent::{default_program, which_executable, ProfileRegistry, ValidatedLaunchProgram};
 
 /// The reviewed Hermes release metadata shipped with this Pohunek build.
 const HERMES_COMPATIBILITY_LOCK: &str =
@@ -501,13 +499,7 @@ fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
 }
 
 fn which_on_path_value(name: &str, path_var: &OsStr) -> Option<std::path::PathBuf> {
-    for dir in std::env::split_paths(path_var) {
-        let candidate = dir.join(name);
-        if is_executable_file(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
+    hostcheck::resolve_executable(name, Some(path_var))
 }
 
 #[cfg(test)]

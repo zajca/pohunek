@@ -21,6 +21,9 @@ _STDERR_BYTES = 4096
 _EXIT_GRACE_SECONDS = 0.2
 _READ_CHUNK_BYTES = 64 * 1024
 _METRIC_CAPACITY = 64
+# `pohunek doctor` prints its `ok` envelope and exits with this status when a
+# required host check fails; that reports host health, not a protocol mismatch.
+_UNHEALTHY_EXIT_STATUS = 1
 # JSON uses six ASCII bytes for the most expensive escaped input byte, such as
 # a NUL encoded as ``\u0000``. Keep the capture cap valid for every bounded
 # terminal and diff string the CLI may place in a successful envelope.
@@ -69,6 +72,9 @@ class Invocation:
 
     argv: tuple[str, ...]
     stdin: str | None = None
+    # Accept a host-health failure exit status when the envelope is a valid
+    # `ok` document: the compatibility probe checks the protocol, not health.
+    health_probe: bool = False
 
 
 class CliRunner:
@@ -102,7 +108,7 @@ class CliRunner:
 
     def verify_compatibility(self) -> None:
         """Prove the installed CLI speaks the policy's protocol before tools exist."""
-        self.run(Invocation(("doctor", "--json")))
+        self.run(Invocation(("doctor", "--json"), health_probe=True))
 
     def _run(self, invocation: Invocation) -> Any:
         if not invocation.argv or any(not isinstance(item, str) or not item for item in invocation.argv):
@@ -135,7 +141,10 @@ class CliRunner:
         envelope = self._validate_envelope(document)
         has_ok = "ok" in envelope
         has_err = "err" in envelope
-        if returncode == 0:
+        healthy_or_probe = returncode == 0 or (
+            invocation.health_probe and returncode == _UNHEALTHY_EXIT_STATUS and has_ok
+        )
+        if healthy_or_probe:
             if not has_ok or has_err:
                 raise CliError("pohunek_cli_invalid_envelope")
             return envelope["ok"]

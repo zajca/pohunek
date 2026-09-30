@@ -30,6 +30,16 @@ use crate::store::StoredInputRules;
 
 /// Everything needed to spawn and register one PTY-backed session, shared by
 /// first launch (`create`) and resume (`resume_binding`).
+/// The worker supervision an active [`SessionRegistry`] launches with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveSupervision {
+    /// Worker executable every new generation runs.
+    pub(crate) worker_executable: PathBuf,
+    /// Whether workers are native service-manager jobs (`--service-config`)
+    /// rather than direct children (`--dev-subprocess`).
+    pub(crate) native: bool,
+}
+
 #[derive(Debug)]
 pub(super) struct PtySessionSpec {
     pub(super) id: SessionId,
@@ -432,6 +442,19 @@ impl SessionRegistry {
             .map_err(|_join_error| {
                 runtime_error("worktree_bind_failed", "worktree bind task panicked")
             })?
+    }
+
+    /// Returns the worker supervision this registry launches sessions with, or
+    /// `None` when it cannot launch workers.
+    pub(crate) fn active_supervision(&self) -> Option<ActiveSupervision> {
+        self.inner
+            .config
+            .supervision
+            .as_ref()
+            .map(|supervision| ActiveSupervision {
+                worker_executable: supervision.worker_executable.clone(),
+                native: supervision.service_config.is_some(),
+            })
     }
 
     /// Returns the lifecycle engine, or `worker_backend_required` when this

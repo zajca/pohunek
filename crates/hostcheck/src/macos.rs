@@ -1,0 +1,2495 @@
+//! macOS platform readiness checks.
+//!
+//! The checks split into two layers. [`MacosFacts`] holds everything read from
+//! the host that is not a plain directory probe (environment, `/etc/shells`,
+//! application presence, the `launchd` domain probe); [`MacosFacts::collect`]
+//! gathers it from the real host, while tests construct it directly. The
+//! `check_*` functions turn facts and directories into
+//! [`protocol::DoctorCheck`] values and never touch the process environment.
+//!
+//! `name` is the stable check code and `detail` carries the remediation. The
+//! statuses follow one rule: a check is `fail` only when pohunek cannot work
+//! without it (runtime directory, worker executable, `launchd` domain,
+//! required filesystem access); optional capabilities are at most `warn`.
+
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use pohunek_paths::{
+    validate_staged_socket_path, worker_socket_path, Platform, SocketKind, LAUNCHD_SUBDIR,
+    SOCKET_NAME, WORKERS_SUBDIR,
+};
+use pohunek_platform::filesystem::{StageOutcome, TrustedDir};
+use protocol::{DoctorCheck, DoctorStatus};
+
+use crate::executable::{is_executable_file, resolve_executable};
+use crate::{binary_with_path, netbird, StandardCheckInputs};
+
+// Rust guideline compliant 2026-09-30
+
+/// The only `launchctl` executable the domain probe runs.
+///
+/// An absolute system path so neither `PATH` nor the working directory can
+/// substitute another program.
+pub const LAUNCHCTL: &str = "/bin/launchctl";
+
+/// Deadline of the `launchctl print gui/<uid>` probe.
+///
+/// `print` answers in milliseconds; ten seconds matches the service installer's
+/// `launchctl` deadline and only guards against a wedged `launchd`. A longer
+/// value makes `pohunek doctor` hang on such a host.
+pub const LAUNCHCTL_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Longest time the deadline-bounded probes of one host-check run can block.
+///
+/// The `launchctl` domain probe is the only such probe; a probe added later
+/// must extend this sum, because [`doctor_request_timeout`] derives the
+/// transport limit from it.
+pub const PROBE_BUDGET: Duration = LAUNCHCTL_DEADLINE;
+
+/// Time a `daemon.doctor` reply needs after the last probe finishes: framing,
+/// serialization and scheduling on the local socket. One second matches the
+/// transport headroom the client adds after other daemon-side deadlines.
+pub const REPLY_HEADROOM: Duration = Duration::from_secs(1);
+
+/// Request timeout for a `daemon.doctor` call.
+///
+/// Strictly longer than [`PROBE_BUDGET`], so the daemon's own bounded result
+/// (such as a timed-out `launchctl`) reaches the caller instead of the client
+/// giving up first at its shorter default.
+#[must_use]
+pub const fn doctor_request_timeout() -> Duration {
+    PROBE_BUDGET.saturating_add(REPLY_HEADROOM)
+}
+
+/// Interval between exit-status polls of the running probe.
+///
+/// Short enough that a healthy probe adds no visible latency, long enough not
+/// to spin a core while waiting for the deadline.
+const LAUNCHCTL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// `launchctl` exit status for a domain that does not exist.
+///
+/// Recorded on GitHub-hosted macOS 14 and 15 runners for `print gui/<unknown
+/// uid>`; the status table lives with the service supervisor's `launchctl`
+/// runner. Output text is localized and never matched.
+const LAUNCHCTL_NO_SUCH_DOMAIN: i32 = 112;
+
+/// Stable name of the worker executable check.
+///
+/// The CLI doctor prefers the daemon's own result for this check, because the
+/// daemon knows which worker its supervision launches.
+pub const WORKER_EXECUTABLE_CHECK: &str = "worker_executable";
+
+/// Shell registry consulted for the login-shell check.
+const ETC_SHELLS: &str = "/etc/shells";
+
+/// Stock macOS terminal application.
+const TERMINAL_APP: &str = "/System/Applications/Utilities/Terminal.app";
+
+/// Stock macOS scripting host the notification path is built on.
+const OSASCRIPT: &str = "/usr/bin/osascript";
+
+/// Stock macOS Keychain command-line tool.
+const SECURITY_TOOL: &str = "/usr/bin/security";
+
+/// Login keychain file relative to the home directory.
+const LOGIN_KEYCHAIN_RELATIVE: [&str; 3] = ["Library", "Keychains", "login.keychain-db"];
+
+/// Home-relative folders macOS protects with Privacy & Security (TCC) consent.
+///
+/// Documents, Desktop and Downloads are the user-facing protected folders;
+/// `Library/Mobile Documents` is iCloud Drive and `Library/CloudStorage` holds
+/// File Provider stores such as third-party sync clients.
+const TCC_PROTECTED_HOME_SUBDIRS: [&[&str]; 5] = [
+    &["Documents"],
+    &["Desktop"],
+    &["Downloads"],
+    &["Library", "Mobile Documents"],
+    &["Library", "CloudStorage"],
+];
+
+/// Volumes root; removable and network volumes are TCC-protected as well.
+const VOLUMES_ROOT: &str = "/Volumes";
+
+/// `errno` value of `EPERM` ("Operation not permitted").
+///
+/// macOS reports a Privacy & Security denial as `EPERM`, distinct from the
+/// `EACCES` of ordinary file permissions.
+const EPERM: i32 = 1;
+
+/// `errno` value of `EACCES` ("Permission denied").
+const EACCES: i32 = 13;
+
+/// Directory mode of the runtime root: owner-only, the mode the daemon
+/// requires at startup.
+const RUNTIME_DIR_MODE: u32 = 0o700;
+
+/// Mode of the writability probe file inside the runtime root.
+const PROBE_FILE_MODE: u32 = 0o600;
+
+/// Prefix of the quarantine name a probe file is moved to before removal.
+const PROBE_QUARANTINE_PREFIX: &str = ".pohunek-doctor-stale-";
+
+/// How the daemon supervises session workers, which decides whether the
+/// launchd checks apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Supervision {
+    /// Workers run as launchd jobs (`--service-config`): every launchd check
+    /// is required.
+    Native,
+    /// Workers run as direct children (`--dev-subprocess`), for example over
+    /// SSH without a `gui/<uid>` domain: the launchd checks do not apply and
+    /// are omitted.
+    Subprocess,
+    /// The mode is not known to this process: the launchd checks are reported,
+    /// but a failure is at most a `warn`.
+    Unknown,
+}
+
+/// Where a resolved worker executable path came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerSource {
+    /// The worker the running daemon's supervision launches.
+    Supervision,
+    /// The `worker_executable` recorded in the installed `service.toml`.
+    ServiceConfig,
+    /// The `POHUNEK_WORKER_BIN` override.
+    Environment,
+    /// `pohunek-sessiond` next to the running executable.
+    Sibling,
+}
+
+impl WorkerSource {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Supervision => "the daemon's active supervision",
+            Self::ServiceConfig => "service.toml",
+            Self::Environment => "POHUNEK_WORKER_BIN",
+            Self::Sibling => "next to the running executable",
+        }
+    }
+}
+
+/// The worker executable a caller expects the daemon to launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerCandidate {
+    /// Path of the worker executable.
+    pub path: PathBuf,
+    /// How the path was derived.
+    pub source: WorkerSource,
+}
+
+/// Resolve the worker executable the way the daemon does.
+///
+/// An installed `service.toml` wins (native supervision), then the
+/// `POHUNEK_WORKER_BIN` override, then `pohunek-sessiond` in
+/// `executable_dir`. Like the daemon's `resolve_worker_binary`, any present
+/// override is used as is, an empty value included; the worker check then
+/// rejects a path that is empty or not absolute instead of falling back.
+#[must_use]
+pub fn resolve_worker_candidate(
+    service_worker: Option<PathBuf>,
+    env_override: Option<OsString>,
+    executable_dir: Option<&Path>,
+) -> Option<WorkerCandidate> {
+    if let Some(path) = service_worker {
+        return Some(WorkerCandidate {
+            path,
+            source: WorkerSource::ServiceConfig,
+        });
+    }
+    if let Some(value) = env_override {
+        return Some(WorkerCandidate {
+            path: PathBuf::from(value),
+            source: WorkerSource::Environment,
+        });
+    }
+    executable_dir.map(|dir| WorkerCandidate {
+        path: dir.join(pohunek_paths::WORKER_EXECUTABLE_NAME),
+        source: WorkerSource::Sibling,
+    })
+}
+
+/// A directory the caller needs to read, with the reason it matters.
+#[derive(Debug, Clone, Copy)]
+pub struct AccessDir<'a> {
+    /// Human label used in the check detail, for example `current directory`.
+    pub label: &'a str,
+    /// Directory to probe.
+    pub path: &'a Path,
+}
+
+/// Outcome of the `launchctl print gui/<uid>` probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainProbe {
+    /// The domain exists.
+    Ready,
+    /// `launchctl` reported that the domain does not exist.
+    Missing,
+    /// `launchctl` exited with another status, or was killed by a signal.
+    Failed(Option<i32>),
+    /// The probe outlived its deadline and was killed.
+    TimedOut,
+    /// `launchctl` could not be started.
+    Unavailable,
+}
+
+/// Result of running an external program under a deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// The program exited; `None` means it was killed by a signal.
+    Exited(Option<i32>),
+    /// The deadline passed and the program was killed.
+    TimedOut,
+    /// The program could not be started.
+    Unavailable,
+}
+
+/// Runs a fixed executable with an argument vector under a deadline.
+pub trait Runner {
+    /// Run the program with `arguments`, discarding its output.
+    fn run(&self, arguments: &[&str], deadline: Duration) -> RunOutcome;
+}
+
+/// [`Runner`] that spawns a real process.
+///
+/// Arguments are passed as an argv array, never through a shell; standard
+/// streams are detached so a chatty child cannot block on a full pipe.
+#[derive(Debug, Clone)]
+pub struct ProcessRunner {
+    program: PathBuf,
+}
+
+impl ProcessRunner {
+    /// Runner for the fixed `/bin/launchctl`.
+    #[must_use]
+    pub fn launchctl() -> Self {
+        Self {
+            program: PathBuf::from(LAUNCHCTL),
+        }
+    }
+
+    /// Runner for an explicit program, used by tests with a scripted stand-in.
+    #[must_use]
+    pub fn for_program(program: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+        }
+    }
+}
+
+impl Runner for ProcessRunner {
+    fn run(&self, arguments: &[&str], deadline: Duration) -> RunOutcome {
+        let Ok(mut child) = Command::new(&self.program)
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return RunOutcome::Unavailable;
+        };
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return RunOutcome::Exited(status.code()),
+                Ok(None) if started.elapsed() < deadline => {
+                    std::thread::sleep(LAUNCHCTL_POLL_INTERVAL);
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return RunOutcome::TimedOut;
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return RunOutcome::Unavailable;
+                }
+            }
+        }
+    }
+}
+
+/// Probe whether the `gui/<uid>` launchd domain exists.
+#[must_use]
+pub fn probe_launchd_domain(runner: &dyn Runner, uid: u32, deadline: Duration) -> DomainProbe {
+    let domain = format!("gui/{uid}");
+    match runner.run(&["print", &domain], deadline) {
+        RunOutcome::Exited(Some(0)) => DomainProbe::Ready,
+        RunOutcome::Exited(Some(LAUNCHCTL_NO_SUCH_DOMAIN)) => DomainProbe::Missing,
+        RunOutcome::Exited(code) => DomainProbe::Failed(code),
+        RunOutcome::TimedOut => DomainProbe::TimedOut,
+        RunOutcome::Unavailable => DomainProbe::Unavailable,
+    }
+}
+
+/// Host facts the macOS checks evaluate.
+#[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent host observations, each consumed by exactly one check"
+)]
+pub struct MacosFacts {
+    /// Value of `$SHELL`, when set.
+    pub shell: Option<OsString>,
+    /// Contents of `/etc/shells`; `None` when unreadable.
+    pub etc_shells: Option<String>,
+    /// Whether the stock Terminal application bundle exists.
+    pub terminal_app_present: bool,
+    /// `terminal=` value from `launcher.conf`, when set.
+    pub launcher_terminal: Option<String>,
+    /// Value of `PATH`.
+    pub path_var: Option<OsString>,
+    /// Result of the `gui/<uid>` domain probe.
+    /// Result of the `gui/<uid>` domain probe; `None` when the probe was
+    /// skipped because launchd is not used.
+    pub launchd_domain: Option<DomainProbe>,
+    /// Whether `/usr/bin/osascript` is executable.
+    pub osascript_present: bool,
+    /// Whether `/usr/bin/security` is executable.
+    pub security_tool_present: bool,
+    /// Whether the login keychain file exists.
+    pub login_keychain_present: bool,
+}
+
+impl MacosFacts {
+    /// Read the facts from the running host.
+    ///
+    /// Runs the bounded `launchctl` domain probe through `runner`; every other
+    /// fact is a plain file or environment read.
+    #[must_use]
+    pub fn collect(inputs: &StandardCheckInputs<'_>, runner: &dyn Runner) -> Self {
+        let login_keychain_present = inputs.home_dir.is_some_and(|home| {
+            LOGIN_KEYCHAIN_RELATIVE
+                .iter()
+                .fold(home.to_path_buf(), |path, part| path.join(part))
+                .is_file()
+        });
+        Self {
+            shell: std::env::var_os("SHELL"),
+            etc_shells: std::fs::read_to_string(ETC_SHELLS).ok(),
+            terminal_app_present: Path::new(TERMINAL_APP).is_dir(),
+            launcher_terminal: read_launcher_terminal(inputs.config_dir),
+            path_var: std::env::var_os("PATH"),
+            launchd_domain: (inputs.supervision != Supervision::Subprocess)
+                .then(|| probe_launchd_domain(runner, inputs.effective_uid, LAUNCHCTL_DEADLINE)),
+            osascript_present: is_executable_file(Path::new(OSASCRIPT)),
+            security_tool_present: is_executable_file(Path::new(SECURITY_TOOL)),
+            login_keychain_present,
+        }
+    }
+}
+
+/// Read the `terminal=` value from `<config_dir>/launcher.conf`.
+///
+/// Mirrors the launcher's `pohunek_config_get` (`scripts/lib.sh`): lines are
+/// stripped, blank and `#` lines are skipped, keys and values are stripped, and
+/// the last `terminal=` assignment wins even when empty (an empty value means
+/// unset, so the launcher falls back to `$TERMINAL`). A non-comment line
+/// without `=` makes the launcher's lookup fail, which reads as unset. An
+/// unreadable or absent file yields `None`.
+#[must_use]
+pub fn read_launcher_terminal(config_dir: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(config_dir.join("launcher.conf")).ok()?;
+    parse_launcher_terminal(&contents)
+}
+
+fn parse_launcher_terminal(contents: &str) -> Option<String> {
+    let mut value = None;
+    for line in contents.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, item) = line.split_once('=')?;
+        if key.trim() == "terminal" {
+            value = Some(item.trim());
+        }
+    }
+    value.filter(|value| !value.is_empty()).map(str::to_owned)
+}
+
+/// The ordered macOS probe list.
+///
+/// Optional Linux capabilities (rofi, swaymsg, `timeout`, `$TERMINAL`, the
+/// launcher scripts, the sway include) and the launcher-only `python3` probe
+/// are omitted: they are not macOS capabilities, and hook interpreter
+/// readiness is reported by `pohunek integration doctor`.
+#[must_use]
+pub fn standard_checks(inputs: &StandardCheckInputs<'_>, facts: &MacosFacts) -> Vec<DoctorCheck> {
+    let state_root = state_root(inputs.log_dir);
+    let mut checks = vec![
+        binary_with_path("git", true, facts.path_var.as_deref(), ""),
+        agent_binary("codex", facts),
+        agent_binary("claude", facts),
+        check_runtime_dir_private(inputs.socket_dir),
+        check_socket_path_length(inputs.socket_dir),
+        check_private_dir(
+            "socket_dir_writable",
+            "control socket directory",
+            inputs.socket_dir,
+        ),
+        check_private_dir(
+            "state_dir_writable",
+            "state data directory",
+            inputs.state_dir,
+        ),
+        check_log_dir(inputs.log_dir),
+        check_private_dir(
+            "worker_runtime_root",
+            "worker runtime root",
+            &inputs.socket_dir.join(WORKERS_SUBDIR),
+        ),
+        check_private_dir(
+            "worker_state_root",
+            "worker state root",
+            &state_root.join(WORKERS_SUBDIR),
+        ),
+        check_filesystem_access(inputs),
+        netbird(),
+        DoctorCheck::new(
+            "schema_version",
+            DoctorStatus::Warn,
+            "not available yet (SQLite store is a later milestone)",
+        ),
+        check_worker_executable(inputs.worker),
+        check_login_shell(facts),
+        check_terminal(facts),
+        check_desktop_notifications(facts),
+        check_keychain(facts),
+    ];
+    let launchd = [
+        facts
+            .launchd_domain
+            .map(|probe| check_launchd_domain(probe, inputs.effective_uid)),
+        Some(check_private_dir(
+            "launchd_definitions_dir",
+            "launchd worker definitions directory",
+            &state_root.join(LAUNCHD_SUBDIR),
+        )),
+        Some(check_private_dir(
+            "launchd_log_dir",
+            "launchd worker log directory",
+            &inputs.log_dir.join(LAUNCHD_SUBDIR),
+        )),
+        Some(check_launch_agents_dir(inputs.home_dir)),
+    ];
+    if inputs.supervision != Supervision::Subprocess {
+        checks.extend(
+            launchd
+                .into_iter()
+                .flatten()
+                .map(|check| apply_supervision(inputs.supervision, check)),
+        );
+    }
+    checks
+}
+
+/// Soften a launchd check when the supervision mode is not known.
+///
+/// A launchd failure only breaks a native service; without knowing the mode it
+/// is reported as a `warn`.
+#[must_use]
+pub fn apply_supervision(supervision: Supervision, mut check: DoctorCheck) -> DoctorCheck {
+    if supervision == Supervision::Unknown && check.status == DoctorStatus::Fail {
+        check.status = DoctorStatus::Warn;
+        check.detail = format!(
+            "{}; only a native launchd service needs this (supervision mode unknown)",
+            check.detail
+        );
+    }
+    check
+}
+
+/// Optional agent program probe with a launchd-aware hint.
+fn agent_binary(name: &str, facts: &MacosFacts) -> DoctorCheck {
+    binary_with_path(
+        name,
+        false,
+        facts.path_var.as_deref(),
+        "; optional. Install it, or set an absolute 'program' in an agent profile. \
+         A daemon started by launchd does not read shell startup files, so a PATH set only \
+         in ~/.zshrc is not visible to it",
+    )
+}
+
+/// Check the runtime directory with the validation the daemon applies at
+/// startup, without creating it.
+///
+/// The default root lives in the world-writable `/private/tmp`, so another
+/// account could pre-create it. [`TrustedDir::open_absolute`] rejects symlinked
+/// path components, a foreign owner, any mode other than `0700`, and (on macOS)
+/// an ACL that grants access beyond the mode bits. An absent directory is `ok`:
+/// the daemon creates it owner-private.
+#[must_use]
+pub fn check_runtime_dir_private(dir: &Path) -> DoctorCheck {
+    const NAME: &str = "runtime_dir_private";
+    match TrustedDir::open_absolute(dir, RUNTIME_DIR_MODE) {
+        Ok(_) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!(
+                "{} passes the daemon's owner-private directory validation",
+                dir.display()
+            ),
+        ),
+        Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!(
+                "{} does not exist yet; the daemon creates it with mode 0700",
+                dir.display()
+            ),
+        ),
+        Err(error) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Fail,
+            format!(
+                "{} fails the owner-private directory validation the daemon applies at startup: \
+                 {error}. It must be a real directory you own with mode 0700 and no symlinked \
+                 path components; remove it or set XDG_RUNTIME_DIR to such a directory",
+                dir.display()
+            ),
+        ),
+    }
+}
+
+/// The state root: the parent of the log directory.
+///
+/// `BasePaths` places the log directory directly below the state root
+/// (`<state>/logs`), and the daemon also keeps the worker journals there.
+fn state_root(log_dir: &Path) -> &Path {
+    log_dir.parent().unwrap_or(log_dir)
+}
+
+/// Check a directory the daemon creates owner-private, without creating it.
+///
+/// The doctor never creates a directory: a directory made here with the
+/// default umask would be `0755`, which startup then refuses. An existing
+/// directory must pass [`TrustedDir::open_absolute`] with mode `0700`, the same
+/// validation startup applies (real directory, owned by you, exact mode, no
+/// ACL beyond the mode, no symlinked component), and is then write-probed with
+/// a randomly named exclusive file relative to the opened descriptor. A missing
+/// directory is `ok` when startup could create it (see [`creatable_below`]).
+#[must_use]
+pub fn check_private_dir(name: &str, label: &str, dir: &Path) -> DoctorCheck {
+    match TrustedDir::open_absolute(dir, RUNTIME_DIR_MODE) {
+        Ok(trusted) => probe_trusted_dir(name, label, dir, &trusted),
+        Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => {
+            match creatable_below(dir) {
+                Ok(ancestor) => DoctorCheck::new(
+                    name,
+                    DoctorStatus::Ok,
+                    format!(
+                        "{label} {} does not exist yet; startup creates it with mode 0700 below {}",
+                        dir.display(),
+                        ancestor.display()
+                    ),
+                ),
+                Err(reason) => DoctorCheck::new(
+                    name,
+                    DoctorStatus::Fail,
+                    format!("{label} {} cannot be created: {reason}", dir.display()),
+                ),
+            }
+        }
+        Err(error) => DoctorCheck::new(
+            name,
+            DoctorStatus::Fail,
+            format!(
+                "{label} {} fails the owner-private directory validation the daemon applies at \
+                 startup: {error}. It must be a real directory you own with mode 0700 and no \
+                 symlinked path components; nothing was written to it",
+                dir.display()
+            ),
+        ),
+    }
+}
+
+/// Group and other write bits the launchd backend refuses on `LaunchAgents`.
+///
+/// Mirrors `AGENTS_DIR_FORBIDDEN_BITS` of the launchd supervisor: the directory
+/// may be readable by others (macOS creates it `0755`) but not writable.
+const AGENTS_DIR_FORBIDDEN_BITS: u32 = 0o022;
+
+/// Names of the checks that apply only to a native launchd service.
+///
+/// The CLI drops its own copies of these when the daemon that answers reports a
+/// subprocess supervision (its report contains none of them).
+pub const LAUNCHD_CHECKS: [&str; 4] = [
+    "launchd_domain",
+    "launchd_definitions_dir",
+    "launchd_log_dir",
+    "launchd_agents_dir",
+];
+
+/// Home-relative `LaunchAgents` directory the daemon agent is installed into.
+const LAUNCH_AGENTS_RELATIVE: [&str; 2] = ["Library", "LaunchAgents"];
+
+/// Check `~/Library/LaunchAgents` the way `pohunek service install` opens it,
+/// without creating it.
+///
+/// The installer requires an existing directory to be owned by you and not
+/// group- or world-writable; a missing one is created. Only the native service
+/// needs it, so a problem is a `warn`.
+#[must_use]
+pub fn check_launch_agents_dir(home: Option<&Path>) -> DoctorCheck {
+    const NAME: &str = "launchd_agents_dir";
+    let Some(home) = home else {
+        return DoctorCheck::new(
+            NAME,
+            DoctorStatus::Warn,
+            "HOME is not set, so the LaunchAgents directory cannot be checked",
+        );
+    };
+    let dir = LAUNCH_AGENTS_RELATIVE
+        .iter()
+        .fold(home.to_path_buf(), |path, part| path.join(part));
+    match TrustedDir::open_absolute_owner_safe(&dir, AGENTS_DIR_FORBIDDEN_BITS) {
+        Ok(_) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!(
+                "{} is owned by you and not writable by others",
+                dir.display()
+            ),
+        ),
+        Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => {
+            match creatable_below(&dir) {
+                Ok(ancestor) => DoctorCheck::new(
+                    NAME,
+                    DoctorStatus::Ok,
+                    format!(
+                        "{} does not exist yet; 'pohunek service install' creates it below {}",
+                        dir.display(),
+                        ancestor.display()
+                    ),
+                ),
+                Err(reason) => DoctorCheck::new(
+                    NAME,
+                    DoctorStatus::Warn,
+                    format!("{} cannot be created: {reason}", dir.display()),
+                ),
+            }
+        }
+        Err(error) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Warn,
+            format!(
+                "{} is refused by 'pohunek service install': {error}. It must be a real directory \
+                 you own that group and others cannot write ('chmod go-w {}')",
+                dir.display(),
+                dir.display()
+            ),
+        ),
+    }
+}
+
+/// Check the log directory without creating anything.
+///
+/// Startup creates the state root owner-private and then the log directory
+/// below it, tolerating an existing real log directory (it resets its mode).
+/// The state root is validated like any private directory. An existing log
+/// directory is judged by the conditions startup imposes: a real directory
+/// (not a symlink) owned by the effective user. Its mode is repaired by
+/// startup, so no write is required before that reset.
+#[must_use]
+pub fn check_log_dir(log_dir: &Path) -> DoctorCheck {
+    check_log_dir_as(log_dir, rustix::process::geteuid().as_raw())
+}
+
+/// [`check_log_dir`] for an explicit effective user id.
+///
+/// Startup resets the log directory's mode with `set_permissions`, which fails
+/// for a directory the effective user does not own even when it is writable,
+/// so an existing directory must be owned by `effective_uid`.
+fn check_log_dir_as(log_dir: &Path, effective_uid: u32) -> DoctorCheck {
+    use std::os::unix::fs::MetadataExt as _;
+
+    const NAME: &str = "log_dir_writable";
+    const LABEL: &str = "log directory";
+    let root = state_root(log_dir);
+    let root_check = check_private_dir(NAME, "state root", root);
+    if root_check.status != DoctorStatus::Ok || !root.exists() {
+        return root_check;
+    }
+    match std::fs::symlink_metadata(log_dir) {
+        Ok(meta) if meta.file_type().is_dir() && meta.uid() != effective_uid => {
+            DoctorCheck::new(
+                NAME,
+                DoctorStatus::Fail,
+                format!(
+                    "{LABEL} {} is owned by uid {} but pohunek runs as uid {effective_uid}; startup \
+                     cannot reset its mode. Remove it or point XDG_STATE_HOME at a directory you own",
+                    log_dir.display(),
+                    meta.uid()
+                ),
+            )
+        }
+        // Startup (`prepare_dir`) resets an owned real directory to 0700 before
+        // it writes anything, so a mode such as 0500 is repaired, not fatal.
+        Ok(meta) if meta.file_type().is_dir() => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!(
+                "{LABEL} {} is a real directory you own; startup resets its mode to 0700",
+                log_dir.display()
+            ),
+        ),
+        Ok(_) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Fail,
+            format!(
+                "{LABEL} {} is not a real directory (a symlink or file is refused); remove it",
+                log_dir.display()
+            ),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!(
+                "{LABEL} {} does not exist yet; startup creates it",
+                log_dir.display()
+            ),
+        ),
+        Err(error) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Fail,
+            format!("cannot inspect {LABEL} {}: {error}", log_dir.display()),
+        ),
+    }
+}
+
+/// Decide, without creating anything, whether startup could create `dir`.
+///
+/// Startup creates missing components with `open_or_create_absolute`, which
+/// needs the nearest existing ancestor to pass the ancestor policy
+/// ([`TrustedDir::open_absolute_ancestor`]) and to be writable and searchable
+/// by the effective user. Returns that ancestor, or the reason it fails.
+fn creatable_below(dir: &Path) -> Result<PathBuf, String> {
+    let ancestor = dir
+        .ancestors()
+        .skip(1)
+        .find(|candidate| std::fs::symlink_metadata(candidate).is_ok())
+        .ok_or_else(|| "no existing ancestor directory".to_owned())?;
+    TrustedDir::open_absolute_ancestor(ancestor).map_err(|error| error.to_string())?;
+    rustix::fs::accessat(
+        rustix::fs::CWD,
+        ancestor,
+        rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK,
+        rustix::fs::AtFlags::EACCESS,
+    )
+    .map_err(|error| {
+        format!(
+            "its nearest existing ancestor {} is not writable and searchable by you ({error})",
+            ancestor.display()
+        )
+    })?;
+    Ok(ancestor.to_path_buf())
+}
+
+/// Write-probe an already validated directory through its descriptor.
+fn probe_trusted_dir(name: &str, label: &str, dir: &Path, trusted: &TrustedDir) -> DoctorCheck {
+    for _ in 0..crate::PROBE_NAME_ATTEMPTS {
+        let probe = crate::probe_file_name();
+        match trusted.create_file(&probe, b"probe", PROBE_FILE_MODE) {
+            Ok(identity) => {
+                // Best-effort cleanup; a leftover probe is harmless.
+                if let Ok(StageOutcome::Staged(entry)) =
+                    trusted.stage_random(&probe, PROBE_QUARANTINE_PREFIX, identity)
+                {
+                    let _ = entry.remove();
+                }
+                return DoctorCheck::new(
+                    name,
+                    DoctorStatus::Ok,
+                    format!("writable: {}", dir.display()),
+                );
+            }
+            Err(error) if error.io_kind() == Some(std::io::ErrorKind::AlreadyExists) => {}
+            Err(error) => {
+                return DoctorCheck::new(
+                    name,
+                    DoctorStatus::Fail,
+                    format!("{label} {} is not writable: {error}", dir.display()),
+                );
+            }
+        }
+    }
+    DoctorCheck::new(
+        name,
+        DoctorStatus::Fail,
+        format!(
+            "{label} {} rejected every probe file name; inspect it for unexpected entries",
+            dir.display()
+        ),
+    )
+}
+
+/// Check that the daemon socket and the longest worker socket fit Darwin's
+/// `sockaddr_un` limit, including staged bind names.
+#[must_use]
+pub fn check_socket_path_length(runtime_dir: &Path) -> DoctorCheck {
+    const NAME: &str = "socket_path_length";
+    let remediation = "set XDG_RUNTIME_DIR to a shorter absolute directory";
+    let daemon_socket = runtime_dir.join(SOCKET_NAME);
+    if let Err(error) =
+        validate_staged_socket_path(&daemon_socket, Platform::MacOs, SocketKind::Daemon)
+    {
+        return DoctorCheck::new(
+            NAME,
+            DoctorStatus::Fail,
+            format!("daemon socket path is unusable: {error}; {remediation}"),
+        );
+    }
+    let longest_session = pohunek_paths::longest_worker_session_id();
+    let worker_root = runtime_dir.join(WORKERS_SUBDIR);
+    match worker_socket_path(&worker_root, &longest_session, Platform::MacOs) {
+        Ok(_) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!(
+                "daemon and worker socket paths fit the {}-byte Darwin limit",
+                Platform::MacOs.socket_path_max_bytes()
+            ),
+        ),
+        Err(error) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Fail,
+            format!("a worker socket path would exceed the platform limit: {error}; {remediation}"),
+        ),
+    }
+}
+
+/// Check that the worker executable exists, is absolute and is executable.
+///
+/// The worker is required: without it no session can start.
+#[must_use]
+pub fn check_worker_executable(candidate: Option<&WorkerCandidate>) -> DoctorCheck {
+    const NAME: &str = WORKER_EXECUTABLE_CHECK;
+    let Some(candidate) = candidate else {
+        return DoctorCheck::new(
+            NAME,
+            DoctorStatus::Fail,
+            "no worker executable is configured; install the service with 'pohunek service install', \
+             or start the daemon with '--service-config' or '--dev-subprocess' (POHUNEK_WORKER_BIN \
+             overrides the path)",
+        );
+    };
+    let source = candidate.source.describe();
+    if !candidate.path.is_absolute() {
+        return DoctorCheck::new(
+            NAME,
+            DoctorStatus::Fail,
+            format!(
+                "worker path '{}' (from {source}) is not absolute (an empty value is rejected too); \
+                 use an absolute path",
+                candidate.path.display()
+            ),
+        );
+    }
+    if is_executable_file(&candidate.path) {
+        DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!("{} (from {source})", candidate.path.display()),
+        )
+    } else {
+        DoctorCheck::new(
+            NAME,
+            DoctorStatus::Fail,
+            format!(
+                "{} (from {source}) is missing or not executable; reinstall with 'pohunek service \
+                 install' or fix POHUNEK_WORKER_BIN",
+                candidate.path.display()
+            ),
+        )
+    }
+}
+
+/// Check `$SHELL`: an absolute executable listed in `/etc/shells`.
+///
+/// Interactive attach uses the login shell; a problem here is a `warn` because
+/// pohunek does not need the shell to supervise agents.
+#[must_use]
+pub fn check_login_shell(facts: &MacosFacts) -> DoctorCheck {
+    const NAME: &str = "login_shell";
+    let Some(shell) = facts.shell.as_deref().filter(|shell| !shell.is_empty()) else {
+        return DoctorCheck::new(
+            NAME,
+            DoctorStatus::Warn,
+            "$SHELL is not set; set it to your login shell, for example /bin/zsh",
+        );
+    };
+    let path = Path::new(shell);
+    if !path.is_absolute() {
+        return DoctorCheck::new(
+            NAME,
+            DoctorStatus::Warn,
+            format!("$SHELL={} is not an absolute path", path.display()),
+        );
+    }
+    if !is_executable_file(path) {
+        return DoctorCheck::new(
+            NAME,
+            DoctorStatus::Warn,
+            format!("$SHELL={} is not an executable file", path.display()),
+        );
+    }
+    match facts.etc_shells.as_deref() {
+        Some(listing) if shell_listed(listing, path) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!("{} is listed in {ETC_SHELLS}", path.display()),
+        ),
+        Some(_) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Warn,
+            format!(
+                "{} is not listed in {ETC_SHELLS}; add it there or run 'chsh -s' with a listed shell",
+                path.display()
+            ),
+        ),
+        None => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Warn,
+            format!("{ETC_SHELLS} could not be read, so {} is unverified", path.display()),
+        ),
+    }
+}
+
+fn shell_listed(listing: &str, shell: &Path) -> bool {
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .any(|line| Path::new(line) == shell)
+}
+
+/// Check the attach terminal: the stock Terminal application and the optional
+/// `terminal=` command from `launcher.conf`.
+///
+/// The configured terminal is optional. The launcher runs the whole `terminal=`
+/// value as one executable name (`"$terminal_bin" -e ...`), so the value is
+/// resolved as a single program, never split into words; a value such as
+/// `kitty -e` is unresolvable. A configured but unresolvable command is a
+/// `warn`, as is a host with neither the stock app nor a working configured
+/// command.
+#[must_use]
+pub fn check_terminal(facts: &MacosFacts) -> DoctorCheck {
+    const NAME: &str = "terminal";
+    let configured = facts.launcher_terminal.as_deref().map(|command| {
+        let resolved = resolve_executable(command, facts.path_var.as_deref());
+        (command, resolved.is_some())
+    });
+    match (facts.terminal_app_present, configured) {
+        (true, None) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!("stock terminal available at {TERMINAL_APP}; 'terminal=' in launcher.conf is optional"),
+        ),
+        (true, Some((command, true))) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!("configured terminal '{command}' resolves; stock {TERMINAL_APP} is also available"),
+        ),
+        (_, Some((command, false))) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Warn,
+            format!(
+                "configured terminal '{command}' (launcher.conf) does not resolve to one executable; \
+                 the launcher runs the whole value as a single program name, so put arguments in a \
+                 wrapper script, or fix or remove the 'terminal=' key"
+            ),
+        ),
+        (false, Some((command, true))) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!("configured terminal '{command}' resolves"),
+        ),
+        (false, None) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Warn,
+            format!(
+                "{TERMINAL_APP} not found and no 'terminal=' set in launcher.conf; set 'terminal=' \
+                 to a terminal command"
+            ),
+        ),
+    }
+}
+
+/// Report the outcome of the `gui/<uid>` launchd domain probe.
+///
+/// A missing domain is a `fail` (native supervision needs a graphical login
+/// session); an inconclusive probe is a `warn`.
+#[must_use]
+pub fn check_launchd_domain(probe: DomainProbe, uid: u32) -> DoctorCheck {
+    const NAME: &str = "launchd_domain";
+    match probe {
+        DomainProbe::Ready => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!("launchd domain gui/{uid} is reachable"),
+        ),
+        DomainProbe::Missing => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Fail,
+            format!(
+                "launchd domain gui/{uid} does not exist; log in to the Mac's graphical session \
+                 as this user (a bare SSH session without a console login has no gui domain) and retry"
+            ),
+        ),
+        DomainProbe::Failed(code) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Warn,
+            match code {
+                Some(code) => format!("'launchctl print gui/{uid}' exited with status {code}; launchd readiness is unconfirmed"),
+                None => format!("'launchctl print gui/{uid}' was terminated by a signal; launchd readiness is unconfirmed"),
+            },
+        ),
+        DomainProbe::TimedOut => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Warn,
+            format!("'launchctl print gui/{uid}' did not answer within {} seconds; launchd may be wedged", LAUNCHCTL_DEADLINE.as_secs()),
+        ),
+        DomainProbe::Unavailable => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Warn,
+            format!("{LAUNCHCTL} could not be started; launchd readiness is unconfirmed"),
+        ),
+    }
+}
+
+/// Report whether the notification path's host tool exists.
+///
+/// Delivery and user denial cannot be observed from a CLI process for an
+/// unbundled binary, so a present tool is reported `ok` with that caveat.
+#[must_use]
+pub fn check_desktop_notifications(facts: &MacosFacts) -> DoctorCheck {
+    const NAME: &str = "desktop_notifications";
+    if facts.osascript_present {
+        DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!(
+                "{OSASCRIPT} is available; delivery cannot be confirmed for an unbundled binary. \
+                 If banners do not appear, allow notifications for the sending app in System \
+                 Settings > Notifications"
+            ),
+        )
+    } else {
+        DoctorCheck::new(
+            NAME,
+            DoctorStatus::Warn,
+            format!("{OSASCRIPT} is missing; desktop notifications are unavailable (optional)"),
+        )
+    }
+}
+
+/// Report whether the Keychain prerequisites exist.
+///
+/// Only the presence of `/usr/bin/security` and the login keychain file is
+/// checked. No secret is read and no Keychain API is called, so the check
+/// cannot prompt or block; lock state is not probed.
+#[must_use]
+pub fn check_keychain(facts: &MacosFacts) -> DoctorCheck {
+    const NAME: &str = "keychain";
+    match (facts.security_tool_present, facts.login_keychain_present) {
+        (true, true) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            "login keychain file and security tool are present; lock state is not probed, a \
+             locked keychain is reported when a provider credential is first requested",
+        ),
+        (false, _) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Warn,
+            format!("{SECURITY_TOOL} is missing; provider credentials cannot use the Keychain (optional)"),
+        ),
+        (true, false) => DoctorCheck::new(
+            NAME,
+            DoctorStatus::Warn,
+            "login keychain file not found under ~/Library/Keychains; provider credentials need a \
+             login keychain (optional)",
+        ),
+    }
+}
+
+/// Check the directories pohunek must read, classifying macOS privacy denials.
+///
+/// The probe runs in the privacy context of the calling process. The CLI's run
+/// covers its own terminal context (including the current directory); the
+/// daemon's run covers only the config and data roots in the launchd context.
+/// Neither proves a project directory is readable by the other context, and the
+/// detail says so.
+///
+/// A denial is a `fail`. `EPERM`, or any denial below a Privacy & Security
+/// protected folder, is explained as a TCC consent problem with the exact grant
+/// to make; Full Disk Access is deliberately not the default remedy.
+#[must_use]
+pub fn check_filesystem_access(inputs: &StandardCheckInputs<'_>) -> DoctorCheck {
+    const NAME: &str = "filesystem_access";
+    let dirs = [
+        AccessDir {
+            label: "config directory",
+            path: inputs.config_dir,
+        },
+        AccessDir {
+            label: "data directory",
+            path: inputs.state_dir,
+        },
+    ];
+    let mut denials = Vec::new();
+    let mut probed = 0_usize;
+    let mut labels = Vec::new();
+    for dir in dirs.iter().chain(inputs.access_dirs.iter()) {
+        match std::fs::read_dir(dir.path) {
+            Ok(_) => {
+                probed += 1;
+                labels.push(dir.label);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => denials.push(describe_denial(dir, &err, inputs.home_dir)),
+        }
+    }
+    if denials.is_empty() {
+        DoctorCheck::new(
+            NAME,
+            DoctorStatus::Ok,
+            format!(
+                "readable by this process ({probed}: {}); other process contexts, such as a \
+                 launchd-run daemon or its workers, are not verified",
+                labels.join(", ")
+            ),
+        )
+    } else {
+        DoctorCheck::new(NAME, DoctorStatus::Fail, denials.join("; "))
+    }
+}
+
+fn describe_denial(dir: &AccessDir<'_>, err: &std::io::Error, home: Option<&Path>) -> String {
+    let denied = err.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(err.raw_os_error(), Some(EPERM | EACCES));
+    if !denied {
+        return format!("{} {} cannot be read: {err}", dir.label, dir.path.display());
+    }
+    if err.raw_os_error() == Some(EPERM) || is_tcc_protected(dir.path, home) {
+        format!(
+            "{label} {path} was denied ({err}), which on macOS is a Privacy & Security consent \
+             denial for a protected location. Grant the app that started the failing process access \
+             in System Settings > Privacy & Security > Files and Folders: your terminal app when \
+             pohunek runs from a terminal, or the pohunekd and pohunek-sessiond executables when \
+             launchd runs them. Alternatively keep projects outside Documents, Desktop, Downloads, \
+             iCloud Drive and external volumes (for example in ~/Code). Full Disk Access is not \
+             required and is not recommended by default",
+            label = dir.label,
+            path = dir.path.display(),
+        )
+    } else {
+        format!(
+            "{label} {path} is not readable ({err}); fix its ownership or mode (chown/chmod)",
+            label = dir.label,
+            path = dir.path.display(),
+        )
+    }
+}
+
+fn is_tcc_protected(path: &Path, home: Option<&Path>) -> bool {
+    if path.starts_with(VOLUMES_ROOT) {
+        return true;
+    }
+    let Some(home) = home else {
+        return false;
+    };
+    TCC_PROTECTED_HOME_SUBDIRS.iter().any(|parts| {
+        let root = parts
+            .iter()
+            .fold(home.to_path_buf(), |dir, part| dir.join(part));
+        path.starts_with(root)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use protocol::DoctorReport;
+
+    use super::*;
+
+    /// Scratch directory under the symlink-free, short fixture root.
+    ///
+    /// On macOS the root is `/private/tmp`: `/tmp` and the per-user temp dir
+    /// are symlinked, and the latter overflows Darwin's 103-byte socket limit.
+    fn temp_dir(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = pohunek_test_support::temp_root()
+            .join(format!("pohunek-hc-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_exec(dir: &Path, name: &str, mode: u32) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    fn facts() -> MacosFacts {
+        MacosFacts {
+            shell: None,
+            etc_shells: Some("# comment\n/bin/zsh\n/bin/bash\n".to_owned()),
+            terminal_app_present: true,
+            launcher_terminal: None,
+            path_var: None,
+            launchd_domain: Some(DomainProbe::Ready),
+            osascript_present: true,
+            security_tool_present: true,
+            login_keychain_present: true,
+        }
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    // --- worker candidate --------------------------------------------------
+
+    #[test]
+    fn worker_candidate_precedence_is_service_then_env_then_sibling() {
+        let dir = Path::new("/opt/pohunek/bin");
+        let service = resolve_worker_candidate(
+            Some(PathBuf::from("/svc/worker")),
+            Some(OsString::from("/env/worker")),
+            Some(dir),
+        )
+        .unwrap();
+        assert_eq!(service.source, WorkerSource::ServiceConfig);
+        assert_eq!(service.path, PathBuf::from("/svc/worker"));
+
+        let env =
+            resolve_worker_candidate(None, Some(OsString::from("/env/worker")), Some(dir)).unwrap();
+        assert_eq!(env.source, WorkerSource::Environment);
+
+        // The daemon uses any present override, an empty one included, and then
+        // rejects a non-absolute path; it never falls back to the sibling.
+        let empty = resolve_worker_candidate(None, Some(OsString::new()), Some(dir)).unwrap();
+        assert_eq!(empty.source, WorkerSource::Environment);
+        assert_eq!(empty.path, PathBuf::new());
+        assert_eq!(
+            check_worker_executable(Some(&empty)).status,
+            DoctorStatus::Fail
+        );
+
+        let sibling = resolve_worker_candidate(None, None, Some(dir)).unwrap();
+        assert_eq!(sibling.source, WorkerSource::Sibling);
+        assert_eq!(sibling.path, dir.join("pohunek-sessiond"));
+
+        assert_eq!(resolve_worker_candidate(None, None, None), None);
+    }
+
+    #[test]
+    fn worker_executable_fails_when_absent_relative_missing_or_not_executable() {
+        assert_eq!(check_worker_executable(None).status, DoctorStatus::Fail);
+
+        let relative = WorkerCandidate {
+            path: PathBuf::from("pohunek-sessiond"),
+            source: WorkerSource::Environment,
+        };
+        assert_eq!(
+            check_worker_executable(Some(&relative)).status,
+            DoctorStatus::Fail
+        );
+
+        let dir = temp_dir("worker");
+        let missing = WorkerCandidate {
+            path: dir.join("missing"),
+            source: WorkerSource::Sibling,
+        };
+        assert_eq!(
+            check_worker_executable(Some(&missing)).status,
+            DoctorStatus::Fail
+        );
+
+        let plain = WorkerCandidate {
+            path: write_exec(&dir, "plain", 0o644),
+            source: WorkerSource::ServiceConfig,
+        };
+        let check = check_worker_executable(Some(&plain));
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert!(check.detail.contains("service.toml"), "{}", check.detail);
+
+        let good = WorkerCandidate {
+            path: write_exec(&dir, "good", 0o755),
+            source: WorkerSource::ServiceConfig,
+        };
+        assert_eq!(
+            check_worker_executable(Some(&good)).status,
+            DoctorStatus::Ok
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- runtime directory ---------------------------------------------------
+
+    /// Every path below `dir` with its mode, sorted, to prove nothing changed.
+    fn tree(dir: &Path) -> Vec<(PathBuf, u32)> {
+        fn walk(dir: &Path, out: &mut Vec<(PathBuf, u32)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                out.push((path.clone(), meta.permissions().mode() & 0o7777));
+                if meta.is_dir() {
+                    walk(&path, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, &mut out);
+        out.sort();
+        out
+    }
+
+    fn entry_names(dir: &Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn runtime_dir_absent_is_ok_without_being_created() {
+        let base = temp_dir("rt-absent");
+        let dir = base.join("pohunek-1");
+
+        let check = check_runtime_dir_private(&dir);
+
+        assert_eq!(check.status, DoctorStatus::Ok);
+        assert!(!dir.exists(), "the check must not create the directory");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn runtime_dir_needs_exactly_mode_0700() {
+        let base = temp_dir("rt-mode");
+        let dir = base.join("rt");
+        std::fs::create_dir(&dir).unwrap();
+
+        for loose in [0o755, 0o770, 0o750, 0o777] {
+            set_mode(&dir, loose);
+            let check = check_runtime_dir_private(&dir);
+            assert_eq!(check.status, DoctorStatus::Fail, "mode {loose:o}");
+            assert!(check.detail.contains("0700"), "{}", check.detail);
+        }
+        set_mode(&dir, 0o700);
+        assert_eq!(check_runtime_dir_private(&dir).status, DoctorStatus::Ok);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn runtime_dir_symlink_or_file_fails() {
+        let base = temp_dir("rt-link");
+        let target = base.join("target");
+        std::fs::create_dir(&target).unwrap();
+        set_mode(&target, 0o700);
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let file = base.join("file");
+        std::fs::write(&file, b"x").unwrap();
+
+        assert_eq!(check_runtime_dir_private(&link).status, DoctorStatus::Fail);
+        assert_eq!(check_runtime_dir_private(&file).status, DoctorStatus::Fail);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_symlinked_ancestor_is_refused_like_at_daemon_startup() {
+        // Startup opens the runtime root with `TrustedDir::open_or_create_absolute`,
+        // which rejects a symlinked path component; the doctor applies the same rule.
+        let real = temp_dir("rt-parent-real");
+        let holder = temp_dir("rt-parent-link");
+        let link_root = holder.join("root");
+        std::os::unix::fs::symlink(&real, &link_root).unwrap();
+        let dir = real.join("rt");
+        std::fs::create_dir(&dir).unwrap();
+        set_mode(&dir, 0o700);
+
+        assert_eq!(check_runtime_dir_private(&dir).status, DoctorStatus::Ok);
+        let through_link = link_root.join("rt");
+        let refused = check_runtime_dir_private(&through_link);
+        assert_eq!(refused.status, DoctorStatus::Fail, "{}", refused.detail);
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_dir_all(&holder);
+    }
+
+    #[test]
+    fn a_symlinked_ancestor_is_still_readable_for_filesystem_access() {
+        let real = temp_dir("fa-real");
+        let holder = temp_dir("fa-link");
+        let link_root = holder.join("root");
+        std::os::unix::fs::symlink(&real, &link_root).unwrap();
+        let dirs = [AccessDir {
+            label: "current directory",
+            path: &link_root,
+        }];
+
+        let access = check_filesystem_access(&access_inputs(&real, None, &dirs));
+
+        assert_eq!(access.status, DoctorStatus::Ok, "{}", access.detail);
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_dir_all(&holder);
+    }
+
+    #[test]
+    fn a_missing_directory_is_reported_but_never_created() {
+        let base = temp_dir("rt-create");
+        let dir = base.join("a").join("b");
+        let before = tree(&base);
+
+        let check = check_private_dir("socket_dir_writable", "control socket directory", &dir);
+
+        assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail);
+        assert!(
+            check.detail.contains("startup creates it"),
+            "{}",
+            check.detail
+        );
+        assert_eq!(tree(&base), before, "the doctor must not create anything");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_missing_directory_below_an_unsafe_ancestor_cannot_be_created() {
+        let base = temp_dir("rt-unsafe-parent");
+        let open = base.join("open");
+        std::fs::create_dir(&open).unwrap();
+        set_mode(&open, 0o777);
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&open, &link).unwrap();
+
+        for parent in [&open, &link] {
+            let check = check_private_dir(
+                "state_dir_writable",
+                "state data directory",
+                &parent.join("state"),
+            );
+            assert_eq!(check.status, DoctorStatus::Fail, "{}", check.detail);
+        }
+        assert!(!open.join("state").exists());
+        set_mode(&open, 0o700);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_missing_directory_below_a_read_only_ancestor_cannot_be_created() {
+        let base = temp_dir("rt-readonly-parent");
+        let parent = base.join("readonly");
+        std::fs::create_dir(&parent).unwrap();
+        set_mode(&parent, 0o500);
+
+        let check = check_private_dir(
+            "state_dir_writable",
+            "state data directory",
+            &parent.join("state"),
+        );
+
+        set_mode(&parent, 0o700);
+        if !rustix::process::geteuid().is_root() {
+            assert_eq!(check.status, DoctorStatus::Fail, "{}", check.detail);
+            assert!(
+                check.detail.contains("cannot be created"),
+                "{}",
+                check.detail
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_dir_that_fails_startup_validation_is_never_written() {
+        let base = temp_dir("rt-planted");
+        let victim = base.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let dir = base.join("rt");
+        std::fs::create_dir(&dir).unwrap();
+        set_mode(&dir, 0o777);
+        std::os::unix::fs::symlink(&victim, dir.join(crate::PROBE_FILE)).unwrap();
+        let before = tree(&base);
+
+        assert_eq!(check_runtime_dir_private(&dir).status, DoctorStatus::Fail);
+        let refused = check_private_dir("socket_dir_writable", "control socket directory", &dir);
+
+        assert_eq!(refused.status, DoctorStatus::Fail, "{}", refused.detail);
+        assert!(
+            refused.detail.contains("nothing was written"),
+            "{}",
+            refused.detail
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(tree(&base), before, "nothing was created or removed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_planted_probe_symlink_in_a_private_dir_is_not_written_through() {
+        let base = temp_dir("rt-planted-ok");
+        let victim = base.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let dir = base.join("rt");
+        std::fs::create_dir(&dir).unwrap();
+        set_mode(&dir, 0o700);
+        std::os::unix::fs::symlink(&victim, dir.join(crate::PROBE_FILE)).unwrap();
+
+        let check = check_private_dir("socket_dir_writable", "control socket directory", &dir);
+
+        assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(entry_names(&dir), [crate::PROBE_FILE]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn worker_roots_need_a_real_owner_private_directory() {
+        // A directory owned by another account cannot be constructed without
+        // chown, so the foreign-owner rule is covered by the platform crate's
+        // `TrustedDir` tests this check delegates to.
+        let base = temp_dir("worker-roots");
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let check =
+            |dir: &Path| check_private_dir("worker_runtime_root", "worker runtime root", dir);
+
+        set_mode(&real, 0o755);
+        assert_eq!(check(&real).status, DoctorStatus::Fail, "wrong mode");
+        set_mode(&real, 0o700);
+        assert_eq!(check(&real).status, DoctorStatus::Ok);
+        assert_eq!(check(&link).status, DoctorStatus::Fail, "symlink");
+        assert_eq!(check(&base.join("absent")).status, DoctorStatus::Ok);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_log_dir_check_validates_the_state_root_and_never_creates() {
+        let base = temp_dir("log-dir");
+        let root = base.join("state");
+        let logs = root.join("logs");
+
+        // Absent state root and log dir: creatable, nothing made.
+        let before = tree(&base);
+        assert_eq!(check_log_dir(&logs).status, DoctorStatus::Ok);
+        assert_eq!(tree(&base), before);
+
+        // A state root with the default umask mode is refused, as at startup.
+        std::fs::create_dir(&root).unwrap();
+        set_mode(&root, 0o755);
+        assert_eq!(check_log_dir(&logs).status, DoctorStatus::Fail);
+
+        set_mode(&root, 0o700);
+        assert_eq!(check_log_dir(&logs).status, DoctorStatus::Ok);
+        std::fs::create_dir(&logs).unwrap();
+        assert_eq!(check_log_dir(&logs).status, DoctorStatus::Ok);
+        assert!(entry_names(&logs).is_empty(), "no probe file is written");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_log_dir_startup_would_repair_is_not_fatal() {
+        // `prepare_dir` resets an owned real log directory to 0700 before it
+        // writes, so a read-only mode is repaired at startup.
+        let base = temp_dir("log-repair");
+        let root = base.join("state");
+        let logs = root.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        set_mode(&root, 0o700);
+        set_mode(&logs, 0o500);
+
+        let check = check_log_dir(&logs);
+
+        set_mode(&logs, 0o700);
+        assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail);
+        assert!(
+            check.detail.contains("resets its mode to 0700"),
+            "{}",
+            check.detail
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_daemon_free_process_fixture_layout_passes_every_host_check() {
+        // The layout `crates/cli/tests/session_process_api.rs` builds: XDG
+        // directories pre-created with the default umask, then the ones the
+        // daemon creates privately chmod'ed to 0700.
+        let root = temp_dir("fx");
+        let bin = temp_dir("fx-bin");
+        write_exec(&bin, "git", 0o755);
+        let worker = WorkerCandidate {
+            path: write_exec(&bin, "pohunek-sessiond", 0o755),
+            source: WorkerSource::Environment,
+        };
+        for dir in [
+            "run/pohunek",
+            "state/pohunek/logs",
+            "data",
+            "config",
+            "cache",
+            "home",
+            "logs",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for dir in ["run/pohunek", "state/pohunek", "state/pohunek/logs"] {
+            set_mode(&root.join(dir), 0o700);
+        }
+        let mut f = facts();
+        f.path_var = Some(OsString::from(bin.as_os_str()));
+        let config_dir = root.join("config").join("pohunek");
+        let runtime = root.join("run/pohunek");
+        let data = root.join("data/pohunek");
+        let logs = root.join("state/pohunek/logs");
+        let home = root.join("home");
+        let inputs = StandardCheckInputs {
+            socket_dir: &runtime,
+            state_dir: &data,
+            log_dir: &logs,
+            launcher_bin_dir: &root,
+            sway_config_dir: &root,
+            config_dir: &config_dir,
+            home_dir: Some(&home),
+            effective_uid: std::fs::metadata(&root).unwrap().uid(),
+            worker: Some(&worker),
+            access_dirs: &[],
+            supervision: Supervision::Native,
+        };
+
+        let checks = standard_checks(&inputs, &f);
+
+        let failing = failing_names(&checks);
+        assert!(failing.is_empty(), "{checks:?}");
+        for name in [
+            "runtime_dir_private",
+            "socket_path_length",
+            "socket_dir_writable",
+            "state_dir_writable",
+            "log_dir_writable",
+            "worker_runtime_root",
+            "worker_state_root",
+            "worker_executable",
+        ] {
+            let check = checks.iter().find(|c| c.name == name).expect(name);
+            assert_eq!(check.status, DoctorStatus::Ok, "{name}: {}", check.detail);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn launchd_worker_directories_are_validated_like_startup_opens_them() {
+        // `LaunchdSupervisor::start_worker` opens `<state>/launchd` and
+        // `<logs>/launchd` with `open_or_create_absolute(.., 0700)`.
+        let root = temp_dir("launchd-dirs");
+        let bin = temp_dir("launchd-dirs-bin");
+        write_exec(&bin, "git", 0o755);
+        let state = root.join("state");
+        let logs = state.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        set_mode(&state, 0o700);
+        set_mode(&logs, 0o700);
+        let definitions = state.join(pohunek_paths::LAUNCHD_SUBDIR);
+        std::fs::create_dir(&definitions).unwrap();
+        set_mode(&definitions, 0o755);
+        let real = root.join("real-logs");
+        std::fs::create_dir(&real).unwrap();
+        set_mode(&real, 0o700);
+        std::os::unix::fs::symlink(&real, logs.join(pohunek_paths::LAUNCHD_SUBDIR)).unwrap();
+        let path = OsString::from(bin.as_os_str());
+
+        let checks = assembled(&root, path.clone(), None);
+        let by_name = |name: &str| checks.iter().find(|c| c.name == name).unwrap();
+        assert_eq!(
+            by_name("launchd_definitions_dir").status,
+            DoctorStatus::Fail,
+            "wrong mode"
+        );
+        assert_eq!(
+            by_name("launchd_log_dir").status,
+            DoctorStatus::Fail,
+            "symlink"
+        );
+
+        set_mode(&definitions, 0o700);
+        std::fs::remove_file(logs.join(pohunek_paths::LAUNCHD_SUBDIR)).unwrap();
+        let fixed = assembled(&root, path, None);
+        for name in ["launchd_definitions_dir", "launchd_log_dir"] {
+            let check = fixed.iter().find(|c| c.name == name).unwrap();
+            assert_eq!(check.status, DoctorStatus::Ok, "{name}: {}", check.detail);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn launchd_checks_depend_on_the_supervision_mode() {
+        let base = temp_dir("supervision");
+        let bin = temp_dir("supervision-bin");
+        write_exec(&bin, "git", 0o755);
+        let path = OsString::from(bin.as_os_str());
+        let names = |checks: &[DoctorCheck]| -> Vec<String> {
+            checks
+                .iter()
+                .filter(|c| c.name.starts_with("launchd_"))
+                .map(|c| c.name.clone())
+                .collect()
+        };
+        let mut missing_domain = facts();
+        missing_domain.path_var = Some(path);
+        missing_domain.launchd_domain = Some(DomainProbe::Missing);
+        let run = |supervision: Supervision| {
+            let config_dir = base.join("config");
+            let inputs = StandardCheckInputs {
+                socket_dir: &base.join("runtime"),
+                state_dir: &base.join("data"),
+                log_dir: &base.join("state").join("logs"),
+                launcher_bin_dir: &base,
+                sway_config_dir: &base,
+                config_dir: &config_dir,
+                home_dir: Some(&base),
+                effective_uid: 0,
+                worker: None,
+                access_dirs: &[],
+                supervision,
+            };
+            let mut facts = missing_domain.clone();
+            if supervision == Supervision::Subprocess {
+                facts.launchd_domain = None;
+            }
+            standard_checks(&inputs, &facts)
+        };
+
+        let native = run(Supervision::Native);
+        let domain = native.iter().find(|c| c.name == "launchd_domain").unwrap();
+        assert_eq!(
+            domain.status,
+            DoctorStatus::Fail,
+            "native requires the domain"
+        );
+        assert_eq!(names(&native).len(), 4);
+
+        let unknown = run(Supervision::Unknown);
+        let domain = unknown.iter().find(|c| c.name == "launchd_domain").unwrap();
+        assert_eq!(
+            domain.status,
+            DoctorStatus::Warn,
+            "unknown is at most a warning"
+        );
+        assert!(domain.detail.contains("supervision mode unknown"));
+        assert_eq!(names(&unknown).len(), 4);
+
+        // A dev-subprocess daemon (for example over SSH) has no launchd checks.
+        assert!(names(&run(Supervision::Subprocess)).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn a_subprocess_daemon_does_not_probe_launchd() {
+        struct Panicking;
+        impl Runner for Panicking {
+            fn run(&self, _arguments: &[&str], _deadline: Duration) -> RunOutcome {
+                panic!("launchctl must not run for a subprocess daemon");
+            }
+        }
+        let base = temp_dir("no-probe");
+        let inputs = access_inputs(&base, None, &[]);
+        let subprocess = StandardCheckInputs {
+            supervision: Supervision::Subprocess,
+            ..inputs
+        };
+
+        let collected = MacosFacts::collect(&subprocess, &Panicking);
+
+        assert_eq!(collected.launchd_domain, None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_log_dir_must_be_owned_by_the_effective_user() {
+        let base = temp_dir("log-owner");
+        let root = base.join("state");
+        let logs = root.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        set_mode(&root, 0o700);
+        let uid = std::fs::metadata(&logs).unwrap().uid();
+
+        assert_eq!(check_log_dir_as(&logs, uid).status, DoctorStatus::Ok);
+        // A directory owned by another account cannot be built without chown, so
+        // the ownership predicate is exercised with an injected effective uid.
+        let foreign = check_log_dir_as(&logs, uid.wrapping_add(1));
+        assert_eq!(foreign.status, DoctorStatus::Fail, "{}", foreign.detail);
+        assert!(
+            foreign.detail.contains("cannot reset its mode"),
+            "{}",
+            foreign.detail
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn filesystem_access_states_which_process_context_it_verified() {
+        let base = temp_dir("fs-label");
+        let dirs = [AccessDir {
+            label: "current directory",
+            path: &base,
+        }];
+
+        let check = check_filesystem_access(&access_inputs(&base, None, &dirs));
+
+        assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail);
+        assert!(
+            check.detail.contains("readable by this process"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("current directory"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("not verified"), "{}", check.detail);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_launch_agents_dir_follows_the_installer_rule() {
+        let home = temp_dir("agents-home");
+        let library = home.join("Library");
+        let agents = library.join("LaunchAgents");
+        std::fs::create_dir_all(&agents).unwrap();
+        set_mode(&library, 0o755);
+        let status = |home: Option<&Path>| check_launch_agents_dir(home).status;
+
+        set_mode(&agents, 0o755);
+        assert_eq!(status(Some(&home)), DoctorStatus::Ok);
+        set_mode(&agents, 0o777);
+        assert_eq!(status(Some(&home)), DoctorStatus::Warn, "others may write");
+        set_mode(&agents, 0o755);
+        std::fs::remove_dir(&agents).unwrap();
+        assert_eq!(
+            status(Some(&home)),
+            DoctorStatus::Ok,
+            "absent is created on install"
+        );
+        let real = home.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &agents).unwrap();
+        assert_eq!(status(Some(&home)), DoctorStatus::Warn, "symlink");
+        assert_eq!(status(None), DoctorStatus::Warn);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_doctor_request_timeout_outlasts_every_bounded_probe() {
+        // A wedged `launchctl` blocks the daemon's probe for up to
+        // `PROBE_BUDGET` (10 s), longer than the client's default 5 s request
+        // timeout; the derived timeout must exceed the budget so the daemon's
+        // own timed-out result is delivered.
+        assert!(PROBE_BUDGET >= LAUNCHCTL_DEADLINE);
+        assert!(doctor_request_timeout() > PROBE_BUDGET);
+        assert_eq!(doctor_request_timeout(), PROBE_BUDGET + REPLY_HEADROOM);
+        assert!(PROBE_BUDGET > Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_full_list_creates_no_directory_even_with_a_default_umask_tree() {
+        let base = temp_dir("no-create");
+        let bin = temp_dir("no-create-bin");
+        write_exec(&bin, "git", 0o755);
+        let before = tree(&base);
+
+        let checks = assembled(&base, OsString::from(bin.as_os_str()), None);
+
+        assert_eq!(tree(&base), before, "the doctor must not create anything");
+        for name in [
+            "socket_dir_writable",
+            "state_dir_writable",
+            "log_dir_writable",
+            "worker_runtime_root",
+            "worker_state_root",
+        ] {
+            let check = checks.iter().find(|c| c.name == name).expect(name);
+            assert_eq!(check.status, DoctorStatus::Ok, "{name}: {}", check.detail);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&bin);
+    }
+
+    // --- socket path length --------------------------------------------------
+
+    #[test]
+    fn socket_path_length_accepts_the_default_darwin_runtime_dir() {
+        let check = check_socket_path_length(Path::new("/private/tmp/pohunek-501"));
+        assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail);
+    }
+
+    #[test]
+    fn socket_path_length_fails_for_overlong_runtime_dir() {
+        let long = format!("/private/tmp/{}", "x".repeat(90));
+
+        let check = check_socket_path_length(Path::new(&long));
+
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert!(check.detail.contains("XDG_RUNTIME_DIR"), "{}", check.detail);
+    }
+
+    #[test]
+    fn socket_path_length_fails_when_only_the_worker_path_overflows() {
+        // The daemon socket fits, but the workers/<id>/control.sock path does not.
+        let dir = format!("/private/tmp/{}", "y".repeat(40));
+        validate_staged_socket_path(
+            Path::new(&dir).join(SOCKET_NAME),
+            Platform::MacOs,
+            SocketKind::Daemon,
+        )
+        .expect("the daemon socket fits");
+
+        let check = check_socket_path_length(Path::new(&dir));
+
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert!(check.detail.contains("worker"), "{}", check.detail);
+    }
+
+    // --- login shell / terminal ----------------------------------------------
+
+    #[test]
+    fn login_shell_reports_each_failure_mode_as_warn() {
+        let dir = temp_dir("shell");
+        let zsh = write_exec(&dir, "zsh", 0o755);
+        let plain = write_exec(&dir, "plain", 0o644);
+        let listing = |path: &Path| format!("# shells\n{}\n", path.display());
+
+        let mut f = facts();
+        assert_eq!(check_login_shell(&f).status, DoctorStatus::Warn);
+
+        f.shell = Some(OsString::from("zsh"));
+        assert!(check_login_shell(&f).detail.contains("not an absolute"));
+
+        f.shell = Some(plain.clone().into_os_string());
+        assert!(check_login_shell(&f).detail.contains("not an executable"));
+
+        f.shell = Some(zsh.clone().into_os_string());
+        f.etc_shells = Some(listing(&plain));
+        let unlisted = check_login_shell(&f);
+        assert_eq!(unlisted.status, DoctorStatus::Warn);
+        assert!(
+            unlisted.detail.contains("not listed"),
+            "{}",
+            unlisted.detail
+        );
+
+        f.etc_shells = None;
+        assert!(check_login_shell(&f).detail.contains("could not be read"));
+
+        f.etc_shells = Some(listing(&zsh));
+        assert_eq!(check_login_shell(&f).status, DoctorStatus::Ok);
+
+        // A commented-out entry does not count as listed.
+        f.etc_shells = Some(format!("#{}\n", zsh.display()));
+        assert_eq!(check_login_shell(&f).status, DoctorStatus::Warn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launcher_terminal_mirrors_the_launcher_parser() {
+        assert_eq!(parse_launcher_terminal("# terminal=x\n"), None);
+        assert_eq!(parse_launcher_terminal("terminal=\n"), None);
+        assert_eq!(
+            parse_launcher_terminal("terminal=kitty\n  terminal = wezterm start \n"),
+            Some("wezterm start".to_owned())
+        );
+        // The last assignment wins even when empty: the launcher then falls
+        // back to $TERMINAL, so the earlier value is not in effect.
+        assert_eq!(
+            parse_launcher_terminal("host=local\nterminal=alacritty\nterminal=\n"),
+            None
+        );
+        // A non-comment line without `=` makes the launcher's lookup fail.
+        assert_eq!(
+            parse_launcher_terminal("terminal=kitty\nbroken line\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_terminal_value_with_arguments_is_not_one_executable() {
+        let dir = temp_dir("term-args");
+        write_exec(&dir, "kitty", 0o755);
+        let mut f = facts();
+        f.path_var = Some(OsString::from(dir.as_os_str()));
+
+        f.launcher_terminal = Some("kitty".to_owned());
+        assert_eq!(check_terminal(&f).status, DoctorStatus::Ok);
+
+        // The launcher runs the whole value as one program name.
+        f.launcher_terminal = Some("kitty -e".to_owned());
+        let with_args = check_terminal(&f);
+        assert_eq!(with_args.status, DoctorStatus::Warn, "{}", with_args.detail);
+        assert!(
+            with_args.detail.contains("single program"),
+            "{}",
+            with_args.detail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn terminal_check_covers_stock_and_configured_terminals() {
+        let dir = temp_dir("term");
+        write_exec(&dir, "kitty", 0o755);
+        let path = OsString::from(dir.as_os_str());
+
+        let mut f = facts();
+        f.path_var = Some(path);
+        assert_eq!(check_terminal(&f).status, DoctorStatus::Ok);
+
+        f.launcher_terminal = Some("kitty".to_owned());
+        let configured = check_terminal(&f);
+        assert_eq!(configured.status, DoctorStatus::Ok);
+        assert!(configured.detail.contains("kitty"));
+
+        f.launcher_terminal = Some("no-such-terminal --flag".to_owned());
+        let broken = check_terminal(&f);
+        assert_eq!(broken.status, DoctorStatus::Warn);
+        assert!(broken.detail.contains("launcher.conf"), "{}", broken.detail);
+
+        f.terminal_app_present = false;
+        f.launcher_terminal = None;
+        assert_eq!(check_terminal(&f).status, DoctorStatus::Warn);
+
+        f.launcher_terminal = Some("kitty".to_owned());
+        assert_eq!(check_terminal(&f).status, DoctorStatus::Ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- launchd -------------------------------------------------------------
+
+    struct FakeRunner {
+        outcome: RunOutcome,
+        seen: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl FakeRunner {
+        fn new(outcome: RunOutcome) -> Self {
+            Self {
+                outcome,
+                seen: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Runner for FakeRunner {
+        fn run(&self, arguments: &[&str], _deadline: Duration) -> RunOutcome {
+            self.seen
+                .borrow_mut()
+                .push(arguments.iter().map(|arg| (*arg).to_owned()).collect());
+            self.outcome
+        }
+    }
+
+    #[test]
+    fn domain_probe_maps_exit_statuses_and_passes_argv_only() {
+        let cases = [
+            (RunOutcome::Exited(Some(0)), DomainProbe::Ready),
+            (RunOutcome::Exited(Some(112)), DomainProbe::Missing),
+            (RunOutcome::Exited(Some(5)), DomainProbe::Failed(Some(5))),
+            (RunOutcome::Exited(None), DomainProbe::Failed(None)),
+            (RunOutcome::TimedOut, DomainProbe::TimedOut),
+            (RunOutcome::Unavailable, DomainProbe::Unavailable),
+        ];
+        for (outcome, expected) in cases {
+            let runner = FakeRunner::new(outcome);
+            assert_eq!(
+                probe_launchd_domain(&runner, 501, Duration::from_secs(1)),
+                expected
+            );
+            assert_eq!(
+                runner.seen.borrow().as_slice(),
+                [vec!["print".to_owned(), "gui/501".to_owned()]]
+            );
+        }
+    }
+
+    #[test]
+    fn launchd_domain_check_fails_only_for_a_missing_domain() {
+        let status = |probe| check_launchd_domain(probe, 501).status;
+        assert_eq!(status(DomainProbe::Ready), DoctorStatus::Ok);
+        assert_eq!(status(DomainProbe::Missing), DoctorStatus::Fail);
+        assert_eq!(status(DomainProbe::Failed(Some(9))), DoctorStatus::Warn);
+        assert_eq!(status(DomainProbe::Failed(None)), DoctorStatus::Warn);
+        assert_eq!(status(DomainProbe::TimedOut), DoctorStatus::Warn);
+        assert_eq!(status(DomainProbe::Unavailable), DoctorStatus::Warn);
+        assert!(check_launchd_domain(DomainProbe::Missing, 501)
+            .detail
+            .contains("gui/501"));
+    }
+
+    #[test]
+    fn process_runner_reports_exit_status_timeout_and_unavailable() {
+        let sh = ProcessRunner::for_program("/bin/sh");
+        let generous = Duration::from_secs(30);
+
+        assert_eq!(
+            sh.run(&["-c", "exit 112"], generous),
+            RunOutcome::Exited(Some(112))
+        );
+        assert_eq!(
+            sh.run(&["-c", "exit 0"], generous),
+            RunOutcome::Exited(Some(0))
+        );
+        assert_eq!(
+            sh.run(&["-c", "kill -9 $$"], generous),
+            RunOutcome::Exited(None)
+        );
+        assert_eq!(
+            sh.run(&["-c", "exec sleep 60"], Duration::from_millis(50)),
+            RunOutcome::TimedOut
+        );
+        assert_eq!(
+            ProcessRunner::for_program("/nonexistent/launchctl").run(&["print"], generous),
+            RunOutcome::Unavailable
+        );
+    }
+
+    // --- filesystem access -----------------------------------------------------
+
+    fn access_inputs<'a>(
+        base: &'a Path,
+        home: Option<&'a Path>,
+        access_dirs: &'a [AccessDir<'a>],
+    ) -> StandardCheckInputs<'a> {
+        StandardCheckInputs {
+            socket_dir: base,
+            state_dir: base,
+            log_dir: base,
+            launcher_bin_dir: base,
+            sway_config_dir: base,
+            config_dir: base,
+            home_dir: home,
+            effective_uid: 0,
+            worker: None,
+            access_dirs,
+            supervision: Supervision::Native,
+        }
+    }
+
+    #[test]
+    fn filesystem_access_is_ok_for_readable_and_absent_directories() {
+        let base = temp_dir("fs-ok");
+        let missing = base.join("missing");
+        let dirs = [AccessDir {
+            label: "current directory",
+            path: &missing,
+        }];
+
+        let check = check_filesystem_access(&access_inputs(&base, None, &dirs));
+
+        assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn filesystem_access_explains_a_denied_protected_folder_without_full_disk_access() {
+        let base = temp_dir("fs-tcc");
+        let project = base.join("Documents").join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        set_mode(&project, 0o000);
+        if std::fs::read_dir(&project).is_ok() {
+            // Running with privileges that bypass mode bits: nothing to assert.
+            set_mode(&project, 0o700);
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let dirs = [AccessDir {
+            label: "current directory",
+            path: &project,
+        }];
+
+        let check = check_filesystem_access(&access_inputs(&base, Some(&base), &dirs));
+
+        set_mode(&project, 0o700);
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert!(
+            check.detail.contains("Privacy & Security"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("Files and Folders"));
+        assert!(check.detail.contains("terminal app"));
+        assert!(check.detail.contains("Full Disk Access is not required"));
+        assert!(!check.detail.contains("grant Full Disk Access"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn filesystem_access_reports_plain_permissions_outside_protected_folders() {
+        let base = temp_dir("fs-plain");
+        let project = base.join("Code").join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        set_mode(&project, 0o000);
+        if std::fs::read_dir(&project).is_ok() {
+            set_mode(&project, 0o700);
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let dirs = [AccessDir {
+            label: "current directory",
+            path: &project,
+        }];
+
+        let check = check_filesystem_access(&access_inputs(&base, Some(&base), &dirs));
+
+        set_mode(&project, 0o700);
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert!(check.detail.contains("chown/chmod"), "{}", check.detail);
+        assert!(!check.detail.contains("Privacy"), "{}", check.detail);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn eperm_is_always_a_privacy_denial() {
+        let dir = AccessDir {
+            label: "current directory",
+            path: Path::new("/Volumes/External/project"),
+        };
+        let err = std::io::Error::from_raw_os_error(EPERM);
+
+        let detail = describe_denial(&dir, &err, None);
+
+        assert!(detail.contains("Privacy & Security"), "{detail}");
+
+        let elsewhere = AccessDir {
+            label: "current directory",
+            path: Path::new("/srv/project"),
+        };
+        assert!(describe_denial(&elsewhere, &err, None).contains("Privacy & Security"));
+    }
+
+    #[test]
+    fn protected_locations_cover_documents_desktop_downloads_icloud_and_volumes() {
+        let home = Path::new("/Users/me");
+        for path in [
+            "/Users/me/Documents/a",
+            "/Users/me/Desktop",
+            "/Users/me/Downloads/x/y",
+            "/Users/me/Library/Mobile Documents/com~apple~CloudDocs/p",
+            "/Users/me/Library/CloudStorage/Dropbox/p",
+            "/Volumes/Disk/p",
+        ] {
+            assert!(is_tcc_protected(Path::new(path), Some(home)), "{path}");
+        }
+        for path in ["/Users/me/Code/p", "/Users/me/DocumentsOld/p", "/tmp/p"] {
+            assert!(!is_tcc_protected(Path::new(path), Some(home)), "{path}");
+        }
+    }
+
+    // --- optional capabilities ---------------------------------------------------
+
+    #[test]
+    fn notification_and_keychain_entries_are_never_fatal() {
+        let mut f = facts();
+        let notify = check_desktop_notifications(&f);
+        assert_eq!(notify.status, DoctorStatus::Ok);
+        assert!(notify.detail.contains("cannot be confirmed"));
+        assert_eq!(check_keychain(&f).status, DoctorStatus::Ok);
+
+        f.osascript_present = false;
+        f.security_tool_present = false;
+        f.login_keychain_present = false;
+        assert_eq!(check_desktop_notifications(&f).status, DoctorStatus::Warn);
+        assert_eq!(check_keychain(&f).status, DoctorStatus::Warn);
+
+        f.security_tool_present = true;
+        assert_eq!(check_keychain(&f).status, DoctorStatus::Warn);
+    }
+
+    // --- assembled list --------------------------------------------------------------
+
+    fn assembled(
+        base: &Path,
+        path_var: OsString,
+        worker: Option<&WorkerCandidate>,
+    ) -> Vec<DoctorCheck> {
+        let mut f = facts();
+        f.path_var = Some(path_var);
+        let config_dir = base.join("config");
+        let inputs = StandardCheckInputs {
+            socket_dir: &base.join("runtime"),
+            state_dir: &base.join("data"),
+            // `BasePaths` puts the log directory directly below the state root.
+            log_dir: &base.join("state").join("logs"),
+            launcher_bin_dir: &base.join("bin"),
+            sway_config_dir: &base.join("sway"),
+            config_dir: &config_dir,
+            home_dir: Some(base),
+            effective_uid: std::fs::metadata(base).unwrap().uid(),
+            worker,
+            access_dirs: &[],
+            supervision: Supervision::Native,
+        };
+        standard_checks(&inputs, &f)
+    }
+
+    #[test]
+    fn macos_list_is_ordered_and_omits_linux_only_capabilities() {
+        let base = temp_dir("list");
+        let bin = temp_dir("list-bin");
+        write_exec(&bin, "git", 0o755);
+        let worker = WorkerCandidate {
+            path: write_exec(&bin, "pohunek-sessiond", 0o755),
+            source: WorkerSource::Sibling,
+        };
+
+        let checks = assembled(&base, OsString::from(bin.as_os_str()), Some(&worker));
+        let names = checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            [
+                "bin:git",
+                "bin:codex",
+                "bin:claude",
+                "runtime_dir_private",
+                "socket_path_length",
+                "socket_dir_writable",
+                "state_dir_writable",
+                "log_dir_writable",
+                "worker_runtime_root",
+                "worker_state_root",
+                "filesystem_access",
+                "netbird_cli",
+                "schema_version",
+                "worker_executable",
+                "login_shell",
+                "terminal",
+                "desktop_notifications",
+                "keychain",
+                "launchd_domain",
+                "launchd_definitions_dir",
+                "launchd_log_dir",
+                "launchd_agents_dir",
+            ]
+        );
+        for linux_only in [
+            "bin:rofi",
+            "bin:swaymsg",
+            "bin:python3",
+            "bin:timeout",
+            "launcher_scripts",
+            "sway_include",
+        ] {
+            assert!(!names.contains(&linux_only), "{linux_only} leaked");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn missing_optional_agents_warn_but_a_missing_worker_fails_overall() {
+        let base = temp_dir("overall");
+        let bin = temp_dir("overall-bin");
+        write_exec(&bin, "git", 0o755);
+        let worker = WorkerCandidate {
+            path: write_exec(&bin, "pohunek-sessiond", 0o755),
+            source: WorkerSource::Sibling,
+        };
+        let path = OsString::from(bin.as_os_str());
+
+        let healthy = assembled(&base, path.clone(), Some(&worker));
+        let by_name = |name: &str| healthy.iter().find(|c| c.name == name).unwrap().status;
+        assert_eq!(by_name("bin:codex"), DoctorStatus::Warn);
+        assert_eq!(by_name("bin:claude"), DoctorStatus::Warn);
+        let fails: Vec<_> = healthy
+            .iter()
+            .filter(|c| c.status == DoctorStatus::Fail)
+            .collect();
+        assert!(fails.is_empty(), "{fails:?}");
+
+        let broken = assembled(&base, path, None);
+        assert_eq!(
+            DoctorReport::from_checks(broken).overall,
+            DoctorStatus::Fail
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&bin);
+    }
+
+    fn failing_names(checks: &[DoctorCheck]) -> Vec<&str> {
+        checks
+            .iter()
+            .filter(|check| check.status == DoctorStatus::Fail)
+            .map(|check| check.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn an_isolated_fixture_with_a_default_umask_runtime_dir_fails_and_is_not_probed() {
+        let base = temp_dir("umask");
+        let bin = temp_dir("umask-bin");
+        write_exec(&bin, "git", 0o755);
+        let worker = WorkerCandidate {
+            path: write_exec(&bin, "pohunek-sessiond", 0o755),
+            source: WorkerSource::Environment,
+        };
+        let runtime = base.join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        let path = OsString::from(bin.as_os_str());
+
+        set_mode(&runtime, 0o755);
+        let loose = assembled(&base, path.clone(), Some(&worker));
+        assert_eq!(
+            failing_names(&loose),
+            ["runtime_dir_private", "socket_dir_writable"]
+        );
+
+        set_mode(&runtime, 0o700);
+        let private = assembled(&base, path, Some(&worker));
+        assert!(failing_names(&private).is_empty(), "{private:?}");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn a_long_isolated_root_overflows_the_worker_socket_limit() {
+        // Shape of a test fixture root on macOS: canonical /private/tmp plus a
+        // descriptive directory name, with the runtime dir at run/pohunek.
+        let long = Path::new("/private/tmp/pohunek-cli-process-api-12345-0/run/pohunek");
+        let short = Path::new("/private/tmp/pcpa-12345-0/run/pohunek");
+
+        let overflow = check_socket_path_length(long);
+        assert_eq!(overflow.status, DoctorStatus::Fail);
+        assert!(overflow.detail.contains("worker"), "{}", overflow.detail);
+        assert_eq!(check_socket_path_length(short).status, DoctorStatus::Ok);
+    }
+
+    #[test]
+    fn agent_hint_explains_launchd_path_without_naming_a_homebrew_prefix() {
+        let mut f = facts();
+        f.path_var = Some(OsString::new());
+
+        let check = agent_binary("codex", &f);
+
+        assert_eq!(check.status, DoctorStatus::Warn);
+        assert!(check.detail.contains("launchd"), "{}", check.detail);
+        assert!(!check.detail.contains("/opt/homebrew"));
+    }
+}

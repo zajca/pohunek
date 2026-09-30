@@ -4,10 +4,13 @@
 //! `hostcheck` crate; this module only selects which checks to run on the host
 //! that owns the agent runtime and assembles them into a [`DoctorReport`].
 
-use hostcheck::StandardCheckInputs;
+use std::path::PathBuf;
+
+use hostcheck::{StandardCheckInputs, Supervision, WorkerCandidate, WorkerSource};
 use protocol::{DoctorCheck, DoctorReport, DoctorStatus, QuarantineReason};
 
 use crate::governance::{HostGovernanceDiagnostic, HostGovernanceService};
+use crate::session::ActiveSupervision;
 use crate::Paths;
 
 /// The bounded daemon doctor task did not produce a report.
@@ -23,27 +26,58 @@ pub struct DoctorReportError;
 /// # Errors
 ///
 /// Returns [`DoctorReportError`] when the bounded blocking host-check task fails.
-pub async fn report(
+///
+/// `supervision` is the worker supervision the daemon runs with, or `None`
+/// when it has none.
+pub(crate) async fn report(
     paths: &Paths,
     governance: &HostGovernanceService,
+    supervision: Option<ActiveSupervision>,
 ) -> Result<DoctorReport, DoctorReportError> {
     let paths = paths.clone();
-    let mut checks = tokio::task::spawn_blocking(move || standard_checks(&paths))
-        .await
-        .map_err(|_error| DoctorReportError)?;
+    let mode = supervision_mode(supervision.as_ref());
+    let worker = supervision.map(|active| WorkerCandidate {
+        path: active.worker_executable,
+        source: WorkerSource::Supervision,
+    });
+    let mut checks =
+        tokio::task::spawn_blocking(move || standard_checks(&paths, worker.as_ref(), mode))
+            .await
+            .map_err(|_error| DoctorReportError)?;
     checks.extend(governance_checks(governance.diagnose().await));
     Ok(DoctorReport::from_checks(checks))
 }
 
-fn standard_checks(paths: &Paths) -> Vec<DoctorCheck> {
+/// The launchd-relevant supervision mode: native jobs, direct children, or
+/// unknown when the daemon has no worker supervision.
+fn supervision_mode(active: Option<&ActiveSupervision>) -> Supervision {
+    match active {
+        Some(active) if active.native => Supervision::Native,
+        Some(_) => Supervision::Subprocess,
+        None => Supervision::Unknown,
+    }
+}
+
+fn standard_checks(
+    paths: &Paths,
+    worker: Option<&WorkerCandidate>,
+    supervision: Supervision,
+) -> Vec<DoctorCheck> {
     let launcher_bin_dir = paths.launcher_bin_dir();
     let sway_config_dir = paths.sway_config_dir();
+    let home_dir = std::env::var_os(pohunek_paths::HOME).map(PathBuf::from);
     hostcheck::standard_checks(StandardCheckInputs {
         socket_dir: &paths.runtime_dir,
         state_dir: &paths.data_dir,
         log_dir: &paths.log_dir,
         launcher_bin_dir: &launcher_bin_dir,
         sway_config_dir: &sway_config_dir,
+        config_dir: &paths.config_dir,
+        home_dir: home_dir.as_deref(),
+        effective_uid: nix::unistd::Uid::effective().as_raw(),
+        worker,
+        access_dirs: &[],
+        supervision,
     })
 }
 
@@ -150,7 +184,7 @@ fn check(name: &'static str, status: DoctorStatus, detail: &str) -> DoctorCheck 
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use base64::prelude::{Engine as _, BASE64_URL_SAFE_NO_PAD};
 
@@ -181,13 +215,28 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn the_supervision_mode_follows_the_active_supervision() {
+        let active = |native| ActiveSupervision {
+            worker_executable: PathBuf::from("/opt/pohunek-sessiond"),
+            native,
+        };
+
+        assert_eq!(supervision_mode(Some(&active(true))), Supervision::Native);
+        assert_eq!(
+            supervision_mode(Some(&active(false))),
+            Supervision::Subprocess
+        );
+        assert_eq!(supervision_mode(None), Supervision::Unknown);
+    }
+
     #[tokio::test]
     async fn report_contains_writable_daemon_paths_and_governance_checks() {
         let root = temp_dir("report");
         let paths = paths_at(&root);
 
         let service = crate::governance::HostGovernanceService::open_test();
-        let report = report(&paths, &service).await.expect("doctor report");
+        let report = report(&paths, &service, None).await.expect("doctor report");
 
         assert!(report
             .checks

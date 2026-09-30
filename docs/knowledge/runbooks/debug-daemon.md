@@ -12,7 +12,15 @@ since: 0.3.3
 
 Use this runbook when commands report that the daemon is unreachable or unhealthy.
 
-1. Run `pohunek doctor --json` for local environment checks.
+1. Run `pohunek doctor --json` for local environment checks. On macOS this
+   includes `runtime_dir_private`, `socket_path_length`, `worker_executable`,
+   `launchd_domain`, `launchd_job`, `filesystem_access` (a Privacy & Security
+   denial names the terminal app or the daemon executables to grant under Files
+   and Folders; Full Disk Access is not the default remedy), `login_shell`,
+   `terminal`, `desktop_notifications` and `keychain`; see
+   [local setup](../guides/setup.md#doctor-checks-by-platform). `daemon.doctor`
+   returns the same list minus the CLI-only `launchd_job` and current-directory
+   probe, evaluated on the host that owns the runtime.
 2. Run `pohunek health --json` to query the local daemon.
    If path resolution fails first, inspect `XDG_RUNTIME_DIR`. It must be an
    absolute nonempty path when present. Linux requires it; macOS uses

@@ -157,6 +157,9 @@ struct World {
     socket_pid: Option<Pid>,
     /// The running job reports no main process.
     processless: bool,
+    /// State an inactive job is observed in; `Stopped` when unset. The launchd
+    /// backend reports `Unknown` (no process) for every loaded, inactive label.
+    inactive_state: Option<ServiceState>,
     fail_discover: bool,
     silent_version: Option<String>,
     /// Version whose daemon definition `replace` refuses without effect.
@@ -264,7 +267,7 @@ impl DaemonSupervisor for Fake {
                 state: if world.running {
                     ServiceState::Running
                 } else {
-                    ServiceState::Stopped
+                    world.inactive_state.unwrap_or(ServiceState::Stopped)
                 },
                 process: (world.running && !world.processless).then_some(ProcessIdentity {
                     pid: DAEMON_PID,
@@ -2560,6 +2563,35 @@ async fn a_second_command_is_refused_while_a_transaction_holds_the_lock() {
     assert!(!status.transaction_in_progress);
     harness.upgrade(V2).await.expect("upgrade after release");
     harness.assert_installed(V2);
+}
+
+/// The `launchd_job` doctor check for the status the engine reports.
+async fn doctor_status(harness: &Harness, reachable: bool) -> protocol::DoctorStatus {
+    use crate::commands::doctor::launchd_job_check;
+
+    let config = harness.config();
+    let status = harness
+        .engine()
+        .status(config.as_ref())
+        .await
+        .expect("status");
+    launchd_job_check(Ok(status), reachable, hostcheck::Supervision::Native).status
+}
+
+#[tokio::test]
+async fn doctor_reads_the_daemon_job_from_the_status_the_engine_reports() {
+    use protocol::DoctorStatus;
+
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    assert_eq!(doctor_status(&harness, true).await, DoctorStatus::Ok);
+
+    // A loaded job that lost its process is `unknown` under launchd: it is a
+    // failure only when the daemon does not answer either.
+    harness.fake.world().running = false;
+    harness.fake.world().inactive_state = Some(ServiceState::Unknown);
+    assert_eq!(doctor_status(&harness, false).await, DoctorStatus::Fail);
+    assert_eq!(doctor_status(&harness, true).await, DoctorStatus::Warn);
 }
 
 #[tokio::test]

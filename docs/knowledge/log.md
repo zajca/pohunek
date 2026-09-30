@@ -2,6 +2,14 @@
 
 ## Unreleased (2026-09-29)
 
+- Documented macOS platform diagnostics and setup: the platform-specific
+  `pohunek doctor` and `daemon.doctor` check lists (Linux-only launcher probes
+  omitted on macOS; `runtime_dir_private`, `socket_path_length`,
+  `filesystem_access` with the Privacy & Security explanation,
+  `worker_executable`, `launchd_domain`, `launchd_job`, `login_shell`,
+  `terminal`, `desktop_notifications`, `keychain`), executable resolution that
+  requires an execute bit, and `pohunek setup` skipping the sway/rofi steps on
+  macOS with a successful, typed `skipped` outcome.
 - Documented transcript indexing for external observation: a bounded
   reconciliation pass every 30 seconds (and on lost-event hints) converges the
   index independently of the inotify or FSEvents watcher, which only reduces

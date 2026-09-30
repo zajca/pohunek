@@ -4372,7 +4372,11 @@ name = "pohunek-hostcheck"
 version = "0.31.6"
 dependencies = [
  "pohunek-netbird",
+ "pohunek-paths",
+ "pohunek-platform",
  "pohunek-protocol",
+ "pohunek-test-support",
+ "rustix 1.1.4",
 ]
 
 [[package]]

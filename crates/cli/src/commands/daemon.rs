@@ -116,33 +116,40 @@ fn foreground_exec(mut command: Command) -> Result<(), CliError> {
 }
 
 /// Locate the `pohunekd` binary: sibling of the running CLI, then `PATH`.
-fn locate_daemon() -> Result<PathBuf, CliError> {
+pub(crate) fn locate_daemon() -> Result<PathBuf, CliError> {
     if let Ok(current) = std::env::current_exe() {
         if let Some(dir) = current.parent() {
             let sibling = dir.join(DAEMON_BIN);
-            if sibling.is_file() {
+            if hostcheck::is_executable_file(&sibling) {
                 return Ok(sibling);
             }
         }
     }
     if let Some(found) = which_on_path(DAEMON_BIN) {
-        return Ok(found);
+        return absolute(&found);
     }
     Err(CliError::Spawn(format!(
         "could not find '{DAEMON_BIN}' next to the CLI or on PATH"
     )))
 }
 
-/// Minimal dependency-free `which` (same approach as the doctor command).
+/// Make a located binary path absolute without touching the filesystem.
+///
+/// A relative `PATH` entry yields a relative match; the spawned daemon sees its
+/// own absolute `current_exe()`, and everything derived from the located path
+/// (such as the sibling worker) must agree with that.
+fn absolute(path: &Path) -> Result<PathBuf, CliError> {
+    std::path::absolute(path).map_err(|error| {
+        CliError::Spawn(format!(
+            "could not make '{}' absolute: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// Resolve a binary on `PATH` to an executable file.
 fn which_on_path(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    hostcheck::which_on_path(name)
 }
 
 #[cfg(test)]
@@ -150,6 +157,50 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
+
+    #[test]
+    fn a_relative_path_match_becomes_absolute() {
+        let located = absolute(Path::new("bin/pohunekd")).expect("absolute path");
+
+        assert!(located.is_absolute(), "{}", located.display());
+        assert!(located.ends_with("bin/pohunekd"));
+        assert_eq!(
+            located
+                .parent()
+                .map(|dir| dir.join("pohunek-sessiond"))
+                .map(|worker| worker.is_absolute()),
+            Some(true),
+            "the derived sibling worker path is absolute too"
+        );
+        assert_eq!(
+            absolute(Path::new("/opt/bin/pohunekd")).unwrap(),
+            Path::new("/opt/bin/pohunekd")
+        );
+    }
+
+    #[test]
+    fn non_executable_daemon_binary_on_path_is_not_resolved() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir =
+            std::env::temp_dir().join(format!("pohunek-locate-daemon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let plain = dir.join(DAEMON_BIN);
+        std::fs::write(&plain, b"#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        assert_eq!(
+            hostcheck::resolve_executable(DAEMON_BIN, Some(dir.as_os_str())),
+            None
+        );
+
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(
+            hostcheck::resolve_executable(DAEMON_BIN, Some(dir.as_os_str())),
+            Some(plain)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn service_mode_passes_only_the_service_config() {

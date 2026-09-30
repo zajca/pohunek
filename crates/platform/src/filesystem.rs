@@ -588,6 +588,48 @@ impl TrustedDir {
         Ok(directory)
     }
 
+    /// Opens an existing absolute directory and validates it as an ancestor
+    /// under which [`Self::open_or_create_absolute`] would create children,
+    /// without creating anything.
+    ///
+    /// Every component, the final one included, is opened without following
+    /// symlinks and must pass the ancestor policy: an effective-user-owned
+    /// directory must not be group- or world-writable, and a system-owned one
+    /// must be sticky or non-writable. A read-only diagnostic uses this to tell
+    /// whether startup could create a missing directory below `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FsError`] when the path is invalid, missing, or unsafe.
+    pub fn open_absolute_ancestor(path: impl AsRef<Path>) -> FsResult<Self> {
+        let components = absolute_components(path.as_ref())?;
+        let root_fd = fs::open(
+            Path::new("/"),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|source| io_error("open filesystem root", Path::new("/"), source))?;
+        let mut directory = Self {
+            path: PathBuf::from("/"),
+            file: File::from(root_fd),
+        };
+        let root_stat = fs::fstat(&directory.file)
+            .map_err(|source| io_error("inspect filesystem root", Path::new("/"), source))?;
+        let system_uid = stat_uid(&root_stat);
+        let effective_uid = rustix::process::geteuid().as_raw();
+        for component in components {
+            directory = directory.open_child_inner(component, 0o700, false, false)?;
+            validate_ancestor(
+                &directory.file,
+                &directory.path,
+                0o700,
+                effective_uid,
+                system_uid,
+            )?;
+        }
+        Ok(directory)
+    }
+
     /// Opens or creates and validates an absolute directory without following symlinks.
     ///
     /// Missing path components and the final directory use exact `mode`. Existing
@@ -3552,6 +3594,47 @@ mod tests {
         let trusted = TrustedDir::open_absolute(&canonical_path, DIRECTORY_MODE)
             .expect("open trusted temporary directory");
         (temporary, trusted)
+    }
+
+    #[test]
+    fn ancestor_validation_accepts_a_private_directory_and_creates_nothing() {
+        let temporary = tempfile::tempdir().expect("create fixture root");
+        // Canonical: the macOS temporary directory sits below the `/var` symlink,
+        // which the ancestor policy refuses.
+        let root = fs::canonicalize(temporary.path()).expect("canonicalize fixture root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("set fixture root mode");
+        let missing = root.join("missing");
+
+        TrustedDir::open_absolute_ancestor(&root).expect("private ancestor");
+        let error = TrustedDir::open_absolute_ancestor(&missing).expect_err("missing");
+
+        assert_eq!(error.io_kind(), Some(io::ErrorKind::NotFound));
+        assert!(
+            !missing.exists(),
+            "validation must not create the directory"
+        );
+    }
+
+    #[test]
+    fn ancestor_validation_rejects_writable_and_symlinked_directories() {
+        let temporary = tempfile::tempdir().expect("create fixture root");
+        // Canonical: the macOS temporary directory sits below the `/var` symlink,
+        // which the ancestor policy refuses.
+        let root = fs::canonicalize(temporary.path()).expect("canonicalize fixture root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("set fixture root mode");
+        let open = root.join("open");
+        fs::create_dir(&open).expect("create directory");
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).expect("make world-writable");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&root, &link).expect("create symlink");
+
+        assert!(matches!(
+            TrustedDir::open_absolute_ancestor(&open),
+            Err(FsError::UnsafeMode { .. })
+        ));
+        TrustedDir::open_absolute_ancestor(&link).expect_err("a symlinked ancestor is refused");
     }
 
     #[test]

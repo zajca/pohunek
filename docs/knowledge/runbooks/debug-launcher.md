@@ -25,5 +25,11 @@ session.
 6. If a session starts but does not appear where expected, use
    `pohunek session list --json` and `pohunek session inspect <target> --json`.
 
+On macOS the rofi/sway launcher does not apply: steps 2 and 4 are skipped by
+`pohunek setup` (an explicit `pohunek setup sway` reports `skipped` and exits
+successfully), and `pohunek doctor` reports the terminal, worker, launchd and
+filesystem-privacy checks described in [local setup](../guides/setup.md#doctor-checks-by-platform)
+instead of the sway/rofi probes.
+
 Keep launcher diagnosis layered: first daemon health, then installed assets, then
 project/action resolution, then session state.

@@ -877,7 +877,7 @@ pub fn valid_runtime_id(id: &str) -> Option<&Path> {
 }
 
 /// Prefix of every managed worker session ID.
-const WORKER_SESSION_ID_PREFIX: &str = "s-";
+pub const WORKER_SESSION_ID_PREFIX: &str = "s-";
 
 /// Most digits a numeric worker session ID may carry.
 ///
@@ -917,6 +917,17 @@ pub fn valid_worker_session_id(id: &str) -> Option<&str> {
             || matches!(byte, b'A'..=b'H' | b'J'..=b'K' | b'M' | b'N' | b'P'..=b'T' | b'V'..=b'Z')
     });
     (numeric || ulid).then_some(id)
+}
+
+/// Returns the longest valid managed worker session ID.
+///
+/// All-zero digits are valid in both the numeric and the ULID form, so the ID
+/// has exactly [`MAX_WORKER_SESSION_ID_BYTES`] bytes. Path-length checks use it
+/// to size the longest worker socket path.
+#[must_use]
+pub fn longest_worker_session_id() -> String {
+    let digits = MAX_WORKER_SESSION_ID_BYTES - WORKER_SESSION_ID_PREFIX.len();
+    format!("{WORKER_SESSION_ID_PREFIX}{}", "0".repeat(digits))
 }
 
 /// Validates an opaque worker ID used as a filename.
@@ -993,6 +1004,15 @@ pub fn encode_worker_generation(entropy: [u8; WORKER_GENERATION_ENTROPY_BYTES]) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn longest_worker_session_id_is_valid_and_maximal() {
+        let id = super::longest_worker_session_id();
+
+        assert_eq!(id.len(), MAX_WORKER_SESSION_ID_BYTES);
+        assert!(id.starts_with(WORKER_SESSION_ID_PREFIX));
+        assert!(valid_worker_session_id(&id).is_some());
+    }
+
     use super::*;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

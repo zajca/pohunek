@@ -291,6 +291,27 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, expected)
                 self.assertEqual(popen.call_args.args[0], [TRUE_BINARY, "doctor", "--json"])
 
+    def test_verify_compatibility_accepts_a_host_health_failure_with_a_valid_envelope(self) -> None:
+        output = json.dumps({
+            "cli_version": "x",
+            "protocol": {"minimum": 1, "maximum": 3},
+            "ok": {"overall": "fail", "checks": []},
+        }).encode()
+        runner = CliRunner(policy())
+        process = mock.Mock()
+        process.wait.return_value = 1
+        with mock.patch("pohunek.cli.subprocess.Popen", return_value=process), mock.patch.object(runner, "_collect", return_value=(output, b"")):
+            runner.verify_compatibility()
+
+        # Only the compatibility probe tolerates the status; a tool call does not.
+        runner = CliRunner(policy())
+        process = mock.Mock()
+        process.wait.return_value = 1
+        with mock.patch("pohunek.cli.subprocess.Popen", return_value=process), mock.patch.object(runner, "_collect", return_value=(output, b"")):
+            with self.assertRaises(CliError) as raised:
+                runner.run(Invocation(("session", "list", "--json")))
+        self.assertEqual(raised.exception.code, "pohunek_cli_invalid_envelope")
+
     def test_validates_protocol_envelope(self) -> None:
         runner = CliRunner(policy())
         output = json.dumps({"cli_version": "x", "protocol": {"minimum": 2, "maximum": 3}, "ok": {"id": "s"}}).encode()
