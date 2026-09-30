@@ -54,7 +54,11 @@ pub fn resolve_executable(
     program: &OsStr,
     search: &SearchPath,
 ) -> Result<PathBuf, ExecutableError> {
-    resolve_in(program, search.entries().iter().map(PathBuf::as_path))
+    resolve_in(
+        program,
+        search.entries().iter().map(PathBuf::as_path),
+        Owners::current(),
+    )
 }
 
 /// Resolves `program` against the raw value of an environment `PATH`.
@@ -79,12 +83,17 @@ pub fn resolve_executable_in_path_value(
                 .collect()
         })
         .unwrap_or_default();
-    resolve_in(program, entries.iter().map(PathBuf::as_path))
+    resolve_in(
+        program,
+        entries.iter().map(PathBuf::as_path),
+        Owners::current(),
+    )
 }
 
 fn resolve_in<'a>(
     program: &OsStr,
     directories: impl Iterator<Item = &'a Path>,
+    owners: Owners,
 ) -> Result<PathBuf, ExecutableError> {
     let bytes = program.as_bytes();
     if bytes.is_empty() || bytes.contains(&0) {
@@ -95,7 +104,7 @@ fn resolve_in<'a>(
         if !path.is_absolute() {
             return Err(ExecutableError::RelativePath);
         }
-        return if is_executable_file(path) {
+        return if is_trusted_executable(path, owners) {
             Ok(path.to_path_buf())
         } else {
             Err(ExecutableError::NotExecutable)
@@ -103,20 +112,73 @@ fn resolve_in<'a>(
     }
     directories
         .map(|directory| directory.join(program))
-        .find(|candidate| is_executable_file(candidate))
+        .find(|candidate| is_trusted_executable(candidate, owners))
         .ok_or(ExecutableError::NotFound)
 }
 
-/// Whether `path` is a regular file the effective user can execute.
+/// Users whose files may be executed: the effective user and root.
+#[derive(Debug, Clone, Copy)]
+struct Owners {
+    effective: u32,
+    root: u32,
+}
+
+impl Owners {
+    fn current() -> Self {
+        Self {
+            effective: rustix::process::geteuid().as_raw(),
+            root: 0,
+        }
+    }
+
+    const fn allows(self, uid: u32) -> bool {
+        uid == self.effective || uid == self.root
+    }
+}
+
+/// Whether `path` is an executable the daemon may run as the owner.
 ///
-/// Asks the kernel with `faccessat(X_OK, AT_EACCESS)`, so owner, group, ACL,
-/// and parent-directory search permission all count. Symlinks are followed.
-/// A candidate the user cannot execute is skipped, as a shell skips it.
+/// The decision is bound to the opened file: symlinks are resolved first, then
+/// the final file is opened with `O_NOFOLLOW | O_CLOEXEC` and its descriptor is
+/// inspected. It must be a regular file owned by the effective user or root,
+/// writable by neither group nor others, and (on macOS) free of an ACL that
+/// grants anything, using the platform's own ACL check for trusted entries.
+/// Finally the kernel must agree the effective user can execute it
+/// (`faccessat(X_OK, AT_EACCESS)`). A symlink's own owner is irrelevant once its
+/// target is validated. An untrusted candidate is skipped, like one the shell
+/// cannot execute. An executable the user cannot read cannot be opened and is
+/// skipped as well. The path is returned as found, not canonicalized, so a
+/// multi-call binary keeps the name it was invoked by; group-writable
+/// executables (an admin-group Intel Homebrew) are out of scope.
 pub(super) fn is_executable_file(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+    is_trusted_executable(path, Owners::current())
+}
+
+fn is_trusted_executable(path: &Path, owners: Owners) -> bool {
+    use rustix::fs::{FileType, Mode, OFlags};
+
+    let Ok(target) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(descriptor) = rustix::fs::open(
+        &target,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return false;
+    };
+    let file = std::fs::File::from(descriptor);
+    let Ok(stat) = rustix::fs::fstat(&file) else {
+        return false;
+    };
+    let mode = Mode::from_raw_mode(stat.st_mode);
+    FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+        && owners.allows(stat.st_uid)
+        && !mode.intersects(Mode::WGRP | Mode::WOTH)
+        && crate::filesystem::validate_private_acl(&file, &target).is_ok()
         && rustix::fs::accessat(
             rustix::fs::CWD,
-            path,
+            &target,
             rustix::fs::Access::EXEC_OK,
             rustix::fs::AtFlags::EACCESS,
         )
@@ -322,6 +384,122 @@ mod tests {
         assert_eq!(
             resolve_executable_in_path_value(OsStr::new("agent"), Some(OsStr::new(&path))),
             Ok(agent)
+        );
+    }
+
+    fn with_mode(dir: &Path, name: &str, mode: u32) -> PathBuf {
+        let path = executable(dir, name);
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("chmod");
+        path
+    }
+
+    #[test]
+    fn a_writable_candidate_is_skipped_and_a_later_trusted_one_wins() {
+        let dir = fixture();
+        let loose = dir.path().join("loose");
+        let tight = dir.path().join("tight");
+        make_dir(dir.path(), &loose);
+        make_dir(dir.path(), &tight);
+        let trusted = executable(&tight, "agent");
+        let search = SearchPath::new(vec![loose.clone(), tight]).expect("search");
+        for mode in [0o777, 0o775, 0o757, 0o722] {
+            with_mode(&loose, "agent", mode);
+            assert_eq!(
+                resolve_executable(OsStr::new("agent"), &search),
+                Ok(trusted.clone()),
+                "mode {mode:o}"
+            );
+            // A configured absolute path gets the same verdict.
+            assert_eq!(
+                resolve_executable(loose.join("agent").as_os_str(), &search),
+                Err(ExecutableError::NotExecutable),
+                "mode {mode:o}"
+            );
+        }
+        // Tight modes are accepted, with or without the read bits for others.
+        for mode in [0o755, 0o700, 0o750, 0o711] {
+            let path = with_mode(&loose, "agent", mode);
+            assert_eq!(
+                resolve_executable(OsStr::new("agent"), &search),
+                Ok(path),
+                "mode {mode:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_foreign_owned_candidate_is_skipped() {
+        let dir = fixture();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        make_dir(dir.path(), &first);
+        make_dir(dir.path(), &second);
+        let mine = executable(&first, "agent");
+        let other = executable(&second, "agent");
+        let dirs = [first.as_path(), second.as_path()];
+        // The real owner of both files is neither of these ids, which stand in
+        // for "another account" since a test cannot chown.
+        let strangers = Owners {
+            effective: u32::MAX - 1,
+            root: u32::MAX - 2,
+        };
+        assert_eq!(
+            resolve_in(OsStr::new("agent"), dirs.into_iter(), strangers),
+            Err(ExecutableError::NotFound)
+        );
+        assert_eq!(
+            resolve_in(mine.as_os_str(), std::iter::empty(), strangers),
+            Err(ExecutableError::NotExecutable)
+        );
+        // Owned by the effective user, the first one wins again.
+        let me = Owners {
+            effective: rustix::process::geteuid().as_raw(),
+            root: u32::MAX - 2,
+        };
+        assert_eq!(
+            resolve_in(OsStr::new("agent"), dirs.into_iter(), me),
+            Ok(mine)
+        );
+        assert_ne!(other, dir.path());
+    }
+
+    #[test]
+    fn a_symlink_is_judged_by_its_target() {
+        let dir = fixture();
+        let cellar = dir.path().join("Cellar");
+        let bin = dir.path().join("bin");
+        make_dir(dir.path(), &cellar);
+        make_dir(dir.path(), &bin);
+        let real = executable(&cellar, "tool");
+        let link = bin.join("tool");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let search = SearchPath::new(vec![bin.clone()]).expect("search");
+        // The link itself is returned, like a shell would, after the target passed.
+        assert_eq!(
+            resolve_executable(OsStr::new("tool"), &search),
+            Ok(link.clone())
+        );
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert_eq!(
+            resolve_executable(OsStr::new("tool"), &search),
+            Err(ExecutableError::NotFound)
+        );
+        // A dangling link is no executable either.
+        fs::remove_file(&real).expect("remove target");
+        assert_eq!(
+            resolve_executable(OsStr::new("tool"), &search),
+            Err(ExecutableError::NotFound)
+        );
+    }
+
+    #[test]
+    fn a_directory_or_special_file_is_never_an_executable() {
+        let dir = fixture();
+        make_dir(dir.path(), &dir.path().join("agent"));
+        let search = SearchPath::new(vec![dir.path().to_path_buf()]).expect("search");
+        assert_eq!(
+            resolve_executable(OsStr::new("agent"), &search),
+            Err(ExecutableError::NotFound)
         );
     }
 }

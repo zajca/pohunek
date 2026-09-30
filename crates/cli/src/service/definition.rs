@@ -70,7 +70,7 @@ pub fn identity_config(
     config_with_search_path(context, prefix, version, SearchPath::empty())
 }
 
-fn config_with_search_path(
+pub(crate) fn config_with_search_path(
     context: &Context,
     prefix: &Path,
     version: &str,

@@ -50,6 +50,16 @@ Highest priority first:
    `/usr/local/{bin,sbin}` (Intel Homebrew and vendor installers), then the
    system directories. No single Homebrew prefix is assumed.
 
+An executable found by any tier (and the login shell itself) is judged on the
+opened file: symlinks are resolved, then the final file must be a regular file
+owned by the user or root, writable by neither group nor others, and without an
+ACL that grants access (macOS), and the kernel must agree the user can run it.
+A candidate that fails is skipped and the search goes on, like one the shell
+cannot execute. The path is returned as found, not canonicalized, so a
+multi-call binary (`sh` linked to `bash` or `busybox`) keeps the name it was
+started by. Group-writable executables, such as an admin-group Intel Homebrew,
+are out of scope.
+
 Login-shell output and the fallback table are untrusted input, so a directory
 is kept only when it is trusted: symlinks are resolved, every component of the
 canonical path is owned by the user or root and not writable by others (the
@@ -79,7 +89,9 @@ Discovery fails closed and never invents a value for required configuration:
 | `$SHELL` is set but not absolute | `pohunek service install` fails (`service_environment_invalid`) |
 | `$SHELL` is unset | `/bin/zsh` is used and the report says so |
 
-If not even one trusted fallback directory exists, `pohunek service install`
+The discovery environment is validated, and discovery run, before any install
+effect, including before a foreign pending transaction is rolled back, and
+`pohunek service check` runs the same validation. If not even one trusted fallback directory exists, `pohunek service install`
 fails with `service_search_path_unavailable` instead of starting a daemon with
 an empty search path. A `HOME`, `USER`, or `LOGNAME` that is set but not UTF-8
 fails the install rather than being left out of the probe environment.

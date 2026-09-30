@@ -859,6 +859,26 @@ mod tests {
     }
 
     #[test]
+    fn a_writable_candidate_is_never_launched_and_does_not_shadow_a_trusted_one() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let first = temp_dir("writable-first");
+        let second = temp_dir("writable-second");
+        // Mode 0777 lets any account replace the file the daemon would run.
+        let loose = write_executable(&first, "agent");
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o777)).expect("chmod");
+        let trusted = write_executable(&second, "agent");
+        let path = std::env::join_paths([&first, &second]).expect("join");
+        let resolved = with_path(Path::new(&path), || {
+            (which_executable("agent"), resolve_binary("agent"))
+        });
+        assert_eq!(resolved.0.as_deref(), Some(trusted.as_path()));
+        assert_eq!(resolved.1.expect("resolves"), trusted.display().to_string());
+        // Alone, the writable candidate does not resolve at all.
+        let alone = with_path(first.as_path(), || resolve_binary("agent"));
+        alone.expect_err("a writable candidate alone does not resolve");
+    }
+
+    #[test]
     fn the_launch_path_refuses_relative_programs_and_path_entries() {
         let cwd = temp_dir("launch-relative");
         let relative_dir = cwd.join("bin");

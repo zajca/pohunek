@@ -126,6 +126,7 @@ use std::time::{Duration, Instant};
 
 use pohunek_paths::InstallLayout;
 use pohunek_platform::process::{HostInspector, Pid, ProcessInspector};
+use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::{
     self, JobDefinition, Namespace, ServiceObservation, ServiceState, WorkerKey,
 };
@@ -135,7 +136,7 @@ use protocol::{RuntimeState, SessionInfo, SessionState};
 use super::backend::Backend;
 use super::context::Context;
 use super::definition::{
-    daemon_definition, identity_config, initial_config_reported, with_version,
+    config_with_search_path, daemon_definition, identity_config, with_version,
 };
 use super::error::{supervisor_error, Error, LiveSession, OutdatedWorker};
 use super::layout::{self, Staged};
@@ -288,7 +289,12 @@ impl<'a> Engine<'a> {
     ) -> Result<InstallReport, Error> {
         let _transaction = self.transaction().await?;
         let layout = install_preflight(self.context, prefix)?;
-        let (resume, rolled_back) = match install_plan(self.store.load()?, prefix, version)? {
+        let plan = install_plan(self.store.load()?, prefix, version)?;
+        // The discovery environment is judged, and discovery run, before a
+        // foreign pending transaction is rolled back, so a hostile environment
+        // fails the install with nothing changed.
+        let discovered = discover_for_plan(self.context, &plan)?;
+        let (resume, rolled_back) = match plan {
             Plan::Fresh => (None, None),
             Plan::Resume(record) => (Some(record), None),
             Plan::RollBack(record) => {
@@ -320,7 +326,14 @@ impl<'a> Engine<'a> {
                 };
                 (config, report)
             }
-            _ => initial_config_reported(self.context, prefix, version)?,
+            _ => {
+                let (search_path, report) =
+                    discovered.expect("a plan that writes service.toml discovered the search path");
+                (
+                    config_with_search_path(self.context, prefix, version, search_path)?,
+                    report,
+                )
+            }
         };
         let namespace = config.namespace();
         let claimed = layout::claim_prefix(&layout, &namespace)?;
@@ -1438,6 +1451,30 @@ pub(crate) fn install_preflight(context: &Context, prefix: &Path) -> Result<Inst
     let layout = install_layout(prefix)?;
     check_layout_dirs(context, &layout)?;
     Ok(layout)
+}
+
+/// Resolves the daemon `PATH` when the install plan will write `service.toml`.
+///
+/// A fresh install, a rolled-back one, and a resume before the config step
+/// resolve it; a resume after that step keeps the recorded path. The discovery
+/// environment and a missing trusted directory fail here, before any effect.
+/// `pohunek service check` runs the same function.
+///
+/// # Errors
+///
+/// Returns the environment errors and [`Error::SearchPath`] of
+/// [`Context::install_search_path`].
+pub(crate) fn discover_for_plan(
+    context: &Context,
+    plan: &Plan,
+) -> Result<Option<(SearchPath, SearchPathReport)>, Error> {
+    let writes_config = match plan {
+        Plan::Fresh | Plan::RollBack(_) => true,
+        Plan::Resume(record) => record.step < Step::Config,
+    };
+    writes_config
+        .then(|| context.install_search_path())
+        .transpose()
 }
 
 /// Everything upgrade checks before it reads `service.toml`.

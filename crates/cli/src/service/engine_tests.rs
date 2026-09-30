@@ -860,6 +860,39 @@ async fn unusable_discovery_variables_fail_only_a_fresh_install_before_any_effec
 }
 
 #[tokio::test]
+async fn a_hostile_discovery_environment_fails_install_and_check_before_a_foreign_rollback() {
+    let mut harness = Harness::new();
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Binaries);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+    let before = harness.pending().expect("a foreign pending install");
+    let config_before = harness.config();
+
+    harness.context = with_hostile_discovery_environment(&harness.context);
+    // `service check` and install agree on the hostile environment.
+    let check = crate::service::check_with(
+        &harness.context,
+        &harness.backend,
+        Some(harness.prefix()),
+        V2,
+        false,
+    )
+    .await
+    .expect_err("check fails");
+    let error = harness.install(V2).await.expect_err("install fails");
+    assert_eq!(check.code(), "service_environment_invalid");
+    assert_eq!(error.code(), check.code());
+    // The pending transaction was neither rolled back nor touched.
+    let after = harness.pending().expect("the record survives");
+    assert_eq!((after.version, after.step), (before.version, before.step));
+    assert_eq!(harness.config(), config_before);
+    assert_eq!(harness.fake.world().installs, 0);
+}
+
+#[tokio::test]
 async fn a_resume_refuses_a_service_toml_of_another_installation() {
     for (key, edit) in [("prefix", 0_u8), ("active_version", 1_u8)] {
         let harness = Harness::new();

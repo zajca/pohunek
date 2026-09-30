@@ -545,6 +545,8 @@ pub(crate) fn check_local(
         };
         let layout = engine::install_preflight(context, &prefix)?;
         let plan = engine::install_plan(pending, &prefix, version)?;
+        // The same discovery validation install runs before its first effect.
+        engine::discover_for_plan(context, &plan)?;
         // A rollback of the pending record removes the `service.toml` it wrote.
         if matches!(plan, engine::Plan::Fresh) && exists(&config_path)? {
             return Err(Error::AlreadyInstalled { path: config_path });
