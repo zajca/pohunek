@@ -8,10 +8,11 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use sqlx::{Postgres, Row, Transaction};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -2638,6 +2639,109 @@ mod tests {
         })
         .await
         .expect("team list waits for concurrent team change");
+    }
+
+    /// Fraction of the lease lifetime one virtual-time step covers.
+    ///
+    /// More than half, so two steps pass the original deadline while a single
+    /// step after a renewal stays inside the renewed one.
+    fn lease_step() -> Duration {
+        LeaseGuard::duration() * 3 / 5
+    }
+
+    /// Opens one authority over a fresh fixture schema for the virtual-time tests.
+    async fn authority_for_deadline_tests() -> (Store, String, Authority, TempDir) {
+        let (store, schema, ..) = fixture().await;
+        let (authority, directory) = authority(
+            store.clone(),
+            AuthorityLimits {
+                global: 1,
+                per_team: 1,
+                per_principal: 1,
+            },
+        )
+        .await;
+        (store, schema, authority, directory)
+    }
+
+    /// Without a renewal the process-local fence deadline lapses with tokio time.
+    ///
+    /// Virtual time is paused only around checks that finish before any
+    /// database I/O: `verify_fence_in_transaction` compares the deadline before
+    /// it touches the transaction, so the runtime never parks on a socket while
+    /// the clock is frozen. A paused clock auto-advances when the runtime
+    /// parks, which would otherwise fire pool timers and move the deadline
+    /// comparison. The clock resumes before every call that does real I/O.
+    #[tokio::test]
+    async fn fence_deadline_lapses_with_tokio_time_without_renewal() {
+        let (store, schema, authority, _directory) = authority_for_deadline_tests().await;
+        let mut transaction = store.begin_serializable().await.expect("begin transaction");
+        authority
+            .verify_fence_in_transaction(&mut transaction)
+            .await
+            .expect("a fresh fence verifies before any time passes");
+
+        tokio::time::pause();
+        tokio::time::advance(LeaseGuard::duration()).await;
+        let lapsed = authority
+            .verify_fence_in_transaction(&mut transaction)
+            .await;
+        tokio::time::resume();
+
+        assert!(
+            matches!(lapsed, Err(AuthorityError::Cancelled)),
+            "an unrenewed fence is cancelled once its lifetime passed, got {lapsed:?}"
+        );
+        assert!(authority.is_closed(), "a lapsed fence closes the authority");
+        drop(transaction);
+        cleanup(&store, &schema).await;
+    }
+
+    /// A renewal moves the process-local fence deadline forward by one lifetime.
+    ///
+    /// The clock is resumed around `renew_once` and the database-backed verify,
+    /// so only the explicit `advance` calls move virtual time. Each deadline
+    /// check that expects a lapse runs while the clock is paused and before any
+    /// I/O; each check that expects success reads a deadline written after the
+    /// last renewal with no parked await in between.
+    #[tokio::test]
+    async fn renewal_moves_the_fence_deadline_with_tokio_time() {
+        let (store, schema, authority, _directory) = authority_for_deadline_tests().await;
+        let mut transaction = store.begin_serializable().await.expect("begin transaction");
+
+        // First step: still inside the original lifetime, then renew.
+        tokio::time::pause();
+        tokio::time::advance(lease_step()).await;
+        tokio::time::resume();
+        authority
+            .renew_once()
+            .await
+            .expect("renew inside the lifetime");
+
+        // Second step: past the original deadline, inside the renewed one.
+        tokio::time::pause();
+        tokio::time::advance(lease_step()).await;
+        tokio::time::resume();
+        authority
+            .verify_fence_in_transaction(&mut transaction)
+            .await
+            .expect("the renewed fence outlives the original deadline");
+
+        // Third step: past the renewed deadline too.
+        tokio::time::pause();
+        tokio::time::advance(lease_step()).await;
+        let lapsed = authority
+            .verify_fence_in_transaction(&mut transaction)
+            .await;
+        tokio::time::resume();
+
+        assert!(
+            matches!(lapsed, Err(AuthorityError::Cancelled)),
+            "the renewed deadline lapses one lifetime after the renewal, got {lapsed:?}"
+        );
+        assert!(authority.is_closed());
+        drop(transaction);
+        cleanup(&store, &schema).await;
     }
 
     #[tokio::test]
