@@ -23,6 +23,7 @@ use pohunek_platform::shell_env::{
 };
 use serde::de::Deserializer;
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 
 use crate::{is_netbird_ip, parse_addr_strip_cidr};
 
@@ -267,21 +268,49 @@ pub fn run_status() -> Result<NetbirdStatus, NetbirdError> {
 ///
 /// Returns the same errors as [`run_status`].
 pub async fn run_status_async() -> Result<NetbirdStatus, NetbirdError> {
-    run_status_async_resolving(resolve_host_program).await
+    run_status_async_resolving(&LOOKUP_GATE, resolve_host_program).await
 }
 
-/// Resolves the program on the blocking pool, then runs it.
+/// Admits one lookup thread at a time.
+///
+/// A lookup stuck in a filesystem call cannot be cancelled, so at most one such
+/// thread exists. Later callers wait for the permit, cancellably and without a
+/// thread of their own, and proceed as soon as the earlier lookup ends.
+static LOOKUP_GATE: Semaphore = Semaphore::const_new(1);
+
+/// Resolves the program on a dedicated thread, then runs it.
 ///
 /// The lookup stats and opens files along every `PATH` entry, so a stalled
-/// filesystem must not hold the caller's task: the future stays cancellable
-/// while the lookup runs, and an abandoned lookup finishes on its own thread.
-async fn run_status_async_resolving<R>(resolve: R) -> Result<NetbirdStatus, NetbirdError>
+/// filesystem must not hold the caller's task. The future stays cancellable
+/// while it waits for the gate and while the lookup runs, and an abandoned
+/// lookup finishes on its own thread: unlike a Tokio blocking-pool task, it
+/// never delays the runtime's shutdown.
+async fn run_status_async_resolving<R>(
+    gate: &'static Semaphore,
+    resolve: R,
+) -> Result<NetbirdStatus, NetbirdError>
 where
     R: FnOnce() -> Result<PathBuf, NetbirdError> + Send + 'static,
 {
-    let program = tokio::task::spawn_blocking(resolve)
-        .await
-        .map_err(|err| NetbirdError::StateUnavailable(format!("netbird lookup failed: {err}")))??;
+    let permit = gate.acquire().await.map_err(|_closed| {
+        NetbirdError::StateUnavailable("the netbird lookup gate is closed".to_owned())
+    })?;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("netbird-lookup".to_owned())
+        .spawn(move || {
+            // The permit is released when the lookup ends, even after the
+            // caller stopped waiting.
+            let _permit = permit;
+            // The receiver is gone when the caller's future was dropped.
+            let _ = sender.send(resolve());
+        })
+        .map_err(|err| {
+            NetbirdError::StateUnavailable(format!("cannot start the netbird lookup: {err}"))
+        })?;
+    let program = receiver.await.map_err(|_closed| {
+        NetbirdError::StateUnavailable("the netbird lookup ended without a result".to_owned())
+    })??;
     run_status_async_at(&program).await
 }
 
@@ -717,24 +746,58 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn a_stalled_lookup_does_not_hold_the_future() {
+    #[test]
+    fn a_stalled_lookup_neither_holds_the_future_nor_the_runtime() {
         const LOOKUP_STALL: std::time::Duration = std::time::Duration::from_secs(5);
         const DEADLINE: std::time::Duration = std::time::Duration::from_millis(50);
+        static GATE: Semaphore = Semaphore::const_new(1);
         let (release, stalled) = std::sync::mpsc::channel::<()>();
-        let status = run_status_async_resolving(move || {
-            // Stands in for a lookup stuck in a filesystem call.
-            let _ = stalled.recv_timeout(LOOKUP_STALL);
-            Err(NetbirdError::CliMissing)
-        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
         let started = std::time::Instant::now();
-        let outcome = tokio::time::timeout(DEADLINE, status).await;
+        let outcome = runtime.block_on(async {
+            let status = run_status_async_resolving(&GATE, move || {
+                // Stands in for a lookup stuck in a filesystem call.
+                let _ = stalled.recv_timeout(LOOKUP_STALL);
+                Err(NetbirdError::CliMissing)
+            });
+            tokio::time::timeout(DEADLINE, status).await
+        });
         assert!(outcome.is_err(), "the caller's deadline must fire");
+        // A second caller queues behind the stuck lookup and is cancellable too.
+        let queued = runtime.block_on(async {
+            tokio::time::timeout(
+                DEADLINE,
+                run_status_async_resolving(&GATE, || Err(NetbirdError::CliMissing)),
+            )
+            .await
+        });
+        assert!(queued.is_err(), "the queued caller's deadline must fire");
+        // Dropping the runtime must not wait for the stuck lookup.
+        drop(runtime);
         assert!(
             started.elapsed() < LOOKUP_STALL,
-            "the caller waited for the lookup"
+            "shutdown waited for the lookup"
         );
         drop(release);
+    }
+
+    #[tokio::test]
+    async fn healthy_concurrent_lookups_all_complete() {
+        static GATE: Semaphore = Semaphore::const_new(1);
+        let (_dir, program) = fake_netbird("concurrent", STATUS_CURRENT, 0o755);
+        let lookups: Vec<_> = (0..4)
+            .map(|_| {
+                let program = program.clone();
+                tokio::spawn(run_status_async_resolving(&GATE, move || Ok(program)))
+            })
+            .collect();
+        for lookup in lookups {
+            let status = lookup.await.expect("task").expect("status");
+            assert!(status.self_netbird_ip().is_some());
+        }
     }
 
     #[test]
