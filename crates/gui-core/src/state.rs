@@ -5406,7 +5406,7 @@ mod tests {
     }
 
     fn review_resume_store_dir(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
+        pohunek_test_support::temp_root().join(format!(
             "pohunek-gui-core-state-review-resume-{tag}-{}",
             std::process::id()
         ))

@@ -239,7 +239,7 @@ mod tests {
     use protocol::SessionId;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
+        pohunek_test_support::temp_root().join(format!(
             "pohunek-gui-core-review-store-{tag}-{}",
             std::process::id()
         ))

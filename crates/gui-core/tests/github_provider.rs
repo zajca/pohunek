@@ -635,7 +635,7 @@ async fn command_runner_fake_gh_error_path_is_typed() {
 #[tokio::test]
 async fn command_runner_missing_gh_is_typed() {
     let client = GitHubClient::with_config(GitHubConfig::new(
-        std::env::temp_dir().join("pohunek-gui-core-missing-gh"),
+        pohunek_test_support::temp_root().join("pohunek-gui-core-missing-gh"),
     ));
 
     let err = client
@@ -656,13 +656,11 @@ fn fake_gh_script(name: &str) -> PathBuf {
 
 /// Creates a unique temporary directory for one fake GitHub CLI fixture.
 ///
-/// The base is canonicalized: on macOS `temp_dir()` sits under the `/var`
-/// symlink, while a script's `pwd` reports the resolved `/private/var` path.
+/// The base is the symlink-free fixture root: on macOS `temp_dir()` sits under
+/// the `/var` symlink, while a script's `pwd` reports the resolved path.
 #[cfg(unix)]
 fn fake_gh_dir(name: &str) -> PathBuf {
-    let base = std::env::temp_dir()
-        .canonicalize()
-        .expect("canonicalize temp dir");
+    let base = pohunek_test_support::temp_root();
     loop {
         // The counter reserves names only; it does not synchronize fixture data.
         let sequence = NEXT_FAKE_GH_DIR.fetch_add(1, Ordering::Relaxed);

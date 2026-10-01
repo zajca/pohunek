@@ -67,12 +67,17 @@ both map to a `TokenErrorKind`, the timeout to `Timeout`.
 
 A keychain read cannot be cancelled and may wait on an unlock prompt
 indefinitely. The caller's `token_lookup_timeout` bounds the wait, not the
-blocking thread. In an interactive GUI session a locked keychain shows the
-unlock prompt, so the lookup surfaces as `Timeout` (the caller gave up) and
-later lookups of any key are refused fast as `Timeout` while that read is
-still pending. A locked keychain blocks every entry, so one lookup runs at a
-time for the whole store; repeated attempts cannot pile up blocking threads.
-Only a non-interactive process sees `Locked`.
+blocking thread. Backend error text is never copied into an error: messages are
+fixed, and at most an OSStatus number appears.
+
+One lookup runs at a time for the whole store, because a locked keychain blocks
+every entry. Other lookups wait for the permit asynchronously: a waiter holds no
+blocking thread, honors its own timeout, and proceeds when the running lookup
+returns, so two healthy overlapping requests both succeed. A lookup stuck on an
+unlock prompt keeps the permit, so every later lookup in that process times out
+(`Timeout`) until the prompt is answered or the process restarts. In an
+interactive GUI session a locked keychain shows the prompt and the lookup
+surfaces as `Timeout`; only a non-interactive process sees `Locked`.
 
 `gh` (GitHub provider) authenticates through its own credential handling and
 does not use the credential store.
@@ -91,9 +96,12 @@ always-run teardown deletes it, restores the original list and default, and
 fails the job if they differ afterwards. Locally the test prints a `SKIPPED`
 line when the variable is unset; on CI a missing variable fails the test.
 
-The real keychain covers: entry not found, success, locked (with user
-interaction disabled, so it reports `Locked` rather than prompting), and the
-keychain file gone (`Unavailable`). Access denial (`errSecAuthFailed`), the
-bounded wait, the interactive unlock prompt, and the one-lookup-at-a-time guard
-are covered only by unit tests over the status-code classification and
-injected lookup closures.
+The real keychain proves not found, success, the keychain file gone
+(`Unavailable`), and the bounded behavior of a locked keychain: the lookup
+returns within its caller timeout as `Locked` or as a timeout, never with a
+value. It does not prove the interactive unlock prompt. The locked case runs
+last, because a read stuck on an unlock prompt keeps the store's lookup permit
+and the process refuses further lookups. Access denial (`errSecAuthFailed`),
+the permit and waiter behavior, and the redaction of backend text are covered
+only by unit tests over the status-code classification and injected lookup
+closures.

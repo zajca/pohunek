@@ -12,11 +12,17 @@
 //! runtime skip.
 //!
 //! One test walks the states in order because they share process-global
-//! keychain state: not found, success, locked, keychain gone. The locked case
-//! runs with user interaction disabled, so it reports `Locked`; in an
-//! interactive GUI session a locked keychain instead shows the unlock prompt
-//! and the lookup surfaces as a timeout or a refused (busy) lookup. That path
-//! is covered by the injected-closure tests in `credential_store`.
+//! keychain state: not found, success, keychain gone, then locked.
+//!
+//! The locked case goes last and runs through the production bounded path
+//! (the store lookup under a short caller timeout). Depending on the session it
+//! reports `Locked` (no unlock UI may be shown) or the bound elapses because
+//! the Security framework waits on an unlock prompt, which is the `Timeout`
+//! contract. In the second case the blocked read keeps the store's single
+//! lookup permit, so no lookup may follow in this process; the process
+//! refuses further lookups until restart, and the test ends there. The
+//! interactive prompt itself is not driven; the permit and timeout behavior is
+//! covered by the injected-closure tests in `credential_store`.
 #![forbid(unsafe_code)]
 
 // Rust guideline compliant 2026-10-01
@@ -86,12 +92,11 @@ fn guard_refuses_an_unmarked_temp_path() {
 mod real_keychain {
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use pohunek_gui_core::providers::linear::{
         KeyringTokenSource, TokenError, TokenErrorKind, TokenSource,
     };
-    use security_framework::os::macos::keychain::SecKeychain;
 
     use super::validate_throwaway_keychain;
 
@@ -101,8 +106,15 @@ mod real_keychain {
     /// Set by GitHub Actions and most CI systems.
     const CI_ENV: &str = "CI";
 
-    /// Longest wait for one lookup against a healthy or locked keychain.
+    /// Longest wait for one lookup against a healthy keychain.
     const LOOKUP_DEADLINE: Duration = Duration::from_secs(30);
+
+    /// Caller timeout of the locked lookup: the bound the product contract
+    /// promises, short because a stuck unlock prompt never answers.
+    const LOCKED_BOUND: Duration = Duration::from_secs(3);
+
+    /// Slack on top of [`LOCKED_BOUND`] for scheduling on a loaded runner.
+    const BOUND_SLACK: Duration = Duration::from_secs(5);
 
     /// Grace period for runtime shutdown when a blocking lookup never returns.
     const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -189,15 +201,12 @@ mod real_keychain {
         runtime.get().block_on(async {
             tokio::time::timeout(LOOKUP_DEADLINE, source.token(key))
                 .await
-                .expect(
-                    "keychain lookup did not return within the deadline; user interaction \
-                     may not be disabled on the blocking thread",
-                )
+                .expect("keychain lookup did not return within the deadline")
         })
     }
 
     #[test]
-    fn real_keychain_reports_missing_success_locked_and_gone() {
+    fn real_keychain_reports_missing_success_gone_and_bounded_locked() {
         let Some(keychain) = throwaway_keychain() else {
             return;
         };
@@ -230,34 +239,41 @@ mod real_keychain {
             "read value differs from stored value"
         );
 
-        // Locked: with user interaction disabled a locked keychain answers
-        // errSecInteractionNotAllowed instead of waiting on an unlock dialog.
-        // The setting is process-wide; the blocking pool, where the lookup
-        // runs, must see it.
-        let lock = security(&["lock-keychain", keychain_arg]);
-        assert!(lock.status.success(), "security lock-keychain failed");
-        let interaction = SecKeychain::disable_user_interaction().expect("disable interaction");
-        let seen_on_blocking_thread = runtime.get().block_on(async {
-            tokio::task::spawn_blocking(SecKeychain::user_interaction_allowed)
-                .await
-                .expect("blocking task")
-                .expect("query user interaction")
-        });
-        assert!(
-            !seen_on_blocking_thread,
-            "user interaction is still allowed on the blocking thread; the locked case would \
-             wait on an unlock dialog"
-        );
-        let locked = run_lookup(&runtime, &source, key).expect_err("locked keychain");
-        drop(interaction);
-        assert_eq!(locked.kind(), TokenErrorKind::Locked, "{locked}");
-        assert!(locked.to_string().contains("unlock the login keychain"));
-        assert!(!locked.to_string().contains(FIXTURE_VALUE));
-
         // Gone: with the keychain file deleted the store is unavailable.
         let delete = security(&["delete-keychain", keychain_arg]);
         assert!(delete.status.success(), "security delete-keychain failed");
         let gone = run_lookup(&runtime, &source, key).expect_err("keychain deleted");
         assert_eq!(gone.kind(), TokenErrorKind::Unavailable, "{gone}");
+
+        // Locked, last: recreate the throwaway keychain, make it the default
+        // again, and lock it. The password is as throwaway as the keychain.
+        let password = format!("pw-{nonce}");
+        let create = security(&["create-keychain", "-p", &password, keychain_arg]);
+        assert!(create.status.success(), "security create-keychain failed");
+        let select = security(&["default-keychain", "-d", "user", "-s", keychain_arg]);
+        assert!(select.status.success(), "security default-keychain failed");
+        require_default_keychain(&keychain);
+        let lock = security(&["lock-keychain", keychain_arg]);
+        assert!(lock.status.success(), "security lock-keychain failed");
+
+        // The production bounded path: `Locked` when no unlock UI may be shown,
+        // otherwise the caller timeout elapses while the framework waits on
+        // the prompt. Nothing may run after this in the process.
+        let started = Instant::now();
+        let outcome = runtime
+            .get()
+            .block_on(async { tokio::time::timeout(LOCKED_BOUND, source.token(key)).await });
+        assert!(
+            started.elapsed() < LOCKED_BOUND + BOUND_SLACK,
+            "the locked lookup was not bounded"
+        );
+        match outcome {
+            Err(_elapsed) => {}
+            Ok(Err(error)) => {
+                assert_eq!(error.kind(), TokenErrorKind::Locked, "{error}");
+                assert!(!error.to_string().contains(FIXTURE_VALUE));
+            }
+            Ok(Ok(_)) => panic!("a locked keychain returned a value"),
+        }
     }
 }

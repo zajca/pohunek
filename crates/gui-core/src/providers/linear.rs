@@ -176,7 +176,7 @@ pub enum TokenErrorKind {
     Locked,
     /// The store cannot be reached or reported a backend failure.
     Unavailable,
-    /// The store did not answer in time, or an earlier lookup is still pending.
+    /// The caller's lookup timeout elapsed before the store answered.
     Timeout,
     /// The entry exists but cannot be used, for example a non-UTF-8 value.
     Invalid,
@@ -241,8 +241,7 @@ impl GraphqlTransportError {
 /// [`LinearError::TokenLookupTimedOut`] is the caller-side timeout.
 /// [`LinearError::token_error_kind`] reports both through one
 /// [`TokenErrorKind`], so a consumer matches a single contract: the timeout is
-/// [`TokenErrorKind::Timeout`], the same kind a refused lookup carries while an
-/// earlier one is stuck.
+/// [`TokenErrorKind::Timeout`].
 #[derive(Debug, Error)]
 pub enum LinearError {
     /// The Linear config omitted the token key.
@@ -433,8 +432,9 @@ where
 ///
 /// Every call reads the platform store afresh: nothing is cached or persisted.
 /// At most one blocking lookup runs at a time across the whole store (a locked
-/// keychain blocks every entry); a lookup requested while an earlier one is
-/// stuck fails with [`TokenErrorKind::Timeout`].
+/// keychain blocks every entry); others wait for it asynchronously, so the
+/// caller's timeout bounds them, and a lookup stuck on an unlock prompt makes
+/// later ones time out until it ends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyringTokenSource {
     service: String,
@@ -460,10 +460,7 @@ impl TokenSource for KeyringTokenSource {
     fn token<'a>(&'a self, token_key: &'a str) -> TokenFuture<'a> {
         let service = self.service.clone();
         let key = token_key.to_owned();
-        Box::pin(async move {
-            let read_key = key.clone();
-            lookup(&key, move || read_keyring(&service, &read_key)).await
-        })
+        Box::pin(lookup(move || read_keyring(&service, &key)))
     }
 }
 

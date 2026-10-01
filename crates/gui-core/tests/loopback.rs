@@ -2111,7 +2111,7 @@ impl LoopbackDaemon {
 /// `SUN_LEN` (108-byte) limit on Unix domain socket paths, which surfaces as
 /// a `worker_socket_path_invalid` protocol error instead of a clean session.
 fn worker_backed_registry(mut config: SessionRegistryConfig) -> SessionRegistry {
-    let worker_home = std::env::temp_dir().join(format!(
+    let worker_home = pohunek_test_support::temp_root().join(format!(
         "pw-g-{}-{}",
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -2625,7 +2625,7 @@ fn temp_dir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = pohunek_test_support::temp_root().join(format!(
         "pohunek-test-{tag}-{}-{nanos}-{n}",
         std::process::id()
     ));
