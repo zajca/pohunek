@@ -872,14 +872,16 @@ impl ProtocolError {
     ///
     /// Raised by `session.remove` when other active tasks use the session's
     /// worktree, including users outside the caller's host share (task RFC
-    /// section 8.7). Code is stable: `worktree_in_use`.
+    /// section 8.7), and by `worktree.remove` when a live session uses the
+    /// worktree. The code is shared by both methods, so the text and the hint
+    /// name no task-only remedy. Code is stable: `worktree_in_use`.
     #[must_use]
     pub fn worktree_in_use() -> Self {
         Self::fixed(
             ErrorClass::Runtime,
             "worktree_in_use",
-            "other active tasks use this session's worktree",
-            Some("stop the worktree users first, or remove with stop_worktree_users and the exact expected_worktree_users"),
+            "live sessions or active tasks use this worktree",
+            Some("stop the sessions or tasks that use the worktree, then retry the removal"),
         )
     }
 

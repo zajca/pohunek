@@ -1414,8 +1414,10 @@ revision, or enrollment from an earlier response.
 The delegated task layer (`docs/design/delegated-task-runs-rfc.md` section
 13.1) defines the codes below. They are part of the public contract; the
 daemon raises them once the task methods are served (until then task methods
-answer `method_not_found`). Every one has fixed `msg` and `recover` text: task
-errors never echo a prompt, answer, path, task id or secret. Session methods
+answer `method_not_found`). Every one has a fixed `msg` and, where the table
+says `yes`, a fixed `recover` hint; `task_snapshot_retired` and
+`task_review_limit_reached` carry no hint. Task errors never echo a prompt,
+answer, path, task id or secret. Session methods
 raise `worktree_busy`, `task_session_ended`, `task_fork_unsupported`,
 `worktree_in_use`, `worktree_users_changed` and `task_snapshot_retired` for
 sessions that belong to tasks.
@@ -1443,7 +1445,7 @@ sessions that belong to tasks.
 | `task_result_unknown` | `runtime` | `task.review`, `task.result` | No result with that `result_id`. | yes |
 | `task_snapshot_retired` | `runtime` | `session.diff` with `turn` | The turn's snapshots were retired with the session content. | no |
 | `task_cursor_expired` | `runtime` | `task.list`, `task.inspect` | The paging cursor is too old or from another daemon epoch. | yes |
-| `worktree_in_use` | `runtime` | `session.remove` | Other active tasks use the session's worktree. | yes |
+| `worktree_in_use` | `runtime` | `session.remove`, `worktree.remove` | `session.remove`: other active tasks use the session's worktree. `worktree.remove`: a live session uses the worktree. The code is shared; the removal is refused either way. | yes |
 | `task_result_pending` | `runtime` | `task.result`, `task.continue` | The turn settled but its checks have not finished. | yes |
 | `task_check_unconfined` | `configuration` | `task.start`, `task.continue` | No kernel-enforced check containment and `checks.allow_unconfined` is not set. | yes |
 | `task_check_not_permitted` | `runtime` | `task.start`, `task.continue` | A requested check is not enabled or not permitted for the caller's origin. | yes |

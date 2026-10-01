@@ -23,6 +23,10 @@ const PRE_TASK_CODES: [&str; 6] = [
     "agent_fork_unsupported",
 ];
 
+/// Task-layer codes the daemon already raises outside the task layer; each is
+/// documented for every method that raises it.
+const SHARED_WITH_DAEMON: [&str; 1] = ["worktree_in_use"];
+
 /// Constructor, expected code, expected class and whether a recovery hint is set.
 type Case = (fn() -> ProtocolError, &'static str, ErrorClass, bool);
 
@@ -389,4 +393,51 @@ fn task_error_travels_in_a_response_envelope() {
     let value = serde_json::to_value(&response).expect("response as value");
     assert_eq!(value["err"]["class"], "runtime");
     assert_eq!(value["err"]["code"], "task_worktree_busy");
+}
+
+/// Every `"code"` string literal in the daemon sources.
+fn daemon_source_literals() -> String {
+    fn walk(dir: &std::path::Path, out: &mut String) {
+        for entry in std::fs::read_dir(dir).expect("read daemon source dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push_str(&std::fs::read_to_string(&path).expect("read daemon source"));
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../daemon/src");
+    let mut out = String::new();
+    walk(&root, &mut out);
+    out
+}
+
+#[test]
+fn task_error_codes_only_overlap_daemon_codes_when_declared_shared() {
+    let sources = daemon_source_literals();
+    for case in task_errors() {
+        let quoted = format!("\"{}\"", case.code);
+        assert_eq!(
+            sources.contains(&quoted),
+            SHARED_WITH_DAEMON.contains(&case.code),
+            "{}: the daemon's use of this code must match SHARED_WITH_DAEMON",
+            case.code
+        );
+    }
+}
+
+#[test]
+fn shared_codes_are_documented_for_every_raising_method() {
+    let docs = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/public-api.md"),
+    )
+    .expect("read public-api.md");
+    let row = docs
+        .lines()
+        .find(|line| line.starts_with("| `worktree_in_use` |"))
+        .expect("worktree_in_use table row");
+    for method in ["`session.remove`", "`worktree.remove`"] {
+        assert!(row.contains(method), "worktree_in_use row misses {method}");
+    }
 }
