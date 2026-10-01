@@ -210,6 +210,10 @@ struct PohunekApp {
     rename_edit: String,
     /// Project the session overview is narrowed to; `None` shows every session.
     project_filter: Option<ProjectRef>,
+    /// Counter bumped whenever the Start form's project, template or contents
+    /// are reset; a template reply is applied only when it carries the current
+    /// value.
+    template_generation: u64,
     state_dir: Option<PathBuf>,
     status: Option<String>,
     notified_intents: usize,
@@ -253,6 +257,7 @@ impl PohunekApp {
                 metadata_edit: MetadataEdit::default(),
                 rename_edit: String::new(),
                 project_filter: None,
+                template_generation: 0,
                 state_dir: boot.state_dir,
                 status: boot.status,
                 notified_intents: 0,
@@ -312,6 +317,7 @@ impl PohunekApp {
             metadata_edit: MetadataEdit::default(),
             rename_edit: String::new(),
             project_filter: None,
+            template_generation: 0,
             state_dir: None,
             status: None,
             notified_intents: 0,

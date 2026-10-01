@@ -205,11 +205,10 @@ pub(crate) enum Message {
     StartProjectSelected(ProjectRef),
     StartAgentSelected(String),
     StartTemplateSelected(String),
-    /// Template resolution for `action` on `project`; applied only while the
-    /// Start form still targets both.
+    /// Template resolution requested under `generation`; applied only while
+    /// that is still the newest template request.
     TemplateResolved {
-        project: ProjectRef,
-        action: String,
+        generation: u64,
         result: Result<ResolvedTemplate, String>,
     },
     PromptEdited(text_editor::Action),

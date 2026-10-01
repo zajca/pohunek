@@ -1096,9 +1096,19 @@ fn action_messages(app: &PohunekApp, action: KeyAction) -> Vec<Message> {
     }
 }
 
+/// Rows a session key may act on: the filtered overview while it is the
+/// foreground, every row while a modal (e.g. one opened from a notification
+/// link) owns the selection.
+fn actionable_session_rows(app: &PohunekApp) -> Vec<pohunek_gui_core::SessionRow> {
+    let filter = (app.modal == ModalView::None)
+        .then_some(app.project_filter.as_ref())
+        .flatten();
+    app.workspace.session_rows_filtered(filter)
+}
+
 fn open_selected_session(app: &PohunekApp) -> Vec<Message> {
     selected_session(app).map_or_else(Vec::new, |(host_id, session)| {
-        let can_open = app.workspace.session_rows().into_iter().any(|row| {
+        let can_open = actionable_session_rows(app).into_iter().any(|row| {
             row.host_id == *host_id
                 && row.session_id == session.id
                 && matches!(
@@ -1120,10 +1130,17 @@ fn open_selected_session(app: &PohunekApp) -> Vec<Message> {
 
 fn show_selected_session(app: &PohunekApp) -> Vec<Message> {
     selected_session(app).map_or_else(Vec::new, |(host_id, session)| {
-        vec![Message::SelectSession {
-            host_id: host_id.clone(),
-            session_id: session.id.clone(),
-        }]
+        let listed = actionable_session_rows(app)
+            .iter()
+            .any(|row| row.host_id == *host_id && row.session_id == session.id);
+        if listed {
+            vec![Message::SelectSession {
+                host_id: host_id.clone(),
+                session_id: session.id.clone(),
+            }]
+        } else {
+            Vec::new()
+        }
     })
 }
 

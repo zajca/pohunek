@@ -72,7 +72,12 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             app.hosts = result.hosts;
             app.status = result.warning;
         }
-        Message::SetProjectFilter(filter) => app.project_filter = filter,
+        Message::SetProjectFilter(filter) => {
+            app.project_filter = filter;
+            if drop_selection_outside_filter(app) {
+                tasks.push(save_ui_state_task(app));
+            }
+        }
         Message::OpenHostsModal => {
             app.modal = ModalView::Hosts;
             tasks.push(keyboard::focus_task(app));
@@ -240,6 +245,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         }
         Message::StartProjectSelected(project) => {
             if app.start.project.as_ref() != Some(&project) {
+                app.template_generation += 1;
                 if app.start.template.take().is_some() {
                     app.prompt_editor = text_editor::Content::new();
                 }
@@ -257,6 +263,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         }
         Message::StartAgentSelected(agent) => app.start.agent = agent,
         Message::StartTemplateSelected(template) => {
+            app.template_generation += 1;
             let chosen = (template != BLANK_TEMPLATE_LABEL).then_some(template);
             app.start.template.clone_from(&chosen);
             app.template_recipe = None;
@@ -268,14 +275,8 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 None => app.prompt_editor = text_editor::Content::new(),
             }
         }
-        Message::TemplateResolved {
-            project,
-            action,
-            result,
-        } => {
-            let current = app.start.project.as_ref() == Some(&project)
-                && app.start.template.as_deref() == Some(action.as_str());
-            if current {
+        Message::TemplateResolved { generation, result } => {
+            if generation == app.template_generation {
                 match result {
                     Ok(resolved) => {
                         app.prompt_editor = text_editor::Content::with_text(&resolved.rendered);
@@ -598,7 +599,32 @@ fn normalize_project_filter(app: &mut PohunekApp) {
     }
 }
 
+/// Clears the session selection when the active project filter hides the
+/// selected session, so global session keys never act on an unlisted row.
+/// Returns whether the selection changed.
+fn drop_selection_outside_filter(app: &mut PohunekApp) -> bool {
+    let Some(Selection::Session {
+        host_id,
+        session_id,
+    }) = &app.ui_state.selection
+    else {
+        return false;
+    };
+    let listed = app
+        .workspace
+        .session_rows_filtered(app.project_filter.as_ref())
+        .iter()
+        .any(|row| row.host_id == *host_id && row.session_id == *session_id);
+    if listed {
+        return false;
+    }
+    app.ui_state.selection = None;
+    app.workspace.selection = None;
+    true
+}
+
 fn open_start_modal(app: &mut PohunekApp) {
+    app.template_generation += 1;
     app.start = StartForm {
         project: preselected_project(app),
         ..StartForm::default()
@@ -1078,12 +1104,7 @@ fn resolve_template_task(app: &PohunekApp, action_name: String) -> Result<Task<M
     let host = target.host;
     let options = connection_options(app)?;
     let project = target.project_ref;
-    let origin_project = app
-        .start
-        .project
-        .clone()
-        .ok_or_else(|| "select a project first".to_owned())?;
-    let origin_action = action_name.clone();
+    let generation = app.template_generation;
     Ok(Task::perform(
         runtime::perform(async move {
             let action = resolve_project_action_with_options(
@@ -1107,11 +1128,7 @@ fn resolve_template_task(app: &PohunekApp, action_name: String) -> Result<Task<M
                 },
             })
         }),
-        move |result| Message::TemplateResolved {
-            project: origin_project,
-            action: origin_action,
-            result,
-        },
+        move |result| Message::TemplateResolved { generation, result },
     ))
 }
 
@@ -1580,10 +1597,9 @@ mod tests {
         }
     }
 
-    fn template_reply(project: ProjectRef, action: &str, rendered: &str) -> Message {
+    fn template_reply(generation: u64, rendered: &str) -> Message {
         Message::TemplateResolved {
-            project,
-            action: action.to_owned(),
+            generation,
             result: Ok(resolved(rendered, "claude")),
         }
     }
@@ -1593,15 +1609,13 @@ mod tests {
         let mut app = app_with_two_hosts();
         app.start.project = Some(project_ref("local", "p-1"));
         app.start.template = Some("review".to_owned());
+        let requested = app.template_generation;
         let _ = update(
             &mut app,
             Message::StartProjectSelected(project_ref("remote", "p-9")),
         );
 
-        let _ = update(
-            &mut app,
-            template_reply(project_ref("local", "p-1"), "review", "stale prompt"),
-        );
+        let _ = update(&mut app, template_reply(requested, "stale prompt"));
 
         assert!(app.template_recipe.is_none());
         assert!(app.prompt_editor.text().trim().is_empty());
@@ -1612,12 +1626,17 @@ mod tests {
     fn template_reply_for_a_previous_template_is_ignored() {
         let mut app = app_with_two_hosts();
         app.start.project = Some(project_ref("local", "p-1"));
-        app.start.template = Some("deploy".to_owned());
-
         let _ = update(
             &mut app,
-            template_reply(project_ref("local", "p-1"), "review", "stale prompt"),
+            Message::StartTemplateSelected("review".to_owned()),
         );
+        let requested = app.template_generation;
+        let _ = update(
+            &mut app,
+            Message::StartTemplateSelected("deploy".to_owned()),
+        );
+
+        let _ = update(&mut app, template_reply(requested, "stale prompt"));
 
         assert!(app.template_recipe.is_none());
         assert!(app.prompt_editor.text().trim().is_empty());
@@ -1627,12 +1646,13 @@ mod tests {
     fn matching_template_reply_applies_prompt_agent_and_recipe() {
         let mut app = app_with_two_hosts();
         app.start.project = Some(project_ref("local", "p-1"));
-        app.start.template = Some("review".to_owned());
-
         let _ = update(
             &mut app,
-            template_reply(project_ref("local", "p-1"), "review", "fresh prompt"),
+            Message::StartTemplateSelected("review".to_owned()),
         );
+
+        let current = app.template_generation;
+        let _ = update(&mut app, template_reply(current, "fresh prompt"));
 
         assert_eq!(app.prompt_editor.text().trim(), "fresh prompt");
         assert_eq!(app.start.agent, "claude");
@@ -1642,6 +1662,35 @@ mod tests {
                 .and_then(|r| r.branch.as_deref()),
             Some("feature")
         );
+    }
+
+    #[test]
+    fn out_of_order_replies_for_the_same_template_keep_the_newest_and_later_edits() {
+        let mut app = app_with_two_hosts();
+        app.start.project = Some(project_ref("local", "p-1"));
+        let _ = update(
+            &mut app,
+            Message::StartTemplateSelected("review".to_owned()),
+        );
+        let older = app.template_generation;
+        let _ = update(
+            &mut app,
+            Message::StartTemplateSelected("review".to_owned()),
+        );
+        let newer = app.template_generation;
+        assert_ne!(older, newer);
+
+        let _ = update(&mut app, template_reply(newer, "newest prompt"));
+        let _ = update(
+            &mut app,
+            Message::PromptEdited(text_editor::Action::Edit(text_editor::Edit::Insert('!'))),
+        );
+        let edited = app.prompt_editor.text();
+        let _ = update(&mut app, template_reply(older, "older prompt"));
+
+        assert_eq!(app.prompt_editor.text(), edited);
+        assert!(edited.contains("newest prompt"));
+        assert!(edited.contains('!'));
     }
 
     #[test]
@@ -1848,6 +1897,88 @@ mod tests {
         assert!(app.project_filter.is_none());
     }
 
+    fn app_with_sessions_in_two_projects() -> PohunekApp {
+        let mut app = app_with_governance_host();
+        let mut snapshot = governance_snapshot("local");
+        let mut second = test_project();
+        second.id = "p-2".to_owned();
+        second.label = "Other".to_owned();
+        snapshot.projects = vec![test_project(), second];
+        snapshot.sessions = vec![
+            test_session("s-1", Some("p-1")),
+            test_session("s-2", Some("p-2")),
+        ];
+        let _ = update(
+            &mut app,
+            Message::Core(CoreEvent::HostSnapshotLoaded { snapshot }),
+        );
+        app
+    }
+
+    fn global_key_messages(app: &PohunekApp, key: &iced::keyboard::Key) -> usize {
+        keyboard::route_key_press(app, key, iced::keyboard::Modifiers::empty()).len()
+    }
+
+    #[test]
+    fn changing_the_filter_drops_a_selection_it_hides() {
+        use iced::keyboard::key::Named;
+        use iced::keyboard::Key;
+
+        let mut app = app_with_sessions_in_two_projects();
+        let _ = update(
+            &mut app,
+            Message::SelectSession {
+                host_id: HostId::new("local"),
+                session_id: SessionId("s-2".to_owned()),
+            },
+        );
+        let _ = update(&mut app, Message::CloseModal);
+        assert!(global_key_messages(&app, &Key::Character("o".into())) > 0);
+        assert!(global_key_messages(&app, &Key::Named(Named::Enter)) > 0);
+
+        let _ = update(
+            &mut app,
+            Message::SetProjectFilter(Some(project_ref("local", "p-1"))),
+        );
+
+        assert!(app.ui_state.selection.is_none());
+        assert!(app.workspace.selection.is_none());
+        assert_eq!(global_key_messages(&app, &Key::Character("o".into())), 0);
+        assert_eq!(global_key_messages(&app, &Key::Named(Named::Enter)), 0);
+    }
+
+    #[test]
+    fn changing_the_filter_keeps_a_selection_it_still_shows() {
+        let mut app = app_with_sessions_in_two_projects();
+        let _ = update(
+            &mut app,
+            Message::SelectSession {
+                host_id: HostId::new("local"),
+                session_id: SessionId("s-1".to_owned()),
+            },
+        );
+        let _ = update(&mut app, Message::CloseModal);
+
+        let _ = update(
+            &mut app,
+            Message::SetProjectFilter(Some(project_ref("local", "p-1"))),
+        );
+
+        assert_eq!(
+            app.ui_state.selection,
+            Some(Selection::Session {
+                host_id: HostId::new("local"),
+                session_id: SessionId("s-1".to_owned()),
+            })
+        );
+        assert!(
+            global_key_messages(
+                &app,
+                &iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter)
+            ) > 0
+        );
+    }
+
     #[test]
     fn same_labelled_projects_on_different_hosts_stay_distinct() {
         let mut app = app_with_two_hosts();
@@ -2038,6 +2169,7 @@ mod tests {
             metadata_edit: MetadataEdit::default(),
             rename_edit: String::new(),
             project_filter: None,
+            template_generation: 0,
             state_dir: None,
             status: None,
             notified_intents: 0,
