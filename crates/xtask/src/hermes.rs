@@ -1,6 +1,6 @@
 //! Validates the pinned Hermes CLI and refreshes bounded PTY evidence.
 
-// Rust guideline compliant 2026-09-30
+// Rust guideline compliant 2026-10-01
 
 use std::ffi::OsString;
 use std::fs;
@@ -2777,7 +2777,7 @@ fn wait_for_evidence(
         let matched = if let (Evidence::AssistantPanel(_), Some(observer)) =
             (evidence, panel_observer.as_mut())
         {
-            observer.feed_snapshot(&bytes) && observer.one_panel().is_some()
+            observer.feed_snapshot(terminated_prefix(&bytes)) && observer.one_panel().is_some()
         } else {
             evidence_matches(evidence, &bytes)
         };
@@ -2821,7 +2821,9 @@ fn evidence_matches(evidence: &Evidence, output: &[u8]) -> bool {
         Evidence::AssistantPanel(_) => {
             unreachable!("assistant panels use the terminal-state matcher")
         }
-        Evidence::Working(command) => has_rendered_terminal_command(&text, command),
+        Evidence::Working(command) => {
+            has_rendered_terminal_command(terminated_lines(&text), command)
+        }
         Evidence::Approval => {
             text.contains("Dangerous Command")
                 && text.contains("HERMES_COMPAT_APPROVAL_SENTINEL")
@@ -2832,6 +2834,24 @@ fn evidence_matches(evidence: &Evidence, output: &[u8]) -> bool {
         Evidence::Resumed(reference) => text.contains(&format!("Resumed session {reference}")),
         Evidence::AlternateScreen => unreachable!("alternate-screen handled above"),
     }
+}
+
+/// Returns the prefix of raw PTY output that ends at its last `\n`.
+///
+/// The PTY line discipline can deliver a line's text before its terminator.
+/// Evidence that triggers the next input must not match such a trailing
+/// fragment: the echo of that input (for example `^C`) would join the line
+/// and break the whole-line checks of the final validation.
+fn terminated_prefix(bytes: &[u8]) -> &[u8] {
+    bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(&[], |end| &bytes[..=end])
+}
+
+/// Returns the prefix of a normalized transcript that ends at its last `\n`.
+fn terminated_lines(text: &str) -> &str {
+    text.rfind('\n').map_or("", |end| &text[..=end])
 }
 
 fn output_snapshot(output: &Arc<Mutex<(Vec<u8>, bool)>>) -> Result<(Vec<u8>, bool), XtaskError> {
@@ -4412,6 +4432,47 @@ mod tests {
             "💻 sleep 80 ( 0.1s)",
             "sleep 8"
         ));
+    }
+
+    #[test]
+    fn working_evidence_waits_for_the_terminated_command_line() {
+        let working = super::Evidence::Working("sleep 30");
+
+        assert!(!super::evidence_matches(&working, b"Running sleep 30"));
+        assert!(super::evidence_matches(&working, b"Running sleep 30\r\n"));
+        assert!(!super::evidence_matches(
+            &working,
+            "\u{1f4bb} sleep 30   ( 0.1s)".as_bytes()
+        ));
+        assert!(super::evidence_matches(
+            &working,
+            "\u{1f4bb} sleep 30   ( 0.1s)\r\n".as_bytes()
+        ));
+        // An interrupt echoed onto an unterminated command line joins it, which
+        // the whole-line validation of the scenario rejects.
+        assert!(!super::has_rendered_terminal_command(
+            "Running sleep 30^C\nInterrupting agent...",
+            "sleep 30"
+        ));
+    }
+
+    #[test]
+    fn panel_evidence_waits_for_the_terminated_border_line() {
+        let panel = format!(
+            "{}\r\n{SHORT_RESPONSE}\r\n{}",
+            super::assistant_panel_top(),
+            super::assistant_panel_bottom()
+        );
+
+        assert_eq!(super::terminated_prefix(b"no terminator"), b"");
+        assert_eq!(super::terminated_prefix(b"one\r\ntwo"), b"one\r\n");
+        let mut open_border = super::AssistantPanelObserver::new(SHORT_RESPONSE);
+        open_border.feed_snapshot(super::terminated_prefix(panel.as_bytes()));
+        assert!(open_border.one_panel().is_none());
+        let closed = format!("{panel}\r\n");
+        let mut closed_border = super::AssistantPanelObserver::new(SHORT_RESPONSE);
+        closed_border.feed_snapshot(super::terminated_prefix(closed.as_bytes()));
+        assert!(closed_border.one_panel().is_some());
     }
 
     #[test]
@@ -6284,6 +6345,53 @@ PY
 
         refresh_with(repo.path(), &binary, one_second_limits())
             .expect_err("a 1.5 s exit stall exceeds the one-second exit grace");
+    }
+
+    /// Rewrites the fake Hermes so that each terminal command line reaches the
+    /// PTY in two writes: the text first, its terminator `FIXTURE_STALL` later.
+    ///
+    /// The harness cannot signal the fixture once it waits for a terminated
+    /// line, so no handshake can release the terminator; the hold only widens
+    /// the window in which an early reader acts on the unterminated text.
+    #[cfg(unix)]
+    fn split_command_line_fake_hermes(root: &Path) -> PathBuf {
+        let binary = fake_hermes(root, "0.20.0");
+        for command in ["sleep 8", "sleep 30"] {
+            rewrite_script(
+                &binary,
+                &format!("echo 'Running {command}'"),
+                &format!(
+                    "printf 'Running {command}'\n          sleep {FIXTURE_STALL}\n          echo"
+                ),
+            );
+        }
+        binary
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn refresh_interrupts_only_after_the_command_line_is_terminated() {
+        let repo = fixture_repo();
+        let binary = split_command_line_fake_hermes(repo.path());
+
+        refresh_with(repo.path(), &binary, fast_limits())
+            .expect("the interrupt is sent after the terminal command line is complete");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn refresh_exits_only_after_the_panel_border_is_terminated() {
+        let repo = fixture_repo();
+        let binary = fake_hermes(repo.path(), "0.20.0");
+        let bottom = super::assistant_panel_bottom();
+        rewrite_script(
+            &binary,
+            &format!("printf '%s\\n' '{bottom}'"),
+            &format!("printf '%s' '{bottom}'\n  sleep {FIXTURE_STALL}\n  printf '\\n'"),
+        );
+
+        refresh_with(repo.path(), &binary, fast_limits())
+            .expect("the exit is sent after the assistant panel border is complete");
     }
 
     #[test]
