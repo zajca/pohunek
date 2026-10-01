@@ -581,9 +581,10 @@ ad hoc directory. See [projects](projects.md) and [worktrees](worktrees.md).
 The protocol reserves a typed error contract for the delegated task layer
 (`task.*` methods). The daemon does not serve those methods yet, so they answer
 `method_not_found` and no task error is raised today. Every task error has a
-stable `code`, a fixed `msg` and, for most, a fixed `recover` hint; none echoes a
-prompt, answer, path, task id or secret, so branch on `class` and `code` and
-show `msg` and `recover` verbatim. The full code table is in the Delegated Task
+stable `code`, a fixed `msg` and, for most, a fixed `recover` hint in the
+daemon's response; none echoes a prompt, answer, path, task id or secret. The
+Rust SDK's remote path prepends `host '<host>':` to `msg`. Branch on `class`
+and `code` and show `msg` and `recover` verbatim. The full code table is in the Delegated Task
 Errors section of `docs/public-api.md`. Sessions that belong to tasks use
 `worktree_busy` (only observation is admitted while a task occupies the
 worktree), `task_session_ended`, `task_fork_unsupported`, `worktree_in_use`,
