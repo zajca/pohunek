@@ -22,8 +22,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -88,17 +87,32 @@ pub(crate) fn apply_outcome(
     }
 }
 
-/// The command backend's executable, resolved once per session.
+/// The command backend's executable, looked up once per session.
 ///
-/// The first notification resolves the program within the notification
-/// deadline; the result, including a miss or a timeout, is kept. Concurrent
-/// notifications wait on that one resolution instead of starting their own
-/// login-shell probes.
+/// The first notification starts the lookup on its own thread and waits for it
+/// within the notification deadline. A completed lookup is definitive: a found
+/// path, or a real not-found or untrusted verdict, is kept for the session and
+/// shared by concurrent notifications, so they never start login-shell probes
+/// of their own. A deadline that passes first is not a verdict: that
+/// notification is unavailable, the lookup keeps running and stores its result
+/// when it finishes, and a later notification uses or awaits it.
 #[derive(Debug)]
 pub(crate) struct CommandResolution {
     resolver: Arc<BinResolver>,
     program: OsString,
-    resolved: OnceLock<Result<PathBuf, String>>,
+    shared: Arc<ResolutionState>,
+}
+
+#[derive(Debug, Default)]
+struct ResolutionState {
+    inner: Mutex<ResolutionInner>,
+    finished: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct ResolutionInner {
+    started: bool,
+    result: Option<Result<PathBuf, String>>,
 }
 
 impl CommandResolution {
@@ -106,32 +120,42 @@ impl CommandResolution {
         Self {
             resolver,
             program: OsString::from(program),
-            resolved: OnceLock::new(),
+            shared: Arc::new(ResolutionState::default()),
         }
     }
 
-    /// Resolves within `budget`; a later caller reads the first result.
-    fn resolve(&self, budget: Duration) -> &Result<PathBuf, String> {
-        self.resolved.get_or_init(|| {
-            let (sender, receiver) = mpsc::channel();
+    /// Returns the lookup result, waiting at most `budget` for it.
+    fn resolve(&self, budget: Duration) -> Result<PathBuf, String> {
+        let mut inner = self.shared.inner.lock().expect("resolution lock");
+        if inner.result.is_none() && !inner.started {
+            inner.started = true;
+            let shared = Arc::clone(&self.shared);
             let resolver = Arc::clone(&self.resolver);
             let program = self.program.clone();
             let spawned = thread::Builder::new()
                 .name("pohunek-gui-notify-resolve".to_owned())
                 .spawn(move || {
-                    let _ = sender.send(resolver.resolve_name(&program));
+                    let outcome = resolver
+                        .resolve_name(&program)
+                        .map_err(|error| error.to_string());
+                    shared.inner.lock().expect("resolution lock").result = Some(outcome);
+                    shared.finished.notify_all();
                 });
             if let Err(error) = spawned {
+                inner.started = false;
                 return Err(format!("cannot start the executable lookup: {error}"));
             }
-            match receiver.recv_timeout(budget) {
-                Ok(Ok(path)) => Ok(path),
-                Ok(Err(error)) => Err(error.to_string()),
-                Err(_) => Err(format!(
-                    "finding `{}` did not finish within {budget:?}",
-                    self.program.to_string_lossy()
-                )),
-            }
+        }
+        let (inner, _) = self
+            .shared
+            .finished
+            .wait_timeout_while(inner, budget, |inner| inner.result.is_none())
+            .expect("resolution lock");
+        inner.result.clone().unwrap_or_else(|| {
+            Err(format!(
+                "finding `{}` did not finish within {budget:?}; it keeps running",
+                self.program.to_string_lossy()
+            ))
         })
     }
 }
@@ -211,10 +235,10 @@ impl Notifier {
             NotificationBackend::Command { resolution } => {
                 let program = match resolution.resolve(remaining(deadline)) {
                     Ok(program) => program,
-                    Err(reason) => return NotificationOutcome::Unavailable(reason.clone()),
+                    Err(reason) => return NotificationOutcome::Unavailable(reason),
                 };
-                let mut command = Command::new(program);
-                command.args(command_arguments(program, title, body));
+                let mut command = Command::new(&program);
+                command.args(command_arguments(&program, title, body));
                 command
             }
         };
@@ -262,6 +286,7 @@ mod tests {
     use std::os::unix::ffi::OsStrExt as _;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
 
     use super::*;
     use crate::bin_resolver::BinError;
@@ -603,6 +628,49 @@ mod tests {
             elapsed < timeout + Duration::from_millis(300),
             "took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn a_lookup_that_finishes_after_the_deadline_serves_the_next_notification() {
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
+        let (_program, record) = recording_backend(dir.path(), "slowcmd", "exit 0");
+        let search = pohunek_platform::shell_env::SearchPath::new(vec![dir.path().to_path_buf()])
+            .expect("search path");
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let resolver = Arc::new(BinResolver::with_discovery("pohunek", move || {
+            // Holds the lookup until the test releases it, after the first
+            // notification has timed out.
+            let _ = gate.lock().expect("lock").recv();
+            Ok(search.clone())
+        }));
+        let resolution = Arc::new(CommandResolution::new(resolver, "slowcmd"));
+        let first = Notifier {
+            backend: NotificationBackend::Command {
+                resolution: Arc::clone(&resolution),
+            },
+            timeout: Duration::from_millis(100),
+        };
+        let second = Notifier {
+            backend: NotificationBackend::Command { resolution },
+            timeout: LONG,
+        };
+
+        let early = first.notify("t", "b");
+        assert!(
+            matches!(&early, NotificationOutcome::Unavailable(reason) if reason.contains("keeps running")),
+            "{early:?}"
+        );
+        assert!(
+            !record.exists(),
+            "the backend did not run for the early notification"
+        );
+
+        // The lookup completes now; the next notification awaits and uses it.
+        release.send(()).expect("release the lookup");
+        assert_eq!(second.notify("t", "b"), NotificationOutcome::Submitted);
+        assert_eq!(read_argv(&record), vec![b"t".to_vec(), b"b".to_vec()]);
     }
 
     #[test]

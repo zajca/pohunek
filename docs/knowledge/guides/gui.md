@@ -195,10 +195,13 @@ attach remains on the same route as its control connection.
   Title and body are only argv items after `--`, never script text, so quotes,
   `$()`, newlines, Unicode, and a leading `-` are inert.
 - A command that is not an absolute path is resolved once, on the first
-  notification and within `notification_timeout_ms`, with the same environment
-  policy as `pohunek_bin`. The result, including a miss or a timeout, is kept
-  for the session and shared by concurrent notifications; restart the GUI after
-  installing the command. A command that cannot be resolved is reported as
+  notification, with the same environment policy as `pohunek_bin`. A completed
+  lookup is kept for the session and shared by concurrent notifications: a found
+  path, or a real not-found or untrusted verdict (restart the GUI after
+  installing the command). A lookup still running when
+  `notification_timeout_ms` passes is not a verdict: that notification is
+  unavailable, the lookup finishes in the background, and the next notification
+  uses or awaits its result. A command that cannot be resolved is reported as
   unavailable, not treated as working.
 - Each notification gets `[gui] notification_timeout_ms` (default 5000, zero is
   rejected); a backend that does not exit by then is killed and reaped. It runs
