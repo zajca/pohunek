@@ -14,13 +14,14 @@ use iced::keyboard::{self, Key, Modifiers};
 use iced::widget::{operation, Id};
 use iced::{Subscription, Task};
 use pohunek_gui_core::assistant::Intent as AssistantIntent;
+use pohunek_gui_core::{project_choice_labels, ProjectChoice, ProjectRef};
 use protocol::ProviderKind;
 
 use crate::message::{
     FormField, FormSelect, InboxView, ListDirection, Message, ModalView,
-    ASSISTANT_AUTO_AGENT_LABEL, BLANK_TEMPLATE_LABEL,
+    ASSISTANT_AUTO_AGENT_LABEL, BLANK_TEMPLATE_LABEL, PROJECT_PLACEHOLDER_LABEL,
 };
-use crate::selection::{available_actions, selected_host_id, selected_project, selected_session};
+use crate::selection::{available_actions, project_host, selected_session};
 use crate::PohunekApp;
 
 /// Keyboard routing scope.
@@ -60,11 +61,13 @@ const START_NAME_INPUT_ID: &str = "start-session-name";
 const START_PROMPT_INPUT_ID: &str = "start-session-prompt";
 const START_BRANCH_INPUT_ID: &str = "start-session-branch";
 const START_BASE_BRANCH_INPUT_ID: &str = "start-session-base-branch";
+const START_PROJECT_SELECT_ID: &str = "start-session-project";
 const START_AGENT_SELECT_ID: &str = "start-session-agent";
 const START_TEMPLATE_SELECT_ID: &str = "start-session-template";
 const ASSISTANT_REQUEST_INPUT_ID: &str = "assistant-request";
 const ASSISTANT_BRANCH_INPUT_ID: &str = "assistant-branch";
 const ASSISTANT_BASE_BRANCH_INPUT_ID: &str = "assistant-base-branch";
+const ASSISTANT_PROJECT_SELECT_ID: &str = "assistant-project";
 const ASSISTANT_INTENT_SELECT_ID: &str = "assistant-intent";
 const ASSISTANT_AGENT_SELECT_ID: &str = "assistant-agent";
 const READ_ONLY_TEXT_INPUT_ID: &str = "read-only-selectable-text";
@@ -85,6 +88,10 @@ pub(crate) fn start_base_branch_input_id() -> Id {
     Id::new(START_BASE_BRANCH_INPUT_ID)
 }
 
+fn start_project_select_id() -> Id {
+    Id::new(START_PROJECT_SELECT_ID)
+}
+
 fn start_agent_select_id() -> Id {
     Id::new(START_AGENT_SELECT_ID)
 }
@@ -103,6 +110,10 @@ pub(crate) fn assistant_branch_input_id() -> Id {
 
 pub(crate) fn assistant_base_branch_input_id() -> Id {
     Id::new(ASSISTANT_BASE_BRANCH_INPUT_ID)
+}
+
+fn assistant_project_select_id() -> Id {
+    Id::new(ASSISTANT_PROJECT_SELECT_ID)
 }
 
 fn assistant_intent_select_id() -> Id {
@@ -772,12 +783,14 @@ pub(crate) fn form_field_focus_task(field: FormField) -> Task<Message> {
 
 fn form_field_id(field: FormField) -> Id {
     match field {
+        FormField::StartProject => start_project_select_id(),
         FormField::StartAgent => start_agent_select_id(),
         FormField::StartTemplate => start_template_select_id(),
         FormField::StartName => start_name_input_id(),
         FormField::StartPrompt => start_prompt_input_id(),
         FormField::StartBranch => start_branch_input_id(),
         FormField::StartBaseBranch => start_base_branch_input_id(),
+        FormField::AssistantProject => assistant_project_select_id(),
         FormField::AssistantIntent => assistant_intent_select_id(),
         FormField::AssistantAgent => assistant_agent_select_id(),
         FormField::AssistantRequest => assistant_request_input_id(),
@@ -795,8 +808,10 @@ fn field_text_id(field: FormField) -> Option<Id> {
         | FormField::AssistantRequest
         | FormField::AssistantBranch
         | FormField::AssistantBaseBranch => Some(form_field_id(field)),
-        FormField::StartAgent
+        FormField::StartProject
+        | FormField::StartAgent
         | FormField::StartTemplate
+        | FormField::AssistantProject
         | FormField::AssistantIntent
         | FormField::AssistantAgent => None,
     }
@@ -806,6 +821,7 @@ fn form_fields(app: &PohunekApp) -> Vec<FormField> {
     match app.modal {
         ModalView::Start => {
             let mut fields = vec![
+                FormField::StartProject,
                 FormField::StartAgent,
                 FormField::StartTemplate,
                 FormField::StartName,
@@ -819,6 +835,7 @@ fn form_fields(app: &PohunekApp) -> Vec<FormField> {
         }
         ModalView::Assistant => {
             let mut fields = vec![
+                FormField::AssistantProject,
                 FormField::AssistantIntent,
                 FormField::AssistantAgent,
                 FormField::AssistantRequest,
@@ -833,6 +850,7 @@ fn form_fields(app: &PohunekApp) -> Vec<FormField> {
         | ModalView::Session
         | ModalView::ConfirmDeleteSession
         | ModalView::Keymap
+        | ModalView::Hosts
         | ModalView::Inbox => Vec::new(),
     }
 }
@@ -851,9 +869,8 @@ const ASSISTANT_INTENTS: [AssistantIntent; 5] = [
 
 pub(crate) fn form_select_options(app: &PohunekApp, field: FormField) -> Vec<String> {
     match field {
-        FormField::StartAgent => selected_host_id(app)
-            .ok()
-            .and_then(|host_id| app.workspace.hosts.get(&host_id))
+        FormField::StartProject | FormField::AssistantProject => project_picker_labels(app),
+        FormField::StartAgent => project_host(app, app.start.project.as_ref())
             .map_or_else(Vec::new, pohunek_gui_core::HostView::launchable_agents),
         FormField::StartTemplate => {
             let mut options = vec![BLANK_TEMPLATE_LABEL.to_owned()];
@@ -863,10 +880,7 @@ pub(crate) fn form_select_options(app: &PohunekApp, field: FormField) -> Vec<Str
         FormField::AssistantIntent => ASSISTANT_INTENTS.iter().map(ToString::to_string).collect(),
         FormField::AssistantAgent => {
             let mut options = vec![ASSISTANT_AUTO_AGENT_LABEL.to_owned()];
-            if let Some(host) = selected_host_id(app)
-                .ok()
-                .and_then(|host_id| app.workspace.hosts.get(&host_id))
-            {
+            if let Some(host) = project_host(app, app.assistant.project.as_ref()) {
                 options.extend(host.launchable_assistant_agents());
             }
             options
@@ -881,8 +895,28 @@ pub(crate) fn form_select_options(app: &PohunekApp, field: FormField) -> Vec<Str
     }
 }
 
+/// Picker labels in `project_choices` order: `label · host`, plus the project
+/// id when one host holds several projects with the same label.
+fn project_picker_labels(app: &PohunekApp) -> Vec<String> {
+    project_choice_labels(&app.workspace.project_choices(), true)
+}
+
+fn project_select_label(app: &PohunekApp, project: Option<&ProjectRef>) -> String {
+    project
+        .and_then(|project| {
+            let choices = app.workspace.project_choices();
+            let index = choices
+                .iter()
+                .position(|choice| &choice.project == project)?;
+            project_picker_labels(app).into_iter().nth(index)
+        })
+        .unwrap_or_else(|| PROJECT_PLACEHOLDER_LABEL.to_owned())
+}
+
 pub(crate) fn form_select_label(app: &PohunekApp, field: FormField) -> String {
     match field {
+        FormField::StartProject => project_select_label(app, app.start.project.as_ref()),
+        FormField::AssistantProject => project_select_label(app, app.assistant.project.as_ref()),
         FormField::StartAgent => app.start.agent.clone(),
         FormField::StartTemplate => app
             .start
@@ -906,6 +940,19 @@ pub(crate) fn form_select_label(app: &PohunekApp, field: FormField) -> String {
 }
 
 pub(crate) fn form_select_cursor(app: &PohunekApp, field: FormField) -> usize {
+    let current_project = match field {
+        FormField::StartProject => app.start.project.as_ref(),
+        FormField::AssistantProject => app.assistant.project.as_ref(),
+        _ => None,
+    };
+    if let Some(project) = current_project {
+        return app
+            .workspace
+            .project_choices()
+            .iter()
+            .position(|choice| &choice.project == project)
+            .unwrap_or(0);
+    }
     let selected = form_select_label(app, field);
     form_select_options(app, field)
         .iter()
@@ -924,8 +971,10 @@ pub(crate) fn form_select_key_message(
         || modifiers.logo()
         || !matches!(
             app.form_focus,
-            FormField::StartAgent
+            FormField::StartProject
+                | FormField::StartAgent
                 | FormField::StartTemplate
+                | FormField::AssistantProject
                 | FormField::AssistantIntent
                 | FormField::AssistantAgent
         )
@@ -985,6 +1034,7 @@ fn form_submit_message_for(
         | ModalView::Session
         | ModalView::ConfirmDeleteSession
         | ModalView::Keymap
+        | ModalView::Hosts
         | ModalView::Inbox => None,
     }
 }
@@ -998,6 +1048,10 @@ pub(crate) fn form_select_choice_message(app: &PohunekApp, select: FormSelect) -
     let options = form_select_options(app, select.field);
     let option = options.get(select.cursor)?.clone();
     match select.field {
+        FormField::StartProject => project_choice_at(app, select.cursor)
+            .map(|choice| Message::StartProjectSelected(choice.project)),
+        FormField::AssistantProject => project_choice_at(app, select.cursor)
+            .map(|choice| Message::AssistantProjectSelected(choice.project)),
         FormField::StartAgent => Some(Message::StartAgentSelected(option)),
         FormField::StartTemplate => Some(Message::StartTemplateSelected(option)),
         FormField::AssistantIntent => ASSISTANT_INTENTS
@@ -1015,6 +1069,10 @@ pub(crate) fn form_select_choice_message(app: &PohunekApp, select: FormSelect) -
     }
 }
 
+fn project_choice_at(app: &PohunekApp, index: usize) -> Option<ProjectChoice> {
+    app.workspace.project_choices().into_iter().nth(index)
+}
+
 fn action_messages(app: &PohunekApp, action: KeyAction) -> Vec<Message> {
     match action {
         KeyAction::OpenInbox => vec![Message::OpenInbox],
@@ -1022,10 +1080,10 @@ fn action_messages(app: &PohunekApp, action: KeyAction) -> Vec<Message> {
         KeyAction::ShowSelectedSession => show_selected_session(app),
         KeyAction::OpenKeymapHelp => vec![Message::OpenKeymapModal],
         KeyAction::NewSession => {
-            if selected_project(app).is_some() {
-                vec![Message::OpenStartModal]
-            } else {
+            if app.workspace.project_choices().is_empty() {
                 Vec::new()
+            } else {
+                vec![Message::OpenStartModal]
             }
         }
         KeyAction::OpenAssistant => vec![Message::OpenAssistantModal],
@@ -1038,9 +1096,19 @@ fn action_messages(app: &PohunekApp, action: KeyAction) -> Vec<Message> {
     }
 }
 
+/// Rows a session key may act on: the filtered overview while it is the
+/// foreground, every row while a modal (e.g. one opened from a notification
+/// link) owns the selection.
+fn actionable_session_rows(app: &PohunekApp) -> Vec<pohunek_gui_core::SessionRow> {
+    let filter = (app.modal == ModalView::None)
+        .then_some(app.project_filter.as_ref())
+        .flatten();
+    app.workspace.session_rows_filtered(filter)
+}
+
 fn open_selected_session(app: &PohunekApp) -> Vec<Message> {
     selected_session(app).map_or_else(Vec::new, |(host_id, session)| {
-        let can_open = app.workspace.session_rows().into_iter().any(|row| {
+        let can_open = actionable_session_rows(app).into_iter().any(|row| {
             row.host_id == *host_id
                 && row.session_id == session.id
                 && matches!(
@@ -1062,10 +1130,17 @@ fn open_selected_session(app: &PohunekApp) -> Vec<Message> {
 
 fn show_selected_session(app: &PohunekApp) -> Vec<Message> {
     selected_session(app).map_or_else(Vec::new, |(host_id, session)| {
-        vec![Message::SelectSession {
-            host_id: host_id.clone(),
-            session_id: session.id.clone(),
-        }]
+        let listed = actionable_session_rows(app)
+            .iter()
+            .any(|row| row.host_id == *host_id && row.session_id == session.id);
+        if listed {
+            vec![Message::SelectSession {
+                host_id: host_id.clone(),
+                session_id: session.id.clone(),
+            }]
+        } else {
+            Vec::new()
+        }
     })
 }
 
@@ -1084,7 +1159,7 @@ fn modal_primary(app: &PohunekApp, open_terminal: bool) -> Vec<Message> {
         ModalView::Session => open_selected_session(app),
         ModalView::ConfirmDeleteSession => vec![Message::ConfirmDeleteSession],
         ModalView::Inbox => inbox_primary(app, open_terminal),
-        ModalView::Keymap | ModalView::None => Vec::new(),
+        ModalView::Keymap | ModalView::Hosts | ModalView::None => Vec::new(),
     }
 }
 
@@ -1175,6 +1250,7 @@ pub(crate) fn focus_task(app: &PohunekApp) -> Task<Message> {
         | ModalView::Session
         | ModalView::ConfirmDeleteSession
         | ModalView::Keymap
+        | ModalView::Hosts
         | ModalView::Inbox => Task::none(),
     }
 }
@@ -1221,11 +1297,12 @@ mod tests {
     fn launch_form_focus_orders_selects_text_fields_and_visible_advanced_fields() {
         let mut app = PohunekApp::test_default();
         app.modal = ModalView::Start;
-        app.form_focus = FormField::StartAgent;
+        app.form_focus = FormField::StartProject;
 
         assert_eq!(
             form_fields(&app),
             vec![
+                FormField::StartProject,
                 FormField::StartAgent,
                 FormField::StartTemplate,
                 FormField::StartName,
@@ -1234,11 +1311,19 @@ mod tests {
         );
         assert_eq!(
             next_form_field(&app, None, ListDirection::Down),
-            FormField::StartTemplate
+            FormField::StartAgent
         );
         assert_eq!(
-            next_form_field(&app, Some(FormField::StartTemplate), ListDirection::Down),
-            FormField::StartName
+            next_form_field(&app, Some(FormField::StartProject), ListDirection::Down),
+            FormField::StartAgent
+        );
+        assert_eq!(
+            next_form_field(&app, Some(FormField::StartAgent), ListDirection::Up),
+            FormField::StartProject
+        );
+        assert_eq!(
+            next_form_field(&app, Some(FormField::StartProject), ListDirection::Up),
+            FormField::StartPrompt
         );
         assert_eq!(
             next_form_field(&app, Some(FormField::StartName), ListDirection::Up),
@@ -1249,6 +1334,7 @@ mod tests {
         assert_eq!(
             form_fields(&app),
             vec![
+                FormField::StartProject,
                 FormField::StartAgent,
                 FormField::StartTemplate,
                 FormField::StartName,
@@ -1263,6 +1349,7 @@ mod tests {
         assert_eq!(
             form_fields(&app),
             vec![
+                FormField::AssistantProject,
                 FormField::AssistantIntent,
                 FormField::AssistantAgent,
                 FormField::AssistantRequest,
@@ -1270,6 +1357,76 @@ mod tests {
                 FormField::AssistantBaseBranch,
             ]
         );
+    }
+
+    #[test]
+    fn project_selects_open_and_move_like_the_other_selects() {
+        let mut app = PohunekApp::test_default();
+        app.modal = ModalView::Start;
+        app.form_focus = FormField::StartProject;
+        let down = Key::Named(Named::ArrowDown);
+
+        assert!(matches!(
+            form_select_key_message(&app, &down, Modifiers::empty()),
+            Some(Message::ToggleFormSelect(FormField::StartProject))
+        ));
+        app.form_select = Some(FormSelect {
+            field: FormField::StartProject,
+            cursor: 0,
+        });
+        assert!(matches!(
+            form_select_key_message(&app, &down, Modifiers::empty()),
+            Some(Message::MoveFormSelect(ListDirection::Down))
+        ));
+
+        app.modal = ModalView::Assistant;
+        app.form_focus = FormField::AssistantProject;
+        app.form_select = None;
+        assert!(matches!(
+            form_select_key_message(&app, &down, Modifiers::empty()),
+            Some(Message::ToggleFormSelect(FormField::AssistantProject))
+        ));
+    }
+
+    #[test]
+    fn new_session_shortcut_needs_a_project_to_target() {
+        let mut app = PohunekApp::test_default();
+        assert!(action_messages(&app, KeyAction::NewSession).is_empty());
+
+        app.workspace
+            .apply(pohunek_gui_core::DomainEvent::HostSnapshotLoaded {
+                snapshot: pohunek_gui_core::HostSnapshot {
+                    host_id: pohunek_gui_core::HostId::new("local"),
+                    health: pohunek_gui_core::HealthSummary {
+                        status: "ok".to_owned(),
+                        daemon_version: "test".to_owned(),
+                        protocol_version: protocol::PROTOCOL_VERSION,
+                    },
+                    sessions: Vec::new(),
+                    projects: vec![protocol::ProjectInfo {
+                        id: "p-1".to_owned(),
+                        label: "api".to_owned(),
+                        repo_root: "/tmp/api".into(),
+                        git_common_dir: "/tmp/api/.git".into(),
+                        origin_url: None,
+                        default_base_branch: None,
+                        source: protocol::ProjectSource::Manual,
+                        is_bare: false,
+                        added_at: "2026-07-06T00:00:00Z".to_owned(),
+                        last_used_at: "2026-07-06T00:00:00Z".to_owned(),
+                    }],
+                    project_error: None,
+                    notifications: Vec::new(),
+                    supported_agents: Vec::new(),
+                    runtimes: Vec::new(),
+                    notification_providers: Vec::new(),
+                    observation_capabilities: pohunek_gui_core::ObservationCapabilities::default(),
+                },
+            });
+        assert!(matches!(
+            action_messages(&app, KeyAction::NewSession).as_slice(),
+            [Message::OpenStartModal]
+        ));
     }
 
     #[test]

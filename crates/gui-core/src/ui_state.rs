@@ -1,6 +1,5 @@
-//! Persisted UI layout, selection, tree-node, and detail-tab view-model types.
+//! Persisted UI layout and selection view-model types.
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -8,50 +7,16 @@ use thiserror::Error;
 
 use protocol::SessionId;
 
-use crate::{
-    HostId, DEFAULT_LEFT_PANE_WIDTH, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, UI_STATE_FILE,
-};
+use crate::{HostId, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, UI_STATE_FILE};
 
 /// Active detail selection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Selection {
-    Host {
-        host_id: HostId,
-    },
-    Project {
-        host_id: HostId,
-        project_id: String,
-    },
     Session {
         host_id: HostId,
         session_id: SessionId,
     },
-}
-
-/// Persisted expanded workspace tree node.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TreeNodeId {
-    Host { host_id: HostId },
-    Project { host_id: HostId, project_id: String },
-}
-
-impl TreeNodeId {
-    /// Construct a host node id.
-    #[must_use]
-    pub fn host(host_id: HostId) -> Self {
-        Self::Host { host_id }
-    }
-
-    /// Construct a project node id.
-    #[must_use]
-    pub fn project(host_id: HostId, project_id: impl Into<String>) -> Self {
-        Self::Project {
-            host_id,
-            project_id: project_id.into(),
-        }
-    }
 }
 
 /// Persisted window dimensions.
@@ -68,21 +33,17 @@ pub struct WindowSize {
 /// Persisted UI layout and selection state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiState {
-    pub left_pane_width: u16,
     pub window_size: WindowSize,
-    pub expanded_nodes: BTreeSet<TreeNodeId>,
     pub selection: Option<Selection>,
 }
 
 impl Default for UiState {
     fn default() -> Self {
         Self {
-            left_pane_width: DEFAULT_LEFT_PANE_WIDTH,
             window_size: WindowSize {
                 width: DEFAULT_WINDOW_WIDTH,
                 height: DEFAULT_WINDOW_HEIGHT,
             },
-            expanded_nodes: BTreeSet::new(),
             selection: None,
         }
     }
@@ -180,5 +141,41 @@ mod tests {
         let parsed: UiState = toml::from_str(&raw).expect("legacy UI state parses");
 
         assert_eq!(parsed, UiState::default());
+    }
+
+    #[test]
+    fn removed_tree_fields_are_ignored_when_loading_legacy_state() {
+        let raw = r#"
+left_pane_width = 312
+expanded_nodes = [{ kind = "host", host_id = "local" }]
+
+[window_size]
+width = 960
+height = 640
+"#;
+
+        let parsed: UiState = toml::from_str(raw).expect("legacy UI state parses");
+
+        assert_eq!(parsed, UiState::default());
+    }
+
+    #[test]
+    fn legacy_project_selection_is_rejected_with_a_parse_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let raw = r#"
+[window_size]
+width = 960
+height = 640
+
+[selection]
+kind = "project"
+host_id = "local"
+project_id = "p-1"
+"#;
+        std::fs::write(dir.path().join(UI_STATE_FILE), raw).expect("write legacy state");
+
+        let error = UiState::load_from_dir(dir.path()).expect_err("project selection is gone");
+
+        assert!(matches!(error, UiStateError::Parse { .. }), "{error:?}");
     }
 }

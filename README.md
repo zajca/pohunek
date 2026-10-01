@@ -130,8 +130,9 @@ where they are doing it, and when they need you.
 
 - `pohunek-gui` (Iced, Wayland) is a session-first control plane. Its main pane
   groups cross-host sessions as Needs you, Running, Ready, and Unavailable;
-  unread history never promotes a ready session. The left rail keeps only
-  Assistant, Activity, hosts, and project context.
+  unread history never promotes a ready session. The header keeps only
+  Assistant, Activity, Hosts, and New session; a project chip on every row and a
+  project filter chip row show which project each session belongs to.
 - Clicking a session opens its detail in a modal over the list. Eligible rows
   expose direct Open/Resume, Terminate, and confirmed Delete actions.
 - Session detail shows concurrent Claude/Codex subagents and their durable

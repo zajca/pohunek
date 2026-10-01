@@ -1,11 +1,8 @@
 //! Selection lookups derived from the current UI selection.
 
-#[cfg(test)]
-use std::path::PathBuf;
-
 use iced::Task;
-use pohunek_gui_core::{ConnectionOptions, HostConfig, HostId, Selection};
-use protocol::{ProjectInfo, ProviderKind, SessionId, SessionInfo};
+use pohunek_gui_core::{ConnectionOptions, HostConfig, HostId, HostView, ProjectRef, Selection};
+use protocol::{ProviderKind, SessionId, SessionInfo};
 
 use crate::config::TerminalSize;
 use crate::message::Message;
@@ -29,22 +26,6 @@ pub(crate) fn sync_rename_edit_for_selection(app: &mut PohunekApp) {
     app.rename_edit = session.name.clone().unwrap_or_default();
 }
 
-pub(crate) fn selected_host_config(app: &PohunekApp) -> Result<HostConfig, String> {
-    host_config(app, &selected_host_id(app)?)
-}
-
-pub(crate) fn selected_host_id(app: &PohunekApp) -> Result<HostId, String> {
-    match app.ui_state.selection.as_ref() {
-        Some(
-            Selection::Host { host_id }
-            | Selection::Project { host_id, .. }
-            | Selection::Session { host_id, .. },
-        ) => Some(host_id.clone()),
-        None => app.hosts.first().map(|host| host.id.clone()),
-    }
-    .ok_or_else(|| "no host is available yet".to_owned())
-}
-
 pub(crate) fn host_config(app: &PohunekApp, host_id: &HostId) -> Result<HostConfig, String> {
     app.hosts
         .iter()
@@ -53,76 +34,77 @@ pub(crate) fn host_config(app: &PohunekApp, host_id: &HostId) -> Result<HostConf
         .ok_or_else(|| format!("unknown host `{host_id}`"))
 }
 
-pub(crate) fn selected_project_reference(app: &PohunekApp) -> Result<String, String> {
-    match app.ui_state.selection.as_ref() {
-        Some(Selection::Project { project_id, .. }) => Some(project_id.clone()),
-        Some(Selection::Session {
-            host_id,
-            session_id,
-        }) => app
-            .workspace
-            .hosts
-            .get(host_id)
-            .and_then(|host| host.sessions.get(&session_id.0))
-            .and_then(|session| session.project_id.clone()),
-        _ => None,
-    }
-    .ok_or_else(|| "select a project or project-linked session first".to_owned())
-}
-
+/// Host connection plus the project reference a launch form targets.
 #[derive(Debug, Clone)]
-pub(crate) struct AssistantProjectTarget {
+pub(crate) struct ProjectTarget {
     pub(crate) host: HostConfig,
     pub(crate) project_ref: String,
 }
 
-pub(crate) fn selected_assistant_project(
+/// Resolves the project chosen in a launch form to its host and wire reference.
+/// The project must still be listed by its host.
+pub(crate) fn project_target(
     app: &PohunekApp,
-) -> Result<AssistantProjectTarget, String> {
-    let host_id = selected_host_id(app)?;
-    Ok(AssistantProjectTarget {
-        host: host_config(app, &host_id)?,
-        project_ref: selected_project_reference(app)?,
+    project: Option<&ProjectRef>,
+) -> Result<ProjectTarget, String> {
+    let project = project.ok_or_else(|| "choose a project first".to_owned())?;
+    let host = host_config(app, &project.host_id)?;
+    if project_host(app, Some(project)).is_none() {
+        return Err(format!(
+            "project `{}` is no longer available on host `{}`",
+            project.project_id, project.host_id
+        ));
+    }
+    Ok(ProjectTarget {
+        host,
+        project_ref: project.project_id.clone(),
     })
 }
 
-#[cfg(test)]
-pub(crate) fn selected_project_identity(app: &PohunekApp) -> Result<(String, PathBuf), String> {
-    match app.ui_state.selection.as_ref() {
-        Some(Selection::Project {
-            host_id,
-            project_id,
-        }) => app
-            .workspace
-            .hosts
-            .get(host_id)
-            .and_then(|host| host.projects.get(project_id))
-            .map(|project| (project.id.clone(), project.repo_root.clone())),
-        Some(Selection::Session {
-            host_id,
-            session_id,
-        }) => app.workspace.hosts.get(host_id).and_then(|host| {
-            let project_id = host.sessions.get(&session_id.0)?.project_id.as_ref()?;
-            host.projects
-                .get(project_id)
-                .map(|project| (project.id.clone(), project.repo_root.clone()))
-        }),
-        _ => None,
-    }
-    .ok_or_else(|| "select a project or project-linked session first".to_owned())
+/// Live view of the host that owns the project chosen in a launch form; `None`
+/// when the host is unknown or no longer lists the project.
+pub(crate) fn project_host<'a>(
+    app: &'a PohunekApp,
+    project: Option<&ProjectRef>,
+) -> Option<&'a HostView> {
+    let project = project?;
+    app.workspace
+        .hosts
+        .get(&project.host_id)
+        .filter(|host| host.projects.contains_key(&project.project_id))
 }
 
+/// Project a freshly opened launch modal starts with: the active session
+/// filter, else the selected session's project, else the only known project.
+/// Candidates the launch picker does not offer are skipped.
+pub(crate) fn preselected_project(app: &PohunekApp) -> Option<ProjectRef> {
+    let choices = app.workspace.project_choices();
+    let offered = |project: &ProjectRef| choices.iter().any(|choice| &choice.project == project);
+    let selected_session_project = selected_session(app).and_then(|(host_id, session)| {
+        session.project_id.as_ref().map(|project_id| ProjectRef {
+            host_id: host_id.clone(),
+            project_id: project_id.clone(),
+        })
+    });
+    app.project_filter
+        .clone()
+        .filter(offered)
+        .or_else(|| selected_session_project.filter(offered))
+        .or_else(|| match choices.as_slice() {
+            [only] => Some(only.project.clone()),
+            _ => None,
+        })
+}
+
+/// Template (`None`-provider) action names loaded for the Start form's project.
 pub(crate) fn available_actions(app: &PohunekApp, provider: &ProviderKind) -> Vec<String> {
-    let Ok(host_id) = selected_host_id(app) else {
-        return Vec::new();
-    };
-    let Ok(reference) = selected_project_reference(app) else {
+    let Some(project) = app.start.project.as_ref() else {
         return Vec::new();
     };
     app.workspace
         .hosts
-        .get(&host_id)
-        .and_then(|host| host.prompt.actions_by_project.get(&reference))
+        .get(&project.host_id)
+        .and_then(|host| host.prompt.actions_by_project.get(&project.project_id))
         .map(|result| {
             result
                 .actions
@@ -172,13 +154,6 @@ pub(crate) fn save_ui_state_task(app: &PohunekApp) -> Task<Message> {
     )
 }
 
-pub(crate) fn project_is_selected(app: &PohunekApp, host_id: &HostId, project_id: &str) -> bool {
-    matches!(
-        app.ui_state.selection.as_ref(),
-        Some(Selection::Project { host_id: h, project_id: p }) if h == host_id && p == project_id
-    )
-}
-
 pub(crate) fn selected_session(app: &PohunekApp) -> Option<(&HostId, &SessionInfo)> {
     let Some(Selection::Session {
         host_id,
@@ -194,23 +169,5 @@ pub(crate) fn selected_session(app: &PohunekApp) -> Option<(&HostId, &SessionInf
             host.sessions
                 .get(&session_id.0)
                 .map(|session| (host_id, session))
-        })
-}
-
-pub(crate) fn selected_project(app: &PohunekApp) -> Option<(&HostId, &ProjectInfo)> {
-    let Some(Selection::Project {
-        host_id,
-        project_id,
-    }) = app.ui_state.selection.as_ref()
-    else {
-        return None;
-    };
-    app.workspace
-        .hosts
-        .get_key_value(host_id)
-        .and_then(|(host_id, host)| {
-            host.projects
-                .get(project_id)
-                .map(|project| (host_id, project))
         })
 }

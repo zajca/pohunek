@@ -118,7 +118,7 @@ fn inbox_list_content(app: &PohunekApp) -> Element<'_, Message> {
 
 fn notification_policy_card(app: &PohunekApp) -> Element<'_, Message> {
     let Some(host_id) = notification_policy_host(app) else {
-        return card(text("Select a host to manage its activity policy").size(12));
+        return card(text("Choose a host above to manage its activity policy").size(12));
     };
     let load = button("Load notification policy")
         .on_press(Message::LoadNotificationPolicy(host_id.clone()))
@@ -169,17 +169,25 @@ fn notification_policy_card(app: &PohunekApp) -> Element<'_, Message> {
     card(rows)
 }
 
+/// Host whose activity policy the modal manages: the explicit host filter, else
+/// the selected session's host, else the only known host.
 fn notification_policy_host(app: &PohunekApp) -> Option<HostId> {
-    app.notification_filter.host_id.clone().or_else(|| {
-        app.workspace
-            .selection
-            .as_ref()
-            .map(|selection| match selection {
-                Selection::Host { host_id }
-                | Selection::Project { host_id, .. }
-                | Selection::Session { host_id, .. } => host_id.clone(),
-            })
-    })
+    app.notification_filter
+        .host_id
+        .clone()
+        .or_else(|| {
+            app.workspace
+                .selection
+                .as_ref()
+                .map(|Selection::Session { host_id, .. }| host_id.clone())
+        })
+        .or_else(|| {
+            let mut hosts = app.workspace.hosts.keys();
+            match (hosts.next(), hosts.next()) {
+                (Some(only), None) => Some(only.clone()),
+                _ => None,
+            }
+        })
 }
 
 fn policy_kind_row(
@@ -232,8 +240,8 @@ fn policy_kind_row(
     values.into()
 }
 
-/// The scope segmented control, plus (when 2+ hosts have notifications) the
-/// host `pick_list` that replaces the old per-axis filter-chip rows.
+/// The scope segmented control, plus (when 2+ hosts are known) the host
+/// `pick_list`.
 fn inbox_controls(app: &PohunekApp) -> Element<'_, Message> {
     let mut controls = row![
         inbox_scope_button("Recent", NotificationScope::Recent, app.inbox_scope),
@@ -263,21 +271,15 @@ fn inbox_scope_button(
     }
 }
 
-/// Host filter picker; hidden entirely below two hosts, since a single-host
-/// workspace has nothing to narrow.
+/// Host filter picker listing every known host, so a host without
+/// notifications can still be chosen to manage its activity policy; hidden
+/// below two hosts, where the policy host is implicit.
 fn inbox_host_picker(app: &PohunekApp) -> Option<Element<'_, Message>> {
-    let hosts_with_notifications: Vec<HostId> = app
-        .workspace
-        .hosts
-        .iter()
-        .filter(|(_, host)| !host.notifications.is_empty())
-        .map(|(host_id, _)| host_id.clone())
-        .collect();
-    if hosts_with_notifications.len() < 2 {
+    if app.workspace.hosts.len() < 2 {
         return None;
     }
     let mut options = vec![INBOX_ALL_HOSTS_LABEL.to_owned()];
-    options.extend(hosts_with_notifications.iter().map(HostId::to_string));
+    options.extend(app.workspace.hosts.keys().map(HostId::to_string));
     let selected = app
         .notification_filter
         .host_id
@@ -779,6 +781,58 @@ mod policy_tests {
         let mut app = PohunekApp::test_default();
         app.notification_filter.host_id = Some(HostId::new("host-b"));
 
+        assert_eq!(notification_policy_host(&app), Some(HostId::new("host-b")));
+    }
+
+    fn empty_snapshot(host_id: &str) -> pohunek_gui_core::HostSnapshot {
+        pohunek_gui_core::HostSnapshot {
+            host_id: HostId::new(host_id),
+            health: pohunek_gui_core::HealthSummary {
+                status: "ok".to_owned(),
+                daemon_version: "test".to_owned(),
+                protocol_version: protocol::PROTOCOL_VERSION,
+            },
+            sessions: Vec::new(),
+            projects: Vec::new(),
+            project_error: None,
+            notifications: Vec::new(),
+            supported_agents: Vec::new(),
+            runtimes: Vec::new(),
+            notification_providers: Vec::new(),
+            observation_capabilities: pohunek_gui_core::ObservationCapabilities::default(),
+        }
+    }
+
+    fn app_with_hosts(ids: &[&str]) -> PohunekApp {
+        let mut app = PohunekApp::test_default();
+        for id in ids {
+            app.workspace
+                .apply(pohunek_gui_core::DomainEvent::HostSnapshotLoaded {
+                    snapshot: empty_snapshot(id),
+                });
+        }
+        app
+    }
+
+    #[test]
+    fn single_host_is_the_policy_host_without_sessions_or_notifications() {
+        let app = app_with_hosts(&["local"]);
+
+        assert_eq!(notification_policy_host(&app), Some(HostId::new("local")));
+        assert!(inbox_host_picker(&app).is_none());
+    }
+
+    #[test]
+    fn several_hosts_need_a_choice_and_the_picker_lists_them_all() {
+        let mut app = app_with_hosts(&["host-a", "host-b"]);
+
+        assert_eq!(notification_policy_host(&app), None);
+        assert!(inbox_host_picker(&app).is_some());
+
+        let _ = crate::command::update(
+            &mut app,
+            Message::FilterNotificationHost(Some(HostId::new("host-b"))),
+        );
         assert_eq!(notification_policy_host(&app), Some(HostId::new("host-b")));
     }
 

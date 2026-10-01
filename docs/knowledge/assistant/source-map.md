@@ -70,7 +70,7 @@ Native GUI client:
 - `crates/gui/src/view/modals.rs`
 - `crates/gui/src/view/inbox.rs`
 - `crates/gui/src/view/session.rs`
-- `crates/gui/src/view/tree.rs`
+- `crates/gui/src/view/hosts.rs`
 - `crates/gui/src/view/selectable_text.rs`
 - `crates/gui-core/src/assistant.rs`
 - `crates/gui-core/src/lib.rs`
@@ -188,7 +188,7 @@ Shipped host-local identity and governance:
 - `crates/gui-core/src/sdk.rs`
 - `crates/gui-core/src/state.rs`
 - `crates/gui/src/command.rs`
-- `crates/gui/src/view/tree.rs`
+- `crates/gui/src/view/hosts.rs`
 - `crates/xtask/src/generators/protocol.rs`
 - `web/sdk/src/governance.ts` — strict TypeScript validation of the public
   `host.governance.inspect` response and its fixed redacted contract-mismatch

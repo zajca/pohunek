@@ -9,9 +9,9 @@ intents: [setup, debug, help]
 
 # GUI Setup
 
-`pohunek-gui` is the native, session-first desktop control plane. It shows
-hosts and project context in a narrow left rail and a prioritized cross-host
-session list in the main pane. It does not embed a terminal: opening a session
+`pohunek-gui` is the native, session-first desktop control plane. It is a single
+pane: a header with the Assistant, Activity, Hosts, and New session controls above
+a prioritized cross-host session list. It does not embed a terminal: opening a session
 spawns the configured `attach_command`.
 
 The native GUI intentionally has no Linear, GitHub, review, worktree-management,
@@ -258,10 +258,23 @@ The main pane always groups every loaded session in this priority order:
 4. **Unavailable** — terminal, external, conflicting, incompatible, lost, or
    otherwise unusable sessions.
 
-Rows are stable within a group by host id and session id. Activity or runtime
-changes may move a row between groups, but do not reorder unrelated rows inside
-the same group. Every row identifies its project explicitly as
-`project:<label>`, falling back to the project id or `project:unassigned`.
+Empty groups are hidden; when no session is loaded the pane shows one empty-state
+message. Rows are stable within a group by project label, session name (or id),
+host id, and session id. Activity or runtime changes may move a row between
+groups, but do not reorder unrelated rows inside the same group. Every row leads
+with a prominent project chip showing the project label, falling back to the
+project id or `unassigned`; the row then shows the session name, branch, and a
+muted host, agent, state, and activity line.
+
+A project filter chip row above the list offers `All` plus one chip per project
+that currently has sessions, each with its session count. Selecting a chip
+restricts every group to that project; the filter is the only project browsing
+surface and is not persisted.
+
+The header's Hosts control opens a modal listing every host with its connection
+state, last error, and the read-only governance projection. A configuration
+error is shown as a banner above the list.
+
 Unread informational or historical notifications never move a session into
 Needs you. A current input or approval request is labeled directly on the row.
 
@@ -286,12 +299,11 @@ including how many are still working.
 
 ## Navigation and Keyboard
 
-The left rail contains Assistant, Activity, hosts, and projects. Select a project
-before starting a session. Sessions do not appear in the left tree because the
-main pane is their single navigation surface.
-
-Double-clicking a project row selects that project and opens a fresh Start
-session modal scoped to it.
+The header holds Assistant, Activity, Hosts, and New session. New session is
+enabled whenever any project is known on any host. The Start
+session and Assistant modals choose their own target project through a Project
+select (see Session and Assistant Launch), so no project has to be selected
+beforehand.
 
 Default global bindings:
 
@@ -301,7 +313,7 @@ Default global bindings:
 | `open_selected_session` | `o` | Open or resume the selected session in a terminal. |
 | `show_selected_session` | `enter` | Open the selected session detail modal. |
 | `open_keymap_help` | `shift+?` | Show the effective keymap. |
-| `new_session` | `n` | Open the Start session modal when a project is selected. |
+| `new_session` | `n` | Open the Start session modal whenever any project exists. |
 | `open_assistant` | `a` | Open the Assistant modal. |
 
 Modal bindings include `escape`, `enter`, `shift+enter`, `o`, and `j`/`k` or
@@ -315,8 +327,8 @@ modifier), and a global binding such as `cmd+i` is valid. Unknown removed bindin
 configuration validation instead of silently doing nothing.
 
 Tab and Shift+Tab are conventional, non-configurable form navigation in the
-Start session and Assistant modals. Focus cycles through both leading select
-fields, the prompt/name inputs, and visible Advanced branch fields, never into
+Start session and Assistant modals. Focus cycles through the Project select, the
+other leading select fields, the prompt/name inputs, and visible Advanced branch fields, never into
 controls behind the modal overlay. On a focused select, Up or Down opens its
 options, the arrow keys move the option cursor, and Enter confirms the choice.
 Ctrl+Enter (and Command+Enter on macOS) submits either launch form from any
@@ -369,14 +381,19 @@ the Terminal.app window itself, and double-clicking an app icon, which need the
 
 ## Session and Assistant Launch
 
-The Start session modal calls `project.actions`, resolves the chosen action with
+The Start session modal opens with a Project select as its first field. Options
+are every known project on every host, labeled with the host (`label · host`).
+The project is preselected from the active project filter, else from the
+selected session's project, else the only project. Choosing another project
+clears the template, reloads that project's actions, and re-validates the agent
+against the target host's runtimes. The modal calls `project.actions`, resolves the chosen action with
 `project.action`, renders through the shared prompt crate, and creates the
 session with `session.new`. A blank session uses provider `none`. Runtime choices
 come from `host.inspect` and fail closed when a runtime is unavailable or
 unsupported.
 
-The Assistant entry opens a native launch modal. It is scoped to the selected
-project, or to the project linked from the selected session. The shared
+The Assistant entry opens a native launch modal with the same Project select as
+its first field and the same preselection rules. The shared
 `gui-core::assistant` launcher performs host inspection, snapshot creation,
 knowledge materialization, prompt composition, and `session.new`.
 
@@ -410,7 +427,7 @@ Relevant implementation sources:
 
 - `crates/gui/src/view/detail.rs` — prioritized list and quick actions.
 - `crates/gui/src/view/session.rs` — detail and delete-confirmation modals.
-- `crates/gui/src/view/tree.rs` — host/project context rail.
+- `crates/gui/src/view/hosts.rs` — Hosts modal (connection state, errors, governance).
 - `crates/gui/src/keyboard.rs` — supported bindings and routing.
 - `crates/gui-core/src/state.rs` — grouping and capability-derived action model.
-- `crates/gui-core/src/ui_state.rs` — persisted window, tree, and selection state.
+- `crates/gui-core/src/ui_state.rs` — persisted window and selection state.

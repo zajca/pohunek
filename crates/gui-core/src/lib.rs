@@ -3,7 +3,7 @@
 //! This crate intentionally has no Iced dependency. The native view layer wraps
 //! these async helpers in Iced `Task` and `Subscription` values.
 
-// Rust guideline compliant 2026-08-28
+// Rust guideline compliant 2026-10-01
 #![forbid(unsafe_code)]
 
 pub mod assistant;
@@ -80,16 +80,16 @@ pub use sdk::{
 };
 #[doc(inline)]
 pub use state::{
-    AgentStateEvent, ConnState, GitHubProviderScope, GitHubProviderState,
+    project_choice_labels, AgentStateEvent, ConnState, GitHubProviderScope, GitHubProviderState,
     GitHubPullRequestStatusKey, GovernanceRequestError, GovernanceRequestId, GovernanceState,
     HostEvent, HostView, LinearProviderState, NotificationFilter, NotificationIntent,
-    NotificationRow, NotificationScope, PromptState, ProviderOperation, ProviderPanel,
-    ProviderRequestId, ProviderState, ReviewCommentEditor, ReviewDiffStatus, ReviewDispatchModal,
-    ReviewLineTarget, ReviewTabState, RuntimeContinuity, SessionAccess, SessionGroup,
-    SessionObservation, SessionRow, Toast, Workspace,
+    NotificationRow, NotificationScope, ProjectChoice, ProjectRef, PromptState, ProviderOperation,
+    ProviderPanel, ProviderRequestId, ProviderState, ReviewCommentEditor, ReviewDiffStatus,
+    ReviewDispatchModal, ReviewLineTarget, ReviewTabState, RuntimeContinuity, SessionAccess,
+    SessionGroup, SessionObservation, SessionRow, Toast, Workspace,
 };
 #[doc(inline)]
-pub use ui_state::{default_state_dir, Selection, TreeNodeId, UiState, UiStateError, WindowSize};
+pub use ui_state::{default_state_dir, Selection, UiState, UiStateError, WindowSize};
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -97,7 +97,6 @@ const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const DEFAULT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const UI_STATE_FILE: &str = "ui-state.toml";
-const DEFAULT_LEFT_PANE_WIDTH: u16 = 280;
 /// Stable protocol code older daemons return for unknown optional methods.
 const METHOD_NOT_FOUND_CODE: &str = "method_not_found";
 const DEFAULT_WINDOW_WIDTH: u32 = 960;

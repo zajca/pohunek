@@ -7,12 +7,13 @@ use iced::widget::text_editor;
 use iced::Size;
 use pohunek_gui_core::assistant::Intent as AssistantIntent;
 use pohunek_gui_core::{
-    DomainEvent as CoreEvent, HostConfig, HostId, NotificationScope, TreeNodeId,
+    DomainEvent as CoreEvent, HostConfig, HostId, NotificationScope, ProjectRef,
 };
 use protocol::{NotificationId, NotificationKind, SessionId};
 
 pub(crate) const BLANK_TEMPLATE_LABEL: &str = "— blank —";
 pub(crate) const ASSISTANT_AUTO_AGENT_LABEL: &str = "Auto";
+pub(crate) const PROJECT_PLACEHOLDER_LABEL: &str = "Choose a project";
 
 /// Which overlay modal is open.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +26,7 @@ pub(crate) enum ModalView {
     ConfirmDeleteSession,
     Keymap,
     Inbox,
+    Hosts,
 }
 
 /// Which layer of the inbox modal is showing.
@@ -56,6 +58,8 @@ pub(crate) struct ResolvedTemplate {
 /// User-editable fields in the session-start modal.
 #[derive(Debug, Clone)]
 pub(crate) struct StartForm {
+    /// Target project, which also decides the host the session runs on.
+    pub(crate) project: Option<ProjectRef>,
     pub(crate) agent: String,
     pub(crate) name: String,
     pub(crate) template: Option<String>,
@@ -67,6 +71,7 @@ pub(crate) struct StartForm {
 impl Default for StartForm {
     fn default() -> Self {
         Self {
+            project: None,
             agent: "codex".to_owned(),
             name: String::new(),
             template: None,
@@ -80,6 +85,8 @@ impl Default for StartForm {
 /// User-editable fields in the assistant-start modal.
 #[derive(Debug, Clone)]
 pub(crate) struct AssistantForm {
+    /// Target project, which also decides the host the assistant runs on.
+    pub(crate) project: Option<ProjectRef>,
     pub(crate) intent: AssistantIntent,
     pub(crate) agent: Option<String>,
     pub(crate) show_advanced: bool,
@@ -92,6 +99,7 @@ pub(crate) struct AssistantForm {
 impl Default for AssistantForm {
     fn default() -> Self {
         Self {
+            project: None,
             intent: AssistantIntent::Help,
             agent: None,
             show_advanced: false,
@@ -126,12 +134,14 @@ pub(crate) enum ListDirection {
 /// A keyboard-focusable field in a launch form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FormField {
+    StartProject,
     StartAgent,
     StartTemplate,
     StartName,
     StartPrompt,
     StartBranch,
     StartBaseBranch,
+    AssistantProject,
     AssistantIntent,
     AssistantAgent,
     AssistantRequest,
@@ -150,8 +160,9 @@ pub(crate) struct FormSelect {
 pub(crate) enum Message {
     Core(CoreEvent),
     HostsDiscovered(DiscoveryResult),
-    ToggleNode(TreeNodeId),
     OpenInbox,
+    OpenHostsModal,
+    SetProjectFilter(Option<ProjectRef>),
     OpenHostInbox(HostId),
     SetInboxScope(NotificationScope),
     FilterNotificationHost(Option<HostId>),
@@ -174,10 +185,6 @@ pub(crate) enum Message {
         host_id: HostId,
         session_id: SessionId,
     },
-    SelectProject {
-        host_id: HostId,
-        project_id: String,
-    },
     OpenSession {
         host_id: HostId,
         session_id: SessionId,
@@ -195,11 +202,18 @@ pub(crate) enum Message {
     OpenAssistantModal,
     OpenKeymapModal,
     CloseModal,
+    StartProjectSelected(ProjectRef),
     StartAgentSelected(String),
     StartTemplateSelected(String),
-    TemplateResolved(Result<ResolvedTemplate, String>),
+    /// Template resolution requested under `generation`; applied only while
+    /// that is still the newest template request.
+    TemplateResolved {
+        generation: u64,
+        result: Result<ResolvedTemplate, String>,
+    },
     PromptEdited(text_editor::Action),
     AssistantRequestEdited(text_editor::Action),
+    AssistantProjectSelected(ProjectRef),
     AssistantIntentSelected(AssistantIntent),
     AssistantAgentSelected(String),
     ToggleAssistantAdvanced,
