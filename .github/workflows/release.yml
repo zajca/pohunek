@@ -482,9 +482,12 @@ jobs:
   #                  and uses only pinned actions. Missing credentials fail it
   #                  before any work: a macOS archive is never published unsigned
   #                  and the run stays red until the credentials exist.
-  #   release-macos  extracts the signed archive outside the checkout, verifies
-  #                  its signatures, runs the packaged smokes, and attaches it.
-  #                  No secret.
+  #   verify-macos   extracts the signed archive outside the checkout, verifies
+  #                  its signatures, and runs the packaged smokes. Read-only
+  #                  token, no secret.
+  #   publish-macos  downloads the signed archive again on a fresh runner,
+  #                  checks its checksum, and attaches it without running
+  #                  anything from it. The only job with a write token.
   #
   # Running the archives on macOS 14 itself is a separate acceptance gate.
   stage-macos:
@@ -656,13 +659,13 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  release-macos:
-    name: Verify and publish ${{ matrix.component }} for aarch64-apple-darwin
+  verify-macos:
+    name: Verify ${{ matrix.component }} for aarch64-apple-darwin
     needs: [sign-macos]
     runs-on: macos-15
     timeout-minutes: 120
     permissions:
-      contents: write
+      contents: read
     env:
       RUSTFLAGS: -D warnings
     strategy:
@@ -703,8 +706,6 @@ jobs:
           grep -q '^signing developer-id$' "$root/MANIFEST"
           packaging/macos/verify-signed --notarized --team-id "$MACOS_TEAM_ID" "$root"
           echo "root=$root" >> "$GITHUB_OUTPUT"
-          echo "archive=$archive" >> "$GITHUB_OUTPUT"
-          echo "checksum=$archive.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Smoke-test the packaged daemon binaries
         if: matrix.component == 'daemon'
@@ -771,10 +772,36 @@ jobs:
             --pohunek-bin "$release_pohunek"
           PATH="/bin:$PATH" "$packaged_smoke" "$release_pohunek" "${{ steps.hermes.outputs.bin }}"
 
+  publish-macos:
+    name: Publish ${{ matrix.component }} for aarch64-apple-darwin
+    needs: [verify-macos]
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [cli, daemon, gui]
+    steps:
+      - name: Download the signed archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: macos-signed-${{ matrix.component }}
+          path: ${{ runner.temp }}/signed-download
+
+      - name: Check the archive checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/signed-download"
+          shasum -a 256 -c ./*.tar.gz.sha256
+          test "$(ls ./*.tar.gz | wc -l | tr -d ' ')" = 1
+
       - name: Attach to release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           fail_on_unmatched_files: true
           files: |
-            ${{ steps.extract.outputs.archive }}
-            ${{ steps.extract.outputs.checksum }}
+            ${{ runner.temp }}/signed-download/*.tar.gz
+            ${{ runner.temp }}/signed-download/*.tar.gz.sha256

@@ -100,6 +100,7 @@ case "$1" in
     if [ "$2 $3" = "-d user" ] && [ "$#" -eq 3 ]; then
       printf '    "/Users/runner/Library/Keychains/login.keychain-db"\\n    "/Library/Keychains/System.keychain"\\n'
     fi ;;
+  import) exit "${SHIM_SECURITY_IMPORT_STATUS:-0}" ;;
   find-identity) printf '  1) %s "Developer ID Application: Example (ABCDE12345)"\\n     1 valid identities found\\n' "$SHIM_IDENTITY" ;;
 esac
 exit 0
@@ -378,6 +379,66 @@ class PackageReleaseTest(Base):
             )
         self.assertEqual(self.calls(), [])
 
+    def test_the_signing_step_audits_signs_notarizes_verifies_and_archives_in_order(self):
+        name = "pohunek-cli-1.2.3-aarch64-apple-darwin"
+        staging = self.root / name
+        program = staging / "pohunek"
+        program.parent.mkdir()
+        program.write_bytes(MACHO)
+        program.chmod(0o755)
+        (staging / "README.md").write_text("text\n")
+        # The audit reads the tree through otool, lipo, and strings, which the
+        # shims below answer for every file.
+        audit_tools = self.root / "audit-tools"
+        audit_tools.mkdir()
+        for tool in ("otool", "lipo", "strings"):
+            write_shim(
+                audit_tools,
+                tool,
+                "#!/bin/sh\n"
+                "case \"$1\" in\n"
+                "  -archs) echo arm64 ;;\n"
+                "  -l) printf 'Load command 1\\n      cmd LC_BUILD_VERSION\\n platform 1\\n    minos 14.0\\n' ;;\n"
+                "  -L) printf 'x:\\n\\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0)\\n' ;;\n"
+                "  -a) echo clean ;;\n"
+                "esac\n",
+            )
+        env = {
+            **SIGNING_ENV,
+            "MACOS_TEAM_ID": TEAM,
+            **NOTARY_ENV,
+            "SOURCE_DATE_EPOCH": "1700000000",
+            "PATH": "%s:%s:%s" % (audit_tools, self.tools, os.environ["PATH"]),
+        }
+        result = self.run_tool("package", "--sign-release", "cli", "1.2.3", staging, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        archive = Path(result.stdout.strip())
+        self.assertEqual(archive, self.root / (name + ".tar.gz"))
+        self.assertTrue(archive.is_file())
+        checksum = (self.root / (name + ".tar.gz.sha256")).read_text()
+        self.assertTrue(checksum.strip().endswith(name + ".tar.gz"))
+        manifest = (staging / "MANIFEST").read_text()
+        self.assertIn("signing developer-id\n", manifest)
+        self.assertIn("minimum-macos 14.0\n", manifest)
+        self.assertIn("component cli\n", manifest)
+        calls = self.calls()
+        first_sign = next(i for i, c in enumerate(calls) if c.startswith("codesign") and "--sign" in c)
+        notarize = next(i for i, c in enumerate(calls) if c.startswith("xcrun notarytool submit"))
+        verify = next(i for i, c in enumerate(calls) if c.startswith("codesign") and "-dvv" in c)
+        self.assertLess(first_sign, notarize)
+        self.assertLess(notarize, verify)
+
+    def test_a_staged_tree_with_a_symlink_is_refused_before_anything_is_signed(self):
+        name = "pohunek-cli-1.2.3-aarch64-apple-darwin"
+        staging = self.root / name
+        staging.mkdir()
+        (staging / "link").symlink_to("/etc/passwd")
+        env = {**SIGNING_ENV, "MACOS_TEAM_ID": TEAM, **NOTARY_ENV}
+        result = self.run_tool("package", "--sign-release", "cli", "1.2.3", staging, env=env)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("symbolic link or special file", result.stderr)
+        self.assertEqual(self.calls(), [])
+
     def test_modes_and_components_are_validated(self):
         for args in (
             ("--sideload", "daemon", "1.2.3", self.root, self.root, self.root),
@@ -445,6 +506,22 @@ class SigningKeychainTest(Base):
         self.assertTrue(any("list-keychains -d user -s /Users/runner/Library/Keychains/login.keychain-db /Library/Keychains/System.keychain" in c for c in calls))
         self.assertFalse((runner_temp / "pohunek-signing").exists())
 
+    def test_a_failing_import_leaves_no_keychain_certificate_or_state(self):
+        result, _, runner_temp = self.keychain(
+            "create",
+            MACOS_CERTIFICATE_P12_BASE64="UEsDBBQ=",
+            MACOS_CERTIFICATE_PASSWORD="pw",
+            SHIM_SECURITY_IMPORT_STATUS="1",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((runner_temp / "pohunek-signing").exists())
+        calls = self.calls("security")
+        # The search list is restored to its original entries.
+        self.assertEqual(
+            calls[-1],
+            "security list-keychains -d user -s /Users/runner/Library/Keychains/login.keychain-db /Library/Keychains/System.keychain",
+        )
+
     def test_delete_without_a_keychain_is_a_no_op(self):
         result, _, _ = self.keychain("delete")
         self.assertEqual(result.returncode, 0)
@@ -470,8 +547,9 @@ class ReleaseWorkflowTest(unittest.TestCase):
     def setUp(self):
         self.text = (ROOT / ".github/workflows/release.yml").read_text()
         self.stage = self.job("stage-macos", "sign-macos")
-        self.sign = self.job("sign-macos", "release-macos")
-        self.release = self.job("release-macos", None)
+        self.sign = self.job("sign-macos", "verify-macos")
+        self.release = self.job("verify-macos", "publish-macos")
+        self.publish = self.job("publish-macos", None)
 
     def job(self, name, following):
         start = self.text.index("\n  %s:\n" % name)
@@ -479,7 +557,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         return self.text[start:end]
 
     def test_secrets_exist_only_in_the_signing_job_and_only_in_its_steps(self):
-        for name, job in (("stage", self.stage), ("release", self.release)):
+        for name, job in (("stage", self.stage), ("release", self.release), ("publish", self.publish)):
             self.assertNotIn("secrets.", job, name)
             self.assertNotIn("macos-signing", job, name)
         header = self.sign.split("    steps:", 1)[0]
@@ -499,7 +577,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
             self.assertNotIn(forbidden, self.sign, forbidden)
 
     def test_every_action_that_shapes_the_signed_bytes_is_pinned(self):
-        for name, job in (("stage", self.stage), ("sign", self.sign), ("release", self.release)):
+        for name, job in (("stage", self.stage), ("sign", self.sign), ("release", self.release), ("publish", self.publish)):
             for use in re.findall(r"uses: (\S+)", job):
                 self.assertRegex(use, r"@[0-9a-f]{40}$", "%s: %s" % (name, use))
 
@@ -540,10 +618,20 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("verify-signed --notarized", self.release)
         self.assertIn("RUNNER_TEMP/extracted", self.release)
         self.assertIn("packaging/smoke-hermes-plugin-release", self.release)
-        self.assertIn("action-gh-release", self.release)
-        self.assertNotIn("action-gh-release", self.stage + self.sign)
+        self.assertNotIn("action-gh-release", self.stage + self.sign + self.release)
         self.assertIn("needs: [sign-macos]", self.release)
         self.assertIn("needs: [stage-macos]", self.sign)
+
+    def test_only_the_publishing_job_can_write_and_it_runs_nothing_from_the_archive(self):
+        self.assertIn("contents: write", self.publish)
+        for name, job in (("stage", self.stage), ("sign", self.sign), ("verify", self.release)):
+            self.assertNotIn("contents: write", job, name)
+        self.assertIn("contents: read", self.release)
+        self.assertIn("needs: [verify-macos]", self.publish)
+        self.assertIn("action-gh-release", self.publish)
+        for forbidden in ("tar -x", "--version", "smoke", "cargo", "bun ", "verify-signed", "checkout"):
+            self.assertNotIn(forbidden, self.publish, forbidden)
+        self.assertIn("shasum -a 256 -c", self.publish)
 
 
 if __name__ == "__main__":

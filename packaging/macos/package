@@ -17,8 +17,8 @@
 # prints the staging directory. `--sign-release` then signs the tree with the
 # Developer ID identity, has Apple notarize it (stapling app bundles), verifies
 # the result, and writes the manifest and the archive, so the manifest hashes the
-# final signed bytes and records `signing developer-id`. It runs nothing from
-# the tree. It needs the environment of `signing-keychain`
+# final signed bytes and records `signing developer-id`. It audits the tree again
+# before signing (the tree came from another runner) and runs nothing from it. It needs the environment of `signing-keychain`
 # (MACOS_SIGNING_IDENTITY, MACOS_SIGNING_KEYCHAIN), of `notarize`
 # (APPLE_NOTARY_*), and MACOS_TEAM_ID, and fails when any is missing: a release
 # is never produced unsigned. Signing embeds Apple's secure timestamp, so a
@@ -86,6 +86,13 @@ if [ "$mode" = --sign-release ]; then
         SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
     fi
     export SOURCE_DATE_EPOCH
+    # The tree arrives from another runner, so what is about to be signed is
+    # checked again here: only regular files and directories, and every
+    # program a Mach-O file of the right platform, architecture, and target.
+    unexpected=$(find "$staging" ! -type f ! -type d -print | head -n 1)
+    [ -z "$unexpected" ] || fail "the staged tree holds a symbolic link or special file: $unexpected"
+    # shellcheck disable=SC2086
+    "$script_dir/audit-macho" $require --forbid-string "$root" "$staging" >&2
     "$script_dir/sign" "$staging" >&2
     "$script_dir/notarize" "$staging" >&2
     "$script_dir/verify-signed" --notarized --team-id "$MACOS_TEAM_ID" "$staging" >&2

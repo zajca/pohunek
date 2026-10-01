@@ -34,6 +34,10 @@ minimum=$(/usr/bin/plutil -extract LSMinimumSystemVersion raw -o - "$plist")
 [ "$identifier" = "$EXPECTED_IDENTIFIER" ] || { printf 'bundle identifier is %s, expected %s\n' "$identifier" "$EXPECTED_IDENTIFIER" >&2; exit 1; }
 executable=$app/Contents/MacOS/$executable_name
 [ -x "$executable" ] || { printf 'bundle executable is missing or not executable: %s\n' "$executable" >&2; exit 1; }
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+expected_minimum=$(tr -d ' \n' <"$script_dir/../packaging/macos/DEPLOYMENT_TARGET")
+[ "$minimum" = "$expected_minimum" ] ||
+    { printf 'bundle minimum macOS is %s, expected the deployment target %s\n' "$minimum" "$expected_minimum" >&2; exit 1; }
 printf 'bundle %s, executable %s, minimum macOS %s\n' "$identifier" "$executable_name" "$minimum"
 
 manager=$(/bin/launchctl managername 2>/dev/null || printf unknown)

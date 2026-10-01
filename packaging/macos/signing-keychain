@@ -44,6 +44,9 @@ case $action in
         [ -n "${MACOS_CERTIFICATE_PASSWORD:-}" ] || fail "MACOS_CERTIFICATE_PASSWORD is not set: the Developer ID certificate secret is missing, so this release cannot be signed"
         [ ! -e "$state_dir" ] || fail "$state_dir already exists; run \`signing-keychain delete\` first"
         mkdir -p "$state_dir"
+        # A failure anywhere below removes the keychain, the temporary PKCS#12,
+        # and the search-list change before the script exits.
+        trap '"$0" delete >/dev/null 2>&1 || true' EXIT
         p12=$state_dir/certificate.p12
         # The state directory exists before the first secret is written, so
         # `delete` always finds what to remove.
@@ -75,6 +78,7 @@ case $action in
                 printf 'MACOS_SIGNING_KEYCHAIN=%s\n' "$keychain"
             } >> "$GITHUB_ENV"
         fi
+        trap - EXIT
         printf 'signing identity %s in %s\n' "$identity" "$keychain"
         ;;
     delete)
