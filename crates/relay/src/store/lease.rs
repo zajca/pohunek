@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use super::{Store, StoreError};
 
-/// RFC-required lifetime for an active relay fence.
-const LEASE_DURATION: Duration = Duration::from_secs(5);
+/// RFC-required lifetime for an active relay fence, shared with the relay configuration.
+const LEASE_DURATION: Duration = crate::config::LEASE_LIFETIME;
 
 /// Proves that this process currently owns a relay fence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,13 +109,14 @@ impl Store {
         }
         let row = sqlx::query(
             "INSERT INTO relay_lease (relay_id, process_instance_id, fence_token, recovery_generation, expires_at, heartbeat_sequence) \
-             VALUES ($1, $2, $3, $4, clock_timestamp() + interval '5 seconds', 1) \
+             VALUES ($1, $2, $3, $4, clock_timestamp() + make_interval(secs => $5), 1) \
              ON CONFLICT (relay_id) DO UPDATE SET process_instance_id = EXCLUDED.process_instance_id, \
              fence_token = EXCLUDED.fence_token, recovery_generation = EXCLUDED.recovery_generation, \
-             expires_at = clock_timestamp() + interval '5 seconds', heartbeat_sequence = relay_lease.heartbeat_sequence + 1, updated_at = clock_timestamp() \
+             expires_at = clock_timestamp() + make_interval(secs => $5), heartbeat_sequence = relay_lease.heartbeat_sequence + 1, updated_at = clock_timestamp() \
              WHERE relay_lease.expires_at <= clock_timestamp() \
              RETURNING fence_token, expires_at",
         ).bind(relay_id).bind(process_instance_id).bind(fence_token).bind(recovery_generation)
+            .bind(LEASE_DURATION.as_secs_f64())
             .fetch_optional(&mut *transaction).await.map_err(StoreError::Database)?
             .ok_or(StoreError::Forbidden)?;
         transaction.commit().await.map_err(StoreError::Database)?;
@@ -131,10 +132,11 @@ impl Store {
     /// Renews the fence only while its previous deadline is current.
     pub async fn renew_lease(&self, guard: &LeaseGuard) -> Result<LeaseGuard, StoreError> {
         let row = sqlx::query(
-            "UPDATE relay_lease SET expires_at = clock_timestamp() + interval '5 seconds', heartbeat_sequence = heartbeat_sequence + 1, updated_at = clock_timestamp() \
+            "UPDATE relay_lease SET expires_at = clock_timestamp() + make_interval(secs => $5), heartbeat_sequence = heartbeat_sequence + 1, updated_at = clock_timestamp() \
              WHERE relay_id = $1 AND process_instance_id = $2 AND fence_token = $3 AND recovery_generation = $4 AND expires_at > clock_timestamp() \
              RETURNING expires_at",
         ).bind(&guard.relay_id).bind(guard.process_instance_id).bind(guard.fence_token).bind(guard.recovery_generation)
+            .bind(LEASE_DURATION.as_secs_f64())
             .fetch_optional(&self.fence_pool).await.map_err(StoreError::Database)?
             .ok_or(StoreError::StaleState)?;
         Ok(LeaseGuard {

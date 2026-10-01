@@ -2453,6 +2453,92 @@ async fn ensure_effective_owner_remains(
     Ok(())
 }
 
+/// Keeps a test authority's relay fence alive the way the relay runtime does.
+#[cfg(test)]
+pub(crate) mod test_lease {
+    use std::sync::Arc;
+
+    use tokio::time::MissedTickBehavior;
+
+    use super::{Authority, Store};
+    use crate::config::MAX_LEASE_RENEW;
+
+    /// Renews the fence once per [`MAX_LEASE_RENEW`] while a test holds the authority.
+    ///
+    /// Runs the production renewal step, [`Authority::renew_once`], on the
+    /// relay runtime's cadence, so a test that outlasts the lease lifetime keeps
+    /// a valid fence. A failed renewal closes the authority and ends the task,
+    /// exactly as it stops the relay in production. The task also ends when the
+    /// last strong reference to the authority is dropped.
+    pub(crate) fn spawn_renewal(authority: &Arc<Authority>) {
+        let authority = Arc::downgrade(authority);
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(MAX_LEASE_RENEW);
+            ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                ticks.tick().await;
+                let Some(authority) = authority.upgrade() else {
+                    return;
+                };
+                if authority.renew_once().await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Renews a lease held directly from the store, for tests that have no authority.
+    ///
+    /// Renews the same fence once per [`MAX_LEASE_RENEW`] until the task is
+    /// aborted or a renewal fails, so a test that holds the lease across slow
+    /// operations keeps it live. Abort the task before releasing the lease.
+    #[cfg(feature = "postgres-tests")]
+    pub(crate) fn spawn_lease_renewal(
+        store: &Store,
+        lease: &crate::store::lease::LeaseGuard,
+    ) -> tokio::task::JoinHandle<()> {
+        let store = store.clone();
+        let mut lease = lease.clone();
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(MAX_LEASE_RENEW);
+            ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                ticks.tick().await;
+                match store.renew_lease(&lease).await {
+                    Ok(renewed) => lease = renewed,
+                    Err(_error) => return,
+                }
+            }
+        })
+    }
+
+    /// Reads the fixture relay's lease heartbeat, which only a renewal advances.
+    pub(crate) async fn heartbeat(store: &Store) -> i64 {
+        sqlx::query_scalar(
+            "SELECT heartbeat_sequence FROM relay_lease WHERE relay_id = 'test-relay'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("read the lease heartbeat")
+    }
+
+    /// Waits until a renewal advances the lease heartbeat past `after`.
+    ///
+    /// # Panics
+    /// Panics, naming the heartbeat, when no renewal lands within the shared
+    /// hang guard.
+    pub(crate) async fn wait_for_renewal(store: &Store, after: i64) -> i64 {
+        pohunek_test_support::wait::wait_until(
+            "the background renewer to advance the lease heartbeat",
+            || async {
+                let current = heartbeat(store).await;
+                (current > after).then_some(current)
+            },
+        )
+        .await
+    }
+}
+
 #[cfg(all(test, feature = "postgres-tests"))]
 mod tests {
     use std::{env, os::unix::fs::PermissionsExt as _};
@@ -2552,7 +2638,8 @@ mod tests {
         )
     }
 
-    async fn authority(store: Store, limits: AuthorityLimits) -> (Authority, TempDir) {
+    /// Opens an authority whose fence is never renewed, for tests that let it lapse.
+    async fn unrenewed_authority(store: Store, limits: AuthorityLimits) -> (Authority, TempDir) {
         let directory = tempfile::tempdir().expect("create witness directory");
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
             .expect("make witness directory private");
@@ -2575,6 +2662,14 @@ mod tests {
             Authority::new(store, lease, witness, current, limits).expect("create authority"),
             directory,
         )
+    }
+
+    /// Opens an authority whose fence a background renewer keeps alive.
+    async fn authority(store: Store, limits: AuthorityLimits) -> (Arc<Authority>, TempDir) {
+        let (authority, directory) = unrenewed_authority(store, limits).await;
+        let authority = Arc::new(authority);
+        test_lease::spawn_renewal(&authority);
+        (authority, directory)
     }
 
     async fn cleanup(store: &Store, schema: &str) {
@@ -2652,7 +2747,7 @@ mod tests {
     /// Opens one authority over a fresh fixture schema for the virtual-time tests.
     async fn authority_for_deadline_tests() -> (Store, String, Authority, TempDir) {
         let (store, schema, ..) = fixture().await;
-        let (authority, directory) = authority(
+        let (authority, directory) = unrenewed_authority(
             store.clone(),
             AuthorityLimits {
                 global: 1,
@@ -3027,7 +3122,7 @@ mod tests {
             .fetch_one(store.pool())
             .await
             .expect("read team");
-        let (authority, _directory) = authority(
+        let (authority, _directory) = unrenewed_authority(
             store.clone(),
             AuthorityLimits {
                 global: 1,
@@ -3104,7 +3199,6 @@ mod tests {
             },
         )
         .await;
-        let authority = Arc::new(authority);
         let entered = Arc::new(tokio::sync::Barrier::new(2));
         let release = Arc::new(tokio::sync::Barrier::new(2));
         *authority.read_hook.lock().expect("read hook lock") = Some(AdmissionHook {
@@ -3233,7 +3327,6 @@ mod tests {
             },
         )
         .await;
-        let authority = Arc::new(authority);
         let entered = Arc::new(tokio::sync::Barrier::new(2));
         let release = Arc::new(tokio::sync::Barrier::new(2));
         *authority.read_hook.lock().expect("read hook lock") = Some(AdmissionHook {
@@ -3554,7 +3647,6 @@ mod tests {
             },
         )
         .await;
-        let authority = Arc::new(authority);
         let entered = Arc::new(tokio::sync::Barrier::new(2));
         let release = Arc::new(tokio::sync::Barrier::new(2));
         *authority
@@ -3621,7 +3713,6 @@ mod tests {
             },
         )
         .await;
-        let authority = Arc::new(authority);
         let entered = Arc::new(tokio::sync::Barrier::new(2));
         let release = Arc::new(tokio::sync::Barrier::new(2));
         *authority.mutation_hook.lock().expect("mutation hook lock") = Some(AdmissionHook {

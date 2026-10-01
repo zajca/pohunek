@@ -3100,7 +3100,15 @@ pub(crate) mod tests {
             .expect("commit restored-credential fixture");
     }
 
+    /// Opens an authority whose fence a background renewer keeps alive.
     pub(crate) async fn authority(store: Store) -> (Arc<Authority>, tempfile::TempDir) {
+        let (authority, directory) = unrenewed_authority(store).await;
+        crate::admission::test_lease::spawn_renewal(&authority);
+        (authority, directory)
+    }
+
+    /// Opens an authority whose fence is renewed only when a test calls `renew_once`.
+    pub(crate) async fn unrenewed_authority(store: Store) -> (Arc<Authority>, tempfile::TempDir) {
         let directory = tempfile::tempdir().expect("create witness directory");
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
             .expect("make witness directory private");
@@ -3138,6 +3146,21 @@ pub(crate) mod tests {
         )
         .expect("create authority");
         (Arc::new(authority), directory)
+    }
+
+    /// The fixture authority renews its lease without the test calling the renewer.
+    ///
+    /// The lease starts at heartbeat 1, and only a renewal advances it, so
+    /// observing a later heartbeat proves the background renewer runs. That
+    /// renewer is what keeps an authority-backed mutation valid after the
+    /// original lease lifetime.
+    #[tokio::test]
+    async fn fixture_authority_renews_its_lease_in_the_background() {
+        let (store, schema, pool) = fixture().await;
+        let (authority, _directory) = authority(store.clone()).await;
+        crate::admission::test_lease::wait_for_renewal(&store, 1).await;
+        assert!(!authority.is_closed(), "a renewed authority stays open");
+        cleanup(&pool, &schema).await;
     }
 
     #[expect(

@@ -17,12 +17,12 @@ use super::*;
 use crate::{
     admission::Authority,
     auth::{
-        service::tests::{authority, cleanup, fixture, limits},
+        service::tests::{authority, cleanup, fixture, limits, unrenewed_authority},
         BrowserCookie, DigestKey, RelayBearerCredential,
     },
     auth::{BrowserCallback, BrowserCallbackOutcome, LoginBindingCookie, OidcCallbackCode},
     config::LoginPolicy,
-    store::Store,
+    store::{lease::LeaseGuard, Store},
 };
 
 /// Issuer the fixture `OidcClient` is configured with.
@@ -60,6 +60,49 @@ fn service(store: &Store, authority: Arc<Authority>) -> AuthService {
         limits(),
         LoginPolicy::AnyAuthenticatedSubject,
         authority,
+    )
+}
+
+/// Unwraps an authority-backed mutation and names the relay fence when it fails.
+///
+/// [`AuthError::Durable`] discards the store error behind it, so a bare failure
+/// cannot tell a lapsed or closed fence from a database fault. The panic
+/// message therefore carries the authority's closed latch and the lease row as
+/// the database sees it.
+trait ExpectMutation<T> {
+    async fn expect_mutation(self, service: &AuthService, what: &str) -> T;
+}
+
+impl<T> ExpectMutation<T> for Result<T, AuthError> {
+    async fn expect_mutation(self, service: &AuthService, what: &str) -> T {
+        match self {
+            Ok(value) => value,
+            Err(error) => {
+                let report = fence_report(service).await;
+                panic!("{what}: {error:?} ({report})");
+            }
+        }
+    }
+}
+
+/// Describes the fixture authority's fence for a failure message.
+async fn fence_report(service: &AuthService) -> String {
+    let lease = sqlx::query_as::<_, (i64, bool, String)>(
+        "SELECT heartbeat_sequence, expires_at <= clock_timestamp(), (expires_at - clock_timestamp())::text \
+         FROM relay_lease WHERE relay_id = 'test-relay'",
+    )
+    .fetch_optional(service.store.pool())
+    .await;
+    let lease = match lease {
+        Ok(Some((heartbeat, lapsed, remaining))) => {
+            format!("heartbeat {heartbeat}, lapsed {lapsed}, remaining {remaining}")
+        }
+        Ok(None) => "no lease row".to_owned(),
+        Err(error) => format!("lease row unreadable: {error:?}"),
+    };
+    format!(
+        "authority closed: {}; lease row: {lease}",
+        service.authority.is_closed()
     )
 }
 
@@ -501,7 +544,8 @@ async fn sequential_repeat_starts_cannot_mint_a_second_transaction() {
     let first = service
         .begin_browser_link(&oidc, account.browser, repeated.clone())
         .await
-        .expect("start the first browser link");
+        .expect_mutation(&service, "start the first browser link")
+        .await;
     assert_eq!(first.record.state, AccountLinkState::Pending);
 
     // The same retry coordinate names a live transaction, so a replay is
@@ -544,7 +588,8 @@ async fn sequential_repeat_starts_cannot_mint_a_second_transaction() {
             },
         )
         .await
-        .expect("cancel the pending transaction");
+        .expect_mutation(&service, "cancel the pending transaction")
+        .await;
     assert!(matches!(
         service
             .begin_browser_link(&oidc, account.browser, repeated.clone())
@@ -589,7 +634,8 @@ async fn completion_rejects_every_wrong_transaction_coordinate() {
 
     let open = open_link(&service, &store, owner.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open a device transaction");
+        .expect_mutation(&service, "open a device transaction")
+        .await;
 
     // Unknown transaction.
     assert!(matches!(
@@ -718,7 +764,8 @@ async fn completion_rejects_every_wrong_transaction_coordinate() {
             },
         )
         .await
-        .expect("cancel the device transaction");
+        .expect_mutation(&service, "cancel the device transaction")
+        .await;
     assert!(matches!(
         service
             .commit_link_once(
@@ -758,7 +805,8 @@ async fn completion_rejects_a_proof_from_another_issuer_or_audience() {
     let account = seed_account(&store, &service, "issuer-bound").await;
     let open = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open a device transaction");
+        .expect_mutation(&service, "open a device transaction")
+        .await;
 
     let foreign = OidcIdentity {
         issuer: "https://other-issuer.example".to_owned(),
@@ -782,7 +830,8 @@ async fn completion_rejects_a_proof_from_another_issuer_or_audience() {
             },
         )
         .await
-        .expect("close the first transaction");
+        .expect_mutation(&service, "close the first transaction")
+        .await;
     let other_audience = open_link_for_audience(
         &service,
         &store,
@@ -791,7 +840,8 @@ async fn completion_rejects_a_proof_from_another_issuer_or_audience() {
         "other-audience",
     )
     .await
-    .expect("open a transaction bound to another audience");
+    .expect_mutation(&service, "open a transaction bound to another audience")
+    .await;
     assert!(matches!(
         service
             .commit_link_once(
@@ -818,7 +868,8 @@ async fn device_poll_requires_the_one_use_possession_secret() {
     let account = seed_account(&store, &service, "possession").await;
     let open = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open a device transaction");
+        .expect_mutation(&service, "open a device transaction")
+        .await;
 
     assert!(matches!(
         service
@@ -881,7 +932,8 @@ async fn proven_identity_collisions_are_refused_by_the_database() {
 
     let self_link = open_link(&service, &store, owner.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open the self-link transaction");
+        .expect_mutation(&service, "open the self-link transaction")
+        .await;
     assert!(matches!(
         service
             .commit_link_once(
@@ -897,7 +949,8 @@ async fn proven_identity_collisions_are_refused_by_the_database() {
 
     let collision = open_link(&service, &store, owner.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open the collision transaction");
+        .expect_mutation(&service, "open the collision transaction")
+        .await;
     assert!(matches!(
         service
             .commit_link_once(
@@ -955,7 +1008,8 @@ async fn a_proven_link_advances_the_generation_and_cannot_be_replayed() {
     let account = seed_account(&store, &service, "generation-owner").await;
     let open = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open a device transaction");
+        .expect_mutation(&service, "open a device transaction")
+        .await;
 
     let linked = service
         .commit_link_once(
@@ -965,7 +1019,8 @@ async fn a_proven_link_advances_the_generation_and_cannot_be_replayed() {
             Some(account.bearer),
         )
         .await
-        .expect("commit the proven link");
+        .expect_mutation(&service, "commit the proven link")
+        .await;
     assert_eq!(linked.record.state, AccountLinkState::Completed);
     assert_eq!(linked.identity.subject, "second-identity");
     assert_eq!(linked.identity.issuer, TEST_ISSUER);
@@ -1047,7 +1102,8 @@ async fn unlink_revokes_bound_access_and_never_removes_the_last_identity() {
 
     let open = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open a device transaction");
+        .expect_mutation(&service, "open a device transaction")
+        .await;
     let linked = service
         .commit_link_once(
             &oidc,
@@ -1056,7 +1112,8 @@ async fn unlink_revokes_bound_access_and_never_removes_the_last_identity() {
             Some(account.bearer),
         )
         .await
-        .expect("link the second identity");
+        .expect_mutation(&service, "link the second identity")
+        .await;
     let target = linked.identity.identity_id;
 
     // Bind a credential and a session to the linked identity so the unlink has
@@ -1114,7 +1171,8 @@ async fn unlink_revokes_bound_access_and_never_removes_the_last_identity() {
 
     let pending = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open a transaction the unlink must cancel");
+        .expect_mutation(&service, "open a transaction the unlink must cancel")
+        .await;
 
     let request = UnlinkIdentityRequest {
         idempotency: idempotency(),
@@ -1122,7 +1180,8 @@ async fn unlink_revokes_bound_access_and_never_removes_the_last_identity() {
     let removed = service
         .unlink_identity(account.bearer, target, request)
         .await
-        .expect("remove the linked identity");
+        .expect_mutation(&service, "remove the linked identity")
+        .await;
     assert_eq!(removed.identity_id, target);
     assert_eq!(removed.revoked_credentials, 1);
     assert_eq!(removed.revoked_sessions, 1);
@@ -1157,7 +1216,8 @@ async fn unlink_revokes_bound_access_and_never_removes_the_last_identity() {
     let replay = service
         .unlink_identity(account.bearer, target, request)
         .await
-        .expect("retry the exact unlink coordinate");
+        .expect_mutation(&service, "retry the exact unlink coordinate")
+        .await;
     assert_eq!(replay.identity_id, removed.identity_id);
     assert_eq!(
         replay.account_link_generation,
@@ -1169,7 +1229,8 @@ async fn unlink_revokes_bound_access_and_never_removes_the_last_identity() {
     // never revived, so credentials bound to it stay dead.
     let relink = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open a relink transaction");
+        .expect_mutation(&service, "open a relink transaction")
+        .await;
     let relinked = service
         .commit_link_once(
             &oidc,
@@ -1178,7 +1239,8 @@ async fn unlink_revokes_bound_access_and_never_removes_the_last_identity() {
             Some(account.bearer),
         )
         .await
-        .expect("relink the freed coordinate");
+        .expect_mutation(&service, "relink the freed coordinate")
+        .await;
     assert_ne!(
         relinked.identity.identity_id, target,
         "a relink mints a new identity rather than reviving the removed row"
@@ -1205,7 +1267,8 @@ async fn unlink_audit_outage_fails_closed_without_an_authority_change() {
     let account = seed_account(&store, &service, "audit-outage").await;
     let open = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open a device transaction");
+        .expect_mutation(&service, "open a device transaction")
+        .await;
     let linked = service
         .commit_link_once(
             &oidc,
@@ -1214,7 +1277,8 @@ async fn unlink_audit_outage_fails_closed_without_an_authority_change() {
             Some(account.bearer),
         )
         .await
-        .expect("link the second identity");
+        .expect_mutation(&service, "link the second identity")
+        .await;
     let generation = account_link_generation(&store, account.principal_id).await;
 
     reject_audit(&store, UNLINK_ACTION).await;
@@ -1264,7 +1328,8 @@ async fn completion_audit_outage_links_no_identity() {
     let account = seed_account(&store, &service, "commit-outage").await;
     let open = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open a device transaction");
+        .expect_mutation(&service, "open a device transaction")
+        .await;
     let generation = account_link_generation(&store, account.principal_id).await;
 
     reject_audit(&store, LINK_COMPLETE_ACTION).await;
@@ -1300,7 +1365,8 @@ async fn quarantine_and_stale_sources_cannot_start_or_finish_a_link() {
     let account = seed_account(&store, &service, "quarantine-owner").await;
     let open = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open a device transaction");
+        .expect_mutation(&service, "open a device transaction")
+        .await;
 
     // Rotating the source credential's generation makes the transaction's
     // recorded authentication binding stale.
@@ -1398,7 +1464,8 @@ async fn the_status_page_is_bounded_and_scoped_to_one_account() {
 
     let mine = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open the caller's transaction");
+        .expect_mutation(&service, "open the caller's transaction")
+        .await;
     let theirs = open_link(
         &service,
         &store,
@@ -1406,7 +1473,8 @@ async fn the_status_page_is_bounded_and_scoped_to_one_account() {
         AccountLinkChannel::Device,
     )
     .await
-    .expect("open the stranger's transaction");
+    .expect_mutation(&service, "open the stranger's transaction")
+    .await;
 
     let page = service
         .list_account_links(
@@ -1457,7 +1525,8 @@ async fn link_start_values_never_render_their_possession_secret() {
     let browser = service
         .begin_browser_link(&oidc, account.browser, link_request())
         .await
-        .expect("start a browser link");
+        .expect_mutation(&service, "start a browser link")
+        .await;
     let binding = browser.binding().to_owned();
     assert!(!binding.is_empty());
     let rendered = format!("{browser:?}");
@@ -1538,7 +1607,8 @@ async fn cancel_is_idempotent_closes_the_provider_row_and_is_account_scoped() {
     let stranger = seed_account(&store, &service, "cancel-stranger").await;
     let open = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open a device transaction");
+        .expect_mutation(&service, "open a device transaction")
+        .await;
 
     assert!(matches!(
         service
@@ -1564,7 +1634,8 @@ async fn cancel_is_idempotent_closes_the_provider_row_and_is_account_scoped() {
             },
         )
         .await
-        .expect("cancel the transaction");
+        .expect_mutation(&service, "cancel the transaction")
+        .await;
     assert_eq!(cancelled.state, AccountLinkState::Cancelled);
     let open_logins: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM device_logins WHERE link_id = $1 AND consumed_at IS NULL",
@@ -1584,7 +1655,8 @@ async fn cancel_is_idempotent_closes_the_provider_row_and_is_account_scoped() {
             },
         )
         .await
-        .expect("a retry after a lost response is safe");
+        .expect_mutation(&service, "a retry after a lost response is safe")
+        .await;
     assert_eq!(repeat.state, AccountLinkState::Cancelled);
     assert_eq!(repeat.revision, cancelled.revision);
     assert!(audited(&store, LINK_CANCEL_ACTION, "changed").await >= 1);
@@ -1602,7 +1674,8 @@ async fn link_transactions_expire_on_the_configured_bound() {
     let link = service
         .begin_browser_link(&oidc, account.browser, link_request())
         .await
-        .expect("start a browser link")
+        .expect_mutation(&service, "start a browser link")
+        .await
         .record;
 
     let row = sqlx::query(
@@ -1669,7 +1742,8 @@ async fn every_refused_transition_records_an_attributable_denial() {
 
     let open = open_link(&service, &store, owner.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open a device transaction");
+        .expect_mutation(&service, "open a device transaction")
+        .await;
     let target = open.record.link_id.to_string();
 
     // A second start meets the one-pending index.
@@ -1862,7 +1936,8 @@ async fn every_refused_transition_records_an_attributable_denial() {
     // and is recorded against the identity the caller named.
     let linked = open_link(&service, &store, owner.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open a transaction to link a second identity");
+        .expect_mutation(&service, "open a transaction to link a second identity")
+        .await;
     let second = service
         .commit_link_once(
             &oidc,
@@ -1871,7 +1946,8 @@ async fn every_refused_transition_records_an_attributable_denial() {
             Some(owner.bearer),
         )
         .await
-        .expect("link a second identity");
+        .expect_mutation(&service, "link a second identity")
+        .await;
     let reused = idempotency();
     service
         .unlink_identity(
@@ -1882,7 +1958,8 @@ async fn every_refused_transition_records_an_attributable_denial() {
             },
         )
         .await
-        .expect("remove the second identity");
+        .expect_mutation(&service, "remove the second identity")
+        .await;
     assert!(matches!(
         service
             .unlink_identity(
@@ -1927,6 +2004,97 @@ async fn every_refused_transition_records_an_attributable_denial() {
         &none,
     )
     .await;
+    cleanup(&pool, &schema).await;
+}
+
+/// One virtual-time step: more than half the lease lifetime.
+///
+/// Two steps pass the original lease deadline, while a single step after a
+/// renewal stays inside the renewed one.
+fn lease_step() -> Duration {
+    LeaseGuard::duration() * 3 / 5
+}
+
+/// Lets `step` of time pass for the relay fence without sleeping.
+///
+/// The process-local fence deadline runs on tokio time, so a paused clock plus
+/// `advance` moves it. The database deadline is PostgreSQL's own clock, so the
+/// lease row is backdated by the same step. The clock is paused only across the
+/// explicit `advance` and resumed before any database I/O, because a paused
+/// clock auto-advances whenever the runtime parks on a socket.
+async fn let_lease_time_pass(store: &Store, step: Duration) {
+    sqlx::query(
+        "UPDATE relay_lease SET expires_at = expires_at - make_interval(secs => $1) \
+         WHERE relay_id = 'test-relay'",
+    )
+    .bind(step.as_secs_f64())
+    .execute(store.pool())
+    .await
+    .expect("backdate the lease row");
+    tokio::time::pause();
+    tokio::time::advance(step).await;
+    tokio::time::resume();
+}
+
+/// A fence renewed between steps keeps authority-backed mutations valid past
+/// the lifetime of the lease the authority first acquired.
+///
+/// Each step ages both clocks the fence depends on, the process-local deadline
+/// and the database row, by 3/5 of the lifetime. Two steps are 6/5 of the
+/// original lifetime, so without renewal the fence would already be gone.
+#[tokio::test]
+async fn mutation_succeeds_past_the_original_lease_lifetime_with_renewal() {
+    let (store, schema, pool) = fixture().await;
+    let (authority, _directory) = unrenewed_authority(store.clone()).await;
+    let service = service(&store, authority);
+    let owner = seed_account(&store, &service, "lease-renewed").await;
+    assert!(
+        lease_step() * 2 > LeaseGuard::duration(),
+        "two steps must pass the original lease lifetime"
+    );
+
+    for round in 0..2 {
+        let_lease_time_pass(&store, lease_step()).await;
+        service
+            .authority
+            .renew_once()
+            .await
+            .expect("renew the fence between steps");
+        let open = open_link(&service, &store, owner.bearer, AccountLinkChannel::Device)
+            .await
+            .expect_mutation(&service, &format!("open a link in round {round}"))
+            .await;
+        close_link(&store, open.record.link_id).await;
+    }
+    cleanup(&pool, &schema).await;
+}
+
+/// The same two steps without a renewal lose the fence, so the mutation above
+/// succeeds because of the renewal and not because time did not pass.
+#[tokio::test]
+async fn mutation_fails_past_the_original_lease_lifetime_without_renewal() {
+    let (store, schema, pool) = fixture().await;
+    let (authority, _directory) = unrenewed_authority(store.clone()).await;
+    let service = service(&store, authority);
+    let owner = seed_account(&store, &service, "lease-lapsed").await;
+
+    open_link(&service, &store, owner.bearer, AccountLinkChannel::Device)
+        .await
+        .expect_mutation(&service, "open a link while the fence is fresh")
+        .await;
+    for _ in 0..2 {
+        let_lease_time_pass(&store, lease_step()).await;
+    }
+    let lapsed = open_link(&service, &store, owner.bearer, AccountLinkChannel::Device).await;
+    assert!(
+        matches!(lapsed, Err(AuthError::Durable)),
+        "an unrenewed fence refuses the mutation, got {:?}",
+        lapsed.as_ref().err()
+    );
+    assert!(
+        service.authority.is_closed(),
+        "a lapsed fence closes the authority"
+    );
     cleanup(&pool, &schema).await;
 }
 
@@ -2100,7 +2268,8 @@ async fn device_poll_refuses_cancelled_expired_and_superseded_transactions() {
 
     let cancelled = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open a transaction to cancel");
+        .expect_mutation(&service, "open a transaction to cancel")
+        .await;
     service
         .cancel_account_link(
             account.bearer,
@@ -2110,7 +2279,8 @@ async fn device_poll_refuses_cancelled_expired_and_superseded_transactions() {
             },
         )
         .await
-        .expect("cancel the transaction");
+        .expect_mutation(&service, "cancel the transaction")
+        .await;
     assert!(matches!(
         service
             .poll_device_link(
@@ -2127,7 +2297,8 @@ async fn device_poll_refuses_cancelled_expired_and_superseded_transactions() {
     // supersedes it, so its own possession secret no longer proves anything.
     let superseded = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open a transaction to supersede");
+        .expect_mutation(&service, "open a transaction to supersede")
+        .await;
     sqlx::query(
         "UPDATE principals SET account_link_generation = account_link_generation + 1 WHERE id = $1",
     )
@@ -2174,7 +2345,8 @@ async fn database_triggers_refuse_provenance_rewrites_and_generation_rewinds() {
     let account = seed_account(&store, &service, "trigger-owner").await;
     let open = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open a device transaction");
+        .expect_mutation(&service, "open a device transaction")
+        .await;
 
     // Every provenance column is immutable once the transaction exists.
     for column in [
@@ -2247,7 +2419,8 @@ async fn an_unlinked_identity_authenticates_again_as_a_new_teamless_principal() 
     let account = seed_account(&store, &service, "ban-owner").await;
     let open = open_link(&service, &store, account.bearer, AccountLinkChannel::Device)
         .await
-        .expect("open a device transaction");
+        .expect_mutation(&service, "open a device transaction")
+        .await;
     let linked = service
         .commit_link_once(
             &oidc,
@@ -2256,7 +2429,8 @@ async fn an_unlinked_identity_authenticates_again_as_a_new_teamless_principal() 
             Some(account.bearer),
         )
         .await
-        .expect("link the identity that will be removed");
+        .expect_mutation(&service, "link the identity that will be removed")
+        .await;
     service
         .unlink_identity(
             account.bearer,
@@ -2266,7 +2440,8 @@ async fn an_unlinked_identity_authenticates_again_as_a_new_teamless_principal() 
             },
         )
         .await
-        .expect("remove the linked identity");
+        .expect_mutation(&service, "remove the linked identity")
+        .await;
 
     // The login path resolves the same coordinate after removal.
     let mut transaction = store

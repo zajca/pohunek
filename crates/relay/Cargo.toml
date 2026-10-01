@@ -51,6 +51,7 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+pohunek-test-support = { workspace = true }
 tempfile.workspace = true
 # `tokio::time::pause` and `advance` virtualize the relay fence's process-local lease deadline in tests.
 tokio = { workspace = true, features = ["test-util"] }
