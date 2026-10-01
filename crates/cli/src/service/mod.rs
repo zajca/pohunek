@@ -134,12 +134,17 @@ pub async fn check(prefix: Option<PathBuf>) -> Result<report::CheckReport, Error
     let context = Context::resolve()?;
     let inherited = inherited_lock(&context)?;
     let checked = check_local(&context, prefix, VERSION, inherited.is_some())?;
+    // Install's order: the rollback of an interrupted install discovers before
+    // it looks at the job, a fresh install after.
+    if checked.needs_discovery && checked.discovery_first {
+        context.install_search_path()?;
+    }
     if checked.fresh_install {
         let namespace = context.namespace()?;
         let backend = Backend::connect(&context, &namespace, settings::LAUNCHCTL_COMMAND).await?;
         engine::ensure_no_daemon_job(&backend).await?;
     }
-    if checked.needs_discovery {
+    if checked.needs_discovery && !checked.discovery_first {
         context.install_search_path()?;
     }
     Ok(checked.report)
@@ -515,6 +520,9 @@ pub(crate) struct Checked {
     /// that after the job check, in install's order
     /// ([`engine::discover_for_plan`]).
     pub(crate) needs_discovery: bool,
+    /// Whether install discovers before it looks for a daemon job: the
+    /// rollback of an interrupted install does, a fresh install does not.
+    pub(crate) discovery_first: bool,
 }
 
 /// Runs the checks of [`check`] that need no service manager.
@@ -606,6 +614,7 @@ pub(crate) fn check_local(
         report,
         fresh_install,
         needs_discovery: operation == record::Operation::Install && engine::plan_discovers(&plan),
+        discovery_first: matches!(plan, engine::Plan::RollBack(_)),
     })
 }
 
@@ -623,10 +632,13 @@ pub(crate) async fn check_with(
     locked: bool,
 ) -> Result<report::CheckReport, Error> {
     let checked = check_local(context, prefix, version, locked)?;
+    if checked.needs_discovery && checked.discovery_first {
+        context.install_search_path()?;
+    }
     if checked.fresh_install {
         engine::ensure_no_daemon_job(backend).await?;
     }
-    if checked.needs_discovery {
+    if checked.needs_discovery && !checked.discovery_first {
         context.install_search_path()?;
     }
     Ok(checked.report)

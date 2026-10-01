@@ -169,7 +169,27 @@ where
                 ignored,
             })
         }
-        Err(error) => fallback_only(staged.fallback, shell, Some(error)),
+        Err(error) => {
+            // A login shell whose whole `PATH` was untrusted still has each
+            // refused directory reported next to the fallback result.
+            let refused = match &error {
+                LoginShellError::UnusablePath(SearchPathError::AllUntrusted { untrusted }) => {
+                    untrusted.clone()
+                }
+                _ => Vec::new(),
+            };
+            let mut resolution = fallback_only(staged.fallback, shell, Some(error))?;
+            for dropped in refused {
+                if !resolution
+                    .untrusted
+                    .iter()
+                    .any(|known| known.entry == dropped.entry)
+                {
+                    resolution.untrusted.push(dropped);
+                }
+            }
+            Ok(resolution)
+        }
     }
 }
 
@@ -440,5 +460,40 @@ mod tests {
             resolution.login_shell_failure,
             Some(LoginShellError::Timeout { .. })
         ));
+    }
+
+    #[test]
+    fn a_login_path_of_only_untrusted_directories_is_still_reported_with_the_fallback() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = fixture();
+        let (home, table, expected) = fake_host(dir.path());
+        let loose_a = dir.path().join("loose-a");
+        let loose_b = dir.path().join("loose-b");
+        for loose in [&loose_a, &loose_b] {
+            make_dir(dir.path(), loose);
+            fs::set_permissions(loose, fs::Permissions::from_mode(0o775)).expect("chmod");
+        }
+        let spec = shell(
+            dir.path(),
+            &format!(
+                "PATH='{}:{}'; export PATH\nexec /bin/sh -c \"$3\"",
+                loose_a.display(),
+                loose_b.display()
+            ),
+        );
+        let resolution = resolve_search_path(&policy(Some(&spec), &refs(&table), Some(&home)))
+            .expect("resolution");
+        assert_eq!(resolution.source, PathSource::FallbackDirectories);
+        assert_eq!(resolution.path.entries(), expected);
+        assert!(resolution.login_shell_failure.is_some());
+        let reported: Vec<&str> = resolution
+            .untrusted
+            .iter()
+            .map(|dropped| dropped.entry.as_str())
+            .collect();
+        assert_eq!(
+            reported,
+            [loose_a.display().to_string(), loose_b.display().to_string()]
+        );
     }
 }

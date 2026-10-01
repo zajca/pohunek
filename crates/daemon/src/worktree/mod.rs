@@ -1190,7 +1190,7 @@ fn current_branch(repo: &Path) -> Result<String, String> {
 /// `Ok(false)` git ran and the ref is absent, `Err` could not tell.
 fn branch_exists(repo: &Path, branch: &str) -> Result<bool, String> {
     let refname = format!("refs/heads/{branch}");
-    let mut cmd = git_command(repo);
+    let mut cmd = git_command(repo)?;
     cmd.args(["rev-parse", "--verify", "--quiet", &refname]);
     let output = run_output_bounded(cmd, GIT_COMMAND_TIMEOUT)?;
     match output.status.code() {
@@ -1212,7 +1212,7 @@ fn has_origin(repo: &Path) -> bool {
 /// the ref is treated positionally even if a future caller forgets the
 /// leading-dash guard (defense in depth against argv flag injection).
 fn fetch_origin(repo: &Path, base_branch: &str) -> Result<(), String> {
-    let mut cmd = git_command(repo);
+    let mut cmd = git_command(repo)?;
     cmd.arg("fetch")
         .arg("--no-tags")
         .arg("origin")
@@ -1230,7 +1230,7 @@ fn worktree_add_new(
     branch: &str,
     start_point: &str,
 ) -> Result<(), String> {
-    let mut cmd = git_command(repo);
+    let mut cmd = git_command(repo)?;
     cmd.arg("worktree")
         .arg("add")
         .arg("-b")
@@ -1243,7 +1243,7 @@ fn worktree_add_new(
 
 /// `git worktree add <path> <branch>` — check out an existing branch.
 fn worktree_add_existing(repo: &Path, path: &Path, branch: &str) -> Result<(), String> {
-    let mut cmd = git_command(repo);
+    let mut cmd = git_command(repo)?;
     cmd.arg("worktree")
         .arg("add")
         .arg("--end-of-options")
@@ -1254,7 +1254,7 @@ fn worktree_add_existing(repo: &Path, path: &Path, branch: &str) -> Result<(), S
 
 /// `git worktree remove --force <path>` — remove the checkout (not the branch).
 fn worktree_remove(repo: &Path, path: &Path) -> Result<(), String> {
-    let mut cmd = git_command(repo);
+    let mut cmd = git_command(repo)?;
     cmd.arg("worktree").arg("remove").arg("--force").arg(path);
     run_command(cmd).map(|_| ())
 }
@@ -1582,7 +1582,17 @@ fn run_one_hook(
     timeout: Duration,
     warnings: &mut Vec<SessionWarning>,
 ) {
-    let mut builder = Command::new(SETUP_SCRIPT_INTERPRETER);
+    let interpreter = match crate::agent::trusted_program(SETUP_SCRIPT_INTERPRETER) {
+        Ok(interpreter) => interpreter,
+        Err(err) => {
+            warnings.push(hook_warning(
+                event,
+                format!("failed to spawn {}: {err}", script.display()),
+            ));
+            return;
+        }
+    };
+    let mut builder = Command::new(interpreter);
     builder
         .arg(script)
         .current_dir(cwd)
@@ -1720,10 +1730,21 @@ fn terminate_process_group(child: &mut Child) {
 
 /// A `git` command scoped to `repo` via `-C` (passed as an `OsStr` so non-UTF-8
 /// repo paths survive).
-pub(crate) fn git_command(repo: &Path) -> Command {
-    let mut cmd = Command::new("git");
+///
+/// The program is the trusted absolute path
+/// [`trusted_program`](crate::agent::trusted_program) resolves once, so no
+/// second `PATH` search can pick another candidate.
+///
+/// # Errors
+///
+/// Returns the not-found-or-untrusted message of `trusted_program`, prefixed
+/// like a failed spawn.
+pub(crate) fn git_command(repo: &Path) -> Result<Command, String> {
+    let program =
+        crate::agent::trusted_program("git").map_err(|err| format!("failed to run git: {err}"))?;
+    let mut cmd = Command::new(program);
     cmd.arg("-C").arg(repo);
-    cmd
+    Ok(cmd)
 }
 
 /// Run a `git` invocation built with [`git_command`], discarding stdout but
@@ -1818,7 +1839,7 @@ fn join_pipe_reader(
 
 /// Run `git -C <repo> <args>` capturing trimmed stdout on success.
 fn git_run(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let mut cmd = git_command(repo);
+    let mut cmd = git_command(repo)?;
     cmd.args(args);
     run_command(cmd)
 }

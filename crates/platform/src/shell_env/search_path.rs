@@ -74,6 +74,13 @@ pub enum SearchPathError {
     /// Nothing usable remained after validation.
     #[error("search path holds no usable directory")]
     NoUsableDirectories,
+    /// Nothing usable remained, and these existing directories were refused as
+    /// untrusted; they are kept so a caller can still report each one.
+    #[error("search path holds no usable directory ({} refused as untrusted)", .untrusted.len())]
+    AllUntrusted {
+        /// The refused directories with the reason for each.
+        untrusted: Vec<DroppedEntry>,
+    },
 }
 
 /// An ordered list of validated executable search directories.
@@ -366,7 +373,13 @@ impl Kept {
 
     fn finish(self) -> Result<SanitizedPath, SearchPathError> {
         if self.entries.is_empty() {
-            return Err(SearchPathError::NoUsableDirectories);
+            return Err(if self.untrusted.is_empty() {
+                SearchPathError::NoUsableDirectories
+            } else {
+                SearchPathError::AllUntrusted {
+                    untrusted: self.untrusted,
+                }
+            });
         }
         Ok(SanitizedPath {
             path: SearchPath::new(self.entries)?,
@@ -530,7 +543,10 @@ mod tests {
             Err(TrustError::Refused("writable by group or others"))
         );
         let only_untrusted = SearchPath::sanitize(&group_writable.display().to_string(), true);
-        assert_eq!(only_untrusted, Err(SearchPathError::NoUsableDirectories));
+        assert!(
+            matches!(&only_untrusted, Err(SearchPathError::AllUntrusted { untrusted }) if untrusted.len() == 1),
+            "{only_untrusted:?}"
+        );
     }
 
     #[test]

@@ -1026,6 +1026,43 @@ async fn rolling_back_an_interrupted_upgrade_needs_no_discovery() {
 }
 
 #[tokio::test]
+async fn check_and_install_agree_when_a_hostile_environment_meets_an_orphan_job() {
+    let mut harness = Harness::new();
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Binaries);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+    let before = harness.pending().expect("a foreign pending install");
+    // An orphan job of this namespace, plus an unusable discovery environment.
+    let config =
+        crate::service::definition::initial_config(&harness.context, &harness.prefix(), V1)
+            .expect("config");
+    let definition =
+        crate::service::definition::daemon_definition(&harness.context, &config).expect("job");
+    harness.fake.world().registered = Some(definition);
+    harness.fake.world().running = true;
+    harness.context = with_hostile_discovery_environment(&harness.context);
+
+    let checked = crate::service::check_with(
+        &harness.context,
+        &harness.backend,
+        Some(harness.prefix()),
+        V2,
+        false,
+    )
+    .await
+    .expect_err("check fails");
+    let installed = harness.install(V2).await.expect_err("install fails");
+    // The rollback of an interrupted install discovers before the job check.
+    assert_eq!(installed.code(), "service_environment_invalid");
+    assert_eq!(checked.code(), installed.code());
+    let after = harness.pending().expect("the transaction is untouched");
+    assert_eq!((after.version, after.step), (before.version, before.step));
+}
+
+#[tokio::test]
 async fn a_resume_refuses_a_service_toml_of_another_installation() {
     for (key, edit) in [("prefix", 0_u8), ("active_version", 1_u8)] {
         let harness = Harness::new();

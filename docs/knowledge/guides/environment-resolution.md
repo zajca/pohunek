@@ -22,7 +22,9 @@ Highest priority first:
 1. **A configured absolute executable.** A program name containing `/` must be
    absolute and executable; a relative one (`./agent`, `bin/agent`) is refused
    and no search happens. The daemon resolves agent programs (capability
-   detection, create, resume) through this same resolver, skipping empty and
+   detection, create, resume) and the helper programs it runs itself (`git`, the
+   worktree-hook interpreter `sh`) through this same resolver and spawns the
+   pinned path, skipping empty and
    relative `PATH` entries (a trailing colon is harmless) rather than failing, and launches the exact
    canonical path it probed.
 2. **An explicitly supplied environment `PATH`.** A caller that already has a

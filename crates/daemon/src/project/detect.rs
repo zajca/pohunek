@@ -245,7 +245,7 @@ fn warn_git_too_old() {
 /// with [`crate::project`] so `project show`'s live `git worktree list` is bound
 /// by the same hot-path discipline as detection.
 pub(crate) fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(crate::agent::trusted_program("git").ok()?);
     command.arg("-C").arg(cwd).args(args);
     run_bounded(command, DETECT_GIT_TIMEOUT)
 }

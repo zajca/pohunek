@@ -595,6 +595,18 @@ pub(crate) fn which_executable(name: &str) -> Option<PathBuf> {
     resolve_program(name, path.as_deref())
 }
 
+/// Resolve a helper program the daemon itself runs (`git`, the hook
+/// interpreter) to the absolute path to spawn.
+///
+/// The lookup uses the shared trusted-executable policy, so a candidate another
+/// account could replace is skipped, and spawning the returned path means the
+/// kernel does no second `PATH` search. A program that is missing or untrusted
+/// yields a message naming it, which callers surface like a failed spawn.
+pub(crate) fn trusted_program(name: &str) -> Result<PathBuf, String> {
+    which_executable(name)
+        .ok_or_else(|| format!("{name} was not found, or is not trusted, on PATH"))
+}
+
 fn missing_binary(name: &str) -> ProtocolError {
     // The canonical constructor lives in the protocol crate so this PATH-resolution
     // path and the daemon's PTY-spawn ENOENT path produce one identical error
@@ -618,9 +630,10 @@ mod tests {
 
     use super::{
         base_capabilities, base_resume_template, build_pty_command, fork_pty_command_from_template,
-        resolve_binary, resume_pty_command_from_template, which_executable, AgentAdapter,
-        ClaudeAdapter, CodexAdapter, ForkMode, ForkTemplate, HermesAdapter, LaunchOpts, ResumeMode,
-        ResumeTemplate, SessionRef, SessionRefKind, ShellAdapter, ValidatedLaunchProgram,
+        resolve_binary, resume_pty_command_from_template, trusted_program, which_executable,
+        AgentAdapter, ClaudeAdapter, CodexAdapter, ForkMode, ForkTemplate, HermesAdapter,
+        LaunchOpts, ResumeMode, ResumeTemplate, SessionRef, SessionRefKind, ShellAdapter,
+        ValidatedLaunchProgram,
     };
     use crate::detect::{ManifestRegion, MatchContext};
 
@@ -876,6 +889,40 @@ mod tests {
         // Alone, the writable candidate does not resolve at all.
         let alone = with_path(first.as_path(), || resolve_binary("agent"));
         alone.expect_err("a writable candidate alone does not resolve");
+    }
+
+    /// Writes an executable `git` that prints `label` into `dir`.
+    fn fake_git(dir: &Path, label: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("git");
+        fs::write(&path, format!("#!/bin/sh\necho {label}\n")).expect("write git");
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("chmod git");
+        path
+    }
+
+    #[test]
+    fn helper_programs_run_the_trusted_candidate_never_an_unsafe_one_earlier_on_path() {
+        let first = temp_dir("git-unsafe");
+        let second = temp_dir("git-safe");
+        // Mode 0777 lets any account replace the program the daemon would run.
+        fake_git(&first, "unsafe", 0o777);
+        let safe = fake_git(&second, "safe", 0o755);
+        let path = std::env::join_paths([&first, &second]).expect("join");
+        let repo = temp_dir("git-repo");
+        let (detected, output, resolved) = with_path(Path::new(&path), || {
+            let detected = crate::project::detect::git(&repo, &[]);
+            let output = crate::worktree::git_command(&repo)
+                .expect("a trusted git exists")
+                .output()
+                .expect("spawn git");
+            (detected, output, trusted_program("git"))
+        });
+        let none = with_path(first.as_path(), || trusted_program("git"));
+        assert_eq!(detected.as_deref(), Some("safe"));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "safe");
+        assert_eq!(resolved, Ok(safe));
+        // With only the unsafe candidate there is no git to run at all.
+        assert!(none.expect_err("untrusted").contains("not trusted"));
     }
 
     #[test]

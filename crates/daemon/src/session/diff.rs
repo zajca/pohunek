@@ -257,10 +257,11 @@ fn untracked_diff(worktree: &Path, relative_path: &str) -> Result<String, Protoc
 /// git operation `session::diff` runs has command-specific exit-code semantics
 /// (see e.g. [`untracked_diff`]'s use of exit code 1 as success).
 fn git_output(worktree: &Path, args: &[&str]) -> Result<Output, ProtocolError> {
-    let mut cmd = git_command(worktree);
+    let failed =
+        |message: String| session_diff_failed(&format!("git {}: {message}", args.join(" ")));
+    let mut cmd = git_command(worktree).map_err(failed)?;
     cmd.args(args);
-    run_output_bounded(cmd, GIT_COMMAND_TIMEOUT)
-        .map_err(|message| session_diff_failed(&format!("git {}: {message}", args.join(" "))))
+    run_output_bounded(cmd, GIT_COMMAND_TIMEOUT).map_err(failed)
 }
 
 /// Split `text` into chunks at each line-start `"diff --git "` marker (the
