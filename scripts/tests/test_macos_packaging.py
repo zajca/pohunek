@@ -164,14 +164,13 @@ class AuditTest(unittest.TestCase):
             "panic at /Users/runner/work/pohunek/src/main.rs",
             "/home/runner/.cargo/registry/src/x",
             "/usr/local/Cellar/openssl/3.0/lib",
-            "/Volumes/Build/pohunek",
         ):
             result = self.audit(self.binary("leak", strings="ok\n" + text + "\n"))
             self.assertEqual(result.returncode, 1, text)
             self.assertIn("build-machine path", result.stderr)
 
-    def test_legitimate_homebrew_search_entries_pass(self):
-        result = self.audit(self.binary("path", strings="/opt/homebrew/bin\n/usr/local/bin\n"))
+    def test_legitimate_homebrew_and_volume_names_pass(self):
+        result = self.audit(self.binary("path", strings="/opt/homebrew/bin\n/usr/local/bin\n/Volumes\n"))
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_extra_forbidden_strings_apply(self):
@@ -182,7 +181,7 @@ class AuditTest(unittest.TestCase):
         self.assertIn("/build/checkout", result.stderr)
 
     def test_every_problem_is_reported_and_counted(self):
-        path = self.binary("bad", archs="x86_64", minos="16.0", rpath="/tmp/x", strings="/Volumes/x\n")
+        path = self.binary("bad", archs="x86_64", minos="16.0", rpath="/tmp/x", strings="/Users/runner/x\n")
         result = self.audit(path)
         self.assertEqual(result.returncode, 1)
         for text in ("expected exactly arm64", "newer than", "runtime search path", "build-machine path"):

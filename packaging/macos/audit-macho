@@ -20,12 +20,12 @@
 set -eu
 
 # Build-machine paths that must never reach a shipped binary: a hosted
-# runner's home, the Homebrew cellar, and mounted volumes. The Homebrew bin
-# directories are not listed because they are legitimate search-path entries.
+# runner's home and the Homebrew cellar. The Homebrew bin directories and
+# `/Volumes` are not listed because the binaries legitimately name them
+# (search-path fallbacks, volume-aware path checks).
 DEFAULT_FORBIDDEN_STRINGS="/Users/runner
 /home/runner
-/Cellar/
-/Volumes/"
+/Cellar/"
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
