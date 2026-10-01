@@ -6,13 +6,15 @@
 //! [`TestEnv`] owns, for one test:
 //!
 //! - a short private root under [`crate::temp_root`], removed when the
-//!   [`TestEnv`] drops (also while a panic unwinds);
+//!   [`TestEnv`] drops (also while a panic unwinds). The base must be
+//!   symlink-free and short enough for nested sockets; otherwise creation
+//!   fails with a message naming `TMPDIR`;
 //! - a private working directory, `HOME`, the five XDG base directories and a
 //!   `TMPDIR`, all inside that root and owner-only (`0700`);
 //! - an environment for child processes built from an allowlist: only the
-//!   parent variables named by [`INHERITED_VARS`] and [`INHERITED_PREFIXES`]
-//!   are passed on, `HOME`, `XDG_*` and `TMPDIR` point at the private
-//!   directories, and every other variable is dropped.
+//!   parent variables named by [`INHERITED_VARS`] are passed on, `HOME`,
+//!   `XDG_*` and `TMPDIR` point at the private directories, and every other
+//!   variable is dropped.
 //!
 //! An allowlist is used because ambient variables steer children towards host
 //! state in ways no denylist anticipates: shell startup hooks (`BASH_ENV`,
@@ -27,7 +29,8 @@
 //! Children are started through [`TestEnv::command`] or
 //! [`TestEnv::tokio_command`]. Both clear the inherited environment, so a
 //! variable a child needs and the allowlist does not cover, such as
-//! `POHUNEK_WORKER_BIN` or `SHELL`, is added explicitly on the returned
+//! `POHUNEK_WORKER_BIN`, `SHELL` or the cargo and rustup variables, is added
+//! explicitly on the returned
 //! command; variables added there are passed on unchanged.
 //!
 //! Unix socket paths below the root are checked against
@@ -51,7 +54,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::DirBuilderExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 
 use tempfile::TempDir;
@@ -75,6 +78,21 @@ const PRIVATE_DIR_MODE: u32 = 0o700;
 /// [`STRICTEST_SOCKET_PATH_CAPACITY`] for each socket bound beneath it.
 const ROOT_PREFIX: &str = "ph-";
 
+/// Number of random characters in the root name.
+///
+/// Fixed so the root name length, and with it the base length budget, is known
+/// before the root is created.
+const ROOT_RANDOM_BYTES: usize = 6;
+
+/// The longest socket path the daemon and worker tests bind below a root,
+/// relative to it: the runtime directory, the pohunek runtime subdirectory,
+/// a 36-character worker id and the control socket name.
+///
+/// [`TestEnv::with_base`] requires `<base>/<root name>` plus this suffix to fit
+/// [`STRICTEST_SOCKET_PATH_CAPACITY`].
+const NESTED_SOCKET_SUFFIX: &str =
+    "/run/pohunek/workers/0123456789abcdef0123456789abcdef0123/control.sock";
+
 /// Directory names inside the root.
 ///
 /// Kept to a few bytes each for the same socket-path budget as [`ROOT_PREFIX`].
@@ -96,13 +114,6 @@ const XDG_CACHE_HOME_VAR: &str = "XDG_CACHE_HOME";
 const XDG_RUNTIME_DIR_VAR: &str = "XDG_RUNTIME_DIR";
 const TMPDIR_VAR: &str = "TMPDIR";
 
-/// Variable-name prefixes passed from the parent to every child environment.
-///
-/// - `LC_`: locale categories (`LC_ALL`, `LC_CTYPE`, ...). They select the
-///   character encoding and message language of child tools and carry no paths
-///   or credentials.
-pub const INHERITED_PREFIXES: &[&str] = &["LC_"];
-
 /// Exact variable names passed from the parent to every child environment.
 ///
 /// Everything else is dropped, including `POHUNEK_*` (an enclosing session's
@@ -115,33 +126,48 @@ pub const INHERITED_PREFIXES: &[&str] = &["LC_"];
 ///
 /// - `PATH`: children locate tools through it. Pinning the tools themselves is a
 ///   separate concern of the test that needs a specific tool.
-/// - `LANG`, `LANGUAGE`: locale selection, as for [`INHERITED_PREFIXES`].
-/// - `CARGO_HOME`, `RUSTUP_HOME`: `HOME` is private, so without them a child
-///   `cargo` or `rustup` cannot find the registry cache or the toolchains.
-/// - `RUSTUP_TOOLCHAIN`: selects the toolchain a rustup proxy runs.
-/// - `CARGO_TARGET_DIR`, `RUSTFLAGS`, `RUSTDOCFLAGS`, `CARGO_ENCODED_RUSTFLAGS`:
-///   a child `cargo` that sees different values rebuilds into a different or
-///   invalidated target directory.
+/// - `LANG`, `LANGUAGE` and the POSIX and glibc locale categories (`LC_ALL`,
+///   `LC_CTYPE`, `LC_COLLATE`, `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`,
+///   `LC_TIME`, `LC_ADDRESS`, `LC_IDENTIFICATION`, `LC_MEASUREMENT`, `LC_NAME`,
+///   `LC_PAPER`, `LC_TELEPHONE`): they select the character encoding and
+///   message language of child tools and carry no paths or credentials. They
+///   are listed one by one because a `LC_` prefix would also admit names such as
+///   `LC_API_KEY`.
 /// - `RUST_BACKTRACE`: diagnostics only; a panicking child reports where.
 ///
-/// Deliberately absent: `USER`/`LOGNAME` (the account name is the developer's,
-/// nothing needs it, and absence is valid), `TERM` and `TZ` (host display and
-/// clock configuration; a test that depends on them sets them), `SHELL`,
-/// `RUST_LOG` (changes child log output), `RUSTC_WRAPPER` (runs an arbitrary
-/// binary around the compiler), `LD_*` and `DYLD_*` (can inject libraries into
-/// a child), and the `CARGO_*` prefix (it includes `CARGO_REGISTRY_TOKEN` and
-/// `CARGO_REGISTRIES_*_TOKEN`).
+/// Deliberately absent:
+///
+/// - The cargo and rustup variables (`CARGO_HOME`, `RUSTUP_HOME`,
+///   `RUSTUP_TOOLCHAIN`, `CARGO_TARGET_DIR`, `RUSTFLAGS`, `RUSTDOCFLAGS`,
+///   `CARGO_ENCODED_RUSTFLAGS`, `CARGO_*`). `CARGO_HOME` holds
+///   `credentials.toml` and the shared registry cache, and `CARGO_TARGET_DIR`
+///   is a shared writable build directory, so passing them would give every
+///   child the developer's registry credentials and write access to shared
+///   build state. A test that must run `cargo` or `rustup` passes exactly the
+///   variables it needs on the returned command.
+/// - `USER`/`LOGNAME` (the account name is the developer's, nothing needs it,
+///   and absence is valid), `TERM` and `TZ` (host display and clock
+///   configuration; a test that depends on them sets them), `SHELL`,
+///   `RUST_LOG` (changes child log output), `RUSTC_WRAPPER` (runs an arbitrary
+///   binary around the compiler), and `LD_*` and `DYLD_*` (can inject
+///   libraries into a child).
 pub const INHERITED_VARS: &[&str] = &[
     "PATH",
     "LANG",
     "LANGUAGE",
-    "CARGO_HOME",
-    "RUSTUP_HOME",
-    "RUSTUP_TOOLCHAIN",
-    "CARGO_TARGET_DIR",
-    "RUSTFLAGS",
-    "RUSTDOCFLAGS",
-    "CARGO_ENCODED_RUSTFLAGS",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_COLLATE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "LC_ADDRESS",
+    "LC_IDENTIFICATION",
+    "LC_MEASUREMENT",
+    "LC_NAME",
+    "LC_PAPER",
+    "LC_TELEPHONE",
     "RUST_BACKTRACE",
 ];
 
@@ -259,8 +285,10 @@ impl TestEnv {
     ///
     /// # Errors
     ///
-    /// Returns the I/O error when the root or one of its directories cannot be
-    /// created.
+    /// Returns an [`std::io::ErrorKind::InvalidInput`] error naming `TMPDIR`
+    /// when the base directory is not canonical or too long for nested
+    /// sockets, and the I/O error when the root or one of its directories
+    /// cannot be created.
     pub fn new() -> std::io::Result<Self> {
         Self::with_parent_environment(std::env::vars_os())
     }
@@ -272,12 +300,31 @@ impl TestEnv {
     ///
     /// # Errors
     ///
-    /// Returns the I/O error when the root or one of its directories cannot be
-    /// created.
+    /// Returns an [`std::io::ErrorKind::InvalidInput`] error naming `TMPDIR`
+    /// when the base directory is not canonical or too long for nested
+    /// sockets, and the I/O error when the root or one of its directories
+    /// cannot be created.
     pub fn with_parent_environment(
         parent: impl IntoIterator<Item = (OsString, OsString)>,
     ) -> std::io::Result<Self> {
-        let root = crate::tempdir_with_prefix(ROOT_PREFIX)?;
+        Self::with_base(&crate::temp_root(), parent)
+    }
+
+    /// Creates the environment with its root below `base`.
+    ///
+    /// `base` must be canonical, so no component is a symlink, and short enough
+    /// that `<base>/<root name>` plus [`NESTED_SOCKET_SUFFIX`] fits
+    /// [`STRICTEST_SOCKET_PATH_CAPACITY`]. Nothing is created when it is not.
+    fn with_base(
+        base: &Path,
+        parent: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> std::io::Result<Self> {
+        validate_base(base)?;
+        let root = tempfile::Builder::new()
+            .prefix(ROOT_PREFIX)
+            .rand_bytes(ROOT_RANDOM_BYTES)
+            .permissions(std::fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+            .tempdir_in(base)?;
         let child = |name: &str| root.path().join(name);
         let (cwd, home) = (child(CWD_DIR), child(HOME_DIR));
         let (config_home, data_home) = (child(CONFIG_DIR), child(DATA_DIR));
@@ -430,13 +477,46 @@ impl TestEnv {
     }
 }
 
+/// Checks that `base` is canonical and leaves room for nested sockets.
+///
+/// On Linux the base follows the ambient `TMPDIR`, so a long or symlinked
+/// `TMPDIR` would otherwise break the short, trusted root silently.
+fn validate_base(base: &Path) -> std::io::Result<()> {
+    let invalid = |detail: String| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "test root base {} (from TMPDIR on Linux) {detail}",
+                base.display()
+            ),
+        )
+    };
+    let canonical = std::fs::canonicalize(base)
+        .map_err(|error| invalid(format!("cannot be resolved: {error}")))?;
+    if canonical != base {
+        return Err(invalid(format!(
+            "is not canonical (it resolves to {}); a symlinked component breaks the trusted filesystem checks, so set TMPDIR to a symlink-free directory",
+            canonical.display()
+        )));
+    }
+    let longest = base.as_os_str().len()
+        + 1
+        + ROOT_PREFIX.len()
+        + ROOT_RANDOM_BYTES
+        + NESTED_SOCKET_SUFFIX.len();
+    if longest >= STRICTEST_SOCKET_PATH_CAPACITY {
+        return Err(invalid(format!(
+            "is too long: a nested socket path would be {longest} bytes, and with its NUL it must fit {STRICTEST_SOCKET_PATH_CAPACITY} bytes; set TMPDIR to a shorter directory"
+        )));
+    }
+    Ok(())
+}
+
 /// Returns whether `name` is passed from the parent to a child environment.
 fn is_inherited(name: &OsStr) -> bool {
-    let bytes = name.as_bytes();
-    INHERITED_PREFIXES
+    INHERITED_VARS
         .iter()
-        .any(|prefix| bytes.starts_with(prefix.as_bytes()))
-        || INHERITED_VARS.iter().any(|var| bytes == var.as_bytes())
+        .any(|var| name.as_bytes() == var.as_bytes())
 }
 
 /// Builds a child environment: the allowlisted variables of `parent`, plus `pinned`.
@@ -454,7 +534,6 @@ fn scrubbed(
 #[cfg(test)]
 mod tests {
     use std::os::unix::ffi::OsStringExt as _;
-    use std::os::unix::fs::PermissionsExt as _;
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     use super::*;
@@ -470,7 +549,7 @@ mod tests {
     const HOST_SESSION_ID: &str = "s-host-session";
 
     /// Values of the crafted parent variables that must not reach a child.
-    const SCRUBBED_HOST_VALUES: [&str; 20] = [
+    const SCRUBBED_HOST_VALUES: [&str; 25] = [
         HOST_SESSION_ID,
         "/run/host/pohunek.sock",
         "postgres://host/db",
@@ -491,10 +570,15 @@ mod tests {
         "/host/preload.so",
         "/host/registry-token",
         "/host/log-filter",
+        "/host/target",
+        "/host/cargo",
+        "/host/rustup",
+        "/host/lc-token",
+        "/host/lc-api-key",
     ];
 
     /// Names of the crafted parent variables that must not reach a child.
-    const SCRUBBED_NAMES: [&str; 15] = [
+    const SCRUBBED_NAMES: [&str; 20] = [
         "POHUNEK_SESSION_ID",
         "BASH_ENV",
         "ZDOTDIR",
@@ -510,15 +594,15 @@ mod tests {
         "XDG_DATA_DIRS",
         "USER",
         "TERM",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "CARGO_TARGET_DIR",
+        "LC_TOKEN",
+        "LC_API_KEY",
     ];
 
     /// Synthetic credential the crafted parent carries; never a real secret.
     const SYNTHETIC_TOKEN: &str = "ghp_synthetic_token_value_0123456789";
-
-    /// Longest socket suffix the daemon tests nest below a root:
-    /// `run/pohunek/workers/<36-character id>/control.sock`.
-    const NESTED_SOCKET: &str =
-        "run/pohunek/workers/0123456789abcdef0123456789abcdef0123/control.sock";
 
     fn pair(name: &str, value: &str) -> (OsString, OsString) {
         (OsString::from(name), OsString::from(value))
@@ -552,6 +636,8 @@ mod tests {
             pair("CARGO_TARGET_DIR", "/host/target"),
             pair("CARGO_HOME", "/host/cargo"),
             pair("RUSTUP_HOME", "/host/rustup"),
+            pair("LC_TOKEN", "/host/lc-token"),
+            pair("LC_API_KEY", "/host/lc-api-key"),
             pair("RUST_BACKTRACE", "1"),
             pair("LANG", "C.UTF-8"),
             pair("LC_ALL", "C.UTF-8"),
@@ -586,18 +672,7 @@ mod tests {
     fn scrub_passes_only_allowlisted_variables() {
         let env = scrubbed(crafted_parent(), []);
         let names: Vec<&str> = env.keys().filter_map(|name| name.to_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "CARGO_HOME",
-                "CARGO_TARGET_DIR",
-                "LANG",
-                "LC_ALL",
-                "PATH",
-                "RUSTUP_HOME",
-                "RUST_BACKTRACE",
-            ]
-        );
+        assert_eq!(names, ["LANG", "LC_ALL", "PATH", "RUST_BACKTRACE"]);
         assert_eq!(env[OsStr::new("PATH")], "/host/bin:/usr/bin");
         for name in SCRUBBED_NAMES {
             assert!(
@@ -609,13 +684,9 @@ mod tests {
 
     #[test]
     fn every_inherited_name_is_passed_on() {
-        let parent: Vec<_> = INHERITED_VARS
-            .iter()
-            .map(|name| pair(name, "v"))
-            .chain([pair("LC_MESSAGES", "v")])
-            .collect();
+        let parent: Vec<_> = INHERITED_VARS.iter().map(|name| pair(name, "v")).collect();
         let env = scrubbed(parent, []);
-        assert_eq!(env.len(), INHERITED_VARS.len() + 1);
+        assert_eq!(env.len(), INHERITED_VARS.len());
     }
 
     #[test]
@@ -643,6 +714,9 @@ mod tests {
                 pair("PATHEXT", "dropped"),
                 pair("CARGO_HOME_EXTRA", "dropped"),
                 pair("LC_CTYPE", "kept"),
+                pair("LC_", "dropped"),
+                pair("LC_TOKEN", "dropped"),
+                pair("LC_API_KEY", "dropped"),
             ],
             [],
         );
@@ -734,9 +808,64 @@ mod tests {
     }
 
     #[test]
+    fn real_base_is_accepted() {
+        validate_base(&crate::temp_root()).expect("the real temp root is a valid base");
+    }
+
+    #[test]
+    fn long_base_is_rejected_without_creating_a_root() {
+        let outer = crate::tempdir().expect("create outer");
+        let base = outer
+            .path()
+            .join("b".repeat(STRICTEST_SOCKET_PATH_CAPACITY / 2));
+        std::fs::create_dir(&base).expect("create long base");
+        let error = TestEnv::with_base(&base, []).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        let message = error.to_string();
+        assert!(message.contains("TMPDIR"), "{message}");
+        assert!(message.contains(&base.display().to_string()), "{message}");
+        assert!(
+            message.contains(&STRICTEST_SOCKET_PATH_CAPACITY.to_string()),
+            "{message}"
+        );
+        let created = std::fs::read_dir(&base).expect("read base").count();
+        assert_eq!(created, 0, "a root was created below a rejected base");
+    }
+
+    #[test]
+    fn symlinked_base_is_rejected() {
+        let outer = crate::tempdir().expect("create outer");
+        let real = outer.path().join("real");
+        let link = outer.path().join("link");
+        std::fs::create_dir(&real).expect("create real base");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+        let error = TestEnv::with_base(&link, []).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        let message = error.to_string();
+        assert!(message.contains("TMPDIR"), "{message}");
+        assert!(message.contains(&link.display().to_string()), "{message}");
+        assert!(message.contains("not canonical"), "{message}");
+        TestEnv::with_base(&real, []).expect("the canonical target is accepted");
+    }
+
+    #[test]
+    fn missing_base_is_rejected_with_the_base_named() {
+        let outer = crate::tempdir().expect("create outer");
+        let missing = outer.path().join("missing");
+        let error = TestEnv::with_base(&missing, []).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains(&missing.display().to_string()),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn nested_worker_socket_fits_the_strictest_limit() {
         let env = TestEnv::new().expect("create env");
-        let socket = env.socket_path(NESTED_SOCKET).expect("socket path fits");
+        let socket = env
+            .socket_path(NESTED_SOCKET_SUFFIX.trim_start_matches('/'))
+            .expect("socket path fits");
         assert!(socket.starts_with(env.runtime_dir().parent().expect("root")));
         let len = socket.as_os_str().len();
         assert!(len < STRICTEST_SOCKET_PATH_CAPACITY, "{len}");
@@ -828,8 +957,7 @@ mod tests {
             "var=LANG=C.UTF-8",
             "var=LC_ALL=C.UTF-8",
             "var=PATH=/host/bin:/usr/bin",
-            "var=CARGO_HOME=/host/cargo",
-            "var=RUSTUP_HOME=/host/rustup",
+            "var=RUST_BACKTRACE=1",
         ] {
             assert!(lines.contains(&kept), "{kept} missing from {lines:?}");
         }
