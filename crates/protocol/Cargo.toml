@@ -23,6 +23,7 @@ ts-rs = { version = "12", optional = true, features = ["serde-json-impl", "forma
 zeroize = { workspace = true }
 
 [dev-dependencies]
+pohunek-test-support = { workspace = true }
 proptest = { workspace = true }
 
 [lints]

@@ -407,7 +407,7 @@ fn daemon_source_literals() -> String {
             }
         }
     }
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../daemon/src");
+    let root = pohunek_test_support::workspace_root().join("crates/daemon/src");
     let mut out = String::new();
     walk(&root, &mut out);
     out
@@ -429,10 +429,9 @@ fn task_error_codes_only_overlap_daemon_codes_when_declared_shared() {
 
 #[test]
 fn shared_codes_are_documented_for_every_raising_method() {
-    let docs = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/public-api.md"),
-    )
-    .expect("read public-api.md");
+    let docs =
+        std::fs::read_to_string(pohunek_test_support::workspace_root().join("docs/public-api.md"))
+            .expect("read public-api.md");
     let row = docs
         .lines()
         .find(|line| line.starts_with("| `worktree_in_use` |"))
