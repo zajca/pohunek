@@ -4,10 +4,9 @@
 # stay up. usage: smoke-gui-release-macos <Pohunek.app>
 #
 # The bundle identity is checked first (identifier, executable, minimum macOS).
-# The bundle's executable then runs with Finder's environment (`env -i`, HOME,
-# USER, LOGNAME, the minimal launchd PATH) and an isolated configuration, so it
-# neither reads nor changes the operator's own pohunek state. A process that
-# exits during the window, or reports a panic, fails the check. Needs a window
+# The app is then opened through LaunchServices (`open -n`), the path Finder and
+# the Dock take, with an isolated configuration. A process that exits during
+# the window, or reports a panic, fails the check. Needs a window
 # server: outside a GUI (Aqua) launchd session it exits 2, never reports
 # success without starting the app.
 
@@ -15,9 +14,9 @@ set -eu
 umask 077
 
 readonly SMOKE_WINDOW_SECONDS=8
+readonly SMOKE_LAUNCH_SECONDS=20
 readonly SMOKE_TERM_WAIT_SECONDS=15
 readonly EXPECTED_IDENTIFIER=io.github.zajca.pohunek.gui
-readonly FINDER_PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
 if [ "$#" -ne 1 ]; then
     printf '%s\n' "usage: $0 <Pohunek.app>" >&2
@@ -69,14 +68,28 @@ trap 'exit 130' INT TERM
 home=$work/h
 mkdir -p "$home/.config/pohunek" "$work/run" "$work/state" "$work/data" "$work/cache"
 user=$(id -un)
-(
-    exec env -i \
-        HOME="$home" USER="$user" LOGNAME="$user" PATH="$FINDER_PATH" \
-        XDG_CONFIG_HOME="$home/.config" XDG_RUNTIME_DIR="$work/run" \
-        XDG_STATE_HOME="$work/state" XDG_DATA_HOME="$work/data" \
-        XDG_CACHE_HOME="$work/cache" "$executable" >"$work/gui.out" 2>"$work/gui.err"
-) &
-gui_pid=$!
+: > "$work/gui.out"
+: > "$work/gui.err"
+# LaunchServices starts the app as Finder does: through launchd, with launchd's
+# minimal environment. `open --env` adds only the isolation variables, so the
+# run neither reads nor changes the operator's own pohunek state.
+/usr/bin/open -n \
+    --env "HOME=$home" --env "USER=$user" --env "LOGNAME=$user" \
+    --env "XDG_CONFIG_HOME=$home/.config" --env "XDG_RUNTIME_DIR=$work/run" \
+    --env "XDG_STATE_HOME=$work/state" --env "XDG_DATA_HOME=$work/data" \
+    --env "XDG_CACHE_HOME=$work/cache" \
+    --stdout "$work/gui.out" --stderr "$work/gui.err" "$app" ||
+    { printf '%s\n' "LaunchServices could not open the bundle" >&2; exit 1; }
+
+# The process is launchd's child, so find it by its executable path.
+waited=0
+while :; do
+    gui_pid=$(/usr/bin/pgrep -f "$executable" | head -n 1 || true)
+    [ -n "$gui_pid" ] && break
+    [ "$waited" -lt "$SMOKE_LAUNCH_SECONDS" ] || { printf '%s\n' "the app did not start within ${SMOKE_LAUNCH_SECONDS}s" >&2; exit 1; }
+    sleep 1
+    waited=$((waited + 1))
+done
 
 elapsed=0
 while [ "$elapsed" -lt "$SMOKE_WINDOW_SECONDS" ]; do

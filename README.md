@@ -248,16 +248,15 @@ installer. It runs beside a compatible local `pohunekd`; unpack it, run
 `~/.config/pohunek/backend.env`, then enable `pohunek-backend.service`. See the
 archive's `README.md` for the complete commands.
 
-macOS on Apple Silicon (macOS 14 or newer) has `aarch64-apple-darwin` CLI,
-daemon, and GUI archives. They are signed with a Developer ID Application
-certificate, hardened-runtime and notarized by Apple, and the GUI archive holds
-`Pohunek.app` with the notarization ticket stapled. Install the daemon archive
-with its `packaging/install-daemon.sh` (a launchd login agent, no `sudo`), then
-copy `Pohunek.app` to `~/Applications`. If Gatekeeper refuses a download, check
-it with `codesign --verify --deep --strict` and `spctl --assess --type execute`;
-never disable Gatekeeper. A build made with `packaging/macos/package
---development` is unsigned, named `...-unsigned-development`, and never
-released.
+macOS on Apple Silicon (macOS 14 or newer) is not yet a published platform:
+public macOS support is declared only when the final native acceptance gate
+(#105) passes. The release workflow already builds the `aarch64-apple-darwin`
+CLI, daemon, and GUI (`Pohunek.app`) archives, signs them with a Developer ID
+Application certificate, has Apple notarize them, and verifies the result, but
+only when the protected `macos-signing` credentials exist (see "Release" below);
+without them the macOS jobs fail and nothing macOS is published. A build made
+with `packaging/macos/package --development` is unsigned, named
+`...-unsigned-development`, and never released.
 
 Download from [Releases](https://github.com/zajca/pohunek/releases), unpack,
 and put the binaries on your `PATH`.
@@ -984,7 +983,11 @@ jobs run in the protected `macos-signing` environment (secrets
 `APPLE_NOTARY_KEY_P8_BASE64`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID`,
 and the variable `MACOS_TEAM_ID`); a missing credential fails them before the
 build, so a macOS archive is never published unsigned and the release run stays
-red until the credentials exist. The offline docs are
+red until the credentials exist. The `macos-signing` environment is created and
+protected by the repository owner, not by the workflow: restrict it to the
+`v*` release tags (and add a required reviewer if wanted), then add the five
+secrets and `MACOS_TEAM_ID`. A workflow that merely names an environment gets
+none of that protection. The offline docs are
 bundled into every native component archive. CLI archives also contain
 `packaging/smoke-hermes-plugin-release`. Release automation provisions the
 source-locked Hermes runtime without provider credentials, runs the model-free

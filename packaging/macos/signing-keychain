@@ -18,8 +18,11 @@
 #
 # delete removes that keychain, restores the saved keychain search list, and
 # removes every temporary file; it runs even when the build failed. Secret
-# values are never printed, passed on a command line, or written to a file
-# other than the 0600 temporary PKCS#12.
+# values are never printed or exported; the random keychain password is masked.
+# `security` takes the passwords only as command-line arguments, so they are
+# visible to other processes of the single-tenant ephemeral runner for the
+# seconds each command runs. The only file holding secret material is the 0600
+# temporary PKCS#12, removed right after the import.
 
 set -euo pipefail
 umask 077

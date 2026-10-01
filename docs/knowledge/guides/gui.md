@@ -226,17 +226,19 @@ What cannot be confirmed: `osascript` exits 0 whether the notification was shown
 or suppressed by System Settings (Notifications, Focus), and an unbundled binary
 cannot ask `UNUserNotificationCenter` for its authorization. "Submitted" means
 the backend accepted the request, not that it was displayed, and the GUI cannot
-detect that a user denied notifications. The release's `Pohunek.app` gives the
-GUI the bundle identity such a check needs, but the GUI does not call
-`UNUserNotificationCenter` yet, so denial is still undetectable (tracked by
-issue #102).
+detect that a user denied notifications. Denial detection needs the app bundle
+and a native `UNUserNotificationCenter` call, which the GUI does not make yet
+(tracked by issue #102).
 
 ## macOS app bundle
 
-The macOS GUI archive `pohunek-gui-<version>-aarch64-apple-darwin.tar.gz`
-contains `Pohunek.app`, signed with a Developer ID Application certificate
-(hardened runtime, secure timestamp) and notarized, with the ticket stapled.
-Copy it to `~/Applications` (or `/Applications`) and open it from Finder.
+The release workflow builds the macOS GUI archive
+`pohunek-gui-<version>-aarch64-apple-darwin.tar.gz` around `Pohunek.app` when
+the repository's `macos-signing` credentials exist: signed with a Developer ID
+Application certificate (hardened runtime, secure timestamp), notarized, ticket
+stapled. macOS is not yet a published platform (see the README); once an archive
+is published, copy `Pohunek.app` to `~/Applications` (or `/Applications`) and
+open it from Finder.
 
 - Bundle identifier `io.github.zajca.pohunek.gui`, executable `pohunek-gui`,
   minimum macOS 14.0, Apple Silicon only.
@@ -252,6 +254,9 @@ Copy it to `~/Applications` (or `/Applications`) and open it from Finder.
   with `spctl --assess --type execute --verbose=4 Pohunek.app` and
   `codesign --verify --deep --strict Pohunek.app`; do not disable Gatekeeper or
   strip quarantine from other files. A signed and notarized app needs neither.
+- The release's `Pohunek.app` has the bundle identity a notification
+  authorization check needs, but the GUI does not call
+  `UNUserNotificationCenter` yet (see the notification limits above).
 
 Provider-specific GUI configuration and `open_url_command` are no longer read.
 Unknown legacy TOML fields are ignored by Serde, but they should be removed from
