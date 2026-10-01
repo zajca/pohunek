@@ -485,12 +485,14 @@ say "7. Uninstall after the sessions ended keeps the durable state"
 for session in "$session_one" "$session_two" "$session_three"; do
   iso_env "$installed_cli" session stop "$session" >/dev/null 2>&1 || die "could not stop session $session"
 done
+# A stopped session's worker job stays registered until the uninstall (or the
+# daemon's reconciliation) retires it, so the wait is on the session state.
 waited=0
 while :; do
-  status_json "$work/ev/status-stopped.json"
-  workers=$(json_get "$work/ev/status-stopped.json" ok.workers)
-  [ "$workers" = "[]" ] && break
-  [ "$waited" -lt "$exit_timeout_s" ] || die "workers still registered after ${exit_timeout_s}s: $workers"
+  iso_env "$installed_cli" session list --json >"$work/ev/list-stopped.json"
+  live=$("$python_bin" "$helper" states "$work/ev/list-stopped.json" "$session_one" "$session_two" "$session_three" | awk '$2 == "live" { print $1 }')
+  [ -z "$live" ] && break
+  [ "$waited" -lt "$exit_timeout_s" ] || die "sessions still live ${exit_timeout_s}s after the stop: $live"
   sleep 1
   waited=$((waited + 1))
 done
