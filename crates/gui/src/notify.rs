@@ -25,7 +25,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::bin_resolver::BinResolver;
 use crate::terminal::{run_bounded, BoundedError};
@@ -110,7 +110,8 @@ impl CommandResolution {
         }
     }
 
-    fn resolve(&self, deadline: Duration) -> &Result<PathBuf, String> {
+    /// Resolves within `budget`; a later caller reads the first result.
+    fn resolve(&self, budget: Duration) -> &Result<PathBuf, String> {
         self.resolved.get_or_init(|| {
             let (sender, receiver) = mpsc::channel();
             let resolver = Arc::clone(&self.resolver);
@@ -123,11 +124,11 @@ impl CommandResolution {
             if let Err(error) = spawned {
                 return Err(format!("cannot start the executable lookup: {error}"));
             }
-            match receiver.recv_timeout(deadline) {
+            match receiver.recv_timeout(budget) {
                 Ok(Ok(path)) => Ok(path),
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(_) => Err(format!(
-                    "finding `{}` did not finish within {deadline:?}",
+                    "finding `{}` did not finish within {budget:?}",
                     self.program.to_string_lossy()
                 )),
             }
@@ -182,17 +183,25 @@ fn command_arguments(program: &std::path::Path, title: &str, body: &str) -> Vec<
     arguments
 }
 
+/// Time left until `deadline`, zero once it has passed.
+fn remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
 impl Notifier {
     /// Shows one notification and waits at most the deadline.
     ///
-    /// Blocks on the first executable resolution and on the child, so callers
-    /// run it off the UI thread. The child is killed and reaped on timeout.
+    /// One deadline, taken at entry, covers the first executable resolution and
+    /// the child together: the child gets only the time the resolution left.
+    /// Blocks, so callers run it off the UI thread. The child is killed and
+    /// reaped on timeout.
     pub(crate) fn notify(&self, title: &str, body: &str) -> NotificationOutcome {
         if title.contains('\0') || body.contains('\0') {
             return NotificationOutcome::Unavailable(
                 "the notification text contains a NUL byte".to_owned(),
             );
         }
+        let deadline = Instant::now() + self.timeout;
         let mut command = match &self.backend {
             NotificationBackend::Osascript { executable } => {
                 let mut command = Command::new(executable);
@@ -200,7 +209,7 @@ impl Notifier {
                 command
             }
             NotificationBackend::Command { resolution } => {
-                let program = match resolution.resolve(self.timeout) {
+                let program = match resolution.resolve(remaining(deadline)) {
                     Ok(program) => program,
                     Err(reason) => return NotificationOutcome::Unavailable(reason.clone()),
                 };
@@ -213,7 +222,14 @@ impl Notifier {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        match run_bounded(&mut command, self.timeout) {
+        let budget = remaining(deadline);
+        if budget.is_zero() {
+            return NotificationOutcome::Unavailable(format!(
+                "the notification deadline of {:?} passed before the backend started",
+                self.timeout
+            ));
+        }
+        match run_bounded(&mut command, budget) {
             Ok(output) => match output.status.code() {
                 Some(0) => NotificationOutcome::Submitted,
                 Some(code) => {
@@ -536,6 +552,43 @@ mod tests {
             "{outcome:?}"
         );
         drop(release);
+    }
+
+    #[test]
+    fn a_slow_lookup_and_a_slow_backend_share_one_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A stopped backend never exits by itself; only the deadline ends it.
+        let (_program, _record) = recording_backend(dir.path(), "slowcmd", "kill -STOP $$");
+        let search = pohunek_platform::shell_env::SearchPath::new(vec![dir.path().to_path_buf()])
+            .expect("search path");
+        let lookup = Duration::from_millis(500);
+        let timeout = Duration::from_millis(1000);
+        let resolver = Arc::new(BinResolver::with_discovery("pohunek", move || {
+            // A bounded wait that stands in for a slow login-shell probe.
+            let (_keep_open, idle) = mpsc::channel::<()>();
+            let _ = idle.recv_timeout(lookup);
+            Ok(search.clone())
+        }));
+        let notifier = Notifier {
+            backend: NotificationBackend::Command {
+                resolution: Arc::new(CommandResolution::new(resolver, "slowcmd")),
+            },
+            timeout,
+        };
+
+        let started = Instant::now();
+        let outcome = notifier.notify("t", "b");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(&outcome, NotificationOutcome::Unavailable(reason) if reason.contains("killed")),
+            "{outcome:?}"
+        );
+        // Lookup plus run would take about 1500ms with a fresh budget each.
+        assert!(
+            elapsed < timeout + Duration::from_millis(300),
+            "took {elapsed:?}"
+        );
     }
 
     #[test]

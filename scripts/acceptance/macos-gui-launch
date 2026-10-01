@@ -53,13 +53,21 @@ socket_path_max=100
 # The minimal PATH launchd gives a Finder-launched app.
 finder_path=/usr/bin:/bin:/usr/sbin:/sbin
 python_bin=${GUI_ACCEPT_PYTHON:-/usr/bin/python3}
+# Upper bounds, in poll steps, on the wait for a process to exit after SIGTERM
+# and after the SIGKILL fallback. pohunekd finishes in-flight work on SIGTERM.
+term_wait_s=${GUI_ACCEPT_TERM_WAIT_S:-15}
+kill_wait_s=${GUI_ACCEPT_KILL_WAIT_S:-5}
 # Upper bound on the wait for a background launch to become the named binary.
 exec_timeout_s=10
 
 work=
 daemon_pid=
 gui_pid=
+escalated=no
 session_id=
+worker_pids=
+child_pid=
+child_name=
 
 say() {
   printf '\n==> %s\n' "$*"
@@ -109,20 +117,73 @@ dump_evidence() {
     while IFS= read -r file; do dump_log "$file"; done
 }
 
+# Whether process $1 is gone: absent from the process table or a zombie
+# (an exited background job stays a zombie until it is waited for).
+process_gone() {
+  state=$(ps -o stat= -p "$1" 2>/dev/null || true)
+  case "$state" in '' | Z*) return 0 ;; *) return 1 ;; esac
+}
+
+# Waits up to $2 poll steps for process $1 to be gone.
+wait_gone() {
+  waited=0
+  while ! process_gone "$1"; do
+    [ "$waited" -lt "$2" ] || return 1
+    sleep "$poll_s"
+    waited=$((waited + 1))
+  done
+  return 0
+}
+
+# Ends process $1, which must be running the binary named $2, and waits for it.
+# The name is checked before every signal, so a pid that has been reused by
+# another program is never signalled (it counts as gone: the original exited).
+# SIGTERM first, polled for term_wait_s steps; SIGKILL as the last resort,
+# reported on stderr. Returns 1 only when the process is still running.
+terminate_and_wait() {
+  tw_pid=$1
+  tw_name=$2
+  process_gone "$tw_pid" && return 0
+  current=$(ps -o comm= -p "$tw_pid" 2>/dev/null || true)
+  if [ "${current##*/}" != "$tw_name" ]; then
+    printf 'warning: pid %s is now "%s", not %s; not signalling it\n' "$tw_pid" "${current##*/}" "$tw_name" >&2
+    return 0
+  fi
+  kill -TERM "$tw_pid" 2>/dev/null || true
+  wait_gone "$tw_pid" "$term_wait_s" && return 0
+  current=$(ps -o comm= -p "$tw_pid" 2>/dev/null || true)
+  [ "${current##*/}" = "$tw_name" ] || return 0
+  escalated=yes
+  printf 'warning: %s (pid %s) ignored SIGTERM for %ss; sending SIGKILL\n' "$tw_name" "$tw_pid" "$term_wait_s" >&2
+  kill -KILL "$tw_pid" 2>/dev/null || true
+  wait_gone "$tw_pid" "$kill_wait_s" && return 0
+  printf 'warning: %s (pid %s) is still running after SIGKILL\n' "$tw_name" "$tw_pid" >&2
+  return 1
+}
+
 cleanup() {
   status=$?
   trap - EXIT
   [ "$status" -eq 0 ] || dump_evidence
-  [ -z "$gui_pid" ] || kill "$gui_pid" 2>/dev/null || true
+  leftover=no
+  [ -z "$gui_pid" ] || terminate_and_wait "$gui_pid" pohunek-gui || leftover=yes
   # Stop the session before the daemon so no worker or shell outlives the run
   # with a deleted runtime directory. Best effort: the daemon may be gone.
   if [ -n "$session_id" ] && [ -n "$daemon_pid" ] && [ -n "$work" ] && [ -d "$work" ]; then
     finder_env "$bin_dir/pohunek" session stop "$session_id" >/dev/null 2>&1 ||
       printf 'warning: could not stop session %s\n' "$session_id" >&2
   fi
-  [ -z "$daemon_pid" ] || kill "$daemon_pid" 2>/dev/null || true
+  [ -z "$daemon_pid" ] || terminate_and_wait "$daemon_pid" pohunekd || leftover=yes
+  # Whatever the session stop and the daemon left behind.
+  for pid in $worker_pids; do
+    terminate_and_wait "$pid" pohunek-sessiond || leftover=yes
+  done
+  [ -z "$child_pid" ] || [ -z "$child_name" ] ||
+    terminate_and_wait "$child_pid" "$child_name" || leftover=yes
   if [ -n "$work" ] && [ -d "$work" ]; then
-    if [ "${GUI_ACCEPT_KEEP:-no}" = yes ]; then
+    if [ "$leftover" = yes ]; then
+      printf 'macos-gui-launch: a process could not be ended; keeping %s\n' "$work" >&2
+    elif [ "${GUI_ACCEPT_KEEP:-no}" = yes ]; then
       printf 'Evidence kept in %s\n' "$work"
     else
       rm -rf -- "$work"
@@ -268,6 +329,9 @@ EOF
   [ -n "$child_pid" ] || die "the session list has no child pid for $session_id"
   worker_lines=$(ps -axww -o pid=,lstart=,command= | grep "pohunek-sessiond" | grep -F -- "$session_id" | grep -v grep || true)
   [ -n "$worker_lines" ] || die "no pohunek-sessiond process for $session_id"
+  worker_pids=$(printf '%s\n' "$worker_lines" | awk '{ print $1 }')
+  child_name=$(ps -o comm= -p "$child_pid" 2>/dev/null || true)
+  child_name=${child_name##*/}
   child_line=$(ps -o pid=,lstart=,command= -p "$child_pid" || true)
   [ -n "$child_line" ] || die "session child $child_pid is not running"
   daemon_line=$(ps -o pid=,lstart= -p "$daemon_pid" || true)
@@ -304,13 +368,8 @@ kill -0 "$gui_pid" 2>/dev/null || die "pohunek-gui is not running after ${up_s}s
 printf 'pohunek-gui pid %s stayed up for %ss\n' "$gui_pid" "$up_s"
 
 say "Ending the GUI with SIGTERM"
-kill -TERM "$gui_pid"
-waited=0
-while kill -0 "$gui_pid" 2>/dev/null; do
-  [ "$waited" -lt "$exit_timeout_s" ] || die "pohunek-gui did not exit within ${exit_timeout_s}s of SIGTERM"
-  sleep "$poll_s"
-  waited=$((waited + poll_s))
-done
+terminate_and_wait "$gui_pid" pohunek-gui || die "pohunek-gui did not exit after SIGTERM and SIGKILL"
+[ "$escalated" = no ] || die "pohunek-gui ignored SIGTERM and had to be killed"
 gui_pid=
 
 say "Identity after the GUI exited"
