@@ -1,6 +1,7 @@
 """Behavior of the portable `pohunek_run_with_timeout` helper in lib.sh (stdlib only)."""
 
 from pathlib import Path
+import functools
 import os
 import shlex
 import signal
@@ -9,8 +10,9 @@ import sys
 import tempfile
 import threading
 import time
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 import unittest
+from unittest import mock
 
 LIB = Path(__file__).resolve().parents[1] / "lib.sh"
 # Bound on the wall clock of each scenario; far above every expected duration.
@@ -104,6 +106,19 @@ def recorded(pid_file, *argv):
 class Process(NamedTuple):
     parent: int
     group: int
+    session: Optional[int]  # None where `ps` has no session id column
+
+
+@functools.cache
+def ps_lists_sessions():
+    """Returns whether `ps` can print a session id (procps does, BSD `ps` does not).
+
+    BSD `ps` only offers `sess`, a kernel pointer that is no usable id.
+    """
+    probe = subprocess.run(
+        ["ps", "-o", "sid=", "-p", str(os.getpid())], capture_output=True, text=True
+    )
+    return probe.returncode == 0 and probe.stdout.strip().isdigit()
 
 
 def live_processes():
@@ -112,30 +127,39 @@ def live_processes():
     A process killed by the helper may stay a zombie until its reaper runs;
     it no longer executes anything and does not count as alive.
     """
+    sessions = ps_lists_sessions()
+    columns = "pid=,ppid=,pgid=,sid=,stat=" if sessions else "pid=,ppid=,pgid=,stat="
     listing = subprocess.run(
-        ["ps", "-A", "-o", "pid=,ppid=,pgid=,stat="],
-        capture_output=True,
-        text=True,
-        check=True,
+        ["ps", "-A", "-o", columns], capture_output=True, text=True, check=True
     ).stdout
     alive = {}
     for line in listing.splitlines():
-        pid, parent, group, state = line.split()
+        fields = line.split()
+        state = fields[-1]
         if not state.startswith("Z"):
-            alive[int(pid)] = Process(int(parent), int(group))
+            pid, parent, group = (int(field) for field in fields[:3])
+            session = int(fields[3]) if sessions else None
+            alive[pid] = Process(parent, group, session)
     return alive
 
 
 def scenario_processes(root):
-    """Returns the live processes descending from `root`, `root` included.
+    """Returns the live processes that belong to the scenario shell `root`.
 
-    `pohunek_run_with_timeout` starts the tested command in a process group
-    of its own, so the scenario cannot be named by one group; the parent
-    links tie every member to the scenario's shell. `ps` offers a session id
-    only on Linux, the parent links work on every `ps`.
+    The shell is a session and process group leader, so a member is any
+    process of that session or group, or a descendant of a member. The helper
+    puts the tested command into a group of its own, and a background child
+    outlives the shell, which reparents it: the session id (where `ps` has
+    one) and the group keep naming those, the parent links catch the rest.
+    A process that left the group, was orphaned and sits in a `ps` without
+    session ids is out of reach.
     """
     table = live_processes()
-    members = {root} & table.keys()
+    members = {
+        pid
+        for pid, process in table.items()
+        if pid == root or process.group == root or process.session == root
+    }
     grown = True
     while grown:
         grown = False
@@ -147,11 +171,10 @@ def scenario_processes(root):
 
 
 def kill_scenario(root):
-    """Kills the scenario shell `root` and everything descending from it.
+    """Kills every process of the scenario shell `root`, which may have exited.
 
-    Repeats until no descendant is left, as a process may fork between the
-    listing and the kill. Process groups of the members are killed too, since
-    a member that forked away from its parent chain stays in its group.
+    Repeats until none is left, as a process may fork between the listing and
+    the kill. The groups of the members are killed too.
     """
     deadline = time.monotonic() + REAP_BOUND_SECONDS
     own_group = os.getpgrp()
@@ -197,6 +220,20 @@ def survivors_after_reap(pids=(), group=None):
         time.sleep(REAP_POLL_SECONDS)
         left = survivors(pids, group)
     return left
+
+
+def command_line(pid):
+    """Returns the complete command line of process `pid`.
+
+    `-ww` lifts the width limit, which otherwise follows `COLUMNS` (procps)
+    or the terminal (BSD `ps`) and cuts the arguments short.
+    """
+    return subprocess.run(
+        ["ps", "-ww", "-p", str(pid), "-o", "args="],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
 
 
 class ScenarioTestCase(unittest.TestCase):
@@ -366,12 +403,9 @@ class ReapDetectionTests(ScenarioTestCase):
     """The reap assertions are bound to the processes the scenario started."""
 
     def test_the_decoy_carries_every_command_line_the_scenarios_use(self):
-        args = subprocess.run(
-            ["ps", "-p", str(decoy.pid), "-o", "args="],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
+        # A narrow terminal width must not cut the listing short.
+        with mock.patch.dict(os.environ, {"COLUMNS": "80"}):
+            args = command_line(decoy.pid)
         for marker in DECOY_MARKERS:
             self.assertIn(marker, args)
 
@@ -430,6 +464,34 @@ class ReapDetectionTests(ScenarioTestCase):
 
 class ScenarioTimeoutTests(ScenarioTestCase):
     """A scenario that outlives its timeout is killed with all it started."""
+
+    def test_a_background_child_of_an_exited_shell_is_killed(self):
+        # The shell exits at once; the child keeps the captured pipes open and
+        # is reparented, so no parent link leads from the shell to it.
+        command = recorded(self.pid_file("command.pid"), "sleep", "45")
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run(f"{command} &", timeout=2)
+        self.assertLess(time.monotonic() - started, SCENARIO_TIMEOUT_SECONDS)
+        self.assertEqual(
+            survivors_after_reap(self.recorded_pids("command.pid")),
+            [],
+            "a background child of the exited shell survived the timeout",
+        )
+
+    @unittest.skipUnless(ps_lists_sessions(), "ps has no session id column")
+    def test_an_orphan_in_a_group_of_its_own_is_killed(self):
+        # Neither the shell's group nor a parent link names the orphan; only
+        # the session it never left does.
+        own_group = "import os, time; os.setpgid(0, 0); time.sleep(45)"
+        command = recorded(self.pid_file("command.pid"), "python3", "-c", own_group)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run(f"{command} &", timeout=2)
+        self.assertEqual(
+            survivors_after_reap(self.recorded_pids("command.pid")),
+            [],
+            "an orphan in a group of its own survived the timeout",
+        )
 
     def test_the_command_of_a_timed_out_scenario_is_killed_at_once(self):
         # The helper runs the command in a process group of its own and the
