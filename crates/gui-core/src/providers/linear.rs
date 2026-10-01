@@ -7,14 +7,13 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
-use super::credential_store::{lookup, CredentialBackend, KeyringBackend};
+use super::credential_store::{lookup, read_keyring};
 
 const DEFAULT_ISSUE_LIMIT: usize = 50;
 const MAX_ISSUE_LIMIT: usize = 100;
@@ -236,6 +235,14 @@ impl GraphqlTransportError {
 }
 
 /// Errors raised by the Linear provider client.
+///
+/// Credential failures come in two shapes: [`LinearError::TokenLookup`]
+/// carries the store's classified [`TokenError`], and
+/// [`LinearError::TokenLookupTimedOut`] is the caller-side timeout.
+/// [`LinearError::token_error_kind`] reports both through one
+/// [`TokenErrorKind`], so a consumer matches a single contract: the timeout is
+/// [`TokenErrorKind::Timeout`], the same kind a refused lookup carries while an
+/// earlier one is stuck.
 #[derive(Debug, Error)]
 pub enum LinearError {
     /// The Linear config omitted the token key.
@@ -302,6 +309,19 @@ pub enum LinearError {
         /// Missing field name.
         field: &'static str,
     },
+}
+
+impl LinearError {
+    /// Returns the credential failure kind, `None` for errors that are not
+    /// credential lookups.
+    #[must_use]
+    pub fn token_error_kind(&self) -> Option<TokenErrorKind> {
+        match self {
+            Self::TokenLookupTimedOut { .. } => Some(TokenErrorKind::Timeout),
+            Self::TokenLookup { source, .. } => Some(source.kind()),
+            _ => None,
+        }
+    }
 }
 
 /// Linear provider client.
@@ -412,9 +432,9 @@ where
 /// Keyring-backed Linear token source.
 ///
 /// Every call reads the platform store afresh: nothing is cached or persisted.
-/// At most one blocking lookup per `(service, key)` runs at a time; a lookup
-/// requested while an earlier one is stuck fails with
-/// [`TokenErrorKind::Timeout`].
+/// At most one blocking lookup runs at a time across the whole store (a locked
+/// keychain blocks every entry); a lookup requested while an earlier one is
+/// stuck fails with [`TokenErrorKind::Timeout`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyringTokenSource {
     service: String,
@@ -438,8 +458,12 @@ impl KeyringTokenSource {
 
 impl TokenSource for KeyringTokenSource {
     fn token<'a>(&'a self, token_key: &'a str) -> TokenFuture<'a> {
-        let backend: Arc<dyn CredentialBackend> = Arc::new(KeyringBackend);
-        Box::pin(lookup(backend, self.service.clone(), token_key.to_owned()))
+        let service = self.service.clone();
+        let key = token_key.to_owned();
+        Box::pin(async move {
+            let read_key = key.clone();
+            lookup(&key, move || read_keyring(&service, &read_key)).await
+        })
     }
 }
 

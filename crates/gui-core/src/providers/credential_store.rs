@@ -7,73 +7,40 @@
 //!
 //! A `get_password` call may block for as long as the platform waits on an
 //! unlock prompt, and it cannot be cancelled. The caller's timeout stops the
-//! wait but not the blocking thread, so at most one lookup per
-//! `(service, key)` is in flight; a further lookup fails fast instead of
-//! parking another thread.
+//! wait but not the blocking thread. A locked keychain blocks every entry, so
+//! the whole store has one lookup in flight at most: a further lookup of any
+//! key fails fast with [`TokenErrorKind::Timeout`] instead of parking another
+//! blocking-pool thread.
 
-// Rust guideline compliant 2026-09-30
+// Rust guideline compliant 2026-10-01
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tokio::task::JoinError;
 
 use super::linear::{TokenError, TokenErrorKind};
 
-/// Reads one credential from a platform store.
-pub(super) trait CredentialBackend: Send + Sync + 'static {
-    /// Returns the secret stored under `service` and `key`.
-    ///
-    /// Errors must be classified and must not contain the secret.
-    fn read(&self, service: &str, key: &str) -> Result<String, TokenError>;
-}
-
-/// [`CredentialBackend`] over the platform keyring.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct KeyringBackend;
-
-impl CredentialBackend for KeyringBackend {
-    fn read(&self, service: &str, key: &str) -> Result<String, TokenError> {
-        let entry = keyring::Entry::new(service, key)
-            .map_err(|source| classify_keyring_error(&source, service, key))?;
-        entry
-            .get_password()
-            .map_err(|source| classify_keyring_error(&source, service, key))
-    }
-}
-
-/// Keychain status codes with a dedicated meaning, decoupled from the FFI type
-/// so the mapping is testable on every host.
+/// `errSecInteractionNotAllowed` in `SecBase.h`: the keychain is locked and no
+/// unlock UI may be shown.
 #[cfg(any(target_os = "macos", test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KeychainStatus {
-    /// `errSecInteractionNotAllowed`: the keychain is locked and no unlock UI
-    /// may be shown.
-    InteractionNotAllowed,
-    /// `errSecUserCanceled`: the user dismissed the unlock prompt.
-    UserCanceled,
-    /// Any other status.
-    Other,
-}
+const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
 
+/// `errSecUserCanceled` in `SecBase.h`: the user dismissed the unlock prompt.
 #[cfg(any(target_os = "macos", test))]
-impl KeychainStatus {
-    /// `errSecInteractionNotAllowed` in `SecBase.h`.
-    const INTERACTION_NOT_ALLOWED_CODE: i32 = -25308;
-    /// `errSecUserCanceled` in `SecBase.h`.
-    const USER_CANCELED_CODE: i32 = -128;
+const ERR_SEC_USER_CANCELED: i32 = -128;
 
-    fn from_code(code: i32) -> Self {
-        match code {
-            Self::INTERACTION_NOT_ALLOWED_CODE => Self::InteractionNotAllowed,
-            Self::USER_CANCELED_CODE => Self::UserCanceled,
-            _ => Self::Other,
-        }
-    }
+/// `errSecAuthFailed` in `SecBase.h`: the store refused access to the entry.
+#[cfg(any(target_os = "macos", test))]
+const ERR_SEC_AUTH_FAILED: i32 = -25293;
 
-    fn kind(self) -> Option<TokenErrorKind> {
-        match self {
-            Self::InteractionNotAllowed | Self::UserCanceled => Some(TokenErrorKind::Locked),
-            Self::Other => None,
-        }
+/// Kind a Keychain status code stands for, `None` when it has no dedicated
+/// meaning.
+#[cfg(any(target_os = "macos", test))]
+fn status_kind(code: i32) -> Option<TokenErrorKind> {
+    match code {
+        ERR_SEC_INTERACTION_NOT_ALLOWED | ERR_SEC_USER_CANCELED => Some(TokenErrorKind::Locked),
+        ERR_SEC_AUTH_FAILED => Some(TokenErrorKind::Unavailable),
+        _ => None,
     }
 }
 
@@ -87,12 +54,23 @@ impl KeychainStatus {
 fn platform_failure_kind(source: &(dyn std::error::Error + 'static)) -> Option<TokenErrorKind> {
     source
         .downcast_ref::<security_framework::base::Error>()
-        .and_then(|error| KeychainStatus::from_code(error.code()).kind())
+        .and_then(|error| status_kind(error.code()))
 }
 
+/// Keyring reports no recognizable platform status off macOS: a locked Secret
+/// Service collection surfaces as an unavailable store.
 #[cfg(not(target_os = "macos"))]
 fn platform_failure_kind(_source: &(dyn std::error::Error + 'static)) -> Option<TokenErrorKind> {
     None
+}
+
+/// Reads `service`/`key` from the platform keyring.
+pub(super) fn read_keyring(service: &str, key: &str) -> Result<String, TokenError> {
+    let entry = keyring::Entry::new(service, key)
+        .map_err(|source| classify_keyring_error(&source, service, key))?;
+    entry
+        .get_password()
+        .map_err(|source| classify_keyring_error(&source, service, key))
 }
 
 /// Maps a keyring failure to a classified [`TokenError`].
@@ -102,6 +80,7 @@ fn classify_keyring_error(source: &keyring::Error, service: &str, key: &str) -> 
         keyring::Error::NoStorageAccess(detail) => unavailable(&detail.to_string()),
         keyring::Error::PlatformFailure(detail) => match platform_failure_kind(detail.as_ref()) {
             Some(TokenErrorKind::Locked) => locked(),
+            Some(TokenErrorKind::Unavailable) => denied(),
             _ => unavailable(&detail.to_string()),
         },
         keyring::Error::BadEncoding(_) => invalid("the stored value is not valid UTF-8"),
@@ -130,8 +109,15 @@ fn not_found(service: &str, key: &str) -> TokenError {
 fn locked() -> TokenError {
     TokenError::with_kind(
         TokenErrorKind::Locked,
-        "the credential store is locked; unlock the login keychain \
-         (Linux: the default Secret Service collection) and retry",
+        "the credential store is locked; unlock the login keychain and retry",
+    )
+}
+
+fn denied() -> TokenError {
+    TokenError::with_kind(
+        TokenErrorKind::Unavailable,
+        "the credential store refused access to the entry; allow access in Keychain Access \
+         or unlock the login keychain with its password, then retry",
     )
 }
 
@@ -140,7 +126,8 @@ fn unavailable(detail: &str) -> TokenError {
         TokenErrorKind::Unavailable,
         format!(
             "the credential store is unavailable ({detail}); check that the login keychain \
-             exists and is accessible (Linux: that a Secret Service provider is running)"
+             exists and is accessible (Linux: that a Secret Service provider is running and \
+             its collection is unlocked)"
         ),
     )
 }
@@ -156,85 +143,91 @@ fn busy(key: &str) -> TokenError {
     TokenError::with_kind(
         TokenErrorKind::Timeout,
         format!(
-            "an earlier lookup of `{key}` is still waiting on the credential store; \
-             it may be waiting for an unlock prompt: unlock the login keychain and retry"
+            "an earlier credential store lookup is still pending, so `{key}` was not read; \
+             the store may be waiting for an unlock prompt: unlock the login keychain and retry"
         ),
     )
 }
 
-/// `(service, key)` pairs with a lookup running on a blocking thread.
-static IN_FLIGHT: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
-
-/// Claim on one in-flight lookup, released when the blocking thread finishes.
-struct InFlight {
-    slot: (String, String),
+/// Maps a failed lookup task to an error. Neither the panic payload nor the
+/// join error text reaches the message: a payload is arbitrary text.
+fn task_failed(error: &JoinError) -> TokenError {
+    tracing::error!(
+        panicked = error.is_panic(),
+        cancelled = error.is_cancelled(),
+        "credential lookup task did not complete"
+    );
+    TokenError::with_kind(
+        TokenErrorKind::Other,
+        "the credential lookup ended unexpectedly; retry, and report this if it persists",
+    )
 }
 
-impl InFlight {
-    fn acquire(service: &str, key: &str) -> Option<Self> {
-        let slot = (service.to_owned(), key.to_owned());
-        // The claim is built only when the slot was free: dropping a claim
-        // releases the slot, which a busy lookup must not do.
-        let mut set = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
-        set.get_or_insert_with(HashSet::new)
-            .insert(slot.clone())
-            .then(|| Self { slot })
+/// Set while a lookup runs on a blocking thread.
+static LOOKUP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Claim on the store's single in-flight lookup. The blocking thread owns it,
+/// so it is released when the read returns, panics, or is dropped unrun at
+/// runtime shutdown, never when the caller gives up.
+struct LookupClaim;
+
+impl LookupClaim {
+    fn acquire() -> Option<Self> {
+        // Built lazily: dropping a claim releases the flag, which a refused
+        // lookup must not do.
+        LOOKUP_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then(|| Self)
     }
 }
 
-impl Drop for InFlight {
+impl Drop for LookupClaim {
     fn drop(&mut self) {
-        let mut set = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(set) = set.as_mut() {
-            set.remove(&self.slot);
-        }
+        LOOKUP_IN_FLIGHT.store(false, Ordering::Release);
     }
 }
 
-/// Reads `service`/`key` through `backend` on a blocking thread.
+/// Runs `read` on a blocking thread as the store's only in-flight lookup.
 ///
 /// Fails with [`TokenErrorKind::Timeout`] without spawning a thread while an
-/// earlier lookup of the same entry has not returned.
-pub(super) async fn lookup(
-    backend: Arc<dyn CredentialBackend>,
-    service: String,
-    key: String,
-) -> Result<String, TokenError> {
-    let Some(claim) = InFlight::acquire(&service, &key) else {
-        return Err(busy(&key));
+/// earlier lookup has not returned. `key` only names the entry in messages.
+pub(super) async fn lookup<F>(key: &str, read: F) -> Result<String, TokenError>
+where
+    F: FnOnce() -> Result<String, TokenError> + Send + 'static,
+{
+    let Some(claim) = LookupClaim::acquire() else {
+        return Err(busy(key));
     };
     tokio::task::spawn_blocking(move || {
         let _claim = claim;
-        backend.read(&service, &key)
+        read()
     })
     .await
-    .map_err(|_join_error| unavailable("the lookup task did not complete"))?
+    .map_err(|error| task_failed(&error))?
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
 
     use super::*;
 
     const SERVICE: &str = "pohunek-credential-store-test";
     const SECRET: &str = "secret-fixture-value";
-    /// Upper bound on yields while waiting for a blocking thread to drop its
-    /// claim; far above what one thread hand-off needs.
-    const CLAIM_RELEASE_POLLS: usize = 1_000_000;
+
+    /// The in-flight flag is process-wide, so tests that call `lookup` take
+    /// turns.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
-    fn keychain_status_maps_locked_codes() {
-        assert_eq!(
-            KeychainStatus::from_code(-25308).kind(),
-            Some(TokenErrorKind::Locked)
-        );
-        assert_eq!(
-            KeychainStatus::from_code(-128).kind(),
-            Some(TokenErrorKind::Locked)
-        );
-        assert_eq!(KeychainStatus::from_code(-25300).kind(), None);
-        assert_eq!(KeychainStatus::from_code(-25294).kind(), None);
+    fn status_kind_maps_locked_and_denied_codes() {
+        assert_eq!(status_kind(-25308), Some(TokenErrorKind::Locked));
+        assert_eq!(status_kind(-128), Some(TokenErrorKind::Locked));
+        assert_eq!(status_kind(-25293), Some(TokenErrorKind::Unavailable));
+        assert_eq!(status_kind(-25300), None);
+        assert_eq!(status_kind(-25294), None);
     }
 
     #[test]
@@ -272,10 +265,13 @@ mod tests {
     }
 
     #[test]
-    fn locked_message_tells_the_user_to_unlock() {
-        let error = locked();
-        assert_eq!(error.kind(), TokenErrorKind::Locked);
-        assert!(error.to_string().contains("unlock the login keychain"));
+    fn locked_and_denied_messages_carry_remediation() {
+        let locked = locked();
+        assert_eq!(locked.kind(), TokenErrorKind::Locked);
+        assert!(locked.to_string().contains("unlock the login keychain"));
+        let denied = denied();
+        assert_eq!(denied.kind(), TokenErrorKind::Unavailable);
+        assert!(denied.to_string().contains("allow access"));
     }
 
     /// Proves the downcast target matches the `security-framework` type keyring
@@ -285,11 +281,23 @@ mod tests {
     #[test]
     fn keyring_platform_failure_downcasts_to_locked() {
         let decoded = keyring::macos::decode_error(security_framework::base::Error::from_code(
-            KeychainStatus::INTERACTION_NOT_ALLOWED_CODE,
+            ERR_SEC_INTERACTION_NOT_ALLOWED,
         ));
         assert!(matches!(decoded, keyring::Error::PlatformFailure(_)));
         let error = classify_keyring_error(&decoded, SERVICE, "k");
         assert_eq!(error.kind(), TokenErrorKind::Locked);
+    }
+
+    /// `errSecAuthFailed` surfaces as a denied, unavailable store.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keyring_auth_failure_is_unavailable_with_remediation() {
+        let decoded = keyring::macos::decode_error(security_framework::base::Error::from_code(
+            ERR_SEC_AUTH_FAILED,
+        ));
+        let error = classify_keyring_error(&decoded, SERVICE, "k");
+        assert_eq!(error.kind(), TokenErrorKind::Unavailable);
+        assert!(error.to_string().contains("allow access"));
     }
 
     /// `errSecNoSuchKeychain` (-25294) surfaces as `NoStorageAccess`.
@@ -302,135 +310,74 @@ mod tests {
         assert_eq!(error.kind(), TokenErrorKind::Unavailable);
     }
 
-    fn shared(backend: &Arc<GatedBackend>) -> Arc<dyn CredentialBackend> {
-        Arc::clone(backend) as Arc<dyn CredentialBackend>
-    }
-
-    /// Backend whose reads report entry and then wait for a release signal.
-    struct GatedBackend {
-        entered: Mutex<mpsc::Sender<()>>,
-        release: Mutex<mpsc::Receiver<()>>,
-        reads: Mutex<usize>,
-    }
-
-    impl CredentialBackend for GatedBackend {
-        fn read(&self, _service: &str, _key: &str) -> Result<String, TokenError> {
-            *self.reads.lock().unwrap_or_else(PoisonError::into_inner) += 1;
-            // Later reads happen after the test stopped listening.
-            let _ = self
-                .entered
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .send(());
-            self.release
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .recv()
-                .expect("test holds the release sender");
-            Ok(SECRET.to_owned())
-        }
-    }
-
     #[tokio::test]
-    async fn stuck_lookup_does_not_accumulate_blocking_threads() {
+    async fn stuck_lookup_refuses_every_key_until_it_returns() {
+        let _turn = SERIAL.lock().await;
         let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let backend = Arc::new(GatedBackend {
-            entered: Mutex::new(entered_tx),
-            release: Mutex::new(release_rx),
-            reads: Mutex::new(0),
-        });
-        let key = "gated-key".to_owned();
-
-        let first = tokio::spawn(lookup(shared(&backend), SERVICE.to_owned(), key.clone()));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let first = tokio::spawn(lookup("first", move || {
+            entered_tx
+                .send(())
+                .expect("test holds the entered receiver");
+            release_rx.recv().expect("test holds the release sender");
+            Ok(SECRET.to_owned())
+        }));
         tokio::task::spawn_blocking(move || entered_rx.recv().expect("first lookup enters"))
             .await
             .expect("wait for entry");
 
-        // The first read is stuck: repeated lookups must fail fast without
-        // reaching the backend.
-        for _ in 0..8 {
-            let error = lookup(shared(&backend), SERVICE.to_owned(), key.clone())
-                .await
-                .expect_err("busy lookup fails fast");
+        // The first read is stuck: lookups of the same and of other keys fail
+        // fast without running their closure.
+        let ran = std::sync::Arc::new(AtomicUsize::new(0));
+        for key in ["first", "second", "third", "first"] {
+            let ran = std::sync::Arc::clone(&ran);
+            let error = lookup(key, move || {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok(SECRET.to_owned())
+            })
+            .await
+            .expect_err("busy lookup fails fast");
             assert_eq!(error.kind(), TokenErrorKind::Timeout);
-            assert!(error.to_string().contains(&key));
+            assert!(error.to_string().contains(key));
             assert!(!error.to_string().contains(SECRET));
         }
-        assert_eq!(*backend.reads.lock().expect("reads"), 1);
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
 
         release_tx.send(()).expect("release first lookup");
         let value = first.await.expect("join").expect("first lookup succeeds");
         assert!(value == SECRET, "unexpected value");
 
-        // Once the blocking thread returned, the entry can be looked up again.
-        release_tx.send(()).expect("pre-release second lookup");
-        let again = lookup(shared(&backend), SERVICE.to_owned(), key)
+        // The blocking thread dropped its claim before the join completed.
+        let again = lookup("second", || Ok("next".to_owned()))
             .await
             .expect("lookup after release");
-        assert!(again == SECRET, "unexpected value");
-        assert_eq!(*backend.reads.lock().expect("reads"), 2);
+        assert_eq!(again, "next");
     }
 
     #[tokio::test]
-    async fn dropped_caller_keeps_the_claim_until_the_thread_returns() {
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let backend = Arc::new(GatedBackend {
-            entered: Mutex::new(entered_tx),
-            release: Mutex::new(release_rx),
-            reads: Mutex::new(0),
-        });
-        let key = "dropped-key".to_owned();
+    async fn panicking_read_is_reported_without_payload_and_releases_the_claim() {
+        let _turn = SERIAL.lock().await;
+        let error = lookup("k", || -> Result<String, TokenError> {
+            panic!("payload {SECRET}")
+        })
+        .await
+        .expect_err("panicking read fails");
+        assert_eq!(error.kind(), TokenErrorKind::Other);
+        assert!(!error.to_string().contains(SECRET));
+        assert!(!format!("{error:?}").contains(SECRET));
 
-        let first = tokio::spawn(lookup(shared(&backend), SERVICE.to_owned(), key.clone()));
-        tokio::task::spawn_blocking(move || entered_rx.recv().expect("first lookup enters"))
+        let again = lookup("k", || Ok("after-panic".to_owned()))
             .await
-            .expect("wait for entry");
-        // A caller timeout drops the future; the blocking read keeps running.
-        first.abort();
-        let _ = first.await;
-
-        let error = lookup(shared(&backend), SERVICE.to_owned(), key.clone())
-            .await
-            .expect_err("claim outlives the aborted caller");
-        assert_eq!(error.kind(), TokenErrorKind::Timeout);
-
-        release_tx.send(()).expect("release the stuck read");
-        // The blocking thread drops the claim right after the read returns, an
-        // instant the test cannot observe; yield until the entry frees.
-        let mut freed = false;
-        for _ in 0..CLAIM_RELEASE_POLLS {
-            let _ = release_tx.send(());
-            if lookup(shared(&backend), SERVICE.to_owned(), key.clone())
-                .await
-                .is_ok()
-            {
-                freed = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(freed, "the claim was never released");
+            .expect("claim released by the unwinding thread");
+        assert_eq!(again, "after-panic");
     }
 
     #[tokio::test]
-    async fn distinct_entries_do_not_block_each_other() {
-        struct Immediate;
-        impl CredentialBackend for Immediate {
-            fn read(&self, _service: &str, key: &str) -> Result<String, TokenError> {
-                Ok(format!("value-for-{key}"))
-            }
-        }
-        let backend: Arc<dyn CredentialBackend> = Arc::new(Immediate);
-        let a = lookup(
-            Arc::clone(&backend),
-            SERVICE.to_owned(),
-            "distinct-a".to_owned(),
-        );
-        let b = lookup(backend, SERVICE.to_owned(), "distinct-b".to_owned());
-        let (a, b) = tokio::join!(a, b);
-        assert_eq!(a.expect("a"), "value-for-distinct-a");
-        assert_eq!(b.expect("b"), "value-for-distinct-b");
+    async fn classified_read_errors_pass_through() {
+        let _turn = SERIAL.lock().await;
+        let error = lookup("k", || Err(not_found(SERVICE, "k")))
+            .await
+            .expect_err("not found");
+        assert_eq!(error.kind(), TokenErrorKind::NotFound);
     }
 }

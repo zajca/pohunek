@@ -673,6 +673,7 @@ async fn token_lookup_error_keeps_the_kind_of_its_source() {
         err,
         LinearError::TokenLookup { ref source, .. } if source.kind() == TokenErrorKind::NotFound
     ));
+    assert_eq!(err.token_error_kind(), Some(TokenErrorKind::NotFound));
 }
 
 #[tokio::test]
@@ -693,4 +694,10 @@ async fn timeout_message_carries_unlock_remediation() {
         .expect_err("timeout");
 
     assert!(err.to_string().contains("unlock the login keychain"));
+    assert_eq!(err.token_error_kind(), Some(TokenErrorKind::Timeout));
+}
+
+#[test]
+fn non_credential_errors_have_no_token_error_kind() {
+    assert_eq!(LinearError::MissingEndpoint.token_error_kind(), None);
 }
