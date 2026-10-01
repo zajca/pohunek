@@ -300,7 +300,13 @@ mod tests {
         assert!(edited);
         assert_eq!(review.comments[0].text, "fix the typo instead");
         assert_eq!(review.comments[0].created_at, created_at);
-        assert!(review.updated_at >= updated_at_before_edit);
+        // RFC 3339 strings with a trimmed fraction do not order lexically, so
+        // the instants are compared.
+        let parse = |text: &str| {
+            time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+                .expect("RFC 3339 timestamp")
+        };
+        assert!(parse(&review.updated_at) >= parse(&updated_at_before_edit));
     }
 
     #[test]
