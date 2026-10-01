@@ -542,7 +542,8 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         },
         Message::AttachSpawned(result) => {
             app.status = Some(match result {
-                Ok(()) => "attach command spawned".to_owned(),
+                Ok(None) => "attach command spawned".to_owned(),
+                Ok(Some(warning)) => format!("attach command spawned (warning: {warning})"),
                 Err(err) => err,
             });
         }
@@ -1671,6 +1672,8 @@ mod tests {
                 login_shell_timeout: std::time::Duration::from_secs(1),
                 login_shell_max_output_bytes: 1024,
                 notification_timeout: std::time::Duration::from_secs(1),
+                attach_observe: std::time::Duration::from_millis(50),
+                attach_script_max_age: std::time::Duration::from_secs(3600),
             },
             bin_resolver: std::sync::Arc::new(crate::bin_resolver::BinResolver::with_discovery(
                 "pohunek",

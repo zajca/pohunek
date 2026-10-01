@@ -36,17 +36,8 @@ where
 
 /// Runs blocking `work` on the runtime's blocking pool.
 ///
-/// A panic inside `work` surfaces as an `Err` instead of tearing down the
-/// caller.
-pub(crate) fn perform_blocking<F>(work: F) -> impl Future<Output = Result<(), String>>
-where
-    F: FnOnce() -> Result<(), String> + Send + 'static,
-{
-    perform_blocking_or(work, Err)
-}
-
-/// Like [`perform_blocking`] for any output; `on_panic` maps a failed task
-/// to a value of the output type.
+/// A panic inside `work` surfaces through `on_panic` instead of tearing down
+/// the caller.
 pub(crate) fn perform_blocking_or<F, T>(
     work: F,
     on_panic: impl FnOnce(String) -> T,

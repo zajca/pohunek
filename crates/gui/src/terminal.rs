@@ -7,20 +7,21 @@
 //! array) to run it. Terminal executes the script through its shebang, so no
 //! Automation permission prompt is involved.
 
-// Rust guideline compliant 2026-09-30
+// Rust guideline compliant 2026-10-01
 #![forbid(unsafe_code)]
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read as _};
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, SystemTime};
 
-use pohunek_platform::filesystem::{FsError, TrustedDir};
+use pohunek_platform::filesystem::{EntryKind, FsError, StageOutcome, TrustedDir};
 use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
 use serde::Deserialize;
 use thiserror::Error;
@@ -31,6 +32,12 @@ const PRIVATE_MODE: u32 = 0o700;
 
 /// Directory below the pohunek runtime root that holds attach scripts.
 const SCRIPT_DIR_NAME: &str = "gui-attach";
+
+/// Name prefix of every attach script; the sweep of stale scripts matches it.
+const SCRIPT_PREFIX: &str = "attach-";
+
+/// Prefix of the temporary name a stale script is moved to before removal.
+const STALE_STAGING_PREFIX: &str = ".stale-attach-";
 
 /// Extension Terminal.app associates with "run in a new window".
 const SCRIPT_EXTENSION: &str = "command";
@@ -105,12 +112,44 @@ pub(crate) enum TerminalError {
     Random(String),
     #[error("cannot start `{}`: {source}", opener.display())]
     OpenerSpawn { opener: PathBuf, source: io::Error },
-    #[error("`{}` exited unsuccessfully ({status})", opener.display())]
-    OpenerFailed { opener: PathBuf, status: ExitStatus },
+    #[error("`{}` exited unsuccessfully ({status}){}", opener.display(), detail_suffix(.detail))]
+    OpenerFailed {
+        opener: PathBuf,
+        status: ExitStatus,
+        /// First line of the opener's standard error, sanitized.
+        detail: String,
+    },
     #[error("`{}` did not finish within {timeout:?} and was killed", opener.display())]
     OpenerTimeout { opener: PathBuf, timeout: Duration },
     #[error("waiting for `{}` failed: {source}", opener.display())]
     OpenerWait { opener: PathBuf, source: io::Error },
+}
+
+fn detail_suffix(detail: &str) -> String {
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {detail}")
+    }
+}
+
+/// Longest stderr diagnostic kept in an error, in characters.
+const DETAIL_MAX_CHARS: usize = 200;
+
+/// First non-empty line of `stderr`, lossily decoded, stripped of control
+/// characters, and bounded.
+fn first_line(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| {
+            line.chars()
+                .filter(|character| !character.is_control())
+                .take(DETAIL_MAX_CHARS)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Renders the `.command` script that runs `argv` and removes itself.
@@ -180,6 +219,14 @@ pub(crate) struct TerminalLauncher {
     opener: PathBuf,
     script_dir: PathBuf,
     open_timeout: Duration,
+    script_max_age: Duration,
+}
+
+/// What a successful launch also wants the user to know.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct LaunchReport {
+    /// Stale scripts that could not be removed; the launch itself succeeded.
+    pub(crate) warnings: Vec<String>,
 }
 
 impl TerminalLauncher {
@@ -191,12 +238,14 @@ impl TerminalLauncher {
         opener: PathBuf,
         script_dir: PathBuf,
         open_timeout: Duration,
+        script_max_age: Duration,
     ) -> Self {
         Self {
             terminal,
             opener,
             script_dir,
             open_timeout,
+            script_max_age,
         }
     }
 
@@ -209,16 +258,19 @@ impl TerminalLauncher {
     /// bounded time for the opener to exit.
     ///
     /// The script is removed again when the opener fails or is killed; on
-    /// success the script deletes itself when Terminal runs it.
+    /// success the script deletes itself when Terminal runs it. Scripts older
+    /// than the configured age that Terminal never ran are removed first; a
+    /// leftover that cannot be removed is reported in the [`LaunchReport`] and
+    /// never fails the launch.
     ///
     /// # Errors
     ///
     /// Returns [`TerminalError`] for an unbuildable script, a directory or
     /// file that is unsafe or unwritable, an opener that cannot start, exits
     /// unsuccessfully, or exceeds the timeout.
-    pub(crate) fn launch(&self, argv: &[OsString]) -> Result<(), TerminalError> {
+    pub(crate) fn launch(&self, argv: &[OsString]) -> Result<LaunchReport, TerminalError> {
         let contents = command_script(argv)?;
-        let script = self.write_script(&contents)?;
+        let (script, report) = self.write_script(&contents)?;
         let mut command = Command::new(&self.opener);
         command
             .arg("-a")
@@ -226,13 +278,14 @@ impl TerminalLauncher {
             .arg(&script)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let outcome = run_bounded(&mut command, self.open_timeout);
         let result = match outcome {
             Ok(output) if output.status.success() => Ok(()),
             Ok(output) => Err(TerminalError::OpenerFailed {
                 opener: self.opener.clone(),
                 status: output.status,
+                detail: first_line(&output.stderr),
             }),
             Err(BoundedError::Spawn(source)) => Err(TerminalError::OpenerSpawn {
                 opener: self.opener.clone(),
@@ -251,7 +304,7 @@ impl TerminalLauncher {
             // The script never ran, so it removes itself nowhere else.
             let _ = std::fs::remove_file(&script);
         }
-        result
+        result.map(|()| report)
     }
 
     /// Creates the script exclusively in the owner-private directory.
@@ -260,21 +313,98 @@ impl TerminalLauncher {
     /// mode without following symlinks, and `create_file` opens with
     /// `O_CREAT | O_EXCL | O_NOFOLLOW`, so a pre-planted name or link fails
     /// instead of being reused.
-    fn write_script(&self, contents: &[u8]) -> Result<PathBuf, TerminalError> {
+    fn write_script(&self, contents: &[u8]) -> Result<(PathBuf, LaunchReport), TerminalError> {
         let directory = TrustedDir::open_or_create_absolute(&self.script_dir, PRIVATE_MODE)
             .map_err(TerminalError::ScriptDirectory)?;
+        let report = LaunchReport {
+            warnings: remove_stale_scripts(&directory, self.script_max_age),
+        };
         let name = script_name()?;
         directory
             .create_file(&name, contents, PRIVATE_MODE)
             .map_err(TerminalError::ScriptWrite)?;
-        Ok(self.script_dir.join(name))
+        Ok((self.script_dir.join(name), report))
+    }
+}
+
+/// Whether `name` is a script this module wrote.
+fn is_script_file_name(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.starts_with(SCRIPT_PREFIX) && name.ends_with(&format!(".{SCRIPT_EXTENSION}"))
+    })
+}
+
+/// Removes attach scripts older than `max_age` that Terminal never ran.
+///
+/// Every step goes through the trusted directory descriptor: a candidate is
+/// opened without following links (owner, mode, and link count validated), its
+/// age comes from the opened inode, and the removal is bound to the inode
+/// identity captured for that same file. A candidate that fails any step is
+/// skipped and reported; the caller's launch never depends on this sweep.
+fn remove_stale_scripts(directory: &TrustedDir, max_age: Duration) -> Vec<String> {
+    let names = match directory.entry_names() {
+        Ok(names) => names,
+        Err(error) => return vec![format!("cannot list stale attach scripts: {error}")],
+    };
+    let now = SystemTime::now();
+    let mut warnings = Vec::new();
+    for name in names.iter().filter(|name| is_script_file_name(name)) {
+        if let Err(reason) = remove_if_stale(directory, name, max_age, now) {
+            warnings.push(format!(
+                "cannot remove stale attach script {}: {reason}",
+                name.to_string_lossy()
+            ));
+        }
+    }
+    warnings
+}
+
+fn remove_if_stale(
+    directory: &TrustedDir,
+    name: &OsStr,
+    max_age: Duration,
+    now: SystemTime,
+) -> Result<(), String> {
+    let Some(file) = directory
+        .open_file(name, PRIVATE_MODE)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    let modified = metadata.modified().map_err(|error| error.to_string())?;
+    // A clock that moved backwards makes the file look new; it is kept.
+    let stale = now.duration_since(modified).is_ok_and(|age| age >= max_age);
+    if !stale {
+        return Ok(());
+    }
+    let identity = directory
+        .entry_identity(name, EntryKind::RegularFile)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the script disappeared".to_owned())?;
+    if identity.device() != metadata.dev() || identity.inode() != metadata.ino() {
+        return Err("the script was replaced while it was inspected".to_owned());
+    }
+    match directory
+        .stage_random(name, STALE_STAGING_PREFIX, identity)
+        .map_err(|error| error.to_string())?
+    {
+        StageOutcome::Staged(entry) => entry
+            .remove()
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        StageOutcome::Missing => Ok(()),
+        StageOutcome::DestinationExists | StageOutcome::IdentityChanged => {
+            Err("the script changed while it was removed".to_owned())
+        }
+        other => Err(format!("unexpected staging outcome: {other:?}")),
     }
 }
 
 fn script_name() -> Result<OsString, TerminalError> {
     let mut random = [0_u8; SCRIPT_NAME_RANDOM_BYTES];
     getrandom::getrandom(&mut random).map_err(|error| TerminalError::Random(error.to_string()))?;
-    let mut name = String::from("attach-");
+    let mut name = String::from(SCRIPT_PREFIX);
     for byte in random {
         use std::fmt::Write as _;
         write!(name, "{byte:02x}").expect("writing hexadecimal to a String cannot fail");
@@ -357,39 +487,102 @@ pub(crate) fn run_bounded(
     }
 }
 
-/// Starts `program` detached from the GUI and reaps it on a helper thread.
+/// Why an observed child did not count as started.
+#[derive(Debug, Error)]
+pub(crate) enum ObserveError {
+    #[error("cannot start `{}`: {source}", program.to_string_lossy())]
+    Spawn {
+        program: OsString,
+        source: io::Error,
+    },
+    #[error("`{}` exited unsuccessfully within the observation window ({status})", program.to_string_lossy())]
+    ExitedEarly {
+        program: OsString,
+        status: ExitStatus,
+    },
+    #[error("waiting for `{}` failed: {source}", program.to_string_lossy())]
+    Wait {
+        program: OsString,
+        source: io::Error,
+    },
+}
+
+/// Starts `program` detached from the GUI, reaps it, and reports a quick failure.
 ///
 /// The child gets its own process group and null stdio, so it survives GUI
-/// exit and terminal signals aimed at the GUI's group. The `Child` is never
-/// killed on drop; the helper thread's `wait` collects the exit status, so no
-/// zombie outlives the process. The returned handle yields that status and may
-/// be dropped.
+/// exit and terminal signals aimed at the GUI's group. It is never killed on
+/// drop. A reaper thread owns the `wait`, so no zombie outlives the process,
+/// and sends the exit status back: a non-zero or signal exit within `window`
+/// is an error (a dead template, a missing terminal), while a child still
+/// running at the deadline or one that exited 0 counts as started. The reaper
+/// keeps waiting after the window closes.
+///
+/// The reaper thread exists before the process does. If the process cannot be
+/// handed to it, the process is killed and reaped here, so no child is left
+/// unreaped and no success follows an error.
 ///
 /// # Errors
 ///
-/// Returns the spawn error, or the error of spawning the helper thread.
-pub(crate) fn spawn_detached(
+/// Returns [`ObserveError`] for a spawn failure or an early unsuccessful exit.
+pub(crate) fn spawn_observed(
     program: &OsStr,
     arguments: &[OsString],
-) -> io::Result<JoinHandle<io::Result<ExitStatus>>> {
-    let mut child = Command::new(program)
+    window: Duration,
+) -> Result<(), ObserveError> {
+    let (child_sender, child_receiver) = mpsc::channel::<std::process::Child>();
+    let (status_sender, status_receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("pohunek-gui-reaper".to_owned())
+        .spawn(move || {
+            if let Ok(mut child) = child_receiver.recv() {
+                let _ = status_sender.send(child.wait());
+            }
+        })
+        .map_err(|source| ObserveError::Spawn {
+            program: program.to_owned(),
+            source,
+        })?;
+    let child = Command::new(program)
         .args(arguments)
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()?;
-    thread::Builder::new()
-        .name("pohunek-gui-reaper".to_owned())
-        .spawn(move || child.wait())
+        .spawn()
+        .map_err(|source| ObserveError::Spawn {
+            program: program.to_owned(),
+            source,
+        })?;
+    if let Err(mpsc::SendError(mut orphan)) = child_sender.send(child) {
+        let _ = orphan.kill();
+        let _ = orphan.wait();
+        return Err(ObserveError::Spawn {
+            program: program.to_owned(),
+            source: io::Error::other("the reaper thread ended before taking the process"),
+        });
+    }
+    match status_receiver.recv_timeout(window) {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => Err(ObserveError::ExitedEarly {
+            program: program.to_owned(),
+            status,
+        }),
+        Ok(Err(source)) => Err(ObserveError::Wait {
+            program: program.to_owned(),
+            source,
+        }),
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(ObserveError::Wait {
+            program: program.to_owned(),
+            source: io::Error::other("the reaper thread ended without an exit status"),
+        }),
+    }
 }
 
 /// Whether `path` names a script this module wrote.
 #[cfg(test)]
 fn is_script_name(path: &std::path::Path) -> bool {
-    path.file_name()
-        .and_then(OsStr::to_str)
-        .is_some_and(|name| name.starts_with("attach-") && name.ends_with(".command"))
+    path.file_name().is_some_and(is_script_file_name)
 }
 
 #[cfg(test)]
@@ -574,8 +767,17 @@ mod tests {
         path
     }
 
+    /// Scripts older than this are stale in the tests.
+    const TEST_MAX_AGE: Duration = Duration::from_secs(3600);
+
     fn launcher(opener: PathBuf, script_dir: PathBuf, timeout: Duration) -> TerminalLauncher {
-        TerminalLauncher::new(AttachTerminal::TerminalApp, opener, script_dir, timeout)
+        TerminalLauncher::new(
+            AttachTerminal::TerminalApp,
+            opener,
+            script_dir,
+            timeout,
+            TEST_MAX_AGE,
+        )
     }
 
     fn scripts_in(dir: &Path) -> Vec<PathBuf> {
@@ -792,25 +994,83 @@ mod tests {
         assert!(scripts_in(&script_dir).is_empty());
     }
 
+    const WINDOW: Duration = Duration::from_secs(30);
+
     #[test]
-    fn spawn_detached_reaps_the_child_and_reports_its_status() {
-        let handle = spawn_detached(
-            OsStr::new("sh"),
-            &[OsString::from("-c"), OsString::from("exit 7")],
+    fn a_quick_successful_exit_counts_as_started() {
+        spawn_observed(
+            OsStr::new("/bin/sh"),
+            &[OsString::from("-c"), OsString::from("exit 0")],
+            WINDOW,
         )
-        .expect("spawn");
-
-        let status = handle.join().expect("reaper thread").expect("wait");
-
-        assert_eq!(status.code(), Some(7));
+        .expect("started");
     }
 
     #[test]
-    fn spawn_detached_puts_the_child_in_its_own_process_group() {
+    fn a_quick_failing_exit_is_reported_with_its_status() {
+        let error = spawn_observed(
+            OsStr::new("/bin/sh"),
+            &[OsString::from("-c"), OsString::from("exit 127")],
+            WINDOW,
+        )
+        .expect_err("dead template");
+
+        assert!(
+            matches!(&error, ObserveError::ExitedEarly { status, .. } if status.code() == Some(127)),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_signalled_child_is_reported() {
+        let error = spawn_observed(
+            OsStr::new("/bin/sh"),
+            &[OsString::from("-c"), OsString::from("kill -KILL $$")],
+            WINDOW,
+        )
+        .expect_err("killed child");
+
+        assert!(matches!(error, ObserveError::ExitedEarly { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_child_still_running_at_the_deadline_counts_as_started_and_is_reaped_later() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifo = dir.path().join("release.fifo");
+        let status = Command::new("mkfifo").arg(&fifo).status().expect("mkfifo");
+        assert!(status.success());
+
+        // The child blocks reading the FIFO until the test releases it.
+        spawn_observed(
+            OsStr::new("/bin/sh"),
+            &[
+                OsString::from("-c"),
+                OsString::from(format!("read line < '{}'", fifo.display())),
+            ],
+            Duration::from_millis(100),
+        )
+        .expect("long-lived terminal");
+
+        fs::write(&fifo, "go\n").expect("release the child");
+    }
+
+    #[test]
+    fn spawn_observed_reports_a_missing_program() {
+        let error = spawn_observed(OsStr::new("/nonexistent/pohunek-attach"), &[], WINDOW)
+            .expect_err("missing program");
+
+        assert!(
+            matches!(&error, ObserveError::Spawn { source, .. } if source.kind() == io::ErrorKind::NotFound),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn spawn_observed_puts_the_child_in_its_own_process_group() {
         let dir = tempfile::tempdir().expect("tempdir");
         let output = dir.path().join("pgid");
-        let handle = spawn_detached(
-            OsStr::new("sh"),
+        spawn_observed(
+            OsStr::new("/bin/sh"),
             &[
                 OsString::from("-c"),
                 OsString::from(format!(
@@ -819,9 +1079,9 @@ mod tests {
                     output.display()
                 )),
             ],
+            WINDOW,
         )
         .expect("spawn");
-        handle.join().expect("reaper thread").expect("wait");
 
         let text = fs::read_to_string(&output).expect("ps output");
         let mut numbers = text.split_whitespace();
@@ -831,9 +1091,99 @@ mod tests {
     }
 
     #[test]
-    fn spawn_detached_reports_a_missing_program() {
-        let error = spawn_detached(OsStr::new("/nonexistent/pohunek-attach"), &[])
-            .expect_err("missing program");
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    fn an_opener_failure_carries_the_first_stderr_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = dir.path().join("open-argv");
+        let opener = fake_open(
+            dir.path(),
+            &record,
+            "printf '\\n  Unable to find application named Terminal\\nsecond line\\n' >&2\nexit 1",
+        );
+        let launcher = launcher(opener, dir.path().join("gui-attach"), WINDOW);
+
+        let error = launcher
+            .launch(&[OsString::from("/bin/true")])
+            .expect_err("failing opener");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("Unable to find application named Terminal"),
+            "{message}"
+        );
+        assert!(!message.contains("second line"), "{message}");
+    }
+
+    #[test]
+    fn first_line_strips_control_characters_and_bounds_length() {
+        assert_eq!(first_line(b"\n\x1b[31mred\x07\nnext"), "[31mred");
+        assert_eq!(first_line(b"   \n"), "");
+        assert_eq!(first_line(&[b'x'; 1000]).chars().count(), DETAIL_MAX_CHARS);
+        assert_eq!(first_line(b"caf\xe9").chars().count(), 4);
+    }
+
+    fn age(path: &Path, by: Duration) {
+        let file = fs::OpenOptions::new().write(true).open(path).expect("open");
+        file.set_modified(SystemTime::now() - by)
+            .expect("set mtime");
+    }
+
+    fn private_file(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, "#!/bin/sh\n").expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("chmod");
+        path
+    }
+
+    #[test]
+    fn a_launch_removes_stale_scripts_and_keeps_fresh_and_unrelated_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = dir.path().join("open-argv");
+        let opener = fake_open(dir.path(), &record, "exit 0");
+        let script_dir = dir.path().join("gui-attach");
+        fs::create_dir(&script_dir).expect("mkdir");
+        fs::set_permissions(&script_dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+        let old = private_file(&script_dir, "attach-old.command");
+        let fresh = private_file(&script_dir, "attach-fresh.command");
+        let unrelated = private_file(&script_dir, "keep-me.txt");
+        age(&old, Duration::from_secs(7200));
+        age(&unrelated, Duration::from_secs(7200));
+        let launcher = launcher(opener, script_dir.clone(), WINDOW);
+
+        let report = launcher
+            .launch(&[OsString::from("/bin/true")])
+            .expect("launch");
+
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(!old.exists(), "stale script removed");
+        assert!(fresh.exists(), "fresh script kept");
+        assert!(unrelated.exists(), "unrelated file kept");
+    }
+
+    #[test]
+    fn an_unremovable_stale_script_is_a_warning_and_never_fails_the_launch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = dir.path().join("open-argv");
+        let opener = fake_open(dir.path(), &record, "exit 0");
+        let script_dir = dir.path().join("gui-attach");
+        fs::create_dir(&script_dir).expect("mkdir");
+        fs::set_permissions(&script_dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+        // A symlink with a script name is never followed or removed.
+        let target = dir.path().join("target");
+        fs::write(&target, "x").expect("target");
+        let link = script_dir.join("attach-link.command");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        // A script with the wrong mode fails validation.
+        let loose = private_file(&script_dir, "attach-loose.command");
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let launcher = launcher(opener, script_dir, WINDOW);
+
+        let report = launcher
+            .launch(&[OsString::from("/bin/true")])
+            .expect("launch still succeeds");
+
+        assert_eq!(report.warnings.len(), 2, "{:?}", report.warnings);
+        assert!(link.symlink_metadata().is_ok(), "symlink untouched");
+        assert!(target.exists(), "symlink target untouched");
+        assert!(loose.exists());
     }
 }

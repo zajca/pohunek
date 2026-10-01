@@ -1,20 +1,22 @@
-//! Resolution of the configured `pohunek_bin` to an absolute executable.
+//! Resolution of the programs the GUI starts to an absolute executable.
 //!
 //! An app started from Finder or launchd carries a minimal `PATH`, so a bare
-//! `pohunek` would not resolve. A configured absolute path is used as is; a
-//! bare name is looked up in a search path resolved by the shared
-//! `pohunek_platform::shell_env` policy (login-shell discovery on macOS, the
-//! process `PATH` elsewhere, then the documented fallback directories).
+//! `pohunek`, `kitty`, or `notify-send` would not resolve. A configured
+//! absolute path is used as is; a bare name is looked up in a search path
+//! resolved by the shared `pohunek_platform::shell_env` policy (login-shell
+//! discovery on macOS, the process `PATH` elsewhere, then the documented
+//! fallback directories).
 //!
-//! The resolved search path is cached. Each lookup re-checks the executable on
-//! disk, and a miss discards the cache once and discovers again, so an
-//! installation done after the GUI started is found without a restart while
-//! the bounded login-shell probe runs at most once per miss.
+//! One resolver serves every program name, so the bounded login-shell probe is
+//! shared. The resolved search path is cached; a lookup that misses discards it
+//! once and discovers again, so an installation done after the GUI started is
+//! found without a restart. Discovery runs under the cache lock, so concurrent
+//! callers wait for one probe instead of starting their own.
 
-// Rust guideline compliant 2026-09-30
+// Rust guideline compliant 2026-10-01
 #![forbid(unsafe_code)]
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -38,26 +40,42 @@ pub(crate) struct LoginShellSettings {
     pub(crate) default_shell: PathBuf,
 }
 
-/// Reports why `pohunek_bin` did not resolve.
+/// Reports why a program did not resolve.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum BinError {
-    #[error("executable `{program}` is unusable: {source}")]
+    /// The program is unusable. `cause` is why the search path is what it is
+    /// (a failed login-shell probe, an unusable inherited `PATH`), when that
+    /// explains a miss.
+    #[error("executable `{program}` is unusable: {source}{}", cause_suffix(.cause.as_deref()))]
     Executable {
         program: String,
         #[source]
         source: ExecutableError,
+        cause: Option<String>,
     },
     #[error("cannot determine an executable search path: {0}")]
     SearchPath(String),
 }
 
-type Discover = dyn Fn() -> Result<SearchPath, BinError> + Send + Sync;
+fn cause_suffix(cause: Option<&str>) -> String {
+    cause.map_or_else(String::new, |cause| format!(" ({cause})"))
+}
 
-/// Resolves one configured program name to an absolute executable.
+/// A discovered search path and the reason it fell back, when it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Discovery {
+    pub(crate) path: SearchPath,
+    /// Why a higher tier was skipped; shown when a lookup misses.
+    pub(crate) cause: Option<String>,
+}
+
+type Discover = dyn Fn() -> Result<Discovery, BinError> + Send + Sync;
+
+/// Resolves program names to absolute executables.
 pub(crate) struct BinResolver {
     program: OsString,
     discover: Box<Discover>,
-    cache: Mutex<Option<SearchPath>>,
+    cache: Mutex<Option<Discovery>>,
 }
 
 impl fmt::Debug for BinResolver {
@@ -70,14 +88,28 @@ impl fmt::Debug for BinResolver {
 
 impl BinResolver {
     /// Builds the resolver that discovers the search path of this host.
+    ///
+    /// `program` is the name [`Self::resolve`] returns; other names go through
+    /// [`Self::resolve_name`].
     pub(crate) fn for_host(program: &str, login_shell: LoginShellSettings) -> Self {
-        Self::with_discovery(program, move || discover_host_search_path(&login_shell))
+        Self::with_discovery_cause(program, move || discover_host_search_path(&login_shell))
     }
 
     /// Builds a resolver around an explicit discovery function.
+    #[cfg(test)]
     pub(crate) fn with_discovery(
         program: &str,
         discover: impl Fn() -> Result<SearchPath, BinError> + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_discovery_cause(program, move || {
+            discover().map(|path| Discovery { path, cause: None })
+        })
+    }
+
+    /// Builds a resolver around a discovery function that reports its cause.
+    pub(crate) fn with_discovery_cause(
+        program: &str,
+        discover: impl Fn() -> Result<Discovery, BinError> + Send + Sync + 'static,
     ) -> Self {
         Self {
             program: OsString::from(program),
@@ -86,23 +118,41 @@ impl BinResolver {
         }
     }
 
-    /// Returns the absolute path of the executable.
+    /// Returns the absolute path of the primary program.
     ///
     /// Blocks while a search path is discovered, so callers run it off the UI
     /// thread.
     ///
     /// # Errors
     ///
+    /// See [`Self::resolve_name`].
+    pub(crate) fn resolve(&self) -> Result<PathBuf, BinError> {
+        self.resolve_name(&self.program)
+    }
+
+    /// Returns the absolute path of `name`.
+    ///
+    /// A name containing `/` must be absolute and executable; a bare name is
+    /// searched.
+    ///
+    /// # Errors
+    ///
     /// Returns [`BinError`] when the name is invalid, a configured path is not
     /// an executable file, no search path can be built, or the name is found
     /// nowhere even after a fresh discovery.
-    pub(crate) fn resolve(&self) -> Result<PathBuf, BinError> {
-        if self.program.as_encoded_bytes().contains(&b'/') {
-            return self.lookup(&SearchPath::empty());
+    pub(crate) fn resolve_name(&self, name: &OsStr) -> Result<PathBuf, BinError> {
+        if name.as_encoded_bytes().contains(&b'/') {
+            return lookup(
+                name,
+                &Discovery {
+                    path: SearchPath::empty(),
+                    cause: None,
+                },
+            );
         }
-        let cached = self.cache.lock().expect("bin resolver cache lock").clone();
-        if let Some(search) = cached {
-            match self.lookup(&search) {
+        let mut cache = self.cache.lock().expect("bin resolver cache lock");
+        if let Some(discovery) = cache.as_ref() {
+            match lookup(name, discovery) {
                 Err(BinError::Executable {
                     source: ExecutableError::NotFound,
                     ..
@@ -111,36 +161,49 @@ impl BinResolver {
             }
         }
         let fresh = (self.discover)()?;
-        let result = self.lookup(&fresh);
-        *self.cache.lock().expect("bin resolver cache lock") = Some(fresh);
+        let result = lookup(name, &fresh);
+        *cache = Some(fresh);
         result
     }
+}
 
-    fn lookup(&self, search: &SearchPath) -> Result<PathBuf, BinError> {
-        resolve_executable(&self.program, search).map_err(|source| BinError::Executable {
-            program: self.program.to_string_lossy().into_owned(),
-            source,
-        })
-    }
+fn lookup(name: &OsStr, discovery: &Discovery) -> Result<PathBuf, BinError> {
+    resolve_executable(name, &discovery.path).map_err(|source| BinError::Executable {
+        program: name.to_string_lossy().into_owned(),
+        cause: matches!(source, ExecutableError::NotFound)
+            .then(|| discovery.cause.clone())
+            .flatten(),
+        source,
+    })
 }
 
 /// Discovers the search path by the documented tier order.
 ///
 /// macOS ignores the inherited `PATH` (a Finder launch carries only the system
 /// directories) and asks the login shell; every other host trusts its
-/// explicitly inherited `PATH`. Both fall back to the fixed directory list.
-fn discover_host_search_path(login_shell: &LoginShellSettings) -> Result<SearchPath, BinError> {
+/// explicitly inherited `PATH`. Both fall back to the fixed directory list, and
+/// the reason for a fallback is carried in [`Discovery::cause`].
+fn discover_host_search_path(login_shell: &LoginShellSettings) -> Result<Discovery, BinError> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let inherited = std::env::var("PATH")
-        .ok()
-        .and_then(|value| SearchPath::sanitize(&value, true).ok())
-        .map(|sanitized| sanitized.path);
     if cfg!(target_os = "macos") {
         let spec = login_shell_spec(login_shell);
-        discover_search_path(None, Some(&spec), home.as_deref())
-    } else {
-        discover_search_path(inherited.as_ref(), None, home.as_deref())
+        return discover_search_path(None, Some(&spec), home.as_deref(), None);
     }
+    let inherited_path = std::env::var("PATH")
+        .map_err(|error| error.to_string())
+        .and_then(|value| {
+            SearchPath::sanitize(&value, true)
+                .map(|sanitized| sanitized.path)
+                .map_err(|error| error.to_string())
+        });
+    let (inherited, inherited_cause) = match inherited_path {
+        Ok(path) => (Some(path), None),
+        Err(reason) => (
+            None,
+            Some(format!("the inherited PATH is unusable: {reason}")),
+        ),
+    };
+    discover_search_path(inherited.as_ref(), None, home.as_deref(), inherited_cause)
 }
 
 fn login_shell_spec(settings: &LoginShellSettings) -> LoginShellSpec {
@@ -165,11 +228,14 @@ fn login_shell_spec(settings: &LoginShellSettings) -> LoginShellSpec {
     }
 }
 
+/// Resolves the policy tiers; `prior_cause` explains a tier the caller already
+/// skipped.
 fn discover_search_path(
     configured: Option<&SearchPath>,
     login_shell: Option<&LoginShellSpec>,
     home: Option<&Path>,
-) -> Result<SearchPath, BinError> {
+    prior_cause: Option<String>,
+) -> Result<Discovery, BinError> {
     let resolution = resolve_search_path(&PathPolicy {
         configured,
         login_shell,
@@ -177,12 +243,19 @@ fn discover_search_path(
         home,
     })
     .map_err(|error: ResolveError| BinError::SearchPath(error.to_string()))?;
-    if let Some(failure) = &resolution.login_shell_failure {
-        // The GUI has no log sink; stderr is the only channel a failed probe
-        // reaches. The error text never contains paths or values.
-        eprintln!("pohunek-gui: login shell PATH discovery failed ({failure}); using the fallback directories");
-    }
-    Ok(resolution.path)
+    let cause = resolution
+        .login_shell_failure
+        .as_ref()
+        .map(|failure| {
+            format!(
+                "login shell PATH discovery failed: {failure}; searched the fallback directories"
+            )
+        })
+        .or(prior_cause);
+    Ok(Discovery {
+        path: resolution.path,
+        cause,
+    })
 }
 
 #[cfg(test)]
@@ -365,13 +438,96 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let configured = search(dir.path());
 
-        let resolved = discover_search_path(Some(&configured), None, None).expect("configured");
-        assert_eq!(resolved, configured);
+        let resolved =
+            discover_search_path(Some(&configured), None, None, None).expect("configured");
+        assert_eq!(resolved.path, configured);
 
         let home = tempfile::tempdir().expect("home");
         let local_bin = home.path().join(".local/bin");
         fs::create_dir_all(&local_bin).expect("mkdir");
-        let fallback = discover_search_path(None, None, Some(home.path())).expect("fallback");
-        assert!(fallback.entries().contains(&local_bin));
+        let fallback = discover_search_path(None, None, Some(home.path()), None).expect("fallback");
+        assert!(fallback.path.entries().contains(&local_bin));
+    }
+
+    #[test]
+    fn a_miss_carries_the_reason_the_search_path_fell_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = search(dir.path());
+        let resolver = BinResolver::with_discovery_cause("pohunek", move || {
+            Ok(Discovery {
+                path: path.clone(),
+                cause: Some("login shell PATH discovery failed: timed out".to_owned()),
+            })
+        });
+
+        let error = resolver.resolve().expect_err("not installed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("login shell PATH discovery failed: timed out"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_hit_does_not_report_the_fallback_cause() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        executable(dir.path(), "pohunek");
+        let path = search(dir.path());
+        let resolver = BinResolver::with_discovery_cause("pohunek", move || {
+            Ok(Discovery {
+                path: path.clone(),
+                cause: Some("ignored".to_owned()),
+            })
+        });
+
+        resolver.resolve().expect("found");
+    }
+
+    #[test]
+    fn other_names_share_the_cached_search_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kitty = executable(dir.path(), "kitty");
+        executable(dir.path(), "pohunek");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let path = search(dir.path());
+        let resolver = BinResolver::with_discovery("pohunek", move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(path.clone())
+        });
+
+        resolver.resolve().expect("pohunek");
+        assert_eq!(
+            resolver.resolve_name(OsStr::new("kitty")).expect("kitty"),
+            kitty
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_callers_share_one_discovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        executable(dir.path(), "pohunek");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let path = search(dir.path());
+        let resolver = Arc::new(BinResolver::with_discovery("pohunek", move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(path.clone())
+        }));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let resolver = Arc::clone(&resolver);
+                std::thread::spawn(move || resolver.resolve().expect("resolve"))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("thread");
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

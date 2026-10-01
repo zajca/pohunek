@@ -1,4 +1,4 @@
-//! Desktop notification backends and their outcome classification.
+//! Desktop notification backends.
 //!
 //! Two backends exist. A configured (or, off macOS, defaulted) command such as
 //! `notify-send` receives the title and body as two positional arguments. On
@@ -8,23 +8,23 @@
 //!
 //! # What an outcome can and cannot say
 //!
-//! [`NotificationOutcome::Submitted`] means the backend accepted the request
-//! and exited 0. `osascript` exits 0 whether the notification was shown or was
+//! [`NotificationOutcome::Submitted`] means the backend accepted the request and
+//! exited 0. `osascript` exits 0 whether the notification was shown or was
 //! suppressed by System Settings (Notifications, Focus), and an unbundled
-//! binary cannot query that state (`UNUserNotificationCenter` requires an app
-//! bundle). Delivery is therefore unconfirmable until the GUI ships as a
-//! bundle. [`NotificationOutcome::Denied`] is reported only for the single
-//! permission signal a backend documents: `osascript` printing error `-1743`
-//! (`errAEEventNotPermitted`). Every other failure is
-//! [`NotificationOutcome::Unavailable`].
+//! binary has no API to ask: `UNUserNotificationCenter` authorization needs an
+//! app bundle (issue #104). Delivery, and a user's denial, are therefore
+//! unobservable until the GUI ships as a bundle; every failure the GUI can
+//! observe is [`NotificationOutcome::Unavailable`].
 
-// Rust guideline compliant 2026-09-30
+// Rust guideline compliant 2026-10-01
 #![forbid(unsafe_code)]
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::mpsc;
+use std::sync::{Arc, OnceLock};
+use std::thread;
 use std::time::Duration;
 
 use crate::bin_resolver::BinResolver;
@@ -35,10 +35,6 @@ pub(crate) const SYSTEM_OSASCRIPT: &str = "/usr/bin/osascript";
 
 /// Default command outside macOS; the freedesktop notification CLI.
 pub(crate) const DEFAULT_NOTIFY_COMMAND: &str = "notify-send";
-
-/// `osascript` error code for a refused Apple-event permission
-/// (`errAEEventNotPermitted`), the one denial signal it documents.
-const OSASCRIPT_DENIED_MARKER: &[u8] = b"(-1743)";
 
 /// Script lines: `argv` item 1 is the title, item 2 the body.
 const OSASCRIPT_SCRIPT: [&str; 3] = [
@@ -52,20 +48,17 @@ const OSASCRIPT_SCRIPT: [&str; 3] = [
 pub(crate) enum NotificationOutcome {
     /// The backend accepted the request and exited successfully.
     Submitted,
-    /// The backend positively reported a permission denial.
-    Denied(String),
     /// The backend could not run, timed out, or failed.
     Unavailable(String),
 }
 
-/// Coarse state used to notify the user once per change.
+/// Coarse state used to tell the user once per change.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum NotificationHealth {
     /// No notification has completed yet.
     #[default]
     Unknown,
     Working,
-    Denied,
     Unavailable,
 }
 
@@ -80,7 +73,6 @@ pub(crate) fn apply_outcome(
 ) -> Option<String> {
     let next = match outcome {
         NotificationOutcome::Submitted => NotificationHealth::Working,
-        NotificationOutcome::Denied(_) => NotificationHealth::Denied,
         NotificationOutcome::Unavailable(_) => NotificationHealth::Unavailable,
     };
     let previous = std::mem::replace(health, next);
@@ -88,55 +80,59 @@ pub(crate) fn apply_outcome(
         return None;
     }
     match outcome {
-        NotificationOutcome::Submitted => matches!(
-            previous,
-            NotificationHealth::Denied | NotificationHealth::Unavailable
-        )
-        .then(|| "desktop notifications work again".to_owned()),
-        NotificationOutcome::Denied(reason) => {
-            Some(format!("desktop notifications are denied: {reason}"))
-        }
+        NotificationOutcome::Submitted => (previous == NotificationHealth::Unavailable)
+            .then(|| "desktop notifications work again".to_owned()),
         NotificationOutcome::Unavailable(reason) => {
             Some(format!("desktop notifications are unavailable: {reason}"))
         }
     }
 }
 
-/// Which backend produced an exit status; the classifier reads it differently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BackendKind {
-    Osascript,
-    Command,
-}
-
-/// Classifies a finished backend process.
+/// The command backend's executable, resolved once per session.
 ///
-/// `code` is `None` when a signal ended the process. `stderr` is inspected only
-/// for `osascript`, whose denial marker is the sole detection implemented.
-pub(crate) fn classify_exit(
-    kind: BackendKind,
-    code: Option<i32>,
-    stderr: &[u8],
-) -> NotificationOutcome {
-    match code {
-        Some(0) => NotificationOutcome::Submitted,
-        Some(code) => {
-            if kind == BackendKind::Osascript && contains(stderr, OSASCRIPT_DENIED_MARKER) {
-                NotificationOutcome::Denied(
-                    "osascript reported that the notification is not permitted".to_owned(),
-                )
-            } else {
-                NotificationOutcome::Unavailable(format!("the backend exited with code {code}"))
-            }
-        }
-        None => NotificationOutcome::Unavailable("the backend was ended by a signal".to_owned()),
-    }
+/// The first notification resolves the program within the notification
+/// deadline; the result, including a miss or a timeout, is kept. Concurrent
+/// notifications wait on that one resolution instead of starting their own
+/// login-shell probes.
+#[derive(Debug)]
+pub(crate) struct CommandResolution {
+    resolver: Arc<BinResolver>,
+    program: OsString,
+    resolved: OnceLock<Result<PathBuf, String>>,
 }
 
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
+impl CommandResolution {
+    pub(crate) fn new(resolver: Arc<BinResolver>, program: &str) -> Self {
+        Self {
+            resolver,
+            program: OsString::from(program),
+            resolved: OnceLock::new(),
+        }
+    }
+
+    fn resolve(&self, deadline: Duration) -> &Result<PathBuf, String> {
+        self.resolved.get_or_init(|| {
+            let (sender, receiver) = mpsc::channel();
+            let resolver = Arc::clone(&self.resolver);
+            let program = self.program.clone();
+            let spawned = thread::Builder::new()
+                .name("pohunek-gui-notify-resolve".to_owned())
+                .spawn(move || {
+                    let _ = sender.send(resolver.resolve_name(&program));
+                });
+            if let Err(error) = spawned {
+                return Err(format!("cannot start the executable lookup: {error}"));
+            }
+            match receiver.recv_timeout(deadline) {
+                Ok(Ok(path)) => Ok(path),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err(format!(
+                    "finding `{}` did not finish within {deadline:?}",
+                    self.program.to_string_lossy()
+                )),
+            }
+        })
+    }
 }
 
 /// Where a notification is sent.
@@ -145,7 +141,7 @@ pub(crate) enum NotificationBackend {
     /// `osascript` at `executable`.
     Osascript { executable: PathBuf },
     /// A command that takes title and body as two positional arguments.
-    Command { resolver: Arc<BinResolver> },
+    Command { resolution: Arc<CommandResolution> },
 }
 
 /// A backend plus the deadline every notification must meet.
@@ -171,38 +167,62 @@ fn osascript_arguments(title: &str, body: &str) -> Vec<OsString> {
     arguments
 }
 
+/// The arguments a command backend receives.
+///
+/// `notify-send` parses options, and the text comes from the daemon, so `--`
+/// precedes it. Other commands keep the plain positional contract
+/// (`<command> <title> <body>`).
+fn command_arguments(program: &std::path::Path, title: &str, body: &str) -> Vec<OsString> {
+    let mut arguments = Vec::new();
+    if program.file_name() == Some(OsStr::new(DEFAULT_NOTIFY_COMMAND)) {
+        arguments.push(OsString::from("--"));
+    }
+    arguments.push(OsString::from(title));
+    arguments.push(OsString::from(body));
+    arguments
+}
+
 impl Notifier {
     /// Shows one notification and waits at most the deadline.
     ///
-    /// Blocks on executable resolution and the child, so callers run it off
-    /// the UI thread. The child is killed and reaped on timeout.
+    /// Blocks on the first executable resolution and on the child, so callers
+    /// run it off the UI thread. The child is killed and reaped on timeout.
     pub(crate) fn notify(&self, title: &str, body: &str) -> NotificationOutcome {
         if title.contains('\0') || body.contains('\0') {
             return NotificationOutcome::Unavailable(
                 "the notification text contains a NUL byte".to_owned(),
             );
         }
-        let (kind, mut command) = match &self.backend {
+        let mut command = match &self.backend {
             NotificationBackend::Osascript { executable } => {
                 let mut command = Command::new(executable);
+                command.args(osascript_arguments(title, body));
                 command
-                    .args(osascript_arguments(title, body))
-                    .stderr(Stdio::piped());
-                (BackendKind::Osascript, command)
             }
-            NotificationBackend::Command { resolver } => {
-                let program = match resolver.resolve() {
+            NotificationBackend::Command { resolution } => {
+                let program = match resolution.resolve(self.timeout) {
                     Ok(program) => program,
-                    Err(error) => return NotificationOutcome::Unavailable(error.to_string()),
+                    Err(reason) => return NotificationOutcome::Unavailable(reason.clone()),
                 };
                 let mut command = Command::new(program);
-                command.arg(title).arg(body).stderr(Stdio::null());
-                (BackendKind::Command, command)
+                command.args(command_arguments(program, title, body));
+                command
             }
         };
-        command.stdin(Stdio::null()).stdout(Stdio::null());
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         match run_bounded(&mut command, self.timeout) {
-            Ok(output) => classify_exit(kind, output.status.code(), &output.stderr),
+            Ok(output) => match output.status.code() {
+                Some(0) => NotificationOutcome::Submitted,
+                Some(code) => {
+                    NotificationOutcome::Unavailable(format!("the backend exited with code {code}"))
+                }
+                None => {
+                    NotificationOutcome::Unavailable("the backend was ended by a signal".to_owned())
+                }
+            },
             Err(BoundedError::Spawn(error)) => {
                 NotificationOutcome::Unavailable(format!("cannot start the backend: {error}"))
             }
@@ -223,6 +243,7 @@ mod tests {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::bin_resolver::BinError;
@@ -233,9 +254,9 @@ mod tests {
     }
 
     /// Writes a fake backend that records its NUL-terminated argv, then runs `tail`.
-    fn recording_backend(dir: &Path, tail: &str) -> (PathBuf, PathBuf) {
+    fn recording_backend(dir: &Path, name: &str, tail: &str) -> (PathBuf, PathBuf) {
         let record = dir.join("argv");
-        let program = dir.join("backend");
+        let program = dir.join(name);
         script(
             &program,
             &format!("printf '%s\\0' \"$@\" > '{}'\n{tail}", record.display()),
@@ -250,12 +271,18 @@ mod tests {
         words
     }
 
+    fn resolver_failing() -> Arc<BinResolver> {
+        Arc::new(BinResolver::with_discovery("unused", || {
+            Err(BinError::SearchPath("must not run".to_owned()))
+        }))
+    }
+
     fn command_notifier(program: &Path, timeout: Duration) -> Notifier {
         Notifier {
             backend: NotificationBackend::Command {
-                resolver: Arc::new(BinResolver::with_discovery(
+                resolution: Arc::new(CommandResolution::new(
+                    resolver_failing(),
                     program.to_str().expect("utf8"),
-                    || Err(BinError::SearchPath("must not run".to_owned())),
                 )),
             },
             timeout,
@@ -286,43 +313,9 @@ mod tests {
     ];
 
     #[test]
-    fn classification_maps_exit_codes_and_the_denial_marker() {
-        assert_eq!(
-            classify_exit(BackendKind::Command, Some(0), b""),
-            NotificationOutcome::Submitted
-        );
-        assert_eq!(
-            classify_exit(BackendKind::Osascript, Some(0), b"ignored (-1743)"),
-            NotificationOutcome::Submitted
-        );
-        assert!(matches!(
-            classify_exit(
-                BackendKind::Osascript,
-                Some(1),
-                b"execution error: x (-1743)\n"
-            ),
-            NotificationOutcome::Denied(_)
-        ));
-        assert!(matches!(
-            classify_exit(BackendKind::Osascript, Some(1), b"syntax error (-2740)"),
-            NotificationOutcome::Unavailable(_)
-        ));
-        // A generic command's stderr is never interpreted as a denial.
-        assert!(matches!(
-            classify_exit(BackendKind::Command, Some(1), b"(-1743)"),
-            NotificationOutcome::Unavailable(_)
-        ));
-        assert!(matches!(
-            classify_exit(BackendKind::Command, None, b""),
-            NotificationOutcome::Unavailable(_)
-        ));
-    }
-
-    #[test]
     fn health_reports_only_state_changes() {
         let mut health = NotificationHealth::default();
         let unavailable = NotificationOutcome::Unavailable("gone".to_owned());
-        let denied = NotificationOutcome::Denied("no".to_owned());
 
         assert_eq!(
             apply_outcome(&mut health, &NotificationOutcome::Submitted),
@@ -332,10 +325,6 @@ mod tests {
             .expect("first failure")
             .contains("unavailable: gone"));
         assert_eq!(apply_outcome(&mut health, &unavailable), None);
-        assert!(apply_outcome(&mut health, &denied)
-            .expect("state change")
-            .contains("denied: no"));
-        assert_eq!(apply_outcome(&mut health, &denied), None);
         assert!(apply_outcome(&mut health, &NotificationOutcome::Submitted)
             .expect("recovery")
             .contains("work again"));
@@ -348,17 +337,19 @@ mod tests {
     #[test]
     fn a_first_failure_is_reported_even_before_any_success() {
         let mut health = NotificationHealth::default();
-        assert!(
-            apply_outcome(&mut health, &NotificationOutcome::Unavailable("x".into())).is_some()
-        );
+        assert!(apply_outcome(
+            &mut health,
+            &NotificationOutcome::Unavailable("x".to_owned())
+        )
+        .is_some());
     }
 
     #[test]
-    fn command_backend_receives_title_and_body_as_two_positional_arguments() {
+    fn a_custom_command_receives_title_and_body_as_two_positional_arguments() {
         for title in DIFFICULT {
             for body in DIFFICULT {
                 let dir = tempfile::tempdir().expect("tempdir");
-                let (program, record) = recording_backend(dir.path(), "exit 0");
+                let (program, record) = recording_backend(dir.path(), "my-notify", "exit 0");
 
                 let outcome = command_notifier(&program, LONG).notify(title, body);
 
@@ -372,10 +363,26 @@ mod tests {
     }
 
     #[test]
+    fn notify_send_gets_an_option_terminator_before_the_text() {
+        for title in ["-t", "--help", "plain"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (program, record) = recording_backend(dir.path(), "notify-send", "exit 0");
+
+            let outcome = command_notifier(&program, LONG).notify(title, "-body");
+
+            assert_eq!(outcome, NotificationOutcome::Submitted);
+            assert_eq!(
+                read_argv(&record),
+                vec![b"--".to_vec(), title.as_bytes().to_vec(), b"-body".to_vec()]
+            );
+        }
+    }
+
+    #[test]
     fn osascript_backend_passes_values_only_as_argv_after_the_terminator() {
         for title in DIFFICULT {
             let dir = tempfile::tempdir().expect("tempdir");
-            let (program, record) = recording_backend(dir.path(), "exit 0");
+            let (program, record) = recording_backend(dir.path(), "osascript", "exit 0");
             let body = "body $(x) 'y'\n-z";
 
             let outcome = osascript_notifier(&program, LONG).notify(title, body);
@@ -396,19 +403,13 @@ mod tests {
             .chain([title.as_bytes().to_vec(), body.as_bytes().to_vec()])
             .collect();
             assert_eq!(argv, expected);
-            assert!(
-                !argv[..7]
-                    .iter()
-                    .any(|word| word.windows(6).any(|w| w == b"INJECT")),
-                "script text carries no notification data"
-            );
         }
     }
 
     #[test]
     fn a_non_zero_exit_is_unavailable() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (program, _record) = recording_backend(dir.path(), "exit 4");
+        let (program, _record) = recording_backend(dir.path(), "backend", "exit 4");
 
         let outcome = command_notifier(&program, LONG).notify("t", "b");
 
@@ -419,19 +420,14 @@ mod tests {
     }
 
     #[test]
-    fn osascript_denial_marker_on_stderr_is_denied() {
+    fn a_signalled_backend_is_unavailable() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (program, _record) = recording_backend(
-            dir.path(),
-            "echo 'execution error: Not authorized. (-1743)' >&2\nexit 1",
-        );
+        let (program, _record) = recording_backend(dir.path(), "backend", "kill -KILL $$");
 
-        let outcome = osascript_notifier(&program, LONG).notify("t", "b");
-
-        assert!(
-            matches!(outcome, NotificationOutcome::Denied(_)),
-            "{outcome:?}"
-        );
+        assert!(matches!(
+            command_notifier(&program, LONG).notify("t", "b"),
+            NotificationOutcome::Unavailable(reason) if reason.contains("signal")
+        ));
     }
 
     #[test]
@@ -447,7 +443,7 @@ mod tests {
 
         let command = command_notifier(&missing, LONG).notify("t", "b");
         assert!(
-            matches!(&command, NotificationOutcome::Unavailable(reason) if reason.contains("not an executable") || reason.contains("unusable")),
+            matches!(&command, NotificationOutcome::Unavailable(reason) if reason.contains("unusable")),
             "{command:?}"
         );
     }
@@ -457,11 +453,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let search = pohunek_platform::shell_env::SearchPath::new(vec![dir.path().to_path_buf()])
             .expect("search path");
+        let resolver = Arc::new(BinResolver::with_discovery("pohunek", move || {
+            Ok(search.clone())
+        }));
         let notifier = Notifier {
             backend: NotificationBackend::Command {
-                resolver: Arc::new(BinResolver::with_discovery("notify-send", move || {
-                    Ok(search.clone())
-                })),
+                resolution: Arc::new(CommandResolution::new(resolver, "notify-send")),
             },
             timeout: LONG,
         };
@@ -475,10 +472,77 @@ mod tests {
     }
 
     #[test]
+    fn the_command_is_resolved_once_and_a_miss_is_remembered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let search = pohunek_platform::shell_env::SearchPath::new(vec![dir.path().to_path_buf()])
+            .expect("search path");
+        let resolver = Arc::new(BinResolver::with_discovery("pohunek", move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(search.clone())
+        }));
+        let notifier = Notifier {
+            backend: NotificationBackend::Command {
+                resolution: Arc::new(CommandResolution::new(resolver, "notify-send")),
+            },
+            timeout: LONG,
+        };
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let notifier = notifier.clone();
+                thread::spawn(move || notifier.notify("t", "b"))
+            })
+            .collect();
+        for handle in handles {
+            assert!(matches!(
+                handle.join().expect("thread"),
+                NotificationOutcome::Unavailable(_)
+            ));
+        }
+        // The cached miss answers without another discovery, even if the
+        // program appears later in the session.
+        script(&dir.path().join("notify-send"), "exit 0");
+        assert!(matches!(
+            notifier.notify("t", "b"),
+            NotificationOutcome::Unavailable(_)
+        ));
+
+        // One discovery served every notification.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_resolution_that_exceeds_the_deadline_is_unavailable() {
+        let (release, wait) = mpsc::channel::<()>();
+        let wait = std::sync::Mutex::new(wait);
+        let resolver = Arc::new(BinResolver::with_discovery("pohunek", move || {
+            // Blocks until the test drops the sender at its end.
+            let _ = wait.lock().expect("lock").recv();
+            Err(BinError::SearchPath("released".to_owned()))
+        }));
+        let notifier = Notifier {
+            backend: NotificationBackend::Command {
+                resolution: Arc::new(CommandResolution::new(resolver, "notify-send")),
+            },
+            timeout: Duration::from_millis(100),
+        };
+
+        let outcome = notifier.notify("t", "b");
+
+        assert!(
+            matches!(&outcome, NotificationOutcome::Unavailable(reason) if reason.contains("did not finish")),
+            "{outcome:?}"
+        );
+        drop(release);
+    }
+
+    #[test]
     fn a_hanging_backend_is_killed_at_the_deadline() {
         let dir = tempfile::tempdir().expect("tempdir");
         // A stopped process never exits by itself; only SIGKILL ends it.
-        let (program, _record) = recording_backend(dir.path(), "kill -STOP $$");
+        let (program, _record) = recording_backend(dir.path(), "backend", "kill -STOP $$");
 
         let outcome = command_notifier(&program, Duration::from_millis(200)).notify("t", "b");
 
@@ -491,7 +555,7 @@ mod tests {
     #[test]
     fn nul_bytes_are_rejected_before_spawning() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (program, record) = recording_backend(dir.path(), "exit 0");
+        let (program, record) = recording_backend(dir.path(), "backend", "exit 0");
 
         let outcome = command_notifier(&program, LONG).notify("a\0b", "body");
 

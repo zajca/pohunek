@@ -1,15 +1,14 @@
 //! Terminal attach/resume plumbing and window-size unit conversions.
 
-// Rust guideline compliant 2026-09-30
+// Rust guideline compliant 2026-10-01
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use iced::Task;
 use pohunek_gui_core::{
-    render_attach_argv, spawn_attach_command, AttachCommandSpawner, AttachSpawnError,
-    AttachTemplateError, AttachTemplateValues, HostId,
+    render_attach_argv, render_attach_command, AttachTemplateError, AttachTemplateValues, HostId,
 };
 use protocol::{SessionId, SessionInfo};
 use thiserror::Error;
@@ -20,9 +19,14 @@ use crate::config::{AttachCommandMode, AttachSelection, LaunchSettings};
 use crate::message::Message;
 use crate::runtime;
 use crate::terminal::{
-    attach_arguments, spawn_detached, TerminalError, TerminalLauncher, SYSTEM_OPEN,
+    attach_arguments, spawn_observed, ObserveError, TerminalError, TerminalLauncher, SYSTEM_OPEN,
 };
 use crate::PohunekApp;
+
+/// The shell that runs a rendered `attach_command` in shell mode. It is an
+/// absolute path because a Finder or launchd start has no useful `PATH`; every
+/// supported host ships `/bin/sh`.
+const SHELL_PROGRAM: &str = "/bin/sh";
 
 /// Everything one attach action needs, owned so it can run on a blocking thread.
 #[derive(Debug, Clone)]
@@ -60,42 +64,24 @@ pub(crate) enum AttachError {
     NonUtf8Bin,
     #[error("invalid attach_command: {0}")]
     Template(#[from] AttachTemplateError),
-    #[error("failed to spawn attach program `{}`: {source}", program.to_string_lossy())]
-    Spawn {
-        program: OsString,
-        source: std::io::Error,
-    },
-    #[error("{0}")]
-    Shell(String),
+    #[error(transparent)]
+    Observe(#[from] ObserveError),
     #[error("cannot locate the attach script directory: {0}")]
     ScriptDirectory(#[source] pohunek_paths::PathError),
     #[error(transparent)]
     Terminal(#[from] TerminalError),
 }
 
-/// Spawns rendered attach commands through `sh -c`, detached from the GUI.
-#[derive(Debug, Default)]
-struct ShellAttachSpawner;
-
-impl AttachCommandSpawner for ShellAttachSpawner {
-    fn spawn(&mut self, command: &str) -> Result<(), String> {
-        spawn_detached(
-            OsStr::new("sh"),
-            &[OsString::from("-c"), OsString::from(command)],
-        )
-        .map(|_| ())
-        .map_err(|err| format!("failed to spawn attach command `{command}`: {err}"))
-    }
-}
-
-/// Resolves `pohunek_bin` and starts the configured terminal.
+/// Resolves `pohunek_bin` and the launcher program, then starts the terminal.
 ///
-/// Blocks on executable resolution and, for a stock terminal, on the bounded
-/// `open` call, so callers run it off the UI thread.
+/// Returns a warning to show next to the success message, when there is one.
+/// Blocks on executable resolution, on the observation window of a template
+/// launch, and on the bounded `open` call of a stock terminal, so callers run
+/// it off the UI thread.
 pub(crate) fn run_attach(
     plan: &AttachPlan,
     terminal: &TerminalEnvironment,
-) -> Result<(), AttachError> {
+) -> Result<Option<String>, AttachError> {
     let bin = plan.resolver.resolve()?;
     match &plan.selection {
         AttachSelection::Command { template, mode } => {
@@ -104,32 +90,31 @@ pub(crate) fn run_attach(
                 host: plan.values.host.clone(),
                 id: plan.values.id.clone(),
             };
+            let observe = plan.launch.attach_observe;
             match mode {
                 AttachCommandMode::Shell => {
-                    spawn_attach_command(&mut ShellAttachSpawner, template, &values)
-                        .map(|_| ())
-                        .map_err(|error| match error {
-                            AttachSpawnError::Template(error) => AttachError::Template(error),
-                            AttachSpawnError::Spawn(message) => AttachError::Shell(message),
-                            _ => AttachError::Shell(error.to_string()),
-                        })
+                    let command = render_attach_command(template, &values)?;
+                    spawn_observed(
+                        SHELL_PROGRAM.as_ref(),
+                        &[OsString::from("-c"), OsString::from(command)],
+                        observe,
+                    )?;
                 }
                 AttachCommandMode::Argv => {
                     let argv: Vec<OsString> = render_attach_argv(template, &values)?
                         .into_iter()
                         .map(OsString::from)
                         .collect();
-                    let (program, arguments) = argv
+                    let (word, arguments) = argv
                         .split_first()
                         .expect("render_attach_argv returns at least the program");
-                    spawn_detached(program, arguments)
-                        .map(|_| ())
-                        .map_err(|source| AttachError::Spawn {
-                            program: program.clone(),
-                            source,
-                        })
+                    // A bare launcher name (`kitty`) must not depend on the
+                    // GUI's own `PATH`, which a Finder launch keeps minimal.
+                    let program = plan.resolver.resolve_name(word)?;
+                    spawn_observed(program.as_os_str(), arguments, observe)?;
                 }
             }
+            Ok(None)
         }
         AttachSelection::Terminal(kind) => {
             let script_dir = match &terminal.script_dir {
@@ -143,11 +128,12 @@ pub(crate) fn run_attach(
                 terminal.opener.clone(),
                 script_dir,
                 plan.launch.open_timeout,
+                plan.launch.attach_script_max_age,
             );
             let mut argv = vec![bin.into_os_string()];
             argv.extend(attach_arguments(&plan.values.host, &plan.values.id));
-            launcher.launch(&argv)?;
-            Ok(())
+            let report = launcher.launch(&argv)?;
+            Ok((!report.warnings.is_empty()).then(|| report.warnings.join("; ")))
         }
     }
 }
@@ -179,9 +165,12 @@ pub(crate) fn attach_task(
 
     let plan = app.attach_plan(host_id, session_id)?;
     Ok(Task::perform(
-        runtime::perform_blocking(move || {
-            run_attach(&plan, &TerminalEnvironment::system()).map_err(|err| err.to_string())
-        }),
+        runtime::perform_blocking_or(
+            move || {
+                run_attach(&plan, &TerminalEnvironment::system()).map_err(|err| err.to_string())
+            },
+            Err,
+        ),
         Message::AttachSpawned,
     ))
 }
@@ -279,6 +268,8 @@ mod tests {
                 login_shell_timeout: Duration::from_secs(1),
                 login_shell_max_output_bytes: 1024,
                 notification_timeout: Duration::from_secs(1),
+                attach_observe: Duration::from_millis(100),
+                attach_script_max_age: Duration::from_secs(3600),
             },
             values: AttachTemplateValues {
                 bin: program,
@@ -330,6 +321,12 @@ mod tests {
         assert_eq!(read_argv(&fifo), expected_attach_words(&["--flag"]));
     }
 
+    /// Gives a plan an observation window long enough to see an early exit.
+    fn observing(mut plan: AttachPlan) -> AttachPlan {
+        plan.launch.attach_observe = Duration::from_secs(30);
+        plan
+    }
+
     #[test]
     fn argv_mode_reports_a_missing_program_with_its_name() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -341,8 +338,93 @@ mod tests {
 
         let error = run_attach(&plan, &unused_terminal()).expect_err("missing program");
 
-        assert!(matches!(error, AttachError::Spawn { .. }), "{error}");
+        assert!(matches!(error, AttachError::Bin(_)), "{error}");
         assert!(error.to_string().contains("/nonexistent/launcher"));
+    }
+
+    #[test]
+    fn argv_mode_resolves_a_bare_launcher_through_the_search_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (recorder, fifo) = fifo_recorder(dir.path());
+        let bin_dir = tempfile::tempdir().expect("bin dir");
+        // A launcher that exists only in the discovered search path, not on the
+        // GUI's own PATH, like kitty under a Finder launch.
+        let launcher = bin_dir.path().join("fake-terminal");
+        fs::copy(&recorder, &launcher).expect("copy launcher");
+        let search =
+            pohunek_platform::shell_env::SearchPath::new(vec![bin_dir.path().to_path_buf()])
+                .expect("search path");
+        let mut plan = plan(
+            command(
+                "fake-terminal --flag {host} attach {id}",
+                AttachCommandMode::Argv,
+            ),
+            &recorder,
+        );
+        plan.resolver = Arc::new(BinResolver::with_discovery(
+            recorder.to_str().expect("utf8"),
+            move || Ok(search.clone()),
+        ));
+
+        run_attach(&plan, &unused_terminal()).expect("attach");
+
+        assert_eq!(read_argv(&fifo), expected_attach_words(&["--flag"]));
+    }
+
+    #[test]
+    fn argv_mode_reports_a_bare_launcher_that_cannot_be_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (recorder, _fifo) = fifo_recorder(dir.path());
+        let empty = tempfile::tempdir().expect("empty dir");
+        let search = pohunek_platform::shell_env::SearchPath::new(vec![empty.path().to_path_buf()])
+            .expect("search path");
+        let mut plan = plan(
+            command("no-such-terminal {bin}", AttachCommandMode::Argv),
+            &recorder,
+        );
+        plan.resolver = Arc::new(BinResolver::with_discovery(
+            recorder.to_str().expect("utf8"),
+            move || Ok(search.clone()),
+        ));
+
+        let error = run_attach(&plan, &unused_terminal()).expect_err("missing launcher");
+
+        assert!(matches!(error, AttachError::Bin(_)), "{error}");
+        assert!(error.to_string().contains("no-such-terminal"));
+    }
+
+    #[test]
+    fn an_argv_launcher_that_exits_at_once_is_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (recorder, _fifo) = fifo_recorder(dir.path());
+        let plan = observing(plan(
+            command("/bin/false {bin}", AttachCommandMode::Argv),
+            &recorder,
+        ));
+
+        let error = run_attach(&plan, &unused_terminal()).expect_err("dead launcher");
+
+        assert!(
+            matches!(
+                error,
+                AttachError::Observe(ObserveError::ExitedEarly { .. })
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_dead_shell_template_is_reported_with_its_exit_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (recorder, _fifo) = fifo_recorder(dir.path());
+        let plan = observing(plan(
+            command("/nonexistent/terminal {bin}", AttachCommandMode::Shell),
+            &recorder,
+        ));
+
+        let error = run_attach(&plan, &unused_terminal()).expect_err("dead template");
+
+        assert!(error.to_string().contains("127"), "{error}");
     }
 
     #[test]
@@ -468,5 +550,29 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    #[test]
+    fn terminal_mode_surfaces_a_stale_script_cleanup_warning_without_failing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = dir.path().join("recorder");
+        script(&recorder, "exit 0");
+        let environment = terminal_environment(dir.path(), "exit 0");
+        let script_dir = dir.path().join("gui-attach");
+        fs::create_dir(&script_dir).expect("mkdir");
+        fs::set_permissions(&script_dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+        // A script with a loose mode cannot be validated, so it cannot be removed.
+        let loose = script_dir.join("attach-loose.command");
+        script(&loose, "exit 0");
+        let plan = plan(
+            AttachSelection::Terminal(AttachTerminal::TerminalApp),
+            &recorder,
+        );
+
+        let warning = run_attach(&plan, &environment)
+            .expect("the launch succeeds")
+            .expect("a cleanup warning");
+
+        assert!(warning.contains("attach-loose.command"), "{warning}");
     }
 }

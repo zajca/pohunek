@@ -15,7 +15,9 @@ use thiserror::Error;
 
 use crate::bin_resolver::{BinResolver, LoginShellSettings};
 use crate::keyboard::{KeyMap, KeyMapError};
-use crate::notify::{NotificationBackend, Notifier, DEFAULT_NOTIFY_COMMAND, SYSTEM_OSASCRIPT};
+use crate::notify::{
+    CommandResolution, NotificationBackend, Notifier, DEFAULT_NOTIFY_COMMAND, SYSTEM_OSASCRIPT,
+};
 use crate::terminal::AttachTerminal;
 
 // 80x24 is the traditional terminal size expected by many CLI tools.
@@ -26,6 +28,16 @@ const DEFAULT_TERMINAL_ROWS: u16 = 24;
 // is accepted; five seconds tolerates a cold Terminal.app launch while a wedged
 // LaunchServices does not block the attach status forever.
 const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
+// A launched terminal that dies within this window (a dead template, a missing
+// program) is reported as a failure; a healthy terminal keeps running past it.
+// One second covers process start and an immediate usage error.
+const DEFAULT_ATTACH_OBSERVE: Duration = Duration::from_secs(1);
+
+// Terminal.app runs an attach script within moments of `open`; a script older
+// than an hour was never run. The age only bounds how long host and session id
+// stay on disk after a launch Terminal never completed.
+const DEFAULT_ATTACH_SCRIPT_MAX_AGE: Duration = Duration::from_secs(3600);
 
 // A notification backend answers within a moment; five seconds tolerates a
 // cold osascript start while a wedged backend cannot pin a blocking-pool thread.
@@ -76,6 +88,8 @@ pub(crate) struct LaunchSettings {
     pub(crate) login_shell_timeout: Duration,
     pub(crate) login_shell_max_output_bytes: usize,
     pub(crate) notification_timeout: Duration,
+    pub(crate) attach_observe: Duration,
+    pub(crate) attach_script_max_age: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -110,12 +124,12 @@ impl AppConfig {
             max_output_bytes: launch.login_shell_max_output_bytes,
             default_shell: DEFAULT_LOGIN_SHELL.into(),
         };
-        let bin_resolver = Arc::new(BinResolver::for_host(&raw.pohunek_bin, login_shell.clone()));
+        let bin_resolver = Arc::new(BinResolver::for_host(&raw.pohunek_bin, login_shell));
         Ok(Self {
             attach,
             pohunek_bin: raw.pohunek_bin,
             launch,
-            bin_resolver,
+            bin_resolver: Arc::clone(&bin_resolver),
             local_host: HostConfig::local("local", local_socket_path()?),
             connection_options: raw_gui.connection_options()?,
             terminal_size: raw_gui.terminal_size()?,
@@ -123,7 +137,7 @@ impl AppConfig {
                 raw.notification_command.as_deref(),
                 cfg!(target_os = "macos"),
                 &launch,
-                &login_shell,
+                &bin_resolver,
             ),
             keymap: keymap_from_raw_keybindings(&raw.keybindings)?,
         })
@@ -171,6 +185,10 @@ pub(crate) struct RawGuiConfig {
     pub(crate) login_shell_max_output_bytes: Option<usize>,
     #[serde(default)]
     pub(crate) notification_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub(crate) attach_observe_ms: Option<u64>,
+    #[serde(default)]
+    pub(crate) attach_script_max_age_secs: Option<u64>,
 }
 
 impl RawGuiConfig {
@@ -231,6 +249,16 @@ impl RawGuiConfig {
                 self.notification_timeout_ms,
                 "gui.notification_timeout_ms",
                 DEFAULT_NOTIFICATION_TIMEOUT,
+            )?,
+            attach_observe: duration_millis(
+                self.attach_observe_ms,
+                "gui.attach_observe_ms",
+                DEFAULT_ATTACH_OBSERVE,
+            )?,
+            attach_script_max_age: duration_secs(
+                self.attach_script_max_age_secs,
+                "gui.attach_script_max_age_secs",
+                DEFAULT_ATTACH_SCRIPT_MAX_AGE,
             )?,
         })
     }
@@ -297,16 +325,16 @@ fn notifier(
     command: Option<&str>,
     darwin: bool,
     launch: &LaunchSettings,
-    login_shell: &LoginShellSettings,
+    resolver: &Arc<BinResolver>,
 ) -> Notifier {
     let backend = match command {
         None if darwin => NotificationBackend::Osascript {
             executable: SYSTEM_OSASCRIPT.into(),
         },
         configured => NotificationBackend::Command {
-            resolver: Arc::new(BinResolver::for_host(
+            resolution: Arc::new(CommandResolution::new(
+                Arc::clone(resolver),
                 configured.unwrap_or(DEFAULT_NOTIFY_COMMAND),
-                login_shell.clone(),
             )),
         },
     };
@@ -602,6 +630,11 @@ open_inbox = "ctrl+i"
         assert_eq!(custom.login_shell_timeout, Duration::from_secs(2));
         assert_eq!(custom.login_shell_max_output_bytes, 1_024);
         assert_eq!(defaults.notification_timeout, DEFAULT_NOTIFICATION_TIMEOUT);
+        assert_eq!(defaults.attach_observe, DEFAULT_ATTACH_OBSERVE);
+        assert_eq!(
+            defaults.attach_script_max_age,
+            DEFAULT_ATTACH_SCRIPT_MAX_AGE
+        );
     }
 
     #[test]
@@ -623,49 +656,57 @@ open_inbox = "ctrl+i"
                 notification_timeout_ms: Some(0),
                 ..RawGuiConfig::default()
             },
+            RawGuiConfig {
+                attach_observe_ms: Some(0),
+                ..RawGuiConfig::default()
+            },
+            RawGuiConfig {
+                attach_script_max_age_secs: Some(0),
+                ..RawGuiConfig::default()
+            },
         ] {
             let err = raw.launch_settings().expect_err("zero");
             assert!(err.to_string().contains("must be greater than zero"));
         }
     }
 
-    fn test_settings() -> (LaunchSettings, LoginShellSettings) {
+    fn test_settings() -> (LaunchSettings, Arc<BinResolver>) {
         let launch = RawGuiConfig::default().launch_settings().expect("defaults");
-        let login_shell = LoginShellSettings {
-            timeout: launch.login_shell_timeout,
-            max_output_bytes: launch.login_shell_max_output_bytes,
-            default_shell: DEFAULT_LOGIN_SHELL.into(),
-        };
-        (launch, login_shell)
+        let resolver = Arc::new(BinResolver::with_discovery("pohunek", || {
+            Err(crate::bin_resolver::BinError::SearchPath(
+                "unused".to_owned(),
+            ))
+        }));
+        (launch, resolver)
     }
 
     #[test]
     fn darwin_defaults_to_osascript_and_other_hosts_to_notify_send() {
-        let (launch, shell) = test_settings();
+        let (launch, resolver) = test_settings();
 
-        let darwin = notifier(None, true, &launch, &shell);
+        let darwin = notifier(None, true, &launch, &resolver);
         assert!(matches!(
             darwin.backend,
             NotificationBackend::Osascript { ref executable } if executable == Path::new(SYSTEM_OSASCRIPT)
         ));
         assert_eq!(darwin.timeout, DEFAULT_NOTIFICATION_TIMEOUT);
 
-        let linux = notifier(None, false, &launch, &shell);
+        let linux = notifier(None, false, &launch, &resolver);
         assert!(matches!(
             linux.backend,
-            NotificationBackend::Command { ref resolver } if format!("{resolver:?}").contains(DEFAULT_NOTIFY_COMMAND)
+            NotificationBackend::Command { ref resolution } if format!("{resolution:?}").contains(DEFAULT_NOTIFY_COMMAND)
         ));
     }
 
     #[test]
     fn an_explicit_notification_command_wins_on_both_platforms() {
-        let (launch, shell) = test_settings();
+        let (launch, resolver) = test_settings();
 
         for darwin in [true, false] {
-            let configured = notifier(Some("my-notify"), darwin, &launch, &shell);
+            let configured = notifier(Some("my-notify"), darwin, &launch, &resolver);
             assert!(matches!(
                 configured.backend,
-                NotificationBackend::Command { ref resolver } if format!("{resolver:?}").contains("my-notify")
+                NotificationBackend::Command { ref resolution } if format!("{resolution:?}").contains("my-notify")
             ));
         }
     }
