@@ -123,6 +123,7 @@ describe("web release installer on Linux", () => {
       await cp(join(RELEASE_DIR, "install.sh"), join(harness.archive, "install.sh"));
       await cp(VERIFY_ARCHIVE, join(harness.archive, "packaging", "verify-archive"));
       await writeFile(join(harness.archive, "marker"), "x");
+      await execFileAsync("chmod", ["-R", "go-w", harness.archive]);
       await sealManifest(harness.archive, LINUX_TARGET);
 
       const result = await install(harness);
@@ -468,6 +469,9 @@ async function createArchive(
   await cp(join(RELEASE_DIR, "backend.env.example"), join(path, "backend.env.example"));
   await cp(join(RELEASE_DIR, "install.sh"), join(path, "install.sh"));
   await cp(VERIFY_ARCHIVE, join(path, "packaging", "verify-archive"));
+  // The installer refuses a tree another account could write, whatever the
+  // umask of the machine running the test.
+  await execFileAsync("chmod", ["-R", "go-w", path]);
   await sealManifest(path, target, component);
 }
 
