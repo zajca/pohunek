@@ -14,7 +14,7 @@ use iced::keyboard::{self, Key, Modifiers};
 use iced::widget::{operation, Id};
 use iced::{Subscription, Task};
 use pohunek_gui_core::assistant::Intent as AssistantIntent;
-use pohunek_gui_core::{ProjectChoice, ProjectRef};
+use pohunek_gui_core::{project_choice_labels, ProjectChoice, ProjectRef};
 use protocol::ProviderKind;
 
 use crate::message::{
@@ -869,12 +869,7 @@ const ASSISTANT_INTENTS: [AssistantIntent; 5] = [
 
 pub(crate) fn form_select_options(app: &PohunekApp, field: FormField) -> Vec<String> {
     match field {
-        FormField::StartProject | FormField::AssistantProject => app
-            .workspace
-            .project_choices()
-            .iter()
-            .map(project_picker_label)
-            .collect(),
+        FormField::StartProject | FormField::AssistantProject => project_picker_labels(app),
         FormField::StartAgent => project_host(app, app.start.project.as_ref())
             .map_or_else(Vec::new, pohunek_gui_core::HostView::launchable_agents),
         FormField::StartTemplate => {
@@ -900,20 +895,20 @@ pub(crate) fn form_select_options(app: &PohunekApp, field: FormField) -> Vec<Str
     }
 }
 
-/// Picker and select label for a project: `label · host`, so same-named
-/// projects on different hosts stay distinguishable.
-pub(crate) fn project_picker_label(choice: &ProjectChoice) -> String {
-    format!("{}  ·  {}", choice.label, choice.project.host_id)
+/// Picker labels in `project_choices` order: `label · host`, plus the project
+/// id when one host holds several projects with the same label.
+fn project_picker_labels(app: &PohunekApp) -> Vec<String> {
+    project_choice_labels(&app.workspace.project_choices(), true)
 }
 
 fn project_select_label(app: &PohunekApp, project: Option<&ProjectRef>) -> String {
     project
         .and_then(|project| {
-            app.workspace
-                .project_choices()
+            let choices = app.workspace.project_choices();
+            let index = choices
                 .iter()
-                .find(|choice| &choice.project == project)
-                .map(project_picker_label)
+                .position(|choice| &choice.project == project)?;
+            project_picker_labels(app).into_iter().nth(index)
         })
         .unwrap_or_else(|| PROJECT_PLACEHOLDER_LABEL.to_owned())
 }

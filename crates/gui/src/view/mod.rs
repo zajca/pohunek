@@ -7,8 +7,10 @@ mod modals;
 mod selectable_text;
 mod session;
 
-use iced::widget::{button, center, column, container, mouse_area, opaque, row, stack, text};
-use iced::{Background, Center, Color, Element, Fill, Theme};
+use iced::widget::{
+    button, center, column, container, mouse_area, opaque, row, scrollable, stack, text,
+};
+use iced::{Background, Center, Color, Element, Fill, Shrink, Theme};
 use pohunek_gui_core::ConnState;
 use protocol::{AgentKind, SessionInfo};
 
@@ -162,6 +164,33 @@ fn dialog_card<'a>(
     container(column![header, content.into()].spacing(16))
         .padding(20)
         .width(640)
+        .style(iced::widget::container::rounded_box)
+        .into()
+}
+
+/// Tallest a form dialog grows before its body scrolls, so long forms stay
+/// reachable in small windows.
+const FORM_DIALOG_MAX_HEIGHT: f32 = 640.0;
+
+/// Like [`dialog_card`], but the content scrolls under a fixed header once the
+/// dialog reaches [`FORM_DIALOG_MAX_HEIGHT`].
+fn scrolling_dialog_card<'a>(
+    title: &'a str,
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let header = row![
+        text(title).size(20),
+        iced::widget::space().width(Fill),
+        button("Close")
+            .on_press(Message::CloseModal)
+            .style(iced::widget::button::secondary),
+    ]
+    .align_y(Center);
+    let body = scrollable(content.into()).height(Shrink);
+    container(column![header, body].spacing(16))
+        .padding(20)
+        .width(640)
+        .max_height(FORM_DIALOG_MAX_HEIGHT)
         .style(iced::widget::container::rounded_box)
         .into()
 }

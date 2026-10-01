@@ -2,11 +2,11 @@
 
 // Rust guideline compliant 2026-10-01
 
-use std::collections::BTreeMap;
-
 use iced::widget::{button, column, container, row, scrollable, text};
 use iced::{Background, Center, Element, Fill, Theme};
-use pohunek_gui_core::{ProjectChoice, ProjectRef, SessionAccess, SessionGroup, SessionRow};
+use pohunek_gui_core::{
+    project_choice_labels, ProjectChoice, ProjectRef, SessionAccess, SessionGroup, SessionRow,
+};
 use protocol::{AgentActivity, NotificationKind};
 
 use crate::message::Message;
@@ -137,22 +137,12 @@ fn config_error_banner(error: &str) -> Element<'_, Message> {
 }
 
 /// Chip labels for `choices`; a label shared by several projects is qualified
-/// with its host so every chip stays distinguishable.
+/// with its host, and with the project id when one host repeats the label.
 fn chip_labels(choices: &[ProjectChoice]) -> Vec<String> {
-    let mut occurrences: BTreeMap<&str, usize> = BTreeMap::new();
-    for choice in choices {
-        *occurrences.entry(choice.label.as_str()).or_default() += 1;
-    }
-    choices
-        .iter()
-        .map(|choice| {
-            let label = if occurrences[choice.label.as_str()] > 1 {
-                format!("{}  ·  {}", choice.label, choice.project.host_id)
-            } else {
-                choice.label.clone()
-            };
-            format!("{label}  {}", choice.session_count)
-        })
+    project_choice_labels(choices, false)
+        .into_iter()
+        .zip(choices)
+        .map(|(label, choice)| format!("{label}  {}", choice.session_count))
         .collect()
 }
 
@@ -426,6 +416,23 @@ mod tests {
             choice("alpha", "p-3", "web", 4),
         ]);
         assert_eq!(labels, ["api  ·  alpha  2", "api  ·  beta  1", "web  4"]);
+    }
+
+    #[test]
+    fn chip_labels_add_the_project_id_for_same_host_duplicates() {
+        let labels = chip_labels(&[
+            choice("local", "p-1", "api", 2),
+            choice("local", "p-2", "api", 1),
+            choice("remote", "p-3", "web", 4),
+        ]);
+        assert_eq!(
+            labels,
+            [
+                "api  ·  local  ·  p-1  2",
+                "api  ·  local  ·  p-2  1",
+                "web  4"
+            ]
+        );
     }
 
     #[test]

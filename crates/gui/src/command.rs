@@ -268,14 +268,24 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 None => app.prompt_editor = text_editor::Content::new(),
             }
         }
-        Message::TemplateResolved(result) => match result {
-            Ok(resolved) => {
-                app.prompt_editor = text_editor::Content::with_text(&resolved.rendered);
-                app.start.agent.clone_from(&resolved.recipe.agent);
-                app.template_recipe = Some(resolved.recipe);
+        Message::TemplateResolved {
+            project,
+            action,
+            result,
+        } => {
+            let current = app.start.project.as_ref() == Some(&project)
+                && app.start.template.as_deref() == Some(action.as_str());
+            if current {
+                match result {
+                    Ok(resolved) => {
+                        app.prompt_editor = text_editor::Content::with_text(&resolved.rendered);
+                        app.start.agent.clone_from(&resolved.recipe.agent);
+                        app.template_recipe = Some(resolved.recipe);
+                    }
+                    Err(err) => app.status = Some(err),
+                }
             }
-            Err(err) => app.status = Some(err),
-        },
+        }
         Message::PromptEdited(action) => {
             app.form_focus = FormField::StartPrompt;
             app.prompt_editor.perform(action);
@@ -1068,6 +1078,12 @@ fn resolve_template_task(app: &PohunekApp, action_name: String) -> Result<Task<M
     let host = target.host;
     let options = connection_options(app)?;
     let project = target.project_ref;
+    let origin_project = app
+        .start
+        .project
+        .clone()
+        .ok_or_else(|| "select a project first".to_owned())?;
+    let origin_action = action_name.clone();
     Ok(Task::perform(
         runtime::perform(async move {
             let action = resolve_project_action_with_options(
@@ -1091,7 +1107,11 @@ fn resolve_template_task(app: &PohunekApp, action_name: String) -> Result<Task<M
                 },
             })
         }),
-        Message::TemplateResolved,
+        move |result| Message::TemplateResolved {
+            project: origin_project,
+            action: origin_action,
+            result,
+        },
     ))
 }
 
@@ -1546,6 +1566,146 @@ mod tests {
         assert_eq!(app.start.agent, "claude");
         assert!(
             crate::selection::available_actions(&app, &protocol::ProviderKind::None).is_empty()
+        );
+    }
+
+    fn resolved(rendered: &str, agent: &str) -> ResolvedTemplate {
+        ResolvedTemplate {
+            rendered: rendered.to_owned(),
+            recipe: TemplateRecipe {
+                agent: agent.to_owned(),
+                branch: Some("feature".to_owned()),
+                base_branch: None,
+            },
+        }
+    }
+
+    fn template_reply(project: ProjectRef, action: &str, rendered: &str) -> Message {
+        Message::TemplateResolved {
+            project,
+            action: action.to_owned(),
+            result: Ok(resolved(rendered, "claude")),
+        }
+    }
+
+    #[test]
+    fn template_reply_for_a_previous_project_is_ignored() {
+        let mut app = app_with_two_hosts();
+        app.start.project = Some(project_ref("local", "p-1"));
+        app.start.template = Some("review".to_owned());
+        let _ = update(
+            &mut app,
+            Message::StartProjectSelected(project_ref("remote", "p-9")),
+        );
+
+        let _ = update(
+            &mut app,
+            template_reply(project_ref("local", "p-1"), "review", "stale prompt"),
+        );
+
+        assert!(app.template_recipe.is_none());
+        assert!(app.prompt_editor.text().trim().is_empty());
+        assert_eq!(app.start.agent, "claude");
+    }
+
+    #[test]
+    fn template_reply_for_a_previous_template_is_ignored() {
+        let mut app = app_with_two_hosts();
+        app.start.project = Some(project_ref("local", "p-1"));
+        app.start.template = Some("deploy".to_owned());
+
+        let _ = update(
+            &mut app,
+            template_reply(project_ref("local", "p-1"), "review", "stale prompt"),
+        );
+
+        assert!(app.template_recipe.is_none());
+        assert!(app.prompt_editor.text().trim().is_empty());
+    }
+
+    #[test]
+    fn matching_template_reply_applies_prompt_agent_and_recipe() {
+        let mut app = app_with_two_hosts();
+        app.start.project = Some(project_ref("local", "p-1"));
+        app.start.template = Some("review".to_owned());
+
+        let _ = update(
+            &mut app,
+            template_reply(project_ref("local", "p-1"), "review", "fresh prompt"),
+        );
+
+        assert_eq!(app.prompt_editor.text().trim(), "fresh prompt");
+        assert_eq!(app.start.agent, "claude");
+        assert_eq!(
+            app.template_recipe
+                .as_ref()
+                .and_then(|r| r.branch.as_deref()),
+            Some("feature")
+        );
+    }
+
+    #[test]
+    fn start_modal_with_many_projects_renders_every_option() {
+        let mut app = app_with_two_hosts();
+        let projects: Vec<(String, String)> = (0..40)
+            .map(|index| (format!("p-{index:02}"), format!("project-{index:02}")))
+            .collect();
+        let refs: Vec<(&str, &str)> = projects
+            .iter()
+            .map(|(id, label)| (id.as_str(), label.as_str()))
+            .collect();
+        app.workspace
+            .hosts
+            .insert(HostId::new("local"), host_with(&refs, &["codex"]));
+        app.modal = ModalView::Start;
+        app.form_select = Some(FormSelect {
+            field: FormField::StartProject,
+            cursor: 0,
+        });
+
+        let local_options = keyboard::form_select_options(&app, FormField::StartProject)
+            .into_iter()
+            .filter(|option| option.ends_with("local"))
+            .count();
+        assert_eq!(local_options, 40);
+        let _ = crate::view::view(&app);
+    }
+
+    #[test]
+    fn same_labelled_projects_on_one_host_get_distinct_picker_labels() {
+        let mut app = app_with_two_hosts();
+        app.workspace.hosts.insert(
+            HostId::new("local"),
+            host_with(&[("p-1", "api"), ("p-2", "api")], &["codex"]),
+        );
+        app.modal = ModalView::Start;
+
+        let options = keyboard::form_select_options(&app, FormField::StartProject);
+        assert_eq!(
+            options,
+            [
+                "api  ·  local  ·  p-1",
+                "api  ·  local  ·  p-2",
+                "api  ·  remote"
+            ]
+        );
+        let pick = |cursor| {
+            keyboard::form_select_choice_message(
+                &app,
+                FormSelect {
+                    field: FormField::StartProject,
+                    cursor,
+                },
+            )
+        };
+        assert!(matches!(
+            pick(1),
+            Some(Message::StartProjectSelected(project)) if project == project_ref("local", "p-2")
+        ));
+        app.start.project = Some(project_ref("local", "p-2"));
+        assert_eq!(
+            keyboard::form_select_label(&app, FormField::StartProject),
+            "api  ·  local  ·  p-2"
         );
     }
 

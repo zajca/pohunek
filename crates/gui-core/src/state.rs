@@ -2241,6 +2241,39 @@ fn project_display_label(host: &HostView, project_id: &str) -> String {
         .map_or_else(|| project_id.to_owned(), |info| info.label.clone())
 }
 
+/// Display labels for `choices`, in the same order.
+///
+/// A label is qualified with its host when `always_host` is set or another
+/// choice shares the label, and additionally with the project id when another
+/// choice shares both label and host (the daemon allows duplicate labels).
+#[must_use]
+pub fn project_choice_labels(choices: &[ProjectChoice], always_host: bool) -> Vec<String> {
+    const SEPARATOR: &str = "  ·  ";
+    let mut by_label: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut by_host_label: BTreeMap<(&HostId, &str), usize> = BTreeMap::new();
+    for choice in choices {
+        *by_label.entry(choice.label.as_str()).or_default() += 1;
+        *by_host_label
+            .entry((&choice.project.host_id, choice.label.as_str()))
+            .or_default() += 1;
+    }
+    choices
+        .iter()
+        .map(|choice| {
+            let mut label = choice.label.clone();
+            if always_host || by_label[choice.label.as_str()] > 1 {
+                label.push_str(SEPARATOR);
+                label.push_str(choice.project.host_id.as_str());
+            }
+            if by_host_label[&(&choice.project.host_id, choice.label.as_str())] > 1 {
+                label.push_str(SEPARATOR);
+                label.push_str(&choice.project.project_id);
+            }
+            label
+        })
+        .collect()
+}
+
 fn sort_project_choices(choices: &mut [ProjectChoice]) {
     choices.sort_by(|left, right| {
         left.label
@@ -5567,6 +5600,44 @@ mod tests {
             ]
         );
         assert!(choices.iter().all(|choice| choice.known));
+    }
+
+    #[test]
+    fn project_choice_labels_add_host_and_id_only_where_needed() {
+        let mut workspace = Workspace::default();
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: connected_snapshot(
+                "local",
+                Vec::new(),
+                vec![
+                    labelled_project("p-1", "api"),
+                    labelled_project("p-2", "api"),
+                    labelled_project("p-3", "web"),
+                ],
+            ),
+        });
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: connected_snapshot(
+                "remote",
+                Vec::new(),
+                vec![labelled_project("p-9", "web")],
+            ),
+        });
+        let choices = workspace.project_choices();
+
+        assert_eq!(
+            project_choice_labels(&choices, false),
+            [
+                "api  ·  local  ·  p-1",
+                "api  ·  local  ·  p-2",
+                "web  ·  local",
+                "web  ·  remote",
+            ]
+        );
+        assert_eq!(
+            project_choice_labels(&choices[2..], true),
+            ["web  ·  local", "web  ·  remote"]
+        );
     }
 
     #[test]

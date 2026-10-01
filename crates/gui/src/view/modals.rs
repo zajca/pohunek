@@ -2,7 +2,9 @@
 
 // Rust guideline compliant 2026-10-01
 
-use iced::widget::{button, checkbox, column, container, row, text, text_editor, text_input};
+use iced::widget::{
+    button, checkbox, column, container, row, scrollable, text, text_editor, text_input,
+};
 use iced::{Center, Element};
 use pohunek_gui_core::Toast;
 
@@ -12,7 +14,10 @@ use crate::selection::project_host;
 use crate::view::session::session_name_input;
 use crate::PohunekApp;
 
-use super::{dialog_card, muted_style};
+use super::{dialog_card, muted_style, scrolling_dialog_card};
+
+/// Tallest an open select option list grows before it scrolls.
+const SELECT_OPTIONS_MAX_HEIGHT: f32 = 240.0;
 
 pub(crate) fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
     let advanced_label = if app.start.show_advanced {
@@ -64,7 +69,7 @@ pub(crate) fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
     {
         start = start.on_press(Message::CreateSession);
     }
-    dialog_card("Start a session", panel.push(start))
+    scrolling_dialog_card("Start a session", panel.push(start))
 }
 
 pub(crate) fn assistant_modal_content(app: &PohunekApp) -> Element<'_, Message> {
@@ -127,7 +132,7 @@ pub(crate) fn assistant_modal_content(app: &PohunekApp) -> Element<'_, Message> 
     if launchable {
         start = start.on_press(Message::LaunchAssistant);
     }
-    dialog_card("Start assistant", panel.push(start))
+    scrolling_dialog_card("Start assistant", panel.push(start))
 }
 
 fn start_prompt_binding(key_press: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
@@ -204,18 +209,21 @@ fn form_select<'a>(
     };
     let mut content = column![text(label).size(14), control].spacing(4);
     if let Some(select) = open {
+        let mut options = column![].spacing(4);
         for (index, option) in crate::keyboard::form_select_options(app, field)
             .into_iter()
             .enumerate()
         {
             let option_button =
                 button(text(option)).on_press(Message::ChooseFormSelect { field, index });
-            content = content.push(if select.cursor == index {
+            options = options.push(if select.cursor == index {
                 option_button.style(iced::widget::button::primary)
             } else {
                 option_button.style(iced::widget::button::secondary)
             });
         }
+        content =
+            content.push(container(scrollable(options)).max_height(SELECT_OPTIONS_MAX_HEIGHT));
     }
     content.into()
 }

@@ -80,7 +80,7 @@ pub use sdk::{
 };
 #[doc(inline)]
 pub use state::{
-    AgentStateEvent, ConnState, GitHubProviderScope, GitHubProviderState,
+    project_choice_labels, AgentStateEvent, ConnState, GitHubProviderScope, GitHubProviderState,
     GitHubPullRequestStatusKey, GovernanceRequestError, GovernanceRequestId, GovernanceState,
     HostEvent, HostView, LinearProviderState, NotificationFilter, NotificationIntent,
     NotificationRow, NotificationScope, ProjectChoice, ProjectRef, PromptState, ProviderOperation,
