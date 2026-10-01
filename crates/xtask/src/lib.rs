@@ -9,6 +9,7 @@ mod hermes;
 mod hermes_mock;
 mod hermes_skill;
 mod site;
+pub mod test_code;
 mod ts;
 
 use std::error::Error;
