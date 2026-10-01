@@ -6,7 +6,6 @@
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,7 +61,6 @@ const GUI_TEST_OUTPUT_BYTES: u32 = 1_024;
 // The state predicate is already true, so this only bounds a regression hang.
 const GUI_TEST_WAIT_MS: u32 = 100;
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
@@ -2111,11 +2109,7 @@ impl LoopbackDaemon {
 /// `SUN_LEN` (108-byte) limit on Unix domain socket paths, which surfaces as
 /// a `worker_socket_path_invalid` protocol error instead of a clean session.
 fn worker_backed_registry(mut config: SessionRegistryConfig) -> SessionRegistry {
-    let worker_home = pohunek_test_support::temp_root().join(format!(
-        "pw-g-{}-{}",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
+    let worker_home = fixture_dir("pwg");
     let worker_environment = SubprocessWorkerEnvironment {
         runtime_home: worker_home.join("runtime"),
         state_home: worker_home.join("state"),
@@ -2620,18 +2614,28 @@ fn agent_name(agent: &AgentKind) -> &'static str {
     }
 }
 
+thread_local! {
+    /// Fixture directories of the current test thread; they are removed when
+    /// the thread ends, after the test body has finished.
+    static FIXTURES: std::cell::RefCell<Vec<tempfile::TempDir>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Creates a random, owner-private, symlink-free directory under the shared
+/// fixture root and keeps it alive for the rest of the test thread.
+///
+/// Keep `prefix` short: it counts against the socket path limit of anything
+/// bound beneath the directory.
+fn fixture_dir(prefix: &str) -> PathBuf {
+    let fixture = pohunek_test_support::tempdir_with_prefix(prefix)
+        .expect("create private fixture directory");
+    let path = fixture.path().to_path_buf();
+    FIXTURES.with(|fixtures| fixtures.borrow_mut().push(fixture));
+    path
+}
+
 fn temp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = pohunek_test_support::temp_root().join(format!(
-        "pohunek-test-{tag}-{}-{nanos}-{n}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("create test dir");
-    make_owner_private(&dir);
-    dir
+    fixture_dir(&format!("pgc-{tag}-"))
 }
 
 /// Create an isolated owner-private directory for durable governance records.

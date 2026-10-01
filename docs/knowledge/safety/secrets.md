@@ -96,12 +96,15 @@ always-run teardown deletes it, restores the original list and default, and
 fails the job if they differ afterwards. Locally the test prints a `SKIPPED`
 line when the variable is unset; on CI a missing variable fails the test.
 
-The real keychain proves not found, success, the keychain file gone
-(`Unavailable`), and the bounded behavior of a locked keychain: the lookup
-returns within its caller timeout as `Locked` or as a timeout, never with a
-value. It does not prove the interactive unlock prompt. The locked case runs
-last, because a read stuck on an unlock prompt keeps the store's lookup permit
-and the process refuses further lookups. Access denial (`errSecAuthFailed`),
-the permit and waiter behavior, and the redaction of backend text are covered
-only by unit tests over the status-code classification and injected lookup
-closures.
+The real keychain proves not found, success, and the bounded behavior of a
+locked keychain: the lookup returns within its caller timeout as `Locked` or as
+a timeout, never with a value. It does not prove the interactive unlock prompt,
+and it does not prove the unavailable-store case: the Security framework keeps
+serving an already-opened keychain after `security delete-keychain`, so a
+deleted keychain is not observable from a running process. That case
+(`errSecNoSuchKeychain` to `Unavailable`) is covered only by the unit tests over
+keyring's `decode_error`. The locked case runs last, because a read stuck on an
+unlock prompt keeps the store's lookup permit and the process refuses further
+lookups. Access denial (`errSecAuthFailed`), the permit and waiter behavior, and
+the redaction of backend text are likewise covered only by unit tests over the
+status-code classification and injected lookup closures.

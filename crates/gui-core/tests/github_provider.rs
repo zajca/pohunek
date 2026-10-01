@@ -7,8 +7,6 @@ use std::future::Future;
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::pin::Pin;
-#[cfg(unix)]
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pohunek_gui_core::providers::github::{
@@ -16,9 +14,6 @@ use pohunek_gui_core::providers::github::{
     GitHubLabel, GitHubPullRequest, PullRequestStatus, ReviewDecision,
 };
 use serde_json::json;
-
-#[cfg(unix)]
-static NEXT_FAKE_GH_DIR: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecordedGhCall {
@@ -574,7 +569,11 @@ async fn invalid_json_error_is_typed() {
 #[cfg(unix)]
 #[tokio::test]
 async fn command_runner_uses_fake_gh_script_for_provider_commands() {
-    let dir = fake_gh_dir("gh-provider");
+    // The fixture root is random, owner-private, and symlink-free (on macOS
+    // `temp_dir()` sits under the `/var` symlink while a script's `pwd` reports
+    // the resolved path).
+    let root = pohunek_test_support::tempdir_with_prefix("pgc-gh").expect("private fixture root");
+    let dir = root.path().to_path_buf();
     let repo = dir.join("repo");
     let seen_cwd = dir.join("seen-cwd");
     std::fs::create_dir_all(&repo).expect("create fake repo cwd");
@@ -634,9 +633,10 @@ async fn command_runner_fake_gh_error_path_is_typed() {
 
 #[tokio::test]
 async fn command_runner_missing_gh_is_typed() {
-    let client = GitHubClient::with_config(GitHubConfig::new(
-        pohunek_test_support::temp_root().join("pohunek-gui-core-missing-gh"),
-    ));
+    // A nonexistent child of a private, random directory: no other user can
+    // pre-create an executable at this path.
+    let root = pohunek_test_support::tempdir_with_prefix("pgc-gh").expect("private fixture root");
+    let client = GitHubClient::with_config(GitHubConfig::new(root.path().join("missing-gh")));
 
     let err = client
         .list_pull_requests(&[])
@@ -652,26 +652,4 @@ fn fake_gh_script(name: &str) -> PathBuf {
         .join("tests")
         .join("assets")
         .join(name)
-}
-
-/// Creates a unique temporary directory for one fake GitHub CLI fixture.
-///
-/// The base is the symlink-free fixture root: on macOS `temp_dir()` sits under
-/// the `/var` symlink, while a script's `pwd` reports the resolved path.
-#[cfg(unix)]
-fn fake_gh_dir(name: &str) -> PathBuf {
-    let base = pohunek_test_support::temp_root();
-    loop {
-        // The counter reserves names only; it does not synchronize fixture data.
-        let sequence = NEXT_FAKE_GH_DIR.fetch_add(1, Ordering::Relaxed);
-        let path = base.join(format!(
-            "pohunek-gui-core-{name}-{}-{sequence}",
-            std::process::id()
-        ));
-        match std::fs::create_dir(&path) {
-            Ok(()) => return path,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => panic!("create unique fake gh dir {}: {error}", path.display()),
-        }
-    }
 }

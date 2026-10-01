@@ -238,11 +238,9 @@ mod tests {
     use crate::HostId;
     use protocol::SessionId;
 
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
-        pohunek_test_support::temp_root().join(format!(
-            "pohunek-gui-core-review-store-{tag}-{}",
-            std::process::id()
-        ))
+    /// Random, owner-private fixture root; removed when the guard drops.
+    fn fixture_root() -> tempfile::TempDir {
+        pohunek_test_support::tempdir_with_prefix("pgc-rs").expect("private fixture root")
     }
 
     fn sample_review() -> Review {
@@ -258,13 +256,15 @@ mod tests {
 
     #[test]
     fn load_all_on_a_missing_directory_returns_an_empty_list() {
-        let store = ReviewStore::new(temp_dir("missing"));
+        let root = fixture_root();
+        let store = ReviewStore::new(root.path().join("missing"));
         assert!(store.load_all().is_empty());
     }
 
     #[test]
     fn save_then_load_all_round_trips_the_review() {
-        let store = ReviewStore::new(temp_dir("round-trip"));
+        let root = fixture_root();
+        let store = ReviewStore::new(root.path().join("reviews"));
         let review = sample_review();
 
         store.save(&review).expect("save review");
@@ -276,7 +276,8 @@ mod tests {
 
     #[test]
     fn corrupt_review_file_surfaces_as_a_load_error_without_dropping_others() {
-        let dir = temp_dir("corrupt");
+        let root = fixture_root();
+        let dir = root.path().join("reviews");
         let store = ReviewStore::new(&dir);
         let review = sample_review();
         store.save(&review).expect("save good review");
@@ -296,7 +297,8 @@ mod tests {
     fn saved_review_file_is_owner_private() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let store = ReviewStore::new(temp_dir("perms"));
+        let root = fixture_root();
+        let store = ReviewStore::new(root.path().join("reviews"));
         let review = sample_review();
         store.save(&review).expect("save review");
 

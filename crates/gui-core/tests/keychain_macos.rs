@@ -12,7 +12,7 @@
 //! runtime skip.
 //!
 //! One test walks the states in order because they share process-global
-//! keychain state: not found, success, keychain gone, then locked.
+//! keychain state: not found, success, then locked.
 //!
 //! The locked case goes last and runs through the production bounded path
 //! (the store lookup under a short caller timeout). Depending on the session it
@@ -23,6 +23,12 @@
 //! refuses further lookups until restart, and the test ends there. The
 //! interactive prompt itself is not driven; the permit and timeout behavior is
 //! covered by the injected-closure tests in `credential_store`.
+//!
+//! A deleted keychain is not exercised: the Security framework keeps serving an
+//! already-opened database after `security delete-keychain`, so the state is
+//! not observable from a running process. The `Unavailable` mapping for
+//! `errSecNoSuchKeychain` is covered by the unit tests over keyring's
+//! `decode_error`.
 #![forbid(unsafe_code)]
 
 // Rust guideline compliant 2026-10-01
@@ -206,7 +212,7 @@ mod real_keychain {
     }
 
     #[test]
-    fn real_keychain_reports_missing_success_gone_and_bounded_locked() {
+    fn real_keychain_reports_missing_success_and_bounded_locked() {
         let Some(keychain) = throwaway_keychain() else {
             return;
         };
@@ -239,20 +245,7 @@ mod real_keychain {
             "read value differs from stored value"
         );
 
-        // Gone: with the keychain file deleted the store is unavailable.
-        let delete = security(&["delete-keychain", keychain_arg]);
-        assert!(delete.status.success(), "security delete-keychain failed");
-        let gone = run_lookup(&runtime, &source, key).expect_err("keychain deleted");
-        assert_eq!(gone.kind(), TokenErrorKind::Unavailable, "{gone}");
-
-        // Locked, last: recreate the throwaway keychain, make it the default
-        // again, and lock it. The password is as throwaway as the keychain.
-        let password = format!("pw-{nonce}");
-        let create = security(&["create-keychain", "-p", &password, keychain_arg]);
-        assert!(create.status.success(), "security create-keychain failed");
-        let select = security(&["default-keychain", "-d", "user", "-s", keychain_arg]);
-        assert!(select.status.success(), "security default-keychain failed");
-        require_default_keychain(&keychain);
+        // Locked, last: lock the keychain that still exists.
         let lock = security(&["lock-keychain", keychain_arg]);
         assert!(lock.status.success(), "security lock-keychain failed");
 
