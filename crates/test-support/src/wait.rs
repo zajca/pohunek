@@ -17,8 +17,9 @@
 //! - [`guard`] bounds an arbitrary future, such as a channel receive or a
 //!   `Notify::notified` wait, that is already its own readiness signal.
 //!
-//! Under `tokio::time::pause` the ceiling and the poll interval are virtual:
-//! the async helpers then fail as soon as the runtime is idle for that long.
+//! Under `tokio::time::pause` the ceiling, the poll interval and the elapsed
+//! time the async helpers measure are virtual: they then fail as soon as the
+//! runtime is idle for that long.
 //! Use paused time only in tests whose awaited signals are timers or in-memory
 //! channels, never real sockets or child processes.
 //!
@@ -118,8 +119,9 @@ fn poll_until_within<T>(
 ///
 /// # Panics
 ///
-/// Panics, naming `what`, when `probe` has not yielded a value after
-/// [`HANG_GUARD`].
+/// Panics, naming `what` and the elapsed time, when [`HANG_GUARD`] has elapsed
+/// before `probe` yields a value, including when a single poll blocks past the
+/// ceiling and then returns a value.
 ///
 /// # Examples
 ///
@@ -167,7 +169,9 @@ where
 ///
 /// # Panics
 ///
-/// Panics, naming `what`, when `future` has not completed after [`HANG_GUARD`].
+/// Panics, naming `what` and the elapsed time, when [`HANG_GUARD`] has elapsed
+/// before `future` completes, including when a single poll blocks past the
+/// ceiling and then completes.
 ///
 /// # Examples
 ///
@@ -185,10 +189,18 @@ pub async fn guard<F: Future>(what: &str, future: F) -> F::Output {
 }
 
 /// [`guard`] with an explicit ceiling.
+///
+/// `tokio::time::timeout` polls the future before it checks the timer, so a
+/// poll that blocks past the ceiling and then completes would be accepted; the
+/// elapsed time is therefore checked again after completion.
 async fn guard_within<F: Future>(ceiling: Duration, what: &str, future: F) -> F::Output {
-    tokio::time::timeout(ceiling, future)
-        .await
-        .unwrap_or_else(|_elapsed| panic!("hang guard of {ceiling:?} elapsed waiting for {what}"))
+    let start = tokio::time::Instant::now();
+    let outcome = tokio::time::timeout(ceiling, future).await;
+    let elapsed = start.elapsed();
+    match outcome {
+        Ok(output) if elapsed < ceiling => output,
+        _ => panic!("hang guard of {ceiling:?} elapsed after {elapsed:?} waiting for {what}"),
+    }
 }
 
 #[cfg(test)]
@@ -340,8 +352,27 @@ mod tests {
         assert_eq!(value, 9);
     }
 
+    #[tokio::test]
+    #[should_panic(expected = "hang guard of 30ms elapsed after")]
+    async fn guard_rejects_a_future_whose_single_poll_blocks_past_the_ceiling() {
+        guard_within(TINY_CEILING, "a blocking future", async {
+            std::thread::sleep(TINY_CEILING * 2);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "waiting for a blocking probe")]
+    async fn wait_until_rejects_a_probe_whose_single_poll_blocks_past_the_ceiling() {
+        wait_until_within(TINY_CEILING, TINY_INTERVAL, "a blocking probe", || async {
+            std::thread::sleep(TINY_CEILING * 2);
+            Some(())
+        })
+        .await;
+    }
+
     #[tokio::test(start_paused = true)]
-    #[should_panic(expected = "hang guard of 10s elapsed waiting for the stuck reply")]
+    #[should_panic(expected = "hang guard of 10s elapsed after 10s waiting for the stuck reply")]
     async fn guard_panic_names_the_awaited_future_and_ceiling() {
         guard_within(
             VIRTUAL_CEILING,
