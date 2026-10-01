@@ -2447,7 +2447,7 @@ fn lines(path: &Path) -> Vec<String> {
 }
 
 /// The release target of the fixture archive. Every fixture simulates a Linux
-/// x86_64 host (see `Fixture::fake_host`), whatever machine runs the tests, so
+/// `x86_64` host (see `Fixture::fake_host`), whatever machine runs the tests, so
 /// the Linux-only legacy migration paths behave the same everywhere.
 const FIXTURE_TARGET: &str = "x86_64-unknown-linux-gnu";
 
