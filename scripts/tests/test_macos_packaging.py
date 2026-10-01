@@ -189,6 +189,18 @@ class AuditTest(unittest.TestCase):
         self.assertIn("4 problem(s)", result.stderr)
         self.assertNotIn("ok ", result.stdout)
 
+    def test_a_required_program_must_itself_be_a_macho_file(self):
+        self.binary("pohunek")
+        (self.tree / "pohunekd").write_text("#!/bin/sh\n")
+        result = self.audit("--require", "pohunek", "--require", "pohunekd", self.tree)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("pohunekd: the required program is missing or not a Mach-O file", result.stderr)
+        self.assertNotIn("pohunek: the required", result.stderr.replace("pohunekd", ""))
+        ok = self.audit("--require", "pohunek", self.tree)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(self.audit("--require", "absent", self.tree).returncode, 1)
+        self.assertEqual(self.audit("--require", "pohunek", self.tree / "pohunek").returncode, 2)
+
     def test_bad_arguments_are_refused(self):
         for args in (["--minimum-os"], ["--forbid-string", ""], ["--minimum-os", "x", "."], ["--nope"], []):
             self.assertEqual(self.audit(*args).returncode, 2, args)

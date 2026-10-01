@@ -2,7 +2,7 @@
 # Audit the Mach-O files below the given paths for a native Apple Silicon
 # release.
 #
-# usage: audit-macho [--minimum-os X.Y] [--forbid-string TEXT]... <path>...
+# usage: audit-macho [--minimum-os X.Y] [--forbid-string TEXT]... [--require REL]... <path>...
 #
 # Every Mach-O file found (a file argument, or any regular file below a
 # directory argument) must be
@@ -14,7 +14,10 @@
 #   - free of build-machine paths: the strings below, plus every
 #     --forbid-string, must not occur in the file.
 # Anything that is not Mach-O is ignored. The audit fails when no Mach-O file
-# is found at all, so a mistyped path cannot pass. It needs `otool`, `lipo`,
+# is found at all, so a mistyped path cannot pass. Each `--require REL` names a
+# file, relative to the single directory argument, that must itself be a Mach-O
+# file: a required program that is a script, a Linux binary, or missing fails
+# even though the rest of the tree is fine. It needs `otool`, `lipo`,
 # and `strings` from the Xcode command line tools.
 
 set -eu
@@ -36,6 +39,7 @@ fail() {
 
 minimum_os=$(tr -d ' \n' < "$script_dir/DEPLOYMENT_TARGET")
 forbidden=$DEFAULT_FORBIDDEN_STRINGS
+required=
 paths=
 
 while [ "$#" -gt 0 ]; do
@@ -49,6 +53,12 @@ while [ "$#" -gt 0 ]; do
             [ "$#" -ge 2 ] || fail "--forbid-string needs a value"
             [ -n "$2" ] || fail "--forbid-string needs a non-empty value"
             forbidden="$forbidden
+$2"
+            shift 2
+            ;;
+        --require)
+            [ "$#" -ge 2 ] || fail "--require needs a value"
+            required="$required
 $2"
             shift 2
             ;;
@@ -113,6 +123,7 @@ audit_file() {
     esac
     checked=$((checked + 1))
     failures_before=$failures
+    printf '%s\n' "$file" >> "$scratch/audited"
 
     archs=$(lipo -archs "$file" 2>&1) || {
         problem "$file" "lipo cannot read it: $archs"
@@ -174,6 +185,7 @@ audit_file() {
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/audit-macho.XXXXXX")
 trap 'rm -rf -- "$scratch"' EXIT
 
+: > "$scratch/audited"
 for path in "$@"; do
     if [ -d "$path" ]; then
         find "$path" -type f -print | LC_ALL=C sort > "$scratch/files"
@@ -187,6 +199,19 @@ for path in "$@"; do
     fi
 done
 
+if [ -n "$required" ]; then
+    [ "$#" -eq 1 ] && [ -d "$1" ] || fail "--require needs exactly one directory argument"
+    printf '%s\n' "$required" | while IFS= read -r relative; do
+        [ -n "$relative" ] || continue
+        if ! grep -qxF -- "$1/$relative" "$scratch/audited"; then
+            printf 'FAIL %s: the required program is missing or not a Mach-O file\n' "$1/$relative" >&2
+        fi
+    done > "$scratch/required-failures" 2>&1 || true
+    if [ -s "$scratch/required-failures" ]; then
+        cat "$scratch/required-failures" >&2
+        failures=$((failures + $(wc -l < "$scratch/required-failures")))
+    fi
+fi
 if [ "$checked" -eq 0 ]; then
     printf 'audit-macho: no Mach-O file found below the given paths\n' >&2
     exit 1

@@ -3,7 +3,7 @@
 #
 # usage: package --development <component> <version> <bindir> <docs-dir> <output-dir>
 #
-# <component> is cli, daemon, or gui. The staged tree is audited
+# <component> is cli or daemon. The staged tree is audited
 # (`audit-macho`), sealed with a MANIFEST, and archived reproducibly; the
 # archive path is printed on stdout.
 #
@@ -29,6 +29,11 @@ version=$3
 bindir=$4
 docs=$5
 output=$6
+case $component in
+    cli) require="--require pohunek" ;;
+    daemon) require="--require pohunek --require pohunekd --require pohunek-sessiond" ;;
+    *) fail "unsupported component: $component" ;;
+esac
 [ "$mode" = --development ] || fail "unsupported mode: $mode (only --development is available)"
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
@@ -54,7 +59,8 @@ mv -- "$output/$name" "$output/$name$suffix"
 name=$name$suffix
 staging=$output/$name
 
-"$script_dir/audit-macho" --forbid-string "$root" "$staging" >&2
+# shellcheck disable=SC2086
+"$script_dir/audit-macho" $require --forbid-string "$root" "$staging" >&2
 sh "$root/packaging/write-manifest" "$staging" "$component" "$version" "$target" \
     unsigned-development "$minimum_macos"
 sh "$root/packaging/archive" "$output" "$name" "$output"

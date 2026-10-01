@@ -361,7 +361,7 @@ wait_live "$session_two"
 snapshot() {
   status_json "$work/ev/snap-status.json"
   iso_env "$installed_cli" session list --json >"$work/ev/snap-list.json"
-  "$python_bin" - "$work/ev/snap-status.json" "$work/ev/snap-list.json" "$session_one" "$session_two" <<'PY' >"$work/ev/snap-pids.txt" || die "cannot read the installation's processes"
+  "$python_bin" - "$work/ev/snap-status.json" "$work/ev/snap-list.json" $snapshot_sessions <<'PY' >"$work/ev/snap-pids.txt" || die "cannot read the installation's processes"
 import json, sys
 status = json.load(open(sys.argv[1]))["ok"]
 sessions = {entry["id"]: entry for entry in json.load(open(sys.argv[2]))["ok"]}
@@ -388,6 +388,7 @@ PY
     printf '%s %s %s %s | %s | %s\n' "$kind" "$first" "$second" "$third" "$started" "$tty"
   done <"$work/ev/snap-pids.txt"
 }
+snapshot_sessions="$session_one $session_two"
 snapshot >"$work/ev/before.txt" || die "cannot snapshot the installation"
 cat "$work/ev/before.txt"
 [ "$(grep -c '^worker ' "$work/ev/before.txt")" -eq 2 ] || die "expected two workers"
@@ -455,6 +456,10 @@ cat "$work/ev/after.txt"
 session_three=$(new_session three)
 [ -n "$session_three" ] || die "no session could be created after the upgrade"
 wait_live "$session_three"
+# From here on every snapshot covers all three sessions; this one is the
+# baseline of the web and uninstall checks.
+snapshot_sessions="$session_one $session_two $session_three"
+snapshot >"$work/ev/baseline.txt" || die "cannot snapshot after the upgrade"
 status_json "$work/ev/status-b2.json"
 new_worker_version=$("$python_bin" - "$work/ev/status-b2.json" "$session_three" <<'PY'
 import json, sys
@@ -474,9 +479,8 @@ fi
 grep -q "$session_one" "$work/ev/uninstall-refused.out" "$work/ev/uninstall-refused.err" ||
   die "the refusal does not name the live session $session_one"
 snapshot >"$work/ev/refused-uninstall.txt" || die "uninstall changed the installation"
-grep -v '^daemon ' "$work/ev/refused-uninstall.txt" >"$work/ev/refused-uninstall.nodaemon.txt"
-cmp -s "$work/ev/before.nodaemon.txt" "$work/ev/refused-uninstall.nodaemon.txt" ||
-  die "the refused uninstall touched a worker or session child"
+cmp -s "$work/ev/baseline.txt" "$work/ev/refused-uninstall.txt" ||
+  die "the refused uninstall changed the daemon, a worker, or a session child; diff $work/ev/baseline.txt $work/ev/refused-uninstall.txt"
 [ -f "$home/.config/pohunek/service.toml" ] || die "the refused uninstall removed service.toml"
 [ -d "$prefix/libexec/pohunek/$version_a" ] || die "the refused uninstall removed version $version_a"
 
