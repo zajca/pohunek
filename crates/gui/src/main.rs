@@ -4,17 +4,24 @@
 #![forbid(unsafe_code)]
 
 mod attach;
+mod bin_resolver;
 mod command;
 mod config;
 mod keyboard;
 mod message;
+mod notify;
 mod runtime;
 mod selection;
+mod terminal;
+#[cfg(test)]
+mod test_support;
 mod view;
 
+#[cfg(target_os = "linux")]
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Instant;
 
 use iced::widget::text_editor;
@@ -26,7 +33,7 @@ use pohunek_gui_core::{
 use protocol::{NotificationId, SessionId};
 use thiserror::Error;
 
-use attach::window_dimension_to_f32;
+use attach::{window_dimension_to_f32, AttachPlan};
 use command::{discover_hosts_task, update};
 use config::AppConfig;
 use message::{
@@ -35,11 +42,15 @@ use message::{
 };
 use view::view;
 
+// The Wayland-only startup contract applies to Linux; macOS uses the native
+// window backend and has no display-server environment to validate.
 // Wayland clients discover their compositor through this standard variable.
+#[cfg(target_os = "linux")]
 const WAYLAND_DISPLAY_ENV: &str = "WAYLAND_DISPLAY";
 
 // X11 clients use this standard variable; seeing it without Wayland gives a
 // clearer error than letting the window backend fail later.
+#[cfg(target_os = "linux")]
 const X11_DISPLAY_ENV: &str = "DISPLAY";
 
 fn main() -> ExitCode {
@@ -53,6 +64,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), StartupError> {
+    #[cfg(target_os = "linux")]
     validate_wayland_environment()?;
     let boot = BootState::load();
     let initial_window_size = boot.ui_state.window_size;
@@ -69,18 +81,21 @@ fn run() -> Result<(), StartupError> {
 
 #[derive(Debug, Error)]
 enum StartupError {
+    #[cfg(target_os = "linux")]
     #[error(transparent)]
     Display(#[from] DisplayServerError),
     #[error(transparent)]
     Iced(#[from] iced::Error),
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisplayServerError {
     MissingWayland,
     X11WithoutWayland,
 }
 
+#[cfg(target_os = "linux")]
 impl std::fmt::Display for DisplayServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -96,14 +111,17 @@ impl std::fmt::Display for DisplayServerError {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl std::error::Error for DisplayServerError {}
 
+#[cfg(target_os = "linux")]
 fn validate_wayland_environment() -> Result<(), DisplayServerError> {
     let wayland_display = std::env::var_os(WAYLAND_DISPLAY_ENV);
     let x11_display = std::env::var_os(X11_DISPLAY_ENV);
     validate_wayland_display(wayland_display.as_deref(), x11_display.as_deref())
 }
 
+#[cfg(target_os = "linux")]
 fn validate_wayland_display(
     wayland_display: Option<&OsStr>,
     x11_display: Option<&OsStr>,
@@ -117,6 +135,7 @@ fn validate_wayland_display(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn has_display_value(value: Option<&OsStr>) -> bool {
     value.is_some_and(|value| !value.is_empty())
 }
@@ -195,6 +214,8 @@ struct PohunekApp {
     state_dir: Option<PathBuf>,
     status: Option<String>,
     notified_intents: usize,
+    /// Last notification backend state, so failures reach the status line once.
+    notification_health: notify::NotificationHealth,
 }
 
 impl PohunekApp {
@@ -236,30 +257,33 @@ impl PohunekApp {
                 state_dir: boot.state_dir,
                 status: boot.status,
                 notified_intents: 0,
+                notification_health: notify::NotificationHealth::default(),
             },
             task,
         )
     }
 
-    pub(crate) fn attach_values(
+    pub(crate) fn attach_plan(
         &self,
         host_id: &HostId,
         session_id: &SessionId,
-    ) -> Result<(String, AttachTemplateValues), String> {
+    ) -> Result<AttachPlan, String> {
         let config = self.config.as_ref().map_err(Clone::clone)?;
         let host = self
             .hosts
             .iter()
             .find(|host| &host.id == host_id)
             .ok_or_else(|| format!("unknown host `{host_id}`"))?;
-        Ok((
-            config.attach_command.clone(),
-            AttachTemplateValues {
+        Ok(AttachPlan {
+            selection: config.attach.clone(),
+            resolver: Arc::clone(&config.bin_resolver),
+            launch: config.launch,
+            values: AttachTemplateValues {
                 bin: config.pohunek_bin.clone(),
                 host: host.attach_host(),
                 id: session_id.0.clone(),
             },
-        ))
+        })
     }
 
     /// A minimal app for view/state unit tests: no config, no hosts, and all
@@ -292,6 +316,7 @@ impl PohunekApp {
             state_dir: None,
             status: None,
             notified_intents: 0,
+            notification_health: notify::NotificationHealth::default(),
         }
     }
 }
@@ -450,6 +475,7 @@ mod tests {
             state_dir: None,
             status: None,
             notified_intents: 0,
+            notification_health: notify::NotificationHealth::default(),
         };
         app.workspace.hosts.insert(host_id.clone(), host);
         app.ui_state.selection = Some(Selection::Project {
@@ -537,6 +563,7 @@ mod tests {
             state_dir: None,
             status: None,
             notified_intents: 0,
+            notification_health: notify::NotificationHealth::default(),
         };
         app.workspace.hosts.insert(host_id.clone(), host);
         app.hosts.push(HostConfig::local(
@@ -620,12 +647,14 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn wayland_guard_accepts_nonempty_wayland_display() {
         validate_wayland_display(Some(std::ffi::OsStr::new("wayland-1")), None)
             .expect("wayland display");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn wayland_guard_rejects_missing_wayland_display() {
         let err = validate_wayland_display(None, None).expect_err("missing wayland display");
@@ -634,6 +663,7 @@ mod tests {
         assert!(err.to_string().contains("Wayland-only"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn wayland_guard_rejects_empty_wayland_display_with_x11_hint() {
         let err = validate_wayland_display(

@@ -35,15 +35,26 @@ The Linux v1 GUI is Wayland-only. If `WAYLAND_DISPLAY` is missing or empty,
 `pohunek-gui` exits before starting Iced. An X11-only `DISPLAY` is not a
 supported fallback.
 
+On macOS the GUI starts with the native window backend and checks no display
+server variable. It reads `~/.config/pohunek/gui.toml` (not `~/Library`) unless
+`XDG_CONFIG_HOME` is set, which also holds for a Finder or launchd start because
+those set `HOME`. A missing or invalid `gui.toml` never crashes the app: the
+typed error is shown in the status line and the workspace stays empty.
+
 ## Configuration
 
 The GUI reads `$XDG_CONFIG_HOME/pohunek/gui.toml`, or
 `~/.config/pohunek/gui.toml` when `XDG_CONFIG_HOME` is unset.
 
+Set exactly one of `attach_command` or `attach_terminal`; setting both, or
+neither, is a startup configuration error shown in the UI.
+
 ```toml
 pohunek_bin = "/path/to/pohunek"
 attach_command = "$TERMINAL -e sh -c 'exec \"$@\"' sh {bin} attach --host {host} {id}"
-notification_command = "notify-send"
+attach_command_mode = "shell"   # optional: "shell" (default) or "argv"
+# attach_terminal = "terminal-app"   # macOS only, instead of attach_command
+notification_command = "notify-send"   # optional; see Notifications
 
 [gui]
 connect_timeout_ms = 2000
@@ -53,10 +64,122 @@ backoff_initial_ms = 1000
 backoff_max_ms = 30000
 terminal_cols = 80
 terminal_rows = 24
+open_timeout_ms = 5000                 # attach_terminal: wait for `open`
+login_shell_timeout_ms = 10000         # macOS: bare pohunek_bin discovery
+login_shell_max_output_bytes = 65536   # macOS: bare pohunek_bin discovery
+notification_timeout_ms = 5000         # per-notification backend deadline
+attach_observe_ms = 1000               # template launch: report a quick failed exit
+attach_script_max_age_secs = 3600      # attach_terminal: sweep never-run scripts
 ```
 
-Use an absolute `pohunek_bin` when a desktop launcher may have a different
-`PATH`. `attach_command` supports exactly `{bin}`, `{host}`, and `{id}`.
+### `pohunek_bin` resolution
+
+An absolute `pohunek_bin` is used as is and must be an executable file. A bare
+name such as `pohunek` is looked up per attach, off the UI thread, in a search
+path built from tiers, first match wins, duplicates dropped. The GUI's own
+inherited `PATH` always comes first, sanitized by the same rules as the other
+tiers (absolute, existing, trusted directories; relative and empty entries are
+skipped; a refused directory is named with its reason when a lookup misses), so a
+GUI started from a shell finds what that shell finds. On macOS it is followed by
+one bounded non-interactive login-shell probe (Finder and launchd start apps
+with only the system directories on `PATH`) that receives `HOME`, `USER`,
+`LOGNAME`, `SHELL` (`/bin/zsh` when unset), and, when set, `ZDOTDIR` and
+`XDG_CONFIG_HOME`, so a profile that branches on them or lives in a custom
+location is read (an unusable value of one of them skips the probe and the
+status line names it), and then by the fixed fallback directories (`~/.local/bin`,
+`~/.cargo/bin`, Homebrew, `/usr/local`); elsewhere the fallback directories
+apply only when the inherited `PATH` yields nothing. The policy is the shared
+[environment-resolution](environment-resolution.md) one.
+The resolved search path is cached; a miss discards it once and discovers again,
+so a `pohunek` installed after the GUI started is found without a restart. An
+unresolvable name is an attach error in the status line, never a guessed
+default. When the lookup misses, the status line also names why the search
+path is what it is (a failed or timed-out login-shell probe, an unusable
+inherited `PATH`). `{bin}` in a template is always the resolved absolute path.
+The same resolver and cached search path serve the launcher program of an argv
+template and the notification command, so a Finder launch finds `kitty`,
+`alacritty`, `wezterm`, or `notify-send` in Homebrew or `~/.local/bin` without a
+login shell per use.
+
+### Attach launch modes
+
+- **`attach_command`, `attach_command_mode = "shell"` (default).** The template
+  is rendered with shell-escaped `{bin}`, `{host}`, `{id}` values and run
+  through `/bin/sh -c` (an absolute path, never a `PATH` lookup). Values cannot
+  change the command structure, but the surrounding template is shell text, and
+  a bare command inside it is found through the shell's own `PATH`, which a
+  Finder launch keeps minimal; prefer argv mode on macOS.
+- **`attach_command`, `attach_command_mode = "argv"` (preferred for new
+  configurations).** The template is split into words with POSIX quoting rules
+  and executed without a shell; `$VAR`, `~`, globs, and command substitution stay
+  literal, and each placeholder value stays one argument. A bare program word
+  such as `kitty` is resolved through the environment policy (see above), so it
+  works from a Finder launch; a word containing `/` must be absolute. Use it for
+  terminals that take a command as arguments.
+- **`attach_terminal = "terminal-app"` (macOS).** The GUI writes a private
+  self-deleting `.command` script and runs `open -a Terminal <script>` with an
+  argument array. The script lives in an owner-only (`0700`) directory below the
+  pohunek runtime directory, is created exclusively under an unpredictable name,
+  removes itself first, then `exec`s `<resolved pohunek_bin> [--host=<host>]
+  attach -- <id>` with every value single-quoted. No AppleScript is built, so no
+  Automation permission prompt appears. Terminal runs the script in its own
+  environment, so the script first exports an allowlist of the GUI's endpoint
+  and configuration roots: `XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`,
+  `XDG_DATA_HOME`, `XDG_STATE_HOME`, and `XDG_CACHE_HOME`, each only when set in
+  the GUI process to an absolute value (a relative value is ignored, as the XDG
+  specification says; an absolute value is forwarded byte for byte, UTF-8 or
+  not), single-quoted like the arguments. Nothing else of the
+  GUI's environment is forwarded, and the script first `unset`s all five names, so
+  a value from Terminal's own login environment can never replace the GUI's (a
+  name the GUI does not set stays unset). The CLI therefore reaches the same
+  daemon socket as the GUI. `HOME` is forwarded too when the GUI has an absolute
+  one (the CLI derives every root without an XDG variable from it, and Terminal's
+  login environment may carry another); unlike the XDG names it is never unset, so
+  a GUI without a usable `HOME` leaves Terminal's own `HOME` in place. The script
+  removes itself with `/bin/rm` and otherwise uses only shell builtins and the
+  absolute program path, so it does not depend on Terminal's `PATH`. `open` gets `open_timeout_ms` to accept
+  the request; a failure or timeout is an attach error (carrying the first line
+  of `open`'s error output) and removes the script. A script Terminal never ran
+  stays on disk until the next terminal launch, which removes owner-private
+  `attach-*.command` files older than `attach_script_max_age_secs` through
+  no-symlink-following filesystem operations; a file it cannot remove is a
+  warning in the status line and never fails the launch.
+  On any other operating system `attach_terminal` is a configuration error.
+
+Every attach process starts in its own process group with null stdio and is
+reaped by a helper thread. A template launch that exits non-zero, or by a
+signal, within `attach_observe_ms` (a dead template, a missing terminal) is
+reported in the status line instead of "attach command spawned"; a terminal that
+keeps running past the window counts as started, and the reaper keeps waiting
+for it. Closing the GUI never stops or kills attached terminals or supervised
+sessions: the GUI sends no stop or kill on exit.
+
+### Third-party terminals on macOS or Linux (argv mode)
+
+These are documented forms of each terminal's command-line syntax, not exercised
+in CI (CI covers the argv rendering, the launcher resolution, and the
+`open`-based Terminal path with stand-in executables); verify them on your
+machine. The launcher program is resolved through the environment policy, so a
+Finder launch does not need it on the GUI's own `PATH`.
+
+```toml
+# kitty
+attach_command_mode = "argv"
+attach_command = "kitty -e {bin} --host={host} attach -- {id}"
+# Alacritty
+attach_command = "alacritty -e {bin} --host={host} attach -- {id}"
+# WezTerm
+attach_command = "wezterm start -- {bin} --host={host} attach -- {id}"
+```
+
+For the local host `{host}` is empty, and an empty `--host=` selects the local
+daemon.
+
+`pohunek_bin`, `attach_command`, and `notification_command` must not be blank or
+contain a NUL byte; that fails at load with an error naming the field.
+
+Use an absolute `pohunek_bin` when you want no lookup at all. `attach_command`
+supports exactly `{bin}`, `{host}`, and `{id}`.
 For a discovered remote host, `{host}` is a provider-qualified
 `<overlay>:<canonical-identity>@<discovered-port>` route. The identity is a
 slash-safe, unpadded base64url `peer~` selector, or an `fqdn~` fallback when the
@@ -66,8 +189,45 @@ discovered port instead of its own registry environment. GUI reconnects use the
 same process and never retain the discovered IP as identity.
 The exact resolved socket endpoint lives only inside one SDK client so its raw
 attach remains on the same route as its control connection.
-`notification_command` defaults to `notify-send` and receives title and body as
-separate arguments.
+
+### Notifications
+
+- **Linux default:** `notify-send`. An explicit `notification_command` (any
+  platform) replaces the default and receives the title and body as two
+  positional arguments. When the command's file name is `notify-send`, `--`
+  precedes them so daemon-supplied text cannot be read as an option.
+- **macOS default:** `/usr/bin/osascript` running
+  `-e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' -e 'end run' -- <title> <body>`.
+  Title and body are only argv items after `--`, never script text, so quotes,
+  `$()`, newlines, Unicode, and a leading `-` are inert.
+- A command that is not an absolute path is resolved once, on the first
+  notification, with the same environment policy as `pohunek_bin`. A completed
+  lookup is kept for the session and shared by concurrent notifications: a found
+  path, or a real not-found or untrusted verdict (restart the GUI after
+  installing the command). A lookup still running when
+  `notification_timeout_ms` passes is not a verdict: that notification is
+  unavailable, the lookup finishes in the background, and the next notification
+  uses or awaits its result. A command that cannot be resolved is reported as
+  unavailable, not treated as working.
+- Each notification gets `[gui] notification_timeout_ms` (default 5000, zero is
+  rejected); a backend that does not exit by then is killed and reaped. It runs
+  in its own process group. At the deadline the whole group is killed while the
+  leader is still unreaped, so a wrapper's background children die with it. After
+  a normal exit nothing is signalled: a child the wrapper backgrounded and left
+  running survives, because the group id of an already reaped leader can belong
+  to an unrelated group by then. A descendant that starts its own session or
+  group escapes the deadline kill.
+- The status line shows a message when the failure reason changes (unresolvable
+  command, spawn failure, timeout, non-zero exit or signal) and one when it
+  recovers; an identical repeated failure stays silent, but a different reason,
+  such as a definitive not-found after an earlier timeout, replaces the old text.
+
+What cannot be confirmed: `osascript` exits 0 whether the notification was shown
+or suppressed by System Settings (Notifications, Focus), and an unbundled binary
+cannot ask `UNUserNotificationCenter` for its authorization. "Submitted" means
+the backend accepted the request, not that it was displayed, and the GUI cannot
+detect that a user denied notifications. Denial detection needs the app bundle
+(issue #104).
 
 Provider-specific GUI configuration and `open_url_command` are no longer read.
 Unknown legacy TOML fields are ignored by Serde, but they should be removed from
@@ -146,8 +306,12 @@ Default global bindings:
 
 Modal bindings include `escape`, `enter`, `shift+enter`, `o`, and `j`/`k` or
 the arrow keys for Activity navigation. Launch forms reserve Enter for select
-confirmation and use Ctrl+Enter for submission. Add a partial `[keybindings]`
-table to override supported names. Unknown removed binding names fail
+confirmation and use Ctrl+Enter for submission; on macOS Command+Enter submits
+as well, and Ctrl+Enter keeps working. The submit chords are fixed, not part of
+the `[keybindings]` table. Add a partial `[keybindings]` table to override
+supported names; chord modifiers are `ctrl`/`control`, `alt`/`option`/`opt`,
+`shift`, and `logo`/`super`/`meta`/`cmd`/`command` (all Command/Super map to one
+modifier), and a global binding such as `cmd+i` is valid. Unknown removed binding names fail
 configuration validation instead of silently doing nothing.
 
 Tab and Shift+Tab are conventional, non-configurable form navigation in the
@@ -155,7 +319,53 @@ Start session and Assistant modals. Focus cycles through both leading select
 fields, the prompt/name inputs, and visible Advanced branch fields, never into
 controls behind the modal overlay. On a focused select, Up or Down opens its
 options, the arrow keys move the option cursor, and Enter confirms the choice.
-Ctrl+Enter submits either launch form from any focused field.
+Ctrl+Enter (and Command+Enter on macOS) submits either launch form from any
+focused field. A Command-modified key never triggers a modal binding: Cmd+O,
+Cmd+J, or Cmd+K do not act as bare `o`, `j`, or `k`, and Cmd+Tab is not form
+navigation.
+
+### macOS input review
+
+The GUI relies on Iced for every text-entry behavior, and the shell only sees
+events no widget consumed (the `keyboard::subscription` function listens through `keyboard::listen`,
+which passes ignored events only), so:
+
+- **Clipboard and editing shortcuts:** the text inputs and the prompt editors
+  are Iced widgets, which map Cmd+C/V/X/A and Option+arrows on macOS and
+  Ctrl+... elsewhere. No GUI code reads or writes the clipboard directly.
+- **Read-only selectable text** (`read_only_binding` in
+  `crates/gui/src/view/selectable_text.rs`) keeps Copy, select, and cursor movement and drops Cut, Paste, and edits, so
+  Cmd+C copies and Cmd+V/X do nothing there.
+- **Browser opening:** there is none. The GUI contains no URL-opening code, and
+  `open_url_command` is not read, so there is nothing to port to `open(1)`.
+- Nothing else needed to change for text selection or input handling.
+
+## macOS launch verification
+
+`scripts/acceptance/macos-gui-launch` verifies, on a Mac logged in at the GUI:
+the real `pohunek-gui` starts from a Finder-like environment (`env -i`, only
+`HOME`, `USER`, `LOGNAME`, and `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, plus XDG
+variables that isolate the run) next to an isolated daemon and shell session
+and stays up for `GUI_ACCEPT_UP_S` seconds without exiting (its stderr is shown;
+only a panic or fatal error fails the check); ending it with SIGTERM leaves the daemon, session worker, and session
+child unchanged (same PIDs and start times) and the session live. It needs `GUI_ACCEPT_BIN_DIR`, a
+directory with `pohunek`, `pohunekd`, `pohunek-sessiond`, and `pohunek-gui`.
+Without a window server (a launchd session other than Aqua, such as SSH) it
+exits 2 and prints the manual steps; it never passes without starting the GUI.
+
+Not verified by the script: the attach launchers (no session-row click can be
+driven headlessly; the pohunek-gui unit tests that CI runs on macOS cover them),
+the Terminal.app window itself, and double-clicking an app icon, which need the
+`.app` bundle from issue #104. Manual procedure until then:
+
+1. Run `pohunek service install` and confirm `pohunek service status`.
+2. Write `~/.config/pohunek/gui.toml` with `pohunek_bin = "pohunek"` and
+   `attach_terminal = "terminal-app"`.
+3. Start `pohunek-gui` from Finder (with the bundle, double-click it).
+4. Confirm the window opens, the local host appears, and the status line shows
+   no configuration error.
+5. Start a session, click Open, and confirm Terminal.app opens attached to it.
+6. Quit the GUI and confirm `pohunek session list` still shows the session live.
 
 ## Session and Assistant Launch
 

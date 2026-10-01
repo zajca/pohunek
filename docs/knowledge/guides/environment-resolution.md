@@ -38,7 +38,9 @@ Highest priority first:
    null stdin, starts from an empty environment plus `HOME`, `USER`, `LOGNAME`, `SHELL` (the shell
    being probed, so a profile that branches on it behaves as in a real login), the
    profile selectors `ZDOTDIR` and `XDG_CONFIG_HOME` when set (each must be an
-   absolute UTF-8 path, or the install fails), `TERM=dumb`, and a baseline
+   absolute UTF-8 path, or the install fails; the GUI skips the probe and names
+   the cause), built by the one shared `shell_env::login_environment` for both
+   the service installer and the GUI, `TERM=dumb`, and a baseline
    `PATH`, and runs in its own process group. One
    deadline (10 s) covers the fallback-directory validation, the executable
    checks, the probe, and the validation of the printed directories; output above 64 KiB kills the probe too. The
@@ -73,7 +75,13 @@ entry after the check. A
 path-based exec cannot be made atomic with the check; the chain check removes
 the attacker's ability to change what the path names. A private 0700 directory
 below the sticky root-owned `/tmp` passes. Group-writable executables or
-directories, such as an admin-group Intel Homebrew, are out of scope.
+directories, such as an admin-group Intel Homebrew, are out of scope. A refused configured
+executable reports which check failed (`Refusal`: owner uid, mode, ACL, the
+untrusted chain directory, or the errno of the open or execute check) so a
+rejection is diagnosable. On macOS an ACL counts only when an allow entry
+grants a change right (deny entries such as `everyone deny delete` do not). An
+ACL that cannot be determined (any query error other than "no ACL") is not
+trusted: the candidate is refused with the errno.
 
 Login-shell output and the fallback table are untrusted input, so a directory
 is kept only when it is trusted: symlinks are resolved, every component of the

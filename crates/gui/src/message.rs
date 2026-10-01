@@ -247,8 +247,9 @@ pub(crate) enum Message {
     SaveNotificationPolicy(HostId),
     MoveListSelection(ListDirection),
     CoreCommandCompleted(Result<CoreEvent, String>),
-    AttachSpawned(Result<(), String>),
-    NotificationSent(Result<(), String>),
+    /// Attach outcome: an optional warning on success, or the failure text.
+    AttachSpawned(Result<Option<String>, String>),
+    NotificationSent(crate::notify::NotificationOutcome),
     WindowResized(Size),
     UiStateSaved(Result<(), String>),
     KeyPressed {

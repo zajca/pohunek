@@ -180,4 +180,23 @@ mod tests {
             "{check:?}"
         );
     }
+
+    /// The doctor accepts stock macOS tools; a failure prints the typed reason.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_doctor_accepts_stock_macos_tools() {
+        let search = std::env::join_paths(["/usr/bin", "/bin"]).unwrap();
+        for name in ["sh", "false", "zsh"] {
+            let check = crate::binary_with_path(name, true, Some(&search), "");
+            let reason = pohunek_platform::shell_env::resolve_executable(
+                OsStr::new(&format!("/bin/{name}")),
+                &pohunek_platform::shell_env::SearchPath::empty(),
+            );
+            assert_eq!(
+                check.status,
+                crate::DoctorStatus::Ok,
+                "bin:{name}: {check:?} (/bin/{name}: {reason:?})"
+            );
+        }
+    }
 }

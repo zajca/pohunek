@@ -599,7 +599,12 @@ selected host.
 pohunek_bin = "/usr/local/bin/pohunek"
 attach_command = "$TERMINAL -e sh -c 'exec \"$@\"' sh {bin} attach --host {host} {id}"
 notification_command = "notify-send"
+# attach_command_mode = "argv"        # run attach_command without a shell
+# attach_terminal = "terminal-app"    # macOS only, instead of attach_command
 ```
+
+Set exactly one of `attach_command` or `attach_terminal`; see
+[GUI setup](docs/knowledge/guides/gui.md) for details.
 
 Highlights: prioritized session groups, modal session detail, quick lifecycle
 actions, `n` for Start session, `a` for Assistant, `i` for Activity, `o` to open

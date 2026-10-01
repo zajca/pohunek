@@ -794,7 +794,7 @@ mod tests {
         let root = pohunek_test_support::tempdir().expect("temporary worker root");
         let launcher = SubprocessWorkerLauncher::new();
         let id = ServiceId::parse("s-42").expect("valid service id");
-        let definition = definition(root.path(), "/bin/true", &[]);
+        let definition = definition(root.path(), "/usr/bin/true", &[]);
 
         assert!(matches!(
             launcher.start(&id, &definition).await,
@@ -861,7 +861,7 @@ mod tests {
         let launcher = super::InProcessWorkerLauncher::new(runtime_root, state_root);
         let first = ServiceId::parse("s-42.abcd2345").expect("valid service id");
         let second = ServiceId::parse("s-42.efgh2345").expect("valid service id");
-        let definition = definition(root.path(), "/bin/true", &[]);
+        let definition = definition(root.path(), "/usr/bin/true", &[]);
 
         launcher.start(&first, &definition).await.expect("first");
         let holder = spawn_child_holding_descriptors();

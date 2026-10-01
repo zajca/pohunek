@@ -34,6 +34,27 @@ where
     async move { receiver.await.expect("tokio task completed") }
 }
 
+/// Runs blocking `work` on the runtime's blocking pool.
+///
+/// A panic inside `work` surfaces through `on_panic` instead of tearing down
+/// the caller.
+pub(crate) fn perform_blocking_or<F, T>(
+    work: F,
+    on_panic: impl FnOnce(String) -> T,
+) -> impl Future<Output = T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let handle = TOKIO.spawn_blocking(work);
+    async move {
+        match handle.await {
+            Ok(output) => output,
+            Err(err) => on_panic(format!("background task failed: {err}")),
+        }
+    }
+}
+
 pub(crate) fn host_subscription(
     input: &(HostConfig, ConnectionOptions),
 ) -> impl Stream<Item = CoreEvent> {

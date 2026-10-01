@@ -3172,6 +3172,48 @@ pub(crate) fn validate_private_acl(file: &File, path: &Path) -> FsResult<()> {
     }
 }
 
+/// ACL permission bits that let a principal change a file or its metadata:
+/// write data, delete, append, write attributes, write extended attributes,
+/// write security, and change owner.
+#[cfg(target_os = "macos")]
+const ACL_FILE_CHANGE_PERMISSIONS: u32 =
+    (1 << 2) | (1 << 4) | (1 << 5) | (1 << 8) | (1 << 10) | (1 << 12) | (1 << 13);
+
+/// Whether an ACL entry of `file` grants anyone the right to change it.
+///
+/// Deny entries (and `everyone deny delete`) never grant access, and an allow
+/// entry for reading or executing is harmless; only an allow entry carrying a
+/// change permission counts. An unknown tag is treated as granting, fail
+/// closed.
+///
+/// # Errors
+///
+/// Returns the I/O error of an ACL query that failed for a reason other than
+/// an absent ACL.
+#[cfg(target_os = "macos")]
+pub(crate) fn acl_grants_change(file: &File) -> io::Result<bool> {
+    use std::os::fd::AsFd as _;
+
+    // Only a missing ACL (`ENOENT`, read as empty by the wrapper) means none;
+    // any other error means the ACL could not be determined and fails closed.
+    let acl = calcifer_macos_acl::read_acl(file.as_fd())?;
+    Ok(acl.entries.iter().any(|entry| match entry.tag {
+        calcifer_macos_acl::TAG_DENY => false,
+        calcifer_macos_acl::TAG_ALLOW => entry.permissions & ACL_FILE_CHANGE_PERMISSIONS != 0,
+        _ => true,
+    }))
+}
+
+/// Without ACLs no entry grants anything.
+#[cfg(not(target_os = "macos"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "keeps the call site identical across supported Unix targets"
+)]
+pub(crate) fn acl_grants_change(_file: &File) -> io::Result<bool> {
+    Ok(false)
+}
+
 #[cfg(target_os = "macos")]
 fn acl_is_deny_only(acl: &calcifer_macos_acl::Acl) -> bool {
     // macOS commonly puts `everyone deny delete` on home directories. A
