@@ -9,7 +9,7 @@ use pohunek_gui_core::{
     validate_attach_argv_template, validate_attach_shell_template, AttachTemplateError,
     ConnectionOptions, HostConfig,
 };
-use pohunek_platform::shell_env::{DEFAULT_LOGIN_SHELL, LOGIN_SHELL_OUTPUT, LOGIN_SHELL_TIMEOUT};
+use pohunek_platform::shell_env::{LOGIN_SHELL_OUTPUT, LOGIN_SHELL_TIMEOUT};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -126,7 +126,6 @@ impl AppConfig {
         let login_shell = LoginShellSettings {
             timeout: launch.login_shell_timeout,
             max_output_bytes: launch.login_shell_max_output_bytes,
-            default_shell: DEFAULT_LOGIN_SHELL.into(),
         };
         let bin_resolver = Arc::new(BinResolver::for_host(&raw.pohunek_bin, login_shell));
         Ok(Self {

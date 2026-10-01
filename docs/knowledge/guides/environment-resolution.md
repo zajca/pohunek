@@ -38,7 +38,9 @@ Highest priority first:
    null stdin, starts from an empty environment plus `HOME`, `USER`, `LOGNAME`, `SHELL` (the shell
    being probed, so a profile that branches on it behaves as in a real login), the
    profile selectors `ZDOTDIR` and `XDG_CONFIG_HOME` when set (each must be an
-   absolute UTF-8 path, or the install fails), `TERM=dumb`, and a baseline
+   absolute UTF-8 path, or the install fails; the GUI skips the probe and names
+   the cause), built by the one shared `shell_env::login_environment` for both
+   the service installer and the GUI, `TERM=dumb`, and a baseline
    `PATH`, and runs in its own process group. One
    deadline (10 s) covers the fallback-directory validation, the executable
    checks, the probe, and the validation of the printed directories; output above 64 KiB kills the probe too. The

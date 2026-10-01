@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use pohunek_paths::{BasePaths, PathEnv, HOME, XDG_RUNTIME_DIR};
 use pohunek_platform::filesystem::TrustedDir;
 use pohunek_platform::shell_env::{
-    resolve_search_path, LoginShellSpec, PathPolicy, SearchPath, DARWIN_FALLBACK_DIRECTORIES,
+    login_environment, login_environment_with, resolve_search_path, LoginEnvironment,
+    LoginEnvironmentError, LoginShellSpec, PathPolicy, SearchPath, DARWIN_FALLBACK_DIRECTORIES,
     PRINTENV_EXECUTABLE,
 };
 use pohunek_platform::supervisor::{self, Namespace};
@@ -378,7 +379,7 @@ impl Context {
 
 /// Builds the managed discovery policy for a user whose login shell is `shell`.
 ///
-/// An unset `shell` selects [`settings::DEFAULT_LOGIN_SHELL`], which the report
+/// An unset `shell` selects the platform default login shell, which the report
 /// says. `environment` holds the non-secret variables the shell needs to find
 /// its startup files.
 ///
@@ -390,98 +391,55 @@ impl Context {
 /// report that names the shell must stay serializable.
 pub fn managed_path_discovery(
     shell: Option<PathBuf>,
-    mut environment: Vec<(String, String)>,
+    environment: Vec<(String, String)>,
 ) -> Result<PathDiscovery, Error> {
-    let shell_defaulted = shell.is_none();
-    let shell = match shell {
-        Some(shell) if shell.to_str().is_none() => {
-            return Err(Error::NonUtf8Env {
-                var: "SHELL",
-                path: shell,
-            });
-        }
-        Some(shell) if shell.is_absolute() => shell,
-        Some(shell) => {
-            return Err(unusable(
-                "SHELL",
-                &shell,
-                "it is not an absolute path".to_owned(),
-            ));
-        }
-        None => PathBuf::from(settings::DEFAULT_LOGIN_SHELL),
-    };
-    // The probe starts from an empty environment, so `$SHELL` is passed on:
-    // a startup profile that branches on it would otherwise skip its `PATH`
-    // setup and the probe would succeed with the baseline value.
-    environment.push((
-        "SHELL".to_owned(),
-        shell
-            .to_str()
-            .expect("the shell path was validated as UTF-8")
-            .to_owned(),
-    ));
-    Ok(PathDiscovery::Managed {
+    let login = login_environment_with(shell, environment).map_err(login_environment_error)?;
+    Ok(managed_discovery(login))
+}
+
+/// The managed policy for an already validated probe environment.
+fn managed_discovery(login: LoginEnvironment) -> PathDiscovery {
+    PathDiscovery::Managed {
         login_shell: Some(LoginShellSpec {
-            shell,
+            shell: login.shell,
             printenv: PathBuf::from(PRINTENV_EXECUTABLE),
-            environment,
+            environment: login.variables,
             timeout: settings::LOGIN_SHELL_TIMEOUT,
             max_output_bytes: settings::LOGIN_SHELL_OUTPUT,
         }),
-        shell_defaulted,
+        shell_defaulted: login.shell_defaulted,
         fallback_directories: DARWIN_FALLBACK_DIRECTORIES
             .iter()
             .map(|directory| (*directory).to_owned())
             .collect(),
-    })
+    }
 }
 
-/// Variables that name where a login shell reads its profile from.
-///
-/// `ZDOTDIR` moves zsh's startup files and `XDG_CONFIG_HOME` moves fish's and
-/// other shells'; without them a custom profile location is never read and the
-/// probe would succeed with the baseline `PATH`.
-const PROFILE_SELECTORS: [&str; 2] = ["ZDOTDIR", "XDG_CONFIG_HOME"];
+/// Maps a probe-environment failure to the service error of the same meaning.
+fn login_environment_error(error: LoginEnvironmentError) -> Error {
+    match error {
+        LoginEnvironmentError::NonUtf8 { var, value } => Error::NonUtf8Env { var, path: value },
+        LoginEnvironmentError::NotAbsolute { var, value } => {
+            unusable(var, &value, "it is not an absolute path".to_owned())
+        }
+        LoginEnvironmentError::NulByte { var } => {
+            unusable(var, Path::new(""), "it contains a NUL byte".to_owned())
+        }
+        other => unusable("login shell environment", Path::new(""), other.to_string()),
+    }
+}
 
 /// Builds the managed policy from an environment lookup.
 ///
-/// A `HOME`, `USER`, or `LOGNAME` that is set but not UTF-8 fails instead of
-/// being left out, because the shell would then read another user's startup
-/// files. A set, non-empty profile selector ([`PROFILE_SELECTORS`]) is passed to
-/// the probe and must be UTF-8 and absolute, or the install fails. `$SHELL` is
-/// validated by [`managed_path_discovery`]. The lookup is injected so the
+/// The environment, its validation, and the failures are those of
+/// [`login_environment`], which the GUI shares. The lookup is injected so the
 /// validation is type-checked and tested on every target.
 fn managed_discovery_from_env(
     lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Result<PathDiscovery, Error> {
-    let mut environment = Vec::new();
-    for name in ["HOME", "USER", "LOGNAME"] {
-        if let Some(value) = lookup(name) {
-            let text = value.into_string().map_err(|value| Error::NonUtf8Env {
-                var: name,
-                path: PathBuf::from(value),
-            })?;
-            environment.push((name.to_owned(), text));
-        }
-    }
-    for name in PROFILE_SELECTORS {
-        let Some(value) = lookup(name).filter(|value| !value.is_empty()) else {
-            continue;
-        };
-        let text = value.into_string().map_err(|value| Error::NonUtf8Env {
-            var: name,
-            path: PathBuf::from(value),
-        })?;
-        if !Path::new(&text).is_absolute() {
-            return Err(unusable(
-                name,
-                Path::new(&text),
-                "it is not an absolute path".to_owned(),
-            ));
-        }
-        environment.push((name.to_owned(), text));
-    }
-    managed_path_discovery(lookup("SHELL").map(PathBuf::from), environment)
+    login_environment(lookup)
+        .map(managed_discovery)
+        .map_err(login_environment_error)
 }
 
 /// Returns where the daemon definition goes for `paths` and `home`.

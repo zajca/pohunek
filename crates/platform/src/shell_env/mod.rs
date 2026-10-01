@@ -56,6 +56,7 @@
 // Rust guideline compliant 2026-09-30
 
 mod executable;
+mod login_environment;
 mod login_shell;
 mod policy;
 mod search_path;
@@ -66,6 +67,10 @@ mod test_support;
 pub use executable::{
     is_trusted_executable_file, resolve_executable, resolve_executable_in_path_value,
     ExecutableError, Refusal,
+};
+#[doc(inline)]
+pub use login_environment::{
+    login_environment, login_environment_with, LoginEnvironment, LoginEnvironmentError,
 };
 #[doc(inline)]
 pub use login_shell::{

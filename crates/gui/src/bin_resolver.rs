@@ -23,21 +23,17 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use pohunek_platform::shell_env::{
-    resolve_executable, resolve_search_path, ExecutableError, LoginShellSpec, PathPolicy,
-    ResolveError, SearchPath, DARWIN_FALLBACK_DIRECTORIES, PRINTENV_EXECUTABLE,
+    login_environment, resolve_executable, resolve_search_path, ExecutableError,
+    LoginEnvironmentError, LoginShellSpec, PathPolicy, ResolveError, SearchPath,
+    DARWIN_FALLBACK_DIRECTORIES, PRINTENV_EXECUTABLE,
 };
 use thiserror::Error;
-
-/// Environment variables a login shell needs to find its startup files.
-const LOGIN_SHELL_ENVIRONMENT: [&str; 3] = ["HOME", "USER", "LOGNAME"];
 
 /// Tunables of the login-shell probe.
 #[derive(Debug, Clone)]
 pub(crate) struct LoginShellSettings {
     pub(crate) timeout: Duration,
     pub(crate) max_output_bytes: usize,
-    /// Used when `$SHELL` is unset or not absolute.
-    pub(crate) default_shell: PathBuf,
 }
 
 /// Reports why a program did not resolve.
@@ -186,8 +182,19 @@ fn lookup(name: &OsStr, discovery: &Discovery) -> Result<PathBuf, BinError> {
 fn discover_host_search_path(login_shell: &LoginShellSettings) -> Result<Discovery, BinError> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     if cfg!(target_os = "macos") {
-        let spec = login_shell_spec(login_shell);
-        return discover_search_path(None, Some(&spec), home.as_deref(), None);
+        return match login_shell_spec(login_shell, |name| std::env::var_os(name)) {
+            Ok(spec) => discover_search_path(None, Some(&spec), home.as_deref(), None),
+            // An unusable `$SHELL` or profile selector cannot start the probe;
+            // the fallback directories apply and the cause is shown on a miss.
+            Err(error) => discover_search_path(
+                None,
+                None,
+                home.as_deref(),
+                Some(format!(
+                    "the login shell environment is unusable: {error}; searched the fallback directories"
+                )),
+            ),
+        };
     }
     let inherited_path = std::env::var("PATH")
         .map_err(|error| error.to_string())
@@ -206,26 +213,24 @@ fn discover_host_search_path(login_shell: &LoginShellSettings) -> Result<Discove
     discover_search_path(inherited.as_ref(), None, home.as_deref(), inherited_cause)
 }
 
-fn login_shell_spec(settings: &LoginShellSettings) -> LoginShellSpec {
-    let shell = std::env::var_os("SHELL")
-        .map(PathBuf::from)
-        .filter(|shell| shell.is_absolute())
-        .unwrap_or_else(|| settings.default_shell.clone());
-    let environment = LOGIN_SHELL_ENVIRONMENT
-        .into_iter()
-        .filter_map(|name| {
-            std::env::var(name)
-                .ok()
-                .map(|value| (name.to_owned(), value))
-        })
-        .collect();
-    LoginShellSpec {
-        shell,
+/// Builds the login-shell probe from the process environment.
+///
+/// The environment (identity variables, `ZDOTDIR`, `XDG_CONFIG_HOME`, and
+/// `$SHELL`) and its validation are the shared
+/// [`pohunek_platform::shell_env::login_environment`], the same one the service
+/// installer uses. `lookup` is injected for tests.
+fn login_shell_spec(
+    settings: &LoginShellSettings,
+    lookup: impl Fn(&str) -> Option<OsString>,
+) -> Result<LoginShellSpec, LoginEnvironmentError> {
+    let login = login_environment(lookup)?;
+    Ok(LoginShellSpec {
+        shell: login.shell,
         printenv: PathBuf::from(PRINTENV_EXECUTABLE),
-        environment,
+        environment: login.variables,
         timeout: settings.timeout,
         max_output_bytes: settings.max_output_bytes,
-    }
+    })
 }
 
 /// Resolves the policy tiers; `prior_cause` explains a tier the caller already
@@ -528,5 +533,108 @@ mod tests {
         }
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn settings() -> LoginShellSettings {
+        LoginShellSettings {
+            timeout: Duration::from_secs(10),
+            max_output_bytes: 4096,
+        }
+    }
+
+    fn lookup(pairs: Vec<(&'static str, OsString)>) -> impl Fn(&str) -> Option<OsString> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    /// Writes a fake login shell: `profile` runs first (it may set `PATH` from
+    /// the variables the probe passed), then the probe script (`$3`) runs.
+    fn fake_shell(dir: &Path, profile: &str) -> PathBuf {
+        let path = dir.join("fake-shell");
+        fs::write(
+            &path,
+            format!("#!/bin/sh\n{profile}\nexport PATH\nexec /bin/sh -c \"$3\"\n"),
+        )
+        .expect("write shell");
+        crate::test_support::make_executable(&path);
+        path
+    }
+
+    fn probe(shell: &Path, extra: Vec<(&'static str, OsString)>) -> SearchPath {
+        let mut pairs = vec![("SHELL", OsString::from(shell.as_os_str()))];
+        pairs.extend(extra);
+        let spec = login_shell_spec(&settings(), lookup(pairs)).expect("spec");
+        discover_search_path(None, Some(&spec), None, None)
+            .expect("discovery")
+            .path
+    }
+
+    #[test]
+    fn a_profile_that_branches_on_shell_reaches_the_probe() {
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
+        let prefix = dir.path().join("by-shell/bin");
+        fs::create_dir_all(&prefix).expect("prefix");
+        // The profile sets its PATH only when $SHELL names this very shell.
+        let shell = fake_shell(
+            dir.path(),
+            &format!("[ \"$SHELL\" = \"$0\" ] && PATH='{}'", prefix.display()),
+        );
+
+        // The trusted fallback directories follow the discovered ones.
+        assert_eq!(probe(&shell, vec![]).entries()[0], prefix);
+    }
+
+    #[test]
+    fn zdotdir_and_xdg_config_home_reach_the_probe() {
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
+        let zsh_prefix = dir.path().join("zdot-prefix");
+        let fish_prefix = dir.path().join("xdg-prefix");
+        fs::create_dir_all(&zsh_prefix).expect("zsh prefix");
+        fs::create_dir_all(&fish_prefix).expect("fish prefix");
+        let zdotdir = dir.path().join("zdotdir");
+        let xdg = dir.path().join("xdg");
+        fs::create_dir_all(&zdotdir).expect("zdotdir");
+        fs::create_dir_all(&xdg).expect("xdg");
+        fs::write(zdotdir.join("path"), zsh_prefix.display().to_string()).expect("zsh profile");
+        fs::write(xdg.join("path"), fish_prefix.display().to_string()).expect("xdg profile");
+        let shell = fake_shell(
+            dir.path(),
+            "[ -n \"$ZDOTDIR\" ] && PATH=\"$(/bin/cat \"$ZDOTDIR/path\")\"\n[ -n \"$XDG_CONFIG_HOME\" ] && PATH=\"$PATH:$(/bin/cat \"$XDG_CONFIG_HOME/path\")\"",
+        );
+
+        let only_zsh = probe(
+            &shell,
+            vec![("ZDOTDIR", OsString::from(zdotdir.as_os_str()))],
+        );
+        assert_eq!(only_zsh.entries()[0], zsh_prefix);
+
+        let both = probe(
+            &shell,
+            vec![
+                ("ZDOTDIR", OsString::from(zdotdir.as_os_str())),
+                ("XDG_CONFIG_HOME", OsString::from(xdg.as_os_str())),
+            ],
+        );
+        assert_eq!(both.entries()[..2], [zsh_prefix, fish_prefix]);
+    }
+
+    #[test]
+    fn an_unusable_shell_environment_is_a_typed_failure() {
+        let error = login_shell_spec(&settings(), lookup(vec![("ZDOTDIR", "relative".into())]))
+            .expect_err("relative ZDOTDIR");
+
+        assert!(
+            matches!(
+                error,
+                LoginEnvironmentError::NotAbsolute { var: "ZDOTDIR", .. }
+            ),
+            "{error:?}"
+        );
     }
 }

@@ -79,7 +79,10 @@ name such as `pohunek` is looked up per attach, off the UI thread, in a search
 path resolved by the shared environment policy
 ([environment-resolution](environment-resolution.md)): on macOS one bounded
 non-interactive login-shell probe (Finder and launchd start apps with only the
-system directories on `PATH`), elsewhere the inherited `PATH`, then the fixed
+system directories on `PATH`) that receives `HOME`, `USER`, `LOGNAME`, `SHELL`
+(`/bin/zsh` when unset), and, when set, `ZDOTDIR` and `XDG_CONFIG_HOME`, so a
+profile that branches on them or lives in a custom location is read; an unusable
+value of one of them skips the probe and the status line names it, elsewhere the inherited `PATH`, then the fixed
 fallback directories (`~/.local/bin`, `~/.cargo/bin`, Homebrew, `/usr/local`).
 The resolved search path is cached; a miss discards it once and discovers again,
 so a `pohunek` installed after the GUI started is found without a restart. An
@@ -117,8 +120,9 @@ login shell per use.
   environment, so the script first exports an allowlist of the GUI's endpoint
   and configuration roots: `XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`,
   `XDG_DATA_HOME`, `XDG_STATE_HOME`, and `XDG_CACHE_HOME`, each only when set in
-  the GUI process to an absolute UTF-8 value (a relative value is ignored, as the
-  XDG specification says), single-quoted like the arguments. Nothing else of the
+  the GUI process to an absolute value (a relative value is ignored, as the XDG
+  specification says; an absolute value is forwarded byte for byte, UTF-8 or
+  not), single-quoted like the arguments. Nothing else of the
   GUI's environment is forwarded, so the CLI reaches the same daemon socket as
   the GUI. `open` gets `open_timeout_ms` to accept
   the request; a failure or timeout is an attach error (carrying the first line
@@ -325,8 +329,8 @@ which passes ignored events only), so:
 the real `pohunek-gui` starts from a Finder-like environment (`env -i`, only
 `HOME`, `USER`, `LOGNAME`, and `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, plus XDG
 variables that isolate the run) next to an isolated daemon and shell session
-and stays up for `GUI_ACCEPT_UP_S` seconds without exiting or writing to
-stderr; ending it with SIGTERM leaves the daemon, session worker, and session
+and stays up for `GUI_ACCEPT_UP_S` seconds without exiting (its stderr is shown;
+only a panic or fatal error fails the check); ending it with SIGTERM leaves the daemon, session worker, and session
 child unchanged (same PIDs and start times) and the session live. It needs `GUI_ACCEPT_BIN_DIR`, a
 directory with `pohunek`, `pohunekd`, `pohunek-sessiond`, and `pohunek-gui`.
 Without a window server (a launchd session other than Aqua, such as SSH) it

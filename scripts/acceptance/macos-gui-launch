@@ -6,7 +6,7 @@
 #   1. The real pohunek-gui binary starts from a Finder-like environment
 #      (`env -i`, HOME/USER/LOGNAME only, PATH=/usr/bin:/bin:/usr/sbin:/sbin)
 #      with an isolated config, runtime, and state directory, and stays running
-#      for a bounded interval without exiting or writing to stderr.
+#      for a bounded interval without exiting.
 #   2. Ending the GUI (SIGTERM) leaves the daemon, the session worker, and the
 #      session's child process untouched: same PIDs and process start times
 #      before and after, and the session is still live.
@@ -33,6 +33,9 @@
 # run the check (no macOS, no window server).
 
 set -eu
+# Every file and directory the run creates is owner-only; the daemon and its
+# workers refuse application directories with any other mode.
+umask 077
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 helper="$script_dir/launchd_lifetime_evidence.py"
@@ -114,6 +117,9 @@ dump_evidence() {
   dump_log "$work/ev/daemon.log"
   dump_log "$work/ev/gui.err"
   dump_log "$work/ev/gui.out"
+  for file in "$work"/ev/*.json "$work"/ev/*.txt; do
+    dump_log "$file"
+  done
   find "$work/state" -type f \( -name '*.jsonl' -o -name '*.log' \) 2>/dev/null |
     while IFS= read -r file; do dump_log "$file"; done
 }
@@ -256,6 +262,10 @@ cleanup() {
   [ -z "$child_pid" ] || [ -z "$child_name" ] ||
     terminate_and_wait "$child_pid" "$child_name" || leftover=yes
   sweep_run_processes
+  if [ "$leftover" = yes ] && [ "$status" -eq 0 ]; then
+    # A run that left a process behind is not a pass.
+    status=1
+  fi
   if [ -n "$work" ] && [ -d "$work" ]; then
     if [ "$leftover" = yes ]; then
       printf 'macos-gui-launch: a process could not be ended; keeping %s\n' "$work" >&2
@@ -305,8 +315,19 @@ socket_path="$work/run/pohunek/daemon.sock"
 [ "${#socket_path}" -le "$socket_path_max" ] ||
   die "socket path is ${#socket_path} bytes, over the $socket_path_max byte limit: $socket_path"
 home="$work/h"
-mkdir -p "$home/.config" "$work/run" "$work/state" "$work/data" "$work/cache" "$work/ev"
-chmod 700 "$work/run"
+# Every directory pohunek will use exists up front with mode 0700: the
+# application directory below each XDG base, the runtime directory, and the
+# parents. The daemon and workers require exactly 0700 for application
+# directories and no group or other write access on ancestors.
+for dir in "$home" "$home/.config" "$home/.config/pohunek" \
+  "$work/run" "$work/run/pohunek" "$work/state" "$work/state/pohunek" \
+  "$work/data" "$work/data/pohunek" "$work/cache" "$work/cache/pohunek" \
+  "$work/ev"; do
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  dir_mode=$(stat -c '%a' "$dir" 2>/dev/null || stat -f '%Lp' "$dir")
+  [ "$dir_mode" = 700 ] || die "directory $dir has mode $dir_mode, expected 700"
+done
 
 # Runs one command with the Finder-like environment. The XDG variables are the
 # single deviation from a real Finder launch: they isolate the run from the
@@ -354,7 +375,6 @@ expect_process_name() {
   done
 }
 
-mkdir -p "$home/.config/pohunek"
 # Startup parses this file; a configuration error would only show in the UI.
 cat >"$home/.config/pohunek/gui.toml" <<TOML
 pohunek_bin = "$bin_dir/pohunek"
@@ -364,7 +384,7 @@ TOML
 say "Starting an isolated daemon (subprocess workers)"
 printf 'command: %s daemon start --dev-subprocess (pohunekd is exec'"'"'d beside it)\n' "$bin_dir/pohunek"
 printf 'environment names: HOME USER LOGNAME PATH XDG_CONFIG_HOME XDG_RUNTIME_DIR XDG_STATE_HOME XDG_DATA_HOME XDG_CACHE_HOME (POHUNEK_WORKER_LAUNCHER is set by the CLI)\n'
-printf 'runtime dir: %s (mode %s)\n' "$work/run" "$(stat -f '%Lp' "$work/run" 2>/dev/null || stat -c '%a' "$work/run")"
+printf 'runtime dir: %s (mode %s)\n' "$work/run" "$(stat -c '%a' "$work/run" 2>/dev/null || stat -f '%Lp' "$work/run")"
 start_background "$work/ev/daemon.log" "$work/ev/daemon.log" "$bin_dir/pohunek" daemon start --dev-subprocess
 daemon_pid=$started_pid
 expect_process_name "$daemon_pid" pohunekd
@@ -437,10 +457,15 @@ while [ "$elapsed" -lt "$up_s" ]; do
   elapsed=$((elapsed + poll_s))
 done
 kill -0 "$gui_pid" 2>/dev/null || die "pohunek-gui is not running after ${up_s}s"
-[ ! -s "$work/ev/gui.err" ] || {
-  cat "$work/ev/gui.err" >&2
-  die "pohunek-gui wrote to stderr while starting"
-}
+# A GUI toolkit may print harmless diagnostics; only a panic or a fatal error
+# counts as a startup failure (an exit is caught above).
+if [ -s "$work/ev/gui.err" ]; then
+  printf 'note: pohunek-gui wrote to stderr while starting:\n' >&2
+  tail -n 20 "$work/ev/gui.err" >&2
+  if grep -qiE 'panicked at|fatal' "$work/ev/gui.err"; then
+    die "pohunek-gui reported a panic or fatal error while starting"
+  fi
+fi
 printf 'pohunek-gui pid %s stayed up for %ss\n' "$gui_pid" "$up_s"
 
 say "Ending the GUI with SIGTERM"

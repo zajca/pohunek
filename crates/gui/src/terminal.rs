@@ -182,9 +182,10 @@ pub(crate) const ENDPOINT_ENVIRONMENT: [&str; 5] = [
 /// Selects the [`ENDPOINT_ENVIRONMENT`] variables that are set in the GUI
 /// process, in allowlist order.
 ///
-/// `lookup` reads one variable. A value that is not absolute UTF-8 text is
-/// skipped, as the XDG specification says to ignore a relative value; no other
-/// variable of the GUI process is ever forwarded.
+/// `lookup` reads one variable. A relative value is skipped, as the XDG
+/// specification says to ignore it; an absolute value is forwarded as the exact
+/// bytes it has, UTF-8 or not, because `pohunek_paths` accepts the same values.
+/// No other variable of the GUI process is ever forwarded.
 pub(crate) fn endpoint_environment(
     lookup: impl Fn(&str) -> Option<OsString>,
 ) -> Vec<(&'static str, OsString)> {
@@ -192,8 +193,9 @@ pub(crate) fn endpoint_environment(
         .into_iter()
         .filter_map(|name| {
             let value = lookup(name)?;
-            let text = value.to_str()?;
-            text.starts_with('/').then_some((name, value))
+            std::path::Path::new(&value)
+                .is_absolute()
+                .then_some((name, value))
         })
         .collect()
 }
@@ -873,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_environment_forwards_only_the_allowlist_of_absolute_utf8_values() {
+    fn endpoint_environment_forwards_only_the_allowlist_of_absolute_values() {
         let _watchdog = crate::test_support::watchdog();
         let host: Vec<(&str, OsString)> = vec![
             ("XDG_RUNTIME_DIR", OsString::from("/run/user/1000")),
@@ -895,6 +897,7 @@ mod tests {
             forwarded,
             vec![
                 ("XDG_RUNTIME_DIR", OsString::from("/run/user/1000")),
+                ("XDG_DATA_HOME", OsStr::from_bytes(b"/data/\xff").to_owned()),
                 ("XDG_STATE_HOME", OsString::from("/state")),
             ]
         );
@@ -997,6 +1000,36 @@ done
             fs::read_to_string(&output).expect("recorded"),
             "/run/pohunek-test"
         );
+    }
+
+    #[test]
+    fn a_non_utf8_value_is_exported_byte_exact() {
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
+        let recorder = dir.path().join("recorder");
+        fs::write(
+            &recorder,
+            "#!/bin/sh\nprintf '%s' \"$XDG_RUNTIME_DIR\" > \"$0.out\"\n",
+        )
+        .expect("write recorder");
+        crate::test_support::make_executable(&recorder);
+        let raw = OsStr::from_bytes(b"/run/caf\xe9 '\xff'").to_owned();
+        let script = dir.path().join("script.command");
+        fs::write(
+            &script,
+            command_script_with_environment(
+                &[("XDG_RUNTIME_DIR", raw.clone())],
+                &[recorder.clone().into_os_string()],
+            )
+            .expect("script"),
+        )
+        .expect("write script");
+
+        let status = Command::new("sh").arg(&script).status().expect("run");
+
+        assert!(status.success());
+        let seen = fs::read(dir.path().join("recorder.out")).expect("recorded");
+        assert_eq!(seen, raw.as_bytes());
     }
 
     #[test]
