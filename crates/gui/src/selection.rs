@@ -42,23 +42,36 @@ pub(crate) struct ProjectTarget {
 }
 
 /// Resolves the project chosen in a launch form to its host and wire reference.
+/// The project must still be listed by its host.
 pub(crate) fn project_target(
     app: &PohunekApp,
     project: Option<&ProjectRef>,
 ) -> Result<ProjectTarget, String> {
     let project = project.ok_or_else(|| "choose a project first".to_owned())?;
+    let host = host_config(app, &project.host_id)?;
+    if project_host(app, Some(project)).is_none() {
+        return Err(format!(
+            "project `{}` is no longer available on host `{}`",
+            project.project_id, project.host_id
+        ));
+    }
     Ok(ProjectTarget {
-        host: host_config(app, &project.host_id)?,
+        host,
         project_ref: project.project_id.clone(),
     })
 }
 
-/// Live view of the host that owns the project chosen in a launch form.
+/// Live view of the host that owns the project chosen in a launch form; `None`
+/// when the host is unknown or no longer lists the project.
 pub(crate) fn project_host<'a>(
     app: &'a PohunekApp,
     project: Option<&ProjectRef>,
 ) -> Option<&'a HostView> {
-    project.and_then(|project| app.workspace.hosts.get(&project.host_id))
+    let project = project?;
+    app.workspace
+        .hosts
+        .get(&project.host_id)
+        .filter(|host| host.projects.contains_key(&project.project_id))
 }
 
 /// Project a freshly opened launch modal starts with: the active session

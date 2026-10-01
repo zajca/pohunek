@@ -59,6 +59,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             };
             app.workspace.apply(event);
             normalize_project_filter(app);
+            tasks.extend(normalize_launch_forms(app));
             if let Some(host_id) = governance_host {
                 match governance_inspect_task(app, host_id) {
                     Ok(task) => tasks.push(task),
@@ -596,6 +597,35 @@ fn normalize_project_filter(app: &mut PohunekApp) {
         .any(|choice| &choice.project == filter);
     if !still_listed {
         app.project_filter = None;
+    }
+}
+
+/// Replaces a launch form's project that its host no longer lists with the
+/// preselection rule's project, or clears it when that yields none. The typed
+/// prompt, request and name text stay. Returns the action reload for the Start
+/// form when it gained a new project while its modal is open.
+fn normalize_launch_forms(app: &mut PohunekApp) -> Option<Task<Message>> {
+    let mut start_project_changed = false;
+    if let Some(project) = app.start.project.clone() {
+        if project_host(app, Some(&project)).is_none() {
+            app.template_generation += 1;
+            app.start.template = None;
+            app.template_recipe = None;
+            app.start.project = preselected_project(app);
+            ensure_start_agent_matches_host(app);
+            start_project_changed = true;
+        }
+    }
+    if let Some(project) = app.assistant.project.clone() {
+        if project_host(app, Some(&project)).is_none() {
+            app.assistant.project = preselected_project(app);
+            ensure_assistant_agent_matches_host(app);
+        }
+    }
+    if start_project_changed && app.modal == ModalView::Start {
+        load_start_actions_task(app)
+    } else {
+        None
     }
 }
 
@@ -1917,6 +1947,73 @@ mod tests {
 
     fn global_key_messages(app: &PohunekApp, key: &iced::keyboard::Key) -> usize {
         keyboard::route_key_press(app, key, iced::keyboard::Modifiers::empty()).len()
+    }
+
+    #[test]
+    fn removing_the_form_project_clears_it_and_keeps_the_typed_text() {
+        let mut app = app_with_sessions_in_two_projects();
+        let _ = update(&mut app, Message::OpenStartModal);
+        let _ = update(
+            &mut app,
+            Message::StartProjectSelected(project_ref("local", "p-2")),
+        );
+        app.start.name = "my name".to_owned();
+        app.start.template = Some("review".to_owned());
+        app.prompt_editor = text_editor::Content::with_text("typed prompt");
+        let generation = app.template_generation;
+
+        let mut without_p2 = governance_snapshot("local");
+        without_p2.projects = vec![test_project()];
+        without_p2.sessions = vec![test_session("s-1", Some("p-1"))];
+        let _ = update(
+            &mut app,
+            Message::Core(CoreEvent::HostSnapshotLoaded {
+                snapshot: without_p2,
+            }),
+        );
+
+        assert_eq!(app.start.project, Some(project_ref("local", "p-1")));
+        assert!(app.start.template.is_none() && app.template_recipe.is_none());
+        assert!(app.template_generation > generation);
+        assert_eq!(app.start.name, "my name");
+        assert_eq!(app.prompt_editor.text(), "typed prompt");
+        assert_eq!(app.modal, ModalView::Start);
+    }
+
+    #[test]
+    fn removing_the_only_form_project_leaves_the_form_unset_and_unsendable() {
+        let mut app = app_with_sessions_in_two_projects();
+        app.start.project = Some(project_ref("local", "p-1"));
+        app.assistant.project = Some(project_ref("local", "p-1"));
+        app.prompt_editor = text_editor::Content::with_text("typed prompt");
+
+        let _ = update(
+            &mut app,
+            Message::Core(CoreEvent::HostSnapshotLoaded {
+                snapshot: governance_snapshot("local"),
+            }),
+        );
+
+        assert!(app.start.project.is_none());
+        assert!(app.assistant.project.is_none());
+        assert_eq!(app.prompt_editor.text(), "typed prompt");
+        let Err(err) = create_session_task(&app) else {
+            panic!("a form without a project must not send");
+        };
+        assert_eq!(err, "choose a project first");
+    }
+
+    #[test]
+    fn a_stale_form_project_is_rejected_before_sending() {
+        let mut app = app_with_two_hosts();
+        app.start.project = Some(project_ref("local", "gone"));
+        app.start.agent = "codex".to_owned();
+
+        assert!(crate::selection::project_host(&app, app.start.project.as_ref()).is_none());
+        let Err(err) = create_session_task(&app) else {
+            panic!("a project the host no longer lists must not send");
+        };
+        assert!(err.contains("no longer available"), "{err}");
     }
 
     #[test]
