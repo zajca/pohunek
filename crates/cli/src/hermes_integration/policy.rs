@@ -196,7 +196,6 @@ impl Policy {
     }
 
     /// Returns the allowed hosts in deterministic caller order.
-    #[must_use]
     pub(crate) fn allowed_hosts(&self) -> impl ExactSizeIterator<Item = &str> {
         self.allowed_hosts.iter().map(Host::as_str)
     }
