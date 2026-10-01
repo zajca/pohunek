@@ -1,6 +1,5 @@
 import { Buffer } from "node:buffer";
-import { randomUUID } from "node:crypto";
-import { tmpdir } from "node:os";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { createConnection, type Socket } from "node:net";
 import { describe, expect, test } from "bun:test";
@@ -25,7 +24,12 @@ import {
   type Request,
   type Subscription,
 } from "@pohunek/sdk";
-import { DEFAULT_PTY_READY_BYTES, startFixtureDaemon, type FixtureDaemonHandle } from "@pohunek/testkit";
+import {
+  DEFAULT_PTY_READY_BYTES,
+  createFixtureRootSync,
+  startFixtureDaemon,
+  type FixtureDaemonHandle,
+} from "@pohunek/testkit";
 
 const TEST_TCP_HOST = "127.0.0.1";
 const TEST_COLS = 80;
@@ -996,8 +1000,14 @@ async function expectProtocolError(promise: Promise<unknown>, code: string): Pro
   expect((error as ClientError).toProtocolError().code).toBe(code);
 }
 
+// One private root per test file keeps every socket path short and out of shared directories.
+const SOCKET_ROOT = createFixtureRootSync("pk-fx-");
+process.on("exit", (): void => {
+  rmSync(SOCKET_ROOT, { recursive: true, force: true });
+});
+
 function testSocketPath(label: string): string {
-  return join(tmpdir(), `pohunek-testkit-${process.pid}-${label}-${randomUUID()}.sock`);
+  return join(SOCKET_ROOT, `${label}.sock`);
 }
 
 function subscribeRequest(id: string): Request {

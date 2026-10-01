@@ -1,5 +1,4 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { PROTOCOL_VERSION, type HostRecord } from "@pohunek/protocol";
@@ -15,6 +14,7 @@ import {
 import { Client, attachRawWs, type RawStream } from "@pohunek/sdk";
 import {
   DEFAULT_PTY_READY_BYTES,
+  createFixtureRoot,
   startFixtureDaemon,
   type FixtureDaemonHandle,
 } from "@pohunek/testkit";
@@ -210,7 +210,7 @@ describe("@pohunek/backend", () => {
   });
 
   test("startup fails through a typed actionable path without a local daemon", async () => {
-    const root = await mkdtemp(join(tmpdir(), "pohunek-backend-missing-"));
+    const root = await createFixtureRoot("pk-bm-");
     const socketPath = join(root, "missing.sock");
     try {
       let thrown: unknown;
@@ -238,7 +238,7 @@ describe("@pohunek/backend", () => {
 async function startBackendFixture(
   discoverIntervalSeconds: number = DISCOVER_INTERVAL_SECONDS,
 ): Promise<BackendFixture> {
-  const root = await mkdtemp(join(tmpdir(), "pohunek-backend-test-"));
+  const root = await createFixtureRoot("pk-bt-");
   const assets = join(root, "assets");
   await mkdir(assets);
   await writeFile(join(assets, "index.html"), INDEX_CONTENT);
