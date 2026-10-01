@@ -201,6 +201,16 @@ class AuditTest(unittest.TestCase):
         self.assertEqual(self.audit("--require", "absent", self.tree).returncode, 1)
         self.assertEqual(self.audit("--require", "pohunek", self.tree / "pohunek").returncode, 2)
 
+    def test_a_binary_for_another_apple_platform_fails(self):
+        path = self.binary("ios")
+        (self.tree / "ios.otool-l").write_text(LOAD_COMMANDS.format(minos="14.0").replace("platform 1", "platform 2"))
+        result = self.audit(path)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("built for platform '2', not macOS", result.stderr)
+        named = self.binary("named")
+        (self.tree / "named.otool-l").write_text(LOAD_COMMANDS.format(minos="14.0").replace("platform 1", "platform MACOS"))
+        self.assertEqual(self.audit(named).returncode, 0)
+
     def test_a_failing_strings_tool_fails_the_audit(self):
         path = self.binary("pohunek")
         (self.tree / "pohunek.strings-fails").write_text("")
@@ -237,6 +247,39 @@ class BuildReleaseTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "%s/out/target/aarch64-apple-darwin/release" % ROOT)
+
+
+class BuildFlagsTest(unittest.TestCase):
+    def test_remap_flags_survive_spaces_and_keep_the_callers_flags(self):
+        root = Path(tempfile.mkdtemp(prefix="pohunek build "))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        tools = root / "tools"
+        tools.mkdir()
+        record = root / "flags"
+        for name, text in (
+            ("uname", '#!/bin/sh\ncase "$1" in -s) echo Darwin ;; -m) echo arm64 ;; esac\n'),
+            ("rustc", "#!/bin/sh\necho '/fake sysroot'\n"),
+            ("cargo", '#!/bin/sh\nprintf "%s" "$CARGO_ENCODED_RUSTFLAGS" > "$RECORD"\n[ -z "${RUSTFLAGS:-}" ]\n'),
+        ):
+            path = tools / name
+            path.write_text(text)
+            path.chmod(0o755)
+        env = dict(
+            os.environ,
+            PATH="%s:%s" % (tools, os.environ["PATH"]),
+            RUSTFLAGS="-D warnings",
+            RECORD=str(record),
+            CARGO_HOME="/cargo home",
+        )
+        result = subprocess.run(
+            [str(MACOS / "build-release"), "cli"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        flags = record.read_text().split("\x1f")
+        self.assertEqual(flags[:2], ["-D", "warnings"])
+        self.assertIn("--remap-path-prefix=%s=/build/pohunek" % ROOT, flags)
+        self.assertIn("--remap-path-prefix=/cargo home=/build/cargo", flags)
+        self.assertIn("--remap-path-prefix=/fake sysroot=/build/rust-sysroot", flags)
 
 
 class ToolingTest(unittest.TestCase):

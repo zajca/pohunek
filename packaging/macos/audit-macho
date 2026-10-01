@@ -7,7 +7,7 @@
 # Every Mach-O file found (a file argument, or any regular file below a
 # directory argument) must be
 #   - a thin arm64 image (no universal binary, no x86_64, no arm64e);
-#   - built for a deployment target no newer than --minimum-os (default: the
+#   - built for macOS (not iOS, tvOS, or watchOS) with a deployment target no newer than --minimum-os (default: the
 #     value in packaging/macos/DEPLOYMENT_TARGET);
 #   - linked only against system libraries under /usr/lib or /System/Library,
 #     with no @rpath/@executable_path/@loader_path library and no LC_RPATH;
@@ -135,6 +135,14 @@ audit_file() {
         problem "$file" "otool -l cannot read it"
         return
     }
+    platform=$(printf '%s\n' "$load_commands" | awk '
+        $1 == "cmd" { section = $2; next }
+        section == "LC_BUILD_VERSION" && $1 == "platform" { print $2; exit }
+        section == "LC_VERSION_MIN_MACOSX" { print "1"; exit }')
+    case $platform in
+        1 | MACOS) ;;
+        *) problem "$file" "built for platform '${platform:-none}', not macOS" ;;
+    esac
     minos=$(printf '%s\n' "$load_commands" | awk '
         $1 == "cmd" { section = $2; next }
         section == "LC_BUILD_VERSION" && $1 == "minos" { print $2; exit }

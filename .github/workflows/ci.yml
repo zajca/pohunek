@@ -419,13 +419,16 @@ jobs:
   # are unsigned development builds; signing and notarization run only in the
   # release workflow.
   macos-package:
-    # macos-14 is the minimum supported macOS and macos-15 the current one: the
-    # packaged archives are exercised natively on both.
+    # macos-15 is the required leg. macos-14 is the minimum supported macOS and
+    # exercises the packaged archives on it, but GitHub retires that hosted
+    # image on 2026-11-02, so its result is informational and cannot block a
+    # merge; the minimum-OS acceptance is a #105 gate on a runner that stays.
     name: macOS package install and upgrade (${{ matrix.runner }})
     if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.macos_package == 'true' }}
     needs: changes
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    continue-on-error: ${{ matrix.runner == 'macos-14' }}
     strategy:
       fail-fast: false
       matrix:

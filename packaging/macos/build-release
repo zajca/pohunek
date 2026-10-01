@@ -33,8 +33,25 @@ export MACOSX_DEPLOYMENT_TARGET
 cd "$root"
 cargo_home=${CARGO_HOME:-$HOME/.cargo}
 sysroot=$(rustc --print sysroot)
-RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$root=/build/pohunek --remap-path-prefix=$cargo_home=/build/cargo --remap-path-prefix=$sysroot=/build/rust-sysroot"
-export RUSTFLAGS
+# Flags travel in CARGO_ENCODED_RUSTFLAGS (separated by the unit separator), so
+# a checkout, cargo home, or sysroot path containing a space stays one argument.
+# The caller's own RUSTFLAGS (for example `-D warnings`) are kept.
+unit_separator=$(printf '\037')
+encoded=${CARGO_ENCODED_RUSTFLAGS:-}
+if [ -z "$encoded" ]; then
+    for flag in ${RUSTFLAGS:-}; do
+        encoded=${encoded:+$encoded$unit_separator}$flag
+    done
+fi
+for flag in \
+    "--remap-path-prefix=$root=/build/pohunek" \
+    "--remap-path-prefix=$cargo_home=/build/cargo" \
+    "--remap-path-prefix=$sysroot=/build/rust-sysroot"; do
+    encoded=${encoded:+$encoded$unit_separator}$flag
+done
+CARGO_ENCODED_RUSTFLAGS=$encoded
+export CARGO_ENCODED_RUSTFLAGS
+unset RUSTFLAGS
 # Archive members written by ld64 or ar carry no timestamps.
 ZERO_AR_DATE=1
 export ZERO_AR_DATE
