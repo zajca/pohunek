@@ -978,7 +978,7 @@ Release workflow re-runs the gates on the tag, then builds and publishes glibc
 and MUSL x86_64 CLI and daemon archives, a glibc x86_64 GUI archive, a
 self-contained Linux x86_64 web-control-center archive, and signed, notarized
 `aarch64-apple-darwin` CLI, daemon, and GUI (`Pohunek.app`) archives. The macOS
-jobs run in the protected `macos-signing` environment (secrets
+build runs without secrets; a separate signing job on a fresh runner runs in the protected `macos-signing` environment (secrets
 `MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_PASSWORD`,
 `APPLE_NOTARY_KEY_P8_BASE64`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID`,
 and the variable `MACOS_TEAM_ID`); a missing credential fails them before the

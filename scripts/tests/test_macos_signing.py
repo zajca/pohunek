@@ -459,57 +459,79 @@ class SigningKeychainTest(Base):
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
+    SECRETS = {
+        "MACOS_CERTIFICATE_P12_BASE64",
+        "MACOS_CERTIFICATE_PASSWORD",
+        "APPLE_NOTARY_KEY_P8_BASE64",
+        "APPLE_NOTARY_KEY_ID",
+        "APPLE_NOTARY_ISSUER_ID",
+    }
+
     def setUp(self):
         self.text = (ROOT / ".github/workflows/release.yml").read_text()
-        start = self.text.index("  build-macos:")
-        self.job = self.text[start:]
+        self.stage = self.job("stage-macos", "sign-macos")
+        self.sign = self.job("sign-macos", "release-macos")
+        self.release = self.job("release-macos", None)
 
-    def test_credentials_are_scoped_to_the_steps_that_use_them(self):
-        header = self.job.split("    steps:", 1)[0]
+    def job(self, name, following):
+        start = self.text.index("\n  %s:\n" % name)
+        end = self.text.index("\n  %s:\n" % following) if following else len(self.text)
+        return self.text[start:end]
+
+    def test_secrets_exist_only_in_the_signing_job_and_only_in_its_steps(self):
+        for name, job in (("stage", self.stage), ("release", self.release)):
+            self.assertNotIn("secrets.", job, name)
+            self.assertNotIn("macos-signing", job, name)
+        header = self.sign.split("    steps:", 1)[0]
         self.assertNotIn("secrets.", header, "no secret may be exposed to the whole job")
         self.assertIn("environment: macos-signing", header)
-        for secret in re.findall(r"secrets\.([A-Z0-9_]+)", self.job):
-            self.assertIn(secret, {
-                "MACOS_CERTIFICATE_P12_BASE64",
-                "MACOS_CERTIFICATE_PASSWORD",
-                "APPLE_NOTARY_KEY_P8_BASE64",
-                "APPLE_NOTARY_KEY_ID",
-                "APPLE_NOTARY_ISSUER_ID",
-            })
+        for secret in re.findall(r"secrets\.([A-Z0-9_]+)", self.sign):
+            self.assertIn(secret, self.SECRETS)
         # Third-party actions never see a secret.
-        for block in re.split(r"\n      - ", self.job):
-            if block.lstrip().startswith("name:") and "uses:" in block:
+        for block in re.split(r"\n      - ", self.sign):
+            if "uses:" in block:
                 self.assertNotIn("secrets.", block)
 
-    def test_missing_credentials_fail_the_job_and_nothing_unsigned_is_attached(self):
-        self.assertIn("Require signing and notarization credentials", self.job)
-        self.assertIn("exit 1", self.job.split("Install Python", 1)[0])
-        self.assertIn("packaging/macos/package --stage-release", self.job)
-        self.assertIn("packaging/macos/package --sign-release", self.job)
-        self.assertNotIn("--development", self.job)
-        self.assertIn("grep -q '^signing developer-id$'", self.job)
+    def test_the_signing_job_uses_only_pinned_actions_and_runs_nothing_from_the_tree(self):
+        for use in re.findall(r"uses: (\S+)", self.sign):
+            self.assertRegex(use, r"@[0-9a-f]{40}$", use)
+        for forbidden in ("--stage-release", "cargo", "bun ", "--version", "smoke", "stage-archive", "setup-"):
+            self.assertNotIn(forbidden, self.sign, forbidden)
 
-    def test_the_keychain_is_always_removed(self):
-        block = self.job.split("- name: Remove ephemeral signing keychain", 1)[1].split("\n      - ", 1)[0]
-        self.assertIn("if: always()", block)
+    def test_the_staged_tree_travels_as_a_checked_tar(self):
+        self.assertIn("stage.tar.sha256", self.stage)
+        self.assertIn("shasum -a 256 -c stage.tar.sha256", self.sign)
+        self.assertIn("packaging/macos/package --stage-release", self.stage)
+        self.assertIn("packaging/macos/package --sign-release", self.sign)
+        self.assertNotIn("--sign-release", self.stage)
+        self.assertNotIn("--stage-release", self.sign)
+        self.assertNotIn("--development", self.text.split("\n  stage-macos:\n", 1)[1])
 
-    def test_no_built_program_runs_while_a_signing_credential_exists(self):
-        stage = self.job.index("name: Stage and audit the archive tree")
-        create = self.job.index("name: Create ephemeral signing keychain")
-        sign = self.job.index("name: Sign, notarize, verify, and package")
-        remove = self.job.index("name: Remove ephemeral signing keychain")
-        # Staging (which runs `pohunek completions`) comes first.
-        self.assertLess(stage, create)
-        self.assertLess(create, sign)
-        self.assertLess(sign, remove)
-        between = self.job[create:remove]
-        self.assertNotIn("--stage-release", between)
-        for runner in ("--version", "smoke", "cargo", "bun run", "stage-archive"):
-            self.assertNotIn(runner, between, runner)
+    def test_missing_credentials_fail_the_signing_job_before_any_work(self):
+        order = [
+            self.sign.index("Require signing and notarization credentials"),
+            self.sign.index("Download the staged tree"),
+            self.sign.index("Create ephemeral signing keychain"),
+        ]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("exit 1", self.sign.split("Download the staged tree", 1)[0])
+        self.assertIn("grep -q '^signing developer-id$'", self.release)
 
-    def test_the_packaged_cli_smoke_runs_from_the_extracted_archive(self):
-        self.assertIn("packaging/smoke-hermes-plugin-release", self.job)
-        self.assertIn("RUNNER_TEMP/extracted", self.job)
+    def test_the_keychain_is_always_removed_and_nothing_runs_between(self):
+        remove = self.sign.split("- name: Remove ephemeral signing keychain", 1)[1].split("\n      - ", 1)[0]
+        self.assertIn("if: always()", remove)
+        create = self.sign.index("name: Create ephemeral signing keychain")
+        removal = self.sign.index("name: Remove ephemeral signing keychain")
+        self.assertEqual(self.sign[create:removal].count("- name:"), 1)
+
+    def test_the_release_job_verifies_the_published_bytes_and_publishes_only_signed_archives(self):
+        self.assertIn("verify-signed --notarized", self.release)
+        self.assertIn("RUNNER_TEMP/extracted", self.release)
+        self.assertIn("packaging/smoke-hermes-plugin-release", self.release)
+        self.assertIn("action-gh-release", self.release)
+        self.assertNotIn("action-gh-release", self.stage + self.sign)
+        self.assertIn("needs: [sign-macos]", self.release)
+        self.assertIn("needs: [stage-macos]", self.sign)
 
 
 if __name__ == "__main__":

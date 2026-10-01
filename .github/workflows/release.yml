@@ -469,22 +469,29 @@ jobs:
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.checksum }}
 
-  # Signed and notarized native Apple Silicon archives (issue #104). Builds on
-  # the maintained macos-15 image against the macOS 14.0 deployment target
-  # (packaging/macos/DEPLOYMENT_TARGET, enforced by the Mach-O audit); running
-  # the archives on macOS 14 itself is a separate acceptance gate. The protected `macos-signing` environment
-  # holds the Developer ID certificate and the notary API key; each secret is
-  # exposed only to the steps that use it. Missing credentials fail this job
-  # before the build: a macOS archive is never published unsigned, and the run
-  # stays red until the credentials exist.
-  build-macos:
-    name: Build ${{ matrix.component }} for aarch64-apple-darwin
+  # Signed and notarized native Apple Silicon archives (issue #104), in three
+  # jobs so that signing credentials never share a runner with build code:
+  #
+  #   stage-macos    builds against the macOS 14.0 deployment target on the
+  #                  maintained macos-15 image (packaging/macos/DEPLOYMENT_TARGET,
+  #                  enforced by the Mach-O audit), runs the built `pohunek` for
+  #                  the completions, audits the tree, and uploads it. No secret.
+  #   sign-macos     a fresh runner in the protected `macos-signing` environment
+  #                  downloads the staged tree, checks it, and signs, notarizes,
+  #                  verifies, and archives it. It runs no program from the tree
+  #                  and uses only pinned actions. Missing credentials fail it
+  #                  before any work: a macOS archive is never published unsigned
+  #                  and the run stays red until the credentials exist.
+  #   release-macos  extracts the signed archive outside the checkout, verifies
+  #                  its signatures, runs the packaged smokes, and attaches it.
+  #                  No secret.
+  #
+  # Running the archives on macOS 14 itself is a separate acceptance gate.
+  stage-macos:
+    name: Stage ${{ matrix.component }} for aarch64-apple-darwin
     needs: [gate, docs-gate, web-gate]
     runs-on: macos-15
-    environment: macos-signing
     timeout-minutes: 120
-    permissions:
-      contents: write
     env:
       RUSTFLAGS: -D warnings
     strategy:
@@ -493,6 +500,71 @@ jobs:
         component: [cli, daemon, gui]
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify native runner architecture
+        shell: bash
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-macos-${{ matrix.component }}
+
+      - name: Build offline documentation
+        run: cargo xtask docs site
+
+      - name: Build release binaries
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          bindir="$(packaging/macos/build-release "${{ matrix.component }}")"
+          echo "bindir=$bindir" >> "$GITHUB_OUTPUT"
+
+      # Staging runs the built `pohunek` to write the shell completions, which
+      # is why it happens here and not next to the credentials.
+      - name: Stage and audit the archive tree
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          # Archives are stamped with the tagged commit's time.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          staging="$(packaging/macos/package --stage-release "${{ matrix.component }}" "${version}" \
+            "${{ steps.build.outputs.bindir }}" target/pohunek-docs dist)"
+          # A tar keeps the modes that an artifact upload would drop.
+          mkdir -p "$RUNNER_TEMP/stage-upload"
+          tar -cf "$RUNNER_TEMP/stage-upload/stage.tar" -C "$(dirname "$staging")" "$(basename "$staging")"
+          ( cd "$RUNNER_TEMP/stage-upload" && shasum -a 256 stage.tar > stage.tar.sha256 )
+
+      - name: Upload the staged tree
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-stage-${{ matrix.component }}
+          path: ${{ runner.temp }}/stage-upload
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-macos:
+    name: Sign ${{ matrix.component }} for aarch64-apple-darwin
+    needs: [stage-macos]
+    runs-on: macos-15
+    environment: macos-signing
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [cli, daemon, gui]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -523,56 +595,23 @@ jobs:
             exit 1
           fi
 
-      - name: Install Python for Hermes release verification
-        if: matrix.component == 'cli'
-        id: python
-        uses: actions/setup-python@v5
+      - name: Download the staged tree
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          python-version: "3.12"
+          name: macos-stage-${{ matrix.component }}
+          path: ${{ runner.temp }}/stage-download
 
-      - name: Install uv for Hermes release verification
-        if: matrix.component == 'cli'
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
-        with:
-          version: "0.9.28"
-          enable-cache: true
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-macos-${{ matrix.component }}
-
-      - name: Build offline documentation
-        run: cargo xtask docs site
-
-      - name: Build release binaries
-        id: build
-        shell: bash
-        run: |
-          set -euo pipefail
-          bindir="$(packaging/macos/build-release "${{ matrix.component }}")"
-          echo "bindir=$bindir" >> "$GITHUB_OUTPUT"
-
-      # Everything that runs a built program (the shell completions written
-      # while staging) happens here, before any signing or notary credential
-      # exists on the runner.
-      - name: Stage and audit the archive tree
+      - name: Check and extract the staged tree
         id: stage
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          ( cd "$RUNNER_TEMP/stage-download" && shasum -a 256 -c stage.tar.sha256 )
           mkdir -p dist
-          # Archives are stamped with the tagged commit's time.
-          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
-          export SOURCE_DATE_EPOCH
-          staging="$(packaging/macos/package --stage-release "${{ matrix.component }}" "${version}" \
-            "${{ matrix.component == 'web' && steps.webinput.outputs.input || steps.build.outputs.bindir }}" \
-            "${{ matrix.component == 'web' && 'web' || 'target/pohunek-docs' }}" dist)"
-          echo "staging=${staging}" >> "$GITHUB_OUTPUT"
+          tar -xf "$RUNNER_TEMP/stage-download/stage.tar" -C dist
+          staging="$(find dist -mindepth 1 -maxdepth 1 -type d)"
+          test "$(printf '%s\n' "$staging" | wc -l | tr -d ' ')" = 1
+          echo "staging=$staging" >> "$GITHUB_OUTPUT"
 
       - name: Create ephemeral signing keychain
         shell: bash
@@ -598,14 +637,46 @@ jobs:
           export SOURCE_DATE_EPOCH
           archive="$(packaging/macos/package --sign-release "${{ matrix.component }}" "${version}" \
             "${{ steps.stage.outputs.staging }}")"
-          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
-          echo "checksum=${archive}.sha256" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/signed-upload"
+          cp "$archive" "$archive.sha256" "$RUNNER_TEMP/signed-upload/"
 
       # Always removes the keychain, restoring the runner's search list.
       - name: Remove ephemeral signing keychain
         if: always()
         shell: bash
         run: packaging/macos/signing-keychain delete
+
+      - name: Upload the signed archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-signed-${{ matrix.component }}
+          path: ${{ runner.temp }}/signed-upload
+          if-no-files-found: error
+          retention-days: 1
+
+  release-macos:
+    name: Verify and publish ${{ matrix.component }} for aarch64-apple-darwin
+    needs: [sign-macos]
+    runs-on: macos-15
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      RUSTFLAGS: -D warnings
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [cli, daemon, gui]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download the signed archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: macos-signed-${{ matrix.component }}
+          path: ${{ runner.temp }}/signed-download
 
       # Everything below runs from the extracted archive outside the
       # checkout: the published bytes, not the build tree.
@@ -616,7 +687,7 @@ jobs:
           MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
         run: |
           set -euo pipefail
-          archive="${{ steps.package.outputs.archive }}"
+          archive="$(ls "$RUNNER_TEMP"/signed-download/*.tar.gz)"
           ( cd "$(dirname "$archive")" && shasum -a 256 -c "$(basename "$archive").sha256" )
           extract_dir="$RUNNER_TEMP/extracted"
           rm -rf "$extract_dir"
@@ -630,6 +701,8 @@ jobs:
           grep -q '^signing developer-id$' "$root/MANIFEST"
           packaging/macos/verify-signed --notarized --team-id "$MACOS_TEAM_ID" "$root"
           echo "root=$root" >> "$GITHUB_OUTPUT"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "checksum=$archive.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Smoke-test the packaged daemon binaries
         if: matrix.component == 'daemon'
@@ -645,6 +718,30 @@ jobs:
         if: matrix.component == 'gui'
         shell: bash
         run: scripts/smoke-gui-release-macos "${{ steps.extract.outputs.root }}/Pohunek.app"
+
+      - name: Install Python for Hermes release verification
+        if: matrix.component == 'cli'
+        id: python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv for Hermes release verification
+        if: matrix.component == 'cli'
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+
+      - name: Install Rust toolchain
+        if: matrix.component == 'cli'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        if: matrix.component == 'cli'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-macos-verify
 
       - name: Provision locked Hermes runtime
         if: matrix.component == 'cli'
@@ -675,5 +772,5 @@ jobs:
         with:
           fail_on_unmatched_files: true
           files: |
-            ${{ steps.package.outputs.archive }}
-            ${{ steps.package.outputs.checksum }}
+            ${{ steps.extract.outputs.archive }}
+            ${{ steps.extract.outputs.checksum }}
