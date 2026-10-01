@@ -722,9 +722,8 @@ the examples use `POHUNEK_SOCKET` rather than reconstructing a Linux-only path.
 With an explicit `XDG_RUNTIME_DIR`, Pohunek uses its `pohunek` child on Linux and
 macOS. Linux requires that variable, while macOS without it uses
 `/private/tmp/pohunek-<effective-uid>` and ignores `TMPDIR` for this decision.
-The current Bun owner backend does not derive that macOS default yet; until the
-#103 integration, configure its exact socket explicitly or provide
-`XDG_RUNTIME_DIR`.
+The Bun owner backend derives the same default and checks the runtime directory
+before connecting; `POHUNEK_BACKEND_DAEMON_SOCKET` overrides it.
 
 ```rust
 // Rust — `pohunek-client`

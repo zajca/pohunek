@@ -1,3 +1,4 @@
+import { lstatSync, realpathSync, type Stats } from "node:fs";
 import { posix } from "node:path";
 
 /**
@@ -32,7 +33,8 @@ export type RuntimePathReason = "empty" | "not_absolute" | "parent_component" | 
 export type RuntimePathFailure =
   | { readonly variant: "missing_env"; readonly variable: string }
   | { readonly variant: "invalid_env"; readonly variable: string; readonly reason: RuntimePathReason }
-  | { readonly variant: "socket_path_invalid"; readonly variable: string; readonly detail: string };
+  | { readonly variant: "socket_path_invalid"; readonly variable: string; readonly detail: string }
+  | { readonly variant: "runtime_dir_untrusted"; readonly variable: string; readonly detail: string };
 
 const REASON_TEXT: Readonly<Record<RuntimePathReason, string>> = {
   empty: "must not be empty when present",
@@ -62,6 +64,7 @@ function runtimePathMessage(failure: RuntimePathFailure): string {
     case "invalid_env":
       return REASON_TEXT[failure.reason];
     case "socket_path_invalid":
+    case "runtime_dir_untrusted":
       return failure.detail;
   }
 }
@@ -109,6 +112,61 @@ export function resolveDaemonSocket(
   const socket = posix.join(resolveRuntimeDir(context, env), SOCKET_NAME);
   validateSocketPath(context.platform, socket, ENV_XDG_RUNTIME_DIR);
   return socket;
+}
+
+/** Mode of a daemon runtime directory: owner-only, exactly (the daemon refuses any other). */
+const RUNTIME_DIR_MODE = 0o700;
+const MODE_BITS = 0o777;
+
+/**
+ * Fails closed unless an existing runtime directory and daemon socket are the
+ * current user's own, as the daemon itself requires of them.
+ *
+ * The macOS default lives under the shared `/private/tmp`, where another local
+ * user could pre-create the predictable directory with a socket of their own.
+ * The directory must be a real directory (no symlink in the path) owned by
+ * `effectiveUid` with mode exactly 0700, and a present socket must be a socket
+ * owned by the same user. An absent entry is not an error here: the connect
+ * reports an unreachable daemon.
+ */
+export function verifyDaemonRuntime(
+  runtimeDir: string,
+  socket: string,
+  effectiveUid: number,
+  variable: string,
+): void {
+  const untrusted = (detail: string): RuntimePathError =>
+    new RuntimePathError({ variant: "runtime_dir_untrusted", variable, detail });
+  const directory = lstatIfPresent(runtimeDir);
+  if (directory !== undefined) {
+    if (directory.isSymbolicLink() || !directory.isDirectory()) {
+      throw untrusted(`runtime directory ${runtimeDir} is not a real directory`);
+    }
+    if (directory.uid !== effectiveUid) {
+      throw untrusted(`runtime directory ${runtimeDir} is not owned by the current user`);
+    }
+    if ((directory.mode & MODE_BITS) !== RUNTIME_DIR_MODE) {
+      throw untrusted(`runtime directory ${runtimeDir} must have mode 0700`);
+    }
+    if (realpathSync(runtimeDir) !== runtimeDir) {
+      throw untrusted(`runtime directory ${runtimeDir} has a symlinked path component`);
+    }
+  }
+  const entry = lstatIfPresent(socket);
+  if (entry !== undefined && (!entry.isSocket() || entry.uid !== effectiveUid)) {
+    throw untrusted(`${socket} is not a socket owned by the current user`);
+  }
+}
+
+function lstatIfPresent(path: string): Stats | undefined {
+  try {
+    return lstatSync(path);
+  } catch (error: unknown) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
 }
 
 /**

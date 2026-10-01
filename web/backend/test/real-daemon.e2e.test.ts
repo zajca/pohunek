@@ -814,13 +814,31 @@ async function startDaemon(
     }),
     ...logs(),
     stop: async (): Promise<void> => {
-      const status = await stopChild(child, exitPromise, () => exitStatus);
-      await removeRoots();
-      if (status.code !== 0 || status.signal !== null) {
-        throw new Error(
+      // Roots are removed whether or not the daemon stopped cleanly: a leaked
+      // default runtime directory would block the next run and the user's daemon.
+      const failures: unknown[] = [];
+      let status: ExitStatus | undefined;
+      try {
+        status = await stopChild(child, exitPromise, () => exitStatus);
+      } catch (error: unknown) {
+        failures.push(error);
+      }
+      try {
+        await removeRoots();
+      } catch (error: unknown) {
+        failures.push(error);
+      }
+      if (status !== undefined && (status.code !== 0 || status.signal !== null)) {
+        failures.push(new Error(
           `pohunekd exited uncleanly (code=${String(status.code)}, signal=${String(status.signal)})\n`
             + `socket: ${socketPath}\nstdout:\n${logs().stdout()}\nstderr:\n${logs().stderr()}`,
-        );
+        ));
+      }
+      if (failures.length > 1) {
+        throw new AggregateError(failures, "daemon teardown failed");
+      }
+      if (failures.length === 1) {
+        throw errorFromUnknown(failures[0]);
       }
     },
   };

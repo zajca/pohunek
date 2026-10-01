@@ -3,6 +3,8 @@ import { once } from "node:events";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "bun:test";
+import { chmod, mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import {
   DEFAULT_DISCOVER_INTERVAL_SECONDS,
   BackendConfigError,
@@ -111,6 +113,52 @@ describe("backend configuration", () => {
       { ...baseEnv(), POHUNEK_BACKEND_STATIC_DIR: "" },
       "POHUNEK_BACKEND_STATIC_DIR",
     );
+  });
+});
+
+describe("runtime directory trust", () => {
+  test("a daemon runtime directory must be a real, owner-only directory of the current user", async () => {
+    const base = await realpath(await mkdtemp(join(tmpdir(), "pk-trust-")));
+    const uid = process.geteuid?.() ?? 0;
+    const context: RuntimePathContext = { platform: "linux", effectiveUid: uid };
+    const env = { ...baseEnv(), XDG_RUNTIME_DIR: base };
+    const runtimeDir = join(base, "pohunek");
+    try {
+      // Absent: the connect reports an unreachable daemon instead.
+      expect(loadBackendConfig(env, context).daemonSocketPath).toBe(join(runtimeDir, "daemon.sock"));
+
+      await mkdir(runtimeDir, { mode: 0o700 });
+      expect(loadBackendConfig(env, context).daemonSocketPath).toBe(join(runtimeDir, "daemon.sock"));
+
+      await chmod(runtimeDir, 0o750);
+      expectConfigError(env, "XDG_RUNTIME_DIR", context);
+      await chmod(runtimeDir, 0o700);
+
+      // Another user's directory: the same check with a different effective uid.
+      expectConfigError(env, "XDG_RUNTIME_DIR", { platform: "linux", effectiveUid: uid + 1 });
+
+      await rm(runtimeDir, { recursive: true });
+      const elsewhere = join(base, "elsewhere");
+      await mkdir(elsewhere, { mode: 0o700 });
+      await symlink(elsewhere, runtimeDir);
+      expectConfigError(env, "XDG_RUNTIME_DIR", context);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  test("a present socket path that is not a socket of the current user is refused", async () => {
+    const base = await realpath(await mkdtemp(join(tmpdir(), "pk-trust-")));
+    const uid = process.geteuid?.() ?? 0;
+    const context: RuntimePathContext = { platform: "linux", effectiveUid: uid };
+    const env = { ...baseEnv(), XDG_RUNTIME_DIR: base };
+    try {
+      await mkdir(join(base, "pohunek"), { mode: 0o700 });
+      await mkdir(join(base, "pohunek", "daemon.sock"));
+      expectConfigError(env, "XDG_RUNTIME_DIR", context);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
   });
 });
 

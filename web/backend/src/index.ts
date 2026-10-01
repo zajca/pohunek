@@ -24,6 +24,7 @@ export {
   resolveDaemonSocket,
   resolveRuntimeDir,
   validateSocketPath,
+  verifyDaemonRuntime,
 } from "./runtime-paths";
 export type {
   RuntimePathContext,

@@ -146,7 +146,12 @@ implementations):
   socket path limit (103 bytes on macOS, 107 on Linux).
 
 A socket path over the limit fails at startup with the variable that caused it
-instead of failing inside the connect call.
+instead of failing inside the connect call. When the socket is derived (not
+overridden), the backend also refuses to start unless an existing runtime
+directory is a real directory, without symlinked components, owned by the
+current user with mode exactly `0700`, and a present socket is a socket of the
+same user: the macOS default lives under the shared `/private/tmp`, where
+another local user could pre-create the predictable path.
 
 The backend runs natively on Apple Silicon, both from the Bun workspace and as
 the compiled release executable. `bun run dev` locates Node itself: it uses
