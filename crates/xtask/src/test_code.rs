@@ -61,8 +61,17 @@ pub struct SourceFile {
     path: String,
     views: Views,
     whole_file: bool,
-    test_spans: Vec<(usize, usize)>,
+    test_spans: Vec<TestSpan>,
     line_starts: Vec<usize>,
+}
+
+/// A test-only item (cfg-gated or test-attribute-decorated) of a file.
+#[derive(Debug)]
+struct TestSpan {
+    start: usize,
+    end: usize,
+    /// Attribute bodies (text between `[` and `]`, comments blanked) of the item.
+    attributes: Vec<String>,
 }
 
 impl SourceFile {
@@ -93,7 +102,21 @@ impl SourceFile {
             || self
                 .test_spans
                 .iter()
-                .any(|&(start, end)| start <= offset && offset < end)
+                .any(|span| span.start <= offset && offset < span.end)
+    }
+
+    /// Attribute bodies (text between `[` and `]`, comments blanked) of every
+    /// test-only item that contains the byte `offset`, outermost first.
+    ///
+    /// A scan that treats some test items differently, such as those declared
+    /// `#[tokio::test(start_paused = true)]`, reads the attribute text here.
+    #[must_use]
+    pub fn test_attributes_at(&self, offset: usize) -> Vec<&str> {
+        self.test_spans
+            .iter()
+            .filter(|span| span.start <= offset && offset < span.end)
+            .flat_map(|span| span.attributes.iter().map(String::as_str))
+            .collect()
     }
 
     /// One-based line number of the byte `offset`.
@@ -252,7 +275,11 @@ pub fn classify(files: &BTreeMap<String, String>) -> BTreeMap<String, SourceFile
                 .items
                 .iter()
                 .filter(|item| item.test_only)
-                .map(|item| (item.start, item.end))
+                .map(|item| TestSpan {
+                    start: item.start,
+                    end: item.end,
+                    attributes: item.attributes.clone(),
+                })
                 .collect();
             let line_starts = std::iter::once(0)
                 .chain(text.match_indices('\n').map(|(at, _)| at + 1))
@@ -519,6 +546,8 @@ struct AttributedItem {
     end: usize,
     test_only: bool,
     path_attribute: Option<String>,
+    /// Attribute bodies in source order, read from the comment-free view.
+    attributes: Vec<String>,
 }
 
 /// The per-file lexing and attribute analysis that does not depend on which
@@ -576,16 +605,18 @@ fn attributed_items(views: &Views) -> (Vec<AttributedItem>, bool) {
                         let mut cursor = i;
                         let mut test_only = false;
                         let mut path = None;
+                        let mut attributes = Vec::new();
                         while skeleton.get(cursor) == Some(&b'#')
                             && skeleton.get(cursor + 1) == Some(&b'[')
                         {
                             let close = matching_close(skeleton, cursor + 1);
                             let body = &views.skeleton[cursor + 2..close];
                             test_only |= is_test_cfg(body) || is_test_marker(body);
+                            let code_body = String::from_utf8_lossy(&code[cursor + 2..close]);
                             if path.is_none() {
-                                let body = String::from_utf8_lossy(&code[cursor + 2..close]);
-                                path = path_attribute(&body);
+                                path = path_attribute(&code_body);
                             }
+                            attributes.push(code_body.into_owned());
                             cursor = close + 1;
                             while skeleton.get(cursor).is_some_and(u8::is_ascii_whitespace) {
                                 cursor += 1;
@@ -597,6 +628,7 @@ fn attributed_items(views: &Views) -> (Vec<AttributedItem>, bool) {
                             end: end_of_item(skeleton, cursor),
                             test_only,
                             path_attribute: path,
+                            attributes,
                         });
                         i = cursor.max(i + 1) - 1;
                     }
@@ -1033,6 +1065,30 @@ mod tests {
         assert!(!file.in_test_code(text.find("fn a").expect("head")));
         assert!(file.in_test_code(text.find('x').expect("body")));
         assert!(!file.in_test_code(text.find("fn c").expect("tail")));
+    }
+
+    #[test]
+    fn test_attributes_at_lists_the_attributes_of_enclosing_test_items() {
+        let text = "fn plain() { a }
+#[cfg(test)]
+mod tests {
+    #[tokio::test(start_paused = true)]
+    #[ignore]
+    async fn paused() { b }
+    #[test]
+    fn other() { c }
+}
+";
+        let files = BTreeMap::from([("crates/demo/src/lib.rs".to_owned(), text.to_owned())]);
+        let classified = classify(&files);
+        let file = &classified["crates/demo/src/lib.rs"];
+        let at = |needle: &str| file.test_attributes_at(text.find(needle).expect("needle"));
+        assert!(at(" a }").is_empty());
+        assert_eq!(
+            at(" b }"),
+            ["cfg(test)", "tokio::test(start_paused = true)", "ignore"]
+        );
+        assert_eq!(at(" c }"), ["cfg(test)", "test"]);
     }
 
     #[test]

@@ -216,6 +216,16 @@ when it touches a `release` filter input in `ci.yml` (`Cargo.toml`,
 release workflows, `scripts/release`, `packaging/**`); run the release build
 locally before declaring such a change done.
 
+Timing in tests: a test never asserts a duration against real time or uses a
+sleep as synchronization. When the deadline is the behavior under test, run on
+virtual time (`#[tokio::test(start_paused = true)]` or an injected clock); when
+it is incidental, wait on a readiness signal with `pohunek_test_support::wait`,
+bounded by `HANG_GUARD`. `crates/xtask/tests/timing_ratchet.rs` counts sleeps
+and `.elapsed()` literal assertions in test code per file against
+`timing_ratchet_baseline.txt`, which may only go down (lower it with the
+ignored `regenerate_timing_baseline` test). An unavoidable real-time wait
+carries `// timing-allowed: #<issue> <reason>` on or directly above its line.
+
 Flaky tests: `.config/nextest.toml` sets `flaky-result = "fail"` in
 `profile.default`, so every profile inherits it. Only `heavy` and `relay-db`
 retry (`count = 2`, fixed 1s delay): PTY, socket, worker-process, and
