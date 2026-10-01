@@ -187,6 +187,7 @@ class AuditTest(unittest.TestCase):
         for text in ("expected exactly arm64", "newer than", "runtime search path", "build-machine path"):
             self.assertIn(text, result.stderr)
         self.assertIn("4 problem(s)", result.stderr)
+        self.assertNotIn("ok ", result.stdout)
 
     def test_bad_arguments_are_refused(self):
         for args in (["--minimum-os"], ["--forbid-string", ""], ["--minimum-os", "x", "."], ["--nope"], []):

@@ -112,6 +112,7 @@ audit_file() {
         *) return ;;
     esac
     checked=$((checked + 1))
+    failures_before=$failures
 
     archs=$(lipo -archs "$file" 2>&1) || {
         problem "$file" "lipo cannot read it: $archs"
@@ -165,7 +166,9 @@ audit_file() {
         cat "$scratch/string-failures" >&2
         failures=$((failures + $(wc -l < "$scratch/string-failures")))
     fi
-    printf 'ok %s: arm64, minos %s\n' "$file" "${minos:-unknown}"
+    if [ "$failures" -eq "$failures_before" ]; then
+        printf 'ok %s: arm64, minos %s\n' "$file" "${minos:-unknown}"
+    fi
 }
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/audit-macho.XXXXXX")

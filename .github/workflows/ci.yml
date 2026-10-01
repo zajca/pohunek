@@ -419,11 +419,17 @@ jobs:
   # are unsigned development builds; signing and notarization run only in the
   # release workflow.
   macos-package:
-    name: macOS package install and upgrade (arm64)
+    # macos-14 is the minimum supported macOS and macos-15 the current one: the
+    # packaged archives are exercised natively on both.
+    name: macOS package install and upgrade (${{ matrix.runner }})
     if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.macos_package == 'true' }}
     needs: changes
-    runs-on: macos-15
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-14, macos-15]
     env:
       # mold is Linux-only: keep the default linker on macOS runners.
       RUSTFLAGS: -D warnings
@@ -444,7 +450,7 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: macos-package
+          shared-key: macos-package-${{ matrix.runner }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build offline documentation
@@ -787,6 +793,7 @@ jobs:
               - 'crates/xtask/src/**'
               - 'scripts/provision-hermes-compat'
               - 'scripts/tests/provision-hermes-compat.sh'
+              - 'packaging/**'
               - 'scripts/smoke-hermes-plugin-release'
               - 'scripts/tests/smoke-hermes-plugin-release.sh'
               - 'scripts/tests/fixtures/smoke-*'
@@ -1350,28 +1357,35 @@ jobs:
       - name: Test Hermes harness natively
         run: cargo test --locked -p xtask --lib hermes
 
-      - name: Build release CLI
-        run: cargo build --locked --release -p pohunek-cli --bin pohunek
+      - name: Build offline documentation
+        run: cargo xtask docs site
 
-      # The release binary and the packaged smoke script are copied to a
-      # directory outside the checkout, so the gate and the smoke can only use
-      # assets embedded in the binary.
-      - name: Stage packaged CLI outside the source tree
+      # The packaged archive is built with the release scripts and extracted
+      # outside the checkout, so the gate and the smoke can only use what the
+      # published macOS CLI archive contains: the binary with its embedded
+      # plugin and skill assets, and the packaged smoke script.
+      - name: Build, package, and extract the CLI archive outside the source tree
         id: packaged
         shell: /bin/bash {0}
         run: |
           set -euo pipefail
-          packaged_dir="$RUNNER_TEMP/packaged-pohunek"
-          rm -rf "$packaged_dir"
-          mkdir -p "$packaged_dir"
-          cp target/release/pohunek "$packaged_dir/pohunek"
-          cp scripts/smoke-hermes-plugin-release "$packaged_dir/smoke-hermes-plugin-release"
-          chmod 0755 "$packaged_dir/pohunek" "$packaged_dir/smoke-hermes-plugin-release"
-          packaged_dir="$(cd "$packaged_dir" && pwd -P)"
+          version="$(awk -F'"' '/^\[workspace\.package\]/ { in_pkg = 1; next } /^\[/ { in_pkg = 0 } in_pkg && /^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)"
+          bindir="$(packaging/macos/build-release cli)"
+          dist="$RUNNER_TEMP/dist-cli"
+          rm -rf "$dist"
+          mkdir -p "$dist"
+          archive="$(packaging/macos/package --development cli "$version" "$bindir" target/pohunek-docs "$dist")"
+          extract_dir="$RUNNER_TEMP/packaged-pohunek"
+          rm -rf "$extract_dir"
+          mkdir -p "$extract_dir"
+          tar -xzf "$archive" -C "$extract_dir"
+          packaged_dir="$(cd "$extract_dir/$(basename "$archive" .tar.gz)" && pwd -P)"
           if git -C "$packaged_dir" rev-parse --git-dir >/dev/null 2>&1; then
             echo "packaged directory is inside a Git worktree: $packaged_dir" >&2
             exit 1
           fi
+          test -x "$packaged_dir/pohunek"
+          test -x "$packaged_dir/packaging/smoke-hermes-plugin-release"
           printf 'dir=%s\n' "$packaged_dir" >> "$GITHUB_OUTPUT"
 
       - name: Check pinned Hermes compatibility
@@ -1386,7 +1400,7 @@ jobs:
         shell: /bin/bash {0}
         run: |
           set -euo pipefail
-          "${{ steps.packaged.outputs.dir }}/smoke-hermes-plugin-release" \
+          "${{ steps.packaged.outputs.dir }}/packaging/smoke-hermes-plugin-release" \
             "${{ steps.packaged.outputs.dir }}/pohunek" \
             "${{ steps.hermes.outputs.bin }}"
 
