@@ -1,17 +1,24 @@
 #!/bin/sh
 # Package built macOS binaries into a release-layout archive.
 #
-# usage: package --development|--release <component> <version> <bindir> <docs-dir> <output-dir>
+# usage:
+#   package --development   <component> <version> <bindir> <docs-dir> <output-dir>
+#   package --stage-release <component> <version> <bindir> <docs-dir> <output-dir>
+#   package --sign-release  <component> <version> <staging-dir>
 #
 # <component> is cli, daemon, or gui (the gui archive holds Pohunek.app, built
 # here from <bindir>/pohunek-gui). The staged tree is audited (`audit-macho`),
 # then sealed with a MANIFEST and archived reproducibly; the archive path is
 # printed on stdout.
 #
-# `--release` signs the tree with the Developer ID identity, has Apple notarize
-# it (stapling app bundles), and verifies the result before the manifest is
-# written, so the manifest hashes the final signed bytes and records
-# `signing developer-id`. It needs the environment of `signing-keychain`
+# A release is made in two steps so that no built program runs while a signing
+# credential exists. `--stage-release` assembles and audits the tree, which runs
+# the built `pohunek` to write the shell completions, and needs no secret; it
+# prints the staging directory. `--sign-release` then signs the tree with the
+# Developer ID identity, has Apple notarize it (stapling app bundles), verifies
+# the result, and writes the manifest and the archive, so the manifest hashes the
+# final signed bytes and records `signing developer-id`. It runs nothing from
+# the tree. It needs the environment of `signing-keychain`
 # (MACOS_SIGNING_IDENTITY, MACOS_SIGNING_KEYCHAIN), of `notarize`
 # (APPLE_NOTARY_*), and MACOS_TEAM_ID, and fails when any is missing: a release
 # is never produced unsigned. Signing embeds Apple's secure timestamp, so a
@@ -34,17 +41,18 @@ fail() {
     exit 1
 }
 
-[ "$#" -eq 6 ] || fail "usage: package --development|--release <component> <version> <bindir> <docs-dir> <output-dir>"
+usage="usage: package --development|--stage-release <component> <version> <bindir> <docs-dir> <output-dir>
+       package --sign-release <component> <version> <staging-dir>"
+[ "$#" -ge 1 ] || fail "$usage"
 mode=$1
+case $mode in
+    --development | --stage-release) [ "$#" -eq 6 ] || fail "$usage" ;;
+    --sign-release) [ "$#" -eq 4 ] || fail "$usage" ;;
+    *) fail "unsupported mode: $mode
+$usage" ;;
+esac
 component=$2
 version=$3
-bindir=$4
-docs=$5
-output=$6
-case $mode in
-    --development | --release) ;;
-    *) fail "unsupported mode: $mode (use --development or --release)" ;;
-esac
 case $component in
     cli) require="--require pohunek" ;;
     daemon) require="--require pohunek --require pohunekd --require pohunek-sessiond" ;;
@@ -57,16 +65,40 @@ root=$(CDPATH= cd -- "$script_dir/../.." && pwd -P)
 target=aarch64-apple-darwin
 minimum_macos=$(tr -d ' \n' < "$script_dir/DEPLOYMENT_TARGET")
 
-if [ "$mode" = --release ]; then
+if [ "$mode" = --sign-release ]; then
     # Checked first so a release with a missing credential fails before any
-    # build output is produced.
+    # work is done.
     for variable in MACOS_SIGNING_IDENTITY MACOS_SIGNING_KEYCHAIN MACOS_TEAM_ID \
         APPLE_NOTARY_KEY_P8_BASE64 APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID; do
         eval "value=\${$variable:-}"
         [ -n "$value" ] || fail "$variable is not set: a release is never produced unsigned"
     done
+    staging=$(CDPATH= cd -- "$4" && pwd -P)
+    output=$(dirname -- "$staging")
+    name=$(basename -- "$staging")
+    case $name in
+        *-unsigned-development) fail "a development staging directory cannot be signed as a release: $name" ;;
+        "pohunek-$component-$version-$target") ;;
+        *) fail "unexpected staging directory name: $name" ;;
+    esac
+    cd "$root"
+    if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
+        SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+    fi
+    export SOURCE_DATE_EPOCH
+    "$script_dir/sign" "$staging" >&2
+    "$script_dir/notarize" "$staging" >&2
+    "$script_dir/verify-signed" --notarized --team-id "$MACOS_TEAM_ID" "$staging" >&2
+    sh "$root/packaging/write-manifest" "$staging" "$component" "$version" "$target" \
+        developer-id "$minimum_macos"
+    sh "$root/packaging/archive" "$output" "$name" "$output"
+    printf '%s\n' "$output/$name.tar.gz"
+    exit 0
 fi
 
+bindir=$4
+docs=$5
+output=$6
 # The caller's relative paths mean the caller's directory.
 bindir=$(CDPATH= cd -- "$bindir" && pwd -P)
 docs=$(CDPATH= cd -- "$docs" && pwd -P)
@@ -91,9 +123,6 @@ if [ "$mode" = --development ]; then
     rm -rf -- "$output/$name$suffix"
     mv -- "$output/$name" "$output/$name$suffix"
     name=$name$suffix
-    signing=unsigned-development
-else
-    signing=developer-id
 fi
 staging=$output/$name
 
@@ -107,12 +136,11 @@ fi
 
 # shellcheck disable=SC2086
 "$script_dir/audit-macho" $require --forbid-string "$root" "$staging" >&2
-if [ "$mode" = --release ]; then
-    "$script_dir/sign" "$staging" >&2
-    "$script_dir/notarize" "$staging" >&2
-    "$script_dir/verify-signed" --notarized --team-id "$MACOS_TEAM_ID" "$staging" >&2
+if [ "$mode" = --stage-release ]; then
+    printf '%s\n' "$staging"
+    exit 0
 fi
 sh "$root/packaging/write-manifest" "$staging" "$component" "$version" "$target" \
-    "$signing" "$minimum_macos"
+    unsigned-development "$minimum_macos"
 sh "$root/packaging/archive" "$output" "$name" "$output"
 printf '%s\n' "$output/$name.tar.gz"

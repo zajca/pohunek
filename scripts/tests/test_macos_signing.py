@@ -351,15 +351,31 @@ class PackageReleaseTest(Base):
             "MACOS_TEAM_ID": TEAM,
             **NOTARY_ENV,
         }
+        staging = self.root / "pohunek-daemon-1.2.3-aarch64-apple-darwin"
+        staging.mkdir()
         for missing in full:
             env = dict(full)
             env[missing] = ""
-            result = self.run_tool(
-                "package", "--release", "daemon", "1.2.3", self.root, self.root, self.root, env=env
-            )
+            result = self.run_tool("package", "--sign-release", "daemon", "1.2.3", staging, env=env)
             self.assertEqual(result.returncode, 1, missing)
             self.assertIn(missing, result.stderr)
             self.assertIn("never produced unsigned", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_development_tree_or_a_misnamed_tree_is_never_signed_as_a_release(self):
+        full = {**SIGNING_ENV, "MACOS_TEAM_ID": TEAM, **NOTARY_ENV}
+        for name in (
+            "pohunek-daemon-1.2.3-aarch64-apple-darwin-unsigned-development",
+            "pohunek-cli-1.2.3-aarch64-apple-darwin",
+        ):
+            staging = self.root / name
+            staging.mkdir()
+            result = self.run_tool("package", "--sign-release", "daemon", "1.2.3", staging, env=full)
+            self.assertEqual(result.returncode, 1, name)
+            self.assertIn(
+                "development staging" if name.endswith("development") else "unexpected staging directory name",
+                result.stderr,
+            )
         self.assertEqual(self.calls(), [])
 
     def test_modes_and_components_are_validated(self):
@@ -367,6 +383,7 @@ class PackageReleaseTest(Base):
             ("--sideload", "daemon", "1.2.3", self.root, self.root, self.root),
             ("--development", "relay", "1.2.3", self.root, self.root, self.root),
             ("--development", "daemon"),
+            ("--release", "daemon", "1.2.3", self.root, self.root, self.root),
         ):
             result = self.run_tool("package", *args)
             self.assertEqual(result.returncode, 1, args)
@@ -467,13 +484,28 @@ class ReleaseWorkflowTest(unittest.TestCase):
     def test_missing_credentials_fail_the_job_and_nothing_unsigned_is_attached(self):
         self.assertIn("Require signing and notarization credentials", self.job)
         self.assertIn("exit 1", self.job.split("Install Python", 1)[0])
-        self.assertIn("packaging/macos/package --release", self.job)
+        self.assertIn("packaging/macos/package --stage-release", self.job)
+        self.assertIn("packaging/macos/package --sign-release", self.job)
         self.assertNotIn("--development", self.job)
         self.assertIn("grep -q '^signing developer-id$'", self.job)
 
     def test_the_keychain_is_always_removed(self):
         block = self.job.split("- name: Remove ephemeral signing keychain", 1)[1].split("\n      - ", 1)[0]
         self.assertIn("if: always()", block)
+
+    def test_no_built_program_runs_while_a_signing_credential_exists(self):
+        stage = self.job.index("name: Stage and audit the archive tree")
+        create = self.job.index("name: Create ephemeral signing keychain")
+        sign = self.job.index("name: Sign, notarize, verify, and package")
+        remove = self.job.index("name: Remove ephemeral signing keychain")
+        # Staging (which runs `pohunek completions`) comes first.
+        self.assertLess(stage, create)
+        self.assertLess(create, sign)
+        self.assertLess(sign, remove)
+        between = self.job[create:remove]
+        self.assertNotIn("--stage-release", between)
+        for runner in ("--version", "smoke", "cargo", "bun run", "stage-archive"):
+            self.assertNotIn(runner, between, runner)
 
     def test_the_packaged_cli_smoke_runs_from_the_extracted_archive(self):
         self.assertIn("packaging/smoke-hermes-plugin-release", self.job)

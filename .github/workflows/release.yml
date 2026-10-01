@@ -556,6 +556,24 @@ jobs:
           bindir="$(packaging/macos/build-release "${{ matrix.component }}")"
           echo "bindir=$bindir" >> "$GITHUB_OUTPUT"
 
+      # Everything that runs a built program (the shell completions written
+      # while staging) happens here, before any signing or notary credential
+      # exists on the runner.
+      - name: Stage and audit the archive tree
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          # Archives are stamped with the tagged commit's time.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          staging="$(packaging/macos/package --stage-release "${{ matrix.component }}" "${version}" \
+            "${{ matrix.component == 'web' && steps.webinput.outputs.input || steps.build.outputs.bindir }}" \
+            "${{ matrix.component == 'web' && 'web' || 'target/pohunek-docs' }}" dist)"
+          echo "staging=${staging}" >> "$GITHUB_OUTPUT"
+
       - name: Create ephemeral signing keychain
         shell: bash
         env:
@@ -563,6 +581,8 @@ jobs:
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
         run: packaging/macos/signing-keychain create
 
+      # Signs, notarizes, verifies, and archives the staged tree. It runs no
+      # program from the tree.
       - name: Sign, notarize, verify, and package
         id: package
         shell: bash
@@ -574,12 +594,10 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          mkdir -p dist
-          # Archives are stamped with the tagged commit's time.
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           export SOURCE_DATE_EPOCH
-          archive="$(packaging/macos/package --release "${{ matrix.component }}" "${version}" \
-            "${{ steps.build.outputs.bindir }}" target/pohunek-docs dist)"
+          archive="$(packaging/macos/package --sign-release "${{ matrix.component }}" "${version}" \
+            "${{ steps.stage.outputs.staging }}")"
           echo "archive=${archive}" >> "$GITHUB_OUTPUT"
           echo "checksum=${archive}.sha256" >> "$GITHUB_OUTPUT"
 

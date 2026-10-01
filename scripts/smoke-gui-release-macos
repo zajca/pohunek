@@ -78,6 +78,9 @@ mkdir -p "$home/.config/pohunek" "$work/run" "$work/state" "$work/data" "$work/c
 user=$(id -un)
 : > "$work/gui.out"
 : > "$work/gui.err"
+# Processes already running this bundle's executable; the new instance is the
+# one that is not among them.
+existing=$(/usr/bin/pgrep -f "$executable" || true)
 # LaunchServices starts the app as Finder does: through launchd, with launchd's
 # minimal environment. `open --env` adds only the isolation variables, so the
 # run neither reads nor changes the operator's own pohunek state.
@@ -95,8 +98,20 @@ user=$(id -un)
 # time is part of its identity so a recycled pid is never signalled.
 waited=0
 while :; do
-    gui_pid=$(/usr/bin/pgrep -f "$executable" | head -n 1 || true)
-    if [ -n "$gui_pid" ]; then
+    candidates=
+    for candidate in $(/usr/bin/pgrep -f "$executable" || true); do
+        case " $(printf '%s' "$existing" | tr '\n' ' ') " in
+            *" $candidate "*) ;;
+            *) candidates="$candidates $candidate" ;;
+        esac
+    done
+    set -- $candidates
+    if [ "$#" -gt 1 ]; then
+        printf 'more than one new instance matches %s:%s\n' "$executable" "$candidates" >&2
+        exit 1
+    fi
+    if [ "$#" -eq 1 ]; then
+        gui_pid=$1
         gui_start=$(ps -o lstart= -p "$gui_pid" 2>/dev/null || true)
         [ -n "$gui_start" ] && break
     fi
@@ -107,7 +122,7 @@ done
 
 elapsed=0
 while [ "$elapsed" -lt "$SMOKE_WINDOW_SECONDS" ]; do
-    if ! kill -0 "$gui_pid" 2>/dev/null; then
+    if ! gui_is_ours; then
         printf '%s\n' "the packaged GUI exited during startup" >&2
         exit 1
     fi

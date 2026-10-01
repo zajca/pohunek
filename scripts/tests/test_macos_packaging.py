@@ -312,11 +312,10 @@ class ToolingTest(unittest.TestCase):
 
     def test_the_development_package_is_never_a_release_name(self):
         text = (MACOS / "package").read_text()
-        development = text.split('if [ "$mode" = --development ]; then', 1)[1].split("else", 1)[0]
+        development = text.split('if [ "$mode" = --development ]; then', 1)[1].split("\nfi", 1)[0]
         self.assertIn("suffix=-unsigned-development", development)
-        self.assertIn("signing=unsigned-development", development)
-        release = text.split("else\n    signing=", 1)[1].split("\nfi", 1)[0]
-        self.assertEqual(release, "developer-id")
+        self.assertIn("unsigned-development", text.split("write-manifest", 2)[2])
+        self.assertIn("developer-id", text.split("--sign-release ]; then", 1)[1])
 
 
 if __name__ == "__main__":
