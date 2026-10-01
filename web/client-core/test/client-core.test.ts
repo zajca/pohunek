@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createServer, type Server } from "node:net";
 import { startRelay, type DaemonTarget, type RelayHandle } from "@pohunek/backend";
 import {
   PROTOCOL_VERSION,
@@ -29,6 +30,11 @@ const RESIZED_COLS = 132;
 const RESIZED_ROWS = 43;
 const PAGINATED_NOTIFICATION_COUNT = 101;
 const DISCOVERED_HOST_COUNT = 97;
+// Reconnect attempts while a host is down must follow the capped exponential
+// backoff (250 ms, doubling, capped at 5 s): within this window at most five
+// attempts fit, so a reconnect storm after a network change fails the bound.
+const OUTAGE_OBSERVATION_MS = 1_500;
+const MAX_ATTEMPTS_DURING_OBSERVATION = 6;
 const NON_UTF8_PAYLOAD = Uint8Array.of(0x00, 0xff, 0x80, 0x61, 0xc3, 0x28);
 
 describe("@pohunek/client-core", () => {
@@ -504,6 +510,61 @@ describe("@pohunek/client-core", () => {
       await workspace.close();
       await relay.close();
       await daemon.close();
+    }
+  });
+
+  test("an action issued during an outage fails and is not replayed after reconnect", async () => {
+    let daemon = await startTcpFixture({});
+    const address = requireTcpAddress(daemon);
+    const relay = await relayFor(new Map([
+      ["outage", { kind: "tcp", host: address.host, port: address.port }],
+    ]));
+    const workspace = workspaceFor(relay, [host("outage")]);
+    try {
+      await waitFor(() => connectionKind(workspace, "outage") === "connected");
+      await daemon.stopAbruptly();
+      await waitFor(() => connectionKind(workspace, "outage") === "error");
+
+      await expectClientError(
+        workspace.actions.sessionNew("outage", { agent: "codex", cols: TEST_COLS, rows: TEST_ROWS }),
+      );
+
+      daemon = await startTcpFixture({ port: address.port });
+      await waitFor(() => connectionKind(workspace, "outage") === "connected");
+      // The failed request is gone: the recovered daemon holds no session for it.
+      expect(sessionIds(workspace, "outage")).toEqual([]);
+    } finally {
+      await workspace.close();
+      await relay.close();
+      await daemon.close();
+    }
+  });
+
+  test("an unreachable host is retried with bounded backoff, not in a storm", async () => {
+    let attempts = 0;
+    const listener: Server = createServer((socket): void => {
+      attempts += 1;
+      socket.destroy();
+    });
+    await new Promise<void>((resolve) => listener.listen(0, LOOPBACK_HOST, resolve));
+    const bound = listener.address();
+    if (bound === null || typeof bound === "string") {
+      throw new Error("test listener has no TCP address");
+    }
+    const relay = await relayFor(new Map([
+      ["storm", { kind: "tcp", host: LOOPBACK_HOST, port: bound.port }],
+    ]));
+    const workspace = workspaceFor(relay, [host("storm")]);
+    try {
+      await waitFor(() => attempts >= 1);
+      await new Promise<void>((resolve) => setTimeout(resolve, OUTAGE_OBSERVATION_MS));
+      expect(attempts <= MAX_ATTEMPTS_DURING_OBSERVATION).toBe(true);
+      expect(attempts >= 2).toBe(true);
+      expect(connectionKind(workspace, "storm") === "connected").toBe(false);
+    } finally {
+      await workspace.close();
+      await relay.close();
+      await new Promise<void>((resolve) => listener.close((): void => resolve()));
     }
   });
 });
