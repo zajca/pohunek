@@ -267,7 +267,21 @@ pub fn run_status() -> Result<NetbirdStatus, NetbirdError> {
 ///
 /// Returns the same errors as [`run_status`].
 pub async fn run_status_async() -> Result<NetbirdStatus, NetbirdError> {
-    let program = resolve_host_program()?;
+    run_status_async_resolving(resolve_host_program).await
+}
+
+/// Resolves the program on the blocking pool, then runs it.
+///
+/// The lookup stats and opens files along every `PATH` entry, so a stalled
+/// filesystem must not hold the caller's task: the future stays cancellable
+/// while the lookup runs, and an abandoned lookup finishes on its own thread.
+async fn run_status_async_resolving<R>(resolve: R) -> Result<NetbirdStatus, NetbirdError>
+where
+    R: FnOnce() -> Result<PathBuf, NetbirdError> + Send + 'static,
+{
+    let program = tokio::task::spawn_blocking(resolve)
+        .await
+        .map_err(|err| NetbirdError::StateUnavailable(format!("netbird lookup failed: {err}")))??;
     run_status_async_at(&program).await
 }
 
@@ -589,7 +603,8 @@ mod tests {
             tokio::select! {
                 result = &mut status => panic!("slow status exited before cancellation: {result:?}"),
                 () = async {
-                    while !pid_path.exists() {
+                    // The shell creates the file before it writes the pid.
+                    while fs::read_to_string(&pid_path).map_or(true, |pid| pid.is_empty()) {
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     }
                 } => {}
@@ -700,6 +715,26 @@ mod tests {
             resolve_program(None, &table, None),
             Err(NetbirdError::CliMissing)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_stalled_lookup_does_not_hold_the_future() {
+        const LOOKUP_STALL: std::time::Duration = std::time::Duration::from_secs(5);
+        const DEADLINE: std::time::Duration = std::time::Duration::from_millis(50);
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let status = run_status_async_resolving(move || {
+            // Stands in for a lookup stuck in a filesystem call.
+            let _ = stalled.recv_timeout(LOOKUP_STALL);
+            Err(NetbirdError::CliMissing)
+        });
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(DEADLINE, status).await;
+        assert!(outcome.is_err(), "the caller's deadline must fire");
+        assert!(
+            started.elapsed() < LOOKUP_STALL,
+            "the caller waited for the lookup"
+        );
+        drop(release);
     }
 
     #[test]

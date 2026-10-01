@@ -111,9 +111,13 @@ macOS-specific routing, bridging, or relay mode.
   process: first the process `PATH`, then the trusted install directories
   (`/opt/homebrew/bin`, `/usr/local/bin` among them). An executable another
   account could replace is never used. `pohunek doctor` reports `netbird_cli`
-  through the same lookup, so a `warn` there means the daemon cannot find the
-  CLI either; install NetBird or fix the ownership and permissions of the
-  directory holding it.
+  through the same lookup. Its warning has several causes: read the detail. A
+  "not found" detail means no trusted `netbird` was located; install NetBird or
+  fix the ownership and permissions of the directory holding it. A "local state
+  is unavailable" or "no NetBird IP" detail means the CLI was found but is not
+  logged in or its daemon is down. When the daemon answers, the entry reads
+  `local: ...; daemon: ...` and the worse status wins: read each side, because
+  a warning from one process does not prove the other cannot find the CLI.
 - **The listener.** The daemon binds its overlay listener only to the address
   the overlay reports for this host and re-binds when that address changes. The
   Unix socket stays available while the VPN is down, starting, or
