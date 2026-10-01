@@ -23,10 +23,6 @@ const PRE_TASK_CODES: [&str; 6] = [
     "agent_fork_unsupported",
 ];
 
-/// Task-layer codes the daemon already raises outside the task layer; each is
-/// documented for every method that raises it.
-const SHARED_WITH_DAEMON: [&str; 1] = ["worktree_in_use"];
-
 /// Exact fixed `msg` and `recover` text of every task-layer error; the public
 /// contract promises both as fixed text, so a reworded constructor must update
 /// this table deliberately.
@@ -571,7 +567,7 @@ fn task_error_travels_in_a_response_envelope() {
     assert_eq!(value["err"]["code"], "task_worktree_busy");
 }
 
-/// The concatenated daemon sources, searched for code literals and constructor calls.
+/// The concatenated daemon sources, searched for hand-written code literals.
 fn daemon_source_literals() -> String {
     fn walk(dir: &std::path::Path, out: &mut String) {
         for entry in std::fs::read_dir(dir).expect("read daemon source dir") {
@@ -590,15 +586,16 @@ fn daemon_source_literals() -> String {
 }
 
 #[test]
-fn task_error_codes_only_overlap_daemon_codes_when_declared_shared() {
+fn task_error_codes_are_never_hand_written_in_daemon_sources() {
+    // Daemon handlers raise task errors through the canonical constructors; a
+    // quoted task code in the daemon sources is a second, hand-written
+    // definition that can drift from the contract or collide with it.
     let sources = daemon_source_literals();
     for case in task_errors() {
         let literal = format!("\"{}\"", case.code);
-        let constructor = format!("ProtocolError::{}(", case.code);
-        assert_eq!(
-            sources.contains(&literal) || sources.contains(&constructor),
-            SHARED_WITH_DAEMON.contains(&case.code),
-            "{}: the daemon's use of this code must match SHARED_WITH_DAEMON",
+        assert!(
+            !sources.contains(&literal),
+            "{}: use the ProtocolError constructor instead of a literal",
             case.code
         );
     }

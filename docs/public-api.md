@@ -1417,7 +1417,12 @@ daemon raises them once the task methods are served (until then task methods
 answer `method_not_found`). Every one has a fixed `msg` and, where the table
 says `yes`, a fixed `recover` hint; `task_snapshot_retired` and
 `task_review_limit_reached` carry no hint. Task errors never echo a prompt,
-answer, path, task id or secret. Session methods
+answer, path, task id or secret. The text is fixed in the daemon's response;
+the Rust SDK's remote path (`ClientError::RemoteProtocol`) prepends
+`host '<host>':` to `msg` and leaves `class`, `code` and `recover` unchanged.
+`ProtocolError` has no data field, so `worktree_in_use` and `task_worktree_busy`
+cannot name the users or the blocking task; the method slice decides where that
+data is carried. Session methods
 raise `worktree_busy`, `task_session_ended`, `task_fork_unsupported`,
 `worktree_in_use`, `worktree_users_changed` and `task_snapshot_retired` for
 sessions that belong to tasks.
