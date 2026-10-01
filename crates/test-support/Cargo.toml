@@ -4,11 +4,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Test-only helpers: fixture roots that satisfy the trusted filesystem and Unix socket limits, and runtime resolution of test binaries, manifests and the session worker."
+description = "Test-only helpers: fixture roots that satisfy the trusted filesystem and Unix socket limits, runtime resolution of test binaries, manifests and the session worker, and readiness waits bounded by one hang-guard ceiling."
 publish = false
 
 [dependencies]
 tempfile.workspace = true
+# The async waits use `tokio::time`; the workspace spec already enables every
+# feature the other crates use, so this adds no build weight to a workspace build.
+tokio.workspace = true
+
+[dev-dependencies]
+# `test-util` provides the paused clock the async wait tests run under.
+tokio = { workspace = true, features = ["test-util"] }
+# Parses `.config/nextest.toml` to check the hang guard against `terminate-after`.
+toml = { workspace = true }
 
 [lints]
 workspace = true

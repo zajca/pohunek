@@ -4613,6 +4613,8 @@ name = "pohunek-test-support"
 version = "0.31.6"
 dependencies = [
  "tempfile",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
