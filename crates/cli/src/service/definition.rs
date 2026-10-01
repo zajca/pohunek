@@ -350,6 +350,29 @@ mod tests {
     }
 
     #[test]
+    fn the_probe_sees_shell_so_a_profile_branching_on_it_sets_its_path() {
+        let (_root, root) = temp_root();
+        let root = root.as_path();
+        let prefix = root.join("opt/tools/bin");
+        make_dirs(root, &prefix);
+        // A profile that sets `PATH` only when `$SHELL` names this very shell.
+        let path = root.join("fake-shell");
+        let shell = fake_shell(
+            root,
+            &format!(
+                "[ \"$SHELL\" = '{}' ] && PATH='{}'; export PATH\nexec /bin/sh -c \"$3\"",
+                path.display(),
+                prefix.display()
+            ),
+        );
+        assert_eq!(shell, path);
+        let context = managed_context(root, shell, &[]);
+        let (recorded, report) = context.install_search_path().expect("resolve");
+        assert_eq!(recorded.entries(), [prefix]);
+        assert_eq!(report.source, "login_shell");
+    }
+
+    #[test]
     fn a_broken_login_shell_falls_back_to_the_directory_list() {
         let (_root, root) = temp_root();
         let root = root.as_path();

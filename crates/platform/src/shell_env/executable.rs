@@ -169,13 +169,23 @@ pub(super) fn is_executable_file(path: &Path) -> bool {
 /// effective-user-owned components are not group- or world-writable and
 /// root-owned ones are non-writable or sticky, so no other account can rename
 /// an entry on either the lexical or the canonical chain.
-fn lookup_chain_is_owner_controlled(path: &Path) -> bool {
+///
+/// Every symlink on the chain must be owned by `owners`, and a directory that
+/// others can write (a sticky `/tmp`) may hold a chain entry only when that
+/// entry is owned by `owners` too: sticky protects an entry from everyone but
+/// its owner, so an entry another account created there is the attack itself.
+fn lookup_chain_is_owner_controlled(path: &Path, owners: Owners) -> bool {
     use std::collections::VecDeque;
     use std::ffi::OsString;
+    use std::os::unix::fs::MetadataExt as _;
     use std::path::Component;
 
     /// Symlinks followed before the lookup is treated as a loop.
     const MAX_LINKS: usize = 40;
+    /// Group and other write permission bits.
+    const WRITABLE_BY_OTHERS: u32 = 0o022;
+    /// The sticky bit.
+    const STICKY: u32 = 0o1000;
 
     let mut pending: VecDeque<OsString> = path
         .components()
@@ -199,9 +209,20 @@ fn lookup_chain_is_owner_controlled(path: &Path) -> bool {
         let Ok(metadata) = std::fs::symlink_metadata(&next) else {
             return false;
         };
+        let owned = owners.allows(metadata.uid());
+        let Ok(holder) = std::fs::metadata(&directory) else {
+            return false;
+        };
+        let holder_mode = holder.mode();
+        if holder_mode & WRITABLE_BY_OTHERS != 0 && !(holder_mode & STICKY != 0 && owned) {
+            return false;
+        }
         if !metadata.file_type().is_symlink() {
             directory = next;
             continue;
+        }
+        if !owned {
+            return false;
         }
         links += 1;
         let Ok(target) = std::fs::read_link(&next) else {
@@ -250,7 +271,7 @@ fn is_trusted_executable(path: &Path, owners: Owners) -> bool {
         && owners.allows(stat.st_uid)
         && !mode.intersects(Mode::WGRP | Mode::WOTH)
         && crate::filesystem::validate_private_acl(&file, &target).is_ok()
-        && lookup_chain_is_owner_controlled(path)
+        && lookup_chain_is_owner_controlled(path, owners)
         && rustix::fs::accessat(
             rustix::fs::CWD,
             &target,
@@ -640,5 +661,55 @@ mod tests {
         let agent = executable(&bin, "agent");
         let search = SearchPath::new(vec![bin]).expect("search");
         assert_eq!(resolve_executable(OsStr::new("agent"), &search), Ok(agent));
+    }
+
+    #[test]
+    fn a_foreign_symlink_or_entry_in_a_sticky_directory_breaks_the_chain() {
+        let dir = fixture();
+        let real = executable(dir.path(), "real");
+        let sticky = dir.path().join("sticky");
+        make_dir(dir.path(), &sticky);
+        fs::set_permissions(&sticky, fs::Permissions::from_mode(0o1777)).expect("chmod");
+        let link = sticky.join("agent");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        // The owner ids stand in for "another account", since a test cannot chown.
+        let strangers = Owners {
+            effective: u32::MAX - 1,
+            root: u32::MAX - 2,
+        };
+        assert!(!lookup_chain_is_owner_controlled(&link, strangers));
+        // A plain entry another account put into the sticky directory is the
+        // same attack.
+        assert!(!lookup_chain_is_owner_controlled(
+            &sticky.join("plain"),
+            strangers
+        ));
+        // A symlink in a private directory is judged by its owner alone.
+        let private = dir.path().join("private");
+        make_dir(dir.path(), &private);
+        let own = private.join("agent");
+        std::os::unix::fs::symlink(&real, &own).expect("symlink");
+        assert!(!lookup_chain_is_owner_controlled(&own, strangers));
+        let me = Owners {
+            effective: rustix::process::geteuid().as_raw(),
+            root: u32::MAX - 2,
+        };
+        assert!(lookup_chain_is_owner_controlled(&own, me));
+    }
+
+    #[test]
+    fn a_homebrew_style_relative_symlink_is_accepted() {
+        let dir = fixture();
+        let cellar = dir.path().join("Cellar/x/1.0/bin");
+        let bin = dir.path().join("bin");
+        make_dir(dir.path(), &cellar);
+        make_dir(dir.path(), &bin);
+        executable(&cellar, "x");
+        std::os::unix::fs::symlink("../Cellar/x/1.0/bin/x", bin.join("x")).expect("symlink");
+        let search = SearchPath::new(vec![bin.clone()]).expect("search");
+        assert_eq!(
+            resolve_executable(OsStr::new("x"), &search),
+            Ok(bin.join("x"))
+        );
     }
 }

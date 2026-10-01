@@ -390,7 +390,7 @@ impl Context {
 /// report that names the shell must stay serializable.
 pub fn managed_path_discovery(
     shell: Option<PathBuf>,
-    environment: Vec<(String, String)>,
+    mut environment: Vec<(String, String)>,
 ) -> Result<PathDiscovery, Error> {
     let shell_defaulted = shell.is_none();
     let shell = match shell {
@@ -410,6 +410,16 @@ pub fn managed_path_discovery(
         }
         None => PathBuf::from(settings::DEFAULT_LOGIN_SHELL),
     };
+    // The probe starts from an empty environment, so `$SHELL` is passed on:
+    // a startup profile that branches on it would otherwise skip its `PATH`
+    // setup and the probe would succeed with the baseline value.
+    environment.push((
+        "SHELL".to_owned(),
+        shell
+            .to_str()
+            .expect("the shell path was validated as UTF-8")
+            .to_owned(),
+    ));
     Ok(PathDiscovery::Managed {
         login_shell: Some(LoginShellSpec {
             shell,
@@ -615,7 +625,10 @@ pub(crate) mod tests {
         // An empty selector counts as unset, as shells treat it.
         assert_eq!(
             spec.environment,
-            [("ZDOTDIR".to_owned(), "/home/u/.config/zsh".to_owned())]
+            [
+                ("ZDOTDIR".to_owned(), "/home/u/.config/zsh".to_owned()),
+                ("SHELL".to_owned(), "/bin/zsh".to_owned()),
+            ]
         );
         for (var, value, code) in [
             (
@@ -722,7 +735,11 @@ pub(crate) mod tests {
         assert!(shell_defaulted);
         assert_eq!(
             spec.environment,
-            [("HOME".to_owned(), "/home/u".to_owned())]
+            [
+                ("HOME".to_owned(), "/home/u".to_owned()),
+                // The defaulted shell is passed on as `$SHELL` too.
+                ("SHELL".to_owned(), "/bin/zsh".to_owned()),
+            ]
         );
     }
 

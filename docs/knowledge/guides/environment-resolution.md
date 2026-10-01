@@ -31,7 +31,8 @@ Highest priority first:
 3. **Bounded login-shell discovery (macOS only).** One `$SHELL -l -c` probe
    prints `PATH` between two random sentinel lines through the absolute
    `/usr/bin/printenv`. It is never interactive (`-i` is not used), reads a
-   null stdin, starts from an empty environment plus `HOME`, `USER`, `LOGNAME`, the
+   null stdin, starts from an empty environment plus `HOME`, `USER`, `LOGNAME`, `SHELL` (the shell
+   being probed, so a profile that branches on it behaves as in a real login), the
    profile selectors `ZDOTDIR` and `XDG_CONFIG_HOME` when set (each must be an
    absolute UTF-8 path, or the install fails), `TERM=dumb`, and a baseline
    `PATH`, and runs in its own process group. One
@@ -61,7 +62,10 @@ started by. The directories the lookup passes through must also be
 owner-controlled, on the lexical chain and on the canonical chain of a symlink
 target: every component passes the platform's trusted-ancestor policy (user-owned
 components not group- or world-writable, root-owned ones non-writable or
-sticky), so no other account can rename or retarget an entry after the check. A
+sticky), every symlink on the chain is owned by the user or root, and a
+directory others can write (a sticky `/tmp`) may hold a chain entry only when
+the entry is ours or root's, so no other account can rename or retarget an
+entry after the check. A
 path-based exec cannot be made atomic with the check; the chain check removes
 the attacker's ability to change what the path names. A private 0700 directory
 below the sticky root-owned `/tmp` passes. Group-writable executables or
