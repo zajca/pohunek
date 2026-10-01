@@ -2387,7 +2387,7 @@ impl SessionRegistry {
                 seq: report_sequence,
                 pid,
                 start_identity,
-                reported_at: Instant::now(),
+                reported_at: crate::time::now(),
                 activity_reported: reported_activity.is_some(),
             };
             entry.active_agent = Some(report.clone());
@@ -2478,7 +2478,7 @@ impl SessionRegistry {
                 seq: report_sequence,
                 pid: None,
                 start_identity: None,
-                reported_at: Instant::now(),
+                reported_at: crate::time::now(),
                 activity_reported: false,
             };
             clear_active_agent(entry, tombstone)
@@ -2576,7 +2576,7 @@ impl SessionRegistry {
         path: String,
         expected: Option<&RuntimeWatchIdentity>,
     ) {
-        let observed_at = Instant::now();
+        let observed_at = crate::time::now();
         let cwd = PathBuf::from(path);
         if !cwd.is_absolute() {
             debug!(
@@ -3410,7 +3410,7 @@ impl SessionRegistry {
                                 worker_metadata.clone(),
                                 outcome,
                                 snapshot.phase,
-                                Instant::now(),
+                                crate::time::now(),
                             ) {
                                 WorkerMetadataProgress::Complete => {}
                                 WorkerMetadataProgress::IdentityDiscarded => {

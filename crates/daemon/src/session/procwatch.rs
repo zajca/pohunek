@@ -56,13 +56,13 @@ impl SessionRegistry {
                 tokio::select! {
                     () = cancel.cancelled() => break,
                     _ = tick.tick() => {
-                        if !registry.rescan_live_root(&id, &expected, root, Instant::now()).await {
+                        if !registry.rescan_live_root(&id, &expected, root, crate::time::now()).await {
                             cancel.cancel();
                             break;
                         }
                     }
                     () = rescan.notified() => {
-                        if !registry.rescan_live_root(&id, &expected, root, Instant::now()).await {
+                        if !registry.rescan_live_root(&id, &expected, root, crate::time::now()).await {
                             cancel.cancel();
                             break;
                         }
@@ -265,7 +265,7 @@ impl SessionRegistry {
         if !focus_is_current() {
             return true;
         }
-        let observed_at = Instant::now();
+        let observed_at = crate::time::now();
         match self.inner.inspector.cwd(focus.pid) {
             Ok(cwd) => {
                 if focus_is_current() {
@@ -333,10 +333,12 @@ impl SessionRegistry {
             match self.reconcile_foreground_agent(
                 entry,
                 entry.info.pid,
-                Instant::now(),
+                crate::time::now(),
                 ForegroundProbe::Observed(entry.foreground_process_group),
             ) {
-                ForegroundDecision::Fallback => self.reconcile_active_agent(entry, Instant::now()),
+                ForegroundDecision::Fallback => {
+                    self.reconcile_active_agent(entry, crate::time::now())
+                }
                 ForegroundDecision::Preserve => None,
                 ForegroundDecision::Updated => Some(entry.info.clone()),
             }
@@ -864,4 +866,101 @@ fn observed_process_matches(
             && &observed.agent_base == agent_base
             && start_identity.is_none_or(|identity| observed.start_identity == identity)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use protocol::{ReportSequence, SessionNewParams, SessionReportAgentParams};
+
+    use crate::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
+
+    /// Interval of the procwatch loop under test.
+    const TEST_PROCWATCH_POLL: Duration = Duration::from_millis(200);
+    /// Lifetime of an unbound agent claim in the registry under test.
+    const TEST_CLAIM_TTL: Duration = Duration::from_secs(2);
+    /// Hook source and agent profile of the reported claim.
+    const TEST_AGENT: &str = "codex";
+    const TEST_AGENT_SOURCE: &str = "pohunek:codex";
+    /// Hook sequence of the reported claim.
+    const TEST_REPORT_SEQ: u64 = 1_000;
+    /// Scheduler yields granted to the procwatch task to react to one tick.
+    const TEST_YIELD_BUDGET: usize = 256;
+
+    /// The procwatch loop must read tokio's clock: an unbound claim older than
+    /// its TTL on the paused clock is released by a loop tick, which a loop
+    /// reading `std::time::Instant::now()` never does while time is virtual.
+    #[tokio::test]
+    async fn procwatch_loop_expires_an_unbound_claim_after_virtual_time_advances() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            procwatch_poll: TEST_PROCWATCH_POLL,
+            active_agent_claim_ttl: TEST_CLAIM_TTL,
+            ..SessionRegistryConfig::default()
+        });
+        let cwd = pohunek_test_support::tempdir().expect("private session cwd");
+        let created = registry
+            .create(SessionNewParams {
+                name: None,
+                agent: "shell".to_owned(),
+                cwd: Some(cwd.path().to_path_buf()),
+                cols: 80,
+                rows: 24,
+                project: None,
+                repo: None,
+                branch: None,
+                base_branch: None,
+                input: None,
+                metadata: BTreeMap::new(),
+            })
+            .await
+            .expect("create shell session");
+
+        tokio::time::pause();
+        let report = registry
+            .report_agent(SessionReportAgentParams {
+                session_id: created.id.clone(),
+                source: TEST_AGENT_SOURCE.to_owned(),
+                agent: TEST_AGENT.to_owned(),
+                activity: None,
+                seq: Some(ReportSequence::new(TEST_REPORT_SEQ)),
+                pid: None,
+                agent_session_id: None,
+                agent_session_path: None,
+            })
+            .await;
+        assert!(report.recorded);
+
+        tokio::time::advance(TEST_CLAIM_TTL.saturating_sub(TEST_PROCWATCH_POLL)).await;
+        for _ in 0..TEST_YIELD_BUDGET {
+            tokio::task::yield_now().await;
+        }
+        let retained = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(
+            retained.active_agent.as_deref(),
+            Some(TEST_AGENT),
+            "a claim younger than its TTL survives procwatch ticks"
+        );
+
+        tokio::time::advance(TEST_CLAIM_TTL).await;
+        let mut released = false;
+        for _ in 0..TEST_YIELD_BUDGET {
+            tokio::task::yield_now().await;
+            let info = registry.inspect(&created.id).await.expect("inspect");
+            if info.active_agent.is_none() {
+                released = true;
+                break;
+            }
+        }
+        assert!(
+            released,
+            "a procwatch tick after the TTL elapsed on the paused clock releases the claim"
+        );
+
+        tokio::time::resume();
+        let _ = registry.stop(&created.id).await;
+    }
 }

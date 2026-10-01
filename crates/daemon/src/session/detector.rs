@@ -3,7 +3,7 @@
 use super::{
     broadcast, debug, event, event_payload, is_terminal, log_lag_warn, record_activity_evidence,
     timestamp_now, ActivityTransition, AgentActivity, DetectionPreviewRequest, Detector,
-    DetectorConfig, DetectorConfigUpdate, DetectorInputs, DetectorScope, Instant, LagWarnThrottle,
+    DetectorConfig, DetectorConfigUpdate, DetectorInputs, DetectorScope, LagWarnThrottle,
     RuntimeWatchIdentity, SessionId, SessionRegistry,
 };
 
@@ -21,7 +21,7 @@ fn apply_detector_config(
 ) {
     *tick = detection_interval(&update.config);
     tick.reset();
-    detector.reconfigure(Instant::now(), update.config);
+    detector.reconfigure(crate::time::now(), update.config);
     *applied_generation = update.generation;
 }
 
@@ -67,7 +67,7 @@ impl SessionRegistry {
             let mut tick = detection_interval(&initial_config.config);
             tick.tick().await;
             let (rows, cols) = size;
-            let mut detector = Detector::new(rows, cols, Instant::now(), initial_config.config);
+            let mut detector = Detector::new(rows, cols, crate::time::now(), initial_config.config);
             let mut lag_warn =
                 LagWarnThrottle::new(registry.inner.config.detector_lag_warn_interval);
 
@@ -99,14 +99,14 @@ impl SessionRegistry {
                         );
                     }
                     _ = tick.tick() => {
-                        for transition in detector.tick(Instant::now()) {
+                        for transition in detector.tick(crate::time::now()) {
                             registry
                                 .record_detector_activity(&id, &runtime, transition)
                                 .await;
                         }
                         // Flush a folded lag batch whose window has elapsed, so a
                         // session that stopped lagging still reports its summary.
-                        if let Some(warn_kind) = lag_warn.poll(Instant::now()) {
+                        if let Some(warn_kind) = lag_warn.poll(crate::time::now()) {
                             log_lag_warn(&id, warn_kind);
                         }
                     }
@@ -120,7 +120,7 @@ impl SessionRegistry {
                     received = output_rx.recv() => {
                         match received {
                             Ok(chunk) => {
-                                for transition in detector.feed(Instant::now(), &chunk) {
+                                for transition in detector.feed(crate::time::now(), &chunk) {
                                     registry
                                         .record_detector_activity(&id, &runtime, transition)
                                         .await;
@@ -134,7 +134,7 @@ impl SessionRegistry {
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 // Always resync; only the logging is rate-limited
                                 // so a runaway session cannot flood the log.
-                                if let Some(warn_kind) = lag_warn.observe(Instant::now(), skipped) {
+                                if let Some(warn_kind) = lag_warn.observe(crate::time::now(), skipped) {
                                     log_lag_warn(&id, warn_kind);
                                 }
                                 detector.resync_after_lag();
@@ -272,13 +272,30 @@ impl SessionRegistry {
 
 #[cfg(test)]
 mod tests {
-    use protocol::DetectionRegionKind;
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use protocol::{AgentActivity, DetectionRegionKind, SessionNewParams, StateSource};
+    use tokio::sync::{broadcast, mpsc, watch};
+    use tokio_util::sync::CancellationToken;
 
     use super::{
         detection_interval, reply_to_preview, DetectionPreviewRequest, Detector, DetectorConfig,
-        DetectorConfigUpdate, Instant,
+        DetectorConfigUpdate,
     };
     use crate::detect::{DetectionConfig, Manifest};
+    use crate::session::{
+        DetectorInputs, DetectorScope, RuntimeWatchIdentity, SessionRegistry,
+        SessionRegistryConfig, ShellCommand,
+    };
+
+    /// Detector recheck cadence of the loop under test.
+    const TEST_RECHECK_AFTER: Duration = Duration::from_millis(100);
+    /// Age at which a stable visible state is re-emitted by `Detector::tick`.
+    const TEST_STABLE_VISIBLE_REFRESH: Duration = Duration::from_millis(800);
+    /// Virtual-time bound on waiting for one agent-state event; a missing event
+    /// resolves as a deterministic timeout once the paused clock auto-advances.
+    const TEST_EVENT_CEILING: Duration = Duration::from_secs(5);
 
     #[tokio::test]
     async fn preview_applies_an_accepted_pending_configuration_first() {
@@ -318,7 +335,7 @@ mod tests {
             generation: 0,
             config: initial.clone(),
         });
-        let mut detector = Detector::new(24, 80, Instant::now(), initial.clone());
+        let mut detector = Detector::new(24, 80, crate::time::now(), initial.clone());
         let mut tick = detection_interval(&initial);
         tick.tick().await;
         let mut applied_generation = 0;
@@ -348,5 +365,116 @@ mod tests {
         assert_eq!(previews.len(), 1);
         assert_eq!(previews[0].kind, DetectionRegionKind::BottomLines);
         assert_eq!(previews[0].region, "bottom_lines(3)");
+    }
+
+    async fn next_agent_state(
+        events: &mut broadcast::Receiver<protocol::Event>,
+    ) -> protocol::AgentStateEvent {
+        tokio::time::timeout(TEST_EVENT_CEILING, async {
+            loop {
+                let event = events.recv().await.expect("event stream stays open");
+                if event.event() == protocol::event::AGENT_STATE {
+                    return serde_json::from_value(event.payload().clone())
+                        .expect("valid agent state event");
+                }
+            }
+        })
+        .await
+        .expect("an agent state event arrives before the virtual-time ceiling")
+    }
+
+    /// The loop must read tokio's clock: a refresh that is due only because
+    /// paused time was advanced reaches the session, which a detector reading
+    /// `std::time::Instant::now()` never observes.
+    #[tokio::test]
+    async fn detector_loop_refreshes_a_stable_state_after_virtual_time_advances() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let cwd = pohunek_test_support::tempdir().expect("private session cwd");
+        let created = registry
+            .create(SessionNewParams {
+                name: None,
+                agent: "shell".to_owned(),
+                cwd: Some(cwd.path().to_path_buf()),
+                cols: 80,
+                rows: 24,
+                project: None,
+                repo: None,
+                branch: None,
+                base_branch: None,
+                input: None,
+                metadata: BTreeMap::new(),
+            })
+            .await
+            .expect("create shell session");
+        let mut events = registry.subscribe();
+
+        let config = DetectorConfig {
+            detection: DetectionConfig {
+                recheck_after: TEST_RECHECK_AFTER,
+                confirmations: 1,
+                cap: TEST_EVENT_CEILING,
+                stable_visible_refresh: TEST_STABLE_VISIBLE_REFRESH,
+                startup_grace: Duration::ZERO,
+            },
+            manifest: Some(
+                Manifest::parse_str(
+                    r#"
+                    [[rules]]
+                    id = "visible-working"
+                    state = "working"
+                    priority = 1
+                    region = "whole_recent"
+                    contains = "compiling workspace"
+                    "#,
+                )
+                .expect("manifest parses"),
+            ),
+        };
+        let (output_tx, output_rx) = broadcast::channel(8);
+        let (_resize_tx, resize_rx) = watch::channel((24, 80));
+        let (_config_tx, config_rx) = watch::channel(DetectorConfigUpdate {
+            generation: 0,
+            config,
+        });
+        let (_preview_tx, preview_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        registry.spawn_detector(DetectorInputs {
+            scope: DetectorScope {
+                id: created.id.clone(),
+                runtime: RuntimeWatchIdentity::from_info(&created)
+                    .expect("created session has a live runtime identity"),
+            },
+            output: output_rx,
+            initial_size: (24, 80),
+            cancel: cancel.clone(),
+            resize: resize_rx,
+            config: config_rx,
+            preview: preview_rx,
+        });
+
+        tokio::time::pause();
+        output_tx
+            .send(b"Compiling workspace".to_vec())
+            .expect("detector holds the output receiver");
+        let first = next_agent_state(&mut events).await;
+        assert_eq!(first.activity, AgentActivity::Working);
+        assert_eq!(first.source, StateSource::Screen);
+
+        tokio::time::advance(TEST_STABLE_VISIBLE_REFRESH).await;
+        let refreshed = next_agent_state(&mut events).await;
+        assert_eq!(refreshed.activity, AgentActivity::Working);
+        assert_eq!(refreshed.source, StateSource::Screen);
+        assert!(
+            refreshed.revision > first.revision,
+            "the tick re-emits the stable state as a new activity revision"
+        );
+
+        tokio::time::resume();
+        cancel.cancel();
+        let _ = registry.stop(&created.id).await;
     }
 }

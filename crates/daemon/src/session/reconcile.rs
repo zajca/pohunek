@@ -2496,7 +2496,7 @@ impl SessionRegistry {
             last_agent_report: active_agent,
             last_native_report: record.native_identity_ordering.clone(),
             observed_agents: Vec::<ObservedAgent>::new(),
-            cwd_observed_at: std::time::Instant::now(),
+            cwd_observed_at: crate::time::now(),
             initial_input_owner: initial_input_owner(&record),
         };
         if let Err(error) = self.write_session_record(record).await {
@@ -2663,7 +2663,7 @@ impl SessionRegistry {
             last_agent_report: None,
             last_native_report: record.native_identity_ordering.clone(),
             observed_agents: Vec::new(),
-            cwd_observed_at: std::time::Instant::now(),
+            cwd_observed_at: crate::time::now(),
             initial_input_owner: initial_input_owner(&record),
         };
         (record, entry)
@@ -3186,7 +3186,7 @@ fn active_report_from_info(info: &protocol::SessionInfo) -> Option<ActiveAgentRe
         seq: None,
         pid: info.active_agent_pid,
         start_identity: None,
-        reported_at: std::time::Instant::now(),
+        reported_at: crate::time::now(),
         activity_reported: false,
     })
 }
@@ -3209,7 +3209,7 @@ fn release_tombstone(
         seq: Some(release.sequence),
         pid: Some(release.process.pid),
         start_identity: Some(release.process.start_identity),
-        reported_at: std::time::Instant::now(),
+        reported_at: crate::time::now(),
         activity_reported: false,
     }
 }
@@ -3276,7 +3276,7 @@ fn apply_worker_identities(
             seq: Some(identity.sequence),
             pid: Some(identity.process.pid),
             start_identity: Some(identity.process.start_identity),
-            reported_at: std::time::Instant::now(),
+            reported_at: crate::time::now(),
             activity_reported: false,
         }),
         release: None,
