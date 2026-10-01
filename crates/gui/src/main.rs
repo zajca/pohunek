@@ -343,6 +343,7 @@ fn theme(_app: &PohunekApp) -> Theme {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use super::*;
     use crate::config::RawGuiConfig;
     use crate::view::inbox::{parse_rfc3339_utc_seconds, SECONDS_PER_DAY};
