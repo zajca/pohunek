@@ -7,7 +7,7 @@ use pohunek_platform::filesystem::{AtomicReplaceError, FsError};
 
 use crate::SCHEMA_VERSION;
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-30
 
 /// A failure while handling the service configuration.
 ///
@@ -82,7 +82,11 @@ pub enum ConfigError {
         message: String,
     },
     /// `schema_version` is not [`SCHEMA_VERSION`].
-    #[error("service config schema_version {found} is unsupported; expected {SCHEMA_VERSION}")]
+    #[error(
+        "service config schema_version {found} is unsupported; expected {SCHEMA_VERSION}; \
+         uninstall with the pohunek version that wrote it (`pohunek service uninstall`), \
+         then run `pohunek service install` to write a current file"
+    )]
     UnsupportedSchema {
         /// The recorded schema version.
         found: i64,
@@ -169,6 +173,12 @@ pub enum ConfigError {
         index: usize,
         /// Zero-based position of its first occurrence.
         first: usize,
+    },
+    /// `environment.search_path` holds an entry or value the job `PATH` cannot carry.
+    #[error("service config key environment.search_path is invalid: {detail}")]
+    InvalidSearchPath {
+        /// The validation failure; never contains a recorded path.
+        detail: String,
     },
     /// An installation root could not be canonicalized for verification.
     #[error("failed to canonicalize {key} {}: {source}", path.display())]

@@ -1,0 +1,1004 @@
+//! Bounded discovery of the `PATH` a user's login shell builds.
+
+use std::fmt::Write as _;
+use std::io::{self, Read as _};
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
+
+use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
+use thiserror::Error;
+
+use super::search_path::{DroppedEntry, SanitizedPath, SearchPath, SearchPathError};
+
+/// Executable printing the environment `PATH` of the login shell.
+///
+/// An absolute path keeps the probe independent of the `PATH` the shell built;
+/// `/usr/bin/printenv` exists on macOS and every mainstream Linux.
+pub const PRINTENV_EXECUTABLE: &str = "/usr/bin/printenv";
+
+/// `PATH` the probe shell starts with.
+///
+/// The value launchd gives its own jobs. Login startup files (`path_helper`
+/// on macOS) extend it; starting from it keeps the result independent of
+/// whichever `PATH` the installing process happened to carry.
+pub const PROBE_BASELINE_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// `TERM` value handed to the probe so startup files skip terminal setup.
+const PROBE_TERM: &str = "dumb";
+
+/// Hard deadline of the login-shell `PATH` discovery.
+///
+/// A login shell that sources `nvm`, `pyenv`, or `conda` initialisation can
+/// need several seconds; ten seconds tolerates that while a wedged startup file
+/// only delays the caller by that much before the fallback directory list
+/// applies. The probe's process group is killed at the deadline.
+pub const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bytes of login-shell stdout kept by the `PATH` discovery.
+///
+/// The machine-readable part is one `PATH` line of at most 4 KiB; the rest
+/// is room for a startup banner. A shell printing more is killed and treated
+/// as failed.
+pub const LOGIN_SHELL_OUTPUT: usize = 64 * 1024;
+
+/// Login shell used for discovery when `$SHELL` is unset or unusable.
+///
+/// `zsh` is the default login shell of every supported macOS release and
+/// `/bin/zsh` ships with the system.
+pub const DEFAULT_LOGIN_SHELL: &str = "/bin/zsh";
+
+/// Prefix of the random sentinel lines delimiting the machine-readable output.
+const SENTINEL_PREFIX: &str = "__POHUNEK_PATH_";
+
+/// Random bytes in one sentinel; user startup output cannot predict them.
+const SENTINEL_RANDOM_BYTES: usize = 12;
+
+/// Inputs of one login-shell probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginShellSpec {
+    /// Absolute path of the user's login shell (`$SHELL`).
+    pub shell: PathBuf,
+    /// Absolute path of the `printenv` executable, [`PRINTENV_EXECUTABLE`].
+    pub printenv: PathBuf,
+    /// Extra non-secret variables the shell needs to find its startup files
+    /// (`HOME`, `USER`, `LOGNAME`); the probe starts from an empty environment.
+    pub environment: Vec<(String, String)>,
+    /// Hard deadline for the whole probe; the process group is killed after it.
+    pub timeout: Duration,
+    /// Most stdout bytes read before the probe is killed.
+    pub max_output_bytes: usize,
+}
+
+/// A successfully discovered login-shell `PATH`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginShellDiscovery {
+    /// The sanitized directories.
+    pub path: SearchPath,
+    /// Existing directories refused as untrusted, with the reason.
+    pub untrusted: Vec<DroppedEntry>,
+    /// Entries ignored without concern (empty, relative, duplicate, missing).
+    pub ignored: usize,
+}
+
+/// Reports why login-shell discovery yielded no usable `PATH`.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum LoginShellError {
+    /// The shell or `printenv` path is not an absolute executable file.
+    #[error("login shell path is unusable: {reason}")]
+    InvalidExecutable {
+        /// Why the path was rejected; never contains the path.
+        reason: &'static str,
+    },
+    /// The probe could not be started or observed.
+    #[error("login shell probe failed to run")]
+    Io(#[source] io::Error),
+    /// The shell did not finish within the deadline and was killed.
+    #[error("login shell probe exceeded {timeout:?} and was killed")]
+    Timeout {
+        /// The deadline that elapsed.
+        timeout: Duration,
+    },
+    /// The shell printed more than the output bound and was killed.
+    #[error("login shell probe printed more than {limit} bytes and was killed")]
+    OutputTooLarge {
+        /// The output bound.
+        limit: usize,
+    },
+    /// The shell exited unsuccessfully.
+    #[error("login shell probe exited unsuccessfully ({status})")]
+    Failed {
+        /// Exit code or terminating signal in words.
+        status: String,
+    },
+    /// The sentinel-delimited value is missing, repeated, or not one line.
+    #[error("login shell probe output holds no single delimited value")]
+    MalformedOutput,
+    /// The delimited value is not UTF-8.
+    #[error("login shell probe printed a non-UTF-8 value")]
+    NotUtf8,
+    /// The delimited value is not a usable `PATH`.
+    #[error("login shell probe printed an unusable PATH")]
+    UnusablePath(#[source] SearchPathError),
+}
+
+/// Runs the user's login shell once and returns the `PATH` it builds.
+///
+/// The shell runs as `<shell> -l -c <script>`, never interactively, with a
+/// null stdin and stderr and only the [`LoginShellSpec::environment`] plus a
+/// baseline `PATH`. Its own startup output is ignored: the value counts only
+/// between two random sentinel lines, and the script runs `printenv PATH`
+/// through an absolute path. The probe is a separate process group killed on
+/// timeout or oversized output.
+///
+/// [`LoginShellSpec::timeout`] bounds the whole discovery: the executable
+/// checks, the probe, and the filesystem validation of the printed
+/// directories. That work runs on a helper thread; when the deadline passes the
+/// caller gets [`LoginShellError::Timeout`] and the thread is abandoned. A
+/// filesystem call stuck in an uninterruptible state (a stalled network mount)
+/// cannot be cancelled, only abandoned, and it stays blocked until the kernel
+/// returns. The abandoned thread re-checks the deadline and a cancel flag before
+/// it spawns the shell and before it validates the printed directories, so it
+/// starts no shell after the caller gave up; a directory validation already in
+/// progress may finish probing its current entries. The installer then falls
+/// back per policy.
+///
+/// Printed directories are kept only when they are trusted: see
+/// [`SearchPath::sanitize`].
+///
+/// # Errors
+///
+/// Returns [`LoginShellError`] for an unusable shell, a spawn failure, a
+/// timeout, oversized output, an unsuccessful exit, malformed or non-UTF-8
+/// output, and a value without any usable directory. A failure never yields
+/// a partial or guessed value.
+pub fn discover_login_shell_path(
+    spec: &LoginShellSpec,
+) -> Result<LoginShellDiscovery, LoginShellError> {
+    discover_with(spec, || {}, |value| SearchPath::sanitize(value, true))
+}
+
+/// Runs the discovery pipeline under one deadline.
+///
+/// `before_checks` runs first on the helper thread and `sanitize` validates the
+/// printed value; both are injectable so tests can stall either step.
+fn discover_with<B, F>(
+    spec: &LoginShellSpec,
+    before_checks: B,
+    sanitize: F,
+) -> Result<LoginShellDiscovery, LoginShellError>
+where
+    B: FnOnce() + Send + 'static,
+    F: FnOnce(&str) -> Result<SanitizedPath, SearchPathError> + Send + 'static,
+{
+    discover_staged(
+        spec,
+        before_checks,
+        || Err(SearchPathError::NoUsableDirectories),
+        || {},
+        sanitize,
+    )
+    .and_then(|staged| staged.login)
+}
+
+/// The fallback validation and the login-shell discovery of one deadline.
+pub(super) struct StagedDiscovery {
+    /// The fallback directories, validated before the probe started.
+    pub(super) fallback: Result<SanitizedPath, SearchPathError>,
+    /// The login-shell outcome; a timeout after the fallback stage is an error
+    /// here, not of the whole call.
+    pub(super) login: Result<LoginShellDiscovery, LoginShellError>,
+}
+
+/// Runs the fallback validation and the discovery under one deadline.
+///
+/// Everything runs on one helper thread in this order: `before_checks`,
+/// `fallback` (a filesystem walk that may stall on a network mount), the
+/// executable checks, the probe, and the validation of the printed directories.
+/// The fallback result is handed over as soon as it exists, so a probe that
+/// later times out still leaves the caller a usable fallback path.
+///
+/// # Errors
+///
+/// Returns [`LoginShellError::Timeout`] when the deadline passes before the
+/// fallback stage ends; a later timeout is reported in
+/// [`StagedDiscovery::login`].
+pub(super) fn discover_staged<B, G, A, F>(
+    spec: &LoginShellSpec,
+    before_checks: B,
+    fallback: G,
+    after_spawn: A,
+    sanitize: F,
+) -> Result<StagedDiscovery, LoginShellError>
+where
+    B: FnOnce() + Send + 'static,
+    G: FnOnce() -> Result<SanitizedPath, SearchPathError> + Send + 'static,
+    A: Fn() + Send + 'static,
+    F: FnOnce(&str) -> Result<SanitizedPath, SearchPathError> + Send + 'static,
+{
+    let deadline = Instant::now() + spec.timeout;
+    let timeout = spec.timeout;
+    let owned = spec.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let pipeline_cancel = Arc::clone(&cancel);
+    let (fallback_tx, fallback_rx) = mpsc::channel();
+    let (login_tx, login_rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("shell-env-discovery".to_owned())
+        .spawn(move || {
+            before_checks();
+            // The receivers are gone once the deadline passed; nothing to report.
+            drop(fallback_tx.send(fallback()));
+            let result =
+                discovery_pipeline(&owned, deadline, &pipeline_cancel, &after_spawn, sanitize);
+            drop(login_tx.send(result));
+        })
+        .map_err(LoginShellError::Io)?;
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+    let Ok(fallback) = fallback_rx.recv_timeout(remaining()) else {
+        cancel.store(true, Ordering::SeqCst);
+        return Err(LoginShellError::Timeout { timeout });
+    };
+    let login = login_rx
+        .recv_timeout(remaining())
+        .unwrap_or_else(|_elapsed| {
+            cancel.store(true, Ordering::SeqCst);
+            Err(LoginShellError::Timeout { timeout })
+        });
+    Ok(StagedDiscovery { fallback, login })
+}
+
+/// Whether the caller gave up or the deadline passed.
+fn expired(deadline: Instant, cancel: &AtomicBool) -> bool {
+    cancel.load(Ordering::SeqCst) || Instant::now() >= deadline
+}
+
+fn discovery_pipeline<F>(
+    spec: &LoginShellSpec,
+    deadline: Instant,
+    cancel: &AtomicBool,
+    after_spawn: &dyn Fn(),
+    sanitize: F,
+) -> Result<LoginShellDiscovery, LoginShellError>
+where
+    F: FnOnce(&str) -> Result<SanitizedPath, SearchPathError>,
+{
+    let timeout = spec.timeout;
+    let timed_out = || LoginShellError::Timeout { timeout };
+    require_executable(&spec.shell)?;
+    require_executable(&spec.printenv)?;
+    let sentinel = random_sentinel().map_err(LoginShellError::Io)?;
+    let printenv = spec
+        .printenv
+        .to_str()
+        .ok_or(LoginShellError::InvalidExecutable {
+            reason: "printenv path is not UTF-8",
+        })?;
+    if printenv.contains('\'') {
+        return Err(LoginShellError::InvalidExecutable {
+            reason: "printenv path contains a quote",
+        });
+    }
+    let script =
+        format!("printf '\\n%s\\n' '{sentinel}'; '{printenv}' PATH; printf '%s\\n' '{sentinel}'");
+
+    let mut command = Command::new(&spec.shell);
+    command
+        .arg("-l")
+        .arg("-c")
+        .arg(script)
+        .env_clear()
+        .env("PATH", PROBE_BASELINE_PATH)
+        .env("TERM", PROBE_TERM)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    for (name, value) in &spec.environment {
+        command.env(name, value);
+    }
+    if expired(deadline, cancel) {
+        return Err(timed_out());
+    }
+    let limits = Limits {
+        deadline,
+        timeout,
+        cancel,
+        after_spawn,
+        max_output_bytes: spec.max_output_bytes,
+    };
+    let output = run_bounded(command, &limits)?;
+    if !output.status.success() {
+        return Err(LoginShellError::Failed {
+            status: describe(output.status),
+        });
+    }
+    let value = delimited_value(&output.stdout, &sentinel)?;
+    if expired(deadline, cancel) {
+        return Err(timed_out());
+    }
+    let sanitized = sanitize(value).map_err(LoginShellError::UnusablePath)?;
+    if expired(deadline, cancel) {
+        return Err(timed_out());
+    }
+    Ok(LoginShellDiscovery {
+        path: sanitized.path,
+        untrusted: sanitized.untrusted,
+        ignored: sanitized.ignored,
+    })
+}
+
+fn require_executable(path: &Path) -> Result<(), LoginShellError> {
+    if !path.is_absolute() {
+        return Err(LoginShellError::InvalidExecutable {
+            reason: "not absolute",
+        });
+    }
+    if !super::executable::is_executable_file(path) {
+        return Err(LoginShellError::InvalidExecutable {
+            reason: "not an executable file",
+        });
+    }
+    Ok(())
+}
+
+fn random_sentinel() -> io::Result<String> {
+    let mut random = [0_u8; SENTINEL_RANDOM_BYTES];
+    getrandom::getrandom(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
+    let mut sentinel = String::from(SENTINEL_PREFIX);
+    for byte in random {
+        // Writing to a String cannot fail.
+        let _ = write!(sentinel, "{byte:02x}");
+    }
+    sentinel.push_str("__");
+    Ok(sentinel)
+}
+
+fn describe(status: ExitStatus) -> String {
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("exit code {code}"),
+        (None, Some(signal)) => format!("signal {signal}"),
+        (None, None) => "unknown status".to_owned(),
+    }
+}
+
+/// Extracts the single line between the two sentinel lines.
+fn delimited_value<'a>(stdout: &'a [u8], sentinel: &str) -> Result<&'a str, LoginShellError> {
+    let lines: Vec<&[u8]> = stdout.split(|byte| *byte == b'\n').collect();
+    let marks: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| **line == sentinel.as_bytes())
+        .map(|(index, _)| index)
+        .collect();
+    let [begin, end] = marks[..] else {
+        return Err(LoginShellError::MalformedOutput);
+    };
+    if end != begin + 2 {
+        return Err(LoginShellError::MalformedOutput);
+    }
+    std::str::from_utf8(lines[begin + 1]).map_err(|_invalid| LoginShellError::NotUtf8)
+}
+
+struct Captured {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+}
+
+enum Event {
+    Output(io::Result<(Vec<u8>, bool)>),
+    Exited(io::Result<()>),
+}
+
+/// Bounds of one probe: the absolute discovery deadline, the caller's cancel
+/// flag, and the output bound.
+struct Limits<'a> {
+    deadline: Instant,
+    /// The configured duration, reported in a timeout error.
+    timeout: Duration,
+    cancel: &'a AtomicBool,
+    /// Runs right after the spawn returns; tests use it to simulate a slow spawn.
+    after_spawn: &'a dyn Fn(),
+    max_output_bytes: usize,
+}
+
+/// Runs `command` with piped stdout under a deadline and an output bound.
+///
+/// The child must lead its own process group. The absolute deadline and the
+/// cancel flag are checked again right after the spawn, so a spawn that stalled
+/// past them kills and reaps the group before the shell does anything. Its exit
+/// is observed with `waitid(WEXITED | WNOWAIT)`, which leaves the leader
+/// unreaped, so its pid (the group id) cannot be recycled while the group is
+/// killed. Every return path kills the group first and reaps the leader
+/// afterwards; the observer threads end once the group is dead.
+fn run_bounded(mut command: Command, limits: &Limits<'_>) -> Result<Captured, LoginShellError> {
+    let mut child = command.spawn().map_err(LoginShellError::Io)?;
+    let group = Pid::from_child(&child);
+    (limits.after_spawn)();
+    let observed = if expired(limits.deadline, limits.cancel) {
+        Err(LoginShellError::Timeout {
+            timeout: limits.timeout,
+        })
+    } else {
+        observe(&mut child, group, limits)
+    };
+    kill_group(group);
+    let status = child.wait().map_err(LoginShellError::Io)?;
+    observed.map(|stdout| Captured { status, stdout })
+}
+
+/// Collects the child's stdout and waits for its exit within the deadline.
+fn observe(child: &mut Child, pid: Pid, limits: &Limits<'_>) -> Result<Vec<u8>, LoginShellError> {
+    let max_output_bytes = limits.max_output_bytes;
+    let timeout = limits.timeout;
+    let deadline = limits.deadline;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| LoginShellError::Io(io::Error::other("probe stdout was not captured")))?;
+    let (sender, receiver) = mpsc::channel();
+    let reader_sender = sender.clone();
+    let bound = u64::try_from(max_output_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    std::thread::Builder::new()
+        .name("shell-env-reader".to_owned())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let result = (&mut stdout).take(bound).read_to_end(&mut bytes).map(|_| {
+                let truncated = bytes.len() > max_output_bytes;
+                (bytes, truncated)
+            });
+            // The receiver is gone once the probe failed; nothing to report.
+            drop(reader_sender.send(Event::Output(result)));
+        })
+        .map_err(LoginShellError::Io)?;
+    std::thread::Builder::new()
+        .name("shell-env-waiter".to_owned())
+        .spawn(move || {
+            let exited = waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+            )
+            .map(drop)
+            .map_err(io::Error::from);
+            drop(sender.send(Event::Exited(exited)));
+        })
+        .map_err(LoginShellError::Io)?;
+
+    let mut stdout_bytes: Option<Vec<u8>> = None;
+    let mut exited = false;
+    while stdout_bytes.is_none() || !exited {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(Event::Output(Ok((bytes, truncated)))) => {
+                if truncated {
+                    return Err(LoginShellError::OutputTooLarge {
+                        limit: max_output_bytes,
+                    });
+                }
+                stdout_bytes = Some(bytes);
+            }
+            Ok(Event::Exited(Ok(()))) => {
+                exited = true;
+                // A login startup may leave a background job holding the pipe
+                // open. The leader is still unreaped, so the group id is valid
+                // and killing it makes the end of output certain.
+                kill_group(pid);
+            }
+            Ok(Event::Output(Err(source)) | Event::Exited(Err(source))) => {
+                return Err(LoginShellError::Io(source));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(LoginShellError::Timeout { timeout });
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(LoginShellError::Io(io::Error::other(
+                    "probe observers ended early",
+                )));
+            }
+        }
+    }
+    stdout_bytes.ok_or(LoginShellError::MalformedOutput)
+}
+
+/// Kills the probe's process group, whose leader is still unreaped.
+///
+/// Startup files may leave background children behind, even with their stdout
+/// redirected; the probe owns its group, so nothing of it survives. An already
+/// gone group (`ESRCH`) is fine.
+fn kill_group(group: Pid) {
+    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use crate::shell_env::test_support::{fixture, make_dir, script};
+
+    fn spec(shell: PathBuf) -> LoginShellSpec {
+        LoginShellSpec {
+            shell,
+            printenv: PathBuf::from(PRINTENV_EXECUTABLE),
+            environment: Vec::new(),
+            timeout: Duration::from_secs(10),
+            max_output_bytes: 64 * 1024,
+        }
+    }
+
+    /// A shell that exports `path` and then runs the probe script like a
+    /// real login shell would after sourcing its startup files.
+    fn fake_shell(dir: &Path, prelude: &str, path: &str) -> PathBuf {
+        script(
+            dir,
+            "fake-shell",
+            &format!("{prelude}\nPATH='{path}'; export PATH\n[ \"$1\" = -l ] && [ \"$2\" = -c ] || exit 64\nexec /bin/sh -c \"$3\""),
+        )
+    }
+
+    #[test]
+    fn discovers_the_path_the_login_shell_builds() {
+        let dir = fixture();
+        let brew = dir.path().join("opt/homebrew/bin");
+        let local = dir.path().join("home/.local/bin");
+        make_dir(dir.path(), &brew);
+        make_dir(dir.path(), &local);
+        let path = format!("{}:{}", brew.display(), local.display());
+        let shell = fake_shell(dir.path(), "", &path);
+        let found = discover_login_shell_path(&spec(shell)).expect("discovery");
+        assert_eq!(found.path.entries(), [brew, local]);
+        assert_eq!(found.ignored, 0);
+        assert!(found.untrusted.is_empty());
+    }
+
+    #[test]
+    fn a_banner_without_a_trailing_newline_does_not_glue_to_the_sentinel() {
+        let dir = fixture();
+        let bin = dir.path().join("bin");
+        make_dir(dir.path(), &bin);
+        let shell = fake_shell(dir.path(), "printf welcome", &bin.display().to_string());
+        let found = discover_login_shell_path(&spec(shell)).expect("discovery");
+        assert_eq!(found.path.entries(), [bin]);
+    }
+
+    #[test]
+    fn ignores_startup_noise_before_and_after_the_sentinels() {
+        let dir = fixture();
+        let bin = dir.path().join("bin");
+        make_dir(dir.path(), &bin);
+        let noise = "echo 'welcome back'; echo '/fake/PATH=decoy'; printf '\\377\\376junk\\n'";
+        let shell = fake_shell(dir.path(), noise, &bin.display().to_string());
+        let found = discover_login_shell_path(&spec(shell)).expect("discovery");
+        assert_eq!(found.path.entries(), [bin]);
+    }
+
+    #[test]
+    fn a_decoy_line_cannot_spoof_the_sentinel() {
+        let dir = fixture();
+        let bin = dir.path().join("bin");
+        make_dir(dir.path(), &bin);
+        let shell = fake_shell(
+            dir.path(),
+            "echo __POHUNEK_PATH_000000000000000000000000__; echo /decoy; echo __POHUNEK_PATH_000000000000000000000000__",
+            &bin.display().to_string(),
+        );
+        let found = discover_login_shell_path(&spec(shell)).expect("discovery");
+        assert_eq!(found.path.entries(), [bin]);
+    }
+
+    #[test]
+    fn keeps_absolute_existing_directories_with_spaces_quotes_and_unicode() {
+        let dir = fixture();
+        let spaced = dir.path().join("my tools/bin dir");
+        let unicode = dir.path().join("nástroje/日本語");
+        let quoted = dir.path().join("it's \"here\"");
+        for entry in [&spaced, &unicode, &quoted] {
+            make_dir(dir.path(), entry);
+        }
+        // Single quotes cannot sit inside the fake shell's quoted PATH, so
+        // the value is passed through a file the fake shell reads.
+        let value = format!(
+            "{}:{}:{}",
+            spaced.display(),
+            unicode.display(),
+            quoted.display()
+        );
+        let value_file = dir.path().join("path-value");
+        fs::write(&value_file, &value).expect("value");
+        let shell = script(
+            dir.path(),
+            "fake-shell",
+            &format!(
+                "PATH=\"$(cat '{}')\"; export PATH\nexec /bin/sh -c \"$3\"",
+                value_file.display()
+            ),
+        );
+        let found = discover_login_shell_path(&spec(shell)).expect("discovery");
+        assert_eq!(found.path.entries(), [spaced, unicode, quoted]);
+    }
+
+    #[test]
+    fn drops_empty_relative_dot_duplicate_and_missing_entries() {
+        let dir = fixture();
+        let bin = dir.path().join("bin");
+        make_dir(dir.path(), &bin);
+        let value = format!(
+            ":.:relative/bin:{bin}:{bin}:{missing}:{bin}/../bin",
+            bin = bin.display(),
+            missing = dir.path().join("missing").display()
+        );
+        let shell = fake_shell(dir.path(), "", &value);
+        let found = discover_login_shell_path(&spec(shell)).expect("discovery");
+        assert_eq!(found.path.entries(), [bin]);
+        assert_eq!(found.ignored, 6);
+        assert!(found.untrusted.is_empty());
+    }
+
+    /// Whether `pid` still runs; a zombie awaiting its reaper counts as gone.
+    fn process_is_running(pid: rustix::process::Pid) -> bool {
+        let stat = format!("/proc/{}/stat", pid.as_raw_nonzero());
+        match fs::read_to_string(stat) {
+            Ok(text) => text
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.trim_start().chars().next())
+                .is_some_and(|state| state != 'Z'),
+            Err(_) if Path::new("/proc/self").exists() => false,
+            Err(_) => rustix::process::test_kill_process(pid).is_ok(),
+        }
+    }
+
+    #[test]
+    fn a_hanging_shell_is_killed_at_the_deadline() {
+        let dir = fixture();
+        let marker = dir.path().join("grandchild-pid");
+        // The grandchild keeps the stdout pipe open, so only a group kill
+        // ends the probe. The deadline leaves the script ample time to start.
+        let shell = script(
+            dir.path(),
+            "hang-shell",
+            &format!("sleep 300 &\necho $! > '{}'\nwait", marker.display()),
+        );
+        let mut hanging = spec(shell);
+        hanging.timeout = Duration::from_secs(3);
+        let error = discover_login_shell_path(&hanging).expect_err("must time out");
+        assert!(
+            matches!(error, LoginShellError::Timeout { .. }),
+            "{error:?}"
+        );
+        let pid: i32 = fs::read_to_string(&marker)
+            .expect("marker")
+            .trim()
+            .parse()
+            .expect("pid");
+        let pid = rustix::process::Pid::from_raw(pid).expect("pid");
+        // The kill is asynchronous with the reaper; wait for the grandchild
+        // to disappear for a bounded time.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while process_is_running(pid) {
+            assert!(Instant::now() < deadline, "grandchild survived the kill");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn a_background_child_with_redirected_stdout_does_not_outlive_a_successful_probe() {
+        let dir = fixture();
+        let bin = dir.path().join("bin");
+        make_dir(dir.path(), &bin);
+        let marker = dir.path().join("background-pid");
+        // The background child detaches its stdio, so the pipe closes when the
+        // shell exits and only the group kill can end it.
+        let shell = script(
+            dir.path(),
+            "background-shell",
+            &format!(
+                "sleep 300 >/dev/null 2>&1 </dev/null &\necho $! > '{}'\nPATH='{}'; export PATH\nexec /bin/sh -c \"$3\"",
+                marker.display(),
+                bin.display()
+            ),
+        );
+        let found = discover_login_shell_path(&spec(shell)).expect("discovery");
+        assert_eq!(found.path.entries(), [bin]);
+        let pid: i32 = fs::read_to_string(&marker)
+            .expect("marker")
+            .trim()
+            .parse()
+            .expect("pid");
+        let pid = rustix::process::Pid::from_raw(pid).expect("pid");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while process_is_running(pid) {
+            assert!(Instant::now() < deadline, "background child survived");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn a_stalled_directory_validation_is_bounded_by_the_overall_deadline() {
+        let dir = fixture();
+        let bin = dir.path().join("bin");
+        make_dir(dir.path(), &bin);
+        let shell = fake_shell(dir.path(), "", &bin.display().to_string());
+        // The deadline dwarfs the fake shell's runtime, so a timeout can only
+        // come from the stalled sanitizer.
+        let mut bounded = spec(shell);
+        bounded.timeout = Duration::from_secs(2);
+        // The sanitizer stands in for a filesystem call that never returns: it
+        // announces it was entered, then blocks until the test releases it.
+        let (entered_tx, entered) = mpsc::channel::<()>();
+        let (release, blocked) = mpsc::channel::<()>();
+        let started = Instant::now();
+        let error = discover_with(
+            &bounded,
+            || {},
+            move |_value| {
+                entered_tx.send(()).expect("announce");
+                let _ = blocked.recv();
+                Err(SearchPathError::NoUsableDirectories)
+            },
+        )
+        .expect_err("must time out");
+        assert!(
+            matches!(error, LoginShellError::Timeout { .. }),
+            "{error:?}"
+        );
+        entered.try_recv().expect("the sanitizer was entered");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "discovery outlived its deadline: {:?}",
+            started.elapsed()
+        );
+        drop(release);
+    }
+
+    #[test]
+    fn an_expired_discovery_never_spawns_the_shell() {
+        let dir = fixture();
+        let marker = dir.path().join("shell-ran");
+        let shell = script(
+            dir.path(),
+            "marker-shell",
+            &format!("touch '{}'\nexit 0", marker.display()),
+        );
+        let mut bounded = spec(shell);
+        bounded.timeout = Duration::from_millis(300);
+        // Stands in for a slow filesystem check before the spawn.
+        let (release, blocked) = mpsc::channel::<()>();
+        let (finished_tx, finished) = mpsc::channel::<()>();
+        let error = discover_with(
+            &bounded,
+            move || {
+                let _ = blocked.recv();
+            },
+            // Dropped when the pipeline returns, which ends `finished`.
+            move |_value| {
+                let _keep = &finished_tx;
+                Err(SearchPathError::NoUsableDirectories)
+            },
+        )
+        .expect_err("must time out");
+        assert!(
+            matches!(error, LoginShellError::Timeout { .. }),
+            "{error:?}"
+        );
+        drop(release);
+        // Disconnection means the abandoned pipeline ended.
+        assert!(finished.recv().is_err());
+        assert!(
+            !marker.exists(),
+            "the abandoned discovery spawned the shell"
+        );
+    }
+
+    #[test]
+    fn a_spawn_that_returns_after_the_deadline_kills_the_shell_before_it_acts() {
+        let dir = fixture();
+        let marker = dir.path().join("shell-acted");
+        // The shell would act one second after it starts.
+        let shell = script(
+            dir.path(),
+            "slow-shell",
+            &format!("sleep 1\ntouch '{}'", marker.display()),
+        );
+        let mut bounded = spec(shell);
+        bounded.timeout = Duration::from_millis(300);
+        let staged = discover_staged(
+            &bounded,
+            || {},
+            || Err(SearchPathError::NoUsableDirectories),
+            // A stalled spawn returns only after the deadline has passed.
+            || std::thread::sleep(Duration::from_millis(600)),
+            |value| SearchPath::sanitize(value, true),
+        )
+        .expect("the fallback stage ends in time");
+        assert!(
+            matches!(staged.login, Err(LoginShellError::Timeout { .. })),
+            "{:?}",
+            staged.login.map(|found| found.path)
+        );
+        // Long enough for the shell to have acted had it not been killed.
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(!marker.exists(), "the shell acted after the deadline");
+    }
+
+    #[test]
+    fn a_background_job_holding_stdout_does_not_stall_a_printed_path() {
+        let dir = fixture();
+        let bin = dir.path().join("bin");
+        make_dir(dir.path(), &bin);
+        // The background job inherits the probe's stdout, so the pipe stays
+        // open after the shell exits; only the group kill ends the output.
+        let shell = script(
+            dir.path(),
+            "job-shell",
+            &format!(
+                "sleep 300 &\nPATH='{}'; export PATH\n/bin/sh -c \"$3\"\nexit 0",
+                bin.display()
+            ),
+        );
+        let mut probing = spec(shell);
+        probing.timeout = Duration::from_secs(20);
+        let started = Instant::now();
+        let found = discover_login_shell_path(&probing).expect("discovery");
+        assert_eq!(found.path.entries(), [bin]);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "waited out the deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_shell_printing_nothing_is_malformed() {
+        let dir = fixture();
+        let shell = script(dir.path(), "silent-shell", "exit 0");
+        let error = discover_login_shell_path(&spec(shell)).expect_err("no output");
+        assert!(
+            matches!(error, LoginShellError::MalformedOutput),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn junk_without_sentinels_is_malformed() {
+        let dir = fixture();
+        let shell = script(dir.path(), "junk-shell", "echo '/usr/bin:/bin'\nexit 0");
+        let error = discover_login_shell_path(&spec(shell)).expect_err("junk");
+        assert!(
+            matches!(error, LoginShellError::MalformedOutput),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_failing_shell_is_reported_with_its_exit_code() {
+        let dir = fixture();
+        let shell = script(dir.path(), "failing-shell", "echo boom\nexit 3");
+        let error = discover_login_shell_path(&spec(shell)).expect_err("failure");
+        assert!(
+            matches!(&error, LoginShellError::Failed { status } if status == "exit code 3"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_multiline_value_is_malformed() {
+        let dir = fixture();
+        let bin = dir.path().join("bin");
+        make_dir(dir.path(), &bin);
+        let value_file = dir.path().join("value");
+        fs::write(&value_file, format!("{}\n/usr/bin", bin.display())).expect("value");
+        let shell = script(
+            dir.path(),
+            "fake-shell",
+            &format!(
+                "PATH=\"$(cat '{}')\"; export PATH\nexec /bin/sh -c \"$3\"",
+                value_file.display()
+            ),
+        );
+        let error = discover_login_shell_path(&spec(shell)).expect_err("multiline");
+        assert!(
+            matches!(error, LoginShellError::MalformedOutput),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_with_a_control_character_is_unusable() {
+        let dir = fixture();
+        let value_file = dir.path().join("value");
+        fs::write(&value_file, "/usr/bin\t:/bin").expect("value");
+        let shell = script(
+            dir.path(),
+            "fake-shell",
+            &format!(
+                "PATH=\"$(cat '{}')\"; export PATH\nexec /bin/sh -c \"$3\"",
+                value_file.display()
+            ),
+        );
+        let error = discover_login_shell_path(&spec(shell)).expect_err("control");
+        assert!(
+            matches!(
+                error,
+                LoginShellError::UnusablePath(SearchPathError::ControlCharacter)
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_output_kills_the_probe() {
+        let dir = fixture();
+        let shell = script(dir.path(), "flood-shell", "yes 'flood flood flood'");
+        let mut flooding = spec(shell);
+        flooding.max_output_bytes = 1024;
+        let error = discover_login_shell_path(&flooding).expect_err("flood");
+        assert!(
+            matches!(error, LoginShellError::OutputTooLarge { limit: 1024 }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn the_probe_never_runs_interactively_and_starts_from_a_clean_environment() {
+        let dir = fixture();
+        let bin = dir.path().join("bin");
+        make_dir(dir.path(), &bin);
+        let report = dir.path().join("report");
+        // The fake shell records its arguments, environment, and stdin, then
+        // behaves like a successful shell.
+        let shell = script(
+            dir.path(),
+            "recording-shell",
+            &format!(
+                "printf '%s|' \"$@\" > '{report}.args'\n/usr/bin/env > '{report}.env'\nif read -r line; then echo open > '{report}.stdin'; fi\nPATH='{bin}'; export PATH\nexec /bin/sh -c \"$3\"",
+                report = report.display(),
+                bin = bin.display()
+            ),
+        );
+        let mut probing = spec(shell);
+        probing.environment = vec![("HOME".to_owned(), "/home/probe".to_owned())];
+        discover_login_shell_path(&probing).expect("discovery");
+        let args = fs::read_to_string(format!("{}.args", report.display())).expect("args");
+        assert!(args.starts_with("-l|-c|"), "{args}");
+        assert!(!args.contains("-i|"), "{args}");
+        let environment = fs::read_to_string(format!("{}.env", report.display())).expect("env");
+        let names: std::collections::BTreeSet<&str> = environment
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name))
+            .collect();
+        // `PWD`, `OLDPWD`, `SHLVL`, and `_` are added by `sh` itself.
+        let expected = ["HOME", "PATH", "TERM", "PWD", "OLDPWD", "SHLVL", "_"];
+        assert!(
+            names.iter().all(|name| expected.contains(name)),
+            "unexpected variables: {names:?}"
+        );
+        assert!(environment.contains("HOME=/home/probe"), "{environment}");
+        assert!(environment.contains("TERM=dumb"), "{environment}");
+        assert!(
+            !Path::new(&format!("{}.stdin", report.display())).exists(),
+            "stdin must be null"
+        );
+    }
+
+    #[test]
+    fn a_relative_or_missing_shell_is_rejected_before_running() {
+        for shell in ["sh", "/nonexistent/shell"] {
+            let error = discover_login_shell_path(&spec(PathBuf::from(shell))).expect_err("shell");
+            assert!(
+                matches!(error, LoginShellError::InvalidExecutable { .. }),
+                "{shell}: {error:?}"
+            );
+        }
+        let dir = fixture();
+        let plain = dir.path().join("plain");
+        fs::write(&plain, "not executable").expect("plain");
+        let error = discover_login_shell_path(&spec(plain)).expect_err("plain file");
+        assert!(matches!(error, LoginShellError::InvalidExecutable { .. }));
+    }
+}

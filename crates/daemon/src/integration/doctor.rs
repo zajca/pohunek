@@ -86,22 +86,14 @@ pub(super) struct PythonProbe {
     pub(super) macos_stub: Option<MacosStub>,
 }
 
-/// Whether `path` is a regular file this process can execute, by the kernel's
-/// own answer for its effective user and group (search permission on every
-/// parent directory included). The file is never run.
+/// Whether `path` is an executable the daemon would run: the shared
+/// trusted-executable check, so this probe agrees with the capability snapshot
+/// and the spawn path. The file is never run.
 ///
-/// A file without that permission is skipped exactly as a shell skips it while
-/// searching `PATH`, so it neither counts as the interpreter nor stops the
-/// search.
+/// A file that fails is skipped exactly as a shell skips it while searching
+/// `PATH`, so it neither counts as the interpreter nor stops the search.
 fn is_executable_file(path: &std::path::Path) -> bool {
-    fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
-        && rustix::fs::accessat(
-            rustix::fs::CWD,
-            path,
-            rustix::fs::Access::EXEC_OK,
-            rustix::fs::AtFlags::EACCESS,
-        )
-        .is_ok()
+    hostcheck::is_executable_file(path)
 }
 
 impl PythonProbe {

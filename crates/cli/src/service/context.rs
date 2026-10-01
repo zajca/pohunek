@@ -1,15 +1,21 @@
 //! Host facts every `pohunek service` operation starts from.
 
-// Rust guideline compliant 2026-09-29
+// Rust guideline compliant 2026-09-30
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use pohunek_paths::{BasePaths, PathEnv, HOME, XDG_RUNTIME_DIR};
 use pohunek_platform::filesystem::TrustedDir;
+use pohunek_platform::shell_env::{
+    resolve_search_path, LoginShellSpec, PathPolicy, SearchPath, DARWIN_FALLBACK_DIRECTORIES,
+    PRINTENV_EXECUTABLE,
+};
 use pohunek_platform::supervisor::{self, Namespace};
 
 use super::error::{fs_error, io_error, Error};
+use super::report::{DroppedPath, SearchPathReport};
+use super::settings;
 
 /// Mode of the application state and runtime roots.
 ///
@@ -31,6 +37,39 @@ const SYSTEMD_USER_UNITS: &str = "systemd/user";
 #[cfg(target_os = "macos")]
 const LAUNCH_AGENTS: &str = "Library/LaunchAgents";
 
+/// How the installer chooses the daemon job's executable search path.
+///
+/// The policy itself lives in [`pohunek_platform::shell_env`]; this value only
+/// carries the host inputs so tests can drive every tier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathDiscovery {
+    /// The service manager's own `PATH` is adequate (systemd inherits the
+    /// user manager's environment); the job definition carries no `PATH`.
+    Unmanaged,
+    /// The job receives a `PATH` resolved by the documented tier order.
+    Managed {
+        /// Login-shell probe to run first, or `None` to use the fallback list.
+        login_shell: Option<LoginShellSpec>,
+        /// Whether the probe shell is the built-in default because `$SHELL`
+        /// was unset.
+        shell_defaulted: bool,
+        /// Fallback directory table, see [`DARWIN_FALLBACK_DIRECTORIES`].
+        fallback_directories: Vec<String>,
+    },
+}
+
+/// Where the install-time `PATH` discovery policy comes from.
+#[derive(Debug, Clone)]
+enum DiscoverySource {
+    /// A policy fixed by the caller.
+    Fixed(PathDiscovery),
+    /// A policy built from the environment only when a fresh install asks.
+    Environment {
+        lookup: fn(&str) -> Option<std::ffi::OsString>,
+        managed: bool,
+    },
+}
+
 /// Paths, identity, and environment of the installing user.
 #[derive(Debug, Clone)]
 pub struct Context {
@@ -40,6 +79,7 @@ pub struct Context {
     runtime_base: Option<PathBuf>,
     supervisor_dir: PathBuf,
     cli_executable: PathBuf,
+    path_discovery: DiscoverySource,
 }
 
 impl Context {
@@ -64,7 +104,32 @@ impl Context {
             runtime_base,
             supervisor_dir,
             cli_executable,
+            path_discovery: DiscoverySource::Fixed(PathDiscovery::Unmanaged),
         }
+    }
+
+    /// Returns this context with `path_discovery` choosing the daemon `PATH`.
+    #[must_use]
+    pub fn with_path_discovery(mut self, path_discovery: PathDiscovery) -> Self {
+        self.path_discovery = DiscoverySource::Fixed(path_discovery);
+        self
+    }
+
+    /// Returns this context reading the discovery environment through `lookup`
+    /// when a fresh install needs it.
+    ///
+    /// Nothing is read or validated before [`Self::install_search_path`], so an
+    /// unusable variable never blocks a command that uses the recorded
+    /// configuration. `managed` selects login-shell discovery; without it the
+    /// service manager's own `PATH` applies.
+    #[must_use]
+    pub fn with_environment_discovery(
+        mut self,
+        lookup: fn(&str) -> Option<std::ffi::OsString>,
+        managed: bool,
+    ) -> Self {
+        self.path_discovery = DiscoverySource::Environment { lookup, managed };
+        self
     }
 
     /// Resolves the context from this process's environment.
@@ -93,7 +158,11 @@ impl Context {
             runtime_base,
             supervisor_dir,
             cli_executable,
-        ))
+        )
+        // Login-shell probing applies on macOS only; systemd hands the user
+        // manager's environment to the daemon job. The target is chosen at run
+        // time, not with `#[cfg]`, so every branch is type-checked everywhere.
+        .with_environment_discovery(|name| std::env::var_os(name), cfg!(target_os = "macos")))
     }
 
     /// Returns the shared application paths.
@@ -163,6 +232,72 @@ impl Context {
     pub fn namespace(&self) -> Result<Namespace, Error> {
         let (state, runtime) = self.roots()?;
         Ok(Namespace::derive(self.uid, &state, &runtime))
+    }
+
+    /// Resolves the executable search path a fresh install records.
+    ///
+    /// Empty for [`PathDiscovery::Unmanaged`]. Otherwise the tier order of
+    /// [`pohunek_platform::shell_env`] applies; a failed login-shell probe
+    /// falls back to the directory list. The report carries the source, the
+    /// failure, and every refused directory, so the caller can show them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SearchPath`] when no tier yields a usable directory.
+    pub fn install_search_path(&self) -> Result<(SearchPath, SearchPathReport), Error> {
+        let discovery = match &self.path_discovery {
+            DiscoverySource::Fixed(discovery) => discovery.clone(),
+            DiscoverySource::Environment { lookup, managed } => {
+                if *managed {
+                    managed_discovery_from_env(lookup)?
+                } else {
+                    PathDiscovery::Unmanaged
+                }
+            }
+        };
+        let PathDiscovery::Managed {
+            login_shell,
+            shell_defaulted,
+            fallback_directories,
+        } = &discovery
+        else {
+            return Ok((
+                SearchPath::empty(),
+                SearchPathReport {
+                    source: "unmanaged",
+                    entries: Vec::new(),
+                    shell_used: None,
+                    shell_defaulted: false,
+                    login_shell_failure: None,
+                    dropped: Vec::new(),
+                },
+            ));
+        };
+        let fallback: Vec<&str> = fallback_directories.iter().map(String::as_str).collect();
+        let resolution = resolve_search_path(&PathPolicy {
+            configured: None,
+            login_shell: login_shell.as_ref(),
+            fallback_directories: &fallback,
+            home: self.home.as_deref(),
+        })?;
+        let report = SearchPathReport {
+            source: resolution.source.as_str(),
+            entries: resolution.path.entries().to_vec(),
+            shell_used: resolution.shell,
+            shell_defaulted: *shell_defaulted && login_shell.is_some(),
+            login_shell_failure: resolution
+                .login_shell_failure
+                .map(|error| error.to_string()),
+            dropped: resolution
+                .untrusted
+                .into_iter()
+                .map(|dropped| DroppedPath {
+                    path: dropped.entry,
+                    reason: dropped.reason,
+                })
+                .collect(),
+        };
+        Ok((resolution.path, report))
     }
 
     /// Returns the bootstrap environment for the daemon's job definition.
@@ -241,6 +376,114 @@ impl Context {
     }
 }
 
+/// Builds the managed discovery policy for a user whose login shell is `shell`.
+///
+/// An unset `shell` selects [`settings::DEFAULT_LOGIN_SHELL`], which the report
+/// says. `environment` holds the non-secret variables the shell needs to find
+/// its startup files.
+///
+/// # Errors
+///
+/// Returns [`Error::UnusableEnv`] for a `shell` that is not absolute and
+/// [`Error::NonUtf8Env`] for one that is not UTF-8: a set but unusable `$SHELL`
+/// is refused before any install effect instead of replaced by a guess, and the
+/// report that names the shell must stay serializable.
+pub fn managed_path_discovery(
+    shell: Option<PathBuf>,
+    mut environment: Vec<(String, String)>,
+) -> Result<PathDiscovery, Error> {
+    let shell_defaulted = shell.is_none();
+    let shell = match shell {
+        Some(shell) if shell.to_str().is_none() => {
+            return Err(Error::NonUtf8Env {
+                var: "SHELL",
+                path: shell,
+            });
+        }
+        Some(shell) if shell.is_absolute() => shell,
+        Some(shell) => {
+            return Err(unusable(
+                "SHELL",
+                &shell,
+                "it is not an absolute path".to_owned(),
+            ));
+        }
+        None => PathBuf::from(settings::DEFAULT_LOGIN_SHELL),
+    };
+    // The probe starts from an empty environment, so `$SHELL` is passed on:
+    // a startup profile that branches on it would otherwise skip its `PATH`
+    // setup and the probe would succeed with the baseline value.
+    environment.push((
+        "SHELL".to_owned(),
+        shell
+            .to_str()
+            .expect("the shell path was validated as UTF-8")
+            .to_owned(),
+    ));
+    Ok(PathDiscovery::Managed {
+        login_shell: Some(LoginShellSpec {
+            shell,
+            printenv: PathBuf::from(PRINTENV_EXECUTABLE),
+            environment,
+            timeout: settings::LOGIN_SHELL_TIMEOUT,
+            max_output_bytes: settings::LOGIN_SHELL_OUTPUT,
+        }),
+        shell_defaulted,
+        fallback_directories: DARWIN_FALLBACK_DIRECTORIES
+            .iter()
+            .map(|directory| (*directory).to_owned())
+            .collect(),
+    })
+}
+
+/// Variables that name where a login shell reads its profile from.
+///
+/// `ZDOTDIR` moves zsh's startup files and `XDG_CONFIG_HOME` moves fish's and
+/// other shells'; without them a custom profile location is never read and the
+/// probe would succeed with the baseline `PATH`.
+const PROFILE_SELECTORS: [&str; 2] = ["ZDOTDIR", "XDG_CONFIG_HOME"];
+
+/// Builds the managed policy from an environment lookup.
+///
+/// A `HOME`, `USER`, or `LOGNAME` that is set but not UTF-8 fails instead of
+/// being left out, because the shell would then read another user's startup
+/// files. A set, non-empty profile selector ([`PROFILE_SELECTORS`]) is passed to
+/// the probe and must be UTF-8 and absolute, or the install fails. `$SHELL` is
+/// validated by [`managed_path_discovery`]. The lookup is injected so the
+/// validation is type-checked and tested on every target.
+fn managed_discovery_from_env(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathDiscovery, Error> {
+    let mut environment = Vec::new();
+    for name in ["HOME", "USER", "LOGNAME"] {
+        if let Some(value) = lookup(name) {
+            let text = value.into_string().map_err(|value| Error::NonUtf8Env {
+                var: name,
+                path: PathBuf::from(value),
+            })?;
+            environment.push((name.to_owned(), text));
+        }
+    }
+    for name in PROFILE_SELECTORS {
+        let Some(value) = lookup(name).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let text = value.into_string().map_err(|value| Error::NonUtf8Env {
+            var: name,
+            path: PathBuf::from(value),
+        })?;
+        if !Path::new(&text).is_absolute() {
+            return Err(unusable(
+                name,
+                Path::new(&text),
+                "it is not an absolute path".to_owned(),
+            ));
+        }
+        environment.push((name.to_owned(), text));
+    }
+    managed_path_discovery(lookup("SHELL").map(PathBuf::from), environment)
+}
+
 /// Returns where the daemon definition goes for `paths` and `home`.
 ///
 /// This is the systemd user unit directory `$XDG_CONFIG_HOME/systemd/user`
@@ -309,6 +552,21 @@ pub(crate) mod tests {
         (root, path)
     }
 
+    /// Creates `path` below `root`, every new component with mode 0755
+    /// regardless of the process umask, as the path trust checks require.
+    pub(crate) fn make_dirs(root: &Path, path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut current = root.to_path_buf();
+        for component in path.strip_prefix(root).expect("below root").components() {
+            current.push(component);
+            if !current.exists() {
+                std::fs::create_dir(&current).expect("create directory");
+                std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod directory");
+            }
+        }
+    }
+
     /// Resolves application paths below `root` without touching the process environment.
     pub(crate) fn paths(root: &Path) -> BasePaths {
         let env = PathEnv {
@@ -338,6 +596,151 @@ pub(crate) mod tests {
             root.join("units"),
             PathBuf::from("/usr/bin/pohunek"),
         )
+    }
+
+    #[test]
+    fn profile_selectors_reach_the_probe_and_must_be_absolute_utf8() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let env = |pairs: Vec<(&'static str, OsString)>| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.clone())
+            }
+        };
+        let PathDiscovery::Managed {
+            login_shell: Some(spec),
+            ..
+        } = managed_discovery_from_env(env(vec![
+            ("ZDOTDIR", OsString::from("/home/u/.config/zsh")),
+            ("XDG_CONFIG_HOME", OsString::from("")),
+        ]))
+        .expect("discovery")
+        else {
+            panic!("managed discovery");
+        };
+        // An empty selector counts as unset, as shells treat it.
+        assert_eq!(
+            spec.environment,
+            [
+                ("ZDOTDIR".to_owned(), "/home/u/.config/zsh".to_owned()),
+                ("SHELL".to_owned(), "/bin/zsh".to_owned()),
+            ]
+        );
+        for (var, value, code) in [
+            (
+                "ZDOTDIR",
+                OsString::from("relative/zsh"),
+                "service_environment_invalid",
+            ),
+            (
+                "XDG_CONFIG_HOME",
+                OsString::from("cfg"),
+                "service_environment_invalid",
+            ),
+            (
+                "ZDOTDIR",
+                OsString::from_vec(b"/z\xff".to_vec()),
+                "service_environment_not_utf8",
+            ),
+        ] {
+            let error = managed_discovery_from_env(env(vec![(var, value)])).expect_err(var);
+            assert_eq!(error.code(), code, "{var}");
+        }
+    }
+
+    #[test]
+    fn a_custom_profile_location_supplies_a_prefix_outside_the_fallback_list() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_root, root) = temp_root();
+        let root = root.as_path();
+        let zdotdir = root.join("zdotdir");
+        let prefix = root.join("nix/profile/bin");
+        make_dirs(root, &zdotdir);
+        make_dirs(root, &prefix);
+        // A fake zsh that reads its PATH from `$ZDOTDIR/path`, as a profile
+        // under `ZDOTDIR` would set it, and ignores everything else.
+        std::fs::write(zdotdir.join("path"), prefix.display().to_string()).expect("profile");
+        let shell = root.join("fake-zsh");
+        std::fs::write(
+            &shell,
+            "#!/bin/sh\n[ -n \"$ZDOTDIR\" ] && PATH=\"$(cat \"$ZDOTDIR/path\")\"; export PATH\nexec /bin/sh -c \"$3\"\n",
+        )
+        .expect("shell");
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let shell_value = OsString::from(shell.as_os_str());
+        let zdotdir_value = OsString::from(zdotdir.as_os_str());
+        let PathDiscovery::Managed {
+            login_shell,
+            shell_defaulted,
+            ..
+        } = managed_discovery_from_env(|name| match name {
+            "SHELL" => Some(shell_value.clone()),
+            "ZDOTDIR" => Some(zdotdir_value.clone()),
+            _ => None,
+        })
+        .expect("discovery")
+        else {
+            panic!("managed discovery");
+        };
+        let context = context(root).with_path_discovery(PathDiscovery::Managed {
+            login_shell,
+            shell_defaulted,
+            fallback_directories: Vec::new(),
+        });
+        let (path, report) = context.install_search_path().expect("resolve");
+        assert_eq!(path.entries(), [prefix]);
+        assert_eq!(report.source, "login_shell");
+    }
+
+    #[test]
+    fn a_non_utf8_shell_or_login_variable_fails_before_any_effect() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let non_utf8 = OsString::from_vec(b"/bin/\xff".to_vec());
+        for var in ["SHELL", "HOME", "USER", "LOGNAME"] {
+            let bad = non_utf8.clone();
+            let error = managed_discovery_from_env(|name| {
+                if name == var {
+                    Some(bad.clone())
+                } else if name == "SHELL" {
+                    Some(OsString::from("/bin/zsh"))
+                } else {
+                    None
+                }
+            })
+            .expect_err(var);
+            assert!(
+                matches!(&error, Error::NonUtf8Env { var: found, .. } if *found == var),
+                "{var}: {error:?}"
+            );
+            assert_eq!(error.code(), "service_environment_not_utf8");
+        }
+        // Valid values pass through and an unset SHELL selects the default.
+        let PathDiscovery::Managed {
+            login_shell: Some(spec),
+            shell_defaulted,
+            ..
+        } = managed_discovery_from_env(|name| (name == "HOME").then(|| OsString::from("/home/u")))
+            .expect("discovery")
+        else {
+            panic!("managed discovery");
+        };
+        assert!(shell_defaulted);
+        assert_eq!(
+            spec.environment,
+            [
+                ("HOME".to_owned(), "/home/u".to_owned()),
+                // The defaulted shell is passed on as `$SHELL` too.
+                ("SHELL".to_owned(), "/bin/zsh".to_owned()),
+            ]
+        );
     }
 
     #[test]

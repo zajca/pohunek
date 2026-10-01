@@ -126,6 +126,7 @@ use std::time::{Duration, Instant};
 
 use pohunek_paths::InstallLayout;
 use pohunek_platform::process::{HostInspector, Pid, ProcessInspector};
+use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::{
     self, JobDefinition, Namespace, ServiceObservation, ServiceState, WorkerKey,
 };
@@ -134,13 +135,15 @@ use protocol::{RuntimeState, SessionInfo, SessionState};
 
 use super::backend::Backend;
 use super::context::Context;
-use super::definition::{daemon_definition, initial_config, with_version};
+use super::definition::{
+    config_with_search_path, daemon_definition, identity_config, with_version,
+};
 use super::error::{supervisor_error, Error, LiveSession, OutdatedWorker};
 use super::layout::{self, Staged};
 use super::record::{self, Operation, Record, Step, Store, TransactionLock};
 use super::report::{
-    state_name, InstallReport, JobReport, KeptVersion, PendingReport, StatusReport,
-    UninstallReport, UpgradeReport, VersionReport, WorkerReport,
+    state_name, InstallReport, JobReport, KeptVersion, PendingReport, SearchPathReport,
+    StatusReport, UninstallReport, UpgradeReport, VersionReport, WorkerReport,
 };
 use super::settings;
 use super::usage::{Journals, Usage};
@@ -286,7 +289,19 @@ impl<'a> Engine<'a> {
     ) -> Result<InstallReport, Error> {
         let _transaction = self.transaction().await?;
         let layout = install_preflight(self.context, prefix)?;
-        let (resume, rolled_back) = match install_plan(self.store.load()?, prefix, version)? {
+        let plan = install_plan(self.store.load()?, prefix, version)?;
+        // The discovery environment is judged, and discovery run, before a
+        // foreign pending transaction is rolled back, so a hostile environment
+        // fails the install with nothing changed.
+        // An existing installation or job wins over discovery for a fresh plan,
+        // so re-running install neither starts the login shell nor masks
+        // `service_already_installed`.
+        let config_path = self.context.config_path();
+        if matches!(plan, Plan::Fresh) {
+            self.ensure_not_installed(&config_path).await?;
+        }
+        let discovered = discover_for_plan(self.context, &plan)?;
+        let (resume, rolled_back) = match plan {
             Plan::Fresh => (None, None),
             Plan::Resume(record) => (Some(record), None),
             Plan::RollBack(record) => {
@@ -295,14 +310,36 @@ impl<'a> Engine<'a> {
                 (None, Some(report))
             }
         };
-        let config_path = self.context.config_path();
-        if resume.is_none() {
-            if file_exists(&config_path)? {
-                return Err(Error::AlreadyInstalled { path: config_path });
-            }
-            ensure_no_daemon_job(self.backend).await?;
+        // The rollback removed the foreign transaction's files; what is left
+        // must not be an installation.
+        if rolled_back.is_some() {
+            self.ensure_not_installed(&config_path).await?;
         }
-        let config = initial_config(self.context, prefix, version)?;
+        // Once `service.toml` is written it is the installation's record, so a
+        // resume past that step reads it instead of probing the host again,
+        // after proving it still describes this installation.
+        let (config, search_path_report) = match &resume {
+            Some(record) if record.step >= Step::Config => {
+                let config = verify_resume_config(self.context, prefix, version)?;
+                let report = SearchPathReport {
+                    source: "recorded",
+                    entries: config.search_path().entries().to_vec(),
+                    shell_used: None,
+                    shell_defaulted: false,
+                    login_shell_failure: None,
+                    dropped: Vec::new(),
+                };
+                (config, report)
+            }
+            _ => {
+                let (search_path, report) =
+                    discovered.expect("a plan that writes service.toml discovered the search path");
+                (
+                    config_with_search_path(self.context, prefix, version, search_path)?,
+                    report,
+                )
+            }
+        };
         let namespace = config.namespace();
         let claimed = layout::claim_prefix(&layout, &namespace)?;
         let resumed = resume.is_some();
@@ -352,7 +389,18 @@ impl<'a> Engine<'a> {
             daemon_executable: config.daemon_executable(),
             resumed,
             rolled_back,
+            search_path: search_path_report,
         })
+    }
+
+    /// Fails when `service.toml` or a daemon job of this namespace exists.
+    async fn ensure_not_installed(&self, config_path: &Path) -> Result<(), Error> {
+        if file_exists(config_path)? {
+            return Err(Error::AlreadyInstalled {
+                path: config_path.to_path_buf(),
+            });
+        }
+        ensure_no_daemon_job(self.backend).await
     }
 
     /// Upgrades the installation to `version` from the binaries in `from`.
@@ -481,7 +529,7 @@ impl<'a> Engine<'a> {
             // missing file was removed afterwards; the record still names the
             // installation, and its daemon may still run live workers.
             (None, Some(pending)) => {
-                initial_config(self.context, &pending.prefix, &pending.version)?
+                identity_config(self.context, &pending.prefix, &pending.version)?
             }
             // The rolled back install never registered its daemon, so nothing
             // of it remains; `--purge` still removes the durable metadata.
@@ -1391,6 +1439,77 @@ pub(crate) fn install_preflight(context: &Context, prefix: &Path) -> Result<Inst
     let layout = install_layout(prefix)?;
     check_layout_dirs(context, &layout)?;
     Ok(layout)
+}
+
+/// Reads `service.toml` for an install resumed past the config step.
+///
+/// The file is proven to describe this installation before any further
+/// effect: its prefix, version, and namespace inputs must equal those of the
+/// interrupted install and of the current user. A mismatch is an error; the
+/// file is never overwritten here. `service check` runs this same function.
+///
+/// # Errors
+///
+/// Returns the load errors of [`ServiceConfig::load`] for a missing or
+/// invalid file, [`Error::Config`] for another namespace, and
+/// [`Error::ResumeConfigMismatch`] for another prefix or version.
+pub(crate) fn verify_resume_config(
+    context: &Context,
+    prefix: &Path,
+    version: &str,
+) -> Result<ServiceConfig, Error> {
+    let config = ServiceConfig::load(&context.config_path())?;
+    let (state_root, runtime_root) = context.roots()?;
+    config.verify_installation(context.uid(), &state_root, &runtime_root)?;
+    if config.prefix() != prefix {
+        return Err(Error::ResumeConfigMismatch {
+            key: "prefix",
+            recorded: config.prefix().display().to_string(),
+            expected: prefix.display().to_string(),
+        });
+    }
+    if config.active_version() != version {
+        return Err(Error::ResumeConfigMismatch {
+            key: "active_version",
+            recorded: config.active_version().to_owned(),
+            expected: version.to_owned(),
+        });
+    }
+    Ok(config)
+}
+
+/// Resolves the daemon `PATH` when the install plan will write `service.toml`.
+///
+/// A fresh install, a rolled-back one, and a resume before the config step
+/// resolve it; a resume after that step keeps the recorded path. The discovery
+/// environment and a missing trusted directory fail here, before any effect.
+/// `pohunek service check` runs the same function.
+///
+/// # Errors
+///
+/// Returns the environment errors and [`Error::SearchPath`] of
+/// [`Context::install_search_path`].
+pub(crate) fn discover_for_plan(
+    context: &Context,
+    plan: &Plan,
+) -> Result<Option<(SearchPath, SearchPathReport)>, Error> {
+    plan_discovers(plan)
+        .then(|| context.install_search_path())
+        .transpose()
+}
+
+/// Whether `plan` writes `service.toml` and so resolves the daemon `PATH`.
+///
+/// Rolling back an interrupted install leaves nothing installed, so install
+/// goes on to write a fresh file. Rolling back an interrupted upgrade restores
+/// the existing `service.toml`, so nothing is written and the rollback must
+/// need neither discovery nor a valid discovery environment.
+pub(crate) fn plan_discovers(plan: &Plan) -> bool {
+    match plan {
+        Plan::Fresh => true,
+        Plan::RollBack(record) => record.operation == Operation::Install,
+        Plan::Resume(record) => record.step < Step::Config,
+    }
 }
 
 /// Everything upgrade checks before it reads `service.toml`.

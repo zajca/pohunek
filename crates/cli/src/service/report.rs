@@ -3,7 +3,7 @@
 //! These types are the stable `--json` payloads (inside the CLI's usual
 //! `{cli_version, protocol, ok}` envelope). Fields are only ever added.
 
-// Rust guideline compliant 2026-09-28
+// Rust guideline compliant 2026-09-30
 
 use std::path::PathBuf;
 
@@ -29,6 +29,45 @@ pub struct InstallReport {
     pub resumed: bool,
     /// An unrelated interrupted transaction that was rolled back first.
     pub rolled_back: Option<PendingReport>,
+    /// How the daemon job's executable search path was obtained.
+    pub search_path: SearchPathReport,
+}
+
+/// How the daemon job's executable search path was obtained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SearchPathReport {
+    /// `login_shell`, `fallback`, `recorded` (an interrupted install resumed
+    /// with the path already written to `service.toml`), or `unmanaged` (the
+    /// service manager's own `PATH` applies and none is recorded).
+    pub source: &'static str,
+    /// The recorded directories in search order.
+    pub entries: Vec<PathBuf>,
+    /// The login shell tried, when discovery ran.
+    pub shell_used: Option<PathBuf>,
+    /// Whether `shell_used` is the built-in default because `$SHELL` was unset.
+    pub shell_defaulted: bool,
+    /// Why login-shell discovery failed, when the fallback list was used.
+    pub login_shell_failure: Option<String>,
+    /// Existing directories refused as untrusted.
+    pub dropped: Vec<DroppedPath>,
+}
+
+impl SearchPathReport {
+    /// Whether the operator should be warned: the login shell did not supply
+    /// the path, or a directory was refused.
+    #[must_use]
+    pub fn needs_warning(&self) -> bool {
+        self.login_shell_failure.is_some() || !self.dropped.is_empty()
+    }
+}
+
+/// A directory refused when the search path was resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DroppedPath {
+    /// The directory as listed.
+    pub path: String,
+    /// Why it was refused.
+    pub reason: &'static str,
 }
 
 /// Result of `pohunek service upgrade`.

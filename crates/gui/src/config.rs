@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pohunek_gui_core::{ConnectionOptions, HostConfig};
+use pohunek_gui_core::{validate_attach_shell_template, ConnectionOptions, HostConfig};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -55,8 +55,8 @@ impl AppConfig {
             toml::from_str(&raw).map_err(|source| ConfigError::Parse { path, source })?;
         let raw_gui = raw.gui.unwrap_or_default();
         Ok(Self {
-            attach_command: raw.attach_command,
-            pohunek_bin: raw.pohunek_bin,
+            attach_command: validated_attach_command(raw.attach_command)?,
+            pohunek_bin: validated_pohunek_bin(raw.pohunek_bin)?,
             local_host: HostConfig::local("local", local_socket_path()?),
             connection_options: raw_gui.connection_options()?,
             terminal_size: raw_gui.terminal_size()?,
@@ -66,6 +66,27 @@ impl AppConfig {
             keymap: keymap_from_raw_keybindings(&raw.keybindings)?,
         })
     }
+}
+
+/// Rejects an attach template that cannot be rendered safely, at config load
+/// instead of at the first attach.
+fn validated_attach_command(template: String) -> Result<String, ConfigError> {
+    validate_attach_shell_template(&template).map_err(|source| ConfigError::Invalid {
+        field: "attach_command",
+        message: source.to_string(),
+    })?;
+    Ok(template)
+}
+
+/// Rejects a `pohunek_bin` no process can receive (a NUL byte), at config load.
+fn validated_pohunek_bin(bin: String) -> Result<String, ConfigError> {
+    if bin.contains('\0') {
+        return Err(ConfigError::Invalid {
+            field: "pohunek_bin",
+            message: "contains a NUL byte".to_owned(),
+        });
+    }
+    Ok(bin)
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,6 +270,65 @@ mod tests {
 
     use super::*;
     use crate::keyboard::{KeyAction, KeyChord, KeyContext};
+
+    #[test]
+    fn a_nul_byte_in_the_template_or_binary_fails_at_config_load() {
+        // TOML accepts an escaped NUL, which no process argument can hold.
+        let raw: RawConfig =
+            toml::from_str("attach_command = \"foot \\u0000 {bin}\"\npohunek_bin = \"p\"")
+                .expect("TOML accepts the escape");
+        let error = validated_attach_command(raw.attach_command).expect_err("NUL template");
+        assert!(
+            matches!(
+                &error,
+                ConfigError::Invalid {
+                    field: "attach_command",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        let raw: RawConfig =
+            toml::from_str("attach_command = \"foot {bin}\"\npohunek_bin = \"a\\u0000b\"")
+                .expect("TOML accepts the escape");
+        let error = validated_pohunek_bin(raw.pohunek_bin).expect_err("NUL binary");
+        assert!(
+            matches!(
+                &error,
+                ConfigError::Invalid {
+                    field: "pohunek_bin",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn an_unsafe_attach_template_fails_at_config_load() {
+        assert_eq!(
+            validated_attach_command("foot -- {bin} attach {host} {id}".to_owned())
+                .expect("unquoted placeholders are valid"),
+            "foot -- {bin} attach {host} {id}"
+        );
+        for template in [
+            "sh -c 'exec {bin} attach {host}'",
+            "echo # {id}",
+            "echo '{host}",
+        ] {
+            let error = validated_attach_command(template.to_owned()).expect_err(template);
+            assert!(
+                matches!(
+                    &error,
+                    ConfigError::Invalid {
+                        field: "attach_command",
+                        ..
+                    }
+                ),
+                "{template}: {error:?}"
+            );
+        }
+    }
 
     #[test]
     fn keybindings_table_builds_config_keymap() {

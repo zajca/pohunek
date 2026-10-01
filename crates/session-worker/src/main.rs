@@ -418,6 +418,7 @@ mod tests {
                 daemon_restart_throttle: other,
             },
             environment_allowlist: vec!["PATH".to_owned()],
+            search_path: pohunek_platform::shell_env::SearchPath::default(),
             sweep_grace: other,
             open_files: 8192,
         })

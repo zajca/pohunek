@@ -24,6 +24,7 @@ use protocol::{
 use super::*;
 use crate::service::backend::{Call, Control, Health};
 use crate::service::context::tests::{context, temp_root};
+use crate::service::definition::initial_config;
 use crate::service::inherited::Token;
 use crate::service::layout::tests::stage_dir;
 use crate::service::layout::CLI_NAME;
@@ -738,6 +739,362 @@ async fn an_install_interrupted_after_every_step_resumes_to_one_installation() {
             harness.fake.world().installs <= 1,
             "{step:?}: the daemon job is installed at most once"
         );
+    }
+}
+
+/// A context whose login shell reports `dir` as the whole `PATH`.
+fn discovering(
+    context: &Context,
+    root: &std::path::Path,
+    name: &str,
+    dir: &std::path::Path,
+) -> Context {
+    use std::os::unix::fs::PermissionsExt as _;
+    crate::service::context::tests::make_dirs(root, dir);
+    let shell = root.join(name);
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nPATH='{}'; export PATH\nexec /bin/sh -c \"$3\"\n",
+            dir.display()
+        ),
+    )
+    .expect("write shell");
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let discovery = crate::service::context::managed_path_discovery(Some(shell), Vec::new())
+        .expect("discovery");
+    let crate::service::context::PathDiscovery::Managed {
+        login_shell,
+        shell_defaulted,
+        ..
+    } = discovery
+    else {
+        panic!("managed discovery");
+    };
+    // No fallback directories, so the recorded path is what the shell printed.
+    context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Managed {
+            login_shell,
+            shell_defaulted,
+            fallback_directories: Vec::new(),
+        })
+}
+
+#[tokio::test]
+async fn a_resumed_install_keeps_the_path_recorded_in_service_toml() {
+    let mut harness = Harness::new();
+    let first = harness.root.join("first-bin");
+    let second = harness.root.join("second-bin");
+    harness.context = discovering(&harness.context, &harness.root, "shell-a", &first);
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registering);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+
+    harness.context = discovering(&harness.context, &harness.root, "shell-b", &second);
+    let report = harness.install(V1).await.expect("resume");
+    assert!(report.resumed);
+    let recorded = harness
+        .config()
+        .expect("config")
+        .search_path()
+        .to_env_value();
+    assert_eq!(recorded, first.display().to_string());
+    let registered = harness.fake.world().registered.clone().expect("registered");
+    assert_eq!(registered.environment().get("PATH"), Some(&recorded));
+}
+
+/// A context whose discovery-only variables are unusable.
+fn with_hostile_discovery_environment(context: &Context) -> Context {
+    context.clone().with_environment_discovery(
+        |name| match name {
+            "SHELL" | "ZDOTDIR" | "XDG_CONFIG_HOME" => Some("relative/path".into()),
+            _ => None,
+        },
+        true,
+    )
+}
+
+#[tokio::test]
+async fn unusable_discovery_variables_fail_only_a_fresh_install_before_any_effect() {
+    // A fresh install needs the discovery environment, so it fails first.
+    let mut harness = Harness::new();
+    harness.context = with_hostile_discovery_environment(&harness.context);
+    let error = harness.install(V1).await.expect_err("fresh install");
+    assert_eq!(error.code(), "service_environment_invalid");
+    assert!(harness.config().is_none(), "no config was written");
+    assert!(harness.pending().is_none(), "no transaction started");
+    assert_eq!(harness.fake.world().installs, 0, "no job was registered");
+
+    // Every other command uses the recorded configuration and never reads it.
+    let mut harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.context = with_hostile_discovery_environment(&harness.context);
+    let config = harness.config();
+    harness
+        .engine()
+        .status(config.as_ref())
+        .await
+        .expect("status ignores the discovery environment");
+    harness.upgrade(V2).await.expect("upgrade ignores it");
+    harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect("uninstall ignores it");
+
+    // A resumed install reads the recorded config instead of discovering.
+    let mut harness = Harness::new();
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registering);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+    harness.context = with_hostile_discovery_environment(&harness.context);
+    let report = harness.install(V1).await.expect("resume ignores it");
+    assert!(report.resumed);
+}
+
+#[tokio::test]
+async fn a_hostile_discovery_environment_fails_install_and_check_before_a_foreign_rollback() {
+    let mut harness = Harness::new();
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Binaries);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+    let before = harness.pending().expect("a foreign pending install");
+    let config_before = harness.config();
+
+    harness.context = with_hostile_discovery_environment(&harness.context);
+    // `service check` and install agree on the hostile environment.
+    let check = crate::service::check_with(
+        &harness.context,
+        &harness.backend,
+        Some(harness.prefix()),
+        V2,
+        false,
+    )
+    .await
+    .expect_err("check fails");
+    let error = harness.install(V2).await.expect_err("install fails");
+    assert_eq!(check.code(), "service_environment_invalid");
+    assert_eq!(error.code(), check.code());
+    // The pending transaction was neither rolled back nor touched.
+    let after = harness.pending().expect("the record survives");
+    assert_eq!((after.version, after.step), (before.version, before.step));
+    assert_eq!(harness.config(), config_before);
+    assert_eq!(harness.fake.world().installs, 0);
+}
+
+#[tokio::test]
+async fn an_existing_installation_wins_over_discovery_and_never_starts_the_probe() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let marker = harness.root.join("probe-ran");
+    let shell = harness.root.join("marker-shell");
+    std::fs::write(
+        &shell,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    )
+    .expect("write shell");
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let discovery = crate::service::context::managed_path_discovery(Some(shell), Vec::new())
+        .expect("discovery");
+    let probing = harness.context.clone().with_path_discovery(discovery);
+    let hostile = with_hostile_discovery_environment(&harness.context);
+    for context in [probing, hostile] {
+        harness.context = context;
+        let error = harness.install(V1).await.expect_err("already installed");
+        assert_eq!(error.code(), "service_already_installed");
+        let checked = crate::service::check_with(
+            &harness.context,
+            &harness.backend,
+            Some(harness.prefix()),
+            V2,
+            false,
+        )
+        .await;
+        // `check` would upgrade; it never discovers for an installed service.
+        assert!(checked.is_ok(), "{checked:?}");
+    }
+    assert!(!marker.exists(), "the login shell must never start");
+}
+
+#[tokio::test]
+async fn check_and_install_agree_on_the_config_of_a_resumed_install() {
+    for variant in ["missing", "prefix", "version", "valid"] {
+        let harness = Harness::new();
+        let mut engine = harness.engine();
+        engine.interrupt_after = Some(Step::Registering);
+        engine
+            .install(&harness.staged(V1), &harness.prefix(), V1)
+            .await
+            .expect_err("interrupted");
+        let path = harness.context.config_path();
+        match variant {
+            "missing" => std::fs::remove_file(&path).expect("remove config"),
+            "prefix" | "version" => {
+                let mut spec = harness.config().expect("config").to_spec();
+                if variant == "prefix" {
+                    spec.prefix = harness.root.join("elsewhere");
+                } else {
+                    spec.active_version = "9.9.9".to_owned();
+                }
+                ServiceConfig::new(spec)
+                    .expect("valid edited config")
+                    .write(&path)
+                    .expect("write");
+            }
+            _ => {}
+        }
+        let checked = crate::service::check_with(
+            &harness.context,
+            &harness.backend,
+            Some(harness.prefix()),
+            V1,
+            false,
+        )
+        .await;
+        let installed = harness.install(V1).await;
+        match (&checked, &installed) {
+            (Ok(_), Ok(_)) => assert_eq!(variant, "valid"),
+            (Err(check), Err(install)) => {
+                assert_ne!(variant, "valid");
+                assert_eq!(check.code(), install.code(), "{variant}");
+                assert_eq!(check.to_string(), install.to_string(), "{variant}");
+            }
+            other => panic!("{variant}: check and install disagree: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn rolling_back_an_interrupted_upgrade_needs_no_discovery() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for hostile in [true, false] {
+        let mut harness = Harness::new();
+        harness.install(V1).await.expect("install");
+        let mut engine = harness.engine();
+        engine.interrupt_after = Some(Step::Binaries);
+        engine
+            .upgrade(&harness.staged(V2), V2)
+            .await
+            .expect_err("interrupted upgrade");
+        assert!(harness.pending().is_some(), "an upgrade record is pending");
+
+        let marker = harness.root.join("probe-ran");
+        let shell = harness.root.join("marker-shell");
+        std::fs::write(
+            &shell,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .expect("write shell");
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        harness.context = if hostile {
+            with_hostile_discovery_environment(&harness.context)
+        } else {
+            let discovery =
+                crate::service::context::managed_path_discovery(Some(shell), Vec::new())
+                    .expect("discovery");
+            harness.context.clone().with_path_discovery(discovery)
+        };
+        // `check` agrees: no discovery for the rollback of an upgrade.
+        let checked = crate::service::check_with(
+            &harness.context,
+            &harness.backend,
+            Some(harness.prefix()),
+            V1,
+            false,
+        )
+        .await;
+        assert!(!matches!(&checked, Err(error) if error.code() == "service_environment_invalid"));
+        // The install rolls the upgrade back, then finds the installation.
+        let error = harness.install(V1).await.expect_err("already installed");
+        assert_eq!(error.code(), "service_already_installed");
+        assert!(harness.pending().is_none(), "the rollback completed");
+        assert!(!marker.exists(), "no profile code ran");
+    }
+}
+
+#[tokio::test]
+async fn check_and_install_agree_when_a_hostile_environment_meets_an_orphan_job() {
+    let mut harness = Harness::new();
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Binaries);
+    engine
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("interrupted");
+    let before = harness.pending().expect("a foreign pending install");
+    // An orphan job of this namespace, plus an unusable discovery environment.
+    let config =
+        crate::service::definition::initial_config(&harness.context, &harness.prefix(), V1)
+            .expect("config");
+    let definition =
+        crate::service::definition::daemon_definition(&harness.context, &config).expect("job");
+    harness.fake.world().registered = Some(definition);
+    harness.fake.world().running = true;
+    harness.context = with_hostile_discovery_environment(&harness.context);
+
+    let checked = crate::service::check_with(
+        &harness.context,
+        &harness.backend,
+        Some(harness.prefix()),
+        V2,
+        false,
+    )
+    .await
+    .expect_err("check fails");
+    let installed = harness.install(V2).await.expect_err("install fails");
+    // The rollback of an interrupted install discovers before the job check.
+    assert_eq!(installed.code(), "service_environment_invalid");
+    assert_eq!(checked.code(), installed.code());
+    let after = harness.pending().expect("the transaction is untouched");
+    assert_eq!((after.version, after.step), (before.version, before.step));
+}
+
+#[tokio::test]
+async fn a_resume_refuses_a_service_toml_of_another_installation() {
+    for (key, edit) in [("prefix", 0_u8), ("active_version", 1_u8)] {
+        let harness = Harness::new();
+        let mut engine = harness.engine();
+        engine.interrupt_after = Some(Step::Registering);
+        engine
+            .install(&harness.staged(V1), &harness.prefix(), V1)
+            .await
+            .expect_err("interrupted");
+        let mut spec = harness.config().expect("config").to_spec();
+        if edit == 0 {
+            spec.prefix = harness.root.join("elsewhere");
+        } else {
+            spec.active_version = "9.9.9".to_owned();
+        }
+        let edited = ServiceConfig::new(spec).expect("valid edited config");
+        edited.write(&harness.context.config_path()).expect("write");
+        let before = std::fs::read(harness.context.config_path()).expect("read");
+
+        let error = harness.install(V1).await.expect_err("mismatch");
+        assert!(
+            matches!(&error, Error::ResumeConfigMismatch { key: found, .. } if *found == key),
+            "{key}: {error:?}"
+        );
+        assert_eq!(error.code(), "service_resume_config_mismatch");
+        // Nothing was overwritten and the record stays for an operator.
+        assert_eq!(
+            std::fs::read(harness.context.config_path()).expect("read"),
+            before,
+            "{key}"
+        );
+        assert!(harness.pending().is_some(), "{key}");
     }
 }
 

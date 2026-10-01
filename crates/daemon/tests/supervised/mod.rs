@@ -1105,6 +1105,7 @@ fn service_config(
             .iter()
             .map(|pattern| (*pattern).to_owned())
             .collect(),
+        search_path: pohunek_platform::shell_env::SearchPath::default(),
         sweep_grace: settings.sweep_grace,
         open_files: OPEN_FILES,
     })

@@ -1,6 +1,6 @@
 //! Typed failures of `pohunek service`.
 
-// Rust guideline compliant 2026-09-29
+// Rust guideline compliant 2026-09-30
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -104,6 +104,26 @@ pub enum Error {
         flag: &'static str,
         /// The rejected path.
         path: PathBuf,
+    },
+
+    /// No configured, discovered, or fallback directory can serve as the
+    /// daemon's executable search path.
+    #[error("cannot determine an executable search path for the daemon job: {0}")]
+    SearchPath(#[from] pohunek_platform::shell_env::ResolveError),
+
+    /// The `service.toml` an interrupted install wrote names another
+    /// installation than the one being resumed.
+    #[error(
+        "service.toml records {key} = {recorded}, but the interrupted install being resumed \
+         uses {expected}; it was changed or belongs to another installation"
+    )]
+    ResumeConfigMismatch {
+        /// The mismatching key.
+        key: &'static str,
+        /// The value in `service.toml`.
+        recorded: String,
+        /// The value of the interrupted install.
+        expected: String,
     },
 
     /// Reading or writing `service.toml` failed.
@@ -442,6 +462,8 @@ impl Error {
             Self::NonUtf8Env { .. } => "service_environment_not_utf8",
             Self::UnusableEnv { .. } => "service_environment_invalid",
             Self::InvalidPath { .. } => "cli_usage",
+            Self::SearchPath(_) => "service_search_path_unavailable",
+            Self::ResumeConfigMismatch { .. } => "service_resume_config_mismatch",
             Self::Config(_) => "service_config_invalid",
             Self::UntrustedDirectory { .. } => "service_untrusted_directory",
             Self::Filesystem { .. } | Self::Io { .. } => "service_io_failed",
@@ -514,6 +536,12 @@ impl Error {
             }
             Self::MissingEnv { var } if var == pohunek_paths::HOME => Some(
                 "set HOME to your existing home directory, the session workers' working directory, then retry",
+            ),
+            Self::SearchPath(_) => Some(
+                "create at least one trusted tool directory (for example ~/.local/bin, not writable by group or others) and run `pohunek service install` again",
+            ),
+            Self::ResumeConfigMismatch { .. } => Some(
+                "restore service.toml, or remove it and the interrupted install's record with `pohunek service uninstall`, then install again",
             ),
             Self::UnusableEnv { .. } => Some(
                 "point the named variable at an absolute normalized path without `.` or `..` segments (HOME must also be an existing directory), then retry",

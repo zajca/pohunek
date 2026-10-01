@@ -29,7 +29,7 @@ pub mod systemd;
 #[doc(inline)]
 pub use namespace::{Namespace, WorkerKey};
 
-// Rust guideline compliant 2026-09-28
+// Rust guideline compliant 2026-09-30
 
 /// Longest accepted service identifier.
 ///
@@ -51,6 +51,14 @@ pub const BOOTSTRAP_ENV_ALLOWLIST: [&str; 6] = [
     "XDG_CACHE_HOME",
     "HOME",
 ];
+
+/// Environment key that carries the executable search path of a job.
+///
+/// Only the daemon job sets it: the service manager's own `PATH` is minimal,
+/// and the daemon forwards its `PATH` to agents through the environment
+/// allowlist. Its value is a `:`-joined list validated as a
+/// [`SearchPath`](crate::shell_env::SearchPath), not a single path.
+pub const SEARCH_PATH_VARIABLE: &str = "PATH";
 
 /// Most arguments one job may pass to its executable.
 ///
@@ -529,9 +537,14 @@ pub fn validate_working_directory(path: &Path) -> Result<(), Error> {
 /// # Errors
 ///
 /// Returns [`Error::InvalidDefinition`] for a key outside
-/// [`BOOTSTRAP_ENV_ALLOWLIST`], or a value that is not an absolute normalized
-/// UTF-8 path of at most [`MAX_JOB_VALUE_BYTES`] bytes without NUL.
+/// [`BOOTSTRAP_ENV_ALLOWLIST`] and [`SEARCH_PATH_VARIABLE`], a bootstrap value
+/// that is not an absolute normalized UTF-8 path of at most
+/// [`MAX_JOB_VALUE_BYTES`] bytes without NUL, or a `PATH` value that is not a
+/// valid non-empty [`SearchPath`](crate::shell_env::SearchPath) rendering.
 pub fn validate_bootstrap_variable(key: &str, value: &str) -> Result<(), Error> {
+    if key == SEARCH_PATH_VARIABLE {
+        return validate_search_path_value(value);
+    }
     if !BOOTSTRAP_ENV_ALLOWLIST.contains(&key) {
         return Err(invalid(format!(
             "environment key `{key}` is outside the bootstrap allowlist"
@@ -539,6 +552,15 @@ pub fn validate_bootstrap_variable(key: &str, value: &str) -> Result<(), Error> 
     }
     validate_value("environment value", value)?;
     validate_path("environment path", Path::new(value))
+}
+
+fn validate_search_path_value(value: &str) -> Result<(), Error> {
+    validate_value("environment value", value)?;
+    let entries = value.split(':').map(PathBuf::from).collect();
+    // An empty value splits into one empty entry, which `new` rejects.
+    crate::shell_env::SearchPath::new(entries)
+        .map(drop)
+        .map_err(|source| invalid(format!("environment `PATH` is unusable: {source}")))
 }
 
 fn validate_path(field: &str, path: &Path) -> Result<(), Error> {
@@ -762,10 +784,17 @@ mod tests {
             rejects(|spec| spec.working_directory = PathBuf::from(rejected));
         }
         validate_bootstrap_variable("HOME", "/home/u").expect("absolute normalized home");
+        validate_bootstrap_variable("PATH", "/opt/homebrew/bin:/my dir/bin:/usr/bin")
+            .expect("valid search path");
         for (key, value) in [
             ("HOME", "."),
             ("XDG_CACHE_HOME", "/home/u/./cache"),
-            ("PATH", "/usr/bin"),
+            ("PATH", ""),
+            ("PATH", "/usr/bin:"),
+            ("PATH", "/usr/bin:."),
+            ("PATH", "bin"),
+            ("PATH", "/a:/a"),
+            ("PATH", "/a\u{1b}"),
         ] {
             assert!(
                 matches!(
@@ -797,7 +826,7 @@ mod tests {
     #[test]
     fn definitions_reject_keys_outside_the_bootstrap_allowlist() {
         for key in [
-            "PATH",
+            "MANPATH",
             "POHUNEK_CONTROLLER_TOKEN",
             "SSH_AUTH_SOCK",
             "xdg_state_home",

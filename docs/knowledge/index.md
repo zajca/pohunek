@@ -19,7 +19,9 @@ Start here:
   [agent profiles](concepts/agent-profiles.md) describe the operating model.
 - [Setup](guides/setup.md), [project setup](guides/project-setup.md),
   [remote hosts](guides/remote-hosts.md), [launcher](guides/launcher.md), and
-  [GUI setup](guides/gui.md) cover common configuration paths. The
+  [GUI setup](guides/gui.md) cover common configuration paths.
+  [Environment and executable resolution](guides/environment-resolution.md)
+  documents the macOS `PATH` policy and safe attach-command rendering. The
   [Hermes operator](guides/hermes-operator.md) documents the managed plugin,
   policy, typed tools, lifecycle reporting, and recovery boundaries. The
   [Pohunek agent skill](guides/agent-skill.md) is the hand-authored source of

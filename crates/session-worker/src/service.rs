@@ -191,6 +191,7 @@ mod tests {
                 daemon_restart_throttle: deadline,
             },
             environment_allowlist: vec!["PATH".to_owned(), "LC_*".to_owned()],
+            search_path: pohunek_platform::shell_env::SearchPath::default(),
             sweep_grace: deadline,
             open_files: 8192,
         })

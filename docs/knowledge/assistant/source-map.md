@@ -358,6 +358,11 @@ Daemon, sessions, integrations, and project state:
   status table, plist rendering, worker and daemon agents).
 - `crates/platform/src/supervisor/systemd.rs` — systemd transient-unit backend
   and the daemon unit/slice installer.
+- `crates/platform/src/shell_env/` — executable search-path policy: bounded
+  login-shell discovery, path validation, and executable resolution (see
+  `docs/knowledge/guides/environment-resolution.md`).
+- `docs/knowledge/guides/environment-resolution.md` — how the daemon and
+  agents resolve `PATH` and executables.
 - `crates/platform/src/process/sweep.rs` — ownership-marker sweep of a lost
   runtime generation.
 - `crates/service-config/src/lib.rs` — `service.toml` schema, trust, and

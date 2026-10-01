@@ -5121,7 +5121,8 @@ mod tests {
                 host: "devbox".to_owned(),
                 id: "s-7".to_owned(),
             },
-        );
+        )
+        .expect("render");
 
         assert_eq!(command, "pohunek attach --host devbox s-7");
     }
@@ -5135,7 +5136,8 @@ mod tests {
                 host: "devbox; touch /tmp/pwn".to_owned(),
                 id: "s-7'$(touch /tmp/pwn)".to_owned(),
             },
-        );
+        )
+        .expect("render");
 
         assert_eq!(
             command,

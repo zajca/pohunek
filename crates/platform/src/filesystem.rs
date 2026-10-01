@@ -3158,7 +3158,7 @@ fn validate_fd_links(
 }
 
 #[cfg(target_os = "macos")]
-fn validate_private_acl(file: &File, path: &Path) -> FsResult<()> {
+pub(crate) fn validate_private_acl(file: &File, path: &Path) -> FsResult<()> {
     use std::os::fd::AsFd as _;
 
     let acl = calcifer_macos_acl::read_acl(file.as_fd())
@@ -3189,7 +3189,7 @@ fn acl_is_deny_only(acl: &calcifer_macos_acl::Acl) -> bool {
     clippy::unnecessary_wraps,
     reason = "keeps ACL validation call sites identical across supported Unix targets"
 )]
-fn validate_private_acl(_file: &File, _path: &Path) -> FsResult<()> {
+pub(crate) fn validate_private_acl(_file: &File, _path: &Path) -> FsResult<()> {
     Ok(())
 }
 

@@ -202,7 +202,42 @@ fn render_install(report: &report::InstallReport) -> String {
     let _ = writeln!(text, "prefix     {}", report.prefix.display());
     let _ = writeln!(text, "config     {}", report.config_path.display());
     let _ = writeln!(text, "daemon     {}", report.daemon_executable.display());
+    render_search_path(&mut text, &report.search_path);
     text
+}
+
+/// Appends the `PATH` source line and a warning for every fallback or refusal.
+fn render_search_path(text: &mut String, report: &report::SearchPathReport) {
+    if report.source == "unmanaged" {
+        return;
+    }
+    let _ = writeln!(
+        text,
+        "path       {} ({} directories)",
+        report.source,
+        report.entries.len()
+    );
+    if let Some(shell) = &report.shell_used {
+        let note = if report.shell_defaulted {
+            " (default: $SHELL is unset)"
+        } else {
+            ""
+        };
+        let _ = writeln!(text, "shell      {}{note}", shell.display());
+    }
+    if let Some(failure) = &report.login_shell_failure {
+        let _ = writeln!(
+            text,
+            "warning: login shell PATH discovery failed ({failure}); the fallback directory list is used"
+        );
+    }
+    for dropped in &report.dropped {
+        let _ = writeln!(
+            text,
+            "warning: ignored PATH directory {} ({})",
+            dropped.path, dropped.reason
+        );
+    }
 }
 
 fn render_upgrade(report: &report::UpgradeReport) -> String {
@@ -444,6 +479,91 @@ mod tests {
         Harness::try_parse_from(std::iter::once("service").chain(args.iter().copied()))
             .expect("parse")
             .action
+    }
+
+    fn install_report(search_path: report::SearchPathReport) -> report::InstallReport {
+        report::InstallReport {
+            version: "1.2.3".to_owned(),
+            prefix: "/p".into(),
+            namespace: "ns".to_owned(),
+            config_path: "/c/service.toml".into(),
+            daemon_executable: "/p/pohunekd".into(),
+            resumed: false,
+            rolled_back: None,
+            search_path,
+        }
+    }
+
+    fn search_path_report(source: &'static str) -> report::SearchPathReport {
+        report::SearchPathReport {
+            source,
+            entries: vec!["/opt/homebrew/bin".into(), "/usr/bin".into()],
+            shell_used: Some("/bin/zsh".into()),
+            shell_defaulted: true,
+            login_shell_failure: None,
+            dropped: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_clean_login_shell_path_prints_no_warning() {
+        let text = render_install(&install_report(search_path_report("login_shell")));
+        assert!(
+            text.contains("path       login_shell (2 directories)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("shell      /bin/zsh (default: $SHELL is unset)"),
+            "{text}"
+        );
+        assert!(!text.contains("warning"), "{text}");
+    }
+
+    #[test]
+    fn a_fallback_and_refused_directories_print_warnings_matching_the_json() {
+        let mut path = search_path_report("fallback");
+        path.login_shell_failure = Some("login shell probe exceeded 10s and was killed".to_owned());
+        path.dropped = vec![report::DroppedPath {
+            path: "/usr/local/bin".to_owned(),
+            reason: "writable by group or others",
+        }];
+        let install = install_report(path);
+        let text = render_install(&install);
+        assert!(
+            text.contains(
+                "warning: login shell PATH discovery failed (login shell probe exceeded 10s"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "warning: ignored PATH directory /usr/local/bin (writable by group or others)"
+            ),
+            "{text}"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&render_json(&install).expect("json")).expect("parse");
+        let search_path = &json["ok"]["search_path"];
+        assert_eq!(search_path["source"], "fallback");
+        assert_eq!(search_path["shell_used"], "/bin/zsh");
+        assert_eq!(search_path["shell_defaulted"], true);
+        assert_eq!(
+            search_path["login_shell_failure"],
+            "login shell probe exceeded 10s and was killed"
+        );
+        assert_eq!(search_path["dropped"][0]["path"], "/usr/local/bin");
+        assert_eq!(
+            search_path["dropped"][0]["reason"],
+            "writable by group or others"
+        );
+    }
+
+    #[test]
+    fn an_unmanaged_path_prints_nothing() {
+        let mut path = search_path_report("unmanaged");
+        path.shell_used = None;
+        let text = render_install(&install_report(path));
+        assert!(!text.contains("path "), "{text}");
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //! # Schema
 //!
 //! ```toml
-//! schema_version = 1
+//! schema_version = 2
 //! prefix = "/home/u/.local"                       # absolute install prefix
 //! active_version = "0.31.6"                       # <prefix>/libexec/pohunek/<version>
 //!
@@ -27,8 +27,9 @@
 //! daemon_exit_timeout_ms = 30000
 //! daemon_restart_throttle_ms = 5000
 //!
-//! [environment]                                    # names or trailing-`*` prefixes
-//! allowlist = ["PATH", "HOME", "LANG", "LC_*", "XDG_*"]
+//! [environment]
+//! search_path = ["/opt/homebrew/bin", "/usr/bin"]  # absolute normalized directories; may be empty
+//! allowlist = ["PATH", "HOME", "LANG", "LC_*", "XDG_*"]   # names or trailing-`*` prefixes
 //!
 //! [sweep]
 //! grace_ms = 5000                                  # 1..=600000
@@ -39,6 +40,15 @@
 //!
 //! This crate validates allowlist patterns only syntactically; which names
 //! the installer allowlists by default is decided by its caller.
+//!
+//! `environment.search_path` is the executable search path the installer
+//! resolved (see `pohunek_platform::shell_env`) and hands to the daemon job as
+//! its `PATH`. Each entry is an absolute, normalized directory without `:` or
+//! control characters, no entry repeats, and the joined value stays within
+//! [`MAX_SEARCH_PATH_BYTES`]. An empty list means the job keeps the service
+//! manager's own `PATH`. Upgrades preserve the recorded list. The daemon does
+//! not read it from the file: it reaches the job definition only when the
+//! installer writes one (install, or an upgrade to a different version).
 //!
 //! # File trust
 //!
@@ -73,7 +83,7 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-09-30
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -86,6 +96,7 @@ use pohunek_paths::{
     MAX_INSTALL_VERSION_BYTES,
 };
 use pohunek_platform::filesystem::{FsError, TrustedDir};
+use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::{
     Namespace, MAX_JOB_TIMEOUT, MAX_JOB_VALUE_BYTES, MAX_OPEN_FILES, MIN_OPEN_FILES,
 };
@@ -99,8 +110,10 @@ pub use error::ConfigError;
 /// The only schema version this crate reads and writes.
 ///
 /// A file with any other value is rejected before its keys are interpreted,
-/// so an older binary never half-understands a newer installation.
-pub const SCHEMA_VERSION: u32 = 1;
+/// so an older binary never half-understands a newer installation and a newer
+/// binary never reads a file that lacks keys it requires. Version 2 added
+/// `environment.search_path`; there is no migration.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// File name of the configuration inside the application config directory.
 pub const FILE_NAME: &str = "service.toml";
@@ -135,6 +148,12 @@ pub const MAX_ALLOWLIST_ENTRIES: usize = 256;
 ///
 /// Matches the worker protocol's bound on base-environment key length.
 pub const MAX_PATTERN_BYTES: usize = 128;
+
+/// Longest accepted joined `environment.search_path` in bytes.
+///
+/// Equal to the supervisor's job value limit, because the list becomes the
+/// daemon job's `PATH` environment value.
+pub const MAX_SEARCH_PATH_BYTES: usize = pohunek_platform::shell_env::MAX_SEARCH_PATH_BYTES;
 
 /// Owner-only mode required of the configuration file.
 const FILE_MODE: u32 = 0o600;
@@ -205,6 +224,9 @@ pub struct ConfigSpec {
     pub deadlines: Deadlines,
     /// Environment names or trailing-`*` prefixes a worker may forward.
     pub environment_allowlist: Vec<String>,
+    /// Executable search path handed to the daemon job; empty keeps the
+    /// service manager's own `PATH`.
+    pub search_path: SearchPath,
     /// Delay between SIGTERM and SIGKILL when sweeping orphaned processes.
     pub sweep_grace: Duration,
     /// Open-file limit applied to supervised jobs.
@@ -225,6 +247,7 @@ pub struct ServiceConfig {
     namespace: Namespace,
     deadlines: Deadlines,
     environment_allowlist: Vec<String>,
+    search_path: SearchPath,
     sweep_grace: Duration,
     open_files: u64,
 }
@@ -295,6 +318,7 @@ impl ServiceConfig {
             namespace,
             deadlines,
             environment_allowlist: spec.environment_allowlist,
+            search_path: spec.search_path,
             sweep_grace: spec.sweep_grace,
             open_files: spec.open_files,
         })
@@ -381,6 +405,12 @@ impl ServiceConfig {
                 daemon_restart_throttle_ms: millis(self.deadlines.daemon_restart_throttle),
             },
             environment: RawEnvironment {
+                search_path: self
+                    .search_path
+                    .entries()
+                    .iter()
+                    .map(|entry| utf8(entry).to_owned())
+                    .collect(),
                 allowlist: self.environment_allowlist.clone(),
             },
             sweep: RawSweep {
@@ -409,6 +439,7 @@ impl ServiceConfig {
             runtime_root: self.runtime_root.clone(),
             deadlines: self.deadlines,
             environment_allowlist: self.environment_allowlist.clone(),
+            search_path: self.search_path.clone(),
             sweep_grace: self.sweep_grace,
             open_files: self.open_files,
         }
@@ -521,6 +552,14 @@ impl ServiceConfig {
         &self.environment_allowlist
     }
 
+    /// Returns the executable search path recorded for the daemon job.
+    ///
+    /// Empty when the job keeps the service manager's own `PATH`.
+    #[must_use]
+    pub fn search_path(&self) -> &SearchPath {
+        &self.search_path
+    }
+
     /// Returns the orphan-sweep grace period between SIGTERM and SIGKILL.
     #[must_use]
     pub fn sweep_grace(&self) -> Duration {
@@ -577,6 +616,7 @@ struct RawDeadlines {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawEnvironment {
+    search_path: Vec<String>,
     allowlist: Vec<String>,
 }
 
@@ -614,6 +654,16 @@ fn parse(path: &Path, text: &str) -> Result<ServiceConfig, ConfigError> {
             found: i64::from(raw.schema_version),
         });
     }
+    let search_path = SearchPath::new(
+        raw.environment
+            .search_path
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
+    )
+    .map_err(|source| ConfigError::InvalidSearchPath {
+        detail: source.to_string(),
+    })?;
     ServiceConfig::new(ConfigSpec {
         prefix: PathBuf::from(raw.prefix),
         active_version: raw.active_version,
@@ -631,6 +681,7 @@ fn parse(path: &Path, text: &str) -> Result<ServiceConfig, ConfigError> {
             ),
         },
         environment_allowlist: raw.environment.allowlist,
+        search_path,
         sweep_grace: Duration::from_millis(raw.sweep.grace_ms),
         open_files: raw.limits.open_files,
     })
@@ -912,6 +963,24 @@ fn utf8(path: &Path) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The schema example in the module documentation must load as written.
+    #[test]
+    fn the_documented_schema_example_parses() {
+        let source = include_str!("lib.rs");
+        let example: String = source
+            .lines()
+            .skip_while(|line| *line != "//! ```toml")
+            .skip(1)
+            .take_while(|line| *line != "//! ```")
+            .map(|line| line.trim_start_matches("//!").trim_start_matches(' '))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(example.contains("schema_version = 2"), "{example}");
+        let config = parse(Path::new("/fixture/pohunek/service.toml"), &example)
+            .expect("the documented example is a valid configuration");
+        assert_eq!(config.search_path().entries().len(), 2);
+    }
 
     #[test]
     fn redaction_masks_only_closed_quoted_values() {

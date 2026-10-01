@@ -257,7 +257,8 @@ mod tests {
                 host: route,
                 id: "s-42".to_owned(),
             },
-        );
+        )
+        .expect("render attach command");
         let selector = command
             .split_whitespace()
             .skip_while(|part| *part != "--host")
