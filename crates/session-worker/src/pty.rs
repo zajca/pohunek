@@ -1853,6 +1853,7 @@ mod tests {
     use pohunek_platform::process::{HostInspector, ProcessInspector};
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::collections::{HashMap, VecDeque};
+    use std::ffi::OsStr;
     use std::io::Cursor;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -2323,17 +2324,56 @@ mod tests {
         );
     }
 
+    /// Marks each variable line the listing child prints, so libtest's own
+    /// banner lines are never mistaken for part of the environment.
+    const ENV_LISTING_PREFIX: &str = "env-listing ";
+    /// Libtest name of [`environment_listing_child`], used to re-execute only it.
+    const ENV_LISTING_CHILD_TEST: &str = "pty::tests::environment_listing_child";
+
+    /// Renders one variable in the listing format owned by this module.
+    ///
+    /// `Debug` escapes control characters and non-UTF-8 bytes, so a value can
+    /// never span or forge a line, and no host tool participates in formatting.
+    fn env_listing_line(name: &OsStr, value: &OsStr) -> String {
+        format!("{ENV_LISTING_PREFIX}{name:?}={value:?}")
+    }
+
+    /// Prints this process's complete environment, one `env_listing_line` each.
+    ///
+    /// Not a test of its own: `empty_base_child_sees_exactly_the_command_environment`
+    /// re-executes the test binary to run it as the PTY child. It is `#[ignore]`
+    /// so ordinary runs skip it; the parent selects it with `--ignored --exact`.
+    #[test]
+    #[ignore = "re-executed as the PTY child of the empty-base environment test"]
+    fn environment_listing_child() {
+        for (name, value) in std::env::vars_os() {
+            println!("{}", env_listing_line(&name, &value));
+        }
+    }
+
     #[tokio::test]
     async fn empty_base_child_sees_exactly_the_command_environment() {
+        let cwd = pohunek_test_support::tempdir().expect("child working directory");
         let pty = spawn(Command {
-            program: "/usr/bin/env".to_owned(),
-            args: Vec::new(),
+            program: std::env::current_exe()
+                .expect("test executable")
+                .into_os_string()
+                .into_string()
+                .expect("test executable path is UTF-8"),
+            args: [
+                "--ignored",
+                "--exact",
+                ENV_LISTING_CHILD_TEST,
+                "--nocapture",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
             base: EnvBase::Empty,
             env: vec![
                 ("SHELL".to_owned(), "/bin/sh".to_owned()),
                 ("EXPLICIT".to_owned(), "value=with equals".to_owned()),
             ],
-            cwd: std::env::temp_dir(),
+            cwd: cwd.path().to_path_buf(),
             cols: 200,
             rows: 24,
         });
@@ -2353,17 +2393,20 @@ mod tests {
             }
         }
         let observed = String::from_utf8(observed).expect("environment listing is UTF-8");
-        let environment = observed
-            .split("\r\n")
-            .filter(|line| !line.is_empty())
-            .map(|line| line.split_once('=').expect("NAME=value line"))
-            .collect::<HashMap<_, _>>();
+        let mut listing = observed
+            .lines()
+            .filter(|line| line.starts_with(ENV_LISTING_PREFIX))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        listing.sort();
 
         // The test runner's own environment (PATH, HOME, ...) must not appear.
-        assert_eq!(
-            environment,
-            HashMap::from([("SHELL", "/bin/sh"), ("EXPLICIT", "value=with equals")])
-        );
+        let mut expected = vec![
+            env_listing_line(OsStr::new("SHELL"), OsStr::new("/bin/sh")),
+            env_listing_line(OsStr::new("EXPLICIT"), OsStr::new("value=with equals")),
+        ];
+        expected.sort();
+        assert_eq!(listing, expected);
     }
 
     #[tokio::test]
