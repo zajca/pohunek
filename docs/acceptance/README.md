@@ -168,3 +168,25 @@ when recovery is expected, `recovery_available` and
 `explicit_recovery_starts_new_generation` (resume exited 0, the runtime is
 `live` with a new runtime ID, and the worker generation differs from the lost
 one).
+
+## macOS package install, upgrade, and uninstall (#104)
+
+`scripts/acceptance/macos-package-install` runs in CI (job `macOS package
+install and upgrade (arm64)`) against the real `gui/<uid>` launchd domain and
+needs no operator. It extracts two daemon archives (version A and a newer
+version B, both built by `packaging/macos/package --development`) into an
+isolated root and checks, from the extracted archives alone:
+
+| Step | Outcome checked |
+|------|-----------------|
+| Two concurrent installers, prefix containing a space and a quote | One healthy installation: one launchd job, the agent property list valid and starting the version A daemon by its exact path; the loser is refused because another `pohunek service` command is running, or runs afterwards as an unchanged upgrade. |
+| Installer run again | The daemon keeps its process. |
+| Corrupt, member-less, other-architecture, and group-writable archives with two live sessions | Refused before any change: daemon, workers, and session children keep PID, start time, and PTY. |
+| Upgrade A to B with two live sessions | The daemon is replaced; both workers and both session children keep PID, start time, PTY, and version A; version A stays installed; a new session runs from version B. |
+| Uninstall with live sessions | Refused, naming the sessions; nothing changed. |
+| Uninstall after the sessions stopped | Daemon job, property list, versions, `<prefix>/bin/pohunek`, and `service.toml` removed; the durable state directory stays. |
+
+Interrupted installs and upgrades at every journaled step are covered by the
+service engine tests, not by this script. Run it locally on a Mac with
+`PKG_ACCEPT_ARCHIVE` and `PKG_ACCEPT_UPGRADE_ARCHIVE` set; it exits 2 when no
+`gui/<uid>` domain exists.

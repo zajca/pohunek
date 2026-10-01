@@ -7,6 +7,11 @@
   it, and that the doctor `netbird_cli` check uses the same lookup. Added the
   macOS host section of the remote-hosts guide (listener binding, sleep and wake,
   troubleshooting).
+- Documented the native macOS package tooling: the deployment-target file, the
+  Mach-O audit (arm64 only, deployment target, system libraries only, no
+  build-machine paths), the unsigned development package, and the CI acceptance
+  that installs, upgrades with live sessions, refuses bad archives, and
+  uninstalls from the extracted archives against real launchd.
 - Documented release archive integrity: every archive carries a `MANIFEST`
   (component, version, target, signing state, SHA-256 of each member) and
   `packaging/install-daemon.sh` verifies it, the host OS and architecture, the

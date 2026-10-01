@@ -1,0 +1,556 @@
+#!/bin/sh
+# Acceptance check for issue #104: install, upgrade, and uninstall pohunek from
+# its published archives on macOS, against the real launchd `gui/<uid>` domain.
+#
+# Everything runs from the extracted daemon archives in an isolated root: no
+# source checkout, no root, and no state of the operator's own installation.
+#
+# Verified here:
+#   1. Two installers started at once leave exactly one healthy installation
+#      (one wins; the other is refused because another `pohunek service`
+#      command is running, or runs after it as an unchanged upgrade). The prefix contains a space
+#      and a quote, so every launchd property list value must be serialized,
+#      never interpolated.
+#   2. Re-running the installer from the same archive changes nothing: the
+#      daemon keeps its process.
+#   3. With two live shell sessions, archives that are corrupt, missing a
+#      member, built for another architecture, or writable by another account
+#      are refused before the host changes: the daemon, both workers, and both
+#      session children keep their process identity.
+#   4. Upgrading to the second archive replaces the daemon and nothing else:
+#      both workers and both session children keep their PID, start time, and
+#      PTY, the workers keep running from the previous version directory, which
+#      stays installed, and a new session runs from the new version.
+#   5. `pohunek service uninstall` with live sessions is refused and changes
+#      nothing; once the sessions are stopped it removes the daemon job, the
+#      installed versions, and `service.toml`, and keeps the durable state
+#      directory.
+#
+# NOT verified here (covered elsewhere):
+#   - interrupted installs and upgrades at every journaled step: the service
+#     engine tests (`crates/cli/src/service/engine_tests.rs`);
+#   - an unavailable login domain: the host checks of `pohunek service check`.
+#
+# Environment:
+#   PKG_ACCEPT_ARCHIVE          Version A daemon archive, `.tar.gz` (required).
+#   PKG_ACCEPT_UPGRADE_ARCHIVE  Version B daemon archive of a newer version
+#                               (required).
+#   PKG_ACCEPT_KEEP             Set to `yes` to keep the work directory.
+#   PKG_ACCEPT_PYTHON           Python 3 for JSON parsing (default /usr/bin/python3).
+#
+# Exit status: 0 all checks passed, 1 a check failed, 2 the environment cannot
+# run the check (no macOS, no `gui/<uid>` launchd domain).
+
+set -eu
+umask 077
+
+# Upper bounds, in poll steps of one second.
+daemon_timeout_s=90
+live_timeout_s=60
+exit_timeout_s=30
+# Longest accepted daemon socket path; the Darwin sockaddr_un limit is 103.
+socket_path_max=100
+log_tail_lines=200
+python_bin=${PKG_ACCEPT_PYTHON:-/usr/bin/python3}
+minimal_path=/usr/bin:/bin:/usr/sbin:/sbin
+label_prefix=io.github.zajca.pohunek
+
+work=
+namespace=
+installed_cli=
+uid=$(id -u)
+
+say() {
+  printf '\n==> %s\n' "$*"
+}
+
+die() {
+  printf 'macos-package-install: FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+dump_log() {
+  [ -f "$1" ] || return 0
+  printf '\n----- %s (last %s lines) -----\n' "$1" "$log_tail_lines" >&2
+  tail -n "$log_tail_lines" "$1" >&2 || true
+}
+
+dump_evidence() {
+  [ -n "$work" ] && [ -d "$work" ] || return 0
+  printf '\nmacos-package-install: evidence logs follow\n' >&2
+  for file in "$work"/ev/*; do
+    dump_log "$file"
+  done
+  find "$work/state" "$work/h/Library" -type f \( -name '*.log' -o -name '*.json' -o -name '*.plist' \) 2>/dev/null |
+    while IFS= read -r file; do dump_log "$file"; done
+}
+
+# Whether process $1 is gone: absent from the process table or a zombie.
+process_gone() {
+  state=$(ps -o stat= -p "$1" 2>/dev/null || true)
+  case "$state" in '' | Z*) return 0 ;; *) return 1 ;; esac
+}
+
+# Ends every process of this run still alive, found from the work directory
+# (the runtime, state, and prefix paths are all below it) and by its command
+# name, so a run that failed halfway leaves nothing behind. SIGTERM first,
+# SIGKILL after the grace period. Sets `leftover=yes` when one survives.
+sweep_run_processes() {
+  [ -n "$work" ] && [ -d "$work" ] || return 0
+  # `ucomm` is the bare process name; `comm` is argv[0], which holds spaces
+  # when the prefix does.
+  pids=$(ps -axeww -o pid=,ucomm=,command= 2>/dev/null |
+    awk -v prefix="$work/" -v self="$$" '
+      index($0, prefix) > 0 && $1 != self {
+        name = $2
+        sub(".*/", "", name)
+        if (name == "pohunekd" || name == "pohunek-sessiond" || name == "pohunek") print $1
+      }')
+  [ -n "$pids" ] || return 0
+  for pid in $pids; do kill -TERM "$pid" 2>/dev/null || true; done
+  waited=0
+  while [ "$waited" -lt 10 ]; do
+    alive=
+    for pid in $pids; do process_gone "$pid" || alive="$alive $pid"; done
+    [ -n "$alive" ] || return 0
+    sleep 1
+    waited=$((waited + 1))
+  done
+  for pid in $alive; do kill -KILL "$pid" 2>/dev/null || true; done
+  sleep 1
+  for pid in $alive; do
+    if ! process_gone "$pid"; then
+      printf 'warning: process %s survived SIGKILL\n' "$pid" >&2
+      leftover=yes
+    fi
+  done
+}
+
+cleanup() {
+  status=$?
+  trap - EXIT
+  [ "$status" -eq 0 ] || dump_evidence
+  leftover=no
+  # Best effort: remove the installation this run made, with its sessions.
+  if [ -n "$installed_cli" ] && [ -x "$installed_cli" ]; then
+    iso_env "$installed_cli" service uninstall --stop-sessions >/dev/null 2>&1 || true
+  fi
+  # A launchd job of this run's namespace that survived is booted out by label.
+  if [ -n "$namespace" ]; then
+    /bin/launchctl list 2>/dev/null | awk -v ns="$label_prefix.$namespace." 'index($3, ns) == 1 { print $3 }' |
+      while IFS= read -r label; do
+        /bin/launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
+      done
+  fi
+  sweep_run_processes
+  if [ "$leftover" = yes ] && [ "$status" -eq 0 ]; then
+    status=1
+  fi
+  if [ -n "$work" ] && [ -d "$work" ]; then
+    if [ "$leftover" = yes ]; then
+      printf 'macos-package-install: a process could not be ended; keeping %s\n' "$work" >&2
+    elif [ "${PKG_ACCEPT_KEEP:-no}" = yes ]; then
+      printf 'Evidence kept in %s\n' "$work"
+    else
+      rm -rf -- "$work"
+    fi
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+[ "$(uname -s)" = Darwin ] || {
+  printf 'macos-package-install: this check runs on macOS only\n' >&2
+  exit 2
+}
+/bin/launchctl print "gui/$uid" >/dev/null 2>&1 || {
+  printf 'macos-package-install: no launchd gui/%s domain (no logged-in GUI session)\n' "$uid" >&2
+  exit 2
+}
+archive_a=${PKG_ACCEPT_ARCHIVE:-}
+archive_b=${PKG_ACCEPT_UPGRADE_ARCHIVE:-}
+[ -f "$archive_a" ] || die "PKG_ACCEPT_ARCHIVE must name the version A daemon archive"
+[ -f "$archive_b" ] || die "PKG_ACCEPT_UPGRADE_ARCHIVE must name the version B daemon archive"
+[ -x "$python_bin" ] || die "$python_bin is required for JSON parsing"
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+helper="$script_dir/launchd_lifetime_evidence.py"
+user=$(id -un)
+# Unix socket paths are limited to 103 bytes on macOS: keep the root short.
+work=$(mktemp -d /tmp/ppi.XXXXXX)
+chmod 700 "$work"
+# /tmp is a symlink to /private/tmp, and pohunek opens every path component
+# without following symlinks, so the root must be the physical path.
+work=$(CDPATH='' cd -- "$work" && pwd -P)
+socket_path="$work/run/pohunek/daemon.sock"
+[ "${#socket_path}" -le "$socket_path_max" ] ||
+  die "socket path is ${#socket_path} bytes, over the $socket_path_max byte limit: $socket_path"
+home="$work/h"
+# A prefix with a space and a quote: every consumer must handle it as data.
+prefix="$work/pre fix's"
+for dir in "$home" "$home/.config" "$home/Library" "$home/Library/LaunchAgents" \
+  "$work/run" "$work/state" "$work/data" "$work/cache" "$work/ev" "$work/x"; do
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+done
+
+# Runs one command in the isolated environment: the shell and PATH of a
+# Terminal, HOME and the XDG roots below the work directory.
+iso_env() {
+  env -i \
+    HOME="$home" USER="$user" LOGNAME="$user" SHELL=/bin/zsh PATH="$minimal_path" \
+    XDG_CONFIG_HOME="$home/.config" XDG_RUNTIME_DIR="$work/run" \
+    XDG_STATE_HOME="$work/state" XDG_DATA_HOME="$work/data" \
+    XDG_CACHE_HOME="$work/cache" "$@"
+}
+
+# Prints the value at dotted path $2 of the JSON file $1 (a scalar, or the
+# compact JSON of a container), or nothing for a missing key or null.
+json_get() {
+  "$python_bin" - "$1" "$2" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1]))
+for key in sys.argv[2].split("."):
+    if isinstance(value, dict) and key in value:
+        value = value[key]
+    else:
+        value = None
+        break
+if value is None:
+    sys.exit(0)
+print(value if isinstance(value, (str, int, float)) else json.dumps(value, sort_keys=True))
+PY
+}
+
+# Runs the installer wrapper of the extracted archive $1; further arguments
+# are `VAR=value` environment assignments for the run.
+run_installer() {
+  ri_dir=$1
+  shift
+  iso_env POHUNEK_INSTALL_PREFIX="$prefix" "$@" sh "$ri_dir/packaging/install-daemon.sh"
+}
+
+status_json() {
+  iso_env "$installed_cli" service status --json >"$1"
+}
+
+# Extracts archive $1 below $work/x and prints the extracted directory.
+extract_archive() {
+  case $(basename "$1") in
+    *.tar.gz) ;;
+    *) die "not a .tar.gz archive: $1" ;;
+  esac
+  if [ -f "$1.sha256" ]; then
+    expected=$(awk '{ print $1 }' "$1.sha256")
+    actual=$(shasum -a 256 "$1" | awk '{ print $1 }')
+    [ "$expected" = "$actual" ] || die "$1 does not match its .sha256 file"
+  fi
+  ea_name=$(basename "$1" .tar.gz)
+  ea_dir="$work/x/$2"
+  mkdir -p "$ea_dir"
+  chmod 700 "$ea_dir"
+  tar -xzf "$1" -C "$ea_dir"
+  [ -f "$ea_dir/$ea_name/MANIFEST" ] || die "$1 has no MANIFEST below $ea_name"
+  printf '%s\n' "$ea_dir/$ea_name"
+}
+
+manifest_field() {
+  awk -v key="$2" '$1 == key { print $2; exit }' "$1/MANIFEST"
+}
+
+dir_a=$(extract_archive "$archive_a" a)
+dir_b=$(extract_archive "$archive_b" b)
+version_a=$(manifest_field "$dir_a" version)
+version_b=$(manifest_field "$dir_b" version)
+[ -n "$version_a" ] && [ -n "$version_b" ] || die "an archive MANIFEST has no version"
+[ "$version_a" != "$version_b" ] || die "both archives are version $version_a; the upgrade needs a newer one"
+[ "$(manifest_field "$dir_a" component)" = daemon ] || die "$archive_a is not a daemon archive"
+[ "$(manifest_field "$dir_b" component)" = daemon ] || die "$archive_b is not a daemon archive"
+[ "$(manifest_field "$dir_a" target)" = aarch64-apple-darwin ] || die "$archive_a is not an aarch64-apple-darwin archive"
+printf 'version A %s, version B %s, prefix %s\n' "$version_a" "$version_b" "$prefix"
+
+installed_cli="$prefix/bin/pohunek"
+
+# ---------------------------------------------------------------------------
+say "1. Concurrent fresh installs of $version_a"
+run_installer "$dir_a" >"$work/ev/install-1.out" 2>"$work/ev/install-1.err" &
+pid_one=$!
+run_installer "$dir_a" >"$work/ev/install-2.out" 2>"$work/ev/install-2.err" &
+pid_two=$!
+status_one=0
+status_two=0
+wait "$pid_one" || status_one=$?
+wait "$pid_two" || status_two=$?
+printf 'installer exit statuses: %s and %s\n' "$status_one" "$status_two"
+if [ "$status_one" -ne 0 ] && [ "$status_two" -ne 0 ]; then
+  die "both concurrent installers failed"
+fi
+# A refused installer must name the concurrent `pohunek service` command, nothing else.
+refused_for_other_reason() {
+  [ "$1" -ne 0 ] && ! grep -q 'another .pohunek service. command is running' "$work/ev/install-$2.err" "$work/ev/install-$2.out"
+}
+if refused_for_other_reason "$status_one" 1; then
+  die "installer 1 failed for a reason other than a concurrent transaction"
+fi
+if refused_for_other_reason "$status_two" 2; then
+  die "installer 2 failed for a reason other than a concurrent transaction"
+fi
+[ -x "$installed_cli" ] || die "no CLI was installed at $installed_cli"
+
+status_json "$work/ev/status-a.json"
+namespace=$(json_get "$work/ev/status-a.json" ok.namespace)
+[ -n "$namespace" ] || die "the status report has no namespace"
+[ "$(json_get "$work/ev/status-a.json" ok.active_version)" = "$version_a" ] || die "active version is not $version_a"
+[ "$(json_get "$work/ev/status-a.json" ok.daemon.state)" = running ] || die "the daemon job is not running"
+[ "$(json_get "$work/ev/status-a.json" ok.prefix)" = "$prefix" ] || die "the recorded prefix differs from $prefix"
+[ -z "$(json_get "$work/ev/status-a.json" ok.pending_transaction)" ] || die "an install transaction is still pending"
+daemon_pid_a=$(json_get "$work/ev/status-a.json" ok.daemon.pid)
+[ -n "$daemon_pid_a" ] || die "the daemon has no process"
+# Start time with the pid: a recycled pid is a different process.
+daemon_start_a=$(ps -o lstart= -p "$daemon_pid_a" 2>/dev/null || true)
+[ -n "$daemon_start_a" ] || die "the daemon process $daemon_pid_a is not running"
+jobs_a=$(/bin/launchctl list | awk -v ns="$label_prefix.$namespace." 'index($3, ns) == 1' | wc -l | tr -d ' ')
+[ "$jobs_a" -eq 1 ] || die "expected exactly one launchd job for namespace $namespace, found $jobs_a"
+
+plist="$home/Library/LaunchAgents/$label_prefix.$namespace.daemon.plist"
+[ -f "$plist" ] || die "the daemon agent definition is missing: $plist"
+/usr/bin/plutil -lint "$plist" >/dev/null || die "the daemon agent definition is not a valid property list"
+program=$(/usr/bin/plutil -extract ProgramArguments.0 raw -o - "$plist")
+[ "$program" = "$prefix/libexec/pohunek/$version_a/pohunekd" ] ||
+  die "ProgramArguments[0] is '$program', expected the version A daemon below the quoted prefix"
+for version_dir in "$prefix/libexec/pohunek/$version_a"; do
+  for binary in pohunek pohunekd pohunek-sessiond; do
+    [ -x "$version_dir/$binary" ] || die "$version_dir/$binary is not installed"
+  done
+done
+printf 'installed version %s as namespace %s; daemon pid %s\n' "$version_a" "$namespace" "$daemon_pid_a"
+
+# ---------------------------------------------------------------------------
+say "2. Repeating the installer changes nothing"
+run_installer "$dir_a" >"$work/ev/install-3.out" 2>"$work/ev/install-3.err" ||
+  die "repeating the installer failed; see $work/ev/install-3.err"
+status_json "$work/ev/status-a2.json"
+[ "$(json_get "$work/ev/status-a2.json" ok.daemon.pid)" = "$daemon_pid_a" ] ||
+  die "the repeated install restarted the daemon"
+[ "$(json_get "$work/ev/status-a2.json" ok.active_version)" = "$version_a" ] || die "the repeated install changed the version"
+
+# ---------------------------------------------------------------------------
+say "3. Two live sessions"
+new_session() {
+  iso_env "$installed_cli" session new --agent shell --cwd "$home" --json >"$work/ev/new-$1.json" ||
+    die "session new failed; see $work/ev/new-$1.json"
+  "$python_bin" "$helper" session-id "$work/ev/new-$1.json"
+}
+wait_live() {
+  waited=0
+  while :; do
+    iso_env "$installed_cli" session list --json >"$work/ev/list.json"
+    state=$("$python_bin" "$helper" states "$work/ev/list.json" "$1" | awk '{ print $2 }')
+    [ "$state" = live ] && return 0
+    [ "$waited" -lt "$live_timeout_s" ] || die "session $1 is '$state' after ${live_timeout_s}s"
+    sleep 1
+    waited=$((waited + 1))
+  done
+}
+session_one=$(new_session one)
+session_two=$(new_session two)
+[ -n "$session_one" ] && [ -n "$session_two" ] || die "session new returned no session id (see $work/ev/new-one.json)"
+wait_live "$session_one"
+wait_live "$session_two"
+
+# Prints the process identity of the installation: the daemon, and for each
+# session its worker (pid, start time, version) and child (pid, start time,
+# PTY). A recycled pid cannot pass for the same process because the start time
+# is part of the identity. Workers are listed from the service status.
+snapshot() {
+  status_json "$work/ev/snap-status.json"
+  iso_env "$installed_cli" session list --json >"$work/ev/snap-list.json"
+  "$python_bin" - "$work/ev/snap-status.json" "$work/ev/snap-list.json" $snapshot_sessions <<'PY' >"$work/ev/snap-pids.txt" || die "cannot read the installation's processes"
+import json, sys
+status = json.load(open(sys.argv[1]))["ok"]
+sessions = {entry["id"]: entry for entry in json.load(open(sys.argv[2]))["ok"]}
+print("daemon", status["daemon"]["pid"])
+for session_id in sys.argv[3:]:
+    workers = [w for w in status["workers"] if w["session_id"] == session_id]
+    if len(workers) != 1:
+        sys.exit("expected one worker for %s, found %d" % (session_id, len(workers)))
+    worker = workers[0]
+    print("worker", session_id, worker["pid"], worker.get("version"))
+    print("child", session_id, sessions[session_id].get("pid"))
+PY
+  while read -r kind first second third; do
+    case $kind in
+      daemon) pid=$first ;;
+      worker) pid=$second ;;
+      child) pid=$second ;;
+      *) continue ;;
+    esac
+    [ -n "$pid" ] && [ "$pid" != None ] || die "no pid for $kind $first in the snapshot"
+    started=$(ps -o lstart= -p "$pid" 2>/dev/null || true)
+    [ -n "$started" ] || die "$kind process $pid is not running"
+    tty=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
+    printf '%s %s %s %s | %s | %s\n' "$kind" "$first" "$second" "$third" "$started" "$tty"
+  done <"$work/ev/snap-pids.txt"
+}
+snapshot_sessions="$session_one $session_two"
+snapshot >"$work/ev/before.txt" || die "cannot snapshot the installation"
+cat "$work/ev/before.txt"
+[ "$(grep -c '^worker ' "$work/ev/before.txt")" -eq 2 ] || die "expected two workers"
+grep '^worker ' "$work/ev/before.txt" | grep -qv " $version_a |" &&
+  die "a worker does not run version $version_a"
+
+# ---------------------------------------------------------------------------
+say "4. Archives that must be refused before anything changes"
+expect_refused() {
+  # $1 label, $2 archive dir, $3 expected stderr text
+  if run_installer "$2" >"$work/ev/refuse-$1.out" 2>"$work/ev/refuse-$1.err"; then
+    die "the installer accepted the $1 archive"
+  fi
+  grep -q "$3" "$work/ev/refuse-$1.err" || die "the $1 refusal does not say '$3': $(cat "$work/ev/refuse-$1.err")"
+  snapshot >"$work/ev/refuse-$1.after.txt" || die "cannot snapshot after the $1 refusal"
+  cmp -s "$work/ev/before.txt" "$work/ev/refuse-$1.after.txt" ||
+    die "the refused $1 archive changed the installation; diff $work/ev/before.txt $work/ev/refuse-$1.after.txt"
+  printf 'refused %s: %s\n' "$1" "$3"
+}
+copy_b() {
+  rm -rf -- "$work/x/$1"
+  mkdir -p "$work/x/$1"
+  chmod 700 "$work/x/$1"
+  cp -Rp "$dir_b" "$work/x/$1/archive"
+  printf '%s\n' "$work/x/$1/archive"
+}
+variant=$(copy_b corrupt)
+printf '# tampered\n' >>"$variant/pohunekd"
+expect_refused corrupt "$variant" 'digest mismatch'
+variant=$(copy_b missing)
+rm -f -- "$variant/pohunek-sessiond"
+expect_refused missing "$variant" 'missing or not a regular file'
+variant=$(copy_b arch)
+sed 's/^target aarch64-apple-darwin$/target x86_64-unknown-linux-gnu/' "$variant/MANIFEST" >"$variant/MANIFEST.new"
+mv -- "$variant/MANIFEST.new" "$variant/MANIFEST"
+expect_refused arch "$variant" 'is built for'
+variant=$(copy_b writable)
+chmod 0775 "$variant/pohunek"
+expect_refused writable "$variant" 'writable by another account'
+
+# ---------------------------------------------------------------------------
+say "5. Upgrade to $version_b with live sessions"
+run_installer "$dir_b" >"$work/ev/upgrade.out" 2>"$work/ev/upgrade.err" ||
+  die "the upgrade failed; see $work/ev/upgrade.err"
+status_json "$work/ev/status-b.json"
+[ "$(json_get "$work/ev/status-b.json" ok.active_version)" = "$version_b" ] || die "active version is not $version_b"
+daemon_pid_b=$(json_get "$work/ev/status-b.json" ok.daemon.pid)
+[ -n "$daemon_pid_b" ] && [ "$daemon_pid_b" != "$daemon_pid_a" ] || die "the daemon was not replaced (pid $daemon_pid_a -> ${daemon_pid_b:-none})"
+[ "$(json_get "$work/ev/status-b.json" ok.daemon.state)" = running ] || die "the upgraded daemon is not running"
+# The replaced daemon must be gone, not merely replaced in launchd's books.
+waited=0
+while [ "$(ps -o lstart= -p "$daemon_pid_a" 2>/dev/null || true)" = "$daemon_start_a" ]; do
+  process_gone "$daemon_pid_a" && break
+  [ "$waited" -lt "$exit_timeout_s" ] || die "the replaced daemon $daemon_pid_a is still running ${exit_timeout_s}s after the upgrade"
+  sleep 1
+  waited=$((waited + 1))
+done
+[ "$(json_get "$work/ev/status-b.json" ok.pending_transaction)" = "" ] || die "an upgrade transaction is still pending"
+program=$(/usr/bin/plutil -extract ProgramArguments.0 raw -o - "$plist")
+[ "$program" = "$prefix/libexec/pohunek/$version_b/pohunekd" ] || die "the agent still starts '$program'"
+[ -x "$prefix/libexec/pohunek/$version_a/pohunek-sessiond" ] ||
+  die "version $version_a was removed while its workers run"
+wait_live "$session_one"
+wait_live "$session_two"
+snapshot >"$work/ev/after.txt" || die "cannot snapshot after the upgrade"
+# Everything but the daemon line must be identical: same worker and child
+# pids, start times, versions, and PTYs.
+grep -v '^daemon ' "$work/ev/before.txt" >"$work/ev/before.nodaemon.txt"
+grep -v '^daemon ' "$work/ev/after.txt" >"$work/ev/after.nodaemon.txt"
+cmp -s "$work/ev/before.nodaemon.txt" "$work/ev/after.nodaemon.txt" ||
+  die "workers or session children changed in the upgrade; diff $work/ev/before.nodaemon.txt $work/ev/after.nodaemon.txt"
+cat "$work/ev/after.txt"
+session_three=$(new_session three)
+[ -n "$session_three" ] || die "no session could be created after the upgrade"
+wait_live "$session_three"
+# From here on every snapshot covers all three sessions; this one is the
+# baseline of the web and uninstall checks.
+snapshot_sessions="$session_one $session_two $session_three"
+snapshot >"$work/ev/baseline.txt" || die "cannot snapshot after the upgrade"
+status_json "$work/ev/status-b2.json"
+new_worker_version=$("$python_bin" - "$work/ev/status-b2.json" "$session_three" <<'PY'
+import json, sys
+for worker in json.load(open(sys.argv[1]))["ok"]["workers"]:
+    if worker["session_id"] == sys.argv[2]:
+        print(worker.get("version") or "")
+PY
+)
+[ "$new_worker_version" = "$version_b" ] || die "the new session's worker runs '$new_worker_version', expected $version_b"
+printf 'the upgrade replaced the daemon (%s -> %s) and kept both workers, children, and PTYs\n' "$daemon_pid_a" "$daemon_pid_b"
+
+# ---------------------------------------------------------------------------
+say "6. Uninstall with live sessions is refused"
+if iso_env "$installed_cli" service uninstall >"$work/ev/uninstall-refused.out" 2>"$work/ev/uninstall-refused.err"; then
+  die "uninstall succeeded with live sessions"
+fi
+grep -q "$session_one" "$work/ev/uninstall-refused.out" "$work/ev/uninstall-refused.err" ||
+  die "the refusal does not name the live session $session_one"
+snapshot >"$work/ev/refused-uninstall.txt" || die "uninstall changed the installation"
+cmp -s "$work/ev/baseline.txt" "$work/ev/refused-uninstall.txt" ||
+  die "the refused uninstall changed the daemon, a worker, or a session child; diff $work/ev/baseline.txt $work/ev/refused-uninstall.txt"
+[ -f "$home/.config/pohunek/service.toml" ] || die "the refused uninstall removed service.toml"
+[ -d "$prefix/libexec/pohunek/$version_a" ] || die "the refused uninstall removed version $version_a"
+
+# ---------------------------------------------------------------------------
+say "7. Uninstall after the sessions ended keeps the durable state"
+for session in "$session_one" "$session_two" "$session_three"; do
+  iso_env "$installed_cli" session stop "$session" >/dev/null 2>&1 || die "could not stop session $session"
+done
+# A stopped session's worker job stays registered until the uninstall (or the
+# daemon's reconciliation) retires it, so the wait is on the session state.
+waited=0
+while :; do
+  iso_env "$installed_cli" session list --json >"$work/ev/list-stopped.json"
+  live=$("$python_bin" "$helper" states "$work/ev/list-stopped.json" "$session_one" "$session_two" "$session_three" | awk '$2 == "live" { print $1 }')
+  [ -z "$live" ] && break
+  [ "$waited" -lt "$exit_timeout_s" ] || die "sessions still live ${exit_timeout_s}s after the stop: $live"
+  sleep 1
+  waited=$((waited + 1))
+done
+# What uninstall must keep: the host identity, the governance record, and the
+# session metadata. The lock file the uninstall leaves behind is not durable
+# state, so the check names these records instead of "any file".
+host_id_of() {
+  "$python_bin" -c 'import json, sys; print(json.load(open(sys.argv[1]))["host_id"])' "$work/state/pohunek/host/identity.json"
+}
+host_id_before=$(host_id_of) || die "cannot read the host identity before uninstall"
+[ -s "$work/state/pohunek/host/governance.json" ] || die "no governance record before uninstall"
+[ -s "$work/data/pohunek/metadata.jsonl" ] || die "no session metadata before uninstall"
+metadata_bytes_before=$(wc -c <"$work/data/pohunek/metadata.jsonl" | tr -d ' ')
+iso_env "$installed_cli" service uninstall >"$work/ev/uninstall.out" 2>"$work/ev/uninstall.err" ||
+  die "uninstall failed; see $work/ev/uninstall.err"
+/bin/launchctl print "gui/$uid/$label_prefix.$namespace.daemon" >/dev/null 2>&1 &&
+  die "the daemon job is still loaded after uninstall"
+[ ! -e "$plist" ] || die "the daemon agent definition remains after uninstall"
+[ ! -e "$home/.config/pohunek/service.toml" ] || die "service.toml remains after uninstall"
+[ ! -e "$prefix/libexec/pohunek/$version_a" ] && [ ! -e "$prefix/libexec/pohunek/$version_b" ] ||
+  die "an installed version directory remains after uninstall"
+[ ! -e "$installed_cli" ] || die "$installed_cli remains after uninstall"
+# Durable HostId, governance keys, and session history are never implicit cleanup.
+[ "$(host_id_of)" = "$host_id_before" ] || die "uninstall changed the host identity"
+[ -s "$work/state/pohunek/host/governance.json" ] || die "uninstall removed the governance record"
+[ -s "$work/data/pohunek/metadata.jsonl" ] || die "uninstall removed the session metadata"
+[ "$(wc -c <"$work/data/pohunek/metadata.jsonl" | tr -d ' ')" -ge "$metadata_bytes_before" ] ||
+  die "uninstall truncated the session metadata"
+installed_cli=
+# Every process the last snapshot recorded (daemon, workers, session children)
+# must be gone: a leak after a successful uninstall is a failure, not something
+# the cleanup may quietly end.
+recorded_pids="$daemon_pid_a $(awk '$1 == "daemon" { print $2 } $1 == "worker" || $1 == "child" { print $3 }' "$work/ev/snap-pids.txt")"
+for pid in $recorded_pids; do
+  waited=0
+  until process_gone "$pid" || [ "$pid" = "$daemon_pid_a" -a "$(ps -o lstart= -p "$pid" 2>/dev/null || true)" != "$daemon_start_a" ]; do
+    [ "$waited" -lt "$exit_timeout_s" ] || die "process $pid of the uninstalled installation is still running after ${exit_timeout_s}s"
+    sleep 1
+    waited=$((waited + 1))
+  done
+done
+printf 'uninstall removed the jobs, versions, and service.toml; host identity %s, governance, and session metadata remain\n' "$host_id_before"
+
+printf '\nmacos-package-install: all checks passed\n'

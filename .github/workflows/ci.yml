@@ -411,6 +411,129 @@ jobs:
           fi
           exit "$failures"
 
+  # Native Apple Silicon packaging (issue #104): the daemon archive is built
+  # twice from the same commit and must come out byte-identical, its Mach-O
+  # files are audited, and the extracted archives are installed, upgraded, and
+  # uninstalled against real launchd with live sessions
+  # (scripts/acceptance/macos-package-install). Archives built here
+  # are unsigned development builds; signing and notarization run only in the
+  # release workflow.
+  macos-package:
+    # macos-15 is the required leg. macos-14 is the minimum supported macOS and
+    # exercises the packaged archives on it, but GitHub retires that hosted
+    # image on 2026-11-02, so its result is informational and cannot block a
+    # merge; the minimum-OS acceptance is a #105 gate on a runner that stays.
+    name: macOS package install and upgrade (${{ matrix.runner }})
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.macos_package == 'true' }}
+    needs: changes
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    continue-on-error: ${{ matrix.runner == 'macos-14' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-14, macos-15]
+    env:
+      # mold is Linux-only: keep the default linker on macOS runners.
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify native runner architecture
+        shell: bash
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: macos-package-${{ matrix.runner }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build offline documentation
+        run: cargo xtask docs site
+
+      - name: Build the daemon component
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          bindir="$(packaging/macos/build-release daemon)"
+          echo "bindir=$bindir" >> "$GITHUB_OUTPUT"
+
+      - name: Package version A
+        id: package-a
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^\[workspace\.package\]/ { in_pkg = 1; next } /^\[/ { in_pkg = 0 } in_pkg && /^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)"
+          mkdir -p "$RUNNER_TEMP/dist-a"
+          archive="$(packaging/macos/package --development daemon "$version" \
+            "${{ steps.build.outputs.bindir }}" target/pohunek-docs "$RUNNER_TEMP/dist-a")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      # The same commit rebuilt from a cold release directory at the same path
+      # must produce the same binaries and the same archive. Cargo mixes the
+      # RUSTFLAGS text (which carries the checkout path for path remapping)
+      # into every crate's metadata hash, so the path itself stays fixed.
+      - name: Rebuild from a cold release directory and compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          first="$RUNNER_TEMP/first-binaries"
+          mkdir -p "$first" "$RUNNER_TEMP/dist-repro"
+          for binary in pohunek pohunekd pohunek-sessiond; do
+            cp "${{ steps.build.outputs.bindir }}/$binary" "$first/"
+          done
+          rm -rf target/aarch64-apple-darwin/release
+          bindir="$(packaging/macos/build-release daemon)"
+          for binary in pohunek pohunekd pohunek-sessiond; do
+            cmp "$first/$binary" "$bindir/$binary" \
+              || { echo "::error::$binary is not reproducible from a cold build"; exit 1; }
+          done
+          rebuilt="$(packaging/macos/package --development daemon \
+            "${{ steps.package-a.outputs.version }}" "$bindir" target/pohunek-docs "$RUNNER_TEMP/dist-repro")"
+          cmp "${{ steps.package-a.outputs.archive }}" "$rebuilt" \
+            || { echo "::error::the daemon archive is not reproducible from a cold build"; exit 1; }
+
+      # A second version of the same tree, so the upgrade installs different
+      # real binaries. The workspace version is bumped only in this runner's
+      # checkout and restored afterwards.
+      - name: Build and package version B
+        id: package-b
+        shell: bash
+        run: |
+          set -euo pipefail
+          version_b="$(python3 - <<'PY'
+          import re
+          text = open("Cargo.toml").read()
+          match = re.search(r'(\[workspace\.package\][^\[]*?version\s*=\s*")(\d+)\.(\d+)\.(\d+)(")', text, re.S)
+          major, minor, patch = (int(match.group(i)) for i in (2, 3, 4))
+          bumped = "%d.%d.%d" % (major, minor, patch + 1)
+          open("Cargo.toml", "w").write(text[:match.start()] + match.group(1) + bumped + match.group(5) + text[match.end():])
+          print(bumped)
+          PY
+          )"
+          bindir="$(CARGO_LOCKED_FLAG= packaging/macos/build-release daemon)"
+          mkdir -p "$RUNNER_TEMP/dist-b"
+          archive="$(packaging/macos/package --development daemon "$version_b" "$bindir" target/pohunek-docs "$RUNNER_TEMP/dist-b")"
+          git checkout -- Cargo.toml Cargo.lock
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Install, upgrade, and uninstall from the archives
+        timeout-minutes: 20
+        env:
+          PKG_ACCEPT_ARCHIVE: ${{ steps.package-a.outputs.archive }}
+          PKG_ACCEPT_UPGRADE_ARCHIVE: ${{ steps.package-b.outputs.archive }}
+        run: scripts/acceptance/macos-package-install
+
   test:
     name: fmt + clippy
     runs-on: ubuntu-latest
@@ -562,6 +685,7 @@ jobs:
       relay: ${{ steps.filter.outputs.relay }}
       feature_matrix: ${{ steps.filter.outputs.feature_matrix }}
       macos: ${{ steps.filter.outputs.macos }}
+      macos_package: ${{ steps.filter.outputs.macos_package }}
       hermes: ${{ steps.filter.outputs.hermes }}
       docs_ts: ${{ steps.filter.outputs.docs_ts }}
       release: ${{ steps.filter.outputs.release }}
@@ -628,6 +752,45 @@ jobs:
               - 'Cargo.lock'
               - '.cargo/**'
               - '.github/workflows/ci.yml'
+            # Native macOS release packaging (issue #104): the archive scripts,
+            # the install acceptance, and every crate the packaged daemon
+            # archive contains or the installer drives.
+            macos_package:
+              - 'packaging/**'
+              - 'docs/knowledge/**'
+              - 'crates/xtask/**'
+              - 'rust-toolchain*'
+              - 'compat/**'
+              - 'scripts/lib.sh'
+              - 'scripts/pohunek-*'
+              - 'README.md'
+              - 'LICENSE'
+              - 'scripts/acceptance/macos-package-install'
+              - 'scripts/acceptance/launchd_lifetime_evidence.py'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'crates/cli/**'
+              - 'crates/daemon/**'
+              - 'crates/session-worker/**'
+              - 'crates/platform/**'
+              - 'crates/paths/**'
+              - 'crates/service-config/**'
+              - 'crates/worker-protocol/**'
+              - 'crates/logging/**'
+              - 'crates/terminal/**'
+              - 'crates/protocol/**'
+              - 'crates/client/**'
+              - 'crates/knowledge/**'
+              - 'crates/hostcheck/**'
+              - 'crates/netbird/**'
+              - 'crates/overlay/**'
+              - 'crates/prompt/**'
+              - 'crates/gui-core/**'
+              - 'crates/relay-client/**'
+              - 'crates/relay-protocol/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/release.yml'
             # Pinned Hermes compatibility provisioning + runtime check
             # (issue #125): gate on the locked runtime metadata, the full CLI
             # surface (the gate drives the CLI parser/dispatch, not just the
@@ -654,6 +817,7 @@ jobs:
               - 'crates/xtask/src/**'
               - 'scripts/provision-hermes-compat'
               - 'scripts/tests/provision-hermes-compat.sh'
+              - 'packaging/**'
               - 'scripts/smoke-hermes-plugin-release'
               - 'scripts/tests/smoke-hermes-plugin-release.sh'
               - 'scripts/tests/fixtures/smoke-*'
@@ -1217,28 +1381,35 @@ jobs:
       - name: Test Hermes harness natively
         run: cargo test --locked -p xtask --lib hermes
 
-      - name: Build release CLI
-        run: cargo build --locked --release -p pohunek-cli --bin pohunek
+      - name: Build offline documentation
+        run: cargo xtask docs site
 
-      # The release binary and the packaged smoke script are copied to a
-      # directory outside the checkout, so the gate and the smoke can only use
-      # assets embedded in the binary.
-      - name: Stage packaged CLI outside the source tree
+      # The packaged archive is built with the release scripts and extracted
+      # outside the checkout, so the gate and the smoke can only use what the
+      # published macOS CLI archive contains: the binary with its embedded
+      # plugin and skill assets, and the packaged smoke script.
+      - name: Build, package, and extract the CLI archive outside the source tree
         id: packaged
         shell: /bin/bash {0}
         run: |
           set -euo pipefail
-          packaged_dir="$RUNNER_TEMP/packaged-pohunek"
-          rm -rf "$packaged_dir"
-          mkdir -p "$packaged_dir"
-          cp target/release/pohunek "$packaged_dir/pohunek"
-          cp scripts/smoke-hermes-plugin-release "$packaged_dir/smoke-hermes-plugin-release"
-          chmod 0755 "$packaged_dir/pohunek" "$packaged_dir/smoke-hermes-plugin-release"
-          packaged_dir="$(cd "$packaged_dir" && pwd -P)"
+          version="$(awk -F'"' '/^\[workspace\.package\]/ { in_pkg = 1; next } /^\[/ { in_pkg = 0 } in_pkg && /^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)"
+          bindir="$(packaging/macos/build-release cli)"
+          dist="$RUNNER_TEMP/dist-cli"
+          rm -rf "$dist"
+          mkdir -p "$dist"
+          archive="$(packaging/macos/package --development cli "$version" "$bindir" target/pohunek-docs "$dist")"
+          extract_dir="$RUNNER_TEMP/packaged-pohunek"
+          rm -rf "$extract_dir"
+          mkdir -p "$extract_dir"
+          tar -xzf "$archive" -C "$extract_dir"
+          packaged_dir="$(cd "$extract_dir/$(basename "$archive" .tar.gz)" && pwd -P)"
           if git -C "$packaged_dir" rev-parse --git-dir >/dev/null 2>&1; then
             echo "packaged directory is inside a Git worktree: $packaged_dir" >&2
             exit 1
           fi
+          test -x "$packaged_dir/pohunek"
+          test -x "$packaged_dir/packaging/smoke-hermes-plugin-release"
           printf 'dir=%s\n' "$packaged_dir" >> "$GITHUB_OUTPUT"
 
       - name: Check pinned Hermes compatibility
@@ -1253,7 +1424,7 @@ jobs:
         shell: /bin/bash {0}
         run: |
           set -euo pipefail
-          "${{ steps.packaged.outputs.dir }}/smoke-hermes-plugin-release" \
+          "${{ steps.packaged.outputs.dir }}/packaging/smoke-hermes-plugin-release" \
             "${{ steps.packaged.outputs.dir }}/pohunek" \
             "${{ steps.hermes.outputs.bin }}"
 

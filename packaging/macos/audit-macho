@@ -1,0 +1,233 @@
+#!/bin/sh
+# Audit the Mach-O files below the given paths for a native Apple Silicon
+# release.
+#
+# usage: audit-macho [--minimum-os X.Y] [--forbid-string TEXT]... [--require REL]... <path>...
+#
+# Every Mach-O file found (a file argument, or any regular file below a
+# directory argument) must be
+#   - a thin arm64 image (no universal binary, no x86_64, no arm64e);
+#   - built for macOS (not iOS, tvOS, or watchOS) with a deployment target no newer than --minimum-os (default: the
+#     value in packaging/macos/DEPLOYMENT_TARGET);
+#   - linked only against system libraries under /usr/lib or /System/Library,
+#     with no @rpath/@executable_path/@loader_path library and no LC_RPATH;
+#   - free of build-machine paths: the strings below, plus every
+#     --forbid-string, must not occur in the file.
+# Anything that is not Mach-O is ignored. The audit fails when no Mach-O file
+# is found at all, so a mistyped path cannot pass. Each `--require REL` names a
+# file, relative to the single directory argument, that must itself be a Mach-O
+# file: a required program that is a script, a Linux binary, or missing fails
+# even though the rest of the tree is fine. It needs `otool`, `lipo`,
+# and `strings` from the Xcode command line tools.
+
+set -eu
+
+# Build-machine paths that must never reach a shipped binary: a hosted
+# runner's home and the Homebrew cellar. The Homebrew bin directories and
+# `/Volumes` are not listed because the binaries legitimately name them
+# (search-path fallbacks, volume-aware path checks).
+DEFAULT_FORBIDDEN_STRINGS="/Users/runner
+/home/runner
+/Cellar/"
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+fail() {
+    printf 'audit-macho: %s\n' "$*" >&2
+    exit 2
+}
+
+minimum_os=$(tr -d ' \n' < "$script_dir/DEPLOYMENT_TARGET")
+forbidden=$DEFAULT_FORBIDDEN_STRINGS
+required=
+paths=
+
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --minimum-os)
+            [ "$#" -ge 2 ] || fail "--minimum-os needs a value"
+            minimum_os=$2
+            shift 2
+            ;;
+        --forbid-string)
+            [ "$#" -ge 2 ] || fail "--forbid-string needs a value"
+            [ -n "$2" ] || fail "--forbid-string needs a non-empty value"
+            forbidden="$forbidden
+$2"
+            shift 2
+            ;;
+        --require)
+            [ "$#" -ge 2 ] || fail "--require needs a value"
+            required="$required
+$2"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*) fail "unknown option: $1" ;;
+        *) break ;;
+    esac
+done
+[ "$#" -ge 1 ] || fail "usage: audit-macho [--minimum-os X.Y] [--forbid-string TEXT]... <path>..."
+case $minimum_os in
+    '' | *[!0-9.]*) fail "--minimum-os must be numeric: $minimum_os" ;;
+esac
+for tool in otool lipo strings od awk find; do
+    command -v "$tool" >/dev/null 2>&1 || fail "required tool not found: $tool"
+done
+
+failures=0
+checked=0
+
+problem() {
+    printf 'FAIL %s: %s\n' "$1" "$2" >&2
+    failures=$((failures + 1))
+}
+
+# Prints the magic number of $1 as lowercase hex, empty for a short file.
+magic_of() {
+    od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n'
+}
+
+# Succeeds when $1 (a version) is not newer than $2.
+version_not_newer() {
+    awk -v have="$1" -v limit="$2" 'BEGIN {
+        n = split(have, a, ".")
+        m = split(limit, b, ".")
+        count = (n > m) ? n : m
+        for (i = 1; i <= count; i++) {
+            x = (i <= n) ? a[i] + 0 : 0
+            y = (i <= m) ? b[i] + 0 : 0
+            if (x < y) exit 0
+            if (x > y) exit 1
+        }
+        exit 0
+    }'
+}
+
+audit_file() {
+    file=$1
+    case $(magic_of "$file") in
+        cffaedfe) ;;
+        cafebabe | bebafeca | cafebabf | bfbafeca)
+            problem "$file" "universal (fat) binary; ship thin arm64 images only"
+            return
+            ;;
+        feedfacf | cefaedfe | feedface)
+            problem "$file" "not a little-endian 64-bit Mach-O image"
+            return
+            ;;
+        *) return ;;
+    esac
+    checked=$((checked + 1))
+    failures_before=$failures
+    printf '%s\n' "$file" >> "$scratch/audited"
+
+    archs=$(lipo -archs "$file" 2>&1) || {
+        problem "$file" "lipo cannot read it: $archs"
+        return
+    }
+    [ "$archs" = arm64 ] || problem "$file" "architecture is '$archs', expected exactly arm64"
+
+    load_commands=$(otool -l "$file" 2>&1) || {
+        problem "$file" "otool -l cannot read it"
+        return
+    }
+    platform=$(printf '%s\n' "$load_commands" | awk '
+        $1 == "cmd" { section = $2; next }
+        section == "LC_BUILD_VERSION" && $1 == "platform" { print $2; exit }
+        section == "LC_VERSION_MIN_MACOSX" { print "1"; exit }')
+    case $platform in
+        1 | MACOS) ;;
+        *) problem "$file" "built for platform '${platform:-none}', not macOS" ;;
+    esac
+    minos=$(printf '%s\n' "$load_commands" | awk '
+        $1 == "cmd" { section = $2; next }
+        section == "LC_BUILD_VERSION" && $1 == "minos" { print $2; exit }
+        section == "LC_VERSION_MIN_MACOSX" && $1 == "version" { print $2; exit }')
+    if [ -z "$minos" ]; then
+        problem "$file" "no macOS deployment target (LC_BUILD_VERSION) recorded"
+    elif ! version_not_newer "$minos" "$minimum_os"; then
+        problem "$file" "deployment target $minos is newer than $minimum_os"
+    fi
+    rpaths=$(printf '%s\n' "$load_commands" | awk '
+        $1 == "cmd" { section = $2; next }
+        section == "LC_RPATH" && $1 == "path" { print $2 }')
+    if [ -n "$rpaths" ]; then
+        problem "$file" "carries a runtime search path: $(printf '%s' "$rpaths" | tr '\n' ' ')"
+    fi
+
+    libraries=$(otool -L "$file" 2>&1) || {
+        problem "$file" "otool -L cannot read it"
+        return
+    }
+    printf '%s\n' "$libraries" | awk 'NR > 1 && NF > 0 { print $1 }' | while IFS= read -r library; do
+        case $library in
+            /usr/lib/* | /System/Library/*) ;;
+            *) printf 'FAIL %s: links %s, outside /usr/lib and /System/Library\n' "$file" "$library" >&2 ;;
+        esac
+    done > "$scratch/library-failures" 2>&1 || true
+    if [ -s "$scratch/library-failures" ]; then
+        cat "$scratch/library-failures" >&2
+        failures=$((failures + $(wc -l < "$scratch/library-failures")))
+    fi
+
+    if ! strings -a "$file" > "$scratch/strings" 2>/dev/null; then
+        problem "$file" "strings cannot read it, so the build-machine path check did not run"
+    fi
+    printf '%s\n' "$forbidden" | while IFS= read -r needle; do
+        [ -n "$needle" ] || continue
+        if grep -F -q -e "$needle" "$scratch/strings"; then
+            printf 'FAIL %s: contains the build-machine path %s\n' "$file" "$needle" >&2
+        fi
+    done > "$scratch/string-failures" 2>&1 || true
+    if [ -s "$scratch/string-failures" ]; then
+        cat "$scratch/string-failures" >&2
+        failures=$((failures + $(wc -l < "$scratch/string-failures")))
+    fi
+    if [ "$failures" -eq "$failures_before" ]; then
+        printf 'ok %s: arm64, minos %s\n' "$file" "${minos:-unknown}"
+    fi
+}
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/audit-macho.XXXXXX")
+trap 'rm -rf -- "$scratch"' EXIT
+
+: > "$scratch/audited"
+for path in "$@"; do
+    if [ -d "$path" ]; then
+        find "$path" -type f -print | LC_ALL=C sort > "$scratch/files"
+        while IFS= read -r file; do
+            audit_file "$file"
+        done < "$scratch/files"
+    elif [ -f "$path" ]; then
+        audit_file "$path"
+    else
+        fail "no such file or directory: $path"
+    fi
+done
+
+if [ -n "$required" ]; then
+    [ "$#" -eq 1 ] && [ -d "$1" ] || fail "--require needs exactly one directory argument"
+    printf '%s\n' "$required" | while IFS= read -r relative; do
+        [ -n "$relative" ] || continue
+        if ! grep -qxF -- "$1/$relative" "$scratch/audited"; then
+            printf 'FAIL %s: the required program is missing or not a Mach-O file\n' "$1/$relative" >&2
+        fi
+    done > "$scratch/required-failures" 2>&1 || true
+    if [ -s "$scratch/required-failures" ]; then
+        cat "$scratch/required-failures" >&2
+        failures=$((failures + $(wc -l < "$scratch/required-failures")))
+    fi
+fi
+if [ "$checked" -eq 0 ]; then
+    printf 'audit-macho: no Mach-O file found below the given paths\n' >&2
+    exit 1
+fi
+if [ "$failures" -ne 0 ]; then
+    printf 'audit-macho: %s problem(s) in %s Mach-O file(s)\n' "$failures" "$checked" >&2
+    exit 1
+fi
+printf 'audit-macho: %s Mach-O file(s) passed\n' "$checked"
