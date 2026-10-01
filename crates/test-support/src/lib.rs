@@ -19,6 +19,10 @@
 //! a path baked in at compile time. A nextest archive extracted at a different
 //! absolute path therefore finds its binaries and source files.
 //!
+//! The [`env`] module holds [`env::TestEnv`], the per-test fixture that owns a
+//! private root, working directory, `HOME` and XDG directories, and builds a
+//! scrubbed environment for child processes.
+//!
 //! The [`wait`] module holds the readiness waits: [`wait::HANG_GUARD`], the
 //! single ceiling every incidental-deadline wait is bounded by, and
 //! [`wait::poll_until`], [`wait::wait_until`] and [`wait::guard`], which fail
@@ -38,6 +42,7 @@
 
 // Rust guideline compliant 2026-10-01
 
+pub mod env;
 pub mod wait;
 
 use std::ffi::OsString;
