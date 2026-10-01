@@ -757,6 +757,9 @@ jobs:
             # archive contains or the installer drives.
             macos_package:
               - 'packaging/**'
+              - 'docs/knowledge/**'
+              - 'README.md'
+              - 'LICENSE'
               - 'scripts/acceptance/macos-package-install'
               - 'scripts/acceptance/launchd_lifetime_evidence.py'
               - 'Cargo.toml'
