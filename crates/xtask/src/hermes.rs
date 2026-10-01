@@ -214,6 +214,12 @@ const WORKING_WAIT: Duration = Duration::from_secs(3);
 /// Give input handling and terminal cleanup a short bounded grace period.
 const INPUT_SETTLE_WAIT: Duration = Duration::from_secs(2);
 const EXIT_GRACE: Duration = Duration::from_secs(8);
+/// Upper bound for the interrupt acknowledgement after Ctrl-C.
+///
+/// The wait returns as soon as the interrupt marker appears, so the bound only
+/// matters when the terminal stalls; a lower value turns a slow runner into a
+/// false failure.
+const INTERRUPT_WAIT: Duration = Duration::from_secs(8);
 /// Reader completion is bounded even if an escaped descendant retained a pipe.
 const READER_GRACE: Duration = Duration::from_secs(2);
 /// Pinned Hermes rejects models below its 64K tool-calling context floor.
@@ -501,7 +507,7 @@ impl Limits {
             turn_wait: TURN_WAIT,
             working_wait: WORKING_WAIT,
             input_settle_wait: INPUT_SETTLE_WAIT,
-            interrupt_wait: INPUT_SETTLE_WAIT,
+            interrupt_wait: INTERRUPT_WAIT,
             exit_grace: EXIT_GRACE,
         }
     }
@@ -3255,7 +3261,8 @@ fn validate_classic_mode_and_exit(id: &str, capture: &PtyCapture) -> Result<(), 
     }
     if capture.killed || capture.exit_code.is_some_and(|code| code != 0) {
         return Err(fail(format!(
-            "Hermes PTY scenario `{id}` exited unsuccessfully"
+            "Hermes PTY scenario `{id}` exited unsuccessfully (killed: {}, exit code: {:?})",
+            capture.killed, capture.exit_code
         )));
     }
     Ok(())
@@ -4032,7 +4039,7 @@ mod tests {
     };
     use super::{
         isolation_root_budget, COMMAND_TIMEOUT, DAEMON_SOCKET_RELATIVE_PATH,
-        DARWIN_SOCKET_PATH_MAX_BYTES, EXIT_GRACE, INTEGRATION_ACTION_TIMEOUT,
+        DARWIN_SOCKET_PATH_MAX_BYTES, EXIT_GRACE, INTEGRATION_ACTION_TIMEOUT, INTERRUPT_WAIT,
         ISOLATED_RUNTIME_DIRECTORY, LINUX_SOCKET_PATH_MAX_BYTES, PRODUCTION_ISOLATION_PREFIX,
         STARTUP_WAIT, TURN_WAIT, WORKING_WAIT,
     };
@@ -4072,7 +4079,7 @@ mod tests {
             turn_wait: TURN_WAIT,
             working_wait: WORKING_WAIT,
             input_settle_wait: Duration::from_secs(1),
-            interrupt_wait: TURN_WAIT,
+            interrupt_wait: INTERRUPT_WAIT,
             exit_grace: EXIT_GRACE,
         }
     }
@@ -6121,6 +6128,33 @@ PY
         assert!(
             message.contains("capture did not reach prompt-ready evidence"),
             "PTY error must stay visible: {message}"
+        );
+    }
+
+    #[test]
+    fn unsuccessful_exit_message_names_kill_or_exit_code() {
+        let killed = PtyCapture {
+            bytes: Vec::new(),
+            exit_code: Some(0),
+            killed: true,
+        };
+        let failed = PtyCapture {
+            bytes: Vec::new(),
+            exit_code: Some(2),
+            killed: false,
+        };
+
+        assert_eq!(
+            super::validate_classic_mode_and_exit("working", &killed)
+                .expect_err("a killed child is unsuccessful")
+                .to_string(),
+            "Hermes PTY scenario `working` exited unsuccessfully (killed: true, exit code: Some(0))"
+        );
+        assert_eq!(
+            super::validate_classic_mode_and_exit("working", &failed)
+                .expect_err("a non-zero exit is unsuccessful")
+                .to_string(),
+            "Hermes PTY scenario `working` exited unsuccessfully (killed: false, exit code: Some(2))"
         );
     }
 
