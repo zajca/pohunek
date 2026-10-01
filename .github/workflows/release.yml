@@ -469,9 +469,10 @@ jobs:
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.checksum }}
 
-  # Signed and notarized native Apple Silicon archives (issue #104). Runs on
-  # the oldest supported macOS runner (macos-14) so the packaged binaries are
-  # exercised on the minimum OS. The protected `macos-signing` environment
+  # Signed and notarized native Apple Silicon archives (issue #104). Builds on
+  # the maintained macos-15 image against the macOS 14.0 deployment target
+  # (packaging/macos/DEPLOYMENT_TARGET, enforced by the Mach-O audit); running
+  # the archives on macOS 14 itself is a separate acceptance gate. The protected `macos-signing` environment
   # holds the Developer ID certificate and the notary API key; each secret is
   # exposed only to the steps that use it. Missing credentials fail this job
   # before the build: a macOS archive is never published unsigned, and the run
@@ -479,7 +480,7 @@ jobs:
   build-macos:
     name: Build ${{ matrix.component }} for aarch64-apple-darwin
     needs: [gate, docs-gate, web-gate]
-    runs-on: macos-14
+    runs-on: macos-15
     environment: macos-signing
     timeout-minutes: 120
     permissions:

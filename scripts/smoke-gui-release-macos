@@ -15,6 +15,7 @@ umask 077
 
 readonly SMOKE_WINDOW_SECONDS=8
 readonly SMOKE_LAUNCH_SECONDS=20
+readonly FINDER_PATH=/usr/bin:/bin:/usr/sbin:/sbin
 readonly SMOKE_TERM_WAIT_SECONDS=15
 readonly EXPECTED_IDENTIFIER=io.github.zajca.pohunek.gui
 
@@ -44,17 +45,24 @@ fi
 work=$(mktemp -d /tmp/pohunek-gui-smoke.XXXXXX)
 work=$(CDPATH='' cd -- "$work" && pwd -P)
 gui_pid=
+gui_start=
+# Whether $gui_pid is still the process this run started.
+gui_is_ours() {
+    [ -n "$gui_pid" ] && [ "$(ps -o lstart= -p "$gui_pid" 2>/dev/null || true)" = "$gui_start" ]
+}
 cleanup() {
     status=$?
     trap - EXIT
-    if [ -n "$gui_pid" ] && kill -0 "$gui_pid" 2>/dev/null; then
+    if gui_is_ours; then
         kill -TERM "$gui_pid" 2>/dev/null || true
         waited=0
-        while kill -0 "$gui_pid" 2>/dev/null && [ "$waited" -lt "$SMOKE_TERM_WAIT_SECONDS" ]; do
+        while gui_is_ours && [ "$waited" -lt "$SMOKE_TERM_WAIT_SECONDS" ]; do
             sleep 1
             waited=$((waited + 1))
         done
-        kill -KILL "$gui_pid" 2>/dev/null || true
+        if gui_is_ours; then
+            kill -KILL "$gui_pid" 2>/dev/null || true
+        fi
     fi
     if [ "$status" -ne 0 ] && [ -f "$work/gui.err" ]; then
         cat "$work/gui.err" >&2
@@ -73,7 +81,9 @@ user=$(id -un)
 # LaunchServices starts the app as Finder does: through launchd, with launchd's
 # minimal environment. `open --env` adds only the isolation variables, so the
 # run neither reads nor changes the operator's own pohunek state.
-/usr/bin/open -n \
+# `env -i` keeps the runner's own variables out of the launch.
+/usr/bin/env -i HOME="$home" USER="$user" LOGNAME="$user" PATH="$FINDER_PATH" \
+    /usr/bin/open -n \
     --env "HOME=$home" --env "USER=$user" --env "LOGNAME=$user" \
     --env "XDG_CONFIG_HOME=$home/.config" --env "XDG_RUNTIME_DIR=$work/run" \
     --env "XDG_STATE_HOME=$work/state" --env "XDG_DATA_HOME=$work/data" \
@@ -81,11 +91,15 @@ user=$(id -un)
     --stdout "$work/gui.out" --stderr "$work/gui.err" "$app" ||
     { printf '%s\n' "LaunchServices could not open the bundle" >&2; exit 1; }
 
-# The process is launchd's child, so find it by its executable path.
+# The process is launchd's child, so find it by its executable path; its start
+# time is part of its identity so a recycled pid is never signalled.
 waited=0
 while :; do
     gui_pid=$(/usr/bin/pgrep -f "$executable" | head -n 1 || true)
-    [ -n "$gui_pid" ] && break
+    if [ -n "$gui_pid" ]; then
+        gui_start=$(ps -o lstart= -p "$gui_pid" 2>/dev/null || true)
+        [ -n "$gui_start" ] && break
+    fi
     [ "$waited" -lt "$SMOKE_LAUNCH_SECONDS" ] || { printf '%s\n' "the app did not start within ${SMOKE_LAUNCH_SECONDS}s" >&2; exit 1; }
     sleep 1
     waited=$((waited + 1))
